@@ -328,7 +328,7 @@ fn write_steering_section(out: &mut String) {
     out.push_str(
         r###"### `agent.steering`
 
-Automatic steering repairs unusable model output and can add bounded guidance about repeated behavior. All eight rules are enabled by default. Configure overrides inside `agent` in `caudra.setup()`. All fields are optional.
+Automatic steering repairs unusable model output and can add bounded guidance about repeated behavior. All nine rules are enabled by default. Configure overrides inside `agent` in `caudra.setup()`. All fields are optional.
 
 | Field | Type | Default | Limits and meaning |
 |-------|------|---------|--------------------|
@@ -348,6 +348,7 @@ Automatic steering repairs unusable model output and can add bounded guidance ab
 | `repeated_tool_call` | `true` | Refuse the third consecutive identical top-level tool name/input before execution. Native batch children do not acquire this hard blocker. |
 | `protocol_mismatch` | `true` | Correct an explicit provider tool-use indication with no actual tool calls, up to 2 continuations per episode. |
 | `missing_task_report` | `true` | Request a missing task summary or required structured report, up to 2 corrections. |
+| `abandoned_turn` | `true` | Continue a turn that ended by announcing work the response never performed, up to 2 continuations per episode. Spending the allowance accepts the text rather than failing the turn. |
 | `repetition` | `true` | Advise on short exact tool cycles, including normalized native batch leaf calls, or repeated normalized assistant text. |
 | `tool_planning` | `true` | Advise after repeated narrow tool choice across responses, with repeated-call/cycle or repeated-error evidence. Successful reads of different files alone are insufficient. |
 | `no_tool_use` | `true` | Suggest tools when useful after eligible responses without tool attempts, only when the effective tool inventory is nonempty. |
@@ -381,6 +382,7 @@ The remaining fields are integers. All ranges are inclusive. Set `enabled = fals
 | `repeated_tool_call.threshold` | `3` | 2–1024 | Consecutive identical top-level calls. Refuse the call reaching this threshold. |
 | `protocol_mismatch.max_attempts` | `2` | 1–1024 | Protocol corrective continuations per episode. |
 | `missing_task_report.max_attempts` | `2` | 1–1024 | Additional report-correction prompts per task invocation. |
+| `abandoned_turn.max_attempts` | `2` | 1–1024 | Continuations per episode after a turn that announced work instead of doing it. |
 | `repetition.window` | `24` | 1–4096 | Recent normalized leaf tool calls retained for cycle detection. |
 | `repetition.cycle_repeats` | `3` | 2–1024 | Exact repetitions of a tool cycle needed for an advisory. |
 | `repetition.max_cycle` | `4` | 2–1024 | Maximum cycle length in leaf calls. Candidate cycle lengths start at 2. |
@@ -454,7 +456,9 @@ Charge one recovery for a completed-response-to-next-request transition caused b
 
 A mixed batch with useful successful siblings proceeds normally. It is not replayed or charged once per child. Transport and authentication retries, ordinary tool execution failures, permission denials, normal successful tool progress, explicit goal evaluation, and manual steering are separate from model-format recovery. The recovery budget does not bound every possible agent loop. Outer turn limits and cancellation still apply.
 
-At most one supplemental steering message is added per request. Recovery takes priority, then repetition, tool planning, and no-tool guidance. Advisory exhaustion only suppresses hints. Recovery exhaustion with an unmet output contract reports a failure and retains partial output. A valid captured structured task report remains usable after an empty tail, but cancellation, transport/permission failures, and hard outer-limit failures do not become success.
+At most one supplemental steering message is added per request. Recovery takes priority, then repetition, tool planning, and no-tool guidance. Advisory exhaustion only suppresses hints. Recovery exhaustion with an unmet output contract reports a failure and retains partial output, except for `abandoned_turn`, which stops intervening and lets the turn end. A valid captured structured task report remains usable after an empty tail, but cancellation, transport/permission failures, and hard outer-limit failures do not become success.
+
+`abandoned_turn` reads the tail of a response that called no tool and would otherwise end the turn. It fires on a text stopping at a bare colon, or on a last sentence that opens on an intent to act. It does not fire on a question, an offer, a completion, or a promise deferred behind another event, and code spans and quoted prose are removed before any of that is matched. Tool-looking prose is not executed here either; the rule only decides whether to ask for one more response.
 
 The resolved `enabled = false` disables automatic recovery, including truncation, advisories, and repeat-policy blocking. It leaves malformed-input rejection, schema validation, permissions, mode restrictions, cancellation, explicit goals, manual steering, and compaction policy intact. A rule-level switch disables only that rule. Zero budgets prevent the corresponding continuations or hints without bypassing input validation or repeat-policy enforcement.
 
@@ -697,7 +701,7 @@ mod tests {
     const MODEL: &str = "provider/model";
     const HEADING: &str = "### `agent.steering`";
     const PROMPT_ROW: &str = "| `prompt` | string | `nil` |";
-    const RULE_COUNT: usize = 8;
+    const RULE_COUNT: usize = 9;
 
     #[test]
     fn steering_reference_matches_resolved_defaults() {
@@ -769,6 +773,7 @@ mod tests {
     #[test_case("/max_recoveries", 32; "combined_recoveries")]
     #[test_case("/max_advisories", 4; "combined_advisories")]
     #[test_case("/rules/truncation/max_attempts", 3; "truncation_attempts")]
+    #[test_case("/rules/abandoned_turn/max_attempts", 2; "abandoned_turn_attempts")]
     fn steering_numeric_defaults(path: &str, expected: u64) {
         let policy = serde_json::to_value(SteeringConfig::default().resolve(MODEL)).unwrap();
         assert_eq!(policy.pointer(path).and_then(Value::as_u64), Some(expected));

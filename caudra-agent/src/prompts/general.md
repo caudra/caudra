@@ -28,5 +28,6 @@ You must NEVER generate or guess URLs unless they are for helping the user with 
 
 # When done
 - Return a concise summary of what you did and any findings.
+- Never end your turn by announcing your next step. Either do it now, or report what you have.
 - If you cannot complete what was asked for, say so clearly and explain why.
 {{instructions}}

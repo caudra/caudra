@@ -118,6 +118,9 @@ rule!(ProtocolMismatchConfig, ProtocolMismatchPolicy, {
 rule!(MissingTaskReportConfig, MissingTaskReportPolicy, {
     max_attempts: u32 = 2, 1..=MAX_COUNT;
 });
+rule!(AbandonedTurnConfig, AbandonedTurnPolicy, {
+    max_attempts: u32 = 2, 1..=MAX_COUNT;
+});
 rule!(RepetitionConfig, RepetitionPolicy, {
     window: usize = 24, 1..=MAX_WINDOW;
     cycle_repeats: usize = 3, 2..=MAX_COUNT;
@@ -200,6 +203,7 @@ rules! {
     repeated_tool_call: RepeatedToolCallConfig => RepeatedToolCallPolicy,
     protocol_mismatch: ProtocolMismatchConfig => ProtocolMismatchPolicy,
     missing_task_report: MissingTaskReportConfig => MissingTaskReportPolicy,
+    abandoned_turn: AbandonedTurnConfig => AbandonedTurnPolicy,
     repetition: RepetitionConfig => RepetitionPolicy,
     tool_planning: ToolPlanningConfig => ToolPlanningPolicy,
     no_tool_use: NoToolUseConfig => NoToolUsePolicy,
@@ -391,12 +395,13 @@ mod tests {
     const INVALID_FIELD: &str = "rules.no_tool_use.window";
     const INVALID_MESSAGE: &str = "must be between 3 and 4096, got 2";
     const UNKNOWN_FIELD: &str = "unknown field";
-    const RULES: [&str; 8] = [
+    const RULES: [&str; 9] = [
         "truncation",
         "empty_response",
         "repeated_tool_call",
         "protocol_mismatch",
         "missing_task_report",
+        "abandoned_turn",
         "repetition",
         "tool_planning",
         "no_tool_use",
@@ -424,6 +429,7 @@ mod tests {
                     "repeated_tool_call": {"enabled": true, "prompt": null, "threshold": 3},
                     "protocol_mismatch": {"enabled": true, "prompt": null, "max_attempts": 2},
                     "missing_task_report": {"enabled": true, "prompt": null, "max_attempts": 2},
+                    "abandoned_turn": {"enabled": true, "prompt": null, "max_attempts": 2},
                     "repetition": {
                         "enabled": true, "prompt": null, "window": 24, "cycle_repeats": 3,
                         "max_cycle": 4, "text_window": 8, "text_repeats": 3, "cooldown": 3
@@ -656,6 +662,8 @@ mod tests {
     #[test_case("truncation", "max_attempts", 0; "truncation_zero")]
     #[test_case("truncation", "max_attempts", MAX_COUNT + 1; "truncation_too_large")]
     #[test_case("missing_task_report", "max_attempts", 0; "report_zero")]
+    #[test_case("abandoned_turn", "max_attempts", 0; "abandoned_zero")]
+    #[test_case("abandoned_turn", "max_attempts", MAX_COUNT + 1; "abandoned_too_large")]
     #[test_case("repetition", "window", MAX_WINDOW + 1; "oversized_window")]
     #[test_case("repetition", "max_cycle", 1; "single_cycle")]
     #[test_case("repetition", "cycle_repeats", 1; "single_cycle_repeat")]

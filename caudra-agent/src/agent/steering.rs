@@ -1,8 +1,11 @@
 use std::collections::VecDeque;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 
 use caudra_config::steering::{SteeringConfig, SteeringPolicy};
-use caudra_providers::{ContentBlock, EMPTY_RESPONSE_MARKER, Message, Model, Role, SteeringKind};
+use caudra_providers::{
+    ContentBlock, EMPTY_RESPONSE_MARKER, Message, Model, Role, SteeringKind, estimate_tokens,
+};
+use regex::Regex;
 use tracing::info;
 
 use super::tool_dispatch::{ToolObservation, ToolOutcome};
@@ -17,6 +20,9 @@ const TRUNCATION_PROMPT: &str = "Continue from where it stopped without repeatin
 const REPORT_STRUCTURED: &str = "The required structured report has not been captured.";
 const REPORT_SUMMARY: &str = "The task ended without a visible summary.";
 const REPORT_PROMPT: &str = "Provide the required task report now, using the reporting tool when structured output is required, or a concise text summary otherwise.";
+const ABANDONED_FACT: &str =
+    "The turn ended on a statement of intent. The work it announced was not performed.";
+const ABANDONED_PROMPT: &str = "Carry out what you said you would do now, using tool calls. Do not restate the plan. When the work is done, end with the report the task asked for.";
 const REPETITION_PROMPT: &str = "Recent responses repeat the same text or tool-call pattern. Reconsider the next useful action and change approach if this repetition is not helping. Legitimate verification or polling may continue.";
 const PLANNING_PROMPT: &str = "Recent responses repeatedly use the same tool with repeated calls or errors. Reassess your tool choices and choose a useful next action; change approach if these calls are not helping.";
 const NO_TOOL_PROMPT: &str = "Recent assistant responses have not attempted tools. Use available tools when useful and consistent with the user's instructions; otherwise answer directly.";
@@ -24,15 +30,60 @@ const HISTORY_SCAN_LIMIT: usize = 16_384;
 const TEXT_BYTES_LIMIT: usize = 8_192;
 const MIN_REPEATED_TEXT_CHARS: usize = 32;
 const MIN_CYCLE: usize = 2;
+/// A closing paragraph that happens to open with `I'll` is a real answer, so
+/// only a preamble-sized tail is eligible for abandonment.
+const MAX_TRAILING_SENTENCE_TOKENS: u32 = 80;
 pub const EMPTY_RULE: &str = "empty_response";
 const PROTOCOL_RULE: &str = "protocol_mismatch";
 const REPORT_RULE: &str = "missing_task_report";
+const ABANDONED_RULE: &str = "abandoned_turn";
 const TRUNCATION_RULE: &str = "truncation";
 const TOOL_REPAIR_RULE: &str = "tool_repair";
 const REPETITION_RULE: &str = "repetition";
 const PLANNING_RULE: &str = "tool_planning";
 const NO_TOOL_RULE: &str = "no_tool_use";
 pub(super) const NO_PROGRESS_RULE: &str = "no_progress";
+
+/// Code spans and quoted prose carry other people's sentences. Matching inside
+/// them reads an example as the model's own intent.
+static INLINE_CODE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"`[^`\n]*`").expect("literal"));
+static QUOTED: LazyLock<Regex> = LazyLock::new(|| Regex::new("\"[^\"\n]*\"").expect("literal"));
+/// Anchored: the tail has to open on the intent, not merely contain one.
+static PROMISE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?i)^(?:(?:ok(?:ay)?|alright|now|next|then|first|finally|so|continuing|moving on)[,:]?\s+)*(?:let(?:'|’)?s\b|let me\b|i(?:'|’)?ll\b|i will\b|i(?:'|’)?m going to\b|i am going to\b|i need to\b|i should\b|going to\b|time to\b|back to\b|continuing\b|proceeding\b|re-?running\b|running\b|checking\b|writing\b|reading\b)",
+    )
+    .expect("literal")
+});
+/// Conversational uses of the same openers, and the forms that hand back.
+static CONVERSATIONAL: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?i)\b(?:let me know|let me explain|let me clarify|let me summari[sz]e|i(?:'|’)?ll wait|i(?:'|’)?ll hold|i(?:'|’)?ll stop|would you like|do you want|want me to|should i\b|if you(?:'|’)?d like|tell me|let me have|just say)\b",
+    )
+    .expect("literal")
+});
+static COMPLETION: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?i)\b(?:done|finished|complete[d]?|no changes|in summary|all set|ready for|nothing else|that(?:'|’)?s it|as requested)\b",
+    )
+    .expect("literal")
+});
+/// A promise scheduled behind another event reports what happens next; it is
+/// not work the model walked away from.
+static DEFERRED: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?i)\b(?:as soon as|once |when (?:the|you|it|that)|during|afterwards?|later|next time|in the meantime|meanwhile|if (?:you|needed|necessary)|on request|upon)\b",
+    )
+    .expect("literal")
+});
+/// A turn that asks the user for something gave control back on purpose,
+/// whatever its last sentence promises.
+static SOLICITS: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?i)(?:\?|\b(?:when|whenever) you(?:'|’)?re ready\b|\bjust (?:say|tell|drop)\b|\blet me know\b|\bwhat would you like\b|\bsay the word\b)",
+    )
+    .expect("literal")
+});
 
 pub(crate) type SharedSteering = Arc<Mutex<Steering>>;
 
@@ -46,6 +97,7 @@ pub(crate) struct Steering {
     reports: u32,
     protocols: u32,
     truncations: u32,
+    abandons: u32,
     responses: u64,
     stalled: u32,
     calls: VecDeque<(u64, ToolObservation)>,
@@ -62,6 +114,8 @@ pub(super) enum Recovery {
     Protocol,
     Truncated,
     ToolRepair,
+    /// Ended on an announcement of work the response never performed.
+    Abandoned,
 }
 
 /// What one response did, as the budgets need to see it.
@@ -70,6 +124,8 @@ pub(super) struct Observed {
     pub protocol: bool,
     /// Carried a tool call or visible text, so the turn moved the task.
     pub productive: bool,
+    /// Announced work instead of doing it, per [`abandons_turn`].
+    pub abandoned: bool,
 }
 
 pub(super) enum RecoveryAction {
@@ -98,6 +154,7 @@ impl Steering {
             reports: 0,
             protocols: 0,
             truncations: 0,
+            abandons: 0,
             responses: 0,
             stalled: 0,
             calls: VecDeque::new(),
@@ -179,6 +236,9 @@ impl Steering {
         if !observed.protocol {
             self.protocols = 0;
         }
+        if !observed.abandoned {
+            self.abandons = 0;
+        }
         self.stalled = if observed.productive {
             0
         } else {
@@ -195,8 +255,12 @@ impl Steering {
         }
     }
 
+    fn exhausted(&self, episode: u32, limit: u32) -> bool {
+        self.recoveries >= self.policy.max_recoveries || episode >= limit
+    }
+
     fn charge(&mut self, rule: &str, episode: u32, limit: u32) -> Result<(), AgentError> {
-        if self.recoveries >= self.policy.max_recoveries || episode >= limit {
+        if self.exhausted(episode, limit) {
             info!(
                 rule,
                 action = "exhausted",
@@ -322,12 +386,32 @@ impl Steering {
                 )
             }
             Recovery::ToolRepair => (TOOL_REPAIR_RULE, 0, u32::MAX, None),
+            // Alone among the recoveries this one gives up quietly. The turn
+            // it is correcting produced real text, so spending the budget is
+            // reason to accept that text, never to fail the run over it.
+            Recovery::Abandoned => {
+                let policy = &self.policy.rules.abandoned_turn;
+                if !policy.enabled || self.exhausted(self.abandons, policy.max_attempts) {
+                    return Ok(RecoveryAction::Disabled);
+                }
+                (
+                    ABANDONED_RULE,
+                    self.abandons,
+                    policy.max_attempts,
+                    Some(format!(
+                        "{ABANDONED_FACT}\n\n{}",
+                        policy.prompt.as_deref().unwrap_or(ABANDONED_PROMPT)
+                    )),
+                )
+            }
         };
         self.charge(rule, episode, limit)?;
         if rule == PROTOCOL_RULE {
             self.protocols += 1;
         } else if rule == TRUNCATION_RULE {
             self.truncations += 1;
+        } else if rule == ABANDONED_RULE {
+            self.abandons += 1;
         }
         Ok(RecoveryAction::Continue(Intervention {
             message: prompt
@@ -522,6 +606,68 @@ pub(super) fn visible_text(message: &Message) -> Option<String> {
     (!text.is_empty()).then_some(text)
 }
 
+/// Whether a terminal response announced work instead of performing it.
+///
+/// Two signals, both read off the tail. A text stopping on a bare colon is a
+/// lead-in whose list never arrived, which is what a model emitting its end
+/// token one sentence early looks like. Otherwise the last sentence has to
+/// open on an intent, and must not be a question, a hand-back, a completion,
+/// or a promise deferred behind some other event.
+///
+/// Measured over 2,571 terminal responses from this project's own sessions:
+/// 35 of 386 qwen3.8-27b turns, and none of the 2,185 from claude and gpt.
+pub(super) fn abandons_turn(text: &str) -> bool {
+    let text = text.trim();
+    if text.is_empty() {
+        return false;
+    }
+    if text.ends_with(':') {
+        return true;
+    }
+    if SOLICITS.is_match(&sanitize(text)) {
+        return false;
+    }
+    let Some(line) = text
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+    else {
+        return false;
+    };
+    let line = sanitize(line);
+    let sentence = trailing_sentence(&line);
+    if sentence.is_empty() || estimate_tokens(sentence) > MAX_TRAILING_SENTENCE_TOKENS {
+        return false;
+    }
+    if CONVERSATIONAL.is_match(sentence)
+        || COMPLETION.is_match(sentence)
+        || DEFERRED.is_match(sentence)
+    {
+        return false;
+    }
+    PROMISE.is_match(sentence)
+}
+
+fn sanitize(text: &str) -> String {
+    QUOTED
+        .replace_all(&INLINE_CODE.replace_all(text, " "), " ")
+        .into_owned()
+}
+
+/// The last sentence of `line`, split on terminators the regex crate cannot
+/// look behind for. Every byte compared is ASCII, so the index is a boundary.
+fn trailing_sentence(line: &str) -> &str {
+    let bytes = line.as_bytes();
+    let mut start = 0;
+    for index in 0..bytes.len().saturating_sub(1) {
+        if matches!(bytes[index], b'.' | b'!' | b'?') && bytes[index + 1].is_ascii_whitespace() {
+            start = index + 1;
+        }
+    }
+    line[start..].trim()
+}
+
 fn text_blocks(message: &Message) -> impl Iterator<Item = &str> {
     message.content.iter().filter_map(|block| match block {
         ContentBlock::Text { text } if text != EMPTY_RESPONSE_MARKER && !text.trim().is_empty() => {
@@ -574,10 +720,11 @@ mod tests {
     use test_case::test_case;
 
     use super::{
-        EMPTY_IDLE, EMPTY_RULE, Intervention, NO_TOOL_RULE, Observed, PLANNING_RULE, PROTOCOL_FACT,
-        PROTOCOL_RULE, REPETITION_RULE, REPORT_RULE, REPORT_STRUCTURED, REPORT_SUMMARY, Recovery,
-        RecoveryAction, Steering, TEXT_BYTES_LIMIT, TRUNCATION_FACT, TRUNCATION_PROMPT,
-        TRUNCATION_RULE, eligible_response, normalized_message,
+        ABANDONED_FACT, ABANDONED_RULE, EMPTY_IDLE, EMPTY_RULE, Intervention, NO_TOOL_RULE,
+        Observed, PLANNING_RULE, PROTOCOL_FACT, PROTOCOL_RULE, REPETITION_RULE, REPORT_RULE,
+        REPORT_STRUCTURED, REPORT_SUMMARY, Recovery, RecoveryAction, Steering, TEXT_BYTES_LIMIT,
+        TRUNCATION_FACT, TRUNCATION_PROMPT, TRUNCATION_RULE, abandons_turn, eligible_response,
+        normalized_message,
     };
     use crate::AgentError;
     use crate::agent::tool_dispatch::{ToolObservation, ToolOutcome};
@@ -589,6 +736,7 @@ mod tests {
     const EXPECTED_CONTINUE: &str = "a charged recovery continues";
     const OTHER_MODEL: &str = "other-model";
     const TRUNCATION_ATTEMPTS: u32 = 3;
+    const ABANDONED_ATTEMPTS: u32 = 2;
 
     fn default_state() -> Steering {
         Steering::new(SteeringConfig::default().resolve(MODEL))
@@ -608,6 +756,7 @@ mod tests {
             calls,
             protocol: false,
             productive,
+            abandoned: false,
         });
     }
 
@@ -878,6 +1027,7 @@ mod tests {
                 calls: Vec::new(),
                 protocol: true,
                 productive: false,
+                abandoned: false,
             });
             let RecoveryAction::Continue(Intervention {
                 message: Some(message),
@@ -1103,5 +1253,90 @@ mod tests {
         } else {
             assert!(normalized_message(&assistant(&TEXT.repeat(TEXT_BYTES_LIMIT))).is_none());
         }
+    }
+
+    // Verbatim tails from this project's own qwen3.8-27b sessions. Paraphrasing
+    // them would test the regex against itself rather than against the model.
+    #[test_case("Let me look at the workcell dependency and provider core files.", true ; "promise_only")]
+    #[test_case("Let me verify the out-of-project permission handling for the code-graph crawl root, then I'll have everything for the report.", true ; "promise_with_a_trailing_intention")]
+    #[test_case("The pinned workcell rev has a cargo checkout there. I can read that for the native tool implementations. Now back to caudra-lua internals:", true ; "dangling_colon")]
+    #[test_case("Now the nuclei tuple:", true ; "bare_lead_in")]
+    #[test_case("Spot-check confirms: escalated system prompt and a 9-phase kill chain. All work is done — committing this session's fixes:", true ; "a_colon_outranks_completion_words")]
+    #[test_case("The script transformed all 10 families. Now let me verify syntax and rendering, then handle CWE.", true ; "promise_after_a_finding")]
+    #[test_case("The 10 families transformed but not yet verified. Continuing: verify syntax + render, then CWE, profiles, hash.", true ; "resumption_opener")]
+    #[test_case("`fromtimestamp` isn't in the isolated interpreter — computing via `timedelta` instead:", true ; "colon_after_inline_code")]
+    // Real hand-backs from the same corpus, and from the claude and gpt
+    // sessions the rule must leave alone.
+    #[test_case("Done — `sleep 20` ran and exited cleanly (code 0, no output).", false ; "completion")]
+    #[test_case("Nothing much — the `sleep 30` command finished cleanly (exit 0). What's next?", false ; "question_to_the_user")]
+    #[test_case("Understood — I'll hold here. When you're ready, just tell me which alternative to plan, and I'll write the plan file.", false ; "offer_awaiting_the_user")]
+    #[test_case("I have not saved the root cause to memory yet, since plan mode limits me to the plan file. I will do that during implementation.", false ; "promise_deferred_to_a_later_phase")]
+    #[test_case("I deliberately did not weaken the guard. I'll report the exact differing field as soon as the run writes its result.", false ; "promise_deferred_behind_an_event")]
+    #[test_case("Awesome. Whenever you're ready, drop a task. I'll investigate, ask clarifying questions if needed, and write up a plan for you.", false ; "conditional_offer")]
+    #[test_case("Wrote a long joke to `joke.txt`.", false ; "plain_report")]
+    #[test_case("The fix is on line 40. Quoting the guidance verbatim: \"Let me check the other callers first.\"", false ; "promise_inside_a_quotation")]
+    #[test_case("Everything passes. The failing assertion was `assert!(let me run this)`.", false ; "promise_inside_inline_code")]
+    #[test_case("", false ; "empty")]
+    fn abandonment_reads_the_tail_of_a_response(text: &str, expected: bool) {
+        assert_eq!(abandons_turn(text), expected);
+    }
+
+    /// The one recovery that gives up quietly: the response it corrects had
+    /// real text, so exhaustion accepts that text instead of failing the run.
+    #[test]
+    fn an_exhausted_abandonment_stops_intervening_without_an_error() {
+        let mut state = default_state();
+        for attempt in 0..ABANDONED_ATTEMPTS {
+            let RecoveryAction::Continue(Intervention {
+                message: Some(message),
+                ..
+            }) = state.recover(Recovery::Abandoned).unwrap()
+            else {
+                panic!("{EXPECTED_CONTINUE}");
+            };
+            let origin = message.steering.as_ref().unwrap();
+            assert_eq!(origin.rule, ABANDONED_RULE);
+            assert_eq!(origin.kind, SteeringKind::Recovery);
+            assert!(
+                message
+                    .first_text_content()
+                    .unwrap()
+                    .starts_with(ABANDONED_FACT)
+            );
+            assert_eq!(state.abandons, attempt + 1);
+        }
+        assert!(matches!(
+            state.recover(Recovery::Abandoned).unwrap(),
+            RecoveryAction::Disabled
+        ));
+    }
+
+    /// The counter tracks a streak, so a response that reports normally lets
+    /// the model spend the allowance again later in the same run.
+    #[test_case(true, 0 ; "a_clean_response_resets_the_streak")]
+    #[test_case(false, 1 ; "a_repeated_abandonment_keeps_it")]
+    fn abandonment_is_counted_per_streak(clean: bool, expected: u32) {
+        let mut state = default_state();
+        assert!(matches!(
+            state.recover(Recovery::Abandoned).unwrap(),
+            RecoveryAction::Continue(_)
+        ));
+        state.observe(Observed {
+            calls: Vec::new(),
+            protocol: false,
+            productive: true,
+            abandoned: !clean,
+        });
+        assert_eq!(state.abandons, expected);
+    }
+
+    #[test]
+    fn a_disabled_abandonment_rule_leaves_the_turn_alone() {
+        let mut state = default_state();
+        state.policy.rules.abandoned_turn.enabled = false;
+        assert!(matches!(
+            state.recover(Recovery::Abandoned).unwrap(),
+            RecoveryAction::Disabled
+        ));
     }
 }

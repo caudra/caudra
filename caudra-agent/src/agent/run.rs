@@ -1186,6 +1186,19 @@ impl<'h> Agent<'h> {
         // produced it is unchanged, so repeating it asks the same question
         // twice rather than retrying anything.
         let barren = empty && response.message.content.is_empty();
+        // A turn that ends by saying what it is about to do, and then does
+        // none of it. Read here because the response is moved below, and only
+        // for a turn that would otherwise hand control back: a tool call or a
+        // captured report means the work continued.
+        let abandoned = !has_tools
+            && stop_reason == Some(StopReason::EndTurn)
+            && !self
+                .report_ready
+                .as_ref()
+                .is_some_and(|ready| ready.load(Ordering::Acquire))
+            && self.tools.as_array().is_some_and(|tools| !tools.is_empty())
+            && steering::visible_text(&response.message)
+                .is_some_and(|text| steering::abandons_turn(&text));
         let (observations, all_repairable) = if has_tools {
             self.response_text = None;
             self.process_tool_calls(response, repair_state).await?
@@ -1209,6 +1222,7 @@ impl<'h> Agent<'h> {
             calls: observations,
             protocol,
             productive: has_tools || !empty,
+            abandoned,
         });
         if self.cancel.is_cancelled() {
             return Err(AgentError::Cancelled);
@@ -1284,6 +1298,8 @@ impl<'h> Agent<'h> {
                 nudges,
                 barren,
             })
+        } else if abandoned {
+            Some(Recovery::Abandoned)
         } else {
             None
         };
@@ -2177,7 +2193,12 @@ mod tests {
     const MAX_AFTER_TOOLS: u32 = 3;
     const MAX_IDLE_NUDGES: u32 = 2;
     const MAX_BARREN_NUDGES: u32 = 1;
+    const MAX_ABANDONED_NUDGES: u32 = 2;
+    /// A real qwen3.8-27b tail: the turn ends on the work it is about to do.
+    const ANNOUNCEMENT: &str = "Let me look at the workcell dependency and provider core files.";
+    const REPORT: &str = "The dependency is pinned at rev f40392a in Cargo.toml:41.";
     const STEERING_EMPTY: &str = "empty_response";
+    const STEERING_ABANDONED: &str = "abandoned_turn";
     const STEERING_PROTOCOL: &str = "protocol_mismatch";
     const STEERING_TOOL_REPAIR: &str = "tool_repair";
     const STEERING_TRUNCATION: &str = "truncation";
@@ -5544,6 +5565,68 @@ mod tests {
                 stalled as usize - 1
             );
         });
+    }
+
+    /// The failure the rule exists for, end to end: a subagent reported its
+    /// preamble because the loop accepted any non-empty text as an answer.
+    #[test]
+    fn an_announced_turn_is_continued_and_the_continuation_is_the_answer() {
+        smol::block_on(async {
+            let responses = vec![
+                announcement_response(),
+                assistant_response(vec![ContentBlock::Text {
+                    text: REPORT.into(),
+                }]),
+            ];
+            let mut history = History::new(Vec::new());
+            let (mut agent, _events) = make_agent(MockProvider::new(responses), &mut history);
+            agent.tools = serde_json::json!([{"name": "file_read"}]);
+            assert!(matches!(
+                agent.run(default_input()).await,
+                Ok(DoneReason::EndTurn)
+            ));
+            assert_eq!(agent.num_turns, 2);
+            // The announcement is replaced, not appended to: the caller reads
+            // the report, which is what a task result is made of.
+            assert_eq!(agent.response_text(), Some(REPORT));
+            assert!(
+                history.as_slice().iter().any(|message| message
+                    .steering
+                    .as_ref()
+                    .is_some_and(|origin| origin.rule == STEERING_ABANDONED))
+            );
+        });
+    }
+
+    /// Soft exhaustion, and the only rule that has it. A model that keeps
+    /// announcing wastes its allowance and is then believed, because the text
+    /// it produced is still a better result than a failed run.
+    #[test_case(false, MAX_ABANDONED_NUDGES + 1 ; "exhaustion_accepts_the_text")]
+    #[test_case(true, 1 ; "disabled_ends_the_turn_untouched")]
+    fn an_announced_turn_never_fails_the_run(disabled: bool, expected_turns: u32) {
+        smol::block_on(async {
+            let responses = (0..=MAX_ABANDONED_NUDGES)
+                .map(|_| announcement_response())
+                .collect();
+            let mut history = History::new(Vec::new());
+            let (mut agent, _events) = make_agent(MockProvider::new(responses), &mut history);
+            agent.tools = serde_json::json!([{"name": "file_read"}]);
+            if disabled {
+                Arc::make_mut(&mut agent.config.steering)
+                    .rules
+                    .abandoned_turn
+                    .enabled = Some(false);
+            }
+            let result = agent.run(default_input()).await;
+            assert!(matches!(result, Ok(DoneReason::EndTurn)), "{result:?}");
+            assert_eq!(agent.num_turns, expected_turns);
+        });
+    }
+
+    fn announcement_response() -> StreamResponse {
+        assistant_response(vec![ContentBlock::Text {
+            text: ANNOUNCEMENT.into(),
+        }])
     }
 
     /// A reply typed into a stall is what the stall interrupted, so it buys one
