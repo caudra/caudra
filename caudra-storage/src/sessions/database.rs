@@ -3463,9 +3463,9 @@ where
     .into_iter()
     .map(|(key, value)| (key, Arc::new(value)))
     .collect::<HashMap<_, _>>();
-    let mut subagent_messages = HashMap::new();
     let mut subagent_task_specs = HashMap::new();
     let mut task_spec_bytes = 0usize;
+    let mut stream_ids = Vec::new();
     {
         let mut statement = connection.prepare(
             "SELECT subagent_id, task_spec FROM subagent_streams \
@@ -3482,10 +3482,20 @@ where
                     deserialize_json(&task_spec, "subagent task spec")?,
                 );
             }
-            let values = query_subagent_rows::<M>(connection, id, &subagent_id)?;
-            subagent_messages.insert(subagent_id, Arc::new(values));
+            stream_ids.push(subagent_id);
         }
     }
+    // A stream with no history items still has a row, which is what keeps a
+    // completed or resumable empty subagent, so the map is built from the
+    // stream list rather than from the histories the payload query returned.
+    let mut histories = query_subagent_histories::<M>(connection, id)?;
+    let subagent_messages: HashMap<_, _> = stream_ids
+        .into_iter()
+        .map(|stream| {
+            let items = histories.remove(&stream).unwrap_or_default();
+            (stream, Arc::new(items))
+        })
+        .collect();
     let subagents = query_subagents(connection, id)?;
     let usage_by_model = query_model_usage(connection, id)?;
     let tool_usage = query_tool_usage(connection, id)?;
@@ -5292,21 +5302,31 @@ fn query_keyed_json_rows<T: DeserializeOwned + Send>(
         .collect())
 }
 
-fn query_subagent_rows<T: DeserializeOwned + Send>(
+/// Every subagent's history in one pass, keyed by the stream that owns it.
+/// Querying per stream gave each one its own decode, and a stream shorter than
+/// the parallel threshold decodes on a single core, so a session made of many
+/// small subagents paid serial cost for nearly all of its rows.
+fn query_subagent_histories<T: DeserializeOwned + Send>(
     connection: &Connection,
     session_id: CaudraId,
-    subagent_id: &str,
-) -> Result<Vec<T>, SessionError> {
+) -> Result<HashMap<String, Vec<T>>, SessionError> {
     let mut statement = connection.prepare(
-        "SELECT payload FROM subagent_history_items \
-         WHERE session_id = ?1 AND subagent_id = ?2 ORDER BY ordinal",
+        "SELECT subagent_id, payload FROM subagent_history_items \
+         WHERE session_id = ?1 ORDER BY subagent_id, ordinal",
     )?;
-    let mut rows = statement.query(params![session_id.as_bytes().as_slice(), subagent_id])?;
+    let mut rows = statement.query(params![session_id.as_bytes().as_slice()])?;
+    let mut owners = Vec::new();
     let mut stored = Vec::new();
     while let Some(row) = rows.next()? {
-        stored.push(row.get::<_, Vec<u8>>(0)?);
+        owners.push(row.get::<_, String>(0)?);
+        stored.push(row.get::<_, Vec<u8>>(1)?);
     }
-    decode_payloads(stored, "subagent history payload")
+    let values = decode_payloads(stored, "subagent history payload")?;
+    let mut histories: HashMap<String, Vec<T>> = HashMap::new();
+    for (owner, value) in owners.into_iter().zip(values) {
+        histories.entry(owner).or_default().push(value);
+    }
+    Ok(histories)
 }
 
 fn query_subagents(
