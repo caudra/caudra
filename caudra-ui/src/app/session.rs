@@ -9,7 +9,9 @@ use crate::chat::{CANCELLED_TEXT, Chat, DONE_TEXT, ERROR_TEXT, history_to_displa
 use crate::components::rewind_picker::RewindEntry;
 use crate::components::session_picker::{SessionPickerAction, SessionRow};
 use crate::components::session_relocation::SessionRelocationAction;
-use crate::components::{Action, DisplaySource, ForkDraft, ForkedSession, LoadedSession};
+use crate::components::{
+    Action, DisplayMessage, DisplaySource, ForkDraft, ForkedSession, LoadedSession,
+};
 use crate::input_document::InputDraft;
 use crate::repaint::{Dirty, Watch};
 use caudra_agent::HistorySnapshot;
@@ -42,6 +44,8 @@ use super::{App, Mode, PendingInput, PlanState, RestoreMode, Status};
 
 /// The shortest gap between two writes that carry only UI state.
 const SOFT_SAVE_DELAY: Duration = Duration::from_millis(1000);
+/// Below this many restored subagents a resume never pays for a thread.
+const PARALLEL_RESTORE_MIN_CHATS: usize = 4;
 const RENAME_USAGE: &str = "Usage: /rename <title>";
 pub(crate) const REVERT_BUSY_MSG: &str = "Wait for the session to become idle before reverting";
 
@@ -741,38 +745,37 @@ impl App {
         // Read, not taken: the live chats below are the source `sync_subagents`
         // mirrors back, so emptying the session here would only make the next
         // checkpoint write the same list again.
-        for sa in self
+        // A subagent reaches disk when it spawns but its transcript only when
+        // it ends, so one without an entry here never got to finish: leftovers
+        // from a kill mid-turn. It has nothing to show, and restoring it would
+        // park a task no agent backs at the top of the picker, running forever.
+        // `sync_subagents` below drops it for good.
+        let restorable: Vec<_> = self
             .state
             .session
             .subagents()
             .iter()
             .filter(|subagent| reachable_subagents.contains(&subagent.tool_use_id))
-            .cloned()
-            .collect::<Vec<_>>()
-        {
-            // A subagent reaches disk when it spawns but its transcript only
-            // when it ends, so one without an entry here never got to finish:
-            // leftovers from a kill mid-turn. It has nothing to show, and
-            // restoring it would park a task no agent backs at the top of the
-            // picker, running forever. `sync_subagents` below drops it for good.
-            let version_id = subagent_versions
-                .get(&sa.tool_use_id)
-                .unwrap_or(&sa.tool_use_id);
-            let Some(messages) = self
-                .state
-                .session
-                .subagent_messages()
-                .get(version_id)
-                .or_else(|| self.state.session.subagent_messages().get(&sa.tool_use_id))
-            else {
-                continue;
-            };
-            let (display, items) = history_to_display(
-                messages,
-                self.state.session.tool_outputs(),
-                &self.ui_config.tool_output_lines,
-                self.ui_config.show_reminders,
-            );
+            .filter_map(|subagent| {
+                let version_id = subagent_versions
+                    .get(&subagent.tool_use_id)
+                    .unwrap_or(&subagent.tool_use_id);
+                let messages = self
+                    .state
+                    .session
+                    .subagent_messages()
+                    .get(version_id)
+                    .or_else(|| self.state.session.subagent_messages().get(&subagent.tool_use_id))?;
+                Some((subagent.clone(), Arc::clone(messages)))
+            })
+            .collect();
+        let rendered = render_subagent_displays(
+            &restorable,
+            self.state.session.tool_outputs(),
+            &self.ui_config.tool_output_lines,
+            self.ui_config.show_reminders,
+        );
+        for ((sa, _), (display, items)) in restorable.into_iter().zip(rendered) {
             self.chat_index
                 .insert(sa.tool_use_id.clone(), self.chats.len());
             let mut chat = Chat::subagent(
@@ -2348,6 +2351,57 @@ fn source_target_id(source: DisplaySource) -> CaudraId {
         | DisplaySource::ToolResult(id) => id,
         DisplaySource::ToolCall { id, result_id } => result_id.unwrap_or(id),
     }
+}
+
+/// Renders each restored subagent's transcript on its own core. The work is
+/// per-chat, independent, and reads nothing but shared state, and a long-lived
+/// session carries enough subagents that doing it serially is the largest
+/// remaining cost of a resume.
+fn render_subagent_displays(
+    restorable: &[(StoredSubagent, Arc<Vec<HistoryItem>>)],
+    tool_outputs: &HashMap<String, Arc<caudra_agent::ToolOutput>>,
+    tool_output_lines: &caudra_config::ToolOutputLines,
+    show_reminders: bool,
+) -> Vec<(Vec<DisplayMessage>, Vec<caudra_lua::RestoreItem>)> {
+    let render = |messages: &Arc<Vec<HistoryItem>>| {
+        history_to_display(messages, tool_outputs, tool_output_lines, show_reminders)
+    };
+    let workers = restore_workers(restorable.len());
+    if workers == 1 {
+        return restorable.iter().map(|(_, items)| render(items)).collect();
+    }
+    let chunk = restorable.len().div_ceil(workers);
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = restorable
+            .chunks(chunk)
+            .map(|chunk| {
+                scope.spawn(move || {
+                    chunk
+                        .iter()
+                        .map(|(_, items)| render(items))
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .flat_map(|handle| {
+                handle
+                    .join()
+                    .unwrap_or_else(|payload| std::panic::resume_unwind(payload))
+            })
+            .collect::<Vec<_>>()
+    })
+}
+
+fn restore_workers(chats: usize) -> usize {
+    if chats < PARALLEL_RESTORE_MIN_CHATS {
+        return 1;
+    }
+    std::thread::available_parallelism()
+        .map(std::num::NonZeroUsize::get)
+        .unwrap_or(1)
+        .min(chats.div_ceil(PARALLEL_RESTORE_MIN_CHATS))
 }
 
 fn tool_call_ids(items: &[HistoryItem]) -> HashSet<String> {
