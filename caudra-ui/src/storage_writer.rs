@@ -831,10 +831,8 @@ impl Writer {
         let Some(database) = &self.database else {
             return;
         };
-        let Ok(stats) = database.stats() else {
-            return;
-        };
-        let total = stats.database_bytes.saturating_add(stats.wal_bytes);
+        let files = database.file_bytes();
+        let total = files.database.saturating_add(files.wal);
         let threshold = STORAGE_WARNING_BYTES
             .checked_shl(self.size_warning_level)
             .unwrap_or(u64::MAX);
@@ -845,10 +843,10 @@ impl Writer {
             ));
             self.size_warning_level = self.size_warning_level.saturating_add(1);
         }
-        if self.wal_outgrew_its_limit(stats.wal_bytes) {
+        if self.wal_outgrew_its_limit(files.wal) {
             let _ = self.warn_tx.send(format!(
                 "Session WAL is {} MiB, past the {} MiB a checkpoint trims to; a reader may be blocking them",
-                mib(stats.wal_bytes),
+                mib(files.wal),
                 mib(WAL_RETENTION_LIMIT_BYTES)
             ));
         }

@@ -117,7 +117,9 @@ const PARALLEL_DECODE_MIN_ROWS: usize = 256;
 const DECODE_WORKER_PANICKED: &str = "a payload decode worker panicked";
 const OWNER_FILE_MODE: u32 = 0o600;
 const OTHER_USER_PERMISSIONS: u32 = 0o077;
-const DATABASE_SIDECAR_SUFFIXES: [&str; 3] = ["-wal", "-shm", "-journal"];
+const WAL_SUFFIX: &str = "-wal";
+const SHM_SUFFIX: &str = "-shm";
+const DATABASE_SIDECAR_SUFFIXES: [&str; 3] = [WAL_SUFFIX, SHM_SUFFIX, "-journal"];
 pub(super) const SESSION_SNAPSHOT_DIR: &str = "session-snapshots";
 const CLEANUP_RETRY_DELAY_MS: i64 = 60_000;
 const PENDING_ARCHIVE_ORPHAN_GRACE: Duration = Duration::from_secs(60 * 60);
@@ -906,6 +908,17 @@ pub struct SessionDatabase {
     _migration_lock: File,
 }
 
+/// What the file itself costs on disk, with none of the surveying `stats`
+/// does. A writer polls this after every commit, and the snapshot and
+/// tool-output trees `stats` walks hold six-figure file counts on a long-lived
+/// state directory, which turns a survey per save into most of a second.
+#[derive(Debug, Clone, Serialize)]
+pub struct SessionFileBytes {
+    pub database: u64,
+    pub wal: u64,
+    pub shm: u64,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct SessionStorageStats {
     pub database_bytes: u64,
@@ -1487,11 +1500,17 @@ impl SessionDatabase {
         Ok(backup_path)
     }
 
-    pub fn stats(&self) -> Result<SessionStorageStats, SessionError> {
+    pub fn file_bytes(&self) -> SessionFileBytes {
         let path = self.path();
-        let database_bytes = file_len(&path);
-        let wal_bytes = file_len(&PathBuf::from(format!("{}-wal", path.display())));
-        let shm_bytes = file_len(&PathBuf::from(format!("{}-shm", path.display())));
+        SessionFileBytes {
+            database: file_len(&path),
+            wal: file_len(&database_sidecar(&path, WAL_SUFFIX)),
+            shm: file_len(&database_sidecar(&path, SHM_SUFFIX)),
+        }
+    }
+
+    pub fn stats(&self) -> Result<SessionStorageStats, SessionError> {
+        let files = self.file_bytes();
         let page_size = pragma_u64(&self.connection, "page_size")?;
         let page_count = pragma_u64(&self.connection, "page_count")?;
         let freelist_count = pragma_u64(&self.connection, "freelist_count")?;
@@ -1535,9 +1554,9 @@ impl SessionDatabase {
         let workflow = workflow_totals(&self.connection)?;
         let state_path = self.state_dir.path();
         Ok(SessionStorageStats {
-            database_bytes,
-            wal_bytes,
-            shm_bytes,
+            database_bytes: files.database,
+            wal_bytes: files.wal,
+            shm_bytes: files.shm,
             page_size,
             page_count,
             freelist_count,
