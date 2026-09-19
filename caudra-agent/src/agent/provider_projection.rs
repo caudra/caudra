@@ -3,11 +3,13 @@ use std::collections::HashMap;
 
 use caudra_providers::estimate_tokens_cached;
 use caudra_providers::{
-    ContentBlock, Message, Model, ReasoningTransport, ResponsesReasoning, Role,
+    ContentBlock, EMPTY_RESPONSE_MARKER, Message, Model, ReasoningTransport, ResponsesReasoning,
+    Role, SteeringKind,
 };
 use serde_json::Value;
 
 use super::history::is_user_turn;
+use super::steering::EMPTY_RULE;
 use crate::tools::{SKILL_TOOL_NAME, TOOL_OUTPUT_TOOL_NAME};
 
 const PROTECTED_USER_TURNS: usize = 2;
@@ -119,11 +121,10 @@ pub fn project_for_target<'a>(
     model: &Model,
     transport: ReasoningTransport,
 ) -> Cow<'a, [Message]> {
-    let projected = project(messages, tools);
-    if !projected
-        .iter()
-        .any(|message| reasoning_requires_lowering(message, model, transport))
-    {
+    let projected = collapse_stalls(project(messages, tools));
+    if !projected.iter().any(|message| {
+        reasoning_requires_lowering(message, model, transport) || needs_filler(message)
+    }) {
         return projected;
     }
 
@@ -131,6 +132,11 @@ pub fn project_for_target<'a>(
     for message in &mut lowered {
         if reasoning_requires_lowering(message, model, transport) {
             lower_reasoning(message);
+        }
+        if needs_filler(message) {
+            message.content.push(ContentBlock::Text {
+                text: EMPTY_RESPONSE_MARKER.into(),
+            });
         }
     }
     Cow::Owned(lowered)
@@ -209,13 +215,63 @@ fn lower_reasoning(message: &mut Message) {
             block => content.push(block),
         }
     }
-    if content.is_empty() {
-        content.push(ContentBlock::Text {
-            text: caudra_providers::EMPTY_RESPONSE_MARKER.into(),
-        });
-    }
     message.content = content;
     message.reasoning_source = None;
+}
+
+/// The filler a provider needs to accept an assistant turn that said nothing.
+/// It is written here and nowhere else: persisted anywhere, it becomes an
+/// in-context example of an empty turn that a later request learns from.
+fn needs_filler(message: &Message) -> bool {
+    matches!(message.role, Role::Assistant)
+        && !message.content.iter().any(|block| {
+            matches!(
+                block,
+                ContentBlock::Text { .. } | ContentBlock::ToolUse { .. }
+            )
+        })
+}
+
+/// A stall is a run of padding turns and the recovery prompts that answered
+/// them. Only the most recent pair is sent: every earlier copy is one more
+/// demonstration that assistant turns here are empty, which is what keeps a
+/// stalled model stalled.
+fn collapse_stalls(projected: Cow<'_, [Message]>) -> Cow<'_, [Message]> {
+    let collapsed = {
+        let messages = projected.as_ref();
+        let mut dropped = vec![false; messages.len()];
+        let mut index = 0;
+        while index + 1 < messages.len() {
+            if !starts_stall_pair(messages, index) {
+                index += 1;
+                continue;
+            }
+            let first = index;
+            while starts_stall_pair(messages, index + 2) {
+                index += 2;
+            }
+            dropped[first..index].fill(true);
+            index += 2;
+        }
+        dropped.iter().any(|dropped| *dropped).then(|| {
+            messages
+                .iter()
+                .zip(&dropped)
+                .filter(|(_, dropped)| !**dropped)
+                .map(|(message, _)| message.clone())
+                .collect::<Vec<_>>()
+        })
+    };
+    collapsed.map_or(projected, Cow::Owned)
+}
+
+fn starts_stall_pair(messages: &[Message], index: usize) -> bool {
+    messages.get(index).is_some_and(Message::is_empty_padding)
+        && messages.get(index + 1).is_some_and(|message| {
+            message.steering.as_ref().is_some_and(|origin| {
+                origin.kind == SteeringKind::Recovery && origin.rule == EMPTY_RULE
+            })
+        })
 }
 
 fn has_tool(tools: &Value, name: &str) -> bool {
@@ -238,8 +294,10 @@ fn protected_turn_start(messages: &[Message]) -> usize {
 
 #[cfg(test)]
 mod tests {
+    use caudra_providers::ReasoningSource;
     use caudra_storage::id::CaudraId;
     use caudra_storage::tool_outputs::ToolOutputRef;
+    use test_case::test_case;
 
     use super::*;
 
@@ -274,6 +332,103 @@ mod tests {
     /// One o200k token per repeat, so a fixture's token count is its repeat
     /// count and the threshold cases stay exact rather than approximate.
     const ONE_TOKEN: &str = " a";
+    const FILLER_MISSING: &str = "a projected assistant turn must carry a text block";
+
+    fn stall_pairs(count: usize) -> Vec<Message> {
+        (0..count)
+            .flat_map(|_| {
+                [
+                    Message::empty_marker(),
+                    Message::steering("stalled".into(), EMPTY_RULE, SteeringKind::Recovery),
+                ]
+            })
+            .collect()
+    }
+
+    fn projected_stalls(messages: &[Message]) -> Vec<Message> {
+        project_for_target(
+            messages,
+            &tools(false),
+            &anthropic_model(),
+            ReasoningTransport::Other,
+        )
+        .into_owned()
+    }
+
+    /// Every extra copy is one more demonstration that assistant turns here are
+    /// empty, which is what keeps a stalled model stalled.
+    #[test_case(1, 1; "single_pair_is_untouched")]
+    #[test_case(2, 1; "two_collapse_to_the_last")]
+    #[test_case(8, 1; "a_long_stall_collapses_to_the_last")]
+    fn a_stall_reaches_the_provider_once(pairs: usize, expected: usize) {
+        let mut messages = vec![Message::user("go".into())];
+        messages.extend(stall_pairs(pairs));
+        let projected = projected_stalls(&messages);
+
+        assert_eq!(
+            projected
+                .iter()
+                .filter(|message| message.is_empty_padding())
+                .count(),
+            expected
+        );
+        assert_eq!(
+            projected
+                .iter()
+                .filter(|message| message.steering.is_some())
+                .count(),
+            expected
+        );
+        assert!(
+            projected
+                .iter()
+                .all(|message| !matches!(message.role, Role::Assistant)
+                    || message
+                        .content
+                        .iter()
+                        .any(|block| matches!(block, ContentBlock::Text { .. }))),
+            "{FILLER_MISSING}"
+        );
+    }
+
+    /// Padding holds no text of its own, so the filler a provider needs is
+    /// written here and only here. A retained thinking block does not stand in
+    /// for it: a provider that keeps reasoning still wants a text block.
+    #[test_case(Vec::new(); "no_content")]
+    #[test_case(vec![ContentBlock::thinking("stalled".into(), None)]; "reasoning_retained")]
+    fn padding_is_given_provider_filler(content: Vec<ContentBlock>) {
+        let model = anthropic_model();
+        let padding = Message {
+            content,
+            reasoning_source: Some(ReasoningSource::new(&model, ReasoningTransport::Other)),
+            ..Message::empty_marker()
+        };
+        let projected = projected_stalls(&[Message::user("go".into()), padding]);
+
+        assert!(
+            matches!(
+                projected.last().and_then(|message| message.content.last()),
+                Some(ContentBlock::Text { text }) if text == EMPTY_RESPONSE_MARKER
+            ),
+            "{FILLER_MISSING}"
+        );
+    }
+
+    /// A turn that only called a tool is complete without text; adding filler
+    /// would put words in a turn that never had any.
+    #[test]
+    fn a_tool_call_turn_is_left_alone() {
+        let messages = vec![Message::user("go".into()), tool_use("t1", "bash")];
+        assert!(matches!(
+            project_for_target(
+                &messages,
+                &tools(false),
+                &anthropic_model(),
+                ReasoningTransport::Other,
+            ),
+            Cow::Borrowed(_)
+        ));
+    }
 
     fn content_of_tokens(tokens: usize) -> String {
         ONE_TOKEN.repeat(tokens)

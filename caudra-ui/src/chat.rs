@@ -26,12 +26,14 @@ use caudra_agent::tools::{
 };
 use caudra_agent::types::{Answer, QuestionEvent, WorkflowRunCard};
 use caudra_agent::{
-    AgentEvent, BatchToolEntry, BufferSnapshot, COMPACTION_ANCHOR, Mention, SubagentProgress,
-    ToolDoneEvent, ToolOutput, ToolStartEvent,
+    AgentEvent, BatchToolEntry, BufferSnapshot, COMPACTION_ANCHOR, EMPTY_RESPONSE_RULE, Mention,
+    SubagentProgress, ToolDoneEvent, ToolOutput, ToolStartEvent,
 };
 use caudra_config::{ToolOutputLines, UiConfig};
 use caudra_lua::WinView;
-use caudra_providers::{CaudraId, HistoryItem, HistoryItemKind, UserOrigin};
+use caudra_providers::{
+    CaudraId, HistoryItem, HistoryItemKind, SteeringKind, SteeringOrigin, UserOrigin,
+};
 use caudra_storage::view::ViewMode;
 use caudra_workflow::RunSnapshot;
 use ratatui::Frame;
@@ -99,6 +101,11 @@ pub struct Chat {
     /// folded, so this is the switch for readers who want the transcript to
     /// hold nothing but the conversation.
     show_reminders: bool,
+    /// The row the current stall is reporting on, and whether the injection
+    /// about to arrive belongs to it. A stall answers itself several times
+    /// over; the transcript should still read as one event.
+    stall_row: Option<usize>,
+    stall_pending: bool,
 }
 
 impl Chat {
@@ -116,6 +123,8 @@ impl Chat {
             model_id: None,
             pending_turn_usage: None,
             show_reminders: ui_config.show_reminders,
+            stall_row: None,
+            stall_pending: false,
             messages_panel: MessagesPanel::new(ui_config, lua_event_handle),
             finish: None,
             task_id: None,
@@ -322,14 +331,29 @@ impl Chat {
             }
             // The continuation itself arrives as `Injected` and carries the
             // prompt the model was actually sent, which is strictly more than a
-            // fixed line could say.
-            AgentEvent::Nudge => {}
+            // fixed line could say. A repeat only updates the row it already
+            // wrote: one stall is one row, however many attempts it takes.
+            AgentEvent::Nudge { attempt, .. } => {
+                if attempt == 1 {
+                    self.stall_row = None;
+                }
+                self.stall_pending = true;
+            }
             AgentEvent::Injected { text } => {
                 if self.show_reminders {
                     self.messages_panel.flush();
-                    self.messages_panel
-                        .push(DisplayMessage::new(DisplayRole::Injected, text));
+                    let row = DisplayMessage::new(DisplayRole::Injected, text);
+                    match self.stall_pending.then_some(self.stall_row).flatten() {
+                        Some(index) => self.messages_panel.replace(index, row),
+                        None => {
+                            let index = self.messages_panel.push(row);
+                            if self.stall_pending {
+                                self.stall_row = Some(index);
+                            }
+                        }
+                    }
                 }
+                self.stall_pending = false;
             }
             AgentEvent::ToolsLoaded { names } => {
                 self.messages_panel.flush();
@@ -838,6 +862,12 @@ pub(crate) fn batch_child_id(tool_id: &str) -> Option<(&str, usize)> {
     Some((parent, index.parse().ok()?))
 }
 
+fn is_stall_prompt(steering: &Option<SteeringOrigin>) -> bool {
+    steering.as_ref().is_some_and(|origin| {
+        origin.kind == SteeringKind::Recovery && origin.rule == EMPTY_RESPONSE_RULE
+    })
+}
+
 pub fn history_to_display(
     items: &[HistoryItem],
     tool_outputs: &HashMap<String, Arc<ToolOutput>>,
@@ -848,6 +878,7 @@ pub fn history_to_display(
     let mut display = Vec::new();
     let mut restore_items: Vec<caudra_lua::RestoreItem> = Vec::new();
     let mut displayed_user_groups = HashSet::new();
+    let mut stall_row: Option<usize> = None;
     for item in items {
         match &item.kind {
             // An injected item is its own row rather than a candidate for the
@@ -856,10 +887,26 @@ pub fn history_to_display(
             HistoryItemKind::User {
                 origin: UserOrigin::Observation | UserOrigin::Synthetic,
                 text,
+                steering,
                 ..
             } => {
                 if show_reminders && text != COMPACTION_ANCHOR {
-                    display.push(DisplayMessage::new(DisplayRole::Injected, text.clone()));
+                    let row = DisplayMessage::new(DisplayRole::Injected, text.clone());
+                    // A stall left one pair per attempt behind. Restoring it as
+                    // one row keeps the record without replaying the repetition
+                    // that a live run already collapsed.
+                    let replaceable = is_stall_prompt(steering)
+                        .then_some(stall_row)
+                        .flatten()
+                        .filter(|index| index + 1 == display.len());
+                    match replaceable {
+                        Some(index) => display[index] = row,
+                        None => {
+                            display.push(row);
+                            stall_row =
+                                is_stall_prompt(steering).then(|| display.len().saturating_sub(1));
+                        }
+                    }
                 }
             }
             HistoryItemKind::User {
@@ -2322,7 +2369,13 @@ mod tests {
         let mut chat = chat();
         text_delta(&mut chat, REPLY_TEXT);
 
-        chat.handle_event(AgentEvent::Nudge, None);
+        chat.handle_event(
+            AgentEvent::Nudge {
+                attempt: 1,
+                limit: 3,
+            },
+            None,
+        );
         chat.handle_event(
             AgentEvent::Injected {
                 text: INJECTED_TEXT.into(),

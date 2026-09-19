@@ -132,13 +132,17 @@ impl History {
             })
     }
 
-    /// Reads the padding tail instead of keeping a counter, so any real
-    /// message resets the nudge budget on its own.
+    /// Reads the padding tail instead of keeping a counter, so the episode
+    /// survives a restore and a fresh agent without new state.
+    ///
+    /// Only a response that carried work ends it. A message typed into a stall
+    /// is what the stall interrupted, not evidence that the model recovered,
+    /// and refilling the budget on it is what left a user unable to break out.
     pub fn recent_nudges(&self) -> u32 {
         self.as_slice()
             .iter()
             .rev()
-            .take_while(|m| is_system_padding(m))
+            .take_while(|m| !is_productive_response(m))
             .filter(|m| is_empty_marker(m))
             .count() as u32
     }
@@ -557,11 +561,20 @@ fn is_system_padding(m: &Message) -> bool {
                 .all(|b| matches!(b, ContentBlock::Text { .. })))
 }
 
-/// Role and `display_text` are part of the shape: a user who types the marker
-/// text verbatim writes a real message, and it has to break the nudge streak
-/// like any other.
 fn is_empty_marker(m: &Message) -> bool {
     m.is_empty_padding()
+}
+
+/// An assistant turn that carried a tool call or text a person could read.
+/// Reasoning alone does not count: a turn that only thought is exactly the
+/// turn the empty-response budget exists to answer.
+fn is_productive_response(m: &Message) -> bool {
+    matches!(m.role, Role::Assistant)
+        && !is_empty_marker(m)
+        && (m.has_tool_calls()
+            || m.content.iter().any(
+                |block| matches!(block, ContentBlock::Text { text } if !text.trim().is_empty()),
+            ))
 }
 
 /// The markers a run leaves behind when it ends without a reply: a cancel, or a failure that
@@ -663,6 +676,7 @@ mod tests {
     const GO: &str = "go";
     const FAILURE: &str = "inference engine is unavailable";
     const EMPTY_RULE: &str = "empty_response";
+    const SPENT: &str = "a reply typed into a stall does not refill the budget";
 
     #[test_case(false; "live")]
     #[test_case(true; "canonical_round_trip")]
@@ -681,6 +695,8 @@ mod tests {
         assert_eq!(history.recent_nudges(), 1);
         assert!(history.has_recent_tool_results(1));
         history.push(Message::user(SECOND.into()));
+        assert_eq!(history.recent_nudges(), 1, "{SPENT}");
+        history.push(assistant_text(GO));
         assert_eq!(history.recent_nudges(), 0);
     }
 
@@ -741,6 +757,14 @@ mod tests {
         let last = history.as_slice().last().unwrap();
         assert!(matches!(last.role, Role::User));
         assert!(matches!(&last.content[0], ContentBlock::Text { text } if text == CANCEL_MARKER));
+    }
+
+    fn assistant_text(text: &str) -> Message {
+        Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::Text { text: text.into() }],
+            ..Default::default()
+        }
     }
 
     fn make_tool_use_msg(ids: &[&str]) -> Message {
@@ -1437,17 +1461,26 @@ mod tests {
             Message::synthetic("nudge".into()),
             Message::user("continue".into()),
         ],
-        0
-        ; "user_message_resets_streak"
+        1
+        ; "a_user_message_does_not_refill_the_budget"
     )]
     #[test_case(
         vec![
             Message::empty_marker(),
             Message::synthetic("nudge".into()),
-            Message::user(caudra_providers::EMPTY_RESPONSE_MARKER.into()),
+            assistant_text(FIRST),
         ],
         0
-        ; "user_typing_the_marker_text_resets_streak"
+        ; "a_productive_response_ends_the_episode"
+    )]
+    #[test_case(
+        vec![
+            Message::empty_marker(),
+            Message::synthetic("nudge".into()),
+            make_tool_use_msg(&[FIRST]),
+        ],
+        0
+        ; "a_tool_call_ends_the_episode"
     )]
     fn recent_nudges(messages: Vec<Message>, expected: u32) {
         assert_eq!(History::new(messages).recent_nudges(), expected);

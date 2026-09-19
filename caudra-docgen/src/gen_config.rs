@@ -335,6 +335,7 @@ Automatic steering repairs unusable model output and can add bounded guidance ab
 | `enabled` | boolean | `true` | Master switch for automatic steering, including truncation recovery and repeat-policy blocking. |
 | `max_recoveries` | integer | `32` | 0–1024 corrective continuations per externally initiated invocation. Zero prevents optional recovery continuations. |
 | `max_advisories` | integer | `4` | 0–1024 advisory injections per invocation. Zero suppresses advisories. |
+| `max_stalled_turns` | integer | `5` | 0–1024 consecutive turns carrying neither a tool call nor visible text before the run ends, whichever rule intervened. Zero disables the backstop. |
 | `rules` | table | `{}` | Overrides by rule name, listed below. Omission uses built-in defaults. |
 | `models` | table | `{}` | Up to 256 exact `provider/model-id` keys, each with its own overrides. |
 
@@ -352,6 +353,8 @@ Automatic steering repairs unusable model output and can add bounded guidance ab
 | `no_tool_use` | `true` | Suggest tools when useful after eligible responses without tool attempts, only when the effective tool inventory is nonempty. |
 
 Recovery and advisory budgets are separate. Advisory rules allow at most 4 total injections per invocation, with a default cooldown of 3 completed model responses for each rule.
+
+An empty-response episode lives in the transcript tail, so it survives a restore and a new invocation. A message typed into a stall is answered, but it does not refill the budget: only a response carrying a tool call or visible text ends the episode. `max_stalled_turns` bounds the turns that interleaved rules spend between them, independently of any single rule's allowance.
 
 Advisories only accompany an independently scheduled next request. They never reopen a valid final answer. Tool-looking prose, JSON, XML, code fences, and quoted examples do not independently trigger protocol correction. Caudra does not scrape tool names or arguments from text and execute them. Only actual tool calls pass through normal validation and authorization. Ordinary assistant answers do not have to be JSON.
 
@@ -371,8 +374,9 @@ The remaining fields are integers. All ranges are inclusive. Set `enabled = fals
 | Field under `rules` | Default | Range | Unit and meaning |
 |---------------------|---------|-------|------------------|
 | `truncation.max_attempts` | `3` | 1–1024 | Actual truncation-correction requests per externally initiated invocation, shared across truncation episodes. |
-| `empty_response.max_after_tools` | `20` | 1–1024 | Empty-output continuations per episode after recent tool results. |
+| `empty_response.max_after_tools` | `3` | 1–1024 | Empty-output continuations per episode after recent tool results. |
 | `empty_response.max_idle` | `2` | 1–1024 | Empty-output continuations per episode without recent tool results. |
+| `empty_response.max_barren` | `1` | 1–1024 | Continuations per episode after a response that carried no content at all. Clamped by the limit above; repeating an unchanged request is not a retry. |
 | `empty_response.recent_tool_window` | `5` | 1–4096 | Non-padding history messages inspected for recent tool results. |
 | `repeated_tool_call.threshold` | `3` | 2–1024 | Consecutive identical top-level calls. Refuse the call reaching this threshold. |
 | `protocol_mismatch.max_attempts` | `2` | 1–1024 | Protocol corrective continuations per episode. |
@@ -428,7 +432,7 @@ caudra.setup({
 })
 ```
 
-Model entries accept `enabled`, `max_recoveries`, `max_advisories`, and `rules` with the same types and limits as the global fields. They cannot contain another `models` table. Omitted fields inherit through the resolution order below.
+Model entries accept `enabled`, `max_recoveries`, `max_advisories`, `max_stalled_turns`, and `rules` with the same types and limits as the global fields. They cannot contain another `models` table. Omitted fields inherit through the resolution order below.
 
 Keys are case-sensitive exact IDs, at most 512 UTF-8 bytes each. Use a nonempty provider and model suffix separated by `/`. Additional slashes inside the suffix are allowed, but every segment must be nonempty. Whitespace, control characters, `*`, `?`, `[`, `]`, `{`, `}`, and backslashes are rejected. Matching requires no authentication or model discovery. There are no glob overrides, provider-wide layers, capability guesses from model names, or Lua detector callbacks.
 
@@ -710,7 +714,12 @@ mod tests {
         );
         assert!(reference.lines().any(|line| line.starts_with(PROMPT_ROW)));
 
-        for field in ["enabled", "max_recoveries", "max_advisories"] {
+        for field in [
+            "enabled",
+            "max_recoveries",
+            "max_advisories",
+            "max_stalled_turns",
+        ] {
             let row = reference
                 .lines()
                 .find(|line| line.starts_with(&format!("| `{field}` |")))

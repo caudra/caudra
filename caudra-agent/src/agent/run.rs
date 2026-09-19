@@ -14,9 +14,8 @@ use tracing::{Instrument, debug, error, info, info_span, warn};
 use caudra_providers::model_registry::{self, Binding};
 use caudra_providers::provider::{self, Provider};
 use caudra_providers::{
-    Billing, CacheKey, ContentBlock, EMPTY_RESPONSE_MARKER, Message, Model, ModelError,
-    ModelPurpose, ReasoningSource, RequestOptions, Role, StopReason, StreamResponse, Timeouts,
-    TokenUsage, estimate_tokens_cached,
+    Billing, CacheKey, ContentBlock, Message, Model, ModelError, ModelPurpose, ReasoningSource,
+    RequestOptions, Role, StopReason, StreamResponse, Timeouts, TokenUsage, estimate_tokens_cached,
 };
 
 use super::compaction;
@@ -31,7 +30,9 @@ use super::instructions::LoadedInstructions;
 use super::mention_preamble;
 use super::provider_projection;
 use super::speculative::SpeculativeRuns;
-use super::steering::{self, Recovery, RecoveryAction, SharedSteering, Steering};
+use super::steering::{
+    self, NO_PROGRESS_RULE, Observed, Recovery, RecoveryAction, SharedSteering, Steering,
+};
 use super::streaming::{StreamError, stream_with_retry};
 use super::title;
 use super::tool_dispatch::{self, RecentCalls, ResponseObservations, ToolObservation};
@@ -60,6 +61,9 @@ use caudra_storage::usage_ledger::LedgerPurpose;
 use caudra_workspace::WorkspaceSession;
 
 const MAX_REAUTH_ATTEMPTS: u32 = 2;
+/// Multiplied by the attempt, so a stall that keeps stalling waits longer
+/// each time instead of billing a full cached prefix every couple of seconds.
+const STALL_BACKOFF: Duration = Duration::from_secs(2);
 const AUTH_RELOAD_POLL_MIN_MS: u64 = 250;
 const AUTH_RELOAD_POLL_MAX_MS: u64 = 1_000;
 const USER_MESSAGE_FRAMING: &str = r#"{"role":"user","content":[]}"#;
@@ -320,6 +324,9 @@ pub struct Agent<'h> {
     speculative: Option<Arc<SpeculativeRuns>>,
     steering: SharedSteering,
     shared_steering: bool,
+    /// Multiplied by the attempt. A field so a test can drop it to zero: the
+    /// pause is real time, and every stall case would otherwise wait it out.
+    stall_backoff: Duration,
     report_ready: Option<Arc<AtomicBool>>,
     response_text: Option<String>,
     continuing_response: bool,
@@ -423,6 +430,7 @@ impl<'h> Agent<'h> {
             speculative: None,
             steering: Arc::new(Mutex::new(steering)),
             shared_steering: false,
+            stall_backoff: STALL_BACKOFF,
             report_ready: None,
             response_text: None,
             continuing_response: false,
@@ -1158,11 +1166,11 @@ impl<'h> Agent<'h> {
         // Tool feedback is already sufficient for repair; charging it must not
         // add a second prompt or replay successful siblings.
         let protocol = !has_tools && stop_reason == Some(StopReason::ToolUse);
-        // A synthetic resume preserves the transcript's padding tail, but starts
-        // a new episode. Only empties from this invocation can spend its allowance;
-        // automatic corrections and queued input retain the same response count.
-        let nudges = u64::from(self.history.recent_nudges())
-            .min(steering::lock(&self.steering).responses()) as u32;
+        // The episode lives in the history tail rather than in this Agent, so a
+        // new invocation inherits what the last one spent. Refilling the
+        // allowance for every fresh run is what left a user unable to break out
+        // of a stall by typing at it.
+        let nudges = self.history.recent_nudges();
         let recent_tool_window = steering::lock(&self.steering)
             .policy()
             .rules
@@ -1174,6 +1182,10 @@ impl<'h> Agent<'h> {
             self.provider.reasoning_transport(&self.model),
         ));
         let empty = !has_tools && steering::visible_text(&response.message).is_none();
+        // Nothing came back at all, not even reasoning. The request that
+        // produced it is unchanged, so repeating it asks the same question
+        // twice rather than retrying anything.
+        let barren = empty && response.message.content.is_empty();
         let (observations, all_repairable) = if has_tools {
             self.response_text = None;
             self.process_tool_calls(response, repair_state).await?
@@ -1184,9 +1196,7 @@ impl<'h> Agent<'h> {
                     .message
                     .content
                     .retain(|block| !matches!(block, ContentBlock::Text { .. }));
-                response.message.content.push(ContentBlock::Text {
-                    text: EMPTY_RESPONSE_MARKER.into(),
-                });
+                response.message.padding = true;
             }
             self.push_assistant_message(response.message);
             (Vec::new(), false)
@@ -1195,9 +1205,27 @@ impl<'h> Agent<'h> {
         if let Some(error) = &interrupted {
             self.push_injected(Message::observation(format!("The provider stream stopped after tool admission ({}). Admitted calls were settled and their actual outcomes are recorded above. Calls not admitted were not executed. Do not replay successful calls; consider possible effects of failed calls before continuing.", error.kind())));
         }
-        steering::lock(&self.steering).observe(observations, protocol);
+        steering::lock(&self.steering).observe(Observed {
+            calls: observations,
+            protocol,
+            productive: has_tools || !empty,
+        });
         if self.cancel.is_cancelled() {
             return Err(AgentError::Cancelled);
+        }
+        // Every rule bounds its own interventions, and interleaved rules can
+        // still spend turn after turn on a run that produces nothing. Counting
+        // the turns is what ends that, whichever rule was speaking.
+        if steering::lock(&self.steering).no_progress() {
+            warn!(
+                rule = NO_PROGRESS_RULE,
+                turns = self.num_turns,
+                model = %self.model.id,
+                "run produced neither a tool call nor visible text for the stall limit, stopping"
+            );
+            return Err(AgentError::SteeringExhausted {
+                rule: NO_PROGRESS_RULE.into(),
+            });
         }
         // User control and context maintenance precede steering. Neither can
         // replenish the invocation allowance, and the turn limit wins before
@@ -1254,6 +1282,7 @@ impl<'h> Agent<'h> {
             Some(Recovery::Empty {
                 after_tools,
                 nudges,
+                barren,
             })
         } else {
             None
@@ -1267,11 +1296,18 @@ impl<'h> Agent<'h> {
             {
                 return Err(error);
             }
-            if let RecoveryAction::Continue(message) = action {
+            if let RecoveryAction::Continue(intervention) = action {
                 self.continuing_response = is_truncated && interrupted.is_none();
-                if let Some(message) = message {
+                if let Some(message) = intervention.message {
                     if is_empty {
-                        self.event_tx.send(AgentEvent::Nudge)?;
+                        self.event_tx.send(AgentEvent::Nudge {
+                            attempt: intervention.attempt,
+                            limit: intervention.limit,
+                        })?;
+                        self.stall_backoff(intervention.attempt).await;
+                        if self.cancel.is_cancelled() {
+                            return Err(AgentError::Cancelled);
+                        }
                     }
                     self.push_injected(*message);
                 }
@@ -1607,6 +1643,23 @@ impl<'h> Agent<'h> {
             num_turns: self.num_turns,
             reason,
         })
+    }
+
+    /// A stalled model is answered at a human pace rather than in a hot loop.
+    /// Each retry re-sends the whole cached prefix, and the pause is also what
+    /// gives someone watching the room to stop it.
+    async fn stall_backoff(&self, attempt: u32) {
+        let delay = self.stall_backoff.saturating_mul(attempt);
+        if delay.is_zero() {
+            return;
+        }
+        futures_lite::future::race(
+            async move {
+                smol::Timer::after(delay).await;
+            },
+            self.cancel.cancelled(),
+        )
+        .await;
     }
 
     fn inject_advisory(&mut self) {
@@ -2121,12 +2174,14 @@ mod tests {
     use crate::{Envelope, QueueItemId};
 
     const AUTH_ERROR_STATUS: u16 = 401;
-    const MAX_NUDGES: u32 = 20;
+    const MAX_AFTER_TOOLS: u32 = 3;
     const MAX_IDLE_NUDGES: u32 = 2;
+    const MAX_BARREN_NUDGES: u32 = 1;
     const STEERING_EMPTY: &str = "empty_response";
     const STEERING_PROTOCOL: &str = "protocol_mismatch";
     const STEERING_TOOL_REPAIR: &str = "tool_repair";
     const STEERING_TRUNCATION: &str = "truncation";
+    const STEERING_NO_PROGRESS: &str = "no_progress";
     const TRUNCATION_ATTEMPTS: u32 = 3;
     const RECOVERY_BUDGET: u32 = 32;
     const TOOL_ROUNDS: u32 = 5;
@@ -2719,7 +2774,15 @@ mod tests {
                 deferred: Vec::new(),
             },
         );
-        (agent, event_rx)
+        // The pause is real time, and a stall case would otherwise wait it out
+        // once per attempt.
+        (
+            Agent {
+                stall_backoff: Duration::ZERO,
+                ..agent
+            },
+            event_rx,
+        )
     }
 
     fn default_input() -> AgentInput {
@@ -4556,7 +4619,7 @@ mod tests {
             assert!(
                 !events
                     .try_iter()
-                    .any(|event| matches!(event.event, AgentEvent::Nudge))
+                    .any(|event| matches!(event.event, AgentEvent::Nudge { .. }))
             );
         });
     }
@@ -4621,7 +4684,7 @@ mod tests {
             );
             assert!(!has_event(&events, |event| matches!(
                 event,
-                AgentEvent::Nudge
+                AgentEvent::Nudge { .. }
             )));
         });
     }
@@ -5361,23 +5424,32 @@ mod tests {
             empty_response(),
             text_response(StopReason::EndTurn),
         ],
-        3, 1
+        3, 1, false
         ; "nudge_on_empty_after_tools"
     )]
     #[test_case(
-        [tool_call_response("glob", "t1"), thinking_response()]
+        vec![
+            tool_call_response("glob", "t1"),
+            empty_response(),
+            empty_response(),
+        ],
+        3, MAX_BARREN_NUDGES as usize, true
+        ; "gives_up_after_the_barren_budget"
+    )]
+    #[test_case(
+        [tool_call_response("glob", "t1")]
             .into_iter()
-            .chain((0..MAX_NUDGES).map(|_| empty_response()))
+            .chain((0..=MAX_AFTER_TOOLS).map(|_| thinking_response()))
             .collect(),
-        MAX_NUDGES + 2, MAX_NUDGES as usize
-        ; "gives_up_after_max_nudges"
+        MAX_AFTER_TOOLS + 2, MAX_AFTER_TOOLS as usize, true
+        ; "reasoning_keeps_the_longer_budget_after_tools"
     )]
     #[test_case(
         vec![
             tool_call_response("glob", "t1"),
             text_response(StopReason::EndTurn),
         ],
-        2, 0
+        2, 0, false
         ; "no_nudge_when_text_after_tools"
     )]
     #[test_case(
@@ -5385,7 +5457,7 @@ mod tests {
             empty_response(),
             text_response(StopReason::EndTurn),
         ],
-        2, 1
+        2, 1, false
         ; "nudge_without_recent_tools"
     )]
     #[test_case(
@@ -5393,93 +5465,143 @@ mod tests {
             thinking_response(),
             text_response(StopReason::EndTurn),
         ],
-        2, 1
+        2, 1, false
         ; "nudge_on_thinking_only_without_tools"
     )]
     #[test_case(
-        (0..=MAX_IDLE_NUDGES).map(|_| empty_response()).collect(),
-        MAX_IDLE_NUDGES + 1, MAX_IDLE_NUDGES as usize
+        (0..=MAX_IDLE_NUDGES).map(|_| thinking_response()).collect(),
+        MAX_IDLE_NUDGES + 1, MAX_IDLE_NUDGES as usize, true
         ; "gives_up_after_max_idle_nudges"
     )]
-    fn nudge_behavior(responses: Vec<StreamResponse>, expected_turns: u32, expected_nudges: usize) {
+    fn nudge_behavior(
+        responses: Vec<StreamResponse>,
+        expected_turns: u32,
+        expected_nudges: usize,
+        exhausted: bool,
+    ) {
         smol::block_on(async {
             let mut history = History::new(Vec::new());
             let (mut agent, event_rx) = make_agent(MockProvider::new(responses), &mut history);
             let result = agent.run(default_input()).await;
             assert_eq!(agent.num_turns, expected_turns);
-            if expected_nudges == MAX_NUDGES as usize || expected_nudges == MAX_IDLE_NUDGES as usize
-            {
-                assert!(matches!(result, Err(AgentError::SteeringExhausted { .. })));
-            } else {
-                assert!(result.is_ok());
-            }
+            assert_eq!(
+                matches!(result, Err(AgentError::SteeringExhausted { .. })),
+                exhausted,
+                "{result:?}"
+            );
             drop(agent);
             let events = drain_events(&event_rx);
 
             let nudges = events
                 .iter()
-                .filter(|e| matches!(e.event, AgentEvent::Nudge))
+                .filter(|e| matches!(e.event, AgentEvent::Nudge { .. }))
                 .count();
             assert_eq!(nudges, expected_nudges);
 
+            // Padding holds no text of its own; the filler a provider needs is
+            // written once, into the request, so this is the projection's
+            // invariant rather than the transcript's.
+            let projected = provider_projection::project_for_target(
+                history.as_slice(),
+                &serde_json::json!([]),
+                &default_model(),
+                caudra_providers::ReasoningTransport::Other,
+            );
             assert!(
-                history
-                    .as_slice()
+                projected
                     .iter()
                     .all(|m| m.content.iter().any(|b| !b.is_thinking())),
-                "history holds a message no provider will accept: {:?}",
-                history.as_slice()
+                "request holds a message no provider will accept: {projected:?}"
             );
         });
     }
 
-    /// Pins the regression where a stale nudge counter made a follow-up
-    /// "continue" end instantly: the budget lives in the history tail, and
-    /// the new user message breaks the streak.
+    /// Raising one rule's budget cannot buy back the doom loop: the backstop
+    /// counts turns that produced nothing, whichever rule was speaking.
     #[test]
-    fn nudge_budget_resets_on_new_run() {
+    fn the_no_progress_guard_ends_a_run_a_rule_would_keep_alive() {
+        smol::block_on(async {
+            let stalled = 5;
+            let responses = [tool_call_response("glob", "t1")]
+                .into_iter()
+                .chain((0..=stalled).map(|_| thinking_response()))
+                .collect();
+            let mut history = History::new(Vec::new());
+            let (mut agent, events) = make_agent(MockProvider::new(responses), &mut history);
+            Arc::make_mut(&mut agent.config.steering)
+                .rules
+                .empty_response
+                .max_after_tools = Some(20);
+            assert!(
+                matches!(agent.run(default_input()).await, Err(AgentError::SteeringExhausted { rule }) if rule == STEERING_NO_PROGRESS)
+            );
+            assert_eq!(agent.num_turns, stalled + 1);
+            assert_eq!(
+                drain_events(&events)
+                    .iter()
+                    .filter(|event| matches!(event.event, AgentEvent::Nudge { .. }))
+                    .count(),
+                stalled as usize - 1
+            );
+        });
+    }
+
+    /// A reply typed into a stall is what the stall interrupted, so it buys one
+    /// more request rather than a fresh allowance. Refilling on every new run
+    /// is what made the loop inescapable from the keyboard.
+    #[test]
+    fn a_new_run_does_not_refill_the_nudge_budget() {
         smol::block_on(async {
             let responses = [tool_call_response("glob", "t1")]
                 .into_iter()
-                .chain((0..=MAX_NUDGES).map(|_| empty_response()))
-                .chain([empty_response(), text_response(StopReason::EndTurn)])
+                .chain((0..6).map(|_| empty_response()))
                 .collect();
             let mut history = History::new(Vec::new());
             let (mut agent, event_rx) = make_agent(MockProvider::new(responses), &mut history);
-            let _ = agent.run(default_input()).await;
-            let _ = agent.run(default_input()).await;
+            assert!(agent.run(default_input()).await.is_err());
+            assert!(matches!(
+                agent.run(default_input()).await,
+                Err(AgentError::SteeringExhausted { .. })
+            ));
             drop(agent);
             let events = drain_events(&event_rx);
 
             let nudges = events
                 .iter()
-                .filter(|e| matches!(e.event, AgentEvent::Nudge))
+                .filter(|e| matches!(e.event, AgentEvent::Nudge { .. }))
                 .count();
-            assert_eq!(nudges, MAX_NUDGES as usize + 1);
+            assert_eq!(nudges, MAX_BARREN_NUDGES as usize);
         });
     }
 
-    #[test_case(empty_response(); "fully_empty")]
-    #[test_case(thinking_response(); "reasoning_only")]
-    #[test_case(assistant_response(vec![ContentBlock::Text { text: " \n\t ".into() }]); "whitespace")]
-    fn empty_variants_have_the_same_episode_budget(response: StreamResponse) {
+    /// A response that carried nothing at all is not a near miss: repeating the
+    /// request changes nothing about it. One that at least reasoned keeps the
+    /// ordinary idle budget.
+    #[test_case(empty_response(), MAX_BARREN_NUDGES; "nothing_returned")]
+    #[test_case(thinking_response(), MAX_IDLE_NUDGES; "reasoning_only")]
+    #[test_case(
+        assistant_response(vec![ContentBlock::Text { text: " \n\t ".into() }]),
+        MAX_IDLE_NUDGES
+        ; "whitespace"
+    )]
+    fn an_empty_variant_spends_the_budget_its_shape_earns(response: StreamResponse, nudges: u32) {
         smol::block_on(async {
             let mut history = History::default();
-            let responses = (0..3)
+            let responses = (0..=nudges)
                 .map(|_| assistant_response(response.message.content.clone()))
                 .collect();
             let (mut agent, events) = make_agent(MockProvider::new(responses), &mut history);
             assert!(
                 matches!(agent.run(default_input()).await, Err(AgentError::SteeringExhausted { rule }) if rule == STEERING_EMPTY)
             );
-            assert_eq!(agent.num_turns, 3);
+            assert_eq!(agent.num_turns, nudges + 1);
             assert_eq!(agent.response_text(), None);
             assert_eq!(
                 events
                     .try_iter()
-                    .filter(|event| matches!(event.event, AgentEvent::Nudge))
+                    .filter(|event| matches!(event.event, AgentEvent::Nudge { .. }))
                     .count(),
-                2
+                nudges as usize
             );
         });
     }
@@ -6050,7 +6172,7 @@ mod tests {
                 event,
                 AgentEvent::CompactionDone
             )));
-            assert_eq!(events.iter().filter(|event| matches!(&event.event, AgentEvent::Injected { text } if text == STEERING_CUSTOM)).count(), budget as usize);
+            assert_eq!(events.iter().filter(|event| matches!(&event.event, AgentEvent::Injected { text } if text.starts_with(STEERING_CUSTOM))).count(), budget as usize);
         });
     }
 

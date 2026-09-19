@@ -9,6 +9,10 @@ use crate::ConfigError;
 
 const DEFAULT_MAX_RECOVERIES: u32 = 32;
 const DEFAULT_MAX_ADVISORIES: u32 = 4;
+/// Longer than any single rule's episode, so a stalling rule still ends on its
+/// own terms and reports itself. Every rule is bounded alone; nothing bounded
+/// the turns that interleaved rules spend between them.
+const DEFAULT_MAX_STALLED_TURNS: u32 = 5;
 // Bound recovery work, retained history, and user-supplied configuration size.
 const MAX_COUNT: usize = 1024;
 const MAX_WINDOW: usize = 4096;
@@ -100,8 +104,9 @@ rule!(TruncationConfig, TruncationPolicy, {
     max_attempts: u32 = 3, 1..=MAX_COUNT;
 });
 rule!(EmptyResponseConfig, EmptyResponsePolicy, {
-    max_after_tools: u32 = 20, 1..=MAX_COUNT;
+    max_after_tools: u32 = 3, 1..=MAX_COUNT;
     max_idle: u32 = 2, 1..=MAX_COUNT;
+    max_barren: u32 = 1, 1..=MAX_COUNT;
     recent_tool_window: usize = 5, 1..=MAX_WINDOW;
 });
 rule!(RepeatedToolCallConfig, RepeatedToolCallPolicy, {
@@ -206,6 +211,7 @@ pub struct SteeringConfig {
     pub enabled: Option<bool>,
     pub max_recoveries: Option<u32>,
     pub max_advisories: Option<u32>,
+    pub max_stalled_turns: Option<u32>,
     pub rules: SteeringRulesConfig,
     pub models: BTreeMap<String, SteeringModelConfig>,
 }
@@ -216,6 +222,7 @@ pub struct SteeringModelConfig {
     pub enabled: Option<bool>,
     pub max_recoveries: Option<u32>,
     pub max_advisories: Option<u32>,
+    pub max_stalled_turns: Option<u32>,
     pub rules: SteeringRulesConfig,
 }
 
@@ -224,12 +231,20 @@ pub struct SteeringPolicy {
     pub enabled: bool,
     pub max_recoveries: u32,
     pub max_advisories: u32,
+    pub max_stalled_turns: u32,
     pub rules: SteeringRules,
 }
 
 impl SteeringModelConfig {
     pub fn merge(&mut self, overlay: Self) {
-        merge_fields!(self, overlay, enabled, max_recoveries, max_advisories);
+        merge_fields!(
+            self,
+            overlay,
+            enabled,
+            max_recoveries,
+            max_advisories,
+            max_stalled_turns
+        );
         self.rules.merge(overlay.rules);
     }
 }
@@ -238,7 +253,14 @@ impl SteeringConfig {
     /// Later layers replace explicit fields, while rules and exact model entries merge
     /// field by field so omitted settings continue to inherit.
     pub fn merge(&mut self, overlay: Self) {
-        merge_fields!(self, overlay, enabled, max_recoveries, max_advisories);
+        merge_fields!(
+            self,
+            overlay,
+            enabled,
+            max_recoveries,
+            max_advisories,
+            max_stalled_turns
+        );
         self.rules.merge(overlay.rules);
         for (model, policy) in overlay.models {
             self.models.entry(model).or_default().merge(policy);
@@ -256,12 +278,27 @@ impl SteeringConfig {
             enabled: true,
             max_recoveries: DEFAULT_MAX_RECOVERIES,
             max_advisories: DEFAULT_MAX_ADVISORIES,
+            max_stalled_turns: DEFAULT_MAX_STALLED_TURNS,
             rules: SteeringRules::default(),
         };
-        override_fields!(policy, self, enabled, max_recoveries, max_advisories);
+        override_fields!(
+            policy,
+            self,
+            enabled,
+            max_recoveries,
+            max_advisories,
+            max_stalled_turns
+        );
         self.rules.apply(&mut policy.rules);
         if let Some(model) = model {
-            override_fields!(policy, model, enabled, max_recoveries, max_advisories);
+            override_fields!(
+                policy,
+                model,
+                enabled,
+                max_recoveries,
+                max_advisories,
+                max_stalled_turns
+            );
             model.rules.apply(&mut policy.rules);
         }
         policy
@@ -309,6 +346,12 @@ impl SteeringPolicy {
         validate_range(
             &format!("{prefix}max_advisories"),
             self.max_advisories as usize,
+            0,
+            MAX_COUNT,
+        )?;
+        validate_range(
+            &format!("{prefix}max_stalled_turns"),
+            self.max_stalled_turns as usize,
             0,
             MAX_COUNT,
         )?;
@@ -371,11 +414,12 @@ mod tests {
             serde_json::to_value(config.resolve(MODEL)).unwrap(),
             json!({
                 "enabled": true, "max_recoveries": 32, "max_advisories": 4,
+                "max_stalled_turns": 5,
                 "rules": {
                     "truncation": {"enabled": true, "prompt": null, "max_attempts": 3},
                     "empty_response": {
-                        "enabled": true, "prompt": null, "max_after_tools": 20,
-                        "max_idle": 2, "recent_tool_window": 5
+                        "enabled": true, "prompt": null, "max_after_tools": 3,
+                        "max_idle": 2, "max_barren": 1, "recent_tool_window": 5
                     },
                     "repeated_tool_call": {"enabled": true, "prompt": null, "threshold": 3},
                     "protocol_mismatch": {"enabled": true, "prompt": null, "max_attempts": 2},

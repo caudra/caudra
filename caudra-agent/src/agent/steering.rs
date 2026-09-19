@@ -24,7 +24,7 @@ const HISTORY_SCAN_LIMIT: usize = 16_384;
 const TEXT_BYTES_LIMIT: usize = 8_192;
 const MIN_REPEATED_TEXT_CHARS: usize = 32;
 const MIN_CYCLE: usize = 2;
-const EMPTY_RULE: &str = "empty_response";
+pub const EMPTY_RULE: &str = "empty_response";
 const PROTOCOL_RULE: &str = "protocol_mismatch";
 const REPORT_RULE: &str = "missing_task_report";
 const TRUNCATION_RULE: &str = "truncation";
@@ -32,6 +32,7 @@ const TOOL_REPAIR_RULE: &str = "tool_repair";
 const REPETITION_RULE: &str = "repetition";
 const PLANNING_RULE: &str = "tool_planning";
 const NO_TOOL_RULE: &str = "no_tool_use";
+pub(super) const NO_PROGRESS_RULE: &str = "no_progress";
 
 pub(crate) type SharedSteering = Arc<Mutex<Steering>>;
 
@@ -46,20 +47,42 @@ pub(crate) struct Steering {
     protocols: u32,
     truncations: u32,
     responses: u64,
+    stalled: u32,
     calls: VecDeque<(u64, ToolObservation)>,
     model: Option<String>,
 }
 
 pub(super) enum Recovery {
-    Empty { after_tools: bool, nudges: u32 },
+    Empty {
+        after_tools: bool,
+        nudges: u32,
+        /// The provider returned no content at all, not merely no text.
+        barren: bool,
+    },
     Protocol,
     Truncated,
     ToolRepair,
 }
 
+/// What one response did, as the budgets need to see it.
+pub(super) struct Observed {
+    pub calls: Vec<ToolObservation>,
+    pub protocol: bool,
+    /// Carried a tool call or visible text, so the turn moved the task.
+    pub productive: bool,
+}
+
 pub(super) enum RecoveryAction {
     Disabled,
-    Continue(Option<Box<Message>>),
+    Continue(Intervention),
+}
+
+/// One charged attempt, with the place it holds in its rule's allowance so a
+/// watcher can see the budget draining instead of a line repeating.
+pub(super) struct Intervention {
+    pub message: Option<Box<Message>>,
+    pub attempt: u32,
+    pub limit: u32,
 }
 
 pub(super) fn lock(steering: &SharedSteering) -> MutexGuard<'_, Steering> {
@@ -76,6 +99,7 @@ impl Steering {
             protocols: 0,
             truncations: 0,
             responses: 0,
+            stalled: 0,
             calls: VecDeque::new(),
             model: None,
         }
@@ -85,6 +109,7 @@ impl Steering {
         &self.policy
     }
 
+    #[cfg(test)]
     pub(super) fn responses(&self) -> u64 {
         self.responses
     }
@@ -105,6 +130,16 @@ impl Steering {
 
     pub(super) fn reset_patterns(&mut self) {
         self.calls.clear();
+    }
+
+    /// A run that has produced neither a tool call nor visible text for this
+    /// many turns is no longer being steered, it is being repeated. Each rule
+    /// bounds its own interventions; nothing bounded the turns they share, so
+    /// the backstop counts turns rather than rules.
+    pub(super) fn no_progress(&self) -> bool {
+        self.policy.enabled
+            && self.policy.max_stalled_turns > 0
+            && self.stalled >= self.policy.max_stalled_turns
     }
 
     pub(super) fn bind_model(&mut self, model: &Model, config: &SteeringConfig) -> bool {
@@ -139,15 +174,20 @@ impl Steering {
         repetition.max(planning)
     }
 
-    pub(super) fn observe(&mut self, calls: Vec<ToolObservation>, protocol: bool) {
+    pub(super) fn observe(&mut self, observed: Observed) {
         self.responses = self.responses.saturating_add(1);
-        if !protocol {
+        if !observed.protocol {
             self.protocols = 0;
         }
+        self.stalled = if observed.productive {
+            0
+        } else {
+            self.stalled.saturating_add(1)
+        };
         if !self.policy.enabled {
             return;
         }
-        for call in calls {
+        for call in observed.calls {
             self.calls.push_back((self.responses, call));
             if self.calls.len() > self.observation_window() {
                 self.calls.pop_front();
@@ -217,22 +257,39 @@ impl Steering {
             Recovery::Empty {
                 after_tools,
                 nudges,
+                barren,
             } => {
                 let policy = &self.policy.rules.empty_response;
                 if !policy.enabled {
                     return Ok(RecoveryAction::Disabled);
                 }
-                let limit = if after_tools {
+                let situational = if after_tools {
                     policy.max_after_tools
                 } else {
                     policy.max_idle
+                };
+                // A response with no content at all was not a near miss. Asking
+                // again changes nothing about the request, so the allowance for
+                // recovering from one is far shorter than for a turn that at
+                // least reasoned.
+                let limit = if barren {
+                    policy.max_barren.min(situational)
+                } else {
+                    situational
                 };
                 let prompt = policy.prompt.as_deref().unwrap_or(if after_tools {
                     EMPTY_AFTER_TOOLS
                 } else {
                     EMPTY_IDLE
                 });
-                (EMPTY_RULE, nudges, limit, Some(prompt.to_owned()))
+                // The count is not decoration: identical copies of one sentence
+                // are what a stalled model reads as the pattern to continue.
+                (
+                    EMPTY_RULE,
+                    nudges,
+                    limit,
+                    Some(format!("{prompt}\n\nAttempt {} of {limit}.", nudges + 1)),
+                )
             }
             Recovery::Protocol => {
                 let policy = &self.policy.rules.protocol_mismatch;
@@ -272,9 +329,12 @@ impl Steering {
         } else if rule == TRUNCATION_RULE {
             self.truncations += 1;
         }
-        Ok(RecoveryAction::Continue(prompt.map(|text| {
-            Box::new(Message::steering(text, rule, SteeringKind::Recovery))
-        })))
+        Ok(RecoveryAction::Continue(Intervention {
+            message: prompt
+                .map(|text| Box::new(Message::steering(text, rule, SteeringKind::Recovery))),
+            attempt: episode + 1,
+            limit,
+        }))
     }
 
     pub(super) fn advisory(
@@ -514,10 +574,10 @@ mod tests {
     use test_case::test_case;
 
     use super::{
-        EMPTY_IDLE, EMPTY_RULE, NO_TOOL_RULE, PLANNING_RULE, PROTOCOL_FACT, PROTOCOL_RULE,
-        REPETITION_RULE, REPORT_RULE, REPORT_STRUCTURED, REPORT_SUMMARY, Recovery, RecoveryAction,
-        Steering, TEXT_BYTES_LIMIT, TRUNCATION_FACT, TRUNCATION_PROMPT, TRUNCATION_RULE,
-        eligible_response, normalized_message,
+        EMPTY_IDLE, EMPTY_RULE, Intervention, NO_TOOL_RULE, Observed, PLANNING_RULE, PROTOCOL_FACT,
+        PROTOCOL_RULE, REPETITION_RULE, REPORT_RULE, REPORT_STRUCTURED, REPORT_SUMMARY, Recovery,
+        RecoveryAction, Steering, TEXT_BYTES_LIMIT, TRUNCATION_FACT, TRUNCATION_PROMPT,
+        TRUNCATION_RULE, eligible_response, normalized_message,
     };
     use crate::AgentError;
     use crate::agent::tool_dispatch::{ToolObservation, ToolOutcome};
@@ -526,6 +586,7 @@ mod tests {
     const TEXT: &str = "This is the same substantial response repeated for testing.";
     const CUSTOM: &str = "Custom guidance, not a rule identity.";
     const TOOL: &str = "file_read";
+    const EXPECTED_CONTINUE: &str = "a charged recovery continues";
     const OTHER_MODEL: &str = "other-model";
     const TRUNCATION_ATTEMPTS: u32 = 3;
 
@@ -541,6 +602,15 @@ mod tests {
         }
     }
 
+    fn observe_calls(state: &mut Steering, calls: Vec<ToolObservation>) {
+        let productive = !calls.is_empty();
+        state.observe(Observed {
+            calls,
+            protocol: false,
+            productive,
+        });
+    }
+
     fn call(fingerprint: u64, outcome: ToolOutcome) -> ToolObservation {
         ToolObservation {
             name: TOOL.into(),
@@ -549,23 +619,86 @@ mod tests {
         }
     }
 
-    #[test_case(false, 2; "idle")]
-    #[test_case(true, 20; "after_tools")]
-    fn empty_episode_limits(after_tools: bool, limit: u32) {
+    #[test_case(false, false, 2; "idle")]
+    #[test_case(true, false, 3; "after_tools")]
+    #[test_case(true, true, 1; "barren_after_tools")]
+    #[test_case(false, true, 1; "barren_idle")]
+    fn empty_episode_limits(after_tools: bool, barren: bool, limit: u32) {
         let mut state = default_state();
         for nudges in 0..limit {
             assert!(matches!(
                 state.recover(Recovery::Empty {
                     after_tools,
-                    nudges
+                    nudges,
+                    barren
                 }),
-                Ok(RecoveryAction::Continue(Some(_)))
+                Ok(RecoveryAction::Continue(Intervention {
+                    message: Some(_),
+                    ..
+                }))
             ));
         }
         assert!(
-            matches!(state.recover(Recovery::Empty { after_tools, nudges: limit }), Err(AgentError::SteeringExhausted { rule }) if rule == EMPTY_RULE)
+            matches!(state.recover(Recovery::Empty { after_tools, nudges: limit, barren }), Err(AgentError::SteeringExhausted { rule }) if rule == EMPTY_RULE)
         );
         assert_eq!(state.recoveries, limit);
+    }
+
+    /// Each rule bounds its own interventions; interleaved rules can still
+    /// spend turn after turn between them, so the backstop counts turns.
+    #[test]
+    fn the_no_progress_guard_counts_turns_whichever_rule_spoke() {
+        let mut state = default_state();
+        let limit = state.policy.max_stalled_turns;
+        for turn in 1..limit {
+            observe_calls(&mut state, Vec::new());
+            assert!(!state.no_progress(), "stopped at turn {turn} of {limit}");
+        }
+        observe_calls(&mut state, Vec::new());
+        assert!(state.no_progress());
+
+        observe_calls(&mut state, vec![call(0, ToolOutcome::Success)]);
+        assert!(!state.no_progress());
+    }
+
+    #[test_case(true; "master_disabled")]
+    #[test_case(false; "budget_zero")]
+    fn a_disabled_guard_never_stops_a_run(master: bool) {
+        let mut state = default_state();
+        if master {
+            state.policy.enabled = false;
+        } else {
+            state.policy.max_stalled_turns = 0;
+        }
+        for _ in 0..=state.policy.max_stalled_turns.saturating_add(1) {
+            observe_calls(&mut state, Vec::new());
+        }
+        assert!(!state.no_progress());
+    }
+
+    #[test_case(1, 3; "first")]
+    #[test_case(3, 3; "last")]
+    fn an_empty_prompt_counts_its_attempt(attempt: u32, limit: u32) {
+        let mut state = default_state();
+        let RecoveryAction::Continue(intervention) = state
+            .recover(Recovery::Empty {
+                after_tools: true,
+                nudges: attempt - 1,
+                barren: false,
+            })
+            .unwrap()
+        else {
+            panic!("{EXPECTED_CONTINUE}");
+        };
+        assert_eq!((intervention.attempt, intervention.limit), (attempt, limit));
+        assert!(
+            intervention
+                .message
+                .unwrap()
+                .first_text_content()
+                .unwrap()
+                .contains(&format!("Attempt {attempt} of {limit}"))
+        );
     }
 
     #[test_case(false; "tool_feedback")]
@@ -577,6 +710,7 @@ mod tests {
                 Recovery::Empty {
                     after_tools: false,
                     nudges: 0,
+                    barren: false,
                 }
             } else {
                 Recovery::ToolRepair
@@ -598,7 +732,7 @@ mod tests {
         state.policy.max_recoveries = 2;
         assert!(matches!(
             state.recover(Recovery::ToolRepair),
-            Ok(RecoveryAction::Continue(None))
+            Ok(RecoveryAction::Continue(Intervention { message: None, .. }))
         ));
         let message = state.report_correction(validating).unwrap().unwrap();
         assert!(message.is_observation());
@@ -647,7 +781,8 @@ mod tests {
         assert!(matches!(
             state.recover(Recovery::Empty {
                 after_tools: false,
-                nudges: 0
+                nudges: 0,
+                barren: false
             }),
             Ok(RecoveryAction::Disabled)
         ));
@@ -673,11 +808,16 @@ mod tests {
             state.policy.rules.truncation.prompt = Some(CUSTOM.into());
         }
         for attempt in 0..TRUNCATION_ATTEMPTS {
-            state.observe(vec![call(u64::from(attempt), ToolOutcome::Success)], false);
-            state.observe(Vec::new(), false);
+            observe_calls(
+                &mut state,
+                vec![call(u64::from(attempt), ToolOutcome::Success)],
+            );
+            observe_calls(&mut state, Vec::new());
             state.reset_patterns();
-            let RecoveryAction::Continue(Some(message)) =
-                state.recover(Recovery::Truncated).unwrap()
+            let RecoveryAction::Continue(Intervention {
+                message: Some(message),
+                ..
+            }) = state.recover(Recovery::Truncated).unwrap()
             else {
                 panic!()
             };
@@ -710,7 +850,10 @@ mod tests {
         for _ in 0..attempts {
             assert!(matches!(
                 state.recover(Recovery::Truncated),
-                Ok(RecoveryAction::Continue(Some(_)))
+                Ok(RecoveryAction::Continue(Intervention {
+                    message: Some(_),
+                    ..
+                }))
             ));
         }
         for _ in 0..2 {
@@ -731,9 +874,15 @@ mod tests {
             state.policy.rules.protocol_mismatch.prompt = Some(CUSTOM.into());
         }
         for _ in 0..2 {
-            state.observe(Vec::new(), true);
-            let RecoveryAction::Continue(Some(message)) =
-                state.recover(Recovery::Protocol).unwrap()
+            state.observe(Observed {
+                calls: Vec::new(),
+                protocol: true,
+                productive: false,
+            });
+            let RecoveryAction::Continue(Intervention {
+                message: Some(message),
+                ..
+            }) = state.recover(Recovery::Protocol).unwrap()
             else {
                 panic!()
             };
@@ -750,7 +899,7 @@ mod tests {
         assert!(
             matches!(state.recover(Recovery::Protocol), Err(AgentError::SteeringExhausted { rule }) if rule == PROTOCOL_RULE)
         );
-        state.observe(Vec::new(), false);
+        observe_calls(&mut state, Vec::new());
         assert!(state.recover(Recovery::Protocol).is_ok());
         assert_eq!(state.recoveries, 3);
     }
@@ -762,10 +911,10 @@ mod tests {
         let mut state = default_state();
         let model = Model::from_spec(MODEL).unwrap();
         for index in 0..period * 3 - 1 {
-            state.observe(vec![call(index % period, ToolOutcome::Success)], false);
+            observe_calls(&mut state, vec![call(index % period, ToolOutcome::Success)]);
         }
         assert!(!state.has_cycle());
-        state.observe(vec![call(period - 1, ToolOutcome::Success)], false);
+        observe_calls(&mut state, vec![call(period - 1, ToolOutcome::Success)]);
         assert!(state.has_cycle());
         let message = state.advisory(&[], &model, true).unwrap();
         assert_eq!(message.steering.unwrap().rule, REPETITION_RULE);
@@ -781,7 +930,8 @@ mod tests {
         state.policy.rules.repetition.enabled = false;
         let model = Model::from_spec(MODEL).unwrap();
         for response in 0..3 {
-            state.observe(
+            observe_calls(
+                &mut state,
                 (0..2)
                     .map(|index| {
                         call(
@@ -794,7 +944,6 @@ mod tests {
                         )
                     })
                     .collect(),
-                false,
             );
         }
         assert_eq!(state.needs_planning(), expected);
@@ -841,16 +990,24 @@ mod tests {
         }
         assert!(state.advisory(&history, &model, has_tools).is_none());
         assert_eq!(state.recoveries, 0);
-        let RecoveryAction::Continue(Some(message)) = state
+        let RecoveryAction::Continue(Intervention {
+            message: Some(message),
+            ..
+        }) = state
             .recover(Recovery::Empty {
                 after_tools: false,
                 nudges: 0,
+                barren: false,
             })
             .unwrap()
         else {
             panic!()
         };
-        assert_eq!(message.first_text_content(), Some(EMPTY_IDLE));
+        assert!(
+            message
+                .first_text_content()
+                .is_some_and(|text| text.starts_with(EMPTY_IDLE))
+        );
     }
 
     #[test_case(Message::empty_marker(); "empty_marker")]
@@ -918,7 +1075,7 @@ mod tests {
         let mut state = Steering::new(config.resolve(MODEL));
         let mut model = Model::from_spec(MODEL).unwrap();
         state.bind_model(&model, &config);
-        state.observe(vec![call(0, ToolOutcome::Success)], false);
+        observe_calls(&mut state, vec![call(0, ToolOutcome::Success)]);
         assert!(!state.calls.is_empty());
         if exhausted {
             state.report_correction(false).unwrap();

@@ -1559,7 +1559,12 @@ pub enum AgentEvent {
     StreamReset,
     AuthRequired,
     AuthRestored,
-    Nudge,
+    /// A stall is being answered. The counts let one row report the budget
+    /// draining instead of the same line arriving once per attempt.
+    Nudge {
+        attempt: u32,
+        limit: u32,
+    },
     /// A message the harness wrote into the conversation on the user's behalf:
     /// a standing reminder, a goal check-in, a nudge, a continuation. Reported
     /// so the transcript can show what was sent rather than only that something
@@ -3226,7 +3231,7 @@ mod tests {
         ; "retrying"
     )]
     #[test_case(AgentEvent::CompactionDone, None ; "unrelated_event_leaves_it_unchanged")]
-    #[test_case(AgentEvent::Nudge, None ; "nudge_leaves_it_unchanged")]
+    #[test_case(AgentEvent::Nudge { attempt: 1, limit: 3 }, None ; "nudge_leaves_it_unchanged")]
     fn activity_reads_the_childs_own_events(
         event: AgentEvent,
         expected: Option<(&str, Option<&str>)>,

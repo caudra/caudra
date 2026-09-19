@@ -8,8 +8,8 @@ use serde_json::Value;
 use thiserror::Error;
 
 use crate::types::{
-    ContentBlock, EMPTY_RESPONSE_MARKER, ImageSource, Message, MessageKind, ReasoningSource,
-    ResponsesReasoning, Role, SteeringOrigin,
+    ContentBlock, ImageSource, Message, MessageKind, ReasoningSource, ResponsesReasoning, Role,
+    SteeringOrigin,
 };
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -605,20 +605,30 @@ fn user_kind(
 
 fn expand_assistant_message(message: &Message) -> Vec<HistoryItemKind> {
     let padding = message.is_empty_padding();
-    if message.content.is_empty() {
-        return vec![HistoryItemKind::AssistantText {
-            text: String::new(),
-            state: AssistantTextState::Complete,
-            retained_output_refs: message.retained_output_refs.clone(),
-            retained_subagent_ids: message.retained_subagent_ids.clone(),
-            is_compaction_summary: message.is_compaction_summary,
-        }];
-    }
     let mut kinds: Vec<_> = message
         .content
         .iter()
         .map(|block| assistant_kind(block, padding, message.reasoning_source.as_ref()))
         .collect();
+    // Padding holds no text of its own, so the state that marks the turn needs
+    // an item to live on, exactly as a wholly empty turn does.
+    if (padding || kinds.is_empty())
+        && !kinds
+            .iter()
+            .any(|kind| matches!(kind, HistoryItemKind::AssistantText { .. }))
+    {
+        kinds.push(HistoryItemKind::AssistantText {
+            text: String::new(),
+            state: if padding {
+                AssistantTextState::Padding
+            } else {
+                AssistantTextState::Complete
+            },
+            retained_output_refs: Vec::new(),
+            retained_subagent_ids: Vec::new(),
+            is_compaction_summary: false,
+        });
+    }
     if let Some(HistoryItemKind::AssistantText {
         retained_output_refs,
         retained_subagent_ids,
@@ -642,7 +652,7 @@ fn assistant_kind(
 ) -> HistoryItemKind {
     match block {
         ContentBlock::Text { text } => HistoryItemKind::AssistantText {
-            text: text.clone(),
+            text: if padding { String::new() } else { text.clone() },
             state: if padding {
                 AssistantTextState::Padding
             } else {
@@ -898,13 +908,16 @@ fn project_group(items: &[HistoryItem]) -> Message {
                     .retained_subagent_ids
                     .extend(retained_subagent_ids.iter().cloned());
                 message.is_compaction_summary |= is_compaction_summary;
-                message.content.push(ContentBlock::Text {
-                    text: if *state == AssistantTextState::Padding {
-                        EMPTY_RESPONSE_MARKER.into()
-                    } else {
-                        text.clone()
-                    },
-                });
+                // Padding is a property of the turn, not content. Restoring it
+                // as a flag keeps rows written before this change, which spell
+                // the marker out, from reintroducing it as model text.
+                if *state == AssistantTextState::Padding {
+                    message.padding = true;
+                } else {
+                    message
+                        .content
+                        .push(ContentBlock::Text { text: text.clone() });
+                }
             }
             HistoryItemKind::Reasoning {
                 text,
@@ -987,6 +1000,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::EMPTY_RESPONSE_MARKER;
     use crate::types::{ImageMediaType, SteeringKind};
     use test_case::test_case;
 
@@ -1492,6 +1506,66 @@ mod tests {
                 state: AssistantTextState::Padding,
                 ..
             }
+        ));
+    }
+
+    /// Padding must never be spelled out in storage. A transcript full of a
+    /// marker is a transcript full of examples of an empty assistant turn, and
+    /// a tool that reads our own storage back teaches the model to write more.
+    #[test_case(Vec::new(); "no_content")]
+    #[test_case(vec![ContentBlock::thinking("stalled".into(), None)]; "reasoning_retained")]
+    fn padding_persists_as_a_state_not_as_text(content: Vec<ContentBlock>) {
+        let message = Message {
+            content,
+            ..Message::empty_marker()
+        };
+        let items = expand_message(&message, None);
+
+        assert!(items.iter().all(|item| matches!(
+            &item.kind,
+            HistoryItemKind::AssistantText {
+                text,
+                state: AssistantTextState::Padding,
+                ..
+            } if text.is_empty()
+        ) || matches!(
+            item.kind,
+            HistoryItemKind::Reasoning { .. }
+        )));
+        let restored = project_messages(&items).unwrap();
+        assert!(restored[0].is_empty_padding());
+        assert!(
+            restored[0]
+                .content
+                .iter()
+                .all(|block| !matches!(block, ContentBlock::Text { .. }))
+        );
+    }
+
+    /// Rows written before padding became a state spell the marker out. They
+    /// still restore as padding, and re-expanding them drops the text.
+    #[test]
+    fn a_legacy_padding_row_restores_without_its_marker_text() {
+        let legacy = vec![HistoryItem {
+            id: CaudraId::generate(),
+            parent_id: None,
+            supersedes: None,
+            group_id: CaudraId::generate(),
+            kind: HistoryItemKind::AssistantText {
+                text: EMPTY_RESPONSE_MARKER.into(),
+                state: AssistantTextState::Padding,
+                retained_output_refs: Vec::new(),
+                retained_subagent_ids: Vec::new(),
+                is_compaction_summary: false,
+            },
+        }];
+        let restored = project_messages(&legacy).unwrap();
+
+        assert!(restored[0].is_empty_padding());
+        assert!(matches!(
+            &expand_message(&restored[0], None)[0].kind,
+            HistoryItemKind::AssistantText { text, state: AssistantTextState::Padding, .. }
+                if text.is_empty()
         ));
     }
 

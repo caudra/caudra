@@ -18,12 +18,12 @@ pub use mentions::Mention;
 pub(crate) mod task_set;
 pub use agent::{
     Agent, AgentParams, AgentRunParams, COMPACTION_ANCHOR, DEFAULT_GOAL_CONTINUATION_LIMIT,
-    GoalError, GoalHandle, GoalResult, GoalSnapshot, GoalStatus, GoalVerdict, History,
-    HistorySnapshot, InstructionBaseline, InstructionSource, Instructions, LoadedInstructions,
-    MAX_GOAL_CHARS, MAX_GOAL_CONTINUATION_LIMIT, SharedHistory, UNAVAILABLE_RESULT,
-    close_dangling_tool_calls, find_subdirectory_instructions, goal_checkin_message,
-    goal_kickoff_message, is_instruction_file, is_run_failure_marker, project_for_provider,
-    project_for_target,
+    EMPTY_RESPONSE_RULE, GoalError, GoalHandle, GoalResult, GoalSnapshot, GoalStatus, GoalVerdict,
+    History, HistorySnapshot, InstructionBaseline, InstructionSource, Instructions,
+    LoadedInstructions, MAX_GOAL_CHARS, MAX_GOAL_CONTINUATION_LIMIT, SharedHistory,
+    UNAVAILABLE_RESULT, close_dangling_tool_calls, find_subdirectory_instructions,
+    goal_checkin_message, goal_kickoff_message, is_instruction_file, is_run_failure_marker,
+    project_for_provider, project_for_target,
 };
 pub use cancel::{CancelMap, CancelToken, CancelTrigger};
 pub use caudra_config::{AgentConfig, PermissionsConfig, ToolOutputLines};
@@ -49,8 +49,8 @@ pub mod workflow;
 pub mod workspace_baseline;
 pub use stored_session::{
     StoredSession, latest_stored_session, load_stored_session, open_stored_session,
-    open_stored_session_with_cursor,
-    resolve_resume_workspace, resume_workspace_session, workspace_logical_cwd,
+    open_stored_session_with_cursor, resolve_resume_workspace, resume_workspace_session,
+    workspace_logical_cwd,
 };
 pub use subagent_history::{
     SubagentHistoryError, SubagentHistoryLease, SubagentHistoryRecord, SubagentHistorySnapshot,

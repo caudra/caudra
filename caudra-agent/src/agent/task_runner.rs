@@ -2008,20 +2008,12 @@ mod tests {
         });
     }
 
-    #[test_case(None, StopReason::EndTurn; "empty_explicit_resume")]
-    #[test_case(Some(PROMPT), StopReason::EndTurn; "empty_external_prompt")]
-    #[test_case(None, StopReason::MaxTokens; "truncation_explicit_resume")]
-    #[test_case(Some(PROMPT), StopReason::MaxTokens; "truncation_external_prompt")]
-    fn an_external_invocation_refreshes_the_recovery_allowance(
-        message: Option<&str>,
-        stop: StopReason,
-    ) {
+    #[test_case(None; "explicit_resume")]
+    #[test_case(Some(PROMPT); "external_prompt")]
+    fn an_external_invocation_refreshes_the_recovery_allowance(message: Option<&str>) {
         smol::block_on(async {
-            let text = if stop == StopReason::MaxTokens {
-                PARTIAL
-            } else {
-                ""
-            };
+            let stop = StopReason::MaxTokens;
+            let text = PARTIAL;
             let incomplete =
                 |usage| response(vec![ContentBlock::Text { text: text.into() }], stop, usage);
             let provider = ScriptedProvider::new(vec![
@@ -2079,6 +2071,80 @@ mod tests {
             assert_eq!(reply.input_tokens, expected_usage.total_input());
             assert_eq!(reply.output_tokens, expected_usage.output);
             assert_eq!(observed.lock().unwrap().len(), 4);
+        });
+    }
+
+    /// A stall is the exception: its episode lives in the history tail, so the
+    /// next invocation still gets its request answered but not a fresh budget
+    /// to keep asking with.
+    #[test_case(None; "explicit_resume")]
+    #[test_case(Some(PROMPT); "external_prompt")]
+    fn an_external_invocation_does_not_refresh_a_stall(message: Option<&str>) {
+        smol::block_on(async {
+            let empty = |usage| {
+                response(
+                    vec![ContentBlock::Text {
+                        text: String::new(),
+                    }],
+                    StopReason::EndTurn,
+                    usage,
+                )
+            };
+            let provider = ScriptedProvider::new(vec![
+                empty(FIRST_TURN),
+                empty(FIRST_TURN),
+                empty(SECOND_TURN),
+                text_response(SUMMARY, SECOND_TURN),
+            ]);
+            let observed = Arc::clone(&provider.requests);
+            let mut ctx = ctx_with(AgentMode::Build, provider);
+            Arc::make_mut(&mut ctx.config.steering)
+                .rules
+                .empty_response
+                .max_idle = Some(1);
+            let mut session = OpenSession(
+                subagent::open_task(
+                    &ctx,
+                    subagent::TaskOptions {
+                        name: LABEL.into(),
+                        task_id: TaskIdentity::Derive,
+                        profile: None,
+                        mode: None,
+                        model_job: None,
+                        local_definitions: Vec::new(),
+                        local_tools: LocalTools::default(),
+                    },
+                )
+                .await
+                .unwrap(),
+            );
+            let exhausted = AgentError::SteeringExhausted {
+                rule: EMPTY_RESPONSE_RULE.into(),
+            }
+            .to_string();
+            assert_eq!(
+                session
+                    .0
+                    .prompt(Some(PROMPT.into()))
+                    .await
+                    .err()
+                    .unwrap()
+                    .error,
+                exhausted
+            );
+            assert_eq!(
+                session
+                    .0
+                    .prompt(message.map(str::to_owned))
+                    .await
+                    .err()
+                    .unwrap()
+                    .error,
+                exhausted
+            );
+            // The follow-up is still sent; only the nudge that would have
+            // followed another empty answer is refused.
+            assert_eq!(observed.lock().unwrap().len(), 3);
         });
     }
 

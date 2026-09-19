@@ -335,6 +335,14 @@ pub struct Message {
     /// Marks the host-generated summary that replaced prior conversation state.
     #[serde(skip)]
     pub is_compaction_summary: bool,
+    /// Stands in for an assistant turn the model returned without content.
+    ///
+    /// Host-only and deliberately not text: a transcript that spells the
+    /// marker out teaches a later request, through any tool that reads our own
+    /// storage back, that assistant turns in this conversation are empty. The
+    /// provider-facing filler is synthesized once, at projection time.
+    #[serde(skip)]
+    pub padding: bool,
 }
 
 impl Message {
@@ -343,26 +351,13 @@ impl Message {
     pub fn empty_marker() -> Self {
         Self {
             role: Role::Assistant,
-            content: vec![ContentBlock::Text {
-                text: EMPTY_RESPONSE_MARKER.into(),
-            }],
+            padding: true,
             ..Default::default()
         }
     }
 
     pub fn is_empty_padding(&self) -> bool {
-        let Some((last, reasoning)) = self.content.split_last() else {
-            return false;
-        };
-        matches!(self.role, Role::Assistant)
-            && self.display_text.is_none()
-            && matches!(last, ContentBlock::Text { text } if text == EMPTY_RESPONSE_MARKER)
-            && reasoning.iter().all(|block| {
-                matches!(
-                    block,
-                    ContentBlock::Thinking { .. } | ContentBlock::RedactedThinking { .. }
-                )
-            })
+        self.padding
     }
 
     /// Something the host saw, reported to the model without pretending

@@ -319,7 +319,7 @@ pub fn run(
             | AgentEvent::ToolSnapshot { .. }
             | AgentEvent::ToolHeaderSnapshot { .. }
             | AgentEvent::LiveToolBuf { .. }
-            | AgentEvent::Nudge
+            | AgentEvent::Nudge { .. }
             | AgentEvent::Injected { .. }
             | AgentEvent::ToolsLoaded { .. }
             | AgentEvent::PromptProgress { .. } => {}
