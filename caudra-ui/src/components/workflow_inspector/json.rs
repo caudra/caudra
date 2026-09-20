@@ -72,14 +72,19 @@ fn drafts(value: &Value, folded: &HashSet<usize>) -> Option<Vec<Draft>> {
     Some(drafts)
 }
 
-/// A row before it is painted: what it opens, and the text it draws once the
-/// fold marker is put in front of it.
+/// A row before it is painted, in the pieces it is painted from. A key and a
+/// string value are one token to a JSON grammar and one colour to every theme
+/// that reads it, so the two are kept apart here rather than left to be told
+/// apart afterwards.
 struct Draft {
     fold: Option<usize>,
     depth: usize,
-    text: String,
-    /// A closed container says how much it is hiding, which is the only reason
-    /// to open it again.
+    key: Option<String>,
+    value: String,
+    /// The comma that separates this row from the sibling after it.
+    tail: &'static str,
+    /// A closed container says how much it is hiding, which is the only
+    /// reason to open it again.
     tally: Option<String>,
 }
 
@@ -93,10 +98,7 @@ impl Walk<'_> {
     /// `visible` is false inside a closed node, where the walk still runs so
     /// the nodes after it keep the names they had when it was open.
     fn push(&mut self, value: &Value, key: Option<&str>, depth: usize, last: bool, visible: bool) {
-        let head = match key {
-            Some(key) => format!("{}{KEY_SEPARATOR}", quoted(key)),
-            None => String::new(),
-        };
+        let head = key.map(quoted);
         let tail = match last {
             true => "",
             false => COMMA,
@@ -107,15 +109,15 @@ impl Walk<'_> {
                     .iter()
                     .map(|(key, value)| (key.as_str(), value))
                     .collect();
-                self.container(&entries, Bracket::Object, &head, tail, depth, visible, true);
+                self.container(&entries, Bracket::Object, head, tail, depth, visible, true);
             }
             Value::Array(items) => {
                 let entries: Vec<(&str, &Value)> = items.iter().map(|value| ("", value)).collect();
-                self.container(&entries, Bracket::Array, &head, tail, depth, visible, false);
+                self.container(&entries, Bracket::Array, head, tail, depth, visible, false);
             }
             scalar => {
                 if visible {
-                    self.emit(depth, None, format!("{head}{scalar}{tail}"), None);
+                    self.emit(depth, None, head, scalar.to_string(), tail, None);
                 }
             }
         }
@@ -126,8 +128,8 @@ impl Walk<'_> {
         &mut self,
         entries: &[(&str, &Value)],
         bracket: Bracket,
-        head: &str,
-        tail: &str,
+        head: Option<String>,
+        tail: &'static str,
         depth: usize,
         visible: bool,
         keyed: bool,
@@ -136,23 +138,20 @@ impl Walk<'_> {
         self.next += 1;
         if entries.is_empty() {
             if visible {
-                self.emit(
-                    depth,
-                    None,
-                    format!("{head}{}{tail}", bracket.empty()),
-                    None,
-                );
+                self.emit(depth, None, head, bracket.empty().to_owned(), tail, None);
             }
             return;
         }
         let closed = self.folded.contains(&node);
         if visible {
-            let text = match closed {
-                true => format!("{head}{}{tail}", bracket.folded()),
-                false => format!("{head}{}", bracket.open()),
+            // An open container ends in a brace of its own, which is the row
+            // that carries the comma.
+            let (value, tail) = match closed {
+                true => (bracket.folded(), tail),
+                false => (bracket.open(), ""),
             };
             let tally = closed.then(|| bracket.tally(entries.len()));
-            self.emit(depth, Some(node), text, tally);
+            self.emit(depth, Some(node), head, value.to_owned(), tail, tally);
         }
         let inside = visible && !closed;
         for (index, (key, value)) in entries.iter().enumerate() {
@@ -160,15 +159,25 @@ impl Walk<'_> {
             self.push(value, key, depth + 1, index + 1 == entries.len(), inside);
         }
         if inside {
-            self.emit(depth, None, format!("{}{tail}", bracket.close()), None);
+            self.emit(depth, None, None, bracket.close().to_owned(), tail, None);
         }
     }
 
-    fn emit(&mut self, depth: usize, fold: Option<usize>, text: String, tally: Option<String>) {
+    fn emit(
+        &mut self,
+        depth: usize,
+        fold: Option<usize>,
+        key: Option<String>,
+        value: String,
+        tail: &'static str,
+        tally: Option<String>,
+    ) {
         self.drafts.push(Draft {
             fold,
             depth,
-            text,
+            key,
+            value,
+            tail,
             tally,
         });
     }
@@ -226,12 +235,13 @@ fn quoted(key: &str) -> String {
     Value::String(key.to_owned()).to_string()
 }
 
-/// The drafts as painted rows. Every line is highlighted on its own rather
-/// than as one document, because a closed node leaves a gap that no grammar
-/// can carry state across.
+/// The drafts as painted rows. A key carries a colour of its own and the
+/// punctuation around it is dim, because a JSON grammar scopes a key and a
+/// string value alike and so every theme paints them alike. A scalar is left
+/// to the grammar, which is where a string, a number and a literal do part
+/// company.
 fn paint(drafts: Vec<Draft>) -> Vec<JsonRow> {
     let t = theme::current();
-    let mut highlighter = caudra_highlight::Highlighter::for_token(JSON_TOKEN);
     drafts
         .into_iter()
         .map(|draft| {
@@ -244,7 +254,17 @@ fn paint(drafts: Vec<Draft>) -> Vec<JsonRow> {
                 Span::raw(INDENT.repeat(draft.depth)),
                 Span::styled(mark, t.tool_dim),
             ];
-            spans.extend(highlight_line(&mut highlighter, &draft.text));
+            if let Some(key) = draft.key {
+                spans.push(Span::styled(key, t.accent));
+                spans.push(Span::styled(KEY_SEPARATOR, t.tool_dim));
+            }
+            match is_structure(&draft.value) {
+                true => spans.push(Span::styled(draft.value, t.tool_dim)),
+                false => spans.extend(scalar_spans(&draft.value)),
+            }
+            if !draft.tail.is_empty() {
+                spans.push(Span::styled(draft.tail, t.tool_dim));
+            }
             if let Some(tally) = draft.tally {
                 spans.push(Span::styled(tally, t.tool_dim));
             }
@@ -256,8 +276,24 @@ fn paint(drafts: Vec<Draft>) -> Vec<JsonRow> {
         .collect()
 }
 
+/// Braces and brackets are punctuation. Nothing else can open with one,
+/// because a string is quoted before it is anything else.
+fn is_structure(value: &str) -> bool {
+    value.starts_with(['{', '[', '}', ']'])
+}
+
+/// A scalar coloured by the JSON grammar, each read on its own so the context
+/// one row left behind cannot decide what the next one is.
+fn scalar_spans(value: &str) -> Vec<Span<'static>> {
+    highlight_line(
+        &mut caudra_highlight::Highlighter::for_token(JSON_TOKEN),
+        value,
+    )
+}
+
 #[cfg(test)]
 mod tests {
+    use ratatui::style::Color;
     use serde_json::json;
 
     use super::*;
@@ -267,6 +303,9 @@ mod tests {
     const FOLD_HIDES_CHILDREN: &str = "a closed node draws no line for what it holds";
     const FOLD_KEEPS_NAMES: &str = "a node keeps its name when a node above it closes";
     const TALLY_READS_THE_COUNT: &str = "a closed node says how much it is hiding";
+    const KEY_READS_APART: &str = "a key is not the colour of the string beside it";
+    const KINDS_READ_APART: &str = "a string, a number and a literal are not one colour";
+    const NO_STYLE: &str = "every span of the row carried a colour";
 
     fn text(rows: &[JsonRow]) -> Vec<String> {
         rows.iter()
@@ -282,6 +321,34 @@ mod tests {
 
     fn nested() -> Value {
         json!({ "a": 1, "b": { "c": [2, 3] } })
+    }
+
+    /// The colour of the first span whose text is `needle`.
+    fn colour_of(rows: &[JsonRow], needle: &str) -> Color {
+        rows.iter()
+            .flat_map(|row| row.line.spans.iter())
+            .find(|span| span.content.as_ref() == needle)
+            .and_then(|span| span.style.fg)
+            .expect(NO_STYLE)
+    }
+
+    /// A JSON grammar scopes a key and a string value the same way, so a theme
+    /// paints them the same colour and a reader cannot tell which side of the
+    /// colon they are looking at. The key is painted here instead.
+    #[test]
+    fn a_key_does_not_read_as_the_string_beside_it() {
+        crate::highlight::refresh_syntax_theme();
+        let value = json!({ "name": "value", "count": 7, "flag": true });
+
+        let rows = rows(&value, &HashSet::new()).expect(NOT_A_TREE);
+
+        let key = colour_of(&rows, "\"name\"");
+        let string = colour_of(&rows, "value");
+        let number = colour_of(&rows, "7");
+        let literal = colour_of(&rows, "true");
+        assert_ne!(key, string, "{KEY_READS_APART}");
+        assert_ne!(string, number, "{KINDS_READ_APART}");
+        assert_ne!(number, literal, "{KINDS_READ_APART}");
     }
 
     #[test]

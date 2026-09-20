@@ -424,12 +424,24 @@ pub struct WorkflowInspector {
     exporting: bool,
 }
 
-/// Which body a folded node belongs to. A call's result and the run's own
-/// result are two different trees that can be open at once.
+/// Which body a folded node belongs to. Every part of every call is its own
+/// tree, and so is the run's own result, because a node is named by where it
+/// sits in the value it came from and two values name their roots alike.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum FoldScope {
-    Call(u64),
+    Prompt(u64),
+    Error(u64),
+    CallResult(u64),
     Result,
+}
+
+/// One part of a call's body: what it is called, what it says, and the tree it
+/// makes when what it says is JSON.
+struct BodyPart<'a> {
+    scope: FoldScope,
+    heading: &'static str,
+    text: &'a str,
+    style: Style,
 }
 
 /// What the cursor rests on in a section: one of its own rows, or a node of a
@@ -1111,10 +1123,10 @@ impl WorkflowInspector {
                         format_elapsed(end.saturating_sub(at)),
                         format_integer(call.tokens_used),
                     ));
-                    for (heading, text, _) in self.body_parts(call) {
-                        out.push_str(heading);
+                    for part in self.body_parts(call) {
+                        out.push_str(part.heading);
                         out.push('\n');
-                        for line in text.lines() {
+                        for line in part.text.lines() {
                             out.push_str(EXPAND_INDENT);
                             out.push_str(line);
                             out.push('\n');
@@ -1141,36 +1153,53 @@ impl WorkflowInspector {
     /// given, the error it raised, and the result it answered with, each from
     /// the journal when the body has landed and from the row's own preview
     /// until it does.
-    fn body_parts<'a>(&'a self, call: &'a RunCall) -> Vec<(&'static str, &'a str, Style)> {
+    fn body_parts<'a>(&'a self, call: &'a RunCall) -> Vec<BodyPart<'a>> {
         let t = theme::current();
-        let body = match self.bodies.get(&call.call_key) {
+        let key = call.call_key;
+        let body = match self.bodies.get(&key) {
             Some(BodyState::Loaded(body)) => Some(body),
             _ => None,
         };
         let mut parts = Vec::with_capacity(3);
-        if let Some(request) = body
+        if let Some(text) = body
             .map(|body| body.request.as_str())
             .or(call.prompt.as_deref())
         {
-            parts.push((PROMPT_HEADING, request, Style::default()));
+            parts.push(BodyPart {
+                scope: FoldScope::Prompt(key),
+                heading: PROMPT_HEADING,
+                text,
+                style: Style::default(),
+            });
         }
-        if let Some(error) = body
+        if let Some(text) = body
             .and_then(|body| body.error.as_deref())
             .or(call.error.as_deref())
         {
-            parts.push((ERROR_HEADING, error, t.tool_error));
+            parts.push(BodyPart {
+                scope: FoldScope::Error(key),
+                heading: ERROR_HEADING,
+                text,
+                style: t.tool_error,
+            });
         }
-        if let Some(result) = body
+        if let Some(text) = body
             .and_then(|body| body.result.as_deref())
             .or(call.result_preview.as_deref())
         {
-            parts.push((RESULT_HEADING, result, Style::default()));
+            parts.push(BodyPart {
+                scope: FoldScope::CallResult(key),
+                heading: RESULT_HEADING,
+                text,
+                style: Style::default(),
+            });
         }
         parts
     }
 
-    /// A call's body on screen, with a JSON result drawn as a tree. Rows that
-    /// open a node are the ones a cursor can rest on.
+    /// A call's body on screen, with every part that is JSON drawn as a tree:
+    /// a prompt built from a workflow's args is as much a value as the result
+    /// answering it. Rows that open a node are the ones a cursor can rest on.
     fn body_rows(&self, call: &RunCall) -> Vec<JsonRow> {
         let t = theme::current();
         let parts = self.body_parts(call);
@@ -1184,41 +1213,42 @@ impl WorkflowInspector {
             ))];
         }
         let mut rows = Vec::new();
-        for (heading, text, style) in parts {
-            rows.push(plain_row(Line::styled(heading, t.tool_dim)));
-            match heading == RESULT_HEADING {
-                true => rows.extend(self.json_rows(FoldScope::Call(call.call_key), text)),
-                false => rows.extend(indented(text, style).into_iter().map(plain_row)),
-            }
+        for part in parts {
+            rows.push(plain_row(Line::styled(part.heading, t.tool_dim)));
+            rows.extend(self.json_rows(&part));
         }
         rows
     }
 
-    /// The nodes a call's body offers the cursor, in the order it draws them.
-    fn body_folds(&self, call: &RunCall) -> Vec<usize> {
+    /// The nodes a call's body offers the cursor, part by part, in the order
+    /// it draws them.
+    fn body_folds(&self, call: &RunCall) -> Vec<(FoldScope, usize)> {
         self.body_parts(call)
             .into_iter()
-            .filter(|(heading, ..)| *heading == RESULT_HEADING)
-            .flat_map(|(_, text, _)| self.json_folds(FoldScope::Call(call.call_key), text))
+            .flat_map(|part| {
+                self.json_folds(&part)
+                    .into_iter()
+                    .map(move |node| (part.scope, node))
+            })
             .collect()
     }
 
-    /// `text` as a folded tree when it parses as one, and as the lines it was
+    /// A part as a folded tree when it parses as one, and as the lines it was
     /// written in when it does not.
-    fn json_rows(&self, scope: FoldScope, text: &str) -> Vec<JsonRow> {
-        match self.json_body(text) {
-            Some(value) => json::rows(&value, self.fold_set(scope)).unwrap_or_default(),
-            None => indented(text, Style::default())
+    fn json_rows(&self, part: &BodyPart<'_>) -> Vec<JsonRow> {
+        match self.json_body(part.text) {
+            Some(value) => json::rows(&value, self.fold_set(part.scope)).unwrap_or_default(),
+            None => indented(part.text, part.style)
                 .into_iter()
                 .map(plain_row)
                 .collect(),
         }
     }
 
-    /// The nodes a body offers the cursor, without paying to paint them.
-    fn json_folds(&self, scope: FoldScope, text: &str) -> Vec<usize> {
-        match self.json_body(text) {
-            Some(value) => json::folds(&value, self.fold_set(scope)),
+    /// The nodes a part offers the cursor, without paying to paint them.
+    fn json_folds(&self, part: &BodyPart<'_>) -> Vec<usize> {
+        match self.json_body(part.text) {
+            Some(value) => json::folds(&value, self.fold_set(part.scope)),
             None => Vec::new(),
         }
     }
@@ -1458,10 +1488,9 @@ impl WorkflowInspector {
     }
 
     fn call_folds(&self, call: &RunCall) -> Vec<Item> {
-        let scope = FoldScope::Call(call.call_key);
         self.body_folds(call)
             .into_iter()
-            .map(|node| Item::Fold(scope, node))
+            .map(|(scope, node)| Item::Fold(scope, node))
             .collect()
     }
 
@@ -2641,6 +2670,10 @@ mod tests {
     const OUTER_KEY: &str = "\"findings\"";
     const OUTER_STAYS_OPEN: &str = "folding a node leaves the nodes above it open";
     const MARK_FOLLOWS_THE_CURSOR: &str = "the marked row is the row the cursor names";
+    const JSON_PROMPT: &str = "{\"question\":\"why\",\"breadth\":2}";
+    const PROMPT_KEY: &str = "\"question\"";
+    const PROMPT_IS_A_TREE: &str = "a prompt that is JSON folds like any other value";
+    const PARTS_FOLD_APART: &str = "closing a node in one part leaves the others open";
     const MARKDOWN_HEADING: &str = "## Findings";
     const MARKDOWN_REPORT: &str = "## Findings\n\nA **bold** claim.\n\n- one\n";
     const PAINTED_HEADING: &str = "Findings";
@@ -3374,6 +3407,42 @@ mod tests {
         let mut journal = detail(settled.clone());
         journal.calls[0].result_preview = Some(JSON_RESULT.into());
         (settled, journal)
+    }
+
+    /// An agent is dispatched with a prompt a workflow built out of its args,
+    /// which is as much a value as the result answering it. A node closed in
+    /// one of them says nothing about the other, because the two are separate
+    /// trees whose roots would otherwise share a name.
+    #[test]
+    fn a_json_prompt_folds_as_its_own_tree() {
+        let (settled, mut journal) = json_call();
+        journal.calls[0].prompt = Some(JSON_PROMPT.into());
+        let mut inspector = open_with(vec![settled]);
+        inspector.fill_detail(journal);
+        let _ = inspector.handle_key(key_event(KeyCode::Char('3')));
+        let _ = inspector.handle_key(key_event(KeyCode::Right));
+        let _ = inspector.handle_key(key_event(KeyCode::Enter));
+        assert!(
+            section_of(&inspector)
+                .0
+                .iter()
+                .any(|line| line.contains(PROMPT_KEY)),
+            "{PROMPT_IS_A_TREE}"
+        );
+
+        let _ = inspector.handle_key(key_event(KeyCode::Down));
+        let _ = inspector.handle_key(key_event(KeyCode::Enter));
+
+        let (text, starts, items) = section_of(&inspector);
+        assert!(
+            text.iter().all(|line| !line.contains(PROMPT_KEY)),
+            "{PROMPT_IS_A_TREE}: {text:?}"
+        );
+        assert!(
+            text.iter().any(|line| line.contains(FOLDED_KEY)),
+            "{PARTS_FOLD_APART}: {text:?}"
+        );
+        assert_eq!(starts, items, "{CURSOR_AND_ROWS_AGREE}: {text:?}");
     }
 
     fn section_of(inspector: &WorkflowInspector) -> (Vec<String>, usize, usize) {

@@ -83,7 +83,9 @@ Every phase and every call carries a bar scaled to the whole run. A phase that t
 
 Enter opens the row under the cursor. On a phase it moves to the first agent that phase dispatched. On a `write_scratch_file` call it opens the file. On an agent call it opens what that agent was asked and what it answered, fetched in full from the journal rather than cut to a preview.
 
-A result that is JSON opens as a tree rather than as a dump. Every object and every array is a row of its own, highlighted as the JSON it is, and Enter on one closes it and says how many keys or items it took with it. Everything starts open, so a result that is small reads without a keystroke and a result that is large can be cut down to the part being read. The nodes take their place in the same cursor the rest of the section uses, so the arrows walk into a result and out the other side.
+A prompt or a result that is JSON opens as a tree rather than as a dump. Every object and every array is a row of its own and Enter on one closes it and says how many keys or items it took with it. Everything starts open, so a body that is small reads without a keystroke and one that is large can be cut down to the part being read. Each part of a call folds on its own, so closing a node in the prompt leaves the result as it was. The nodes take their place in the same cursor the rest of the section uses, so the arrows walk into a body and out the other side.
+
+Keys carry a colour of their own. A JSON grammar scopes a key and a string value alike, which leaves every theme painting both the same, so the key is painted rather than parsed. Strings, numbers and literals keep the colours the syntax theme gives them.
 
 ### Agent rows
 
