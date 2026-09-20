@@ -2775,6 +2775,13 @@ impl App {
             return vec![];
         }
         self.key_focus = KeyFocus::Composer;
+        // The same branch the press path takes, so a held word chord reaches
+        // the composer by the route its first press took. Only the chords
+        // `repeat_key_allowed` passed get here, and none of them is one of the
+        // commands `handle_ctrl_key` checks first.
+        if is_ctrl(&key) {
+            return self.handle_ctrl_key(key);
+        }
         if self.is_main_chat() {
             self.handle_main_chat_key(key)
         } else {
@@ -2782,8 +2789,24 @@ impl App {
         }
     }
 
+    /// Shift is stripped before the modifiers are read, so a held
+    /// `Ctrl+Shift+←` keeps extending a selection the way a held `Ctrl+←`
+    /// keeps moving. Only the word chords repeat under Ctrl: every other one
+    /// runs a command, and a command must answer a press rather than a hold.
     fn repeat_key_allowed(key: KeyEvent, editing: bool) -> bool {
-        if !(key.modifiers - KeyModifiers::SHIFT).is_empty() {
+        let modifiers = key.modifiers - KeyModifiers::SHIFT;
+        if modifiers == KeyModifiers::CONTROL {
+            return editing
+                && matches!(
+                    key.code,
+                    KeyCode::Char('w')
+                        | KeyCode::Backspace
+                        | KeyCode::Delete
+                        | KeyCode::Left
+                        | KeyCode::Right
+                );
+        }
+        if !modifiers.is_empty() {
             return false;
         }
         match key.code {

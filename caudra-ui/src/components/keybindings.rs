@@ -256,7 +256,6 @@ pub mod key {
         label: "End",
     };
     pub const POP_QUEUE: Bind = ctrl_bind!('q');
-    pub const DELETE_WORD: Bind = ctrl_bind!('w');
     pub const SEARCH: Bind = ctrl_bind!('f');
     pub const FILE_PICKER: Bind = ctrl_bind!('s');
     pub const OPEN_EDITOR: Bind = ctrl_bind!('o');
@@ -289,6 +288,7 @@ pub mod key {
     pub const LINE_END: Bind = ctrl_bind!('e');
     /// The editor chords the composer, the paste editor and the review note
     /// share with the workbench.
+    pub const DELETE_WORD: Bind = Bind::from_workbench(wb::DELETE_WORD);
     pub const CUT: Bind = Bind::from_workbench(wb::CUT);
     pub const SAVE: Bind = Bind::from_workbench(wb::SAVE);
     pub const SELECT_ALL: Bind = Bind::from_workbench(wb::SELECT_ALL);
@@ -824,6 +824,12 @@ pub const KEYBINDS: &[Keybind] = &[
         platform: Platform::All,
     },
     Keybind {
+        label: KeyLabel::Alt(wb::DELETE_WORD.label, mod_key!("Backspace")),
+        description: "Delete word backward",
+        context: KeybindContext::PasteEditor,
+        platform: Platform::All,
+    },
+    Keybind {
         label: KeyLabel::Single("Ctrl+S"),
         description: "Save pasted text",
         context: KeybindContext::PasteEditor,
@@ -856,6 +862,12 @@ pub const KEYBINDS: &[Keybind] = &[
     Keybind {
         label: KeyLabel::Single(wb::COPY.label),
         description: "Copy the selection",
+        context: KeybindContext::Review,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Alt(wb::DELETE_WORD.label, mod_key!("Backspace")),
+        description: "Delete word backward in a note",
         context: KeybindContext::Review,
         platform: Platform::All,
     },
@@ -1412,6 +1424,12 @@ pub const KEYBINDS: &[Keybind] = &[
     Keybind {
         label: KeyLabel::Single(wb::KILL_LINE.label),
         description: "Delete to the end of the line",
+        context: KeybindContext::WorkbenchEditor,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Alt(wb::DELETE_WORD.label, mod_key!("Backspace")),
+        description: "Delete word backward",
         context: KeybindContext::WorkbenchEditor,
         platform: Platform::All,
     },

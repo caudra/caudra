@@ -107,6 +107,9 @@ const PERMISSION_TITLE: &str = "Permission required";
 const PERMISSION_ALLOW_HINT: &str = "[y Once]";
 const PERMISSION_EDITOR_DRAFT: &str = "unsaved editor text";
 const REPEAT_FIELD_TEXT: &str = "repeat field";
+const REPEAT_WORDS: &str = "alpha beta";
+const REPEAT_WORDS_ONE_LEFT: &str = "alpha ";
+const REPEAT_WORDS_CARET_HOME: &str = "Xalpha beta";
 const REPEAT_FIELD_EDITED: &str = "repeat fiel";
 const REPEAT_EDITOR_FILE: &str = "repeat-input.txt";
 const RELOCATION_DESTINATION: &str = "destination with spaces";
@@ -14894,6 +14897,45 @@ fn reported_key_routing_preserves_composer_editing(kind: KeyEventKind) {
     assert_eq!(app.input_box.buffer.value(), "ab");
 }
 
+/// A held word delete has to keep deleting. A terminal reporting event types
+/// sends every repeat after the first as `Repeat`, so a guard that only knows
+/// `Press` leaves the chord good for exactly one word.
+#[test_case(KeyEventKind::Press; "legacy_autorepeat")]
+#[test_case(KeyEventKind::Repeat; "reported_autorepeat")]
+fn a_held_word_delete_keeps_deleting_words(kind: KeyEventKind) {
+    let mut app = test_app();
+    app.update(Msg::Paste(REPEAT_WORDS.into()));
+    dispatch_reported_key(&mut app, kb::DELETE_WORD.to_key_event(), kind);
+    assert_eq!(app.input_box.buffer.value(), REPEAT_WORDS_ONE_LEFT);
+    dispatch_reported_key(&mut app, kb::DELETE_WORD.to_key_event(), kind);
+    assert!(app.input_box.buffer.value().is_empty());
+}
+
+#[test]
+fn a_held_word_motion_keeps_crossing_words() {
+    let mut app = test_app();
+    app.update(Msg::Paste(REPEAT_WORDS.into()));
+    let word_left = KeyEvent::new(KeyCode::Left, KeyModifiers::CONTROL);
+    for _ in 0..2 {
+        dispatch_reported_key(&mut app, word_left, KeyEventKind::Repeat);
+    }
+    dispatch_reported_key(&mut app, key(KeyCode::Char('X')), KeyEventKind::Repeat);
+    assert_eq!(app.input_box.buffer.value(), REPEAT_WORDS_CARET_HOME);
+}
+
+/// Shift is stripped before a repeat is judged, so a held selection chord
+/// keeps extending instead of stopping after the first word.
+#[test]
+fn a_held_word_selection_keeps_extending() {
+    let mut app = test_app();
+    app.update(Msg::Paste(REPEAT_WORDS.into()));
+    let extend_left = KeyEvent::new(KeyCode::Left, KeyModifiers::CONTROL | KeyModifiers::SHIFT);
+    for _ in 0..2 {
+        dispatch_reported_key(&mut app, extend_left, KeyEventKind::Repeat);
+    }
+    assert_eq!(app.input_box.selected_text().as_deref(), Some(REPEAT_WORDS));
+}
+
 #[test_case(KeyEventKind::Press; "press")]
 #[test_case(KeyEventKind::Repeat; "repeat")]
 fn reported_key_routing_preserves_paste_editor_editing(kind: KeyEventKind) {
@@ -15183,6 +15225,9 @@ fn reported_ctrl_c_cannot_cancel_a_run_after_denying_its_last_prompt(kind: KeyEv
 #[test_case(kb::LEADER.to_key_event(); "leader")]
 #[test_case(kb::EXIT.to_key_event(); "exit")]
 #[test_case(kb::QUIT.to_key_event(); "quit")]
+#[test_case(kb::SEARCH.to_key_event(); "search")]
+#[test_case(kb::FILE_PICKER.to_key_event(); "file_picker")]
+#[test_case(kb::OPEN_EDITOR.to_key_event(); "open_editor")]
 #[test_case(key(KeyCode::Enter); "submit")]
 #[test_case(key(KeyCode::Esc); "escape")]
 fn reported_repeats_do_not_activate_global_actions(key: KeyEvent) {
@@ -15193,6 +15238,8 @@ fn reported_repeats_do_not_activate_global_actions(key: KeyEvent) {
     }
     assert_eq!(app.input_box.buffer.value(), REPORTED_PERMISSION_COMMAND);
     assert!(!app.which_key.is_armed());
+    assert!(!app.search_modal.is_open());
+    assert!(!app.file_picker.is_open());
     assert_eq!(app.exit_request, ExitRequest::None);
     assert!(app.last_exit.is_none());
     assert!(app.last_esc.is_none());

@@ -88,6 +88,7 @@ Holding `Alt` while turning the wheel scrolls four times as far. A middle-click 
 | `Ctrl+A` | Select the whole text |
 | `Ctrl+C` / `Shift+Delete` / `Ctrl+V` | Copy, cut or paste the selection |
 | `Ctrl+Z` / `Ctrl+Y` | Undo or redo an edit |
+| `Ctrl+W` / `Ctrl+Backspace` | Delete word backward |
 | `Ctrl+S` | Save pasted text |
 | `Esc` | Cancel editing |
 
@@ -99,6 +100,7 @@ Holding `Alt` while turning the wheel scrolls four times as far. A middle-click 
 | `Shift+↑` / `Shift+↓` / `Shift+←` / `Shift+→` | Select part of the passage |
 | `Ctrl+A` | Select the whole passage |
 | `Ctrl+C` | Copy the selection |
+| `Ctrl+W` / `Ctrl+Backspace` | Delete word backward in a note |
 | `Enter` | Write a note on the selection |
 | `e` / `d` | Edit or delete the note under the cursor |
 | `n` / `p` | Jump between notes |
@@ -199,6 +201,7 @@ Some pickers add extra bindings on top of the defaults:
 | Workbench Editor | `Shift+Delete` / `Ctrl+X x` | Cut the selection |
 | Workbench Editor | `Ctrl+A` | Select the whole buffer |
 | Workbench Editor | `Ctrl+K` | Delete to the end of the line |
+| Workbench Editor | `Ctrl+W` / `Ctrl+Backspace` | Delete word backward |
 | Workbench Editor | `Ctrl+X z` | Wrap long lines onto more rows |
 | Workbench Editor | `Ctrl+PageUp` / `Ctrl+PageDown` | Previous / next tab |
 | Workbench Editor | `Ctrl+X k` | Close the active tab |

@@ -89,6 +89,10 @@ pub const FIND_PREV: Bind = bind!(KeyCode::F(3), KeyModifiers::SHIFT, "Shift+F3"
 pub const GOTO_LINE: Bind = bind!(KeyCode::Char('g'), CTRL, "Ctrl+G");
 pub const SELECT_ALL: Bind = bind!(KeyCode::Char('a'), CTRL, "Ctrl+A");
 pub const KILL_LINE: Bind = bind!(KeyCode::Char('k'), CTRL, "Ctrl+K");
+/// Emacs' kill-word-backward, the one word delete a terminal always delivers:
+/// `Ctrl+Backspace` is byte 0x08 without the kitty protocol, so it reaches a
+/// plain terminal as an ordinary Backspace.
+pub const DELETE_WORD: Bind = bind!(KeyCode::Char('w'), CTRL, "Ctrl+W");
 pub const COPY: Bind = bind!(KeyCode::Char('c'), CTRL, "Ctrl+C");
 /// `Ctrl+X` is the leader in every Caudra surface, so cut takes CUA's other
 /// standard. `Shift+Delete` predates `Ctrl+X`, carries no control byte, and
@@ -150,6 +154,7 @@ const GLOBAL_BINDS: &[Bind] = &[
     GOTO_LINE,
     SELECT_ALL,
     KILL_LINE,
+    DELETE_WORD,
     COPY,
     CUT,
     PASTE,

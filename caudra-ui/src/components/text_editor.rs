@@ -143,6 +143,11 @@ impl TextEditor {
             self.record(edit);
             return EditorKey::Consumed;
         }
+        if keys::DELETE_WORD.matches(key) {
+            let edit = self.buffer.delete_word_left();
+            self.record(edit);
+            return EditorKey::Consumed;
+        }
         self.motion_key(key)
     }
 
@@ -426,6 +431,7 @@ mod tests {
 
     const BODY: Rect = Rect::new(0, 0, 10, 4);
     const WRAPPED: &str = "hello world again";
+    const WRAPPED_WORD_DELETED: &str = "hello world ";
 
     fn editor(text: &str) -> TextEditor {
         let mut editor = TextEditor::new();
@@ -493,6 +499,14 @@ mod tests {
         press(&mut editor, column, row);
         let cursor = editor.buffer.cursor();
         assert_eq!((cursor.line, cursor.col), expected);
+    }
+
+    #[test]
+    fn ctrl_w_deletes_the_word_before_the_caret() {
+        let mut editor = editor(WRAPPED);
+        editor.move_to_end();
+        editor.handle_key(key(KeyCode::Char('w'), KeyModifiers::CONTROL));
+        assert_eq!(editor.text(), WRAPPED_WORD_DELETED);
     }
 
     #[test]

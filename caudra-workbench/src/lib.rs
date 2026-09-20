@@ -2624,6 +2624,15 @@ impl Workbench {
             }
             return Some(WorkbenchAction::Consumed);
         }
+        if keys::DELETE_WORD.matches(key) {
+            let tab = self.editor.active_mut()?;
+            if tab.is_editable() {
+                let edit = tab.buffer.delete_word_left();
+                tab.record(edit);
+                self.follow_cursor();
+            }
+            return Some(WorkbenchAction::Consumed);
+        }
         if keys::FIND.matches(key) {
             let tab = self.editor.active_mut()?;
             tab.find.open();
@@ -4658,6 +4667,22 @@ mod tests {
                 .has_selection(),
             expected == WorkbenchAction::Close,
             "{ESC_LEFT}"
+        );
+    }
+
+    #[test]
+    fn ctrl_w_deletes_the_word_before_the_caret() {
+        const WORD_DELETED: &str = "\ntwo\nthree\n";
+
+        let (dir, mut workbench) = project();
+        open_file(&dir, &mut workbench);
+        workbench.handle_key(key(KeyCode::End));
+
+        workbench.handle_key(press(keys::DELETE_WORD));
+
+        assert_eq!(
+            workbench.editor.active().expect(NO_TAB).contents(),
+            WORD_DELETED
         );
     }
 
