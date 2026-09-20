@@ -7,9 +7,10 @@
 //! runtime for a run's detail when the selection or the run moves, and
 //! every control names the run it acts on.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
+mod json;
 mod timeline;
 
 use caudra_agent::SubagentProgress;
@@ -24,6 +25,7 @@ use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
+use serde_json::Value;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::animation::{animation_elapsed_ms, spinner_str};
@@ -35,6 +37,7 @@ use crate::components::tool_display::{
 use crate::components::workflow_card::{
     AGENTS_SUFFIX, TOKENS_SUFFIX, phase_strip_line, status_span,
 };
+use crate::components::workflow_inspector::json::JsonRow;
 use crate::components::workflow_inspector::timeline::{TimelineRow, span_bar, timeline};
 use crate::components::{
     ModalScroll, Overlay, ToolProgress, escape_terminal_controls, format_compact, format_elapsed,
@@ -283,12 +286,6 @@ impl Section {
         Self::ALL[index]
     }
 
-    /// Sections whose rows a cursor walks. Enter also acts on the result,
-    /// which has one thing to open and no cursor to place.
-    fn has_items(self) -> bool {
-        matches!(self, Self::Timeline | Self::Agents)
-    }
-
     /// The timeline follows its tail, because the newest row is the one a
     /// reader watching a live run wants. Everything else opens at the top.
     fn scroll(self) -> ModalScroll {
@@ -419,8 +416,29 @@ pub struct WorkflowInspector {
     /// preview stands in until its body lands, and the map is dropped whole
     /// when the selection moves, because the keys belong to one run.
     bodies: HashMap<u64, BodyState>,
+    /// The JSON nodes a reader has closed, by the body they belong to. Empty
+    /// is every node open, which is what a body a reader has not touched
+    /// shows. Dropped whole with the selection, like `bodies`.
+    folded: HashMap<FoldScope, HashSet<usize>>,
     /// An export is waiting on the bodies it asked for.
     exporting: bool,
+}
+
+/// Which body a folded node belongs to. A call's result and the run's own
+/// result are two different trees that can be open at once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum FoldScope {
+    Call(u64),
+    Result,
+}
+
+/// What the cursor rests on in a section: one of its own rows, or a node of a
+/// JSON body opened beneath one. Both are built from one walk, so the cursor
+/// cannot count rows the section did not draw.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Item {
+    Row(usize),
+    Fold(FoldScope, usize),
 }
 
 /// A call body's journey from asked-for to readable.
@@ -462,6 +480,7 @@ impl WorkflowInspector {
             footer_hits: FooterHits::default(),
             live: HashMap::new(),
             bodies: HashMap::new(),
+            folded: HashMap::new(),
             exporting: false,
         }
     }
@@ -802,7 +821,7 @@ impl WorkflowInspector {
                 // Only a row the cursor can land on takes the pane: the cursor
                 // is the one thing the pane makes visible, so a graze over a
                 // section without rows must not move the keys.
-                if let Some(index) = hit.filter(|_| self.section.has_items()) {
+                if let Some(index) = hit.filter(|_| self.has_items()) {
                     self.pane = Pane::Detail;
                     self.cursor = index;
                 }
@@ -853,7 +872,7 @@ impl WorkflowInspector {
     fn step(&mut self, delta: isize) -> InspectorAction {
         match self.pane {
             Pane::Runs => self.step_selection(delta),
-            Pane::Detail if self.section.has_items() => {
+            Pane::Detail if self.has_items() => {
                 let count = self.item_count();
                 if count > 0 {
                     self.cursor =
@@ -896,6 +915,7 @@ impl WorkflowInspector {
         self.detail = None;
         self.expanded_call = None;
         self.bodies.clear();
+        self.folded.clear();
         self.cursor = 0;
         self.scroll = self.section.scroll();
         match &self.selected {
@@ -919,6 +939,9 @@ impl WorkflowInspector {
     }
 
     fn activate(&mut self) -> InspectorAction {
+        if let Some(Item::Fold(scope, node)) = self.items().get(self.cursor).copied() {
+            return self.toggle_fold(scope, node);
+        }
         match self.section {
             Section::Timeline => self.open_timeline_row(),
             Section::Agents => match self.cursor_agent().map(|agent| agent.call_key) {
@@ -939,16 +962,20 @@ impl WorkflowInspector {
         let run = self.selected_run()?;
         match self.section {
             Section::Agents => {
-                let index = *agent_order(run).get(self.cursor)?;
+                let Item::Row(index) = self.items().get(self.cursor).copied()? else {
+                    return None;
+                };
                 run.roster.get(index)
             }
             Section::Timeline => {
-                let TimelineRow::Call { call, .. } =
-                    self.timeline_rows(now_secs()).get(self.cursor)?.clone()
-                else {
+                let Item::Row(index) = self.items().get(self.cursor).copied()? else {
                     return None;
                 };
-                let call_key = self.detail.as_ref()?.calls.get(call)?.call_key;
+                let rows = self.timeline_rows(now_secs());
+                let TimelineRow::Call { call, .. } = rows.get(index)? else {
+                    return None;
+                };
+                let call_key = self.detail.as_ref()?.calls.get(*call)?.call_key;
                 run.roster.iter().find(|agent| agent.call_key == call_key)
             }
             _ => None,
@@ -1084,15 +1111,14 @@ impl WorkflowInspector {
                         format_elapsed(end.saturating_sub(at)),
                         format_integer(call.tokens_used),
                     ));
-                    for line in self.body_lines(call) {
-                        out.push_str(
-                            &line
-                                .spans
-                                .iter()
-                                .map(|span| span.content.as_ref())
-                                .collect::<String>(),
-                        );
+                    for (heading, text, _) in self.body_parts(call) {
+                        out.push_str(heading);
                         out.push('\n');
+                        for line in text.lines() {
+                            out.push_str(EXPAND_INDENT);
+                            out.push_str(line);
+                            out.push('\n');
+                        }
                     }
                 }
                 TimelineRow::Log { at, message } => out.push_str(&format!(
@@ -1111,44 +1137,111 @@ impl WorkflowInspector {
     /// What an opened call shows: what it was asked, what it answered, and
     /// what went wrong. The stored body replaces the row's preview once it
     /// lands, so the reader never has to know which one they are looking at.
-    fn body_lines(&self, call: &RunCall) -> Vec<Line<'static>> {
+    /// What a call has to show, in the order it shows it: the prompt it was
+    /// given, the error it raised, and the result it answered with, each from
+    /// the journal when the body has landed and from the row's own preview
+    /// until it does.
+    fn body_parts<'a>(&'a self, call: &'a RunCall) -> Vec<(&'static str, &'a str, Style)> {
         let t = theme::current();
         let body = match self.bodies.get(&call.call_key) {
             Some(BodyState::Loaded(body)) => Some(body),
             _ => None,
         };
-        let mut lines = Vec::new();
-        let request = body
+        let mut parts = Vec::with_capacity(3);
+        if let Some(request) = body
             .map(|body| body.request.as_str())
-            .or(call.prompt.as_deref());
-        if let Some(request) = request {
-            lines.push(Line::styled(PROMPT_HEADING, t.tool_dim));
-            lines.extend(indented(request, Style::default()));
+            .or(call.prompt.as_deref())
+        {
+            parts.push((PROMPT_HEADING, request, Style::default()));
         }
-        let error = body
+        if let Some(error) = body
             .and_then(|body| body.error.as_deref())
-            .or(call.error.as_deref());
-        if let Some(error) = error {
-            lines.push(Line::styled(ERROR_HEADING, t.tool_dim));
-            lines.extend(indented(error, t.tool_error));
+            .or(call.error.as_deref())
+        {
+            parts.push((ERROR_HEADING, error, t.tool_error));
         }
-        let result = body
+        if let Some(result) = body
             .and_then(|body| body.result.as_deref())
-            .or(call.result_preview.as_deref());
-        if let Some(result) = result {
-            lines.push(Line::styled(RESULT_HEADING, t.tool_dim));
-            lines.extend(indented(result, Style::default()));
+            .or(call.result_preview.as_deref())
+        {
+            parts.push((RESULT_HEADING, result, Style::default()));
         }
-        if body.is_none() && lines.is_empty() {
-            lines.push(Line::styled(
+        parts
+    }
+
+    /// A call's body on screen, with a JSON result drawn as a tree. Rows that
+    /// open a node are the ones a cursor can rest on.
+    fn body_rows(&self, call: &RunCall) -> Vec<JsonRow> {
+        let t = theme::current();
+        let parts = self.body_parts(call);
+        if parts.is_empty() {
+            return vec![plain_row(Line::styled(
                 match self.bodies.get(&call.call_key) {
                     Some(BodyState::Missing) => BODY_MISSING,
                     _ => LOADING,
                 },
                 t.tool_dim,
-            ));
+            ))];
         }
-        lines
+        let mut rows = Vec::new();
+        for (heading, text, style) in parts {
+            rows.push(plain_row(Line::styled(heading, t.tool_dim)));
+            match heading == RESULT_HEADING {
+                true => rows.extend(self.json_rows(FoldScope::Call(call.call_key), text)),
+                false => rows.extend(indented(text, style).into_iter().map(plain_row)),
+            }
+        }
+        rows
+    }
+
+    /// The nodes a call's body offers the cursor, in the order it draws them.
+    fn body_folds(&self, call: &RunCall) -> Vec<usize> {
+        self.body_parts(call)
+            .into_iter()
+            .filter(|(heading, ..)| *heading == RESULT_HEADING)
+            .flat_map(|(_, text, _)| self.json_folds(FoldScope::Call(call.call_key), text))
+            .collect()
+    }
+
+    /// `text` as a folded tree when it parses as one, and as the lines it was
+    /// written in when it does not.
+    fn json_rows(&self, scope: FoldScope, text: &str) -> Vec<JsonRow> {
+        match self.json_body(text) {
+            Some(value) => json::rows(&value, self.fold_set(scope)).unwrap_or_default(),
+            None => indented(text, Style::default())
+                .into_iter()
+                .map(plain_row)
+                .collect(),
+        }
+    }
+
+    /// The nodes a body offers the cursor, without paying to paint them.
+    fn json_folds(&self, scope: FoldScope, text: &str) -> Vec<usize> {
+        match self.json_body(text) {
+            Some(value) => json::folds(&value, self.fold_set(scope)),
+            None => Vec::new(),
+        }
+    }
+
+    fn json_body(&self, text: &str) -> Option<Value> {
+        serde_json::from_str::<Value>(text)
+            .ok()
+            .filter(|value| value.is_object() || value.is_array())
+    }
+
+    fn fold_set(&self, scope: FoldScope) -> &HashSet<usize> {
+        static NONE: std::sync::OnceLock<HashSet<usize>> = std::sync::OnceLock::new();
+        self.folded
+            .get(&scope)
+            .unwrap_or_else(|| NONE.get_or_init(HashSet::new))
+    }
+
+    fn toggle_fold(&mut self, scope: FoldScope, node: usize) -> InspectorAction {
+        let folded = self.folded.entry(scope).or_default();
+        if !folded.insert(node) {
+            folded.remove(&node);
+        }
+        InspectorAction::Consumed
     }
 
     /// What the row under the cursor opens: a scratch call opens its file, an
@@ -1156,7 +1249,10 @@ impl WorkflowInspector {
     /// lands the cursor on the first agent it dispatched. The rest are the
     /// record speaking for itself and have nothing behind them.
     fn open_timeline_row(&mut self) -> InspectorAction {
-        let Some(row) = self.timeline_rows(now_secs()).get(self.cursor).cloned() else {
+        let Some(Item::Row(index)) = self.items().get(self.cursor).copied() else {
+            return InspectorAction::Consumed;
+        };
+        let Some(row) = self.timeline_rows(now_secs()).get(index).cloned() else {
             return InspectorAction::Consumed;
         };
         match row {
@@ -1308,11 +1404,91 @@ impl WorkflowInspector {
         timeline(run, detail, now)
     }
 
-    fn item_count(&self) -> usize {
+    /// Everything the cursor can rest on in the open section, in the order it
+    /// is drawn: the section's own rows, and the JSON nodes of a body opened
+    /// beneath one of them. One enumeration feeds the cursor, the marks and
+    /// the click targets, so none of the three can count a row the others did
+    /// not draw.
+    fn items(&self) -> Vec<Item> {
+        let Some(run) = self.selected_run() else {
+            return Vec::new();
+        };
         match self.section {
-            Section::Timeline => self.timeline_rows(now_secs()).len(),
-            Section::Agents => self.selected_run().map_or(0, |run| run.roster.len()),
-            _ => 0,
+            Section::Timeline => {
+                let mut items = Vec::new();
+                for (index, row) in self.timeline_rows(now_secs()).iter().enumerate() {
+                    items.push(Item::Row(index));
+                    if let TimelineRow::Call { call, .. } = row
+                        && let Some(call) = self.expanded_body(*call)
+                    {
+                        items.extend(self.call_folds(call));
+                    }
+                }
+                items
+            }
+            Section::Agents => {
+                let mut items = Vec::new();
+                for index in agent_order(run) {
+                    items.push(Item::Row(index));
+                    let call_key = run.roster[index].call_key;
+                    if let Some(call) = self
+                        .agent_call(call_key)
+                        .filter(|_| self.expanded_call == Some(call_key))
+                    {
+                        items.extend(self.call_folds(call));
+                    }
+                }
+                items
+            }
+            Section::Result => {
+                let mut items = self.result_folds(run);
+                if run.scratch_path().is_some() {
+                    items.push(Item::Row(0));
+                }
+                items
+            }
+            Section::Overview => Vec::new(),
+        }
+    }
+
+    /// The call a timeline row stands for, when its body is the open one.
+    fn expanded_body(&self, index: usize) -> Option<&RunCall> {
+        let call = self.detail.as_ref()?.calls.get(index)?;
+        (self.expanded_call == Some(call.call_key)).then_some(call)
+    }
+
+    fn call_folds(&self, call: &RunCall) -> Vec<Item> {
+        let scope = FoldScope::Call(call.call_key);
+        self.body_folds(call)
+            .into_iter()
+            .map(|node| Item::Fold(scope, node))
+            .collect()
+    }
+
+    /// The nodes of a run's own result, which is a tree only when it is JSON
+    /// the run did not write a report into.
+    fn result_folds(&self, run: &RunSnapshot) -> Vec<Item> {
+        let Some(result) = run.result.as_ref().filter(|result| !has_report(result)) else {
+            return Vec::new();
+        };
+        json::folds(result, self.fold_set(FoldScope::Result))
+            .into_iter()
+            .map(|node| Item::Fold(FoldScope::Result, node))
+            .collect()
+    }
+
+    fn item_count(&self) -> usize {
+        self.items().len()
+    }
+
+    /// Sections the arrows walk with a cursor rather than scroll. The result
+    /// earns one only when it has nodes to fold: a report is prose, and prose
+    /// is read by scrolling.
+    fn has_items(&self) -> bool {
+        match self.section {
+            Section::Timeline | Section::Agents => true,
+            Section::Result => self.item_count() > 0,
+            Section::Overview => false,
         }
     }
 
@@ -1553,7 +1729,7 @@ impl WorkflowInspector {
             .collect();
         if self.reveal_cursor
             && self.pane == Pane::Detail
-            && self.section.has_items()
+            && self.has_items()
             && let Some(&(top, height)) = self.item_rows.get(self.cursor)
         {
             self.scroll.reveal(top, height);
@@ -1589,7 +1765,7 @@ impl WorkflowInspector {
             Section::Overview => (self.overview_lines(run, now), Vec::new()),
             Section::Timeline => self.timeline_lines(run, now, width),
             Section::Agents => self.agent_lines(run),
-            Section::Result => result_lines(run, width),
+            Section::Result => result_lines(self, run, width),
         }
     }
 
@@ -1687,12 +1863,14 @@ impl WorkflowInspector {
         if detail.journal_trimmed {
             lines.push(Line::styled(JOURNAL_TRIMMED, t.tool_warning));
         }
-        for (position, row) in rows.iter().enumerate() {
+        let mut position = 0;
+        for row in rows.iter() {
             starts.push(lines.len());
             let mut spans = vec![
                 Span::styled(self.cursor_mark(position), t.accent),
                 Span::styled(clock_column(row, run.created_at), t.tool_dim),
             ];
+            position += 1;
             let label_cols = match row.is_nested() {
                 true => {
                     spans.push(Span::raw(NEST_INDENT));
@@ -1789,7 +1967,7 @@ impl WorkflowInspector {
             if let TimelineRow::Call { call, .. } = row {
                 let call = &detail.calls[*call];
                 if self.expanded_call == Some(call.call_key) {
-                    lines.extend(self.body_lines(call));
+                    self.push_body(call, &mut lines, &mut starts, &mut position);
                 }
             }
         }
@@ -1816,7 +1994,8 @@ impl WorkflowInspector {
         let mut lines: Vec<Line<'static>> = Vec::with_capacity(run.roster.len());
         let mut starts = Vec::with_capacity(run.roster.len());
         let mut group: Option<&str> = None;
-        for (position, index) in agent_order(run).into_iter().enumerate() {
+        let mut position = 0;
+        for index in agent_order(run) {
             let agent = &run.roster[index];
             let header = agent.phase.as_deref().unwrap_or(UNPHASED_GROUP);
             if grouped && group != Some(header) {
@@ -1851,6 +2030,7 @@ impl WorkflowInspector {
                 spans.extend(activity_spans(progress, agent.state));
             }
             starts.push(lines.len());
+            position += 1;
             lines.push(Line::from(spans));
             // The batch the agent is working through, hung under the row that
             // names it and indented past the mark and glyph columns so the
@@ -1871,10 +2051,37 @@ impl WorkflowInspector {
             if let Some(call) = self.agent_call(agent.call_key)
                 && self.expanded_call == Some(agent.call_key)
             {
-                lines.extend(self.body_lines(call));
+                self.push_body(call, &mut lines, &mut starts, &mut position);
             }
         }
         (lines, starts)
+    }
+
+    /// A call's body under the row that opened it. A row that opens a JSON
+    /// node takes a cursor position of its own, in the same order `items`
+    /// counts them, so a mark cannot land on a row that opens nothing.
+    fn push_body(
+        &self,
+        call: &RunCall,
+        lines: &mut Vec<Line<'static>>,
+        starts: &mut Vec<usize>,
+        position: &mut usize,
+    ) {
+        let t = theme::current();
+        for row in self.body_rows(call) {
+            let mark = match row.fold {
+                Some(_) => {
+                    starts.push(lines.len());
+                    let mark = self.cursor_mark(*position);
+                    *position += 1;
+                    mark
+                }
+                None => NO_MARK,
+            };
+            let mut line = row.line;
+            line.spans.insert(0, Span::styled(mark, t.accent));
+            lines.push(line);
+        }
     }
 
     /// The journal row an agent came from, once the detail has landed. The
@@ -1932,7 +2139,7 @@ impl WorkflowInspector {
                 FooterCommand::Control(control) => {
                     controllable && run.is_some_and(|run| control.applies_to(run.status))
                 }
-                FooterCommand::Activate => self.section.has_items() && self.item_count() > 0,
+                FooterCommand::Activate => self.has_items() && self.item_count() > 0,
                 FooterCommand::Transcript => self.cursor_task_id().is_some(),
                 FooterCommand::Script => run.is_some_and(|run| run.source_path.is_some()),
                 FooterCommand::Export => self.detail.is_some(),
@@ -2095,25 +2302,48 @@ fn activity_spans(progress: &ToolProgress, state: RosterState) -> Vec<Span<'stat
     spans
 }
 
-fn result_lines(run: &RunSnapshot, width: u16) -> (Vec<Line<'static>>, Vec<usize>) {
+fn result_lines(
+    inspector: &WorkflowInspector,
+    run: &RunSnapshot,
+    width: u16,
+) -> (Vec<Line<'static>>, Vec<usize>) {
     let t = theme::current();
     let mut lines = Vec::new();
     let mut starts = Vec::new();
+    let mut position = 0;
     if let Some(result) = &run.result {
-        match result.get(REPORT_FIELD).and_then(serde_json::Value::as_str) {
+        match result.get(REPORT_FIELD).and_then(Value::as_str) {
             Some(report) => lines.extend(report_lines(report, width)),
             None => {
-                let pretty =
-                    serde_json::to_string_pretty(result).unwrap_or_else(|_| result.to_string());
                 lines.push(Line::styled(RESULT_LABEL, t.tool_dim));
-                lines.extend(pretty.lines().map(|line| Line::raw(line.to_owned())));
+                let rows = json::rows(result, inspector.fold_set(FoldScope::Result))
+                    .unwrap_or_else(|| vec![plain_row(Line::raw(result.to_string()))]);
+                for row in rows {
+                    let mark = match row.fold {
+                        Some(_) => {
+                            starts.push(lines.len());
+                            let mark = inspector.cursor_mark(position);
+                            position += 1;
+                            mark
+                        }
+                        None => NO_MARK,
+                    };
+                    let mut line = row.line;
+                    line.spans.insert(0, Span::styled(mark, t.accent));
+                    lines.push(line);
+                }
             }
         }
     }
     if let Some(path) = run.scratch_path() {
         lines.push(Line::default());
         starts.push(lines.len());
-        lines.push(labelled(SCRATCH_LABEL, path, t.tool_path));
+        let mut line = labelled(SCRATCH_LABEL, path, t.tool_path);
+        if position > 0 {
+            line.spans
+                .insert(0, Span::styled(inspector.cursor_mark(position), t.accent));
+        }
+        lines.push(line);
     }
     if let Some(message) = &run.pause_message {
         lines.push(labelled(PAUSED_LABEL, message, t.tool_warning));
@@ -2247,6 +2477,18 @@ fn labelled(label: &'static str, text: &str, style: Style) -> Line<'static> {
         Span::styled(label, theme::current().tool_dim),
         Span::styled(escape_terminal_controls(text), style),
     ])
+}
+
+/// Whether a result carries the report a workflow wrote, which is prose and
+/// not a tree.
+fn has_report(result: &Value) -> bool {
+    result.get(REPORT_FIELD).and_then(Value::as_str).is_some()
+}
+
+/// A body line that opens nothing, which is every line but the head of a
+/// JSON node.
+fn plain_row(line: Line<'static>) -> JsonRow {
+    JsonRow { fold: None, line }
 }
 
 fn indented(text: &str, style: Style) -> Vec<Line<'static>> {
@@ -2388,6 +2630,17 @@ mod tests {
     const HITS_STAY_IN_THE_PANE: &str = "a tab claims no cells outside the pane it drew in";
     const TIGHT_ROW_FITS: &str = "a timeline row fits the pane it was laid out for";
     const WIDE_ROW_TALLIES: &str = "a pane with room for the tallies shows them";
+    const JSON_RESULT: &str = "{\"findings\":{\"claims\":[1,2],\"score\":3}}";
+    const FOLDED_KEY: &str = "\"claims\"";
+    const CURSOR_AND_ROWS_AGREE: &str =
+        "the cursor counts exactly the rows the section marked as its items";
+    const NODES_FOLLOW_THEIR_ROW: &str = "a body's nodes come after the row that opened it";
+    const FOLD_HIDES_THE_SUBTREE: &str = "closing a node takes its children off the section";
+    const JSON_IS_A_TREE: &str = "a result that is JSON draws as a tree";
+    const CALL_STAYS_OPEN: &str = "folding a node inside a body leaves the body open";
+    const OUTER_KEY: &str = "\"findings\"";
+    const OUTER_STAYS_OPEN: &str = "folding a node leaves the nodes above it open";
+    const MARK_FOLLOWS_THE_CURSOR: &str = "the marked row is the row the cursor names";
     const MARKDOWN_HEADING: &str = "## Findings";
     const MARKDOWN_REPORT: &str = "## Findings\n\nA **bold** claim.\n\n- one\n";
     const PAINTED_HEADING: &str = "Findings";
@@ -3116,6 +3369,152 @@ mod tests {
         assert_eq!(line_text(&lines[1]), ABBREVIATED_STATS);
     }
 
+    fn json_call() -> (RunSnapshot, RunDetail) {
+        let settled = run(RUN_ID, RunStatus::Completed, vec![agent(Some(TASK_ID))]);
+        let mut journal = detail(settled.clone());
+        journal.calls[0].result_preview = Some(JSON_RESULT.into());
+        (settled, journal)
+    }
+
+    fn section_of(inspector: &WorkflowInspector) -> (Vec<String>, usize, usize) {
+        let (lines, starts) = inspector.section_lines(now_secs(), FRAME_WIDTH);
+        let text: Vec<String> = lines.iter().map(line_text).collect();
+        (text, starts.len(), inspector.item_count())
+    }
+
+    /// The cursor, the marks and the click targets all read one enumeration.
+    /// If they ever disagree, an arrow key lands the cursor on a row nothing
+    /// marked and Enter acts on something the reader is not looking at.
+    #[test_case('2' ; "timeline")]
+    #[test_case('3' ; "agents")]
+    fn every_marked_row_is_a_row_the_cursor_can_reach(section: char) {
+        let (settled, journal) = json_call();
+        let mut inspector = open_with(vec![settled]);
+        inspector.fill_detail(journal);
+        let _ = inspector.handle_key(key_event(KeyCode::Char(section)));
+        let _ = inspector.handle_key(key_event(KeyCode::Enter));
+
+        let (text, starts, items) = section_of(&inspector);
+
+        assert!(
+            text.iter().any(|line| line.contains(FOLDED_KEY)),
+            "{JSON_IS_A_TREE}: {text:?}"
+        );
+        assert_eq!(starts, items, "{CURSOR_AND_ROWS_AGREE}: {text:?}");
+    }
+
+    /// A node opens under the row that owns it, so walking down from a call
+    /// walks into its result rather than past it to the next call.
+    #[test]
+    fn an_opened_body_puts_its_nodes_after_the_row_that_opened_it() {
+        let (settled, journal) = json_call();
+        let mut inspector = open_with(vec![settled]);
+        inspector.fill_detail(journal);
+        let _ = inspector.handle_key(key_event(KeyCode::Char('3')));
+
+        let before = inspector.item_count();
+        let _ = inspector.handle_key(key_event(KeyCode::Enter));
+
+        assert!(inspector.item_count() > before, "{NODES_FOLLOW_THEIR_ROW}");
+        assert!(
+            matches!(inspector.items().get(1), Some(Item::Fold(..))),
+            "{NODES_FOLLOW_THEIR_ROW}: {:?}",
+            inspector.items()
+        );
+    }
+
+    /// Enter on a node closes it, and what it held leaves the section with it.
+    #[test]
+    fn closing_a_node_takes_its_children_with_it() {
+        let (settled, journal) = json_call();
+        let mut inspector = open_with(vec![settled]);
+        inspector.fill_detail(journal);
+        let _ = inspector.handle_key(key_event(KeyCode::Char('3')));
+        let _ = inspector.handle_key(key_event(KeyCode::Right));
+        let _ = inspector.handle_key(key_event(KeyCode::Enter));
+        let _ = inspector.handle_key(key_event(KeyCode::Down));
+
+        let action = inspector.handle_key(key_event(KeyCode::Enter));
+
+        let (text, starts, items) = section_of(&inspector);
+        assert_eq!(
+            action,
+            InspectorAction::Consumed,
+            "{FOLD_HIDES_THE_SUBTREE}"
+        );
+        assert!(
+            text.iter().any(|line| line.contains(RESULT_HEADING)),
+            "{CALL_STAYS_OPEN}: {text:?}"
+        );
+        assert!(
+            text.iter().all(|line| !line.contains(FOLDED_KEY)),
+            "{FOLD_HIDES_THE_SUBTREE}: {text:?}"
+        );
+        assert_eq!(starts, items, "{CURSOR_AND_ROWS_AGREE}: {text:?}");
+    }
+
+    /// A result the run wrote no report into is JSON, and a reader folds it
+    /// rather than scrolling past it. The arrows walk its nodes, so the second
+    /// node closes while the one holding it stays open.
+    #[test]
+    fn a_result_without_a_report_folds_as_a_tree() {
+        let mut settled = run(RUN_ID, RunStatus::Completed, Vec::new());
+        settled.result = Some(serde_json::from_str(JSON_RESULT).unwrap());
+        let mut inspector = open_with(vec![settled]);
+        let _ = inspector.handle_key(key_event(KeyCode::Char('4')));
+        let _ = inspector.handle_key(key_event(KeyCode::Right));
+        assert!(
+            section_of(&inspector)
+                .0
+                .iter()
+                .any(|line| line.contains(FOLDED_KEY)),
+            "{JSON_IS_A_TREE}"
+        );
+
+        let _ = inspector.handle_key(key_event(KeyCode::Down));
+        let _ = inspector.handle_key(key_event(KeyCode::Enter));
+
+        let (text, starts, items) = section_of(&inspector);
+        assert!(
+            text.iter().any(|line| line.contains(OUTER_KEY)),
+            "{OUTER_STAYS_OPEN}: {text:?}"
+        );
+        assert!(
+            text.iter().all(|line| !line.contains(FOLDED_KEY)),
+            "{FOLD_HIDES_THE_SUBTREE}: {text:?}"
+        );
+        assert_eq!(starts, items, "{CURSOR_AND_ROWS_AGREE}: {text:?}");
+    }
+
+    /// Enter acts on the item the cursor names, so the mark has to be drawn on
+    /// the row that item starts. A body's nodes take positions of their own,
+    /// which is exactly where the two can come apart.
+    #[test]
+    fn the_marked_row_is_the_row_the_cursor_names() {
+        let (settled, journal) = json_call();
+        let mut inspector = open_with(vec![settled]);
+        inspector.fill_detail(journal);
+        let _ = inspector.handle_key(key_event(KeyCode::Char('3')));
+        let _ = inspector.handle_key(key_event(KeyCode::Right));
+        let _ = inspector.handle_key(key_event(KeyCode::Enter));
+        let _ = inspector.handle_key(key_event(KeyCode::Down));
+        let _ = inspector.handle_key(key_event(KeyCode::Down));
+
+        let (lines, starts) = inspector.section_lines(now_secs(), FRAME_WIDTH);
+
+        let marked: Vec<usize> = lines
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| line_text(line).starts_with(CURSOR_MARK))
+            .map(|(index, _)| index)
+            .collect();
+        assert_eq!(
+            marked,
+            vec![starts[inspector.cursor]],
+            "{MARK_FOLLOWS_THE_CURSOR}"
+        );
+    }
+
     /// Where `needle` ends in `line`, in the columns a terminal draws it in.
     fn end_column(line: &str, needle: &str) -> Option<usize> {
         let byte = line.find(needle)? + needle.len();
@@ -3614,7 +4013,9 @@ mod tests {
             "path": SCRATCH_PATH,
         }));
 
-        let (lines, starts) = result_lines(&settled, FRAME_WIDTH);
+        let inspector = open_with(vec![settled.clone()]);
+
+        let (lines, starts) = result_lines(&inspector, &settled, FRAME_WIDTH);
 
         let painted: Vec<String> = lines.iter().map(line_text).collect();
         assert!(

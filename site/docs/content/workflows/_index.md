@@ -65,7 +65,7 @@ Pressing Esc cancels the main turn and leaves workflow runs alone. Stop them fro
 | Overview | One line in the card's shape carrying status, phase and where it sits among the declared ones, agents landed against the roster, agents admitted against the budget, tokens, and elapsed time, then the objective, the phase strip, and the last log lines |
 | Timeline | Everything the run did, in the order it did it |
 | Agents | The roster gathered under the phase that dispatched each agent, as a ledger of who ran and what they cost |
-| Result | The report, drawn as the markdown it is, or the result JSON as source, then the scratch file path and the pause message or error. Enter, or a click on the path, opens the scratch file in the workbench |
+| Result | The report, drawn as the markdown it is, or a result with no report as a JSON tree, then the scratch file path and the pause message or error. Enter, or a click on the path, opens the scratch file in the workbench |
 
 ### Narrow terminals
 
@@ -82,6 +82,8 @@ Every row reads in the same columns: when it happened on the run's clock, then w
 Every phase and every call carries a bar scaled to the whole run. A phase that took most of the run looks like it, and a fan-out whose agents ran at the same time shows overlapping bars while one that serialised shows a staircase. A pane too narrow for a useful bar leaves it out, along with the counts that follow it, and spends the columns on the names instead.
 
 Enter opens the row under the cursor. On a phase it moves to the first agent that phase dispatched. On a `write_scratch_file` call it opens the file. On an agent call it opens what that agent was asked and what it answered, fetched in full from the journal rather than cut to a preview.
+
+A result that is JSON opens as a tree rather than as a dump. Every object and every array is a row of its own, highlighted as the JSON it is, and Enter on one closes it and says how many keys or items it took with it. Everything starts open, so a result that is small reads without a keystroke and a result that is large can be cut down to the part being read. The nodes take their place in the same cursor the rest of the section uses, so the arrows walk into a result and out the other side.
 
 ### Agent rows
 
