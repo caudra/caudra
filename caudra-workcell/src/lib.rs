@@ -4464,7 +4464,11 @@ mod tests {
                     "properties": {
                         "pattern": { "type": "string", "minLength": 1 },
                         "path": { "type": "string", "minLength": 1 },
-                        "include": { "type": "string", "minLength": 1 }
+                        "include": { "type": "string", "minLength": 1 },
+                        "-A": { "type": "integer", "minimum": 0 },
+                        "-B": { "type": "integer", "minimum": 0 },
+                        "-C": { "type": "integer", "minimum": 0 },
+                        "head_limit": { "type": "integer", "minimum": 1 }
                     },
                     "required": ["pattern"]
                 }),

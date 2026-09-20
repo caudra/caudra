@@ -116,7 +116,11 @@ A search that reaches its bounds returns what it found instead of failing. The r
 |-----------|------|----------|-------------|
 | `pattern` | string | yes | Linear-time regular expression without look-around or backreferences. |
 | `path` | string | no | Optional file or directory under the root. |
-| `include` | string | no | Optional file glob filter. |
+| `include` | string | no | Optional file glob filter. `glob` is accepted as an alias. |
+| `-A` | integer | no | Lines of context after each match. |
+| `-B` | integer | no | Lines of context before each match. |
+| `-C` | integer | no | Lines of context on both sides. An explicit -A or -B wins. |
+| `head_limit` | integer | no | Stop after this many matches. |
 
 ### `tool_output` {#tool_output}
 
