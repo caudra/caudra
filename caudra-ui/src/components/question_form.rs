@@ -13,6 +13,7 @@ use ratatui::text::{Line, Span};
 use unicode_width::UnicodeWidthStr;
 
 use caudra_agent::types::AskedQuestion;
+use caudra_grab::grab_scope;
 
 use super::form::render_form;
 use super::keybindings::{Bind, key};
@@ -260,6 +261,7 @@ impl QuestionForm {
     }
 
     pub fn view(&mut self, frame: &mut Frame, area: Rect) {
+        grab_scope!("question_form", area);
         let width = area.width.saturating_sub(2);
         let body = self.body(width);
         let rows = visual_rows(&body.lines, width);

@@ -65,6 +65,10 @@ fn autoscroll_rows(distance: i32) -> i32 {
 impl App {
     pub(super) fn handle_mouse(&mut self, event: MouseEvent) -> Vec<crate::components::Action> {
         let at = Position::new(event.column, event.row);
+        #[cfg(debug_assertions)]
+        if let Some(actions) = self.handle_grab_mouse(event) {
+            return actions;
+        }
         if self.permissions_picker.is_open() && self.permissions_picker.editor_mut().is_some() {
             self.clear_control_hovers();
             if self.permission_mutation_pending() {

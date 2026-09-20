@@ -7,6 +7,7 @@
 
 use std::collections::HashMap;
 
+use caudra_grab::grab_scope;
 use caudra_storage::id::CaudraId;
 use crossterm::event::{KeyCode, KeyEvent, MouseEvent};
 use ratatui::Frame;
@@ -274,6 +275,7 @@ impl SessionPicker {
     }
 
     pub fn view(&mut self, frame: &mut Frame, area: Rect) -> Rect {
+        grab_scope!("session_picker", area);
         self.picker.view(frame, area)
     }
 

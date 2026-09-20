@@ -1,6 +1,7 @@
 use std::time::Duration;
 
 use caudra_agent::{GoalStatus, GoalVerdict, MAX_GOAL_CONTINUATION_LIMIT};
+use caudra_grab::grab_scope;
 use caudra_providers::model_registry::Binding;
 use crossterm::event::{KeyCode, KeyEvent, MouseEvent};
 use ratatui::Frame;
@@ -141,6 +142,7 @@ impl GoalModal {
         if !self.open {
             return Rect::default();
         }
+        grab_scope!("goal_modal", area);
 
         let width = Modal::inner_width(area.width, WIDTH_PERCENT).saturating_sub(H_PAD * 2);
         self.active = is_active(status);

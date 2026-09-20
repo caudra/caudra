@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use caudra_agent::{SharedBuf, SnapshotLine, SpanStyle};
+use caudra_grab::grab_scope;
 use caudra_lua::{Anchor, Axis, Border, FloatConfig, Split, TitlePos, WinCommand, WinEvent};
 use crossterm::event::{KeyEvent, MouseEvent};
 use ratatui::Frame;
@@ -320,6 +321,7 @@ impl FloatManager {
             if popup.width == 0 || popup.height == 0 {
                 continue;
             }
+            grab_scope!("lua_float", popup);
             self.render_window(frame, idx, popup);
             union = union_rect(union, popup);
         }
@@ -354,6 +356,7 @@ impl FloatManager {
         if rect.width == 0 || rect.height == 0 {
             return;
         }
+        grab_scope!("lua_float_split", rect);
         self.render_window(frame, idx, rect);
     }
 
@@ -373,6 +376,7 @@ impl FloatManager {
         if rect.width == 0 || rect.height == 0 {
             return;
         }
+        grab_scope!("lua_float_panel", rect);
         self.render_window(frame, idx, rect);
     }
 

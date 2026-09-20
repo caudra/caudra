@@ -1,5 +1,6 @@
 use std::path::Path;
 
+use caudra_grab::grab_scope;
 use ratatui::buffer::Buffer;
 use ratatui::style::Modifier;
 use ratatui::widgets::Widget;
@@ -317,6 +318,7 @@ fn content_area(area: Rect) -> Rect {
 
 impl PermissionPrompt {
     pub fn view(&mut self, frame: &mut Frame, area: Rect) {
+        grab_scope!("permission_prompt", area);
         self.view_with_theme(frame, area, &theme::current());
     }
 

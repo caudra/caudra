@@ -11,6 +11,24 @@ pub(super) enum SegmentKind {
     Done,
 }
 
+impl SegmentKind {
+    /// Names the segment in a grab's component stack, so a transcript row
+    /// reports what kind of thing was painted there rather than only that the
+    /// transcript painted it.
+    #[cfg(debug_assertions)]
+    pub fn grab_name(self) -> &'static str {
+        match self {
+            Self::User => "transcript_user",
+            Self::Assistant => "transcript_assistant",
+            Self::Thinking => "transcript_thinking",
+            Self::ToolInline | Self::ToolBlock => "transcript_tool",
+            Self::Instruction => "transcript_instruction",
+            Self::Error => "transcript_error",
+            Self::Done => "transcript_done",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct SegmentChrome {
     pub margin_top: u16,

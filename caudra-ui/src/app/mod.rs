@@ -7,6 +7,8 @@
 mod btw;
 mod delegation;
 mod extract;
+#[cfg(debug_assertions)]
+mod grab;
 mod image_paste;
 mod memory;
 pub(crate) mod mode;
@@ -416,6 +418,8 @@ pub struct App {
     replacement_item: Option<QueueItemId>,
     goal_deferred: bool,
     pub(super) zones: ZoneRegistry,
+    #[cfg(debug_assertions)]
+    grab: grab::GrabState,
     pub(super) selection_state: Option<SelectionState>,
     /// Velocity scrolling anchored on a middle press, which reaches the far end
     /// of a long document without a bar and without a wheel.
@@ -637,6 +641,8 @@ impl App {
             replacement_item: None,
             goal_deferred: false,
             zones: ZoneRegistry::new(),
+            #[cfg(debug_assertions)]
+            grab: grab::GrabState::default(),
             selection_state: None,
             autoscroll: None,
             clipboard: ClipboardState::new(),
@@ -2661,6 +2667,10 @@ impl App {
             KeyEventKind::Release => return vec![],
             KeyEventKind::Repeat => return self.handle_key_repeat(key),
             KeyEventKind::Press => {}
+        }
+        #[cfg(debug_assertions)]
+        if self.handle_grab_key(key) {
+            return vec![];
         }
         self.clear_selection_unless_pending_copy();
         self.sync_subagent_input_target();

@@ -1,0 +1,15 @@
+[package]
+name = "caudra-grab"
+description = "Debug-only render tracing that maps a screen cell back to the component that drew it."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+ratatui = { workspace = true }
+
+[dev-dependencies]
+test-case = { workspace = true }

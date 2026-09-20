@@ -13,6 +13,7 @@ use crate::components::tools_modal::ToolsModalContext;
 use crate::components::usage_modal::UsageModalContext;
 use crate::selection::{self, SelectableZone, SelectionZone, ZoneRegistry};
 use crate::theme;
+use caudra_grab::grab_scope;
 use caudra_lua::Split;
 use caudra_providers::RequestOptions;
 #[cfg(test)]
@@ -47,7 +48,19 @@ struct ViewLayout {
 }
 
 impl App {
+    /// Recording brackets the whole draw, so anything painted after
+    /// `caudra_grab::end_frame` is invisible to the grab hit test. The grab
+    /// interface paints there, which is how it stays out of its own results.
     pub fn view(&mut self, frame: &mut Frame) {
+        caudra_grab::begin_frame();
+        self.view_body(frame);
+        caudra_grab::end_frame();
+        #[cfg(debug_assertions)]
+        self.render_grab(frame);
+    }
+
+    fn view_body(&mut self, frame: &mut Frame) {
+        grab_scope!("app", frame.area());
         self.sync_subagent_input_target();
         self.queue_hits.clear();
         self.admission_hits.clear();
@@ -90,6 +103,7 @@ impl App {
     /// Skipping them left a permission prompt invisible while it went on
     /// owning the keyboard, which hangs the session outright.
     fn render_workbench(&mut self, frame: &mut Frame) {
+        grab_scope!("workbench", frame.area());
         let render_chat = self.active_chat;
         let [mut body, status] = Layout::vertical([Constraint::Min(1), Constraint::Length(1)])
             .areas(main_content_area(frame.area()));
@@ -298,6 +312,7 @@ impl App {
     }
 
     fn render_messages(&mut self, frame: &mut Frame, layout: &ViewLayout, render_chat: usize) {
+        grab_scope!("messages", layout.msg_area);
         let accent = self.effective_mode_color();
         // Pushed per frame rather than at construction so subagent chats,
         // which are created mid-session, inherit the current mode.
@@ -312,6 +327,7 @@ impl App {
     }
 
     fn render_bottom_panel(&mut self, frame: &mut Frame, layout: &ViewLayout) {
+        grab_scope!("bottom_panel", layout.bottom_area);
         if self.permission_prompt.is_open() {
             self.permission_prompt.view(frame, layout.bottom_area);
         } else if self.question_form.is_open() {
@@ -584,6 +600,7 @@ impl App {
     }
 
     fn render_status_bar(&mut self, frame: &mut Frame, status_area: Rect, render_chat: usize) {
+        grab_scope!("status_bar", status_area);
         let chat = &self.chats[render_chat];
         let goal = self.state.goal.snapshot();
         let chat_name = (self.chats.len() > 1).then_some(chat.name.as_str());

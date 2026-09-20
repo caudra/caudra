@@ -5,6 +5,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Wrap;
 
 use caudra_config::providers::{self, Protocol, ProviderDef, ProvidersConfig, slugify};
+use caudra_grab::grab_scope;
 use caudra_providers::catalog_providers_if_available;
 use caudra_storage::StateDir;
 use caudra_storage::auth::{
@@ -839,6 +840,7 @@ impl LoginPicker {
     }
 
     pub fn view(&mut self, frame: &mut Frame, area: Rect) -> Rect {
+        grab_scope!("login_picker", area);
         match &mut self.step {
             Step::Closed => Rect::default(),
             Step::PickProvider(picker) => picker.view(frame, area),

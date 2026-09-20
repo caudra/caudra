@@ -3,6 +3,7 @@ use std::fs;
 use std::mem;
 use std::path::Path;
 
+use caudra_grab::grab_scope;
 use caudra_storage::id::CaudraId;
 use caudra_storage::paths;
 use caudra_storage::sessions::{SessionLocation, SessionRelocation};
@@ -291,6 +292,7 @@ impl SessionRelocationPicker {
     }
 
     pub fn view(&mut self, frame: &mut Frame, area: Rect) -> Rect {
+        grab_scope!("session_relocation", area);
         self.picker.view(frame, area)
     }
 

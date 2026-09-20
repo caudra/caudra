@@ -17,6 +17,7 @@
 use std::fmt::Write as _;
 use std::ops::Range;
 
+use caudra_grab::grab_scope;
 use caudra_markdown::render::SpanSource;
 use caudra_workbench::Clicks;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
@@ -737,6 +738,7 @@ impl ReviewModal {
         if self.target.is_none() {
             return Rect::default();
         }
+        grab_scope!("review", area);
         match self.mode {
             Mode::Passage { .. } => self.view_passage(frame, area),
             Mode::Note { .. } => self.view_note(frame, area),
@@ -744,6 +746,7 @@ impl ReviewModal {
     }
 
     fn view_passage(&mut self, frame: &mut Frame, area: Rect) -> Rect {
+        grab_scope!("review_passage", area);
         let modal = Modal {
             title: PASSAGE_TITLE,
             width_percent: MODAL_WIDTH_PERCENT,
@@ -787,6 +790,7 @@ impl ReviewModal {
     }
 
     fn render_meta(&self, frame: &mut Frame, area: Rect) {
+        grab_scope!("review_meta", area);
         let theme = theme::current();
         let notes = self.notes.len();
         let (start, end) = self.selected_rows();
@@ -807,6 +811,7 @@ impl ReviewModal {
     }
 
     fn render_gutter(&self, frame: &mut Frame, area: Rect) {
+        grab_scope!("review_gutter", area);
         let theme = theme::current();
         let (start, end) = self.selected_rows();
         let noted: Vec<(u16, u16)> = self.visible_notes().map(|note| note.rows).collect();
@@ -830,6 +835,7 @@ impl ReviewModal {
 
     fn render_passage(&mut self, frame: &mut Frame, area: Rect) {
         let Some(target) = &self.target else { return };
+        grab_scope!("review_passage_text", area);
         frame.render_widget(
             Paragraph::new(target.lines.clone())
                 .wrap(Wrap { trim: false })
@@ -865,6 +871,7 @@ impl ReviewModal {
         let Mode::Note { ref quote, .. } = self.mode else {
             return Rect::default();
         };
+        grab_scope!("review_note", area);
         let modal = Modal {
             title: NOTE_TITLE,
             width_percent: MODAL_WIDTH_PERCENT,

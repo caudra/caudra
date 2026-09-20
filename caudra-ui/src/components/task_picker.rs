@@ -4,6 +4,7 @@
 //! every refresh rebuilds the rows from [`crate::app::App::tasks`], and
 //! previewing is a real focus with a restore on cancel.
 
+use caudra_grab::grab_scope;
 use crossterm::event::{KeyEvent, MouseEvent};
 use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
@@ -154,6 +155,7 @@ impl TaskPicker {
     }
 
     pub fn view(&mut self, frame: &mut Frame, area: Rect) -> Rect {
+        grab_scope!("task_picker", area);
         self.picker.view(frame, area)
     }
 

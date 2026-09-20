@@ -1,3 +1,4 @@
+use caudra_grab::grab_scope;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -115,6 +116,7 @@ impl PasteEditor {
             return Rect::default();
         }
 
+        grab_scope!("paste_editor", area);
         let modal = Modal {
             title: MODAL_TITLE,
             width_percent: MODAL_WIDTH_PERCENT,
@@ -150,6 +152,7 @@ impl PasteEditor {
     }
 
     fn render_meta(&self, frame: &mut Frame, area: Rect) {
+        grab_scope!("paste_editor_meta", area);
         let text = self.editor.text();
         let line = Line::from(vec![
             Span::styled(

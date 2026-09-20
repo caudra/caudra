@@ -1,5 +1,6 @@
 use crate::theme::Theme;
 
+use caudra_grab::grab_scope;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::Style;
@@ -22,6 +23,7 @@ pub(crate) fn render_form(
     scroll: (u16, u16),
     footer: Option<Line<'static>>,
 ) -> Rect {
+    grab_scope!("form", area);
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)

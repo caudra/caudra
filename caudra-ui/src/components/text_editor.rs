@@ -12,6 +12,7 @@
 use std::ops::Range;
 use std::time::Instant;
 
+use caudra_grab::grab_scope;
 use caudra_workbench::buffer::{Buffer, Cursor, Edit};
 use caudra_workbench::history::History;
 use caudra_workbench::{Clicks, keys, render};
@@ -310,6 +311,7 @@ impl TextEditor {
     }
 
     pub fn view(&mut self, frame: &mut Frame, area: Rect) {
+        grab_scope!("text_editor", area);
         self.area = area;
         let rows = self.visual_rows();
         let height = usize::from(area.height.max(1));

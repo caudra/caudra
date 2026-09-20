@@ -7,6 +7,7 @@ use caudra_agent::permissions::{
 use caudra_config::{
     Effect, PermissionReviewCandidate, PermissionReviewKind, PermissionRule, PermissionSource,
 };
+use caudra_grab::grab_scope;
 use caudra_storage::permission_patterns::{
     ArgumentDomain, ObservedTuple, OptionLikePolicy, PatternDefinition, PatternToken,
     SlotCombinations, SlotId,
@@ -288,6 +289,7 @@ impl SuggestionInspector {
     }
 
     fn view(&mut self, frame: &mut Frame, area: Rect, description: &str) -> Rect {
+        grab_scope!("permissions_picker_inspector", area);
         let mut lines = vec![Line::from(SUGGESTED_GUIDANCE), Line::default()];
         lines.extend(description.lines().map(Line::from));
         lines.extend([
@@ -864,6 +866,7 @@ impl PermissionsPicker {
     }
 
     pub(crate) fn view(&mut self, frame: &mut Frame, area: Rect) -> Rect {
+        grab_scope!("permissions_picker", area);
         if let Some(inspector) = &mut self.suggestion_inspector {
             let description = self
                 .picker
@@ -1069,6 +1072,7 @@ impl PermissionsPicker {
     }
 
     fn view_detail(&mut self, frame: &mut Frame, area: Rect) {
+        grab_scope!("permissions_picker_detail", area);
         self.detail.popup = area;
         if area.is_empty() {
             return;

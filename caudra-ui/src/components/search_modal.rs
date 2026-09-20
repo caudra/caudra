@@ -7,6 +7,7 @@ use crate::components::modal::Modal;
 use crate::components::scrollbar::{Scrollbar, ScrollbarMouse};
 use crate::text_buffer::TextBuffer;
 use crate::theme;
+use caudra_grab::grab_scope;
 use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use nucleo_matcher::pattern::{Atom, AtomKind, CaseMatching, Normalization};
 use nucleo_matcher::{Config, Matcher, Utf32Str};
@@ -343,6 +344,7 @@ impl SearchModal {
         if !self.open {
             return Rect::default();
         }
+        grab_scope!("search_modal", area);
 
         let content_rows = if self.matches.is_empty() && !self.search.value().is_empty() {
             1
@@ -394,6 +396,7 @@ impl SearchModal {
     }
 
     fn render_list(&self, frame: &mut Frame, area: Rect, viewport_height: usize) {
+        grab_scope!("search_modal_list", area);
         let t = theme::current();
 
         if self.matches.is_empty() {
@@ -425,6 +428,7 @@ impl SearchModal {
     }
 
     fn render_search(&self, frame: &mut Frame, area: Rect) {
+        grab_scope!("search_modal_search", area);
         let t = theme::current();
         let query = self.search.value();
         let cursor_byte = TextBuffer::char_to_byte(&query, self.search.x());

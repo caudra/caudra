@@ -2,6 +2,7 @@ use caudra_agent::context::{
     ContextBuiltinState, ContextMcpStatus, ContextProfileSource, ContextReadiness, ContextReserve,
     ContextSnapshot, ContextWindow,
 };
+use caudra_grab::grab_scope;
 use caudra_providers::{format_tokens, token_label};
 use crossterm::event::{KeyCode, KeyEvent, MouseEvent};
 use ratatui::Frame;
@@ -126,6 +127,7 @@ impl ContextModal {
         if !self.open {
             return Rect::default();
         }
+        grab_scope!("context_modal", area);
 
         let content_width = content_width(area);
         let theme = theme::current();

@@ -8,6 +8,7 @@
 //! form takes the key only when a plan is ready, and it is hidden otherwise.
 
 use caudra_agent::types::{TodoItem, TodoStatus};
+use caudra_grab::grab_scope;
 use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
@@ -205,6 +206,7 @@ impl TodoPanel {
             self.header = Rect::default();
             return;
         }
+        grab_scope!("todo_panel", area);
         let t = theme::current();
         let left = if area.width >= 32 {
             3

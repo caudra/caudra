@@ -1,5 +1,6 @@
 use std::time::{Duration, Instant};
 
+use caudra_grab::grab_scope;
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
@@ -109,6 +110,7 @@ pub(crate) fn render(
         total_width.min(width),
         1,
     );
+    grab_scope!("prompt_progress", bar_area);
     progress_bar::render(
         frame,
         bar_area,

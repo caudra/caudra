@@ -1,5 +1,6 @@
 use arc_swap::ArcSwapOption;
 use caudra_agent::snapshots::StoreEntry;
+use caudra_grab::grab_scope;
 use caudra_storage::sessions::SessionStorageStats;
 use crossterm::event::{KeyCode, KeyEvent, MouseEvent};
 use ratatui::Frame;
@@ -167,6 +168,7 @@ impl StorageModal {
         if !self.open {
             return Rect::default();
         }
+        grab_scope!("storage_modal", area);
 
         let content_width = content_width(area);
         let theme = theme::current();

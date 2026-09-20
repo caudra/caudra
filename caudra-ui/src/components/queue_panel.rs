@@ -1,6 +1,7 @@
 use std::borrow::Cow;
 
 use caudra_agent::{PromptAdmission, QueueItemId};
+use caudra_grab::grab_scope;
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::Style;
@@ -91,6 +92,7 @@ pub fn view(
     if entries.is_empty() || area.width < 2 || area.height < 2 {
         return Vec::new();
     }
+    grab_scope!("queue_panel", area);
 
     let left = if area.width >= 32 {
         3

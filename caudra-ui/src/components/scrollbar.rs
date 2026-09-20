@@ -12,6 +12,7 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
 
+use caudra_grab::grab_leaf;
 use caudra_workbench::scroll;
 
 pub use caudra_workbench::scroll::{ScrollHint, ScrollbarMouse};
@@ -63,6 +64,14 @@ impl Scrollbar {
             return;
         }
         self.0.place(area, total.into(), position.into());
+        // The strip is a column of the region it was placed in, not the region,
+        // and it is only known once placed. Recording the region instead would
+        // put the bar over every row of the surface it belongs to. Written
+        // without a binding so the whole statement leaves release builds.
+        grab_leaf!(
+            "scrollbar",
+            self.0.track().map_or(Rect::ZERO, scroll::ScrollTrack::area)
+        );
         self.0.render(frame.buffer_mut(), THUMB);
     }
 

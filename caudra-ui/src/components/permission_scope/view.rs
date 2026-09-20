@@ -1,3 +1,4 @@
+use caudra_grab::grab_scope;
 use caudra_storage::permission_patterns::{
     ArgumentDomain, ArgumentRole, OptionLikePolicy, PatternDefinition, PatternToken,
     SlotCombinations, SlotId,
@@ -211,6 +212,7 @@ impl ScopeView {
         buffer: &mut Buffer,
         theme: &Theme,
     ) {
+        grab_scope!("permission_scope", area);
         self.render_with_properties(model, area, buffer, theme, None);
     }
 

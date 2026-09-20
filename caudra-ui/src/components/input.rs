@@ -11,6 +11,7 @@ use crate::theme;
 
 use caudra_agent::PromptAdmission;
 use caudra_agent::mentions::{self, Mention};
+use caudra_grab::grab_scope;
 use caudra_storage::input_history::InputHistory;
 use caudra_workbench::buffer::Cursor;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent};
@@ -525,6 +526,7 @@ impl InputBox {
         focused: bool,
         top_right_hint: Option<Line<'_>>,
     ) {
+        grab_scope!("input", area);
         let content_area = content_area(area);
         let content_height = content_area.height;
         let ew = effective_width(content_area.width as usize);

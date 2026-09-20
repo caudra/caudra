@@ -15,6 +15,7 @@ mod timeline;
 
 use caudra_agent::SubagentProgress;
 use caudra_agent::types::{PhaseMark, WorkflowRunCard};
+use caudra_grab::grab_scope;
 use caudra_workflow::{
     AgentRosterEntry, CallKind, CallState, MAX_AGENT_BUDGET, RosterState, RunCall, RunCallBody,
     RunDetail, RunHistoryEntry, RunSnapshot, RunStatus,
@@ -1565,6 +1566,7 @@ impl WorkflowInspector {
         if !self.open {
             return Rect::default();
         }
+        grab_scope!("workflow_inspector", area);
         let modal = Modal {
             title: TITLE,
             width_percent: WIDTH_PERCENT,
@@ -1653,6 +1655,7 @@ impl WorkflowInspector {
     }
 
     fn render_list(&mut self, frame: &mut Frame, area: Rect) {
+        grab_scope!("workflow_inspector_list", area);
         let t = theme::current();
         let entries = self.entries();
         let mut lines: Vec<Line<'static>> = Vec::with_capacity(entries.len() + Group::ALL.len());
@@ -1712,6 +1715,7 @@ impl WorkflowInspector {
     }
 
     fn render_tabs(&mut self, frame: &mut Frame, area: Rect) {
+        grab_scope!("workflow_inspector_tabs", area);
         let t = theme::current();
         let mut spans = Vec::with_capacity(Section::ALL.len() * 2);
         let mut hits = Vec::with_capacity(Section::ALL.len());
@@ -1746,6 +1750,7 @@ impl WorkflowInspector {
     }
 
     fn render_body(&mut self, frame: &mut Frame, area: Rect) {
+        grab_scope!("workflow_inspector_body", area);
         let (lines, item_starts) = self.section_lines(now_secs(), area.width);
         let rows = visual_rows(&lines, area.width);
         self.scroll.update_dimensions(rows.total, area.height);

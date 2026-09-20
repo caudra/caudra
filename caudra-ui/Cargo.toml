@@ -9,6 +9,7 @@ authors.workspace = true
 caudra-agent = { workspace = true }
 caudra-config = { workspace = true }
 caudra-diff = { workspace = true }
+caudra-grab = { workspace = true }
 caudra-otel = { workspace = true }
 caudra-highlight = { workspace = true }
 caudra-markdown = { workspace = true }

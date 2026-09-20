@@ -6,6 +6,7 @@
 
 use std::ops::Range;
 
+use caudra_grab::grab_scope;
 use caudra_highlight::StyledSegment;
 use ratatui::Frame;
 use ratatui::buffer::Buffer as Surface;
@@ -161,6 +162,7 @@ pub(crate) enum Toggle {
 
 impl Workbench {
     pub fn view(&mut self, frame: &mut Frame, area: Rect) {
+        grab_scope!("workbench_view", area);
         self.panes = layout(area, self.sidebar_width, self.sidebar_collapsed);
         let panes = self.panes;
         let buf = frame.buffer_mut();
@@ -185,6 +187,7 @@ impl Workbench {
             self.panes.menu = Rect::default();
             return;
         };
+        grab_scope!("workbench_menu", area);
         let panel = menu_panel(menu, area);
         chrome::fill(buf, panel, self.styles.background);
         let [top, rows, bottom] = Layout::vertical([
@@ -238,6 +241,7 @@ impl Workbench {
     }
 
     fn render_sidebar(&mut self, buf: &mut Surface, area: Rect) {
+        grab_scope!("workbench_sidebar", area);
         let [header, body] =
             Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(area);
         self.panes.header = header;
@@ -320,6 +324,7 @@ impl Workbench {
     /// Two fields and a toggle row over the results, so the whole question and
     /// its answer stay visible in one column.
     fn render_search(&mut self, buf: &mut Surface, area: Rect, focused: bool) {
+        grab_scope!("workbench_search", area);
         let [query, include, toggles, body] = Layout::vertical([
             Constraint::Length(1),
             Constraint::Length(1),
@@ -406,6 +411,7 @@ impl Workbench {
     /// scrolls under it. The title stays put so the fold handle and the count
     /// never scroll out of reach.
     fn render_scm(&mut self, buf: &mut Surface, area: Rect) {
+        grab_scope!("workbench_source_control", area);
         if !self.scm.is_repository() || self.scm.error().is_some() {
             let notice = self.scm.error().unwrap_or(NOT_A_REPOSITORY);
             placeholder(buf, area, notice, self.styles.dim);
@@ -452,6 +458,7 @@ impl Workbench {
     /// Reports the rows it drew into, which is the section's body less
     /// whatever its scrollbar took.
     fn render_section(&mut self, buf: &mut Surface, section: Section, area: Rect) -> Rect {
+        grab_scope!("workbench_source_control_section", area);
         let height = area.height as usize;
         if !self.bars.sections[section.index()].is_dragging() {
             self.scm.clamp_scroll(section, height);
@@ -510,6 +517,7 @@ impl Workbench {
     }
 
     fn render_tree(&mut self, buf: &mut Surface, area: Rect) {
+        grab_scope!("workbench_explorer", area);
         let height = area.height as usize;
         if !self.bars.sidebar.is_dragging() {
             self.tree.clamp_scroll(height);
@@ -556,6 +564,7 @@ impl Workbench {
     }
 
     fn render_editor(&mut self, buf: &mut Surface, area: Rect) {
+        grab_scope!("workbench_editor", area);
         let prompt = self.prompt();
         let [tabs, body, bar] = Layout::vertical([
             Constraint::Length(1),
@@ -581,6 +590,7 @@ impl Workbench {
             self.panes.palette = Rect::default();
             return;
         }
+        grab_scope!("workbench_palette", area);
         let width = area.width.min(PALETTE_WIDTH);
         let listed = u16::try_from(self.palette.len().min(PALETTE_ROWS)).unwrap_or(u16::MAX);
         let height = (listed + PALETTE_CHROME).min(area.height);
@@ -657,6 +667,7 @@ impl Workbench {
             self.panes.confirm = Rect::default();
             return;
         };
+        grab_scope!("workbench_confirm", area);
         let question = self.question(confirm.ask);
         let content = question.width().max(answers_width(confirm.ask)) as u16;
         let width = (content + CONFIRM_PADDING * 2).min(area.width);
@@ -755,6 +766,7 @@ impl Workbench {
     }
 
     fn render_tabs(&mut self, buf: &mut Surface, area: Rect) {
+        grab_scope!("workbench_tabs", area);
         let active = self.editor.active_index();
         let shown = visible_range(&self.editor, area.width);
         let pointed = self
@@ -835,6 +847,7 @@ impl Workbench {
     }
 
     fn render_body(&mut self, buf: &mut Surface, area: Rect) {
+        grab_scope!("workbench_editor_body", area);
         let focused = self.focus == Focus::Editor && self.goto.is_none() && !self.palette.is_open();
         let Some(tab) = self.editor.active_mut() else {
             self.panes.text = Rect::default();
@@ -894,6 +907,7 @@ impl Workbench {
     }
 
     fn render_prompt(&self, buf: &mut Surface, area: Rect, label: &str, input: &str, caret: bool) {
+        grab_scope!("workbench_prompt", area);
         let mut left = vec![Span::styled(label.to_owned(), self.styles.accent)];
         if !input.is_empty() {
             left.push(Span::styled(input.to_owned(), self.styles.text));
@@ -916,6 +930,7 @@ impl Workbench {
     }
 
     fn render_status(&mut self, buf: &mut Surface, area: Rect) {
+        grab_scope!("workbench_status", area);
         let half = area.width as usize / 2;
         let left = match (&self.flash, self.editor.active()) {
             (Some(message), _) => vec![Span::styled(chrome::fit(message, half), self.styles.error)],

@@ -13,6 +13,7 @@ use crate::repaint::Cadence;
 use crate::text_buffer::{EditResult, TextBuffer};
 use crate::theme;
 
+use caudra_grab::grab_scope;
 use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
@@ -728,6 +729,7 @@ impl<T: PickerItem> ListPicker<T> {
     }
 
     pub fn view(&mut self, frame: &mut Frame, area: Rect) -> Rect {
+        grab_scope!("list_picker", area);
         let footer = self.footer;
         match self.state.as_mut() {
             None => Rect::default(),
@@ -1024,6 +1026,7 @@ fn render_list<T: PickerItem>(
     row_hits: &mut Vec<PickerRowHit>,
     empty_text: &str,
 ) {
+    grab_scope!("list_picker_list", area);
     if filtered.is_empty() {
         let line = Line::from(Span::styled(
             format!("  {empty_text}"),
@@ -1144,6 +1147,7 @@ fn render_list<T: PickerItem>(
 }
 
 fn render_search(frame: &mut Frame, area: Rect, search: &TextBuffer) {
+    grab_scope!("list_picker_search", area);
     let query = search.value();
     let cursor_x = search.x();
     let chars: Vec<char> = query.chars().collect();

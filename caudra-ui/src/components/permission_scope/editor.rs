@@ -6,6 +6,7 @@ use caudra_agent::permissions::editor::{
     ResourcesDraft, SelectorDraft, SelectorMode, SelectorValue, SemanticChange, TemplateSource,
 };
 use caudra_agent::permissions::pattern_recognition::PatternCandidate;
+use caudra_grab::grab_scope;
 use caudra_storage::permission_patterns::{
     ArgumentDomain, ArgumentRole, ObservedTuple, PatternDefinition, PatternToken, SlotCombinations,
     SlotId,
@@ -2103,6 +2104,7 @@ impl ScopeEditor {
     }
 
     pub(crate) fn view(&mut self, frame: &mut Frame, area: Rect) {
+        grab_scope!("permission_scope_editor", area);
         let theme = theme::current();
         self.view_themed(frame, area, &theme);
     }
@@ -2291,6 +2293,7 @@ impl ScopeEditor {
     }
 
     fn view_input(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
+        grab_scope!("permission_scope_editor_input", area);
         let [label, value] = Layout::horizontal([
             Constraint::Length(INPUT_LABEL.width() as u16),
             Constraint::Min(1),
@@ -2400,6 +2403,7 @@ impl ScopeEditor {
     }
 
     fn view_changes(&mut self, frame: &mut Frame, area: Rect, theme: &Theme) {
+        grab_scope!("permission_scope_editor_changes", area);
         let Some(preview) = &self.preview else {
             frame.render_widget(
                 Paragraph::new(NEEDS_PREVIEW).style(theme.tool_warning),

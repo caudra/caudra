@@ -11,6 +11,7 @@ rust-version.workspace = true
 [dependencies]
 async-trait = { workspace = true }
 caudra-diff = { workspace = true }
+caudra-grab = { workspace = true }
 caudra-highlight = { workspace = true }
 caudra-workspace = { workspace = true }
 crossterm = { workspace = true }

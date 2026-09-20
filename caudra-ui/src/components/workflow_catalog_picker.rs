@@ -6,6 +6,7 @@
 //! two-key confirmation that quotes the digest the runtime pins, modelled on
 //! the MCP picker's project trust.
 
+use caudra_grab::grab_scope;
 use caudra_workflow::WorkflowCatalog;
 use crossterm::event::{KeyCode, KeyEvent, MouseEvent};
 use ratatui::Frame;
@@ -175,6 +176,7 @@ impl WorkflowCatalogPicker {
     }
 
     pub fn view(&mut self, frame: &mut Frame, area: Rect) -> Rect {
+        grab_scope!("workflow_catalog_picker", area);
         self.picker.view(frame, area)
     }
 

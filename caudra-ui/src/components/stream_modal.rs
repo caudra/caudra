@@ -11,6 +11,7 @@ use crate::text_buffer::TextBuffer;
 use crate::theme;
 
 use caudra_agent::{CancelTrigger, format_live_duration, format_settled_duration};
+use caudra_grab::grab_scope;
 use caudra_providers::{Billing, TokenUsage};
 use caudra_storage::usage_ledger::LedgerPurpose;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent};
@@ -574,6 +575,7 @@ impl StreamModal {
         if !self.open {
             return Rect::default();
         }
+        grab_scope!("stream_modal", area);
 
         let theme = theme::current();
         let padded_width = Modal::inner_width(area.width, WIDTH_PERCENT).saturating_sub(H_PAD * 2);
@@ -675,6 +677,7 @@ impl StreamModal {
         let Some(elapsed) = self.exchanges.last().map(|e| e.started_at.elapsed()) else {
             return;
         };
+        grab_scope!("stream_modal_status", area);
         frame.render_widget(
             Paragraph::new(Line::from(vec![
                 Span::styled(spinner_str(elapsed.as_millis()), theme.spinner),

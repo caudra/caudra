@@ -945,6 +945,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "caudra-grab"
+version = "0.1.0"
+dependencies = [
+ "ratatui",
+ "test-case",
+]
+
+[[package]]
 name = "caudra-highlight"
 version = "0.1.0"
 dependencies = [
@@ -1160,6 +1168,7 @@ dependencies = [
  "caudra-agent",
  "caudra-config",
  "caudra-diff",
+ "caudra-grab",
  "caudra-highlight",
  "caudra-lua",
  "caudra-markdown",
@@ -1208,6 +1217,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "caudra-diff",
+ "caudra-grab",
  "caudra-highlight",
  "caudra-workspace",
  "crossterm",

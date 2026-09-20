@@ -2,6 +2,7 @@
 //! typing `/`. Shares its command list with the inline dropdown in
 //! [`crate::components::command`]; only the surface differs.
 
+use caudra_grab::grab_scope;
 use crossterm::event::{KeyCode, KeyEvent, MouseEvent};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
@@ -218,6 +219,7 @@ impl CommandModal {
     }
 
     pub fn view(&mut self, frame: &mut Frame, area: Rect) -> Rect {
+        grab_scope!("command_modal", area);
         let popup = match &mut self.stage {
             Stage::Closed => Rect::default(),
             Stage::Pick(picker) => picker.view(frame, area),

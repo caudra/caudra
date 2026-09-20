@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use caudra_agent::command::CustomCommand;
 use caudra_agent::{McpPromptInfo, McpSnapshotReader};
+use caudra_grab::grab_scope;
 use caudra_lua::{LuaCommandInfo, LuaCommandReader};
 use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use nucleo::pattern::{CaseMatching, Normalization};
@@ -969,6 +970,7 @@ impl CommandPalette {
             width: popup_width.min(input_area.width),
             height: popup_height,
         };
+        grab_scope!("command", popup);
 
         let t = theme::current();
         let viewport_height = popup_height as usize;

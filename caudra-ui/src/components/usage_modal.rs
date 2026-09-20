@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use arc_swap::ArcSwapOption;
 
 use caudra_config::ClockFormat;
+use caudra_grab::grab_scope;
 use caudra_providers::{
     Billing, Model, ModelSpend, ProviderUsage, TokenUsage, add_cost, format_hit_rate,
     format_tokens, format_tokens_u64, model_cost,
@@ -200,6 +201,7 @@ impl UsageModal {
         if !self.open {
             return Rect::default();
         }
+        grab_scope!("usage_modal", area);
 
         let theme = theme::current();
         let lines = match self.scope {

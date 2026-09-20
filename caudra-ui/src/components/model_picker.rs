@@ -6,6 +6,7 @@ use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
 
 use caudra_config::ModelPolicy;
+use caudra_grab::grab_scope;
 use caudra_providers::dynamic;
 use caudra_providers::model_registry::{self, Binding};
 use caudra_providers::provider::ProviderKind;
@@ -515,6 +516,7 @@ impl ModelPicker {
     }
 
     pub fn view(&mut self, frame: &mut Frame, area: Rect) -> Rect {
+        grab_scope!("model_picker", area);
         self.picker.view(frame, area)
     }
 }

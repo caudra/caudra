@@ -57,6 +57,14 @@ pub(super) struct Placement {
 }
 
 impl Placement {
+    /// The screen rect the segment occupies, which is what a grab of one of
+    /// its rows reports. Spelled once here so it cannot drift from the
+    /// `seg_area` the paint derives the same way.
+    #[cfg(debug_assertions)]
+    pub fn rect(self, viewport: Rect) -> Rect {
+        Rect::new(viewport.x, self.y, viewport.width, self.visible)
+    }
+
     /// The screen rows a run of segment rows takes, clipped to what is on
     /// screen. `None` when the run is entirely scrolled out.
     pub fn clip(self, start: u16, span: u16) -> Option<(u16, u16)> {

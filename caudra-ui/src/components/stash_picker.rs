@@ -1,3 +1,4 @@
+use caudra_grab::grab_scope;
 use caudra_storage::prompt_stash::StashEntry;
 use crossterm::event::{KeyEvent, MouseEvent};
 use ratatui::Frame;
@@ -116,6 +117,7 @@ impl StashPicker {
     }
 
     pub fn view(&mut self, frame: &mut Frame, area: Rect) -> Rect {
+        grab_scope!("stash_picker", area);
         self.picker.view(frame, area)
     }
 

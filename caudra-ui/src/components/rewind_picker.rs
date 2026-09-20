@@ -2,6 +2,7 @@ use crate::components::Overlay;
 use crate::components::list_picker::{ListPicker, PickerAction, PickerItem};
 use crate::repaint::Cadence;
 
+use caudra_grab::grab_scope;
 use caudra_providers::{HistoryItem, HistoryItemKind, UserOrigin};
 use crossterm::event::{KeyEvent, MouseEvent};
 use ratatui::Frame;
@@ -117,6 +118,7 @@ impl RewindPicker {
     }
 
     pub fn view(&mut self, frame: &mut Frame, area: Rect) -> Rect {
+        grab_scope!("rewind_picker", area);
         self.picker.view(frame, area)
     }
 }

@@ -1,3 +1,4 @@
+use caudra_grab::grab_scope;
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
@@ -22,6 +23,7 @@ pub fn render(frame: &mut Frame, area: Rect, config: &ProgressBarConfig<'_>) {
         return;
     }
 
+    grab_scope!("progress_bar", area);
     let ratio = config.ratio.clamp(0.0, 1.0);
     let cache_ratio = config.cache_ratio.clamp(0.0, 1.0);
     let width = config.bar_width as usize;

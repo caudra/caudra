@@ -3,6 +3,7 @@ use crate::components::list_picker::{ListPicker, PickerAction};
 use crate::repaint::Cadence;
 use crate::theme;
 
+use caudra_grab::grab_scope;
 use crossterm::event::{KeyEvent, MouseEvent};
 use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
@@ -96,6 +97,7 @@ impl ThemePicker {
     }
 
     pub fn view(&mut self, frame: &mut Frame, area: Rect) -> Rect {
+        grab_scope!("theme_picker", area);
         self.picker.view(frame, area)
     }
 

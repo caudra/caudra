@@ -4,6 +4,7 @@ use caudra_agent::permissions::editor::{
 use caudra_agent::permissions::{
     argument_constraint_matches, canonical_json_sha256, selected_input_pointer,
 };
+use caudra_grab::grab_scope;
 use caudra_storage::permission_patterns::{
     ArgumentDomain, ArgumentRole, OptionLikePolicy, PatternDefinition, PatternToken,
     SlotCombinations,
@@ -881,6 +882,7 @@ impl ChangeView {
         theme: &Theme,
         focus: Option<&DetailControl>,
     ) -> Vec<(Rect, DetailControl)> {
+        grab_scope!("permission_scope_changes", area);
         self.predicate = self
             .predicate
             .min(review.predicates.len().saturating_sub(1));

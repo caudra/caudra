@@ -6,6 +6,7 @@ use caudra_agent::mcp::config::McpConfigSource;
 use caudra_agent::{
     McpConfigErrors, McpServerInfo, McpServerStatus, McpSnapshot, McpSnapshotReader,
 };
+use caudra_grab::grab_scope;
 
 use crate::components::keybindings::key;
 use crate::components::list_picker::{ListPicker, PickerAction, PickerItem};
@@ -293,6 +294,7 @@ impl McpPicker {
     }
 
     pub fn view(&mut self, frame: &mut Frame, area: Rect) -> Rect {
+        grab_scope!("mcp_picker", area);
         self.picker.view(frame, area)
     }
 }

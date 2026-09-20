@@ -4,6 +4,7 @@ use crate::components::queue_panel::QueueEntry;
 use crate::repaint::Cadence;
 
 use caudra_agent::{PromptAdmission, QueueItemId};
+use caudra_grab::grab_scope;
 use crossterm::event::{KeyEvent, MouseEvent};
 use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
@@ -150,6 +151,7 @@ impl QueueActions {
     }
 
     pub fn view(&mut self, frame: &mut Frame, area: Rect) -> Rect {
+        grab_scope!("queue_actions", area);
         self.picker.view(frame, area)
     }
 }

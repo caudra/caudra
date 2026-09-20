@@ -3,6 +3,7 @@ use caudra_agent::tools::ToolRegistry;
 use caudra_agent::tools::native::skill::{
     self, SkillDirCandidate, SkillDirState, SkillInventoryEntry,
 };
+use caudra_grab::grab_scope;
 use caudra_providers::token_label;
 use crossterm::event::{KeyEvent, MouseEvent, MouseEventKind};
 use ratatui::Frame;
@@ -112,6 +113,7 @@ impl SkillsModal {
         if !self.open {
             return Rect::default();
         }
+        grab_scope!("skills_modal", area);
 
         let theme = theme::current();
         let lines = build_lines(&self.inventory, &self.dirs, snapshot, &theme);

@@ -4,6 +4,7 @@ use caudra_agent::context::{
 use caudra_agent::format_settled_duration;
 use caudra_agent::tools::TOOL_SEARCH_TOOL_NAME as TOOL_SEARCH;
 use caudra_agent::tools::report::{CATALOG_SOURCE, REASON_CATALOG};
+use caudra_grab::grab_scope;
 use caudra_providers::{format_tokens_u64, token_label};
 use caudra_storage::tool_ledger::{ToolOutcome, ToolSlice, ToolStats};
 use crossterm::event::{KeyCode, KeyEvent, MouseEvent, MouseEventKind};
@@ -195,6 +196,7 @@ impl ToolsModal {
         if !self.open {
             return Rect::default();
         }
+        grab_scope!("tools_modal", area);
 
         let theme = theme::current();
         // Inventory wraps, because a row is prose that a narrow modal should

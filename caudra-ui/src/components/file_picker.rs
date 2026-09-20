@@ -14,6 +14,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use tracing::warn;
 
+use caudra_grab::grab_scope;
 use caudra_workbench::{
     BackendDriver, BackendError, BackendEvent, ResourceEntry, WorkbenchBackend, WorkbenchPath,
 };
@@ -413,6 +414,7 @@ impl FilePickerModal {
             Some(s) if s.visible => s,
             _ => return Rect::default(),
         };
+        grab_scope!("file_picker", area);
 
         let match_count = s.matches.len() as u16;
         let title = if s.walk == Walk::Running {
@@ -561,6 +563,7 @@ fn invalidate_mouse_geometry(s: &mut Session) {
 }
 
 fn render_list(frame: &mut Frame, area: Rect, s: &mut Session) {
+    grab_scope!("file_picker_list", area);
     let t = theme::current();
 
     if s.matches.is_empty() {
@@ -611,6 +614,7 @@ fn render_list(frame: &mut Frame, area: Rect, s: &mut Session) {
 }
 
 fn render_search(frame: &mut Frame, area: Rect, s: &Session) {
+    grab_scope!("file_picker_search", area);
     let t = theme::current();
     let query = s.search.value();
     let cursor_byte = TextBuffer::char_to_byte(&query, s.search.x());

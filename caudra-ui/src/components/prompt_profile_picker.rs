@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use caudra_agent::prompt::profile::{BUILTIN_PROFILE_NAME, PromptProfileCatalog};
+use caudra_grab::grab_scope;
 use crossterm::event::{KeyEvent, MouseEvent};
 use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
@@ -92,6 +93,7 @@ impl PromptProfilePicker {
     }
 
     pub fn view(&mut self, frame: &mut Frame, area: Rect) -> Rect {
+        grab_scope!("prompt_profile_picker", area);
         self.picker.view(frame, area)
     }
 

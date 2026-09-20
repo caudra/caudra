@@ -5,6 +5,7 @@
 //! system prompt advertises.
 
 use caudra_agent::tools::native::memory::BrowseEntry;
+use caudra_grab::grab_scope;
 use caudra_providers::token_label;
 use crossterm::event::{KeyEvent, MouseEvent};
 use ratatui::Frame;
@@ -136,6 +137,7 @@ impl MemoryPicker {
     }
 
     pub fn view(&mut self, frame: &mut Frame, area: Rect) -> Rect {
+        grab_scope!("memory_picker", area);
         self.picker.view(frame, area)
     }
 

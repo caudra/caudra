@@ -597,6 +597,11 @@ impl Chat {
         self.messages_panel.dispatched_id_at(row, area)
     }
 
+    #[cfg(debug_assertions)]
+    pub fn grab_provenance_at(&self, row: u16, area: Rect) -> Option<String> {
+        self.messages_panel.grab_provenance_at(row, area)
+    }
+
     pub fn source_at(&self, row: u16, area: Rect) -> Option<DisplaySource> {
         self.messages_panel.source_at(row, area)
     }

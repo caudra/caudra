@@ -2,6 +2,7 @@ use crate::components::list_picker::{ListPicker, PickerAction, PickerItem};
 use crate::components::{DisplaySource, Overlay};
 use crate::repaint::Cadence;
 
+use caudra_grab::grab_scope;
 use crossterm::event::{KeyEvent, MouseEvent};
 use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
@@ -123,6 +124,7 @@ impl MessageActions {
     }
 
     pub fn view(&mut self, frame: &mut Frame, area: Rect) -> Rect {
+        grab_scope!("message_actions", area);
         self.picker.view(frame, area)
     }
 }

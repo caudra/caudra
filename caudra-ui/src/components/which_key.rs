@@ -2,6 +2,7 @@ use crate::components::keybindings::{LEADER_PREFIX, LeaderChord};
 use crate::repaint::Cadence;
 use crate::theme;
 
+use caudra_grab::grab_scope;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Flex, Layout, Rect};
 use ratatui::text::{Line, Span};
@@ -72,6 +73,7 @@ impl WhichKey {
         let [panel] = Layout::vertical([Constraint::Length(height.min(area.height))])
             .flex(Flex::End)
             .areas(area);
+        grab_scope!("which_key", panel);
 
         frame.render_widget(Clear, panel);
         let block = Block::bordered()

@@ -7,6 +7,7 @@ use crate::components::scrollbar::{Scrollbar, ScrollbarMouse};
 use crate::components::{ModalScroll, bar_area};
 use crate::theme;
 
+use caudra_grab::grab_scope;
 use crossterm::event::{KeyCode, KeyEvent, MouseEvent};
 use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
@@ -159,6 +160,7 @@ impl HelpModal {
         if !self.open {
             return Rect::default();
         }
+        grab_scope!("help_modal", area);
 
         let mut lines: Vec<Line> = Vec::new();
         let theme = theme::current();

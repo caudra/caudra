@@ -41,6 +41,7 @@ use crate::theme;
 use crate::update;
 use caudra_agent::types::WorkflowRunCard;
 use caudra_config::{ClockFormat, ToolOutputLines, UiConfig};
+use caudra_grab::grab_leaf;
 use caudra_markdown::render::SpanSource;
 use caudra_workflow::RunSnapshot;
 
@@ -2383,6 +2384,31 @@ impl MessagesPanel {
             .flatten()
     }
 
+    /// What produced the row under the pointer: the segment, the message
+    /// behind it, and the call it belongs to. A grab's component stack names
+    /// the code that drew a cell, and this names the data it drew.
+    #[cfg(debug_assertions)]
+    pub fn grab_provenance_at(&self, row: u16, area: Rect) -> Option<String> {
+        if area.height == 0 {
+            return None;
+        }
+        let doc_row = self.doc_row(row, area);
+        let (index, segment, _) = self.cache.segment_at_row(doc_row, self.viewport_width)?;
+        let mut parts = vec![format!("segment {index}")];
+        if let Some(msg_index) = segment.msg_index {
+            let role = self
+                .messages
+                .get(msg_index)
+                .map(|message| format!(" ({:?})", message.role))
+                .unwrap_or_default();
+            parts.push(format!("message {msg_index}{role}"));
+        }
+        if let Some(tool_id) = segment.tool_id.as_deref() {
+            parts.push(format!("tool {tool_id}"));
+        }
+        Some(parts.join(", "))
+    }
+
     /// The dispatched id of the batch child at `row`, which is the card's own
     /// with the child's index appended. Rebuilding it is what lets a click on
     /// a roster row reach the subagent that row dispatched, since the roster
@@ -3341,6 +3367,7 @@ impl MessagesPanel {
                 frame,
             );
             if let Some(placement) = placement {
+                grab_leaf!(seg.kind().grab_name(), placement.rect(viewport));
                 collect_card_windows(seg, placement, width, viewport, &mut windows);
             }
             if let (Some(area), Some(source)) = (action_area, source) {
@@ -3372,6 +3399,8 @@ impl MessagesPanel {
             if cached_count > 0 || height_idx > 0 {
                 let h = streaming_heights[height_idx];
                 height_idx += 1;
+                #[cfg(debug_assertions)]
+                let placement = cursor.placement(h);
                 let _ = cursor.render(
                     (&spacer_lines, None),
                     h,
@@ -3380,10 +3409,16 @@ impl MessagesPanel {
                     RenderFeedback::default(),
                     frame,
                 );
+                grab_leaf!(
+                    "transcript_spacer",
+                    placement.map_or(Rect::ZERO, |at| at.rect(viewport))
+                );
             }
             if height_idx < streaming_heights.len() {
                 let h = streaming_heights[height_idx];
                 height_idx += 1;
+                #[cfg(debug_assertions)]
+                let placement = cursor.placement(h);
                 if collapsed {
                     let hover = matches!(self.hover, Some(HoverTarget::StreamingThinking))
                         .then_some((HoverFeedback::Chrome, accent));
@@ -3422,6 +3457,10 @@ impl MessagesPanel {
                         );
                     }
                 }
+                grab_leaf!(
+                    kind.grab_name(),
+                    placement.map_or(Rect::ZERO, |at| at.rect(viewport))
+                );
             }
         }
         self.terminal_links = cursor.into_terminal_links();

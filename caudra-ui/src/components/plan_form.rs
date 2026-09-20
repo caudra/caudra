@@ -3,6 +3,7 @@ use crate::components::keybindings::{key, leader};
 use crate::components::{Hint, HintBar};
 use crate::theme;
 
+use caudra_grab::grab_scope;
 use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
@@ -259,6 +260,7 @@ impl PlanForm {
             return;
         }
 
+        grab_scope!("plan_form", area);
         let t = theme::current();
         let mut lines: Vec<Line<'static>> = Vec::with_capacity(MENU.len() + 1);
 

@@ -21,6 +21,7 @@ use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Clear, Paragraph, Widget};
 
+use caudra_grab::grab_scope;
 use caudra_workbench::{
     BackendDriver, BackendEvent, ResourceEntry, WorkbenchBackend, WorkbenchPath,
 };
@@ -384,6 +385,7 @@ impl MentionPopup {
         };
         session.area = area;
 
+        grab_scope!("mention_popup", area);
         let theme = theme::current();
         let rows: Vec<Line> = session
             .matches

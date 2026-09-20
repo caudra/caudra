@@ -10,6 +10,7 @@ use std::ops::Range;
 use std::path::Path;
 use std::time::Duration;
 
+use caudra_grab::grab_scope;
 use caudra_storage::log::record::{Entry, Filter, Level, Record};
 use caudra_storage::log::tail::{LogTail, ScanOutcome};
 use caudra_storage::log::{self, DEFAULT_MAX_FILES};
@@ -559,6 +560,7 @@ impl LogsModal {
         if !self.open {
             return Rect::default();
         }
+        grab_scope!("logs_modal", area);
         let modal = Modal {
             title: TITLE,
             width_percent: WIDTH_PERCENT,

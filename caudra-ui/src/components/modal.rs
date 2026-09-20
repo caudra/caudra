@@ -4,6 +4,7 @@ use std::ops::Range;
 use crate::components::hover_style;
 use crate::theme;
 
+use caudra_grab::grab_scope;
 use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Flex, Layout, Position, Rect};
@@ -47,6 +48,7 @@ impl Modal<'_> {
         .flex(Flex::Center)
         .areas(popup);
 
+        grab_scope!("modal", popup);
         frame.render_widget(Clear, popup);
 
         let block = Block::bordered()
