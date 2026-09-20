@@ -2,7 +2,9 @@ use caudra_providers::{HistoryItem, TokenUsage};
 use caudra_storage::StateDir;
 use caudra_storage::id::CaudraId;
 use caudra_storage::remote_snapshots::RemoteSnapshotMetadataStore;
-use caudra_storage::sessions::{Session, SessionCursor, SessionDatabase, SessionError, mark_opened};
+use caudra_storage::sessions::{
+    Session, SessionCursor, SessionDatabase, SessionError, mark_opened,
+};
 use caudra_storage::workspace_binding::StoredWorkspaceBinding;
 use caudra_workspace::{WorkspacePath, WorkspaceSession};
 

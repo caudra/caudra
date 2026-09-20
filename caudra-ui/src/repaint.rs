@@ -374,7 +374,10 @@ mod tests {
         assert!(limiter.admit(typed, true), "{EXPECT_URGENT}");
         // The keystroke's own frame is what the next cap is measured from, so
         // a background change right behind it still waits a whole one.
-        assert!(!limiter.admit(typed + MIN_FRAME / 2, false), "{EXPECT_CAPPED}");
+        assert!(
+            !limiter.admit(typed + MIN_FRAME / 2, false),
+            "{EXPECT_CAPPED}"
+        );
     }
 
     /// Without this a frame held back while the cadence is `IDLE` sits off the

@@ -81,8 +81,7 @@ fn sample_band(connection: &Connection, band: &Band) -> Vec<Vec<u8>> {
     let predicate = band.predicate();
     let mut rows = Vec::new();
     for table in TABLES {
-        let sql =
-            format!("SELECT payload FROM {table} WHERE {predicate} LIMIT {ROWS_PER_BAND}");
+        let sql = format!("SELECT payload FROM {table} WHERE {predicate} LIMIT {ROWS_PER_BAND}");
         let Ok(mut statement) = connection.prepare(&sql) else {
             continue;
         };
@@ -98,7 +97,11 @@ fn zstd_roundtrip(rows: &[Vec<u8>], level: i32) -> (usize, usize) {
     let raw = rows.iter().map(Vec::len).sum();
     let compressed = rows
         .iter()
-        .map(|row| zstd::encode_all(row.as_slice(), level).expect("zstd encode").len())
+        .map(|row| {
+            zstd::encode_all(row.as_slice(), level)
+                .expect("zstd encode")
+                .len()
+        })
         .sum();
     (raw, compressed)
 }
@@ -161,16 +164,18 @@ fn bench_band(criterion: &mut Criterion, band: &str, rows: &[Vec<u8>], dictionar
     let raw: usize = rows.iter().map(Vec::len).sum();
     let mut group = criterion.benchmark_group(format!("compress/{band}"));
     group.throughput(Throughput::Bytes(raw as u64));
-    group.bench_function(BenchmarkId::from_parameter(format!("zstd-{ZSTD_FAST}")), |b| {
-        b.iter(|| zstd_roundtrip(rows, ZSTD_FAST))
-    });
+    group.bench_function(
+        BenchmarkId::from_parameter(format!("zstd-{ZSTD_FAST}")),
+        |b| b.iter(|| zstd_roundtrip(rows, ZSTD_FAST)),
+    );
     group.bench_function(
         BenchmarkId::from_parameter(format!("zstd-{ZSTD_DENSE}")),
         |b| b.iter(|| zstd_roundtrip(rows, ZSTD_DENSE)),
     );
-    group.bench_function(BenchmarkId::from_parameter(format!("gzip-{GZIP_LEVEL}")), |b| {
-        b.iter(|| gzip_roundtrip(rows))
-    });
+    group.bench_function(
+        BenchmarkId::from_parameter(format!("gzip-{GZIP_LEVEL}")),
+        |b| b.iter(|| gzip_roundtrip(rows)),
+    );
     group.bench_function(
         BenchmarkId::from_parameter(format!("zstd-{ZSTD_FAST}-dict")),
         |b| b.iter(|| zstd_dictionary_roundtrip(rows, dictionary)),
@@ -184,24 +189,34 @@ fn bench_band(criterion: &mut Criterion, band: &str, rows: &[Vec<u8>], dictionar
     let gzipped: Vec<Vec<u8>> = rows.iter().map(|row| gzip_compress(row)).collect();
     let mut group = criterion.benchmark_group(format!("decompress/{band}"));
     group.throughput(Throughput::Bytes(raw as u64));
-    group.bench_function(BenchmarkId::from_parameter(format!("zstd-{ZSTD_FAST}")), |b| {
-        b.iter_batched(
-            || &fast,
-            |rows| {
-                rows.iter()
-                    .map(|row| zstd::decode_all(row.as_slice()).expect("zstd decode").len())
-                    .sum::<usize>()
-            },
-            BatchSize::SmallInput,
-        )
-    });
-    group.bench_function(BenchmarkId::from_parameter(format!("gzip-{GZIP_LEVEL}")), |b| {
-        b.iter_batched(
-            || &gzipped,
-            |rows| rows.iter().map(|row| gzip_decompress(row).len()).sum::<usize>(),
-            BatchSize::SmallInput,
-        )
-    });
+    group.bench_function(
+        BenchmarkId::from_parameter(format!("zstd-{ZSTD_FAST}")),
+        |b| {
+            b.iter_batched(
+                || &fast,
+                |rows| {
+                    rows.iter()
+                        .map(|row| zstd::decode_all(row.as_slice()).expect("zstd decode").len())
+                        .sum::<usize>()
+                },
+                BatchSize::SmallInput,
+            )
+        },
+    );
+    group.bench_function(
+        BenchmarkId::from_parameter(format!("gzip-{GZIP_LEVEL}")),
+        |b| {
+            b.iter_batched(
+                || &gzipped,
+                |rows| {
+                    rows.iter()
+                        .map(|row| gzip_decompress(row).len())
+                        .sum::<usize>()
+                },
+                BatchSize::SmallInput,
+            )
+        },
+    );
     group.finish();
 }
 
@@ -222,8 +237,7 @@ fn payload_codecs(criterion: &mut Criterion) {
             continue;
         }
         let samples: Vec<&[u8]> = rows.iter().map(Vec::as_slice).collect();
-        let dictionary =
-            zstd::dict::from_samples(&samples, DICTIONARY_BYTES).unwrap_or_default();
+        let dictionary = zstd::dict::from_samples(&samples, DICTIONARY_BYTES).unwrap_or_default();
         report_ratios(band.name, &rows, &dictionary);
         bench_band(criterion, band.name, &rows, &dictionary);
     }

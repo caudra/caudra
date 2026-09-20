@@ -347,7 +347,9 @@ mod tests {
     /// mainline model must stay put whichever image model is configured.
     #[test_case(ImageModel::Sunburst ; "sunburst")]
     #[test_case(ImageModel::Flare ; "flare")]
-    fn the_configured_image_model_reaches_the_tool_and_leaves_the_mainline_alone(model: ImageModel) {
+    fn the_configured_image_model_reaches_the_tool_and_leaves_the_mainline_alone(
+        model: ImageModel,
+    ) {
         let mut req = request(&[], None);
         req.model = model;
         let body = build_body(&req);

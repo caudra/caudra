@@ -4445,11 +4445,10 @@ fn compress_existing_payloads(transaction: &Transaction<'_>) -> Result<(), Sessi
             key_count + 1,
             key_count + 2
         ))?;
-        let counted: i64 = transaction.query_row(
-            &format!("SELECT count(*) FROM {legacy}"),
-            [],
-            |row| row.get(0),
-        )?;
+        let counted: i64 =
+            transaction.query_row(&format!("SELECT count(*) FROM {legacy}"), [], |row| {
+                row.get(0)
+            })?;
         let total = from_i64(counted, "legacy payload rows")?;
         let mut rows = select.query([])?;
         let mut moved: u64 = 0;
@@ -4486,7 +4485,12 @@ fn compress_existing_payloads(transaction: &Transaction<'_>) -> Result<(), Sessi
             done: moved,
             total,
         });
-        tracing::info!(table, rows = moved, stored_bytes = stored, "compressed payloads");
+        tracing::info!(
+            table,
+            rows = moved,
+            stored_bytes = stored,
+            "compressed payloads"
+        );
     }
     for rewrite in &COMPRESSED_PAYLOAD_TABLES {
         transaction.execute_batch(&format!("DROP TABLE {};", rewrite.legacy))?;
@@ -4757,11 +4761,10 @@ fn compress_payload(payload: &str) -> Result<Vec<u8>, SessionError> {
 /// compression a damaged row still parsed as text, and afterwards it fails at
 /// the frame instead.
 fn decompress_payload(stored: &[u8], field: &'static str) -> Result<String, SessionError> {
-    let decoded =
-        zstd::decode_all(stored).map_err(|error| SessionError::CorruptDatabaseValue {
-            field,
-            reason: format!("{PAYLOAD_DECOMPRESSION_FAILED}: {error}"),
-        })?;
+    let decoded = zstd::decode_all(stored).map_err(|error| SessionError::CorruptDatabaseValue {
+        field,
+        reason: format!("{PAYLOAD_DECOMPRESSION_FAILED}: {error}"),
+    })?;
     String::from_utf8(decoded).map_err(|error| SessionError::CorruptDatabaseValue {
         field,
         reason: error.to_string(),
@@ -4801,10 +4804,14 @@ fn decode_payloads<T: DeserializeOwned + Send>(
             .collect();
         let mut values = Vec::with_capacity(stored.len());
         for handle in handles {
-            values.extend(handle.join().map_err(|_| SessionError::CorruptDatabaseValue {
-                field,
-                reason: DECODE_WORKER_PANICKED.to_owned(),
-            })??);
+            values.extend(
+                handle
+                    .join()
+                    .map_err(|_| SessionError::CorruptDatabaseValue {
+                        field,
+                        reason: DECODE_WORKER_PANICKED.to_owned(),
+                    })??,
+            );
         }
         Ok(values)
     })
@@ -5989,14 +5996,19 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
         database.save(&session, None).unwrap();
         let payload = json!({"id": session.id, "type": "tool_call"}).to_string();
         for table in ["main_history_items", "subagent_history_items"] {
-            database.connection.execute(
-                &format!("UPDATE {table} SET payload = ?1, byte_count = ?2 WHERE session_id = ?3"),
-                params![
-                    compress_payload(&payload).unwrap(),
-                    payload.len() as i64,
-                    session.id.as_bytes().as_slice()
-                ],
-            ).unwrap();
+            database
+                .connection
+                .execute(
+                    &format!(
+                        "UPDATE {table} SET payload = ?1, byte_count = ?2 WHERE session_id = ?3"
+                    ),
+                    params![
+                        compress_payload(&payload).unwrap(),
+                        payload.len() as i64,
+                        session.id.as_bytes().as_slice()
+                    ],
+                )
+                .unwrap();
         }
         session.id
     }
@@ -9117,7 +9129,9 @@ CREATE TABLE subagent_history_items (
             decoded.len() as i64,
             "{BYTE_COUNT_IS_UNCOMPRESSED}"
         );
-        let loaded = database.load::<TestMessage, Value, Value>(session.id).unwrap();
+        let loaded = database
+            .load::<TestMessage, Value, Value>(session.id)
+            .unwrap();
         assert_eq!(loaded.tool_outputs(), session.tool_outputs());
     }
 
@@ -9187,9 +9201,15 @@ CREATE TABLE subagent_history_items (
         };
         assert_eq!(*found, COMPRESSION_PREVIOUS_SCHEMA);
         assert_eq!(*supported, SCHEMA_VERSION);
-        assert!(holders.contains(&id.to_string()), "{BLOCKED_NAMES_SESSIONS}");
         assert!(
-            holders.contains(&format!("{}{TITLE_ELLIPSIS}", &title[..MAX_HOLDER_TITLE_BYTES])),
+            holders.contains(&id.to_string()),
+            "{BLOCKED_NAMES_SESSIONS}"
+        );
+        assert!(
+            holders.contains(&format!(
+                "{}{TITLE_ELLIPSIS}",
+                &title[..MAX_HOLDER_TITLE_BYTES]
+            )),
             "{BLOCKED_NAMES_SESSIONS}: {holders}"
         );
     }

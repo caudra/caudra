@@ -5589,12 +5589,12 @@ mod tests {
             // The announcement is replaced, not appended to: the caller reads
             // the report, which is what a task result is made of.
             assert_eq!(agent.response_text(), Some(REPORT));
-            assert!(
-                history.as_slice().iter().any(|message| message
+            assert!(history.as_slice().iter().any(|message| {
+                message
                     .steering
                     .as_ref()
-                    .is_some_and(|origin| origin.rule == STEERING_ABANDONED))
-            );
+                    .is_some_and(|origin| origin.rule == STEERING_ABANDONED)
+            }));
         });
     }
 

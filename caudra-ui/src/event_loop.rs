@@ -2352,7 +2352,11 @@ impl<'t> EventLoop<'t> {
                         return;
                     }
                 };
-                let runtime = match self.ctx.spawn_runtime(SessionTab { session, lease, cursor: None }) {
+                let runtime = match self.ctx.spawn_runtime(SessionTab {
+                    session,
+                    lease,
+                    cursor: None,
+                }) {
                     Ok(runtime) => runtime,
                     Err(error) => {
                         let _ = reply_tx.send(Err(error));
@@ -2624,7 +2628,11 @@ impl<'t> EventLoop<'t> {
             drop(old_lease);
             return Ok(());
         }
-        let runtime = self.ctx.spawn_runtime(SessionTab { session, lease, cursor: None })?;
+        let runtime = self.ctx.spawn_runtime(SessionTab {
+            session,
+            lease,
+            cursor: None,
+        })?;
         let idx = self.push_runtime(runtime);
         self.focused = idx;
         Ok(())
@@ -2791,7 +2799,11 @@ impl<'t> EventLoop<'t> {
                     return false;
                 }
             };
-            let runtime = match self.ctx.spawn_runtime(SessionTab { session, lease, cursor: None }) {
+            let runtime = match self.ctx.spawn_runtime(SessionTab {
+                session,
+                lease,
+                cursor: None,
+            }) {
                 Ok(runtime) => runtime,
                 Err(error) => {
                     self.sessions[idx].app.flash(error);
@@ -3197,7 +3209,11 @@ impl<'t> EventLoop<'t> {
                 if let Some(draft) = draft {
                     install_fork_draft(&mut session, draft);
                 }
-                let runtime = match self.ctx.spawn_runtime(SessionTab { session, lease, cursor: None }) {
+                let runtime = match self.ctx.spawn_runtime(SessionTab {
+                    session,
+                    lease,
+                    cursor: None,
+                }) {
                     Ok(runtime) => runtime,
                     Err(error) => {
                         self.sessions[idx].app.flash(error);

@@ -765,7 +765,12 @@ impl App {
                     .session
                     .subagent_messages()
                     .get(version_id)
-                    .or_else(|| self.state.session.subagent_messages().get(&subagent.tool_use_id))?;
+                    .or_else(|| {
+                        self.state
+                            .session
+                            .subagent_messages()
+                            .get(&subagent.tool_use_id)
+                    })?;
                 Some((subagent.clone(), Arc::clone(messages)))
             })
             .collect();
@@ -2449,11 +2454,10 @@ pub(crate) fn reachable_subagent_ids(
     let mut pending: Vec<String> = reachable.iter().cloned().collect();
     loop {
         for subagent in subagents {
-            let linked = subagent
-                .parent_tool_use_id
-                .as_ref()
-                .is_some_and(|parent| reachable.contains(parent) || active_calls.contains(parent))
-                || subagent
+            let linked =
+                subagent.parent_tool_use_id.as_ref().is_some_and(|parent| {
+                    reachable.contains(parent) || active_calls.contains(parent)
+                }) || subagent
                     .root_tool_use_id
                     .as_ref()
                     .is_some_and(|root| active_calls.contains(root));

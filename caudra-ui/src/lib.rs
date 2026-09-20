@@ -266,9 +266,7 @@ fn draw_loading_screen<B: ratatui::backend::Backend>(
             ..area
         };
         frame.render_widget(
-            Paragraph::new(message)
-                .alignment(Alignment::Center)
-                .dim(),
+            Paragraph::new(message).alignment(Alignment::Center).dim(),
             line,
         );
     });
