@@ -121,7 +121,6 @@ use caudra_storage::StateDir;
 use caudra_storage::id::CaudraId;
 use caudra_storage::input_history::InputHistory;
 use caudra_storage::model::persist_model;
-use caudra_storage::permission_state::mutation::PermissionSnapshot;
 use caudra_storage::tool_ledger::{ToolCall, ToolLedger, ToolStats};
 use caudra_storage::usage_ledger::{LedgerPurpose, LifetimeUsage, TurnUsage, UsageLedger};
 use caudra_storage::view::ViewMode;
@@ -137,6 +136,7 @@ pub(crate) use mode::{Mode, PlanState, PlanTrigger};
 use mouse::Autoscroll;
 #[cfg(test)]
 use mouse::EDGE_SCROLL_LINES;
+pub(crate) use permission_editor::ConversationPermissions;
 pub(crate) use queue::{MessageQueue, SubmitOutcome};
 use session::{MergedHistory, Sent};
 pub(crate) use session::{
@@ -455,7 +455,7 @@ pub struct App {
     pub(crate) shell: shell::ShellState,
     pub(crate) ui_config: UiConfig,
     pub(crate) permissions: Arc<PermissionManager>,
-    pub(crate) permission_snapshot: Option<Arc<ArcSwap<PermissionSnapshot>>>,
+    pub(crate) conversation_permissions: ConversationPermissions,
     pub(crate) permission_authority_factory: Option<crate::PermissionAuthorityFactory>,
     pattern_suggestion_loader: Option<PatternSuggestionLoader>,
     pending_pattern_suggestions: Option<PendingPatternSuggestions>,
@@ -664,7 +664,7 @@ impl App {
             shell: shell::ShellState::default(),
             ui_config,
             permissions,
-            permission_snapshot: None,
+            conversation_permissions: ConversationPermissions::Detached,
             permission_authority_factory: None,
             pattern_suggestion_loader: None,
             pending_pattern_suggestions: None,

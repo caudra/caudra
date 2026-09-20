@@ -23,6 +23,7 @@ pub(crate) const REPLACE_BUSY_ERR: &str = "session is already stopping a run";
 pub(crate) const CONTINUE_BUSY_ERR: &str = "session is already working";
 pub(crate) const CONTINUE_EMPTY_ERR: &str = "nothing to continue";
 pub(crate) const CONTINUE_HINT: &str = "/continue resumes the turn";
+pub(crate) const PERMISSION_PUBLISH_ERR: &str = "Failed to initialize conversation permissions";
 
 pub(crate) enum SubmitOutcome {
     Started(Vec<Action>),
@@ -1240,6 +1241,12 @@ impl App {
                 .is_some_and(|pending| pending.restore_operation.is_some())
         {
             self.flash(super::REVERT_BUSY_MSG.into());
+            return Vec::new();
+        }
+        // The turn is what earns this session its row, and a conversation
+        // grant cannot be published before there is one.
+        if let Err(error) = self.publish_conversation_permissions() {
+            self.flash(format!("{PERMISSION_PUBLISH_ERR}: {error}"));
             return Vec::new();
         }
         self.run_id += 1;

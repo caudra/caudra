@@ -198,6 +198,7 @@ const RETRY_CONTROL_MISPLACED: &str = "only the main chat's countdown can be cli
 const MISSING_DIR: &str = "gone";
 const RESUMED_PROMPT: &str = "carry me over";
 const CONVERSATION_PERMISSION_PATTERN: &str = "just *";
+const FIRST_TURN_PROMPT: &str = "the turn that earns a row";
 const SONNET_SPEC: &str = "anthropic/claude-sonnet-4-5";
 const OPUS_SPEC: &str = "anthropic/claude-opus-4-8";
 const PLAIN_MODEL_SPEC: &str = "ollama/qwen3";
@@ -7484,6 +7485,130 @@ fn a_session_holding_only_permission_grants_still_restores() {
 
     let stored = AppSession::load(id, &dir).unwrap();
     assert!(crate::app::session::session_has_content(&stored));
+}
+
+/// A tab the way the event loop spawns a fresh one: durable, but owed no row
+/// until it holds something.
+fn pending_app() -> (TempDir, StateDir, Arc<StorageWriter>, App) {
+    let (tmp, dir, writer, mut app) = tempdir_app();
+    app.conversation_permissions = ConversationPermissions::Pending;
+    (tmp, dir, writer, app)
+}
+
+fn saved_sessions(app: &App, dir: &StateDir) -> usize {
+    AppSession::list(&app.state.session.cwd, dir).unwrap().len()
+}
+
+/// Starting Caudra and quitting must leave nothing behind, which it only does
+/// while the conversation permissions have yet to publish.
+#[test]
+fn a_pristine_session_reaches_shutdown_without_a_row() {
+    let (_tmp, dir, writer, mut app) = pending_app();
+    app.checkpoint_now();
+    let cwd = app.state.session.cwd.clone();
+    drain_writer(app, writer);
+
+    assert!(AppSession::list(&cwd, &dir).unwrap().is_empty());
+}
+
+/// The turn is what earns the row, so the publication that fences conversation
+/// grants against it can only attach here.
+#[test]
+fn the_first_run_creates_the_row_and_publishes_permissions() {
+    let (_tmp, dir, writer, mut app) = pending_app();
+    let actions = app.submit_prompt(queued_msg(FIRST_TURN_PROMPT));
+
+    assert!(matches!(actions, SubmitOutcome::Started(_)));
+    assert!(app.conversation_permissions.is_published());
+    assert!(app.permissions.conversation_permission_snapshot().is_some());
+    assert_eq!(saved_sessions(&app, &dir), 1);
+    drain_writer(app, writer);
+}
+
+/// Without a published row a conversation grant has nothing to be fenced
+/// against, so the turn is refused rather than run unprotected.
+#[test]
+fn a_failed_publication_rejects_the_run() {
+    let (_tmp, dir, writer, mut app) = pending_app();
+    // A directory where the database belongs fails the open whoever runs the
+    // suite, which a read-only state dir does not.
+    let database = dir.path().join(caudra_storage::sessions::SESSIONS_DB_FILE);
+    fs::remove_file(&database).unwrap();
+    fs::create_dir(&database).unwrap();
+
+    let actions = app.submit_prompt(queued_msg(FIRST_TURN_PROMPT));
+
+    assert!(matches!(actions, SubmitOutcome::Started(rejected) if rejected.is_empty()));
+    assert!(!app.conversation_permissions.is_published());
+    assert!(
+        app.status_bar
+            .flash_text()
+            .is_some_and(|flash| flash.contains(queue::PERMISSION_PUBLISH_ERR))
+    );
+    assert_eq!(app.status, Status::Idle);
+    drain_writer(app, writer);
+}
+
+/// A draft is worth a row of its own, and clearing it takes that row back. The
+/// delete is only reachable while nothing has published against the session.
+#[test]
+fn a_cleared_draft_removes_the_row_it_created() {
+    let (_tmp, dir, writer, mut app) = pending_app();
+    app.update(Msg::Key(key(KeyCode::Char('x'))));
+    app.checkpoint_now();
+    writer.save_sync(Arc::clone(&app.state.session)).unwrap();
+    assert_eq!(saved_sessions(&app, &dir), 1);
+
+    app.update(Msg::Key(key(KeyCode::Backspace)));
+    app.checkpoint_now();
+    let cwd = app.state.session.cwd.clone();
+    drain_writer(app, writer);
+
+    assert!(AppSession::list(&cwd, &dir).unwrap().is_empty());
+}
+
+/// A grant made before the first turn is persisted by the ordinary checkpoint,
+/// so the attach has to adopt it instead of reading it as a conflict.
+#[test]
+fn a_grant_made_before_the_first_run_survives_publication() {
+    let (_tmp, _dir, writer, mut app) = pending_app();
+    let record = conversation_permission_record();
+    app.permissions
+        .load_structured_conversation_rules(vec![record.clone()]);
+    app.checkpoint_now();
+
+    app.publish_conversation_permissions().unwrap();
+
+    let published = app.conversation_permissions.published().unwrap().load();
+    assert_eq!(published.records.len(), 1);
+    assert_eq!(published.records[0].id, record.id);
+    drain_writer(app, writer);
+}
+
+/// `/new` hands the tab a fresh session, which owes a row no sooner than the
+/// one it replaced did.
+#[test]
+fn reset_session_writes_no_row_until_its_first_run() {
+    let (_tmp, dir, writer, mut app) = pending_app();
+    app.submit_prompt(queued_msg(FIRST_TURN_PROMPT));
+    crate::push_history_message(
+        app.state.session_mut(),
+        Message::user(FIRST_TURN_PROMPT.into()),
+    );
+    let retired = app.state.session.id;
+
+    app.reset_session();
+    app.checkpoint_now();
+
+    assert!(matches!(
+        app.conversation_permissions,
+        ConversationPermissions::Pending
+    ));
+    assert_ne!(app.state.session.id, retired);
+    let saved = AppSession::list(&app.state.session.cwd, &dir).unwrap();
+    assert_eq!(saved.len(), 1);
+    assert_eq!(saved[0].id, retired);
+    drain_writer(app, writer);
 }
 
 fn app_and_session_with_yolo(seed: bool, stored: Option<bool>) -> (App, AppSession) {

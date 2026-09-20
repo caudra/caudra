@@ -57,7 +57,7 @@ use serde_json::json;
 use tracing::{info, warn};
 
 use crate::agent::{AgentCommand, AgentHandles, ModelSlot, shared_queue::QueueItem};
-use crate::app::permission_editor::attach_session_permissions;
+use crate::app::permission_editor::{ConversationPermissions, attach_session_permissions};
 use crate::app::shell::{
     RemoteShellTarget, ShellEvent, spawn_remote_cd, spawn_remote_control, spawn_remote_shell,
     spawn_shell,
@@ -1086,12 +1086,19 @@ impl SpawnCtx {
         let (system_prompt_profile_name, system_prompt_profile, profile_warning) =
             self.resolve_prompt_profile(&session);
         let permissions = Arc::new(self.permissions.fork());
-        let permission_snapshot = attach_session_permissions(
-            &self.storage,
-            &self.storage_writer,
-            &mut session,
-            &permissions,
-        )?;
+        // Publishing writes the session out so a conversation grant has a row
+        // to be fenced against. A session holding nothing has nothing to keep,
+        // so it earns its row at its first run instead of at startup.
+        let conversation_permissions = if restore_session {
+            ConversationPermissions::Published(attach_session_permissions(
+                &self.storage,
+                &self.storage_writer,
+                &mut session,
+                &permissions,
+            )?)
+        } else {
+            ConversationPermissions::Pending
+        };
         permissions.set_session_yolo(session.meta.yolo);
         let goal = caudra_agent::GoalHandle::restored(session.meta.active_goal.as_deref());
         if let Some(limit) = session.meta.goal_continuation_limit {
@@ -1155,7 +1162,7 @@ impl SpawnCtx {
             workspace_session.clone(),
         );
         app.local_documents = self.local_documents.clone();
-        app.permission_snapshot = Some(permission_snapshot);
+        app.conversation_permissions = conversation_permissions;
         app.permission_authority_factory = self.permission_authority_factory.clone();
         app.sync_permission_authority()
             .map_err(|error| error.to_string())?;

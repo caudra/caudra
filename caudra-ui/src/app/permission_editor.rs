@@ -110,6 +110,42 @@ impl PermissionPublication for SessionPermissionPublication {
     }
 }
 
+/// Where a session stands with the durable conversation permission store.
+///
+/// A conversation grant is fenced against the session's own row, so the row
+/// has to exist before anything can publish. A session that has nothing worth
+/// keeping has no row, which is why publication waits for the first run rather
+/// than happening at startup.
+pub(crate) enum ConversationPermissions {
+    /// Never publishes: tests, and any `App` built without durable storage.
+    Detached,
+    /// Durable, but the session is not on disk yet.
+    Pending,
+    Published(Arc<ArcSwap<PermissionSnapshot>>),
+}
+
+impl ConversationPermissions {
+    pub(crate) fn published(&self) -> Option<&Arc<ArcSwap<PermissionSnapshot>>> {
+        match self {
+            Self::Published(snapshot) => Some(snapshot),
+            Self::Detached | Self::Pending => None,
+        }
+    }
+
+    pub(crate) fn is_published(&self) -> bool {
+        self.published().is_some()
+    }
+
+    /// The state a session that owns no row yet starts in, keeping a
+    /// non-durable `App` non-durable.
+    pub(crate) fn deferred(&self) -> Self {
+        match self {
+            Self::Detached => Self::Detached,
+            Self::Pending | Self::Published(_) => Self::Pending,
+        }
+    }
+}
+
 pub(crate) fn attach_session_permissions(
     storage: &StateDir,
     writer: &Arc<StorageWriter>,
@@ -341,6 +377,26 @@ pub(super) struct PermissionUi {
 }
 
 impl App {
+    /// The first run is where a session earns its row: until then there is
+    /// nothing on disk for a conversation grant to be fenced against. Rules
+    /// granted while the publication waits are already persisted through
+    /// `build_meta`, and the attach adopts them.
+    pub(crate) fn publish_conversation_permissions(&mut self) -> Result<(), String> {
+        if !matches!(
+            self.conversation_permissions,
+            ConversationPermissions::Pending
+        ) {
+            return Ok(());
+        }
+        let storage = self.storage.clone();
+        let writer = Arc::clone(&self.storage_writer);
+        let permissions = Arc::clone(&self.permissions);
+        let snapshot =
+            attach_session_permissions(&storage, &writer, self.state.session_mut(), &permissions)?;
+        self.conversation_permissions = ConversationPermissions::Published(snapshot);
+        Ok(())
+    }
+
     #[cfg(test)]
     pub(super) fn finish_permission_jobs(&mut self) {
         while let Some(pending) = &mut self.permission_ui.pending {
@@ -1291,9 +1347,8 @@ mod tests {
     use crate::{AppSession, PermissionAuthorityBinding};
 
     use super::{
-        App, GuardDraft, PERMISSION_SAVED, PermissionReply, PermissionUi, ResourceDraft,
-        ResourcesDraft, SelectorDraft, SelectorValue, SessionPermissionPublication,
-        attach_session_permissions,
+        App, ConversationPermissions, GuardDraft, PERMISSION_SAVED, PermissionReply, PermissionUi,
+        ResourceDraft, ResourcesDraft, SelectorDraft, SelectorValue, SessionPermissionPublication,
     };
 
     const TOOL: &str = "editor-test-shell";
@@ -1769,17 +1824,8 @@ mod tests {
         ));
         app.permissions
             .set_permission_authority_provider(authority());
-        let mut session = app.state.session.as_ref().clone();
-        app.permission_snapshot = Some(
-            attach_session_permissions(
-                &app.storage,
-                &app.storage_writer,
-                &mut session,
-                &app.permissions,
-            )
-            .unwrap(),
-        );
-        app.state.session = Arc::new(session);
+        app.conversation_permissions = ConversationPermissions::Pending;
+        app.publish_conversation_permissions().unwrap();
         app.permission_ui = PermissionUi::default();
         app.open_permissions_picker().unwrap();
         app.finish_permission_jobs();
@@ -2098,7 +2144,7 @@ mod tests {
                         storage: app.storage.clone(),
                         session: app.state.session.id,
                         writer: app.storage_writer.permission_mutation_writer(),
-                        snapshot: Arc::clone(app.permission_snapshot.as_ref().unwrap()),
+                        snapshot: Arc::clone(app.conversation_permissions.published().unwrap()),
                     },
                 )))
                 .unwrap();
@@ -2142,6 +2188,10 @@ mod tests {
         );
         if new_session {
             assert_ne!(app.state.session.id, old);
+            // The replacement owns no row yet, so it holds no authority at all
+            // rather than the authority it replaced.
+            assert!(app.permissions.conversation_permission_snapshot().is_none());
+            app.publish_conversation_permissions().unwrap();
             assert_eq!(
                 app.permissions
                     .conversation_permission_snapshot()
@@ -2155,8 +2205,10 @@ mod tests {
         }
     }
 
-    #[test_case((); "initial_empty_session")]
-    fn empty_session_row_is_durable_before_publication_and_is_not_pruned(_: ()) {
+    /// Publication fences conversation grants against the session's own row,
+    /// so once it has attached the row outlives an empty session.
+    #[test]
+    fn a_published_session_keeps_its_empty_row() {
         let mut app = durable_app();
         app.checkpoint_now();
         let database = SessionDatabase::open_read_only(&app.storage).unwrap();
@@ -2285,18 +2337,11 @@ mod tests {
             None,
         )
         .unwrap();
-        let mut session =
+        let session =
             AppSession::new_with_workspace(&app.state.session.model, REMOTE_CWD, stored.clone());
-        app.permission_snapshot = Some(
-            attach_session_permissions(
-                &app.storage,
-                &app.storage_writer,
-                &mut session,
-                &app.permissions,
-            )
-            .unwrap(),
-        );
         app.state.session = Arc::new(session);
+        app.conversation_permissions = ConversationPermissions::Pending;
+        app.publish_conversation_permissions().unwrap();
         app.workspace_session = Some(workspace.clone());
         app.workbench
             .bind_workspace_with_gate(workspace.clone(), MutationGate::allow())

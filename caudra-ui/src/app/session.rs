@@ -38,7 +38,9 @@ use ratatui::layout::Rect;
 use crate::AppSession;
 use crate::storage_writer::StorageWriter;
 
-use super::permission_editor::{PERMISSION_WORKER_BUSY, attach_session_permissions};
+use super::permission_editor::{
+    ConversationPermissions, PERMISSION_WORKER_BUSY, attach_session_permissions,
+};
 use super::session_state::SessionState;
 use super::{App, Mode, PendingInput, PlanState, RestoreMode, Status};
 
@@ -264,7 +266,9 @@ impl App {
             .set_current_head(self.history_head());
 
         if !self.has_content() {
-            if self.permission_snapshot.is_some() {
+            // A published session is fenced against its own row, so the row
+            // outlives whatever emptied the session.
+            if self.conversation_permissions.is_published() {
                 return;
             }
             // A draft typed and then deleted is already on disk, and a file with
@@ -456,7 +460,7 @@ impl App {
             yolo: self.permissions.persisted_yolo(),
             snapshots_unavailable: self.snapshots_unavailable.clone(),
         };
-        if let Some(snapshot) = &self.permission_snapshot {
+        if let Some(snapshot) = self.conversation_permissions.published() {
             let snapshot = snapshot.load();
             if let Err(error) = snapshot.apply_to_meta(state.session.id, &mut meta) {
                 tracing::error!(%error, session_id = %state.session.id, "permission snapshot owner mismatch");
@@ -837,7 +841,7 @@ impl App {
     /// history, so no respawn follows and the restored queue must be
     /// flushed here.
     pub(crate) fn restore_resumed_session(&mut self) {
-        if self.permission_snapshot.is_none() {
+        if !self.conversation_permissions.is_published() {
             self.permissions.load_structured_conversation_rules(
                 self.state.session.meta.structured_permission_rules.clone(),
             );
@@ -880,7 +884,7 @@ impl App {
             self.status_bar.flash(REVERT_BUSY_MSG.into());
             return Vec::new();
         }
-        let mut replacement = self.state.session.workspace_binding().map_or_else(
+        let replacement = self.state.session.workspace_binding().map_or_else(
             || AppSession::new(&self.state.session.model, &self.state.session.cwd),
             |binding| {
                 AppSession::new_with_workspace(
@@ -921,24 +925,7 @@ impl App {
             }
         };
         let permissions = Arc::new(self.permissions.fork());
-        let permission_snapshot = if self.permission_snapshot.is_some() {
-            match attach_session_permissions(
-                &self.storage,
-                &self.storage_writer,
-                &mut replacement,
-                &permissions,
-            ) {
-                Ok(snapshot) => Some(snapshot),
-                Err(error) => {
-                    self.flash(format!(
-                        "Failed to initialize conversation permissions: {error}"
-                    ));
-                    return Vec::new();
-                }
-            }
-        } else {
-            None
-        };
+        let conversation_permissions = self.conversation_permissions.deferred();
         if let Err(error) = self.retire_current_session() {
             self.status_bar
                 .flash(format!("Failed to retire current session: {error}"));
@@ -946,7 +933,7 @@ impl App {
         }
         self.suspend_permission_editor();
         self.permissions = permissions;
-        self.permission_snapshot = permission_snapshot;
+        self.conversation_permissions = conversation_permissions;
         self.reset_ui_chrome();
         self.state.token_usage = TokenUsage::default();
         self.state.cost = None;
@@ -2126,24 +2113,29 @@ impl App {
             store
         };
         let permissions = Arc::new(self.permissions.fork());
-        let permission_snapshot = if self.permission_snapshot.is_some() {
-            Some(attach_session_permissions(
-                &self.storage,
-                &self.storage_writer,
-                &mut session,
-                &permissions,
-            )?)
-        } else {
-            permissions.load_structured_conversation_rules(
-                session.meta.structured_permission_rules.clone(),
-            );
-            None
+        // A loaded session that holds nothing owns no row worth publishing
+        // against, so it waits for its first run like a fresh one.
+        let conversation_permissions = match self.conversation_permissions.deferred() {
+            ConversationPermissions::Pending if session_has_content(&session) => {
+                ConversationPermissions::Published(attach_session_permissions(
+                    &self.storage,
+                    &self.storage_writer,
+                    &mut session,
+                    &permissions,
+                )?)
+            }
+            deferred => {
+                permissions.load_structured_conversation_rules(
+                    session.meta.structured_permission_rules.clone(),
+                );
+                deferred
+            }
         };
         self.retire_current_session()
             .map_err(|error| format!("Failed to retire current session: {error}"))?;
         self.suspend_permission_editor();
         self.permissions = permissions;
-        self.permission_snapshot = permission_snapshot;
+        self.conversation_permissions = conversation_permissions;
         self.apply_stored_yolo(&session.meta);
         self.state =
             SessionState::from_session(session, fallback_model, &self.storage, &self.model_policy);

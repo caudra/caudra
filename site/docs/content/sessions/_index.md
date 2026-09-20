@@ -21,6 +21,10 @@ Caudra releases ownership on normal exit, process termination, or a crash. A
 running process that has stopped responding still owns its session. Forking an
 active session remains available because the child receives a new ID.
 
+A session is recorded once it holds something worth keeping, such as a prompt, a
+typed draft, or a queued message. Starting Caudra and quitting leaves no session
+behind, so the picker and `caudra --continue` skip it.
+
 ## Moving sessions to another directory
 
 Use `/migrate-sessions` to move every saved local session with one exact stored working directory. The source directory may already be gone. Choose a destination directory and review the confirmation before applying the move.
