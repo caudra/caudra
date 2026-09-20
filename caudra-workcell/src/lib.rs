@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 pub mod editor_adapter;
+mod native_redirect;
 mod pattern_analysis;
 mod read_only_shell;
 mod remote;
@@ -49,6 +50,7 @@ use caudra_agent::{
     ShellFilterInfo as AgentShellFilterInfo, ShellOutput as AgentShellOutput, SnapshotLine,
     TextOutput, ToolInput, ToolOutput,
 };
+use caudra_config::ShellNativeRedirect;
 use caudra_storage::permission_state::{
     BROWSE_DIRECT, BROWSE_RECURSION_ATTRIBUTE, BROWSE_RECURSIVE,
 };
@@ -1209,7 +1211,13 @@ impl WorkcellInvocation {
                         Ok::<_, String>((group, prepared))
                     })
                     .await??;
-                shell_prepared(group, shell, &project, self.raw_input.as_ref())
+                shell_prepared(
+                    group,
+                    shell,
+                    &project,
+                    self.raw_input.as_ref(),
+                    ctx.config.shell_native_redirect,
+                )?
             }
             Input::Code(_) => exact_custom_prepared(
                 "isolated_compute",
@@ -3130,7 +3138,8 @@ fn shell_prepared(
     shell: PreparedShell,
     project: &Path,
     raw_input: Option<&Value>,
-) -> PreparedInvocation {
+    redirect: ShellNativeRedirect,
+) -> Result<PreparedInvocation, String> {
     let raw_input = raw_input
         .filter(|input| input.get("command").and_then(Value::as_str) == Some(shell.command()));
     let mut opaque = true;
@@ -3142,6 +3151,25 @@ fn shell_prepared(
             .unwrap_or_else(|_| program.command_contexts(shell.workdir()));
         let facts = pattern_analysis::shell_facts(program, &contexts);
         opaque = facts.opaque;
+        if !opaque
+            && redirect != ShellNativeRedirect::Off
+            && let Some(natives) = native_redirect::detect(&facts.commands)
+        {
+            let enforced = redirect == ShellNativeRedirect::Enforce;
+            tracing::info!(
+                tools = natives
+                    .iter()
+                    .map(|native| native.name)
+                    .collect::<Vec<_>>()
+                    .join(","),
+                commands = facts.commands.len(),
+                enforced,
+                "shell command duplicates a native tool"
+            );
+            if enforced {
+                return Err(native_redirect::refusal(&natives));
+            }
+        }
         for command in &facts.commands {
             let workdir = pattern_analysis::singleton_workdir(command);
             let mut attributes = BTreeMap::new();
@@ -3208,7 +3236,7 @@ fn shell_prepared(
             )]),
         });
     }
-    PreparedInvocation {
+    Ok(PreparedInvocation {
         intent: PermissionIntent::new(
             // Opaque commands carry `requires_prompt` instead of forcing a prompt on
             // the whole request: scope allows and configured command allows still
@@ -3232,7 +3260,7 @@ fn shell_prepared(
         // takes guards nor invalidates the tracker.
         mutation_targets: Vec::new(),
         read_targets: Vec::new(),
-    }
+    })
 }
 
 fn exact_custom_prepared(
@@ -4400,6 +4428,11 @@ mod tests {
             registry,
         );
         ctx.config.stale_read_check = false;
+        // Most shell cases below use `cat` or `rg` as a stand-in for some
+        // read-only command, and are about confinement, plan mode, or `cd`
+        // branches rather than about which command was chosen. The redirect has
+        // its own cases, which turn it back on.
+        ctx.config.shell_native_redirect = ShellNativeRedirect::Off;
         ctx
     }
 
@@ -5041,6 +5074,50 @@ mod tests {
         smol::block_on(invocation.preflight(&ctx)).expect("shell preflight");
 
         matches!(invocation.plan_mode_access(), PlanModeAccess::ReadOnly)
+    }
+
+    fn shell_redirect_preflight(
+        command: &str,
+        redirect: ShellNativeRedirect,
+    ) -> Result<(), String> {
+        let root = TempDir::new().expect("tempdir");
+        let (_host, registry) = host_and_registry(root.path());
+        let mut ctx = context(root.path(), Arc::clone(&registry), CancelToken::none());
+        ctx.config.shell_native_redirect = redirect;
+        let invocation = registry
+            .get("shell")
+            .expect("registered shell")
+            .tool
+            .parse(&json!({"command": command}))
+            .expect("valid shell input");
+
+        smol::block_on(invocation.preflight(&ctx)).map(|_| ())
+    }
+
+    const DUPLICATING_COMMAND: &str = "rg needle src";
+    const IRREPLACEABLE_COMMAND: &str = "rg -i needle src";
+
+    #[test_case(ShellNativeRedirect::Annotate ; "annotating only observes")]
+    #[test_case(ShellNativeRedirect::Off ; "the check is disabled")]
+    fn a_duplicating_command_still_runs_outside_enforcement(redirect: ShellNativeRedirect) {
+        assert!(shell_redirect_preflight(DUPLICATING_COMMAND, redirect).is_ok());
+    }
+
+    #[test]
+    fn enforcement_refuses_a_duplicating_command_and_names_the_tool() {
+        let error = shell_redirect_preflight(DUPLICATING_COMMAND, ShellNativeRedirect::Enforce)
+            .expect_err("enforcement must refuse");
+
+        assert!(error.contains("file_grep"), "{error:?} must name the tool");
+    }
+
+    /// The trap enforcement has to avoid: a flag the native tool cannot express
+    /// leaves the model with nowhere to go if the shell is closed to it too.
+    #[test]
+    fn enforcement_leaves_a_search_the_native_tool_cannot_express() {
+        assert!(
+            shell_redirect_preflight(IRREPLACEABLE_COMMAND, ShellNativeRedirect::Enforce).is_ok()
+        );
     }
 
     fn shell_preflight_intent(root: &Path, command: &str) -> PermissionIntent {

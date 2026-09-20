@@ -445,7 +445,7 @@ fn argument_stays_in_project(argument: &str, workdir: &Path, project: &Path) -> 
 ///
 /// An expansion, a glob, or a brace stands for text that is not in the command,
 /// so a rule reading that text is answering about something else.
-fn literal_arguments(scope: &ShellCommandScope) -> Option<Vec<&str>> {
+pub(crate) fn literal_arguments(scope: &ShellCommandScope) -> Option<Vec<&str>> {
     scope
         .arguments
         .as_ref()?

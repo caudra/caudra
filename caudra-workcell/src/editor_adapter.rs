@@ -19,7 +19,7 @@ use caudra_agent::tools::{
     PermissionIntent, PermissionScopes, PlanModeAccess, ToolAudience, ToolFilter, ToolRegistry,
     expand_tilde,
 };
-use caudra_config::ToolKey;
+use caudra_config::{ShellNativeRedirect, ToolKey};
 use caudra_storage::permission_state::BROWSE_RECURSION_ATTRIBUTE;
 use caudra_workspace::WorkspaceSession;
 use serde_json::{Value, json};
@@ -509,7 +509,13 @@ async fn prepare_example(
     match input {
         Input::Shell(input) => {
             let shell = groups.shell.prepare(input).await?;
-            Ok(shell_prepared(groups.shell, shell, &project, Some(&raw)))
+            shell_prepared(
+                groups.shell,
+                shell,
+                &project,
+                Some(&raw),
+                ShellNativeRedirect::Off,
+            )
         }
         Input::FileRead(input) => {
             let token = CancellationToken::new();

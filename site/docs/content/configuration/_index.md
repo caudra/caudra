@@ -154,6 +154,7 @@ The `bash`, `python_execution`, and `task` entries apply only when `ui.scroll_ca
 | `tool_json_repair` | bool | `true` | - | Repair malformed tool JSON syntax locally, with one bounded isolated model fallback; independent of eager dispatch |
 | `eager_tool_dispatch` | bool | `true` | - | Start tools and batch children as soon as their complete arguments arrive, instead of waiting for the whole message |
 | `shell_output_filter` | bool | `true` | - | Filter completed model-facing shell output with built-in rules |
+| `shell_native_redirect` | string | `enforce` | - | What happens when a shell command only re-implements a native tool, such as bare `rg` or `cat`: `enforce` refuses it and names the tool to call instead, `annotate` only logs the finding, `off` disables the check. A command using any flag the native tool cannot express is never affected |
 | `defer_builtin_tools` | string | `auto` | - | When the on-demand built-in tools start outside the request array: `auto` defers them for a small model or one with no supply metadata and declares them upfront for a known non-small model, `always` defers for every model, `never` declares them upfront |
 | `image_model` | string | `sunburst` | - | GPT Image 2.5 model behind `image_generate`: `sunburst` is the most capable and the better editor, `flare` is faster at the same price |
 | `disabled_tools` | string[] | `[]` | - | Tools to withhold from the model: built-in names, `server.tool`, or `server.*` for a whole MCP server. A project list extends the global one |

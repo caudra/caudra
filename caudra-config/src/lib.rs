@@ -823,6 +823,26 @@ pub enum DeferBuiltinTools {
     Never,
 }
 
+/// What happens when a shell command does nothing a native tool could not.
+///
+/// A model that reaches for `rg` or `cat` out of habit pays for unstructured
+/// text the native tool would have bounded, and the habit survives every
+/// instruction in the prompt. Refusing the call is the only feedback that
+/// reliably lands, so `Enforce` answers with the tool to use instead.
+///
+/// The detector only fires when every flag on the line has a native
+/// equivalent, so a search the native tool genuinely cannot express is never
+/// refused. `Annotate` logs the same finding without refusing, which is how a
+/// run measures the habit before changing it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ShellNativeRedirect {
+    #[default]
+    Enforce,
+    Annotate,
+    Off,
+}
+
 /// Which GPT Image 2.5 model the hosted `image_generation` tool runs.
 ///
 /// `Sunburst` is the more capable of the two and is built for editing
@@ -964,6 +984,7 @@ pub struct AgentFileConfig {
     pub eager_batch_dispatch: Option<bool>,
     pub eager_tool_dispatch: Option<bool>,
     pub shell_output_filter: Option<bool>,
+    pub shell_native_redirect: Option<ShellNativeRedirect>,
     pub defer_builtin_tools: Option<DeferBuiltinTools>,
     pub image_model: Option<ImageModel>,
     pub disabled_tools: Option<Vec<String>>,
@@ -990,6 +1011,7 @@ impl AgentFileConfig {
             eager_batch_dispatch,
             eager_tool_dispatch,
             shell_output_filter,
+            shell_native_redirect,
             defer_builtin_tools,
             image_model
         );
@@ -1860,6 +1882,14 @@ pub struct AgentConfig {
     pub shell_output_filter: bool,
 
     #[config(
+        default = ShellNativeRedirect::Enforce,
+        ty = "string",
+        default_doc = "enforce",
+        desc = "What happens when a shell command only re-implements a native tool, such as bare `rg` or `cat`: `enforce` refuses it and names the tool to call instead, `annotate` only logs the finding, `off` disables the check. A command using any flag the native tool cannot express is never affected"
+    )]
+    pub shell_native_redirect: ShellNativeRedirect,
+
+    #[config(
         default = DeferBuiltinTools::Auto,
         ty = "string",
         default_doc = "auto",
@@ -1935,6 +1965,7 @@ impl AgentConfig {
                 .or(file.eager_batch_dispatch)
                 .unwrap_or(true),
             shell_output_filter: !no_rtk && file.shell_output_filter.unwrap_or(true),
+            shell_native_redirect: file.shell_native_redirect.unwrap_or_default(),
             defer_builtin_tools: file.defer_builtin_tools.unwrap_or_default(),
             image_model: file.image_model.unwrap_or_default(),
             max_turns: None,
