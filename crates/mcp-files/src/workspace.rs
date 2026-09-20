@@ -1264,6 +1264,10 @@ impl FileToolGroup {
                         .include
                         .as_ref()
                         .map(|value| value.as_str().to_owned()),
+                    context_after: None,
+                    context_before: None,
+                    context: None,
+                    head_limit: None,
                 },
                 token,
             )

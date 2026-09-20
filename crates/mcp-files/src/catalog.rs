@@ -51,7 +51,9 @@ const GREP_DESCRIPTION: &str = r#"Fast content search tool for files under the f
 - An empty path is treated as ".", and an empty include filter is ignored.
 - Returns file paths, line numbers, and matching lines.
 - Use this tool when you need to find files containing specific patterns.
-- For filtering the output of a shell command pipeline, use shell with rg when available, falling back to grep only when rg is unavailable.
+- Ask for surrounding lines with -A, -B, or -C, exactly as you would from grep. A hit is rendered `path:line: text` and a context line `path:line- text`, with `--` between runs that are not adjacent. Prefer this over piping rg through shell to read a definition.
+- Cap the result yourself with head_limit rather than piping through head.
+- Reach for shell with rg only when the output has to feed another program in a pipeline. Searching to read the result is this tool's job.
 - Broad searches skip binary files, .git, node_modules, and regenerable build output and tool caches such as target, dist, .venv, and __pycache__. Dependency sources such as vendor are not skipped. Pass one of the skipped directories as the path to search inside it.
 - Broad searches also apply the repository's own .gitignore rules. Global and $GIT_DIR/info/exclude rules are not read. A path you name explicitly is never skipped, so passing an ignored directory as the path searches it.
 - Results are truncated to a safe match limit. A truncated result says so on its last line and reports how many files were searched.
@@ -359,9 +361,29 @@ fn grep_schema() -> Map<String, Value> {
                 "minLength": 1
             },
             "include": {
-                "description": "Optional file glob filter.",
+                "description": "Optional file glob filter. `glob` is accepted as an alias.",
                 "type": "string",
                 "minLength": 1
+            },
+            "-A": {
+                "description": "Lines of context after each match.",
+                "type": "integer",
+                "minimum": 0
+            },
+            "-B": {
+                "description": "Lines of context before each match.",
+                "type": "integer",
+                "minimum": 0
+            },
+            "-C": {
+                "description": "Lines of context on both sides. An explicit -A or -B wins.",
+                "type": "integer",
+                "minimum": 0
+            },
+            "head_limit": {
+                "description": "Stop after this many matches.",
+                "type": "integer",
+                "minimum": 1
             }
         },
         "required": ["pattern"],

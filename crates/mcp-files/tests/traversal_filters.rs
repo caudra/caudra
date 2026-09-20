@@ -226,6 +226,7 @@ async fn ignore_rules_narrow_a_grep_as_well_as_a_listing() {
                 pattern: "needle".to_owned(),
                 path: None,
                 include: None,
+                ..Default::default()
             },
             &token(),
         )

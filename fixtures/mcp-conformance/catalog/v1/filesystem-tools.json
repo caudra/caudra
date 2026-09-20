@@ -324,7 +324,7 @@
       {
         "name": "file_grep",
         "title": "Search file contents",
-        "description": "Fast content search tool for files under the file root.\n\n- Searches file contents using linear-time regular expressions.\n- Supports common regex syntax such as alternation, groups, classes, and repetition. Look-around and backreferences are rejected to guarantee bounded matching time.\n- Filter files by pattern with the include parameter, for example \"*.js\" or \"*.{ts,tsx}\".\n- An empty path is treated as \".\", and an empty include filter is ignored.\n- Returns file paths, line numbers, and matching lines.\n- Use this tool when you need to find files containing specific patterns.\n- For filtering the output of a shell command pipeline, use shell with rg when available, falling back to grep only when rg is unavailable.\n- Broad searches skip binary files, .git, node_modules, and regenerable build output and tool caches such as target, dist, .venv, and __pycache__. Dependency sources such as vendor are not skipped. Pass one of the skipped directories as the path to search inside it.\n- Broad searches also apply the repository's own .gitignore rules. Global and $GIT_DIR/info/exclude rules are not read. A path you name explicitly is never skipped, so passing an ignored directory as the path searches it.\n- Results are truncated to a safe match limit. A truncated result says so on its last line and reports how many files were searched.\n- This first local OSS executor is not sandboxed; hosts can override permission policy before exposing it.",
+        "description": "Fast content search tool for files under the file root.\n\n- Searches file contents using linear-time regular expressions.\n- Supports common regex syntax such as alternation, groups, classes, and repetition. Look-around and backreferences are rejected to guarantee bounded matching time.\n- Filter files by pattern with the include parameter, for example \"*.js\" or \"*.{ts,tsx}\".\n- An empty path is treated as \".\", and an empty include filter is ignored.\n- Returns file paths, line numbers, and matching lines.\n- Use this tool when you need to find files containing specific patterns.\n- Ask for surrounding lines with -A, -B, or -C, exactly as you would from grep. A hit is rendered `path:line: text` and a context line `path:line- text`, with `--` between runs that are not adjacent. Prefer this over piping rg through shell to read a definition.\n- Cap the result yourself with head_limit rather than piping through head.\n- Reach for shell with rg only when the output has to feed another program in a pipeline. Searching to read the result is this tool's job.\n- Broad searches skip binary files, .git, node_modules, and regenerable build output and tool caches such as target, dist, .venv, and __pycache__. Dependency sources such as vendor are not skipped. Pass one of the skipped directories as the path to search inside it.\n- Broad searches also apply the repository's own .gitignore rules. Global and $GIT_DIR/info/exclude rules are not read. A path you name explicitly is never skipped, so passing an ignored directory as the path searches it.\n- Results are truncated to a safe match limit. A truncated result says so on its last line and reports how many files were searched.\n- This first local OSS executor is not sandboxed; hosts can override permission policy before exposing it.",
         "inputSchema": {
           "type": "object",
           "properties": {
@@ -339,9 +339,29 @@
               "minLength": 1
             },
             "include": {
-              "description": "Optional file glob filter.",
+              "description": "Optional file glob filter. `glob` is accepted as an alias.",
               "type": "string",
               "minLength": 1
+            },
+            "-A": {
+              "description": "Lines of context after each match.",
+              "type": "integer",
+              "minimum": 0
+            },
+            "-B": {
+              "description": "Lines of context before each match.",
+              "type": "integer",
+              "minimum": 0
+            },
+            "-C": {
+              "description": "Lines of context on both sides. An explicit -A or -B wins.",
+              "type": "integer",
+              "minimum": 0
+            },
+            "head_limit": {
+              "description": "Stop after this many matches.",
+              "type": "integer",
+              "minimum": 1
             }
           },
           "required": [
@@ -433,6 +453,11 @@
                 },
                 "text": {
                   "type": "string"
+                },
+                "matched": {
+                  "type": "boolean",
+                  "description": "False for a line carried only as context. Rendering separates the two the\nway grep does, so a reader can tell a hit from its surroundings.",
+                  "default": true
                 }
               },
               "required": [

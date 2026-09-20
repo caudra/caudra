@@ -100,6 +100,9 @@ pub struct PreparedFileGrep {
     pub(crate) include: Option<String>,
     pub(crate) regex: Regex,
     pub(crate) include_matcher: Option<GlobMatcher>,
+    pub(crate) context_before: usize,
+    pub(crate) context_after: usize,
+    pub(crate) head_limit: Option<usize>,
 }
 
 impl PreparedFileGrep {

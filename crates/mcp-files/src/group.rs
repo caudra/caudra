@@ -32,6 +32,8 @@ use crate::{
 };
 
 const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
+/// Context lines per side. Past this a search is really a file read.
+const MAX_GREP_CONTEXT_LINES: usize = 100;
 const PREPARED_DIRECTORY_REQUIRED: &str = "Directory listing requires a prepared directory read";
 // This is a protocol compatibility bound, not a deployment tuning default.
 pub(crate) const MCP_RAW_RESULT_CEILING_BYTES: usize = 64_000;
@@ -318,6 +320,9 @@ impl FileToolGroup {
                 access,
             }],
             relative_paths: [relative_path],
+            context_before: input.before(),
+            context_after: input.after(),
+            head_limit: input.head_limit,
             pattern: input.pattern,
             include: input.include,
             regex,
@@ -1303,6 +1308,22 @@ fn validate_grep(mut input: FileGrepInput) -> Result<FileGrepInput, FilesystemEr
     if input.include.as_deref() == Some("") {
         input.include = None;
     }
+    // A caller asking for more context than this wants the file, not a search,
+    // so the request is clamped rather than refused.
+    for lines in [
+        &mut input.context_after,
+        &mut input.context_before,
+        &mut input.context,
+    ] {
+        if let Some(lines) = lines.as_mut() {
+            *lines = (*lines).min(MAX_GREP_CONTEXT_LINES);
+        }
+    }
+    // Zero would return nothing and read as a bug in the tool rather than in the
+    // call, so it folds onto absent.
+    if input.head_limit == Some(0) {
+        input.head_limit = None;
+    }
     Ok(input)
 }
 
@@ -1357,6 +1378,7 @@ mod tests {
                 relative_path: "a.txt".into(),
                 line,
                 text: "x".repeat(2_000),
+                matched: true,
             })
             .collect::<Vec<_>>();
         let output = FileGrepOutput {
@@ -1397,6 +1419,7 @@ mod tests {
                 relative_path: "a.txt".into(),
                 line: 1,
                 text: "x".repeat(1_000),
+                matched: true,
             }],
             matches: 1,
             files_scanned: 1,

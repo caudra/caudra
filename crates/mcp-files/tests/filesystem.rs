@@ -11,7 +11,7 @@ use tokio_util::sync::CancellationToken;
 use workcell_mcp_files::{
     FileApplyPatchInput, FileEditInput, FileGlobInput, FileGrepInput, FileReadInput,
     FileReadOutput, FileResourceAccess, FileToolGroup, FileWriteInput, FilesystemError,
-    FilesystemLimits,
+    FilesystemLimits, ModelText,
 };
 
 const STALE_PUBLICATION: &str = "changed before publication";
@@ -187,6 +187,7 @@ async fn protects_sensitive_names_and_omits_them_from_listing_and_search() {
                 pattern: "secret".into(),
                 path: None,
                 include: None,
+                ..Default::default()
             },
             &token(),
         )
@@ -252,6 +253,7 @@ async fn reads_bounded_lines_and_supports_glob_grep_metadata_and_cancellation() 
                 pattern: "^alpha".into(),
                 path: None,
                 include: Some("*.txt".into()),
+                ..Default::default()
             },
             &token(),
         )
@@ -298,6 +300,7 @@ async fn bounds_regex_lines_file_sizes_results_and_binary_inputs() {
                 pattern: "12345".into(),
                 path: None,
                 include: None,
+                ..Default::default()
             },
             &token(),
         )
@@ -311,6 +314,7 @@ async fn bounds_regex_lines_file_sizes_results_and_binary_inputs() {
                 pattern: "SECR".into(),
                 path: Some("long.txt".into()),
                 include: None,
+                ..Default::default()
             },
             &token(),
         )
@@ -323,6 +327,7 @@ async fn bounds_regex_lines_file_sizes_results_and_binary_inputs() {
                 pattern: "^abc".into(),
                 path: Some("long.txt".into()),
                 include: None,
+                ..Default::default()
             },
             &token(),
         )
@@ -412,6 +417,7 @@ async fn classifies_file_content_independently_from_extensions_across_operations
                 pattern: "needle".into(),
                 path: None,
                 include: None,
+                ..Default::default()
             },
             &token(),
         )
@@ -544,6 +550,7 @@ async fn pathological_regex_is_linear_and_unsupported_constructs_are_explicit() 
                 pattern: "(a+)+$".into(),
                 path: Some("redos.txt".into()),
                 include: None,
+                ..Default::default()
             },
             &token(),
         ),
@@ -562,6 +569,7 @@ async fn pathological_regex_is_linear_and_unsupported_constructs_are_explicit() 
                 pattern: "(a+)+$".into(),
                 path: Some("redos.txt".into()),
                 include: None,
+                ..Default::default()
             },
             &cancelled,
         ),
@@ -576,6 +584,7 @@ async fn pathological_regex_is_linear_and_unsupported_constructs_are_explicit() 
                 pattern: "(?=a)a".into(),
                 path: Some("redos.txt".into()),
                 include: None,
+                ..Default::default()
             },
             &token(),
         )
@@ -803,6 +812,7 @@ async fn exhausting_the_glob_work_budget_truncates_instead_of_failing() {
                 pattern: "x".into(),
                 path: None,
                 include: Some("**/*.ts".into()),
+                ..Default::default()
             },
             &token(),
         )
@@ -853,6 +863,7 @@ async fn truncated_searches_report_totals_and_say_so_in_the_model_text() {
                 pattern: "needle".into(),
                 path: None,
                 include: None,
+                ..Default::default()
             },
             &token(),
         )
@@ -862,6 +873,200 @@ async fn truncated_searches_report_totals_and_say_so_in_the_model_text() {
     assert!(output.truncated);
     assert!(output.files_scanned <= output.files_listed);
     assert_eq!(output.files_listed, 13, "twelve candidates plus notes.txt");
+}
+
+/// Ten numbered lines with a hit on 2, 4 and 9, so windows can be made to
+/// overlap, to swallow a later hit whole, and to run off the end of the file.
+async fn context_fixture() -> (Fixture, FileToolGroup) {
+    let fixture = fixture();
+    let body = (1..=10)
+        .map(|line| {
+            if [2, 4, 9].contains(&line) {
+                format!("line{line} needle")
+            } else {
+                format!("line{line}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(fixture.root.join("ctx.txt"), format!("{body}\n")).expect("context fixture");
+    let files = FileToolGroup::new(&fixture.root, false, None)
+        .await
+        .expect("tool group");
+    (fixture, files)
+}
+
+async fn context_grep(files: &FileToolGroup, input: FileGrepInput) -> Vec<(usize, bool)> {
+    files
+        .file_grep(input, &token())
+        .await
+        .expect("grep")
+        .rows
+        .iter()
+        .filter(|row| row.relative_path == "ctx.txt")
+        .map(|row| (row.line, row.matched))
+        .collect()
+}
+
+fn ctx_input(after: Option<usize>, before: Option<usize>, both: Option<usize>) -> FileGrepInput {
+    FileGrepInput {
+        pattern: "needle".into(),
+        path: Some("ctx.txt".into()),
+        context_after: after,
+        context_before: before,
+        context: both,
+        ..Default::default()
+    }
+}
+
+/// Without context the result is unchanged: one row per hit, every row a match.
+#[tokio::test]
+async fn a_search_without_context_returns_only_its_hits() {
+    let (_fixture, files) = context_fixture().await;
+    assert_eq!(
+        context_grep(&files, ctx_input(None, None, None)).await,
+        vec![(2, true), (4, true), (9, true)]
+    );
+}
+
+/// Trailing context stops at the last line rather than running past it or
+/// reaching into the empty element the terminating newline leaves behind.
+#[tokio::test]
+async fn trailing_context_is_bounded_by_the_end_of_the_file() {
+    let (_fixture, files) = context_fixture().await;
+    assert_eq!(
+        context_grep(&files, ctx_input(Some(4), None, None)).await,
+        vec![
+            (2, true),
+            (3, false),
+            (4, true),
+            (5, false),
+            (6, false),
+            (7, false),
+            (8, false),
+            (9, true),
+            (10, false),
+        ],
+        "four trailing lines per hit covers the file, and line 10 ends it"
+    );
+}
+
+/// Leading context never emits a line twice, and a hit inside an earlier
+/// window is still reported as a hit.
+#[tokio::test]
+async fn overlapping_windows_merge_without_repeating_a_line() {
+    let (_fixture, files) = context_fixture().await;
+    let rows = context_grep(&files, ctx_input(Some(3), Some(3), None)).await;
+    let lines: Vec<_> = rows.iter().map(|(line, _)| *line).collect();
+    let mut deduped = lines.clone();
+    deduped.dedup();
+    assert_eq!(lines, deduped, "a merged run repeated a line");
+    assert_eq!(lines, (1..=10).collect::<Vec<_>>());
+    let matched: Vec<_> = rows
+        .iter()
+        .filter(|(_, matched)| *matched)
+        .map(|(line, _)| *line)
+        .collect();
+    assert_eq!(matched, vec![2, 4, 9], "every hit kept its mark");
+}
+
+/// `-C` sets both sides, and an explicit `-A` or `-B` beats it.
+#[tokio::test]
+async fn an_explicit_side_overrides_the_combined_context_flag() {
+    let (_fixture, files) = context_fixture().await;
+    assert_eq!(
+        context_grep(&files, ctx_input(None, None, Some(1))).await,
+        vec![
+            (1, false),
+            (2, true),
+            (3, false),
+            (4, true),
+            (5, false),
+            (8, false),
+            (9, true),
+            (10, false),
+        ]
+    );
+    assert_eq!(
+        context_grep(&files, ctx_input(Some(0), None, Some(1))).await,
+        vec![
+            (1, false),
+            (2, true),
+            (3, false),
+            (4, true),
+            (8, false),
+            (9, true)
+        ],
+        "-A 0 removes the trailing side that -C asked for"
+    );
+}
+
+/// The cap counts hits, so context lines cannot crowd matches out of a result,
+/// and `head_limit` applies the same cap from the caller's side.
+#[tokio::test]
+async fn the_result_cap_counts_hits_rather_than_rows() {
+    let (_fixture, files) = context_fixture().await;
+    let output = files
+        .file_grep(
+            FileGrepInput {
+                head_limit: Some(2),
+                ..ctx_input(Some(2), None, None)
+            },
+            &token(),
+        )
+        .await
+        .expect("grep");
+    assert_eq!(output.matches, 2, "two hits, whatever the row count");
+    assert!(output.truncated, "the third hit was withheld");
+    assert!(
+        output.rows.len() > output.matches,
+        "context lines are rows without being matches"
+    );
+    assert!(
+        output.rows.iter().all(|row| row.line <= 6),
+        "the withheld hit contributed nothing, not even context"
+    );
+}
+
+/// A caller that learned the parameter name from another search tool still gets
+/// a filtered search instead of a silent whole-tree scan.
+#[tokio::test]
+async fn the_glob_alias_filters_the_same_as_include() {
+    let (_fixture, files) = context_fixture().await;
+    let input: FileGrepInput =
+        serde_json::from_value(serde_json::json!({"pattern": "needle", "glob": "*.md"}))
+            .expect("glob alias");
+    assert_eq!(input.include.as_deref(), Some("*.md"));
+    assert!(
+        files
+            .file_grep(input, &token())
+            .await
+            .expect("grep")
+            .rows
+            .is_empty(),
+        "no markdown file holds the pattern"
+    );
+}
+
+/// Rendering follows grep: `:` after the line number for a hit, `-` for a
+/// context line, and `--` between runs that are not adjacent.
+#[tokio::test]
+async fn model_text_marks_hits_and_separates_runs() {
+    let (_fixture, files) = context_fixture().await;
+    let output = files
+        .file_grep(ctx_input(Some(1), None, None), &token())
+        .await
+        .expect("grep");
+    assert_eq!(
+        output.model_text(),
+        "ctx.txt:2: line2 needle\n\
+         ctx.txt:3- line3\n\
+         ctx.txt:4: line4 needle\n\
+         ctx.txt:5- line5\n\
+         --\n\
+         ctx.txt:9: line9 needle\n\
+         ctx.txt:10- line10"
+    );
 }
 
 /// Broad traversal skips regenerable build output, but an explicit path still
@@ -1417,6 +1622,7 @@ async fn empty_read_scope_and_filter_values_mean_what_the_descriptions_say_they_
                 pattern: "alpha".into(),
                 path: None,
                 include: None,
+                ..Default::default()
             },
             &token(),
         )
@@ -1428,6 +1634,7 @@ async fn empty_read_scope_and_filter_values_mean_what_the_descriptions_say_they_
                 pattern: "alpha".into(),
                 path: Some(String::new()),
                 include: Some(String::new()),
+                ..Default::default()
             },
             &token(),
         )
@@ -1625,6 +1832,7 @@ async fn prepared_reads_and_searches_keep_the_exact_options_and_scope() {
         pattern: "beta".into(),
         path: Some("notes.txt".into()),
         include: None,
+        ..Default::default()
     };
     let grep = files
         .prepare_grep(grep_input.clone(), &token())

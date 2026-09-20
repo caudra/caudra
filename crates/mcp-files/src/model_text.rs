@@ -81,12 +81,26 @@ impl ModelText for FileGlobOutput {
 
 impl ModelText for FileGrepOutput {
     fn model_text(&self) -> Cow<'_, str> {
-        let mut text = self
-            .rows
-            .iter()
-            .map(|row| format!("{}:{}: {}", row.relative_path, row.line, row.text))
-            .collect::<Vec<_>>()
-            .join("\n");
+        // grep's own separators: `:` marks a hit, `-` a context line, and `--`
+        // stands between runs that are not adjacent in the file. A result with no
+        // context has no runs to delimit, so it stays a plain list of hits.
+        let windowed = self.rows.iter().any(|row| !row.matched);
+        let mut lines = Vec::with_capacity(self.rows.len());
+        let mut previous: Option<(&str, usize)> = None;
+        for row in &self.rows {
+            let adjacent = previous
+                .is_some_and(|(path, line)| path == row.relative_path && line + 1 == row.line);
+            if windowed && previous.is_some() && !adjacent {
+                lines.push("--".to_owned());
+            }
+            let separator = if row.matched { ':' } else { '-' };
+            lines.push(format!(
+                "{}:{}{} {}",
+                row.relative_path, row.line, separator, row.text
+            ));
+            previous = Some((&row.relative_path, row.line));
+        }
+        let mut text = lines.join("\n");
         if self.truncated {
             if !text.is_empty() {
                 text.push('\n');

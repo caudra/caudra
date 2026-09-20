@@ -176,14 +176,42 @@ pub struct FileGlobInput {
     pub path: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct FileGrepInput {
     pub pattern: String,
     #[serde(default)]
     pub path: Option<String>,
-    #[serde(default)]
+    /// `glob` is accepted as an alias so a caller that learned the name from a
+    /// different search tool still filters instead of silently scanning.
+    #[serde(default, alias = "glob")]
     pub include: Option<String>,
+    /// Lines of trailing context per match. Named for the grep flag because
+    /// that is what callers reach for.
+    #[serde(default, rename = "-A")]
+    pub context_after: Option<usize>,
+    #[serde(default, rename = "-B")]
+    pub context_before: Option<usize>,
+    /// Sets both sides at once. Loses to an explicit `-A` or `-B`.
+    #[serde(default, rename = "-C")]
+    pub context: Option<usize>,
+    /// Caller-imposed row ceiling, below whatever the host already enforces.
+    #[serde(default)]
+    pub head_limit: Option<usize>,
+}
+
+impl FileGrepInput {
+    /// Trailing context lines, with `-A` winning over `-C`.
+    #[must_use]
+    pub fn after(&self) -> usize {
+        self.context_after.or(self.context).unwrap_or(0)
+    }
+
+    /// Leading context lines, with `-B` winning over `-C`.
+    #[must_use]
+    pub fn before(&self) -> usize {
+        self.context_before.or(self.context).unwrap_or(0)
+    }
 }
 
 // Mutation inputs reject unknown fields so a misspelled or stale argument fails
@@ -312,6 +340,15 @@ pub struct FileGrepRow {
     pub relative_path: String,
     pub line: usize,
     pub text: String,
+    /// False for a line carried only as context. Rendering separates the two the
+    /// way grep does, so a reader can tell a hit from its surroundings.
+    #[serde(default = "matched_by_default")]
+    pub matched: bool,
+}
+
+/// A row without the field predates context support, where every row was a hit.
+fn matched_by_default() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]

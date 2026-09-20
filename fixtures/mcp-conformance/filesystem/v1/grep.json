@@ -30,13 +30,15 @@
           "path": "{{ROOT}}/notes.txt",
           "relativePath": "notes.txt",
           "line": 1,
-          "text": "alpha"
+          "text": "alpha",
+          "matched": true
         },
         {
           "path": "{{ROOT}}/notes.txt",
           "relativePath": "notes.txt",
           "line": 3,
-          "text": "alpha beta"
+          "text": "alpha beta",
+          "matched": true
         }
       ],
       "matches": 2,
