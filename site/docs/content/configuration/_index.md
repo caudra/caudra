@@ -122,9 +122,9 @@ It is off by default, so a normal run reaches only the model provider you config
 
 ### `ui.tool_output_lines`
 
-How many lines of output an open card shows per tool before it says how many it is holding back. Clicking the card shows all of it regardless. All values are `usize` with a minimum of 1.
+How many terminal rows of output an open card shows per tool before it says how many it is holding back. A line that wraps spends a row for each row it wraps to, so an abridged card is the same height whatever its lines are. Clicking the card shows all of it regardless. All values are `usize` with a minimum of 1.
 
-The `bash`, `python_execution`, and `task` entries apply only when `ui.scroll_card_lines` is `0`. Above that, those tools draw a fixed window of that many lines instead, and the budget here goes unused. `write` does not reach a `file_write` that created a file, whose body is that file and is always drawn whole. It is also a floor rather than a bound for anything drawn as a diff, since a diff is already only the part that changed: an edit, a patch, and an overwrite are drawn whole until they run long, and raising `write` past that point is what makes this number matter to them.
+The `bash`, `python_execution`, and `task` entries apply only when `ui.scroll_card_lines` is `0`. Above that, those tools draw a fixed window of that many rows instead, and the budget here goes unused. `write` does not reach a `file_write` that created a file, whose body is that file and is always drawn whole. It is also a floor rather than a bound for anything drawn as a diff, since a diff is already only the part that changed: an edit, a patch, and an overwrite are drawn whole until they run long, and raising `write` past that point is what makes this number matter to them.
 
 | Field | Default | Tools |
 |-------|---------|-------|

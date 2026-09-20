@@ -2,6 +2,7 @@ use super::segment;
 use super::*;
 use crate::animation::test_clock::FrozenSpinner;
 use crate::chat::{DONE_TEXT, ERROR_TEXT};
+use crate::components::code_view::ScrollSpan;
 use crate::components::prompt_progress::PROMPT_PROGRESS_LABEL;
 use crate::components::tool_display::{FOLLOWING, NOTICE_PREFIX, PAUSED};
 use crate::repaint::expect::{OWED, QUIET};
@@ -14,15 +15,17 @@ use caudra_agent::tools::{
     VIEW_IMAGE_TOOL_NAME,
 };
 use caudra_agent::{
-    CodeGraphRow, GrepFileEntry, GrepMatchGroup, NO_FILES_FOUND, SearchCap, ShellFilterInfo,
-    ShellOutput, SnapshotLine, SnapshotSpan, SpanStyle, SubagentActivity, SubagentProgress,
-    ToolAccounting, ToolInput, ToolOutput,
+    ActivityChild, CodeGraphRow, GrepFileEntry, GrepMatchGroup, NO_FILES_FOUND, SearchCap,
+    ShellFilterInfo, ShellOutput, SnapshotLine, SnapshotSpan, SpanStyle, SubagentActivity,
+    SubagentProgress, ToolAccounting, ToolInput, ToolOutput,
 };
 use caudra_workbench::scroll::SCROLLBAR_THUMB;
+use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::style::Modifier;
 use std::collections::HashSet;
 use std::path::Path;
+use std::thread;
 use std::time::Duration;
 use test_case::test_case;
 use unicode_width::UnicodeWidthStr;
@@ -61,6 +64,65 @@ const EAGER_SUMMARY: &str = "executed arguments";
 const EAGER_BODY: &str = "execution output";
 const EAGER_ANNOTATION: &str = "ranking 12 files";
 const EAGER_CHILD_ID: &str = "t1:0";
+const SIBLING_WINDOW_LINES: u32 = 6;
+const SIBLING_VIEWPORT: u16 = 60;
+const REPORTING_SIBLING: &str = "reporting sibling";
+const SIBLING_WINDOW_SETUP_MSG: &str = "the nested child must have a clipped output window";
+const SIBLING_VIEWPORT_MSG: &str = "all child rows must fit without transcript scrolling";
+const SIBLING_WINDOW_STABLE_MSG: &str =
+    "a nested activity roster must not move existing windows or its task header";
+const SIBLING_OUTPUT_STABLE_MSG: &str =
+    "a nested activity roster must not change already-visible output";
+const SIBLING_ROSTER_MSG: &str =
+    "the inner batch roster must remain in history while its task thinks";
+const SIBLING_HEIGHT_MSG: &str = "retained nested batches must not contract the running card";
+const BATCH_HEADER_WIDTH: u16 = 32;
+const BATCH_HEADER_PATH: &str =
+    "src/components/a_very_long_directory_name/another_long_directory/final_header.rs";
+const BATCH_HEADER_NEXT: &str = "next";
+const BATCH_HEADER_SETUP_MSG: &str =
+    "the narrow viewport must show the whole batch with transcript scrollback above it";
+const BATCH_HEADER_ROWS_MSG: &str =
+    "a live batch keeps one row per read-only child through status changes";
+const BATCH_HEADER_Y_MSG: &str = "a live batch's next sibling must stay on the same screen row";
+const BATCH_HEADER_STATUS_MSG: &str =
+    "the batch must retain the requested child lifecycle and its pending sibling";
+const CANCELLED_HEADER_MSG: &str =
+    "a terminal batch must restore full wrapped headers even while children remain pending";
+const BATCH_HEADER_HIGHLIGHT_SETUP_MSG: &str =
+    "a fresh batch header phase must enqueue a real highlight";
+const BATCH_HEADER_HIGHLIGHT_TIMEOUT_MSG: &str =
+    "the batch header highlight worker did not finish before the deadline";
+const VARIABLE_ROSTER_SETUP_MSG: &str =
+    "both tasks must stay running with the first task's complete activity roster visible";
+const VARIABLE_ROSTER_HEIGHT_MSG: &str = "a running task's variable batch roster must not contract its height or pull its sibling backwards";
+const HISTORY_FIRST_ID: &str = "batch-alpha";
+const HISTORY_SECOND_ID: &str = "batch-bravo";
+const HISTORY_THIRD_ID: &str = "batch-charlie";
+const HISTORY_LATE_ID: &str = "batch-late";
+const HISTORY_SMALL_BUDGET: u32 = 4;
+const HISTORY_LARGE_BUDGET: u32 = 7;
+const HISTORY_SCROLL_JOBS: usize = 12;
+const HISTORY_FINAL_OUTPUT: &str = "final task response";
+const HISTORY_SETUP_MSG: &str =
+    "a live task must expose its retained activities through one window";
+const HISTORY_CAP_MSG: &str =
+    "task output and retained activities must share the configured row budget";
+const HISTORY_RETAINED_MSG: &str =
+    "earlier keyed batches must remain available while later work runs";
+const HISTORY_PAUSED_MSG: &str = "appending a batch must not move a paused task's visible history";
+const HISTORY_RESUME_MSG: &str = "scrolling to the end must resume following the latest activity";
+const HISTORY_TERMINAL_MSG: &str =
+    "terminal tasks must discard visible history and reject late updates";
+const HISTORY_PREFIX_ROWS: usize = 8;
+const HISTORY_PREFIX_GROWTH: usize = 3;
+const HISTORY_PAUSE_OFFSET: usize = 1;
+const HISTORY_REFLOW_WIDTH: u16 = 64;
+const HISTORY_PREFIX_ANCHOR_MSG: &str =
+    "output growth must preserve the paused row, rebasing only readers inside history";
+const HISTORY_PHASE_JOBS: usize = 2;
+const HISTORY_PHASE_MSG: &str =
+    "same-call batch updates must retain intervening phases and reported child states";
 
 fn snap_line(text: &str) -> SnapshotLine {
     SnapshotLine {
@@ -4439,6 +4501,390 @@ fn anchored_resize_keeps_the_topmost_visible_segment() {
     );
 }
 
+const READER_WIDTH: u16 = 80;
+const READER_VIEWPORT: u16 = 12;
+const READER_MESSAGES: usize = 40;
+const ABOVE_ID: &str = "above";
+const ABOVE_LIVE_LINES: usize = 30;
+const ABOVE_SETTLED_LINES: usize = 2;
+/// Far enough below the card above that no height it takes reaches the screen.
+const PAUSE_ROWS: u32 = 6;
+const READER_SETUP: &str = "the reader must start paused, below the card that changes height";
+const READER_MOVED: &str =
+    "a paused reader must keep the same rows on screen while a card above them changes height";
+const READER_FOLLOWED: &str =
+    "a card above a paused reader changing height is not the reader asking to follow";
+
+/// Everything on screen bar the transcript's own scrollbar, which reports the
+/// document and is meant to move when the document does.
+fn visible_text(terminal: &ratatui::Terminal<TestBackend>) -> String {
+    let buf = terminal.backend().buffer();
+    (0..buf.area.height)
+        .map(|y| {
+            (0..buf.area.width.saturating_sub(1))
+                .filter_map(|x| buf.cell((x, y)).map(ratatui::buffer::Cell::symbol))
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// A call still running part way up the transcript, which is what one of
+/// several parallel calls looks like, with plenty below it to be reading.
+/// Expanded because that is the mode that draws a card the reader scrolled
+/// past rather than folding it to a row.
+fn panel_with_a_live_card_above() -> MessagesPanel {
+    let mut panel = panel_with_tools(&[(ABOVE_ID, SHELL_TOOL_NAME)]);
+    panel.set_view(ViewMode::Expanded);
+    for i in 0..READER_MESSAGES {
+        panel.push(DisplayMessage::new(
+            DisplayRole::Assistant,
+            format!("reader {i:02}"),
+        ));
+    }
+    panel
+}
+
+/// Puts the reader clear of the card above and hands back what they can see.
+fn pause_below_the_card(panel: &mut MessagesPanel) -> String {
+    render(panel, READER_WIDTH, READER_VIEWPORT);
+    let above = u32::from(panel.segment_heights()[0]);
+    panel.set_scroll_top(above + PAUSE_ROWS);
+    let seen = visible_text(&render(panel, READER_WIDTH, READER_VIEWPORT));
+    assert!(!panel.auto_scroll(), "{READER_SETUP}");
+    seen
+}
+
+/// The bug: automatic disclosure, the dirty-card flush and the live-progress
+/// refresh all re-measured the transcript before the anchor was taken, so the
+/// offset it was taken from already named different content and the reader
+/// was slid by whatever the card above had gained or given back.
+#[test]
+fn a_paused_reader_keeps_its_rows_while_a_card_above_grows_and_shrinks() {
+    let _clock = FrozenSpinner::at(0);
+    let mut panel = panel_with_a_live_card_above();
+    let reading = pause_below_the_card(&mut panel);
+
+    panel.tool_output(ABOVE_ID, &numbered_body(ABOVE_LIVE_LINES));
+    let grown = visible_text(&render(&mut panel, READER_WIDTH, READER_VIEWPORT));
+
+    panel.tool_done(long_done(ABOVE_ID, ABOVE_SETTLED_LINES));
+    let shrunk = visible_text(&render(&mut panel, READER_WIDTH, READER_VIEWPORT));
+
+    assert_eq!(grown, reading, "{READER_MOVED}");
+    assert_eq!(shrunk, reading, "{READER_MOVED}");
+    assert!(!panel.auto_scroll(), "{READER_FOLLOWED}");
+}
+
+const PIN_DECLINED_SETUP: &str = "the reflow must insert a segment mid-walk and slide the reader, or the frame never declined \
+     to pin and there is nothing to keep an anchor against";
+const UNPINNED_ANCHOR_MSG: &str = "a frame that could not re-pin must leave the reader's anchor alone, so the next frame puts \
+     them back rather than restoring the slide for ever";
+
+/// A settled call part way up the transcript whose output carries no
+/// instructions yet, so the segment that would hold them has not been built.
+fn panel_with_a_settled_card_above() -> MessagesPanel {
+    let mut panel = panel_with_tools(&[(ABOVE_ID, FILE_READ_TOOL_NAME)]);
+    panel.set_view(ViewMode::Expanded);
+    panel.tool_done(ToolDoneEvent {
+        output: read_code_with_instructions(Vec::new()),
+        ..done(ABOVE_ID)
+    });
+    for i in 0..READER_MESSAGES {
+        panel.push(DisplayMessage::new(
+            DisplayRole::Assistant,
+            format!("reader {i:02}"),
+        ));
+    }
+    panel
+}
+
+/// `reflow_viewport` declines to re-pin when a rebuild inserts an instruction
+/// segment mid-walk, so that one frame slides the reader. Recording where it
+/// left them turns the slide into the position every later frame restores,
+/// which is the one thing the anchor exists to undo.
+///
+/// The instructions are attached to the message by hand because the event
+/// that carries them marks the card dirty, and the flush redraws it before
+/// the reflow looks: the insert has to land inside the walk to shift the
+/// indices under it.
+#[test]
+fn a_frame_that_could_not_pin_keeps_the_readers_anchor() {
+    let mut panel = panel_with_a_settled_card_above();
+    let reading = pause_below_the_card(&mut panel);
+    let segments = panel.cache.len();
+
+    panel.messages[0].tool_output = Some(read_code_with_instructions(instruction_blocks()).into());
+    panel.cache.mark_all_width_stale();
+    let slid = visible_text(&render(&mut panel, READER_WIDTH, READER_VIEWPORT));
+    assert!(panel.cache.len() > segments, "{PIN_DECLINED_SETUP}");
+    assert_ne!(slid, reading, "{PIN_DECLINED_SETUP}");
+
+    let settled = visible_text(&render(&mut panel, READER_WIDTH, READER_VIEWPORT));
+    assert_eq!(settled, reading, "{UNPINNED_ANCHOR_MSG}");
+}
+
+const AUTO_CLOSED_ID: &str = "t1";
+const AUTO_TAIL_ID: &str = "t2";
+const AUTO_BODY_LINES: usize = 30;
+const AUTO_VIEWPORT: u16 = 8;
+const AUTO_PAUSE_ROWS: u32 = 3;
+const AUTO_CARD_OPEN: &str = "the reader must start inside the card auto is about to take back";
+const READER_LOST_THE_CARD: &str = "a card auto closes under a paused reader must leave them on that card, not on whatever \
+     moved up into the rows it gave back";
+
+/// Auto hands the open card to whatever landed last, so a reader part way
+/// down the card it takes it from has the rows under them removed outright.
+/// The anchor cannot keep a row that is gone; what it keeps is the content
+/// that row belonged to, which is the card itself.
+#[test]
+fn a_card_auto_closing_under_a_paused_reader_leaves_them_on_it() {
+    let mut panel = panel_with_tools(&[(AUTO_CLOSED_ID, SHELL_TOOL_NAME)]);
+    panel.tool_done(long_done(AUTO_CLOSED_ID, AUTO_BODY_LINES));
+    render(&mut panel, READER_WIDTH, AUTO_VIEWPORT);
+    panel.set_scroll_top(AUTO_PAUSE_ROWS);
+    render(&mut panel, READER_WIDTH, AUTO_VIEWPORT);
+    assert!(!panel.card_closed(AUTO_CLOSED_ID), "{AUTO_CARD_OPEN}");
+    assert!(!panel.auto_scroll(), "{READER_SETUP}");
+
+    panel.tool_start(start(AUTO_TAIL_ID, SHELL_TOOL_NAME));
+    panel.tool_done(long_done(AUTO_TAIL_ID, AUTO_BODY_LINES));
+    let screen = visible_text(&render(&mut panel, READER_WIDTH, AUTO_VIEWPORT));
+
+    assert!(panel.card_closed(AUTO_CLOSED_ID), "{AUTO_HANDOFF_MSG}");
+    assert!(
+        screen
+            .lines()
+            .next()
+            .is_some_and(|row| row.contains(AUTO_CLOSED_ID)),
+        "{READER_LOST_THE_CARD}: {screen:?}"
+    );
+    assert!(!panel.auto_scroll(), "{READER_FOLLOWED}");
+}
+
+const SHRINK_STREAM_LINES: usize = 60;
+const SHRINK_STREAM_LEFT: usize = 20;
+const SHRINK_VIEWPORT: u16 = 10;
+const SHRINK_SETUP: &str = "the shrunk document must still have somewhere to be paused";
+const SHRINK_REFOLLOWED: &str =
+    "a document getting shorter under a paused reader must not turn following back on";
+const BOTTOM_IS_THE_ASK: &str =
+    "following starts and stops at the last row, and nowhere short of it";
+const BOTTOM_SETUP: &str = "the document must have more scrollback than the move stops short by, or every offset under \
+     test is the same row";
+
+/// The clamp doubled as a resume: a reader who had scrolled up was put back
+/// on the tail the moment anything below them gave rows back, which while a
+/// card streams happens constantly.
+#[test]
+fn a_shrinking_document_does_not_re_enable_following() {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel
+        .streaming_text
+        .set_buffer(&"a\n".repeat(SHRINK_STREAM_LINES));
+    render(&mut panel, READER_WIDTH, SHRINK_VIEWPORT);
+    panel.scroll(panel.half_page());
+    assert!(!panel.auto_scroll(), "{READER_SETUP}");
+
+    panel
+        .streaming_text
+        .set_buffer(&"a\n".repeat(SHRINK_STREAM_LEFT));
+    render(&mut panel, READER_WIDTH, SHRINK_VIEWPORT);
+
+    assert!(panel.max_scroll() > 0, "{SHRINK_SETUP}");
+    assert!(!panel.auto_scroll(), "{SHRINK_REFOLLOWED}");
+}
+
+/// Asserted on the move itself rather than after a frame: following is read
+/// from what the reader did, not from where a later clamp happened to leave
+/// them.
+#[test_case(0, true ; "on_the_last_row")]
+#[test_case(1, false ; "one_row_short_of_it")]
+fn reaching_the_bottom_by_scrolling_re_enables_following(short_by: u32, follows: bool) {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel
+        .streaming_text
+        .set_buffer(&"a\n".repeat(SHRINK_STREAM_LINES));
+    render(&mut panel, READER_WIDTH, SHRINK_VIEWPORT);
+    panel.scroll_to_top();
+    render(&mut panel, READER_WIDTH, SHRINK_VIEWPORT);
+    assert!(!panel.auto_scroll(), "{READER_SETUP}");
+    assert!(panel.max_scroll() > short_by, "{BOTTOM_SETUP}");
+
+    panel.set_scroll_top(panel.max_scroll() - short_by);
+
+    assert_eq!(panel.auto_scroll(), follows, "{BOTTOM_IS_THE_ASK}");
+}
+
+const SWITCH_TALLER: usize = 120;
+const SWITCH_SHORTER: usize = 3;
+const SWITCH_LOST: &str = "a transcript switched away from must come back to the rows and the follow state it was \
+     left at, whatever was being read instead";
+
+/// Two parallel tasks are two transcripts of their own, and work keeps
+/// landing in the one nobody is looking at. Every height that changed while
+/// it was away is applied by the one frame that brings it back, which is the
+/// worst case for an anchor taken after the fact.
+#[test_case(SWITCH_TALLER ; "a_taller_transcript")]
+#[test_case(SWITCH_SHORTER ; "a_shorter_transcript")]
+fn a_transcript_keeps_its_place_across_a_switch_to(other_messages: usize) {
+    let _clock = FrozenSpinner::at(0);
+    let mut panel = panel_with_a_live_card_above();
+    let reading = pause_below_the_card(&mut panel);
+    let mut other = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    for i in 0..other_messages {
+        other.push(DisplayMessage::new(
+            DisplayRole::Assistant,
+            format!("other {i:02}"),
+        ));
+    }
+
+    panel.tool_output(ABOVE_ID, &numbered_body(ABOVE_LIVE_LINES));
+    render(&mut other, READER_WIDTH, READER_VIEWPORT);
+    panel.tool_done(long_done(ABOVE_ID, ABOVE_SETTLED_LINES));
+    render(&mut other, READER_WIDTH, READER_VIEWPORT);
+
+    let back = visible_text(&render(&mut panel, READER_WIDTH, READER_VIEWPORT));
+
+    assert_eq!(back, reading, "{SWITCH_LOST}");
+    assert!(!panel.auto_scroll(), "{SWITCH_LOST}");
+}
+
+const GROWTH_ID: &str = "growing";
+const GROWTH_VIEWPORT: u16 = 12;
+const GROWTH_SCROLLBACK: usize = 20;
+/// Wider than the rows any test here streams, so the child's window never
+/// starts scrolling inside itself and every report is a row the card gains.
+const GROWTH_WINDOW: u32 = 24;
+const GROWTH_ROWS: usize = 12;
+/// A batch draws its children in one body, so the first one grows in the
+/// middle of that body and the last one grows at the end of it.
+const MIDDLE_CHILD: usize = 0;
+const TAIL_CHILD: usize = 1;
+const CHILD_ROW_PREFIX: &str = "child";
+const FIRST_REPORTED_ROW: usize = 1;
+const PAUSE_NOTCH: i32 = 2;
+const NEWEST_OFF_SCREEN: &str = "following must keep the newest row on screen";
+const FIRST_MOVE_SETUP: &str =
+    "the card must grow far enough to move the viewport, or there is no follow move under test";
+const GROWTH_SETUP: &str = "the child must still be running to report another row";
+const PAUSED_ROWS_MOVED: &str =
+    "a paused reader must keep their rows while the card goes on growing below them";
+const PAUSED_GAP: &str = "a paused reader must sit on the document, not past the end of it";
+const PAUSED_MARKER_SETUP: &str =
+    "the reader must still see the row the card goes on growing below";
+
+/// `rows` rows of one child's live output, each naming the child and its own
+/// index so a row can be found on screen without an older one matching a
+/// prefix of it.
+fn growing_body(child: usize, rows: usize) -> String {
+    (0..rows)
+        .map(|row| format!("{CHILD_ROW_PREFIX}{child} {row:02} end\n"))
+        .collect()
+}
+
+fn newest_row(child: usize, rows: usize) -> String {
+    format!("{CHILD_ROW_PREFIX}{child} {:02} end", rows - 1)
+}
+
+fn screen_row_of(seen: &str, marker: &str) -> Option<usize> {
+    seen.lines().position(|row| row.contains(marker))
+}
+
+/// Two subagents reporting into one card, under enough transcript to be
+/// following rather than to be reading the whole thing. Both start with a row
+/// of output, so every step a test takes afterwards is one row of growth and
+/// not the card finding its shape.
+fn panel_with_a_growing_batch() -> MessagesPanel {
+    let config = UiConfig {
+        scroll_card_lines: GROWTH_WINDOW,
+        ..UiConfig::default()
+    };
+    let mut panel = MessagesPanel::new(config, EventHandle::disconnected_for_test());
+    for i in 0..GROWTH_SCROLLBACK {
+        panel.push(DisplayMessage::new(
+            DisplayRole::Assistant,
+            format!("scrollback {i:02}"),
+        ));
+    }
+    let mut ev = start(GROWTH_ID, BATCH_TOOL);
+    ev.output = Some(ToolOutput::Batch {
+        entries: vec![running_child(TASK_TOOL_NAME), running_child(TASK_TOOL_NAME)],
+        text: String::new(),
+    });
+    panel.tool_start(ev);
+    for child in [MIDDLE_CHILD, TAIL_CHILD] {
+        grow_child(&mut panel, child, 1);
+    }
+    panel
+}
+
+/// One report from a running child, and what the frame it draws leaves on
+/// screen.
+fn grow_child(panel: &mut MessagesPanel, child: usize, rows: usize) -> String {
+    assert!(
+        panel.set_batch_child_output(GROWTH_ID, child, &growing_body(child, rows)),
+        "{GROWTH_SETUP}"
+    );
+    visible_text(&render(panel, READER_WIDTH, GROWTH_VIEWPORT))
+}
+
+/// Reports rows until the viewport moves, and hands back how many the child
+/// had by then.
+fn grow_until_the_viewport_moves(panel: &mut MessagesPanel, child: usize) -> Option<usize> {
+    let held = panel.scroll_top();
+    (2..=GROWTH_ROWS).find(|&rows| {
+        grow_child(panel, child, rows);
+        panel.scroll_top() != held
+    })
+}
+
+/// A reader who scrolls up pauses, and the anchor holds the rows they were
+/// reading in place while the card goes on growing below them.
+#[test]
+fn scrolling_up_pauses_and_keeps_the_rows() {
+    let mut panel = panel_with_a_growing_batch();
+    let rows = grow_until_the_viewport_moves(&mut panel, TAIL_CHILD).expect(FIRST_MOVE_SETUP);
+
+    panel.scroll(PAUSE_NOTCH);
+    let seen = visible_text(&render(&mut panel, READER_WIDTH, GROWTH_VIEWPORT));
+    assert!(!panel.auto_scroll(), "{READER_SETUP}");
+    assert!(panel.scroll_top() <= panel.max_scroll(), "{PAUSED_GAP}");
+
+    // The middle child's first row: the tail child grows below it, so it only
+    // moves if the reader does.
+    let marker = newest_row(MIDDLE_CHILD, FIRST_REPORTED_ROW);
+    let was_at = screen_row_of(&seen, &marker).expect(PAUSED_MARKER_SETUP);
+    let grown = grow_child(&mut panel, TAIL_CHILD, rows + 1);
+
+    assert_eq!(
+        screen_row_of(&grown, &marker),
+        Some(was_at),
+        "{PAUSED_ROWS_MOVED}: {grown:?}"
+    );
+    assert!(!panel.auto_scroll(), "{READER_FOLLOWED}");
+}
+
+/// Resuming is still the last row and nowhere short of it, and what resumes
+/// is following: the rows that land afterwards stay on screen.
+#[test]
+fn scrolling_back_to_the_bottom_resumes_following_a_growing_card() {
+    let mut panel = panel_with_a_growing_batch();
+    let rows = grow_until_the_viewport_moves(&mut panel, TAIL_CHILD).expect(FIRST_MOVE_SETUP);
+    panel.scroll(PAUSE_NOTCH);
+    render(&mut panel, READER_WIDTH, GROWTH_VIEWPORT);
+    assert!(!panel.auto_scroll(), "{READER_SETUP}");
+
+    panel.set_scroll_top(panel.max_scroll());
+    assert!(panel.auto_scroll(), "{BOTTOM_IS_THE_ASK}");
+
+    let seen = grow_child(&mut panel, TAIL_CHILD, rows + 1);
+    assert!(
+        seen.contains(&newest_row(TAIL_CHILD, rows + 1)),
+        "{NEWEST_OFF_SCREEN}: {seen:?}"
+    );
+}
+
 const THEME_CODE: &str = "fn main() { let x = 1; }";
 const THEME_CODE_KEYWORDS: [&str; 3] = ["fn", "main", "let"];
 
@@ -6809,6 +7255,144 @@ fn a_child_that_fits_carries_no_bar() {
     assert!(card_bar_rows(&terminal).is_empty(), "{CARD_BAR_MSG}");
 }
 
+const WRAPPED_CHILD_LINES: usize = 30;
+const WRAPPED_CHILD_FILL: usize = 200;
+const CHILD_EXTENT_SETUP: &str =
+    "the body must wrap, or its source count and its row count agree by accident";
+const CHILD_EXTENT_MSG: &str =
+    "a child's window must travel the rows it painted, which is the extent its bar already spans";
+
+/// A body whose every source line wraps to several rows, so counting the
+/// source and counting what was drawn cannot come out the same.
+fn wrapping_child_body() -> String {
+    (0..WRAPPED_CHILD_LINES)
+        .map(|line| format!("line {line} {}\n", "w".repeat(WRAPPED_CHILD_FILL)))
+        .collect()
+}
+
+fn panel_with_a_wrapping_child() -> MessagesPanel {
+    let mut panel = panel_with_tools(&[("t1", BATCH_TOOL)]);
+    let mut ev = start("t1", BATCH_TOOL);
+    ev.output = Some(ToolOutput::Batch {
+        entries: vec![caudra_agent::BatchToolEntry {
+            output: Some(ToolOutput::Plain(wrapping_child_body().into())),
+            ..batch_child(SHELL_TOOL_NAME, "x")
+        }],
+        text: String::new(),
+    });
+    panel.tool_start(ev);
+    panel
+}
+
+/// The bug: the extent was counted in source lines while the rows it scrolls
+/// are visual rows, so the bar and the body it sat beside described different
+/// documents.
+#[test]
+fn a_childs_scrollable_extent_is_the_rows_it_painted() {
+    let mut panel = panel_with_a_wrapping_child();
+    render(&mut panel, READER_WIDTH, 24);
+
+    let painted = panel
+        .window_rows("t1", Some(0))
+        .expect("the child drew a window");
+    let source = panel
+        .child_body_lines("t1", 0)
+        .expect("the child is a scroll card");
+
+    assert!(painted > source, "{CHILD_EXTENT_SETUP}");
+    assert_eq!(
+        panel
+            .window_body(&child_scroll_id("t1", 0))
+            .map(|(rows, _)| rows),
+        Some(painted),
+        "{CHILD_EXTENT_MSG}"
+    );
+}
+
+/// The extent is what the wheel spends, so one counted in source lines runs
+/// out part way up a wrapped body and hands the rest of the burst back to the
+/// transcript, leaving rows the bar says are there unreachable.
+#[test]
+fn a_childs_window_reaches_the_head_of_a_wrapped_body() {
+    let mut panel = panel_with_a_wrapping_child();
+    let terminal = render(&mut panel, READER_WIDTH, 24);
+    let painted = panel
+        .window_rows("t1", Some(0))
+        .expect("the child drew a window");
+    let reachable = painted - caudra_config::DEFAULT_SCROLL_CARD_LINES as usize;
+
+    let spilled = wheel_child(&mut panel, &terminal, 0, reachable as i32);
+    render(&mut panel, READER_WIDTH, 24);
+
+    assert_eq!(spilled, 0, "{CHILD_EXTENT_MSG}");
+    let text = seg_text(&panel, "t1");
+    assert!(text.contains("line 0 "), "{CHILD_EXTENT_MSG}: {text:?}");
+}
+
+const CARD_EXTENT_MSG: &str = "a card's own window must travel the rows it painted, which is the extent its bar already \
+     spans";
+const NO_EXTENT_SETUP: &str = "the card must have a body to scroll and no painted extent yet";
+const NO_EXTENT_MSG: &str = "a body the build published no extent for declines the wheel, rather than spending it in \
+     source lines";
+/// Enough to move a window sized in source lines, so declining is visible as
+/// the whole burst coming back.
+const NO_EXTENT_NOTCHES: i32 = 3;
+
+/// The same body under a card of its own rather than inside a batch, since
+/// the two extents are read the same way and only the child path was guarded.
+fn panel_with_a_wrapping_card() -> MessagesPanel {
+    let mut panel = panel_with_tools(&[(TOOL_ID, SHELL_TOOL_NAME)]);
+    panel.tool_output(TOOL_ID, &wrapping_child_body());
+    panel
+}
+
+/// The card path of [`a_childs_window_reaches_the_head_of_a_wrapped_body`]: an
+/// extent counted in source lines runs out part way up, and the rows the bar
+/// says are there stay unreachable.
+#[test]
+fn a_cards_window_reaches_the_head_of_a_wrapped_body() {
+    let mut panel = panel_with_a_wrapping_card();
+    let terminal = render(&mut panel, READER_WIDTH, 24);
+    let painted = panel
+        .window_rows(TOOL_ID, None)
+        .expect("the card drew a window");
+    let source = panel
+        .card_body_lines(TOOL_ID)
+        .expect("the card is a scroll card");
+    assert!(painted > source, "{CHILD_EXTENT_SETUP}");
+
+    let (column, row) = card_bar_rows(&terminal)[0];
+    assert!(panel.arm_card_at(column, row), "{ARM_MSG}");
+    let reachable = painted - caudra_config::DEFAULT_SCROLL_CARD_LINES as usize;
+    let spilled = panel.scroll_card_at(column, row, reachable as i32);
+    render(&mut panel, READER_WIDTH, 24);
+
+    assert_eq!(spilled, 0, "{CARD_EXTENT_MSG}");
+    let text = seg_text(&panel, TOOL_ID);
+    assert!(text.contains("line 0 "), "{CARD_EXTENT_MSG}: {text:?}");
+}
+
+/// A body that has arrived but that no frame has drawn: its rows do not exist
+/// yet, so neither does any travel over them. Substituting the source count
+/// scrolls the window in the wrong unit, which is invisible until the body
+/// wraps and then strands its head.
+#[test]
+fn a_body_with_no_painted_extent_declines_the_wheel() {
+    let mut panel = panel_with_a_wrapping_card();
+
+    assert!(
+        panel.card_body_lines(TOOL_ID).is_some(),
+        "{NO_EXTENT_SETUP}"
+    );
+    assert_eq!(panel.window_rows(TOOL_ID, None), None, "{NO_EXTENT_SETUP}");
+    assert!(panel.window_body(TOOL_ID).is_none(), "{NO_EXTENT_MSG}");
+    assert_eq!(
+        panel.scroll_window(TOOL_ID, NO_EXTENT_NOTCHES),
+        NO_EXTENT_NOTCHES,
+        "{NO_EXTENT_MSG}"
+    );
+}
+
 /// The press has to reach the child's window rather than the transcript or a
 /// selection sweep, and it has to move that window absolutely: a press on a
 /// track names a position, not a delta. The top of the track is the start of
@@ -6866,6 +7450,50 @@ fn a_closed_window_takes_its_bar_with_it() {
     render(&mut panel, 80, 24);
 
     assert!(panel.card_bars.is_empty(), "{CARD_BAR_SWEPT_MSG}");
+}
+
+const FITTING_SPAN_MSG: &str =
+    "a body that fits keeps its span and takes neither a bar nor the wheel";
+
+/// The span and the window answer different questions, and a body that fits
+/// answers them differently. The span is how far the body reaches, which is
+/// what holds the wheel and the bar to the same rows whatever the body is
+/// made of; the window is a claim that something is hidden. Reading the
+/// second off the first puts a bar beside a whole body and, worse, lays a
+/// grab region over it, so every press and notch that crosses the card is
+/// taken from the transcript for travel the card does not have.
+#[test]
+fn a_settled_child_that_fits_keeps_its_span_but_not_its_window() {
+    let mut panel = panel_with_running_shell();
+    panel.set_batch_child_output("t1", 0, &shell_stream());
+    let terminal = render(&mut panel, 80, 24);
+    let (column, _) = card_bar_rows(&terminal)[0];
+    let windowed = batch_child_row(&panel, 0) + 1;
+    assert!(
+        panel.card_window_key_at(column, windowed).is_some(),
+        "{FITTING_SPAN_MSG}: the streaming child must window, or the probe proves nothing"
+    );
+
+    panel.batch_progress("t1", 0, batch_child(SHELL_TOOL_NAME, "a"));
+    render(&mut panel, 80, 24);
+    let row = batch_child_row(&panel, 0) + 1;
+
+    assert!(
+        panel.window_rows("t1", Some(0)).is_some(),
+        "{FITTING_SPAN_MSG}"
+    );
+    assert!(panel.card_bars.is_empty(), "{FITTING_SPAN_MSG}");
+    assert_eq!(
+        panel.card_window_key_at(column, row),
+        None,
+        "{FITTING_SPAN_MSG}"
+    );
+    assert!(!panel.arm_card_at(column, row), "{FITTING_SPAN_MSG}");
+    assert_eq!(
+        panel.scroll_card_at(column, row, CHILD_SCROLL_UP),
+        CHILD_SCROLL_UP,
+        "{FITTING_SPAN_MSG}"
+    );
 }
 
 /// The index has to name a child of this batch, for the same reason a report
@@ -7967,9 +8595,10 @@ fn scrolling_off_returns_a_shell_body_to_its_budget() {
     assert!(text.contains(BODY_HEAD), "{BUDGET_SHAPE_MSG}: {text:?}");
     assert!(!text.contains(&tail), "{BUDGET_SHAPE_MSG}: {text:?}");
     assert!(
-        text.contains(&crate::markdown::truncation_notice(
+        text.contains(&crate::markdown::expand_notice(&format!(
+            "{} rows",
             TRUNCATING_LINES - budget
-        )),
+        ))),
         "{BUDGET_SHAPE_MSG}: {text:?}"
     );
     assert!(!text.contains(FOLLOWING), "{NO_WINDOW_MSG}: {text:?}");
@@ -9176,5 +9805,1265 @@ fn a_card_that_records_no_source_still_copies_by_scraping() {
     assert!(
         panel.extract_selection_text(&sel, area).contains(ADDED),
         "{SCRAPE_MSG}"
+    );
+}
+
+const HELD_HEIGHT_MSG: &str = "a running card must not take back rows it has already drawn";
+const HELD_CONTENT_MSG: &str =
+    "a held row is buffered content revealed, never a blank the card is holding open";
+const HELD_SETTLES_ONCE_MSG: &str =
+    "a running card's height moves one way, and settles at the call that settles it";
+const FLOOR_RELEASED_MSG: &str =
+    "a floor outliving its call strands the card at a height nothing is left to fill";
+const HELD_SETUP_MSG: &str = "the case needs a live task with a retained batch roster";
+const HELD_OUTPUT_LINES: usize = 40;
+const HELD_ROSTER: usize = 3;
+const HELD_VIEWPORT: u16 = 24;
+/// A row of the buffer the window is sitting on, by its index in it.
+fn held_row(line: usize) -> String {
+    format!("out {line:02}")
+}
+
+fn held_output() -> String {
+    (0..HELD_OUTPUT_LINES)
+        .map(|line| format!("{}\n", held_row(line)))
+        .collect()
+}
+
+fn batching_report(jobs: usize) -> SubagentProgress {
+    SubagentProgress {
+        activity: SubagentActivity::batch(
+            Arc::from(BATCH_TOOL),
+            CHILD_TALLY,
+            (0..jobs)
+                .map(|job| caudra_agent::ActivityChild {
+                    tool: Arc::from(SHELL_TOOL_NAME),
+                    summary: format!("job {job}"),
+                    status: caudra_agent::BatchToolStatus::Running,
+                })
+                .collect(),
+        ),
+        tools: jobs as u32,
+        elapsed: Duration::ZERO,
+    }
+}
+
+fn history_job(id: &str, job: usize) -> String {
+    format!("{id} job {job:02}")
+}
+
+fn keyed_batching_report(id: &str, jobs: usize, tools: u32) -> SubagentProgress {
+    let mut report = batching_report(jobs);
+    report.tools = tools;
+    let children = report
+        .activity
+        .children()
+        .iter()
+        .enumerate()
+        .map(|(job, child)| ActivityChild {
+            summary: history_job(id, job),
+            ..child.clone()
+        })
+        .collect();
+    report.activity = SubagentActivity::batch(Arc::from(BATCH_TOOL), id, children).with_call_id(id);
+    report
+}
+
+fn task_history_span(panel: &MessagesPanel, child: bool) -> ScrollSpan {
+    let spans = &panel.cache.segments()[0].scroll_spans;
+    assert_eq!(spans.len(), 1, "{HISTORY_SETUP_MSG}");
+    let span = spans[0];
+    assert_eq!(
+        span.child,
+        child.then_some(MIDDLE_CHILD),
+        "{HISTORY_SETUP_MSG}"
+    );
+    span
+}
+
+fn panel_with_a_reporting_card() -> MessagesPanel {
+    let mut panel = panel_with_tools(&[(TOOL_ID, TASK_TOOL_NAME)]);
+    panel.set_view(ViewMode::Expanded);
+    panel.tool_output(TOOL_ID, &held_output());
+    panel.set_tool_progress(
+        TOOL_ID,
+        keyed_batching_report(HISTORY_FIRST_ID, HELD_ROSTER, HELD_ROSTER as u32),
+    );
+    render(&mut panel, READER_WIDTH, HELD_VIEWPORT);
+    panel
+}
+
+fn card_height(panel: &MessagesPanel) -> u16 {
+    panel.segment_heights()[0]
+}
+
+#[test_case(panel_with_a_reporting_card as fn() -> MessagesPanel ; "a_card_of_its_own")]
+fn a_running_card_does_not_shrink_when_its_report_does(build: fn() -> MessagesPanel) {
+    let mut panel = build();
+    let reporting = card_height(&panel);
+    assert!(reporting > HELD_ROSTER as u16, "{HELD_SETUP_MSG}");
+
+    drop_the_roster(&mut panel);
+
+    assert_eq!(card_height(&panel), reporting, "{HELD_HEIGHT_MSG}");
+}
+
+fn drop_the_roster(panel: &mut MessagesPanel) {
+    let mut report = panel.messages[0]
+        .progress
+        .as_ref()
+        .expect(HELD_SETUP_MSG)
+        .report
+        .clone();
+    report.activity = SubagentActivity::Thinking { title: None };
+    panel.set_tool_progress(TOOL_ID, report);
+    render(panel, READER_WIDTH, HELD_VIEWPORT);
+}
+
+/// The constraint the repo already settled: a held height is filled from the
+/// buffer, so the rows that arrive are rows the reader can read. Blanks were
+/// rejected for answering clicks as a card that had given them up.
+#[test_case(panel_with_a_reporting_card as fn() -> MessagesPanel ; "a_card_of_its_own")]
+fn a_held_window_fills_from_its_buffer(build: fn() -> MessagesPanel) {
+    let _clock = FrozenSpinner::at(0);
+    let mut panel = build();
+    let before = task_history_span(&panel, false);
+
+    drop_the_roster(&mut panel);
+
+    let seen = visible_text(&render(&mut panel, READER_WIDTH, HELD_VIEWPORT));
+    let after = task_history_span(&panel, false);
+    assert!(after.total > before.total, "{HISTORY_RETAINED_MSG}");
+    assert_eq!(after.lines, before.lines, "{HISTORY_CAP_MSG}");
+    assert_eq!(after.offset + after.lines, after.total, "{HISTORY_CAP_MSG}");
+    assert!(
+        after.lines <= caudra_config::DEFAULT_SCROLL_CARD_LINES as usize,
+        "{HISTORY_CAP_MSG}"
+    );
+    assert!(window_rows(&panel) > 0, "{HELD_CONTENT_MSG}");
+    for child in keyed_batching_report(HISTORY_FIRST_ID, HELD_ROSTER, HELD_ROSTER as u32)
+        .activity
+        .children()
+    {
+        assert!(
+            seen.contains(&child.summary),
+            "{HISTORY_RETAINED_MSG}: {seen:?}"
+        );
+    }
+}
+
+/// The rows of the buffer the window is drawing, however deep it sits.
+fn window_rows(panel: &MessagesPanel) -> usize {
+    let text = seg_text(panel, TOOL_ID);
+    (0..HELD_OUTPUT_LINES)
+        .filter(|line| text.contains(&held_row(*line)))
+        .count()
+}
+
+/// Monotone while running, and one contraction at the end. Without the
+/// settle the card would keep a height the finished call has nothing left to
+/// fill, which is the stranded space blanks were rejected for.
+#[test]
+fn a_running_cards_height_settles_once_at_completion() {
+    let mut panel = panel_with_a_reporting_card();
+    let mut seen = vec![card_height(&panel)];
+    let mut tools = HELD_ROSTER as u32;
+
+    for (index, jobs) in [HELD_ROSTER * 2, 1, HELD_ROSTER, 0].into_iter().enumerate() {
+        tools += jobs as u32;
+        let report = if jobs == 0 {
+            SubagentProgress {
+                activity: SubagentActivity::Thinking { title: None },
+                tools,
+                elapsed: Duration::ZERO,
+            }
+        } else {
+            keyed_batching_report(&format!("held-{index}"), jobs, tools)
+        };
+        panel.set_tool_progress(TOOL_ID, report);
+        render(&mut panel, READER_WIDTH, HELD_VIEWPORT);
+        seen.push(card_height(&panel));
+    }
+    assert!(
+        seen.windows(2).all(|pair| pair[1] >= pair[0]),
+        "{HELD_SETTLES_ONCE_MSG}: {seen:?}"
+    );
+
+    let running = card_height(&panel);
+    panel.tool_done(done(TOOL_ID));
+    render(&mut panel, READER_WIDTH, HELD_VIEWPORT);
+    let settled = card_height(&panel);
+    render(&mut panel, READER_WIDTH, HELD_VIEWPORT);
+
+    assert!(settled < running, "{HELD_SETTLES_ONCE_MSG}");
+    assert_eq!(card_height(&panel), settled, "{HELD_SETTLES_ONCE_MSG}");
+}
+
+/// Every way a card stops being the card the floor was measured against. A
+/// floor that survived one of them would hold a height against geometry the
+/// reader has already replaced, or against a call with nothing left to fill
+/// it. Read before the next frame, which is free to arm a new one for a call
+/// that is still running.
+#[test_case(|panel| panel.tool_done(done(TOOL_ID)) ; "the_call_settles")]
+#[test_case(MessagesPanel::cancel_in_progress ; "the_turn_is_cancelled")]
+#[test_case(|panel| panel.load_messages(Vec::new()) ; "the_transcript_is_replaced")]
+#[test_case(|panel| panel.set_view(ViewMode::Compact) ; "the_view_mode_changes")]
+fn the_floor_is_released(release: fn(&mut MessagesPanel)) {
+    let mut panel = panel_with_a_reporting_card();
+    assert!(!panel.card_floor.is_empty(), "{HELD_SETUP_MSG}");
+
+    release(&mut panel);
+
+    assert!(panel.card_floor.is_empty(), "{FLOOR_RELEASED_MSG}");
+}
+
+#[test_case(0; "sibling_window_following")]
+#[test_case(CHILD_SCROLL_UP; "sibling_window_paused")]
+fn a_nested_batch_roster_does_not_move_sibling_output_or_headers(scroll_up: i32) {
+    let _clock = FrozenSpinner::at(0);
+    let mut panel = MessagesPanel::new(
+        UiConfig {
+            scroll_card_lines: SIBLING_WINDOW_LINES,
+            ..UiConfig::default()
+        },
+        EventHandle::disconnected_for_test(),
+    );
+    panel.set_view(ViewMode::Expanded);
+    let entries = vec![
+        BatchToolEntry {
+            output: Some(ToolOutput::Markdown(
+                format!("```\n{}```", numbered_body(HELD_OUTPUT_LINES)).into(),
+            )),
+            ..batch_child(TASK_TOOL_NAME, TOOL_ID)
+        },
+        BatchToolEntry {
+            summary: REPORTING_SIBLING.into(),
+            ..running_child(TASK_TOOL_NAME)
+        },
+    ];
+    let mut event = start(TOOL_ID, BATCH_TOOL);
+    event.output = Some(ToolOutput::Batch {
+        entries,
+        text: String::new(),
+    });
+    panel.tool_start(event);
+    if scroll_up > 0 {
+        let terminal = render(&mut panel, READER_WIDTH, SIBLING_VIEWPORT);
+        assert_eq!(
+            wheel_child(&mut panel, &terminal, MIDDLE_CHILD, scroll_up),
+            0,
+            "{CHILD_SCROLL_MSG}"
+        );
+        assert!(
+            !panel.card_scroll[&child_scroll_id(TOOL_ID, MIDDLE_CHILD)].follow,
+            "{CHILD_SCROLL_MSG}"
+        );
+    }
+    let frames = [
+        (HISTORY_FIRST_ID, false, HELD_ROSTER as u32),
+        (HISTORY_FIRST_ID, true, HELD_ROSTER as u32),
+        (HISTORY_SECOND_ID, false, (HELD_ROSTER * 2) as u32),
+    ]
+    .map(|(id, thinking, tools)| {
+        let mut report = keyed_batching_report(id, HELD_ROSTER, tools);
+        let children = report.activity.children().to_vec();
+        if thinking {
+            report.activity = SubagentActivity::Thinking { title: None };
+        }
+        assert!(
+            panel.set_batch_child_progress(TOOL_ID, TAIL_CHILD, report),
+            "{HELD_SETUP_MSG}"
+        );
+        let seen = visible_text(&render(&mut panel, READER_WIDTH, SIBLING_VIEWPORT));
+        assert_eq!(panel.scroll_top(), 0, "{SIBLING_VIEWPORT_MSG}");
+        assert!(
+            card_height(&panel) < SIBLING_VIEWPORT,
+            "{SIBLING_VIEWPORT_MSG}"
+        );
+        for child in &children {
+            assert!(
+                seen.contains(&child.summary),
+                "{SIBLING_ROSTER_MSG}: {seen:?}"
+            );
+        }
+        let progress = &panel.batch_child_progress[TOOL_ID][&TAIL_CHILD];
+        assert!(progress.has_history(), "{HISTORY_RETAINED_MSG}");
+        assert!(
+            progress.activities().any(|(activity, _)| activity
+                .children()
+                .iter()
+                .any(|child| child.summary == history_job(HISTORY_FIRST_ID, 0))),
+            "{HISTORY_RETAINED_MSG}"
+        );
+        let header_y = screen_row_of(&seen, REPORTING_SIBLING).expect(SIBLING_VIEWPORT_MSG);
+        let window = panel.cache.segments()[0]
+            .scroll_spans
+            .iter()
+            .find(|span| span.child == Some(MIDDLE_CHILD))
+            .expect(SIBLING_WINDOW_SETUP_MSG);
+        assert!(window.offset > 0, "{SIBLING_WINDOW_SETUP_MSG}");
+        let output: Vec<_> = seen
+            .lines()
+            .skip(usize::from(batch_child_row(&panel, MIDDLE_CHILD)) + 1)
+            .take(window.lines)
+            .map(str::to_owned)
+            .collect();
+        (
+            header_y,
+            window.offset,
+            window.lines,
+            output,
+            card_height(&panel),
+        )
+    });
+
+    assert_eq!(
+        frames[0].2, SIBLING_WINDOW_LINES as usize,
+        "{SIBLING_WINDOW_SETUP_MSG}"
+    );
+    for frame in &frames[1..] {
+        assert_eq!(
+            (frame.0, frame.1, frame.2),
+            (frames[0].0, frames[0].1, frames[0].2),
+            "{SIBLING_WINDOW_STABLE_MSG}"
+        );
+        assert_eq!(frame.3, frames[0].3, "{SIBLING_OUTPUT_STABLE_MSG}");
+    }
+    assert!(
+        frames.windows(2).all(|rows| rows[1].4 >= rows[0].4),
+        "{SIBLING_HEIGHT_MSG}"
+    );
+}
+
+fn panel_with_pending_batch_headers(tool: &str) -> MessagesPanel {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.set_view(ViewMode::Expanded);
+    panel.push(DisplayMessage::new(
+        DisplayRole::Assistant,
+        format!("```\n{}```", numbered_body(READER_MESSAGES)),
+    ));
+    let mut event = start(TOOL_ID, BATCH_TOOL);
+    event.output = Some(ToolOutput::Batch {
+        entries: [BATCH_HEADER_PATH, BATCH_HEADER_NEXT]
+            .into_iter()
+            .map(|summary| BatchToolEntry {
+                summary: summary.into(),
+                ..pending_child(tool)
+            })
+            .collect(),
+        text: String::new(),
+    });
+    panel.tool_start(event);
+    panel
+}
+
+fn batch_header_statuses(panel: &MessagesPanel) -> [BatchToolStatus; 2] {
+    let Some(ToolOutput::Batch { entries, .. }) = panel
+        .messages
+        .last()
+        .and_then(|message| message.tool_output.as_deref())
+    else {
+        panic!("{BATCH_HEADER_STATUS_MSG}");
+    };
+    [MIDDLE_CHILD, TAIL_CHILD].map(|child| entries[child].status)
+}
+
+fn render_batch_header_frame(panel: &mut MessagesPanel) -> (String, [Vec<u16>; 2]) {
+    let terminal = render(panel, BATCH_HEADER_WIDTH, READER_VIEWPORT);
+    assert!(panel.scroll_top() > 0, "{BATCH_HEADER_SETUP_MSG}");
+    assert!(has_scrollbar_thumb(&terminal), "{BATCH_HEADER_SETUP_MSG}");
+    let segment = panel
+        .cache
+        .segments()
+        .iter()
+        .find(|segment| segment.tool_id.as_deref() == Some(TOOL_ID))
+        .expect(BATCH_HEADER_SETUP_MSG);
+    assert!(
+        segment.height(panel.viewport_width) < READER_VIEWPORT,
+        "{BATCH_HEADER_SETUP_MSG}"
+    );
+    let area = terminal.backend().buffer().area;
+    let rows = [MIDDLE_CHILD, TAIL_CHILD].map(|child| {
+        let id = format!("{TOOL_ID}:{child}");
+        (area.y..area.bottom())
+            .filter(|row| panel.dispatched_id_at(*row, area).as_deref() == Some(id.as_str()))
+            .collect()
+    });
+    (visible_text(&terminal), rows)
+}
+
+fn wait_for_batch_header_highlights(panel: &mut MessagesPanel) -> bool {
+    let deadline = Instant::now() + HIGHLIGHT_DEADLINE;
+    let mut saw_pending = false;
+    while panel
+        .cache
+        .segments()
+        .iter()
+        .any(|segment| segment.has_pending_highlight())
+    {
+        saw_pending = true;
+        assert!(
+            Instant::now() < deadline,
+            "{BATCH_HEADER_HIGHLIGHT_TIMEOUT_MSG}"
+        );
+        let _ = panel.drain_highlights();
+        thread::yield_now();
+    }
+    saw_pending
+}
+
+#[test_case(FILE_READ_TOOL_NAME; "read")]
+#[test_case(FILE_GREP_TOOL_NAME; "grep")]
+fn a_live_batch_keeps_child_header_rows_through_status_changes(tool: &str) {
+    let _clock = FrozenSpinner::at(0);
+    let mut panel = panel_with_pending_batch_headers(tool);
+    let mut sibling_rows = Vec::new();
+    for status in [
+        BatchToolStatus::Pending,
+        BatchToolStatus::Running,
+        BatchToolStatus::Success,
+    ] {
+        panel.batch_progress(
+            TOOL_ID,
+            MIDDLE_CHILD,
+            BatchToolEntry {
+                summary: BATCH_HEADER_PATH.into(),
+                status,
+                output: status
+                    .is_terminal()
+                    .then(|| ToolOutput::Plain(BATCH_CHILD_BODY.into())),
+                ..pending_child(tool)
+            },
+        );
+        assert_eq!(
+            batch_header_statuses(&panel),
+            [status, BatchToolStatus::Pending],
+            "{BATCH_HEADER_STATUS_MSG}"
+        );
+        assert_eq!(
+            msg_status(&panel, TOOL_ID),
+            ToolStatus::InProgress,
+            "{BATCH_HEADER_STATUS_MSG}"
+        );
+        for highlighted in [false, true] {
+            if highlighted {
+                let saw_pending = wait_for_batch_header_highlights(&mut panel);
+                if status == BatchToolStatus::Pending {
+                    assert!(saw_pending, "{BATCH_HEADER_HIGHLIGHT_SETUP_MSG}");
+                }
+            }
+            let (seen, rows) = render_batch_header_frame(&mut panel);
+            assert_eq!(
+                rows.map(|rows| rows.len()),
+                [1, 1],
+                "{BATCH_HEADER_ROWS_MSG}: {status:?}, highlighted={highlighted}"
+            );
+            sibling_rows.push(screen_row_of(&seen, BATCH_HEADER_NEXT).expect(BATCH_HEADER_Y_MSG));
+        }
+    }
+    assert!(
+        sibling_rows.windows(2).all(|rows| rows[0] == rows[1]),
+        "{BATCH_HEADER_Y_MSG}: {sibling_rows:?}"
+    );
+}
+
+#[test_case(BatchToolStatus::Pending; "pending_child")]
+#[test_case(BatchToolStatus::Running; "running_child")]
+fn cancelling_a_batch_restores_wrapped_headers_with_pending_children(initial: BatchToolStatus) {
+    let _clock = FrozenSpinner::at(0);
+    let mut panel = panel_with_pending_batch_headers(FILE_READ_TOOL_NAME);
+    panel.batch_progress(
+        TOOL_ID,
+        MIDDLE_CHILD,
+        BatchToolEntry {
+            summary: BATCH_HEADER_PATH.into(),
+            status: initial,
+            ..pending_child(FILE_READ_TOOL_NAME)
+        },
+    );
+    for highlighted in [false, true] {
+        if highlighted {
+            let saw_pending = wait_for_batch_header_highlights(&mut panel);
+            if initial == BatchToolStatus::Pending {
+                assert!(saw_pending, "{BATCH_HEADER_HIGHLIGHT_SETUP_MSG}");
+            }
+        }
+        let (_, rows) = render_batch_header_frame(&mut panel);
+        assert_eq!(
+            rows.map(|rows| rows.len()),
+            [1, 1],
+            "{BATCH_HEADER_ROWS_MSG}"
+        );
+    }
+
+    panel.cancel_in_progress();
+
+    assert_eq!(
+        msg_status(&panel, TOOL_ID),
+        ToolStatus::Error,
+        "{BATCH_HEADER_STATUS_MSG}"
+    );
+    assert_eq!(
+        batch_header_statuses(&panel),
+        [
+            if initial == BatchToolStatus::Running {
+                BatchToolStatus::Error
+            } else {
+                initial
+            },
+            BatchToolStatus::Pending,
+        ],
+        "{BATCH_HEADER_STATUS_MSG}"
+    );
+    for highlighted in [false, true] {
+        if highlighted {
+            assert!(
+                wait_for_batch_header_highlights(&mut panel),
+                "{BATCH_HEADER_HIGHLIGHT_SETUP_MSG}"
+            );
+        }
+        let (seen, rows) = render_batch_header_frame(&mut panel);
+        assert!(rows[MIDDLE_CHILD].len() > 1, "{CANCELLED_HEADER_MSG}");
+        assert_eq!(rows[TAIL_CHILD].len(), 1, "{CANCELLED_HEADER_MSG}");
+        let restored: String = rows[MIDDLE_CHILD]
+            .iter()
+            .flat_map(|row| seen.lines().nth(usize::from(*row)).unwrap().chars())
+            .filter(|character| character.is_ascii() && !character.is_ascii_whitespace())
+            .collect();
+        assert!(
+            restored.contains(BATCH_HEADER_PATH),
+            "{CANCELLED_HEADER_MSG}: {restored:?}, highlighted={highlighted}"
+        );
+    }
+}
+
+#[test_case(&[Some(1), None, Some(5), None, Some(2)]; "thinking_between_variable_batches")]
+#[test_case(&[Some(1), Some(5), Some(2)]; "consecutive_variable_batches")]
+fn a_running_subagents_variable_batch_roster_does_not_contract(batches: &[Option<usize>]) {
+    let _clock = FrozenSpinner::at(0);
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.set_view(ViewMode::Expanded);
+    let mut event = start(TOOL_ID, BATCH_TOOL);
+    event.output = Some(ToolOutput::Batch {
+        entries: vec![
+            running_child(TASK_TOOL_NAME),
+            BatchToolEntry {
+                summary: REPORTING_SIBLING.into(),
+                ..running_child(TASK_TOOL_NAME)
+            },
+        ],
+        text: String::new(),
+    });
+    panel.tool_start(event);
+    let first_id = format!("{TOOL_ID}:{MIDDLE_CHILD}");
+    let mut tools = 0;
+    let frames: Vec<_> = batches
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(index, jobs)| {
+            let report = match jobs {
+                Some(jobs) => {
+                    tools += jobs as u32;
+                    keyed_batching_report(&format!("history-{index}"), jobs, tools)
+                }
+                None => SubagentProgress {
+                    activity: SubagentActivity::Thinking { title: None },
+                    tools,
+                    elapsed: Duration::ZERO,
+                },
+            };
+            let summaries: Vec<_> = report
+                .activity
+                .children()
+                .iter()
+                .map(|child| child.summary.clone())
+                .collect();
+            assert!(
+                panel.set_batch_child_progress(TOOL_ID, MIDDLE_CHILD, report),
+                "{VARIABLE_ROSTER_SETUP_MSG}"
+            );
+            let terminal = render(&mut panel, READER_WIDTH, SIBLING_VIEWPORT);
+            let seen = visible_text(&terminal);
+            assert_eq!(panel.scroll_top(), 0, "{SIBLING_VIEWPORT_MSG}");
+            assert!(
+                card_height(&panel) < SIBLING_VIEWPORT,
+                "{SIBLING_VIEWPORT_MSG}"
+            );
+            assert_eq!(
+                batch_header_statuses(&panel),
+                [BatchToolStatus::Running, BatchToolStatus::Running],
+                "{VARIABLE_ROSTER_SETUP_MSG}"
+            );
+            for summary in &summaries {
+                assert!(
+                    seen.contains(summary.as_str()),
+                    "{VARIABLE_ROSTER_SETUP_MSG}: {summary}"
+                );
+            }
+            let area = terminal.backend().buffer().area;
+            let height = (area.y..area.bottom())
+                .filter(|row| {
+                    panel.dispatched_id_at(*row, area).as_deref() == Some(first_id.as_str())
+                })
+                .count();
+            assert!(height > 1, "{VARIABLE_ROSTER_SETUP_MSG}");
+            let sibling_y =
+                screen_row_of(&seen, REPORTING_SIBLING).expect(VARIABLE_ROSTER_SETUP_MSG);
+            (height, sibling_y)
+        })
+        .collect();
+
+    let progress = &panel.batch_child_progress[TOOL_ID][&MIDDLE_CHILD];
+    assert_eq!(
+        progress
+            .activities()
+            .filter(|(activity, _)| !activity.children().is_empty())
+            .count(),
+        batches.iter().flatten().count(),
+        "{HISTORY_RETAINED_MSG}"
+    );
+    assert!(
+        frames
+            .windows(2)
+            .all(|rows| rows[1].0 >= rows[0].0 && rows[1].1 >= rows[0].1),
+        "{VARIABLE_ROSTER_HEIGHT_MSG}: batches={batches:?}, child heights={:?}, sibling rows={:?}",
+        frames.iter().map(|frame| frame.0).collect::<Vec<_>>(),
+        frames.iter().map(|frame| frame.1).collect::<Vec<_>>()
+    );
+}
+
+fn panel_with_history_task(child: bool, scroll_card_lines: u32) -> MessagesPanel {
+    let mut panel = MessagesPanel::new(
+        UiConfig {
+            scroll_card_lines,
+            ..UiConfig::default()
+        },
+        EventHandle::disconnected_for_test(),
+    );
+    panel.set_view(ViewMode::Expanded);
+    let mut event = start(TOOL_ID, if child { BATCH_TOOL } else { TASK_TOOL_NAME });
+    if child {
+        event.output = Some(ToolOutput::Batch {
+            entries: vec![
+                running_child(TASK_TOOL_NAME),
+                BatchToolEntry {
+                    summary: REPORTING_SIBLING.into(),
+                    ..running_child(TASK_TOOL_NAME)
+                },
+            ],
+            text: String::new(),
+        });
+    }
+    panel.tool_start(event);
+    panel
+}
+
+fn report_task_history(panel: &mut MessagesPanel, child: bool, report: SubagentProgress) {
+    if child {
+        assert!(
+            panel.set_batch_child_progress(TOOL_ID, MIDDLE_CHILD, report),
+            "{HISTORY_SETUP_MSG}"
+        );
+    } else {
+        panel.set_tool_progress(TOOL_ID, report);
+    }
+}
+
+fn task_history_progress(panel: &MessagesPanel, child: bool) -> &ToolProgress {
+    if child {
+        &panel.batch_child_progress[TOOL_ID][&MIDDLE_CHILD]
+    } else {
+        panel.messages[0]
+            .progress
+            .as_ref()
+            .expect(HISTORY_SETUP_MSG)
+    }
+}
+
+fn task_history_key(child: bool) -> String {
+    if child {
+        child_scroll_id(TOOL_ID, MIDDLE_CHILD)
+    } else {
+        TOOL_ID.to_owned()
+    }
+}
+
+fn render_task_history(panel: &mut MessagesPanel) -> Terminal<TestBackend> {
+    let terminal = render(panel, READER_WIDTH, SIBLING_VIEWPORT);
+    assert_eq!(panel.scroll_top(), 0, "{SIBLING_VIEWPORT_MSG}");
+    assert!(
+        card_height(panel) < SIBLING_VIEWPORT,
+        "{SIBLING_VIEWPORT_MSG}"
+    );
+    terminal
+}
+
+fn visible_history_jobs(text: &str, id: &str, jobs: usize) -> Vec<(usize, usize)> {
+    (0..jobs)
+        .filter_map(|job| screen_row_of(text, &history_job(id, job)).map(|row| (job, row)))
+        .collect()
+}
+
+#[test_case(false, HISTORY_SMALL_BUDGET; "standalone_four_rows")]
+#[test_case(false, HISTORY_LARGE_BUDGET; "standalone_seven_rows")]
+#[test_case(true, HISTORY_SMALL_BUDGET; "child_four_rows")]
+#[test_case(true, HISTORY_LARGE_BUDGET; "child_seven_rows")]
+fn history_only_tasks_share_a_capped_scroll_body(child: bool, budget: u32) {
+    let _clock = FrozenSpinner::at(0);
+    let mut panel = panel_with_history_task(child, budget);
+    for (id, thinking, tools) in [
+        (HISTORY_FIRST_ID, false, HISTORY_SCROLL_JOBS as u32),
+        (HISTORY_FIRST_ID, true, HISTORY_SCROLL_JOBS as u32),
+        (HISTORY_SECOND_ID, false, (HISTORY_SCROLL_JOBS * 2) as u32),
+    ] {
+        let mut report = keyed_batching_report(id, HISTORY_SCROLL_JOBS, tools);
+        if thinking {
+            report.activity = SubagentActivity::Thinking { title: None };
+        }
+        report_task_history(&mut panel, child, report);
+        let terminal = render_task_history(&mut panel);
+        let seen = visible_text(&terminal);
+        let span = task_history_span(&panel, child);
+        let progress = task_history_progress(&panel, child);
+        assert!(progress.has_history(), "{HISTORY_RETAINED_MSG}");
+        assert_eq!(span.lines, budget as usize, "{HISTORY_CAP_MSG}");
+        assert_eq!(span.offset + span.lines, span.total, "{HISTORY_CAP_MSG}");
+        assert_eq!(
+            span.total,
+            progress
+                .activities()
+                .map(|(activity, _)| 1 + activity.children().len())
+                .sum::<usize>(),
+            "{HISTORY_RETAINED_MSG}"
+        );
+        assert_eq!(
+            panel
+                .window_body(&task_history_key(child))
+                .map(|(total, _)| total),
+            Some(span.total),
+            "{HISTORY_CAP_MSG}"
+        );
+        assert!(
+            seen.contains(&history_job(id, HISTORY_SCROLL_JOBS - 1)),
+            "{HISTORY_RESUME_MSG}: {seen:?}"
+        );
+        let (first, rows) =
+            panel.cache.segments()[0].rows_for_lines(span.first, span.lines, panel.viewport_width);
+        let body: Vec<_> = seen
+            .lines()
+            .skip(usize::from(first))
+            .take(usize::from(rows))
+            .collect();
+        assert_eq!(body.len(), budget as usize, "{HISTORY_CAP_MSG}");
+        assert!(
+            body.iter()
+                .all(|line| line.chars().any(char::is_alphanumeric)),
+            "{HELD_CONTENT_MSG}: {body:?}"
+        );
+    }
+}
+
+#[test_case(false; "standalone_history_only")]
+#[test_case(true; "child_history_only")]
+fn paused_task_history_keeps_its_rows_when_a_batch_appends(child: bool) {
+    let _clock = FrozenSpinner::at(0);
+    let mut panel = panel_with_history_task(child, HISTORY_SMALL_BUDGET);
+    let key = task_history_key(child);
+    report_task_history(
+        &mut panel,
+        child,
+        keyed_batching_report(
+            HISTORY_FIRST_ID,
+            HISTORY_SCROLL_JOBS,
+            HISTORY_SCROLL_JOBS as u32,
+        ),
+    );
+    let terminal = render_task_history(&mut panel);
+    let (column, row) = card_bar_rows(&terminal)[0];
+    assert!(panel.arm_card_at(column, row), "{ARM_MSG}");
+    assert_eq!(
+        panel.scroll_card_at(column, row, CHILD_SCROLL_UP),
+        0,
+        "{HISTORY_PAUSED_MSG}"
+    );
+    let paused = visible_text(&render_task_history(&mut panel));
+    let before = task_history_span(&panel, child);
+    let paused_jobs = visible_history_jobs(&paused, HISTORY_FIRST_ID, HISTORY_SCROLL_JOBS);
+    assert_eq!(
+        paused_jobs.len(),
+        HISTORY_SMALL_BUDGET as usize,
+        "{HISTORY_SETUP_MSG}"
+    );
+    assert!(!panel.card_scroll[&key].follow, "{HISTORY_PAUSED_MSG}");
+    let sibling_y = screen_row_of(&paused, REPORTING_SIBLING);
+
+    report_task_history(
+        &mut panel,
+        child,
+        keyed_batching_report(
+            HISTORY_SECOND_ID,
+            HISTORY_SCROLL_JOBS,
+            (HISTORY_SCROLL_JOBS * 2) as u32,
+        ),
+    );
+    let terminal = render_task_history(&mut panel);
+    let seen = visible_text(&terminal);
+    let appended = task_history_span(&panel, child);
+    assert!(appended.total > before.total, "{HISTORY_RETAINED_MSG}");
+    assert_eq!(
+        (appended.offset, appended.lines),
+        (before.offset, before.lines),
+        "{HISTORY_PAUSED_MSG}"
+    );
+    assert_eq!(
+        visible_history_jobs(&seen, HISTORY_FIRST_ID, HISTORY_SCROLL_JOBS),
+        paused_jobs,
+        "{HISTORY_PAUSED_MSG}"
+    );
+    assert!(
+        !seen.contains(HISTORY_SECOND_ID),
+        "{HISTORY_PAUSED_MSG}: {seen:?}"
+    );
+    assert!(!panel.card_scroll[&key].follow, "{HISTORY_PAUSED_MSG}");
+    assert_eq!(
+        screen_row_of(&seen, REPORTING_SIBLING),
+        sibling_y,
+        "{HISTORY_PAUSED_MSG}"
+    );
+
+    let remaining = appended.total - appended.lines - appended.offset;
+    let (column, row) = card_bar_rows(&terminal)[0];
+    assert!(panel.arm_card_at(column, row), "{ARM_MSG}");
+    assert_eq!(
+        panel.scroll_card_at(column, row, -(remaining as i32)),
+        0,
+        "{HISTORY_RESUME_MSG}"
+    );
+    let resumed = visible_text(&render_task_history(&mut panel));
+    let span = task_history_span(&panel, child);
+    assert!(panel.card_scroll[&key].follow, "{HISTORY_RESUME_MSG}");
+    assert_eq!(span.offset + span.lines, span.total, "{HISTORY_RESUME_MSG}");
+    assert!(
+        resumed.contains(&history_job(HISTORY_SECOND_ID, HISTORY_SCROLL_JOBS - 1)),
+        "{HISTORY_RESUME_MSG}: {resumed:?}"
+    );
+
+    report_task_history(
+        &mut panel,
+        child,
+        keyed_batching_report(
+            HISTORY_THIRD_ID,
+            HELD_ROSTER,
+            (HISTORY_SCROLL_JOBS * 2 + HELD_ROSTER) as u32,
+        ),
+    );
+    let latest = visible_text(&render_task_history(&mut panel));
+    let span = task_history_span(&panel, child);
+    assert!(panel.card_scroll[&key].follow, "{HISTORY_RESUME_MSG}");
+    assert_eq!(span.offset + span.lines, span.total, "{HISTORY_RESUME_MSG}");
+    assert!(
+        latest.contains(&history_job(HISTORY_THIRD_ID, HELD_ROSTER - 1)),
+        "{HISTORY_RESUME_MSG}"
+    );
+    assert_eq!(
+        screen_row_of(&latest, REPORTING_SIBLING),
+        sibling_y,
+        "{HISTORY_RESUME_MSG}"
+    );
+}
+
+#[test_case(false; "standalone_task")]
+#[test_case(true; "batch_child_task")]
+fn live_output_and_history_use_one_task_window(child: bool) {
+    let _clock = FrozenSpinner::at(0);
+    let mut panel = panel_with_history_task(child, SIBLING_WINDOW_LINES);
+    report_task_history(
+        &mut panel,
+        child,
+        keyed_batching_report(HISTORY_FIRST_ID, HELD_ROSTER, HELD_ROSTER as u32),
+    );
+    render_task_history(&mut panel);
+    let before = task_history_span(&panel, child);
+
+    if child {
+        assert!(
+            panel.set_batch_child_output(TOOL_ID, MIDDLE_CHILD, &held_output()),
+            "{CHILD_STREAM_MSG}"
+        );
+    } else {
+        panel.tool_output(TOOL_ID, &held_output());
+    }
+    let seen = visible_text(&render_task_history(&mut panel));
+    let combined = task_history_span(&panel, child);
+    assert!(combined.total > before.total, "{HISTORY_CAP_MSG}");
+    assert_eq!(
+        combined.lines, SIBLING_WINDOW_LINES as usize,
+        "{HISTORY_CAP_MSG}"
+    );
+    assert_eq!(
+        combined.offset + combined.lines,
+        combined.total,
+        "{HISTORY_RESUME_MSG}"
+    );
+    assert!(
+        seen.contains(&held_row(HELD_OUTPUT_LINES - 1)),
+        "{HELD_CONTENT_MSG}: {seen:?}"
+    );
+    assert!(
+        seen.contains(&history_job(HISTORY_FIRST_ID, HELD_ROSTER - 1)),
+        "{HISTORY_RETAINED_MSG}"
+    );
+
+    report_task_history(
+        &mut panel,
+        child,
+        keyed_batching_report(HISTORY_SECOND_ID, HELD_ROSTER, (HELD_ROSTER * 2) as u32),
+    );
+    let seen = visible_text(&render_task_history(&mut panel));
+    let appended = task_history_span(&panel, child);
+    assert!(appended.offset > combined.offset, "{HISTORY_RESUME_MSG}");
+    assert_eq!(appended.lines, combined.lines, "{HISTORY_CAP_MSG}");
+    assert_eq!(
+        appended.offset + appended.lines,
+        appended.total,
+        "{HISTORY_RESUME_MSG}"
+    );
+    assert!(
+        seen.contains(&history_job(HISTORY_SECOND_ID, HELD_ROSTER - 1)),
+        "{HISTORY_RESUME_MSG}"
+    );
+}
+
+#[test_case(false, false; "standalone_success")]
+#[test_case(false, true; "standalone_cancel")]
+#[test_case(true, false; "child_success")]
+#[test_case(true, true; "child_cancel")]
+fn terminal_tasks_clear_history_and_ignore_late_reports(child: bool, cancel: bool) {
+    let _clock = FrozenSpinner::at(0);
+    let mut panel = panel_with_history_task(child, SIBLING_WINDOW_LINES);
+    for (index, id) in [HISTORY_FIRST_ID, HISTORY_SECOND_ID]
+        .into_iter()
+        .enumerate()
+    {
+        report_task_history(
+            &mut panel,
+            child,
+            keyed_batching_report(id, HELD_ROSTER, ((index + 1) * HELD_ROSTER) as u32),
+        );
+        render_task_history(&mut panel);
+    }
+    assert!(
+        task_history_progress(&panel, child).has_history(),
+        "{HISTORY_SETUP_MSG}"
+    );
+    let last_activity = task_history_progress(&panel, child).report.activity.clone();
+    let last_tools = task_history_progress(&panel, child).report.tools;
+
+    if cancel {
+        panel.cancel_in_progress();
+    } else if child {
+        panel.batch_progress(
+            TOOL_ID,
+            MIDDLE_CHILD,
+            BatchToolEntry {
+                output: Some(ToolOutput::Plain(HISTORY_FINAL_OUTPUT.into())),
+                ..batch_child(TASK_TOOL_NAME, TOOL_ID)
+            },
+        );
+    } else {
+        panel.tool_done(ToolDoneEvent {
+            tool: TASK_TOOL_NAME.into(),
+            output: ToolOutput::Plain(HISTORY_FINAL_OUTPUT.into()),
+            ..done(TOOL_ID)
+        });
+    }
+    for late in [false, true] {
+        if late {
+            let report = keyed_batching_report(
+                HISTORY_LATE_ID,
+                HELD_ROSTER,
+                last_tools + HELD_ROSTER as u32,
+            );
+            if child {
+                assert!(
+                    !panel.set_batch_child_progress(TOOL_ID, MIDDLE_CHILD, report),
+                    "{HISTORY_TERMINAL_MSG}"
+                );
+                assert!(
+                    !panel.set_batch_child_output(TOOL_ID, MIDDLE_CHILD, HISTORY_LATE_ID),
+                    "{HISTORY_TERMINAL_MSG}"
+                );
+            } else {
+                panel.set_tool_progress(TOOL_ID, report);
+                panel.tool_output(TOOL_ID, HISTORY_LATE_ID);
+            }
+        }
+        render_task_history(&mut panel);
+        let _ = wait_for_batch_header_highlights(&mut panel);
+        let seen = visible_text(&render_task_history(&mut panel));
+        let progress = task_history_progress(&panel, child);
+        assert!(!progress.is_live(), "{HISTORY_TERMINAL_MSG}");
+        assert!(!progress.has_history(), "{HISTORY_TERMINAL_MSG}");
+        assert_eq!(
+            progress.report.activity, last_activity,
+            "{HISTORY_TERMINAL_MSG}"
+        );
+        assert_eq!(progress.report.tools, last_tools, "{HISTORY_TERMINAL_MSG}");
+        for id in [HISTORY_FIRST_ID, HISTORY_SECOND_ID, HISTORY_LATE_ID] {
+            assert!(!seen.contains(id), "{HISTORY_TERMINAL_MSG}: {seen:?}");
+        }
+        if cancel {
+            assert_eq!(
+                msg_status(&panel, TOOL_ID),
+                ToolStatus::Error,
+                "{HISTORY_TERMINAL_MSG}"
+            );
+        } else {
+            assert!(
+                seen.contains(HISTORY_FINAL_OUTPUT),
+                "{HISTORY_TERMINAL_MSG}: {seen:?}"
+            );
+            if child {
+                assert_eq!(
+                    batch_header_statuses(&panel),
+                    [BatchToolStatus::Success, BatchToolStatus::Running],
+                    "{HISTORY_TERMINAL_MSG}"
+                );
+            } else {
+                assert_eq!(
+                    msg_status(&panel, TOOL_ID),
+                    ToolStatus::Success,
+                    "{HISTORY_TERMINAL_MSG}"
+                );
+            }
+        }
+    }
+}
+
+#[test_case(false, true; "standalone_paused_in_history")]
+#[test_case(true, true; "child_paused_in_history")]
+#[test_case(false, false; "standalone_paused_in_output")]
+#[test_case(true, false; "child_paused_in_output")]
+fn paused_task_windows_keep_their_content_when_output_grows(child: bool, history: bool) {
+    let _clock = FrozenSpinner::at(0);
+    let mut panel = panel_with_history_task(child, HISTORY_SMALL_BUDGET);
+    let key = task_history_key(child);
+    let set_output = |panel: &mut MessagesPanel, rows: usize| {
+        let output = held_output()
+            .lines()
+            .take(rows)
+            .collect::<Vec<_>>()
+            .join("\n");
+        if child {
+            assert!(
+                panel.set_batch_child_output(TOOL_ID, MIDDLE_CHILD, &output),
+                "{CHILD_STREAM_MSG}"
+            );
+        } else {
+            panel.tool_output(TOOL_ID, &output);
+        }
+    };
+    set_output(&mut panel, HISTORY_PREFIX_ROWS);
+    report_task_history(
+        &mut panel,
+        child,
+        keyed_batching_report(
+            HISTORY_FIRST_ID,
+            HISTORY_SCROLL_JOBS,
+            HISTORY_SCROLL_JOBS as u32,
+        ),
+    );
+    render_task_history(&mut panel);
+    let whole = task_history_span(&panel, child);
+    let history_rows: usize = task_history_progress(&panel, child)
+        .activities()
+        .map(|(activity, _)| 1 + activity.children().len())
+        .sum();
+    let history_start = whole
+        .total
+        .checked_sub(history_rows)
+        .expect(HISTORY_SETUP_MSG);
+    assert!(
+        history_start > HISTORY_PAUSE_OFFSET + HISTORY_SMALL_BUDGET as usize,
+        "{HISTORY_SETUP_MSG}"
+    );
+    let (offset, marker) = if history {
+        (
+            history_start + HISTORY_PAUSE_OFFSET,
+            history_job(HISTORY_FIRST_ID, 0),
+        )
+    } else {
+        (HISTORY_PAUSE_OFFSET, held_row(HISTORY_PAUSE_OFFSET))
+    };
+    panel.jump_window(&key, offset);
+    let frame = |panel: &mut MessagesPanel, width| {
+        let terminal = render(panel, width, SIBLING_VIEWPORT);
+        assert_eq!(panel.scroll_top(), 0, "{SIBLING_VIEWPORT_MSG}");
+        let span = task_history_span(panel, child);
+        assert_eq!(
+            span.lines, HISTORY_SMALL_BUDGET as usize,
+            "{HISTORY_CAP_MSG}"
+        );
+        assert!(
+            !panel.card_scroll[&key].follow,
+            "{HISTORY_PREFIX_ANCHOR_MSG}"
+        );
+        let (first, _) =
+            panel.cache.segments()[0].rows_for_lines(span.first, span.lines, panel.viewport_width);
+        let seen = visible_text(&terminal);
+        let row = screen_row_of(&seen, &marker)
+            .and_then(|row| row.checked_sub(usize::from(first)))
+            .filter(|row| *row < span.lines);
+        let body: Vec<_> = seen
+            .lines()
+            .skip(usize::from(first))
+            .take(span.lines)
+            .map(str::to_owned)
+            .collect();
+        (span, row, body)
+    };
+    let (before, marker_row, before_body) = frame(&mut panel, READER_WIDTH);
+    assert_eq!(before.offset, offset, "{HISTORY_SETUP_MSG}");
+    assert_eq!(
+        marker_row,
+        Some(0),
+        "{HISTORY_SETUP_MSG}: body={before_body:?}"
+    );
+
+    set_output(&mut panel, HISTORY_PREFIX_ROWS + HISTORY_PREFIX_GROWTH);
+    let mut shapes = Vec::new();
+    for (view, width) in [
+        (ViewMode::Expanded, READER_WIDTH),
+        (ViewMode::Expanded, HISTORY_REFLOW_WIDTH),
+        (ViewMode::Auto, HISTORY_REFLOW_WIDTH),
+        (ViewMode::Expanded, READER_WIDTH),
+    ] {
+        panel.set_view(view);
+        let (after, row, body) = frame(&mut panel, width);
+        shapes.push((
+            view,
+            width,
+            after.offset,
+            after.lines,
+            after.total,
+            after.history_start,
+            row,
+            body,
+        ));
+        assert!(
+            after.total > before.total,
+            "{HISTORY_PREFIX_ANCHOR_MSG}: before (offset, lines, total, history_start, marker_row)={:?}, before_body={before_body:?}, frames (view, width, offset, lines, total, history_start, marker_row, body)={shapes:?}",
+            (
+                before.offset,
+                before.lines,
+                before.total,
+                before.history_start,
+                marker_row
+            )
+        );
+        let growth = after.total - before.total;
+        assert_eq!(
+            after.offset,
+            before.offset + if history { growth } else { 0 },
+            "{HISTORY_PREFIX_ANCHOR_MSG}: {view:?}, width={width}"
+        );
+        assert_eq!(
+            row, marker_row,
+            "{HISTORY_PREFIX_ANCHOR_MSG}: {view:?}, width={width}"
+        );
+    }
+}
+
+#[test_case(false; "standalone_task")]
+#[test_case(true; "batch_child_task")]
+fn same_call_batch_updates_retain_phase_rows_and_known_children(child: bool) {
+    let _clock = FrozenSpinner::at(0);
+    let mut panel = panel_with_history_task(child, HISTORY_LARGE_BUDGET);
+    let initial = keyed_batching_report(
+        HISTORY_FIRST_ID,
+        HISTORY_PHASE_JOBS,
+        HISTORY_PHASE_JOBS as u32,
+    );
+    let mut children = initial.activity.children().to_vec();
+    children[MIDDLE_CHILD].status = BatchToolStatus::Success;
+    let updated = SubagentActivity::batch(Arc::from(BATCH_TOOL), HISTORY_FIRST_ID, children)
+        .with_call_id(HISTORY_FIRST_ID);
+    let pending = SubagentActivity::tool(Arc::from(BATCH_TOOL), "").with_call_id(HISTORY_FIRST_ID);
+    let mut heights = Vec::new();
+    for (activity, first_status, permission) in [
+        (initial.activity.clone(), BatchToolStatus::Running, false),
+        (
+            SubagentActivity::AwaitingPermission,
+            BatchToolStatus::Running,
+            true,
+        ),
+        (updated, BatchToolStatus::Success, true),
+        (pending, BatchToolStatus::Success, true),
+    ] {
+        report_task_history(
+            &mut panel,
+            child,
+            SubagentProgress {
+                activity,
+                ..initial
+            },
+        );
+        let seen = visible_text(&render_task_history(&mut panel));
+        let progress = task_history_progress(&panel, child);
+        let span = task_history_span(&panel, child);
+        assert!(
+            span.total < HISTORY_LARGE_BUDGET as usize,
+            "{HISTORY_SETUP_MSG}"
+        );
+        assert_eq!(span.lines, span.total, "{HISTORY_CAP_MSG}");
+        assert_eq!(
+            span.total,
+            progress
+                .activities()
+                .map(|(activity, _)| 1 + activity.children().len())
+                .sum::<usize>(),
+            "{HISTORY_PHASE_MSG}"
+        );
+        assert_eq!(
+            progress
+                .activities()
+                .flat_map(|(activity, _)| activity.children())
+                .map(|entry| entry.status)
+                .collect::<Vec<_>>(),
+            [first_status, BatchToolStatus::Running],
+            "{HISTORY_PHASE_MSG}"
+        );
+        assert_eq!(
+            progress
+                .activities()
+                .filter(|(activity, _)| matches!(activity, SubagentActivity::AwaitingPermission))
+                .count(),
+            usize::from(permission),
+            "{HISTORY_PHASE_MSG}"
+        );
+        assert_eq!(
+            seen.to_lowercase()
+                .matches(SubagentActivity::AwaitingPermission.label())
+                .count(),
+            usize::from(permission),
+            "{HISTORY_PHASE_MSG}"
+        );
+        for entry in initial.activity.children() {
+            assert!(
+                seen.contains(&entry.summary),
+                "{HISTORY_PHASE_MSG}: {}",
+                entry.summary
+            );
+        }
+        let (_, rows) =
+            panel.cache.segments()[0].rows_for_lines(span.first, span.lines, panel.viewport_width);
+        heights.push((rows, card_height(&panel)));
+    }
+    assert!(
+        heights
+            .windows(2)
+            .all(|rows| rows[1].0 >= rows[0].0 && rows[1].1 >= rows[0].1),
+        "{HISTORY_PHASE_MSG}: body/card heights={heights:?}"
     );
 }

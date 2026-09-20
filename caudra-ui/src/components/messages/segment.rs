@@ -49,6 +49,7 @@ struct HighlightKey {
     input: Option<Arc<ToolInput>>,
     output: Option<Arc<ToolOutput>>,
     theme_gen: u64,
+    settled: bool,
     /// A child view changes which lines the range holds, so reusing across a
     /// fold would splice back the body the reader just put away.
     views: BatchViews,
@@ -65,6 +66,7 @@ struct HighlightKey {
 impl PartialEq for HighlightKey {
     fn eq(&self, other: &Self) -> bool {
         self.theme_gen == other.theme_gen
+            && self.settled == other.settled
             && self.views == other.views
             && self.scroll == other.scroll
             && self.child_scroll == other.child_scroll
@@ -93,6 +95,7 @@ impl HighlightKey {
             input: hl.and_then(|h| h.input.clone()),
             output: hl.and_then(|h| h.output.clone()),
             theme_gen: theme::generation(),
+            settled: hl.is_some_and(|h| h.limits.settled),
             views: hl.map(|h| h.limits.views.clone()).unwrap_or_default(),
             scroll: hl.and_then(|h| h.limits.scroll),
             child_scroll: hl
@@ -644,6 +647,11 @@ impl Segment {
         self.apply_highlight_result(lines, rows, source_rows);
     }
 
+    #[cfg(test)]
+    pub fn has_pending_highlight(&self) -> bool {
+        self.pending_highlight.is_some()
+    }
+
     /// Keeps recorded line positions (spinners, buffer base) in step when
     /// a splice changes the number of lines before them.
     fn shift_after(&mut self, from: usize, delta: isize) {
@@ -862,10 +870,20 @@ mod tests {
 
     const OTHER_THEME: &str = "dracula";
     const WIDTH: u16 = 40;
-    /// What [`SegmentChrome`] leaves an inline row at [`WIDTH`].
-    const INLINE_CONTENT_WIDTH: usize = 37;
+    const NARROW_WIDTH: u16 = 24;
+    /// What [`SegmentChrome`] leaves an inline row at [`WIDTH`], pinned by
+    /// `inline_content_width_tracks_the_chrome` because the boundary cases
+    /// below stop testing a boundary the moment it drifts.
+    const INLINE_CONTENT_WIDTH: usize = 36;
+    /// One call's worth of streaming: a summary line, an annotation, a live
+    /// body, the authoritative summary `tool_start` restores, then output.
+    const STREAMED_LINE_COUNTS: [usize; 5] = [1, 2, 9, 1, 12];
     const EXPECT_DENSE_AGREES: &str =
         "the wrap-free dense test must answer exactly what re-wrapping would";
+    const EXPECT_ONE_WRAP_WIDTH: &str =
+        "a card must wrap to one width while its line count crosses one";
+    const EXPECT_KIND_STILL_FLIPS: &str =
+        "the inline/block flip is the movement this test exists to survive";
     const EXPECT_ORACLE_AGREES: &str =
         "skipping the wrapper must answer exactly what the wrapper would";
     const MEASURE_WIDTHS: [u16; 6] = [1, 2, 7, 20, 40, 100];
@@ -983,6 +1001,62 @@ mod tests {
         assert!(!segment.is_dense_row(WIDTH), "{EXPECT_DENSE_AGREES}");
     }
 
+    fn streamed_tool_lines(count: usize) -> ToolLines {
+        let lines: Vec<Line<'static>> = (0..count).map(|i| Line::raw(format!("l{i}"))).collect();
+        ToolLines {
+            links: LinkMap::none_for(&lines),
+            lines,
+            search_text: String::new(),
+            highlight: None,
+            spinner_lines: Vec::new(),
+            snapshot_base: None,
+            snapshot_skip: 0,
+            shell_toggle_line: None,
+            scroll_footer_line: None,
+            scroll_spans: Vec::new(),
+            content_indent: "",
+            rows: Vec::new(),
+            truncation: false,
+            source: None,
+        }
+    }
+
+    #[test]
+    fn inline_content_width_tracks_the_chrome() {
+        assert_eq!(
+            SegmentChrome::for_kind(SegmentKind::ToolInline, WIDTH, 0).content_width(WIDTH),
+            INLINE_CONTENT_WIDTH as u16
+        );
+    }
+
+    /// The jitter this guards against: a card crosses one logical line several
+    /// times per call, and it used to rewrap everything already on screen each
+    /// time it did. The kind is still free to flip; the width is not.
+    #[test_case(WIDTH ; "width_40")]
+    #[test_case(NARROW_WIDTH ; "narrow")]
+    fn a_streaming_card_keeps_one_wrap_width(width: u16) {
+        let mut kind = SegmentKind::ToolBlock;
+        let mut seen = Vec::new();
+
+        for count in STREAMED_LINE_COUNTS {
+            kind = tool_kind(kind, &streamed_tool_lines(count), false);
+            seen.push((
+                kind,
+                SegmentChrome::for_kind(kind, width, 0).content_width(width),
+            ));
+        }
+
+        assert!(
+            seen.iter().any(|(k, _)| *k == SegmentKind::ToolInline)
+                && seen.iter().any(|(k, _)| *k == SegmentKind::ToolBlock),
+            "{EXPECT_KIND_STILL_FLIPS}: {seen:?}"
+        );
+        assert!(
+            seen.iter().all(|(_, w)| *w == seen[0].1),
+            "{EXPECT_ONE_WRAP_WIDTH}: {seen:?}"
+        );
+    }
+
     #[test]
     fn wrapped_tool_separates_the_next_inline_tool() {
         let mut cache = SegmentCache::new();
@@ -1026,6 +1100,9 @@ mod tests {
         assert_eq!(seg.buf_row(3), 1);
         assert_eq!(seg.buf_row(5), 3);
     }
+
+    const SETTLED_HIGHLIGHT_MSG: &str =
+        "settlement must not reuse live heading geometry from the highlight cache";
 
     #[test]
     fn reuse_highlight_keys_on_theme_and_width() {
@@ -1073,6 +1150,13 @@ mod tests {
         assert!(
             seg.reuse_highlight(&key(RESIZED), (1, 3)).is_none(),
             "width mismatch must force a fresh highlight, not splice stale wrapping"
+        );
+
+        let mut settled = key(WIDTH);
+        settled.settled = true;
+        assert!(
+            seg.reuse_highlight(&settled, (1, 3)).is_none(),
+            "{SETTLED_HIGHLIGHT_MSG}"
         );
 
         theme::set(theme::load_by_name(OTHER_THEME).unwrap());

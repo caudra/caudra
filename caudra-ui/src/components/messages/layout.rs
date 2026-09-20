@@ -55,12 +55,18 @@ impl SegmentChrome {
                 | SegmentKind::Instruction
                 | SegmentKind::Error
         );
+        // A tool row's kind crosses between `ToolInline` and `ToolBlock` every
+        // time its logical line count crosses one, which streaming output does
+        // repeatedly within a single call. Both therefore spell the same
+        // horizontal box, so the wrap width never moves under text already on
+        // screen; only the rail and the vertical padding still tell them apart.
+        let right_inset = card || kind == SegmentKind::ToolInline;
         let vertical_padding = u16::from(card && width >= 24);
 
         Self {
             margin_top,
             left: inset.min(width),
-            right: u16::from(card && width >= 32),
+            right: u16::from(right_inset && width >= 32),
             top: vertical_padding,
             bottom: vertical_padding,
             rail: card,
@@ -83,6 +89,88 @@ impl SegmentChrome {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use test_case::test_case;
+
+    const EXPECT_TOOL_BOX_AGREES: &str =
+        "a tool row's horizontal box must not depend on how many lines it holds";
+    const EXPECT_INLINE_STAYS_FLAT: &str = "an inline row keeps no rail and no blank separator";
+    const EXPECT_BLOCK_STAYS_A_CARD: &str = "a block row keeps its rail and its padding";
+    const EXPECT_FIXED_ROLE_CHROME: &str =
+        "a kind that cannot flip mid-stream keeps the chrome it always painted";
+
+    /// Every step of the inset ladder and both sides of each threshold the
+    /// chrome branches on, so a width-dependent regression cannot hide between
+    /// the cases.
+    const CHROME_WIDTHS: [u16; 9] = [80, 40, 32, 31, 24, 23, 20, 16, 10];
+
+    #[test_case(CHROME_WIDTHS[0] ; "width_80")]
+    #[test_case(CHROME_WIDTHS[1] ; "width_40")]
+    #[test_case(CHROME_WIDTHS[2] ; "width_32")]
+    #[test_case(CHROME_WIDTHS[3] ; "width_31")]
+    #[test_case(CHROME_WIDTHS[4] ; "width_24")]
+    #[test_case(CHROME_WIDTHS[5] ; "width_23")]
+    #[test_case(CHROME_WIDTHS[6] ; "width_20")]
+    #[test_case(CHROME_WIDTHS[7] ; "width_16")]
+    #[test_case(CHROME_WIDTHS[8] ; "width_10")]
+    fn tool_kinds_wrap_to_one_content_width(width: u16) {
+        let inline = SegmentChrome::for_kind(SegmentKind::ToolInline, width, 0);
+        let block = SegmentChrome::for_kind(SegmentKind::ToolBlock, width, 0);
+
+        assert_eq!(
+            (inline.left, inline.right),
+            (block.left, block.right),
+            "{EXPECT_TOOL_BOX_AGREES} at width {width}"
+        );
+        assert_eq!(
+            inline.content_width(width),
+            block.content_width(width),
+            "{EXPECT_TOOL_BOX_AGREES} at width {width}"
+        );
+    }
+
+    /// `block_padding` is spelled out per row rather than recomputed from the
+    /// width, so moving the threshold or the padding breaks a case here instead
+    /// of being copied into the expectation.
+    #[test_case(CHROME_WIDTHS[0], 1 ; "width_80")]
+    #[test_case(CHROME_WIDTHS[1], 1 ; "width_40")]
+    #[test_case(CHROME_WIDTHS[4], 1 ; "width_24")]
+    #[test_case(CHROME_WIDTHS[5], 0 ; "width_23")]
+    #[test_case(CHROME_WIDTHS[6], 0 ; "width_20")]
+    fn sharing_the_box_leaves_the_vertical_shapes_apart(width: u16, block_padding: u16) {
+        let inline = SegmentChrome::for_kind(SegmentKind::ToolInline, width, 0);
+        let block = SegmentChrome::for_kind(SegmentKind::ToolBlock, width, 0);
+
+        assert_eq!(
+            (inline.top, inline.bottom, inline.rail),
+            (0, 0, false),
+            "{EXPECT_INLINE_STAYS_FLAT} at width {width}"
+        );
+        assert!(block.rail, "{EXPECT_BLOCK_STAYS_A_CARD} at width {width}");
+        assert_eq!(
+            (block.top, block.bottom),
+            (block_padding, block_padding),
+            "{EXPECT_BLOCK_STAYS_A_CARD} at width {width}"
+        );
+    }
+
+    /// Only the tool pair flips kind mid-stream, so only the tool pair had to
+    /// change. A message's role is fixed once it exists, which keeps every
+    /// other kind on the chrome it already painted.
+    #[test_case(SegmentKind::User, 1, true ; "user_is_still_a_card")]
+    #[test_case(SegmentKind::Instruction, 1, true ; "instruction_is_still_a_card")]
+    #[test_case(SegmentKind::Error, 1, true ; "error_is_still_a_card")]
+    #[test_case(SegmentKind::Assistant, 0, false ; "assistant_is_still_flat")]
+    #[test_case(SegmentKind::Thinking, 0, false ; "thinking_is_still_flat")]
+    #[test_case(SegmentKind::Done, 0, false ; "done_is_still_flat")]
+    fn kinds_that_cannot_flip_keep_their_chrome(kind: SegmentKind, right: u16, rail: bool) {
+        let chrome = SegmentChrome::for_kind(kind, CHROME_WIDTHS[0], 0);
+
+        assert_eq!(
+            (chrome.right, chrome.rail),
+            (right, rail),
+            "{EXPECT_FIXED_ROLE_CHROME}"
+        );
+    }
 
     #[test]
     fn wide_user_and_assistant_content_align() {

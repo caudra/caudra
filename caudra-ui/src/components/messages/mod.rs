@@ -20,7 +20,7 @@ use super::{
     apply_scroll_rows,
     code_view::{
         BatchLiveMap, BatchProgressMap, BatchStartedMap, BatchViewMap, CardPolicy, Disclosure,
-        RowTarget, ScrollWindow,
+        RowTarget, ScrollSpan, ScrollWindow,
     },
     review, workflow_card,
     workflow_card::CardHit,
@@ -734,6 +734,13 @@ fn collect_card_windows(
         return;
     }
     for span in &seg.scroll_spans {
+        // A body that fits still publishes its span, so the wheel and the bar
+        // keep measuring the same rows, but it is not a window: a bar would
+        // claim a remainder that is not there, and the grab region under it
+        // would take presses and notches the transcript should have had.
+        if span.total <= span.lines {
+            continue;
+        }
         let (start, rows) = seg.rows_for_lines(span.first, span.lines, width);
         let Some((y, height)) = at.clip(start, rows) else {
             continue;
@@ -750,13 +757,41 @@ fn collect_card_windows(
     }
 }
 
+/// Which of the card's windows give up how many rows to hold a height of
+/// `deficit` more than it just drew, in the order they were drawn.
+///
+/// Each window offers only what it is already holding back, so the plan runs
+/// out where the buffers do and the card then shrinks — which is the honest
+/// answer, and the only alternative to padding with blanks.
+fn refill_plan(tl: &ToolLines, deficit: usize) -> Vec<(Option<usize>, usize)> {
+    let mut owed = deficit;
+    let mut plan = Vec::new();
+    for span in tl
+        .scroll_spans
+        .iter()
+        .filter(|span| span.child.is_none() && span.history_start.is_none())
+    {
+        let take = span.total.saturating_sub(span.lines).min(owed);
+        if take == 0 {
+            continue;
+        }
+        plan.push((span.child, take));
+        owed -= take;
+        if owed == 0 {
+            break;
+        }
+    }
+    plan
+}
+
 /// Where one scroll card's window sits. A card starts pinned to the tail and
 /// returns to it the moment the reader scrolls back to the bottom, so the
 /// default is the state most cards are in most of the time.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 struct CardScroll {
     offset: usize,
     follow: bool,
+    history_base: Option<usize>,
 }
 
 impl Default for CardScroll {
@@ -764,7 +799,60 @@ impl Default for CardScroll {
         Self {
             offset: 0,
             follow: true,
+            history_base: None,
         }
+    }
+}
+
+impl CardScroll {
+    fn at_offset(offset: usize, span: &ScrollSpan) -> Self {
+        let max_offset = span.total.saturating_sub(span.extent_lines);
+        let offset = offset.min(max_offset);
+        let follow = offset == max_offset;
+        Self {
+            offset,
+            follow,
+            history_base: span.history_start.filter(|&base| !follow && offset >= base),
+        }
+    }
+
+    fn rebase_history(&mut self, history_start: Option<usize>) -> bool {
+        let Some(base) = self.history_base.filter(|_| !self.follow) else {
+            return false;
+        };
+        let Some(history_start) = history_start.filter(|&start| start != base) else {
+            return false;
+        };
+        self.offset = history_start.saturating_add(self.offset.saturating_sub(base));
+        self.history_base = Some(history_start);
+        true
+    }
+}
+
+/// What the reader's first visible row is looking at, named so that
+/// re-measuring the transcript cannot move it.
+///
+/// A raw row offset stops naming that content the moment anything above it
+/// changes height, and between two frames plenty does: a tool event reshapes
+/// its card as it lands, and the next frame then applies disclosure, redraws
+/// every dirty card and refreshes the live rows before it resolves the
+/// scroll. A segment index is no better, because a rebuild that splits an
+/// instruction segment off its card inserts one and every index below shifts.
+#[derive(Clone)]
+struct ReadingAnchor {
+    /// The message behind the row. Safe to hold across a rebuild because
+    /// every path that renumbers `messages` drops the whole cache with it.
+    msg_index: Option<usize>,
+    /// The call the row was drawn for, which is what tells a card apart from
+    /// the instruction segment that shares its message.
+    tool_id: Option<String>,
+    /// Rows into that segment, at the width the reader was reading at.
+    rel: u16,
+}
+
+impl ReadingAnchor {
+    fn names(&self, seg: &Segment) -> bool {
+        seg.msg_index == self.msg_index && seg.tool_id == self.tool_id
     }
 }
 
@@ -901,6 +989,25 @@ pub struct MessagesPanel {
     /// Keyed by tool id rather than segment index, so the cache moving under
     /// it cannot turn an entry into a rebuild of the wrong card.
     dirty_cards: HashSet<String>,
+    /// What the reader was looking at when their position last settled, which
+    /// is what the next frame puts them back on. Absent while following,
+    /// which needs no anchor because the tail is one.
+    held_anchor: Option<ReadingAnchor>,
+    /// The rows each still-running call's card has already drawn, by tool id.
+    ///
+    /// A running card may grow but must not shrink, so its height is monotone
+    /// and settles exactly once, at the boundary the reader already
+    /// understands. What it is held against is a change of *representation* —
+    /// `tool_start` swapping a streamed preview for a shorter authoritative
+    /// summary, an annotation replaced by shorter text, output replaced
+    /// rather than appended — and never content that has genuinely gone away.
+    ///
+    /// Held rows are filled from the window's own scrollback, so a card that
+    /// has shown `n` rows keeps showing `n` rows of real buffered content; a
+    /// card with nothing left to reveal shrinks, which is honest. Blanks are
+    /// never an option: they answer clicks as a card that gave them up and
+    /// leave the transcript holding space it cannot draw into.
+    card_floor: HashMap<String, usize>,
 }
 
 impl MessagesPanel {
@@ -976,6 +1083,8 @@ impl MessagesPanel {
             message_action_hits: Vec::new(),
             terminal_links: Vec::new(),
             dirty_cards: HashSet::new(),
+            held_anchor: None,
+            card_floor: HashMap::new(),
         }
     }
 
@@ -992,6 +1101,9 @@ impl MessagesPanel {
         self.view = view;
         self.policy.compact = view == ViewMode::Compact;
         self.policy.expanded = view == ViewMode::Expanded;
+        // The modes draw wildly different cards, so a height held against one
+        // of them says nothing about the next.
+        self.card_floor.clear();
         self.clear_hover();
         self.disclosure.clear();
         self.streaming_reasoning_open = None;
@@ -1145,69 +1257,106 @@ impl MessagesPanel {
     ///
     /// `delta` is positive upwards, as everywhere else in the app.
     fn scroll_window(&mut self, key: &str, delta: i32) -> i32 {
-        let Some((body, rebuild)) = self.window_body(key) else {
+        let Some((_, rebuild)) = self.window_body(key) else {
             return delta;
         };
-        self.move_window(key.to_owned(), &rebuild, body, delta)
+        self.move_window(key.to_owned(), &rebuild, delta)
     }
 
     /// The body a scroll key names and the card to redraw for it: a card's own
     /// body, or one child of it. The child suffix is only taken when it
     /// resolves, so a tool whose id happens to carry one still names itself.
+    ///
+    /// The two counts answer different questions. Whether there is a window at
+    /// all is a question about the tool, which only the message can answer;
+    /// how far that window can travel is a question about rows, which only the
+    /// build that drew them can answer. Sizing the travel from the source
+    /// instead puts the wheel and the bar in different units the moment a body
+    /// is wrapped or rendered as anything but plain text.
+    ///
+    /// So a body the last build recorded no extent for is one there is
+    /// nothing to scroll *yet*, and it says so. Standing the source count in
+    /// for the missing one is the unit mix this split exists to prevent: the
+    /// travel it sizes runs out part way up a wrapped body, stranding rows the
+    /// bar says are there and spilling the rest of the burst to the transcript.
     fn window_body(&self, key: &str) -> Option<(usize, String)> {
         if let Some((parent, index)) = split_child_scroll_id(key)
-            && let Some(body) = self.child_body_lines(parent, index)
+            && self.child_body_lines(parent, index).is_some()
         {
-            return Some((body, parent.to_owned()));
+            let rows = self.window_rows(parent, Some(index))?;
+            return Some((rows, parent.to_owned()));
         }
-        self.card_body_lines(key).map(|body| (body, key.to_owned()))
+        self.card_body_lines(key)?;
+        let rows = self.window_rows(key, None)?;
+        Some((rows, key.to_owned()))
+    }
+
+    /// The extent the last build recorded beside the window it drew, which is
+    /// the count the bar's track already spans. Absent until the card has been
+    /// built once, and for a card drawn without a window at all.
+    fn window_rows(&self, tool_id: &str, child: Option<usize>) -> Option<usize> {
+        self.window_span(tool_id, child).map(|span| span.total)
+    }
+
+    fn window_span(&self, tool_id: &str, child: Option<usize>) -> Option<&ScrollSpan> {
+        let seg = self.cache.get(self.cache.find_by_tool_id(tool_id)?)?;
+        seg.scroll_spans.iter().find(|span| span.child == child)
+    }
+
+    fn keyed_window_span(&self, key: &str, tool_id: &str) -> Option<&ScrollSpan> {
+        let child = split_child_scroll_id(key)
+            .filter(|(parent, _)| *parent == tool_id)
+            .map(|(_, index)| index);
+        self.window_span(tool_id, child)
     }
 
     /// Puts a window at an absolute offset, which is what dragging a bar asks
     /// for. Landing on the last row re-arms following, exactly as scrolling
     /// back to the bottom does.
     fn jump_window(&mut self, key: &str, offset: usize) {
-        let Some((body, rebuild)) = self.window_body(key) else {
+        let Some((_, rebuild)) = self.window_body(key) else {
             return;
         };
-        let max_offset = body.saturating_sub(self.policy.scroll_card_lines as usize);
-        let landed = offset.min(max_offset);
-        self.card_scroll.insert(
-            key.to_owned(),
-            CardScroll {
-                offset: landed,
-                follow: landed == max_offset,
-            },
-        );
+        let Some(span) = self.keyed_window_span(key, &rebuild) else {
+            return;
+        };
+        let scroll = CardScroll::at_offset(offset, span);
+        self.card_scroll.insert(key.to_owned(), scroll);
         self.rebuild_expanded_tool(&rebuild);
     }
 
     /// `rebuild` is the card to redraw, which for a child is the parent whose
     /// body it is drawn inside.
-    fn move_window(&mut self, key: String, rebuild: &str, body: usize, delta: i32) -> i32 {
-        let height = self.policy.scroll_card_lines as usize;
-        let max_offset = body.saturating_sub(height);
-        if max_offset == 0 {
+    fn move_window(&mut self, key: String, rebuild: &str, delta: i32) -> i32 {
+        let Some(span) = self.keyed_window_span(&key, rebuild) else {
+            return delta;
+        };
+        let max_offset = span.total.saturating_sub(span.extent_lines);
+        if max_offset == 0 || delta == 0 {
             return delta;
         }
-        let at = self.card_scroll.get(&key).copied().unwrap_or_default();
-        let offset = if at.follow { max_offset } else { at.offset };
+        let offset = span.offset;
         // Upwards is towards the start of the body, which is a lower offset.
         let wanted = offset as i64 - i64::from(delta);
         let landed = wanted.clamp(0, max_offset as i64) as usize;
         let used = offset.abs_diff(landed) as i32;
-        if used == 0 {
+        let scroll = CardScroll::at_offset(landed, span);
+        if used == 0 && self.card_scroll.get(&key).copied().unwrap_or_default() == scroll {
             return delta;
         }
-        self.card_scroll.insert(
-            key,
-            CardScroll {
-                offset: landed,
-                follow: landed == max_offset,
-            },
-        );
+        self.card_scroll.insert(key, scroll);
         self.rebuild_expanded_tool(rebuild);
         (delta.abs() - used) * delta.signum()
+    }
+
+    fn clear_history_anchors(&mut self, tool_id: &str) {
+        for (key, scroll) in &mut self.card_scroll {
+            if key == tool_id
+                || split_child_scroll_id(key).is_some_and(|(parent, _)| parent == tool_id)
+            {
+                scroll.history_base = None;
+            }
+        }
     }
 
     /// How many lines this card's body holds, or `None` when it is not a
@@ -1234,8 +1383,9 @@ impl MessagesPanel {
             .tool_output
             .as_deref()
             .map(ToolOutput::as_text)
-            .or_else(|| msg.text.split_once('\n').map(|(_, body)| body.to_owned()))?;
-        Some(text.lines().count())
+            .or_else(|| msg.text.split_once('\n').map(|(_, body)| body.to_owned()));
+        text.map(|text| text.lines().count())
+            .or_else(|| self.window_rows(tool_id, None))
     }
 
     fn child_body_lines(&self, parent_id: &str, index: usize) -> Option<usize> {
@@ -1355,6 +1505,9 @@ impl MessagesPanel {
         self.messages.remove(index);
         self.cache.clear();
         self.auto_open = None;
+        // Every index above `index` now names a different message, which is
+        // exactly what the anchor is holding.
+        self.held_anchor = None;
     }
 
     /// Drops the newest harness notice reading `text`. Found by content rather
@@ -1378,12 +1531,17 @@ impl MessagesPanel {
         self.messages = msgs;
         self.cache.clear();
         self.auto_open = None;
+        self.held_anchor = None;
+        self.card_floor.clear();
         self.disclosure.clear();
         self.shell_raw.clear();
         self.batch_views.clear();
         self.batch_child_progress.clear();
         self.batch_child_output.clear();
         self.batch_child_started.clear();
+        for scroll in self.card_scroll.values_mut() {
+            scroll.history_base = None;
+        }
         self.card_bars.clear();
         self.card_windows.clear();
         self.armed_card = None;
@@ -1725,12 +1883,16 @@ impl MessagesPanel {
         if !self.batch_child_running(tool_id, index) {
             return false;
         }
-        Arc::make_mut(
+        let children = Arc::make_mut(
             self.batch_child_progress
                 .entry(tool_id.to_owned())
                 .or_default(),
-        )
-        .insert(index, ToolProgress::live(report));
+        );
+        if let Some(progress) = children.get_mut(&index) {
+            progress.update(report);
+        } else {
+            children.insert(index, ToolProgress::live(report));
+        }
         self.mark_card_dirty(tool_id);
         true
     }
@@ -1827,6 +1989,9 @@ impl MessagesPanel {
     }
 
     fn settle_child_progress(&mut self, tool_id: &str, index: usize) {
+        if let Some(scroll) = self.card_scroll.get_mut(&child_scroll_id(tool_id, index)) {
+            scroll.history_base = None;
+        }
         if let Some(children) = self.batch_child_progress.get_mut(tool_id)
             && let Some(progress) = Arc::make_mut(children).get_mut(&index)
         {
@@ -1883,6 +2048,7 @@ impl MessagesPanel {
     }
 
     pub fn tool_done(&mut self, event: ToolDoneEvent) {
+        self.clear_history_anchors(&event.id);
         self.dirty_cards.remove(&event.id);
         self.remove_child_live_bufs(&event.id);
         let retain_live_output = matches!(&event.output, ToolOutput::Shell(_));
@@ -1993,7 +2159,11 @@ impl MessagesPanel {
             return;
         }
         self.update_tool(tool_id, |msg| {
-            msg.progress = Some(ToolProgress::live(report));
+            if let Some(progress) = &mut msg.progress {
+                progress.update(report);
+            } else {
+                msg.progress = Some(ToolProgress::live(report));
+            }
         });
     }
 
@@ -2157,6 +2327,7 @@ impl MessagesPanel {
             .collect();
 
         for id in &affected_ids {
+            self.clear_history_anchors(id);
             // The stale-run_id filter drops these tools' ToolDone events,
             // so retire their live bufs here: keeps them clickable via
             // the warm path and stops them being polled forever.
@@ -2165,6 +2336,7 @@ impl MessagesPanel {
             self.batch_child_output.remove(id);
             self.batch_child_started.remove(id);
             self.dirty_cards.remove(id);
+            self.card_floor.remove(id);
             if let Some(children) = self.batch_child_progress.get_mut(id) {
                 Arc::make_mut(children)
                     .values_mut()
@@ -2321,12 +2493,21 @@ impl MessagesPanel {
         self.set_scroll_top(apply_scroll_rows(self.scroll_top, delta));
     }
 
-    /// Always unpins, and the next `view` re-pins if this lands on the
-    /// bottom line.
+    /// Following is decided here, from the move the reader just made, against
+    /// the document they were looking at when they made it. Leaving it to the
+    /// next frame's clamp cannot tell the two apart: a card above getting
+    /// shorter is not the reader asking to follow, and while cards stream
+    /// that happens constantly.
+    ///
+    /// A document with no scrollback is settled by the frame instead, since a
+    /// move inside one is neither a pause nor a resume; see
+    /// [`Self::resolve_scroll`].
     pub fn set_scroll_top(&mut self, top: u32) {
         self.clear_hover();
-        self.scroll_top = top.min(self.max_scroll());
-        self.auto_scroll = false;
+        let bottom = self.max_scroll();
+        self.scroll_top = top.min(bottom);
+        self.auto_scroll = bottom > 0 && top >= bottom;
+        self.hold_reading_position();
     }
 
     pub fn auto_scroll(&self) -> bool {
@@ -2340,6 +2521,7 @@ impl MessagesPanel {
     pub fn enable_auto_scroll(&mut self) {
         self.clear_hover();
         self.auto_scroll = true;
+        self.hold_reading_position();
     }
 
     pub fn scroll_to_segment(&mut self, segment_index: usize) {
@@ -2358,6 +2540,7 @@ impl MessagesPanel {
         self.clear_hover();
         self.scroll_top = scroll_top;
         self.auto_scroll = auto_scroll;
+        self.hold_reading_position();
     }
 
     pub fn set_highlight_segment(&mut self, idx: Option<usize>) {
@@ -3200,6 +3383,9 @@ impl MessagesPanel {
         }
         let previous_scroll_top = self.scroll_top;
         let previous_total_lines = self.last_total_lines;
+        let mut held = (!self.auto_scroll)
+            .then(|| self.held_anchor.clone())
+            .flatten();
         self.viewport_height = area.height;
         let width = area.width.saturating_sub(1);
         let theme_gen = theme::generation();
@@ -3211,6 +3397,9 @@ impl MessagesPanel {
         if width_changed {
             self.viewport_width = width;
             self.theme_generation = theme_gen;
+            // A held height counts rows broken to a width, so the rows it
+            // names stop existing the moment that width moves.
+            self.card_floor.clear();
         }
         if theme_changed {
             self.rebake_stale_snapshots(theme_gen);
@@ -3242,6 +3431,9 @@ impl MessagesPanel {
         self.flush_dirty_cards();
         if let Some(seg_idx) = self.pending_scroll_segment.take() {
             self.scroll_to_segment(seg_idx.min(self.cache.len().saturating_sub(1)));
+            // A density switch repositions the reader deliberately, so the
+            // row they were on before it is no longer what they asked for.
+            held = None;
         }
         if self.has_in_progress() {
             self.update_spinners();
@@ -3309,10 +3501,23 @@ impl MessagesPanel {
         // and the reflow changes the heights both are derived from: resolve
         // before to aim the window, and after to place the result.
         self.cache.update_margins(width);
+        // Before the window is aimed rather than after it: the reflow reflows
+        // what `scroll_top` points at, so putting the reader back first is
+        // what makes it reflow the segments they are actually looking at.
+        if let Some(anchor) = &held {
+            self.restore_reading_anchor(anchor, width);
+        }
         self.resolve_scroll(width, streaming_sum, has_selection);
-        self.reflow_viewport(width, has_selection);
+        let pinned = self.reflow_viewport(width, has_selection);
         self.cache.update_margins(width);
         let total_lines = self.resolve_scroll(width, streaming_sum, has_selection);
+        // A frame that could not re-pin slid the reader, and holding the row
+        // it left them on would make that slide the thing every later frame
+        // restores. Keeping the anchor they had is what lets the next frame,
+        // whose indices have settled, put them back.
+        if pinned {
+            self.hold_reading_position();
+        }
         if self.scroll_top != previous_scroll_top || total_lines != previous_total_lines {
             self.clear_hover();
         }
@@ -4227,6 +4432,83 @@ impl MessagesPanel {
         tl
     }
 
+    /// Builds a card, holding a still-running one to the tallest it has
+    /// already drawn.
+    ///
+    /// The shortfall comes out of the scrollback its windows are already
+    /// holding and nowhere else: a window that has shown `n` rows reopens on
+    /// `n` rows of buffered content, so a height that is held is a height full
+    /// of something to read. A card with nothing left to reveal is returned as
+    /// built, because the alternative is blank rows that take clicks and hover
+    /// for a card that gave them up.
+    fn build_held_tool_lines(
+        msg: &DisplayMessage,
+        status: ToolStatus,
+        rctx: &RenderCtx,
+        exp: Option<Disclosure>,
+        floor: usize,
+    ) -> ToolLines {
+        let tl = Self::build_tool_segment_lines(msg, status, rctx, exp);
+        if status != ToolStatus::InProgress {
+            return tl;
+        }
+        let plan = refill_plan(&tl, floor.saturating_sub(tl.lines.len()));
+        if plan.is_empty() {
+            return tl;
+        }
+        Self::build_tool_segment_lines(msg, status, &rctx.with_windows_opened(&plan), exp)
+    }
+
+    fn build_anchored_tool_lines(
+        &mut self,
+        tool_id: &str,
+        msg_index: usize,
+        status: ToolStatus,
+        exp: Option<Disclosure>,
+    ) -> ToolLines {
+        let floor = self.card_floor.get(tool_id).copied().unwrap_or_default();
+        let build = |panel: &Self| {
+            let msg = &panel.messages[msg_index];
+            let rctx = panel.rctx(msg.role.tool_name().unwrap_or_default(), tool_id);
+            Self::build_held_tool_lines(msg, status, &rctx, exp, floor)
+        };
+        let lines = build(self);
+        if self.rebase_history_windows(tool_id, &lines.scroll_spans) {
+            build(self)
+        } else {
+            lines
+        }
+    }
+
+    fn rebase_history_windows(&mut self, tool_id: &str, spans: &[ScrollSpan]) -> bool {
+        let mut changed = false;
+        for span in spans {
+            let child_key = span.child.map(|index| child_scroll_id(tool_id, index));
+            let key = child_key.as_deref().unwrap_or(tool_id);
+            if let Some(scroll) = self.card_scroll.get_mut(key) {
+                changed |= scroll.rebase_history(span.history_start);
+            }
+        }
+        changed
+    }
+
+    /// Records what a running call's card drew, and gives the floor back the
+    /// moment the call settles so the one contraction a card makes lands
+    /// where the reader is already expecting a change.
+    fn hold_card_height(&mut self, tool_id: &str, status: ToolStatus, rows: usize) {
+        if status != ToolStatus::InProgress {
+            self.card_floor.remove(tool_id);
+            return;
+        }
+        // Looked up before it is inserted: this runs for every running card on
+        // every frame, and the entry is already there for all but the first.
+        if let Some(held) = self.card_floor.get_mut(tool_id) {
+            *held = (*held).max(rows);
+        } else {
+            self.card_floor.insert(tool_id.to_owned(), rows);
+        }
+    }
+
     fn flush_thinking(&mut self) {
         let started = self.thinking_started.take();
         if self.streaming_thinking.is_empty() {
@@ -4445,24 +4727,25 @@ impl MessagesPanel {
             return;
         };
         let (status, opens) = (t.status, self.opens_by_default(t, msg_idx));
-        let msg = &self.messages[msg_idx];
         let Some(seg_idx) = self.cache.find_by_tool_id(tool_id) else {
             return;
         };
 
         let exp = self.tool_expansion(tool_id, opens);
-        let rctx = self.rctx(msg.role.tool_name().unwrap_or_default(), tool_id);
-        let tl = Self::build_tool_segment_lines(msg, status, &rctx, exp);
+        let tl = self.build_anchored_tool_lines(tool_id, msg_idx, status, exp);
+        let msg = &self.messages[msg_idx];
 
         let instructions = msg
             .tool_output
             .as_deref()
             .and_then(|o| o.owned_instructions());
 
-        let compact = rctx.compact;
+        let compact = self.draws_compact(msg.role.tool_name().unwrap_or_default());
+        let drawn = tl.lines.len();
         let seg = self.cache.get_mut(seg_idx).unwrap();
         seg.search_text = tl.search_text.clone();
         seg.update_with_reuse(tl, &self.hl_worker, compact);
+        self.hold_card_height(tool_id, status, drawn);
 
         if let Some(blocks) = instructions {
             self.upsert_instruction_segment(tool_id, &blocks, seg_idx);
@@ -4479,20 +4762,20 @@ impl MessagesPanel {
             if let DisplayRole::Tool(t) = &msg.role {
                 let exp = self.tool_expansion(&t.id, self.opens_by_default(t, i));
                 let status = t.status;
-                let rctx = self.rctx(&t.name, &t.id);
-                let tl = Self::build_tool_segment_lines(msg, status, &rctx, exp);
                 let id = t.id.clone();
-                let search_text = tl.search_text.clone();
                 let compact = self.draws_compact(&t.name);
-                let mut seg = Segment::with_tool(id.clone(), SegmentKind::ToolBlock, Some(i));
-                seg.search_text = search_text;
-                seg.apply_highlight(tl, &self.hl_worker, compact);
-                self.cache.push(seg);
-
                 let blocks = msg
                     .tool_output
                     .as_deref()
                     .and_then(|o| o.owned_instructions());
+                let tl = self.build_anchored_tool_lines(&id, i, status, exp);
+                let drawn = tl.lines.len();
+                let mut seg = Segment::with_tool(id.clone(), SegmentKind::ToolBlock, Some(i));
+                seg.search_text = tl.search_text.clone();
+                seg.apply_highlight(tl, &self.hl_worker, compact);
+                self.cache.push(seg);
+                self.hold_card_height(&id, status, drawn);
+
                 if let Some(blocks) = blocks {
                     let last_idx = self.cache.len().saturating_sub(1);
                     self.upsert_instruction_segment(&id, &blocks, last_idx);
@@ -4519,22 +4802,66 @@ impl MessagesPanel {
         self.cache.mark_built(self.messages.len());
     }
 
-    /// Clamps `scroll_top` against the document height and applies the bottom
-    /// pin, returning the total the scrollbar draws from.
+    /// The only follow state it writes is for a document with no scrollback:
+    /// every row of one is on screen, so there is nowhere to be paused, and
+    /// the pin has to be armed for when it grows past the viewport again.
+    ///
+    /// A document that does have scrollback is left alone. Shrinking under a
+    /// paused reader lands them on the last row it has left, and landing
+    /// there is not the statement scrolling there is: only
+    /// [`Self::set_scroll_top`] and the follow controls speak for the reader.
     fn resolve_scroll(&mut self, width: u16, streaming_sum: u32, has_selection: bool) -> u32 {
         let total_lines = self.cache.total_height(width) + streaming_sum;
         self.last_total_lines = total_lines;
         let max_scroll = total_lines.saturating_sub(u32::from(self.viewport_height));
-        self.scroll_top = self.scroll_top.min(max_scroll);
-        if !has_selection {
-            if self.scroll_top >= max_scroll {
-                self.auto_scroll = true;
-            }
-            if self.auto_scroll {
-                self.scroll_top = max_scroll;
-            }
+        if has_selection {
+            self.scroll_top = self.scroll_top.min(max_scroll);
+            return total_lines;
         }
+        self.auto_scroll |= max_scroll == 0;
+        self.scroll_top = if self.auto_scroll {
+            max_scroll
+        } else {
+            self.scroll_top.min(max_scroll)
+        };
         total_lines
+    }
+
+    /// Records where the reader has come to rest, against the geometry they
+    /// are resting on. Called wherever `scroll_top` settles: at the end of a
+    /// frame, and on the moves the reader makes between two of them.
+    fn hold_reading_position(&mut self) {
+        self.held_anchor = (!self.auto_scroll).then(|| self.reading_anchor()).flatten();
+    }
+
+    /// What the first visible row is looking at. `None` when that row belongs
+    /// to the streaming tail, which has no segment, or to a segment carrying
+    /// neither a message nor a call to name it by.
+    fn reading_anchor(&self) -> Option<ReadingAnchor> {
+        let (idx, rel) = self.cache.anchor_at(self.scroll_top, self.viewport_width)?;
+        let seg = self.cache.get(idx)?;
+        (seg.msg_index.is_some() || seg.tool_id.is_some()).then(|| ReadingAnchor {
+            msg_index: seg.msg_index,
+            tool_id: seg.tool_id.clone(),
+            rel,
+        })
+    }
+
+    /// Puts `scroll_top` back on the row the anchor names. A segment that has
+    /// since shrunk past `rel` lands on its own last row, which keeps the
+    /// reader inside the content they were reading rather than throwing them
+    /// past it; one that is gone entirely leaves the offset for
+    /// [`Self::resolve_scroll`] to clamp.
+    fn restore_reading_anchor(&mut self, anchor: &ReadingAnchor, width: u16) {
+        let Some(idx) = self
+            .cache
+            .segments()
+            .iter()
+            .position(|seg| anchor.names(seg))
+        else {
+            return;
+        };
+        self.scroll_top = self.cache.anchor_offset((idx, anchor.rel), width);
     }
 
     /// Re-lays out the stale segments the viewport plus its margin reaches,
@@ -4546,7 +4873,11 @@ impl MessagesPanel {
     /// only after each segment is reflowed. Document offsets move as the
     /// reflow runs, so a window expressed in them would need repeated passes
     /// to settle; this one is right the first time.
-    fn reflow_viewport(&mut self, width: u16, has_selection: bool) {
+    ///
+    /// Reports whether `scroll_top` still names what it named on entry, which
+    /// is false only for the frame that could not re-pin. The caller needs it
+    /// to tell a position the reader is at from one they were slid to.
+    fn reflow_viewport(&mut self, width: u16, has_selection: bool) -> bool {
         // `resolve_scroll` only pins to the bottom when it owns the scroll, so
         // that is exactly when the viewport is the document tail.
         let pinned_to_bottom = self.auto_scroll && !has_selection;
@@ -4584,11 +4915,14 @@ impl MessagesPanel {
 
         // A rebuild can insert a missing instruction segment, which shifts the
         // anchor index. Rare enough to just skip the pin for one frame.
-        if let Some(anchor) = anchor
-            && self.cache.len() == len_before
-        {
-            self.scroll_top = self.cache.anchor_offset(anchor, width);
+        let Some(anchor) = anchor else {
+            return true;
+        };
+        if self.cache.len() != len_before {
+            return false;
         }
+        self.scroll_top = self.cache.anchor_offset(anchor, width);
+        true
     }
 
     /// Reflows `seg_idx` if it is stale, then reports the height it draws at.
@@ -4996,4 +5330,351 @@ fn review_search_text(notes: &[review::ParsedNote]) -> String {
         .map(review::ParsedNote::search_text)
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+#[cfg(test)]
+mod retained_progress_tests {
+    use super::{CardScroll, MessagesPanel, child_scroll_id, refill_plan};
+    use crate::components::code_view::ScrollSpan;
+    use crate::components::{ToolProgress, ToolStatus};
+    use caudra_agent::tools::{BATCH_TOOL_NAME, SHELL_TOOL_NAME, TASK_TOOL_NAME, ToolEffect};
+    use caudra_agent::{
+        ActivityChild, BatchToolEntry, BatchToolStatus, SubagentActivity, SubagentProgress,
+        ToolOutput, ToolStartEvent,
+    };
+    use caudra_config::UiConfig;
+    use caudra_lua::EventHandle;
+    use caudra_storage::view::ViewMode;
+    use std::time::Duration;
+    use test_case::test_case;
+
+    const PARENT_ID: &str = "task-parent";
+    const FIRST_CALL: &str = "batch-first";
+    const SECOND_CALL: &str = "batch-second";
+    const TASK_SUMMARY: &str = "inspect files";
+    const CHILD_SUMMARY: &str = "ls";
+    const TOOL_COUNT: u32 = 2;
+    const HISTORY_VIEW_WIDTH: u16 = 80;
+    const WHEEL_NOTCH: i32 = 1;
+    const HISTORY_PREFIX: usize = 20;
+    const HISTORY_WINDOW_ROWS: usize = 10;
+    const HISTORY_BODY_ROWS: usize = 60;
+    const PAUSED_HISTORY_OFFSET: usize = HISTORY_PREFIX + 2;
+    const OUTPUT_OFFSET: usize = HISTORY_PREFIX - 2;
+    const SHIFTED_HISTORY_PREFIX: usize = HISTORY_PREFIX + 5;
+    const SNAPSHOT_BODY_LINES: usize = 5;
+
+    fn history_span(history_start: Option<usize>) -> ScrollSpan {
+        ScrollSpan {
+            child: None,
+            first: 0,
+            lines: HISTORY_WINDOW_ROWS,
+            extent_lines: HISTORY_WINDOW_ROWS,
+            total: HISTORY_BODY_ROWS,
+            offset: PAUSED_HISTORY_OFFSET,
+            history_start,
+        }
+    }
+
+    #[test_case(4, 2 ; "wrapped_snapshot")]
+    #[test_case(2, 2 ; "unwrapped_snapshot")]
+    fn wheel_consumes_one_notch_in_extent_units(painted_rows: usize, selected_lines: usize) {
+        let mut panel = panel(false);
+        panel.rebuild_line_cache();
+        let span = ScrollSpan {
+            lines: painted_rows,
+            extent_lines: selected_lines,
+            total: SNAPSHOT_BODY_LINES,
+            offset: SNAPSHOT_BODY_LINES - selected_lines,
+            ..history_span(None)
+        };
+        let following = CardScroll::at_offset(span.offset, &span);
+        assert_eq!(following.offset, span.offset);
+        assert!(following.follow);
+        let index = panel.cache.find_by_tool_id(PARENT_ID).unwrap();
+        panel.cache.get_mut(index).unwrap().scroll_spans = vec![span];
+
+        assert_eq!(
+            panel.move_window(PARENT_ID.into(), PARENT_ID, WHEEL_NOTCH),
+            0
+        );
+        let scroll = &panel.card_scroll[PARENT_ID];
+        assert_eq!(scroll.offset, span.offset - WHEEL_NOTCH as usize);
+        assert!(!scroll.follow);
+    }
+
+    #[test_case(None ; "pure_output_keeps_its_floor")]
+    #[test_case(Some(HISTORY_PREFIX) ; "history_never_refills")]
+    fn only_pure_output_root_windows_offer_refill_rows(history_start: Option<usize>) {
+        let panel = panel(false);
+        let rctx = panel.rctx(TASK_TOOL_NAME, PARENT_ID);
+        let mut lines = MessagesPanel::build_tool_segment_lines(
+            &panel.messages[0],
+            ToolStatus::InProgress,
+            &rctx,
+            None,
+        );
+        lines.scroll_spans = vec![history_span(history_start)];
+        let expected = if history_start.is_some() {
+            Vec::new()
+        } else {
+            vec![(None, HISTORY_WINDOW_ROWS)]
+        };
+        assert_eq!(refill_plan(&lines, HISTORY_WINDOW_ROWS), expected);
+    }
+
+    #[test_case(OUTPUT_OFFSET, Some(HISTORY_PREFIX), None, false ; "output")]
+    #[test_case(HISTORY_PREFIX, Some(HISTORY_PREFIX), Some(HISTORY_PREFIX), false ; "boundary")]
+    #[test_case(PAUSED_HISTORY_OFFSET, Some(HISTORY_PREFIX), Some(HISTORY_PREFIX), false ; "history")]
+    #[test_case(HISTORY_BODY_ROWS - HISTORY_WINDOW_ROWS, Some(HISTORY_PREFIX), None, true ; "following")]
+    #[test_case(PAUSED_HISTORY_OFFSET, None, None, false ; "no_history")]
+    fn explicit_scroll_offsets_classify_only_paused_history(
+        offset: usize,
+        history_start: Option<usize>,
+        expected_base: Option<usize>,
+        following: bool,
+    ) {
+        let scroll = CardScroll::at_offset(offset, &history_span(history_start));
+        assert_eq!(scroll.offset, offset);
+        assert_eq!(scroll.history_base, expected_base);
+        assert_eq!(scroll.follow, following);
+    }
+
+    #[test_case(Some(SHIFTED_HISTORY_PREFIX) ; "prefix_growth")]
+    #[test_case(Some(OUTPUT_OFFSET) ; "prefix_shrink")]
+    #[test_case(Some(HISTORY_PREFIX) ; "unchanged_prefix")]
+    #[test_case(None ; "missing_history")]
+    fn history_rebase_keeps_the_relative_offset_without_resuming(history_start: Option<usize>) {
+        let mut scroll =
+            CardScroll::at_offset(PAUSED_HISTORY_OFFSET, &history_span(Some(HISTORY_PREFIX)));
+        assert_eq!(
+            scroll.rebase_history(history_start),
+            history_start.is_some_and(|base| base != HISTORY_PREFIX)
+        );
+        let base = history_start.unwrap_or(HISTORY_PREFIX);
+        assert_eq!(scroll.offset, base + PAUSED_HISTORY_OFFSET - HISTORY_PREFIX);
+        assert_eq!(scroll.history_base, Some(base));
+        assert!(!scroll.follow);
+    }
+
+    #[test_case(OUTPUT_OFFSET ; "paused_in_output")]
+    #[test_case(HISTORY_BODY_ROWS - HISTORY_WINDOW_ROWS ; "following")]
+    fn history_rebase_does_not_reclassify_other_readers(offset: usize) {
+        let mut scroll = CardScroll::at_offset(offset, &history_span(Some(HISTORY_PREFIX)));
+        let following = scroll.follow;
+        assert!(!scroll.rebase_history(Some(0)));
+        assert_eq!(scroll.offset, offset);
+        assert_eq!(scroll.history_base, None);
+        assert_eq!(scroll.follow, following);
+    }
+
+    #[test_case(None ; "root")]
+    #[test_case(Some(0) ; "child")]
+    fn history_rebase_matches_only_the_named_window(child: Option<usize>) {
+        let mut panel = panel(child.is_some());
+        let key = child.map_or_else(
+            || PARENT_ID.to_owned(),
+            |index| child_scroll_id(PARENT_ID, index),
+        );
+        let untouched_key = child_scroll_id(PARENT_ID, 1);
+        let scroll =
+            CardScroll::at_offset(PAUSED_HISTORY_OFFSET, &history_span(Some(HISTORY_PREFIX)));
+        panel.card_scroll.insert(key.clone(), scroll);
+        panel.card_scroll.insert(untouched_key.clone(), scroll);
+        assert!(!panel.rebase_history_windows(PARENT_ID, &[]));
+        assert_eq!(panel.card_scroll[&key].history_base, Some(HISTORY_PREFIX));
+
+        let span = ScrollSpan {
+            child,
+            ..history_span(Some(SHIFTED_HISTORY_PREFIX))
+        };
+        assert!(panel.rebase_history_windows(PARENT_ID, &[span]));
+        assert!(!panel.rebase_history_windows(PARENT_ID, &[span]));
+        assert_eq!(
+            panel.card_scroll[&key].offset,
+            SHIFTED_HISTORY_PREFIX + PAUSED_HISTORY_OFFSET - HISTORY_PREFIX
+        );
+        assert_eq!(
+            panel.card_scroll[&key].history_base,
+            Some(SHIFTED_HISTORY_PREFIX)
+        );
+        assert!(!panel.card_scroll[&key].follow);
+        assert_eq!(
+            panel.card_scroll[&untouched_key].offset,
+            PAUSED_HISTORY_OFFSET
+        );
+        assert_eq!(
+            panel.card_scroll[&untouched_key].history_base,
+            Some(HISTORY_PREFIX)
+        );
+    }
+
+    fn panel(child: bool) -> MessagesPanel {
+        let mut panel =
+            MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+        panel.tool_start(ToolStartEvent {
+            id: PARENT_ID.into(),
+            tool: if child {
+                BATCH_TOOL_NAME
+            } else {
+                TASK_TOOL_NAME
+            }
+            .into(),
+            effect: ToolEffect::Orchestrator,
+            summary: TASK_SUMMARY.into(),
+            render_header: None,
+            annotation: None,
+            input: None,
+            raw_input: None,
+            output: child.then(|| ToolOutput::Batch {
+                entries: vec![BatchToolEntry {
+                    tool: TASK_TOOL_NAME.into(),
+                    effect: ToolEffect::Orchestrator,
+                    summary: TASK_SUMMARY.into(),
+                    status: BatchToolStatus::Running,
+                    input: None,
+                    raw_input: None,
+                    output: None,
+                    annotation: None,
+                    model_suffix: None,
+                }],
+                text: String::new(),
+            }),
+        });
+        panel
+    }
+
+    fn report(id: &str) -> SubagentProgress {
+        SubagentProgress {
+            activity: SubagentActivity::batch(
+                BATCH_TOOL_NAME.into(),
+                TASK_SUMMARY,
+                vec![ActivityChild {
+                    tool: SHELL_TOOL_NAME.into(),
+                    summary: CHILD_SUMMARY.into(),
+                    status: BatchToolStatus::Running,
+                }],
+            )
+            .with_call_id(id),
+            tools: TOOL_COUNT,
+            elapsed: Duration::ZERO,
+        }
+    }
+
+    fn ingest(panel: &mut MessagesPanel, child: bool, report: SubagentProgress) {
+        if child {
+            panel.set_batch_child_progress(PARENT_ID, 0, report);
+        } else {
+            panel.set_tool_progress(PARENT_ID, report);
+        }
+    }
+
+    fn progress(panel: &MessagesPanel, child: bool) -> &ToolProgress {
+        if child {
+            &panel.batch_child_progress[PARENT_ID][&0]
+        } else {
+            panel.messages[0].progress.as_ref().unwrap()
+        }
+    }
+
+    #[test_case(false ; "wheel")]
+    #[test_case(true ; "drag")]
+    fn a_root_history_only_window_uses_its_published_extent(drag: bool) {
+        let mut panel = panel(false);
+        panel.set_view(ViewMode::Expanded);
+        panel.viewport_width = HISTORY_VIEW_WIDTH;
+        for call in 0..=panel.policy.scroll_card_lines {
+            panel.set_tool_progress(PARENT_ID, report(&call.to_string()));
+        }
+        panel.rebuild_line_cache();
+
+        let message = &panel.messages[0];
+        assert!(message.render_snapshot.is_none());
+        assert!(message.live_output.is_none());
+        assert!(message.live_body.is_none());
+        assert!(message.tool_output.is_none());
+        assert!(!message.text.contains('\n'));
+        let segment = panel
+            .cache
+            .get(panel.cache.find_by_tool_id(PARENT_ID).unwrap())
+            .unwrap();
+        let span = segment
+            .scroll_spans
+            .iter()
+            .find(|span| span.child.is_none())
+            .unwrap();
+        assert!(span.total > span.lines);
+        let max_offset = span.total - span.extent_lines;
+        let history_start = span.history_start;
+        assert_eq!(
+            panel.window_body(PARENT_ID),
+            Some((span.total, PARENT_ID.into()))
+        );
+        panel.card_scroll.insert(
+            PARENT_ID.into(),
+            CardScroll {
+                offset: usize::MAX,
+                follow: false,
+                history_base: None,
+            },
+        );
+
+        let expected_offset = if drag {
+            panel.jump_window(PARENT_ID, 0);
+            0
+        } else {
+            assert_eq!(panel.scroll_window(PARENT_ID, WHEEL_NOTCH), 0);
+            max_offset - WHEEL_NOTCH as usize
+        };
+        let scroll = &panel.card_scroll[PARENT_ID];
+        assert_eq!(scroll.offset, expected_offset);
+        assert_eq!(scroll.history_base, history_start);
+        assert!(!scroll.follow);
+    }
+
+    #[test_case(false ; "standalone_task")]
+    #[test_case(true ; "batch_child_task")]
+    fn ingestion_retains_history_until_cancellation(child: bool) {
+        let mut panel = panel(child);
+        let first = report(FIRST_CALL);
+        let second = report(SECOND_CALL);
+        ingest(&mut panel, child, first.clone());
+        ingest(&mut panel, child, first.clone());
+        assert_eq!(progress(&panel, child).activities().count(), 1);
+        let thinking = SubagentProgress {
+            activity: SubagentActivity::Thinking { title: None },
+            ..first.clone()
+        };
+        ingest(&mut panel, child, thinking.clone());
+        ingest(&mut panel, child, second.clone());
+
+        assert_eq!(
+            progress(&panel, child).activities().collect::<Vec<_>>(),
+            [
+                (&first.activity, false),
+                (&thinking.activity, false),
+                (&second.activity, true),
+            ]
+        );
+        let key = if child {
+            child_scroll_id(PARENT_ID, 0)
+        } else {
+            PARENT_ID.into()
+        };
+        panel.card_scroll.insert(
+            key.clone(),
+            CardScroll::at_offset(PAUSED_HISTORY_OFFSET, &history_span(Some(HISTORY_PREFIX))),
+        );
+        panel.cancel_in_progress();
+
+        assert_eq!(panel.card_scroll[&key].history_base, None);
+        let settled = progress(&panel, child);
+        assert!(!settled.is_live());
+        assert!(!settled.has_history());
+        assert_eq!(settled.report.activity, second.activity);
+        assert_eq!(settled.report.tools, second.tools);
+        ingest(&mut panel, child, first);
+        assert!(!progress(&panel, child).has_history());
+        assert_eq!(progress(&panel, child).report.activity, second.activity);
+    }
 }

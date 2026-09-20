@@ -153,11 +153,15 @@ impl ProgressRelay {
     fn watched_batch(&self) -> Option<SubagentActivity> {
         let watch = self.batch.as_ref()?;
         match &self.last {
-            Some(SubagentActivity::Tool { name, summary, .. }) => Some(SubagentActivity::batch(
-                Arc::clone(name),
+            Some(SubagentActivity::Tool {
+                name,
                 summary,
-                watch.children.clone(),
-            )),
+                call_id: Some(call_id),
+                ..
+            }) if call_id == &watch.id => Some(
+                SubagentActivity::batch(Arc::clone(name), summary, watch.children.clone())
+                    .with_call_id(&watch.id),
+            ),
             _ => None,
         }
     }
@@ -181,14 +185,20 @@ impl ProgressRelay {
             // The header a plugin paints mid-run is the one its transcript
             // shows, and it arrives without a tool name to match on. The
             // roster survives the retitle: it describes the same call.
-            AgentEvent::ToolHeaderSnapshot { snapshot, .. } => match &self.last {
-                Some(SubagentActivity::Tool { name, children, .. }) => {
-                    Some(SubagentActivity::batch(
+            AgentEvent::ToolHeaderSnapshot { id, snapshot, .. } => match &self.last {
+                Some(SubagentActivity::Tool {
+                    name,
+                    children,
+                    call_id: Some(call_id),
+                    ..
+                }) if call_id == id => Some(
+                    SubagentActivity::batch(
                         Arc::clone(name),
                         &snapshot.first_line_text(),
                         children.clone(),
-                    ))
-                }
+                    )
+                    .with_call_id(id),
+                ),
                 _ => None,
             },
             // A batch hands its whole roster over in its start event, which is
@@ -208,15 +218,17 @@ impl ProgressRelay {
                     }),
                     _ => None,
                 };
-                let summary = start.summary.clone();
-                Some(match &self.batch {
-                    Some(watch) => SubagentActivity::batch(
-                        Arc::clone(&start.tool),
-                        &summary,
-                        watch.children.clone(),
-                    ),
-                    None => SubagentActivity::tool(Arc::clone(&start.tool), &summary),
-                })
+                Some(
+                    match &self.batch {
+                        Some(watch) => SubagentActivity::batch(
+                            Arc::clone(&start.tool),
+                            &start.summary,
+                            watch.children.clone(),
+                        ),
+                        None => SubagentActivity::tool(Arc::clone(&start.tool), &start.summary),
+                    }
+                    .with_call_id(&start.id),
+                )
             }
             // One child moved. The row it names is patched in place, and the
             // digest republished so the parent's tree redraws that row alone.
@@ -272,8 +284,6 @@ impl ProgressRelay {
         let Some(activity) = self.activity(&envelope.event) else {
             return;
         };
-        // Two identical calls in a row leave the activity untouched, and the
-        // count is the only thing that moved.
         if counted == 0 && self.last.as_ref() == Some(&activity) {
             return;
         }
@@ -1160,6 +1170,8 @@ mod tests {
     const PARENT_WORKFLOW_RUN: &str = "wf-parent";
     const PARENT_ID: &str = "task-1";
     const TOOL_ID: &str = "toolu_01";
+    const NEXT_TOOL_ID: &str = "toolu_02";
+    const BATCH_HEADER: &str = "2 tools";
     const PLAN_MODEL_SPEC: &str = "openai/gpt-5.4";
     const PINNED_MODEL_SPEC: &str = "anthropic/claude-haiku-4-5";
     const PINNING_PROFILE: &str = "pinned";
@@ -1812,6 +1824,84 @@ mod tests {
             index,
             entry: roster_entry(index, status),
         }))
+    }
+
+    #[test_case(tool_pending() ; "pending")]
+    #[test_case(tool_input_delta() ; "input_preview")]
+    #[test_case(tool_start(CHILD_TOOL) ; "started")]
+    fn tool_activity_uses_the_event_call_id(event: AgentEvent) {
+        let mut relay = ProgressRelay::new();
+        for activity in [SubagentActivity::from_event(&event), relay.activity(&event)] {
+            assert!(matches!(
+                activity,
+                Some(SubagentActivity::Tool { call_id: Some(id), .. }) if id == TOOL_ID
+            ));
+        }
+    }
+
+    #[test_case(batch_progress(TOOL_ID, 0, BatchToolStatus::Running) ; "child_status")]
+    #[test_case(header_snapshot(BATCH_HEADER) ; "retitled")]
+    fn watched_batch_updates_keep_the_call_id(event: AgentEvent) {
+        let mut relay = ProgressRelay::new();
+        relay.last = relay.activity(&batch_start(2));
+
+        assert!(matches!(
+            relay.activity(&event),
+            Some(SubagentActivity::Tool { call_id: Some(id), .. }) if id == TOOL_ID
+        ));
+    }
+
+    #[test_case(batch_progress(TOOL_ID, 0, BatchToolStatus::Running) ; "child_status")]
+    #[test_case(header_snapshot(BATCH_HEADER) ; "retitled")]
+    fn old_batch_events_do_not_change_a_new_call(event: AgentEvent) {
+        let mut relay = ProgressRelay::new();
+        relay.last = relay.activity(&batch_start(2));
+        relay.last = relay.activity(&AgentEvent::ToolPending {
+            id: NEXT_TOOL_ID.into(),
+            name: BATCH_TOOL_NAME.into(),
+        });
+
+        assert!(relay.activity(&event).is_none());
+    }
+
+    #[test_case(BatchToolStatus::Success ; "success")]
+    #[test_case(BatchToolStatus::Error ; "error")]
+    fn identical_batch_calls_publish_distinct_identities(status: BatchToolStatus) {
+        let mut next = batch_start(1);
+        if let AgentEvent::ToolStart(start) = &mut next {
+            start.id = NEXT_TOOL_ID.into();
+        }
+        let published: Vec<_> = relayed(vec![
+            batch_start(1),
+            batch_progress(TOOL_ID, 0, status),
+            next,
+            batch_progress(NEXT_TOOL_ID, 0, BatchToolStatus::Running),
+        ])
+        .into_iter()
+        .filter_map(|envelope| match envelope.event {
+            AgentEvent::SubagentProgress {
+                progress:
+                    SubagentProgress {
+                        activity:
+                            SubagentActivity::Tool {
+                                call_id, children, ..
+                            },
+                        ..
+                    },
+            } => Some((call_id, children[0].status)),
+            _ => None,
+        })
+        .collect();
+
+        assert_eq!(
+            published,
+            [
+                (Some(TOOL_ID.into()), BatchToolStatus::Pending),
+                (Some(TOOL_ID.into()), status),
+                (Some(NEXT_TOOL_ID.into()), BatchToolStatus::Pending),
+                (Some(NEXT_TOOL_ID.into()), BatchToolStatus::Running),
+            ]
+        );
     }
 
     /// Every roster the fragments published, as tool names and statuses.

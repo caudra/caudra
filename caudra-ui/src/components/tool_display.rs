@@ -7,7 +7,7 @@ use caudra_config::{ClockFormat, ToolOutputLines};
 use code_view::{
     BatchLiveMap, BatchProgressMap, BatchStartedMap, BatchViewMap, BatchViews, BodySource,
     CardPolicy, Disclosure, RenderLimits, RowTarget, ScrollSpan, ScrollWindow, SourceTrace,
-    WrappedRows,
+    UNCONSTRAINED_WIDTH, WrappedRows,
 };
 
 use std::borrow::Cow;
@@ -18,15 +18,15 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use unicode_width::UnicodeWidthStr;
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use jiff::Timestamp;
 use jiff::tz::TimeZone;
 
-use crate::markdown::{
-    LinkMap, should_truncate, text_to_painted, truncate_output, truncate_output_tail,
-    truncation_notice,
-};
+use caudra_markdown::render::truncate_long_lines;
+
+use crate::markdown::{LinkMap, expand_notice, should_truncate, text_to_painted};
 use caudra_agent::{
     ActivityChild, BatchToolStatus, BufferSnapshot, InstructionBlock, NO_FILES_FOUND, ShellOutput,
     SnapshotSpan, SpanStyle, SubagentActivity, SubagentProgress, ToolInput, ToolOutput,
@@ -42,6 +42,7 @@ use ratatui::text::{Line, Span};
 
 use crate::render_worker::RenderWorker;
 
+#[derive(Clone)]
 pub struct RenderCtx<'a> {
     pub started_at: Instant,
     pub width: u16,
@@ -98,6 +99,36 @@ impl RenderCtx<'_> {
     /// back the notice-and-click it had before.
     pub fn scrolls(&self, tool: &str) -> bool {
         self.policy.scrolls(tool)
+    }
+
+    /// The same context with each named window opened by the rows beside it,
+    /// which is how a running card holds a height it has already drawn: the
+    /// rows that fill it come out of the buffers those windows are already
+    /// sitting on, so they are content the reader can read rather than space
+    /// nothing draws into.
+    ///
+    /// A child's window counts as much as the card's. Inside a batch the rows
+    /// a card loses are usually a nested report's, the card itself has no
+    /// window at all, and the only buffers with anything left in them belong
+    /// to the children; refusing to open one would leave the whole card
+    /// shrinking around rows a child is already holding.
+    pub fn with_windows_opened(&self, opened: &[(Option<usize>, usize)]) -> Self {
+        let mut card_scroll = self.card_scroll;
+        let mut child_scroll = (*self.child_scroll).clone();
+        for &(child, extra) in opened {
+            let window = match child {
+                Some(index) => child_scroll.get_mut(&index),
+                None => card_scroll.as_mut(),
+            };
+            if let Some(window) = window {
+                window.height += extra;
+            }
+        }
+        Self {
+            card_scroll,
+            child_scroll: Arc::new(child_scroll),
+            ..self.clone()
+        }
     }
 
     /// The rows a card rests at, `usize::MAX` for a call with no useful
@@ -522,6 +553,109 @@ pub(super) fn activity_child_spans(child: &ActivityChild, prefix: String) -> Vec
     spans
 }
 
+fn append_activity_spans(activity: &SubagentActivity, spans: &mut Vec<Span<'static>>) {
+    let theme = theme::current();
+    if let Some(sigil) = activity_sigil(activity) {
+        spans.push(Span::styled(format!("{sigil} "), theme.tool_prefix));
+    }
+    spans.push(Span::styled(activity_label(activity), theme.tool_prefix));
+    if let Some(detail) = activity_detail(activity) {
+        spans.push(Span::styled(format!(" {detail}"), theme.tool_dim));
+    }
+}
+
+pub(super) fn progress_lines(
+    progress: &ToolProgress,
+    continuation: &str,
+    width: u16,
+) -> Vec<Line<'static>> {
+    let theme = theme::current();
+    let mut lines = Vec::new();
+    let mut activities = progress.activities().peekable();
+    while let Some((activity, current)) = activities.next() {
+        let (connector, trunk) = if activities.peek().is_some() {
+            (TREE_BRANCH, TREE_TRUNK)
+        } else {
+            (TREE_LAST, TREE_GAP)
+        };
+        let mut spans = vec![Span::styled(
+            format!("{continuation}{connector}"),
+            theme.tool_dim,
+        )];
+        append_activity_spans(activity, &mut spans);
+        if current {
+            spans.push(Span::styled(
+                format!(
+                    "{ACTIVITY_SEPARATOR}{}",
+                    SubagentProgress::tally(progress.report.tools, progress.elapsed())
+                ),
+                theme.tool_dim,
+            ));
+        }
+        lines.push(Line::from(clamp_to_row(spans, width)));
+        let children = activity.children();
+        for (index, child) in children.iter().enumerate() {
+            let connector = if index + 1 == children.len() {
+                TREE_LAST
+            } else {
+                TREE_BRANCH
+            };
+            let row = activity_child_spans(child, format!("{continuation}{trunk}{connector}"));
+            lines.push(Line::from(clamp_to_row(row, width)));
+        }
+    }
+    lines
+}
+
+/// Spans cut to a single row of `width` columns, with an ellipsis standing
+/// where the rest was dropped.
+///
+/// A status row names what a subagent is doing at this instant and is
+/// rewritten every time that changes. Letting one wrap would make its height a
+/// function of how long the current command happens to be, so walking through
+/// calls of different lengths would reflow every row under it. The text these
+/// rows summarise is reachable by opening the call they name.
+///
+/// A caller with no width to give is left alone, the way every other renderer
+/// here treats [`UNCONSTRAINED_WIDTH`].
+pub(super) fn clamp_to_row(spans: Vec<Span<'static>>, width: u16) -> Vec<Span<'static>> {
+    if width == UNCONSTRAINED_WIDTH {
+        return spans;
+    }
+    let width = usize::from(width);
+    let drawn: usize = spans
+        .iter()
+        .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+        .sum();
+    if drawn <= width {
+        return spans;
+    }
+
+    let mut room = width.saturating_sub(UnicodeWidthChar::width(ELLIPSIS).unwrap_or(1));
+    let mut kept = Vec::with_capacity(spans.len());
+    for span in spans {
+        let span_width = UnicodeWidthStr::width(span.content.as_ref());
+        if span_width <= room {
+            room -= span_width;
+            kept.push(span);
+            continue;
+        }
+        let mut cut = String::with_capacity(span.content.len());
+        for grapheme in span.content.graphemes(true) {
+            let grapheme_width = UnicodeWidthStr::width(grapheme);
+            if grapheme_width > room {
+                break;
+            }
+            room -= grapheme_width;
+            cut.push_str(grapheme);
+        }
+        cut.push(ELLIPSIS);
+        kept.push(Span::styled(cut, span.style));
+        break;
+    }
+    kept
+}
+
 /// A phase label is authored lowercase to read mid-sentence, but on this row it
 /// stands where a tool's inflected verb would and has to match it.
 fn capitalized(label: &str) -> String {
@@ -834,7 +968,7 @@ impl HighlightRequest {
         output: Option<Arc<ToolOutput>>,
         limits: RenderLimits,
     ) -> Option<Self> {
-        if range.0 == range.1 {
+        if range.0 == range.1 || limits.has_live_rows() {
             return None;
         }
         let output = output.and_then(|o| match *o {
@@ -860,9 +994,7 @@ impl HighlightRequest {
             // a child still reporting or still printing is the exception: its
             // rows move faster than the worker's cache key, so an answer
             // spliced back over them would freeze what the reader is watching.
-            ToolOutput::Batch { ref entries, .. } => {
-                (!entries.is_empty() && !limits.has_live_rows()).then_some(o)
-            }
+            ToolOutput::Batch { ref entries, .. } => (!entries.is_empty()).then_some(o),
         });
         if input.is_none() && output.is_none() {
             return None;
@@ -985,13 +1117,59 @@ pub(super) fn batch_sigil_style(status: BatchToolStatus, output: Option<&ToolOut
     }
 }
 
+/// How much of a body a card draws, counted in the rows it paints into rather
+/// than in the source lines behind them. One source line is any number of rows
+/// once it wraps, so a limit spent on lines leaves a card's height following
+/// the length of whatever happens to be in it.
+///
+/// Applied by the painter, since only it knows how many rows a line of this
+/// text takes at this width.
+#[derive(Clone, Copy)]
+enum RowLimit {
+    /// The reader's own position in the body. The footer under it says where
+    /// it sits, and nothing it leaves out is beyond reach.
+    Scroll(ScrollWindow),
+    /// The height the card rests at, `tail` for a body whose newest rows are
+    /// the ones worth keeping. Whatever falls outside is what the notice
+    /// offering the rest reports.
+    Budget { height: usize, tail: bool },
+}
+
+impl RowLimit {
+    /// What a body nothing abridges is drawn under.
+    const WHOLE: Self = Self::Budget {
+        height: usize::MAX,
+        tail: false,
+    };
+
+    /// The rows kept, and how many were withheld above and below them.
+    ///
+    /// A budget pays for its own notice: the row saying what is missing comes
+    /// out of the budget rather than on top of it, so a card that had to
+    /// abridge stands exactly as tall as one that did not. That is also what
+    /// keeps the count honest — one row over budget costs the body a row and
+    /// so withholds two, never the single row no notice is allowed to report.
+    fn apply<T>(self, rows: Vec<T>) -> (Vec<T>, Option<(usize, usize)>) {
+        let window = match self {
+            Self::Scroll(window) => Some(window),
+            Self::Budget { height, tail } => (rows.len() > height).then(|| ScrollWindow {
+                height: height.saturating_sub(1),
+                offset: 0,
+                follow: tail,
+            }),
+        };
+        code_view::window_rows(rows, window)
+    }
+}
+
 struct ResolvedOutput<'a> {
     text: Option<Cow<'a, str>>,
     full_text: Option<Cow<'a, str>>,
-    skipped: usize,
-    /// Lines above and below a scroll card's window. `None` for a body that
-    /// was abridged to a budget instead, which reports itself with `skipped`.
-    scrolled: Option<(usize, usize)>,
+    /// Lines cut on the way in rather than by the card's own limit. It never
+    /// painted them and so cannot count their rows, so the notice adds them to
+    /// the rows it withheld itself.
+    dropped: usize,
+    limit: RowLimit,
 }
 
 fn resolve_output<'a>(
@@ -1027,17 +1205,10 @@ fn resolve_output<'a>(
     // that means to show more than the budget has to read the output itself.
     // A window means exactly that: it is free to sit anywhere in the body.
     let whole = expanded || limits.scroll.is_some();
-    let (raw_text, already_truncated): (Option<Cow<'a, str>>, usize) = if whole {
+    let (raw_text, dropped): (Option<Cow<'a, str>>, usize) = if whole {
         match &full_text {
             Some(t) => (Some(t.clone()), 0),
-            None if output.is_some() => {
-                return ResolvedOutput {
-                    text: None,
-                    full_text: None,
-                    skipped: 0,
-                    scrolled: None,
-                };
-            }
+            None if output.is_some() => (None, 0),
             None => match live_output {
                 Some(live) => (Some(Cow::Borrowed(live)), 0),
                 None => match body {
@@ -1050,67 +1221,45 @@ fn resolve_output<'a>(
         match (body, &full_text) {
             (Some(b), _) => (Some(Cow::Borrowed(b)), pre_truncated),
             (None, Some(t)) => (Some(t.clone()), 0),
-            (None, None) if output.is_some() => {
-                return ResolvedOutput {
-                    text: None,
-                    full_text: None,
-                    skipped: 0,
-                    scrolled: None,
-                };
-            }
             (None, None) => (None, 0),
         }
     };
 
     // A window is the reader's own position in the body, so it outranks both
     // the budget and the expansion a click would otherwise have granted.
-    if let Some(window) = limits.scroll.filter(|_| !expanded) {
-        let (text, scrolled) = match raw_text {
-            Some(t) if !t.is_empty() => {
-                let (kept, above, below) = window_lines(&t, window);
-                (Some(Cow::Owned(kept)), Some((above, below)))
-            }
-            _ => (None, None),
-        };
-        return ResolvedOutput {
-            text,
-            full_text,
-            skipped: 0,
-            scrolled,
-        };
-    }
-
-    let keep_tail = matches!(output, Some(ToolOutput::Shell(_)));
-    let (text, skipped) = match raw_text {
-        Some(t) if !t.is_empty() => {
-            let tr = if keep_tail {
-                truncate_output_tail(&t, limits.budget)
-            } else {
-                truncate_output(&t, limits.budget)
-            };
-            let s = if tr.skipped > 0 {
-                tr.skipped
-            } else {
-                already_truncated
-            };
-            (Some(Cow::Owned(tr.kept.into_owned())), s)
-        }
-        _ => (None, already_truncated),
+    let limit = match limits.scroll.filter(|_| !expanded) {
+        Some(window) => RowLimit::Scroll(window),
+        None => RowLimit::Budget {
+            height: limits.budget,
+            // A command's newest output is the part worth keeping; every other
+            // body reports what it did from the top down.
+            tail: matches!(output, Some(ToolOutput::Shell(_))),
+        },
     };
 
+    let text = raw_text.filter(|text| !text.is_empty());
     ResolvedOutput {
-        text,
+        // Bounding how wide one source line may paint bounds the rows it can
+        // charge the budget, so a body with a megabyte on a single line cannot
+        // spend the whole card on it. A window has no budget to protect.
+        text: match limit {
+            RowLimit::Budget { .. } => text.map(capped_lines),
+            RowLimit::Scroll(_) => text,
+        },
         full_text,
-        skipped,
-        scrolled: None,
+        dropped,
+        limit,
     }
 }
 
-/// The window's slice of `text`, with the line counts either side of it.
-fn window_lines(text: &str, window: ScrollWindow) -> (String, usize, usize) {
-    let lines: Vec<&str> = text.lines().collect();
-    let (start, end) = window.range(lines.len());
-    (lines[start..end].join("\n"), start, lines.len() - end)
+/// `text` with no source line longer than the renderer will draw, borrowed
+/// still when it already was.
+fn capped_lines(text: Cow<'_, str>) -> Cow<'_, str> {
+    let capped = match truncate_long_lines(&text) {
+        Cow::Owned(capped) => Some(capped),
+        Cow::Borrowed(_) => None,
+    };
+    capped.map_or(text, Cow::Owned)
 }
 
 struct ToolLineBuilder {
@@ -1160,7 +1309,10 @@ impl ToolLineBuilder {
             source: SourceTrace::default(),
             width,
             truncation: false,
-            limits,
+            limits: RenderLimits {
+                settled: !matches!(indicator, Indicator::InProgress),
+                ..limits
+            },
             markdown: false,
             indicator,
             head: 0,
@@ -1373,16 +1525,7 @@ impl ToolLineBuilder {
     fn progress_spans(&self, progress: &ToolProgress, out: &mut Vec<Span<'static>>) {
         let theme = theme::current();
         if self.is_in_progress() {
-            if let Some(sigil) = activity_sigil(&progress.report.activity) {
-                out.push(Span::styled(format!("{sigil} "), theme.tool_prefix));
-            }
-            out.push(Span::styled(
-                activity_label(&progress.report.activity),
-                theme.tool_prefix,
-            ));
-            if let Some(detail) = activity_detail(&progress.report.activity) {
-                out.push(Span::styled(format!(" {detail}"), theme.tool_dim));
-            }
+            append_activity_spans(&progress.report.activity, out);
             out.push(Span::styled(ACTIVITY_SEPARATOR, theme.tool_dim));
         }
         out.push(Span::styled(
@@ -1394,25 +1537,62 @@ impl ToolLineBuilder {
     /// Must run after `prepend_indicator`, which owns row 0 and shifts the
     /// spinner spans sitting on it.
     fn push_progress(&mut self, progress: &ToolProgress) {
+        if self.is_in_progress() {
+            self.lines
+                .extend(progress_lines(progress, TOOL_BODY_INDENT, self.width));
+            return;
+        }
         let mut spans = vec![Span::styled(ACTIVITY_PREFIX, theme::current().tool_dim)];
         self.progress_spans(progress, &mut spans);
         self.lines.push(Line::from(spans));
-        // The roster hangs off the activity row, which is itself the last node
-        // under the header, so every level below it is gap rather than trunk.
-        if !self.is_in_progress() {
+    }
+
+    fn push_progress_body(
+        &mut self,
+        progress: &ToolProgress,
+        first: usize,
+        window: Option<ScrollWindow>,
+    ) {
+        let output_end = self.lines.len();
+        self.push_progress(progress);
+        self.content_range = (0, 0);
+        self.source.abandon();
+        let Some(window) = window else {
             return;
+        };
+        let (body, hidden) = code_view::window_rows(self.lines.split_off(first), Some(window));
+        let (above, below) = hidden.unwrap_or_default();
+        let start = first + above;
+        let end = start + body.len();
+        let keep_row = |line: &mut usize| {
+            if *line < first {
+                return true;
+            }
+            if !(start..end).contains(line) {
+                return false;
+            }
+            *line -= above;
+            true
+        };
+        self.link_rows.retain_mut(|(line, _)| keep_row(line));
+        self.spinner_lines.retain_mut(|(line, _)| keep_row(line));
+        self.shell_toggle_line = self
+            .shell_toggle_line
+            .filter(|line| (start..end).contains(line));
+        self.shell_toggle_line = self.shell_toggle_line.map(|line| line - above);
+        if let Some(base) = self.snapshot_base {
+            self.snapshot_skip += start.saturating_sub(base);
+            self.snapshot_base =
+                (base.max(start) < output_end.min(end)).then_some(base.max(start) - above);
         }
-        let children = progress.report.activity.children();
-        for (index, child) in children.iter().enumerate() {
-            let connector = match index + 1 == children.len() {
-                true => TREE_LAST,
-                false => TREE_BRANCH,
-            };
-            self.lines.push(Line::from(activity_child_spans(
-                child,
-                format!("{TOOL_BODY_INDENT}{TREE_GAP}{connector}"),
-            )));
+        self.rows.resize(end, None);
+        self.rows.drain(first..start);
+        self.lines.extend(body);
+        self.push_card_scroll_span(first, above, below);
+        if let Some(span) = self.scroll_spans.last_mut() {
+            span.history_start = Some(output_end - first);
         }
+        self.push_scroll_footer(above, below);
     }
 
     /// A compact row is one line by contract, so progress joins the header
@@ -1432,7 +1612,7 @@ impl ToolLineBuilder {
         // source and would splice it back over what was drawn.
         match output {
             Some(ToolOutput::WriteCode { path, lines, .. }) if renders_as_markdown(path) => {
-                self.push_markdown_body(&lines.join("\n"));
+                self.push_markdown_body(&lines.join("\n"), RowLimit::WHOLE);
             }
             _ => self.push_rendered_code(input, output),
         }
@@ -1476,8 +1656,10 @@ impl ToolLineBuilder {
             child: None,
             first,
             lines,
+            extent_lines: lines,
             total: above + lines + below,
             offset: above,
+            history_start: None,
         });
     }
 
@@ -1498,21 +1680,18 @@ impl ToolLineBuilder {
     fn push_live_body(&mut self, body: &str, markdown: bool) {
         self.source.abandon();
         let start = self.lines.len();
-        let (windowed, scrolled) = match self.limits.scroll {
-            Some(window) => {
-                let (kept, above, below) = window_lines(body, window);
-                (Cow::Owned(kept), Some((above, below)))
-            }
-            None => (Cow::Borrowed(body), None),
-        };
-        if markdown {
-            self.push_markdown_body(&windowed);
+        let limit = self.limits.scroll.map_or(RowLimit::WHOLE, RowLimit::Scroll);
+        let scrolled = if markdown {
+            self.push_markdown_body(body, limit)
         } else {
-            for mut line in code_view::render_live_body(&windowed, self.body_width()) {
+            let (rows, scrolled) =
+                limit.apply(code_view::render_live_body(body, self.body_width()));
+            for mut line in rows {
                 line.spans.insert(0, Span::raw(TOOL_BODY_INDENT));
                 self.lines.push(line);
             }
-        }
+            scrolled
+        };
         self.content_range = (start, self.lines.len());
         if let Some((above, below)) = scrolled {
             self.push_card_scroll_span(start, above, below);
@@ -1553,29 +1732,45 @@ impl ToolLineBuilder {
 
         if let Some(text) = &resolved.text {
             let body_start = self.lines.len();
-            if self.markdown {
-                self.push_markdown_body(text);
+            let scrolled = if self.markdown {
+                self.push_markdown_body(text, resolved.limit)
             } else {
                 // Broken to the body's own width, so a row too long for the
                 // card keeps the indent that says whose body it is instead of
                 // restarting at column zero when the terminal breaks it.
                 let (body, source) = code_view::plain_body(text, self.body_width());
+                let (body, scrolled) = resolved.limit.apply(body);
+                // The rows behind the lines the limit kept, so a copy reads
+                // back what was drawn rather than the whole body it came from.
+                let source = match scrolled {
+                    Some((above, _)) => source.keep_rows(above..above + body.len()),
+                    None => Some(source),
+                };
                 self.lines.extend(indented(body, TOOL_BODY_INDENT));
-                // The window has already taken its slice, so the ranges index
-                // what was drawn rather than the line numbers it came from.
-                self.source.record(body_start, source.indented());
-            }
+                match source {
+                    Some(source) => self.source.record(body_start, source.indented()),
+                    None => self.source.abandon(),
+                }
+                scrolled
+            };
             if let Some(full) = &resolved.full_text {
                 self.push_search_text(full);
             } else {
                 self.push_search_text(text);
             }
-            match resolved.scrolled {
-                Some((above, below)) => {
-                    self.push_card_scroll_span(body_start, above, below);
-                    self.push_scroll_footer(above, below);
+            match resolved.limit {
+                RowLimit::Scroll(_) => {
+                    if let Some((above, below)) = scrolled {
+                        self.push_card_scroll_span(body_start, above, below);
+                        self.push_scroll_footer(above, below);
+                    }
                 }
-                None => self.push_truncation_count(resolved.skipped),
+                // Both halves of the count come out of the same cut, so the
+                // notice cannot claim a number the body did not withhold.
+                RowLimit::Budget { .. } => {
+                    let withheld = scrolled.map_or(0, |(above, below)| above + below);
+                    self.push_truncation_count(withheld + resolved.dropped);
+                }
             }
         }
     }
@@ -1646,7 +1841,7 @@ impl ToolLineBuilder {
     /// The markdown renderer keeps its own provenance against the text it
     /// parsed, which is not the card's source, so a card that draws prose
     /// copies by scraping rather than by slicing the wrong string.
-    fn push_markdown_body(&mut self, text: &str) {
+    fn push_markdown_body(&mut self, text: &str, limit: RowLimit) -> Option<(usize, usize)> {
         self.source.abandon();
         let style = theme::current().assistant;
         let (painted, _) = text_to_painted(
@@ -1658,18 +1853,26 @@ impl ToolLineBuilder {
             Some(caudra_markdown::render::TOOL_OUTPUT_MAX_LINE_BYTES),
             Vec::new(),
         );
-        for (mut line, mut links) in painted.lines.into_iter().zip(painted.links.rows) {
+        // A heading, a table and a fence each break differently, so the rows
+        // exist only once the renderer has run; the limit is taken on them.
+        let painted: Vec<_> = painted.lines.into_iter().zip(painted.links.rows).collect();
+        let (painted, scrolled) = limit.apply(painted);
+        for (mut line, mut links) in painted {
             line.spans.insert(0, Span::raw(TOOL_BODY_INDENT));
             links.insert(0, None);
             self.link_rows.push((self.lines.len(), links));
             self.lines.push(line);
         }
+        scrolled
     }
 
-    fn push_truncation_count(&mut self, skipped: usize) {
-        if should_truncate(skipped) {
+    /// The rows the budget held back, counted in the rows a reader would have
+    /// read them in. The notice sits in the budget rather than beside it, so
+    /// this is never the one row it would not be allowed to report.
+    fn push_truncation_count(&mut self, withheld: usize) {
+        if should_truncate(withheld) {
             self.truncation = true;
-            let text = truncation_notice(skipped);
+            let text = expand_notice(&format!("{withheld} rows"));
             let mut line = Line::from(Span::styled(text, theme::current().tool_dim));
             line.spans.insert(0, Span::raw(TOOL_BODY_INDENT));
             self.lines.push(line);
@@ -1713,6 +1916,7 @@ impl ToolLineBuilder {
             self.push_search_text(text);
         }
         if self.limits.scroll.is_some() {
+            self.push_card_scroll_span(base, start, total - end);
             self.push_scroll_footer(start, total - end);
         }
     }
@@ -1765,10 +1969,7 @@ impl ToolLineBuilder {
             scroll_spans: self
                 .scroll_spans
                 .into_iter()
-                .map(|span| ScrollSpan {
-                    first: wrapped.row_of(span.first),
-                    ..span
-                })
+                .map(|span| wrapped.scroll_span(span))
                 .collect(),
             content_indent,
             truncation: self.truncation,
@@ -2012,7 +2213,22 @@ pub fn build_tool_lines(
     if let Some(elapsed) = shell_elapsed(msg, status) {
         b.append_duration(elapsed);
     }
-    if let Some(progress) = msg.progress.as_ref() {
+    let progress_body = msg
+        .progress
+        .as_ref()
+        .filter(|_| b.is_in_progress() && (!rctx.compact || expansion.is_some()))
+        .map(|progress| {
+            let window = b
+                .limits
+                .scroll
+                .or_else(|| b.limits.policy.window(tool_name, 0, true));
+            if window.is_some() {
+                b.limits.scroll = None;
+                b.limits.budget = usize::MAX;
+            }
+            (progress, b.lines.len(), window)
+        });
+    if let Some(progress) = msg.progress.as_ref().filter(|_| progress_body.is_none()) {
         if rctx.compact {
             b.append_progress(progress);
         } else {
@@ -2027,6 +2243,9 @@ pub fn build_tool_lines(
             || msg.tool_output.is_some()
             || msg.live_body.is_some()
             || body.is_some_and(|body| !body.trim().is_empty());
+        if let Some((progress, first, window)) = progress_body {
+            b.push_progress_body(progress, first, window);
+        }
         return b.finish(
             msg.tool_input.clone(),
             msg.tool_output.clone(),
@@ -2077,18 +2296,34 @@ pub fn build_tool_lines(
         true
     };
     if show_output {
-        let resolved = resolve_output(
+        let window = progress_body.and_then(|(_, _, window)| window);
+        let output_limits = match window {
+            Some(window) => RenderLimits {
+                budget: window.height,
+                scroll: Some(window),
+                ..b.limits.clone()
+            },
+            None => b.limits.clone(),
+        };
+        let mut resolved = resolve_output(
             msg.tool_output.as_deref(),
             body,
             msg.live_output.as_deref(),
             msg.truncated_lines,
-            b.limits.clone(),
+            output_limits,
             expanded.shell_raw,
         );
+        if window.is_some() {
+            resolved.limit = RowLimit::WHOLE;
+            resolved.dropped = 0;
+        }
         b.push_resolved_output(&resolved);
     }
     if let Some(ToolOutput::Shell(output)) = msg.tool_output.as_deref() {
         b.push_shell_footer(output, expanded.shell_raw);
+    }
+    if let Some((progress, first, window)) = progress_body {
+        b.push_progress_body(progress, first, window);
     }
     b.finish(
         msg.tool_input.clone(),
@@ -2202,7 +2437,7 @@ mod tests {
 
     const TOL: ToolOutputLines = ToolOutputLines::DEFAULT;
     use crate::components::{DisplayRole, ToolRole};
-    use crate::markdown::TRUNCATION_PREFIX;
+    use crate::markdown::{TRUNCATION_PREFIX, truncate_output};
     use caudra_agent::tools::{
         BATCH_TOOL_NAME, FILE_GREP_TOOL_NAME, FILE_READ_TOOL_NAME, SHELL_TOOL_NAME, TASK_TOOL_NAME,
         ToolEffect,
@@ -3438,15 +3673,7 @@ mod tests {
     fn resolve_output_pre_truncated_forwarded() {
         let limits = RenderLimits::new(false, TOL.get("bash"), BatchViews::default(), TOL);
         let resolved = resolve_output(None, Some("short"), None, 42, limits, false);
-        assert_eq!(resolved.skipped, 42);
-    }
-
-    #[test]
-    fn resolve_output_truncation_overrides_pre_truncated() {
-        let long = n_lines(200);
-        let limits = RenderLimits::new(false, TOL.get("bash"), BatchViews::default(), TOL);
-        let resolved = resolve_output(None, Some(&long), None, 5, limits, false);
-        assert!(resolved.skipped > 5);
+        assert_eq!(resolved.dropped, 42);
     }
 
     fn bash_output_msg(line_count: usize, live: bool) -> DisplayMessage {
@@ -3580,6 +3807,459 @@ mod tests {
         );
         let text = lines_text(&tl);
         assert!(text.contains(label), "{SCROLL_NOTICE_MSG}: {text}");
+    }
+
+    const WINDOW_ROWS_MSG: &str = "a window is a height in terminal rows, so a card drawn in one \
+        keeps that height however long the lines arriving under it are";
+    const WINDOW_OFFSET_MSG: &str =
+        "a window offset counts the rows the body was painted into, before and after it grew";
+    const NARROW_BODY_MSG: &str = "a narrow card still draws its body across the width it has";
+    /// Long enough to take several terminal rows at every width these cases
+    /// use, so a window counted in source lines and one counted in rows cannot
+    /// agree by accident.
+    const WRAPPING_PAD: usize = 90;
+
+    fn wrapping_output(count: usize) -> String {
+        (0..count)
+            .map(|index| format!("row{index}-{}", "x".repeat(WRAPPING_PAD)))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn scroll_card(count: usize, width: u16, window: ScrollWindow) -> ToolLines {
+        let msg = bash_msg(
+            "cmd",
+            ToolStatus::Success,
+            None,
+            Some(ToolOutput::Plain(wrapping_output(count).into())),
+        );
+        build_tool_lines(
+            &msg,
+            ToolStatus::Success,
+            &scroll_rctx(width, SCROLL_HEIGHT, window),
+            Some(exp(false)),
+        )
+    }
+
+    /// The rows the card gave its window, and the height of the whole card.
+    fn windowed(tl: &ToolLines, msg: &str) -> (Vec<String>, usize) {
+        let span = tl.scroll_spans.first().copied().expect(msg);
+        let rows = tl.lines[span.first..span.first + span.lines]
+            .iter()
+            .map(line_text)
+            .collect();
+        (rows, tl.lines.len())
+    }
+
+    /// The reported defect: a card with a fixed line budget grew and shrank as
+    /// output arrived, because the budget picked source lines while the card
+    /// was painted in the rows those lines wrapped into.
+    #[test_case(40 ; "narrow")]
+    #[test_case(80 ; "wide")]
+    fn a_windowed_card_paints_the_same_rows_however_long_its_lines_are(width: u16) {
+        let measured: Vec<(usize, usize)> = [6usize, 9, 20, 61]
+            .into_iter()
+            .map(|count| {
+                let tl = scroll_card(count, width, at(0, true));
+                let (rows, height) = windowed(&tl, WINDOW_ROWS_MSG);
+                (rows.len(), height)
+            })
+            .collect();
+
+        assert_eq!(measured[0].0, SCROLL_HEIGHT as usize, "{WINDOW_ROWS_MSG}");
+        assert!(
+            measured.iter().all(|seen| *seen == measured[0]),
+            "{WINDOW_ROWS_MSG}: {measured:?}"
+        );
+    }
+
+    /// A paused window holds a position in the rows the card painted. Counted
+    /// in source lines it lands somewhere else entirely, and moves again as
+    /// soon as the lines under it wrap differently.
+    #[test_case(40 ; "narrow")]
+    #[test_case(80 ; "wide")]
+    fn a_paused_window_holds_the_rows_the_body_was_painted_into(width: u16) {
+        const OFFSET: usize = 7;
+        const COUNT: usize = 30;
+        let (painted, _) =
+            code_view::plain_body(&wrapping_output(COUNT), width - TOOL_BODY_INDENT_WIDTH);
+        let expected: Vec<String> = painted[OFFSET..OFFSET + SCROLL_HEIGHT as usize]
+            .iter()
+            .map(|line| format!("{TOOL_BODY_INDENT}{}", line_text(line)))
+            .collect();
+
+        let tl = scroll_card(COUNT, width, at(OFFSET, false));
+        let grown = scroll_card(COUNT * 2, width, at(OFFSET, false));
+
+        let (shown, _) = windowed(&tl, WINDOW_OFFSET_MSG);
+        assert_eq!(shown, expected, "{WINDOW_OFFSET_MSG}");
+        assert_eq!(
+            windowed(&grown, WINDOW_OFFSET_MSG).0,
+            expected,
+            "{WINDOW_OFFSET_MSG}"
+        );
+        let span = tl.scroll_spans[0];
+        assert_eq!((span.offset, span.total), (OFFSET, painted.len()));
+        assert_eq!(span.history_start, None, "{WINDOW_OFFSET_MSG}");
+    }
+
+    /// Holding a card still is worth nothing if it costs the body the columns
+    /// it is read in, which is what a narrow terminal has least of.
+    #[test_case(40 ; "forty")]
+    #[test_case(30 ; "thirty")]
+    #[test_case(24 ; "twenty_four")]
+    fn a_narrow_windowed_card_still_draws_its_body(width: u16) {
+        let tl = scroll_card(20, width, at(0, true));
+
+        let (shown, _) = windowed(&tl, NARROW_BODY_MSG);
+        assert_eq!(shown.len(), SCROLL_HEIGHT as usize, "{NARROW_BODY_MSG}");
+        for row in &shown {
+            let body = row.strip_prefix(TOOL_BODY_INDENT).unwrap_or(row);
+            assert!(!body.trim().is_empty(), "{NARROW_BODY_MSG}: {row:?}");
+        }
+        let widest = shown.iter().map(|row| row.chars().count()).max();
+        assert_eq!(widest, Some(usize::from(width)), "{NARROW_BODY_MSG}");
+    }
+
+    const SNAPSHOT_SPAN_MSG: &str = "a snapshot card drawing the footer must publish the window that footer describes, or \
+         there is nothing for a bar to sit beside and the wheel falls through to the transcript";
+    const SNAPSHOT_TRACK_MSG: &str = "a window's track is the rows it painted, so a snapshot line the card had to break \
+         lengthens the track instead of leaving it counting lines";
+
+    /// Whoever painted a snapshot laid it out already, so its lines reach the
+    /// card unbroken and the card's own final break is what splits them. That
+    /// makes it the one body whose window is recorded across fewer lines than
+    /// it paints rows.
+    fn wide_snapshot(count: usize) -> BufferSnapshot {
+        make_snapshot(
+            (0..count)
+                .map(|index| {
+                    vec![SnapshotSpan {
+                        text: format!("row{index}-{}", "y".repeat(WRAPPING_PAD)),
+                        style: SpanStyle::Default,
+                    }]
+                })
+                .collect(),
+        )
+    }
+
+    /// The reported defect: every tool streaming through the live buffer draws
+    /// its window's footer from a snapshot, and the card published no span to
+    /// go with it, so the bar had nowhere to land and the wheel scrolled the
+    /// transcript out from under the card the reader was pointing at.
+    #[test_case(40 ; "narrow")]
+    #[test_case(80 ; "wide")]
+    fn a_windowed_snapshot_card_publishes_the_window_it_painted(width: u16) {
+        const TOTAL: usize = 40;
+        let shown = SCROLL_HEIGHT as usize;
+        let tl = build_tool_lines(
+            &snapshot_msg(wide_snapshot(TOTAL)),
+            ToolStatus::InProgress,
+            &scroll_rctx(width, SCROLL_HEIGHT, at(0, true)),
+            Some(exp(false)),
+        );
+
+        let base = tl.snapshot_base.expect(SNAPSHOT_SPAN_MSG);
+        let footer = tl.scroll_footer_line.expect(SNAPSHOT_SPAN_MSG);
+        let span = tl.scroll_spans.first().copied().expect(SNAPSHOT_SPAN_MSG);
+
+        assert_eq!(span.first, base, "{SNAPSHOT_SPAN_MSG}");
+        assert_eq!(span.extent_lines, shown, "{SNAPSHOT_SPAN_MSG}");
+        assert_eq!(
+            (span.offset, span.total),
+            (TOTAL - shown, TOTAL),
+            "{SNAPSHOT_SPAN_MSG}"
+        );
+        // The footer is pushed straight after the rows the window kept, so it
+        // is exactly where the track has to stop.
+        assert_eq!(span.first + span.lines, footer, "{SNAPSHOT_TRACK_MSG}");
+        assert!(
+            span.lines > shown,
+            "{SNAPSHOT_TRACK_MSG}: {} rows for {shown} lines",
+            span.lines
+        );
+    }
+
+    #[test_case(80, 4; "two_source_rows_paint_four_rows")]
+    #[test_case(40, 6; "two_source_rows_paint_six_rows")]
+    fn a_snapshot_scroll_extent_stays_in_the_offset_units(width: u16, painted: usize) {
+        const TOTAL: usize = 5;
+        const SELECTED: u32 = 2;
+        let shown = SELECTED as usize;
+        let tl = build_tool_lines(
+            &snapshot_msg(wide_snapshot(TOTAL)),
+            ToolStatus::InProgress,
+            &scroll_rctx(
+                width,
+                SELECTED,
+                ScrollWindow {
+                    height: shown,
+                    offset: 0,
+                    follow: true,
+                },
+            ),
+            Some(exp(false)),
+        );
+        let span = tl.scroll_spans.first().copied().expect(SNAPSHOT_SPAN_MSG);
+        assert_eq!(
+            (span.total, span.offset, span.extent_lines, span.lines),
+            (TOTAL, TOTAL - shown, shown, painted),
+            "{SNAPSHOT_TRACK_MSG}"
+        );
+        assert_eq!(
+            span.total.saturating_sub(span.extent_lines),
+            span.offset,
+            "{SNAPSHOT_SPAN_MSG}"
+        );
+    }
+
+    const BUDGET_ROWS_MSG: &str = "a budget is a height in terminal rows too, so a card resting \
+        at one keeps that height however long the lines arriving under it are";
+    const BUDGET_NOTICE_MSG: &str = "the notice counts what the budget counts, so the rows it \
+        names and the rows the body left out are the same number";
+    const BUDGET_WHOLE_MSG: &str =
+        "a body that fits its budget is drawn whole, and never padded out to fill it";
+    const BUDGET_TAIL_MSG: &str = "a command is read from its newest output back, so a budget \
+        spent on its rows is spent from the bottom up";
+    const LONG_LINE_MSG: &str = "one line longer than the whole budget must still show its tail \
+        rather than vanishing or taking more rows than the budget has";
+    const NARROW_BUDGET_MSG: &str =
+        "a card held to a budget still draws its body across the width it has";
+
+    /// Raised off the `bash` default so a budget card has rows to lose and
+    /// still say something with the ones it keeps.
+    const BUDGET: usize = 10;
+    /// The notice's own row comes out of the budget, so an abridged body is
+    /// one row shorter than an unabridged one is allowed to be.
+    const BUDGET_BODY_ROWS: usize = BUDGET - 1;
+    /// These fixtures head their card with one short command, which no width
+    /// under test breaks.
+    const HEADER_ROWS: usize = 1;
+
+    const BUDGET_TOL: ToolOutputLines = ToolOutputLines {
+        bash: BUDGET,
+        ..ToolOutputLines::DEFAULT
+    };
+
+    fn budget_rctx(width: u16) -> RenderCtx<'static> {
+        RenderCtx {
+            tool_output_lines: &BUDGET_TOL,
+            ..test_rctx(width)
+        }
+    }
+
+    const SHELL_FIXTURE_MSG: &str = "the shell fixture is what gives a card the tail-keeping \
+        budget, so nothing else can stand in for it";
+
+    /// A command's own output, with nothing for the shell footer to report, so
+    /// the notice stays the last row the card pushes.
+    fn budget_output(text: String, tail: bool) -> ToolOutput {
+        if !tail {
+            return ToolOutput::Plain(text.into());
+        }
+        let ToolOutput::Shell(base) = shell_output(false) else {
+            unreachable!("{SHELL_FIXTURE_MSG}")
+        };
+        ToolOutput::Shell(ShellOutput {
+            stdout: text,
+            stderr: String::new(),
+            ..base
+        })
+    }
+
+    fn budget_card(text: String, tail: bool, width: u16) -> ToolLines {
+        let msg = bash_msg(
+            "cmd",
+            ToolStatus::Success,
+            None,
+            Some(budget_output(text, tail)),
+        );
+        build_tool_lines(
+            &msg,
+            ToolStatus::Success,
+            &budget_rctx(width),
+            Some(exp(false)),
+        )
+    }
+
+    /// Every row the body would paint if nothing held it back, which is the
+    /// only thing a claim about withheld rows can be checked against.
+    fn painted_rows(text: &str, width: u16) -> Vec<String> {
+        code_view::plain_body(text, width - TOOL_BODY_INDENT_WIDTH)
+            .0
+            .iter()
+            .map(|line| format!("{TOOL_BODY_INDENT}{}", line_text(line)))
+            .collect()
+    }
+
+    /// The rows a card gave its body, and the count its notice claims. The
+    /// notice is the last thing pushed, so the body is what lies between it
+    /// and the header.
+    fn budgeted(tl: &ToolLines) -> (Vec<String>, Option<usize>) {
+        let rows: Vec<String> = tl.lines.iter().map(line_text).collect();
+        let notice = rows.iter().position(|row| row.contains(TRUNCATION_PREFIX));
+        let body = rows[HEADER_ROWS..notice.unwrap_or(rows.len())].to_vec();
+        (body, notice.map(|at| notice_count(&rows[at..])))
+    }
+
+    /// A narrow card breaks the notice across rows, so the number is read back
+    /// off the whole of it rather than off the row it started on.
+    fn notice_count(notice: &[String]) -> usize {
+        let text = notice.join("");
+        let (_, count) = text.split_once('(').expect(BUDGET_NOTICE_MSG);
+        count
+            .split_whitespace()
+            .next()
+            .expect(BUDGET_NOTICE_MSG)
+            .parse()
+            .expect(BUDGET_NOTICE_MSG)
+    }
+
+    /// The reported defect on the path a fixed budget takes: the card's height
+    /// moved with the length of the lines in it, because the budget picked
+    /// source lines while the card was painted in the rows they wrapped into.
+    #[test_case(80, false ; "wide_head")]
+    #[test_case(80, true  ; "wide_tail")]
+    #[test_case(40, false ; "narrow_head")]
+    #[test_case(40, true  ; "narrow_tail")]
+    fn a_budgeted_card_paints_the_same_rows_however_long_its_lines_are(width: u16, tail: bool) {
+        let measured: Vec<usize> = [6usize, 9, 20, 61]
+            .into_iter()
+            .map(|count| {
+                budgeted(&budget_card(wrapping_output(count), tail, width))
+                    .0
+                    .len()
+            })
+            .collect();
+
+        assert!(
+            measured.iter().all(|rows| *rows == BUDGET_BODY_ROWS),
+            "{BUDGET_ROWS_MSG}: {measured:?}"
+        );
+    }
+
+    /// A notice counting lines while the body spends rows is a notice that
+    /// disagrees with the card the moment anything wraps.
+    #[test_case(80, false ; "wide_head")]
+    #[test_case(80, true  ; "wide_tail")]
+    #[test_case(40, false ; "narrow_head")]
+    #[test_case(40, true  ; "narrow_tail")]
+    #[test_case(24, true  ; "very_narrow_tail")]
+    fn a_budget_notice_counts_the_rows_it_withheld(width: u16, tail: bool) {
+        const COUNT: usize = 20;
+        let text = wrapping_output(COUNT);
+        let painted = painted_rows(&text, width);
+
+        let (body, claimed) = budgeted(&budget_card(text, tail, width));
+
+        assert_eq!(
+            claimed,
+            Some(painted.len() - body.len()),
+            "{BUDGET_NOTICE_MSG}"
+        );
+    }
+
+    /// The budget is a ceiling, not a height to reach: a short body keeps the
+    /// rows it has and the card ends there.
+    #[test_case(80 ; "wide")]
+    #[test_case(24 ; "very_narrow")]
+    fn a_body_inside_its_budget_is_drawn_whole(width: u16) {
+        const COUNT: usize = 2;
+        let text = wrapping_output(COUNT);
+        let painted = painted_rows(&text, width);
+
+        let (body, claimed) = budgeted(&budget_card(text, false, width));
+
+        assert!(painted.len() <= BUDGET, "{BUDGET_WHOLE_MSG}: {painted:?}");
+        assert_eq!(body, painted, "{BUDGET_WHOLE_MSG}");
+        assert_eq!(claimed, None, "{BUDGET_WHOLE_MSG}");
+    }
+
+    /// A command that printed for a minute is read from the end, so the rows
+    /// the budget keeps have to be the last ones painted rather than the
+    /// first.
+    #[test_case(80 ; "wide")]
+    #[test_case(40 ; "narrow")]
+    fn a_command_budget_keeps_the_rows_its_newest_output_painted(width: u16) {
+        const COUNT: usize = 20;
+        let text = wrapping_output(COUNT);
+        let painted = painted_rows(&text, width);
+
+        let (body, _) = budgeted(&budget_card(text, true, width));
+
+        assert_eq!(
+            body,
+            painted[painted.len() - body.len()..],
+            "{BUDGET_TAIL_MSG}"
+        );
+    }
+
+    /// A body whose every row belongs to one source line is the case a budget
+    /// counted in lines cannot express at all: keeping the line keeps all of
+    /// it, and dropping it leaves the card with nothing.
+    #[test_case(80 ; "wide")]
+    #[test_case(40 ; "narrow")]
+    #[test_case(24 ; "very_narrow")]
+    fn one_line_too_long_for_the_budget_still_shows_its_tail(width: u16) {
+        const LONG_LINE_CHARS: usize = 1_200;
+        let text = format!("tail-of-one-long-line-{}", "z".repeat(LONG_LINE_CHARS));
+        let painted = painted_rows(&text, width);
+
+        let (body, claimed) = budgeted(&budget_card(text, true, width));
+
+        assert!(painted.len() > BUDGET, "{LONG_LINE_MSG}: {}", painted.len());
+        assert_eq!(body.len(), BUDGET_BODY_ROWS, "{LONG_LINE_MSG}");
+        assert_eq!(
+            body,
+            painted[painted.len() - body.len()..],
+            "{LONG_LINE_MSG}"
+        );
+        assert_eq!(claimed, Some(painted.len() - body.len()), "{LONG_LINE_MSG}");
+    }
+
+    /// Holding a card still is worth nothing if it costs the body the columns
+    /// it is read in, which is what a narrow terminal has least of.
+    #[test_case(40 ; "forty")]
+    #[test_case(30 ; "thirty")]
+    #[test_case(24 ; "twenty_four")]
+    fn a_narrow_budgeted_card_still_draws_its_body(width: u16) {
+        let (body, _) = budgeted(&budget_card(wrapping_output(20), false, width));
+
+        assert_eq!(body.len(), BUDGET_BODY_ROWS, "{NARROW_BUDGET_MSG}");
+        for row in &body {
+            let drawn = row.strip_prefix(TOOL_BODY_INDENT).unwrap_or(row);
+            assert!(!drawn.trim().is_empty(), "{NARROW_BUDGET_MSG}: {row:?}");
+        }
+        let widest = body.iter().map(|row| row.chars().count()).max();
+        assert_eq!(widest, Some(usize::from(width)), "{NARROW_BUDGET_MSG}");
+    }
+
+    const DROPPED_MSG: &str = "rows cut before the card saw them are rows it cannot paint, so the \
+        notice adds them to what it withheld itself rather than reporting one and losing the other";
+
+    #[test]
+    fn a_budget_notice_counts_what_never_reached_the_card_too() {
+        const DROPPED: usize = 7;
+        const WIDTH: u16 = 40;
+        let text = wrapping_output(20);
+        let painted = painted_rows(&text, WIDTH);
+        let mut msg = bash_msg("cmd", ToolStatus::Success, None, None);
+        msg.text = format!("cmd\n{text}");
+        msg.truncated_lines = DROPPED;
+
+        let tl = build_tool_lines(
+            &msg,
+            ToolStatus::Success,
+            &budget_rctx(WIDTH),
+            Some(exp(false)),
+        );
+
+        let (body, claimed) = budgeted(&tl);
+        assert_eq!(
+            claimed,
+            Some(painted.len() - body.len() + DROPPED),
+            "{DROPPED_MSG}"
+        );
     }
 
     #[test_case(200, true,  false, false ; "expanded_shows_all")]
@@ -3952,10 +4632,55 @@ mod tests {
         );
     }
 
+    const CLAMP_ROW_MSG: &str = "a live row must fit without splitting display characters";
+    const SETTLED_TALLY_MSG: &str = "a settled activity tally wraps instead of losing detail";
+    const SETTLED_TALLY_WIDTH: u16 = 16;
+
+    #[test_case("abcdef", 0, "abcdef"; "unconstrained")]
+    #[test_case("abc", 3, "abc"; "exact_fit")]
+    #[test_case("abcd", 3, "ab…"; "ascii")]
+    #[test_case("abcd", 1, "…"; "one_column")]
+    #[test_case("漢字x", 3, "漢…"; "wide_characters")]
+    #[test_case("\u{2764}\u{fe0f}x", 2, "…"; "presentation_selector")]
+    #[test_case("a\u{301}bc", 2, "a\u{301}…"; "combining_mark")]
+    fn a_live_status_row_fits_its_display_width(text: &str, width: u16, expected: &str) {
+        let style = Style::default().fg(Color::Red);
+        let row = Line::from(clamp_to_row(
+            vec![Span::styled(text.to_owned(), style)],
+            width,
+        ));
+        let drawn = line_text(&row);
+        assert_eq!(drawn, expected, "{CLAMP_ROW_MSG}");
+        assert!(
+            width == UNCONSTRAINED_WIDTH || drawn.width() <= usize::from(width),
+            "{CLAMP_ROW_MSG}"
+        );
+        assert!(
+            row.spans.iter().all(|span| span.style == style),
+            "{CLAMP_ROW_MSG}"
+        );
+    }
+
+    #[test_case(ToolStatus::Success; "success")]
+    #[test_case(ToolStatus::Error; "error")]
+    fn a_settled_subagent_wraps_its_complete_tally(status: ToolStatus) {
+        let msg = subagent_msg(status, Some(running_tool_report(7)));
+        let tl = build_tool_lines(
+            &msg,
+            status,
+            &test_rctx(SETTLED_TALLY_WIDTH),
+            Some(Disclosure::default()),
+        );
+        let text = lines_text(&tl);
+        assert!(text.contains("7 tools"), "{SETTLED_TALLY_MSG}: {text}");
+        assert!(text.contains("3.4s"), "{SETTLED_TALLY_MSG}: {text}");
+        assert!(!text.contains(ELLIPSIS), "{SETTLED_TALLY_MSG}: {text}");
+    }
+
     const NESTED_ROSTER_MSG: &str =
         "a subagent batching draws the roster it is working through, one node in";
-    const ROSTER_TRUNK: &str = "a roster row with a sibling below it carries the trunk past its \
-        own break, or the tree comes apart at the first row too long for the card";
+    const ROSTER_ONE_ROW: &str = "a roster row must stay one row however long the call it names, \
+        or the tree's height tracks whatever the subagent happens to be running";
     /// Long enough that a narrow card has to break the roster row drawing it.
     const LONG_SUMMARY: &str =
         "cargo nextest run --workspace --locked --no-fail-fast --status-level all";
@@ -3967,6 +4692,276 @@ mod tests {
             summary: summary.to_owned(),
             status,
         }
+    }
+
+    const HISTORY_FIRST: &str = "first batch";
+    const HISTORY_SECOND: &str = "second batch";
+    const HISTORY_READ: &str = "history.rs";
+    const HISTORY_RUN: &str = "history command";
+    const HISTORY_GREP: &str = "history pattern";
+    const HISTORY_THINKING: &str = "Thinking";
+    const HISTORY_TOOLS: u32 = 7;
+    const HISTORY_TALLY: &str = " · 7 tools · ";
+    const HISTORY_WINDOW: u32 = 4;
+    const HISTORY_WIDTH: u16 = 80;
+    const HISTORY_ROWS: usize = 8;
+    const HISTORY_OUTPUT: &str = "output before the history\noutput beside the history";
+    const HISTORY_ANSWER: &str = "the settled answer";
+    const HISTORY_TREE_MSG: &str = "retained batches keep their statuses and continuing trunks";
+    const HISTORY_CURRENT_MSG: &str = "the current phase and tally appear exactly once";
+    const HISTORY_WINDOW_MSG: &str = "one task body owns output, history, and one scroll span";
+    const HISTORY_WORKER_MSG: &str = "live history must not be overwritten by a highlight result";
+    const HISTORY_LINK_MSG: &str =
+        "windowing progress and output keeps markdown links on their rows";
+    const HISTORY_LINK: &str = "https://example.com/history";
+
+    fn retained_task_progress() -> ToolProgress {
+        let mut progress = ToolProgress::live(report(
+            SubagentActivity::batch(
+                Arc::from(BATCH_TOOL_NAME),
+                HISTORY_FIRST,
+                vec![
+                    batch_child(FILE_READ_TOOL_NAME, HISTORY_READ, BatchToolStatus::Running),
+                    batch_child(SHELL_TOOL_NAME, HISTORY_RUN, BatchToolStatus::Error),
+                    batch_child(FILE_GREP_TOOL_NAME, HISTORY_GREP, BatchToolStatus::Pending),
+                ],
+            ),
+            HISTORY_TOOLS,
+        ));
+        progress.update(report(
+            SubagentActivity::Thinking { title: None },
+            HISTORY_TOOLS,
+        ));
+        progress.update(report(
+            SubagentActivity::batch(
+                Arc::from(BATCH_TOOL_NAME),
+                HISTORY_SECOND,
+                vec![batch_child(
+                    SHELL_TOOL_NAME,
+                    LONG_SUMMARY,
+                    BatchToolStatus::Running,
+                )],
+            ),
+            HISTORY_TOOLS,
+        ));
+        progress.update(report(
+            SubagentActivity::Thinking { title: None },
+            HISTORY_TOOLS,
+        ));
+        progress
+    }
+
+    fn history_msg() -> DisplayMessage {
+        let mut msg = subagent_msg(ToolStatus::InProgress, None);
+        if let DisplayRole::Tool(tool) = &mut msg.role {
+            tool.name = TASK_TOOL_NAME.into();
+        }
+        msg.progress = Some(retained_task_progress());
+        msg
+    }
+
+    fn history_text(line: &Line<'static>) -> String {
+        line_text(line)
+            .split(ACTIVITY_SEPARATOR)
+            .next()
+            .unwrap_or_default()
+            .to_owned()
+    }
+
+    #[test_case(TOOL_BODY_INDENT; "standalone")]
+    #[test_case(TREE_TRUNK; "nested_with_sibling")]
+    #[test_case(TREE_GAP; "nested_last_child")]
+    fn retained_groups_draw_real_rows_and_one_current_phase(continuation: &str) {
+        let progress = retained_task_progress();
+        let lines = progress_lines(&progress, continuation, UNBROKEN);
+        let rows: Vec<_> = lines.iter().map(history_text).collect();
+        assert_eq!(
+            rows,
+            [
+                format!("{continuation}{TREE_BRANCH}⇶ Batching {HISTORY_FIRST}"),
+                format!("{continuation}{TREE_TRUNK}{TREE_BRANCH}→ Reading {HISTORY_READ}"),
+                format!("{continuation}{TREE_TRUNK}{TREE_BRANCH}$ Run {HISTORY_RUN}"),
+                format!("{continuation}{TREE_TRUNK}{TREE_LAST}⌕ Grep {HISTORY_GREP}"),
+                format!("{continuation}{TREE_BRANCH}{HISTORY_THINKING}"),
+                format!("{continuation}{TREE_BRANCH}⇶ Batching {HISTORY_SECOND}"),
+                format!("{continuation}{TREE_TRUNK}{TREE_LAST}$ Running {LONG_SUMMARY}"),
+                format!("{continuation}{TREE_LAST}{HISTORY_THINKING}"),
+            ],
+            "{HISTORY_TREE_MSG}"
+        );
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|line| line_text(line).contains(HISTORY_TALLY))
+                .count(),
+            1,
+            "{HISTORY_CURRENT_MSG}"
+        );
+        assert_eq!(
+            lines[2].spans[1].style,
+            batch_sigil_style(BatchToolStatus::Error, None),
+            "{HISTORY_TREE_MSG}"
+        );
+    }
+
+    #[test_case(48; "narrow")]
+    #[test_case(HISTORY_WIDTH; "wide")]
+    fn standalone_history_and_output_use_one_row_window(width: u16) {
+        let mut msg = history_msg();
+        msg.live_body = Some(format!("[history link]({HISTORY_LINK})"));
+        msg.live_output = Some(wrapping_output(2));
+        let whole = build_tool_lines(
+            &msg,
+            ToolStatus::InProgress,
+            &test_rctx(width),
+            Some(exp(true)),
+        );
+        let expected: Vec<_> = whole.lines.iter().skip(1).map(history_text).collect();
+        let history_start = expected.len() - HISTORY_ROWS;
+        assert!(whole.scroll_spans.is_empty(), "{HISTORY_WINDOW_MSG}");
+        for offset in 0..expected.len() {
+            let window = ScrollWindow {
+                height: HISTORY_WINDOW as usize,
+                offset,
+                follow: false,
+            };
+            let (start, end) = window.range(expected.len());
+            let tl = build_tool_lines(
+                &msg,
+                ToolStatus::InProgress,
+                &scroll_rctx(width, HISTORY_WINDOW, window),
+                Some(Disclosure::default()),
+            );
+            assert_eq!(tl.scroll_spans.len(), 1, "{HISTORY_WINDOW_MSG}");
+            let span = tl.scroll_spans[0];
+            assert_eq!(span.extent_lines, span.lines, "{HISTORY_WINDOW_MSG}");
+            assert_eq!(
+                span.history_start,
+                Some(history_start),
+                "{HISTORY_WINDOW_MSG}"
+            );
+            assert_eq!(
+                (span.child, span.first, span.lines, span.total, span.offset),
+                (None, 1, end - start, expected.len(), start),
+                "{HISTORY_WINDOW_MSG}"
+            );
+            let shown: Vec<_> = tl.lines[span.first..span.first + span.lines]
+                .iter()
+                .map(history_text)
+                .collect();
+            assert_eq!(shown, expected[start..end], "{HISTORY_WINDOW_MSG}");
+            assert_eq!(
+                tl.scroll_footer_line,
+                Some(span.first + span.lines),
+                "{HISTORY_WINDOW_MSG}"
+            );
+            assert_eq!(tl.rows.len(), tl.lines.len(), "{HISTORY_WINDOW_MSG}");
+            assert_eq!(
+                tl.links.rows[span.first..span.first + span.lines],
+                whole.links.rows[start + 1..end + 1],
+                "{HISTORY_LINK_MSG}"
+            );
+            assert!(tl.highlight.is_none(), "{HISTORY_WORKER_MSG}");
+        }
+        assert!(
+            whole
+                .links
+                .rows
+                .iter()
+                .flatten()
+                .any(|link| link.as_deref() == Some(HISTORY_LINK)),
+            "{HISTORY_LINK_MSG}"
+        );
+    }
+
+    #[test_case(0; "unwindowed")]
+    #[test_case(HISTORY_WINDOW; "windowed")]
+    fn collapsed_task_output_keeps_retained_status_visible(height: u32) {
+        let mut msg = history_msg();
+        msg.live_output = Some(HISTORY_OUTPUT.to_owned());
+        let rctx = RenderCtx {
+            policy: CardPolicy {
+                scroll_card_lines: height,
+                always_collapsed: Arc::from([TASK_TOOL_NAME.to_owned()]),
+                ..CardPolicy::default()
+            },
+            ..test_rctx(HISTORY_WIDTH)
+        };
+        let tl = build_tool_lines(&msg, ToolStatus::InProgress, &rctx, None);
+        let text = lines_text(&tl);
+        assert!(
+            HISTORY_OUTPUT.lines().all(|line| !text.contains(line)),
+            "{HISTORY_WINDOW_MSG}: {text}"
+        );
+        assert_eq!(
+            text.matches(&format!("{HISTORY_THINKING}{HISTORY_TALLY}"))
+                .count(),
+            1,
+            "{HISTORY_CURRENT_MSG}"
+        );
+        assert_eq!(
+            text.matches(HISTORY_TALLY).count(),
+            1,
+            "{HISTORY_CURRENT_MSG}"
+        );
+        if height == 0 {
+            assert_eq!(tl.lines.len(), HISTORY_ROWS + 1, "{HISTORY_WINDOW_MSG}");
+            assert!(tl.scroll_spans.is_empty(), "{HISTORY_WINDOW_MSG}");
+        } else {
+            assert_eq!(tl.scroll_spans.len(), 1, "{HISTORY_WINDOW_MSG}");
+            assert_eq!(
+                tl.scroll_spans[0].history_start,
+                Some(0),
+                "{HISTORY_WINDOW_MSG}"
+            );
+            assert_eq!(
+                tl.scroll_spans[0].total, HISTORY_ROWS,
+                "{HISTORY_WINDOW_MSG}"
+            );
+        }
+    }
+
+    #[test_case(false; "closed")]
+    #[test_case(true; "open")]
+    fn compact_task_history_follows_body_disclosure(open: bool) {
+        let tl = build_tool_lines(
+            &history_msg(),
+            ToolStatus::InProgress,
+            &compact_rctx(UNBROKEN),
+            open.then(Disclosure::default),
+        );
+        let text = lines_text(&tl);
+        assert_eq!(
+            tl.lines.len(),
+            if open { HISTORY_ROWS + 1 } else { 1 },
+            "{HISTORY_WINDOW_MSG}"
+        );
+        assert_eq!(
+            text.matches(&format!("{HISTORY_THINKING}{HISTORY_TALLY}"))
+                .count(),
+            1,
+            "{HISTORY_CURRENT_MSG}"
+        );
+        assert_eq!(text.contains(HISTORY_FIRST), open, "{HISTORY_TREE_MSG}");
+        assert!(tl.scroll_spans.is_empty(), "{HISTORY_WINDOW_MSG}");
+    }
+
+    #[test]
+    fn retained_history_blocks_highlighting_even_with_an_input() {
+        let limits = RenderLimits {
+            progress: Arc::new(HashMap::from([(0, retained_task_progress())])),
+            ..RenderLimits::default()
+        };
+        let highlight = HighlightRequest::new(
+            (0, 1),
+            code_input().map(Arc::new),
+            Some(Arc::new(ToolOutput::Batch {
+                entries: vec![code_child()],
+                text: String::new(),
+            })),
+            limits,
+        );
+        assert!(highlight.is_none(), "{HISTORY_WORKER_MSG}");
     }
 
     /// The reported bug: a subagent running a batch reported only `Batching 3
@@ -4000,10 +4995,63 @@ mod tests {
         );
     }
 
-    /// The reported bug: the break put spaces where the trunk was, so a roster
-    /// row too long for the card cut the tree in half.
+    const ROSTER_HELD_MSG: &str = "a child changing state rewrites its own row and leaves the \
+        roster the height and the order it already had";
+    /// The calls one roster names, distinct enough that a row drawn in the
+    /// wrong place reads as the wrong call rather than as a changed one.
+    const ROSTER_CALLS: [(&str, &str); 3] = [
+        (FILE_READ_TOOL_NAME, "a.rs"),
+        (SHELL_TOOL_NAME, "cargo check"),
+        (FILE_GREP_TOOL_NAME, "fn main"),
+    ];
+
+    /// The rows a batching subagent's card draws, with its children in
+    /// `states`.
+    fn subagent_roster(states: [BatchToolStatus; ROSTER_CALLS.len()]) -> Vec<String> {
+        let children = ROSTER_CALLS
+            .iter()
+            .zip(states)
+            .map(|((tool, call), status)| batch_child(tool, call, status))
+            .collect();
+        let activity = SubagentActivity::batch(Arc::from(BATCH_TOOL_NAME), "3 tools", children);
+        let msg = subagent_msg(ToolStatus::InProgress, Some(report(activity, 3)));
+
+        build_tool_lines(&msg, ToolStatus::InProgress, &test_rctx(80), None)
+            .lines
+            .iter()
+            .map(line_text)
+            .collect()
+    }
+
+    /// The same reservation one level up from the batch card: the call named
+    /// its children when it parsed, so one of them running and then answering
+    /// rewrites a row and moves none.
     #[test]
-    fn a_wrapped_roster_row_carries_the_trunk_past_the_break() {
+    fn a_batching_subagent_holds_its_roster_as_its_children_move() {
+        let queued = subagent_roster([BatchToolStatus::Pending; ROSTER_CALLS.len()]);
+        let underway = subagent_roster([
+            BatchToolStatus::Success,
+            BatchToolStatus::Running,
+            BatchToolStatus::Pending,
+        ]);
+
+        assert_eq!(
+            underway.len(),
+            queued.len(),
+            "{ROSTER_HELD_MSG}: {underway:?}"
+        );
+        let roster = &underway[underway.len() - ROSTER_CALLS.len()..];
+        for (row, (_, call)) in roster.iter().zip(ROSTER_CALLS) {
+            assert!(row.ends_with(call), "{ROSTER_HELD_MSG}: {underway:?}");
+        }
+    }
+
+    /// The reported bug: a roster row whose summary outgrew the card wrapped,
+    /// so the row's height tracked whichever call the subagent had reached,
+    /// and every switch between calls of different lengths reflowed the rows
+    /// under it. One child is one row, whatever it is running.
+    #[test]
+    fn a_long_roster_row_stays_one_row() {
         let activity = SubagentActivity::batch(
             Arc::from(BATCH_TOOL_NAME),
             "2 tools",
@@ -4021,17 +5069,18 @@ mod tests {
         let opened = rows
             .iter()
             .position(|row| row.starts_with(&format!("{level}{TREE_BRANCH}")))
-            .expect(ROSTER_TRUNK);
+            .expect(ROSTER_ONE_ROW);
         let last = rows
             .iter()
             .position(|row| row.starts_with(&format!("{level}{TREE_LAST}")))
-            .expect(ROSTER_TRUNK);
-        let trunk = format!("{level}{}", TREE_TRUNK.trim_end());
+            .expect(ROSTER_ONE_ROW);
 
-        assert!(last > opened + 1, "{ROSTER_TRUNK}: {rows:#?}");
-        for row in rows.iter().take(last).skip(opened + 1) {
-            assert!(row.starts_with(&trunk), "{ROSTER_TRUNK}: {row:?}");
-        }
+        assert_eq!(last, opened + 1, "{ROSTER_ONE_ROW}: {rows:#?}");
+        assert!(
+            rows[opened].ends_with(ELLIPSIS),
+            "{ROSTER_ONE_ROW}: {:?}",
+            rows[opened]
+        );
     }
 
     const HEADER_HANG: &str = "a header too long for its card carries on under its label, not \
@@ -4095,21 +5144,31 @@ mod tests {
     /// stops, exactly as the activity beside it does.
     #[test]
     fn a_settled_subagent_drops_the_roster_with_its_activity() {
-        let activity = SubagentActivity::batch(
-            Arc::from(BATCH_TOOL_NAME),
-            "1 tool",
-            vec![batch_child(
-                FILE_READ_TOOL_NAME,
-                "a.rs",
-                BatchToolStatus::Success,
-            )],
+        let mut msg = history_msg();
+        msg.progress.as_mut().expect(HISTORY_TREE_MSG).settle();
+        msg.tool_output = Some(Arc::new(ToolOutput::Plain(HISTORY_ANSWER.into())));
+        let tl = build_tool_lines(
+            &msg,
+            ToolStatus::Success,
+            &test_rctx(HISTORY_WIDTH),
+            Some(Disclosure::default()),
         );
-        let msg = subagent_msg(ToolStatus::Success, Some(report(activity, 1)));
-
-        let tl = build_tool_lines(&msg, ToolStatus::Success, &test_rctx(80), None);
-
         let text = lines_text(&tl);
-        assert!(!text.contains("a.rs"), "{text}");
+        assert!(!text.contains(HISTORY_FIRST), "{HISTORY_TREE_MSG}: {text}");
+        assert!(!text.contains(HISTORY_SECOND), "{HISTORY_TREE_MSG}: {text}");
+        assert!(
+            !text.contains(HISTORY_THINKING),
+            "{HISTORY_CURRENT_MSG}: {text}"
+        );
+        assert!(
+            text.contains(HISTORY_ANSWER),
+            "{HISTORY_WINDOW_MSG}: {text}"
+        );
+        assert_eq!(
+            text.matches(&format!("{HISTORY_TOOLS} tools")).count(),
+            1,
+            "{HISTORY_CURRENT_MSG}: {text}"
+        );
     }
 
     /// A phase is not a call, so nothing names a tool on that row and the

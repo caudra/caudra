@@ -11,9 +11,9 @@ use crate::selection::wrap_breaks;
 use crate::theme;
 
 use super::tool_display::{
-    ScrollTail, TREE_BRANCH, TREE_GAP, TREE_LAST, TREE_TRUNK, activity_child_spans,
-    activity_detail, activity_label, activity_sigil, batch_sigil_style, compact_args_for,
-    compact_sigil_label, header_spans, inflected_header, names_tool, scroll_footer_text,
+    ScrollTail, TREE_BRANCH, TREE_GAP, TREE_LAST, TREE_TRUNK, batch_sigil_style, clamp_to_row,
+    compact_args_for, compact_sigil_label, header_spans, inflected_header, names_tool,
+    progress_lines, scroll_footer_text,
 };
 use super::{ToolProgress, environment_card, is_collapsible, workflow_card};
 use caudra_agent::tools::{PYTHON_EXECUTION_TOOL_NAME, SHELL_TOOL_NAME, TASK_TOOL_NAME};
@@ -39,7 +39,6 @@ pub(crate) const MAX_INSTRUCTION_LINES: usize = 15;
 /// What a child's body clears past the trunk it hangs from, so its text lands
 /// under the label the connector and sigil pushed across.
 const BATCH_BODY_PAD: &str = "  ";
-const BATCH_CHILD_INDENT_WIDTH: u16 = (TREE_GAP.len() + BATCH_BODY_PAD.len()) as u16;
 const ANSWER_MARK: &str = "  \u{2713} ";
 /// An option the user passed over. Borrowed from the todo list's pending
 /// marker, which is already what an unfinished circle means in a card.
@@ -57,7 +56,7 @@ const CHILD_ACTIVITY_SEPARATOR: &str = " · ";
 const BATCH_FOLDED_MARK: &str = " \u{2026}";
 const QUEUED_ANNOTATION: &str = "queued";
 /// What the markdown renderer calls a width it should not wrap to.
-const UNCONSTRAINED_WIDTH: u16 = 0;
+pub(super) const UNCONSTRAINED_WIDTH: u16 = 0;
 const GREP_COUNT_SEP: &str = " \u{b7} ";
 /// Workcell cuts a receipt at a byte bound and reports no line count for what
 /// it dropped, so this says that the patch is short without inventing a number.
@@ -80,6 +79,13 @@ const MIN_CODE_COLUMNS: usize = 60;
 /// Below this a row has no room left to say anything, and breaking it would
 /// cost more rows than the overflow it was meant to spare.
 const MIN_WRAP_COLUMNS: usize = 8;
+/// The digits a numbered body reserves before it knows how far it reaches. A
+/// gutter sized to the highest number drawn so far widens at ten lines and
+/// again at a hundred, and each widening narrows the code column and rewraps
+/// every row already on screen. Three digits covers the bodies a card usually
+/// draws, costs four columns of even a forty-column card, and moves the
+/// gutter once at a thousand lines instead of twice on the way there.
+const MIN_GUTTER_DIGITS: usize = 3;
 /// The characters a row's gutter is built from: the card's own indent, the four
 /// tree glyphs, and the check a settled row opens with.
 const GUTTER_CHARS: &str = " \u{2502}\u{251c}\u{2514}\u{2500}\u{2713}";
@@ -100,6 +106,17 @@ const BLOCK_GAP: &str = "\n\n";
 /// children read as its sections rather than as cards of their own.
 const CHILD_HEADING_LEVEL: &str = "###";
 
+/// The columns `indent_all` puts back in front of every row of a child's
+/// body, which is what that body's width is narrowed by before it is built.
+///
+/// Measured rather than counted in bytes. The connector a body hangs from is
+/// `TREE_GAP` or `TREE_TRUNK` depending on whether a sibling follows, and the
+/// two agree on four columns while disagreeing on four bytes against six, so a
+/// byte count is right only for whichever of the pair happens to be ASCII.
+fn batch_child_indent_width() -> u16 {
+    (UnicodeWidthStr::width(TREE_TRUNK) + UnicodeWidthStr::width(BATCH_BODY_PAD)) as u16
+}
+
 pub(crate) fn instruction_limit(expanded: bool) -> usize {
     if expanded {
         usize::MAX
@@ -110,6 +127,14 @@ pub(crate) fn instruction_limit(expanded: bool) -> usize {
 
 fn nr_width(max_nr: usize) -> usize {
     max_nr.max(1).ilog10() as usize + 1
+}
+
+/// The columns a code body holds back for its line numbers, given the highest
+/// number its whole line range reaches rather than the highest it happens to
+/// be drawing. Reserved so that growing content, a raised budget or a moved
+/// window cannot re-gutter rows that are already on screen.
+fn gutter_digits(max_nr: usize) -> usize {
+    nr_width(max_nr).max(MIN_GUTTER_DIGITS)
 }
 
 fn gutter(nr_str: &str) -> Span<'static> {
@@ -173,6 +198,26 @@ impl BodySource {
     /// by scraping, or every row of it would reach the clipboard as nothing.
     pub fn names_source(&self) -> bool {
         self.rows.iter().any(|row| row.line.is_some())
+    }
+
+    /// The rows a window or a budget kept, giving the body up when they can no
+    /// longer be told to line up. The blocks move with them, or a fence would
+    /// land around rows the window never drew.
+    pub(crate) fn keep_rows(mut self, kept: Range<usize>) -> Option<Self> {
+        self.rows = self.rows.get(kept.clone())?.to_vec();
+        self.code = self
+            .code
+            .into_iter()
+            .filter_map(|block| {
+                let start = block.rows.start.max(kept.start);
+                let end = block.rows.end.min(kept.end);
+                (start < end).then(|| CodeBlock {
+                    rows: start - kept.start..end - kept.start,
+                    ..block
+                })
+            })
+            .collect();
+        Some(self)
     }
 
     /// Names the code blocks after the language a tool declared for them.
@@ -317,8 +362,11 @@ fn render_code(
     let hidden = total_count.saturating_sub(capped);
     let truncated = should_truncate(hidden);
     let display_count = if truncated { capped } else { code_lines.len() };
-    let max_nr = start_line + display_count.saturating_sub(1);
-    let w = nr_width(max_nr);
+    // The body's whole range, not the part of it being drawn: a budget that
+    // opens or a window that moves must not change the column the code starts
+    // in, or every row on screen rewraps around it.
+    let extent = start_line + total_count.max(display_count).saturating_sub(1);
+    let w = gutter_digits(extent);
 
     let shown = &code_lines[..display_count.min(code_lines.len())];
     let mut source = BodySource {
@@ -947,6 +995,13 @@ fn option_lines(label: &str, picked: bool, t: &theme::Theme) -> Vec<Line<'static
 /// exactly where they are worst, since a long search header is what wraps.
 fn render_batch(entries: &[BatchToolEntry], highlight: bool, limits: &RenderLimits) -> BatchCard {
     let t = theme::current();
+    let running = !limits.settled
+        && entries.iter().any(|entry| {
+            matches!(
+                entry.status,
+                BatchToolStatus::Pending | BatchToolStatus::Running
+            )
+        });
     let mut lines = Vec::new();
     let mut rows = Vec::new();
     let mut spans_out = Vec::new();
@@ -954,9 +1009,23 @@ fn render_batch(entries: &[BatchToolEntry], highlight: bool, limits: &RenderLimi
     let mut previous_has_body = false;
     for (index, entry) in entries.iter().enumerate() {
         let view = limits.child(index, entry);
+        let progress = limits.progress.get(&index).filter(|p| p.is_live());
+        let progress_window = progress.and_then(|_| {
+            limits
+                .child_scroll
+                .get(&index)
+                .copied()
+                .or_else(|| limits.policy.window(&entry.tool, 0, true))
+        });
         // Resolved before the summary row so the separator below knows whether
         // this child is a list entry or a block.
-        let body = view.map(|child| child_body(entry, highlight, &child, limits.live.get(&index)));
+        let body = view.map(|mut child| {
+            if progress_window.is_some() {
+                child.scroll = None;
+                child.budget = usize::MAX;
+            }
+            child_body(entry, highlight, &child, limits.live.get(&index))
+        });
         let has_body = body.as_ref().is_some_and(|body| !body.lines.is_empty());
         // Every row of a child answers for it, whether or not a click would
         // change what is drawn: this is also how a dispatched child's rows are
@@ -1035,6 +1104,9 @@ fn render_batch(entries: &[BatchToolEntry], highlight: bool, limits: &RenderLimi
         if body.is_none() && holds_a_body(entry) {
             spans.push(Span::styled(BATCH_FOLDED_MARK, t.tool_dim));
         }
+        if running {
+            spans = clamp_to_row(spans, limits.width);
+        }
         // A child is a section of the card, not another run of its output, so
         // its summary row copies as the heading that says whose output follows.
         // Without it ten calls reach the clipboard as one undivided block.
@@ -1053,21 +1125,40 @@ fn render_batch(entries: &[BatchToolEntry], highlight: bool, limits: &RenderLimi
         // A child's own output is content and clears the trunk; what the child
         // dispatched hangs off it as nodes. Content first, so reading down a
         // child never steps back out to a shallower level than the row above.
+        let mut body = body.map(|body| body.indented(continuation));
+        if let Some(progress) = progress {
+            let mut combined =
+                body.unwrap_or_else(|| ChildBody::traced(Vec::new(), BodySource::default()));
+            let history = progress_lines(progress, continuation, limits.width);
+            if let Some(source) = combined.source.as_mut() {
+                for line in &history {
+                    source.push_chrome(line.spans.len());
+                }
+            }
+            let history_start = combined.lines.len();
+            combined.lines.extend(history);
+            combined = child_view(
+                combined,
+                progress_window,
+                usize::MAX,
+                ScrollTail::Live,
+                &format!("{continuation}{BATCH_BODY_PAD}"),
+            );
+            if let Some(span) = combined.span.as_mut() {
+                span.history_start = Some(history_start);
+            }
+            body = Some(combined);
+        }
         if let Some(body) = body {
             if let Some(span) = body.span {
                 spans_out.push(span.shifted(lines.len(), Some(index)));
             }
             rows.resize(rows.len() + body.lines.len(), target);
             match body.source {
-                Some(source) => trace.record(lines.len(), source.indented()),
+                Some(source) => trace.record(lines.len(), source),
                 None => trace.abandon(),
             }
-            lines.extend(indent_all(body.lines, continuation));
-        }
-        if let Some(progress) = limits.progress.get(&index).filter(|p| p.is_live()) {
-            let progress_lines = child_progress_lines(progress, continuation);
-            rows.resize(rows.len() + progress_lines.len(), target);
-            lines.extend(progress_lines);
+            lines.extend(body.lines);
         }
     }
     BatchCard {
@@ -1196,52 +1287,6 @@ fn settled_tally(progress: &ToolProgress) -> Option<String> {
     }
 }
 
-/// How a dispatched child is getting on, and the roster it is working through
-/// when the tool it is running is itself a batch.
-///
-/// `continuation` is the trunk carried down from the child that owns this
-/// progress: `│   ` while that child has siblings below it, spaces once it is
-/// the last one.
-fn child_progress_lines(progress: &ToolProgress, continuation: &str) -> Vec<Line<'static>> {
-    let theme = theme::current();
-    let mut spans = vec![Span::styled(
-        format!("{continuation}{TREE_LAST}"),
-        theme.tool_dim,
-    )];
-    if let Some(sigil) = activity_sigil(&progress.report.activity) {
-        spans.push(Span::styled(format!("{sigil} "), theme.tool_prefix));
-    }
-    spans.push(Span::styled(
-        activity_label(&progress.report.activity),
-        theme.tool_prefix,
-    ));
-    if let Some(detail) = activity_detail(&progress.report.activity) {
-        spans.push(Span::styled(format!(" {detail}"), theme.tool_dim));
-    }
-    spans.push(Span::styled(
-        format!(
-            "{CHILD_ACTIVITY_SEPARATOR}{}",
-            SubagentProgress::tally(progress.report.tools, progress.elapsed())
-        ),
-        theme.tool_dim,
-    ));
-    let mut lines = vec![Line::from(spans)];
-    // The activity row is the last node under its child, so everything below
-    // it clears the trunk rather than continuing one.
-    let children = progress.report.activity.children();
-    for (index, child) in children.iter().enumerate() {
-        let connector = match index + 1 == children.len() {
-            true => TREE_LAST,
-            false => TREE_BRANCH,
-        };
-        lines.push(Line::from(activity_child_spans(
-            child,
-            format!("{continuation}{TREE_GAP}{connector}"),
-        )));
-    }
-    lines
-}
-
 /// A child's own rendering, structured where the tool produced structure and
 /// its text otherwise, with whether it is holding anything back. Errors read
 /// as plain text: a failed call has no structured result to draw.
@@ -1286,7 +1331,13 @@ fn child_body(
                 true => ScrollTail::Live,
                 false => ScrollTail::Settled,
             };
-            let body = child_view(ChildBody::traced(lines, source), limits, tail);
+            let body = child_view(
+                ChildBody::traced(lines, source),
+                limits.scroll,
+                limits.budget,
+                tail,
+                "",
+            );
             with_script(entry, highlight, limits, body)
         }
         None => {
@@ -1326,26 +1377,14 @@ impl ChildBody {
         }
     }
 
-    /// Keeps the rows behind the lines a window or a budget kept, giving the
-    /// body up when they can no longer be told to line up. The blocks move with
-    /// them, or a fence would land around rows the window never drew.
     fn keep_rows(&mut self, kept: Range<usize>) {
-        self.source = self.source.take().and_then(|mut source| {
-            source.rows = source.rows.get(kept.clone())?.to_vec();
-            source.code = source
-                .code
-                .into_iter()
-                .filter_map(|block| {
-                    let start = block.rows.start.max(kept.start);
-                    let end = block.rows.end.min(kept.end);
-                    (start < end).then(|| CodeBlock {
-                        rows: start - kept.start..end - kept.start,
-                        ..block
-                    })
-                })
-                .collect();
-            Some(source)
-        });
+        self.source = self.source.take().and_then(|source| source.keep_rows(kept));
+    }
+
+    fn indented(mut self, continuation: &str) -> Self {
+        self.lines = indent_all(self.lines, continuation);
+        self.source = self.source.map(BodySource::indented);
+        self
     }
 
     /// Marks a line the body was closed with, which is chrome wherever it came
@@ -1436,29 +1475,42 @@ fn with_script(
 /// what is not being shown; a window says it as two edges and which one the
 /// reader is pinned to, because that is what tells them whether output is
 /// still arriving under what they are reading.
-fn child_view(mut body: ChildBody, limits: &RenderLimits, tail: ScrollTail) -> ChildBody {
-    let Some(window) = limits.scroll else {
-        return body.capped(limits.budget);
+fn child_view(
+    mut body: ChildBody,
+    scroll: Option<ScrollWindow>,
+    budget: usize,
+    tail: ScrollTail,
+    footer_indent: &str,
+) -> ChildBody {
+    let Some(window) = scroll else {
+        return body.capped(budget);
     };
     let total = body.lines.len();
-    let (start, end) = window.range(total);
-    body.lines = body.lines[start..end].to_vec();
-    body.keep_rows(start..end);
-    let span = ScrollSpan {
+    let (lines, hidden) = window_rows(std::mem::take(&mut body.lines), Some(window));
+    let (start, below) = hidden.unwrap_or_default();
+    body.lines = lines;
+    body.keep_rows(start..start + body.lines.len());
+    // Published before the footer is decided, and against the rows the window
+    // kept rather than the line the footer would add to them. A body that
+    // fits has nothing to say in a footer and is still drawn in a window, and
+    // a card's own body already publishes that case from `push_live_body`.
+    body.span = Some(ScrollSpan {
         child: None,
         first: 0,
         lines: body.lines.len(),
+        extent_lines: body.lines.len(),
         total,
         offset: start,
-    };
-    let Some(footer) = scroll_footer_text(start, total - end, tail) else {
+        history_start: None,
+    });
+    let Some(mut footer) = scroll_footer_text(start, below, tail) else {
         return body;
     };
+    footer.insert_str(0, footer_indent);
     body.lines
         .push(Line::from(Span::styled(footer, theme::current().tool_dim)));
     body.push_chrome();
     body.truncation = true;
-    body.span = Some(span);
     body
 }
 
@@ -1849,6 +1901,19 @@ impl WrappedRows {
     /// A range of lines as the range of rows they became.
     pub(crate) fn range(&self, range: Range<usize>) -> Range<usize> {
         self.row_of(range.start)..self.row_of(range.end)
+    }
+
+    /// A window recorded against lines, moved onto the rows those lines broke
+    /// into. The extent travels with the start: a window whose lines wrapped
+    /// paints taller than it was recorded, and a track left at the old count
+    /// is a bar shorter than the body it sits beside.
+    pub(crate) fn scroll_span(&self, span: ScrollSpan) -> ScrollSpan {
+        let rows = self.range(span.first..span.first + span.lines);
+        ScrollSpan {
+            first: rows.start,
+            lines: rows.end - rows.start,
+            ..span
+        }
     }
 
     /// A card's source, moved onto the rows the break produced. The text is
@@ -2609,6 +2674,26 @@ impl ScrollWindow {
     }
 }
 
+/// The rows a window shows, with the counts it hides above and below. `None`
+/// for a body drawn to a budget instead, which keeps every row it painted.
+///
+/// Cut from painted rows rather than from the source lines behind them. A
+/// window is a height in terminal rows, and one source line is any number of
+/// rows wide once it wraps, so windowing the source makes the card's height
+/// follow the length of whatever happens to be in view.
+pub(crate) fn window_rows<T>(
+    mut rows: Vec<T>,
+    window: Option<ScrollWindow>,
+) -> (Vec<T>, Option<(usize, usize)>) {
+    let Some(window) = window else {
+        return (rows, None);
+    };
+    let total = rows.len();
+    let (start, end) = window.range(total);
+    rows.truncate(end);
+    (rows.split_off(start), Some((start, total - end)))
+}
+
 /// The tools whose body reports on work rather than being the work, and is
 /// long, arrives over time, or both. They are drawn in a fixed window that
 /// follows the tail rather than abridged with a notice offering the rest.
@@ -2663,10 +2748,21 @@ impl CardPolicy {
 #[derive(Clone, Default)]
 pub struct RenderLimits {
     pub budget: usize,
+    pub settled: bool,
     /// Present only for a card drawn as a fixed-height scroller. It replaces
     /// the budget and the notice under it: the window is the whole story of
     /// how much is shown, and the footer says where it sits.
     pub scroll: Option<ScrollWindow>,
+    /// Whether a level above this one on the same nesting path already draws
+    /// an output body of its own.
+    ///
+    /// One body per path is the whole point: a leaf that gains a row scrolls
+    /// inside that one body instead of growing its parent, which grows its
+    /// parent, until some level happens to hit a cap. Tree rows are untouched
+    /// — every level still draws its roster, its live status and its clocks —
+    /// so what is held to one is the *output* a path scrolls, never what it
+    /// says it is doing.
+    pub body_taken: bool,
     pub policy: CardPolicy,
     /// Where each scrolling child of this card has its window, by index in
     /// the roster. A child absent from the map is pinned to its tail.
@@ -2690,7 +2786,9 @@ impl RenderLimits {
     pub fn new(full: bool, budget: usize, views: BatchViews, tool_lines: ToolOutputLines) -> Self {
         Self {
             budget: if full { usize::MAX } else { budget },
+            settled: false,
             scroll: None,
+            body_taken: false,
             policy: CardPolicy::default(),
             child_scroll: Arc::default(),
             views,
@@ -2797,11 +2895,20 @@ impl RenderLimits {
     /// would take back what the mode was chosen for. Opening a child by hand
     /// is still the way out, and it opens whole.
     ///
+    /// A path already carrying a bounded body draws no second one. The level
+    /// above is where that path's growth is absorbed, so a child under it
+    /// keeps its row — sigil, status, annotation, counts, clock — and its own
+    /// roster, and folds its output away instead of opening another window
+    /// for every ancestor to grow around. Clicking the row is still the way
+    /// in, and it is what moves the body down to this level: an opened child
+    /// draws whole, bounds nothing, and hands the path on to whatever *it*
+    /// nests.
+    ///
     /// The views and the reports name this card's children, so both are
     /// dropped on the way in or a nested batch would read them as its own.
     fn child(&self, index: usize, entry: &BatchToolEntry) -> Option<Self> {
         let open = self.views.is_open(index);
-        if self.policy.compact && !open {
+        if (self.policy.compact || self.body_taken) && !open {
             return None;
         }
         let streaming = entry.output.is_none()
@@ -2822,7 +2929,12 @@ impl RenderLimits {
         };
         Some(Self {
             budget,
+            settled: self.settled || entry.status.is_terminal(),
             scroll,
+            // A child the reader opened draws whole, which is them asking for
+            // what is under it too, so it hands the path on rather than
+            // claiming the one body for itself.
+            body_taken: budget != usize::MAX,
             policy: self.policy.clone(),
             child_scroll: Arc::default(),
             views: BatchViews::default(),
@@ -2830,7 +2942,7 @@ impl RenderLimits {
             live: ChildLive::default(),
             started: ChildStarted::default(),
             tool_lines: self.tool_lines,
-            width: self.width.saturating_sub(BATCH_CHILD_INDENT_WIDTH),
+            width: self.width.saturating_sub(batch_child_indent_width()),
         })
     }
 }
@@ -2885,9 +2997,11 @@ pub struct ScrollSpan {
     pub first: usize,
     /// Lines of window, which is what the bar's track spans.
     pub lines: usize,
+    pub extent_lines: usize,
     /// Lines of body the window is a view onto, and how far down it sits.
     pub total: usize,
     pub offset: usize,
+    pub history_start: Option<usize>,
 }
 
 impl ScrollSpan {
@@ -3109,10 +3223,7 @@ fn wrapped_content(content: ToolContent, width: u16) -> ToolContent {
         scroll_spans: content
             .scroll_spans
             .into_iter()
-            .map(|span| ScrollSpan {
-                first: wrapped.row_of(span.first),
-                ..span
-            })
+            .map(|span| wrapped.scroll_span(span))
             .collect(),
         source: content.source.map(|source| wrapped.body(source)),
     }
@@ -3167,7 +3278,9 @@ fn merge_syntax_with_diff(
 mod tests {
     use super::*;
     use crate::markdown::{EXPAND_AFFORDANCE, TRUNCATION_PREFIX};
-    use caudra_agent::tools::{BATCH_TOOL_NAME, FILE_GREP_TOOL_NAME, ToolEffect};
+    use caudra_agent::tools::{
+        BATCH_TOOL_NAME, FILE_GREP_TOOL_NAME, FILE_READ_TOOL_NAME, ToolEffect,
+    };
     use caudra_agent::types::QuestionOption;
     use caudra_agent::{
         ActivityChild, EnvironmentFact, GrepLine, GrepMatchGroup, ShellOutput, SubagentActivity,
@@ -3246,7 +3359,7 @@ mod tests {
     fn a_numbered_line_is_numbered_once_however_many_rows_it_takes(start: usize, last: usize) {
         const LONG: &str = "git status --short; git diff --stat; git diff --cached --stat";
         let code_lines = Vec::from([LONG.to_owned(), "echo done".to_owned()]);
-        let width = nr_width(last) + 1;
+        let width = gutter_digits(last) + 1;
 
         let rendered = render_code(None, start, &code_lines, 2, usize::MAX, CODE_CARD_WIDTH);
 
@@ -3278,6 +3391,86 @@ mod tests {
         );
     }
 
+    const STABLE_GUTTER: &str =
+        "a body that grows or opens must not re-gutter the rows already on screen";
+    const GUTTER_LEAVES_ROOM: &str =
+        "a reserved gutter must still leave a narrow card room to read the code behind it";
+
+    /// Lines long enough to break at every width these cases use, so a gutter
+    /// that moved shows as rewrapped rows rather than only as shifted numbers.
+    fn wrapping_lines(count: usize) -> String {
+        (1..=count)
+            .map(|nr| format!("call{nr}(alpha, beta, gamma, delta, epsilon)"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The reported defect: a file arriving line by line widened its gutter as
+    /// it crossed a digit boundary, which narrowed the code column and rewrapped
+    /// every row that had already been drawn.
+    #[test_case(9, 10 ; "nine_to_ten")]
+    #[test_case(99, 100 ; "ninety_nine_to_a_hundred")]
+    fn a_growing_body_leaves_the_rows_already_drawn_alone(before: usize, after: usize) {
+        let drawn: Vec<String> = render_live_body(&wrapping_lines(before), CODE_CARD_WIDTH)
+            .iter()
+            .map(line_text)
+            .collect();
+
+        let grown: Vec<String> = render_live_body(&wrapping_lines(after), CODE_CARD_WIDTH)
+            .iter()
+            .take(drawn.len())
+            .map(line_text)
+            .collect();
+
+        assert_eq!(drawn, grown, "{STABLE_GUTTER}");
+    }
+
+    /// The same body at two budgets. A gutter sized to the rows on screen
+    /// rather than to the file's own range moves the moment a card is opened,
+    /// taking every row that was already readable with it.
+    #[test]
+    fn opening_a_budget_leaves_the_gutter_where_it_was() {
+        const SHOWN: usize = 5;
+        const TOTAL: usize = 1200;
+        let code: Vec<String> = (1..=TOTAL)
+            .map(|nr| format!("row {nr} of the file"))
+            .collect();
+
+        let closed = render_code(None, 1, &code, TOTAL, SHOWN, CODE_CARD_WIDTH);
+        let open = render_code(None, 1, &code, TOTAL, usize::MAX, CODE_CARD_WIDTH);
+
+        let closed: Vec<String> = closed.lines.iter().take(SHOWN).map(line_text).collect();
+        let open: Vec<String> = open.lines.iter().take(SHOWN).map(line_text).collect();
+        assert_eq!(closed, open, "{STABLE_GUTTER}");
+    }
+
+    /// Reserving the gutter is only worth it while the code still has columns
+    /// to be read in, which is the thing a narrow terminal has least of.
+    #[test_case(40 ; "forty_columns")]
+    #[test_case(30 ; "thirty_columns")]
+    #[test_case(24 ; "twenty_four_columns")]
+    fn a_reserved_gutter_still_leaves_a_narrow_card_room_to_read(width: u16) {
+        const CODE: &str = "let total = alpha + beta + gamma + delta;";
+        let rendered = render_live_body(CODE, width);
+
+        let rows: Vec<String> = rendered.iter().map(line_text).collect();
+        assert!(
+            rows.iter()
+                .all(|row| row.chars().count() <= usize::from(width)),
+            "{GUTTER_LEAVES_ROOM}: {rows:?}"
+        );
+        for line in &rendered {
+            let code = spans_text(&line.spans[1..]);
+            assert!(!code.trim().is_empty(), "{GUTTER_LEAVES_ROOM}: {rows:?}");
+        }
+        for word in ["alpha", "beta", "gamma", "delta"] {
+            assert!(
+                rows.iter().any(|row| row.contains(word)),
+                "{GUTTER_LEAVES_ROOM}: {rows:?}"
+            );
+        }
+    }
+
     /// A break must not put the clipboard out of step with the screen: the
     /// pieces of a cut span name the bytes each row drew, and together they are
     /// the line that was written.
@@ -3305,6 +3498,82 @@ mod tests {
             assert_eq!(row.spans.len(), line.spans.len(), "{SPANS_PER_ROW}");
             assert_eq!(row.line, Some(0..LONG.len() as u32), "{NUMBERED_ONCE}");
         }
+    }
+
+    const WRAPPED_TRACK_MSG: &str = "a window's track is the rows it painted, so a line the final break split lengthens it \
+         instead of leaving the bar counting lines the card no longer has";
+    /// Where the window sits in the body behind it. Both are counted in that
+    /// body's own lines, which the break does not touch.
+    const WINDOWED_BODY_LINES: usize = 40;
+    const WINDOWED_BODY_OFFSET: usize = 7;
+
+    /// A window is recorded while the card is still in logical lines, and the
+    /// card is broken to its width once, at the end. Whatever that break
+    /// lengthened has to be carried across it, or the bar, the wheel and the
+    /// painted height stop agreeing about the same rows.
+    #[test_case(None; "without_history")]
+    #[test_case(Some(WINDOWED_BODY_OFFSET); "with_history")]
+    fn a_window_whose_lines_break_keeps_its_track_over_the_rows_it_painted(
+        history_start: Option<usize>,
+    ) {
+        const WINDOW_LINES: usize = 3;
+        let over_wide = "z".repeat(usize::from(CODE_CARD_WIDTH) * 2);
+        let lines: Vec<Line<'static>> = (0..=WINDOW_LINES)
+            .map(|index| Line::from(format!("row{index} {over_wide}")))
+            .collect();
+        let content = ToolContent {
+            rows: vec![None; lines.len()],
+            lines,
+            truncation: false,
+            // Every line but the first, so the rows it kept are every row the
+            // card has once the first line's are taken off the front.
+            scroll_spans: Vec::from([ScrollSpan {
+                child: None,
+                first: 1,
+                lines: WINDOW_LINES,
+                extent_lines: WINDOW_LINES,
+                total: WINDOWED_BODY_LINES,
+                offset: WINDOWED_BODY_OFFSET,
+                history_start,
+            }]),
+            source: None,
+        };
+
+        let wrapped = wrapped_content(content, CODE_CARD_WIDTH);
+
+        let span = wrapped.scroll_spans[0];
+        assert!(
+            span.lines > WINDOW_LINES,
+            "{WRAPPED_TRACK_MSG}: {} rows for {WINDOW_LINES} lines",
+            span.lines
+        );
+        assert_eq!(
+            span.first + span.lines,
+            wrapped.lines.len(),
+            "{WRAPPED_TRACK_MSG}"
+        );
+        assert_eq!(
+            (span.total, span.offset),
+            (WINDOWED_BODY_LINES, WINDOWED_BODY_OFFSET),
+            "{WRAPPED_TRACK_MSG}"
+        );
+        assert_eq!(span.history_start, history_start, "{WRAPPED_TRACK_MSG}");
+        assert_eq!(span.extent_lines, WINDOW_LINES, "{WRAPPED_TRACK_MSG}");
+        let mut body = ChildBody::traced(wrapped.lines, BodySource::default());
+        body.span = Some(span);
+        let shifted = body
+            .indented(TREE_TRUNK)
+            .span
+            .expect(WRAPPED_TRACK_MSG)
+            .shifted(WINDOW_LINES, Some(0))
+            .shift_lines(WINDOW_LINES);
+        assert_eq!(
+            shifted.first,
+            span.first + WINDOW_LINES * 2,
+            "{WRAPPED_TRACK_MSG}"
+        );
+        assert_eq!(shifted.history_start, history_start, "{WRAPPED_TRACK_MSG}");
+        assert_eq!(shifted.extent_lines, WINDOW_LINES, "{WRAPPED_TRACK_MSG}");
     }
 
     const PATCH: &str = "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -8,3 +8,4 @@\n context\n-gone\n+added\n+also added\n";
@@ -4398,7 +4667,7 @@ mod tests {
     /// given the child's width plus the indent it prefixes, so `width` is what
     /// the body itself ends up with.
     fn markdown_child_body(text: &str, width: u16) -> Vec<String> {
-        let limits = limits(BatchViews::new([0])).with_width(width + BATCH_CHILD_INDENT_WIDTH);
+        let limits = limits(BatchViews::new([0])).with_width(width + batch_child_indent_width());
         let card = render_batch(&[markdown_entry(text)], false, &limits);
         card.lines
             .iter()
@@ -4520,8 +4789,8 @@ mod tests {
                 .to_owned(),
             ..batch_entry(SHELL_CHILD, 0)
         };
-        let limits =
-            limits(BatchViews::default()).with_width(NARROW_BODY_WIDTH + BATCH_CHILD_INDENT_WIDTH);
+        let limits = limits(BatchViews::default())
+            .with_width(NARROW_BODY_WIDTH + batch_child_indent_width());
 
         let card = render_batch(&[long, batch_entry(SHELL_CHILD, 0)], false, &limits);
 
@@ -4559,7 +4828,7 @@ mod tests {
     #[test]
     fn the_rows_a_broken_paragraph_drew_name_one_source_line() {
         let limits =
-            limits(BatchViews::new([0])).with_width(NARROW_BODY_WIDTH + BATCH_CHILD_INDENT_WIDTH);
+            limits(BatchViews::new([0])).with_width(NARROW_BODY_WIDTH + batch_child_indent_width());
         let card = render_batch(&[markdown_entry(LONG_PARAGRAPH)], false, &limits);
 
         let body = lone_child_body(&card);
@@ -4582,7 +4851,7 @@ mod tests {
     #[test]
     fn a_plain_child_breaks_an_over_wide_body_to_its_own_width() {
         let limits =
-            limits(BatchViews::new([0])).with_width(NARROW_BODY_WIDTH + BATCH_CHILD_INDENT_WIDTH);
+            limits(BatchViews::new([0])).with_width(NARROW_BODY_WIDTH + batch_child_indent_width());
         let card = render_batch(&[plain_entry(LONG_PARAGRAPH)], false, &limits);
 
         let body = lone_child_body(&card);
@@ -4603,6 +4872,66 @@ mod tests {
             );
             assert_eq!(row.line.as_ref(), Some(&written), "{ONE_SOURCE_LINE}");
         }
+    }
+
+    const CHILD_SPAN_MSG: &str = "a child drawn in a window publishes it whether or not there is a footer to draw, or a \
+         child whose body fits has a window with no bar and hands the wheel back to the transcript";
+    const TREE_LEVEL_MSG: &str = "every connector draws one tree level, so a child body narrowed by one indent lines up \
+         under whichever of them drew it";
+
+    /// A window with nothing either side of it writes no footer, and the span
+    /// was published only alongside one. The bar is what makes a child's rows
+    /// the wheel's target, so dropping it costs the wheel to the transcript
+    /// for exactly the bodies that already fit.
+    #[test]
+    fn a_child_body_that_fits_its_window_still_publishes_it() {
+        const BODY: &str = "first\nsecond\nthird";
+        let (lines, source) = plain_body(BODY, NARROW_BODY_WIDTH);
+        let painted = lines.len();
+        let limits = limits(BatchViews::default()).with_scroll(Some(ScrollWindow {
+            height: painted + 1,
+            offset: 0,
+            follow: true,
+        }));
+
+        let body = child_view(
+            ChildBody::traced(lines, source),
+            limits.scroll,
+            limits.budget,
+            ScrollTail::Settled,
+            "",
+        );
+
+        let span = body.span.expect(CHILD_SPAN_MSG);
+        assert_eq!(
+            (span.first, span.lines, span.total, span.offset),
+            (0, painted, painted, 0),
+            "{CHILD_SPAN_MSG}"
+        );
+        assert_eq!(body.lines.len(), painted, "{CHILD_SPAN_MSG}");
+        assert_eq!(span.history_start, None, "{CHILD_SPAN_MSG}");
+        assert!(!body.truncation, "{CHILD_SPAN_MSG}");
+    }
+
+    /// `RenderLimits::child` narrows a body by one indent and `indent_all`
+    /// puts one back in front of every row. The two are the same number only
+    /// while every glyph that can open that indent measures the same width,
+    /// and half the tree is drawn in box glyphs whose bytes say otherwise.
+    #[test_case(TREE_BRANCH ; "branch")]
+    #[test_case(TREE_LAST ; "last")]
+    #[test_case(TREE_TRUNK ; "trunk")]
+    #[test_case(TREE_GAP ; "gap")]
+    fn every_tree_glyph_draws_one_child_indent(connector: &str) {
+        assert_eq!(
+            UnicodeWidthStr::width(connector),
+            UnicodeWidthStr::width(TREE_GAP),
+            "{TREE_LEVEL_MSG}"
+        );
+        assert_eq!(
+            UnicodeWidthStr::width(format!("{connector}{BATCH_BODY_PAD}").as_str()),
+            usize::from(batch_child_indent_width()),
+            "{TREE_LEVEL_MSG}"
+        );
     }
 
     /// The budget cuts the text before the renderer sees it, so the closing
@@ -4772,6 +5101,185 @@ mod tests {
             .child(0, &batch_entry("read", 1))
             .expect("an asked-for child draws");
         assert_eq!(child.views, BatchViews::default());
+    }
+
+    /// What the reader's window is configured at here: short enough that a
+    /// body twice its height leaves scrollback behind it, tall enough that a
+    /// windowed body is unmistakable beside a folded one.
+    const NESTED_WINDOW_LINES: u32 = 4;
+    const NESTED_BODY_LINES: usize = NESTED_WINDOW_LINES as usize * 2;
+    const NESTED_CHILD: &str = TASK_TOOL_NAME;
+    const NESTED_RUNNING: &str = "Delegating";
+    const NESTED_SETTLED: &str = "Delegated";
+    const ONE_BODY_MSG: &str = "one nesting path draws one scrolling body, so a row gained at the bottom scrolls inside \
+         it instead of growing every level above it";
+    const NESTED_ROSTER_MSG: &str =
+        "every level keeps one row per child it dispatched, in the tense that child is in";
+    const BODY_MOVES_MSG: &str =
+        "opening a nested row hands the path's one body down to the level it names";
+
+    /// A dispatch rather than a read: what it did is its own call, so it is
+    /// drawn rather than folded to its row, which is what gives it a body for
+    /// the one-body rule to place.
+    fn dispatch_entry(tool: &str, body_lines: usize) -> BatchToolEntry {
+        BatchToolEntry {
+            effect: ToolEffect::Orchestrator,
+            ..batch_entry(tool, body_lines)
+        }
+    }
+
+    fn nested_batch_entry(children: Vec<BatchToolEntry>) -> BatchToolEntry {
+        BatchToolEntry {
+            output: Some(ToolOutput::Batch {
+                entries: children,
+                text: String::new(),
+            }),
+            ..dispatch_entry(BATCH_TOOL_NAME, 0)
+        }
+    }
+
+    fn scrolling_limits(views: BatchViews) -> RenderLimits {
+        limits(views).with_policy(
+            CardPolicy {
+                scroll_card_lines: NESTED_WINDOW_LINES,
+                ..CardPolicy::default()
+            },
+            Arc::default(),
+        )
+    }
+
+    fn nested_card(children: Vec<BatchToolEntry>, views: BatchViews) -> BatchCard {
+        render_batch(
+            &[nested_batch_entry(children)],
+            false,
+            &scrolling_limits(views),
+        )
+    }
+
+    /// The level that has nothing above it answers exactly what it answered
+    /// before: the one-body rule is about nesting, and there is none here.
+    #[test]
+    fn a_single_level_batch_keeps_its_window() {
+        let card = render_batch(
+            &[dispatch_entry(NESTED_CHILD, NESTED_BODY_LINES)],
+            false,
+            &scrolling_limits(BatchViews::default()),
+        );
+
+        assert_eq!(
+            body_count(&card.lines),
+            NESTED_WINDOW_LINES as usize,
+            "{ONE_BODY_MSG}"
+        );
+    }
+
+    /// The jumping this exists to stop: the dispatch under a nested batch
+    /// opened a window of its own inside a body that was already being drawn,
+    /// so every row it gained pushed both levels above it taller.
+    #[test]
+    fn a_nested_dispatch_opens_no_second_body_under_its_parent() {
+        let card = nested_card(
+            Vec::from([dispatch_entry(NESTED_CHILD, NESTED_BODY_LINES)]),
+            BatchViews::default(),
+        );
+
+        assert_eq!(body_count(&card.lines), 0, "{ONE_BODY_MSG}");
+        assert!(
+            card.lines
+                .iter()
+                .any(|line| line_text(line).contains(BATCH_FOLDED_MARK)),
+            "{BODY_MOVES_MSG}: the row the body moved off still offers it"
+        );
+    }
+
+    /// Losing the body must not cost the row. The nested level keeps its own
+    /// node, its sigil and the verb its status puts that node in, and the verb
+    /// follows the call as it runs.
+    #[test_case(BatchToolStatus::Running, NESTED_RUNNING ; "still_running")]
+    #[test_case(BatchToolStatus::Success, NESTED_SETTLED ; "answered")]
+    fn a_nested_dispatch_keeps_its_row_and_its_status(status: BatchToolStatus, label: &str) {
+        let card = nested_card(
+            Vec::from([
+                BatchToolEntry {
+                    status,
+                    ..dispatch_entry(NESTED_CHILD, NESTED_BODY_LINES)
+                },
+                dispatch_entry(NESTED_CHILD, NESTED_BODY_LINES),
+            ]),
+            BatchViews::default(),
+        );
+
+        let drawn: Vec<String> = card.lines.iter().map(line_text).collect();
+        assert_eq!(drawn.len(), 3, "{NESTED_ROSTER_MSG}: {drawn:?}");
+        assert!(drawn[1].contains(label), "{NESTED_ROSTER_MSG}: {drawn:?}");
+        assert!(
+            drawn[2].contains(NESTED_SETTLED),
+            "{NESTED_ROSTER_MSG}: {drawn:?}"
+        );
+    }
+
+    /// The body belongs to the deepest level the reader opened, and the tree
+    /// it moved through is the same tree either way.
+    #[test]
+    fn opening_a_nested_row_moves_the_body_down_to_it() {
+        let child = || Vec::from([dispatch_entry(NESTED_CHILD, NESTED_BODY_LINES)]);
+        let folded = nested_card(child(), BatchViews::default());
+        let opened = nested_card(child(), BatchViews::new([0]));
+
+        assert_eq!(body_count(&folded.lines), 0, "{ONE_BODY_MSG}");
+        assert_eq!(
+            body_count(&opened.lines),
+            NESTED_WINDOW_LINES as usize,
+            "{BODY_MOVES_MSG}"
+        );
+        let roster = |card: &BatchCard| {
+            card.lines
+                .iter()
+                .filter(|line| line_text(line).contains(NESTED_SETTLED))
+                .count()
+        };
+        assert_eq!(roster(&folded), roster(&opened), "{NESTED_ROSTER_MSG}");
+    }
+
+    fn nested_height(leaf_lines: usize, limits: &RenderLimits) -> usize {
+        render_batch(
+            &[nested_batch_entry(Vec::from([dispatch_entry(
+                NESTED_CHILD,
+                leaf_lines,
+            )]))],
+            false,
+            limits,
+        )
+        .lines
+        .len()
+    }
+
+    /// The leaf's own budget bounds it eventually, but not before it has grown
+    /// through every level between it and the card. With the body placed once,
+    /// what it prints moves nothing at all.
+    #[test]
+    fn growth_below_a_folded_nesting_moves_nothing_above_it() {
+        let limits = limits(BatchViews::default());
+
+        assert_eq!(
+            nested_height(NESTED_BODY_LINES, &limits),
+            nested_height(NESTED_BODY_LINES * 8, &limits),
+            "{ONE_BODY_MSG}"
+        );
+    }
+
+    /// And once the reader has opened the nesting, the window they opened is
+    /// where the growth lands: past its cap the leaf scrolls instead of
+    /// pushing the levels above it down.
+    #[test]
+    fn growth_past_the_one_windows_cap_moves_nothing_above_it() {
+        let limits = scrolling_limits(BatchViews::new([0]));
+
+        assert_eq!(
+            nested_height(NESTED_BODY_LINES * 4, &limits),
+            nested_height(NESTED_BODY_LINES * 8, &limits),
+            "{ONE_BODY_MSG}"
+        );
     }
 
     /// Asking for a child is asking for all of it. A budget is where a child
@@ -4962,6 +5470,275 @@ mod tests {
         }
     }
 
+    const HISTORY_WINDOW: u32 = 4;
+    const HISTORY_WIDTH: u16 = 80;
+    const HISTORY_CALL: &str = "history call";
+    const HISTORY_CALL_COUNT: usize = 8;
+    const HISTORY_WINDOW_MSG: &str = "a task windows output and retained activity rows together";
+    const HISTORY_REACHABLE_MSG: &str = "every retained row remains reachable in the task window";
+    const HISTORY_COLLAPSED_MSG: &str = "folding output must not hide the task's status tree";
+    const HISTORY_HEIGHTS: [usize; 5] = [3, 4, 6, 6, 6];
+
+    fn history_report(batch: usize, count: usize) -> SubagentProgress {
+        SubagentProgress {
+            activity: SubagentActivity::batch(
+                Arc::from(BATCH_TOOL_NAME),
+                &format!("{count} tools"),
+                (0..count)
+                    .map(|index| {
+                        activity_child(
+                            SHELL_CHILD,
+                            &format!("{HISTORY_CALL} {batch}-{index}"),
+                            BatchToolStatus::Running,
+                        )
+                    })
+                    .collect(),
+            ),
+            tools: batch as u32,
+            elapsed: Duration::ZERO,
+        }
+    }
+
+    fn retained_progress() -> ToolProgress {
+        let mut progress = ToolProgress::live(history_report(0, 1));
+        progress.update(SubagentProgress {
+            activity: SubagentActivity::Thinking { title: None },
+            ..progress.report.clone()
+        });
+        progress.update(history_report(1, 5));
+        progress.update(SubagentProgress {
+            activity: SubagentActivity::Thinking { title: None },
+            ..progress.report.clone()
+        });
+        progress.update(history_report(2, 2));
+        progress
+    }
+
+    fn history_card(progress: &ToolProgress, limits: RenderLimits) -> BatchCard {
+        render_batch(
+            &[BatchToolEntry {
+                status: BatchToolStatus::Running,
+                output: None,
+                ..batch_entry(TASK_TOOL_NAME, 0)
+            }],
+            false,
+            &RenderLimits {
+                progress: Arc::new(HashMap::from([(0, progress.clone())])),
+                ..limits
+            },
+        )
+    }
+
+    fn history_text(line: &Line<'static>) -> String {
+        line_text(line)
+            .split(CHILD_ACTIVITY_SEPARATOR)
+            .next()
+            .unwrap_or_default()
+            .to_owned()
+    }
+
+    #[test]
+    fn retained_batches_fill_one_task_window_across_thinking_phases() {
+        let mut progress = batching_report(Vec::new());
+        let limits = limits(BatchViews::default())
+            .with_policy(
+                CardPolicy {
+                    scroll_card_lines: HISTORY_WINDOW,
+                    ..CardPolicy::default()
+                },
+                Arc::default(),
+            )
+            .with_width(HISTORY_WIDTH);
+        let mut heights = Vec::new();
+        for (batch, count) in [Some(1), None, Some(5), None, Some(2)]
+            .into_iter()
+            .enumerate()
+        {
+            progress.update(match count {
+                Some(count) => history_report(batch, count),
+                None => SubagentProgress {
+                    activity: SubagentActivity::Thinking { title: None },
+                    ..progress.report.clone()
+                },
+            });
+            let card = history_card(&progress, limits.clone());
+            heights.push(card.lines.len());
+            assert_eq!(card.spans.len(), 1, "{HISTORY_WINDOW_MSG}");
+            assert_eq!(card.spans[0].history_start, Some(0), "{HISTORY_WINDOW_MSG}");
+            assert!(
+                card.rows.iter().all(|row| *row == Some(RowTarget(0))),
+                "{HISTORY_WINDOW_MSG}"
+            );
+            assert!(
+                card.lines
+                    .iter()
+                    .all(|line| !line_text(line).trim().is_empty()),
+                "{HISTORY_WINDOW_MSG}"
+            );
+        }
+        assert_eq!(heights, HISTORY_HEIGHTS, "{HISTORY_WINDOW_MSG}");
+    }
+
+    #[test_case(48; "narrow")]
+    #[test_case(HISTORY_WIDTH; "wide")]
+    fn output_and_every_retained_row_share_the_child_scroll_span(width: u16) {
+        let progress = retained_progress();
+        let limits = limits(BatchViews::new([0]))
+            .with_width(width)
+            .with_progress(
+                Arc::default(),
+                Arc::new(HashMap::from([(0, LONG_PARAGRAPH.to_owned())])),
+                Arc::default(),
+            );
+        let whole = history_card(&progress, limits.clone());
+        let expected: Vec<_> = whole.lines.iter().skip(1).map(history_text).collect();
+        let history_start = plain_body(
+            LONG_PARAGRAPH,
+            width.saturating_sub(batch_child_indent_width()),
+        )
+        .0
+        .len();
+        assert!(whole.spans.is_empty(), "{HISTORY_REACHABLE_MSG}");
+        assert_eq!(
+            expected
+                .iter()
+                .filter(|line| line.contains(HISTORY_CALL))
+                .count(),
+            HISTORY_CALL_COUNT,
+            "{HISTORY_REACHABLE_MSG}"
+        );
+        for offset in 0..expected.len() {
+            let window = ScrollWindow {
+                height: HISTORY_WINDOW as usize,
+                offset,
+                follow: false,
+            };
+            let (start, end) = window.range(expected.len());
+            let card = history_card(
+                &progress,
+                limits.clone().with_policy(
+                    CardPolicy {
+                        scroll_card_lines: HISTORY_WINDOW,
+                        ..CardPolicy::default()
+                    },
+                    Arc::new(HashMap::from([(0, window)])),
+                ),
+            );
+            assert_eq!(card.spans.len(), 1, "{HISTORY_WINDOW_MSG}");
+            let span = card.spans[0];
+            assert_eq!(span.extent_lines, span.lines, "{HISTORY_WINDOW_MSG}");
+            assert_eq!(
+                span.history_start,
+                Some(history_start),
+                "{HISTORY_WINDOW_MSG}"
+            );
+            assert_eq!(
+                (span.child, span.first, span.lines, span.total, span.offset),
+                (Some(0), 1, end - start, expected.len(), start),
+                "{HISTORY_WINDOW_MSG}"
+            );
+            let shown: Vec<_> = card.lines[span.first..span.first + span.lines]
+                .iter()
+                .map(history_text)
+                .collect();
+            assert_eq!(shown, expected[start..end], "{HISTORY_REACHABLE_MSG}");
+            assert!(
+                card.rows.iter().all(|row| *row == Some(RowTarget(0))),
+                "{HISTORY_WINDOW_MSG}"
+            );
+            let source = card.source.as_ref().expect(ROWS_PER_CARD_LINE);
+            assert_eq!(source.rows.len(), card.lines.len(), "{ROWS_PER_CARD_LINE}");
+            for (row, line) in source.rows.iter().zip(&card.lines) {
+                assert_eq!(row.spans.len(), line.spans.len(), "{SPANS_PER_ROW}");
+            }
+        }
+    }
+
+    #[test_case(false, false, false, true; "streaming_output_opens")]
+    #[test_case(true, false, false, false; "compact_keeps_only_status")]
+    #[test_case(false, true, false, false; "always_collapsed_keeps_only_status")]
+    #[test_case(false, false, true, false; "ancestor_body_keeps_only_status")]
+    fn task_history_respects_the_existing_output_expansion_policy(
+        compact: bool,
+        always_collapsed: bool,
+        body_taken: bool,
+        shows_output: bool,
+    ) {
+        let progress = retained_progress();
+        let card = history_card(
+            &progress,
+            RenderLimits {
+                body_taken,
+                live: Arc::new(HashMap::from([(0, CHILD_BODY.to_owned())])),
+                ..limits(BatchViews::default()).with_policy(
+                    CardPolicy {
+                        compact,
+                        always_collapsed: if always_collapsed {
+                            Arc::from([TASK_TOOL_NAME.to_owned()])
+                        } else {
+                            Arc::default()
+                        },
+                        ..CardPolicy::default()
+                    },
+                    Arc::default(),
+                )
+            },
+        );
+        assert_eq!(
+            body_count(&card.lines) > 0,
+            shows_output,
+            "{HISTORY_COLLAPSED_MSG}"
+        );
+        assert_eq!(
+            card.lines
+                .iter()
+                .filter(|line| line_text(line).contains(HISTORY_CALL))
+                .count(),
+            HISTORY_CALL_COUNT,
+            "{HISTORY_REACHABLE_MSG}"
+        );
+        assert!(card.spans.is_empty(), "{HISTORY_REACHABLE_MSG}");
+    }
+
+    const NESTED_HEIGHT: &str = "a nested roster must keep its height as the subagent moves \
+        between calls, or every switch reflows the rows under it";
+    /// Wider than the card and much wider than the call beside it: the pair a
+    /// subagent switching between them used to resize the tree with.
+    const LONG_CALL: &str =
+        "cargo nextest run --workspace --locked --no-fail-fast --status-level all";
+    const SHORT_CALL: &str = "fn main";
+    const NESTED_WIDTH: u16 = 48;
+
+    /// The reported bug: the nested rows wrapped, so their height tracked
+    /// whichever call the subagent had reached, and a batch of subagents each
+    /// working through tools of different lengths resized the tree under the
+    /// reader continuously.
+    #[test]
+    fn a_nested_roster_keeps_its_height_across_calls() {
+        let entries = [
+            batch_entry(TASK_TOOL_NAME, 0),
+            batch_entry(TASK_TOOL_NAME, 1),
+        ];
+        let height = |call: &str| {
+            let roster = vec![
+                activity_child(SHELL_CHILD, call, BatchToolStatus::Running),
+                activity_child(FILE_GREP_TOOL_NAME, call, BatchToolStatus::Pending),
+            ];
+            let mut limits = limits(BatchViews::default()).with_width(NESTED_WIDTH);
+            limits.progress = Arc::new(HashMap::from([(0, batching_report(roster))]));
+            let card = render_batch(&entries, false, &limits);
+            // The card is broken to its width at the end, so the rows the
+            // reader sees are the wrapped ones, not the lines built here.
+            WrappedRows::new(card.lines, 0, NESTED_WIDTH)
+                .per_line
+                .iter()
+                .map(Vec::len)
+                .sum::<usize>()
+        };
+
+        assert_eq!(height(SHORT_CALL), height(LONG_CALL), "{NESTED_HEIGHT}");
+    }
+
     /// The reported bug: a dispatched subagent running its own batch said only
     /// `Batching 2 tools`, and what it was batching was invisible. It is a
     /// third level of the same tree, carrying the trunk of the child it
@@ -4998,6 +5775,269 @@ mod tests {
         assert!(
             card.rows[..4].iter().all(|row| *row == Some(RowTarget(0))),
             "every row of a child answers for the child that owns it"
+        );
+    }
+
+    /// The calls one roster names, distinct enough that a row drawn in the
+    /// wrong place reads as the wrong call rather than as a changed one.
+    const ROSTER_CALLS: [&str; 3] = ["cargo check", "cargo test", "cargo clippy"];
+    /// The rows a dispatched child draws above its own roster: its summary row
+    /// and the activity row the roster hangs off.
+    const ROSTER_HEAD: usize = 2;
+    /// The roster row every state-change case moves.
+    const MOVED_ROW: usize = ROSTER_HEAD + 1;
+    const QUEUED_ROW: &str = "Run";
+    const ROSTER_NAMED_MSG: &str =
+        "a roster names every child the call has, including the ones still queued behind it";
+    const ROSTER_HELD_MSG: &str = "a child changing state rewrites its own row and leaves the \
+        roster the height and the order it already had";
+    const ROSTER_GROWS_MSG: &str = "a call still spelling its children out has not named them all \
+        yet, so its roster is still free to grow";
+
+    /// The card a dispatched child's batch report draws, with its children in
+    /// `states`.
+    fn nested_roster(states: [BatchToolStatus; ROSTER_CALLS.len()]) -> Vec<String> {
+        let children = ROSTER_CALLS
+            .iter()
+            .zip(states)
+            .map(|(call, status)| activity_child(SHELL_CHILD, call, status))
+            .collect();
+        let mut limits = limits(BatchViews::default());
+        limits.progress = Arc::new(HashMap::from([(0, batching_report(children))]));
+        render_batch(&[batch_entry(TASK_TOOL_NAME, 0)], false, &limits)
+            .lines
+            .iter()
+            .map(line_text)
+            .collect()
+    }
+
+    /// The row `index` draws in a nested roster. The prefix is positional, so
+    /// the verb is the only part a state change is allowed to move.
+    fn nested_row(index: usize, verb: &str) -> String {
+        let connector = match index + 1 == ROSTER_CALLS.len() {
+            true => TREE_LAST,
+            false => TREE_BRANCH,
+        };
+        format!(
+            "{TREE_GAP}{TREE_GAP}{connector}$ {verb} {}",
+            ROSTER_CALLS[index]
+        )
+    }
+
+    /// The reservation that costs nothing: the call named all three children
+    /// when it parsed, so all three have a row before any of them runs.
+    #[test]
+    fn a_nested_roster_names_every_child_before_any_of_them_starts() {
+        let rows = nested_roster([BatchToolStatus::Pending; ROSTER_CALLS.len()]);
+
+        assert_eq!(
+            rows[ROSTER_HEAD..],
+            [
+                nested_row(0, QUEUED_ROW),
+                nested_row(1, QUEUED_ROW),
+                nested_row(2, QUEUED_ROW),
+            ],
+            "{ROSTER_NAMED_MSG}: {rows:?}"
+        );
+    }
+
+    #[test_case(BatchToolStatus::Running, "Running" ; "started")]
+    #[test_case(BatchToolStatus::Success, "Ran"     ; "answered")]
+    #[test_case(BatchToolStatus::Error,   QUEUED_ROW ; "failed")]
+    fn a_nested_child_changing_state_rewrites_its_row_alone(status: BatchToolStatus, verb: &str) {
+        let queued = nested_roster([BatchToolStatus::Pending; ROSTER_CALLS.len()]);
+        let moved = nested_roster([BatchToolStatus::Pending, status, BatchToolStatus::Pending]);
+        let siblings = |rows: &[String]| {
+            rows.iter()
+                .enumerate()
+                .filter(|(row, _)| *row != MOVED_ROW)
+                .map(|(_, text)| text.clone())
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(moved.len(), queued.len(), "{ROSTER_HELD_MSG}: {moved:?}");
+        assert_eq!(
+            moved[MOVED_ROW],
+            nested_row(1, verb),
+            "{ROSTER_HELD_MSG}: {moved:?}"
+        );
+        assert_eq!(siblings(&moved), siblings(&queued), "{ROSTER_HELD_MSG}");
+    }
+
+    /// A child that answers before the ones dispatched with it keeps the row
+    /// it was dispatched into, so nothing under it slides up a line.
+    #[test]
+    fn a_nested_child_answering_early_leaves_its_siblings_in_place() {
+        let rows = nested_roster([
+            BatchToolStatus::Pending,
+            BatchToolStatus::Pending,
+            BatchToolStatus::Success,
+        ]);
+
+        assert_eq!(
+            rows[ROSTER_HEAD..],
+            [
+                nested_row(0, QUEUED_ROW),
+                nested_row(1, QUEUED_ROW),
+                nested_row(2, "Ran"),
+            ],
+            "{ROSTER_HELD_MSG}: {rows:?}"
+        );
+    }
+
+    /// A roster row before the child behind it has anything to show: named, in
+    /// a state, and with no output of its own.
+    fn queued_entry(summary: &str, status: BatchToolStatus) -> BatchToolEntry {
+        BatchToolEntry {
+            summary: summary.to_owned(),
+            status,
+            output: None,
+            ..batch_entry(SHELL_CHILD, 0)
+        }
+    }
+
+    fn single_level_rows(states: &[BatchToolStatus]) -> Vec<String> {
+        let entries: Vec<BatchToolEntry> = ROSTER_CALLS
+            .iter()
+            .zip(states)
+            .map(|(call, status)| queued_entry(call, *status))
+            .collect();
+        render_batch(&entries, false, &limits(BatchViews::default()))
+            .lines
+            .iter()
+            .map(line_text)
+            .collect()
+    }
+
+    const LIVE_HEADER_PATH: &str = "src/abcdefghijklmnopq.rs";
+    const LIVE_HEADER_SIBLING: &str = "sibling";
+    const LIVE_HEADER_STABLE: &str =
+        "status changes must not move a batch sibling while the batch is running";
+    const SETTLED_HEADER_WRAPS: &str =
+        "settled batch headings must wrap again without losing their full summaries";
+
+    fn batch_header_frame(status: BatchToolStatus, settled: bool, nested: bool) -> ToolContent {
+        let mut entries = vec![
+            BatchToolEntry {
+                tool: FILE_READ_TOOL_NAME.into(),
+                ..queued_entry(LIVE_HEADER_PATH, status)
+            },
+            queued_entry(
+                LIVE_HEADER_SIBLING,
+                if settled {
+                    BatchToolStatus::Success
+                } else {
+                    BatchToolStatus::Pending
+                },
+            ),
+        ];
+        if nested {
+            entries = vec![BatchToolEntry {
+                status: if settled {
+                    BatchToolStatus::Success
+                } else {
+                    BatchToolStatus::Running
+                },
+                ..nested_batch_entry(entries)
+            }];
+        }
+        render_tool_content(
+            None,
+            Some(&ToolOutput::Batch {
+                entries,
+                text: String::new(),
+            }),
+            false,
+            limits(BatchViews::new([0])).with_width(NARROW_BODY_WIDTH),
+        )
+    }
+
+    #[test_case(false; "batch_children")]
+    #[test_case(true; "nested_batch_children")]
+    fn live_batch_headers_keep_sibling_rows_through_status_changes(nested: bool) {
+        let mut positions = Vec::new();
+        for status in [
+            BatchToolStatus::Pending,
+            BatchToolStatus::Running,
+            BatchToolStatus::Success,
+            BatchToolStatus::Error,
+        ] {
+            let frame = batch_header_frame(status, false, nested);
+            positions.push(
+                frame
+                    .lines
+                    .iter()
+                    .position(|line| line_text(line).contains(LIVE_HEADER_SIBLING))
+                    .expect(LIVE_HEADER_STABLE),
+            );
+            assert_eq!(frame.lines.len(), frame.rows.len(), "{ROWS_PER_CARD_LINE}");
+            let source = frame.source.as_ref().expect(CARD_RECORDS_SOURCE);
+            assert!(
+                source.text.contains(LIVE_HEADER_PATH),
+                "{CARD_RECORDS_SOURCE}"
+            );
+            assert_eq!(source.rows.len(), frame.lines.len(), "{ROWS_PER_CARD_LINE}");
+        }
+        assert!(
+            positions.iter().all(|row| *row == 1 + usize::from(nested)),
+            "{LIVE_HEADER_STABLE}: {positions:?}"
+        );
+    }
+
+    #[test_case(false; "batch_children")]
+    #[test_case(true; "nested_batch_children")]
+    fn settled_batch_headers_restore_wrapped_detail(nested: bool) {
+        let running = batch_header_frame(BatchToolStatus::Running, false, nested);
+        let settled = batch_header_frame(BatchToolStatus::Success, true, nested);
+        assert!(
+            settled.lines.len() > running.lines.len(),
+            "{SETTLED_HEADER_WRAPS}"
+        );
+        assert!(
+            settled
+                .source
+                .as_ref()
+                .expect(CARD_RECORDS_SOURCE)
+                .text
+                .contains(LIVE_HEADER_PATH),
+            "{SETTLED_HEADER_WRAPS}"
+        );
+    }
+
+    /// While the arguments are still arriving the child list genuinely is not
+    /// known, so a roster gaining a row there is the call telling the truth
+    /// about what it has read so far.
+    #[test_case(1 ; "one_named")]
+    #[test_case(2 ; "two_named")]
+    #[test_case(3 ; "all_named")]
+    fn a_roster_still_being_spelled_out_draws_the_children_named_so_far(named: usize) {
+        let rows = single_level_rows(&vec![BatchToolStatus::Pending; named]);
+
+        assert_eq!(rows.len(), named, "{ROSTER_GROWS_MSG}: {rows:?}");
+    }
+
+    /// The level that has nothing above it answers what it answered before:
+    /// one row per child, in dispatch order, whatever each one has got to.
+    #[test]
+    fn a_single_level_roster_keeps_one_row_per_child_through_every_state() {
+        let queued = single_level_rows(&[BatchToolStatus::Pending; ROSTER_CALLS.len()]);
+        let mixed = single_level_rows(&[
+            BatchToolStatus::Success,
+            BatchToolStatus::Running,
+            BatchToolStatus::Pending,
+        ]);
+
+        assert_eq!(mixed.len(), queued.len(), "{ROSTER_HELD_MSG}: {mixed:?}");
+        let named: Vec<&String> = mixed
+            .iter()
+            .zip(ROSTER_CALLS)
+            .filter(|(row, call)| row.contains(call))
+            .map(|(row, _)| row)
+            .collect();
+        assert_eq!(
+            named.len(),
+            ROSTER_CALLS.len(),
+            "{ROSTER_HELD_MSG}: {mixed:?}"
         );
     }
 

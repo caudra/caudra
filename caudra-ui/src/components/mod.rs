@@ -67,7 +67,9 @@ use std::time::{Duration, Instant};
 
 use caudra_agent::AgentInput;
 use caudra_agent::tools::{SHELL_TOOL_NAME, ToolEffect};
-use caudra_agent::{BufferSnapshot, ImageSource, SubagentProgress, ToolInput, ToolOutput};
+use caudra_agent::{
+    BufferSnapshot, ImageSource, SubagentActivity, SubagentProgress, ToolInput, ToolOutput,
+};
 use caudra_providers::model_registry::Binding;
 use caudra_providers::{CaudraId, HistoryItem, ModelPurpose};
 use caudra_storage::sessions::SessionRelocation;
@@ -938,14 +940,78 @@ pub struct ToolProgress {
     pub report: SubagentProgress,
     /// `None` once the call ended and the report is the final word.
     since: Option<Instant>,
+    history: Vec<SubagentActivity>,
+    current_activity: Option<usize>,
 }
 
 impl ToolProgress {
     pub fn live(report: SubagentProgress) -> Self {
+        let history = if report.activity.children().is_empty() {
+            Vec::new()
+        } else {
+            vec![report.activity.clone()]
+        };
+        let current_activity = (!history.is_empty()).then_some(0);
         Self {
             report,
             since: Some(Instant::now()),
+            history,
+            current_activity,
         }
+    }
+
+    pub fn update(&mut self, mut report: SubagentProgress) {
+        if self.has_history() || !report.activity.children().is_empty() {
+            let existing = match &report.activity {
+                SubagentActivity::Tool { call_id: Some(id), .. } => {
+                    self.history.iter().position(|activity| {
+                        matches!(activity, SubagentActivity::Tool { call_id: Some(other), .. } if other == id)
+                    })
+                }
+                SubagentActivity::Tool { call_id: None, name, .. } => {
+                    self.current_activity.filter(|&index| {
+                        self.report.tools == report.tools
+                            && matches!(
+                                &self.history[index],
+                                SubagentActivity::Tool { call_id: None, name: other, .. } if other == name
+                            )
+                    })
+                }
+                activity => self.current_activity.filter(|&index| {
+                    mem::discriminant(&self.history[index]) == mem::discriminant(activity)
+                }),
+            };
+            self.current_activity = Some(if let Some(index) = existing {
+                if let SubagentActivity::Tool { children, .. } = &mut report.activity
+                    && children.is_empty()
+                {
+                    *children = self.history[index].children().to_vec();
+                }
+                self.history[index] = report.activity.clone();
+                index
+            } else {
+                self.history.push(report.activity.clone());
+                self.history.len() - 1
+            });
+        }
+        self.report = report;
+        self.since = Some(Instant::now());
+    }
+
+    pub fn activities(&self) -> impl Iterator<Item = (&SubagentActivity, bool)> {
+        self.history
+            .iter()
+            .enumerate()
+            .map(move |(index, activity)| (activity, self.current_activity == Some(index)))
+            .chain(
+                self.current_activity
+                    .is_none()
+                    .then_some((&self.report.activity, true)),
+            )
+    }
+
+    pub fn has_history(&self) -> bool {
+        !self.history.is_empty()
     }
 
     pub fn is_live(&self) -> bool {
@@ -955,6 +1021,8 @@ impl ToolProgress {
     pub fn settle(&mut self) {
         self.report.elapsed = self.elapsed();
         self.since = None;
+        self.history = Vec::new();
+        self.current_activity = None;
     }
 
     pub fn elapsed(&self) -> Duration {
@@ -1193,6 +1261,417 @@ pub(crate) fn key(code: crossterm::event::KeyCode) -> crossterm::event::KeyEvent
         modifiers: crossterm::event::KeyModifiers::NONE,
         kind: crossterm::event::KeyEventKind::Press,
         state: crossterm::event::KeyEventState::NONE,
+    }
+}
+
+#[cfg(test)]
+mod tool_progress_tests {
+    use super::ToolProgress;
+    use super::tool_display::progress_lines;
+    use caudra_agent::tools::{BATCH_TOOL_NAME, SHELL_TOOL_NAME};
+    use caudra_agent::{ActivityChild, BatchToolStatus, SubagentActivity, SubagentProgress};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+    use test_case::test_case;
+
+    const FIRST_CALL: &str = "batch-1";
+    const SECOND_CALL: &str = "batch-2";
+    const THIRD_CALL: &str = "tool-3";
+    const BATCH_SUMMARY: &str = "inspect files";
+    const CHILD_SUMMARY: &str = "ls";
+    const TOOL_PREVIEW: &str = "inspect another file";
+    const THINKING_TITLE: &str = "Inspecting files";
+    const UPDATED_THINKING_TITLE: &str = "Inspecting more files";
+    const PROGRESS_WIDTH: u16 = 80;
+    const TOOL_COUNT: u32 = 8;
+    const REPORTED_ELAPSED: Duration = Duration::from_secs(5);
+    const STALE_ANCHOR_AGE: Duration = Duration::from_secs(60);
+
+    fn report(activity: SubagentActivity) -> SubagentProgress {
+        SubagentProgress {
+            activity,
+            tools: TOOL_COUNT,
+            elapsed: REPORTED_ELAPSED,
+        }
+    }
+
+    fn batch_report(id: Option<&str>, statuses: &[BatchToolStatus]) -> SubagentProgress {
+        let activity = SubagentActivity::batch(
+            Arc::from(BATCH_TOOL_NAME),
+            BATCH_SUMMARY,
+            statuses
+                .iter()
+                .map(|&status| ActivityChild {
+                    tool: Arc::from(SHELL_TOOL_NAME),
+                    summary: CHILD_SUMMARY.into(),
+                    status,
+                })
+                .collect(),
+        );
+        report(match id {
+            Some(id) => activity.with_call_id(id),
+            None => activity,
+        })
+    }
+
+    #[test_case(BatchToolStatus::Running ; "unfinished")]
+    #[test_case(BatchToolStatus::Error ; "failed")]
+    fn identical_consecutive_keyed_calls_remain_distinct(status: BatchToolStatus) {
+        let first = batch_report(Some(FIRST_CALL), &[status]);
+        let second = batch_report(Some(SECOND_CALL), &[status]);
+        let mut progress = ToolProgress::live(first.clone());
+        assert!(progress.has_history());
+        assert_eq!(
+            progress.activities().collect::<Vec<_>>(),
+            [(&first.activity, true)]
+        );
+
+        progress.update(second.clone());
+        progress.update(second.clone());
+
+        assert_eq!(
+            progress.activities().collect::<Vec<_>>(),
+            [(&first.activity, false), (&second.activity, true)]
+        );
+    }
+
+    #[test_case(false ; "active_batch")]
+    #[test_case(true ; "earlier_batch")]
+    fn per_call_updates_replace_rows_without_appending_snapshots(interrupted: bool) {
+        let first = batch_report(
+            Some(FIRST_CALL),
+            &[BatchToolStatus::Pending, BatchToolStatus::Running],
+        );
+        let second = batch_report(Some(SECOND_CALL), &[BatchToolStatus::Running]);
+        let mut progress = ToolProgress::live(first);
+        if interrupted {
+            progress.update(second.clone());
+        }
+
+        for status in [
+            BatchToolStatus::Running,
+            BatchToolStatus::Success,
+            BatchToolStatus::Error,
+        ] {
+            let updated = batch_report(Some(FIRST_CALL), &[status, BatchToolStatus::Running]);
+            progress.update(updated.clone());
+            let mut expected = vec![(&updated.activity, true)];
+            if interrupted {
+                expected.push((&second.activity, false));
+            }
+            assert_eq!(progress.activities().collect::<Vec<_>>(), expected);
+        }
+    }
+
+    #[test_case(FIRST_CALL ; "same_call_after_pending")]
+    #[test_case(SECOND_CALL ; "identical_independent_call_after_pending")]
+    fn pending_phases_preserve_keyed_batch_identity(next_id: &str) {
+        let first = batch_report(Some(FIRST_CALL), &[BatchToolStatus::Running]);
+        let mut progress = ToolProgress::live(first.clone());
+        let pending = SubagentActivity::tool(Arc::from(BATCH_TOOL_NAME), "").with_call_id(next_id);
+        progress.update(report(pending.clone()));
+        if next_id == FIRST_CALL {
+            let retained = SubagentActivity::batch(
+                Arc::from(BATCH_TOOL_NAME),
+                "",
+                first.activity.children().to_vec(),
+            )
+            .with_call_id(next_id);
+            assert_eq!(
+                progress.activities().collect::<Vec<_>>(),
+                [(&retained, true)]
+            );
+            assert_eq!(
+                progress.report.activity.children(),
+                first.activity.children()
+            );
+        } else {
+            assert_eq!(
+                progress.activities().collect::<Vec<_>>(),
+                [(&first.activity, false), (&pending, true)]
+            );
+        }
+
+        let next = batch_report(Some(next_id), &[BatchToolStatus::Running]);
+        progress.update(next.clone());
+        let mut expected = Vec::new();
+        if next_id != FIRST_CALL {
+            expected.push((&first.activity, false));
+        }
+        expected.push((&next.activity, true));
+        assert_eq!(progress.activities().collect::<Vec<_>>(), expected);
+    }
+
+    #[test_case(SubagentActivity::Thinking { title: None } ; "thinking")]
+    #[test_case(SubagentActivity::Responding ; "responding")]
+    #[test_case(SubagentActivity::Compacting ; "compacting")]
+    #[test_case(SubagentActivity::Retrying ; "retrying")]
+    #[test_case(SubagentActivity::AwaitingPermission ; "permission")]
+    #[test_case(SubagentActivity::tool(Arc::from(SHELL_TOOL_NAME), CHILD_SUMMARY) ; "single_tool")]
+    fn phases_keep_the_last_observed_batch_statuses(phase: SubagentActivity) {
+        let batch = batch_report(
+            Some(FIRST_CALL),
+            &[
+                BatchToolStatus::Pending,
+                BatchToolStatus::Running,
+                BatchToolStatus::Success,
+                BatchToolStatus::Error,
+            ],
+        );
+        let mut progress = ToolProgress::live(batch.clone());
+        progress.update(report(phase.clone()));
+        progress.update(report(phase.clone()));
+
+        assert_eq!(
+            progress.activities().collect::<Vec<_>>(),
+            [(&batch.activity, false), (&phase, true)]
+        );
+        let responding = SubagentActivity::Responding;
+        progress.update(report(responding.clone()));
+        let mut expected = vec![(&batch.activity, false)];
+        if phase != responding {
+            expected.push((&phase, false));
+        }
+        expected.push((&responding, true));
+        assert_eq!(progress.activities().collect::<Vec<_>>(), expected);
+    }
+
+    #[test_case(1 ; "single_child")]
+    #[test_case(5 ; "multiple_children")]
+    fn intervening_phases_do_not_shrink_rendered_history(children: usize) {
+        let mut statuses = vec![BatchToolStatus::Running; children];
+        let mut progress = ToolProgress::live(batch_report(Some(FIRST_CALL), &statuses));
+        let permission = SubagentActivity::AwaitingPermission;
+        let thinking = SubagentActivity::Thinking {
+            title: Some(THINKING_TITLE.into()),
+        };
+        statuses[0] = BatchToolStatus::Error;
+        let updated = batch_report(Some(FIRST_CALL), &statuses);
+        let preview = SubagentActivity::tool(Arc::from(BATCH_TOOL_NAME), TOOL_PREVIEW)
+            .with_call_id(FIRST_CALL);
+        let mut heights = vec![progress_lines(&progress, "", PROGRESS_WIDTH).len()];
+
+        for incoming in [
+            report(permission.clone()),
+            updated.clone(),
+            report(thinking.clone()),
+            report(preview),
+        ] {
+            progress.update(incoming);
+            heights.push(progress_lines(&progress, "", PROGRESS_WIDTH).len());
+            assert_eq!(
+                progress
+                    .activities()
+                    .filter(|(_, current)| *current)
+                    .count(),
+                1
+            );
+        }
+
+        assert_eq!(
+            heights,
+            [
+                children + 1,
+                children + 2,
+                children + 2,
+                children + 3,
+                children + 3
+            ]
+        );
+        let retained = SubagentActivity::batch(
+            Arc::from(BATCH_TOOL_NAME),
+            TOOL_PREVIEW,
+            updated.activity.children().to_vec(),
+        )
+        .with_call_id(FIRST_CALL);
+        assert_eq!(
+            progress.activities().collect::<Vec<_>>(),
+            [(&retained, true), (&permission, false), (&thinking, false)]
+        );
+        assert_eq!(
+            progress.report.activity.children(),
+            updated.activity.children()
+        );
+    }
+
+    #[test_case(false ; "before_any_batch")]
+    #[test_case(true ; "after_first_batch")]
+    fn thinking_title_updates_reuse_the_current_phase(retained: bool) {
+        let batch = batch_report(Some(FIRST_CALL), &[BatchToolStatus::Running]);
+        let mut progress = ToolProgress::live(if retained {
+            batch.clone()
+        } else {
+            report(SubagentActivity::Responding)
+        });
+
+        for title in [None, Some(THINKING_TITLE), Some(UPDATED_THINKING_TITLE)] {
+            let thinking = SubagentActivity::Thinking {
+                title: title.map(str::to_owned),
+            };
+            progress.update(report(thinking.clone()));
+            let mut expected = Vec::new();
+            if retained {
+                expected.push((&batch.activity, false));
+            }
+            expected.push((&thinking, true));
+            assert_eq!(progress.activities().collect::<Vec<_>>(), expected);
+            assert_eq!(progress.has_history(), retained);
+        }
+    }
+
+    #[test_case(SHELL_TOOL_NAME ; "ordinary_tool")]
+    #[test_case(BATCH_TOOL_NAME ; "pending_batch")]
+    fn keyed_tool_previews_update_their_original_record(tool: &str) {
+        let batch = batch_report(Some(FIRST_CALL), &[BatchToolStatus::Running]);
+        let mut progress = ToolProgress::live(batch.clone());
+        let first =
+            SubagentActivity::tool(Arc::from(tool), CHILD_SUMMARY).with_call_id(SECOND_CALL);
+        let second =
+            SubagentActivity::tool(Arc::from(tool), CHILD_SUMMARY).with_call_id(THIRD_CALL);
+        let thinking = SubagentActivity::Thinking { title: None };
+        progress.update(report(first));
+        progress.update(report(thinking.clone()));
+        progress.update(report(second.clone()));
+        let preview =
+            SubagentActivity::tool(Arc::from(tool), TOOL_PREVIEW).with_call_id(SECOND_CALL);
+        progress.update(report(preview.clone()));
+        progress.update(report(preview.clone()));
+
+        assert_eq!(
+            progress.activities().collect::<Vec<_>>(),
+            [
+                (&batch.activity, false),
+                (&preview, true),
+                (&thinking, false),
+                (&second, false)
+            ]
+        );
+    }
+
+    #[test_case(&[1, 5, 2] ; "small_large_small")]
+    fn successive_batches_survive_thinking_phases(sizes: &[usize]) {
+        let thinking = SubagentActivity::Thinking { title: None };
+        let mut progress = ToolProgress::live(report(thinking.clone()));
+        assert!(!progress.has_history());
+
+        for (index, &size) in sizes.iter().enumerate() {
+            progress.update(batch_report(
+                Some(&index.to_string()),
+                &vec![BatchToolStatus::Running; size],
+            ));
+            assert_eq!(progress.activities().count(), index * 2 + 1);
+            progress.update(report(thinking.clone()));
+            assert_eq!(
+                progress
+                    .activities()
+                    .map(|(activity, current)| (activity.children().len(), current))
+                    .collect::<Vec<_>>(),
+                sizes[..=index]
+                    .iter()
+                    .enumerate()
+                    .flat_map(|(batch, &size)| [(size, false), (0, batch == index)])
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test_case(false ; "separate_instances")]
+    #[test_case(true ; "cloned_instance")]
+    fn progress_histories_are_independent(cloned: bool) {
+        let batch = batch_report(Some(FIRST_CALL), &[BatchToolStatus::Running]);
+        let mut first = ToolProgress::live(batch.clone());
+        let second = if cloned {
+            first.clone()
+        } else {
+            ToolProgress::live(batch.clone())
+        };
+        first.update(batch_report(Some(FIRST_CALL), &[BatchToolStatus::Success]));
+        first.update(batch_report(Some(SECOND_CALL), &[BatchToolStatus::Error]));
+        first.settle();
+
+        assert!(!first.has_history());
+        assert!(!first.is_live());
+        assert!(second.has_history());
+        assert!(second.is_live());
+        assert_eq!(
+            second.activities().collect::<Vec<_>>(),
+            [(&batch.activity, true)]
+        );
+    }
+
+    #[test_case(false ; "phase_boundary")]
+    #[test_case(true ; "tool_tally_boundary")]
+    fn anonymous_batches_merge_only_within_one_uninterrupted_call(tally_boundary: bool) {
+        let batch = batch_report(None, &[BatchToolStatus::Running]);
+        let mut progress = ToolProgress::live(batch.clone());
+        progress.update(batch.clone());
+        assert_eq!(progress.activities().count(), 1);
+
+        let mut next = batch.clone();
+        if tally_boundary {
+            next.tools += 1;
+        } else {
+            progress.update(report(SubagentActivity::Thinking { title: None }));
+        }
+        progress.update(next);
+        let thinking = SubagentActivity::Thinking { title: None };
+        let mut expected = vec![(&batch.activity, false)];
+        if !tally_boundary {
+            expected.push((&thinking, false));
+        }
+        expected.push((&batch.activity, true));
+        assert_eq!(progress.activities().collect::<Vec<_>>(), expected);
+    }
+
+    #[test_case(64 ; "many_batches")]
+    fn all_batches_remain_available_for_the_active_task(calls: usize) {
+        let mut progress = ToolProgress::live(report(SubagentActivity::Responding));
+        for index in 0..calls {
+            progress.update(batch_report(
+                Some(&index.to_string()),
+                &[BatchToolStatus::Running],
+            ));
+        }
+        let ids: Vec<_> = progress
+            .activities()
+            .filter_map(|(activity, current)| match activity {
+                SubagentActivity::Tool { call_id, .. } => Some((call_id.clone(), current)),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(
+            ids,
+            (0..calls)
+                .map(|index| (Some(index.to_string()), index == calls - 1))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test_case(SubagentActivity::Responding ; "non_batch")]
+    #[test_case(batch_report(Some(SECOND_CALL), &[BatchToolStatus::Error]).activity ; "batch")]
+    fn updating_resets_the_elapsed_anchor_and_settling_keeps_the_report(
+        activity: SubagentActivity,
+    ) {
+        let mut progress =
+            ToolProgress::live(batch_report(Some(FIRST_CALL), &[BatchToolStatus::Running]));
+        progress.since = Some(Instant::now() - STALE_ANCHOR_AGE);
+        let before_update = Instant::now();
+        let latest = report(activity);
+        progress.update(latest.clone());
+
+        assert!(progress.since.is_some_and(|since| since >= before_update));
+        assert_eq!(progress.report, latest);
+        progress.settle();
+        assert!(!progress.is_live());
+        assert!(!progress.has_history());
+        assert_eq!(
+            progress.activities().collect::<Vec<_>>(),
+            [(&latest.activity, true)]
+        );
+        assert_eq!(progress.report.tools, latest.tools);
+        assert_eq!(progress.elapsed(), progress.report.elapsed);
+        assert_eq!(progress.history.capacity(), 0);
     }
 }
 

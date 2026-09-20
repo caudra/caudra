@@ -1997,8 +1997,9 @@ pub enum SubagentActivity {
     Tool {
         name: Arc<str>,
         summary: String,
-        /// The roster, when the tool is a `batch`. Empty for every other call,
-        /// which is what keeps the common activity a two-field struct.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        call_id: Option<String>,
+        /// The roster, when the tool is a `batch`. Empty for every other call.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         children: Vec<ActivityChild>,
     },
@@ -2015,6 +2016,7 @@ impl SubagentActivity {
         Self::Tool {
             name,
             summary: summary.split_whitespace().collect::<Vec<_>>().join(" "),
+            call_id: None,
             children: Vec::new(),
         }
     }
@@ -2025,10 +2027,18 @@ impl SubagentActivity {
             Self::Tool { name, summary, .. } => Self::Tool {
                 name,
                 summary,
+                call_id: None,
                 children,
             },
             other => other,
         }
+    }
+
+    pub fn with_call_id(mut self, id: &str) -> Self {
+        if let Self::Tool { call_id, .. } = &mut self {
+            *call_id = Some(id.to_owned());
+        }
+        self
     }
 
     /// The batch roster behind this activity, empty for everything else.
@@ -2050,12 +2060,16 @@ impl SubagentActivity {
             // The input is still streaming, so the header is whatever the
             // arguments have revealed so far: nothing at first, then the one
             // scalar the preview pulled out of the fragments.
-            AgentEvent::ToolPending { name, .. } => Some(Self::tool(Arc::from(name.as_str()), "")),
-            AgentEvent::ToolInputDelta { name, preview, .. } => preview
+            AgentEvent::ToolPending { id, name } => {
+                Some(Self::tool(Arc::from(name.as_str()), "").with_call_id(id))
+            }
+            AgentEvent::ToolInputDelta {
+                id, name, preview, ..
+            } => preview
                 .as_deref()
-                .map(|preview| Self::tool(Arc::from(name.as_str()), preview)),
+                .map(|preview| Self::tool(Arc::from(name.as_str()), preview).with_call_id(id)),
             AgentEvent::ToolStart(start) => {
-                Some(Self::tool(Arc::clone(&start.tool), &start.summary))
+                Some(Self::tool(Arc::clone(&start.tool), &start.summary).with_call_id(&start.id))
             }
             AgentEvent::Compacting => Some(Self::Compacting),
             AgentEvent::Retry { .. } => Some(Self::Retrying),
