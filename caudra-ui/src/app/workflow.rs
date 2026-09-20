@@ -24,6 +24,7 @@ use crate::components::command::CommandAction;
 use crate::components::logs_modal::LogsAction;
 use crate::components::workflow_catalog_picker::WorkflowCatalogAction;
 use crate::components::workflow_inspector::{InspectorAction, RunControl};
+use crate::components::{DisplayMessage, DisplayRole};
 use crate::repaint::Dirty;
 
 pub(crate) const UNAVAILABLE_MSG: &str = "Workflows are unavailable in this session";
@@ -490,12 +491,19 @@ impl App {
         }
     }
 
-    /// Brings every card the transcript holds up to what the mirror knows,
-    /// for a restored session whose cards were drawn from stored results.
+    /// Puts this session's runs back on a transcript that has just been
+    /// rebuilt. A card the `workflow` tool drew is stored with the tool result
+    /// and comes back frozen at the moment of launch, so the mirror brings it
+    /// up to date. A card a slash command drew was never stored, and the run
+    /// outlived the transcript that showed it, so what it came to is kept as a
+    /// notice rather than as a card no restore can rebuild.
     pub(crate) fn refresh_workflow_cards(&mut self) {
         let runs = self.workflow.runs().to_vec();
         for run in &runs {
-            self.main_chat().workflow_card_update(run);
+            if !self.main_chat().workflow_card_update(run) {
+                let notice = DisplayMessage::new(DisplayRole::Notice, outcome_headline(run));
+                self.main_chat().push(notice);
+            }
         }
     }
 
@@ -676,13 +684,19 @@ pub(crate) fn parse_launch(args: &str) -> Result<LaunchRequest, String> {
     })
 }
 
+/// The sentence a settled run is named and reported by, which the transcript
+/// keeps on its own when the card that drew the run is gone.
+pub(crate) fn outcome_headline(run: &RunSnapshot) -> String {
+    format!(
+        "Workflow {} ({}) finished with status {}.",
+        run.display_name, run.workflow_name, run.status
+    )
+}
+
 /// What the model is told when a run settles: the outcome first, then what
 /// it produced, bounded so a long report cannot swamp the turn.
 pub(crate) fn completion_notice(run: &RunSnapshot) -> String {
-    let mut text = format!(
-        "Workflow {} ({}) finished with status {}.",
-        run.display_name, run.workflow_name, run.status
-    );
+    let mut text = outcome_headline(run);
     if let Some(result) = &run.result {
         match result.get(REPORT_FIELD).and_then(Value::as_str) {
             Some(report) => {
@@ -762,6 +776,11 @@ mod tests {
     const LAUNCHES_ITS_OWN: &str =
         "a built-in slash command launches the workflow it is named after, with its free text";
     const CARD_DRAWN: &str = "a slash launch draws the run's card in the transcript";
+    const CARD_IS_BROUGHT_UP_TO_DATE: &str =
+        "a restored card reads the state the runtime has, not the one it was stored at";
+    const RUN_IS_NOT_LOST: &str = "a run whose card was never stored is still accounted for";
+    const NOTICE_IS_NOT_A_SECOND_CARD: &str =
+        "a run the transcript already draws is not announced again";
     const CARD_FOLLOWS: &str = "the card must follow the run's snapshots";
     const LOG_MIRRORED: &str = "a log line must reach the mirror's tail";
     const NO_CARD_CHURN: &str = "an agent's activity must not touch the transcript";
@@ -1512,6 +1531,56 @@ mod tests {
         let card = drawn_card(&mut app);
         assert_card_is_live(&card);
         assert!(!card.text.contains(MISSING_TOOL_COMPLETION), "{card:?}");
+    }
+
+    /// A card is stored with the tool result that drew it, which freezes it at
+    /// the moment of launch. The runtime outlives the process, so a restored
+    /// transcript reads the run from the mirror rather than from the snapshot
+    /// it was written with.
+    #[test]
+    fn a_restored_card_is_brought_up_to_date_from_the_runtime() {
+        let mut app = app_watching_a_run();
+        app.workflow.apply(run(RunStatus::Completed));
+
+        app.refresh_workflow_cards();
+
+        let card = drawn_card(&mut app);
+        assert!(
+            matches!(&card.role, DisplayRole::Tool(tool) if tool.status == ToolStatus::Success),
+            "{CARD_IS_BROUGHT_UP_TO_DATE}"
+        );
+    }
+
+    /// A slash launch draws a card the session never stored, so a resume has
+    /// nothing to rebuild it from. The run itself is durable, so the outcome
+    /// is kept as a notice rather than dropped.
+    #[test]
+    fn a_run_whose_card_was_never_stored_comes_back_as_a_notice() {
+        let mut app = scripted_app();
+        app.workflow.apply(run(RunStatus::Completed));
+
+        app.refresh_workflow_cards();
+
+        let notice = drawn_card(&mut app);
+        assert_eq!(notice.role, DisplayRole::Notice, "{RUN_IS_NOT_LOST}");
+        assert_eq!(
+            notice.text,
+            outcome_headline(&run(RunStatus::Completed)),
+            "{RUN_IS_NOT_LOST}"
+        );
+    }
+
+    #[test]
+    fn a_run_the_transcript_still_draws_is_not_announced_again() {
+        let mut app = app_watching_a_run();
+        app.workflow.apply(run(RunStatus::Completed));
+
+        app.refresh_workflow_cards();
+
+        assert!(
+            app.main_chat().message_at(1).is_none(),
+            "{NOTICE_IS_NOT_A_SECOND_CARD}"
+        );
     }
 
     /// Cancelling the turn leaves workflow runs alone, so the card of one

@@ -1205,6 +1205,9 @@ impl SpawnCtx {
         if restore_session {
             app.restore_resumed_session();
         }
+        // After the transcript exists: a card can only be brought up to date
+        // once the restore that draws it has run.
+        app.refresh_workflow_cards();
         app.set_pattern_suggestion_loader(self.pattern_suggestion_loader.clone());
         info!(
             session_id = %session_id,

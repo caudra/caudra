@@ -204,7 +204,6 @@ impl AgentHandles {
         }
         app.state.goal = self.goal.clone();
         app.workflow.set_handle(self.workflow_handle());
-        app.refresh_workflow_cards();
         let restore_tx =
             caudra_agent::EventSender::new(self.agent_tx.clone(), crate::app::RESTORE_RUN_ID);
         app.restore_event_tx = Some(restore_tx.clone());
@@ -319,6 +318,7 @@ impl AgentHandles {
         // Repoint the app at the new queue before dropping `old`, otherwise the app keeps
         // the last old `QueueSender` alive and the old loop parks in `recv_notify` forever.
         self.apply_to_app(app);
+        app.refresh_workflow_cards();
         app.flush_restored_queue();
         old.cancel();
     }
