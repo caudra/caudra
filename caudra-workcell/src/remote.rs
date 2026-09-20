@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use crate::SHELL_EXECUTION_TIMEOUT;
 use async_trait::async_trait;
 use caudra_config::workcell::{RemoteWorkcellSelection, WorkcellEndpoint};
 use caudra_storage::auth::{WorkcellCredential, WorkcellCredentialName};
@@ -87,6 +88,7 @@ const SNAPSHOT_RESTORE_KIND: &str = "snapshot_restore";
 const SNAPSHOT_UNREVERT_KIND: &str = "snapshot_unrevert";
 const SNAPSHOT_CLEANUP_KIND: &str = "snapshot_cleanup";
 const MAX_CONTROL_OPERATIONS: usize = 32;
+const SHELL_CONTRACT_ID: &str = "shell.execution.v1";
 
 #[derive(Clone)]
 pub struct NamedBearerCredential {
@@ -385,9 +387,14 @@ impl RemoteTransport {
         max_request_bytes: u64,
         cancellation: &CancellationToken,
     ) -> Result<Value, RequestFailure> {
-        self.request_tracked_with_dispatch(method, params, max_request_bytes, cancellation, || {
-            Ok(())
-        })
+        self.request_tracked_with_dispatch(
+            method,
+            params,
+            max_request_bytes,
+            cancellation,
+            None,
+            || Ok(()),
+        )
         .await
     }
 
@@ -397,6 +404,7 @@ impl RemoteTransport {
         mut params: Value,
         max_request_bytes: u64,
         cancellation: &CancellationToken,
+        timeout_override: Option<Duration>,
         before_dispatch: F,
     ) -> Result<Value, RequestFailure>
     where
@@ -436,7 +444,14 @@ impl RemoteTransport {
             });
         }
         let dispatched = AtomicBool::new(false);
-        let operation = self.send(method, body, id, &dispatched, before_dispatch);
+        let operation = self.send(
+            method,
+            body,
+            id,
+            &dispatched,
+            timeout_override,
+            before_dispatch,
+        );
         let cancelled = async {
             cancellation.cancelled().await;
             Err(RemoteWorkcellError::Cancelled)
@@ -455,6 +470,7 @@ impl RemoteTransport {
         body: Vec<u8>,
         id: u64,
         dispatched: &AtomicBool,
+        timeout_override: Option<Duration>,
         before_dispatch: F,
     ) -> Result<Value, RemoteWorkcellError>
     where
@@ -467,6 +483,12 @@ impl RemoteTransport {
             .header(ACCEPT, ACCEPT_VALUE)
             .header("mcp-method", method)
             .header(PROTOCOL_HEADER, PROTOCOL_VERSION);
+        // The server answers an execution request only once the command has
+        // finished, and dropping the request cancels it, so the client's own
+        // deadline has to outlast what it asked the command to be allowed.
+        if let Some(timeout) = timeout_override {
+            builder = builder.timeout(timeout);
+        }
         if let Some(bearer) = &self.bearer {
             builder = builder.header(AUTHORIZATION, format!("Bearer {bearer}"));
         }
@@ -2479,8 +2501,9 @@ impl RemoteWorkcellClient {
         &self,
         request: &contract::ExecuteRequest,
         cancellation: &CancellationToken,
-        journal_operation_id: Option<&OperationId>,
+        stored: &StoredOperation,
     ) -> Result<contract::StatusResponse, RequestFailure> {
+        let journal_operation_id = stored.journal.as_ref().map(|journal| &journal.operation_id);
         let params = serde_json::to_value(request).map_err(|_| RequestFailure {
             error: RemoteWorkcellError::InvalidProtocol,
             dispatched: false,
@@ -2498,6 +2521,7 @@ impl RemoteWorkcellClient {
                 params,
                 self.request_limit(contract::EXECUTE_METHOD),
                 cancellation,
+                execution_timeout(&stored.binding),
                 || {
                     journal_operation_id.map_or(Ok(()), |operation_id| {
                         self.0.mutation_journal.mark_dispatched(operation_id)
@@ -2723,11 +2747,7 @@ impl RemoteWorkcellClient {
             host: self.host_binding(),
         };
         match self
-            .call_execute(
-                &request,
-                &self.0.cancellation.child_token(),
-                stored.journal.as_ref().map(|journal| &journal.operation_id),
-            )
+            .call_execute(&request, &self.0.cancellation.child_token(), &stored)
             .await
         {
             Ok(status) => {
@@ -2806,11 +2826,7 @@ impl RemoteWorkcellClient {
             host: self.host_binding(),
         };
         match self
-            .call_execute(
-                &request,
-                &self.0.cancellation.child_token(),
-                stored.journal.as_ref().map(|journal| &journal.operation_id),
-            )
+            .call_execute(&request, &self.0.cancellation.child_token(), &stored)
             .await
         {
             Ok(status) => {
@@ -3922,10 +3938,12 @@ impl WorkspaceExecService for RemoteWorkcellClient {
                 capability: WorkspaceCapability::ExecExecute,
             },
         )?;
+        // Zero is the server's own way of asking for its maximum, so it passes
+        // through rather than being second-guessed here.
         if request.command.as_str().len() > capability.max_command_bytes as usize
             || request
                 .timeout_ms
-                .is_some_and(|timeout| timeout == 0 || timeout > capability.max_timeout_ms)
+                .is_some_and(|timeout| timeout > capability.max_timeout_ms)
         {
             return Err(invalid_response());
         }
@@ -6265,6 +6283,17 @@ fn unix_millis() -> u64 {
         .unwrap_or(u64::MAX)
 }
 
+/// Only the two contracts that run a command need the longer client deadline.
+/// Both are validated against the catalogue before an operation is stored, so a
+/// server cannot widen its own budget by naming a contract it does not own.
+fn execution_timeout(binding: &contract::OperationBinding) -> Option<Duration> {
+    matches!(
+        binding.contract.id.as_str(),
+        SHELL_CONTRACT_ID | contract::DIRECT_EXEC_CONTRACT_ID
+    )
+    .then_some(SHELL_EXECUTION_TIMEOUT)
+}
+
 fn contract_binding(spec: &OwnedToolSpec) -> Result<contract::ContractBinding, WorkspaceError> {
     Ok(contract::ContractBinding {
         id: contract::Identifier::new(spec.contract_id.clone()).map_err(|_| invalid_response())?,
@@ -7224,6 +7253,7 @@ mod tests {
     use std::sync::Arc;
     use std::sync::mpsc;
     use std::thread;
+    use std::time::Duration;
 
     use serde_json::{Value, json};
     use test_case::test_case;
@@ -7233,13 +7263,14 @@ mod tests {
         BoundedMap, CursorRecord, CursorRegistry, DIRECT_EXEC_KIND, JournalOperation, JsonRpcError,
         MAX_SSE_EVENT_BYTES, OperationRegistry, PreparedWorkspaceContext, RecoveryOperation,
         RemoteEvent, RemoteMutationJournal, RemoteTransport, RemoteWorkcellError, ResourceCache,
-        StoredOperation, ToolListWire, WORKSPACE_MUTATION_KIND, canonical_journal_policy,
-        cleanup_preview_partitions, convert_status, freeze_catalog, join_workspace_path,
-        map_rpc_error, numeric_loopback, pagination_flags, parse_content_range,
-        parse_snapshot_result, project_asset_kind, project_asset_trust, recovery_status,
-        require_full_remote_parity, require_nonzero_within, same_descriptor_except_instance,
-        same_unique_ids, serialized_items_bytes, source_trust_anchor, validate_capabilities,
-        validate_selector_id, watch_path_within,
+        SHELL_CONTRACT_ID, SHELL_EXECUTION_TIMEOUT, StoredOperation, ToolListWire,
+        WORKSPACE_MUTATION_KIND, canonical_journal_policy, cleanup_preview_partitions,
+        convert_status, execution_timeout, freeze_catalog, join_workspace_path, map_rpc_error,
+        numeric_loopback, pagination_flags, parse_content_range, parse_snapshot_result,
+        project_asset_kind, project_asset_trust, recovery_status, require_full_remote_parity,
+        require_nonzero_within, same_descriptor_except_instance, same_unique_ids,
+        serialized_items_bytes, source_trust_anchor, validate_capabilities, validate_selector_id,
+        watch_path_within,
     };
     use caudra_config::workcell::{
         RemoteWorkcellSelection, WorkcellEndpoint, WorkcellProfileName, WorkcellSourceRef,
@@ -7970,6 +8001,24 @@ mod tests {
         assert!(failure.dispatched);
         release.send(()).unwrap();
         server.join().unwrap();
+    }
+
+    fn binding_for(contract_id: &str) -> contract::OperationBinding {
+        let mut binding = completed_status().binding.unwrap();
+        binding.contract.id = contract::Identifier::new(contract_id).unwrap();
+        binding
+    }
+
+    /// The server answers an execution request only when the command is done, so
+    /// the two contracts that run one need a request deadline longer than the
+    /// transport default. Nothing else does, and a contract the catalogue never
+    /// validated cannot claim it.
+    #[test_case(SHELL_CONTRACT_ID => Some(SHELL_EXECUTION_TIMEOUT) ; "the shell waits for its command")]
+    #[test_case(contract::DIRECT_EXEC_CONTRACT_ID => Some(SHELL_EXECUTION_TIMEOUT) ; "so does a direct host command")]
+    #[test_case("file.read.v1" => None ; "an ordinary tool keeps the transport default")]
+    #[test_case("test.v1" => None ; "an unknown contract cannot widen its own budget")]
+    fn only_command_contracts_extend_the_request_deadline(contract_id: &str) -> Option<Duration> {
+        execution_timeout(&binding_for(contract_id))
     }
 
     #[test]

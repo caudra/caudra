@@ -132,6 +132,13 @@ const REMOTE_DISPLAY_MAX_CHARS: usize = 512;
 const REMOTE_POLL_INITIAL: Duration = Duration::from_millis(100);
 const REMOTE_POLL_MAX: Duration = Duration::from_secs(2);
 const REMOTE_EXECUTION_TIMEOUT: Duration = Duration::from_secs(600);
+/// Headroom for cleanup and result delivery once a command has used the whole
+/// deadline Workcell allows it. It buys the client no extra execution time: the
+/// server stops the process on its own timer, and waiting slightly longer is
+/// what turns a completed run into a result instead of a cancellation.
+const SHELL_COMPLETION_ALLOWANCE_MS: u64 = 30_000;
+const SHELL_EXECUTION_TIMEOUT: Duration =
+    Duration::from_millis(workcell::shell::MAX_TIMEOUT_MS + SHELL_COMPLETION_ALLOWANCE_MS);
 const REMOTE_RECONCILE_TIMEOUT: Duration = Duration::from_secs(10);
 const REMOTE_RECONCILE_MAX_POLLS: usize = 4;
 /// Caudra owns authorization, so Workcell always hands over the mutation
@@ -1527,10 +1534,9 @@ impl RemoteWorkcellInvocation {
             return Err("Remote Workcell workspace context changed after preparation".into())
                 .into();
         }
+        let ceiling = remote_execution_ceiling(self.kind);
         let timeout = match ctx.deadline.remaining() {
-            Ok(remaining) => remaining
-                .unwrap_or(REMOTE_EXECUTION_TIMEOUT)
-                .min(REMOTE_EXECUTION_TIMEOUT),
+            Ok(remaining) => remaining.unwrap_or(ceiling).min(ceiling),
             Err(_) => Duration::ZERO,
         };
         let deadline = Instant::now() + timeout;
@@ -1690,6 +1696,16 @@ impl RemoteWorkcellInvocation {
 
 fn bounded_remote_display(value: &str) -> String {
     value.chars().take(REMOTE_DISPLAY_MAX_CHARS).collect()
+}
+
+/// A shell command may legitimately run for the whole deadline Workcell grants
+/// it, and giving up first cancels the remote operation rather than reporting
+/// it. Every other tool keeps the shorter ceiling.
+const fn remote_execution_ceiling(kind: ToolKind) -> Duration {
+    match kind {
+        ToolKind::Shell => SHELL_EXECUTION_TIMEOUT,
+        _ => REMOTE_EXECUTION_TIMEOUT,
+    }
 }
 
 impl ToolKind {
@@ -4224,6 +4240,16 @@ mod tests {
         assert!(!canonical_remote_catalog(&changed));
     }
 
+    /// A remote command runs on the server's clock, so the client has to outwait
+    /// the deadline it asked for. Giving up first cancels the operation, which is
+    /// why the shell ceiling is not the one every other tool uses.
+    #[test_case(ToolKind::Shell => SHELL_EXECUTION_TIMEOUT ; "a command waits out the deadline it was given")]
+    #[test_case(ToolKind::FileRead => REMOTE_EXECUTION_TIMEOUT ; "a read keeps the ordinary ceiling")]
+    #[test_case(ToolKind::Code => REMOTE_EXECUTION_TIMEOUT ; "so does the code worker, which bounds itself")]
+    fn the_execution_ceiling_is_raised_only_for_the_shell(kind: ToolKind) -> Duration {
+        remote_execution_ceiling(kind)
+    }
+
     #[test]
     fn remote_file_result_uses_the_embedded_specialized_adapter() {
         let output = FileReadOutput::File {
@@ -4526,7 +4552,7 @@ mod tests {
                     "additionalProperties": false,
                     "properties": {
                         "command": { "type": "string", "minLength": 1 },
-                        "timeout": { "type": "integer", "minimum": 1, "maximum": 600_000, "default": 120_000 },
+                        "timeout": { "type": "integer", "minimum": 0, "maximum": 1_800_000, "default": 120_000 },
                         "workdir": { "type": "string", "minLength": 1 }
                     },
                     "required": ["command"]

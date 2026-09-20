@@ -245,7 +245,7 @@ A progress bar redraws a row instead of printing lines. Caudra renders both the 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `command` | string | yes | Bash command to execute on the MCP server host. |
-| `timeout` | integer | no | Optional timeout in milliseconds. Defaults to 120000 and is capped at 600000. |
+| `timeout` | integer | no | Optional timeout in milliseconds. Defaults to 120000, 0 selects the 1800000 maximum, and a larger value is rejected. |
 | `workdir` | string | no | Optional configured-root-relative or absolute initial working directory inside the configured root. |
 
 ### `python_execution` <span class="badge">on demand</span> {#python_execution}
