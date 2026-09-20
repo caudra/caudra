@@ -18,7 +18,7 @@ const DESCRIPTION: &str = r#"Execute a Bash command on the MCP server host.
 Usage notes:
 - The command parameter is required.
 - Commands must be valid MCP JSON strings, are bounded to 65536 UTF-8 bytes, and are authorized by immutable operator policy before execution. Malformed JSON or non-UTF-8 request payloads are rejected by the MCP transport before tool dispatch.
-- timeout is optional, measured in milliseconds, defaults to 120000, and is capped at 600000.
+- timeout is optional and measured in milliseconds. It defaults to 120000, 0 selects the 1800000 maximum, and a larger value is rejected rather than clamped.
 - Use workdir instead of embedding cd commands. It must resolve inside the configured root and defaults to ".".
 - Only the initial working directory is root-confined. Execution is unsafe and unsandboxed: commands can mutate host files, access the network, and read inherited environment variables.
 - Prefer the dedicated file tools when they are available and fit the operation, and prefer the code execution tool for pure computation such as arithmetic, statistics, string processing, and JSON reshaping, because it runs isolated from the host.
@@ -39,7 +39,7 @@ pub fn catalog() -> Vec<Tool> {
 #[must_use]
 pub fn specs() -> Vec<ToolSpec> {
     // Reject unknown fields to keep client mistakes from silently changing execution semantics.
-    let schema = json!({"type":"object","additionalProperties":false,"properties":{"command":{"type":"string","minLength":1,"description":"Bash command to execute on the MCP server host."},"timeout":{"type":"integer","minimum":1,"maximum":MAX_TIMEOUT_MS,"default":DEFAULT_TIMEOUT_MS,"description":"Optional timeout in milliseconds. Defaults to 120000 and is capped at 600000."},"workdir":{"type":"string","minLength":1,"description":"Optional configured-root-relative or absolute initial working directory inside the configured root."}},"required":["command"],"$schema":"http://json-schema.org/draft-07/schema#"});
+    let schema = json!({"type":"object","additionalProperties":false,"properties":{"command":{"type":"string","minLength":1,"description":"Bash command to execute on the MCP server host."},"timeout":{"type":"integer","minimum":0,"maximum":MAX_TIMEOUT_MS,"default":DEFAULT_TIMEOUT_MS,"description":"Optional timeout in milliseconds. Defaults to 120000, 0 selects the 1800000 maximum, and a larger value is rejected."},"workdir":{"type":"string","minLength":1,"description":"Optional configured-root-relative or absolute initial working directory inside the configured root."}},"required":["command"],"$schema":"http://json-schema.org/draft-07/schema#"});
     // Destructive/idempotent annotations are presentation hints only. The explicit description is
     // the durable warning that arbitrary commands inherit files, network, and environment access.
     vec![
@@ -119,7 +119,7 @@ mod tests {
         assert!(description.contains("Prefer separate streams to 2>&1"));
         assert_eq!(
             tools[0].input_schema["properties"]["timeout"]["description"],
-            "Optional timeout in milliseconds. Defaults to 120000 and is capped at 600000."
+            "Optional timeout in milliseconds. Defaults to 120000, 0 selects the 1800000 maximum, and a larger value is rejected."
         );
         assert_eq!(
             tools[0].meta.as_ref().unwrap().0[workcell_tool_contract::PRESENTATION_METADATA_KEY],

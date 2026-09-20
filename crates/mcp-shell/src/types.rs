@@ -15,7 +15,7 @@ use crate::{
 };
 
 pub const DEFAULT_TIMEOUT_MS: u64 = 120_000;
-pub const MAX_TIMEOUT_MS: u64 = 600_000;
+pub const MAX_TIMEOUT_MS: u64 = 1_800_000;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 // Strict decoding mirrors the advertised schema and prevents typoed controls from being ignored.

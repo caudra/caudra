@@ -225,12 +225,19 @@ impl ShellToolGroup {
                 input.command.len()
             ));
         }
-        let timeout_ms = input.timeout.unwrap_or(DEFAULT_TIMEOUT_MS);
-        if timeout_ms == 0 || timeout_ms > MAX_TIMEOUT_MS {
-            return Err(format!(
-                "Invalid arguments: timeout must be between 1 and {MAX_TIMEOUT_MS}"
-            ));
-        }
+        // Zero names the longest run this server allows, so a caller that means "as long as
+        // possible" never has to guess a number the schema would reject. It stays finite: no
+        // input disables the deadline.
+        let timeout_ms = match input.timeout {
+            None => DEFAULT_TIMEOUT_MS,
+            Some(0) => MAX_TIMEOUT_MS,
+            Some(requested) if requested > MAX_TIMEOUT_MS => {
+                return Err(format!(
+                    "Invalid arguments: timeout is {requested} milliseconds; the maximum is {MAX_TIMEOUT_MS}. Omit timeout for {DEFAULT_TIMEOUT_MS}, or pass 0 for the maximum"
+                ));
+            }
+            Some(requested) => requested,
+        };
         let requested_workdir = input.workdir.as_deref().unwrap_or(".");
         let workdir = if self.confined {
             workdir::resolve(&self.root, requested_workdir).await?
@@ -707,6 +714,7 @@ mod tests {
     const CARGO_TEST_STDOUT: &str = "running 2 tests\ntest sdk_mode::tests::wire_init ... ok\ntest sdk_mode::tests::wire_result ... ok\ntest result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s\n";
     const CARGO_TEST_STDERR: &str = "warning: future incompatibility\n";
     const PREPARED_TIMEOUT_MS: u64 = 321;
+    const ZERO_MAXIMUM_HINT: &str = "pass 0 for the maximum";
 
     async fn group_for_render(output_filter: bool) -> (tempfile::TempDir, ShellToolGroup) {
         let root = tempfile::tempdir().unwrap();
@@ -1014,6 +1022,83 @@ mod tests {
         let chunks = progress.chunks.lock().unwrap();
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].text, "bound");
+    }
+
+    #[tokio::test]
+    async fn an_omitted_timeout_defaults_and_zero_selects_the_maximum() {
+        let root = tempfile::tempdir().unwrap();
+        let group = ShellToolGroup::with_policy(root.path(), ShellPermissionPolicy::yolo())
+            .await
+            .unwrap();
+        for (requested, expected) in [
+            (None, DEFAULT_TIMEOUT_MS),
+            (Some(0), MAX_TIMEOUT_MS),
+            (Some(1), 1),
+            (Some(MAX_TIMEOUT_MS), MAX_TIMEOUT_MS),
+        ] {
+            let prepared = group
+                .prepare(ShellInput {
+                    command: "printf bounded".into(),
+                    timeout: requested,
+                    workdir: None,
+                })
+                .await
+                .unwrap();
+            assert_eq!(prepared.timeout_ms(), expected, "{requested:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_timeout_above_the_maximum_is_refused_with_its_value_and_the_bound() {
+        let root = tempfile::tempdir().unwrap();
+        let group = ShellToolGroup::with_policy(root.path(), ShellPermissionPolicy::yolo())
+            .await
+            .unwrap();
+        let error = group
+            .prepare(ShellInput {
+                command: "printf refused".into(),
+                timeout: Some(MAX_TIMEOUT_MS + 1),
+                workdir: None,
+            })
+            .await
+            .unwrap_err();
+        assert!(error.contains(&(MAX_TIMEOUT_MS + 1).to_string()), "{error}");
+        assert!(error.contains(&MAX_TIMEOUT_MS.to_string()), "{error}");
+        assert!(error.contains(ZERO_MAXIMUM_HINT), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_zero_timeout_runs_and_reports_the_maximum_deadline() {
+        let root = tempfile::tempdir().unwrap();
+        let group = ShellToolGroup::with_policy(root.path(), ShellPermissionPolicy::yolo())
+            .await
+            .unwrap();
+        let output = call(&group, json!({"command":"printf zero","timeout":0}))
+            .await
+            .structured_content
+            .unwrap();
+        assert_eq!(output["timeoutMs"], MAX_TIMEOUT_MS);
+        assert_eq!(output["timedOut"], false);
+        assert_eq!(output["stdout"], "zero");
+    }
+
+    #[tokio::test]
+    async fn a_direct_host_operation_reads_zero_the_same_way() {
+        let root = tempfile::tempdir().unwrap();
+        let group = ShellToolGroup::with_policy(root.path(), ShellPermissionPolicy::yolo())
+            .await
+            .unwrap();
+        let prepared = group
+            .prepare_direct(
+                DirectExecOptions {
+                    command: workcell_host_contract::CommandText::new("printf direct").unwrap(),
+                    timeout_ms: Some(0),
+                },
+                ".".to_owned(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(prepared.timeout_ms(), MAX_TIMEOUT_MS);
     }
 
     #[tokio::test]

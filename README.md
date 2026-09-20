@@ -1223,7 +1223,8 @@ through the same confined resolver the filesystem tools use and never opens a pa
 - `workdir` selects the initial directory and defaults to `.`. It must resolve inside the configured
   root. Only that initial directory is root-confined; the command can subsequently reach any path,
   process, or network destination visible to the server process.
-- `timeout` is measured in milliseconds, defaults to 120,000, and is capped at 600,000.
+- `timeout` is measured in milliseconds and defaults to 120,000. Zero selects the 1,800,000 maximum;
+  a larger value is rejected rather than clamped, so no input removes the deadline.
 - Shell execution is denied unless admitted by `--shell-policy` or `--yolo`. Explicit deny rules always
   win. Policy inspects command syntax but cannot infer the behavior of scripts, interpreters, wrappers,
   or allowed programs.
