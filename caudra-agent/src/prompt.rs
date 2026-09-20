@@ -126,7 +126,8 @@ pub const DEFAULT_TONE: &str = r#"- Be concise. Your output is displayed on a CL
 - Output text to communicate with the user; all text you output outside of tool use is displayed to the user. Only use tools to complete tasks. NEVER use shell commands to communicate thoughts, explanations, diagrams, or instructions to the user. Output all communication directly in your response text instead.
 - NEVER create files unless absolutely necessary. ALWAYS prefer editing existing files."#;
 
-const NATIVE_EFFICIENT_TOOLS: &[&str] = &["batch", "python_execution", "task"];
+const NATIVE_EFFICIENT_TOOLS: &[&str] =
+    &["batch", "file_grep", "file_edit", "file_apply_patch", "task"];
 const SYSTEM_COMPONENTS: &[&str] = &[
     "default",
     "identity",
@@ -662,7 +663,11 @@ mod tests {
     use super::*;
     use test_case::test_case;
 
-    const NATIVE_EFFICIENT_LINE: &str = "Most efficient tools: batch, python_execution, task";
+    const NATIVE_EFFICIENT_LINE: &str =
+        "Most efficient tools: batch, file_grep, file_edit, file_apply_patch, task";
+    /// Subagent prompts drop `task`, which only the main agent may call.
+    const SUBAGENT_EFFICIENT_LINE: &str =
+        "Most efficient tools: batch, file_grep, file_edit, file_apply_patch";
 
     fn slots(prompt: PromptId, entries: &[(Slot, &str)]) -> ResolvedSlots {
         let mut slots = ResolvedSlots::default();
@@ -765,7 +770,7 @@ mod tests {
     #[test_case(PromptId::General ; "general")]
     fn task_prompts_do_not_recommend_the_main_only_task_tool(prompt: PromptId) {
         let out = assemble(prompt, &ResolvedSlots::default(), "");
-        assert!(out.contains("Most efficient tools: batch, python_execution."));
+        assert!(out.contains(&format!("{SUBAGENT_EFFICIENT_LINE}.")));
         assert!(!out.contains(NATIVE_EFFICIENT_LINE));
     }
 
@@ -810,7 +815,7 @@ mod tests {
         );
         let out = assemble(PromptId::Research, &s, "");
         assert!(!out.contains("DROPPED"));
-        assert!(out.contains("Most efficient tools: batch, python_execution, EXTRA."));
+        assert!(out.contains(&format!("{SUBAGENT_EFFICIENT_LINE}, EXTRA.")));
     }
 
     #[test_case(PromptId::System, Slot::ToolUsage, true ; "system_tool_usage")]
