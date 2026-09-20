@@ -39,6 +39,9 @@ const PRESERVE_RECENT_MIN_TOKENS: u32 = 2_000;
 const PRESERVE_RECENT_MAX_TOKENS: u32 = 15_000;
 /// The share of the usable window the preserved tail may claim.
 const PRESERVE_RECENT_FRACTION: u32 = 4;
+/// Newlines that separate the summary from the requirements section appended
+/// below it, so the two never run together as one paragraph.
+const BLANK_LINE_NEWLINES: usize = 2;
 
 // A completed request is billable even when its summary cannot replace history.
 #[derive(Debug)]
@@ -217,8 +220,13 @@ pub(super) async fn compact_history(
             .and_then(RequirementsInput::prior)
             .map(Cow::Borrowed)
     });
-    if let Some(section) = section {
-        append_requirements(&mut response.message, &section);
+    // Sent as a delta, not left for the message alone: the transcript every
+    // surface draws is built from the stream, so an edit made after the stream
+    // closed would reach storage and never the screen.
+    if let Some(section) = section
+        && let Some(appended) = append_requirements(&mut response.message, &section)
+    {
+        let _ = event_tx.send(AgentEvent::TextDelta { text: appended });
     }
     let usage = response.usage;
     let result = finish_compact(response, history, head_end, event_tx, compact_start, model);
@@ -229,28 +237,38 @@ pub(super) async fn compact_history(
     })
 }
 
-/// Appends the list under [`REQUIREMENTS_MARKER`]. The marker is added when
-/// the section is a fresh extraction and already present when it is carried
-/// forward from an earlier summary.
-fn append_requirements(message: &mut Message, section: &str) {
+/// Appends the list under [`REQUIREMENTS_MARKER`], returning exactly the text
+/// it added. The marker is added when the section is a fresh extraction and
+/// already present when it is carried forward from an earlier summary.
+///
+/// The return value is a true continuation of what was there before, so it can
+/// be sent as a stream delta: surfaces that build their transcript from deltas
+/// never see a message edited after its stream closed. That is why the
+/// separator counts the newlines the summary already ended with instead of
+/// trimming them, which would make the new text no longer extend the old.
+fn append_requirements(message: &mut Message, section: &str) -> Option<String> {
     let Some(ContentBlock::Text { text }) = message
         .content
         .iter_mut()
         .find(|block| matches!(block, ContentBlock::Text { .. }))
     else {
-        return;
+        return None;
     };
-    let body = text.trim_end();
-    let mut appended = String::with_capacity(body.len() + section.len() + 4);
-    appended.push_str(body);
-    appended.push_str("\n\n");
-    if !section.starts_with(REQUIREMENTS_MARKER) {
-        appended.push_str(REQUIREMENTS_MARKER);
-        appended.push('\n');
+    let mut suffix = String::with_capacity(section.len() + REQUIREMENTS_MARKER.len() + 4);
+    if !text.is_empty() {
+        let present = text.len() - text.trim_end_matches('\n').len();
+        for _ in present..BLANK_LINE_NEWLINES {
+            suffix.push('\n');
+        }
     }
-    appended.push_str(section.trim());
-    appended.push('\n');
-    *text = appended;
+    if !section.starts_with(REQUIREMENTS_MARKER) {
+        suffix.push_str(REQUIREMENTS_MARKER);
+        suffix.push('\n');
+    }
+    suffix.push_str(section.trim());
+    suffix.push('\n');
+    text.push_str(&suffix);
+    Some(suffix)
 }
 
 fn summary_prompt(head: &[Message], config: &AgentConfig) -> String {
@@ -305,6 +323,10 @@ fn finish_compact(
     compact_start: std::time::Instant,
     model: &Model,
 ) -> Result<(), AgentError> {
+    // Set before the clone below: the event is how every surface learns the
+    // turn was a summary, and one that denies it gets drawn as an ordinary
+    // reply.
+    response.message.is_compaction_summary = true;
     let _ = event_tx.send(AgentEvent::TurnComplete(Box::new(TurnCompleteEvent {
         message: response.message.clone(),
         usage: response.usage,
@@ -326,7 +348,6 @@ fn finish_compact(
     let summarized = &history.as_slice()[..head_end];
     response.message.retained_output_refs = retained_output_refs(summarized);
     response.message.retained_subagent_ids = retained_subagent_ids(summarized);
-    response.message.is_compaction_summary = true;
 
     let tail = history.as_slice()[head_end..].to_vec();
     let preserved = tail.len();
@@ -806,6 +827,79 @@ mod tests {
                     .iter()
                     .any(|message| message.user_text().is_some_and(|t| t.contains("[user 1]")))
             );
+        });
+    }
+
+    /// The section is appended after the summary's stream has closed, so it is
+    /// streamed too. A surface that builds its transcript from the stream would
+    /// otherwise draw a summary its own session file contradicts. The delta has
+    /// to be a true continuation of the streamed text, which is why the blank
+    /// line counts what the summary already ended with.
+    #[test_case(SUMMARY_TEXT, "\n\n" ; "no_trailing_newline")]
+    #[test_case("response\n", "\n" ; "one_trailing_newline")]
+    #[test_case("response\n\n", "" ; "already_a_blank_line")]
+    fn the_appended_section_is_streamed_as_a_delta(summary: &str, separator: &str) {
+        smol::block_on(async {
+            let provider = MockProvider::new(vec![Ok(text_of(summary))]);
+            let extractor = extractor(vec![Ok(text_of(EXTRACTED))]);
+            let (raw_tx, rx) = flume::unbounded();
+            let mut history = History::new(vec![Message::user("work".into())]);
+
+            compact(
+                &provider,
+                &default_model(),
+                &mut history,
+                &EventSender::new(raw_tx, 0),
+                &AgentConfig::default(),
+                Some(&extractor),
+            )
+            .await
+            .unwrap();
+
+            let delta = rx
+                .drain()
+                .find_map(|envelope| match envelope.event {
+                    AgentEvent::TextDelta { text } => Some(text),
+                    _ => None,
+                })
+                .expect("the append is streamed");
+            assert_eq!(
+                delta,
+                format!("{separator}{REQUIREMENTS_MARKER}\n{EXTRACTED}\n")
+            );
+            assert_eq!(format!("{summary}{delta}"), summary_text(&history));
+        });
+    }
+
+    /// The event is how every surface learns the turn was a summary, so the
+    /// flag has to be set before the message is cloned into it.
+    #[test]
+    fn the_turn_complete_event_marks_the_summary() {
+        smol::block_on(async {
+            let provider = MockProvider::new(vec![Ok(text_response(StopReason::EndTurn))]);
+            let (raw_tx, rx) = flume::unbounded();
+            let mut history = History::new(vec![Message::user("work".into())]);
+
+            compact(
+                &provider,
+                &default_model(),
+                &mut history,
+                &EventSender::new(raw_tx, 0),
+                &AgentConfig::default(),
+                None,
+            )
+            .await
+            .unwrap();
+
+            let turn = rx
+                .drain()
+                .find_map(|envelope| match envelope.event {
+                    AgentEvent::TurnComplete(turn) => Some(turn),
+                    _ => None,
+                })
+                .expect("the summary completes a turn");
+            assert!(matches!(turn.purpose, LedgerPurpose::Compaction));
+            assert!(turn.message.is_compaction_summary);
         });
     }
 

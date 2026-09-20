@@ -1591,6 +1591,26 @@ impl MessagesPanel {
         self.streaming_text.push(text);
     }
 
+    /// Reconciles the open buffer with the text the agent actually kept, so a
+    /// card can never show less than the session file holds. A summary gains
+    /// its requirements section once extraction finishes, which is after its
+    /// own stream closed.
+    ///
+    /// The common case is an extension, which only has to be pushed; a buffer
+    /// that is not a prefix of the final text is replaced outright, since a
+    /// delta cannot take characters back.
+    pub fn adopt_final_text(&mut self, text: &str) {
+        if self.streaming_role != DisplayRole::Assistant || self.streaming_text.is_empty() {
+            return;
+        }
+        let Some(tail) = text.strip_prefix(self.streaming_text.buffer()) else {
+            self.streaming_text.clear();
+            self.streaming_text.push(text);
+            return;
+        };
+        self.streaming_text.push(tail);
+    }
+
     /// Grows the instruction a delegated task is being given while the call
     /// that will carry it is still being written. The chat it lands in has no
     /// agent behind it yet, so nothing else can be streaming into the same

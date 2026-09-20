@@ -458,10 +458,16 @@ fn strip_thinking(raw: &str) -> String {
 
 /// The `# User requirements` block of a compaction summary, marker included,
 /// so a compaction whose extraction failed can carry the last one forward.
+///
+/// Only a marker opening its own line counts. A summary that merely quotes the
+/// marker in prose would otherwise be carried forward as though it held the
+/// section, and every later compaction would inherit that prose in place of the
+/// requirements.
 pub fn requirements_section(summary: &str) -> Option<&str> {
     summary
-        .find(REQUIREMENTS_MARKER)
-        .map(|start| summary[start..].trim_end())
+        .match_indices(REQUIREMENTS_MARKER)
+        .find(|(start, _)| *start == 0 || summary.as_bytes()[*start - 1] == b'\n')
+        .map(|(start, _)| summary[start..].trim_end())
 }
 
 #[cfg(test)]
@@ -947,7 +953,29 @@ mod tests {
 
     #[test_case("## Objective\n- x\n\n# User requirements\n## Requirements\n- one\n\n", Some("# User requirements\n## Requirements\n- one") ; "found")]
     #[test_case("## Objective\n- x\n", None ; "absent")]
+    #[test_case("# User requirements\n- one\n", Some("# User requirements\n- one") ; "at_the_very_start")]
     fn the_section_is_found_by_its_marker(summary: &str, expected: Option<&str>) {
         assert_eq!(requirements_section(summary), expected);
+    }
+
+    /// A session about this feature discusses the marker, and a summary of it
+    /// quotes the marker in prose. Matching that would carry the prose forward
+    /// as the requirements and every later compaction would inherit it.
+    #[test_case("- the const is `REQUIREMENTS_MARKER = \"# User requirements\"`\n" ; "quoted_in_a_bullet")]
+    #[test_case("The marker is # User requirements, appended verbatim.\n" ; "quoted_mid_sentence")]
+    #[test_case("## User requirements are extracted per session\n" ; "deeper_heading")]
+    fn a_marker_that_does_not_open_a_line_is_not_a_section(summary: &str) {
+        assert_eq!(requirements_section(summary), None);
+    }
+
+    /// Prose first, a real section after: the section still wins, because the
+    /// search keeps looking rather than stopping at the first textual match.
+    #[test]
+    fn a_real_section_is_found_past_prose_that_quotes_the_marker() {
+        let summary = "- we append `# User requirements` verbatim\n\n# User requirements\n- one\n";
+        assert_eq!(
+            requirements_section(summary),
+            Some("# User requirements\n- one")
+        );
     }
 }

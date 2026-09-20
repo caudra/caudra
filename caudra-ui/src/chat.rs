@@ -34,6 +34,7 @@ use caudra_lua::WinView;
 use caudra_providers::{
     CaudraId, HistoryItem, HistoryItemKind, SteeringKind, SteeringOrigin, UserOrigin,
 };
+use caudra_storage::usage_ledger::LedgerPurpose;
 use caudra_storage::view::ViewMode;
 use caudra_workflow::RunSnapshot;
 use ratatui::Frame;
@@ -244,7 +245,19 @@ impl Chat {
                         .push(DisplayMessage::plan(content, pp.display().to_string()));
                 }
             }
-            AgentEvent::TurnComplete(_) | AgentEvent::ModelUsage { .. } => {}
+            // A compaction summary is edited after its stream closes: the
+            // requirements section is appended once extraction finishes. The
+            // agent streams that append too, so this is a no-op on the happy
+            // path and the guarantee that the card equals what was stored on
+            // any other.
+            AgentEvent::TurnComplete(turn) => {
+                if turn.purpose == LedgerPurpose::Compaction
+                    && let Some(text) = turn.message.first_text_content()
+                {
+                    self.messages_panel.adopt_final_text(text);
+                }
+            }
+            AgentEvent::ModelUsage { .. } => {}
             AgentEvent::GoalEvaluating { .. }
             | AgentEvent::GoalEvaluation { .. }
             | AgentEvent::GoalFinished { .. }
@@ -1254,10 +1267,10 @@ mod tests {
     use caudra_agent::tools::{BATCH_TOOL_NAME, SHELL_TOOL_NAME};
     use caudra_agent::{
         AgentEvent, BatchToolEntry, BatchToolStatus, IndexLine, IndexLineSemantic, IndexOutput,
-        IndexSourceRange, SharedBuf, ToolDoneEvent, ToolOutput, ToolStartEvent,
+        IndexSourceRange, SharedBuf, ToolDoneEvent, ToolOutput, ToolStartEvent, TurnCompleteEvent,
     };
     use caudra_config::UiConfig;
-    use caudra_providers::{ContentBlock, Message, Role};
+    use caudra_providers::{Billing, ContentBlock, Message, Role};
     use test_case::test_case;
 
     fn tool_start(id: &str, tool: &str) -> AgentEvent {
@@ -2364,6 +2377,73 @@ mod tests {
         chat.flush();
         assert_eq!(chat.message_count(), 4);
         assert_eq!(chat.last_message_text(), "new");
+    }
+
+    fn turn_complete(text: &str, purpose: LedgerPurpose) -> AgentEvent {
+        AgentEvent::TurnComplete(Box::new(TurnCompleteEvent {
+            message: Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::Text { text: text.into() }],
+                ..Default::default()
+            },
+            usage: Default::default(),
+            model: String::new(),
+            provider: String::new(),
+            purpose,
+            cost: None,
+            billing: Billing::Api,
+            context_size: None,
+            context_window: 0,
+        }))
+    }
+
+    /// The requirements section is appended once extraction finishes, which is
+    /// after the summary's own stream closed. The card has to end up holding
+    /// what was stored, not only what streamed.
+    #[test]
+    fn a_compaction_turn_adopts_the_message_the_agent_kept() {
+        const STREAMED: &str = "did the work";
+        const APPENDED: &str = "\n\n# User requirements\n- one";
+
+        let mut chat = chat();
+        chat.handle_event(AgentEvent::Compacting, None);
+        text_delta(&mut chat, STREAMED);
+
+        let kept = format!("{STREAMED}{APPENDED}");
+        chat.handle_event(turn_complete(&kept, LedgerPurpose::Compaction), None);
+        chat.handle_event(AgentEvent::CompactionDone, None);
+
+        assert_eq!(chat.last_message_text(), kept);
+    }
+
+    /// A buffer the final message does not extend is replaced outright: a delta
+    /// cannot take characters back, so pushing a tail would leave the card
+    /// holding text no one wrote.
+    #[test]
+    fn a_diverged_buffer_is_replaced_rather_than_extended() {
+        const KEPT: &str = "what was really kept";
+
+        let mut chat = chat();
+        chat.handle_event(AgentEvent::Compacting, None);
+        text_delta(&mut chat, "something else entirely");
+
+        chat.handle_event(turn_complete(KEPT, LedgerPurpose::Compaction), None);
+        chat.handle_event(AgentEvent::CompactionDone, None);
+
+        assert_eq!(chat.last_message_text(), KEPT);
+    }
+
+    /// Only compaction edits a message after its stream: an ordinary turn is
+    /// already whole, and adopting it would risk redrawing a settled card.
+    #[test]
+    fn an_ordinary_turn_leaves_the_streamed_text_alone() {
+        let mut chat = chat();
+        text_delta(&mut chat, REPLY_TEXT);
+
+        chat.handle_event(turn_complete("something else", LedgerPurpose::Chat), None);
+        chat.flush();
+
+        assert_eq!(chat.last_message_text(), REPLY_TEXT);
     }
 
     /// `Nudge` only says a continuation is coming; the continuation itself
