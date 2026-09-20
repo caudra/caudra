@@ -20,6 +20,23 @@ use crate::{
 
 pub(super) const BETA_TOOL_EXAMPLES_BEDROCK: &str = "tool-examples-2025-10-29";
 
+/// Tool names that are also ordinary English words. Prose rewriting only
+/// touches these when they are fenced in backticks or bold, so "a shell command
+/// pipeline" survives while `` `shell` `` is renamed with everything else.
+const AMBIGUOUS_TOOL_WORDS: &[&str] = &[
+    "batch",
+    "index",
+    "memory",
+    "question",
+    "shell",
+    "skill",
+    "task",
+    "workflow",
+];
+
+/// Longest wire name the messages API accepts.
+const MAX_TOOL_NAME: usize = 64;
+
 /// The messages API refuses requests without max_tokens. Anthropic-kind
 /// models always get a window from the fallback table, so this only fires if
 /// an unknown-window model is ever routed here; 32k is safe for every Claude.
@@ -322,10 +339,45 @@ pub(super) fn apply_oauth_request_profile(
         {"type": "text", "text": CLAUDE_CODE_IDENTITY},
     ]);
 
+    // Every tool is registered before any prose is rewritten: a description may
+    // name a sibling declared after it, and the system prompt names tools in no
+    // particular order.
+    let mut renames = HashMap::new();
+    if let Some(tools) = body["tools"].as_array() {
+        for tool in tools {
+            if let Some(name) = tool["name"].as_str() {
+                mapped_oauth_tool_name(name, &mut renames);
+            }
+        }
+    }
+
+    if let Some(tools) = body["tools"].as_array_mut() {
+        for tool in tools {
+            if let Some(wire) = tool["name"]
+                .as_str()
+                .and_then(|name| renames.get(name))
+                .cloned()
+            {
+                tool["name"] = json!(wire);
+            }
+            // Descriptions cross-reference siblings by their canonical names,
+            // which are not callable once the tools are renamed.
+            let described = tool["description"]
+                .as_str()
+                .map(|text| rewrite_tool_mentions(text, &renames));
+            if let Some(described) = described {
+                tool["description"] = json!(described);
+            }
+        }
+    }
+
     if !system.is_empty()
         && let Some(messages) = body["messages"].as_array_mut()
     {
-        let instruction = json!({"type": "text", "text": system});
+        let instruction = json!({
+            "type": "text",
+            "text": rewrite_tool_mentions(system, &renames),
+        });
         if let Some(message) = messages
             .iter_mut()
             .find(|message| message["role"].as_str() == Some("user"))
@@ -337,29 +389,69 @@ pub(super) fn apply_oauth_request_profile(
         }
     }
 
-    let mut tool_names = HashMap::new();
-    if let Some(tools) = body["tools"].as_array_mut() {
-        for tool in tools {
-            if let Some(name) = tool["name"].as_str() {
-                tool["name"] = json!(mapped_oauth_tool_name(name, &mut tool_names));
-            }
-        }
-    }
     if let Some(messages) = body["messages"].as_array_mut() {
         for message in messages {
             let Some(content) = message["content"].as_array_mut() else {
                 continue;
             };
             for block in content {
+                // A historical call may name a tool no longer registered, so
+                // this still maps lazily rather than looking the name up.
                 if block["type"].as_str() == Some("tool_use")
                     && let Some(name) = block["name"].as_str()
                 {
-                    block["name"] = json!(mapped_oauth_tool_name(name, &mut tool_names));
+                    block["name"] = json!(mapped_oauth_tool_name(name, &mut renames));
                 }
             }
         }
     }
-    tool_names
+
+    renames
+        .into_iter()
+        .map(|(canonical, wire)| (wire, canonical))
+        .collect()
+}
+
+fn is_word_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
+}
+
+fn is_fence_byte(byte: u8) -> bool {
+    byte == b'`' || byte == b'*'
+}
+
+/// Rewrites whole-word tool mentions in prose to the names the request carries.
+/// Word runs are ASCII by construction, so every index lands on a char boundary.
+fn rewrite_tool_mentions(text: &str, renames: &HashMap<String, String>) -> String {
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut copied = 0;
+    let mut start = 0;
+    while start < bytes.len() {
+        if !is_word_byte(bytes[start]) {
+            start += 1;
+            continue;
+        }
+        let mut end = start;
+        while end < bytes.len() && is_word_byte(bytes[end]) {
+            end += 1;
+        }
+        let word = &text[start..end];
+        if let Some(wire) = renames.get(word) {
+            let fenced = start > 0
+                && is_fence_byte(bytes[start - 1])
+                && end < bytes.len()
+                && is_fence_byte(bytes[end]);
+            if fenced || !AMBIGUOUS_TOOL_WORDS.contains(&word) {
+                out.push_str(&text[copied..start]);
+                out.push_str(wire);
+                copied = end;
+            }
+        }
+        start = end;
+    }
+    out.push_str(&text[copied..]);
+    out
 }
 
 fn first_user_text(body: &Value) -> Option<&str> {
@@ -407,15 +499,16 @@ fn oauth_tool_name(name: &str) -> String {
     format!("mcp_{}{}", first.to_uppercase(), chars.as_str())
 }
 
-fn mapped_oauth_tool_name(name: &str, names: &mut HashMap<String, String>) -> String {
-    if let Some((wire, _)) = names.iter().find(|(_, original)| original.as_str() == name) {
+/// Registers `name` in the canonical-to-wire map, returning the wire name.
+fn mapped_oauth_tool_name(name: &str, renames: &mut HashMap<String, String>) -> String {
+    if let Some(wire) = renames.get(name) {
         return wire.clone();
     }
     let mut wire = oauth_tool_name(name);
-    if wire.len() > 64 || names.contains_key(&wire) {
+    if wire.len() > MAX_TOOL_NAME || renames.values().any(|taken| taken == &wire) {
         let digest = hex_encode(&Sha256::digest(name.as_bytes()));
         let suffix = format!("_{}", &digest[..12]);
-        let max_prefix = 64 - suffix.len();
+        let max_prefix = MAX_TOOL_NAME - suffix.len();
         let mut truncate_at = max_prefix.min(wire.len());
         while !wire.is_char_boundary(truncate_at) {
             truncate_at -= 1;
@@ -423,7 +516,7 @@ fn mapped_oauth_tool_name(name: &str, names: &mut HashMap<String, String>) -> St
         wire.truncate(truncate_at);
         wire.push_str(&suffix);
     }
-    names.insert(wire.clone(), name.to_string());
+    renames.insert(name.to_string(), wire.clone());
     wire
 }
 
@@ -1021,8 +1114,8 @@ mod tests {
     }
 
     use super::{
-        LONG_CONTEXT_SUFFIX, LONG_CONTEXT_WINDOW, WIDE_CONTEXT_WINDOW, long_context_window,
-        mapped_oauth_tool_name, strip_long_context,
+        AMBIGUOUS_TOOL_WORDS, LONG_CONTEXT_SUFFIX, LONG_CONTEXT_WINDOW, WIDE_CONTEXT_WINDOW,
+        long_context_window, mapped_oauth_tool_name, rewrite_tool_mentions, strip_long_context,
     };
     use std::collections::HashMap;
 
@@ -1065,9 +1158,42 @@ mod tests {
     #[test_case("bash" ; "builtin")]
     #[test_case("mcp_fetch" ; "already_prefixed")]
     fn oauth_tool_names_round_trip(name: &str) {
-        let mut names = HashMap::new();
-        let wire = mapped_oauth_tool_name(name, &mut names);
-        assert_eq!(names[&wire], name);
+        let mut renames = HashMap::new();
+        let wire = mapped_oauth_tool_name(name, &mut renames);
+        assert_eq!(renames[name], wire);
+    }
+
+    /// The prose rules, pinned one case at a time. An unambiguous name is
+    /// rewritten anywhere; a name that is also an English word only when fenced.
+    #[test_case("use file_read now", "use mcp_File_read now" ; "bare_compound_name")]
+    #[test_case("`file_read`", "`mcp_File_read`" ; "fenced_compound_name")]
+    #[test_case("see code_map.", "see mcp_Code_map." ; "trailing_punctuation")]
+    #[test_case("file_reader", "file_reader" ; "longer_word_is_not_a_mention")]
+    #[test_case("my_file_read", "my_file_read" ; "suffix_is_not_a_mention")]
+    #[test_case("a shell command pipeline", "a shell command pipeline" ; "english_word_survives")]
+    #[test_case("shell children inherit", "shell children inherit" ; "english_word_at_start_survives")]
+    #[test_case("`shell`", "`mcp_Shell`" ; "fenced_english_word_is_a_mention")]
+    #[test_case("**shell**", "**mcp_Shell**" ; "bold_english_word_is_a_mention")]
+    #[test_case("nothing to do", "nothing to do" ; "untouched_prose")]
+    #[test_case("", "" ; "empty")]
+    #[test_case("café file_read", "café mcp_File_read" ; "multibyte_neighbour")]
+    fn tool_mentions_rewrite_by_fencing(text: &str, expected: &str) {
+        let renames = HashMap::from([
+            ("file_read".to_string(), "mcp_File_read".to_string()),
+            ("code_map".to_string(), "mcp_Code_map".to_string()),
+            ("shell".to_string(), "mcp_Shell".to_string()),
+        ]);
+        assert_eq!(rewrite_tool_mentions(text, &renames), expected);
+    }
+
+    /// The stoplist is scanned linearly per matched word, so keep it sorted and
+    /// free of duplicates for review.
+    #[test]
+    fn ambiguous_words_are_sorted_and_unique() {
+        let mut sorted = AMBIGUOUS_TOOL_WORDS.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted, AMBIGUOUS_TOOL_WORDS);
     }
 
     use serde_json::{Value, json};

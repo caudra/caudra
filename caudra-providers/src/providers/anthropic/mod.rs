@@ -1374,6 +1374,47 @@ mod tests {
         assert_eq!(body["messages"][1]["content"][0]["name"], "mcp_Bash");
     }
 
+    /// Descriptions cross-reference siblings, and the system prompt names tools
+    /// in no particular order, so both must follow the rename. The first tool
+    /// names the last one to prove the map is complete before any rewriting.
+    #[test]
+    fn oauth_request_profile_rewrites_prose_to_wire_names() {
+        const SYSTEM: &str = "Use `file_grep`, not `shell` with rg. A shell pipeline is fine.";
+        let mut body = json!({
+            "messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}],
+            "tools": [
+                {
+                    "name": "shell",
+                    "description": "Prefer file_read over sed. Piping into rg is fine.",
+                    "input_schema": {"type": "object"}
+                },
+                {"name": "file_grep", "input_schema": {"type": "object"}},
+                {"name": "file_read", "input_schema": {"type": "object"}}
+            ]
+        });
+        shared::apply_oauth_request_profile(&mut body, SYSTEM, "2.1.248");
+
+        assert_eq!(
+            body["tools"][0]["description"],
+            "Prefer mcp_File_read over sed. Piping into rg is fine."
+        );
+        assert_eq!(
+            body["messages"][0]["content"][0]["text"],
+            "Use `mcp_File_grep`, not `mcp_Shell` with rg. A shell pipeline is fine."
+        );
+    }
+
+    /// A tool with no description must not grow one.
+    #[test]
+    fn oauth_request_profile_leaves_a_missing_description_absent() {
+        let mut body = json!({
+            "messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}],
+            "tools": [{"name": "shell", "input_schema": {"type": "object"}}]
+        });
+        shared::apply_oauth_request_profile(&mut body, "", "2.1.248");
+        assert!(body["tools"][0].get("description").is_none());
+    }
+
     #[test]
     fn oauth_request_uses_first_party_headers_once() {
         let provider = Anthropic::with_auth(
