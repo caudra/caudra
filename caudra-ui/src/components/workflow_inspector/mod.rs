@@ -32,12 +32,15 @@ use crate::components::scrollbar::{ScrollHint, Scrollbar, ScrollbarMouse};
 use crate::components::tool_display::{
     TREE_BRANCH, TREE_LAST, activity_child_spans, activity_detail, activity_label, activity_sigil,
 };
-use crate::components::workflow_card::{phase_strip_line, status_span};
+use crate::components::workflow_card::{
+    AGENTS_SUFFIX, TOKENS_SUFFIX, phase_strip_line, status_span,
+};
 use crate::components::workflow_inspector::timeline::{TimelineRow, span_bar, timeline};
 use crate::components::{
     ModalScroll, Overlay, ToolProgress, escape_terminal_controls, format_compact, format_elapsed,
     format_integer, hover_style, input_line_with_cursor, now_secs, visual_rows,
 };
+use crate::markdown::text_to_painted;
 use crate::repaint::Cadence;
 use crate::text_buffer::TextBuffer;
 use crate::theme;
@@ -48,6 +51,12 @@ const MAX_HEIGHT_PERCENT: u16 = 85;
 const LIST_MAX_WIDTH: u16 = 34;
 const LIST_PERCENT: u16 = 35;
 const PANE_GAP: u16 = 1;
+/// A run list narrower than this shows a name with nowhere to put its clock,
+/// and a detail pane narrower than this shows neither the tab strip nor the
+/// timeline grid, so a modal too narrow for both panes shows one at a time.
+const LIST_MIN_COLS: u16 = 24;
+const DETAIL_MIN_COLS: u16 = 52;
+const SPLIT_MIN_COLS: u16 = LIST_MIN_COLS + PANE_GAP + DETAIL_MIN_COLS;
 /// Blank columns a list row keeps between its text and its clock.
 const PANE_GAP_COLS: usize = 1;
 const H_PAD: u16 = 1;
@@ -119,6 +128,8 @@ const EXPORT_KEY: char = ascii_key(EXPORT_LABEL);
 const COPY_KEY: char = ascii_key(COPY_LABEL);
 const FILTER_KEY: char = ascii_key(FILTER_LABEL);
 const SECTION_GAP: &str = "  ";
+/// What the footer puts between its keys once it has given up their words.
+const KEY_GAP: &str = " ";
 const GROUP_RUNNING: &str = "Running";
 const GROUP_WAITING: &str = "Waiting";
 const GROUP_FINISHED: &str = "Finished";
@@ -127,11 +138,6 @@ const CURSOR_MARK: &str = "\u{203a} ";
 const NO_MARK: &str = "  ";
 const SEPARATOR: &str = " \u{b7} ";
 const EXPAND_INDENT: &str = "      ";
-const STATUS_LABEL: &str = "Status: ";
-const PHASE_LABEL: &str = "Phase: ";
-const ELAPSED_LABEL: &str = "Elapsed: ";
-const AGENTS_LABEL: &str = "Agents: ";
-const TOKENS_LABEL: &str = "Tokens: ";
 const OBJECTIVE_LABEL: &str = "Objective: ";
 const SESSION_LABEL: &str = "Session: ";
 const PAUSED_LABEL: &str = "Paused: ";
@@ -144,10 +150,7 @@ const ERROR_HEADING: &str = "Error";
 const BODY_MISSING: &str = "This call left nothing in the journal";
 const REPORT_FIELD: &str = "report";
 const CALL_PREFIX: &str = "#";
-const TOKENS_UNIT: &str = " tokens";
-const AGENTS_UNIT: &str = " agents";
 const DONE_UNIT: &str = " done";
-const ADMITTED_UNIT: &str = " admitted";
 const AGENT_SLASH: &str = "/";
 const FOOTER: [(&str, &str, FooterCommand); 10] = [
     (
@@ -169,6 +172,11 @@ const FOOTER: [(&str, &str, FooterCommand); 10] = [
     (FILTER_LABEL, "Filter", FooterCommand::Filter),
     ("Esc", "Close", FooterCommand::Close),
 ];
+/// How the footer draws itself, widest first: glossed, then keys alone, then
+/// keys packed. Every key is on every rung, because a key a reader cannot see
+/// is a key they cannot press.
+const FOOTER_RUNGS: [(bool, &str); 3] =
+    [(true, SECTION_GAP), (false, SECTION_GAP), (false, KEY_GAP)];
 /// The prompt takes every key, so its footer names no click targets.
 const BUDGET_FOOTER: [(&str, &str); 2] = [("Enter", "Resume"), ("Esc", "Cancel")];
 
@@ -1235,7 +1243,7 @@ impl WorkflowInspector {
         if self.selected_run().is_none() {
             return InspectorAction::Consumed;
         }
-        let (lines, _) = self.section_lines(now_secs());
+        let (lines, _) = self.section_lines(now_secs(), self.body_area.width);
         let text = lines
             .iter()
             .map(|line| {
@@ -1363,36 +1371,27 @@ impl WorkflowInspector {
             width: inner.width.saturating_sub(H_PAD.saturating_mul(2)),
             ..inner
         };
-        let list_width = (padded.width * LIST_PERCENT / 100).min(LIST_MAX_WIDTH);
-        let [list, _, detail] = Layout::horizontal([
-            Constraint::Length(list_width),
-            Constraint::Length(PANE_GAP),
-            Constraint::Fill(1),
-        ])
-        .areas(padded);
+        let (list, detail) = self.panes(padded);
         let filtering = self.filter_focused || !self.filter.value().is_empty();
         let input_row = filtering || self.budget.is_some();
         let footer_rows = 1 + u16::from(input_row);
         let panes_height = padded.height.saturating_sub(footer_rows);
-        let list = Rect {
-            height: panes_height,
-            ..list
-        };
+        let list = pane_rows(list, panes_height);
         let [tabs, body] =
-            Layout::vertical([Constraint::Length(CHROME_ROWS - 1), Constraint::Fill(1)]).areas(
-                Rect {
-                    height: panes_height,
-                    ..detail
-                },
-            );
+            Layout::vertical([Constraint::Length(CHROME_ROWS - 1), Constraint::Fill(1)])
+                .areas(pane_rows(detail, panes_height));
         self.popup = popup;
         self.list_area = list;
         self.tabs_area = tabs;
         self.body_area = body;
 
-        self.render_list(frame, list);
-        self.render_tabs(frame, tabs);
-        self.render_body(frame, body);
+        if list.width > 0 {
+            self.render_list(frame, list);
+        }
+        if body.width > 0 {
+            self.render_tabs(frame, tabs);
+            self.render_body(frame, body);
+        }
 
         let mut row = padded.y.saturating_add(panes_height);
         if input_row {
@@ -1419,13 +1418,33 @@ impl WorkflowInspector {
             height: 1,
             ..padded
         };
-        self.footer = self.footer_line();
+        self.footer = self.footer_line(footer.width);
         self.footer_hits.set(self.footer.hits(footer, 0, 1));
         frame.render_widget(
             Paragraph::new(self.footer.line(self.footer_hits.hovered())),
             footer,
         );
         popup
+    }
+
+    /// The run list and the detail pane, or the one the cursor is on when the
+    /// modal is too narrow to hold both. The hidden pane keeps a zero area, so
+    /// nothing draws into it and the pointer cannot land on it.
+    fn panes(&self, padded: Rect) -> (Rect, Rect) {
+        if padded.width < SPLIT_MIN_COLS {
+            return match self.pane {
+                Pane::Runs => (padded, Rect::default()),
+                Pane::Detail => (Rect::default(), padded),
+            };
+        }
+        let list_width = (padded.width * LIST_PERCENT / 100).min(LIST_MAX_WIDTH);
+        let [list, _, detail] = Layout::horizontal([
+            Constraint::Length(list_width),
+            Constraint::Length(PANE_GAP),
+            Constraint::Fill(1),
+        ])
+        .areas(padded);
+        (list, detail)
     }
 
     fn render_list(&mut self, frame: &mut Frame, area: Rect) {
@@ -1492,15 +1511,22 @@ impl WorkflowInspector {
         let mut spans = Vec::with_capacity(Section::ALL.len() * 2);
         let mut hits = Vec::with_capacity(Section::ALL.len());
         let mut x = area.x;
+        let named = tab_strip_cols() <= area.width;
         for section in Section::ALL {
-            let text = format!("{} {}", section.index() + 1, section.label());
+            let digit = section.index() + 1;
+            let text = match named {
+                true => format!("{digit} {}", section.label()),
+                false => digit.to_string(),
+            };
             let width = u16::try_from(text.len()).unwrap_or(u16::MAX);
             let style = match section == self.section {
                 true => t.item_selected,
                 false => t.tool_dim,
             };
             let hit = Rect::new(x, area.y, width, 1);
-            hits.push((hit, section));
+            if hit.right() <= area.right() {
+                hits.push((hit, section));
+            }
             spans.push(Span::styled(
                 text,
                 hover_style(style, self.pointer.is_some_and(|at| hit.contains(at))),
@@ -1515,7 +1541,7 @@ impl WorkflowInspector {
     }
 
     fn render_body(&mut self, frame: &mut Frame, area: Rect) {
-        let (lines, item_starts) = self.section_lines(now_secs());
+        let (lines, item_starts) = self.section_lines(now_secs(), area.width);
         let rows = visual_rows(&lines, area.width);
         self.scroll.update_dimensions(rows.total, area.height);
         self.item_rows = item_starts
@@ -1548,8 +1574,9 @@ impl WorkflowInspector {
     }
 
     /// The selected section as lines, and the logical line each of its
-    /// items starts on.
-    fn section_lines(&self, now: u64) -> (Vec<Line<'static>>, Vec<usize>) {
+    /// items starts on. `width` is the columns the lines will be drawn in,
+    /// which the sections that lay themselves out need and zero disables.
+    fn section_lines(&self, now: u64, width: u16) -> (Vec<Line<'static>>, Vec<usize>) {
         let t = theme::current();
         let Some(run) = self.selected_run() else {
             let text = match self.selected.is_some() {
@@ -1560,9 +1587,9 @@ impl WorkflowInspector {
         };
         match self.section {
             Section::Overview => (self.overview_lines(run, now), Vec::new()),
-            Section::Timeline => self.timeline_lines(run, now),
+            Section::Timeline => self.timeline_lines(run, now, width),
             Section::Agents => self.agent_lines(run),
-            Section::Result => result_lines(run),
+            Section::Result => result_lines(run, width),
         }
     }
 
@@ -1576,31 +1603,26 @@ impl WorkflowInspector {
                 t.tool_dim,
             ),
         ])];
-        let mut status = vec![Span::raw(STATUS_LABEL), status_span(run.status)];
+        // The card's shape, carrying what the card has no room for: where the
+        // phase sits among the declared ones, how much of the roster landed,
+        // and a clock that runs while the run does.
+        let mut stats = vec![status_span(run.status)];
         if let Some(phase) = &run.phase {
-            status.push(Span::raw(SEPARATOR));
-            status.push(Span::raw(PHASE_LABEL));
-            status.push(Span::styled(escape_terminal_controls(phase), t.accent));
+            stats.push(Span::raw(SEPARATOR));
+            stats.push(Span::styled(escape_terminal_controls(phase), t.accent));
             if let Some((at, of)) = run.phase_position() {
-                status.push(Span::styled(format!(" {at}/{of}"), t.tool_dim));
+                stats.push(Span::styled(format!(" {at}/{of}"), t.tool_dim));
             }
         }
-        lines.push(Line::from(status));
-        lines.push(Line::from(vec![
-            Span::raw(ELAPSED_LABEL),
-            Span::raw(format_elapsed(run.elapsed_secs(now))),
-            Span::raw(SEPARATOR),
-            Span::raw(AGENTS_LABEL),
-            Span::raw(roster_tally(run)),
-            Span::raw(SEPARATOR),
-            Span::raw(format!(
-                "{}{AGENT_SLASH}{}{ADMITTED_UNIT}",
-                run.usage.agents_admitted, run.agent_budget
-            )),
-            Span::raw(SEPARATOR),
-            Span::raw(TOKENS_LABEL),
-            Span::raw(format_integer(run.usage.tokens_used)),
-        ]));
+        stats.push(Span::raw(format!(
+            "{SEPARATOR}{}{SEPARATOR}{}{AGENT_SLASH}{}{AGENTS_SUFFIX}{SEPARATOR}{}{TOKENS_SUFFIX}{SEPARATOR}{}",
+            roster_tally(run),
+            run.usage.agents_admitted,
+            run.agent_budget,
+            format_compact(run.usage.tokens_used),
+            format_elapsed(run.elapsed_secs(now)),
+        )));
+        lines.push(Line::from(stats));
         if let Some(objective) = &run.objective {
             lines.push(labelled(OBJECTIVE_LABEL, objective, Style::default()));
         }
@@ -1637,7 +1659,12 @@ impl WorkflowInspector {
     /// The run's record as one ordered list. Phases are the spine, and the
     /// calls and log lines that happened inside one are indented under it, so
     /// the join a reader used to perform across four sections is already done.
-    fn timeline_lines(&self, run: &RunSnapshot, now: u64) -> (Vec<Line<'static>>, Vec<usize>) {
+    fn timeline_lines(
+        &self,
+        run: &RunSnapshot,
+        now: u64,
+        width: u16,
+    ) -> (Vec<Line<'static>>, Vec<usize>) {
         let t = theme::current();
         let Some(detail) = &self.detail else {
             return (vec![Line::styled(LOADING, t.tool_dim)], Vec::new());
@@ -1653,7 +1680,7 @@ impl WorkflowInspector {
         if rows.is_empty() {
             return (vec![Line::styled(NO_TIMELINE, t.tool_dim)], Vec::new());
         }
-        let (label_cols, bar_width) = timeline_columns(self.body_area.width);
+        let (label_cols, bar_width) = timeline_columns(width);
         let spinner = spinner_str(animation_elapsed_ms());
         let mut lines: Vec<Line<'static>> = Vec::with_capacity(rows.len());
         let mut starts = Vec::with_capacity(rows.len());
@@ -1695,7 +1722,7 @@ impl WorkflowInspector {
                     ));
                     if *agents > 0 {
                         tally.push(Span::styled(
-                            format!("{COLUMN_GAP}{agents}{AGENTS_UNIT}"),
+                            format!("{COLUMN_GAP}{agents}{AGENTS_SUFFIX}"),
                             t.tool_dim,
                         ));
                     }
@@ -1755,7 +1782,9 @@ impl WorkflowInspector {
                     spans.push(Span::styled(bar, t.tool_dim));
                 }
             }
-            spans.extend(tally);
+            if !grid_is_tight(width) {
+                spans.extend(tally);
+            }
             lines.push(Line::from(spans));
             if let TimelineRow::Call { call, .. } = row {
                 let call = &detail.calls[*call];
@@ -1810,7 +1839,7 @@ impl WorkflowInspector {
                 RosterState::Running => {}
                 _ => spans.push(Span::styled(
                     format!(
-                        "{SEPARATOR}{}{TOKENS_UNIT}{SEPARATOR}{}",
+                        "{SEPARATOR}{}{TOKENS_SUFFIX}{SEPARATOR}{}",
                         format_compact(agent.tokens_used),
                         format_elapsed(agent.duration_ms / 1_000)
                     ),
@@ -1859,25 +1888,45 @@ impl WorkflowInspector {
             .find(|call| call.call_key == call_key)
     }
 
-    fn footer_line(&self) -> FooterLine {
-        let t = theme::current();
+    /// The footer is one centred row, and a line wider than that row wraps and
+    /// then answers no clicks at all, so a narrow modal gives up the words that
+    /// gloss its keys, and then the space between them, before it gives up a
+    /// key.
+    fn footer_line(&self, width: u16) -> FooterLine {
         if self.budget.is_some() {
-            let mut footer = FooterLine::default();
-            for (index, (key, description)) in BUDGET_FOOTER.iter().enumerate() {
-                if index > 0 {
-                    footer.text(SECTION_GAP, Style::default());
-                }
-                footer.text(*key, t.keybind_key);
-                footer.text(format!(" {description}"), t.tool_dim);
-            }
-            return footer;
+            return self.budget_footer();
         }
+        let mut footer = self.commands_footer(FOOTER_RUNGS[0].0, FOOTER_RUNGS[0].1);
+        for (glossed, gap) in FOOTER_RUNGS.into_iter().skip(1) {
+            if footer.fits(width) {
+                break;
+            }
+            footer = self.commands_footer(glossed, gap);
+        }
+        footer
+    }
+
+    fn budget_footer(&self) -> FooterLine {
+        let t = theme::current();
+        let mut footer = FooterLine::default();
+        for (index, (key, description)) in BUDGET_FOOTER.iter().enumerate() {
+            if index > 0 {
+                footer.text(SECTION_GAP, Style::default());
+            }
+            footer.text(*key, t.keybind_key);
+            footer.text(format!(" {description}"), t.tool_dim);
+        }
+        footer
+    }
+
+    fn commands_footer(&self, glossed: bool, gap: &'static str) -> FooterLine {
+        let t = theme::current();
         let run = self.selected_run();
         let controllable = run.is_some_and(|run| !self.is_foreign(&run.run_id));
         let mut footer = FooterLine::default();
         for (index, (key, description, command)) in FOOTER.iter().enumerate() {
             if index > 0 {
-                footer.text(SECTION_GAP, Style::default());
+                footer.text(gap, Style::default());
             }
             let enabled = match command {
                 FooterCommand::Control(control) => {
@@ -1895,7 +1944,9 @@ impl WorkflowInspector {
                 false => t.tool_dim,
             };
             footer.command(key, key_style);
-            footer.describe(format!(" {description}"), t.tool_dim);
+            if glossed {
+                footer.describe(format!(" {description}"), t.tool_dim);
+            }
         }
         footer
     }
@@ -2044,13 +2095,13 @@ fn activity_spans(progress: &ToolProgress, state: RosterState) -> Vec<Span<'stat
     spans
 }
 
-fn result_lines(run: &RunSnapshot) -> (Vec<Line<'static>>, Vec<usize>) {
+fn result_lines(run: &RunSnapshot, width: u16) -> (Vec<Line<'static>>, Vec<usize>) {
     let t = theme::current();
     let mut lines = Vec::new();
     let mut starts = Vec::new();
     if let Some(result) = &run.result {
         match result.get(REPORT_FIELD).and_then(serde_json::Value::as_str) {
-            Some(report) => lines.extend(report.lines().map(|line| Line::raw(line.to_owned()))),
+            Some(report) => lines.extend(report_lines(report, width)),
             None => {
                 let pretty =
                     serde_json::to_string_pretty(result).unwrap_or_else(|_| result.to_string());
@@ -2074,6 +2125,29 @@ fn result_lines(run: &RunSnapshot) -> (Vec<Line<'static>>, Vec<usize>) {
         true => (vec![Line::styled(NO_RESULT, t.tool_dim)], starts),
         false => (lines, starts),
     }
+}
+
+/// A workflow's report is markdown a model wrote, so it is painted rather
+/// than shown as source. Painting needs the columns it will wrap into, and a
+/// caller that has none asks for the source instead.
+fn report_lines(report: &str, width: u16) -> Vec<Line<'static>> {
+    if width == 0 {
+        return report
+            .lines()
+            .map(|line| Line::raw(line.to_owned()))
+            .collect();
+    }
+    let style = theme::current().assistant;
+    let (painted, _) = text_to_painted(
+        report,
+        "",
+        style,
+        style,
+        width,
+        Some(caudra_markdown::render::TOOL_OUTPUT_MAX_LINE_BYTES),
+        Vec::new(),
+    );
+    painted.lines
 }
 
 fn log_line(offset: u64, message: &str, style: Style) -> Line<'static> {
@@ -2106,12 +2180,42 @@ fn duration_column(seconds: u64) -> String {
 /// The label and bar widths at this pane width. Both give way to the fixed
 /// columns around them and share what is left, so a wider pane spends it on
 /// longer names and longer bars rather than on moving the columns.
+/// A pane below the width the grid was drawn for keeps the clock, the label
+/// and the duration, and leaves the bar and the tallies out: a bar of two
+/// columns says nothing, and a tally that wraps costs the row below it. No
+/// width at all is a caller with no pane to fit, such as a copy.
+fn grid_is_tight(width: u16) -> bool {
+    width > 0 && width < DETAIL_MIN_COLS
+}
+
 fn timeline_columns(width: u16) -> (usize, usize) {
-    let fixed =
-        MARK_COLS + CLOCK_COLS + GLYPH_PAD.len() + DURATION_COLS + COLUMN_GAP.len() + TALLY_COLS;
+    let mut fixed = MARK_COLS + CLOCK_COLS + GLYPH_PAD.len() + DURATION_COLS + COLUMN_GAP.len();
+    if grid_is_tight(width) {
+        let label = usize::from(width).saturating_sub(fixed);
+        return (label.clamp(LABEL_MIN_COLS, LABEL_MAX_COLS), 0);
+    }
+    fixed += TALLY_COLS;
     let free = usize::from(width).saturating_sub(fixed);
     let label = (free / 2).clamp(LABEL_MIN_COLS, LABEL_MAX_COLS);
     (label, free.saturating_sub(label).min(BAR_MAX_WIDTH))
+}
+
+/// A pane's rows, or nothing at all when the pane is the hidden one.
+fn pane_rows(pane: Rect, height: u16) -> Rect {
+    match pane.width {
+        0 => Rect::default(),
+        _ => Rect { height, ..pane },
+    }
+}
+
+/// What the tab strip needs to name every section, including the gap the last
+/// one carries.
+fn tab_strip_cols() -> u16 {
+    let named: usize = Section::ALL
+        .iter()
+        .map(|section| section.label().len() + 1 + SECTION_GAP.len() + 1)
+        .sum();
+    u16::try_from(named).unwrap_or(u16::MAX)
 }
 
 /// A label at exactly `cols` columns, cut with an ellipsis when it is longer,
@@ -2254,6 +2358,44 @@ mod tests {
     const PHASE_TWO: &str = "Report";
     const ELAPSED_SECS: u64 = 134;
     const ELAPSED_TEXT: &str = "2m14s";
+    const BUSY_ROSTER: u64 = 8;
+    const LANDED_AGENTS: usize = 3;
+    const BIG_BUDGET: u32 = 128;
+    const ADMITTED_AGENTS: u32 = 11;
+    const MANY_TOKENS: u64 = 1_068_245;
+    /// Wide enough to be usable and too narrow to split into two panes.
+    const NARROW_TERMINAL: u16 = 80;
+    /// Too narrow for the whole tab strip, wide enough for one section name,
+    /// so a strip that gave up on names is told apart from one that was cut.
+    const CRAMPED_TERMINAL: u16 = 40;
+    /// Narrower than one tab.
+    const TINY_TERMINAL: u16 = 8;
+    /// The keys with one space between them and none of their words.
+    const PACKED_FOOTER_COLS: u16 = 25;
+    const GLOSSED_KEY: &str = "Transcript";
+    const TIGHT_PANE_COLS: u16 = 38;
+    const BOTH_PANES_DRAW: &str = "a modal wide enough for two panes draws both";
+    const ONE_PANE_DRAWS: &str = "a modal too narrow for two panes draws one";
+    const RIGHT_SHOWS_DETAIL: &str = "right moves the cursor to the detail pane";
+    const LEFT_SHOWS_RUNS: &str = "left moves the cursor back to the run list";
+    const ONE_PANE_TAKES_THE_WIDTH: &str = "the pane on show takes every column";
+    const FOOTER_FITS: &str = "the footer draws on one row of the width it was given";
+    const FOOTER_KEEPS_KEYS: &str = "every footer key answers the pointer at every width";
+    const FOOTER_GLOSSES: &str = "a footer with room for its words keeps them";
+    const NAMES_WHEN_THEY_FIT: &str = "a tab strip with room names its sections";
+    const DIGITS_WHEN_NAMES_DO_NOT_FIT: &str = "a tab strip without room shows digits alone";
+    const TINY_STRIP_DROPS_TABS: &str = "a strip too narrow for every tab draws fewer";
+    const HITS_STAY_IN_THE_PANE: &str = "a tab claims no cells outside the pane it drew in";
+    const TIGHT_ROW_FITS: &str = "a timeline row fits the pane it was laid out for";
+    const WIDE_ROW_TALLIES: &str = "a pane with room for the tallies shows them";
+    const MARKDOWN_HEADING: &str = "## Findings";
+    const MARKDOWN_REPORT: &str = "## Findings\n\nA **bold** claim.\n\n- one\n";
+    const PAINTED_HEADING: &str = "Findings";
+    const PAINTED_BULLET: &str = "\u{2022} one";
+    const PAINTS_MARKDOWN: &str = "a report is painted as markdown, not shown as source";
+    const KEEPS_SOURCE: &str = "a report asked for with no width stays source";
+    const SCRATCH_IS_A_TARGET: &str = "the scratch row is the row the result section targets";
+    const ABBREVIATED_STATS: &str = "active \u{b7} Report 2/2 \u{b7} 3/8 done \u{b7} 11/128 agents \u{b7} 1.1M tokens \u{b7} 2m14s";
     const ONE_AGENT: &str = "1 agents";
     const CALL_LABEL: &str = "researcher";
     const LONG_CALL: &str = "researcher-with-a-name-too-long-for-one-column";
@@ -2413,7 +2555,149 @@ mod tests {
     }
 
     fn terminal() -> Terminal<TestBackend> {
-        Terminal::new(TestBackend::new(FRAME_WIDTH, FRAME_HEIGHT)).unwrap()
+        terminal_at(FRAME_WIDTH)
+    }
+
+    fn terminal_at(width: u16) -> Terminal<TestBackend> {
+        Terminal::new(TestBackend::new(width, FRAME_HEIGHT)).unwrap()
+    }
+
+    /// One pane drew, and the other kept nothing for the pointer to land on.
+    fn only_pane_drawn(inspector: &WorkflowInspector) -> Option<Pane> {
+        match (inspector.list_area.width, inspector.body_area.width) {
+            (0, 0) => None,
+            (0, _) => Some(Pane::Detail),
+            (_, 0) => Some(Pane::Runs),
+            _ => None,
+        }
+    }
+
+    /// Two panes at a width that holds both, so the narrow case is measured
+    /// against a frame that is known to split.
+    #[test]
+    fn a_wide_modal_shows_both_panes() {
+        let mut terminal = terminal();
+        let mut inspector = open_with(vec![run(RUN_ID, RunStatus::Active, Vec::new())]);
+
+        draw(&mut inspector, &mut terminal);
+
+        assert!(inspector.list_area.width > 0, "{BOTH_PANES_DRAW}");
+        assert!(inspector.body_area.width > 0, "{BOTH_PANES_DRAW}");
+    }
+
+    /// Two panes split out of too few columns are two panes too narrow to
+    /// read, so below the width they need the modal shows the one the cursor
+    /// is on and the arrows move between them.
+    #[test]
+    fn a_modal_too_narrow_for_two_panes_shows_one_at_a_time() {
+        let mut terminal = terminal_at(NARROW_TERMINAL);
+        let mut inspector = open_with(vec![run(RUN_ID, RunStatus::Active, Vec::new())]);
+
+        draw(&mut inspector, &mut terminal);
+        assert_eq!(
+            only_pane_drawn(&inspector),
+            Some(Pane::Runs),
+            "{ONE_PANE_DRAWS}"
+        );
+        let runs_width = inspector.list_area.width;
+
+        let _ = inspector.handle_key(key_event(KeyCode::Right));
+        draw(&mut inspector, &mut terminal);
+        assert_eq!(
+            only_pane_drawn(&inspector),
+            Some(Pane::Detail),
+            "{RIGHT_SHOWS_DETAIL}"
+        );
+        assert_eq!(
+            inspector.body_area.width, runs_width,
+            "{ONE_PANE_TAKES_THE_WIDTH}"
+        );
+
+        let _ = inspector.handle_key(key_event(KeyCode::Left));
+        draw(&mut inspector, &mut terminal);
+        assert_eq!(
+            only_pane_drawn(&inspector),
+            Some(Pane::Runs),
+            "{LEFT_SHOWS_RUNS}"
+        );
+    }
+
+    /// A footer wider than its row wraps, and a wrapped footer answers no
+    /// clicks at all, so every width that can hold the keys holds all of them.
+    #[test]
+    fn the_footer_keeps_every_key_clickable_as_it_narrows() {
+        let inspector = open_with(vec![run(RUN_ID, RunStatus::Active, Vec::new())]);
+
+        for width in PACKED_FOOTER_COLS..=FRAME_WIDTH {
+            let footer = inspector.footer_line(width);
+            let row = Rect::new(0, 0, width, 1);
+            assert!(footer.fits(width), "{FOOTER_FITS}: {width}");
+            assert_eq!(
+                footer.hits(row, 0, 1).len(),
+                FOOTER.len(),
+                "{FOOTER_KEEPS_KEYS}: {width}"
+            );
+        }
+    }
+
+    /// The words are what the footer gives up first, so a row wide enough to
+    /// gloss the keys still does.
+    #[test]
+    fn a_wide_footer_still_glosses_its_keys() {
+        let inspector = open_with(vec![run(RUN_ID, RunStatus::Active, Vec::new())]);
+
+        let footer = inspector.footer_line(FRAME_WIDTH);
+
+        assert!(
+            line_text(&footer.line(None)).contains(GLOSSED_KEY),
+            "{FOOTER_GLOSSES}"
+        );
+    }
+
+    /// A name cut in half selects nothing a reader can read, so a strip with
+    /// no room for names shows the digits that select the sections instead.
+    #[test]
+    fn a_tab_strip_too_narrow_for_names_shows_the_digits() {
+        let mut terminal = terminal_at(NARROW_TERMINAL);
+        let mut inspector = open_with(vec![run(RUN_ID, RunStatus::Active, Vec::new())]);
+        inspector.pane = Pane::Detail;
+
+        draw(&mut inspector, &mut terminal);
+        let named = buffer_text(terminal.backend().buffer()).contains(Section::Overview.label());
+
+        let mut narrow = terminal_at(CRAMPED_TERMINAL);
+        draw(&mut inspector, &mut narrow);
+
+        assert!(named, "{NAMES_WHEN_THEY_FIT}");
+        assert!(
+            !buffer_text(narrow.backend().buffer()).contains(Section::Overview.label()),
+            "{DIGITS_WHEN_NAMES_DO_NOT_FIT}"
+        );
+    }
+
+    /// A tab the pane had no room to draw claims no cells, because a click
+    /// there landed on whatever the terminal actually shows.
+    #[test]
+    fn a_tab_drawn_past_its_pane_claims_no_cells() {
+        let mut terminal = terminal_at(TINY_TERMINAL);
+        let mut inspector = open_with(vec![run(RUN_ID, RunStatus::Active, Vec::new())]);
+        inspector.pane = Pane::Detail;
+
+        draw(&mut inspector, &mut terminal);
+
+        assert!(
+            inspector.tab_hits.len() < Section::ALL.len(),
+            "{TINY_STRIP_DROPS_TABS}: {:?}",
+            inspector.tabs_area
+        );
+        let edge = inspector.tabs_area.right();
+        assert!(
+            inspector
+                .tab_hits
+                .iter()
+                .all(|(hit, _)| hit.right() <= edge),
+            "{HITS_STAY_IN_THE_PANE}"
+        );
     }
 
     fn reversed_at(terminal: &Terminal<TestBackend>, row: u16) -> bool {
@@ -2807,10 +3091,58 @@ mod tests {
             .collect()
     }
 
+    /// A run of any size reads at a glance, which a grouped integer does not:
+    /// `1,068,245` is four columns of digits nobody counts. The line carries
+    /// what the transcript card has no room for as well, so opening the
+    /// inspector tells the reader more than the card it was opened from.
+    #[test]
+    fn the_overview_reads_its_stats_on_one_abbreviated_line() {
+        let mut settled = roster(BUSY_ROSTER);
+        for agent in settled.iter_mut().take(LANDED_AGENTS) {
+            agent.state = RosterState::Completed;
+        }
+        let mut run = run(RUN_ID, RunStatus::Active, settled);
+        run.phase = Some(PHASE_TWO.into());
+        run.phases = vec![PHASE_ONE.into(), PHASE_TWO.into()];
+        run.agent_budget = BIG_BUDGET;
+        run.usage = RunUsage {
+            agents_admitted: ADMITTED_AGENTS,
+            tokens_used: MANY_TOKENS,
+        };
+        let inspector = open_with(vec![run.clone()]);
+
+        let lines = inspector.overview_lines(&run, ELAPSED_SECS);
+
+        assert_eq!(line_text(&lines[1]), ABBREVIATED_STATS);
+    }
+
     /// Where `needle` ends in `line`, in the columns a terminal draws it in.
     fn end_column(line: &str, needle: &str) -> Option<usize> {
         let byte = line.find(needle)? + needle.len();
         Some(UnicodeWidthStr::width(&line[..byte]))
+    }
+
+    /// A grid laid out for a wide pane wraps in a narrow one, and a wrapped
+    /// row costs the row below it, so a tight pane keeps the clock, the label
+    /// and the duration and leaves the bar and the tallies out.
+    #[test]
+    fn a_tight_timeline_row_fits_the_pane_it_was_laid_out_for() {
+        let (walked, journal) = timed_run();
+        let mut inspector = open_with(vec![walked.clone()]);
+        inspector.fill_detail(journal);
+
+        let (tight, _) = inspector.timeline_lines(&walked, PHASE_SECS, TIGHT_PANE_COLS);
+        let (wide, _) = inspector.timeline_lines(&walked, PHASE_SECS, FRAME_WIDTH);
+
+        for line in &tight {
+            let text = line_text(line);
+            assert!(
+                UnicodeWidthStr::width(text.as_str()) <= usize::from(TIGHT_PANE_COLS),
+                "{TIGHT_ROW_FITS}: {text:?}"
+            );
+        }
+        let wide: String = wide.iter().map(line_text).collect();
+        assert!(wide.contains(ONE_AGENT), "{WIDE_ROW_TALLIES}: {wide}");
     }
 
     #[test]
@@ -2819,7 +3151,7 @@ mod tests {
         let mut inspector = open_with(vec![walked.clone()]);
         inspector.fill_detail(journal);
 
-        let (lines, _) = inspector.timeline_lines(&walked, PHASE_SECS);
+        let (lines, _) = inspector.timeline_lines(&walked, PHASE_SECS, FRAME_WIDTH);
 
         let rows: Vec<String> = lines.iter().map(line_text).collect();
         let phase = end_column(&rows[0], PHASE_ELAPSED).expect(&rows[0]);
@@ -3268,6 +3600,49 @@ mod tests {
             result_preview: Some(SCRATCH_PATH.into()),
             error: None,
         }
+    }
+
+    /// A report is markdown a model wrote, and the section that shows it is
+    /// the one place a reader reads it in full, so it is painted rather than
+    /// shown as source. The scratch row is targeted by the line it landed on,
+    /// so painting must not leave the target pointing at prose.
+    #[test]
+    fn the_result_paints_the_report_and_keeps_the_scratch_row() {
+        let mut settled = run(RUN_ID, RunStatus::Completed, Vec::new());
+        settled.result = Some(serde_json::json!({
+            REPORT_FIELD: MARKDOWN_REPORT,
+            "path": SCRATCH_PATH,
+        }));
+
+        let (lines, starts) = result_lines(&settled, FRAME_WIDTH);
+
+        let painted: Vec<String> = lines.iter().map(line_text).collect();
+        assert!(
+            painted.contains(&PAINTED_HEADING.to_owned()),
+            "{PAINTS_MARKDOWN}: {painted:?}"
+        );
+        assert!(
+            painted.contains(&PAINTED_BULLET.to_owned()),
+            "{PAINTS_MARKDOWN}: {painted:?}"
+        );
+        let scratch = starts.first().copied().expect(SCRATCH_IS_A_TARGET);
+        assert!(
+            painted[scratch].contains(SCRATCH_PATH),
+            "{SCRATCH_IS_A_TARGET}: {painted:?}"
+        );
+    }
+
+    /// Copying a section asks for no width, and a report with no columns to
+    /// wrap into is the source the workflow wrote, not a painted rendering.
+    #[test]
+    fn a_report_with_no_width_stays_source() {
+        let lines = report_lines(MARKDOWN_REPORT, 0);
+
+        let text: Vec<String> = lines.iter().map(line_text).collect();
+        assert!(
+            text.contains(&MARKDOWN_HEADING.to_owned()),
+            "{KEEPS_SOURCE}: {text:?}"
+        );
     }
 
     #[test]

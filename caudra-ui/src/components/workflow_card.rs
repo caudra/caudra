@@ -12,6 +12,7 @@ use ratatui::text::{Line, Span};
 
 use crate::components::code_view::RowTarget;
 use crate::components::{ToolStatus, escape_terminal_controls, format_compact, format_elapsed};
+use crate::markdown::text_to_painted;
 use crate::theme;
 
 /// The tool id of a card a slash command opened, ahead of its run id. A
@@ -24,8 +25,8 @@ const PHASE_ARROW: &str = " \u{203a} ";
 const RUNNING_MARK: &str = "\u{25cf} ";
 const FAILED_MARK: &str = "\u{2717} ";
 const LOG_PREFIX: &str = "+";
-const AGENTS_SUFFIX: &str = " agents";
-const TOKENS_SUFFIX: &str = " tokens";
+pub(crate) const AGENTS_SUFFIX: &str = " agents";
+pub(crate) const TOKENS_SUFFIX: &str = " tokens";
 const SCRATCH_LABEL: &str = "Scratch file: ";
 /// The one row target a card carries: a run has at most one scratch file.
 const SCRATCH_ROW: usize = 0;
@@ -84,8 +85,13 @@ pub(crate) fn status(status: RunStatus) -> ToolStatus {
 /// The phase strip, the agents still working or that failed, the last log
 /// lines while the run is going, and what it produced once it is not. The
 /// rows run parallel to the lines and mark the one that lists the scratch
-/// file, so a click can name it after a reflow.
-pub(crate) fn render(card: &WorkflowRunCard) -> (Vec<Line<'static>>, Vec<Option<RowTarget>>) {
+/// file, so a click can name it after a reflow. `width` is the columns the
+/// card draws in, which the preview wraps its markdown into and zero leaves
+/// as source.
+pub(crate) fn render(
+    card: &WorkflowRunCard,
+    width: u16,
+) -> (Vec<Line<'static>>, Vec<Option<RowTarget>>) {
     let t = theme::current();
     let mut lines = Vec::new();
     let mut scratch_line = None;
@@ -121,11 +127,7 @@ pub(crate) fn render(card: &WorkflowRunCard) -> (Vec<Line<'static>>, Vec<Option<
     }
     if card.status.is_terminal() {
         if let Some(preview) = &card.result_preview {
-            lines.extend(
-                preview
-                    .lines()
-                    .map(|line| Line::raw(escape_terminal_controls(line))),
-            );
+            lines.extend(preview_lines(preview, width));
         }
         if let Some(path) = &card.scratch_path {
             scratch_line = Some(lines.len());
@@ -158,6 +160,28 @@ pub(crate) fn render(card: &WorkflowRunCard) -> (Vec<Line<'static>>, Vec<Option<
         .map(|line| (Some(line) == scratch_line).then_some(RowTarget(SCRATCH_ROW)))
         .collect();
     (lines, rows)
+}
+
+/// A run's preview is the head of a report a model wrote, so it is painted as
+/// the markdown it is. A caller with no width to wrap into gets the source.
+fn preview_lines(preview: &str, width: u16) -> Vec<Line<'static>> {
+    if width == 0 {
+        return preview
+            .lines()
+            .map(|line| Line::raw(escape_terminal_controls(line)))
+            .collect();
+    }
+    let style = theme::current().assistant;
+    let (painted, _) = text_to_painted(
+        preview,
+        "",
+        style,
+        style,
+        width,
+        Some(caudra_markdown::render::TOOL_OUTPUT_MAX_LINE_BYTES),
+        Vec::new(),
+    );
+    painted.lines
 }
 
 pub(crate) fn phase_strip_line(strip: &[(String, PhaseMark)]) -> Line<'static> {
@@ -212,6 +236,11 @@ mod tests {
     const LIVE_LOGS: &str = "a live card shows its log tail, a settled one its report";
     const SCRATCH_PATH: &str = "/state/workflow_scratch/session/run-1/report.md";
     const NO_SCRATCH_ROW: &str = "a card without a scratch file carries no row target";
+    const CARD_COLS: u16 = 60;
+    const MARKDOWN_PREVIEW: &str = "## Findings\n\n- 42 of them\n";
+    const PAINTED_HEADING: &str = "Findings";
+    const PAINTED_BULLET: &str = "\u{2022} 42 of them";
+    const PAINTS_MARKDOWN: &str = "a card paints its preview as the markdown it is";
     const ONE_SCRATCH_ROW: &str = "the scratch line is the card's only row target";
 
     fn run(status: RunStatus) -> RunSnapshot {
@@ -285,7 +314,7 @@ mod tests {
 
     #[test]
     fn a_live_card_shows_the_strip_the_roster_and_the_log_tail() {
-        let (lines, rows) = render(&WorkflowRunCard::from(&run(RunStatus::Active)));
+        let (lines, rows) = render(&WorkflowRunCard::from(&run(RunStatus::Active)), CARD_COLS);
         let body = text(&lines);
 
         assert!(rows.iter().all(Option::is_none), "{NO_SCRATCH_ROW}");
@@ -297,7 +326,10 @@ mod tests {
 
     #[test]
     fn a_settled_card_shows_the_report_instead_of_the_logs() {
-        let (lines, rows) = render(&WorkflowRunCard::from(&run(RunStatus::Completed)));
+        let (lines, rows) = render(
+            &WorkflowRunCard::from(&run(RunStatus::Completed)),
+            CARD_COLS,
+        );
         let body = text(&lines);
 
         assert!(body.contains(REPORT), "{LIVE_LOGS}: {body}");
@@ -305,12 +337,26 @@ mod tests {
         assert!(rows.iter().all(Option::is_none), "{NO_SCRATCH_ROW}");
     }
 
+    /// A report is markdown a model wrote, and a card that shows its head
+    /// shows it the way the transcript shows every other model answer.
+    #[test]
+    fn a_settled_card_paints_its_preview_as_markdown() {
+        let mut settled = run(RunStatus::Completed);
+        settled.result = Some(json!({ "report": MARKDOWN_PREVIEW }));
+
+        let (lines, _) = render(&WorkflowRunCard::from(&settled), CARD_COLS);
+
+        let body = text(&lines);
+        assert!(body.contains(PAINTED_HEADING), "{PAINTS_MARKDOWN}: {body}");
+        assert!(body.contains(PAINTED_BULLET), "{PAINTS_MARKDOWN}: {body}");
+    }
+
     #[test]
     fn the_scratch_line_of_a_settled_card_is_its_one_row_target() {
         let mut settled = run(RunStatus::Completed);
         settled.result = Some(json!({ "report": REPORT, "path": SCRATCH_PATH }));
 
-        let (lines, rows) = render(&WorkflowRunCard::from(&settled));
+        let (lines, rows) = render(&WorkflowRunCard::from(&settled), CARD_COLS);
 
         let targets: Vec<usize> = rows
             .iter()

@@ -3044,7 +3044,7 @@ pub fn render_tool_content(
         Some(ToolOutput::TodoList(items)) => (render_todos(items), false),
         Some(ToolOutput::Answers(answers)) => render_answers(answers, limits.bounded_budget()),
         Some(ToolOutput::WorkflowRun(card)) => {
-            let (card_lines, rows) = workflow_card::render(card);
+            let (card_lines, rows) = workflow_card::render(card, limits.width);
             output_rows = rows;
             (card_lines, false)
         }

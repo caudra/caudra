@@ -25,6 +25,12 @@ const MIN_WIDTH_PERCENT: u16 = 65;
 const MAX_HEIGHT_PERCENT: u16 = 80;
 const SEARCH_ROW: u16 = 1;
 const DETAIL_RIGHT_PAD: u16 = 1;
+/// The blank a row keeps between its label and its detail.
+const LABEL_DETAIL_GAP: usize = 1;
+/// What a row keeps for its label whatever its detail costs. A row that spends
+/// every column on the detail names nothing the reader can pick, and picking is
+/// what the row is for.
+const LABEL_MIN_COLS: usize = 20;
 const DETAIL_DIM: f32 = 0.4;
 pub(crate) const DISABLED_DIM: f32 = 0.45;
 
@@ -960,6 +966,29 @@ fn find_scroll_offset_for_bottom<T: PickerItem>(
     find_scroll_offset_for(filtered, items, len - 1, viewport_height)
 }
 
+/// How one row splits its columns between the label and the detail: the label
+/// keeps [`LABEL_MIN_COLS`] whatever the detail costs, the detail gives up its
+/// tail to pay for it, and `pad` is the blank between them that puts every
+/// row's detail against the same right edge.
+struct DetailRow {
+    label: String,
+    detail: String,
+    pad: usize,
+}
+
+fn detail_row(label: &str, detail: &str, trailing_gap: usize, width: u16) -> DetailRow {
+    let room = usize::from(width)
+        .saturating_sub(trailing_gap + usize::from(DETAIL_RIGHT_PAD) + LABEL_DETAIL_GAP);
+    let floor = LABEL_MIN_COLS.min(room);
+    let label = truncate_label(label, room.saturating_sub(detail.width()).max(floor));
+    let detail = truncate_label(
+        detail,
+        room.saturating_sub(label.width() + LABEL_DETAIL_GAP),
+    );
+    let pad = room.saturating_sub(label.width() + detail.width());
+    DetailRow { label, detail, pad }
+}
+
 fn truncate_label(label: &str, max_width: usize) -> String {
     if label.width() <= max_width {
         return label.to_string();
@@ -1079,24 +1108,18 @@ fn render_list<T: PickerItem>(
         let trailing_gap = suffix_w + if suffix_w > 0 { suffix_gap } else { 0 };
         let line = match detail {
             Some(detail) => {
-                let max_label = area.width.saturating_sub(
-                    detail.width() as u16 + trailing_gap as u16 + 1 + DETAIL_RIGHT_PAD,
-                ) as usize;
-                let label = truncate_label(&label, max_label);
-                let pad = (area.width as usize).saturating_sub(
-                    label.width() + trailing_gap + detail.width() + DETAIL_RIGHT_PAD as usize + 1,
-                );
+                let row = detail_row(&label, detail, trailing_gap, area.width);
                 let mut spans = Vec::with_capacity(7);
                 if let Some(cb) = checkbox {
                     spans.push(cb);
                 }
-                spans.push(Span::styled(label, style));
+                spans.push(Span::styled(row.label, style));
                 if let Some(s) = suffix {
                     spans.push(Span::styled(" ".repeat(suffix_gap), style));
                     spans.push(Span::styled(s.to_string(), theme::dim_style(style, 0.4)));
                 }
-                spans.push(Span::styled(" ".repeat(pad), style));
-                spans.push(Span::styled(detail.to_string(), detail_style));
+                spans.push(Span::styled(" ".repeat(row.pad), style));
+                spans.push(Span::styled(row.detail, detail_style));
                 spans.push(Span::styled(" ".repeat(DETAIL_RIGHT_PAD as usize), style));
                 Line::from(spans)
             }
@@ -1154,6 +1177,22 @@ mod tests {
     /// More items than the 80x24 test terminal can show, so the bar has a
     /// track to press on.
     const OVERFLOWING_ITEMS: usize = 50;
+    /// The columns a modal row gets in a terminal of the usual width.
+    const ROW_WIDTH: u16 = 70;
+    const SHORT_LABEL: &str = "  hi";
+    const SHORT_DETAIL: &str = "2h ago";
+    /// A builtin workflow's description, which is longer than the row is wide.
+    const LONG_DETAIL: &str =
+        "Survey a change, then refute the findings and keep the ones that survive a quorum";
+    const SUFFIX: &str = "Anthropic";
+    const SUFFIX_GAP: usize = 2;
+    const ELLIPSIS: char = '\u{2026}';
+    const ONE_RIGHT_EDGE: &str = "every row ends its detail in the same column";
+    const ROW_FITS: &str = "a row draws inside the width it was given";
+    const LABEL_SURVIVES: &str = "a label short enough to fit is never cut for a detail";
+    const DETAIL_GIVES_UP_ITS_TAIL: &str = "a detail too long for the row is cut";
+    const LABEL_KEEPS_ITS_BLANK: &str = "a label and a detail never run together";
+    const LABEL_KEEPS_ITS_FLOOR: &str = "a label keeps its floor whatever the detail costs";
 
     fn ready_state<T>(p: &ListPicker<T>) -> &State<T> {
         p.state.as_ref().expect("expected open state")
@@ -1892,30 +1931,54 @@ mod tests {
         truncate_label(label, max_width)
     }
 
+    /// Where a row's detail ends, in the columns the row draws it in.
+    fn end_column(row: &DetailRow, trailing_gap: usize) -> usize {
+        row.label.width() + trailing_gap + row.pad + row.detail.width() + DETAIL_RIGHT_PAD as usize
+    }
+
     #[test]
-    fn detail_right_edge_consistent_for_long_and_short_labels() {
-        let width: u16 = 40;
-        let detail = "2h ago";
-        let suffix_gap = 2usize;
-
-        let end_col = |label: &str, suffix_w: usize| -> usize {
-            let trailing = suffix_w + if suffix_w > 0 { suffix_gap } else { 0 };
-            let max_label = width
-                .saturating_sub(detail.width() as u16 + trailing as u16 + 1 + DETAIL_RIGHT_PAD)
-                as usize;
-            let t = truncate_label(label, max_label);
-            let pad = (width as usize).saturating_sub(
-                t.width() + trailing + detail.width() + DETAIL_RIGHT_PAD as usize + 1,
-            );
-            t.width() + trailing + pad + detail.width() + DETAIL_RIGHT_PAD as usize
-        };
-
+    fn a_detail_ends_in_the_same_column_whatever_the_label_costs() {
         let long = "  ".to_string() + "x".repeat(60).as_str();
-        assert_eq!(end_col(&long, 0), end_col("  hi", 0));
-        assert!(end_col(&long, 0) <= width as usize);
 
-        let sfx = "Anthropic".width();
-        assert_eq!(end_col(&long, sfx), end_col("  hi", sfx));
-        assert!(end_col(&long, sfx) <= width as usize);
+        for trailing in [0, SUFFIX_GAP + SUFFIX.width()] {
+            let wide = detail_row(&long, SHORT_DETAIL, trailing, ROW_WIDTH);
+            let narrow = detail_row(SHORT_LABEL, SHORT_DETAIL, trailing, ROW_WIDTH);
+
+            assert_eq!(
+                end_column(&wide, trailing),
+                end_column(&narrow, trailing),
+                "{ONE_RIGHT_EDGE}"
+            );
+            assert!(
+                end_column(&wide, trailing) <= usize::from(ROW_WIDTH),
+                "{ROW_FITS}"
+            );
+        }
+    }
+
+    /// A workflow description is longer than the modal is wide, and a row that
+    /// spent every column on it showed no name at all: the run the reader came
+    /// to pick was invisible.
+    #[test]
+    fn a_detail_longer_than_the_row_gives_up_its_tail_not_the_label() {
+        let row = detail_row(SHORT_LABEL, LONG_DETAIL, 0, ROW_WIDTH);
+
+        assert_eq!(row.label, SHORT_LABEL, "{LABEL_SURVIVES}");
+        assert!(row.detail.ends_with(ELLIPSIS), "{DETAIL_GIVES_UP_ITS_TAIL}");
+        assert!(row.pad >= LABEL_DETAIL_GAP, "{LABEL_KEEPS_ITS_BLANK}");
+        assert!(end_column(&row, 0) <= usize::from(ROW_WIDTH), "{ROW_FITS}");
+    }
+
+    /// A label past the floor is cut, because the detail cannot pay for more
+    /// than the row has.
+    #[test]
+    fn a_long_label_and_a_long_detail_both_give_up_their_tails() {
+        let long_label = "  ".to_string() + "x".repeat(60).as_str();
+
+        let row = detail_row(&long_label, LONG_DETAIL, 0, ROW_WIDTH);
+
+        assert_eq!(row.label.width(), LABEL_MIN_COLS, "{LABEL_KEEPS_ITS_FLOOR}");
+        assert!(row.detail.ends_with(ELLIPSIS), "{DETAIL_GIVES_UP_ITS_TAIL}");
+        assert!(end_column(&row, 0) <= usize::from(ROW_WIDTH), "{ROW_FITS}");
     }
 }

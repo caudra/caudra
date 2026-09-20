@@ -298,6 +298,13 @@ mod tests {
     const DIGEST: &str = "sha256:abc";
     const DESCRIPTION: &str = "Research a query";
     const NOT_CONFIRMED: &str = "a trust must not fire before its digest is confirmed";
+    /// A real builtin description, which is longer than a modal row at the
+    /// terminal width most people run.
+    const LONG_DESCRIPTION: &str =
+        "Survey a change, then refute the findings and keep the ones that survive a quorum";
+    const TERMINAL_COLS: u16 = 80;
+    const TERMINAL_ROWS: u16 = 24;
+    const NAME_IS_VISIBLE: &str = "a row shows the workflow name whatever its description costs";
     const LAUNCHED: &str = "a trusted row launches on Enter";
     const CONFIRMED: &str = "confirming must carry the exact digest the row showed";
 
@@ -324,6 +331,31 @@ mod tests {
             ..WorkflowCatalog::default()
         });
         picker
+    }
+
+    fn screen(picker: &mut WorkflowCatalogPicker) -> String {
+        let backend = ratatui::backend::TestBackend::new(TERMINAL_COLS, TERMINAL_ROWS);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                picker.view(frame, frame.area());
+            })
+            .unwrap();
+        crate::components::buffer_text(terminal.backend().buffer())
+    }
+
+    /// Every builtin description is longer than the modal is wide at 80
+    /// columns, and the row used to spend all of them on the description and
+    /// draw no name at all, leaving nothing to pick by.
+    #[test]
+    fn a_row_shows_its_name_beside_a_description_too_long_for_the_modal() {
+        let mut long = entry(true, SourceKind::Builtin);
+        long.description = LONG_DESCRIPTION.into();
+        let mut picker = open_with(vec![long]);
+
+        let screen = screen(&mut picker);
+
+        assert!(screen.contains(NAME), "{NAME_IS_VISIBLE}: {screen}");
     }
 
     #[test]

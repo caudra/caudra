@@ -133,12 +133,12 @@ impl FooterLine {
     /// `offset` and its `total` wrapped row count. The footer is the last line,
     /// so it is on the last row.
     pub(crate) fn hits(&self, area: Rect, offset: u16, total: u16) -> Vec<Rect> {
-        let width = u16::try_from(self.width()).unwrap_or(u16::MAX);
         // A footer wider than its area wraps, and then a single-row hit rect
         // would claim cells the command was never drawn in.
-        if area.width == 0 || width > area.width {
+        if !self.fits(area.width) {
             return Vec::new();
         }
+        let width = u16::try_from(self.width()).unwrap_or(u16::MAX);
         let Some(row) = total.saturating_sub(1).checked_sub(offset) else {
             return Vec::new();
         };
@@ -164,6 +164,12 @@ impl FooterLine {
                 )
             })
             .collect()
+    }
+
+    /// Whether the line draws on one row of `columns`, which is what decides
+    /// whether it answers the pointer at all.
+    pub(crate) fn fits(&self, columns: u16) -> bool {
+        columns > 0 && u16::try_from(self.width()).unwrap_or(u16::MAX) <= columns
     }
 
     fn width(&self) -> usize {
