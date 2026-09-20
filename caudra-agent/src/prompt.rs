@@ -126,8 +126,13 @@ pub const DEFAULT_TONE: &str = r#"- Be concise. Your output is displayed on a CL
 - Output text to communicate with the user; all text you output outside of tool use is displayed to the user. Only use tools to complete tasks. NEVER use shell commands to communicate thoughts, explanations, diagrams, or instructions to the user. Output all communication directly in your response text instead.
 - NEVER create files unless absolutely necessary. ALWAYS prefer editing existing files."#;
 
-const NATIVE_EFFICIENT_TOOLS: &[&str] =
-    &["batch", "file_grep", "file_edit", "file_apply_patch", "task"];
+const NATIVE_EFFICIENT_TOOLS: &[&str] = &[
+    "batch",
+    "file_grep",
+    "file_edit",
+    "file_apply_patch",
+    "task",
+];
 const SYSTEM_COMPONENTS: &[&str] = &[
     "default",
     "identity",

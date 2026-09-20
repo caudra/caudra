@@ -364,7 +364,8 @@ mod tests {
     fn a_transcript_grab_resolves_one_message_rather_than_the_whole_panel() {
         let (mut app, mut terminal) = armed_app();
         for index in 0..TRANSCRIPT_MESSAGES {
-            app.main_chat().push_user_message(format!("message {index}"));
+            app.main_chat()
+                .push_user_message(format!("message {index}"));
         }
         terminal.draw(|frame| app.view(frame)).expect("filled draw");
         let panel = app.msg_area();
@@ -396,11 +397,7 @@ mod tests {
         let (mut app, mut terminal) = armed_app();
         app.update(mouse_event(MouseEventKind::Moved, 10, 10));
         terminal.draw(|frame| app.view(frame)).expect("armed draw");
-        app.update(mouse_event(
-            MouseEventKind::Down(MouseButton::Left),
-            10,
-            10,
-        ));
+        app.update(mouse_event(MouseEventKind::Down(MouseButton::Left), 10, 10));
         assert!(app.grab.armed, "the click only queues the grab");
         terminal.draw(|frame| app.view(frame)).expect("grab draw");
         assert!(!app.grab.armed, "the grab left the mode armed");
@@ -423,10 +420,8 @@ mod tests {
     #[test]
     fn escape_disarms_without_reaching_the_interface_behind_it() {
         let (mut app, _terminal) = armed_app();
-        let escape = crossterm::event::KeyEvent::new(
-            crossterm::event::KeyCode::Esc,
-            KeyModifiers::NONE,
-        );
+        let escape =
+            crossterm::event::KeyEvent::new(crossterm::event::KeyCode::Esc, KeyModifiers::NONE);
         assert!(app.handle_grab_key(escape));
         assert!(!app.grab.armed);
         assert!(!app.handle_grab_key(escape));
@@ -437,7 +432,10 @@ mod tests {
         let mut buf = Buffer::empty(Rect::new(0, 0, 8, 2));
         buf.set_string(0, 0, "hi", Style::default());
         buf.set_string(0, 1, WIDE, Style::default());
-        assert_eq!(rect_text(&buf, Rect::new(0, 0, 8, 2)), format!("hi\n{WIDE}\n"));
+        assert_eq!(
+            rect_text(&buf, Rect::new(0, 0, 8, 2)),
+            format!("hi\n{WIDE}\n")
+        );
     }
 
     #[test]
@@ -457,9 +455,24 @@ mod tests {
     fn outline_reverses_the_perimeter_and_spares_the_interior() {
         let mut buf = Buffer::empty(Rect::new(0, 0, 4, 3));
         outline(&mut buf, Rect::new(0, 0, 4, 3), true);
-        assert!(buf[(0, 1)].style().add_modifier.contains(Modifier::REVERSED));
-        assert!(buf[(3, 1)].style().add_modifier.contains(Modifier::REVERSED));
-        assert!(!buf[(1, 1)].style().add_modifier.contains(Modifier::REVERSED));
+        assert!(
+            buf[(0, 1)]
+                .style()
+                .add_modifier
+                .contains(Modifier::REVERSED)
+        );
+        assert!(
+            buf[(3, 1)]
+                .style()
+                .add_modifier
+                .contains(Modifier::REVERSED)
+        );
+        assert!(
+            !buf[(1, 1)]
+                .style()
+                .add_modifier
+                .contains(Modifier::REVERSED)
+        );
     }
 
     #[test]

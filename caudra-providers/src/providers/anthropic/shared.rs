@@ -24,14 +24,7 @@ pub(super) const BETA_TOOL_EXAMPLES_BEDROCK: &str = "tool-examples-2025-10-29";
 /// touches these when they are fenced in backticks or bold, so "a shell command
 /// pipeline" survives while `` `shell` `` is renamed with everything else.
 const AMBIGUOUS_TOOL_WORDS: &[&str] = &[
-    "batch",
-    "index",
-    "memory",
-    "question",
-    "shell",
-    "skill",
-    "task",
-    "workflow",
+    "batch", "index", "memory", "question", "shell", "skill", "task", "workflow",
 ];
 
 /// Longest wire name the messages API accepts.
