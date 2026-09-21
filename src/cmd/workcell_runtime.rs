@@ -249,6 +249,9 @@ impl WorkcellRuntime {
             caudra_agent::remote_project_context::load_remote_project_context(&workspace_session),
         )
         .map_err(WorkcellRuntimeError::ProjectContext)?;
+        // A host that will not make a scratch directory costs the model a path,
+        // never the session, so the outcome is adopted rather than propagated.
+        let _ = smol::block_on(caudra_agent::scratch::prepare_remote(&workspace_session));
         for pending in client.pending_remote_operations() {
             eprintln!(
                 "warning: remote mutations overlapping pending operation {} are blocked until it is reconciled or explicitly acknowledged",

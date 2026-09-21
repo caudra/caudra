@@ -2965,7 +2965,12 @@ mod tests {
             };
             fixture.put(source.clone(), FILE, AFTER);
             let first = fixture.plan(action.clone(), &[FILE]).await;
-            let total = super::journal::MAX_RECORDS + 2;
+            // Rotation is what this measures, and it is `ROTATE_RECORDS` that
+            // triggers one. Crossing that twice proves a second rotation reads
+            // the page the first wrote, which is where an archive chain breaks;
+            // every confirmed entry is evicted at each one, so the hot set never
+            // approaches `MAX_RECORDS` and counting that high only bought time.
+            let total = super::journal::ROTATE_RECORDS * 2 + 2;
             let mut last = first.review.files[0].operation_id.clone();
             for index in 0..total {
                 let plan = if index == 0 {
@@ -3135,8 +3140,14 @@ mod tests {
             let mut first = Fixture::new();
             let mut second = Fixture::new();
             second.journal = TransferJournal::new(first.state.path().join(JOURNAL_FILE)).unwrap();
+            // Two rotations per project is what the claim needs: each one has to
+            // archive under its own namespace and read back the page the previous
+            // left, which is how one project's history is shown not to consume the
+            // other's. Terminal entries are evicted at every rotation, so the
+            // shared hot set never nears `MAX_RECORDS` and looping that far only
+            // repeated a proof already made.
             for fixture in [&mut first, &mut second] {
-                for _ in 0..super::journal::MAX_RECORDS {
+                for _ in 0..super::journal::ROTATE_RECORDS * 2 {
                     fixture.put(Side::Local, FILE, AFTER);
                     let plan = fixture.plan(TransferAction::Push, &[FILE]).await;
                     fixture

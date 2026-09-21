@@ -43,6 +43,13 @@ pub const STANDING_PROMPT: &str = concat!(
 /// changes when the user switches one.
 pub const ENVIRONMENT_PROMPT: &str = include_str!("prompts/environment.md");
 pub const ENVIRONMENT_MARKER: &str = "# Environment";
+/// Two fragments rather than one with a substituted clause, because the claim
+/// that differs is the useful one: locally the scratch directory is where
+/// `TMPDIR` already points and a command falls into it by itself, and on a
+/// remote host it is a directory Caudra made that nothing else knows about.
+pub const SCRATCH_LOCAL_PROMPT: &str = include_str!("prompts/scratch_local.md");
+pub const SCRATCH_REMOTE_PROMPT: &str = include_str!("prompts/scratch_remote.md");
+pub const SCRATCH_DIR_SLOT: &str = "{scratch_dir}";
 /// Instruction files are snapshotted into the system prompt, so a later edit
 /// arrives as a diff against that snapshot rather than by rebuilding it.
 pub const INSTRUCTIONS_CHANGED_PROMPT: &str = include_str!("prompts/instructions_changed.md");

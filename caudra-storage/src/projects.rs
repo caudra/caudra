@@ -18,6 +18,7 @@ pub(crate) const PROJECTS_DIR: &str = "projects";
 const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 const DOCUMENT_SCOPE_DOMAIN: &str = "remote-local-documents.v1";
+const REMOTE_SCRATCH_DOMAIN: &str = "remote-scratch-directory.v1";
 
 #[derive(Clone)]
 pub(crate) enum DocumentProjectScope {
@@ -30,25 +31,11 @@ pub(crate) enum DocumentProjectScope {
 
 impl DocumentProjectScope {
     pub(crate) fn remote(binding: &SessionWorkspaceBinding) -> Self {
-        let authority = binding.authority();
-        let mut identity = Vec::new();
-        for field in [
-            authority.trust_anchor().as_str(),
-            authority.server_id(),
-            authority.workspace_id(),
-            authority.workspace_generation(),
-            authority.resource_namespace_version(),
-            binding.principal().subject(),
-            binding.project().key().as_str(),
-        ] {
-            identity.extend_from_slice(&(field.len() as u64).to_be_bytes());
-            identity.extend_from_slice(field.as_bytes());
-        }
         Self::Remote {
             project: binding.project().key().clone(),
             subdir: Path::new(PROJECTS_DIR).join(format!(
                 "remote-docs-{}",
-                opaque_hash(DOCUMENT_SCOPE_DOMAIN, &identity)
+                opaque_hash(DOCUMENT_SCOPE_DOMAIN, &remote_identity(binding))
             )),
         }
     }
@@ -94,6 +81,41 @@ impl DocumentProjectScope {
             Self::Remote { subdir, .. } => subdir.as_os_str().as_encoded_bytes(),
         }
     }
+}
+
+/// Length-prefixed so no two different field splits hash alike. Every field is
+/// vouched for by the remote authority, which is what makes a value derived
+/// from it safe to key a directory on the remote host with.
+fn remote_identity(binding: &SessionWorkspaceBinding) -> Vec<u8> {
+    let authority = binding.authority();
+    let mut identity = Vec::new();
+    for field in [
+        authority.trust_anchor().as_str(),
+        authority.server_id(),
+        authority.workspace_id(),
+        authority.workspace_generation(),
+        authority.resource_namespace_version(),
+        binding.principal().subject(),
+        binding.project().key().as_str(),
+    ] {
+        identity.extend_from_slice(&(field.len() as u64).to_be_bytes());
+        identity.extend_from_slice(field.as_bytes());
+    }
+    identity
+}
+
+/// The directory name a remote project's scratch work goes under, keyed by the
+/// remote identity rather than by any local path, because no local path is
+/// meaningful on the host the tools actually run on.
+///
+/// The hash is base58, so the whole name is alphanumeric behind a fixed
+/// prefix: nothing in it can be read as an option, a path separator, or a
+/// shell metacharacter by the remote command that creates it.
+pub fn remote_scratch_id(binding: &SessionWorkspaceBinding) -> String {
+    format!(
+        "remote-{}",
+        opaque_hash(REMOTE_SCRATCH_DOMAIN, &remote_identity(binding))
+    )
 }
 
 /// FNV-1a over the raw bytes, lowercase hex. The Lua original split the state

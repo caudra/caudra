@@ -37,6 +37,7 @@ pub mod patch;
 pub mod permissions;
 pub mod prompt;
 pub mod remote_project_context;
+pub mod scratch;
 pub mod snapshots;
 mod stored_session;
 mod subagent_history;

@@ -5,7 +5,7 @@ use caudra_agent::agent::tool_dispatch::{self, Emit};
 use caudra_agent::tools::{FileReadTracker, ToolEffect, ToolRegistry, interpreter_ctx};
 use caudra_agent::workspace_baseline::{BaselineGate, WorkspaceBaseline};
 use caudra_agent::{
-    AgentEvent, AgentMode, CancelToken, EventSender,
+    AgentEvent, AgentMode, CancelToken, EventSender, ToolOutput,
     permissions::{
         PermissionAnswer, PermissionAuthorityProfile, PermissionManager, PermissionResourceAccess,
         PermissionResourceKind, PermissionSubject, PluginRuleStore, RemotePermissionIdentity,
@@ -45,18 +45,20 @@ use caudra_workspace::{
     WorkspaceMutationService, WorkspaceTransferService, WriteContent,
 };
 use caudra_workspace::{
-    CheckpointId, DirectoryNavigation, ListRequest, OperationState, ReadBytesRequest,
-    ResourceSelector, ScmDiscoverRequest, ScmStatusRequest, SearchRequest, SessionBindingId,
-    SnapshotCaptureRequest, SnapshotInspectRequest, SnapshotOperationPreview, ToolPrepareRequest,
-    WatchOpenRequest, WatchPollRequest, WorkspaceAssetService, WorkspaceCursor, WorkspacePath,
-    WorkspaceReadService, WorkspaceScmReadService, WorkspaceSearchService,
-    WorkspaceSnapshotMutationService, WorkspaceSnapshotReadService, WorkspaceWatchService,
+    CheckpointId, DirectoryNavigation, ListRequest, MutationResult, OperationState,
+    OperationStatus, ReadBytesRequest, ResourceRevision, ResourceSelector, ScmDiscoverRequest,
+    ScmStatusRequest, SearchRequest, SessionBindingId, SnapshotCaptureRequest,
+    SnapshotInspectRequest, SnapshotOperationPreview, ToolPrepareRequest, WatchOpenRequest,
+    WatchPollRequest, WorkspaceAssetService, WorkspaceCursor, WorkspacePath, WorkspaceReadService,
+    WorkspaceScmReadService, WorkspaceSearchService, WorkspaceSnapshotMutationService,
+    WorkspaceSnapshotReadService, WorkspaceWatchService,
 };
 use caudra_workspace::{
     ScmDiffRequest, ScmDiffTarget, ScmLogRequest, ScmMutation, ScmReadSideRequest, ScmSide,
     WorkspaceScmMutationService,
 };
 use futures_lite::io::{AsyncReadExt, repeat};
+use image::{DynamicImage, ImageFormat};
 use isahc::AsyncReadResponseExt;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -98,8 +100,20 @@ const BATCH_WRITE: &str = "batch-write.txt";
 const BATCH_CONTENT: &str = "batch completed";
 const PENDING_MUTATION: &str = "workspace mutation is blocked by pending operation";
 const BATCH_CANCELLED: &str = "batch-cancelled.txt";
+const LAPSED_FILE: &str = "lapsed-preparation.txt";
+const LAPSED_TTL_MS: u64 = 1_500;
 const REMOTE_PREPARATION_CAPACITY: usize = 64;
 const HELD_PREPARATIONS: usize = 4;
+const EDITOR_FILE: &str = "editor.txt";
+const EDITOR_IMAGE: &str = "editor.png";
+const EDITOR_IMAGE_EDGE: u32 = 3;
+const EDITOR_ORIGINAL: &str = "original editor line\n";
+const EDITOR_SAVED: &str = "saved editor line\n";
+const EDITOR_EXTERNAL: &str = "external editor line\n";
+const EDITOR_NAMESPACE: &str =
+    "a byte read must report the revision a conditional write is checked against";
+const EDITOR_SAVE_REFUSED: &str = "an edited remote buffer must save against the revision it read";
+const EDITOR_STALE_ACCEPTED: &str = "a concurrent remote modification must refuse the save";
 
 struct TransferTestHost {
     root: PathBuf,
@@ -739,6 +753,11 @@ fn reviewed_transfer() {
             BINARY_BYTES,
         )
         .await;
+        // Larger than the workspace hashes, so only reviewed transfer can
+        // answer for it; the content digest still has to be what a byte read
+        // reports, and the transfer revision still has to stay out of it.
+        let content_revision = ResourceRevision::new(file.content.digest.as_str()).unwrap();
+        assert_ne!(content_revision, file.revision);
         let read = WorkspaceReadService::read_bytes(
             &client,
             binding,
@@ -747,12 +766,28 @@ fn reviewed_transfer() {
                 resource: ResourceSelector::Path(prepared.request.path.clone()),
                 byte_offset: range.start,
                 max_bytes: 1024,
-                if_revision: Some(file.revision.clone()),
+                if_revision: Some(content_revision.clone()),
             },
         )
         .await
         .unwrap();
         assert_eq!(read.bytes, vec![BINARY_BYTE; 1024]);
+        assert_eq!(read.revision, content_revision);
+        assert!(matches!(
+            WorkspaceReadService::read_bytes(
+                &client,
+                binding,
+                cursor,
+                &ReadBytesRequest {
+                    resource: ResourceSelector::Path(prepared.request.path.clone()),
+                    byte_offset: range.start,
+                    max_bytes: 1024,
+                    if_revision: Some(file.revision.clone()),
+                },
+            )
+            .await,
+            Err(WorkspaceError::StaleResource { .. })
+        ));
         let short = binary_content(1024);
         let stage = client
             .stage(
@@ -1522,6 +1557,158 @@ async fn concurrent_registry_regressions(
     );
 }
 
+/// A command queued behind another one waits on a client admission lock while
+/// the server expires its preparation on an independent timer. The wait is
+/// legitimate work, so the call has to be renewed and run.
+async fn lapsed_preparation_regression(client: &RemoteWorkcellClient, root: &Path) {
+    let registry = Arc::new(ToolRegistry::new());
+    RemoteWorkcellHost::new(client.clone())
+        .register(&registry)
+        .unwrap();
+    let permissions = Arc::new(PermissionManager::new_nonpersistent(
+        PermissionsConfig {
+            yolo: true,
+            ..Default::default()
+        },
+        root.to_path_buf(),
+        Arc::default(),
+    ));
+    let (tx, _rx) = flume::unbounded();
+    let mut ctx = interpreter_ctx(
+        &AgentMode::Build,
+        &EventSender::new(tx, 0),
+        CancelToken::none(),
+        permissions,
+        Arc::new(FileReadTracker::new()),
+        None,
+        registry.clone(),
+    );
+    ctx.workspace_session = Some(
+        caudra_workspace::WorkspaceSession::new(
+            client.workspace_handle().unwrap(),
+            client.session_binding().clone(),
+            client.root_cursor().clone(),
+        )
+        .unwrap(),
+    );
+    let baseline_state = tempfile::tempdir().unwrap();
+    ctx.baseline = Some(BaselineGate::new(
+        WorkspaceBaseline::new_workspace_session(
+            StateDir::from_path(baseline_state.path().into()),
+            CaudraId::generate(),
+            ctx.workspace_session.clone().unwrap(),
+            client.stored_binding().clone(),
+            true,
+        ),
+        None,
+    ));
+    let fault = PathBuf::from(env::var_os("WORKCELL_TEST_FAULT").unwrap());
+    let gate = fault.with_file_name("batch-execute-gate");
+    let shorten = fault.with_file_name("short-preparation-ttl");
+    let expiry = fault.with_file_name("short-preparation-expiry");
+    let diagnostics = fault.with_file_name("rpc-diagnostics");
+    let trace = fault.with_file_name("batch-rpc-trace");
+    fs::write(&diagnostics, "").unwrap();
+    fs::write(&trace, "").unwrap();
+    for stale in [
+        &expiry,
+        &gate.with_extension("entered"),
+        &gate.with_extension("release"),
+    ] {
+        let _ = fs::remove_file(stale);
+    }
+    fs::write(&gate, "hold the first command before forwarding").unwrap();
+    let holder = json!({"command":format!("printf '{BATCH_CONTENT}'")});
+    let queued = json!({"command":format!("printf '{BATCH_CONTENT}' > {LAPSED_FILE}; printf '{BATCH_CONTENT}'")});
+    let exercise = async {
+        let held = tool_dispatch::run(
+            &registry,
+            None,
+            "lapsed-holder".into(),
+            "shell",
+            &holder,
+            &ctx,
+            Emit::Silent,
+        );
+        let overlap = async {
+            while !gate.with_extension("entered").exists() {
+                smol::Timer::after(BATCH_POLL).await;
+            }
+            fs::write(&shorten, LAPSED_TTL_MS.to_string()).unwrap();
+            let queued = tool_dispatch::run(
+                &registry,
+                None,
+                "lapsed-queued".into(),
+                "shell",
+                &queued,
+                &ctx,
+                Emit::Silent,
+            );
+            let release = async {
+                loop {
+                    if let Ok(deadline) = fs::read_to_string(&expiry)
+                        && let Ok(deadline) = deadline.trim().parse::<u128>()
+                    {
+                        while unix_millis() <= deadline {
+                            smol::Timer::after(BATCH_POLL).await;
+                        }
+                        break;
+                    }
+                    smol::Timer::after(BATCH_POLL).await;
+                }
+                assert!(!root.join(LAPSED_FILE).exists());
+                fs::write(gate.with_extension("release"), "release").unwrap();
+            };
+            let (queued, ()) = futures_lite::future::zip(queued, release).await;
+            assert!(!queued.is_error, "{}", queued.output.as_text());
+            assert!(queued.output.as_text().contains(BATCH_CONTENT));
+        };
+        let (held, ()) = futures_lite::future::zip(held, overlap).await;
+        assert!(!held.is_error, "{}", held.output.as_text());
+    };
+    futures_lite::future::race(exercise, async {
+        smol::Timer::after(BATCH_TIMEOUT).await;
+        panic!(
+            "queued command behind a lapsed preparation did not finish: entered={}, trace={:?}",
+            gate.with_extension("entered").exists(),
+            fs::read_to_string(&trace)
+        );
+    })
+    .await;
+    assert_eq!(
+        fs::read_to_string(root.join(LAPSED_FILE)).unwrap(),
+        BATCH_CONTENT
+    );
+    let records = fs::read_to_string(&diagnostics)
+        .unwrap()
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .collect::<Vec<_>>();
+    let prepared = records
+        .iter()
+        .filter(|record| record["method"] == "ai.workcell/prepare" && record["tool"] == "shell")
+        .count();
+    assert_eq!(prepared, 3, "the queued command did not renew: {records:?}");
+    let executed = fs::read_to_string(&trace)
+        .unwrap()
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|record| record["method"] == "ai.workcell/execute")
+        .count();
+    assert_eq!(executed, 2, "a lapsed preparation was dispatched twice");
+    assert!(client.pending_remote_operations().is_empty());
+    eprintln!(
+        "PASS a command queued behind another renews the preparation the server expired, runs exactly once, and leaves no unresolved row"
+    );
+}
+
+fn unix_millis() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis()
+}
+
 async fn canonical_registry_regressions(client: &RemoteWorkcellClient, root: &Path) {
     let registry = Arc::new(ToolRegistry::new());
     RemoteWorkcellHost::new(client.clone())
@@ -1787,6 +1974,205 @@ async fn canonical_registry_regressions(client: &RemoteWorkcellClient, root: &Pa
     );
 }
 
+async fn conditional_write(
+    client: &RemoteWorkcellClient,
+    path: &WorkspacePath,
+    contents: &str,
+    revision: ResourceRevision,
+) -> Result<OperationStatus<MutationResult>, WorkspaceError> {
+    WorkspaceMutationService::execute(
+        client,
+        client.session_binding(),
+        client.root_cursor(),
+        &MutationRequest {
+            mutations: vec![Mutation::Write {
+                path: path.clone(),
+                content: WriteContent::Text(contents.to_owned()),
+                condition: MutationCondition::Matches(revision),
+            }],
+        },
+    )
+    .await
+}
+
+/// A remote buffer is opened with a byte read and saved with a conditional
+/// write, so the revision the read reports and the revision the write is
+/// checked against have to be the same kind of value. Reviewed transfer stat
+/// answers in its own revision namespace, which no workspace precondition can
+/// ever match, so an editor that trusted it could never save.
+async fn remote_editor_revision_namespace(client: &RemoteWorkcellClient, root: &Path) {
+    let binding = client.session_binding();
+    let cursor = client.root_cursor();
+    fs::write(root.join(EDITOR_FILE), EDITOR_ORIGINAL).unwrap();
+    let path = WorkspacePath::new(EDITOR_FILE).unwrap();
+    let opened = WorkspaceReadService::read_bytes(
+        client,
+        binding,
+        cursor,
+        &ReadBytesRequest {
+            resource: ResourceSelector::Path(path.clone()),
+            byte_offset: 0,
+            max_bytes: LIMIT as u64,
+            if_revision: None,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(opened.bytes, EDITOR_ORIGINAL.as_bytes());
+    let stat = WorkspaceReadService::stat(
+        client,
+        binding,
+        cursor,
+        &ResourceSelector::Path(path.clone()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(stat.scope.resource_id(), &opened.resource_id);
+    assert_eq!(
+        stat.revision.as_ref(),
+        Some(&opened.revision),
+        "{EDITOR_NAMESPACE}"
+    );
+    let reread = WorkspaceReadService::read_bytes(
+        client,
+        binding,
+        cursor,
+        &ReadBytesRequest {
+            resource: ResourceSelector::Id(opened.resource_id.clone()),
+            byte_offset: 0,
+            max_bytes: LIMIT as u64,
+            if_revision: Some(opened.revision.clone()),
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(reread.revision, opened.revision, "{EDITOR_NAMESPACE}");
+    let saved = conditional_write(client, &path, EDITOR_SAVED, opened.revision.clone()).await;
+    assert!(
+        matches!(
+            saved,
+            Ok(OperationStatus {
+                state: OperationState::Completed { .. },
+                ..
+            })
+        ),
+        "{EDITOR_SAVE_REFUSED}: {saved:?}"
+    );
+    assert_eq!(
+        fs::read_to_string(root.join(EDITOR_FILE)).unwrap(),
+        EDITOR_SAVED
+    );
+    let reopened = WorkspaceReadService::read_bytes(
+        client,
+        binding,
+        cursor,
+        &ReadBytesRequest {
+            resource: ResourceSelector::Path(path.clone()),
+            byte_offset: 0,
+            max_bytes: LIMIT as u64,
+            if_revision: None,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(reopened.bytes, EDITOR_SAVED.as_bytes());
+    fs::write(root.join(EDITOR_FILE), EDITOR_EXTERNAL).unwrap();
+    let refused =
+        conditional_write(client, &path, EDITOR_ORIGINAL, reopened.revision.clone()).await;
+    assert!(
+        !matches!(
+            refused,
+            Ok(OperationStatus {
+                state: OperationState::Completed { .. },
+                ..
+            })
+        ),
+        "{EDITOR_STALE_ACCEPTED}: {refused:?}"
+    );
+    assert_eq!(
+        fs::read_to_string(root.join(EDITOR_FILE)).unwrap(),
+        EDITOR_EXTERNAL
+    );
+    assert!(matches!(
+        WorkspaceReadService::read_bytes(
+            client,
+            binding,
+            cursor,
+            &ReadBytesRequest {
+                resource: ResourceSelector::Id(reopened.resource_id.clone()),
+                byte_offset: 0,
+                max_bytes: LIMIT as u64,
+                if_revision: Some(reopened.revision),
+            },
+        )
+        .await,
+        Err(WorkspaceError::StaleResource { .. })
+    ));
+    eprintln!(
+        "PASS remote byte reads report workspace revisions, conditional saves commit, concurrent modification refused"
+    );
+    remote_image_bytes(client, root).await;
+}
+
+/// `view_image` resolves and stats a remote image, then reads its bytes under
+/// that revision, so it only loads when reads answer in the namespace stat
+/// speaks.
+async fn remote_image_bytes(client: &RemoteWorkcellClient, root: &Path) {
+    DynamicImage::new_rgb8(EDITOR_IMAGE_EDGE, EDITOR_IMAGE_EDGE)
+        .save_with_format(root.join(EDITOR_IMAGE), ImageFormat::Png)
+        .unwrap();
+    let registry = Arc::new(ToolRegistry::new());
+    caudra_agent::tools::native::register(&registry).unwrap();
+    let permissions = Arc::new(PermissionManager::new_nonpersistent(
+        PermissionsConfig {
+            yolo: true,
+            ..Default::default()
+        },
+        root.to_path_buf(),
+        Arc::default(),
+    ));
+    let (tx, _events) = flume::unbounded();
+    let mut ctx = interpreter_ctx(
+        &AgentMode::Build,
+        &EventSender::new(tx, 0),
+        CancelToken::none(),
+        permissions,
+        Arc::new(FileReadTracker::new()),
+        None,
+        registry.clone(),
+    );
+    ctx.workspace_session = Some(
+        caudra_workspace::WorkspaceSession::new(
+            client.workspace_handle().unwrap(),
+            client.session_binding().clone(),
+            client.root_cursor().clone(),
+        )
+        .unwrap(),
+    );
+    let done = tool_dispatch::run(
+        &registry,
+        None,
+        "remote-image".into(),
+        "view_image",
+        &json!({ "path": EDITOR_IMAGE }),
+        &ctx,
+        Emit::Silent,
+    )
+    .await;
+    assert!(!done.is_error, "{}", done.output.as_text());
+    match &done.output {
+        ToolOutput::Image { text, source } => {
+            assert!(
+                text.contains(&format!("{EDITOR_IMAGE_EDGE}x{EDITOR_IMAGE_EDGE}")),
+                "{text}"
+            );
+            assert!(!source.data.is_empty());
+        }
+        other => panic!("remote view_image must return pixels: {other:?}"),
+    }
+    eprintln!("PASS remote view_image resolves, stats, and reads image bytes");
+}
+
 #[test]
 fn unsupported_server() {
     if env::var("WORKCELL_TEST_UNSUPPORTED").as_deref() != Ok("1") {
@@ -1910,6 +2296,7 @@ fn authenticated_local() {
             &state,
         ))
         .await;
+        Box::pin(lapsed_preparation_regression(&client, &root)).await;
         Box::pin(canonical_registry_regressions(&client, &root)).await;
         let assets = WorkspaceAssetService::discover(&client, binding, cursor)
             .await
@@ -2075,6 +2462,7 @@ fn authenticated_local() {
             .await
             .unwrap();
         assert_eq!(bytes.bytes, b"fte");
+        Box::pin(remote_editor_revision_namespace(&client, &root)).await;
         let watch = WorkspaceWatchService::open(
             &client,
             binding,

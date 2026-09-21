@@ -5,7 +5,7 @@ use caudra_workspace::{
     ByteContent, ByteRange, DownloadedTransfer, LocalTransferSource, Mutation, MutationCondition,
     MutationEntryResult, MutationKind, MutationRequest, MutationResult, OperationError,
     OperationId, OperationState, OperationStatus, PreparedTransferPublication, ReadBytesRequest,
-    ReleaseResult, RemoteTransferFile, RemoteTransferStage, SealedTransfer,
+    ReleaseResult, RemoteTransferFile, RemoteTransferStage, ResourceRevision, SealedTransfer,
     SessionWorkspaceBinding, TransferContent, TransferDigest, TransferLimits, TransferMode,
     TransferPublicationRequest, TransferPublicationState, TransferPublicationStatus,
     WorkspaceCapability, WorkspaceCursor, WorkspaceError, WorkspacePath, WorkspaceTransferService,
@@ -231,6 +231,17 @@ impl RemoteWorkcellClient {
         }
         Ok(response)
     }
+    /// A reviewed transfer stat carries two revisions for one file. Its
+    /// `revision` covers identity, mode and timestamps as well as content, and
+    /// exists so a transfer can refuse a metadata-level race; nothing outside
+    /// the transfer protocol can match it. Its `digest` is the content hash,
+    /// which is what the workspace calls a revision and what `stat`, `list` and
+    /// every write precondition speak. A `ByteContent` is a workspace answer,
+    /// so the digest is the only one of the two that may be compared here or
+    /// handed back, and the transfer revision stays inside the download it
+    /// authorises. Deriving it from the same stat that authorises the download
+    /// keeps the revision bound to the bytes actually returned, and keeps a
+    /// file too large for the workspace to hash readable.
     pub(super) async fn read_reviewed_bytes(
         &self,
         binding: &SessionWorkspaceBinding,
@@ -248,10 +259,12 @@ impl RemoteWorkcellClient {
             &WorkspacePath::new(path.as_str()).map_err(|_| invalid_response())?,
         )
         .await?;
+        let revision =
+            ResourceRevision::new(file.content.digest.as_str()).map_err(|_| invalid_response())?;
         if request
             .if_revision
             .as_ref()
-            .is_some_and(|revision| revision != &file.revision)
+            .is_some_and(|expected| expected != &revision)
         {
             return Err(WorkspaceError::StaleResource {
                 resource_id: file.resource_id,
@@ -284,7 +297,7 @@ impl RemoteWorkcellClient {
         Ok(ByteContent {
             bytes,
             resource_id: file.resource_id,
-            revision: file.revision,
+            revision,
             range,
             total_bytes: Some(file.content.size_bytes),
             truncated: range.end_exclusive < file.content.size_bytes,

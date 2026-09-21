@@ -155,6 +155,14 @@ const SHELL_EXECUTION_TIMEOUT: Duration =
 const REMOTE_RECONCILE_TIMEOUT: Duration = Duration::from_secs(10);
 const REMOTE_RECONCILE_MAX_POLLS: usize = 4;
 const REMOTE_ADMISSION_EXPIRED: &str = "Remote Workcell execution deadline expired before dispatch";
+/// A preparation lives on the server's own timer, so a call that waits behind
+/// review or behind another command's admission can outlive it. Renewing before
+/// dispatch keeps a legitimate call alive; the renewed intent still has to be
+/// the one that was reviewed.
+const REMOTE_PREPARATION_RENEWAL: Duration = Duration::from_secs(15);
+const REMOTE_PREPARATION_LAPSED: &str =
+    "Remote Workcell preparation expired before dispatch and could not be renewed";
+const REMOTE_PREPARATION_CHANGED: &str = "Remote Workcell preparation expired before dispatch and the renewed request no longer matches the reviewed intent";
 /// Caudra owns authorization, so Workcell always hands over the mutation
 /// tools and every write still passes through the permission layer first.
 /// Withholding them here would hide tools the user is allowed to approve.
@@ -1547,7 +1555,7 @@ impl RemoteWorkcellInvocation {
     async fn execute_remote(
         &self,
         ctx: &ToolContext,
-        call: RemotePreparedToolCall,
+        mut call: RemotePreparedToolCall,
         cleanup: &mut RemoteExecutionCleanup,
     ) -> ToolExecResult {
         let mut progress = RemoteProgress::new(ctx);
@@ -1573,10 +1581,10 @@ impl RemoteWorkcellInvocation {
             .cancel
             .race(future::race(
                 async {
-                    self.client
-                        .admit_canonical_tool(&call.prepared)
-                        .await
-                        .map_err(|error| error.to_string())
+                    Ok(self
+                        .client
+                        .admit_canonical_tool(self.kind.name(), &call.intent)
+                        .await)
                 },
                 async {
                     smol::Timer::at(deadline).await;
@@ -1591,6 +1599,9 @@ impl RemoteWorkcellInvocation {
             Ok(Err(error)) | Err(error) => return Err(error).into(),
             _ => return Err(REMOTE_ADMISSION_EXPIRED.into()).into(),
         };
+        if let Err(error) = self.renew_lapsing_preparation(&mut call, cleanup).await {
+            return Err(error).into();
+        }
         let executed = race_remote_execution(
             ctx,
             deadline,
@@ -1702,6 +1713,39 @@ impl RemoteWorkcellInvocation {
                 }
             }
         }
+    }
+
+    async fn renew_lapsing_preparation(
+        &self,
+        call: &mut RemotePreparedToolCall,
+        cleanup: &mut RemoteExecutionCleanup,
+    ) -> Result<(), String> {
+        if !call.expires_within(REMOTE_PREPARATION_RENEWAL) {
+            return Ok(());
+        }
+        let request = ToolPrepareRequest {
+            name: self.kind.name().to_owned(),
+            input: self.raw_input.clone(),
+        };
+        let renewed = self
+            .client
+            .prepare_canonical_tool(&call.binding, &call.cursor, &request)
+            .await
+            .map_err(|error| format!("{REMOTE_PREPARATION_LAPSED}: {error}"))?;
+        if renewed.intent != call.intent {
+            let _ = self
+                .client
+                .release_canonical_tool(&renewed.binding, &renewed.cursor, &renewed.prepared)
+                .await;
+            return Err(REMOTE_PREPARATION_CHANGED.into());
+        }
+        let lapsed = std::mem::replace(call, renewed);
+        cleanup.call = Some(call.clone());
+        let _ = self
+            .client
+            .release_canonical_tool(&lapsed.binding, &lapsed.cursor, &lapsed.prepared)
+            .await;
+        Ok(())
     }
 
     async fn reconcile(

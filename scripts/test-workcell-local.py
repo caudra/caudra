@@ -267,6 +267,22 @@ def main():
                                 counts = {state: list(self.operation_states.values()).count(state) for state in set(self.operation_states.values())}
                                 print("Quota diagnostics:", json.dumps({"method": method, "tool": params.get("tool"), "limits": self.operation_limits, "in_flight": self.rpc_active, "observed_operation_states": counts}), flush=True)
                             self.rpc_active.pop(rpc_key, None)
+                    shorten = temp / "short-preparation-ttl"
+                    if method == "ai.workcell/prepare" and shorten.exists():
+                        def lapse_soon(payload):
+                            result = payload.get("result", {})
+                            if "expiresAtUnixMs" in result:
+                                result["expiresAtUnixMs"] = int(time.time() * 1000) + int(shorten.read_text())
+                                (temp / "short-preparation-expiry").write_text(str(result["expiresAtUnixMs"]))
+                                shorten.unlink()
+                            return json.dumps(payload).encode()
+
+                        with self.fault_lock:
+                            if shorten.exists():
+                                if response.getheader("Content-Type", "").startswith("text/event-stream"):
+                                    body = b"".join(b"data: " + lapse_soon(json.loads(line[5:])) + b"\n" if line.startswith(b"data:") else line for line in body.splitlines(keepends=True))
+                                else:
+                                    body = lapse_soon(json.loads(body))
                     if method == "ai.workcell/execute" and (temp / "drop-operation-response.progress").exists():
                         def lose_progress(payload):
                             result = payload.get("result", {})

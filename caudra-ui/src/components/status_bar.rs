@@ -51,6 +51,10 @@ const CLICKABLE_MODEL_FLOOR: usize = 3;
 const PLAIN_MODEL_FLOOR: usize = 1;
 const CHAT_NAME_MAX_WIDTH: usize = 24;
 const CHAT_NAME_WIDTH_DIVISOR: usize = 4;
+const SANDBOX_PREFIX: &str = "[sandbox: ";
+const SANDBOX_SUFFIX: &str = "]";
+const SANDBOX_MAX_WIDTH: usize = 24;
+const SANDBOX_FLOOR: usize = BRACKET_WIDTH + TRUNCATE_PREFIX.len() + 1;
 const MARQUEE_STEP: Duration = Duration::from_millis(120);
 const MARQUEE_PAUSE: Duration = Duration::from_millis(600);
 /// Marks a figure a subscription already covers. One column is all the bar can
@@ -146,6 +150,7 @@ pub enum StatusBarHitTarget {
     Cwd,
     ResumeAutoScroll,
     Yolo,
+    Sandbox,
 }
 
 impl StatusBarHitTarget {
@@ -169,7 +174,8 @@ impl StatusBarHitTarget {
             | Self::ChatName
             | Self::Cwd
             | Self::ResumeAutoScroll
-            | Self::Yolo => ChatScope::Any,
+            | Self::Yolo
+            | Self::Sandbox => ChatScope::Any,
             Self::Mode
             | Self::Model
             | Self::Thinking
@@ -235,6 +241,10 @@ pub struct StatusBarContext<'a> {
     pub stats: UsageStats,
     pub auto_scroll: bool,
     pub chat_name: Option<&'a str>,
+    /// The sandbox instance the runtime is attached to. `None` unless this
+    /// runtime's own authenticated connection is up, so the chip cannot claim a
+    /// sandbox that is merely running.
+    pub sandbox: Option<&'a str>,
     pub main_chat: bool,
     pub retry_info: Option<&'a RetryInfo>,
     /// The effective level alone (`off`, `xhigh`, `8192`), drawn directly as a
@@ -795,18 +805,33 @@ impl StatusBar {
             ));
         }
 
+        let mut sandbox_hit = None;
+        if let Some(name) = ctx.sandbox {
+            let offset = left_spans.iter().map(Span::width).sum::<usize>() + " ".width();
+            let budget = (area.width as usize)
+                .saturating_sub(offset)
+                .saturating_sub(critical_right(ctx))
+                .min(SANDBOX_MAX_WIDTH);
+            if let Some(label) = sandbox_label(name, budget) {
+                let width = label.width();
+                left_spans.push(Span::raw(" "));
+                left_spans.push(Span::styled(
+                    label,
+                    hover_style(
+                        control_style(ctx, StatusBarHitTarget::Sandbox),
+                        ctx.hovered == Some(StatusBarHitTarget::Sandbox),
+                    ),
+                ));
+                sandbox_hit = Some((offset, width));
+            }
+        }
+
         let mut chat_hit = None;
         if let Some(name) = ctx.chat_name {
             let wrapper_width = usize::from(ctx.main_chat) * BRACKET_WIDTH;
-            let critical_right = model_floor(ctx)
-                + if ctx.yolo {
-                    YOLO_SHORT_LABEL.width()
-                } else {
-                    0
-                };
             let available = (area.width as usize)
                 .saturating_sub(left_spans.iter().map(Span::width).sum::<usize>())
-                .saturating_sub(critical_right)
+                .saturating_sub(critical_right(ctx))
                 .saturating_sub(1);
             let slot_total = (area.width as usize / CHAT_NAME_WIDTH_DIVISOR)
                 .min(CHAT_NAME_MAX_WIDTH)
@@ -910,6 +935,8 @@ impl StatusBar {
             );
             mode_width = ctx.mode.short().width();
             back_offset = back_offset.map(|offset| offset.saturating_sub(short_saving));
+            sandbox_hit =
+                sandbox_hit.map(|(offset, width)| (offset.saturating_sub(short_saving), width));
             chat_hit = chat_hit.map(|(offset, width)| (offset.saturating_sub(short_saving), width));
             resume_hit =
                 resume_hit.map(|(offset, width)| (offset.saturating_sub(short_saving), width));
@@ -991,6 +1018,16 @@ impl StatusBar {
                 offset,
                 width,
                 StatusBarHitTarget::Retry,
+            );
+        }
+        if let Some((offset, width)) = sandbox_hit {
+            push_hit(
+                &mut hits,
+                ctx,
+                left_area,
+                offset,
+                width,
+                StatusBarHitTarget::Sandbox,
             );
         }
         if let Some((offset, width)) = chat_hit {
@@ -1268,6 +1305,28 @@ fn control_style(ctx: &StatusBarContext<'_>, target: StatusBarHitTarget) -> Styl
     } else {
         theme::current().status_dim
     }
+}
+
+/// The columns the right-hand side keeps whatever the left side asks for: the
+/// model control's own floor, plus the yolo sigil a bypassed session has to
+/// carry at every width.
+fn critical_right(ctx: &StatusBarContext<'_>) -> usize {
+    model_floor(ctx)
+        + if ctx.yolo {
+            YOLO_SHORT_LABEL.width()
+        } else {
+            0
+        }
+}
+
+/// `[sandbox: name]`, then `[name]`, then `[na..]`, then nothing. The head is
+/// kept because an instance name separates on its prefix.
+fn sandbox_label(name: &str, budget: usize) -> Option<String> {
+    let full = format!("{SANDBOX_PREFIX}{name}{SANDBOX_SUFFIX}");
+    if full.width() <= budget {
+        return Some(full);
+    }
+    (budget >= SANDBOX_FLOOR).then(|| format!("[{}]", truncate_head(name, budget - BRACKET_WIDTH)))
 }
 
 fn model_floor(ctx: &StatusBarContext<'_>) -> usize {
@@ -1617,6 +1676,13 @@ mod tests {
     const UNCLICKABLE_LABEL_MSG: &str = "the bar drew the resume label without a hit to click it";
     const MISSING_YOLO_HIT_MSG: &str = "a bypassed session must be switchable back from the footer";
     const UNCLICKABLE_YOLO_MSG: &str = "the bar drew the yolo chip without a hit to click it";
+    const SANDBOX_INSTANCE: &str = "sandbox-7a2f";
+    const SANDBOX_CHIP: &str = "[sandbox: sandbox-7a2f]";
+    const MISSING_SANDBOX_HIT_MSG: &str =
+        "an attached session must reach its sandbox from the footer";
+    const SANDBOX_CLIPPED_MSG: &str =
+        "the bar drew part of the sandbox chip with no hit to click it";
+    const SANDBOX_CROWDED_MSG: &str = "the sandbox chip pushed a footer control off the bar";
 
     /// The glyphs a hit claims, read back out of the bar it was measured on.
     fn bar_glyphs(text: &str, hit: &StatusBarHit) -> String {
@@ -1688,6 +1754,7 @@ mod tests {
         model_id: &'a str,
         pending_model: Option<&'a str>,
         chat_name: Option<&'a str>,
+        sandbox: Option<&'a str>,
         auto_scroll: bool,
     }
 
@@ -1707,6 +1774,7 @@ mod tests {
                 model_id: MODEL_ID,
                 pending_model: None,
                 chat_name: None,
+                sandbox: None,
                 auto_scroll: true,
             }
         }
@@ -1727,6 +1795,7 @@ mod tests {
             model_id,
             pending_model,
             chat_name,
+            sandbox,
             auto_scroll,
         } = fixture;
         let mut bar = StatusBar::new(FLASH_TTL, ".", false);
@@ -1753,6 +1822,7 @@ mod tests {
             },
             auto_scroll,
             chat_name,
+            sandbox,
             main_chat,
             retry_info,
             thinking: Some(THINKING_LEVEL.into()),
@@ -1817,6 +1887,7 @@ mod tests {
             },
             auto_scroll: true,
             chat_name: None,
+            sandbox: None,
             main_chat: true,
             retry_info: None,
             thinking: Some(LADDER_THINKING.into()),
@@ -2742,6 +2813,151 @@ mod tests {
                 ),
             }
         });
+    }
+
+    /// The chip is the whole control: the space ahead of it separates it from
+    /// whatever the bar drew last and must not answer the pointer.
+    #[test]
+    fn an_attached_session_names_its_sandbox() {
+        let (text, hits, _) = render_at(Fixture {
+            sandbox: Some(SANDBOX_INSTANCE),
+            ..Default::default()
+        });
+        let hit = hits
+            .iter()
+            .find(|hit| hit.target == StatusBarHitTarget::Sandbox)
+            .expect(MISSING_SANDBOX_HIT_MSG);
+
+        assert_eq!(bar_glyphs(&text, hit), SANDBOX_CHIP);
+        assert_eq!(text.chars().nth(usize::from(hit.area.x) - 1), Some(' '));
+        assert!(hit.target.accepts_click());
+    }
+
+    /// A local runtime, a remote one with no sandbox and one whose connection
+    /// has not finished authenticating all arrive here as `None`, so a bar that
+    /// was told nothing can never say the session is on a sandbox.
+    #[test]
+    fn a_detached_session_has_no_sandbox_control() {
+        let (text, hits, _) = render_at(Fixture::default());
+
+        assert!(!text.contains(SANDBOX_PREFIX.trim()));
+        assert!(
+            hits.iter()
+                .all(|hit| hit.target != StatusBarHitTarget::Sandbox)
+        );
+    }
+
+    #[test]
+    fn hovering_the_sandbox_control_highlights_its_chip_alone() {
+        let (_, hits, styles) = render_at(Fixture {
+            sandbox: Some(SANDBOX_INSTANCE),
+            hovered: Some(StatusBarHitTarget::Sandbox),
+            ..Default::default()
+        });
+        let hit = hits
+            .iter()
+            .find(|hit| hit.target == StatusBarHitTarget::Sandbox)
+            .expect(MISSING_SANDBOX_HIT_MSG);
+        let start = usize::from(hit.area.x);
+        let end = usize::from(hit.area.right());
+
+        assert!(!styles[start - 1].add_modifier.contains(Modifier::REVERSED));
+        assert!(
+            styles[start..end]
+                .iter()
+                .all(|style| style.add_modifier.contains(Modifier::REVERSED))
+        );
+    }
+
+    #[test]
+    fn the_sandbox_chip_is_plain_without_the_pointer() {
+        let (_, hits, styles) = render_at(Fixture {
+            sandbox: Some(SANDBOX_INSTANCE),
+            ..Default::default()
+        });
+        let hit = hits
+            .iter()
+            .find(|hit| hit.target == StatusBarHitTarget::Sandbox)
+            .expect(MISSING_SANDBOX_HIT_MSG);
+
+        assert!(
+            styles[usize::from(hit.area.x)..usize::from(hit.area.right())]
+                .iter()
+                .all(|style| !style.add_modifier.contains(Modifier::REVERSED))
+        );
+    }
+
+    /// The runtime is the session's, not one transcript's, so a task footer
+    /// names the same sandbox and opens the same manager.
+    #[test]
+    fn a_subagent_footer_names_the_sandbox() {
+        let (_, hits, _) = render_at(Fixture {
+            sandbox: Some(SANDBOX_INSTANCE),
+            main_chat: false,
+            ..Default::default()
+        });
+
+        assert_eq!(StatusBarHitTarget::Sandbox.scope(), ChatScope::Any);
+        assert!(
+            hits.iter()
+                .any(|hit| hit.target == StatusBarHitTarget::Sandbox)
+        );
+    }
+
+    /// The chip gives up its word before its name and its name before the bar,
+    /// and whatever survives keeps a hit that covers exactly what was drawn. A
+    /// bar too narrow drops it rather than crowding the mode and model controls
+    /// the rest of the footer is built around.
+    #[test_case(12        ; "no_room_beside_the_model")]
+    #[test_case(24        ; "truncated_name")]
+    #[test_case(32        ; "bare_name")]
+    #[test_case(48        ; "named_in_full")]
+    #[test_case(BAR_WIDTH ; "wide")]
+    fn a_narrow_bar_squeezes_the_sandbox_chip_before_dropping_it(width: u16) {
+        let (text, hits, _) = render_at(Fixture {
+            width,
+            sandbox: Some(SANDBOX_INSTANCE),
+            ..Default::default()
+        });
+
+        match hits
+            .iter()
+            .find(|hit| hit.target == StatusBarHitTarget::Sandbox)
+        {
+            Some(hit) => {
+                let glyphs = bar_glyphs(&text, hit);
+                assert!(glyphs.starts_with('['), "{STALE_HIT_MSG}: {glyphs:?}");
+                assert!(
+                    glyphs.ends_with(SANDBOX_SUFFIX),
+                    "{STALE_HIT_MSG}: {glyphs:?}"
+                );
+                assert!(glyphs.width() <= SANDBOX_MAX_WIDTH, "{glyphs:?}");
+            }
+            None => {
+                assert!(
+                    !text.contains(SANDBOX_PREFIX.trim()),
+                    "{SANDBOX_CLIPPED_MSG}"
+                );
+                assert!(!text.contains(SANDBOX_INSTANCE), "{SANDBOX_CLIPPED_MSG}");
+            }
+        }
+        for target in [StatusBarHitTarget::Mode, StatusBarHitTarget::Model] {
+            assert!(
+                hits.iter().any(|hit| hit.target == target),
+                "{SANDBOX_CROWDED_MSG}: {target:?}"
+            );
+        }
+    }
+
+    #[test_case(48, Some(SANDBOX_CHIP)       ; "named_in_full")]
+    #[test_case(23, Some(SANDBOX_CHIP)       ; "exactly_fits")]
+    #[test_case(14, Some("[sandbox-7a2f]")   ; "word_dropped_for_the_name")]
+    #[test_case(13, Some("[sandbox-7..]")    ; "name_truncated_from_the_head")]
+    #[test_case(5,  Some("[s..]")            ; "floor")]
+    #[test_case(4,  None                     ; "below_the_floor")]
+    #[test_case(0,  None                     ; "no_columns")]
+    fn sandbox_label_cases(budget: usize, expected: Option<&str>) {
+        assert_eq!(sandbox_label(SANDBOX_INSTANCE, budget).as_deref(), expected);
     }
 
     #[test]

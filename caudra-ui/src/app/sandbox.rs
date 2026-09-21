@@ -1,4 +1,5 @@
 use super::App;
+use crate::AppSession;
 use crate::components::sandbox_manager::{SandboxAction, SandboxView};
 use crate::components::{DisplayMessage, DisplayRole, Overlay};
 use crate::repaint::Dirty;
@@ -9,7 +10,7 @@ use crate::sandbox::{
     NetworkReconcileReport, NetworkReconcileRequest, StoreEffect, StoreResult,
     start_network_reconcile,
 };
-use crate::sandbox::{SandboxSnapshot, SandboxSnapshotRequest, start_store_effect};
+use crate::sandbox::{SandboxSnapshot, SandboxSnapshotRequest, SandboxWorkers, start_store_effect};
 use caudra_agent::AgentEvent;
 use flume::TryRecvError;
 use std::sync::Arc;
@@ -18,6 +19,23 @@ use std::time::{Duration, Instant};
 const REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 const UNSAVED_DRAFT_ERR: &str =
     "Save or discard unsaved local editor/composer drafts before changing sandbox authority";
+
+/// The instance the footer names, or `None` when there is nothing to name.
+/// Readiness is the manager's own: the binding's sandbox record says which
+/// instance, and this runtime's authenticated connection says the session is
+/// attached to it rather than the instance merely running. Takes its two halves
+/// apart so a caller already holding the bar can still ask.
+pub(crate) fn attached_sandbox_instance<'a>(
+    session: &'a AppSession,
+    live: &SandboxWorkers,
+) -> Option<&'a str> {
+    let binding = session.workspace_binding()?;
+    binding.sandbox_record()?;
+    live.readiness
+        .as_ref()
+        .is_some_and(|ready| ready())
+        .then(|| binding.server_id())
+}
 
 impl App {
     pub(super) fn open_sandbox(&mut self, args: &str) {

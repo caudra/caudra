@@ -198,6 +198,16 @@ pub struct RemotePreparedToolCall {
     pub cursor: WorkspaceCursor,
 }
 
+impl RemotePreparedToolCall {
+    pub fn expires_within(&self, margin: Duration) -> bool {
+        let margin = u64::try_from(margin.as_millis()).unwrap_or(u64::MAX);
+        self.prepared
+            .operation
+            .expires_at_unix_ms
+            .is_some_and(|expires| expires <= unix_millis().saturating_add(margin))
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum RemoteToolExecutionError {
     #[error("{0}")]
@@ -1420,7 +1430,7 @@ impl OperationRegistry {
         let stored = self
             .entries
             .get(&operation.preparation_id)
-            .ok_or(WorkspaceError::Conflict)?;
+            .ok_or_else(|| stale_preparation(&operation.preparation_id))?;
         if operation.invocation_id.as_ref() != Some(&stored.invocation_id)
             || operation.expires_at_unix_ms != Some(stored.expires_at_unix_ms)
         {
@@ -1432,7 +1442,7 @@ impl OperationRegistry {
     fn mark_persisted(&mut self, preparation_id: &OperationId) -> Result<(), WorkspaceError> {
         self.entries
             .get_mut(preparation_id)
-            .ok_or(WorkspaceError::Conflict)?
+            .ok_or_else(|| stale_preparation(preparation_id))?
             .persisted = true;
         Ok(())
     }
@@ -1726,27 +1736,17 @@ impl RemoteWorkcellClient {
 
     pub(crate) async fn admit_canonical_tool(
         &self,
-        prepared: &PreparedToolCall,
-    ) -> Result<Option<OwnedMutexGuard<()>>, WorkspaceError> {
-        let journaled = self
-            .0
-            .operations
-            .lock()
-            .map_err(|_| WorkspaceError::Unavailable)?
-            .get(&prepared.operation)?
-            .journal
-            .is_some();
-        if journaled {
-            Ok(Some(
-                self.0
-                    .canonical_mutation_admission
-                    .clone()
-                    .lock_owned()
-                    .await,
-            ))
-        } else {
-            Ok(None)
-        }
+        name: &str,
+        intent: &contract::OperationIntent,
+    ) -> Option<OwnedMutexGuard<()>> {
+        canonical_journal_policy(name, intent)?;
+        Some(
+            self.0
+                .canonical_mutation_admission
+                .clone()
+                .lock_owned()
+                .await,
+        )
     }
 
     pub async fn execute_canonical_tool(
@@ -2293,7 +2293,7 @@ impl RemoteWorkcellClient {
         let stored = operations
             .entries
             .get(&operation.preparation_id)
-            .ok_or(WorkspaceError::Conflict)?;
+            .ok_or_else(|| stale_preparation(&operation.preparation_id))?;
         if stored
             .context
             .as_ref()
@@ -5869,6 +5869,12 @@ fn invalid_response() -> WorkspaceError {
     }
 }
 
+fn stale_preparation(preparation_id: &OperationId) -> WorkspaceError {
+    ResourceId::new(preparation_id.as_str()).map_or(WorkspaceError::Conflict, |resource_id| {
+        WorkspaceError::StaleResource { resource_id }
+    })
+}
+
 fn invalid_path() -> WorkspaceError {
     WorkspaceError::InvalidResponse {
         violation: caudra_workspace::InvalidResponseKind::InvalidPath,
@@ -7081,6 +7087,7 @@ mod tests {
     use std::net::TcpListener;
     use std::pin::pin;
     use std::str::FromStr;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc;
     use std::sync::{Arc, Mutex};
     use std::thread;
@@ -7093,23 +7100,24 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     use super::{
-        BoundedMap, CursorRecord, CursorRegistry, DIRECT_EXEC_KIND, JournalOperation, JsonRpcError,
-        MAX_SSE_EVENT_BYTES, OperationRegistry, PreparedWorkspaceContext, RecoveryOperation,
-        RemoteEvent, RemoteInner, RemoteMutationJournal, RemotePreparedToolCall,
-        RemoteToolExecutionError, RemoteTransport, RemoteWorkcellClient, RemoteWorkcellError,
-        ResourceCache, SHELL_CONTRACT_ID, SHELL_EXECUTION_TIMEOUT, StoredOperation, ToolListWire,
-        WORKSPACE_MUTATION_KIND, canonical_journal_policy, cleanup_preview_partitions,
-        convert_status, execution_timeout, freeze_catalog, join_workspace_path, map_rpc_error,
-        numeric_loopback, pagination_flags, parse_content_range, parse_snapshot_result,
-        project_asset_kind, project_asset_trust, recovery_status, require_full_remote_parity,
-        require_nonzero_within, same_descriptor_except_instance, same_unique_ids,
-        serialized_items_bytes, source_trust_anchor, validate_capabilities, validate_selector_id,
+        BoundedMap, CursorRecord, CursorRegistry, DIRECT_EXEC_KIND, JSON_SCHEMA_VERSION,
+        JournalOperation, JsonRpcError, MAX_SSE_EVENT_BYTES, OperationRegistry,
+        PreparedWorkspaceContext, RecoveryOperation, RemoteEvent, RemoteInner,
+        RemoteMutationJournal, RemotePreparedToolCall, RemoteToolExecutionError, RemoteTransport,
+        RemoteWorkcellClient, RemoteWorkcellError, ResourceCache, SHELL_CONTRACT_ID,
+        SHELL_EXECUTION_TIMEOUT, StoredOperation, ToolListWire, WORKSPACE_MUTATION_KIND,
+        canonical_journal_policy, cleanup_preview_partitions, convert_status, execution_timeout,
+        freeze_catalog, join_workspace_path, map_rpc_error, numeric_loopback, pagination_flags,
+        parse_content_range, parse_snapshot_result, project_asset_kind, project_asset_trust,
+        recovery_status, require_full_remote_parity, require_nonzero_within,
+        same_descriptor_except_instance, same_unique_ids, serialized_items_bytes,
+        source_trust_anchor, unix_millis, validate_capabilities, validate_selector_id,
         watch_path_within, workspace_capabilities,
     };
     use crate::transfer::PrivateStaging;
     use crate::{
-        Input, REMOTE_ADMISSION_EXPIRED, RemoteExecutionCleanup, RemotePreparedState,
-        RemoteWorkcellInvocation, ToolKind,
+        Input, REMOTE_ADMISSION_EXPIRED, REMOTE_PREPARATION_RENEWAL, RemoteExecutionCleanup,
+        RemotePreparedState, RemoteWorkcellInvocation, ToolKind,
     };
     use caudra_agent::cancel::CancelToken;
     use caudra_agent::tools::{Deadline, ToolRegistry};
@@ -7127,9 +7135,10 @@ mod tests {
         ProjectAssetKind, ProjectAssetTrust, ResourceId, ResourceRevision, ResourceScope,
         ResourceSelector, RestoreId, SessionBindingId, SnapshotCleanupPreview, SnapshotId,
         SnapshotOperationPreview, SnapshotRestorePreview, SnapshotUnrevertPreview,
-        WorkspaceCapability, WorkspaceCursor, WorkspaceError, WorkspacePath, WorkspaceSession,
+        ToolPrepareRequest, WorkspaceCapability, WorkspaceCursor, WorkspaceError, WorkspacePath,
+        WorkspaceSession,
     };
-    use workcell::host_contract as contract;
+    use workcell::{ToolManifest, host_contract as contract};
 
     const PLAINTEXT_BEARER_BOUNDARY: &str =
         "a bearer may ride plaintext only to a numeric loopback literal";
@@ -8273,41 +8282,22 @@ mod tests {
             cursor: cursor.clone(),
         };
         smol::block_on(async {
-            let first = client.admit_canonical_tool(&call.prepared).await.unwrap();
-            for tool in ["file_read", "python_execution"] {
-                let mut bypass = call.prepared.clone();
-                bypass.operation.preparation_id = OperationId::new(tool).unwrap();
-                let mut stored = client
-                    .0
-                    .operations
-                    .lock()
-                    .unwrap()
-                    .get(&call.prepared.operation)
-                    .unwrap()
-                    .clone();
-                stored.journal = None;
-                client
-                    .0
-                    .operations
-                    .lock()
-                    .unwrap()
-                    .insert(bypass.operation.preparation_id.clone(), stored)
-                    .unwrap();
-                let mut admission = pin!(client.admit_canonical_tool(&bypass));
-                assert!(
-                    future::poll_once(&mut admission)
-                        .await
-                        .unwrap()
-                        .unwrap()
-                        .is_none()
-                );
+            let first = client
+                .admit_canonical_tool(tool, &call.intent)
+                .await
+                .unwrap();
+            for (bypass, kind) in [("file_read", "read"), ("python_execution", "execute")] {
+                let intent =
+                    serde_json::from_value(json!({"kind":kind, "mutating":false, "resources":[]}))
+                        .unwrap();
+                let mut admission = pin!(client.admit_canonical_tool(bypass, &intent));
+                assert!(future::poll_once(&mut admission).await.unwrap().is_none());
             }
             let cloned = client.clone();
-            let mut queued = pin!(cloned.admit_canonical_tool(&call.prepared));
+            let mut queued = pin!(cloned.admit_canonical_tool(tool, &call.intent));
             assert!(future::poll_once(&mut queued).await.is_none());
             drop(first);
-            let admitted = queued.await.unwrap();
-            assert!(admitted.is_some());
+            assert!(queued.await.is_some());
         });
         let failure = smol::block_on(client.execute_canonical_tool_tracked(
             &binding,
@@ -8338,7 +8328,10 @@ mod tests {
         };
         smol::block_on(async {
             const CANCELLED: &str = "cancelled";
-            let first = client.admit_canonical_tool(&call.prepared).await.unwrap();
+            let first = client
+                .admit_canonical_tool(tool, &call.intent)
+                .await
+                .unwrap();
             let mut queued = pin!(invocation.execute_remote(&ctx, call.clone(), &mut cleanup));
             assert!(future::poll_once(&mut queued).await.is_none());
             trigger.cancel();
@@ -8371,6 +8364,396 @@ mod tests {
         );
         listener.set_nonblocking(true).unwrap();
         assert!(listener.accept().is_err());
+    }
+
+    struct ScriptedHost {
+        endpoint: WorkcellEndpoint,
+        calls: Arc<Mutex<Vec<(String, Value)>>>,
+        stop: Arc<AtomicBool>,
+        server: Option<thread::JoinHandle<()>>,
+    }
+
+    impl Drop for ScriptedHost {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Release);
+            if let Some(server) = self.server.take() {
+                server.join().unwrap();
+            }
+        }
+    }
+
+    impl ScriptedHost {
+        fn new(respond: impl Fn(&str, &Value) -> Value + Send + 'static) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let endpoint =
+                WorkcellEndpoint::parse(&format!("http://{}/mcp", listener.local_addr().unwrap()))
+                    .unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            let stop = Arc::new(AtomicBool::new(false));
+            let recorded = calls.clone();
+            let halt = stop.clone();
+            let server = thread::spawn(move || {
+                while !halt.load(Ordering::Acquire) {
+                    let Ok((mut stream, _)) = listener.accept() else {
+                        thread::yield_now();
+                        continue;
+                    };
+                    stream.set_nonblocking(false).unwrap();
+                    let mut reader = BufReader::new(stream.try_clone().unwrap());
+                    let mut length = 0;
+                    loop {
+                        let mut line = String::new();
+                        reader.read_line(&mut line).unwrap();
+                        if line == "\r\n" {
+                            break;
+                        }
+                        if let Some(value) =
+                            line.to_ascii_lowercase().strip_prefix("content-length: ")
+                        {
+                            length = value.trim().parse().unwrap();
+                        }
+                    }
+                    let mut body = vec![0; length];
+                    reader.read_exact(&mut body).unwrap();
+                    let request: Value = serde_json::from_slice(&body).unwrap();
+                    let method = request["method"].as_str().unwrap().to_owned();
+                    let params = request["params"].clone();
+                    let result = respond(&method, &params);
+                    recorded.lock().unwrap().push((method, params));
+                    let body =
+                        json!({"jsonrpc":"2.0","id":request["id"],"result":result}).to_string();
+                    write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .unwrap();
+                }
+            });
+            Self {
+                endpoint,
+                calls,
+                stop,
+                server: Some(server),
+            }
+        }
+
+        fn methods(&self) -> Vec<String> {
+            self.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(method, _)| method.clone())
+                .collect()
+        }
+
+        fn params_for(&self, method: &str) -> Vec<Value> {
+            self.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(recorded, _)| recorded == method)
+                .map(|(_, params)| params.clone())
+                .collect()
+        }
+    }
+
+    fn scripted_descriptor() -> contract::RemoteHostDescriptor {
+        const BYTES: u64 = 64 * 1024;
+        const COUNT: u32 = 64;
+        let mut descriptor = descriptor("instance", "generation");
+        descriptor
+            .capabilities
+            .tool_execution
+            .limits
+            .max_request_bytes = BYTES;
+        descriptor
+            .capabilities
+            .tool_catalog
+            .limits
+            .max_request_bytes = BYTES;
+        let operations = descriptor.capabilities.operations.as_mut().unwrap();
+        operations.limits.max_argument_bytes = BYTES;
+        operations.limits.max_preparations = COUNT;
+        operations.limits.max_operations = COUNT;
+        operations.limits.max_ledger_bytes = BYTES;
+        operations.limits.max_resource_intents = COUNT;
+        operations.limits.max_progress_events = COUNT;
+        operations.limits.max_progress_bytes = BYTES;
+        descriptor
+    }
+
+    fn shell_manifest() -> ToolManifest {
+        freeze_catalog(
+            serde_json::from_value(json!({
+                "resultType":"complete",
+                "ttlMs":0,
+                "cacheScope":"private",
+                "tools":[{
+                    "name":"shell",
+                    "title":"Shell",
+                    "description":"Run a command",
+                    "inputSchema":{"$schema":JSON_SCHEMA_VERSION,"type":"object"},
+                    "outputSchema":{"$schema":JSON_SCHEMA_VERSION,"type":"object"},
+                    "annotations":{
+                        "readOnlyHint":false,
+                        "destructiveHint":true,
+                        "idempotentHint":false,
+                        "openWorldHint":true
+                    },
+                    "_meta":{
+                        "ai.workcell/presentation-profile":"shell.result.v1",
+                        "ai.workcell/contract":{
+                            "id":SHELL_CONTRACT_ID,
+                            "version":"v1",
+                            "resultVersion":"v1"
+                        }
+                    }
+                }]
+            }))
+            .unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn shell_intent() -> Value {
+        json!({
+            "kind":"execute",
+            "mutating":true,
+            "resources":[{
+                "resourceId":"resource-command",
+                "scope":["resource-command"],
+                "display":"true",
+                "access":"execute",
+                "revision":null
+            }]
+        })
+    }
+
+    /// A queued command waits behind whatever holds admission, and the server
+    /// expires preparations on its own timer. The wait is legitimate, so the
+    /// call has to be renewed and run, never reported as a conflict.
+    #[test]
+    fn a_command_queued_past_its_preparation_renews_instead_of_conflicting() {
+        const LAPSING_MS: u64 = 200;
+        const LAPSE_POLL: Duration = Duration::from_millis(5);
+        const HEALTHY_MS: u64 = 600_000;
+        const RENEWED_PREPARATION: &str = "prepared-2";
+        const COMMAND_OUTPUT: &str = "renewed";
+        let temp = tempfile::tempdir().unwrap();
+        let state_dir = StateDir::from_path(temp.path().join("state"));
+        let seed = StoredWorkspaceBinding::local_from_cwd("opaque-workspace");
+        let cursor = WorkspaceCursor::new(
+            seed.binding(),
+            ResourceScope::root(ResourceId::new("root").unwrap()),
+            0,
+            CwdHandle::new("cwd").unwrap(),
+        );
+        let stored_binding = seed.with_cursor(cursor.clone()).unwrap();
+        let binding = stored_binding.binding().clone();
+        let coordinator = RemoteMutationJournal::new(
+            RemoteOperationJournal::open(&state_dir).unwrap(),
+            stored_binding.clone(),
+        )
+        .unwrap();
+        let manifest = shell_manifest();
+        let issued: Arc<Mutex<Vec<(String, u64)>>> = Arc::new(Mutex::new(Vec::new()));
+        let prepared = issued.clone();
+        let host = ScriptedHost::new(move |method, params| {
+            let host = host_binding();
+            match method {
+                contract::PREPARE_METHOD => {
+                    let mut prepared = prepared.lock().unwrap();
+                    let count = prepared.len() + 1;
+                    let expires = unix_millis() + if count < 2 { LAPSING_MS } else { HEALTHY_MS };
+                    let preparation_id = format!("prepared-{count}");
+                    prepared.push((preparation_id.clone(), expires));
+                    json!({
+                        "version":"v1",
+                        "preparationId":preparation_id,
+                        "expiresAtUnixMs":expires,
+                        "binding":{
+                            "host":host,
+                            "contract":{
+                                "id":SHELL_CONTRACT_ID,
+                                "version":"v1",
+                                "resultVersion":"v1"
+                            },
+                            "argumentDigest":TEST_REQUEST_DIGEST
+                        },
+                        "intent":shell_intent()
+                    })
+                }
+                contract::EXECUTE_METHOD => json!({
+                    "version":"v1",
+                    "state":"completed",
+                    "preparationId":params["preparationId"],
+                    "invocationId":params["invocationId"],
+                    "executionId":params["invocationId"],
+                    "expiresAtUnixMs":issued
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .find(|(id, _)| Some(id.as_str()) == params["preparationId"].as_str())
+                        .map(|(_, expires)| *expires)
+                        .unwrap(),
+                    "binding":{
+                        "host":host,
+                        "contract":{
+                            "id":SHELL_CONTRACT_ID,
+                            "version":"v1",
+                            "resultVersion":"v1"
+                        },
+                        "argumentDigest":TEST_REQUEST_DIGEST
+                    },
+                    "outcome":{
+                        "kind":"completed",
+                        "sideEffectsPossible":false,
+                        "result":{
+                            "version":"v1",
+                            "content":[{"type":"text","text":COMMAND_OUTPUT}],
+                            "structuredContent":{
+                                "version":1,
+                                "kind":"shell",
+                                "relativeWorkdir":"",
+                                "timeoutMs":1_000,
+                                "durationMs":1,
+                                "exitCode":0,
+                                "signal":null,
+                                "timedOut":false,
+                                "outputLimitExceeded":false,
+                                "finalSequence":0,
+                                "stdoutUtf8Bytes":COMMAND_OUTPUT.len(),
+                                "stderrUtf8Bytes":0,
+                                "stdout":COMMAND_OUTPUT,
+                                "stderr":"",
+                                "stdoutCaptureTruncated":false,
+                                "stderrCaptureTruncated":false,
+                                "stdoutPreviewTruncated":false,
+                                "stderrPreviewTruncated":false,
+                                "stdoutRedrawsCollapsed":0,
+                                "stderrRedrawsCollapsed":0
+                            },
+                            "isError":false
+                        },
+                        "error":null
+                    },
+                    "progressMetadata":{
+                        "firstRetainedSequence":null,
+                        "nextSequence":1,
+                        "gapBeforeFirst":false
+                    },
+                    "progress":[]
+                }),
+                contract::RELEASE_METHOD => {
+                    json!({"version":"v1","state":"forgotten","released":true})
+                }
+                other => panic!("unexpected method {other}"),
+            }
+        });
+        let (transport, events) = RemoteTransport::new(&host.endpoint, None).unwrap();
+        let descriptor = scripted_descriptor();
+        let client = RemoteWorkcellClient(Arc::new(RemoteInner {
+            staging: PrivateStaging::new(super::transfer::negotiated_limits(
+                descriptor.capabilities.reviewed_transfer.as_ref(),
+            )),
+            transport,
+            capabilities: workspace_capabilities(&descriptor.capabilities),
+            descriptor,
+            host_binding: Mutex::new(host_binding()),
+            authority: binding.authority().clone(),
+            project: binding.project().clone(),
+            session_binding: binding.clone(),
+            stored_binding,
+            root_cursor: cursor.clone(),
+            catalog: manifest
+                .tools
+                .iter()
+                .cloned()
+                .map(|tool| (tool.name.clone(), tool))
+                .collect(),
+            manifest,
+            events,
+            cancellation: CancellationToken::new(),
+            paths: Mutex::new(ResourceCache::new(8, Duration::MAX)),
+            repositories: Mutex::new(BoundedMap::new(8, Duration::MAX)),
+            cursors: Mutex::new(CursorRegistry {
+                records: HashMap::from([(
+                    cursor.cwd_handle().clone(),
+                    CursorRecord {
+                        cursor: cursor.clone(),
+                        path: WorkspacePath::root(),
+                    },
+                )]),
+                limit: 8,
+            }),
+            watches: Mutex::new(BoundedMap::new(8, Duration::MAX)),
+            operations: Mutex::new(OperationRegistry::new(8)),
+            canonical_mutation_admission: Arc::new(AsyncMutex::new(())),
+            mutation_journal: coordinator,
+        }));
+        let raw_input = json!({"command":"true"});
+        let request = ToolPrepareRequest {
+            name: "shell".into(),
+            input: raw_input.clone(),
+        };
+        let call =
+            smol::block_on(client.prepare_canonical_tool(&binding, &cursor, &request)).unwrap();
+        assert!(call.expires_within(REMOTE_PREPARATION_RENEWAL));
+        let mut ctx = crate::tests::context(
+            temp.path(),
+            Arc::new(ToolRegistry::new()),
+            CancelToken::none(),
+        );
+        ctx.workspace_session = Some(
+            WorkspaceSession::new(
+                client.workspace_handle().unwrap(),
+                binding.clone(),
+                cursor.clone(),
+            )
+            .unwrap(),
+        );
+        let invocation = RemoteWorkcellInvocation {
+            client: client.clone(),
+            kind: ToolKind::Shell,
+            input: Input::parse(ToolKind::Shell, raw_input.clone()).unwrap(),
+            raw_input,
+            prepared: AsyncMutex::new(RemotePreparedState::default()),
+        };
+        let mut cleanup = RemoteExecutionCleanup {
+            client: client.clone(),
+            call: Some(call.clone()),
+            execution_started: false,
+        };
+        let expiry = call.prepared.operation.expires_at_unix_ms.unwrap();
+        let result = smol::block_on(async {
+            let held = client.admit_canonical_tool("shell", &call.intent).await;
+            assert!(held.is_some());
+            let mut queued = pin!(invocation.execute_remote(&ctx, call, &mut cleanup));
+            assert!(future::poll_once(&mut queued).await.is_none());
+            while unix_millis() <= expiry {
+                smol::Timer::after(LAPSE_POLL).await;
+            }
+            drop(held);
+            queued.await
+        });
+
+        let output = result.output.expect("queued command reported an error");
+        assert!(!result.is_error);
+        assert!(output.as_text().contains(COMMAND_OUTPUT), "{output:?}");
+        let executed = host.params_for(contract::EXECUTE_METHOD);
+        assert_eq!(executed.len(), 1);
+        assert_eq!(executed[0]["preparationId"], RENEWED_PREPARATION);
+        assert_eq!(
+            host.methods()
+                .iter()
+                .filter(|method| method.as_str() == contract::PREPARE_METHOD)
+                .count(),
+            2
+        );
+        assert!(client.pending_remote_operations().is_empty());
+        assert_eq!(client.0.operations.lock().unwrap().len(), 0);
     }
 
     #[test_case(RemoteOperationState::Dispatched, OperationState::NeverSeen; "dispatched_never_seen")]

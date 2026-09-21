@@ -31,4 +31,5 @@ url = { workspace = true }
 workcell = { workspace = true }
 
 [dev-dependencies]
+image = { workspace = true }
 test-case = { workspace = true }

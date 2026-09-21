@@ -45,6 +45,7 @@ enum PathsError {
 static STRATEGY: OnceLock<Result<Paths, PathsError>> = OnceLock::new();
 
 struct Paths {
+    app_dir_name: String,
     config: PathBuf,
     data: PathBuf,
     state: PathBuf,
@@ -230,6 +231,7 @@ fn paths_for(strategy: &impl BaseStrategy, app_dir_name: &str, temp_root: &Path)
     let scratch = temp_root.join(app_dir_name);
     let (state, logs) = state_logs(strategy, &data, app_dir_name);
     Paths {
+        app_dir_name: app_dir_name.to_owned(),
         config,
         data,
         state,
@@ -358,6 +360,14 @@ pub fn cache_dir() -> Result<PathBuf, std::io::Error> {
 /// that points `TMPDIR` inside it must call this before setting the variable.
 pub fn scratch_root() -> Result<PathBuf, std::io::Error> {
     ensure_private_dir(&resolve().map_err(err)?.scratch)
+}
+
+/// The single directory name every platform root is namespaced by, including
+/// the `CAUDRA_NAMESPACE` override. A remote scratch directory joins it to a
+/// temp root this process cannot see, so the name has to be available apart
+/// from any local path built from it.
+pub fn active_app_dir_name() -> Result<&'static str, std::io::Error> {
+    Ok(&resolve().map_err(err)?.app_dir_name)
 }
 
 pub fn home() -> Option<PathBuf> {

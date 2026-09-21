@@ -26,6 +26,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Widget};
 
 use super::permission_editor::LOCAL_SOURCE_NOTICE;
+use super::sandbox::attached_sandbox_instance;
 use super::{App, Mode, Status};
 
 const MAIN_GUTTER_WIDE: u16 = 2;
@@ -605,6 +606,7 @@ impl App {
         let chat = &self.chats[render_chat];
         let goal = self.state.goal.snapshot();
         let chat_name = (self.chats.len() > 1).then_some(chat.name.as_str());
+        let sandbox = attached_sandbox_instance(&self.state.session, &self.sandbox_live);
         let mode = self.mode_label();
         let main_chat = render_chat == 0;
         let effective_model = main_chat.then(|| self.status_main_model()).flatten();
@@ -675,6 +677,7 @@ impl App {
             },
             auto_scroll: chat.auto_scroll(),
             chat_name,
+            sandbox,
             main_chat,
             retry_info: chat.retry(),
             thinking,

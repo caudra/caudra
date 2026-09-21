@@ -1284,6 +1284,7 @@ dependencies = [
  "caudra-workspace",
  "flume",
  "futures-lite",
+ "image",
  "isahc",
  "jiff",
  "serde",

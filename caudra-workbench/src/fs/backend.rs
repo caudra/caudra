@@ -1232,6 +1232,12 @@ impl WorkbenchFilesystem for WorkspaceFilesystem {
         })
     }
 
+    /// Reads what the resource says now. A listing is a snapshot of a workspace
+    /// another writer is still working in, so conditioning the read on the
+    /// revision it recorded refuses the open of every file that moved since,
+    /// and the tab that would carry the current revision never exists to
+    /// recover with. Identity stays pinned to the resource id, and the revision
+    /// the read reports is what a later save is conditional on.
     async fn read(&self, entry: &ResourceEntry) -> Result<LoadedFile, BackendError> {
         if entry.kind != ResourceKind::File {
             return Err(BackendError::NotFile);
@@ -1246,10 +1252,6 @@ impl WorkbenchFilesystem for WorkspaceFilesystem {
             .resource_id
             .clone()
             .ok_or(BackendError::InvalidResponse)?;
-        let expected = match &entry.revision {
-            Some(BackendRevision::Remote(revision)) => Some(revision.clone()),
-            _ => None,
-        };
         let content = self
             .read_service()?
             .read_bytes(
@@ -1259,7 +1261,7 @@ impl WorkbenchFilesystem for WorkspaceFilesystem {
                     resource: ResourceSelector::Id(resource_id.clone()),
                     byte_offset: 0,
                     max_bytes: MAX_EDITABLE_BYTES + 1,
-                    if_revision: expected,
+                    if_revision: None,
                 },
             )
             .await?;

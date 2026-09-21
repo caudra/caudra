@@ -1,6 +1,7 @@
 use super::diagnostics::prompt_reason_message;
 use super::diagnostics::{answer_scope_kind, bounded_log_value};
 use super::manager::PERMISSION_POLL_INTERVAL;
+use super::policy::TRUSTED_UNSCOPED_TOOLS;
 use super::{
     DECISION_SOURCE_RULE, DECISION_SOURCE_USER_ABORT, DECISION_SOURCE_YOLO, DEFAULT_DENY_GUIDANCE,
     NORMALIZED_COMMAND_ATTRIBUTE, PERMISSION_DENIED_PREFIX, PERMISSION_LOG_TARGET,
@@ -25,6 +26,21 @@ use tracing::{info, warn};
 
 pub(super) const CURRENT_POLICY_DENIES_REQUEST: &str =
     "current permission policy denies this request";
+
+/// An intent that names no resource is normally a tool that under-declared what
+/// it touches, and denying it is what keeps a broad tool-level rule from
+/// standing in for the path scoping the tool should have supplied.
+///
+/// The tools in [`TRUSTED_UNSCOPED_TOOLS`] are the exception, because for them
+/// the empty list is the true answer rather than a missing one: `python_execution`
+/// runs isolated with no filesystem, network or subprocess, and `batch`, `task`
+/// and `workflow` reach the manager again for every inner call. Denying those
+/// leaves the tool unusable and teaches the model nothing, so the request goes
+/// on to be evaluated as the unscoped call it is. Evaluation still runs, so a
+/// deny rule aimed at one of these tools keeps blocking it.
+fn is_unscoped_tool(tool: &ToolKey) -> bool {
+    matches!(tool, ToolKey::Native(name) if TRUSTED_UNSCOPED_TOOLS.contains(&name.as_ref()))
+}
 
 #[derive(Debug, Error)]
 pub struct PermissionError {
@@ -499,7 +515,7 @@ impl PermissionManager {
         } else {
             make_request(tool.clone(), scopes.scopes.clone(), force_prompt)
         };
-        if intent.is_some() && full_request.resources.is_empty() {
+        if intent.is_some() && full_request.resources.is_empty() && !is_unscoped_tool(tool) {
             warn!(tool = %tool, "explicit permission intent has no resources");
             return Err(deny(
                 DECISION_SOURCE_RULE,
@@ -1281,6 +1297,59 @@ mod tests {
         });
     }
 
+    /// `python_execution` runs isolated, so the resource list it declares is
+    /// empty because there is nothing to declare. Failing that closed leaves a
+    /// tool that cannot be called at all, which is what remote mode hit. The
+    /// request is evaluated instead, so an explicit deny still stops it and the
+    /// guard keeps failing closed for a tool that should have named something.
+    #[test_case(false => true ; "isolated_tool_runs_without_naming_a_resource")]
+    #[test_case(true => false ; "an_explicit_deny_still_stops_it")]
+    fn an_unscoped_tool_may_declare_no_resources(denied: bool) -> bool {
+        const ISOLATED_TOOL: &str = "python_execution";
+
+        smol::block_on(async {
+            let rules = if denied {
+                vec![caudra_config::PermissionRule {
+                    tool: ToolKey::native(ISOLATED_TOOL),
+                    scope: Some("*".into()),
+                    effect: caudra_config::Effect::Deny,
+                }]
+            } else {
+                Vec::new()
+            };
+            let manager = mgr_with(
+                PermissionsConfig {
+                    default: DefaultEffect::Allow,
+                    rules,
+                    ..Default::default()
+                },
+                PathBuf::from("/tmp"),
+            );
+            let intent = crate::tools::PermissionIntent::new(
+                crate::tools::PermissionScopes::default(),
+                Vec::new(),
+                PermissionRisk::Low,
+            );
+            let (event_tx, _event_rx) = flume::unbounded();
+            let event_tx = crate::EventSender::new(event_tx, 0);
+            manager
+                .enforce_with_intent(
+                    &ToolKey::native(ISOLATED_TOOL),
+                    &intent,
+                    &serde_json::json!({ "code": "1 + 1" }),
+                    &event_tx,
+                    None,
+                    "isolated-intent",
+                    &crate::CancelToken::none(),
+                    None,
+                    None,
+                    true,
+                )
+                .await
+                .is_ok()
+        })
+    }
+
     #[test]
     fn explicit_intent_does_not_authorize_resources_from_unrelated_scopes() {
         smol::block_on(async {
@@ -1609,6 +1678,7 @@ mod tests {
         const SCRATCH_NOTE: &str = "note.md";
         const SIBLING_NOTE: &str = "caudra-scratch-sibling.md";
 
+        let _scratch_mode = crate::scratch::ScratchGuard::local();
         let project = tempfile::tempdir().unwrap();
         let manager = mgr_with(PermissionsConfig::default(), project.path().to_path_buf());
         let path = if inside {

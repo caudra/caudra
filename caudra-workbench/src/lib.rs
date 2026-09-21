@@ -2596,7 +2596,7 @@ impl Workbench {
             // work, so it throws the buffer away rather than merging.
             if self.remote_backend.is_some() {
                 let path = self.editor.active()?.path.clone();
-                let Some(mut entry) = self
+                let Some(entry) = self
                     .remote_entries
                     .iter()
                     .find(|entry| entry.path == path)
@@ -2605,8 +2605,6 @@ impl Workbench {
                     self.flash = Some("remote file revision is still refreshing".into());
                     return Some(WorkbenchAction::Consumed);
                 };
-                // Discard requests the current contents, not the revision cached before a conflict.
-                entry.revision = None;
                 self.request_remote_open(entry, OpenPurpose::Discard);
                 return Some(WorkbenchAction::Consumed);
             }
@@ -8174,6 +8172,25 @@ mod tests {
                 tab.buffer.line(0) == REPLACEMENT && !tab.is_dirty() && !tab.conflict
             })
         });
+    }
+
+    #[test]
+    fn remote_open_reads_the_current_revision_with_a_stale_listing() {
+        const FILE: &str = "same-name.txt";
+        const REPLACEMENT: &str = "theirs";
+
+        let (session, control) = crate::fs::backend::tests::widget_fixture();
+        let mut workbench = Workbench::new(WorkbenchStyles::default());
+        workbench.toggle_workspace(session).unwrap();
+        settle_remote(&mut workbench, |workbench| !workbench.is_busy());
+        control.replace(FILE, REPLACEMENT);
+        let path = WorkbenchPath::Remote(caudra_workspace::WorkspacePath::new(FILE).unwrap());
+
+        workbench.open_workbench_path(&path, super::OpenPurpose::Open);
+
+        settle_remote(&mut workbench, |workbench| !workbench.is_busy());
+        let tab = workbench.editor.active().expect(NO_TAB);
+        assert_eq!(tab.buffer.line(0), REPLACEMENT, "{STALE_TAB}");
     }
 
     #[test]

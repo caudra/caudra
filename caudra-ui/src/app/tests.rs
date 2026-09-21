@@ -1,5 +1,6 @@
 use super::*;
 use crate::agent::shared_queue;
+use crate::app::sandbox::attached_sandbox_instance;
 use crate::app::tasks::{MAIN_TASK_ID, TaskStatus};
 use crate::chat::{CANCELLED_TEXT, DONE_TEXT, ERROR_TEXT};
 use crate::components::command::{BUILTIN_COMMANDS, CommandPalette, ParsedCommand};
@@ -5142,6 +5143,99 @@ fn a_subagent_footer_turns_yolo_off() {
     click_status(&mut app, StatusBarHitTarget::Yolo);
 
     assert!(!app.permissions.is_yolo());
+}
+
+/// A session bound to a sandbox, `connected` saying whether this runtime's own
+/// authenticated connection is up. Both halves are the ones the sandbox manager
+/// reads, so the footer cannot call a session attached on weaker evidence.
+fn sandboxed_app(connected: bool) -> App {
+    let mut app = test_app();
+    let workspace = remote_workspace_session();
+    let binding = StoredWorkspaceBinding::new_with_cursor(
+        workspace.binding().clone(),
+        workspace.cursor().clone(),
+        None,
+    )
+    .unwrap()
+    .with_sandbox_record(CaudraId::generate())
+    .unwrap();
+    app.state.session = Arc::new(AppSession::new_with_workspace("test", ".", binding));
+    app.workspace_session = Some(workspace);
+    app.sandbox_live.readiness = Some(Arc::new(move || connected));
+    app
+}
+
+/// Both halves of the manager's own readiness have to hold: a sandbox that is
+/// merely running, with no authenticated connection to this runtime, is not one
+/// the footer may call attached.
+#[test_case(false, false ; "no_sandbox_binding")]
+#[test_case(true,  false ; "sandbox_running_but_not_connected")]
+#[test_case(true,  true  ; "attached")]
+fn the_footer_names_a_sandbox_only_once_it_is_attached(bound: bool, connected: bool) {
+    let mut app = if bound {
+        sandboxed_app(connected)
+    } else {
+        test_app()
+    };
+
+    let _ = rendered(&mut app);
+
+    assert_eq!(
+        app.status_hits
+            .iter()
+            .any(|hit| hit.target == StatusBarHitTarget::Sandbox),
+        bound && connected
+    );
+    assert_eq!(
+        attached_sandbox_instance(&app.state.session, &app.sandbox_live).is_some(),
+        bound && connected
+    );
+}
+
+/// The chip opens what `/sandbox` opens, so there is one way into the manager
+/// and the keyboard reaches it without the footer claiming a global key.
+#[test]
+fn clicking_the_sandbox_chip_opens_the_manager() {
+    let mut app = sandboxed_app(true);
+
+    assert!(click_status(&mut app, StatusBarHitTarget::Sandbox).is_empty());
+
+    assert!(app.sandbox_manager.is_open());
+    assert_eq!(app.status_hover, None);
+}
+
+/// The pointer passing over a control says where it is, never what to do, so a
+/// move hovers the chip and leaves the manager shut.
+#[test]
+fn moving_over_the_sandbox_chip_hovers_without_opening_the_manager() {
+    let mut app = sandboxed_app(true);
+    let hit = status_hit(&mut app, StatusBarHitTarget::Sandbox);
+
+    app.update(mouse_event(MouseEventKind::Moved, hit.area.x, hit.area.y));
+
+    assert_eq!(app.status_hover, Some(StatusBarHitTarget::Sandbox));
+    assert!(!app.sandbox_manager.is_open());
+}
+
+/// A press that travels off the chip before it is released is not a click, so
+/// the release lands on nothing and the manager stays shut.
+#[test]
+fn releasing_off_the_sandbox_chip_opens_nothing() {
+    let mut app = sandboxed_app(true);
+    let hit = status_hit(&mut app, StatusBarHitTarget::Sandbox);
+
+    app.update(mouse_event(
+        MouseEventKind::Down(MouseButton::Left),
+        hit.area.x,
+        hit.area.y,
+    ));
+    app.update(mouse_event(
+        MouseEventKind::Up(MouseButton::Left),
+        hit.area.right(),
+        hit.area.y,
+    ));
+
+    assert!(!app.sandbox_manager.is_open());
 }
 
 /// The footer draws no price until a turn has been billed, and no price means

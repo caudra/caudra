@@ -109,24 +109,23 @@ pub(super) fn validate_compiled_templates(
 /// inside it. `/cd` rebinds the project and rebuilds these rules, while
 /// `TMPDIR` stays where startup put it, so a narrower grant would start
 /// prompting for the very directory the model was told to use.
+///
+/// Which root that is comes from [`crate::scratch`], because in remote mode the
+/// directory the model was handed lives on the host running the tools and the
+/// local one names nothing any of them can reach. The rule follows the advertised
+/// path in both modes, and covers no more than the root holding it.
 pub(super) fn builtin_rules(cwd: &Path) -> Vec<PermissionRule> {
-    let glob = |root: &Path| {
-        format!(
-            "{}/**",
-            caudra_storage::paths::canonicalize_clean(root).display()
-        )
-    };
     let allow = |tool: &str, scope: &str| PermissionRule {
         tool: ToolKey::native(tool),
         scope: Some(scope.into()),
         effect: Effect::Allow,
     };
-    let roots: Vec<String> = std::iter::once(glob(cwd))
-        .chain(
-            caudra_storage::paths::scratch_root()
-                .ok()
-                .map(|scratch| glob(&scratch)),
-        )
+    let cwd_glob = format!(
+        "{}/**",
+        caudra_storage::paths::canonicalize_clean(cwd).display()
+    );
+    let roots: Vec<String> = std::iter::once(cwd_glob)
+        .chain(crate::scratch::permission_root().map(|scratch| format!("{scratch}/**")))
         .collect();
     let mut rules: Vec<PermissionRule> = Vec::new();
     for root in &roots {
@@ -2307,17 +2306,80 @@ mod tests {
     /// for one of several possible reasons.
     #[test]
     fn builtin_rules_allow_the_scratch_root_and_not_the_temp_root_holding_it() {
+        let _scratch_mode = crate::scratch::ScratchGuard::local();
         let project = tempfile::tempdir().unwrap();
         let scratch = caudra_storage::paths::scratch_root().unwrap();
-        let scopes: Vec<String> = super::builtin_rules(project.path())
-            .into_iter()
-            .filter(|rule| rule.effect == Effect::Allow)
-            .filter_map(|rule| rule.scope)
-            .collect();
+        let scopes = allow_scopes(project.path());
 
         let glob = |root: &Path| format!("{}/**", root.display());
         assert!(scopes.contains(&glob(&scratch)));
         assert!(!scopes.contains(&glob(&std::env::temp_dir())));
+    }
+
+    fn allow_scopes(cwd: &Path) -> Vec<String> {
+        super::builtin_rules(cwd)
+            .into_iter()
+            .filter(|rule| rule.effect == Effect::Allow)
+            .filter_map(|rule| rule.scope)
+            .collect()
+    }
+
+    /// In remote mode the pre-allowed root is the one on the host the tools run
+    /// on, which is also the one the model was handed. The local scratch root
+    /// stops being covered because no remote tool can reach it, and the remote
+    /// temp root holding the grant is not covered either: the grant is the
+    /// namespace Caudra made, never everything beside it.
+    #[test]
+    fn builtin_rules_follow_the_remote_scratch_root_when_tools_run_remotely() {
+        const REMOTE_ROOT: &str = "/var/folders/xy/caudra";
+        const REMOTE_PROJECT: &str = "/var/folders/xy/caudra/remote-abc";
+        const REMOTE_TEMP: &str = "/var/folders/xy";
+        const REMOTE_IS_COVERED: &str = "the advertised remote directory must be pre-allowed";
+        const LOCAL_IS_NOT: &str = "a local scratch root no remote tool can reach must not be";
+        const TEMP_IS_NOT: &str = "the remote temp root beside the grant must not be";
+
+        let project = tempfile::tempdir().unwrap();
+        let local = caudra_storage::paths::scratch_root().unwrap();
+        let _scratch_mode =
+            crate::scratch::ScratchGuard::remote(Some((REMOTE_ROOT, REMOTE_PROJECT)));
+
+        let scopes = allow_scopes(project.path());
+
+        assert!(
+            scopes.contains(&format!("{REMOTE_ROOT}/**")),
+            "{REMOTE_IS_COVERED}"
+        );
+        assert!(
+            !scopes.contains(&format!("{}/**", local.display())),
+            "{LOCAL_IS_NOT}"
+        );
+        assert!(
+            !scopes.contains(&format!("{REMOTE_TEMP}/**")),
+            "{TEMP_IS_NOT}"
+        );
+    }
+
+    /// A remote host that would not make the directory leaves the project rule
+    /// and nothing else. Granting the local root here would be authority over a
+    /// machine the model is not working on.
+    #[test]
+    fn builtin_rules_grant_no_scratch_root_when_the_remote_host_made_none() {
+        const ONLY_THE_PROJECT: &str = "an uncreated scratch directory must earn no grant";
+
+        let project = tempfile::tempdir().unwrap();
+        let local = caudra_storage::paths::scratch_root().unwrap();
+        let _scratch_mode = crate::scratch::ScratchGuard::remote(None);
+
+        let scopes = allow_scopes(project.path());
+
+        assert!(
+            !scopes.contains(&format!("{}/**", local.display())),
+            "{ONLY_THE_PROJECT}"
+        );
+        assert!(scopes.contains(&format!(
+            "{}/**",
+            caudra_storage::paths::canonicalize_clean(project.path()).display()
+        )));
     }
 
     #[test]

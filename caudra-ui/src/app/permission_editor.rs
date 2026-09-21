@@ -1405,6 +1405,8 @@ mod tests {
     const REMOTE_REVISION: &str = "remote-before";
     const REMOTE_SAVED_REVISION: &str = "remote-after";
     const REMOTE_OPERATION: &str = "source-test-write";
+    const UNCONDITIONAL_OPEN: &str =
+        "a remote open must not be conditioned on the revision a listing recorded";
     const SOURCE_PLUGIN: &str = "source-test-plugin";
     const REMOTE_TIMEOUT: &str = "remote workbench did not settle";
     const SOURCE_WIDTH: u16 = 120;
@@ -1535,7 +1537,7 @@ mod tests {
             };
             let files = self.files.lock().unwrap();
             let (content, revision) = files.get(id.as_str()).ok_or(WorkspaceError::Unavailable)?;
-            assert_eq!(request.if_revision.as_ref(), Some(revision));
+            assert_eq!(request.if_revision, None, "{UNCONDITIONAL_OPEN}");
             Ok(ByteContent {
                 bytes: content.as_bytes().to_vec(),
                 resource_id: id.clone(),

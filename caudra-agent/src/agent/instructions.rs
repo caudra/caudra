@@ -456,18 +456,64 @@ mod tests {
         assert!(!block.contains(crate::prompt::MODEL_SLOT));
     }
 
+    const SCRATCH_SLOT: &str = "{scratch}";
+    const SCRATCH_HEADING: &str = "- Scratch directory:";
+
+    fn scratch_block() -> String {
+        let model = Model::from_spec("anthropic/claude-sonnet-4-20250514").unwrap();
+        environment_block(&crate::template::env_vars(), &model)
+    }
+
     /// The model is told where temporary work goes, and told the real path:
     /// the block reads the same variable the shell inherits, so the two cannot
     /// disagree even when the redirect at startup failed.
     #[test]
     fn the_environment_block_names_the_scratch_directory() {
-        const SCRATCH_SLOT: &str = "{scratch}";
+        let _scratch_mode = crate::scratch::ScratchGuard::local();
 
-        let model = Model::from_spec("anthropic/claude-sonnet-4-20250514").unwrap();
-        let block = environment_block(&crate::template::env_vars(), &model);
+        let block = scratch_block();
 
         assert!(block.contains(&std::env::temp_dir().to_string_lossy().into_owned()));
         assert!(!block.contains(SCRATCH_SLOT));
+    }
+
+    /// With tools on a remote host the block names the directory created there,
+    /// never this machine's temp directory, which nothing the model can call is
+    /// able to open.
+    #[test]
+    fn the_environment_block_names_the_remote_scratch_directory_in_remote_mode() {
+        const REMOTE_ROOT: &str = "/var/folders/xy/caudra";
+        const REMOTE_PROJECT: &str = "/var/folders/xy/caudra/remote-abc";
+        const LOCAL_PATH_STAYS_OUT: &str =
+            "a local temp directory must not be offered to remote tools";
+
+        let _scratch_mode =
+            crate::scratch::ScratchGuard::remote(Some((REMOTE_ROOT, REMOTE_PROJECT)));
+
+        let block = scratch_block();
+
+        assert!(block.contains(REMOTE_PROJECT));
+        assert!(!block.contains(SCRATCH_SLOT));
+        assert!(
+            !block.contains(&std::env::temp_dir().to_string_lossy().into_owned()),
+            "{LOCAL_PATH_STAYS_OUT}"
+        );
+    }
+
+    /// When the remote host made no directory the block says nothing about one.
+    /// Naming a path the model cannot write costs it a wasted call and a prompt;
+    /// naming none costs it a sentence.
+    #[test]
+    fn the_environment_block_omits_the_scratch_directory_when_there_is_none() {
+        const NO_HEADING: &str = "a block with no scratch directory must not head a line for one";
+
+        let _scratch_mode = crate::scratch::ScratchGuard::remote(None);
+
+        let block = scratch_block();
+
+        assert!(!block.contains(SCRATCH_HEADING), "{NO_HEADING}");
+        assert!(!block.contains(SCRATCH_SLOT));
+        assert!(block.contains(crate::prompt::ENVIRONMENT_MARKER));
     }
 
     #[test]

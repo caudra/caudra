@@ -1043,6 +1043,11 @@ impl App {
                 self.clear_control_hovers();
                 self.execute_workflow("")
             }
+            StatusBarHitTarget::Sandbox => {
+                self.clear_control_hovers();
+                self.open_sandbox("");
+                Vec::new()
+            }
             // The label goes as soon as the transcript follows again, so the
             // hover it was drawn under has nothing left to sit on.
             StatusBarHitTarget::ResumeAutoScroll => {
