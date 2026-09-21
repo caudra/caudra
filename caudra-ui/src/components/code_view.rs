@@ -1217,10 +1217,11 @@ struct BatchCard {
 /// folded child is redrawn as often as the card is, and the body it is hiding
 /// may be long.
 fn holds_a_body(entry: &BatchToolEntry) -> bool {
-    entry
-        .output
-        .as_ref()
-        .is_some_and(|output| !output.is_empty_result())
+    entry.input.is_some()
+        || entry
+            .output
+            .as_ref()
+            .is_some_and(|output| !output.is_empty_result())
 }
 
 /// What a child row reports after its arguments. `batch` carries only the
@@ -2899,8 +2900,12 @@ impl RenderLimits {
         if (self.policy.compact || self.body_taken) && !open {
             return None;
         }
+        // A script arrives before the call it belongs to is dispatched, so a
+        // child that has one is worth watching a frame earlier than one whose
+        // only claim is output it has started to print.
         let streaming = entry.output.is_none()
-            && self.live.get(&index).is_some_and(|tail| !tail.is_empty())
+            && (entry.input.is_some()
+                || self.live.get(&index).is_some_and(|tail| !tail.is_empty()))
             && !self.policy.stays_collapsed(&entry.tool);
         let scroll = self.child_scroll.get(&index).copied().or_else(|| {
             self.policy
@@ -5400,6 +5405,59 @@ mod tests {
             [TREE_BRANCH, TREE_BRANCH, TREE_LAST],
             "{TREE_MSG}"
         );
+    }
+
+    const STREAMED_SCRIPT_MSG: &str = "a child still having its call written draws the whole \
+        script that has arrived, and its row stops repeating the first line the body carries";
+    const STREAMED_COMMAND: &str = "set -e\ncargo build --workspace\ncargo test --workspace";
+
+    /// A child mid-stream: its script has arrived, nothing has been dispatched,
+    /// and so there is no output and no live tail to draw instead.
+    fn streaming_script_entry() -> BatchToolEntry {
+        BatchToolEntry {
+            status: BatchToolStatus::Pending,
+            summary: STREAMED_COMMAND.lines().next().unwrap_or_default().into(),
+            input: Some(ToolInput::Code {
+                language: "bash".into(),
+                code: STREAMED_COMMAND.into(),
+            }),
+            output: None,
+            ..batch_entry(SHELL_CHILD, 0)
+        }
+    }
+
+    #[test]
+    fn a_streaming_childs_script_is_drawn_whole() {
+        let card = render_batch(
+            &[streaming_script_entry()],
+            false,
+            &limits(BatchViews::default()),
+        );
+
+        let drawn: Vec<String> = card.lines.iter().map(line_text).collect();
+        for line in STREAMED_COMMAND.lines() {
+            assert!(
+                drawn.iter().any(|row| row.contains(line)),
+                "{STREAMED_SCRIPT_MSG}: {line:?} missing from {drawn:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_streaming_childs_row_does_not_repeat_its_scripts_first_line() {
+        let card = render_batch(
+            &[streaming_script_entry()],
+            false,
+            &limits(BatchViews::default()),
+        );
+
+        let first = STREAMED_COMMAND.lines().next().unwrap_or_default();
+        let carrying = card
+            .lines
+            .iter()
+            .filter(|line| line_text(line).contains(first))
+            .count();
+        assert_eq!(carrying, 1, "{STREAMED_SCRIPT_MSG}");
     }
 
     const SETTLED_MSG: &str = "a settled child owns its row and its body and nothing else: a \

@@ -6,7 +6,7 @@
 //! and the status line can say *which* file is being edited before the model
 //! has finished saying it.
 
-use crate::tools::relative_path;
+use crate::tools::{PYTHON_EXECUTION_TOOL_NAME, SHELL_TOOL_NAME, relative_path};
 
 /// Wide enough for a path or a short command, short enough that a header row
 /// never becomes the payload.
@@ -50,6 +50,18 @@ const PREVIEW_KEYS: &[(&str, &[&str])] = &[
     ("code_refs", &["symbol"]),
     ("code_impact", &["symbol"]),
     ("code_expand", &["symbol"]),
+];
+
+/// The tools whose call *is* a script, with the language it is written in and
+/// the argument carrying it.
+///
+/// A header can only ever be the script's first line, so a batch child of one
+/// of these carries the value uncapped as well and draws it as a body. The
+/// languages are the ones stamped when the call starts, which is what lets the
+/// body a child streams be the body it keeps once it is dispatched.
+const SCRIPT_TOOLS: &[(&str, &str, &str)] = &[
+    (SHELL_TOOL_NAME, "bash", "command"),
+    (PYTHON_EXECUTION_TOOL_NAME, "python", "code"),
 ];
 
 /// Tools that lead with a blob or an aggregate. There is nothing short to show
@@ -137,6 +149,18 @@ pub(super) fn candidates(tool: &str) -> impl Iterator<Item = &str> {
     })
 }
 
+/// The language and argument name of `tool`'s script, for the tools that are
+/// called with one. `None` for every tool whose arguments merely describe what
+/// to do rather than spell it out.
+pub(super) fn script_arg(tool: &str) -> Option<(&'static str, &'static str)> {
+    candidates(tool).find_map(|rest| {
+        SCRIPT_TOOLS
+            .iter()
+            .find(|(name, ..)| same_key(name, rest))
+            .map(|(_, language, key)| (*language, *key))
+    })
+}
+
 fn rule(tool: &str) -> Rule {
     for rest in candidates(tool) {
         if let Some((_, keys)) = PREVIEW_KEYS.iter().find(|(name, _)| same_key(name, rest)) {
@@ -214,6 +238,15 @@ pub(super) fn string_member(json: &str, key: &str) -> Option<(String, bool)> {
     Some((found.value, found.complete))
 }
 
+/// The same, keeping the newlines and tabs a preview would spend as spaces.
+/// For a value that is drawn as a body rather than summarised into a row.
+pub(super) fn literal_member(json: &str, key: &str) -> Option<(String, bool)> {
+    let (found, _) =
+        Scanner::literal(json).find_strings(1, |name| same_key(name, key).then_some(0))?;
+    let found = found.into_iter().flatten().next()?;
+    Some((found.value, found.complete))
+}
+
 /// Everything that has arrived of the object value of the first top-level
 /// member named `key`, from its opening brace. `None` while the member is
 /// unwritten or its value is not an object.
@@ -262,11 +295,26 @@ fn tidy(value: &str) -> String {
 struct Scanner<'a> {
     src: &'a str,
     pos: usize,
+    /// Whether a control escape keeps the character it names. A preview is one
+    /// line by construction and spends them as spaces; a script is drawn as it
+    /// was written and cannot.
+    literal: bool,
 }
 
 impl<'a> Scanner<'a> {
     fn new(src: &'a str) -> Self {
-        Self { src, pos: 0 }
+        Self {
+            src,
+            pos: 0,
+            literal: false,
+        }
+    }
+
+    fn literal(src: &'a str) -> Self {
+        Self {
+            literal: true,
+            ..Self::new(src)
+        }
     }
 
     fn peek(&self) -> Option<char> {
@@ -379,13 +427,21 @@ impl<'a> Scanner<'a> {
 
     /// Decodes a string body, the opening quote already consumed. Returns
     /// whether the closing quote arrived. Control escapes collapse to a space
-    /// because a preview is one line by construction.
+    /// unless the scanner reads literally, since a preview is one line by
+    /// construction.
     fn read_string(&mut self, out: &mut String) -> bool {
         while let Some(c) = self.bump() {
             match c {
                 '"' => return true,
                 '\\' => match self.bump() {
-                    Some('n' | 't' | 'r' | 'b' | 'f') => out.push(' '),
+                    Some(escaped @ ('n' | 't' | 'r' | 'b' | 'f')) => out.push(match escaped {
+                        _ if !self.literal => ' ',
+                        'n' => '\n',
+                        't' => '\t',
+                        'r' => '\r',
+                        'b' => '\u{8}',
+                        _ => '\u{c}',
+                    }),
                     Some('u') => self.read_unicode_escape(out),
                     Some(escaped) => out.push(escaped),
                     None => return false,

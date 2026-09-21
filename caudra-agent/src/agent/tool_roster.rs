@@ -23,11 +23,12 @@
 
 use super::tool_delegation::{Delegated, DelegationStream};
 use super::tool_preview::{
-    candidates, object_member, past_scan_cap, preview_for, same_key, string_member,
+    candidates, literal_member, object_member, past_scan_cap, preview_for, same_key, script_arg,
+    string_member,
 };
 use crate::tools::native::batch::MAX_BATCH_SIZE;
 use crate::tools::{BATCH_TOOL_NAME, ToolEffect};
-use crate::types::{BatchToolEntry, BatchToolStatus};
+use crate::types::{BatchToolEntry, BatchToolStatus, ToolInput};
 use caudra_providers::MAX_TOOL_INPUT_BYTES;
 
 /// The argument holding the calls to run.
@@ -105,6 +106,9 @@ struct Child {
     /// resolves to no tool, and the row it would draw is worse than no row.
     tool: Option<String>,
     summary: String,
+    /// The whole script of a child called with one, uncapped, kept once the
+    /// row settles so the body it drew while streaming is the body it keeps.
+    script: Option<String>,
     settled: bool,
     /// Present only for a child that delegates, from the moment it names
     /// itself. A prompt outgrows anything worth rescanning, so it is read one
@@ -175,13 +179,22 @@ impl Child {
     /// The roster row this child draws, `None` while it has no name to draw
     /// it under.
     fn entry(&self) -> Option<BatchToolEntry> {
+        let tool = self.tool.clone()?;
+        // The same value `input_start_input` stamps at dispatch, so the script
+        // the reader is watching does not change the moment the call starts.
+        let input = self.script.as_ref().and_then(|code| {
+            script_arg(&tool).map(|(language, _)| ToolInput::Code {
+                language: language.to_owned(),
+                code: code.clone(),
+            })
+        });
         Some(BatchToolEntry {
             model_suffix: None,
-            tool: self.tool.clone()?,
+            tool,
             effect: ToolEffect::Unknown,
             summary: self.summary.clone(),
             status: BatchToolStatus::Pending,
-            input: None,
+            input,
             raw_input: None,
             output: None,
             annotation: None,
@@ -273,14 +286,33 @@ impl RosterStream {
         }
         // The flat shape is its own arguments, and the `tool` member the
         // scanner meets first there is not a preview key for any tool.
-        let preview = preview_for(
-            &tool,
-            object_member(&child.text, PARAMETERS_KEY).unwrap_or(&child.text),
-        );
-        let summary = preview.as_ref().map(|p| p.text.clone()).unwrap_or_default();
-        let changed = child.tool.as_deref() != Some(tool.as_str()) || child.summary != summary;
+        let (script, summary, complete) = {
+            let params = object_member(&child.text, PARAMETERS_KEY).unwrap_or(&child.text);
+            let script = script_arg(&tool).and_then(|(_, key)| literal_member(params, key));
+            let preview = preview_for(&tool, params);
+            // A script tool's row is its command's first line, which is what
+            // the settled header reports too, so neither the row nor the body
+            // under it moves when the call is dispatched. The tidied preview
+            // would cut both to a header's width and fold their newlines.
+            let summary = match &script {
+                Some((code, _)) => code.lines().next().unwrap_or_default().to_owned(),
+                None => preview.as_ref().map(|p| p.text.clone()).unwrap_or_default(),
+            };
+            // A script's own closing quote settles the row for a tool that has
+            // no preview key to settle it, which is every script tool whose
+            // argument reads as a blob.
+            let complete = match &script {
+                Some((_, done)) => *done,
+                None => preview.is_some_and(|p| p.complete),
+            };
+            (script.map(|(code, _)| code), summary, complete)
+        };
+        let changed = child.tool.as_deref() != Some(tool.as_str())
+            || child.summary != summary
+            || child.script != script;
         child.tool = Some(tool.clone());
         child.summary = summary;
+        child.script = script;
         self.changed |= changed;
         // A delegating child owns the rest of its element: it stops being
         // rescanned and starts being decoded, which is what carries a prompt
@@ -289,7 +321,7 @@ impl RosterStream {
         if child.settled {
             return;
         }
-        if preview.is_some_and(|p| p.complete) || past_scan_cap(child.text.len()) {
+        if complete || past_scan_cap(child.text.len()) {
             child.settle();
         }
     }
@@ -427,7 +459,7 @@ impl RosterStream {
 #[cfg(test)]
 mod tests {
     use super::{MAX_BATCH_SIZE, RosterStream, ToolEffect};
-    use crate::types::{BatchToolEntry, BatchToolStatus};
+    use crate::types::{BatchToolEntry, BatchToolStatus, ToolInput};
     use test_case::test_case;
 
     const BATCH: &str = "batch";
@@ -487,6 +519,97 @@ mod tests {
             .filter_map(|fragment| stream.absorb(fragment).entries)
             .map(rows)
             .collect()
+    }
+
+    /// The last roster the fragments produced, whole, for the rows whose body
+    /// matters as much as their header.
+    fn entries(fragments: &[&str]) -> Vec<BatchToolEntry> {
+        let mut stream = RosterStream::new(BATCH, false).unwrap();
+        fragments
+            .iter()
+            .filter_map(|fragment| stream.absorb(fragment).entries)
+            .last()
+            .unwrap_or_default()
+    }
+
+    fn call(tool: &str, key: &str, value: &str) -> String {
+        serde_json::json!({ "tool_calls": [{ "tool": tool, "parameters": { key: value } }] })
+            .to_string()
+    }
+
+    fn script(language: &str, code: &str) -> Option<ToolInput> {
+        Some(ToolInput::Code {
+            language: language.to_owned(),
+            code: code.to_owned(),
+        })
+    }
+
+    const SCRIPT_MSG: &str = "a script tool's child carries its whole command, newlines and all, \
+        so the body the reader watches while it streams is the body the call is dispatched with";
+    const MULTILINE_COMMAND: &str = "set -e\ncargo build\ncargo test";
+    const PYTHON: &str = "python_execution";
+    const BASH_LANG: &str = "bash";
+    const PYTHON_LANG: &str = "python";
+
+    #[test]
+    fn a_shell_childs_whole_command_streams_as_its_script() {
+        let entries = entries(&[&call(SHELL, "command", MULTILINE_COMMAND)]);
+        assert_eq!(
+            entries[0].input,
+            script(BASH_LANG, MULTILINE_COMMAND),
+            "{SCRIPT_MSG}"
+        );
+    }
+
+    #[test]
+    fn a_python_childs_script_names_its_own_language() {
+        const CODE: &str = "import sys\nprint(sys.version)";
+        let entries = entries(&[&call(PYTHON, "code", CODE)]);
+        assert_eq!(entries[0].input, script(PYTHON_LANG, CODE), "{SCRIPT_MSG}");
+    }
+
+    /// The row is the command's first line, which is what the settled header
+    /// reports too, so dispatching the call moves neither the row nor the body.
+    #[test]
+    fn a_script_childs_row_is_its_commands_first_line() {
+        let entries = entries(&[&call(SHELL, "command", MULTILINE_COMMAND)]);
+        assert_eq!(entries[0].summary, "set -e", "{SCRIPT_MSG}");
+    }
+
+    /// The cap that keeps a header a header must not reach the body.
+    #[test]
+    fn a_long_command_is_cut_in_neither_the_row_nor_the_script() {
+        let command = format!("git add -- {}", ["caudra/src/lib.rs"; 20].join(" "));
+        let entries = entries(&[&call(SHELL, "command", &command)]);
+        assert!(command.chars().count() > 160, "{SCRIPT_MSG}");
+        assert_eq!(
+            entries[0].input,
+            script(BASH_LANG, &command),
+            "{SCRIPT_MSG}"
+        );
+        assert_eq!(entries[0].summary, command, "{SCRIPT_MSG}");
+    }
+
+    #[test]
+    fn a_child_called_with_arguments_rather_than_a_script_carries_none() {
+        let entries = entries(&[&call(READ, "filePath", "a.rs")]);
+        assert_eq!(entries[0].input, None, "{SCRIPT_MSG}");
+        assert_eq!(entries[0].summary, "a.rs", "{SCRIPT_MSG}");
+    }
+
+    /// A settled child drops the text it was scanned from, and the script has
+    /// to outlive it or every row but the last would lose its body.
+    #[test]
+    fn a_settled_childs_script_survives_the_text_it_came_from() {
+        let entries = entries(&[
+            r#"{"tool_calls": [{"tool": "shell", "parameters": {"command": "echo one"}}, "#,
+            r#"{"tool": "file_read", "parameters": {"filePath": "b.r"#,
+        ]);
+        assert_eq!(
+            entries[0].input,
+            script(BASH_LANG, "echo one"),
+            "{SCRIPT_MSG}"
+        );
     }
 
     #[test_case(BATCH, true ; "the_batch_tool_itself")]
