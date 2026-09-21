@@ -8,7 +8,7 @@ use std::{
     mem::size_of,
     path::{Component, Path, PathBuf},
     sync::{Arc, Mutex},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use serde::{Deserialize, Serialize};
@@ -16,7 +16,7 @@ use sha2::{Digest, Sha256};
 use tokio::{
     fs,
     io::{AsyncReadExt, AsyncWriteExt},
-    sync::Mutex as AsyncMutex,
+    sync::{Mutex as AsyncMutex, MutexGuard, OwnedMutexGuard},
 };
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -38,6 +38,7 @@ use workcell_mcp_files::{
 const MANIFEST_VERSION: &str = "workspace-snapshot.v1";
 const JOURNAL_VERSION: &str = "workspace-restore-journal.v1";
 const CHECKPOINT_VERSION: &str = "workspace-snapshot-checkpoint.v1";
+const CAPTURE_ADMISSION_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_PRIVATE_METADATA_BYTES: u64 = 2 * 1_024 * 1_024;
 const MAX_JOURNAL_STORAGE_BYTES: u64 = 64 * 1_024 * 1_024;
 const MAX_EXCLUSIONS: usize = 32;
@@ -442,7 +443,7 @@ pub enum SnapshotError {
     LimitExceeded,
     #[error("snapshot storage quota was exceeded")]
     QuotaExceeded,
-    #[error("snapshot capture is already running")]
+    #[error("snapshot capture admission timed out")]
     Busy,
     #[error("prepared snapshot restore is stale or conflicts with later edits")]
     Conflict,
@@ -584,12 +585,7 @@ impl SnapshotManager {
         checkpoint_id: &Identifier,
         token: &CancellationToken,
     ) -> Result<SnapshotCaptureResponse, SnapshotError> {
-        let _capture = self
-            .inner
-            .capture
-            .try_lock()
-            .map_err(|_| SnapshotError::Busy)?;
-        let _publication = self.inner.publication.lock().await;
+        let (_capture, _publication, _workspace) = self.capture_guards(token).await?;
         check_cancelled(token)?;
         if let Some(manifest) = self.load_checkpoint(checkpoint_id.as_str()).await? {
             return Ok(SnapshotCaptureResponse {
@@ -607,7 +603,6 @@ impl SnapshotManager {
             return Err(SnapshotError::QuotaExceeded);
         }
         let result = async {
-            let _workspace = self.inner.workspace.capture_guard().await;
             let manifest = self.capture_manifest(token).await?;
             self.persist_manifest(&manifest).await?;
             let manifest = self.load_manifest(&manifest.snapshot_id, false).await?;
@@ -1070,16 +1065,34 @@ impl SnapshotManager {
         })
     }
 
+    // One admission deadline covers all locks, without cancelling publication once it starts.
+    async fn capture_guards(
+        &self,
+        token: &CancellationToken,
+    ) -> Result<(MutexGuard<'_, ()>, MutexGuard<'_, ()>, OwnedMutexGuard<()>), SnapshotError> {
+        let acquire = async {
+            let capture = self.inner.capture.lock().await;
+            let publication = self.inner.publication.lock().await;
+            let workspace = self.inner.workspace.capture_guard().await;
+            (capture, publication, workspace)
+        };
+        tokio::select! {
+            biased;
+            () = token.cancelled() => Err(SnapshotError::Cancelled),
+            result = tokio::time::timeout(CAPTURE_ADMISSION_TIMEOUT, acquire) => {
+                result.map_err(|_| SnapshotError::Busy)
+            }
+        }
+    }
+
     async fn prepare_restore_inner(
         &self,
         snapshot_id: &str,
         unrevert_of: Option<&str>,
         token: &CancellationToken,
     ) -> Result<(PreparedSnapshotRestore, SnapshotRestorePreview), SnapshotError> {
-        let _capture = self.inner.capture.lock().await;
-        let _publication = self.inner.publication.lock().await;
+        let (_capture, _publication, _workspace) = self.capture_guards(token).await?;
         let target = self.load_manifest(snapshot_id, true).await?;
-        let _workspace = self.inner.workspace.capture_guard().await;
         let current = self.consistent_manifest(false, token).await?;
         let changes = compare_manifests(&current, &target)?;
         let created_directories = self.missing_ancestors(&changes).await?;
@@ -3491,6 +3504,85 @@ mod tests {
             second.snapshot.created_at_unix_ms
         );
         assert!(second.reused_checkpoint);
+    }
+
+    #[tokio::test]
+    async fn concurrent_checkpoint_captures_wait_and_reuse() {
+        let (_workspace, _storage, manager) = fixture().await;
+        let checkpoint = Identifier::new("concurrent-checkpoint").unwrap();
+        let token = CancellationToken::new();
+        let publication = manager.inner.publication.lock().await;
+        let first = manager.capture(&checkpoint, &token);
+        let second = manager.capture(&checkpoint, &token);
+        tokio::pin!(first, second);
+        std::future::poll_fn(|cx| {
+            assert!(first.as_mut().poll(cx).is_pending());
+            assert!(second.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        drop(publication);
+        let (first, second) = tokio::join!(first, second);
+        let first = first.unwrap();
+        let second = second.unwrap();
+        assert!(!first.reused_checkpoint);
+        assert!(second.reused_checkpoint);
+        assert_eq!(first.snapshot.snapshot_id, second.snapshot.snapshot_id);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn capture_admission_is_cancellable_and_bounded_at_every_lock() {
+        for held_lock in ["capture", "publication", "workspace"] {
+            for cancel in [true, false] {
+                let (_workspace, _storage, manager) = fixture().await;
+                let checkpoint = Identifier::new("waiting-checkpoint").unwrap();
+                let token = CancellationToken::new();
+                let capture = if held_lock == "capture" {
+                    Some(manager.inner.capture.lock().await)
+                } else {
+                    None
+                };
+                let publication = if held_lock == "publication" {
+                    Some(manager.inner.publication.lock().await)
+                } else {
+                    None
+                };
+                let workspace = if held_lock == "workspace" {
+                    Some(manager.inner.workspace.capture_guard().await)
+                } else {
+                    None
+                };
+                let pending = manager.capture(&checkpoint, &token);
+                tokio::pin!(pending);
+                std::future::poll_fn(|cx| {
+                    assert!(pending.as_mut().poll(cx).is_pending());
+                    std::task::Poll::Ready(())
+                })
+                .await;
+                let expected = if cancel {
+                    token.cancel();
+                    SnapshotError::Cancelled
+                } else {
+                    tokio::time::advance(CAPTURE_ADMISSION_TIMEOUT).await;
+                    SnapshotError::Busy
+                };
+                assert_eq!(pending.await.unwrap_err(), expected);
+                assert!(
+                    manager
+                        .load_checkpoint(checkpoint.as_str())
+                        .await
+                        .unwrap()
+                        .is_none()
+                );
+                drop((capture, publication, workspace));
+                assert!(manager.inner.capture.try_lock().is_ok());
+                assert!(manager.inner.publication.try_lock().is_ok());
+                manager
+                    .capture(&checkpoint, &CancellationToken::new())
+                    .await
+                    .unwrap();
+            }
+        }
     }
 
     #[tokio::test]

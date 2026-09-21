@@ -99,7 +99,8 @@ impl WorkcellServer {
                 };
                 remote.validate_host(&binding.host).map_err(remote_error)?;
                 let reservation = remote
-                    .reserve_preparation(SMALL_PREPARATION_RESERVATION_BYTES)
+                    .reserve_preparation_wait(SMALL_PREPARATION_RESERVATION_BYTES, token)
+                    .await
                     .map_err(remote_error)?;
                 let prepared = manager
                     .prepare(request, digest, token)

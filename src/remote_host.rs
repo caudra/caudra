@@ -7,16 +7,20 @@ use std::{
 };
 
 use serde::Serialize;
-use tokio::task::AbortHandle;
+use tokio::{
+    sync::{Notify, Semaphore},
+    task::AbortHandle,
+};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use workcell_host_contract::{
-    ContractVersion, Cursor, ExecuteRequest, HostBinding, Identifier, MAX_WATCH_LIFETIME_EVENTS,
-    MAX_WATCH_RETAINED_BYTES, MAX_WATCH_RETAINED_EVENTS, MAX_WATCH_SUBSCRIPTIONS, OperationBinding,
-    OperationIntent, OperationState, OutcomeKind, PrepareResponse, ProgressChunkText,
-    ProgressEvent, ProgressMetadata, ReleaseResponse, RemoteHostDescriptor, RemoteOperationLimits,
-    StatusResponse, StructuredOutcome, WATCH_SUBSCRIPTION_TTL_MS, WatchEvent, WatchOpenResponse,
-    WatchPollResponse, WatchResyncReason, WatchState, WorkspaceRequestBinding,
+    ContractVersion, Cursor, ExecuteRequest, HostBinding, Identifier, MAX_ID_BYTES,
+    MAX_WATCH_LIFETIME_EVENTS, MAX_WATCH_RETAINED_BYTES, MAX_WATCH_RETAINED_EVENTS,
+    MAX_WATCH_SUBSCRIPTIONS, OperationBinding, OperationIntent, OperationState, OutcomeKind,
+    PrepareResponse, ProgressChunkText, ProgressEvent, ProgressMetadata, ReleaseResponse,
+    RemoteHostDescriptor, RemoteOperationLimits, StatusResponse, StructuredOutcome,
+    WATCH_SUBSCRIPTION_TTL_MS, WatchEvent, WatchOpenResponse, WatchPollResponse, WatchResyncReason,
+    WatchState, WorkspaceRequestBinding,
 };
 
 pub use workcell_host_contract::{
@@ -49,16 +53,22 @@ use crate::execution_environment::{
 };
 
 const PREPARATION_TTL: Duration = Duration::from_secs(120);
+const PREPARATION_ADMISSION_TIMEOUT: Duration = Duration::from_secs(30);
 const RETENTION_TTL: Duration = Duration::from_secs(600);
 const MAX_PREPARATIONS: usize = 64;
 const MAX_OPERATIONS: usize = 128;
 const MAX_LEDGER_BYTES: usize = 32 * 1_024 * 1_024;
 pub(crate) const MAX_PREPARED_OPERATION_BYTES: usize = MAX_LEDGER_BYTES - 2 * 1_024 * 1_024;
-pub(crate) const LARGE_PREPARATION_RESERVATION_BYTES: usize = MAX_LEDGER_BYTES - 64 * 1_024;
+pub(crate) const LARGE_PREPARATION_RESERVATION_BYTES: usize =
+    MAX_LEDGER_BYTES - MAX_TOMBSTONE_LEDGER_BYTES - PREPARATION_BOOKKEEPING_BYTES;
 pub(crate) const MEDIUM_PREPARATION_RESERVATION_BYTES: usize = 16 * 1_024 * 1_024;
 pub(crate) const SMALL_PREPARATION_RESERVATION_BYTES: usize = 4 * 1_024 * 1_024;
 const MAX_PROGRESS_BYTES: usize = 64 * 1_024;
 const MAX_TOMBSTONES: usize = 256;
+// Match refresh_bytes: each tombstone is charged both inline and in deque capacity.
+const MAX_TOMBSTONE_LEDGER_BYTES: usize =
+    MAX_TOMBSTONES * (2 * size_of::<Tombstone>() + 2 * (size_of::<Identifier>() + MAX_ID_BYTES));
+const PREPARATION_BOOKKEEPING_BYTES: usize = 64 * 1_024;
 const MAX_WATCH_TOMBSTONES: usize = 32;
 const WATCH_TOMBSTONE_TTL: Duration = Duration::from_secs(600);
 const EXECUTION_LEASE_OVERHEAD_BYTES: usize = size_of::<ExecutionLease>()
@@ -69,6 +79,8 @@ pub(crate) struct RemoteHostState {
     pub descriptor: Arc<RemoteHostDescriptor>,
     pub binding: HostBinding,
     ledger: Arc<Mutex<Ledger>>,
+    preparation_changed: Arc<Notify>,
+    preparation_waiters: Arc<Semaphore>,
     watches: Arc<Mutex<WatchRegistry>>,
 }
 
@@ -197,6 +209,8 @@ impl RemoteHostState {
             descriptor: Arc::new(descriptor),
             binding,
             ledger: Arc::new(Mutex::new(Ledger::default())),
+            preparation_changed: Arc::new(Notify::new()),
+            preparation_waiters: Arc::new(Semaphore::new(MAX_PREPARATIONS)),
             watches: Arc::new(Mutex::new(WatchRegistry::default())),
         }
     }
@@ -252,6 +266,7 @@ impl RemoteHostState {
         self.prepare_reserved(reservation, operation, binding, intent)
     }
 
+    #[cfg(test)]
     pub fn reserve_preparation(
         &self,
         bytes: usize,
@@ -263,9 +278,56 @@ impl RemoteHostState {
         ledger.reserve(bytes, Instant::now())?;
         Ok(PreparationReservation {
             ledger: self.ledger.clone(),
+            changed: self.preparation_changed.clone(),
             bytes,
             active: true,
         })
+    }
+
+    pub async fn reserve_preparation_wait(
+        &self,
+        bytes: usize,
+        token: &CancellationToken,
+    ) -> Result<PreparationReservation, RemoteOperationError> {
+        let _waiter = self
+            .preparation_waiters
+            .try_acquire()
+            .map_err(|_| RemoteOperationError::QuotaExceeded)?;
+        let admission = async {
+            loop {
+                let changed = self.preparation_changed.notified();
+                tokio::pin!(changed);
+                changed.as_mut().enable();
+                {
+                    let mut ledger = self
+                        .ledger
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    match ledger.reserve(bytes, Instant::now()) {
+                        Ok(()) => {
+                            return Ok(PreparationReservation {
+                                ledger: self.ledger.clone(),
+                                changed: self.preparation_changed.clone(),
+                                bytes,
+                                active: true,
+                            });
+                        }
+                        // Only in-progress inspections release their pessimistic reservation
+                        // automatically. Retained operations still require client release.
+                        Err(RemoteOperationError::QuotaExceeded) if ledger.reservations > 0 => {}
+                        Err(error) => return Err(error),
+                    }
+                }
+                changed.await;
+            }
+        };
+        tokio::select! {
+            biased;
+            () = token.cancelled() => Err(RemoteOperationError::Cancelled),
+            result = tokio::time::timeout(PREPARATION_ADMISSION_TIMEOUT, admission) => {
+                result.unwrap_or(Err(RemoteOperationError::QuotaExceeded))
+            }
+        }
     }
 
     pub fn prepare_reserved(
@@ -899,6 +961,7 @@ impl std::fmt::Debug for BeginExecution {
 
 pub(crate) struct PreparationReservation {
     ledger: Arc<Mutex<Ledger>>,
+    changed: Arc<Notify>,
     bytes: usize,
     active: bool,
 }
@@ -932,6 +995,7 @@ impl Drop for PreparationReservation {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .rollback_reservation(self.bytes);
         }
+        self.changed.notify_waiters();
     }
 }
 
@@ -945,6 +1009,7 @@ pub(crate) enum RemoteOperationError {
     Forgotten,
     Expired,
     Running,
+    Cancelled,
     QuotaExceeded,
     ResourceLimit,
     InvalidRequest,
@@ -962,6 +1027,7 @@ impl RemoteOperationError {
             Self::Forgotten => "forgotten",
             Self::Expired => "expired",
             Self::Running => "running",
+            Self::Cancelled => "cancelled",
             Self::QuotaExceeded => "quota_exceeded",
             Self::ResourceLimit => "resource_limit",
             Self::InvalidRequest => "invalid_request",
@@ -979,6 +1045,7 @@ impl RemoteOperationError {
             Self::Forgotten => "preparation is no longer retained",
             Self::Expired => "preparation expired before execution",
             Self::Running => "operation is already running",
+            Self::Cancelled => "preparation admission was cancelled",
             Self::QuotaExceeded => "remote operation ledger quota is exhausted",
             Self::ResourceLimit => "operation intents exceed the configured limit",
             Self::InvalidRequest => "remote operation request is invalid",
@@ -1390,6 +1457,9 @@ impl Ledger {
             if progress_metadata.next_sequence != 1 {
                 progress_metadata.gap_before_first = true;
             }
+            if self.tombstones.len() == MAX_TOMBSTONES {
+                self.tombstones.pop_front();
+            }
             self.tombstones.push_back(Tombstone {
                 preparation_id: preparation_id.clone(),
                 invocation_id: record.invocation_id,
@@ -1398,9 +1468,7 @@ impl Ledger {
                 forgotten_at: now,
             });
         }
-        while self.tombstones.len() > MAX_TOMBSTONES {
-            self.tombstones.pop_front();
-        }
+        self.records.shrink_to_fit();
         self.refresh_bytes();
     }
 
@@ -2192,6 +2260,231 @@ mod tests {
         assert_eq!(ledger.reservations, 0);
         assert_eq!(ledger.reserved_bytes, 0);
         assert!(ledger.records.is_empty());
+    }
+
+    #[tokio::test]
+    async fn overlapping_shell_and_write_preparations_wait_for_inspection_not_execution() {
+        let state = state();
+        let first = state
+            .reserve_preparation(LARGE_PREPARATION_RESERVATION_BYTES)
+            .unwrap();
+        // These are the actual shell and file_write reservation sizes on a fresh ledger.
+        for bytes in [
+            LARGE_PREPARATION_RESERVATION_BYTES,
+            MEDIUM_PREPARATION_RESERVATION_BYTES,
+        ] {
+            assert_eq!(
+                state.reserve_preparation(bytes).err(),
+                Some(RemoteOperationError::QuotaExceeded)
+            );
+        }
+        let token = CancellationToken::new();
+        let shell = state.reserve_preparation_wait(LARGE_PREPARATION_RESERVATION_BYTES, &token);
+        let write = state.reserve_preparation_wait(MEDIUM_PREPARATION_RESERVATION_BYTES, &token);
+        tokio::pin!(shell, write);
+        std::future::poll_fn(|cx| {
+            assert!(shell.as_mut().poll(cx).is_pending());
+            assert!(write.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        let first = state
+            .prepare_reserved(
+                first,
+                PreparedRemoteOperation::Test(Vec::new()),
+                operation_binding(&state),
+                OperationIntent {
+                    kind: OperationKind::Read,
+                    mutating: false,
+                    resources: Vec::new(),
+                },
+            )
+            .unwrap();
+        tokio::join!(
+            async {
+                drop(shell.await.unwrap());
+            },
+            async {
+                drop(write.await.unwrap());
+            }
+        );
+        let ledger = state.ledger.lock().unwrap();
+        assert_eq!(ledger.reservations, 0);
+        assert_eq!(ledger.reserved_bytes, 0);
+        assert!(ledger.total_bytes() <= MAX_LEDGER_BYTES);
+        assert_eq!(
+            ledger.records[&first.preparation_id].state,
+            OperationState::Prepared
+        );
+    }
+
+    #[test]
+    fn releasing_preparations_reclaims_table_capacity_for_shell_inspection() {
+        let state = state();
+        let prepared = (0..MAX_PREPARATIONS)
+            .map(|_| prepare(&state).unwrap())
+            .collect::<Vec<_>>();
+        for prepared in prepared {
+            state
+                .release(&prepared.preparation_id, None, &state.binding)
+                .unwrap();
+        }
+        let ledger = state.ledger.lock().unwrap();
+        let retained = ledger.total_bytes();
+        let capacity = ledger.records.capacity();
+        drop(ledger);
+        assert!(
+            state
+                .reserve_preparation(LARGE_PREPARATION_RESERVATION_BYTES)
+                .is_ok(),
+            "empty operation table retains {retained} bytes with capacity {capacity}"
+        );
+    }
+
+    #[test]
+    fn executed_operation_churn_preserves_replay_and_large_preparation_capacity() {
+        let state = state();
+        let mut requests = Vec::new();
+        for index in 0..MAX_TOMBSTONES * 2 {
+            let prepared = prepare(&state).unwrap();
+            let invocation = format!(
+                "invocation-{index:0width$}",
+                width = MAX_ID_BYTES - "invocation-".len()
+            );
+            let request = ExecuteRequest {
+                version: ContractVersion::V1,
+                preparation_id: prepared.preparation_id,
+                invocation_id: Identifier::new(invocation).unwrap(),
+                host: state.binding.clone(),
+            };
+            let BeginExecution::Start { lease, .. } =
+                state.begin(&request, CancellationToken::new()).unwrap()
+            else {
+                panic!("execution did not start");
+            };
+            state.finish(
+                &request.preparation_id,
+                &request.invocation_id,
+                successful_outcome(0),
+            );
+            drop(lease);
+            state
+                .release(
+                    &request.preparation_id,
+                    Some(&request.invocation_id),
+                    &state.binding,
+                )
+                .unwrap();
+            requests.push(request);
+            if requests.len() >= MAX_TOMBSTONES {
+                let reservation = state.reserve_preparation(LARGE_PREPARATION_RESERVATION_BYTES);
+                let ledger = state.ledger.lock().unwrap();
+                assert!(
+                    reservation.is_ok(),
+                    "idle replay ledger retains {} bytes, {} tombstones, deque capacity {}",
+                    ledger.total_bytes(),
+                    ledger.tombstones.len(),
+                    ledger.tombstones.capacity()
+                );
+                assert!(ledger.total_bytes() <= MAX_LEDGER_BYTES);
+                assert!(ledger.bytes <= MAX_TOMBSTONE_LEDGER_BYTES);
+                assert_eq!(ledger.tombstones.len(), MAX_TOMBSTONES);
+                assert!(ledger.tombstones.capacity() <= MAX_TOMBSTONES);
+            }
+        }
+        assert_eq!(
+            state
+                .begin(&requests[0], CancellationToken::new())
+                .unwrap_err(),
+            RemoteOperationError::NotFound
+        );
+        for request in &requests[MAX_TOMBSTONES..] {
+            assert_eq!(
+                state.begin(request, CancellationToken::new()).unwrap_err(),
+                RemoteOperationError::Forgotten
+            );
+            let mut other = request.clone();
+            other.invocation_id = Identifier::new("different-invocation").unwrap();
+            assert_eq!(
+                state.begin(&other, CancellationToken::new()).unwrap_err(),
+                RemoteOperationError::InvocationMismatch
+            );
+        }
+        let reservation = state
+            .reserve_preparation(LARGE_PREPARATION_RESERVATION_BYTES)
+            .unwrap();
+        state
+            .prepare_reserved(
+                reservation,
+                PreparedRemoteOperation::Test(vec![
+                    0;
+                    MAX_PREPARED_OPERATION_BYTES
+                        - size_of::<PreparedRemoteOperation>()
+                ]),
+                operation_binding(&state),
+                OperationIntent {
+                    kind: OperationKind::Read,
+                    mutating: false,
+                    resources: Vec::new(),
+                },
+            )
+            .unwrap();
+        assert!(state.ledger.lock().unwrap().total_bytes() <= MAX_LEDGER_BYTES);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn preparation_admission_cancels_times_out_and_preserves_retained_quota() {
+        let state = state();
+        let first = state
+            .reserve_preparation(LARGE_PREPARATION_RESERVATION_BYTES)
+            .unwrap();
+        for cancel in [true, false] {
+            let token = CancellationToken::new();
+            let pending =
+                state.reserve_preparation_wait(LARGE_PREPARATION_RESERVATION_BYTES, &token);
+            tokio::pin!(pending);
+            std::future::poll_fn(|cx| {
+                assert!(pending.as_mut().poll(cx).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            let expected = if cancel {
+                token.cancel();
+                RemoteOperationError::Cancelled
+            } else {
+                tokio::time::advance(PREPARATION_ADMISSION_TIMEOUT).await;
+                RemoteOperationError::QuotaExceeded
+            };
+            assert_eq!(pending.await.err(), Some(expected));
+            assert_eq!(state.ledger.lock().unwrap().reservations, 1);
+            assert_eq!(
+                state.preparation_waiters.available_permits(),
+                MAX_PREPARATIONS
+            );
+        }
+        state
+            .prepare_reserved(
+                first,
+                PreparedRemoteOperation::Test(vec![0; MEDIUM_PREPARATION_RESERVATION_BYTES]),
+                operation_binding(&state),
+                OperationIntent {
+                    kind: OperationKind::Read,
+                    mutating: false,
+                    resources: Vec::new(),
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            state
+                .reserve_preparation_wait(
+                    LARGE_PREPARATION_RESERVATION_BYTES,
+                    &CancellationToken::new()
+                )
+                .await
+                .err(),
+            Some(RemoteOperationError::QuotaExceeded)
+        );
+        assert_eq!(state.ledger.lock().unwrap().records.len(), 1);
     }
 
     #[test]

@@ -104,6 +104,7 @@ const MODERN_PROTOCOLS: &[ProtocolVersion] = &[ProtocolVersion::V_2026_07_28];
 const DUAL_ERA_PROTOCOLS: &[ProtocolVersion] =
     &[ProtocolVersion::V_2026_07_28, ProtocolVersion::V_2025_11_25];
 const RESOURCE_NAMESPACE_VERSION: &str = "v1";
+const ISOLATED_PYTHON_RESOURCE: &str = "isolated-python";
 static PROCESS_INSTANCE_ID: OnceLock<Arc<str>> = OnceLock::new();
 
 pub(crate) fn protocol_versions(modern_only: bool) -> &'static [ProtocolVersion] {
@@ -908,13 +909,15 @@ impl WorkcellServer {
         &self,
         remote: &RemoteHostState,
         request: PrepareRequest,
+        token: &CancellationToken,
     ) -> Result<workcell_host_contract::PrepareResponse, ErrorData> {
         remote.validate_host(&request.host).map_err(remote_error)?;
         request
             .validate(RemoteHostState::limits().max_argument_bytes)
             .map_err(|_| remote_error(crate::remote_host::RemoteOperationError::InvalidRequest))?;
         let reservation = remote
-            .reserve_preparation(preparation_reservation_bytes(request.tool.as_str()))
+            .reserve_preparation_wait(preparation_reservation_bytes(request.tool.as_str()), token)
+            .await
             .map_err(remote_error)?;
         let tool = self
             .catalog
@@ -957,6 +960,7 @@ impl WorkcellServer {
         &self,
         remote: &RemoteHostState,
         request: PrepareMutationRequest,
+        token: &CancellationToken,
     ) -> Result<workcell_host_contract::PrepareResponse, ErrorData> {
         remote
             .validate_host(&request.binding.host)
@@ -964,7 +968,8 @@ impl WorkcellServer {
         request.validate().map_err(|_| remote_invalid())?;
         let encoded = serde_json::to_value(&request).map_err(|_| remote_invalid())?;
         let reservation = remote
-            .reserve_preparation(LARGE_PREPARATION_RESERVATION_BYTES)
+            .reserve_preparation_wait(LARGE_PREPARATION_RESERVATION_BYTES, token)
+            .await
             .map_err(remote_error)?;
         let prepared = self
             .workspace_files
@@ -1006,13 +1011,15 @@ impl WorkcellServer {
         &self,
         remote: &RemoteHostState,
         request: PrepareExecRequest,
+        token: &CancellationToken,
     ) -> Result<workcell_host_contract::PrepareResponse, ErrorData> {
         remote
             .validate_host(&request.binding.host)
             .map_err(remote_error)?;
         let encoded = serde_json::to_value(&request).map_err(|_| remote_invalid())?;
         let reservation = remote
-            .reserve_preparation(LARGE_PREPARATION_RESERVATION_BYTES)
+            .reserve_preparation_wait(LARGE_PREPARATION_RESERVATION_BYTES, token)
+            .await
             .map_err(remote_error)?;
         let relative_workdir = self
             .workspace_files
@@ -1063,7 +1070,8 @@ impl WorkcellServer {
             .map_err(remote_error)?;
         let encoded = serde_json::to_value(&request).map_err(|_| remote_invalid())?;
         let reservation = remote
-            .reserve_preparation(LARGE_PREPARATION_RESERVATION_BYTES)
+            .reserve_preparation_wait(LARGE_PREPARATION_RESERVATION_BYTES, token)
+            .await
             .map_err(remote_error)?;
         let scm = self.scm.as_ref().ok_or_else(method_not_found)?;
         let prepared = scm
@@ -1135,7 +1143,8 @@ impl WorkcellServer {
         validate_snapshot_cwd(remote, &request.binding)?;
         let encoded = serde_json::to_value(&request).map_err(|_| remote_invalid())?;
         let reservation = remote
-            .reserve_preparation(LARGE_PREPARATION_RESERVATION_BYTES)
+            .reserve_preparation_wait(LARGE_PREPARATION_RESERVATION_BYTES, token)
+            .await
             .map_err(remote_error)?;
         let (prepared, preview) = self
             .snapshots
@@ -1180,7 +1189,8 @@ impl WorkcellServer {
         validate_snapshot_cwd(remote, &request.binding)?;
         let encoded = serde_json::to_value(&request).map_err(|_| remote_invalid())?;
         let reservation = remote
-            .reserve_preparation(LARGE_PREPARATION_RESERVATION_BYTES)
+            .reserve_preparation_wait(LARGE_PREPARATION_RESERVATION_BYTES, token)
+            .await
             .map_err(remote_error)?;
         let (prepared, preview) = self
             .snapshots
@@ -1217,6 +1227,7 @@ impl WorkcellServer {
         &self,
         remote: &RemoteHostState,
         request: SnapshotPrepareCleanupRequest,
+        token: &CancellationToken,
     ) -> Result<SnapshotPrepareCleanupResponse, ErrorData> {
         remote
             .validate_host(&request.binding.host)
@@ -1224,7 +1235,8 @@ impl WorkcellServer {
         validate_snapshot_cwd(remote, &request.binding)?;
         let encoded = serde_json::to_value(&request).map_err(|_| remote_invalid())?;
         let reservation = remote
-            .reserve_preparation(LARGE_PREPARATION_RESERVATION_BYTES)
+            .reserve_preparation_wait(LARGE_PREPARATION_RESERVATION_BYTES, token)
+            .await
             .map_err(remote_error)?;
         let (prepared, preview) = self
             .snapshots
@@ -1635,12 +1647,15 @@ impl WorkcellServer {
                 let shell = self.shell.as_ref().ok_or_else(invalid)?;
                 let prepared = shell.prepare(input).await.map_err(|_| invalid())?;
                 shell.authorize_prepared(&prepared).map_err(|_| invalid())?;
-                let mut intents = vec![resource_intent(
-                    prepared.relative_workdir(),
-                    ResourceAccess::Execute,
-                )?];
-                for scope in &prepared.analysis().scopes {
-                    intents.push(resource_intent(&scope.permission, ResourceAccess::Execute)?);
+                let mut intents = vec![
+                    resource_intent(prepared.relative_workdir(), ResourceAccess::Traverse)?,
+                    resource_intent(prepared.command(), ResourceAccess::Execute)?,
+                ];
+                if let Ok(contexts) = prepared.bash_command_contexts() {
+                    intents.push(resource_intent(
+                        &serde_json::to_string(&contexts.assumptions).map_err(|_| invalid())?,
+                        ResourceAccess::Inspect,
+                    )?);
                 }
                 (
                     PreparedRemoteOperation::Shell(prepared),
@@ -1661,7 +1676,10 @@ impl WorkcellServer {
                     PreparedRemoteOperation::PythonExecution(prepared),
                     OperationKind::Execute,
                     false,
-                    Vec::new(),
+                    vec![resource_intent(
+                        ISOLATED_PYTHON_RESOURCE,
+                        ResourceAccess::Execute,
+                    )?],
                 )
             }
             EXECUTION_ENVIRONMENT_TOOL if matches!(arguments, Value::Object(values) if values.is_empty()) =>
@@ -2179,7 +2197,7 @@ impl ServerHandler for WorkcellServer {
         let value = match request.method.as_str() {
             PREPARE_METHOD => {
                 let request = parse_custom::<PrepareRequest>(params)?;
-                serde_json::to_value(self.prepare_remote(remote, request).await?)
+                serde_json::to_value(self.prepare_remote(remote, request, &context.ct).await?)
             }
             EXECUTE_METHOD => {
                 let request = parse_custom::<workcell_host_contract::ExecuteRequest>(params)?;
@@ -2330,11 +2348,17 @@ impl ServerHandler for WorkcellServer {
             }
             PREPARE_MUTATION_METHOD => {
                 let request = parse_custom::<PrepareMutationRequest>(params)?;
-                serde_json::to_value(self.prepare_workspace_mutation(remote, request).await?)
+                serde_json::to_value(
+                    self.prepare_workspace_mutation(remote, request, &context.ct)
+                        .await?,
+                )
             }
             PREPARE_EXEC_METHOD => {
                 let request = parse_custom::<PrepareExecRequest>(params)?;
-                serde_json::to_value(self.prepare_direct_exec(remote, request).await?)
+                serde_json::to_value(
+                    self.prepare_direct_exec(remote, request, &context.ct)
+                        .await?,
+                )
             }
             SCM_DISCOVER_METHOD => {
                 let request = parse_custom::<ScmDiscoverRequest>(params)?;
@@ -2492,7 +2516,10 @@ impl ServerHandler for WorkcellServer {
             }
             SNAPSHOT_PREPARE_CLEANUP_METHOD => {
                 let request = parse_custom::<SnapshotPrepareCleanupRequest>(params)?;
-                serde_json::to_value(self.prepare_snapshot_cleanup(remote, request).await?)
+                serde_json::to_value(
+                    self.prepare_snapshot_cleanup(remote, request, &context.ct)
+                        .await?,
+                )
             }
             _ => unreachable!("known custom method"),
         }
@@ -3851,12 +3878,20 @@ mod tests {
             "stored"
         );
 
-        let operation = stored_operation(
-            &server,
-            "shell",
-            serde_json::json!({"command":"pwd","workdir":"scope"}),
-        )
-        .await;
+        let (operation, intent) = server
+            .prepare_operation(
+                "shell",
+                serde_json::json!({"command":"pwd","workdir":"scope"}),
+            )
+            .await
+            .unwrap();
+        assert!(intent.mutating);
+        assert_eq!(intent.resources.len(), 3);
+        assert_eq!(intent.resources[0].display.as_str(), "scope");
+        assert_eq!(intent.resources[0].access, ResourceAccess::Traverse);
+        assert_eq!(intent.resources[1].display.as_str(), "pwd");
+        assert_eq!(intent.resources[1].access, ResourceAccess::Execute);
+        assert_eq!(intent.resources[2].access, ResourceAccess::Inspect);
         let result = server
             .execute_prepared_operation(operation, CancellationToken::new(), None)
             .await
@@ -4018,12 +4053,18 @@ mod tests {
         .with_remote_host(remote_configuration())
         .await
         .unwrap();
-        let operation = stored_operation(
-            &server,
-            "python_execution",
-            serde_json::json!({"code":"40 + 2"}),
-        )
-        .await;
+        let (operation, intent) = server
+            .prepare_operation("python_execution", serde_json::json!({"code":"40 + 2"}))
+            .await
+            .unwrap();
+        assert!(!intent.mutating);
+        assert_eq!(intent.kind, OperationKind::Execute);
+        assert_eq!(intent.resources.len(), 1);
+        assert_eq!(
+            intent.resources[0].display.as_str(),
+            ISOLATED_PYTHON_RESOURCE
+        );
+        assert_eq!(intent.resources[0].access, ResourceAccess::Execute);
         let result = server
             .execute_prepared_operation(operation, CancellationToken::new(), None)
             .await
