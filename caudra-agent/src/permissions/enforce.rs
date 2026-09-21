@@ -1597,6 +1597,37 @@ mod tests {
         allows_without_prompt(&manager, &request)
     }
 
+    /// The scratch root is pre-allowed the way the project is, and the shared
+    /// temp root around it is not. The allowed path sits under a project id
+    /// that is not the current one, because that is the case `/cd` creates:
+    /// `TMPDIR` keeps pointing at the directory startup chose while these rules
+    /// are rebuilt for somewhere else, and the write has to stay covered.
+    #[test_case(true => true ; "any_project_inside_the_scratch_root")]
+    #[test_case(false => false ; "beside_the_scratch_root")]
+    fn scratch_writes_skip_the_prompt_that_the_temp_root_still_earns(inside: bool) -> bool {
+        const OTHER_PROJECT: &str = "other-project-0123456789abcdef";
+        const SCRATCH_NOTE: &str = "note.md";
+        const SIBLING_NOTE: &str = "caudra-scratch-sibling.md";
+
+        let project = tempfile::tempdir().unwrap();
+        let manager = mgr_with(PermissionsConfig::default(), project.path().to_path_buf());
+        let path = if inside {
+            caudra_storage::paths::scratch_root()
+                .unwrap()
+                .join(OTHER_PROJECT)
+                .join(SCRATCH_NOTE)
+        } else {
+            std::env::temp_dir().join(SIBLING_NOTE)
+        };
+        let request = legacy_request(
+            &manager,
+            ToolKey::native("write"),
+            &[&path.to_string_lossy()],
+        );
+
+        allows_without_prompt(&manager, &request)
+    }
+
     #[test]
     fn builtin_echo_allow_requires_a_bundled_implementation() {
         let manager = default_mgr();

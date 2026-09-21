@@ -12,6 +12,7 @@ pub fn env_vars() -> Vars {
         .set("{cwd}", cwd)
         .set("{platform}", env::consts::OS)
         .set("{date}", date)
+        .set("{scratch}", env::temp_dir().to_string_lossy().into_owned())
         .set(
             "{task_system_prompt_profiles}",
             "- `builtin`: Caudra's built-in task prompt",

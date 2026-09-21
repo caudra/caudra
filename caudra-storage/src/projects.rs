@@ -136,6 +136,18 @@ pub fn project_subdir(cwd: &Path) -> PathBuf {
     Path::new(PROJECTS_DIR).join(project_id(&project_root(cwd)))
 }
 
+/// A project's own corner of the scratch root, keyed the way its state is, so
+/// two checkouts writing the same filename do not collide.
+///
+/// The scratch root holds nothing but these, so they sit directly inside it
+/// rather than under a `projects` level. Keying on the repository rather than
+/// `cwd` means a session started in a subdirectory shares the repository's
+/// scratch, which is the same reason [`project_root`] exists.
+pub fn project_scratch_dir(cwd: &Path) -> Result<PathBuf, std::io::Error> {
+    let root = crate::paths::scratch_root()?;
+    crate::paths::ensure_private_dir(&root.join(project_id(&project_root(cwd))))
+}
+
 #[derive(Clone, PartialEq, Eq)]
 pub struct LocalProjectAliases {
     project_key: ProjectKey,
@@ -291,6 +303,39 @@ mod tests {
         std::fs::create_dir_all(&nested).unwrap();
         std::fs::create_dir_all(root.join(GIT_MARKER)).unwrap();
         assert_eq!(project_subdir(&nested), project_subdir(&root));
+    }
+
+    #[test]
+    fn a_subdirectory_shares_the_repositorys_scratch_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("repo");
+        let nested = root.join("crates/inner");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::create_dir_all(root.join(GIT_MARKER)).unwrap();
+
+        let scratch = project_scratch_dir(&nested).unwrap();
+
+        assert_eq!(scratch, project_scratch_dir(&root).unwrap());
+        assert_eq!(
+            scratch.parent(),
+            Some(crate::paths::scratch_root().unwrap().as_path())
+        );
+    }
+
+    /// Two checkouts named the same are the case the hash in `project_id`
+    /// exists for, and the case a flat scratch directory got wrong.
+    #[test]
+    fn checkouts_sharing_a_name_get_different_scratch_directories() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = temp.path().join("a/caudra");
+        let second = temp.path().join("b/caudra");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+
+        assert_ne!(
+            project_scratch_dir(&first).unwrap(),
+            project_scratch_dir(&second).unwrap()
+        );
     }
 
     #[test]

@@ -8,6 +8,7 @@ mod subcmd;
 mod tui;
 mod workcell_runtime;
 
+use std::env;
 use std::path::Path;
 use std::process::ExitCode;
 
@@ -19,6 +20,10 @@ use caudra_storage::{EphemeralRoot, StateDir};
 
 use crate::cli::{AuthAction, Cli, Command, McpAction, WorkcellAuthAction, normalize_tool_name};
 use crate::update;
+
+/// The three names Workcell's shell forwards from this process into every
+/// command it runs. Windows reads the last two, Unix the first.
+const TEMP_DIR_VARS: [&str; 3] = ["TMPDIR", "TMP", "TEMP"];
 
 fn run_storage(persistent: StateDir, ephemeral: bool) -> Result<(StateDir, Option<EphemeralRoot>)> {
     if !ephemeral {
@@ -113,8 +118,48 @@ fn configure_native_tools(agent: &caudra_config::AgentConfig) {
     caudra_agent::tools::native::task::set_max_concurrent(agent.task_max_concurrent);
 }
 
+/// Points the temp-directory variables at Caudra's own scratch directory, so a
+/// command's `mktemp`, a build tool's cache, and everything else that honors
+/// them land there instead of littering the shared temp root. Workcell's shell
+/// clears the child environment and forwards exactly these three names from
+/// this process, so writing them here is what reaches a tool call.
+///
+/// Resolving the scratch path first fixes the process temp root; the variables
+/// are written only afterwards, so a later resolution cannot nest the namespace
+/// inside itself. A failure leaves them untouched and scratch work returns to
+/// the shared temp root, which the environment block still reports accurately.
+/// No subscriber exists this early, so the warning is best-effort.
+///
+/// The directory is keyed to the project the user launched in and stays there
+/// for the life of the process. `/cd` cannot move it, because writing the
+/// environment once threads exist is exactly what makes `set_var` unsafe.
+/// Permission policy answers that by pre-allowing the whole scratch root, so a
+/// path handed to the model before a directory change stays writable after one.
+///
+/// Must run before any thread exists, which is why `dispatch` calls it first.
+fn redirect_temp_dir() {
+    let scratch = match env::current_dir()
+        .and_then(|cwd| caudra_storage::projects::project_scratch_dir(&cwd))
+    {
+        Ok(scratch) => scratch,
+        Err(error) => {
+            tracing::warn!(%error, "scratch directory unavailable, leaving the temp directory alone");
+            return;
+        }
+    };
+    if env::temp_dir() == scratch {
+        return;
+    }
+    for name in TEMP_DIR_VARS {
+        // SAFETY: called before any thread is spawned, so nothing can be
+        // reading the environment concurrently.
+        unsafe { env::set_var(name, &scratch) };
+    }
+}
+
 pub fn dispatch(mut cli: Cli) -> Result<ExitCode> {
     caudra_storage::paths::check_namespace_override()?;
+    redirect_temp_dir();
     match cli.command.take() {
         Some(Command::Sandbox { action }) => {
             let storage = StateDir::resolve().context("resolve data directory")?;

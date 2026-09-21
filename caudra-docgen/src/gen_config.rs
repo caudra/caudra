@@ -661,8 +661,13 @@ Caudra follows platform directory conventions. On Linux and macOS that is XDG. O
 | State | `~/.local/state/caudra/` | `%APPDATA%\\caudra\\` |
 | Logs | `~/.local/logs/caudra/` | `%APPDATA%\\caudra\\` |
 | Cache | `~/.cache/caudra/` | `%LOCALAPPDATA%\\caudra\\` |
+| Scratch | `$TMPDIR/caudra/` | `%TEMP%\\caudra\\` |
 
 Config holds `init.lua`, `permissions.toml`, `mcp.toml`, `providers.toml`, `workcell.toml`, `sandboxes.toml`, and `commands/`. State holds sessions, auth tokens, memories, plans, model-job bindings, sandbox lifecycle records and transfer recovery journals. The install script puts the binary under `%LOCALAPPDATA%\\caudra` on Windows; that is separate from these runtime dirs.
+
+Scratch holds work that belongs outside your project, such as a file the model writes while thinking or a temporary a command leaves behind. Each project gets its own subdirectory named by the same project id used for state, so two checkouts writing the same filename do not collide. Caudra creates it at startup and points `TMPDIR`, `TMP`, and `TEMP` at it, so every command Caudra runs puts its own temporary files there instead of the shared temp root. The model is told the path, and writing anywhere under the scratch root needs no approval. Paths beside the root still ask.
+
+The choice of subdirectory is fixed when Caudra starts. `/cd` moves the project without moving it, which is why approval covers the whole root rather than one project's share of it. Directories are owner-only, and Caudra refuses to use one that turns out to be a symlink. Nothing sweeps them, so they live as long as your system keeps its temp root.
 
 State that belongs to one project sits under `…/state/caudra/projects/<project-id>/`, where the id is the project directory name plus a hash of its path. Memory notes and plan-mode documents both live there, so removing that directory clears everything Caudra kept for the project.
 

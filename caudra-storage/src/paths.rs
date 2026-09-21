@@ -1,12 +1,15 @@
 use std::env;
 use std::ffi::OsStr;
 use std::fs;
+#[cfg(unix)]
+use std::os::unix::fs::DirBuilderExt;
 use std::path::{Component, Path, PathBuf};
 use std::sync::OnceLock;
 
 use etcetera::base_strategy::BaseStrategy;
 
 const NAMESPACE_ENV: &str = "CAUDRA_NAMESPACE";
+const DIRECTORY_MODE: u32 = 0o700;
 
 /// Debug builds get their own directory so a development run never shares
 /// config, sessions, auth, logs, or caches with an installed release.
@@ -47,6 +50,7 @@ struct Paths {
     state: PathBuf,
     logs: PathBuf,
     cache: PathBuf,
+    scratch: PathBuf,
 }
 
 /// Parse an explicit namespace override. Pure: the caller supplies the raw
@@ -215,10 +219,15 @@ fn state_logs(s: &impl BaseStrategy, fallback: &Path, app_dir_name: &str) -> (Pa
     (state, logs)
 }
 
-fn paths_for(strategy: &impl BaseStrategy, app_dir_name: &str) -> Paths {
+/// `temp_root` is a parameter rather than an `env::temp_dir()` read so the join
+/// stays pure and testable, and so the caller controls when it is sampled:
+/// [`scratch_dir`] is what `TMPDIR` is later pointed at, and reading the
+/// variable after that redirect would nest the namespace inside itself.
+fn paths_for(strategy: &impl BaseStrategy, app_dir_name: &str, temp_root: &Path) -> Paths {
     let config = strategy.config_dir().join(app_dir_name);
     let data = strategy.data_dir().join(app_dir_name);
     let cache = strategy.cache_dir().join(app_dir_name);
+    let scratch = temp_root.join(app_dir_name);
     let (state, logs) = state_logs(strategy, &data, app_dir_name);
     Paths {
         config,
@@ -226,6 +235,7 @@ fn paths_for(strategy: &impl BaseStrategy, app_dir_name: &str) -> Paths {
         state,
         logs,
         cache,
+        scratch,
     }
 }
 
@@ -235,7 +245,11 @@ fn resolve() -> Result<&'static Paths, &'static PathsError> {
             let raw = env::var_os(NAMESPACE_ENV);
             let namespace = namespace_from(raw.as_deref())?;
             let strategy = etcetera::choose_base_strategy().map_err(|_| PathsError::BaseDirs)?;
-            Ok(paths_for(&strategy, namespace.unwrap_or(APP_DIR_NAME)))
+            Ok(paths_for(
+                &strategy,
+                namespace.unwrap_or(APP_DIR_NAME),
+                &env::temp_dir(),
+            ))
         })
         .as_ref()
 }
@@ -259,6 +273,40 @@ pub fn check_namespace_override() -> Result<(), NamespaceError> {
 
 fn ensure(path: &Path) -> Result<PathBuf, std::io::Error> {
     fs::create_dir_all(path)?;
+    Ok(path.to_path_buf())
+}
+
+/// Create one owner-only directory, refusing to accept an entry somebody else
+/// put there first.
+///
+/// The scratch tree is the one part of Caudra that lives in a world-writable
+/// directory under a predictable name, `TMPDIR` aims every child process at it,
+/// and permission policy pre-allows writes below it. A local user who wins the
+/// race and leaves a symlink behind would redirect all three. `create_dir_all`
+/// follows such a link without complaint, so the scratch levels are created one
+/// at a time through this instead.
+pub(crate) fn ensure_private_dir(path: &Path) -> Result<PathBuf, std::io::Error> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let mut builder = fs::DirBuilder::new();
+            #[cfg(unix)]
+            builder.mode(DIRECTORY_MODE);
+            match builder.create(path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error),
+            }
+            fs::symlink_metadata(path)?
+        }
+        Err(error) => return Err(error),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("refusing scratch access through {}", path.display()),
+        ));
+    }
     Ok(path.to_path_buf())
 }
 
@@ -296,6 +344,20 @@ pub fn logs_dir_path() -> Result<PathBuf, std::io::Error> {
 
 pub fn cache_dir() -> Result<PathBuf, std::io::Error> {
     active_path(|paths| &paths.cache)
+}
+
+/// The root every project's scratch directory sits under. Namespaced like every
+/// other directory, so a debug build never shares scratch with a release.
+///
+/// Permission policy pre-allows the whole root rather than the current project's
+/// subdirectory. `/cd` rebinds the project but cannot move `TMPDIR`, which is
+/// fixed for the life of the process, so a narrower grant would strand a path
+/// the model was already handed.
+///
+/// Resolving this fixes the temp root for the process, which is why the redirect
+/// that points `TMPDIR` inside it must call this before setting the variable.
+pub fn scratch_root() -> Result<PathBuf, std::io::Error> {
+    ensure_private_dir(&resolve().map_err(err)?.scratch)
 }
 
 pub fn home() -> Option<PathBuf> {
@@ -374,13 +436,60 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let strategy = TestStrategy::new(root.path(), true);
 
-        let paths = paths_for(&strategy, name);
+        let paths = paths_for(&strategy, name, &root.path().join("tmp"));
 
         assert_eq!(paths.config, root.path().join("config").join(name));
         assert_eq!(paths.data, root.path().join("data").join(name));
         assert_eq!(paths.state, root.path().join("state").join(name));
         assert_eq!(paths.logs, root.path().join("logs").join(name));
         assert_eq!(paths.cache, root.path().join("cache").join(name));
+        assert_eq!(paths.scratch, root.path().join("tmp").join(name));
+    }
+
+    /// The whole reason the scratch levels bypass `create_dir_all`: another
+    /// local user can win the race in a world-writable temp root, and a
+    /// symlink left behind would silently redirect everything `TMPDIR` aims
+    /// at the directory, including writes permission policy pre-allows.
+    #[test]
+    #[cfg(unix)]
+    fn a_planted_symlink_is_refused_rather_than_followed() {
+        let root = tempfile::tempdir().unwrap();
+        let elsewhere = root.path().join("elsewhere");
+        let planted = root.path().join("planted");
+        std::fs::create_dir(&elsewhere).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &planted).unwrap();
+
+        let error = ensure_private_dir(&planted).unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_created_directory_is_owner_only_and_reopening_it_changes_nothing() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("scratch");
+
+        let created = ensure_private_dir(&dir).unwrap();
+        let mode = std::fs::metadata(&created).unwrap().permissions().mode();
+
+        assert_eq!(mode & 0o777, DIRECTORY_MODE);
+        assert_eq!(ensure_private_dir(&dir).unwrap(), created);
+    }
+
+    #[test]
+    fn scratch_sits_beside_the_temp_root_rather_than_inside_a_previous_scratch() {
+        let root = tempfile::tempdir().unwrap();
+        let strategy = TestStrategy::new(root.path(), true);
+        let temp_root = root.path().join("tmp");
+
+        let first = paths_for(&strategy, APP_DIR_NAME, &temp_root);
+        let second = paths_for(&strategy, APP_DIR_NAME, &temp_root);
+
+        assert_eq!(first.scratch, second.scratch);
+        assert_eq!(first.scratch.parent(), Some(temp_root.as_path()));
     }
 
     #[test_case(None, None ; "unset")]
@@ -424,7 +533,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let strategy = TestStrategy::new(root.path(), false);
 
-        let paths = paths_for(&strategy, "caudra-debug");
+        let paths = paths_for(&strategy, "caudra-debug", &root.path().join("tmp"));
         let data = root.path().join("data/caudra-debug");
 
         assert_eq!(paths.state, data);

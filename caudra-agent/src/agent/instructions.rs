@@ -456,6 +456,20 @@ mod tests {
         assert!(!block.contains(crate::prompt::MODEL_SLOT));
     }
 
+    /// The model is told where temporary work goes, and told the real path:
+    /// the block reads the same variable the shell inherits, so the two cannot
+    /// disagree even when the redirect at startup failed.
+    #[test]
+    fn the_environment_block_names_the_scratch_directory() {
+        const SCRATCH_SLOT: &str = "{scratch}";
+
+        let model = Model::from_spec("anthropic/claude-sonnet-4-20250514").unwrap();
+        let block = environment_block(&crate::template::env_vars(), &model);
+
+        assert!(block.contains(&std::env::temp_dir().to_string_lossy().into_owned()));
+        assert!(!block.contains(SCRATCH_SLOT));
+    }
+
     #[test]
     fn the_system_prompt_explains_the_mode_protocol() {
         assert!(system_prompt().contains(crate::prompt::MODES_PROMPT.trim_end()));

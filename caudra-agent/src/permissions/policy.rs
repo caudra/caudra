@@ -98,21 +98,41 @@ pub(super) fn validate_compiled_templates(
     Ok(())
 }
 
+/// The scratch directory joins the project as a pre-allowed root. Work that
+/// does not belong in the workspace has to go somewhere, and a prompt for every
+/// temporary file teaches nothing: the directory is Caudra's own, holds no
+/// secret, and is where `TMPDIR` already points. Paths beside it under the
+/// shared temp root keep prompting, which is what makes the free one worth
+/// aiming at.
+///
+/// The whole scratch root is covered, not the current project's subdirectory
+/// inside it. `/cd` rebinds the project and rebuilds these rules, while
+/// `TMPDIR` stays where startup put it, so a narrower grant would start
+/// prompting for the very directory the model was told to use.
 pub(super) fn builtin_rules(cwd: &Path) -> Vec<PermissionRule> {
-    let cwd_glob = format!(
-        "{}/**",
-        caudra_storage::paths::canonicalize_clean(cwd).display()
-    );
+    let glob = |root: &Path| {
+        format!(
+            "{}/**",
+            caudra_storage::paths::canonicalize_clean(root).display()
+        )
+    };
     let allow = |tool: &str, scope: &str| PermissionRule {
         tool: ToolKey::native(tool),
         scope: Some(scope.into()),
         effect: Effect::Allow,
     };
-    let mut rules: Vec<PermissionRule> = FILE_WRITE_TOOLS
-        .iter()
-        .map(|tool| allow(tool, &cwd_glob))
+    let roots: Vec<String> = std::iter::once(glob(cwd))
+        .chain(
+            caudra_storage::paths::scratch_root()
+                .ok()
+                .map(|scratch| glob(&scratch)),
+        )
         .collect();
-    rules.extend(PROJECT_READ_TOOLS.iter().map(|tool| allow(tool, &cwd_glob)));
+    let mut rules: Vec<PermissionRule> = Vec::new();
+    for root in &roots {
+        rules.extend(FILE_WRITE_TOOLS.iter().map(|tool| allow(tool, root)));
+        rules.extend(PROJECT_READ_TOOLS.iter().map(|tool| allow(tool, root)));
+    }
     rules.extend(TRUSTED_UNSCOPED_TOOLS.iter().map(|tool| allow(tool, "*")));
     rules
 }
@@ -2261,6 +2281,24 @@ mod tests {
                     && record.rule.lifetime == PermissionLifetime::Global
             }));
         });
+    }
+
+    /// Asserted on the rule list rather than through an enforcement decision,
+    /// so a failure names the missing rule instead of a prompt that appeared
+    /// for one of several possible reasons.
+    #[test]
+    fn builtin_rules_allow_the_scratch_root_and_not_the_temp_root_holding_it() {
+        let project = tempfile::tempdir().unwrap();
+        let scratch = caudra_storage::paths::scratch_root().unwrap();
+        let scopes: Vec<String> = super::builtin_rules(project.path())
+            .into_iter()
+            .filter(|rule| rule.effect == Effect::Allow)
+            .filter_map(|rule| rule.scope)
+            .collect();
+
+        let glob = |root: &Path| format!("{}/**", root.display());
+        assert!(scopes.contains(&glob(&scratch)));
+        assert!(!scopes.contains(&glob(&std::env::temp_dir())));
     }
 
     #[test]

@@ -368,12 +368,12 @@ Structured requests distinguish files, directories, URLs, commands, queries, and
 
 - File matching uses normalized path components and resolves existing symlinks.
 - Protected paths such as `.git`, `.ssh`, `.aws`, and dotenv files require exact authority.
-- Access outside the project prompts even when ordinary project reads and writes are trusted.
+- Access outside the project prompts even when ordinary project reads and writes are trusted, apart from the scratch directory.
 - URL matching and fetching reject credentials and ambiguous encoded path separators or dot segments.
 - Shell authority includes the initial working directory.
 - A deny that intersects any resource blocks the complete call.
 
-File-write tools remain pre-allowed inside the project working directory. Read-only filesystem tools declare scopes and trusted native policy allows them by default. Loading a skill is allowed by default wherever the skill lives. A skill name is a catalog key rather than a path, so the tool can only open a `SKILL.md` under Caudra's own skill directories or read a skill built into the binary. Explicit deny rules can therefore block `file_read`, `file_glob`, `file_grep`, `file_index`, `skill`, or image access without adding normal prompt noise.
+File-write tools remain pre-allowed inside the project working directory and anywhere under the [scratch root](/docs/configuration/#directory-layout), which holds the directory `TMPDIR` points at. Approval covers the root rather than one project's subdirectory inside it, so `/cd` cannot strand a path the model was already given. Paths beside the root under the shared temp root still prompt. Read-only filesystem tools declare scopes and trusted native policy allows them by default. Loading a skill is allowed by default wherever the skill lives. A skill name is a catalog key rather than a path, so the tool can only open a `SKILL.md` under Caudra's own skill directories or read a skill built into the binary. Explicit deny rules can therefore block `file_read`, `file_glob`, `file_grep`, `file_index`, `skill`, or image access without adding normal prompt noise.
 
 Every registered model tool reaches the permission manager. A tool without declared scopes receives its canonical validated input as an exact fallback scope. The `batch` container routes inner calls through the same manager. Native `python_execution` is isolated and has no inner tool calls.
 
