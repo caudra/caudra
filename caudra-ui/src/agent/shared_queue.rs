@@ -189,6 +189,7 @@ impl QueueItem {
 
 #[derive(Clone)]
 pub(crate) struct QueueSender {
+    dispatch_guard: SharedDispatchGuard,
     queue: EditableQueue<QueueItem>,
     paused: Arc<AtomicBool>,
     claim_gate: Arc<Mutex<()>>,
@@ -198,6 +199,7 @@ pub(crate) struct QueueSender {
 }
 
 pub(crate) struct QueueReceiver {
+    dispatch_guard: SharedDispatchGuard,
     queue: EditableQueueReceiver<QueueItem>,
     paused: Arc<AtomicBool>,
     claim_gate: Arc<Mutex<()>>,
@@ -207,6 +209,8 @@ pub(crate) struct QueueReceiver {
     processing: Arc<AtomicBool>,
 }
 
+type SharedDispatchGuard = Arc<Mutex<Option<Arc<dyn Fn() -> bool + Send + Sync>>>>;
+
 pub(crate) fn queue() -> (QueueSender, QueueReceiver) {
     let (queue, receiver) = editable_queue();
     let paused = Arc::new(AtomicBool::new(false));
@@ -214,8 +218,10 @@ pub(crate) fn queue() -> (QueueSender, QueueReceiver) {
     let active = Arc::new(AtomicBool::new(false));
     let active_run_id = Arc::new(AtomicU64::new(0));
     let processing = Arc::new(AtomicBool::new(false));
+    let dispatch_guard = SharedDispatchGuard::default();
     (
         QueueSender {
+            dispatch_guard: dispatch_guard.clone(),
             queue,
             paused: Arc::clone(&paused),
             claim_gate: Arc::clone(&claim_gate),
@@ -224,6 +230,7 @@ pub(crate) fn queue() -> (QueueSender, QueueReceiver) {
             processing: Arc::clone(&processing),
         },
         QueueReceiver {
+            dispatch_guard,
             queue: receiver,
             paused,
             claim_gate,
@@ -236,6 +243,16 @@ pub(crate) fn queue() -> (QueueSender, QueueReceiver) {
 }
 
 impl QueueSender {
+    pub(crate) fn wake_dispatch(&self) {
+        self.queue.wake();
+    }
+
+    pub(crate) fn set_dispatch_guard(&self, guard: Arc<dyn Fn() -> bool + Send + Sync>) {
+        if let Ok(mut slot) = self.dispatch_guard.lock() {
+            *slot = Some(guard);
+        }
+    }
+
     pub(crate) fn push(&self, entry: QueueItem) -> QueueItemId {
         self.queue.push(entry)
     }
@@ -466,12 +483,18 @@ impl QueueSender {
 }
 
 impl QueueReceiver {
+    fn dispatch_allowed(&self) -> bool {
+        self.dispatch_guard
+            .lock()
+            .is_ok_and(|guard| guard.as_ref().is_none_or(|guard| guard()))
+    }
+
     pub(crate) fn claim_idle(&self, min_run_id: u64) -> Vec<(QueueItemId, QueueItem)> {
         let _claim = self
             .claim_gate
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if self.paused.load(Ordering::Acquire) {
+        if self.paused.load(Ordering::Acquire) || !self.dispatch_allowed() {
             return Vec::new();
         }
         self.processing.store(true, Ordering::Release);
@@ -555,7 +578,7 @@ impl QueueReceiver {
             .claim_gate
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if self.paused.load(Ordering::Acquire) {
+        if self.paused.load(Ordering::Acquire) || !self.dispatch_allowed() {
             return Vec::new();
         }
         if !self.active.load(Ordering::Acquire) {
@@ -591,9 +614,10 @@ impl QueueReceiver {
     }
 
     pub(crate) fn has_newer_interrupt(&self, run_id: u64) -> bool {
-        self.queue.has_matching(|item| {
-            item.admission() == PromptAdmission::Interrupt && item.run_id() > run_id
-        })
+        self.dispatch_allowed()
+            && self.queue.has_matching(|item| {
+                item.admission() == PromptAdmission::Interrupt && item.run_id() > run_id
+            })
     }
 
     /// Runs `publish` under the queue lock, so a drain event can never
@@ -644,6 +668,36 @@ mod tests {
 
     const PADDED_DRAFT: &str = "  ab cd  ";
     const PLAN_PATH: &str = ".caudra/plans/test.md";
+
+    #[test_case(false; "idle")]
+    #[test_case(true; "steer")]
+    fn network_dispatch_guard_retains_queued_work_until_verified(steering: bool) {
+        let (sender, receiver) = queue();
+        let allowed = Arc::new(AtomicBool::new(false));
+        let guard = allowed.clone();
+        sender.set_dispatch_guard(Arc::new(move || guard.load(Ordering::Acquire)));
+        sender.push(if steering {
+            steer(AgentMode::Build)
+        } else {
+            msg(false)
+        });
+        receiver.set_active_run(0);
+        if steering {
+            assert!(receiver.claim_steers().is_empty());
+        } else {
+            assert!(receiver.claim_idle(0).is_empty());
+        }
+        assert_eq!(sender.len(), 1);
+        allowed.store(true, Ordering::Release);
+        sender.wake_dispatch();
+        let claimed = if steering {
+            receiver.claim_steers()
+        } else {
+            receiver.claim_idle(0)
+        };
+        assert_eq!(claimed.len(), 1);
+        assert!(sender.is_empty());
+    }
 
     fn msg(displayed: bool) -> QueueItem {
         msg_with_mode(displayed, AgentMode::Build)

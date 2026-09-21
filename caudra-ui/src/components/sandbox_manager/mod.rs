@@ -4,25 +4,30 @@ mod live;
 mod transfer;
 mod view;
 
+use super::scrollbar::{Scrollbar, ScrollbarMouse};
 use super::text_editor::{EditorKey, EditorMouse, TextEditor};
 use super::{HintBar, Overlay, keybindings::key};
 use crate::sandbox::{
-    LiveOperation, LiveOutcome, LiveReply, LiveRequest, SandboxAttachment, SandboxProviderSnapshot,
-    SandboxSnapshot, SandboxSnapshotRequest, SnapshotState, StoreEffect, StoreReply, StoreResult,
-    StoreTicket,
+    LiveOperation, LiveOutcome, LiveReply, LiveRequest, NETWORK_SAVE_NOTICE, SandboxAttachment,
+    SandboxProviderSnapshot, SandboxSnapshot, SandboxSnapshotRequest, SnapshotState, StoreEffect,
+    StoreReply, StoreResult, StoreTicket,
 };
 use caudra_config::sandbox::persistence::LoadedSandboxes;
 use caudra_config::sandbox::{
     Enforcement, MAX_SANDBOX_FILE_BYTES, MAX_SANDBOX_RECORD_BYTES, MAX_SANDBOX_RECORDS, RecordKind,
     ResourceRange, Revision, SandboxDraft, SandboxName, TlsMode,
 };
+use caudra_sandbox::Ownership;
 use caudra_storage::id::CaudraId;
 use crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use form::Form;
 use live::LiveForm;
+use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -105,6 +110,13 @@ enum Confirmation {
         preview: String,
         choice: usize,
     },
+    NetworkSave {
+        effect: Box<StoreEffect>,
+        after: Option<Navigation>,
+        preview: String,
+        draft_revision: u64,
+        choice: usize,
+    },
 }
 
 #[derive(PartialEq, Eq)]
@@ -159,6 +171,7 @@ impl ReferencePicker {
 
 #[derive(Clone, PartialEq, Eq)]
 enum Control {
+    Editor,
     View(SandboxView),
     Row(usize),
     Field(usize),
@@ -166,6 +179,54 @@ enum Control {
     Confirm(usize),
     Reference(usize),
     LiveField(usize),
+    InstanceActions,
+    InstanceAction(usize),
+}
+
+#[derive(Default)]
+struct ReadPane {
+    editor: TextEditor,
+    fingerprint: Option<u64>,
+    area: Rect,
+    visible: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReadSurface {
+    Body,
+    Summary,
+    Help,
+    Status,
+    Empty,
+}
+
+impl ReadSurface {
+    const ALL: [Self; 5] = [
+        Self::Body,
+        Self::Summary,
+        Self::Help,
+        Self::Status,
+        Self::Empty,
+    ];
+}
+
+impl ReadPane {
+    fn view(&mut self, frame: &mut Frame, area: Rect, text: String) {
+        if self.area != area {
+            self.editor.cancel_selection();
+        }
+        self.visible = true;
+        let mut hash = DefaultHasher::new();
+        text.hash(&mut hash);
+        let fingerprint = hash.finish();
+        if self.fingerprint != Some(fingerprint) {
+            self.editor = TextEditor::new();
+            self.editor.set_text(text);
+            self.fingerprint = Some(fingerprint);
+        }
+        self.area = area;
+        self.editor.view_json(frame, area);
+    }
 }
 
 struct Manager {
@@ -181,6 +242,7 @@ struct Manager {
     pending: Option<Pending>,
     live_pending: Option<(StoreTicket, SandboxSnapshotRequest)>,
     live_form: Option<LiveForm>,
+    report_draft: Option<LiveForm>,
     transfer: Option<transfer::TransferPanel>,
     conflict: Option<Result<Arc<LoadedSandboxes>, String>>,
     snapshot: Option<SandboxSnapshot>,
@@ -189,6 +251,7 @@ struct Manager {
     form: Option<Form>,
     document: Option<DocumentEditor>,
     references: Option<ReferencePicker>,
+    instance_action: Option<usize>,
     confirmation: Option<Confirmation>,
     focus: Focus,
     detail: bool,
@@ -198,17 +261,35 @@ struct Manager {
     reveal_selected: bool,
     detail_scroll: u16,
     status: String,
+    network_report: Option<String>,
     hints: Vec<HintBar>,
     hits: Vec<(Rect, Control)>,
     pressed: Option<Control>,
+    hovered: Option<Control>,
     area: Rect,
     list_area: Rect,
     editor_area: Rect,
+    readers: [ReadPane; ReadSurface::ALL.len()],
+    reader_focus: Option<ReadSurface>,
+    reader_capture: Option<ReadSurface>,
+    editor_capture: bool,
+    search_capture: bool,
+    list_bar: Scrollbar,
+    fields_bar: Scrollbar,
+    references_bar: Scrollbar,
+    fields_area: Rect,
+    references_area: Rect,
+    reference_scroll: usize,
+    reveal_reference: bool,
+    live_scroll: usize,
+    live_scroll_focus: usize,
 }
 
 impl SandboxManager {
     pub(crate) fn open(&mut self, conversation: CaudraId, view: SandboxView) -> SandboxAction {
         if let Some(state) = self.state.as_mut() {
+            state.cancel_selections();
+            state.reset_mouse();
             state.open = true;
             if state.conversation != conversation {
                 if state.pending.is_some() || state.live_pending.is_some() {
@@ -223,6 +304,7 @@ impl SandboxManager {
                 || state.pending.is_some()
                 || state.live_pending.is_some()
                 || state.live_form.is_some()
+                || state.report_draft.is_some()
                 || state.transfer.is_some()
             {
                 return SandboxAction::None;
@@ -243,6 +325,7 @@ impl SandboxManager {
             pending: None,
             live_pending: None,
             live_form: None,
+            report_draft: None,
             transfer: None,
             conflict: None,
             snapshot: None,
@@ -251,6 +334,7 @@ impl SandboxManager {
             form: None,
             document: None,
             references: None,
+            instance_action: None,
             confirmation: None,
             focus: Focus::List,
             detail: false,
@@ -260,12 +344,28 @@ impl SandboxManager {
             reveal_selected: true,
             detail_scroll: 0,
             status: "Loading saved sandbox configuration…".into(),
+            network_report: None,
             hints: Vec::new(),
             hits: Vec::new(),
             pressed: None,
+            hovered: None,
             area: Rect::ZERO,
             list_area: Rect::ZERO,
             editor_area: Rect::ZERO,
+            readers: std::array::from_fn(|_| ReadPane::default()),
+            reader_focus: None,
+            reader_capture: None,
+            editor_capture: false,
+            search_capture: false,
+            list_bar: Scrollbar::default(),
+            fields_bar: Scrollbar::default(),
+            references_bar: Scrollbar::default(),
+            fields_area: Rect::ZERO,
+            references_area: Rect::ZERO,
+            reference_scroll: 0,
+            reveal_reference: true,
+            live_scroll: 0,
+            live_scroll_focus: 0,
         };
         let action = state.effect(StoreEffect::Load, None);
         self.state = Some(Box::new(state));
@@ -299,6 +399,9 @@ impl SandboxManager {
     }
 
     pub(crate) fn receive_live(&mut self, reply: LiveReply) -> Option<SandboxAttachment> {
+        if let Some(state) = self.state.as_mut() {
+            state.reset_mouse();
+        }
         if self.snapshot_request(reply.scope.conversation).as_ref() != Some(&reply.scope) {
             return None;
         }
@@ -307,6 +410,7 @@ impl SandboxManager {
             return None;
         }
         state.live_pending = None;
+        state.cancel_selections();
         if let Ok(LiveOutcome::ImageProbe(probe)) = reply.result {
             if let Some(form) = state.live_form.as_mut() {
                 form.install_probe(probe);
@@ -399,6 +503,8 @@ impl SandboxManager {
             return false;
         }
         let selected = state.entries().get(state.selected).cloned();
+        state.cancel_selections();
+        state.reset_mouse();
         state.snapshot = Some(snapshot);
         if let Some(selected) = selected
             .and_then(|selected| state.entries().iter().position(|entry| entry == &selected))
@@ -409,7 +515,18 @@ impl SandboxManager {
         true
     }
 
+    pub(crate) fn receive_network_report(&mut self, report: String) {
+        if let Some(state) = self.state.as_mut() {
+            state.cancel_selections();
+            state.network_report = Some(report);
+            state.status = "Saved-network results available in Instances. Saved is not necessarily enforced; /sandbox reconcile-network inspects before retrying.".into();
+        }
+    }
+
     pub(crate) fn receive(&mut self, reply: StoreReply) -> SandboxAction {
+        if let Some(state) = self.state.as_mut() {
+            state.reset_mouse();
+        }
         let Some(state) = self.state.as_mut() else {
             return SandboxAction::None;
         };
@@ -439,6 +556,10 @@ impl SandboxManager {
                 state.status = CONFLICT.into();
             }
             StoreResult::Saved(saved) => {
+                let networks_changed = state.baseline.as_ref().is_some_and(|baseline| {
+                    baseline.saved().configuration().networks
+                        != saved.saved().configuration().networks
+                });
                 state.formatting = None;
                 state.draft = saved.draft();
                 state.baseline = Some(saved);
@@ -461,7 +582,12 @@ impl SandboxManager {
                                     Form::new(record.kind(), Some(name), Some(record)).ok()
                                 });
                     }
-                    state.status = SAVED.into();
+                    state.status = if networks_changed {
+                        NETWORK_SAVE_NOTICE
+                    } else {
+                        SAVED
+                    }
+                    .into();
                     if let Some(after) = pending.and_then(|pending| pending.after) {
                         return state.go(after);
                     }
@@ -506,7 +632,7 @@ impl SandboxManager {
         let Some(state) = self.state.as_mut().filter(|state| state.open) else {
             return false;
         };
-        if state.confirmation.is_none() {
+        if state.confirmation.is_none() && state.reader_focus.is_none() {
             state.paste(text);
         }
         true
@@ -521,6 +647,24 @@ impl SandboxManager {
 
     pub(crate) fn scroll_at(&mut self, position: Position, delta: i32) {
         if let Some(state) = self.state.as_mut().filter(|state| state.open) {
+            if state.search_capture
+                || (state.focus == Focus::Search
+                    && state.hits.iter().any(|(area, control)| {
+                        *control == Control::Search && area.contains(position)
+                    }))
+            {
+                state.search.scroll(delta);
+                return;
+            }
+            if let Some(reader) = state
+                .readers
+                .iter_mut()
+                .find(|reader| reader.area.contains(position))
+            {
+                reader.editor.scroll(delta);
+                return;
+            }
+            state.reset_mouse();
             if let Some(panel) = state.transfer.as_mut() {
                 panel.scroll(position, delta);
                 return;
@@ -532,16 +676,47 @@ impl SandboxManager {
                 return;
             }
             if let Some(form) = state.live_form.as_mut() {
-                if let Some(field) = form.fields.get_mut(form.focus) {
+                if let Some(picker) = form.picker.as_mut() {
+                    picker.scroll_at(position, delta);
+                } else if state.fields_area.contains(position) {
+                    state.live_scroll = state
+                        .live_scroll
+                        .saturating_add_signed(-(delta as isize))
+                        .min(
+                            form.fields
+                                .len()
+                                .saturating_sub(state.fields_area.height as usize),
+                        );
+                } else if let Some(field) = form.fields.get_mut(form.focus) {
                     field.editor.scroll(delta);
                 }
-            } else if let Some(picker) = state.references.as_mut() {
-                picker.selected = picker
-                    .selected
+            } else if state.instance_action.is_some() {
+                state.reveal_reference = false;
+                state.reference_scroll = state
+                    .reference_scroll
                     .saturating_add_signed(-(delta as isize))
-                    .min(picker.filtered().len().saturating_sub(1));
+                    .min(
+                        live::INSTANCE_ACTIONS
+                            .len()
+                            .saturating_sub(state.references_area.height as usize),
+                    );
+            } else if let Some(picker) = state.references.as_mut() {
+                state.reveal_reference = false;
+                state.reference_scroll = state
+                    .reference_scroll
+                    .saturating_add_signed(-(delta as isize))
+                    .min(
+                        picker
+                            .filtered()
+                            .len()
+                            .saturating_sub(state.references_area.height as usize),
+                    );
             } else if let Some(document) = state.document.as_mut() {
-                document.editor.scroll(delta);
+                document
+                    .destination
+                    .as_mut()
+                    .unwrap_or(&mut document.editor)
+                    .scroll(delta);
             } else if state.editor_area.contains(position)
                 && state.form.as_ref().is_some_and(|form| form.editing)
             {
@@ -553,13 +728,19 @@ impl SandboxManager {
                 state.list_scroll = state
                     .list_scroll
                     .saturating_add_signed(-(delta as isize))
-                    .min(state.entries().len().saturating_sub(1));
+                    .min(
+                        state
+                            .entries()
+                            .len()
+                            .saturating_sub(state.list_area.height.saturating_sub(1) as usize),
+                    );
             } else if let Some(form) = state.form.as_mut() {
                 form.reveal_focus = false;
-                form.scroll = form
-                    .scroll
-                    .saturating_add_signed(-(delta as isize))
-                    .min(form.fields.len().saturating_sub(1));
+                form.scroll = form.scroll.saturating_add_signed(-(delta as isize)).min(
+                    form.fields
+                        .len()
+                        .saturating_sub(state.fields_area.height as usize),
+                );
             } else {
                 state.detail_scroll = state
                     .detail_scroll
@@ -576,19 +757,35 @@ impl Overlay for SandboxManager {
     fn close(&mut self) {
         if let Some(state) = self.state.as_mut() {
             state.open = false;
-            state.pressed = None;
+            state.cancel_selections();
+            state.reset_mouse();
         }
     }
 }
 
 impl Manager {
     fn live_report(&mut self, report: String) {
+        self.cancel_selections();
         self.status = report.clone();
-        if self.live_form.is_some() {
+        if self.live_form.is_some() && self.live_pending.is_some() {
             return;
         }
+        self.reset_mouse();
+        if let Some(form) = self.live_form.take() {
+            self.report_draft = Some(form);
+        }
         let mut editor = TextEditor::new();
-        editor.set_text(format!("{report}\n\nEsc returns to the manager. No automatic retry or attachment. If the outcome is unknown, Reconcile before any new Create."));
+        let destination = if self.report_draft.is_some() {
+            "the unchanged draft"
+        } else {
+            "the manager"
+        };
+        if self.report_draft.is_some() {
+            self.status = format!(
+                "Action report · Esc returns to {destination}. No automatic retry or attachment."
+            );
+        }
+        editor.set_text(format!("{report}\n\nEsc returns to {destination}. No automatic retry or attachment. If the outcome is unknown, Reconcile before any new Create."));
         self.document = Some(DocumentEditor {
             mode: DocumentMode::LiveReport,
             editor,
@@ -672,6 +869,7 @@ impl Manager {
     }
 
     fn inspect(&mut self) {
+        self.cancel_selections();
         self.form = None;
         self.detail_scroll = 0;
         let entries = self.entries();
@@ -976,6 +1174,32 @@ impl Manager {
         };
         match self.candidate() {
             Ok(draft) => {
+                if baseline.saved().configuration().networks != draft.networks {
+                    let mut preview = NETWORK_SAVE_NOTICE.to_owned();
+                    preview.push_str("\n\nAffected existing instances (last snapshot; worker revalidates after commit):\n");
+                    match self.snapshot.as_ref().map(|snapshot| &snapshot.instances) {
+                        Some(SnapshotState::Ready(rows)) => {
+                            for record in rows.iter().filter_map(|row| row.record.as_ref()) {
+                                let Some(launch) = record.launch.as_ref().map(|launch| launch.configuration()) else { continue; };
+                                let network = &launch.profile.value().network;
+                                if record.ownership != Ownership::Owned || record.detached
+                                    || baseline.saved().configuration().networks.get(network) == draft.networks.get(network) { continue; }
+                                let current = draft.profiles.get(&launch.profile_name).map(|profile| profile.network.as_str()).unwrap_or("missing");
+                                preview.push_str(&format!("{}: launch network {network}; current profile network {current}\n", record.name));
+                            }
+                        }
+                        _ => preview.push_str("Inventory unavailable; affected names will be discovered by the worker.\n"),
+                    }
+                    self.confirmation = Some(Confirmation::NetworkSave {
+                        effect: Box::new(StoreEffect::Save { baseline, draft }),
+                        after,
+                        preview,
+                        draft_revision: self.revision,
+                        choice: 0,
+                    });
+                    self.detail_scroll = 0;
+                    return SandboxAction::None;
+                }
                 self.status = "Saving configuration with file revision precondition…".into();
                 self.effect(StoreEffect::Save { baseline, draft }, after)
             }
@@ -1006,6 +1230,8 @@ impl Manager {
     }
 
     fn go(&mut self, after: Navigation) -> SandboxAction {
+        self.cancel_selections();
+        self.instance_action = None;
         self.confirmation = None;
         self.pressed = None;
         self.hits.clear();
@@ -1095,6 +1321,20 @@ impl Manager {
 
     fn confirm(&mut self, choice: usize) -> SandboxAction {
         match self.confirmation.take() {
+            Some(Confirmation::NetworkSave {
+                effect,
+                after,
+                draft_revision,
+                ..
+            }) if choice == 1 => {
+                if self.revision != draft_revision {
+                    self.status = "Draft changed after network review. Save again to review the current changes; nothing was persisted.".into();
+                    return SandboxAction::None;
+                }
+                self.status =
+                    "Saving configuration; network reconciliation starts only after commit.".into();
+                self.effect(*effect, after)
+            }
             Some(Confirmation::Live { operation, .. }) if choice == 1 => {
                 self.start_operation(*operation)
             }
@@ -1141,6 +1381,43 @@ impl Manager {
         if event.kind == KeyEventKind::Release {
             return SandboxAction::None;
         }
+        let reader = self.reader_focus.or_else(|| {
+            ((!matches!(event.code, KeyCode::Left | KeyCode::Right) && self.confirmation.is_some())
+                || self.live_pending.is_some()
+                || (self.focus == Focus::Detail
+                    && self.form.is_none()
+                    && self.instance_action.is_none()))
+            .then_some(ReadSurface::Body)
+        });
+        if let Some(surface) = reader.filter(|_| read_only_key(event)) {
+            let reader = &mut self.readers[surface as usize];
+            if !reader.area.is_empty() {
+                let mut event = event;
+                if matches!(event.code, KeyCode::Home | KeyCode::End) {
+                    event.modifiers.insert(KeyModifiers::CONTROL);
+                }
+                return editor_action(reader.editor.handle_key(event));
+            }
+        }
+        if self.reader_focus.is_some()
+            && !read_only_key(event)
+            && !matches!(
+                event.code,
+                KeyCode::Esc | KeyCode::Tab | KeyCode::BackTab | KeyCode::F(_)
+            )
+        {
+            return SandboxAction::None;
+        }
+        if !read_only_key(event) {
+            self.reader_focus = None;
+        }
+        if matches!(
+            event.code,
+            KeyCode::Esc | KeyCode::Tab | KeyCode::BackTab | KeyCode::F(6)
+        ) {
+            self.cancel_selections();
+        }
+        self.reset_mouse();
         if self.transfer.is_some() {
             return self.transfer_key(event);
         }
@@ -1148,7 +1425,12 @@ impl Manager {
             && (self.confirmation.is_some() || !self.form.as_ref().is_some_and(|form| form.editing))
             && !matches!(
                 event.code,
-                KeyCode::Up | KeyCode::Down | KeyCode::PageUp | KeyCode::PageDown
+                KeyCode::Up
+                    | KeyCode::Down
+                    | KeyCode::PageUp
+                    | KeyCode::PageDown
+                    | KeyCode::Home
+                    | KeyCode::End
             )
         {
             return SandboxAction::None;
@@ -1169,6 +1451,7 @@ impl Manager {
                 let (choice, count) = match confirmation {
                     Confirmation::Dirty { choice, .. } => (choice, 3),
                     Confirmation::DeleteProfile { choice, .. }
+                    | Confirmation::NetworkSave { choice, .. }
                     | Confirmation::Live { choice, .. } => (choice, 2),
                 };
                 match event.code {
@@ -1180,6 +1463,8 @@ impl Manager {
                     }
                     KeyCode::PageDown => self.detail_scroll = self.detail_scroll.saturating_add(5),
                     KeyCode::PageUp => self.detail_scroll = self.detail_scroll.saturating_sub(5),
+                    KeyCode::Home => self.detail_scroll = 0,
+                    KeyCode::End => self.detail_scroll = u16::MAX,
                     _ => {}
                 }
             }
@@ -1194,13 +1479,31 @@ impl Manager {
             return SandboxAction::None;
         }
         if self.live_form.is_some() {
+            if self
+                .live_form
+                .as_ref()
+                .and_then(|form| form.fields.get(form.focus))
+                .is_some_and(|field| field.secret)
+                && ((event.modifiers.contains(KeyModifiers::CONTROL)
+                    && matches!(event.code, KeyCode::Char('a' | 'c' | 'x')))
+                    || (event.modifiers.contains(KeyModifiers::SHIFT) && read_only_key(event)))
+            {
+                return SandboxAction::None;
+            }
             return self.live_key(event);
         }
         if self.references.is_some() {
             return self.reference_key(event);
         }
+        if self.instance_action.is_some() {
+            return self.instance_actions_key(event);
+        }
         if self.document.is_some() {
             return self.document_key(event);
+        }
+        if event.code == KeyCode::F(3) && self.view == SandboxView::Instances {
+            self.open_instance_actions();
+            return SandboxAction::None;
         }
         if event.code == KeyCode::F(2) {
             self.open_references();
@@ -1245,11 +1548,20 @@ impl Manager {
             if event.code == KeyCode::Enter {
                 self.focus = Focus::List;
             } else {
-                let result = self.search.handle_key(event);
-                self.selected = 0;
-                self.list_scroll = 0;
-                self.reveal_selected = true;
-                self.inspect();
+                let before = self.search.text();
+                let Ok(result) = self
+                    .search
+                    .handle_key_bounded(event, MAX_SANDBOX_RECORD_BYTES)
+                else {
+                    self.status = TOO_LARGE.into();
+                    return SandboxAction::None;
+                };
+                if self.search.text() != before {
+                    self.selected = 0;
+                    self.list_scroll = 0;
+                    self.reveal_selected = true;
+                    self.inspect();
+                }
                 return editor_action(result);
             }
             return SandboxAction::None;
@@ -1269,15 +1581,23 @@ impl Manager {
                 self.status = field.locked.clone().unwrap_or_default();
                 return SandboxAction::None;
             }
-            if field.text().len() >= MAX_SANDBOX_RECORD_BYTES
-                && matches!(event.code, KeyCode::Char(_) | KeyCode::Enter)
-                && event.modifiers.is_empty()
-            {
-                self.status = TOO_LARGE.into();
-                return SandboxAction::None;
-            }
             let before = field.text();
-            let result = field.editor.handle_key(event);
+            let result = if matches!(field.input, form::Input::Domains | form::Input::Cidrs)
+                && form::network_list_key(&mut field.editor, event, MAX_SANDBOX_RECORD_BYTES)
+            {
+                EditorKey::Consumed
+            } else {
+                match field
+                    .editor
+                    .handle_key_bounded(event, MAX_SANDBOX_RECORD_BYTES)
+                {
+                    Ok(result) => result,
+                    Err(()) => {
+                        self.status = TOO_LARGE.into();
+                        return SandboxAction::None;
+                    }
+                }
+            };
             if field.text() != before {
                 self.revision += 1;
                 self.validate();
@@ -1398,8 +1718,20 @@ impl Manager {
                 }
                 SandboxAction::None
             }
-            KeyCode::Up | KeyCode::Down => {
-                let delta: isize = if event.code == KeyCode::Up { -1 } else { 1 };
+            KeyCode::Up
+            | KeyCode::Down
+            | KeyCode::PageUp
+            | KeyCode::PageDown
+            | KeyCode::Home
+            | KeyCode::End => {
+                let delta = match event.code {
+                    KeyCode::Up => -1,
+                    KeyCode::Down => 1,
+                    KeyCode::PageUp => -(self.list_area.height.max(1) as isize),
+                    KeyCode::PageDown => self.list_area.height.max(1) as isize,
+                    KeyCode::Home => -isize::MAX,
+                    _ => isize::MAX,
+                };
                 if self.focus == Focus::List {
                     let index = self
                         .selected
@@ -1418,7 +1750,14 @@ impl Manager {
                         .min(form.fields.len().saturating_sub(1));
                     form.reveal_focus = true;
                 } else {
-                    self.detail_scroll = self.detail_scroll.saturating_add_signed(delta as i16);
+                    self.detail_scroll = self.detail_scroll.saturating_add_signed(
+                        delta.clamp(i16::MIN as isize, i16::MAX as isize) as i16,
+                    );
+                    if event.code == KeyCode::End {
+                        self.detail_scroll = u16::MAX;
+                    } else if event.code == KeyCode::Home {
+                        self.detail_scroll = 0;
+                    }
                 }
                 SandboxAction::None
             }
@@ -1447,21 +1786,22 @@ impl Manager {
                     "API key must be visible ASCII without whitespace; paste only the key.".into();
                 return;
             }
-            if field.editor.text().len().saturating_add(text.len())
-                > crate::sandbox::MAX_LIVE_PREVIEW_BYTES
+            if !field
+                .editor
+                .handle_paste_bounded(text, crate::sandbox::MAX_LIVE_PREVIEW_BYTES)
             {
                 self.status = TOO_LARGE.into();
-            } else {
-                field.editor.handle_paste(text);
             }
             return;
         }
         if let Some(picker) = self.references.as_mut() {
-            if picker.search.text().len().saturating_add(text.len()) > MAX_SANDBOX_RECORD_BYTES {
+            if !picker
+                .search
+                .handle_paste_bounded(text, MAX_SANDBOX_RECORD_BYTES)
+            {
                 self.status = TOO_LARGE.into();
                 return;
             }
-            picker.search.handle_paste(text);
             picker.selected = 0;
             return;
         }
@@ -1484,11 +1824,10 @@ impl Manager {
         } else {
             return;
         };
-        if editor.text().len().saturating_add(text.len()) > limit {
+        if !editor.handle_paste_bounded(text, limit) {
             self.status = TOO_LARGE.into();
             return;
         }
-        editor.handle_paste(text);
         if self.focus == Focus::Search && self.document.is_none() {
             self.selected = 0;
             self.list_scroll = 0;
@@ -1509,6 +1848,10 @@ impl Manager {
                 }
                 if document.mode != DocumentMode::Import {
                     self.document = None;
+                    if let Some(form) = self.report_draft.take() {
+                        self.live_form = Some(form);
+                        self.status = "Returned to the unchanged draft. No action retried.".into();
+                    }
                     return SandboxAction::None;
                 }
             }
@@ -1538,7 +1881,13 @@ impl Manager {
                     );
                 }
             }
-            return editor_action(destination.handle_key(event));
+            return match destination.handle_key_bounded(event, MAX_SANDBOX_RECORD_BYTES) {
+                Ok(result) => editor_action(result),
+                Err(()) => {
+                    self.status = TOO_LARGE.into();
+                    SandboxAction::None
+                }
+            };
         }
         if document.mode == DocumentMode::Export && key::SAVE.matches(event) {
             document.destination = Some(TextEditor::new());
@@ -1581,15 +1930,24 @@ impl Manager {
         if document.mode != DocumentMode::Import && !read_only_key(event) {
             return SandboxAction::None;
         }
-        let before = document.editor.text();
-        if before.len() >= MAX_SANDBOX_FILE_BYTES
-            && matches!(event.code, KeyCode::Char(_) | KeyCode::Enter)
-            && event.modifiers.is_empty()
+        let event = if document.mode != DocumentMode::Import
+            && matches!(event.code, KeyCode::Home | KeyCode::End)
         {
+            KeyEvent {
+                modifiers: event.modifiers | KeyModifiers::CONTROL,
+                ..event
+            }
+        } else {
+            event
+        };
+        let before = document.editor.text();
+        let Ok(result) = document
+            .editor
+            .handle_key_bounded(event, MAX_SANDBOX_FILE_BYTES)
+        else {
             self.status = TOO_LARGE.into();
             return SandboxAction::None;
-        }
-        let result = document.editor.handle_key(event);
+        };
         if document.editor.text() != before {
             self.revision += 1;
         }
@@ -1653,6 +2011,121 @@ impl Manager {
     }
 
     fn mouse(&mut self, event: MouseEvent) -> SandboxAction {
+        if self.search_capture {
+            if event.kind == MouseEventKind::Up(MouseButton::Left) {
+                self.search_capture = false;
+                self.pressed = None;
+            }
+            return match self.search.handle_mouse(&event) {
+                EditorMouse::Copy(text) => SandboxAction::Copy(text),
+                _ => SandboxAction::None,
+            };
+        }
+        if self.editor_capture {
+            if event.kind == MouseEventKind::Up(MouseButton::Left) {
+                self.editor_capture = false;
+                self.pressed = None;
+            }
+            return self.editor_mouse(event);
+        }
+        let at = Position::new(event.column, event.row);
+        let captured = self.reader_capture.is_some();
+        let reader = self.reader_capture.or_else(|| {
+            ReadSurface::ALL
+                .into_iter()
+                .find(|surface| self.readers[*surface as usize].area.contains(at))
+        });
+        if let Some(surface) = reader {
+            if event.kind == MouseEventKind::Down(MouseButton::Left) {
+                self.reader_capture = Some(surface);
+                self.reader_focus = Some(surface);
+                self.pressed = None;
+                self.hovered = None;
+            }
+            let action = self.readers[surface as usize].editor.handle_mouse(&event);
+            if event.kind == MouseEventKind::Up(MouseButton::Left) {
+                self.reader_capture = None;
+                self.pressed = None;
+            }
+            match action {
+                EditorMouse::Copy(text) => return SandboxAction::Copy(text),
+                EditorMouse::Consumed => return SandboxAction::None,
+                EditorMouse::Passthrough if captured => return SandboxAction::None,
+                EditorMouse::Passthrough => {}
+            }
+        } else if event.kind == MouseEventKind::Down(MouseButton::Left) {
+            self.reader_focus = None;
+        }
+        for index in 0..3 {
+            let (bar, area) = match index {
+                0 => (&mut self.list_bar, self.list_area),
+                1 => (&mut self.fields_bar, self.fields_area),
+                _ => (&mut self.references_bar, self.references_area),
+            };
+            if area.is_empty() {
+                continue;
+            }
+            match bar.handle(&event) {
+                ScrollbarMouse::Ignored => {}
+                ScrollbarMouse::Consumed => {
+                    self.pressed = None;
+                    return SandboxAction::None;
+                }
+                ScrollbarMouse::ScrollTo(top) => {
+                    self.pressed = None;
+                    match index {
+                        0 => {
+                            self.list_scroll = top as usize;
+                            self.reveal_selected = false;
+                        }
+                        1 => {
+                            if self.live_form.is_some() {
+                                self.live_scroll = top as usize;
+                            } else if let Some(form) = self.form.as_mut() {
+                                form.scroll = top as usize;
+                                form.reveal_focus = false;
+                            }
+                        }
+                        _ => {
+                            self.reference_scroll = top as usize;
+                            self.reveal_reference = false;
+                        }
+                    }
+                    return SandboxAction::None;
+                }
+            }
+        }
+        if self.confirmation.is_none()
+            && let Some(picker) = self
+                .live_form
+                .as_mut()
+                .and_then(|form| form.picker.as_mut())
+        {
+            let key = picker.mouse(event);
+            if let Some(text) = picker.copy.take() {
+                return SandboxAction::Copy(text);
+            }
+            return key.map_or(SandboxAction::None, |code| {
+                self.handle_key(KeyEvent::new(code, KeyModifiers::NONE))
+            });
+        }
+        let at = Position::new(event.column, event.row);
+        let hit = self
+            .hits
+            .iter()
+            .find(|(area, control)| area.contains(at) && self.control_enabled(control))
+            .map(|(_, control)| control.clone())
+            .or_else(|| {
+                (self.editor_area.contains(at)
+                    && self.confirmation.is_none()
+                    && self.live_pending.is_none()
+                    && self.transfer.is_none())
+                .then_some(Control::Editor)
+            });
+        self.hovered = hit.clone();
+        if !self.area.contains(at) || (event.kind == MouseEventKind::Moved && hit.is_none()) {
+            self.pressed = None;
+        }
         for hint in &mut self.hints {
             if let Some(key) = hint.handle_mouse(event) {
                 return self.handle_key(key);
@@ -1661,69 +2134,56 @@ impl Manager {
         if let Some(panel) = self.transfer.as_mut() {
             return panel.mouse(event);
         }
-        let at = Position::new(event.column, event.row);
-        if self
-            .live_form
-            .as_ref()
-            .is_some_and(|form| form.picker.is_some())
-        {
+        if event.kind == MouseEventKind::Moved {
+            if !self.editor_area.is_empty() && self.confirmation.is_none() {
+                self.editor_mouse(event);
+            }
+            if self.focus == Focus::Search {
+                self.search.handle_mouse(&event);
+            }
             return SandboxAction::None;
         }
+        let pressed = self.pressed.take();
+        if event.kind == MouseEventKind::Down(MouseButton::Left) {
+            self.pressed = hit.clone();
+        } else if !matches!(event.kind, MouseEventKind::Up(MouseButton::Left)) {
+            self.pressed = pressed.clone();
+        }
         if self.editor_area.contains(at) && self.confirmation.is_none() {
-            let secret = self
-                .live_form
-                .as_ref()
-                .and_then(|form| form.fields.get(form.focus))
-                .is_some_and(|field| field.secret);
-            let editor = if let Some(form) = self.live_form.as_mut() {
-                form.fields
-                    .get_mut(form.focus)
-                    .map(|field| &mut field.editor)
-            } else if let Some(picker) = self.references.as_mut() {
-                Some(&mut picker.search)
-            } else if let Some(document) = self.document.as_mut() {
-                Some(
-                    document
-                        .destination
-                        .as_mut()
-                        .unwrap_or(&mut document.editor),
-                )
-            } else if let Some(form) = self.form.as_mut().filter(|form| form.editing) {
-                Some(&mut form.fields[form.focus].editor)
-            } else {
-                None
-            };
-            if let Some(editor) = editor {
-                return match editor.handle_mouse(&event) {
-                    EditorMouse::Copy(text) if !secret => SandboxAction::Copy(text),
-                    _ => SandboxAction::None,
-                };
+            if event.kind == MouseEventKind::Down(MouseButton::Left) {
+                self.editor_capture = true;
             }
+            return self.editor_mouse(event);
         }
         if self.focus == Focus::Search && self.confirmation.is_none() && self.list_area.contains(at)
         {
+            if event.kind == MouseEventKind::Down(MouseButton::Left) && hit == Some(Control::Search)
+            {
+                self.search_capture = true;
+                self.pressed = None;
+            }
             match self.search.handle_mouse(&event) {
                 EditorMouse::Copy(text) => return SandboxAction::Copy(text),
                 EditorMouse::Consumed => return SandboxAction::None,
                 EditorMouse::Passthrough => {}
             }
         }
-        let hit = self
-            .hits
-            .iter()
-            .find(|(area, _)| area.contains(at))
-            .map(|(_, control)| control.clone());
         match event.kind {
             MouseEventKind::Down(MouseButton::Left) => self.pressed = hit,
             MouseEventKind::Up(MouseButton::Left) => {
-                let pressed = self.pressed.take();
                 if hit != pressed {
                     return SandboxAction::None;
                 }
+                self.cancel_selections();
+                self.reset_mouse();
                 match hit {
                     Some(Control::Reference(index)) => {
                         self.apply_reference(index);
                     }
+                    Some(Control::InstanceAction(index)) => {
+                        return self.choose_instance_action(index);
+                    }
+                    Some(Control::InstanceActions) => self.open_instance_actions(),
                     Some(Control::Confirm(choice)) => return self.confirm(choice),
                     _ if self.confirmation.is_some() => {}
                     Some(Control::LiveField(index)) => {
@@ -1750,6 +2210,132 @@ impl Manager {
             _ => {}
         }
         SandboxAction::None
+    }
+
+    fn editor_mouse(&mut self, event: MouseEvent) -> SandboxAction {
+        if let Some(field) = self
+            .live_form
+            .as_mut()
+            .and_then(|form| form.fields.get_mut(form.focus))
+            && field.secret
+        {
+            field.editor.handle_scrollbar_mouse(&event);
+            return SandboxAction::None;
+        }
+        let editor = if let Some(form) = self.live_form.as_mut() {
+            form.fields
+                .get_mut(form.focus)
+                .map(|field| &mut field.editor)
+        } else if let Some(picker) = self.references.as_mut() {
+            Some(&mut picker.search)
+        } else if let Some(document) = self.document.as_mut() {
+            Some(
+                document
+                    .destination
+                    .as_mut()
+                    .unwrap_or(&mut document.editor),
+            )
+        } else if let Some(form) = self.form.as_mut().filter(|form| form.editing) {
+            Some(&mut form.fields[form.focus].editor)
+        } else {
+            None
+        };
+        match editor.map(|editor| editor.handle_mouse(&event)) {
+            Some(EditorMouse::Copy(text)) => SandboxAction::Copy(text),
+            _ => SandboxAction::None,
+        }
+    }
+
+    fn cancel_selections(&mut self) {
+        self.reset_bars();
+        self.search_capture = false;
+        self.pressed = None;
+        self.reader_focus = None;
+        self.reader_capture = None;
+        self.editor_capture = false;
+        for reader in &mut self.readers {
+            reader.editor.cancel_selection();
+        }
+        self.search.cancel_selection();
+        if let Some(document) = self.document.as_mut() {
+            document.editor.cancel_selection();
+            if let Some(destination) = document.destination.as_mut() {
+                destination.cancel_selection();
+            }
+        }
+        if let Some(picker) = self.references.as_mut() {
+            picker.search.cancel_selection();
+        }
+        if let Some(form) = self.form.as_mut() {
+            for field in &mut form.fields {
+                field.editor.cancel_selection();
+            }
+        }
+        if let Some(form) = self.live_form.as_mut() {
+            for field in &mut form.fields {
+                field.editor.cancel_selection();
+            }
+        }
+    }
+
+    fn reset_mouse(&mut self) {
+        self.reset_bars();
+        self.search_capture = false;
+        self.editor_capture = false;
+        self.hovered = None;
+        self.pressed = None;
+        self.hits.clear();
+        if let Some(picker) = self
+            .live_form
+            .as_mut()
+            .and_then(|form| form.picker.as_mut())
+        {
+            picker.reset_mouse();
+        }
+        if let Some(panel) = self.transfer.as_mut() {
+            panel.reset_mouse();
+        }
+        for hint in &mut self.hints {
+            hint.reset();
+        }
+    }
+
+    fn reset_bars(&mut self) {
+        self.list_bar = Scrollbar::default();
+        self.fields_bar = Scrollbar::default();
+        self.references_bar = Scrollbar::default();
+    }
+
+    fn control_enabled(&self, control: &Control) -> bool {
+        if self.transfer.is_some() || self.live_pending.is_some() {
+            return false;
+        }
+        if self.confirmation.is_some() {
+            return matches!(control, Control::Confirm(_));
+        }
+        if let Some(form) = &self.live_form {
+            return form.picker.is_none()
+                && matches!(control, Control::LiveField(index) if *index < form.fields.len());
+        }
+        if self.references.is_some() {
+            return matches!(control, Control::Reference(_));
+        }
+        if self.instance_action.is_some() {
+            return matches!(control, Control::InstanceAction(_));
+        }
+        if self.document.is_some() {
+            return false;
+        }
+        match control {
+            Control::View(_) | Control::Row(_) | Control::InstanceActions => true,
+            Control::Search => !self.dirty(),
+            Control::Field(index) => self
+                .form
+                .as_ref()
+                .and_then(|form| form.fields.get(*index))
+                .is_some_and(|field| field.locked.is_none()),
+            _ => false,
+        }
     }
 
     fn open_references(&mut self) {
@@ -1854,6 +2440,7 @@ impl Manager {
     }
 
     fn reference_key(&mut self, event: KeyEvent) -> SandboxAction {
+        self.reveal_reference = true;
         if event.code == KeyCode::Esc {
             self.references = None;
             return SandboxAction::None;
@@ -1872,8 +2459,32 @@ impl Manager {
                 picker.selected =
                     (picker.selected + 1).min(picker.filtered().len().saturating_sub(1))
             }
+            KeyCode::Home | KeyCode::End if event.modifiers.contains(KeyModifiers::CONTROL) => {
+                picker.selected = if event.code == KeyCode::Home {
+                    0
+                } else {
+                    picker.filtered().len().saturating_sub(1)
+                };
+            }
+            KeyCode::PageUp | KeyCode::PageDown => {
+                let page = self.area.height.saturating_sub(1).max(1) as usize;
+                picker.selected = if event.code == KeyCode::PageUp {
+                    picker.selected.saturating_sub(page)
+                } else {
+                    picker
+                        .selected
+                        .saturating_add(page)
+                        .min(picker.filtered().len().saturating_sub(1))
+                };
+            }
             _ => {
-                let action = picker.search.handle_key(event);
+                let Ok(action) = picker
+                    .search
+                    .handle_key_bounded(event, MAX_SANDBOX_RECORD_BYTES)
+                else {
+                    self.status = TOO_LARGE.into();
+                    return SandboxAction::None;
+                };
                 picker.selected = 0;
                 return editor_action(action);
             }
@@ -1892,7 +2503,9 @@ impl Manager {
             for (key, value) in &choice.fields {
                 if let Some(field) = form.fields.iter_mut().find(|field| field.key == *key) {
                     field.editor.handle_key(key::SELECT_ALL.to_key_event());
-                    field.editor.handle_paste(value);
+                    field
+                        .editor
+                        .handle_paste_bounded(value, MAX_SANDBOX_RECORD_BYTES);
                 }
             }
             form.editing = false;
@@ -1941,8 +2554,8 @@ pub(crate) mod tests {
     };
     use caudra_config::sandbox::persistence::SandboxStore;
     use caudra_config::sandbox::{
-        Architecture, Enforcement, ProviderCapabilities, RecordKind, ResourceRange, SandboxDraft,
-        SandboxName, TemplateCatalog, TemplateEntry, TlsMode,
+        Architecture, DomainRule, Enforcement, ProviderCapabilities, RecordKind, ResourceRange,
+        SandboxDraft, SandboxName, TemplateCatalog, TemplateEntry, TlsMode,
     };
     use caudra_sandbox::{InstanceRecord, LifecycleAction, Ownership};
     use caudra_storage::id::CaudraId;
@@ -1999,8 +2612,9 @@ on_exit = "detach"
     const LIVE_ERROR: &str = "Outcome unknown; Reconcile before retrying";
     const IMPORT_COMMENT: &str = "# Imported sandbox defaults stay commented";
 
-    #[test]
-    fn first_image_import_is_native_and_probe_is_separately_reviewed() {
+    #[test_case(false; "successful_probe")]
+    #[test_case(true; "failed_probe_retains_draft")]
+    fn first_image_import_is_native_and_probe_is_separately_reviewed(failed: bool) {
         let (directory, _, mut manager) = fixture();
         let source = directory.path().join("first image.qcow2");
         let qemu = directory.path().join("qemu-img");
@@ -2053,6 +2667,57 @@ on_exit = "detach"
         let LiveOperation::ProbeImage(probe) = request.operation else {
             panic!("expected probe only")
         };
+        if failed {
+            const REPORT_END: &str = "Final probe diagnostic retained";
+            let report = format!("{}\n{REPORT_END}", "Probe diagnostic\n".repeat(100));
+            let draft = manager
+                .state
+                .as_ref()
+                .unwrap()
+                .live_form
+                .as_ref()
+                .unwrap()
+                .fields
+                .iter()
+                .map(|field| field.editor.text())
+                .collect::<Vec<_>>();
+            manager.receive_live(LiveReply {
+                ticket: request.ticket,
+                scope: request.scope,
+                result: Err(report.clone()),
+            });
+            let state = manager.state.as_ref().unwrap();
+            assert!(state.live_form.is_none());
+            assert!(
+                state
+                    .document
+                    .as_ref()
+                    .unwrap()
+                    .editor
+                    .text()
+                    .contains(&report)
+            );
+            render(&mut manager, 80, 24);
+            press(&mut manager, KeyCode::End);
+            assert!(render(&mut manager, 80, 24).contains(REPORT_END));
+            press(&mut manager, KeyCode::Esc);
+            let state = manager.state.as_ref().unwrap();
+            assert!(state.document.is_none());
+            assert!(state.report_draft.is_none());
+            assert!(state.live_pending.is_none());
+            assert_eq!(
+                state
+                    .live_form
+                    .as_ref()
+                    .unwrap()
+                    .fields
+                    .iter()
+                    .map(|field| field.editor.text())
+                    .collect::<Vec<_>>(),
+                draft
+            );
+            return;
+        }
         manager.receive_live(LiveReply {
             ticket: request.ticket,
             scope: request.scope,
@@ -2215,12 +2880,27 @@ on_exit = "detach"
     #[test_case(KeyCode::Char('e'); "extend")]
     #[test_case(KeyCode::Delete; "delete")]
     #[test_case(KeyCode::Char('r'); "reconcile")]
-    #[test_case(KeyCode::Char('z'); "cancel_create")]
     #[test_case(KeyCode::Char('g'); "apply_network")]
     #[test_case(KeyCode::Char('f'); "acknowledge_failure")]
     fn live_actions_require_separate_nondefault_confirmation(code: KeyCode) {
         let (_directory, store, mut manager) = fixture();
         live_instance(&mut manager, false);
+        if code == KeyCode::Char('u') {
+            let SnapshotState::Ready(rows) = &mut manager
+                .state
+                .as_mut()
+                .unwrap()
+                .snapshot
+                .as_mut()
+                .unwrap()
+                .instances
+            else {
+                panic!("missing instance")
+            };
+            rows[0].state = SandboxInstanceState::Paused;
+            rows[0].live.as_mut().unwrap().state = caudra_sandbox::dto::InstanceState::Paused;
+            rows[0].record.as_mut().unwrap().instance = rows[0].live.clone();
+        }
         if code == KeyCode::Char('f') {
             let SnapshotState::Ready(rows) = &mut manager
                 .state
@@ -2548,6 +3228,92 @@ on_exit = "detach"
             ),
         });
         (directory, store, manager)
+    }
+
+    #[test_case(0, false; "cancel_keeps_draft")]
+    #[test_case(1, false; "accept_commits_reviewed_network")]
+    #[test_case(1, true; "changed_draft_requires_new_review")]
+    fn network_save_reviews_owned_launch_references_before_persistence(choice: usize, stale: bool) {
+        let (_directory, store, mut manager) = fixture();
+        live_instance(&mut manager, false);
+        let state = manager.state.as_mut().unwrap();
+        let baseline = state.baseline.clone().unwrap();
+        let (profile_name, profile) = baseline
+            .saved()
+            .configuration()
+            .profiles
+            .iter()
+            .next()
+            .unwrap();
+        let snapshot = state.snapshot.as_mut().unwrap();
+        let provider = &snapshot.providers[&profile.provider];
+        let SnapshotState::Ready(catalog) = &provider.catalog else {
+            panic!("catalog fixture");
+        };
+        let launch = baseline
+            .saved()
+            .resolve_launch(profile_name, &provider.capabilities, catalog)
+            .unwrap();
+        let SnapshotState::Ready(rows) = &mut snapshot.instances else {
+            panic!("instance fixture");
+        };
+        rows[0].record.as_mut().unwrap().launch = Some(launch);
+        let other = SandboxName::parse("other-network").unwrap();
+        state
+            .draft
+            .networks
+            .insert(other.clone(), Default::default());
+        state.draft.profiles.get_mut(profile_name).unwrap().network = other;
+        state
+            .draft
+            .networks
+            .get_mut(&profile.network)
+            .unwrap()
+            .enforcement = Enforcement::Required;
+        state.form = None;
+        state
+            .draft
+            .networks
+            .get_mut(&profile.network)
+            .unwrap()
+            .domains
+            .push(DomainRule::parse("network-review.example").unwrap());
+        assert!(matches!(state.save(None), SandboxAction::None));
+        let Some(Confirmation::NetworkSave {
+            preview,
+            choice: initial_choice,
+            ..
+        }) = &state.confirmation
+        else {
+            panic!("network review required");
+        };
+        assert_eq!(*initial_choice, 0);
+        assert!(preview.contains(super::NETWORK_SAVE_NOTICE));
+        assert!(preview.contains(LIVE_NAME));
+        assert!(preview.contains("current profile network other-network"));
+        assert_eq!(
+            store.load().unwrap().saved().revision(),
+            baseline.saved().revision()
+        );
+        if stale {
+            state.revision += 1;
+        }
+        let action = state.confirm(choice);
+        if choice == 1 && !stale {
+            assert!(matches!(
+                action,
+                SandboxAction::Store {
+                    effect: StoreEffect::Save { .. },
+                    ..
+                }
+            ));
+        } else {
+            assert!(matches!(action, SandboxAction::None));
+            assert_eq!(
+                store.load().unwrap().saved().revision(),
+                baseline.saved().revision()
+            );
+        }
     }
 
     fn effect(action: SandboxAction) -> (StoreTicket, StoreEffect) {
@@ -2986,6 +3752,53 @@ on_exit = "detach"
         assert!(!manager.dirty());
     }
 
+    #[test_case(false; "replacement")]
+    #[test_case(true; "reordering")]
+    fn accepted_snapshot_cancels_pressed_row_identity(reorder: bool) {
+        let (_directory, _, mut manager) = fixture();
+        live_instance(&mut manager, false);
+        render(&mut manager, 120, 36);
+        let state = manager.state.as_ref().unwrap();
+        let (area, _) = state
+            .hits
+            .iter()
+            .find(|(_, control)| *control == Control::Row(0))
+            .unwrap();
+        let event = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: area.x,
+            row: area.y,
+            modifiers: KeyModifiers::NONE,
+        };
+        let mut snapshot = state.snapshot.as_ref().unwrap().clone();
+        snapshot.sequence += 1;
+        let SnapshotState::Ready(rows) = &mut snapshot.instances else {
+            panic!("missing instance")
+        };
+        let mut replacement = rows[0].clone();
+        replacement.id = "replacement".into();
+        if reorder {
+            rows.insert(0, replacement);
+        } else {
+            rows[0] = replacement;
+        }
+        let request = manager.snapshot_request(state.conversation).unwrap();
+        manager.handle_mouse(event);
+        assert!(manager.state.as_ref().unwrap().pressed.is_some());
+        assert!(manager.install_snapshot(&request, snapshot));
+        assert!(manager.state.as_ref().unwrap().pressed.is_none());
+        assert!(manager.state.as_ref().unwrap().hovered.is_none());
+        let selected = manager.state.as_ref().unwrap().selected;
+        render(&mut manager, 120, 36);
+        manager.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            ..event
+        });
+        let state = manager.state.as_ref().unwrap();
+        assert_eq!(state.selected, selected);
+        assert!(state.focus == Focus::List);
+    }
+
     #[test_case(0; "conversation")]
     #[test_case(1; "manager_session")]
     #[test_case(2; "configuration_epoch")]
@@ -3012,12 +3825,187 @@ on_exit = "detach"
         assert!(!manager.install_snapshot(&request, newer));
     }
 
+    #[test_case(KeyCode::Home, 0; "home")]
+    #[test_case(KeyCode::End, usize::MAX; "end")]
+    fn boundary_keys_navigate_fields_without_editing(code: KeyCode, expected: usize) {
+        let (_directory, _store, mut manager) = fixture();
+        press(&mut manager, KeyCode::Enter);
+        press(&mut manager, code);
+        let state = manager.state.as_ref().unwrap();
+        let form = state.form.as_ref().unwrap();
+        assert_eq!(form.focus, expected.min(form.fields.len() - 1));
+        assert!(!form.editing);
+        assert!(!manager.dirty());
+    }
+
+    #[test_case("domains", "api.example.com"; "domains")]
+    #[test_case("cidrs", "10.0.0.0/24"; "cidrs")]
+    fn saved_network_shortcuts_validate_and_advance_revision(field_key: &str, value: &str) {
+        let (_directory, store, mut manager) = fixture();
+        let state = manager.state.as_mut().unwrap();
+        state.go(Navigation::Policies(RecordKind::Network));
+        state.focus = Focus::Detail;
+        let form = state.form.as_mut().unwrap();
+        form.focus = form
+            .fields
+            .iter()
+            .position(|field| field.key == field_key)
+            .unwrap();
+        form.editing = true;
+        form.fields[form.focus].editor.set_text(value.into());
+        let revision = state.revision;
+        state.handle_key(KeyEvent::new(KeyCode::Insert, KeyModifiers::ALT));
+        assert_eq!(state.revision, revision + 1);
+        let form = state.form.as_ref().unwrap();
+        assert_eq!(form.text(field_key), format!("{value}\n"));
+        assert!(form.fields[form.focus].error.is_none());
+        state.handle_key(KeyEvent::new(KeyCode::Home, KeyModifiers::CONTROL));
+        assert_eq!(state.revision, revision + 1);
+        state.handle_key(KeyEvent::new(KeyCode::Delete, KeyModifiers::ALT));
+        assert_eq!(state.revision, revision + 2);
+        let form = state.form.as_ref().unwrap();
+        assert!(form.text(field_key).trim().is_empty());
+        assert!(form.fields[form.focus].error.is_none());
+        assert_eq!(
+            store.load().unwrap().draft(),
+            SandboxDraft::import(CONFIG).unwrap()
+        );
+    }
+
+    #[test_case(KeyCode::Home, 0; "first")]
+    #[test_case(KeyCode::End, 3; "last")]
+    fn live_field_boundaries_preserve_unmodified_cursor_keys(code: KeyCode, expected: usize) {
+        let (_directory, _store, mut manager) = fixture();
+        live_instance(&mut manager, false);
+        let state = manager.state.as_mut().unwrap();
+        state.open_live(super::live::Kind::Network);
+        state.live_form.as_mut().unwrap().focus = 1;
+        state.handle_key(KeyEvent::new(code, KeyModifiers::NONE));
+        assert_eq!(state.live_form.as_ref().unwrap().focus, 1);
+        state.handle_key(KeyEvent::new(code, KeyModifiers::ALT));
+        assert_eq!(state.live_form.as_ref().unwrap().focus, expected);
+    }
+
+    #[test_case(false; "hover_only")]
+    #[test_case(true; "click_selects")]
+    fn live_field_mouse_selection_is_inert_until_release(click: bool) {
+        let (_directory, _store, mut manager) = fixture();
+        live_instance(&mut manager, false);
+        manager
+            .state
+            .as_mut()
+            .unwrap()
+            .open_live(super::live::Kind::Network);
+        render(&mut manager, 120, 36);
+        let state = manager.state.as_mut().unwrap();
+        let (area, _) = state
+            .hits
+            .iter()
+            .find(|(_, control)| *control == Control::LiveField(1))
+            .unwrap();
+        let event = MouseEvent {
+            kind: MouseEventKind::Moved,
+            column: area.x,
+            row: area.y,
+            modifiers: KeyModifiers::NONE,
+        };
+        state.mouse(event);
+        assert!(state.hovered == Some(Control::LiveField(1)));
+        assert_eq!(state.live_form.as_ref().unwrap().focus, 0);
+        if click {
+            state.mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                ..event
+            });
+            assert_eq!(state.live_form.as_ref().unwrap().focus, 0);
+            state.mouse(MouseEvent {
+                kind: MouseEventKind::Up(MouseButton::Left),
+                ..event
+            });
+            assert_eq!(state.live_form.as_ref().unwrap().focus, 1);
+        }
+        assert!(state.confirmation.is_none());
+        assert!(state.live_pending.is_none());
+    }
+
+    #[test_case(KeyCode::Home; "home")]
+    #[test_case(KeyCode::End; "end")]
+    fn boundary_keys_preserve_search_and_editor_focus(code: KeyCode) {
+        let (_directory, _store, mut manager) = fixture();
+        press(&mut manager, KeyCode::Char('/'));
+        manager.handle_paste("profile");
+        press(&mut manager, code);
+        let state = manager.state.as_ref().unwrap();
+        assert!(state.focus == Focus::Search);
+        assert_eq!(state.search.text(), "profile");
+        press(&mut manager, KeyCode::Esc);
+        let state = manager.state.as_mut().unwrap();
+        state.form = None;
+        state.focus = Focus::Detail;
+        state.detail_scroll = 10;
+        press(&mut manager, KeyCode::End);
+        assert_eq!(manager.state.as_ref().unwrap().detail_scroll, u16::MAX);
+        press(&mut manager, KeyCode::Home);
+        assert_eq!(manager.state.as_ref().unwrap().detail_scroll, 0);
+    }
+
+    #[test_case(false; "outside")]
+    #[test_case(true; "keyboard_transition")]
+    fn hover_is_inert_and_clears_with_stale_press(transition: bool) {
+        let (_directory, _store, mut manager) = fixture();
+        render(&mut manager, 120, 36);
+        let state = manager.state.as_mut().unwrap();
+        let hits = state.hits.clone();
+        for (area, control) in hits {
+            let enabled = state.control_enabled(&control);
+            let focus = state.focus == Focus::List;
+            assert!(matches!(
+                state.mouse(MouseEvent {
+                    kind: MouseEventKind::Moved,
+                    column: area.x,
+                    row: area.y,
+                    modifiers: KeyModifiers::NONE
+                }),
+                SandboxAction::None
+            ));
+            assert!(state.hovered == enabled.then_some(control));
+            assert_eq!(state.focus == Focus::List, focus);
+        }
+        let (area, _) = state
+            .hits
+            .iter()
+            .find(|(_, control)| *control == Control::View(SandboxView::Images))
+            .cloned()
+            .unwrap();
+        let event = |kind, column, row| MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+        state.mouse(event(
+            MouseEventKind::Down(MouseButton::Left),
+            area.x,
+            area.y,
+        ));
+        if transition {
+            state.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        } else {
+            state.mouse(event(MouseEventKind::Moved, 0, 0));
+        }
+        assert!(state.hovered.is_none());
+        assert!(state.pressed.is_none());
+        state.mouse(event(MouseEventKind::Up(MouseButton::Left), area.x, area.y));
+        assert_eq!(state.view, SandboxView::Profiles);
+    }
+
     #[test]
     fn wheel_scroll_is_not_undone_by_render() {
         let (_directory, _store, mut manager) = fixture();
         press(&mut manager, KeyCode::Enter);
-        render(&mut manager, 120, 26);
-        manager.scroll_at(Position::new(80, 12), -5);
+        render(&mut manager, 120, 18);
+        let area = manager.state.as_ref().unwrap().fields_area;
+        manager.scroll_at(Position::new(area.x, area.y), -5);
         let scroll = manager
             .state
             .as_ref()
@@ -3026,7 +4014,7 @@ on_exit = "detach"
             .as_ref()
             .unwrap()
             .scroll;
-        render(&mut manager, 120, 26);
+        render(&mut manager, 120, 18);
         assert_eq!(
             manager
                 .state

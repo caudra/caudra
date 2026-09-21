@@ -880,6 +880,9 @@ impl App {
         msg: QueuedMessage,
         admission: PromptAdmission,
     ) -> SubmitOutcome {
+        if let Some(reason) = self.sandbox_network_dispatch_blocker() {
+            return SubmitOutcome::Rejected(reason);
+        }
         if msg.text.trim().is_empty() && msg.images.is_empty() {
             return SubmitOutcome::Rejected(EMPTY_PROMPT_ERR);
         }
@@ -1231,6 +1234,10 @@ impl App {
     /// `Action::SendMessage` must go through here so `run_id` bumps exactly
     /// once per run.
     pub(super) fn start_run(&mut self, input: AgentInput, display: String) -> Vec<Action> {
+        if let Some(reason) = self.sandbox_network_dispatch_blocker() {
+            self.flash(reason.into());
+            return Vec::new();
+        }
         if self.cancelling_run.is_some()
             || self
                 .state

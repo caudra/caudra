@@ -1194,6 +1194,24 @@ fn merge_prompt(flag: Option<String>, piped: Option<String>) -> Option<String> {
     (!merged.trim().is_empty()).then_some(merged)
 }
 
+fn sandbox_phase<T>(name: &str, phase: &str, operation: impl FnOnce() -> Result<T>) -> Result<T> {
+    let _progress = SandboxProgress::start_named(format!("Sandbox '{name}': {phase}"));
+    operation().wrap_err_with(|| format!(
+        "Sandbox '{name}': {phase} failed. Sessions saved; active TUI ended. Inspect/Reconcile the sandbox before explicitly reopening or retrying. No automatic retry, acknowledgement or local fallback."
+    ))
+}
+
+fn after_runtime_release<T, U>(
+    runtime: Arc<T>,
+    operation: impl FnOnce() -> Result<U>,
+) -> Result<U> {
+    let runtime = Arc::try_unwrap(runtime).map_err(|_| {
+        eyre!("Runtime still has owners; no control sent. Inspect/Reconcile before reopening explicitly")
+    })?;
+    drop(runtime);
+    operation()
+}
+
 pub fn run(mut cli: Cli) -> Result<ExitCode> {
     // Every phase up to `init_logging` runs without a subscriber, so its cost is
     // invisible unless it is measured here and reported once the sink exists.
@@ -1509,51 +1527,81 @@ pub fn run(mut cli: Cli) -> Result<ExitCode> {
             } => {
                 let reconnect = control.reconnects();
                 let name = control.name.clone();
+                let action = control.action_label();
                 let session_ids: Vec<_> = stopped.iter().map(|tab| tab.session.id).collect();
-                stack.plugin_host.shutdown_checked().context(
-                    "Sandbox control refused: source plugins did not stop; no control sent",
+                sandbox_phase(
+                    name.as_str(),
+                    "stopping attached runtime (no control sent)",
+                    || {
+                        stack
+                            .plugin_host
+                            .shutdown_checked()
+                            .context("Source plugins did not stop")?;
+                        teardown.join();
+                        drop(stopped);
+                        drop(stack);
+                        ToolRegistry::global().install_stopped_runtime(&ToolRegistry::default());
+                        after_runtime_release(workcell_runtime, || Ok(()))
+                    },
                 )?;
-                teardown.join();
-                drop(stopped);
-                drop(stack);
-                ToolRegistry::global().install_stopped_runtime(&ToolRegistry::default());
-                let runtime = Arc::try_unwrap(workcell_runtime).map_err(|_| eyre!("Sandbox control refused: runtime still has owners; no control sent. Sessions saved; reopen explicitly."))?;
-                drop(runtime);
-                let record = control.execute(&storage).map_err(|error| eyre!("Sandbox {name} is DETACHED; sessions are saved. Control failed: {error}. Inspect/Reconcile and explicitly acknowledge failure if needed before retrying. No automatic retry, reconnect or local fallback."))?;
+                let record = sandbox_phase(name.as_str(), &format!("{action} control"), || {
+                    control.execute(&storage).map_err(|error| eyre!(error))
+                })?;
                 if !reconnect {
                     eprintln!(
-                        "Sandbox {name} is detached; sessions saved. No reconnect or local fallback. {}",
-                        serde_json::to_string_pretty(&record)?
+                        "Sandbox '{name}': {action} completed. Active TUI ended; conversations saved and detached. Inspect the sandbox and explicitly resume/attach when ready. No local fallback."
                     );
                     return Ok(ExitCode::SUCCESS);
                 }
                 let registry = ToolRegistry::default();
-                let runtime = super::workcell_runtime::WorkcellRuntime::initialize_sandbox_reviewed(&name, false, &cwd, &storage, &registry, Some(&record.revision()?))
-                    .context("Control postconditions verified but Workcell reconnect failed. Sessions saved; runtime detached. Reopen --sandbox explicitly; no local fallback")?;
-                let restored = session_ids
-                    .into_iter()
-                    .map(|id| {
-                        let lease = Arc::new(SessionLease::acquire(&storage, id)?);
-                        let session = setup::load_session(id, &storage)?;
-                        StoredWorkspaceBinding::validate_resume_identity(
-                            session.workspace_binding(),
-                            runtime.stored_binding(),
-                        )?;
-                        Ok(SessionTab {
-                            session,
-                            lease,
-                            cursor: None,
-                        })
-                    })
-                    .collect::<Result<Vec<_>>>()?;
+                let runtime = sandbox_phase(
+                    name.as_str(),
+                    "reconnecting Workcell and verifying identity",
+                    || {
+                        Ok(
+                            super::workcell_runtime::WorkcellRuntime::initialize_sandbox_reviewed(
+                                &name,
+                                false,
+                                &cwd,
+                                &storage,
+                                &registry,
+                                Some(&record.revision()?),
+                            )?,
+                        )
+                    },
+                )?;
+                let restored = sandbox_phase(
+                    name.as_str(),
+                    "restoring saved conversations and validating bindings",
+                    || {
+                        session_ids
+                            .into_iter()
+                            .map(|id| {
+                                let lease = Arc::new(SessionLease::acquire(&storage, id)?);
+                                let session = setup::load_session(id, &storage)?;
+                                StoredWorkspaceBinding::validate_resume_identity(
+                                    session.workspace_binding(),
+                                    runtime.stored_binding(),
+                                )?;
+                                Ok(SessionTab {
+                                    session,
+                                    lease,
+                                    cursor: None,
+                                })
+                            })
+                            .collect::<Result<Vec<_>>>()
+                    },
+                )?;
                 ToolRegistry::global().install_stopped_runtime(&registry);
                 workcell_runtime = Arc::new(runtime);
-                let (new_stack, new_warnings) = build_stack(&cli, &cwd, &storage, None, true)
-                    .context("Control and Workcell identity verified; UI rebuild failed. Sessions saved; reopen --sandbox explicitly")?;
+                let (new_stack, new_warnings) =
+                    sandbox_phase(name.as_str(), "rebuilding TUI", || {
+                        build_stack(&cli, &cwd, &storage, None, true)
+                    })?;
                 tabs = restored;
                 focused = stopped_focus;
                 warnings = new_warnings;
-                warnings.push(format!("Sandbox {name}: control postconditions and Workcell identity verified; runtime rebuilt."));
+                warnings.push(format!("Sandbox {name}: {action} completed; control postconditions and Workcell identity verified. Runtime rebuilt; same saved conversations reopened."));
                 stack = new_stack;
                 continue;
             }
@@ -1790,6 +1838,9 @@ mod tests {
     const WRONG_CWD_WARNING: &str = "belongs to";
     const INJECTED_CWD_FAILURE: &str = "injected working directory failure";
     const INJECTED_CONFIG_FAILURE: &str = "injected destination config failure";
+    const SANDBOX_TEST_NAME: &str = "saved-dev";
+    const SANDBOX_TEST_PHASE: &str = "reconnecting Workcell and verifying identity";
+    const SANDBOX_TEST_FAILURE: &str = "injected sandbox failure";
     const RELOCATION_COMMITTED: &str = "Relocation committed";
     const RELOCATION_USAGE_MIGRATED: &str = "Historical project usage migrated: 2 spend bucket(s) and 0 tool bucket(s) moved (1 and 0 merged into existing destination buckets)";
     const RELOCATION_TEST_USAGE: StoredTokenUsage = StoredTokenUsage {
@@ -1800,6 +1851,51 @@ mod tests {
         cost: Some(0.25),
         subscription_cost: None,
     };
+
+    #[test_case(false; "released_before_operation")]
+    #[test_case(true; "retained_owner_blocks_operation")]
+    fn sandbox_runtime_handoff(retain_owner: bool) {
+        struct Runtime(Arc<AtomicBool>);
+        impl Drop for Runtime {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let released = Arc::new(AtomicBool::new(false));
+        let runtime = Arc::new(Runtime(Arc::clone(&released)));
+        let owner = retain_owner.then(|| Arc::clone(&runtime));
+        let mut called = false;
+        let result = after_runtime_release(runtime, || {
+            assert!(released.load(Ordering::SeqCst));
+            called = true;
+            Ok(())
+        });
+        assert_eq!(result.is_ok(), !retain_owner);
+        assert_eq!(called, !retain_owner);
+        assert_eq!(released.load(Ordering::SeqCst), !retain_owner);
+        drop(owner);
+    }
+
+    #[test_case(false; "success_once")]
+    #[test_case(true; "failure_without_retry")]
+    fn sandbox_phase_preserves_result(fail: bool) {
+        let mut calls = 0;
+        let result = sandbox_phase(SANDBOX_TEST_NAME, SANDBOX_TEST_PHASE, || {
+            calls += 1;
+            if fail {
+                bail!(SANDBOX_TEST_FAILURE);
+            }
+            Ok(())
+        });
+        assert_eq!(calls, 1);
+        assert_eq!(result.is_err(), fail);
+        if let Err(error) = result {
+            let report = format!("{error:#}");
+            assert!(report.contains(SANDBOX_TEST_NAME));
+            assert!(report.contains(SANDBOX_TEST_PHASE));
+            assert!(report.contains(SANDBOX_TEST_FAILURE));
+        }
+    }
 
     fn suggestion_candidate(project: &Path) -> PatternCandidate {
         PatternCandidate {

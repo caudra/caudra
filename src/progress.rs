@@ -31,6 +31,13 @@ pub struct SandboxProgress(ProgressBar);
 impl SandboxProgress {
     pub fn start(cli: &Cli) -> Option<Self> {
         let message = sandbox_message(cli, stdout().is_terminal(), stderr().is_terminal())?;
+        Self::start_named(message)
+    }
+
+    pub fn start_named(message: String) -> Option<Self> {
+        if !stderr().is_terminal() {
+            return None;
+        }
         let progress = Self::new(message, ProgressDrawTarget::stderr());
         progress.0.enable_steady_tick(BAR_REFRESH);
         Some(progress)

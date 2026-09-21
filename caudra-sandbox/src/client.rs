@@ -4,6 +4,7 @@ use futures_lite::io::AsyncReadExt;
 use isahc::{
     HttpClient, Request,
     config::{Configurable, RedirectPolicy, VersionNegotiation},
+    error::ErrorKind,
     http::{HeaderValue, Method},
 };
 use serde::{Serialize, de::DeserializeOwned};
@@ -12,7 +13,7 @@ use url::{Url, form_urlencoded};
 use uuid::Uuid;
 
 use crate::{
-    Error, Result,
+    Error, Result, TransportDiagnostic,
     dto::{
         Create, Credentials, Discovery, Expected, FailureEnvelope, Instance, MAX_CATALOG_SIZE,
         MAX_PAGE_SIZE, Operation, Page, Policy, Template, identifier, timestamp,
@@ -25,6 +26,56 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const KEY_BYTES: usize = 32;
 const HEX: &[u8; 16] = b"0123456789abcdef";
+const UNAVAILABLE: &str =
+    "read-only request unavailable; check provider daemon and proxy configuration";
+const UNKNOWN_OUTCOME: &str = "outcome may be unknown; inspect instead of replaying; check provider daemon and proxy configuration";
+const SETUP_UNAVAILABLE: &str =
+    "client unavailable; no request sent; check local HTTP client configuration";
+const BODY_FAILURE: &str = "response body read failed";
+
+fn transport_failure(kind: &ErrorKind) -> &'static str {
+    match kind {
+        ErrorKind::ConnectionFailed => "connection failed (daemon, proxy, or TLS handshake)",
+        ErrorKind::NameResolution => "name resolution failed",
+        ErrorKind::BadClientCertificate => "TLS client certificate rejected",
+        ErrorKind::BadServerCertificate => "TLS server certificate validation failed",
+        ErrorKind::InvalidTlsConfiguration | ErrorKind::TlsEngine => {
+            "TLS configuration or engine failed"
+        }
+        ErrorKind::Timeout => "request timed out",
+        ErrorKind::Io => "request/response I/O failed",
+        ErrorKind::ClientInitialization => "HTTP client initialization failed",
+        ErrorKind::ProtocolViolation => "HTTP transport protocol failed",
+        _ => "HTTP request failed",
+    }
+}
+
+fn transport_operation(method: &Method, path: &str) -> &'static str {
+    let path = path.split('?').next().unwrap_or_default();
+    if method == Method::GET {
+        return match path {
+            "/discover" => "discovery",
+            "/templates" => "template listing",
+            "/instances" => "instance listing",
+            _ if path.starts_with("/templates/") => "template inspection",
+            _ if path.starts_with("/operations/") => "operation inspection",
+            _ => "instance inspection",
+        };
+    }
+    if method == Method::DELETE {
+        return "delete";
+    }
+    match path.rsplit('/').next() {
+        Some("instances") => "create",
+        Some("resume") => "resume",
+        Some("pause") => "pause",
+        Some("renew") => "lease renewal",
+        Some("policy") => "network policy update",
+        Some("credentials") => "credential acquisition",
+        Some("cancel") => "create cancellation",
+        _ => "lifecycle mutation",
+    }
+}
 
 pub struct LifecycleClient {
     origin: SandboxOrigin,
@@ -57,7 +108,13 @@ impl LifecycleClient {
         Ok(Self {
             origin,
             key,
-            http: builder.build().map_err(|_| Error::Transport)?,
+            http: builder.build().map_err(|error| {
+                Error::Transport(TransportDiagnostic {
+                    operation: "client setup",
+                    failure: transport_failure(error.kind()),
+                    guidance: SETUP_UNAVAILABLE,
+                })
+            })?,
         })
     }
 
@@ -68,6 +125,12 @@ impl LifecycleClient {
         body: Option<&impl Serialize>,
         key: Option<&str>,
     ) -> Result<T> {
+        let operation = transport_operation(&method, path);
+        let guidance = if method == Method::GET {
+            UNAVAILABLE
+        } else {
+            UNKNOWN_OUTCOME
+        };
         let accepted_allowed = method == Method::POST
             && (path == "/instances"
                 || path
@@ -95,11 +158,13 @@ impl LifecycleClient {
             request = request.header("Idempotency-Key", key);
         }
         let request = request.body(body).map_err(|_| Error::Protocol)?;
-        let mut response = self
-            .http
-            .send_async(request)
-            .await
-            .map_err(|_| Error::Transport)?;
+        let mut response = self.http.send_async(request).await.map_err(|error| {
+            Error::Transport(TransportDiagnostic {
+                operation,
+                failure: transport_failure(error.kind()),
+                guidance,
+            })
+        })?;
         let status = response.status().as_u16();
         if response.status().is_redirection() {
             return Err(Error::Protocol);
@@ -130,7 +195,13 @@ impl LifecycleClient {
             .take(MAX_BODY_BYTES + 1)
             .read_to_end(&mut bytes)
             .await
-            .map_err(|_| Error::Transport)?;
+            .map_err(|_| {
+                Error::Transport(TransportDiagnostic {
+                    operation,
+                    failure: BODY_FAILURE,
+                    guidance,
+                })
+            })?;
         if bytes.len() as u64 > MAX_BODY_BYTES {
             return Err(Error::Protocol);
         }
@@ -385,10 +456,13 @@ pub fn generate_api_key() -> Result<SandboxApiKey> {
 
 #[cfg(test)]
 mod tests {
-    use super::{LifecycleClient, MAX_BODY_BYTES, generate_api_key};
-    use crate::Error;
+    use super::{
+        BODY_FAILURE, LifecycleClient, MAX_BODY_BYTES, UNAVAILABLE, UNKNOWN_OUTCOME,
+        generate_api_key, transport_failure, transport_operation,
+    };
+    use crate::{Error, TransportDiagnostic};
     use caudra_config::sandbox::SandboxOrigin;
-    use isahc::http::Method;
+    use isahc::{error::ErrorKind, http::Method};
     use serde_json::Value;
     use std::{
         io::{BufRead, BufReader, Write},
@@ -403,6 +477,8 @@ mod tests {
     const TEST_TIMEOUT: Duration = Duration::from_millis(500);
     const IO_TIMEOUT: Duration = Duration::from_secs(5);
     const CANCEL_PATH: &str = "/operations/0199650a-9e00-7000-8000-000000000001/cancel";
+    const TIMEOUT_FAILURE: &str = "request timed out";
+    const TLS_FAILURE: &str = "TLS server certificate validation failed";
 
     fn read_headers(stream: &TcpStream) {
         stream.set_read_timeout(Some(IO_TIMEOUT)).unwrap();
@@ -504,12 +580,85 @@ mod tests {
         let client =
             LifecycleClient::with_timeout(origin, generate_api_key().unwrap(), TEST_TIMEOUT)
                 .unwrap();
-        assert!(matches!(
-            smol::block_on(client.get::<Value>("/discover")),
-            Err(Error::Transport)
-        ));
+        let error = smol::block_on(client.get::<Value>("/discover")).unwrap_err();
         release.send(()).unwrap();
         server.join().unwrap();
+        assert!(error.to_string().contains(TIMEOUT_FAILURE));
+        assert!(error.to_string().contains(UNAVAILABLE));
+        assert!(!error.to_string().contains(UNKNOWN_OUTCOME));
+    }
+
+    #[test]
+    fn unreachable_discovery_is_unavailable_not_unknown() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let origin =
+            SandboxOrigin::parse(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+        let client = LifecycleClient::new(origin, generate_api_key().unwrap()).unwrap();
+        drop(listener);
+        let error = smol::block_on(client.discover()).unwrap_err();
+        let Error::Transport(diagnostic) = &error else {
+            panic!("{error:?}")
+        };
+        assert_eq!(diagnostic.operation, "discovery");
+        assert_eq!(
+            diagnostic.failure,
+            transport_failure(&ErrorKind::ConnectionFailed)
+        );
+        assert!(error.to_string().contains(UNAVAILABLE));
+        assert!(!error.to_string().contains("unknown"));
+        assert!(!error.to_string().contains("replaying"));
+    }
+
+    #[test_case(false; "lost_headers")]
+    #[test_case(true; "lost_body")]
+    fn dispatched_mutation_lost_response_remains_unknown(partial_body: bool) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let origin =
+            SandboxOrigin::parse(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            read_headers(&stream);
+            if partial_body {
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nCache-Control: no-store\r\nContent-Length: 100\r\n\r\n{{"
+                )
+                .unwrap();
+            }
+        });
+        let key = generate_api_key().unwrap();
+        let secret = key.expose_secret().to_owned();
+        let client = LifecycleClient::new(origin, key).unwrap();
+        let path = format!("/instances/{SECRET}/resume?token={SECRET}");
+        let error = smol::block_on(client.request::<Value>(Method::POST, &path, None::<&()>, None))
+            .unwrap_err();
+        server.join().unwrap();
+        let Error::Transport(diagnostic) = &error else {
+            panic!("{error:?}")
+        };
+        assert_eq!(diagnostic.operation, "resume");
+        if partial_body {
+            assert_eq!(diagnostic.failure, BODY_FAILURE);
+        }
+        assert!(error.to_string().contains(UNKNOWN_OUTCOME));
+        let rendered = format!("{error:?}: {error}");
+        assert!(!rendered.contains(SECRET));
+        assert!(!rendered.contains(&secret));
+        assert!(!rendered.contains("http://"));
+    }
+
+    #[test_case(ErrorKind::Timeout, TIMEOUT_FAILURE; "timeout")]
+    #[test_case(ErrorKind::BadServerCertificate, TLS_FAILURE; "tls")]
+    fn transport_metadata_is_allowlisted(kind: ErrorKind, expected: &str) {
+        let path = format!("/instances/{SECRET}/policy?token={SECRET}");
+        let error = Error::Transport(TransportDiagnostic {
+            operation: transport_operation(&Method::PUT, &path),
+            failure: transport_failure(&kind),
+            guidance: UNKNOWN_OUTCOME,
+        });
+        assert!(error.to_string().contains(expected));
+        assert!(error.to_string().contains("network policy update"));
+        assert!(!format!("{error:?}: {error}").contains(SECRET));
     }
 
     #[test_case("http://localhost:8080")]

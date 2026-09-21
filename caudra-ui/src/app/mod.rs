@@ -3370,6 +3370,10 @@ impl App {
         }
 
         if let Some(prefix) = shell::parse_shell_prefix(&sub.text) {
+            if let Some(reason) = self.sandbox_network_dispatch_blocker() {
+                self.flash(reason.into());
+                return Vec::new();
+            }
             let cmd = prefix.command.trim();
             if cmd == "cd" || cmd.starts_with("cd ") {
                 self.flash("Only /cd can change the working directory".into());
@@ -4858,6 +4862,11 @@ impl App {
     }
 
     pub(crate) fn lifecycle_blocker(&self) -> Option<&'static str> {
+        if self.sandbox_network_reconciliation_pending() {
+            return Some(
+                "Wait for saved-network reconciliation to finish before closing this session; its results must be retained",
+            );
+        }
         if crate::sandbox::transfer::active() {
             return Some(
                 "Close/cancel the transfer and await cleanup before changing sessions or exiting",

@@ -9,6 +9,7 @@ pub(crate) mod form;
 pub(crate) mod goal_modal;
 pub(crate) mod help_modal;
 pub mod input;
+pub(crate) mod json_text;
 pub mod keybindings;
 pub(crate) mod list_picker;
 pub(crate) mod login_picker;

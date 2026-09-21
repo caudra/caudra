@@ -12,7 +12,7 @@ use std::collections::HashSet;
 use ratatui::text::{Line, Span};
 use serde_json::Value;
 
-use crate::highlight::highlight_line;
+use crate::components::json_text::scalar_spans;
 use crate::theme;
 
 const INDENT: &str = "  ";
@@ -32,7 +32,6 @@ const ITEM_UNIT: &str = " item";
 const PLURAL: &str = "s";
 const COMMA: &str = ",";
 const KEY_SEPARATOR: &str = ": ";
-const JSON_TOKEN: &str = "json";
 
 /// One line of a body, and the node it opens when it opens one. A row that
 /// opens nothing is a scalar, a closing brace, or a node whose parent is shut.
@@ -280,15 +279,6 @@ fn paint(drafts: Vec<Draft>) -> Vec<JsonRow> {
 /// because a string is quoted before it is anything else.
 fn is_structure(value: &str) -> bool {
     value.starts_with(['{', '[', '}', ']'])
-}
-
-/// A scalar coloured by the JSON grammar, each read on its own so the context
-/// one row left behind cannot decide what the next one is.
-fn scalar_spans(value: &str) -> Vec<Span<'static>> {
-    highlight_line(
-        &mut caudra_highlight::Highlighter::for_token(JSON_TOKEN),
-        value,
-    )
 }
 
 #[cfg(test)]

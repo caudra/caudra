@@ -1,18 +1,21 @@
 use super::{
-    Confirmation, Control, Manager, SandboxAction, SandboxView, SnapshotState, StoreTicket,
-    TextEditor, editor_action, image,
+    Confirmation, Control, Focus, Manager, ReadSurface, SandboxAction, SandboxView, SnapshotState,
+    StoreTicket, TextEditor, editor_action,
+    form::{CIDR_HELP, DOMAIN_HELP, network_list_key, parse_cidrs, parse_domains},
+    image,
+    view::hover_style,
 };
 use crate::{
     sandbox::{
         LiveOperation, LiveRequest, MAX_LIVE_PREVIEW_BYTES, RULE_TEST_NOTICE,
-        SandboxInstanceSnapshot, SandboxSnapshotRequest,
+        SandboxInstanceSnapshot, SandboxInstanceState, SandboxSnapshotRequest,
     },
     theme,
 };
 use caudra_config::sandbox::SandboxName;
 use caudra_sandbox::{
     CreateReview, LifecycleAction, Ownership,
-    dto::Policy,
+    dto::{OperationStatus, Policy},
     local_admin::{AdminOperation, AdminRequest, ImageProbe, ProbedImage},
 };
 use caudra_storage::sandbox_auth::{SandboxApiKey, SandboxCredentialRef};
@@ -21,7 +24,8 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
     Frame,
     layout::{Constraint, Layout, Rect},
-    widgets::{Block, Borders, Paragraph, Wrap},
+    style::Style,
+    widgets::{Block, Borders, Paragraph},
 };
 use std::path::{Path, PathBuf};
 
@@ -31,6 +35,38 @@ const DELETE_APPROVAL: &str = "DELETE";
 const TRANSITION: &str = "Attach opens a NEW sandbox session after Workcell verification and session gates. The local session is saved unchanged. No conversation, grants, pending prompts, files or secrets are copied. Closing/exiting detaches; it never deletes or pauses the VM.";
 const MIB_BYTES: u64 = 1024 * 1024;
 const LIVE_FIELD_ROWS: u16 = 6;
+const RECOVERY_REQUIRED: &str = "Pending or unknown outcome: Inspect / Reconcile first; acknowledging failure is separate from retrying.";
+const PERSISTENT_REQUIRED: &str =
+    "Requires a persistent disk. Stop never silently deletes an ephemeral instance.";
+const PAUSE_REVIEW: &str = "PAUSE / STOP: stop execution, preserve the persistent disk. Memory/process state is not saved; Resume is a cold boot. The running lease ends; paused-disk retention still applies. When attached, save conversations and drain active work before detaching; the active TUI then closes.";
+const RESTART_REVIEW: &str = "RESTART: stop then cold boot the SAME persistent disk with the reviewed new lease. No delete or recreate. Memory/process state is lost. If stop or boot is uncertain, reconcile; never automatically retry. When attached, save conversations and drain active work before detaching. Only after verified success, reconstruct the verified sandbox runtime and restore the same saved conversations; never switch to a new local workspace.";
+const ACK_REVIEW: &str = "Acknowledge FAILURE only. No remote action or automatic resume/retry. Inspect / Reconcile first when possible; a later Resume requires a fresh, separate review. Attached sessions exit detached.";
+pub(super) const INSTANCE_ACTIONS: &[(&str, Option<Kind>)] = &[
+    ("Inspect · read-only, no request", None),
+    (
+        "Reconcile · look up outcome, never retry",
+        Some(Kind::Reconcile),
+    ),
+    (
+        "Acknowledge failure · explicit local recovery",
+        Some(Kind::AcknowledgeFailure),
+    ),
+    ("Resume · cold boot preserved disk", Some(Kind::Resume)),
+    ("Pause / Stop · preserve disk", Some(Kind::Pause)),
+    ("Restart · cold boot same disk", Some(Kind::Restart)),
+    ("Extend running lease", Some(Kind::Extend)),
+    ("Attach · new sandbox session", Some(Kind::Attach)),
+    ("Network · review live policy", Some(Kind::Network)),
+    (
+        "Cancel create · explicit remote cancellation",
+        Some(Kind::CancelCreate),
+    ),
+    ("Detach record · keep VM and disk", Some(Kind::Detach)),
+    (
+        "Delete · destructive (borrowed: detach by default)",
+        Some(Kind::Delete),
+    ),
+];
 
 #[derive(Clone, PartialEq, Eq)]
 pub(super) enum Kind {
@@ -38,6 +74,7 @@ pub(super) enum Kind {
     Attach,
     Pause,
     Resume,
+    Restart,
     Extend,
     Delete,
     Detach,
@@ -106,18 +143,8 @@ impl LiveForm {
     fn policy(&self) -> Result<Policy, String> {
         let policy = Policy {
             mode: self.field("TLS mode"),
-            domains: self
-                .field("Domains (one per line)")
-                .lines()
-                .filter(|line| !line.trim().is_empty())
-                .map(|line| line.trim().to_owned())
-                .collect(),
-            cidrs: self
-                .field("CIDRs (one per line)")
-                .lines()
-                .filter(|line| !line.trim().is_empty())
-                .map(|line| line.trim().to_owned())
-                .collect(),
+            domains: parse_domains(&self.field("Domains (one per line)"))?,
+            cidrs: parse_cidrs(&self.field("CIDRs (one per line)"))?,
         };
         policy.validate().map_err(|error| error.to_string())?;
         Ok(policy)
@@ -125,7 +152,88 @@ impl LiveForm {
 }
 
 impl Manager {
+    pub(super) fn selected_instance(&self) -> Option<&SandboxInstanceSnapshot> {
+        let selected = self.entries().get(self.selected)?.clone();
+        match &self.snapshot.as_ref()?.instances {
+            SnapshotState::Ready(rows) if self.view == SandboxView::Instances => {
+                rows.iter().find(|row| row.id == selected)
+            }
+            _ => None,
+        }
+    }
+
+    pub(super) fn instance_action_error(&self, kind: &Kind) -> Option<String> {
+        if self.dirty() || self.pending.is_some() || self.live_pending.is_some() {
+            return Some("Save or discard edits and wait for pending operations.".into());
+        }
+        instance_action_error(kind, self.selected_instance()).map(str::to_owned)
+    }
+
+    pub(super) fn open_instance_actions(&mut self) {
+        self.cancel_selections();
+        self.instance_action = Some(0);
+        self.reference_scroll = 0;
+        self.reveal_reference = true;
+        self.status = "Choose an action to draft and review; selection never executes. Disabled actions explain why. Inspect and Reconcile do not retry; acknowledgement does not resume.".into();
+    }
+
+    pub(super) fn choose_instance_action(&mut self, index: usize) -> SandboxAction {
+        let Some((_, kind)) = INSTANCE_ACTIONS.get(index) else {
+            return SandboxAction::None;
+        };
+        self.instance_action = Some(index);
+        if let Some(kind) = kind {
+            if let Some(reason) = self.instance_action_error(kind) {
+                self.status = reason;
+                return SandboxAction::None;
+            }
+            self.instance_action = None;
+            self.open_live(kind.clone())
+        } else {
+            self.instance_action = None;
+            self.detail = true;
+            self.focus = Focus::Detail;
+            self.status = "Inspect only: no lifecycle request, acknowledgement or retry.".into();
+            SandboxAction::None
+        }
+    }
+
+    pub(super) fn instance_actions_key(&mut self, event: KeyEvent) -> SandboxAction {
+        let Some(index) = self.instance_action else {
+            return SandboxAction::None;
+        };
+        let delta = match event.code {
+            KeyCode::Esc | KeyCode::F(3) => {
+                self.instance_action = None;
+                return SandboxAction::None;
+            }
+            KeyCode::Enter => return self.choose_instance_action(index),
+            KeyCode::Up | KeyCode::BackTab => -1,
+            KeyCode::Down | KeyCode::Tab => 1,
+            KeyCode::PageUp => -(self.references_area.height.max(1) as isize),
+            KeyCode::PageDown => self.references_area.height.max(1) as isize,
+            KeyCode::Home => -isize::MAX,
+            KeyCode::End => isize::MAX,
+            _ => return SandboxAction::None,
+        };
+        self.instance_action = Some(
+            index
+                .saturating_add_signed(delta)
+                .min(INSTANCE_ACTIONS.len() - 1),
+        );
+        self.reveal_reference = true;
+        SandboxAction::None
+    }
+
     pub(super) fn open_live(&mut self, kind: Kind) -> SandboxAction {
+        if INSTANCE_ACTIONS
+            .iter()
+            .any(|(_, action)| action.as_ref() == Some(&kind))
+            && let Some(reason) = self.instance_action_error(&kind)
+        {
+            self.status = reason;
+            return SandboxAction::None;
+        }
         if self.dirty() || self.pending.is_some() || self.live_pending.is_some() {
             self.status = "Save or discard configuration edits and wait for pending acknowledgments before live actions.".into();
             return SandboxAction::None;
@@ -197,7 +305,7 @@ impl Manager {
             {
                 field(DESTROY_BORROWED, String::new(), false)
             }
-            Kind::Resume | Kind::Extend => field(
+            Kind::Resume | Kind::Restart | Kind::Extend => field(
                 "Lease seconds",
                 target
                     .as_ref()
@@ -288,7 +396,7 @@ impl Manager {
             probe: None,
         });
         self.detail_scroll = 0;
-        self.status = "Live action draft. Ctrl+Enter previews (does not execute). Esc closes and retains this draft; F6 explicitly discards it. Tab changes field. Network F4 evaluates rules only.".into();
+        self.status = "Live action draft. Ctrl+Enter previews (does not execute). Esc closes and retains this draft; F6 explicitly discards it. Tab changes field; Alt+Home/End selects first/last field. Network F4 evaluates rules only.".into();
         if self.live_form.as_ref().is_some_and(|form| {
             matches!(
                 form.kind,
@@ -444,6 +552,9 @@ impl Manager {
             }
             _ => {
                 let target = form.target.as_ref().ok_or("Select an instance first")?;
+                if let Some(reason) = instance_action_error(&form.kind, Some(target)) {
+                    return Err(reason.into());
+                }
                 if form.kind == Kind::Attach && target.record.is_none() {
                     let instance = target.live.clone().ok_or("Live instance unavailable")?;
                     let name = name("Borrowed instance name")?;
@@ -484,6 +595,16 @@ impl Manager {
                         Kind::Attach => LiveOperation::Attach { name, revision },
                         Kind::Reconcile => LiveOperation::Reconcile { name },
                         Kind::CancelCreate => LiveOperation::CancelCreate { name, revision },
+                        Kind::Restart => LiveOperation::Restart {
+                            name,
+                            revision,
+                            lease_seconds: form
+                                .field("Lease seconds")
+                                .parse::<u32>()
+                                .ok()
+                                .filter(|lease| *lease > 0)
+                                .ok_or("Lease must be a positive number of seconds")?,
+                        },
                         Kind::AcknowledgeFailure => {
                             LiveOperation::AcknowledgeFailure { name, revision }
                         }
@@ -530,13 +651,16 @@ impl Manager {
                     };
                     let effect = match &operation {
                         LiveOperation::Attach { .. } => TRANSITION.into(),
-                        LiveOperation::AcknowledgeFailure { .. } => record.lifecycle_failure_review().map_err(|error| error.to_string())?,
+                        LiveOperation::AcknowledgeFailure { .. } => format!("{ACK_REVIEW}\n{}", record.lifecycle_failure_review().map_err(|error| error.to_string())?),
+                        LiveOperation::Restart { lease_seconds, .. } => format!("{RESTART_REVIEW}\nNew running lease: {lease_seconds} seconds."),
+                        LiveOperation::Control { action: LifecycleAction::Pause, .. } => PAUSE_REVIEW.into(),
+                        LiveOperation::Control { action: LifecycleAction::Resume { lease_seconds }, .. } => format!("RESUME: cold boot the preserved disk; no memory/process restoration or disk deletion. New running lease: {lease_seconds} seconds. Reconnect only after verified success."),
                         LiveOperation::Control { action: LifecycleAction::Delete { destroy_borrowed: false }, .. } if record.ownership == Ownership::Borrowed => "DETACH borrowed instance only. VM and disk are NOT deleted.".into(),
                         LiveOperation::Control { action: LifecycleAction::Detach, .. } => "DETACH local record only. VM and disk are NOT deleted.".into(),
                         LiveOperation::Control { action: LifecycleAction::Delete { .. }, .. } => "PERMANENTLY DELETE this VM AND DISK. Cannot be undone.".into(),
                         LiveOperation::Control { action: LifecycleAction::ApplyPolicy { policy }, .. } => {
                             let doctor = self.snapshot.as_ref().and_then(|snapshot| snapshot.providers.get(&target.provider)).and_then(|provider| provider.doctor.as_ref()).ok_or("Provider TLS metadata unavailable")?;
-                            format!("Apply host-only rules (no port/method policy). MITM terminates TLS and can break pinning.\n{}\nDiscovered TLS modes: {:?}; live mode change: {}; reviewed image guest CA: {}; instance guest CA ready: {}", pretty(policy)?, doctor.discovery.tls_modes, doctor.discovery.capabilities.live_tls_mode_change, record.template.manifest.guest_ca, target.live.as_ref().is_some_and(|instance| instance.egress.guest_ca_ready))
+                            format!("Apply host-only rules (no port/method policy). Empty domains AND CIDRs deny all. Saved profiles remain unchanged. MITM terminates TLS and can break pinning.\n{}\nDiscovered TLS modes: {:?}; live mode change: {}; reviewed image guest CA: {}; instance guest CA ready: {}", pretty(policy)?, doctor.discovery.tls_modes, doctor.discovery.capabilities.live_tls_mode_change, record.template.manifest.guest_ca, target.live.as_ref().is_some_and(|instance| instance.egress.guest_ca_ready))
                         }
                         LiveOperation::Control { action, .. } => format!("{action:?}\nConditional on the reviewed execution and revision. Saved profiles remain unchanged."),
                         LiveOperation::CancelCreate { .. } => "CANCEL CREATE: explicit remote cancellation; may race completion. Reconcile if outcome is unknown. Escape/close alone never requests this.".into(),
@@ -658,7 +782,7 @@ impl Manager {
                     .map_err(|error| error.to_string())
             }) {
                 Ok(matched) => format!(
-                    "Saved rule match: {}. {RULE_TEST_NOTICE}",
+                    "Draft rule match: {}. {RULE_TEST_NOTICE}",
                     if matched { "ALLOW" } else { "DENY (default)" }
                 ),
                 Err(error) => error,
@@ -666,6 +790,16 @@ impl Manager {
             return SandboxAction::None;
         }
         if form.fields.is_empty() {
+            return SandboxAction::None;
+        }
+        if event.modifiers == KeyModifiers::ALT
+            && matches!(event.code, KeyCode::Home | KeyCode::End)
+        {
+            form.focus = if event.code == KeyCode::Home {
+                0
+            } else {
+                form.fields.len() - 1
+            };
             return SandboxAction::None;
         }
         if matches!(event.code, KeyCode::Tab | KeyCode::BackTab) {
@@ -677,6 +811,15 @@ impl Manager {
             return SandboxAction::None;
         }
         let field = &mut form.fields[form.focus];
+        if form.kind == Kind::Network
+            && matches!(
+                field.label,
+                "Domains (one per line)" | "CIDRs (one per line)"
+            )
+            && network_list_key(&mut field.editor, event, MAX_LIVE_PREVIEW_BYTES)
+        {
+            return SandboxAction::None;
+        }
         if event.code == KeyCode::F(3) && !field.choices.is_empty() {
             let next = field
                 .choices
@@ -687,20 +830,20 @@ impl Manager {
             return SandboxAction::None;
         }
         if field.secret
-            && matches!(event.code, KeyCode::Char(character) if event.modifiers.is_empty() && !character.is_ascii_graphic())
+            && matches!(event.code, KeyCode::Char(character) if (event.modifiers - KeyModifiers::SHIFT).is_empty() && !character.is_ascii_graphic())
         {
             return SandboxAction::None;
         }
         if field.secret && event.code == KeyCode::Enter {
             return SandboxAction::None;
         }
-        if field.editor.text().len() >= MAX_LIVE_PREVIEW_BYTES
-            && matches!(event.code, KeyCode::Char(_) | KeyCode::Enter)
-            && event.modifiers.is_empty()
-        {
+        let Ok(result) = field
+            .editor
+            .handle_key_bounded(event, MAX_LIVE_PREVIEW_BYTES)
+        else {
+            self.status = super::TOO_LARGE.into();
             return SandboxAction::None;
-        }
-        let result = field.editor.handle_key(event);
+        };
         if field.secret {
             SandboxAction::None
         } else {
@@ -744,22 +887,54 @@ impl Manager {
         let Some(form) = self.live_form.as_mut() else {
             return;
         };
-        if let Some(picker) = &form.picker {
+        if let Some(picker) = &mut form.picker {
             picker.view(frame, area);
             return;
         }
         if form.fields.is_empty() {
-            frame.render_widget(Paragraph::new("Ctrl+Enter reviews this action. No action runs until the separate confirmation is accepted. Escape closes, F6 discards the action draft.").wrap(Wrap { trim: false }), area);
+            self.readers[ReadSurface::Body as usize].view(frame, area, "Ctrl+Enter reviews this action. No action runs until the separate confirmation is accepted. Escape closes, F6 discards the action draft.".into());
             return;
         }
-        let [list, editor] = Layout::vertical([
+        let help = if form.kind == Kind::Network {
+            match form.fields[form.focus].label {
+                "Domains (one per line)" => DOMAIN_HELP,
+                "CIDRs (one per line)" => CIDR_HELP,
+                "TLS mode" => {
+                    "F3 switches TLS mode. MITM needs a guest CA and can break certificate pinning. Live changes require provider support."
+                }
+                _ => {
+                    "Bare hostname or IP only, not a URL. F4 evaluates the draft rules locally; this is not a connectivity or TLS test."
+                }
+            }
+        } else {
+            ""
+        };
+        let help_rows = if help.is_empty() {
+            0
+        } else {
+            3.min(area.height / 3)
+        };
+        let [list, editor, help_area] = Layout::vertical([
             Constraint::Length((form.fields.len() as u16).min(LIVE_FIELD_ROWS)),
             Constraint::Min(1),
+            Constraint::Length(help_rows),
         ])
         .areas(area);
-        let start = form
-            .focus
-            .saturating_sub(list.height.saturating_sub(1) as usize);
+        self.readers[ReadSurface::Help as usize].view(frame, help_area, help.into());
+        self.fields_area = list;
+        if self.live_scroll_focus != form.focus {
+            self.live_scroll = self.live_scroll.min(form.focus);
+            if form.focus >= self.live_scroll + list.height as usize {
+                self.live_scroll = form
+                    .focus
+                    .saturating_sub(list.height.saturating_sub(1) as usize);
+            }
+            self.live_scroll_focus = form.focus;
+        }
+        self.live_scroll = self
+            .live_scroll
+            .min(form.fields.len().saturating_sub(list.height as usize));
+        let start = self.live_scroll;
         for (row, (index, field)) in form
             .fields
             .iter()
@@ -784,26 +959,102 @@ impl Manager {
                         format!(" [{}; F3]", field.choices.join(" | "))
                     }
                 ))
-                .style(theme::current().tool_dim),
+                .style(hover_style(
+                    theme::current().tool_dim,
+                    self.hovered == Some(Control::LiveField(index)),
+                )),
                 area,
             );
             self.hits.push((area, Control::LiveField(index)));
         }
+        self.fields_bar
+            .draw(frame, list, form.fields.len() as u32, start as u32);
         let count = form.fields.len();
         let field = &mut form.fields[form.focus];
-        let block = Block::default().borders(Borders::ALL).title(format!(
-            "{} ({}/{})",
-            field.label,
-            form.focus + 1,
-            count
-        ));
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(hover_style(
+                Style::default(),
+                self.hovered == Some(Control::Editor),
+            ))
+            .title(format!("{} ({}/{})", field.label, form.focus + 1, count));
         self.editor_area = block.inner(editor);
         frame.render_widget(block, editor);
         if field.secret {
             field.editor.view_masked(frame, self.editor_area);
         } else {
-            field.editor.view(frame, self.editor_area);
+            field.editor.view_json(frame, self.editor_area);
         }
+    }
+}
+
+fn instance_action_error(
+    kind: &Kind,
+    target: Option<&SandboxInstanceSnapshot>,
+) -> Option<&'static str> {
+    let Some(target) = target else {
+        return Some("Select an instance first; refresh if unavailable.");
+    };
+    let record = target.record.as_ref();
+    let pending = record
+        .and_then(|record| record.lifecycle.as_ref())
+        .is_some_and(|intent| intent.is_pending());
+    match kind {
+        Kind::Reconcile => {
+            return record
+                .is_none()
+                .then_some("Attach as borrowed before reconciling a local record.");
+        }
+        Kind::AcknowledgeFailure => {
+            return (!pending).then_some("No unresolved lifecycle intent to acknowledge.");
+        }
+        Kind::CancelCreate => {
+            return (pending
+                || !record
+                    .and_then(|record| record.create.as_ref())
+                    .and_then(|intent| intent.operation.as_ref())
+                    .is_some_and(|operation| {
+                        operation.status == OperationStatus::Creating && !operation.cancel_requested
+                    }))
+            .then_some("Only an unresolved create can be cancelled; Reconcile first.");
+        }
+        _ => {}
+    }
+    if pending
+        || matches!(
+            target.state,
+            SandboxInstanceState::Creating
+                | SandboxInstanceState::Recovering
+                | SandboxInstanceState::Unknown
+        )
+    {
+        return Some(RECOVERY_REQUIRED);
+    }
+    if *kind != Kind::Attach && record.is_none() {
+        return Some("Attach as borrowed before controlling this instance.");
+    }
+    if *kind == Kind::Detach {
+        return None;
+    }
+    let Some(instance) = &target.live else {
+        return Some("Live state unavailable: Inspect / Reconcile first.");
+    };
+    if record.is_some_and(|record| record.instance.as_ref() != Some(instance)) {
+        return Some("Live state changed: Reconcile, then review a fresh action.");
+    }
+    if matches!(kind, Kind::Pause | Kind::Resume | Kind::Restart) && !instance.persistent {
+        return Some(PERSISTENT_REQUIRED);
+    }
+    match kind {
+        Kind::Resume if target.state != SandboxInstanceState::Paused => {
+            Some("Resume requires a paused instance; Reconcile if the state is stale.")
+        }
+        Kind::Pause | Kind::Restart | Kind::Extend | Kind::Attach | Kind::Network
+            if target.state != SandboxInstanceState::Running =>
+        {
+            Some("Requires a running instance; Resume a paused disk separately.")
+        }
+        _ => None,
     }
 }
 
@@ -813,16 +1064,216 @@ fn pretty(value: &impl serde::Serialize) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Kind, LiveForm, image};
+    use super::{
+        ACK_REVIEW, INSTANCE_ACTIONS, Kind, LiveField, LiveForm, PAUSE_REVIEW, PERSISTENT_REQUIRED,
+        RECOVERY_REQUIRED, RESTART_REVIEW, TextEditor, image, instance_action_error,
+    };
+    use crate::components::sandbox_manager::{
+        Confirmation, SandboxAction, SnapshotState,
+        tests::{fixture, live_instance},
+    };
+    use crate::sandbox::{LiveOperation, SandboxInstanceState};
     use caudra_sandbox::{
-        dto::{PROTOCOL_VERSION, TRANSFER_PROTOCOL},
+        dto::{InstanceState, PROTOCOL_VERSION, TRANSFER_PROTOCOL},
         local_admin::AdminOperation,
     };
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use serde_json::json;
     use test_case::test_case;
 
     const DIGEST: &str = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const RAW: &str = "Raw operation JSON override (optional)";
+
+    #[test_case(Kind::Pause, InstanceState::Running, true; "running_pause")]
+    #[test_case(Kind::Restart, InstanceState::Running, true; "running_restart")]
+    #[test_case(Kind::Resume, InstanceState::Running, false; "running_resume_disabled")]
+    #[test_case(Kind::Resume, InstanceState::Paused, true; "paused_resume")]
+    #[test_case(Kind::Pause, InstanceState::Paused, false; "paused_stop_disabled")]
+    #[test_case(Kind::Extend, InstanceState::Paused, false; "paused_extend_disabled")]
+    #[test_case(Kind::Resume, InstanceState::Deleted, false; "deleted_resume_disabled")]
+    #[test_case(Kind::Pause, InstanceState::Deleted, false; "deleted_stop_disabled")]
+    #[test_case(Kind::Restart, InstanceState::Deleted, false; "deleted_restart_disabled")]
+    #[test_case(Kind::Attach, InstanceState::Deleted, false; "deleted_attach_disabled")]
+    #[test_case(Kind::Pause, InstanceState::Pausing, false; "pending_pause_disabled")]
+    #[test_case(Kind::Reconcile, InstanceState::Pausing, true; "pending_reconcile")]
+    #[test_case(Kind::CancelCreate, InstanceState::Running, false; "completed_create_cannot_cancel")]
+    fn action_eligibility(kind: Kind, state: InstanceState, enabled: bool) {
+        let (_directory, _store, mut manager) = fixture();
+        live_instance(&mut manager, false);
+        let mut target = manager
+            .state
+            .as_ref()
+            .unwrap()
+            .selected_instance()
+            .unwrap()
+            .clone();
+        target.state = SandboxInstanceState::from(&state);
+        target.live.as_mut().unwrap().state = state;
+        target.record.as_mut().unwrap().instance = target.live.clone();
+        assert_eq!(
+            instance_action_error(&kind, Some(&target)).is_none(),
+            enabled
+        );
+    }
+
+    #[test_case(Kind::Pause; "pause")]
+    #[test_case(Kind::Restart; "restart")]
+    fn persistent_actions_review_without_implicit_delete(kind: Kind) {
+        let (_directory, _store, mut manager) = fixture();
+        live_instance(&mut manager, false);
+        let state = manager.state.as_mut().unwrap();
+        assert!(matches!(state.open_live(kind.clone()), SandboxAction::None));
+        assert!(state.live_pending.is_none());
+        state.live_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL));
+        let Some(Confirmation::Live {
+            operation,
+            preview,
+            choice,
+        }) = &state.confirmation
+        else {
+            panic!("missing review")
+        };
+        assert_eq!(*choice, 0);
+        if kind == Kind::Restart {
+            assert!(matches!(
+                **operation,
+                LiveOperation::Restart {
+                    lease_seconds: 3600,
+                    ..
+                }
+            ));
+            assert!(preview.contains(RESTART_REVIEW));
+        } else {
+            assert!(matches!(
+                **operation,
+                LiveOperation::Control {
+                    action: caudra_sandbox::LifecycleAction::Pause,
+                    ..
+                }
+            ));
+            assert!(preview.contains(PAUSE_REVIEW));
+        }
+        assert!(matches!(state.confirm(0), SandboxAction::None));
+        assert!(state.live_pending.is_none());
+    }
+
+    #[test_case(false; "ephemeral_disk")]
+    #[test_case(true; "pending_intent")]
+    fn disabled_picker_and_shortcut_never_dispatch(pending: bool) {
+        let (_directory, _store, mut manager) = fixture();
+        live_instance(&mut manager, false);
+        let state = manager.state.as_mut().unwrap();
+        let SnapshotState::Ready(rows) = &mut state.snapshot.as_mut().unwrap().instances else {
+            panic!("missing instance")
+        };
+        let row = &mut rows[0];
+        if pending {
+            let record = row.record.as_mut().unwrap();
+            record.lifecycle = Some(serde_json::from_value(json!({"action":"pause", "expected":record.instance.as_ref().unwrap().expected(), "lease_seconds":null, "observed_revision":null, "policy":null, "policy_revision":null, "minimum_lease_deadline":null, "allow_equal_revision":false, "failure_acknowledged":false})).unwrap());
+        } else {
+            row.live.as_mut().unwrap().persistent = false;
+            row.record.as_mut().unwrap().instance = row.live.clone();
+        }
+        let index = INSTANCE_ACTIONS
+            .iter()
+            .position(|(_, kind)| *kind == Some(Kind::Pause))
+            .unwrap();
+        state.open_instance_actions();
+        assert!(matches!(
+            state.choose_instance_action(index),
+            SandboxAction::None
+        ));
+        assert_eq!(
+            state.status,
+            if pending {
+                RECOVERY_REQUIRED
+            } else {
+                PERSISTENT_REQUIRED
+            }
+        );
+        assert!(state.instance_action.is_some());
+        assert!(matches!(state.open_live(Kind::Pause), SandboxAction::None));
+        state.instance_action = None;
+        assert!(matches!(
+            state.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE)),
+            SandboxAction::None
+        ));
+        assert_eq!(
+            state.status,
+            if pending {
+                RECOVERY_REQUIRED
+            } else {
+                PERSISTENT_REQUIRED
+            }
+        );
+        assert!(state.live_form.is_none());
+        assert!(state.live_pending.is_none());
+        assert!(state.confirmation.is_none());
+        if pending {
+            state.instance_action = None;
+            state.open_live(Kind::AcknowledgeFailure);
+            state.live_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL));
+            let Some(Confirmation::Live {
+                operation,
+                preview,
+                choice,
+            }) = &state.confirmation
+            else {
+                panic!("missing acknowledgement review")
+            };
+            assert_eq!(*choice, 0);
+            assert!(preview.contains(ACK_REVIEW));
+            assert!(matches!(
+                **operation,
+                LiveOperation::AcknowledgeFailure { .. }
+            ));
+            let SandboxAction::Live(request) = state.confirm(1) else {
+                panic!("missing explicit acknowledgement")
+            };
+            assert!(matches!(
+                request.operation,
+                LiveOperation::AcknowledgeFailure { .. }
+            ));
+        }
+    }
+
+    #[test_case(" API.Example.com \n\n", " 10.20.30.40/24 ", "mitm", true; "normalizes_both_lists_preserves_tls")]
+    #[test_case("\n", "", "sni-only", true; "deny_all")]
+    #[test_case("https://api.example.com", "", "sni-only", false; "rejects_url")]
+    #[test_case("api.example.com", "10.0.0.0/99", "sni-only", false; "rejects_cidr")]
+    fn network_policy_fields(domains: &str, cidrs: &str, mode: &str, valid: bool) {
+        let mut form = form(Kind::Network);
+        form.fields = [
+            ("Domains (one per line)", domains),
+            ("CIDRs (one per line)", cidrs),
+            ("TLS mode", mode),
+        ]
+        .into_iter()
+        .map(|(label, value)| {
+            let mut editor = TextEditor::new();
+            editor.set_text(value.into());
+            LiveField {
+                label,
+                editor,
+                secret: false,
+                choices: &[],
+            }
+        })
+        .collect();
+        let policy = form.policy();
+        assert_eq!(policy.is_ok(), valid);
+        if let Ok(policy) = policy {
+            assert_eq!(policy.mode, mode);
+            if domains.trim().is_empty() {
+                assert!(policy.domains.is_empty());
+                assert!(policy.cidrs.is_empty());
+                assert!(!policy.test_destination("api.example.com").unwrap());
+            } else {
+                assert_eq!(policy.domains, ["api.example.com"]);
+                assert_eq!(policy.cidrs, ["10.20.30.0/24"]);
+            }
+        }
+    }
 
     fn form(kind: Kind) -> LiveForm {
         let fields = image::fields(&kind, "local".into(), None);

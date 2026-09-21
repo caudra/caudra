@@ -1,15 +1,18 @@
 use super::super::text_editor::TextEditor;
 use caudra_config::sandbox::{
-    CidrRule, DomainRule, RecordKind, Revision, SandboxDraft, SandboxError, SandboxName,
-    SandboxOrigin, SandboxRecord, TransferPolicy,
+    CidrRule, DomainRule, MAX_NETWORK_RULES, RecordKind, Revision, SandboxDraft, SandboxError,
+    SandboxName, SandboxOrigin, SandboxRecord, TransferPolicy,
 };
 use caudra_storage::sandbox_auth::SandboxCredentialRef;
 use caudra_workspace::WorkspacePath;
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use serde_json::{Map, Value};
 use std::num::NonZeroU32;
 
 const POSITIVE: &str = "Use a positive whole number (no units or rounding).";
 const BOOLEAN: &str = "Use true or false; this changes saved defaults only.";
+pub(super) const DOMAIN_HELP: &str = "One hostname per line, e.g. api.example.com or *.example.com (subdomains only). No URLs, paths, ports or methods. Enter adds a line; Alt+Insert appends; Alt+Delete clears the current line. Blank lines are ignored. Empty domains AND CIDRs deny all under required enforcement. Operator blocks still win.";
+pub(super) const CIDR_HELP: &str = "One IPv4/IPv6 network per line; normalized at review. Enter adds a line; Alt+Insert appends; Alt+Delete clears the current line. Blank lines are ignored. Operator metadata/private-destination blocks still win.";
 const PROFILE_FIELDS: &[(&str, &str, Input, &str)] = &[
     (
         "provider",
@@ -112,13 +115,13 @@ const NETWORK_FIELDS: &[(&str, &str, Input, &str)] = &[
         "domains",
         "Allowed domains (one per line)",
         Input::Domains,
-        "DNS names or leading *. subdomains (all matching subdomains); no URL, path, port or method. Operator blocks still win.",
+        DOMAIN_HELP,
     ),
     (
         "cidrs",
         "Allowed CIDRs (one per line)",
         Input::Cidrs,
-        "IPv4/IPv6 networks; normalized at save. Rules cannot loosen operator metadata/private-destination blocks.",
+        CIDR_HELP,
     ),
 ];
 const TRANSFER_FIELDS: &[(&str, &str, Input, &str)] = &[
@@ -222,17 +225,11 @@ impl Field {
                 text
             }
             Input::Domains | Input::Cidrs | Input::Excludes => {
-                let values = text
-                    .lines()
-                    .map(|line| match self.input {
-                        Input::Domains => {
-                            DomainRule::parse(line).map(|rule| rule.as_str().to_owned())
-                        }
-                        Input::Cidrs => CidrRule::parse(line).map(|rule| rule.as_str().to_owned()),
-                        _ => Ok(line.to_owned()),
-                    })
-                    .collect::<Result<Vec<_>, _>>()
-                    .map_err(sandbox_error)?;
+                let values = match self.input {
+                    Input::Domains => parse_domains(&text)?,
+                    Input::Cidrs => parse_cidrs(&text)?,
+                    _ => text.lines().map(str::to_owned).collect(),
+                };
                 return Ok(Value::Array(
                     values.into_iter().map(Value::String).collect(),
                 ));
@@ -432,6 +429,58 @@ impl Form {
     }
 }
 
+pub(super) fn parse_domains(text: &str) -> Result<Vec<String>, String> {
+    parse_rules(text, "Domain", |line| {
+        DomainRule::parse(line).map(|rule| rule.as_str().to_owned())
+    })
+}
+
+pub(super) fn parse_cidrs(text: &str) -> Result<Vec<String>, String> {
+    parse_rules(text, "CIDR", |line| {
+        CidrRule::parse(line).map(|rule| rule.as_str().to_owned())
+    })
+}
+
+fn parse_rules(
+    text: &str,
+    label: &str,
+    parse: impl Fn(&str) -> Result<String, SandboxError>,
+) -> Result<Vec<String>, String> {
+    let mut rules = Vec::new();
+    for (index, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if rules.len() == MAX_NETWORK_RULES {
+            return Err(format!("{label} list exceeds {MAX_NETWORK_RULES} rules."));
+        }
+        rules.push(parse(line).map_err(|error| format!("{label} line {}: {error}", index + 1))?);
+    }
+    Ok(rules)
+}
+
+pub(super) fn network_list_key(editor: &mut TextEditor, event: KeyEvent, limit: usize) -> bool {
+    if event.modifiers != KeyModifiers::ALT {
+        return false;
+    }
+    match event.code {
+        KeyCode::Insert => {
+            editor.move_to_end();
+            if !editor.text().is_empty() && !editor.text().ends_with('\n') {
+                editor.handle_paste_bounded("\n", limit);
+            }
+        }
+        KeyCode::Delete => {
+            editor.handle_key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
+            editor.handle_key(KeyEvent::new(KeyCode::End, KeyModifiers::SHIFT));
+            editor.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+        }
+        _ => return false,
+    }
+    true
+}
+
 fn value_text(value: &Value) -> String {
     match value {
         Value::String(value) => value.clone(),
@@ -458,4 +507,80 @@ fn default_text(key: &str) -> String {
         _ => "",
     }
     .into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MAX_NETWORK_RULES, TextEditor, network_list_key, parse_cidrs, parse_domains};
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use test_case::test_case;
+
+    const DOMAIN: &str = "api.example.com";
+    const LINE_ERROR: &str = "Domain line 3:";
+
+    #[test_case(0, false; "at_bound")]
+    #[test_case(1, true; "room_for_newline")]
+    fn network_append_respects_bound(extra: usize, appended: bool) {
+        let mut editor = TextEditor::new();
+        editor.set_text(DOMAIN.into());
+        assert!(network_list_key(
+            &mut editor,
+            KeyEvent::new(KeyCode::Insert, KeyModifiers::ALT),
+            DOMAIN.len() + extra
+        ));
+        assert_eq!(
+            editor.text(),
+            if appended {
+                format!("{DOMAIN}\n")
+            } else {
+                DOMAIN.into()
+            }
+        );
+    }
+
+    #[test_case(" API.Example.com \n\n *.Example.com \n", vec!["api.example.com", "*.example.com"]; "normalize_and_skip_blank_lines")]
+    #[test_case(" \n\t\n", vec![]; "empty_is_deny_all")]
+    fn domain_list_parsing(text: &str, expected: Vec<&str>) {
+        assert_eq!(parse_domains(text).unwrap(), expected);
+    }
+
+    #[test_case("https://api.example.com"; "url")]
+    #[test_case("api.example.com:443"; "port")]
+    #[test_case("api.example.com/path"; "path")]
+    #[test_case("127.0.0.1"; "ip")]
+    #[test_case("*"; "all_hosts")]
+    fn invalid_domain_reports_source_line(invalid: &str) {
+        let error = parse_domains(&format!("{DOMAIN}\n\n{invalid}")).unwrap_err();
+        assert!(error.starts_with(LINE_ERROR), "{error}");
+    }
+
+    #[test_case(MAX_NETWORK_RULES, true; "at_bound")]
+    #[test_case(MAX_NETWORK_RULES + 1, false; "over_bound")]
+    fn domain_list_bound(count: usize, valid: bool) {
+        assert_eq!(
+            parse_domains(&vec![DOMAIN; count].join("\n")).is_ok(),
+            valid
+        );
+    }
+
+    #[test_case(" 10.20.30.40/24 \n\n", vec!["10.20.30.0/24"]; "normalize_cidr")]
+    #[test_case("\n", vec![]; "empty_cidrs")]
+    fn cidr_list_parsing(text: &str, expected: Vec<&str>) {
+        assert_eq!(parse_cidrs(text).unwrap(), expected);
+    }
+
+    #[test_case(KeyCode::Insert, "api.example.com\n"; "append")]
+    #[test_case(KeyCode::Delete, ""; "clear")]
+    fn rule_list_shortcut_is_undoable(code: KeyCode, expected: &str) {
+        let mut editor = TextEditor::new();
+        editor.set_text(DOMAIN.into());
+        assert!(network_list_key(
+            &mut editor,
+            KeyEvent::new(code, KeyModifiers::ALT),
+            usize::MAX,
+        ));
+        assert_eq!(editor.text(), expected);
+        editor.handle_key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL));
+        assert_eq!(editor.text(), DOMAIN);
+    }
 }

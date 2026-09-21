@@ -11,7 +11,7 @@ use std::collections::HashSet;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use arc_swap::{ArcSwap, ArcSwapOption};
@@ -19,7 +19,8 @@ use color_eyre::Result;
 use color_eyre::eyre::{Context, eyre};
 
 use crate::sandbox::{
-    LiveOperation, SandboxAttachment, SandboxConnector, SandboxControl, SandboxReadiness,
+    LiveOperation, NETWORK_RECOVERY, NetworkGate, SandboxAttachment, SandboxConnector,
+    SandboxControl, SandboxReadiness,
 };
 use caudra_agent::command::CustomCommand;
 use caudra_agent::permissions::PermissionManager;
@@ -937,6 +938,7 @@ struct SpawnCtx {
     sandbox_connector: Option<SandboxConnector>,
     transfer_connector: Option<crate::sandbox::transfer::TransferConnector>,
     sandbox_readiness: Option<SandboxReadiness>,
+    network_gate: Arc<Mutex<NetworkGate>>,
     timeouts: Timeouts,
     custom_commands: Arc<[CustomCommand]>,
     no_commands: bool,
@@ -1177,6 +1179,7 @@ impl SpawnCtx {
         app.sandbox_live.connector = self.sandbox_connector.clone();
         app.sandbox_live.transfer_connector = self.transfer_connector.clone();
         app.sandbox_live.readiness = self.sandbox_readiness.clone();
+        app.sandbox_live.network_gate = self.network_gate.clone();
         app.conversation_permissions = conversation_permissions;
         app.permission_authority_factory = self.permission_authority_factory.clone();
         app.sync_permission_authority()
@@ -1573,6 +1576,7 @@ impl<'t> EventLoop<'t> {
             sandbox_readiness,
             timeouts,
             custom_commands: Arc::from(commands),
+            network_gate: Arc::default(),
             no_commands,
             lua_command_reader,
             keymap_reader,
@@ -1925,6 +1929,11 @@ impl<'t> EventLoop<'t> {
     /// still drain their floats, or a plugin writing to a window nobody is
     /// looking at would lose the output.
     fn tick(&mut self) -> Dirty {
+        let blocked: Vec<_> = self
+            .sessions
+            .iter()
+            .map(|runtime| runtime.app.sandbox_network_dispatch_blocker())
+            .collect();
         self.sync_auto_theme();
         let mut dirty = self.poll_appearance();
         for (i, rt) in self.sessions.iter_mut().enumerate() {
@@ -1936,6 +1945,22 @@ impl<'t> EventLoop<'t> {
             }
         }
         dirty |= self.poll_sandbox_actions();
+        for (runtime, previous) in self.sessions.iter_mut().zip(blocked) {
+            let current = runtime.app.sandbox_network_dispatch_blocker();
+            if previous.is_some() && current.is_none() {
+                runtime.handles.queue.wake_dispatch();
+            }
+            if current == Some(NETWORK_RECOVERY) && previous != current {
+                runtime.app.flash(NETWORK_RECOVERY.into());
+                if runtime.app.status == Status::Streaming {
+                    let run_id = runtime.app.begin_main_cancel(true, true);
+                    let _ = runtime
+                        .handles
+                        .cmd_tx
+                        .try_send(AgentCommand::Cancel { run_id });
+                }
+            }
+        }
         dirty
     }
 
@@ -2070,7 +2095,29 @@ impl<'t> EventLoop<'t> {
                             self.sessions[index].app.sandbox_failed(error.to_string());
                             continue;
                         }
-                        _ => {}
+                        Ok(record) => {
+                            let other_holder = self.sessions.iter().any(|runtime| {
+                                runtime
+                                    .app
+                                    .state
+                                    .session
+                                    .workspace_binding()
+                                    .and_then(StoredWorkspaceBinding::sandbox_record)
+                                    == Some(record.id)
+                            });
+                            let blocker = if other_holder {
+                                Some("Another tab holds this sandbox; control it from that tab")
+                            } else {
+                                self.sessions[index].app.sandbox_detached_action_blocker()
+                            };
+                            if let Some(reason) = blocker {
+                                self.sessions[index].app.sandbox_failed(reason.into());
+                            } else {
+                                self.sessions[index].app.start_sandbox_live(*request);
+                            }
+                            dirty = Dirty::YES;
+                            continue;
+                        }
                     }
                 }
                 let transition = matches!(
@@ -2449,7 +2496,8 @@ impl<'t> EventLoop<'t> {
             .iter_mut()
             .enumerate()
             .filter_map(|(index, runtime)| {
-                if !runtime.quiescent() {
+                if !runtime.quiescent() || runtime.app.sandbox_network_dispatch_blocker().is_some()
+                {
                     return None;
                 }
                 let mut preamble = runtime.handles.claim_mailbox_wake();
@@ -2473,6 +2521,7 @@ impl<'t> EventLoop<'t> {
             .enumerate()
             .filter_map(|(index, runtime)| {
                 (runtime.quiescent()
+                    && runtime.app.sandbox_network_dispatch_blocker().is_none()
                     && runtime.app.goal_checkin_due()
                     && runtime.handles.active_background_tasks() == 0)
                     .then_some(index)
@@ -3642,6 +3691,11 @@ impl<'t> EventLoop<'t> {
                 visible,
             } => {
                 let rt = &mut self.sessions[idx];
+                if let Some(reason) = rt.app.sandbox_network_dispatch_blocker() {
+                    rt.app.shell.release_id(&id);
+                    rt.app.flash(reason.into());
+                    return;
+                }
                 let (trigger, cancel) = CancelToken::new();
                 rt.app.shell.add_trigger(trigger);
                 if let Some(workspace) = rt.app.workspace_session.clone() {

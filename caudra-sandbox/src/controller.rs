@@ -2,7 +2,7 @@ use caudra_config::{
     sandbox::{
         Architecture, Enforcement, ProviderCapabilities, ResolvedLaunch, ResourceRange,
         Resources as ProfileResources, Revision, SandboxName, SandboxProvider, SavedSandboxes,
-        TemplateCatalog, TemplateEntry, TlsMode,
+        TemplateCatalog, TemplateEntry, TlsMode, persistence::SandboxStore,
     },
     workcell::{ExpectedWorkcellId, RemoteWorkcellSelection, WorkcellEndpoint, WorkcellSourceRef},
 };
@@ -19,6 +19,7 @@ use caudra_workspace::WorkspacePath;
 use serde::Serialize;
 use std::{
     num::NonZeroU32,
+    result::Result as StdResult,
     time::{Duration, Instant},
 };
 use uuid::Uuid;
@@ -44,6 +45,22 @@ pub enum ResumePolicy {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RestartPhase {
+    Pause,
+    Resume,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "restart stopped during {phase:?}: {source}; inspect before further action, never replay an unknown request"
+)]
+pub struct RestartFailure {
+    pub phase: RestartPhase,
+    #[source]
+    pub source: Error,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LifecycleAction {
     Pause,
     Resume { lease_seconds: u32 },
@@ -51,6 +68,14 @@ pub enum LifecycleAction {
     Delete { destroy_borrowed: bool },
     Detach,
     ApplyPolicy { policy: Policy },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NetworkReconcileStatus {
+    Applied,
+    NoChange,
+    Deferred,
+    Excluded,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -471,6 +496,68 @@ impl Controller {
         self.action_reviewed(name, Some(revision), action).await
     }
 
+    /// Cold restart of a reviewed, owned, persistent running instance, never recreation.
+    /// Callers must drain runtime leases first. Only authoritative pause success permits
+    /// resume; interruption between phases leaves a paused instance for explicit recovery.
+    pub async fn restart_at(
+        &self,
+        name: &SandboxName,
+        revision: &Revision,
+        lease_seconds: u32,
+    ) -> StdResult<InstanceRecord, RestartFailure> {
+        let mut phase = RestartPhase::Pause;
+        let result = async {
+            let record = self.store.get(name)?;
+            let _control = self.store.control_lease(&record)?;
+            if &record.revision()? != revision {
+                return Err(Error::ReviewChanged);
+            }
+            if record.ownership != Ownership::Owned {
+                return Err(Error::Borrowed);
+            }
+            let instance = record.instance.as_ref().ok_or(Error::NotReady)?;
+            if !instance.persistent {
+                return Err(Error::PauseUnsupported);
+            }
+            if record.detached || instance.state != InstanceState::Running {
+                return Err(Error::NotReady);
+            }
+            if record
+                .lifecycle
+                .as_ref()
+                .is_some_and(LifecycleIntent::is_pending)
+            {
+                return Err(Error::Unresolved);
+            }
+            let lease = self.store.lease(&record, true)?;
+            self.require_quiescent(&record)?;
+            let (_, discovery) = self.owned_client(&record).await?;
+            if lease_seconds == 0 || lease_seconds > discovery.limits.max_lease_seconds {
+                return Err(Error::Lease);
+            }
+            let paused = self
+                .action_locked(
+                    name,
+                    Some(revision),
+                    LifecycleAction::Pause,
+                    None,
+                    Some(&lease),
+                )
+                .await?;
+            phase = RestartPhase::Resume;
+            self.action_locked(
+                name,
+                Some(&paused.revision()?),
+                LifecycleAction::Resume { lease_seconds },
+                None,
+                Some(&lease),
+            )
+            .await
+        }
+        .await;
+        result.map_err(|source| RestartFailure { phase, source })
+    }
+
     async fn action_reviewed(
         &self,
         name: &SandboxName,
@@ -486,6 +573,18 @@ impl Controller {
         }
         let record = self.store.get(name)?;
         let _control = self.store.control_lease(&record)?;
+        self.action_locked(name, revision, action, None, None).await
+    }
+
+    async fn action_locked(
+        &self,
+        name: &SandboxName,
+        revision: Option<&Revision>,
+        action: LifecycleAction,
+        saved_guard: Option<(&SandboxStore, &Revision)>,
+        held_lease: Option<&RuntimeLease>,
+    ) -> Result<InstanceRecord> {
+        let record = self.store.get(name)?;
         if revision.is_some_and(|expected| record.revision().ok().as_ref() != Some(expected)) {
             return Err(Error::ReviewChanged);
         }
@@ -497,9 +596,14 @@ impl Controller {
         {
             return Err(Error::PauseUnsupported);
         }
-        let _lease = self
-            .store
-            .lease(&record, !matches!(action, LifecycleAction::Extend { .. }))?;
+        let _lease = if held_lease.is_none() {
+            Some(self.store.lease(
+                &record,
+                saved_guard.is_none() && !matches!(action, LifecycleAction::Extend { .. }),
+            )?)
+        } else {
+            None
+        };
         if matches!(
             action,
             LifecycleAction::Pause
@@ -507,7 +611,11 @@ impl Controller {
                 | LifecycleAction::Detach
                 | LifecycleAction::ApplyPolicy { .. }
         ) {
-            self.require_quiescent(&record)?;
+            if saved_guard.is_some() {
+                self.require_resolved_mutations(&record)?;
+            } else {
+                self.require_quiescent(&record)?;
+            }
         }
         if action == LifecycleAction::Detach
             || (matches!(
@@ -591,12 +699,17 @@ impl Controller {
             lifecycle: Some(intent),
             ..record.clone()
         };
+        if let Some((store, revision)) = saved_guard
+            && store.load()?.saved().revision() != revision
+        {
+            return Err(Error::ReviewChanged);
+        }
         self.store.replace(&record, &pending)?;
         let intent = pending.lifecycle.as_ref().ok_or(Error::Store)?;
         let response = if let Some(policy) = &intent.policy {
             client
                 .apply_policy(&instance.sandbox_id, &instance.expected(), policy)
-                .await?
+                .await
         } else {
             client
                 .control(
@@ -605,8 +718,9 @@ impl Controller {
                     &instance.expected(),
                     lease_seconds,
                 )
-                .await?
+                .await
         };
+        let response = self.lifecycle_response(&record, &pending, response)?;
         validate_instance(&record, &response)?;
         validate_lifecycle_result(intent, &response)?;
         if response.revision == instance.revision && response != *instance {
@@ -619,7 +733,163 @@ impl Controller {
             .observed_revision = Some(response.revision);
         next.instance = Some(response);
         self.store.replace(&pending, &next)?;
+        if let Some((store, revision)) = saved_guard
+            && store.load()?.saved().revision() != revision
+        {
+            return Err(Error::NetworkChanged);
+        }
         Ok(next)
+    }
+
+    fn lifecycle_response<T>(
+        &self,
+        previous: &InstanceRecord,
+        pending: &InstanceRecord,
+        response: Result<T>,
+    ) -> Result<T> {
+        if let Err(
+            refusal @ Error::Daemon {
+                outcome_unknown: false,
+                ..
+            },
+        ) = response
+        {
+            return match self.store.replace(pending, previous) {
+                Ok(()) => Err(refusal),
+                Err(cleanup) => Err(Error::LifecycleRefusalCleanup {
+                    refusal: Box::new(refusal),
+                    cleanup: Box::new(cleanup),
+                }),
+            };
+        }
+        response
+    }
+
+    pub async fn reconcile_saved_network(
+        &self,
+        name: &SandboxName,
+        saved: &SandboxStore,
+    ) -> Result<(NetworkReconcileStatus, InstanceRecord)> {
+        self.reconcile_network(name, saved, false, None).await
+    }
+
+    pub async fn reconcile_saved_network_at(
+        &self,
+        name: &SandboxName,
+        saved: &SandboxStore,
+        expected_revision: &Revision,
+    ) -> Result<(NetworkReconcileStatus, InstanceRecord)> {
+        self.reconcile_network(name, saved, false, Some(expected_revision))
+            .await
+    }
+
+    async fn reconcile_network(
+        &self,
+        name: &SandboxName,
+        saved: &SandboxStore,
+        selected: bool,
+        expected_revision: Option<&Revision>,
+    ) -> Result<(NetworkReconcileStatus, InstanceRecord)> {
+        let record = self.store.get(name)?;
+        let _control = self.store.control_lease(&record)?;
+        let record = self.store.get(name)?;
+        if record.ownership != Ownership::Owned || (!selected && record.detached) {
+            return Ok((NetworkReconcileStatus::Excluded, record));
+        }
+        if record.launch.is_none() {
+            return Ok((NetworkReconcileStatus::Excluded, record));
+        }
+        if record
+            .lifecycle
+            .as_ref()
+            .is_some_and(LifecycleIntent::is_pending)
+        {
+            return Err(Error::Unresolved);
+        }
+        let loaded = saved.load()?;
+        if expected_revision.is_some_and(|revision| loaded.saved().revision() != revision) {
+            return Err(Error::ReviewChanged);
+        }
+        let (client, _) = self.owned_client(&record).await?;
+        let instance = record.instance.as_ref().ok_or(Error::NotReady)?;
+        if record
+            .create
+            .as_ref()
+            .and_then(|intent| intent.operation.as_ref())
+            .is_some_and(|operation| operation.cancel_requested)
+        {
+            return Err(Error::NotReady);
+        }
+        let observed = client.instance(&instance.sandbox_id).await?;
+        if saved.load()?.saved().revision() != loaded.saved().revision() {
+            return Err(Error::ReviewChanged);
+        }
+        let record = self.record_instance(&record, observed)?;
+        let launch = record.launch.as_ref().ok_or(Error::Store)?;
+        let network = loaded
+            .saved()
+            .configuration()
+            .networks
+            .get(&launch.configuration().profile.value().network)
+            .ok_or(Error::MissingNetwork)?;
+        let instance = record.instance.as_ref().ok_or(Error::NotReady)?;
+        if instance.state == InstanceState::Paused {
+            return Ok((NetworkReconcileStatus::Deferred, record));
+        }
+        if instance.state != InstanceState::Running {
+            return Err(Error::NotReady);
+        }
+        if network.enforcement != launch.configuration().network.value().enforcement
+            || (network.enforcement == Enforcement::Required) != instance.egress.enforced
+        {
+            return Err(Error::NetworkReview);
+        }
+        if network.enforcement == Enforcement::Off {
+            return Ok((NetworkReconcileStatus::NoChange, record));
+        }
+        let policy = Policy {
+            mode: match network.tls_mode {
+                TlsMode::SniOnly => "sni-only",
+                TlsMode::Mitm => "mitm",
+            }
+            .into(),
+            domains: network
+                .domains
+                .iter()
+                .map(|rule| rule.as_str().to_owned())
+                .collect(),
+            cidrs: network
+                .cidrs
+                .iter()
+                .map(|rule| rule.as_str().to_owned())
+                .collect(),
+        }
+        .canonical()?;
+        let previous = instance
+            .egress
+            .policy
+            .as_ref()
+            .ok_or(Error::NetworkReview)?;
+        if previous.mode != policy.mode {
+            return Err(Error::NetworkReview);
+        }
+        let policy_revision = policy.revision()?;
+        if previous.canonical()? == policy
+            && instance.egress.revision == policy_revision
+            && instance.egress.effective_revision.as_deref() == Some(policy_revision.as_str())
+        {
+            return Ok((NetworkReconcileStatus::NoChange, record));
+        }
+        let next = self
+            .action_locked(
+                name,
+                Some(&record.revision()?),
+                LifecycleAction::ApplyPolicy { policy },
+                Some((saved, loaded.saved().revision())),
+                None,
+            )
+            .await?;
+        Ok((NetworkReconcileStatus::Applied, next))
     }
 
     /// Abandon an unresolved request after explicitly reviewing its observed state and intent.
@@ -648,6 +918,11 @@ impl Controller {
     }
 
     fn require_quiescent(&self, record: &InstanceRecord) -> Result<()> {
+        self.require_resolved_mutations(record)?;
+        self.require_idle_sessions(record)
+    }
+
+    fn require_resolved_mutations(&self, record: &InstanceRecord) -> Result<()> {
         let Some(binding) = &record.workcell_binding else {
             return Ok(());
         };
@@ -659,6 +934,13 @@ impl Controller {
         {
             return Err(Error::Busy);
         }
+        Ok(())
+    }
+
+    fn require_idle_sessions(&self, record: &InstanceRecord) -> Result<()> {
+        let Some(binding) = &record.workcell_binding else {
+            return Ok(());
+        };
         let database = SessionDatabase::open_state(self.store.state()).map_err(|_| Error::Store)?;
         for session in database
             .list_for_workspace_identity(binding)
@@ -765,7 +1047,8 @@ impl Controller {
         self.store.replace(&record, &pending)?;
         let response = client
             .cancel_create(&intent.key, &operation.execution_id)
-            .await?;
+            .await;
+        let response = self.lifecycle_response(&record, &pending, response)?;
         if !cancellation_accepted(pending.lifecycle.as_ref().ok_or(Error::Store)?, &response) {
             return Err(Error::Identity);
         }
@@ -788,7 +1071,7 @@ impl Controller {
         name: &SandboxName,
         resume: ResumePolicy,
     ) -> Result<AttachTicket> {
-        self.prepare_attach_reviewed(name, resume, None).await
+        self.prepare_attach_reviewed(name, resume, None, None).await
     }
 
     pub async fn prepare_attach_at(
@@ -796,7 +1079,7 @@ impl Controller {
         name: &SandboxName,
         revision: &Revision,
     ) -> Result<AttachTicket> {
-        self.prepare_attach_reviewed(name, ResumePolicy::Refuse, Some(revision))
+        self.prepare_attach_reviewed(name, ResumePolicy::Refuse, Some(revision), None)
             .await
     }
 
@@ -805,6 +1088,7 @@ impl Controller {
         name: &SandboxName,
         resume: ResumePolicy,
         revision: Option<&Revision>,
+        saved: Option<&SandboxStore>,
     ) -> Result<AttachTicket> {
         let mut record = self.inspect(name).await?;
         if revision.is_some_and(|revision| record.revision().ok().as_ref() != Some(revision)) {
@@ -845,6 +1129,20 @@ impl Controller {
             record = self
                 .action(name, LifecycleAction::Resume { lease_seconds })
                 .await?;
+        }
+        if record.ownership == Ownership::Owned && record.launch.is_some() {
+            let global;
+            let saved = if let Some(saved) = saved {
+                saved
+            } else {
+                global = SandboxStore::user_global()?;
+                &global
+            };
+            let (status, reconciled) = self.reconcile_network(name, saved, true, None).await?;
+            if status == NetworkReconcileStatus::Deferred {
+                return Err(Error::ResumeRequired);
+            }
+            record = reconciled;
         }
         let lease = self.store.lease(&record, false)?;
         if self.store.get(name)?.revision()? != record.revision()? {
@@ -1156,7 +1454,10 @@ fn validate_instance(record: &InstanceRecord, instance: &Instance) -> Result<()>
 
 #[cfg(test)]
 mod tests {
-    use super::{Controller, LifecycleAction, ResumePolicy, template_entry, validate_instance};
+    use super::{
+        Controller, LifecycleAction, NetworkReconcileStatus, RestartPhase, ResumePolicy,
+        template_entry, validate_instance,
+    };
     use crate::{
         Error, InstanceRecord, LifecycleClient, Ownership,
         dto::{Instance, InstanceState, OperationStatus, Policy, Template},
@@ -1176,6 +1477,7 @@ mod tests {
         AuthenticatedPrincipalId, AuthorityIdentity, CwdHandle, ProjectIdentity, ProjectKey,
         SessionBindingId, SessionWorkspaceBinding, SourceTrustAnchor, WorkspacePath,
     };
+    use futures_lite::future;
     use serde_json::{Value, json};
     use std::os::unix::fs::PermissionsExt;
     use std::{
@@ -1211,6 +1513,322 @@ mod tests {
     const DENY_REVISION: &str = "fb44c0f5ba3bfc047e139e764fc03a852d08600a8777ea16ef62c2892c9503d9";
     const ALLOW_REVISION: &str = "9702568256299b79c8a8a32db948ac6bba9a0e476cdadbbc7168f6c84394a017";
     const INSTANCE_STORE: &str = "sandboxes/instances.json";
+
+    #[test]
+    fn interrupted_restart_after_pause_requires_explicit_resume() {
+        let (notify, notified) = smol::channel::bounded(1);
+        let (release, released) = smol::channel::bounded(1);
+        let mut paused = false;
+        let server = Server::new(move |method, path, _, headers| {
+            assert!(!path.ends_with("/resume"));
+            if path.ends_with("/discover") && paused {
+                notify.try_send(()).unwrap();
+                smol::block_on(released.recv()).unwrap();
+                return None;
+            }
+            if path.ends_with("/pause") {
+                paused = true;
+                let mut response = instance();
+                response["state"] = json!("paused");
+                response["leaseDeadline"] = Value::Null;
+                response["revision"] = json!(2);
+                return Some((200, response));
+            }
+            regular(method, path, headers)
+        });
+        let (_temp, controller, saved) = setup(&server);
+        let before = create_ready(&controller, &saved);
+        let result = smol::block_on(future::or(
+            async {
+                notified.recv().await.unwrap();
+                None
+            },
+            async {
+                Some(
+                    controller
+                        .restart_at(&name(), &before.revision().unwrap(), 300)
+                        .await,
+                )
+            },
+        ));
+        release.try_send(()).unwrap();
+        assert!(result.is_none());
+        let recovered = Controller::new(controller.store.state()).unwrap();
+        let after = recovered.store.get(&name()).unwrap();
+        assert_eq!(
+            after.instance.as_ref().unwrap().state,
+            InstanceState::Paused
+        );
+        let intent = after.lifecycle.as_ref().unwrap();
+        assert_eq!(intent.action, "pause");
+        assert_eq!(intent.observed_revision, Some(2));
+        assert!(!intent.failure_acknowledged);
+        assert!(matches!(
+            smol::block_on(recovered.restart_at(&name(), &after.revision().unwrap(), 300)),
+            Err(super::RestartFailure {
+                source: Error::NotReady,
+                ..
+            })
+        ));
+        assert!(recovered.store.lease(&after, true).is_ok());
+    }
+
+    #[test_case("success")]
+    #[test_case("pause_lost")]
+    #[test_case("resume_lost")]
+    #[test_case("pause_refused")]
+    #[test_case("resume_refused")]
+    #[test_case("pause_unknown")]
+    #[test_case("pause_invalid")]
+    #[test_case("resume_disk_changed")]
+    #[test_case("resume_same_execution")]
+    #[test_case("refusal_concurrent_change")]
+    #[test_case("refusal_concurrent_clear")]
+    fn restart_phases_are_conditional_durable_and_never_replayed(scenario: &'static str) {
+        let state = Arc::new(Mutex::new(None::<StateDir>));
+        let server_state = state.clone();
+        let sends = Arc::new(Mutex::new(Vec::new()));
+        let server_sends = sends.clone();
+        let server = Server::new(move |method, path, body, headers| {
+            let pause = path.ends_with("/pause");
+            if !pause && !path.ends_with("/resume") {
+                return regular(method, path, headers);
+            }
+            let action = if pause { "pause" } else { "resume" };
+            server_sends.lock().unwrap().push(action);
+            let controller =
+                Controller::new(server_state.lock().unwrap().as_ref().unwrap()).unwrap();
+            let pending = controller.store.get(&name()).unwrap();
+            let intent = pending.lifecycle.as_ref().unwrap();
+            assert!(intent.is_pending());
+            assert!(!intent.failure_acknowledged);
+            assert_eq!(intent.action, action);
+            assert_eq!(body["expectedExecutionID"], EXECUTION);
+            assert_eq!(body["expectedRevision"], if pause { 1 } else { 2 });
+            assert_eq!(intent.expected.expected_revision, if pause { 1 } else { 2 });
+            assert!(matches!(
+                controller.store.lease(&pending, false),
+                Err(Error::Busy)
+            ));
+            if scenario.starts_with("refusal_concurrent_") {
+                let mut changed = pending.clone();
+                changed.detached = true;
+                changed.instance.as_mut().unwrap().revision = 2;
+                if scenario == "refusal_concurrent_clear" {
+                    changed.lifecycle = None;
+                }
+                controller.store.replace(&pending, &changed).unwrap();
+            }
+            if (pause
+                && matches!(
+                    scenario,
+                    "pause_refused"
+                        | "pause_unknown"
+                        | "refusal_concurrent_change"
+                        | "refusal_concurrent_clear"
+                ))
+                || (!pause && scenario == "resume_refused")
+            {
+                return Some((
+                    409,
+                    json!({"error":{"code":"template_incompatible","retryable":false,"outcomeUnknown":scenario == "pause_unknown"}}),
+                ));
+            }
+            if (pause && scenario == "pause_lost") || (!pause && scenario == "resume_lost") {
+                return None;
+            }
+            let mut response = instance();
+            response["revision"] = json!(if pause { 2 } else { 3 });
+            if pause {
+                response["state"] = json!("paused");
+                response["leaseDeadline"] = Value::Null;
+                if scenario == "pause_invalid" {
+                    response["revision"] = json!(1);
+                }
+            } else {
+                response["executionID"] = json!(CHANGED_EXECUTION);
+                if scenario == "resume_disk_changed" {
+                    response["workspaceGeneration"] = json!("different-disk");
+                }
+                if scenario == "resume_same_execution" {
+                    response["executionID"] = json!(EXECUTION);
+                }
+            }
+            Some((200, response))
+        });
+        let (_temp, controller, saved) = setup(&server);
+        *state.lock().unwrap() = Some(controller.store.state().clone());
+        let before = create_ready(&controller, &saved);
+        let result =
+            smol::block_on(controller.restart_at(&name(), &before.revision().unwrap(), 300));
+        let pause_failed =
+            scenario.starts_with("pause_") || scenario.starts_with("refusal_concurrent_");
+        assert_eq!(
+            *sends.lock().unwrap(),
+            if pause_failed {
+                vec!["pause"]
+            } else {
+                vec!["pause", "resume"]
+            }
+        );
+        if scenario == "success" {
+            assert!(result.is_ok());
+        } else {
+            let failure = result.unwrap_err();
+            assert_eq!(
+                failure.phase,
+                if pause_failed {
+                    RestartPhase::Pause
+                } else {
+                    RestartPhase::Resume
+                }
+            );
+            if scenario.ends_with("refused") {
+                assert!(matches!(
+                    failure.source,
+                    Error::Daemon {
+                        status: 409,
+                        code: crate::dto::FailureCode::TemplateIncompatible,
+                        outcome_unknown: false,
+                        ..
+                    }
+                ));
+            }
+            if scenario.starts_with("refusal_concurrent_") {
+                let message = failure.source.to_string();
+                let Error::LifecycleRefusalCleanup { refusal, cleanup } = failure.source else {
+                    panic!("expected definitive refusal with local cleanup failure");
+                };
+                assert!(matches!(
+                    *refusal,
+                    Error::Daemon {
+                        status: 409,
+                        code: crate::dto::FailureCode::TemplateIncompatible,
+                        outcome_unknown: false,
+                        ..
+                    }
+                ));
+                assert!(matches!(
+                    *cleanup,
+                    Error::PrivateFile(PrivateFileError::Conflict)
+                ));
+                assert!(message.contains(&refusal.to_string()));
+                assert!(message.contains(&cleanup.to_string()));
+            }
+        }
+        let recovered = Controller::new(controller.store.state()).unwrap();
+        let after = recovered.store.get(&name()).unwrap();
+        assert_eq!(after.launch, before.launch);
+        let observed = after.instance.as_ref().unwrap();
+        let original = before.instance.as_ref().unwrap();
+        assert_eq!(observed.sandbox_id, original.sandbox_id);
+        assert_eq!(observed.template, original.template);
+        assert_eq!(observed.resources, original.resources);
+        assert_eq!(observed.workspace_generation, original.workspace_generation);
+        assert!(observed.persistent);
+        if scenario.starts_with("refusal_concurrent_") {
+            assert!(after.detached);
+            assert_eq!(observed.revision, 2);
+        }
+        if scenario == "success" {
+            assert_eq!(observed.execution_id, CHANGED_EXECUTION);
+            assert_eq!(observed.revision, 3);
+        } else if scenario == "pause_refused" {
+            assert_eq!(after.revision().unwrap(), before.revision().unwrap());
+            assert!(
+                smol::block_on(recovered.action_at(
+                    &name(),
+                    &after.revision().unwrap(),
+                    LifecycleAction::Pause
+                ))
+                .is_err()
+            );
+            assert_eq!(sends.lock().unwrap().len(), 2);
+        } else if scenario == "resume_refused" {
+            assert_eq!(observed.state, InstanceState::Paused);
+            assert_eq!(after.lifecycle.as_ref().unwrap().action, "pause");
+            assert!(!after.lifecycle.as_ref().unwrap().is_pending());
+            assert!(
+                smol::block_on(recovered.action_at(
+                    &name(),
+                    &after.revision().unwrap(),
+                    LifecycleAction::Resume { lease_seconds: 300 }
+                ))
+                .is_err()
+            );
+            assert_eq!(sends.lock().unwrap().len(), 3);
+        } else if scenario == "refusal_concurrent_clear" {
+            assert!(after.lifecycle.is_none());
+            assert_eq!(sends.lock().unwrap().len(), 1);
+        } else {
+            assert!(after.lifecycle.as_ref().unwrap().is_pending());
+            assert!(!after.lifecycle.as_ref().unwrap().failure_acknowledged);
+            assert!(matches!(
+                smol::block_on(recovered.action_at(
+                    &name(),
+                    &after.revision().unwrap(),
+                    LifecycleAction::Resume { lease_seconds: 300 }
+                )),
+                Err(Error::Unresolved)
+            ));
+            assert_eq!(
+                sends.lock().unwrap().len(),
+                if pause_failed { 1 } else { 2 }
+            );
+        }
+    }
+
+    #[test_case("stale")]
+    #[test_case("ephemeral")]
+    #[test_case("borrowed")]
+    #[test_case("paused")]
+    #[test_case("runtime")]
+    #[test_case("lease")]
+    fn restart_preflight_never_dispatches(scenario: &str) {
+        let server = Server::new(|method, path, _, headers| {
+            assert!(!path.ends_with("/pause") && !path.ends_with("/resume"));
+            regular(method, path, headers)
+        });
+        let (_temp, controller, saved) = setup(&server);
+        let original = create_ready(&controller, &saved);
+        let mut record = original.clone();
+        match scenario {
+            "stale" => record.detached = true,
+            "ephemeral" => record.instance.as_mut().unwrap().persistent = false,
+            "borrowed" => record.ownership = Ownership::Borrowed,
+            "paused" => record.instance.as_mut().unwrap().state = InstanceState::Paused,
+            _ => {}
+        }
+        controller.store.replace(&original, &record).unwrap();
+        let _lease =
+            (scenario == "runtime").then(|| controller.store.lease(&record, false).unwrap());
+        let revision = if scenario == "stale" {
+            original.revision()
+        } else {
+            record.revision()
+        }
+        .unwrap();
+        let error = smol::block_on(controller.restart_at(
+            &name(),
+            &revision,
+            if scenario == "lease" { 0 } else { 300 },
+        ))
+        .unwrap_err();
+        assert_eq!(error.phase, RestartPhase::Pause);
+        assert!(match scenario {
+            "stale" => matches!(error.source, Error::ReviewChanged),
+            "ephemeral" => matches!(error.source, Error::PauseUnsupported),
+            "borrowed" => matches!(error.source, Error::Borrowed),
+            "paused" => matches!(error.source, Error::NotReady),
+            "runtime" => matches!(error.source, Error::Busy),
+            "lease" => matches!(error.source, Error::Lease),
+            _ => false,
+        });
+        assert_eq!(
+            controller.store.get(&name()).unwrap().revision().unwrap(),
+            record.revision().unwrap()
+        );
+    }
 
     #[test_case("sni-only", false, true, true; "sni_without_ca")]
     #[test_case("mitm", true, true, true; "eligible_mitm")]
@@ -1354,6 +1972,264 @@ mod tests {
         }
     }
 
+    #[test_case("apply")]
+    #[test_case("startup")]
+    #[test_case("resume")]
+    #[test_case("startup_tls")]
+    #[test_case("startup_lost")]
+    #[test_case("same")]
+    #[test_case("paused")]
+    #[test_case("borrowed")]
+    #[test_case("unmanaged")]
+    #[test_case("missing")]
+    #[test_case("detached")]
+    #[test_case("tls")]
+    #[test_case("enforcement")]
+    #[test_case("lost")]
+    #[test_case("drift_before")]
+    #[test_case("drift_after")]
+    #[test_case("stale_commit")]
+    fn saved_network_reconciliation_is_narrow_and_conditional(scenario: &str) {
+        let remote = Arc::new(Mutex::new(enforced_instance(false)));
+        let server_remote = remote.clone();
+        let sends = Arc::new(Mutex::new(Vec::new()));
+        let server_sends = sends.clone();
+        let lost = matches!(scenario, "lost" | "startup_lost");
+        let drift_before = scenario == "drift_before";
+        let drift_after = scenario == "drift_after";
+        let config_slot = Arc::new(Mutex::new(None::<SandboxStore>));
+        let server_config = config_slot.clone();
+        let mut discoveries = 0;
+        let server = Server::new(move |method, path, body, headers| {
+            if path.ends_with("/discover") {
+                discoveries += 1;
+            }
+            if (drift_before && path.ends_with("/discover") && discoveries == 3)
+                || (drift_after && path.ends_with("/policy"))
+            {
+                let config = server_config.lock().unwrap();
+                let config = config.as_ref().unwrap();
+                let loaded = config.load().unwrap();
+                let mut draft = loaded.draft();
+                draft
+                    .networks
+                    .get_mut(&SandboxName::parse("net").unwrap())
+                    .unwrap()
+                    .domains
+                    .clear();
+                config.save(&loaded, &draft).unwrap();
+            }
+            if let Some(metadata) = enforced_metadata(path) {
+                return Some(metadata);
+            }
+            let mut current = server_remote.lock().unwrap();
+            if path.ends_with("/policy") {
+                server_sends.lock().unwrap().push("policy");
+                assert_eq!(method, "PUT");
+                assert_eq!(body["expectedRevision"], current["revision"]);
+                if lost {
+                    return None;
+                }
+                let revision = current["revision"].as_u64().unwrap() + 1;
+                current["egress"] = enforced_instance(true)["egress"].clone();
+                current["revision"] = json!(revision);
+                return Some((200, current.clone()));
+            }
+            if path.ends_with("/resume") {
+                server_sends.lock().unwrap().push("resume");
+                *current = enforced_instance(false);
+                current["revision"] = json!(3);
+                current["executionID"] = json!(CHANGED_EXECUTION);
+                return Some((200, current.clone()));
+            }
+            if path.ends_with("/credentials") {
+                server_sends.lock().unwrap().push("credentials");
+                return Some((
+                    200,
+                    json!({"instance":current.clone(),"trafficAccessToken":"b".repeat(64),"mcpPath":format!("/sandboxes/{INSTANCE}/mcp"),"filesPath":"/files","credentialScope":"sandbox_lifetime"}),
+                ));
+            }
+            if method == "POST" {
+                let key = headers
+                    .lines()
+                    .find_map(|line| {
+                        line.to_ascii_lowercase()
+                            .strip_prefix("idempotency-key: ")
+                            .map(str::to_owned)
+                    })
+                    .unwrap();
+                return Some((200, operation(&key, current.clone())));
+            }
+            if path.contains("/operations/") {
+                return Some((
+                    200,
+                    operation(path.rsplit('/').next().unwrap(), current.clone()),
+                ));
+            }
+            Some((200, current.clone()))
+        });
+        let (temp, controller, saved) = setup(&server);
+        let config = SandboxStore::from_config_dir(&temp.path().join("config")).unwrap();
+        *config_slot.lock().unwrap() =
+            Some(SandboxStore::from_config_dir(&temp.path().join("config")).unwrap());
+        let mut draft = saved.draft();
+        let net = SandboxName::parse("net").unwrap();
+        draft.networks.get_mut(&net).unwrap().enforcement =
+            caudra_config::sandbox::Enforcement::Required;
+        let saved = config.save(&config.load().unwrap(), &draft).unwrap();
+        let original = create_ready(&controller, saved.saved());
+        let mut record = original.clone();
+        if scenario == "borrowed" {
+            record.ownership = Ownership::Borrowed;
+        }
+        if scenario == "unmanaged" {
+            record.launch = None;
+        }
+        if scenario == "detached" || scenario == "startup" {
+            record.detached = true;
+        }
+        if matches!(scenario, "paused" | "resume") {
+            let mut current = remote.lock().unwrap();
+            current["state"] = json!("paused");
+            current["leaseDeadline"] = Value::Null;
+            current["revision"] = json!(2);
+        }
+        controller.store.replace(&original, &record).unwrap();
+        let loaded = config.load().unwrap();
+        let mut draft = loaded.draft();
+        if scenario != "same" {
+            draft.networks.get_mut(&net).unwrap().domains =
+                vec![caudra_config::sandbox::DomainRule::parse(DOMAIN).unwrap()];
+        }
+        if matches!(scenario, "tls" | "startup_tls") {
+            draft.networks.get_mut(&net).unwrap().tls_mode = caudra_config::sandbox::TlsMode::Mitm;
+        }
+        if scenario == "enforcement" {
+            draft.networks.get_mut(&net).unwrap().enforcement =
+                caudra_config::sandbox::Enforcement::Off;
+            draft.networks.get_mut(&net).unwrap().domains.clear();
+        }
+        let other = SandboxName::parse("other").unwrap();
+        draft.networks.insert(
+            other.clone(),
+            saved.saved().configuration().networks[&net].clone(),
+        );
+        let profile = draft
+            .profiles
+            .get_mut(&SandboxName::parse("dev").unwrap())
+            .unwrap();
+        profile.network = other;
+        profile.cpus = super::nonzero(4).unwrap();
+        if scenario == "missing" {
+            draft.networks.remove(&net);
+        }
+        draft
+            .providers
+            .get_mut(&SandboxName::parse("daemon").unwrap())
+            .unwrap()
+            .api_endpoint = SandboxOrigin::parse("https://changed.test").unwrap();
+        let committed = config.save(&loaded, &draft).unwrap();
+        if matches!(
+            scenario,
+            "startup" | "resume" | "startup_tls" | "startup_lost"
+        ) {
+            let result = smol::block_on(controller.prepare_attach_reviewed(
+                &name(),
+                ResumePolicy::Confirmed,
+                None,
+                Some(&config),
+            ));
+            if scenario == "startup_tls" {
+                assert!(matches!(result, Err(Error::NetworkReview)));
+                assert!(sends.lock().unwrap().is_empty());
+                return;
+            }
+            if scenario == "startup_lost" {
+                assert!(result.is_err());
+                assert_eq!(*sends.lock().unwrap(), vec!["policy"]);
+                return;
+            }
+            let ticket = result.unwrap();
+            assert_eq!(ticket.record.launch, original.launch);
+            let expected = if scenario == "resume" {
+                vec!["resume", "policy", "credentials"]
+            } else {
+                vec!["policy", "credentials"]
+            };
+            assert_eq!(*sends.lock().unwrap(), expected);
+            return;
+        }
+        let _runtime = controller.store.lease(&record, false).unwrap();
+        let expected_revision = if scenario == "stale_commit" {
+            saved.saved().revision()
+        } else {
+            committed.saved().revision()
+        };
+        let result = smol::block_on(controller.reconcile_saved_network_at(
+            &name(),
+            &config,
+            expected_revision,
+        ));
+        match scenario {
+            "drift_before" | "stale_commit" => {
+                assert!(matches!(result, Err(Error::ReviewChanged)));
+                assert!(sends.lock().unwrap().is_empty());
+                assert!(controller.store.get(&name()).unwrap().lifecycle.is_none());
+            }
+            "drift_after" => {
+                assert!(matches!(result, Err(Error::NetworkChanged)));
+                assert_eq!(*sends.lock().unwrap(), vec!["policy"]);
+                assert!(
+                    !controller
+                        .store
+                        .get(&name())
+                        .unwrap()
+                        .lifecycle
+                        .unwrap()
+                        .is_pending()
+                );
+            }
+            "missing" => assert!(matches!(result, Err(Error::MissingNetwork))),
+            "tls" | "enforcement" => assert!(matches!(result, Err(Error::NetworkReview))),
+            "lost" => {
+                assert!(result.is_err());
+                assert!(matches!(
+                    smol::block_on(controller.reconcile_saved_network(&name(), &config)),
+                    Err(Error::Unresolved)
+                ));
+                assert_eq!(*sends.lock().unwrap(), vec!["policy"]);
+            }
+            _ => {
+                let (status, next) = result.unwrap();
+                let expected = match scenario {
+                    "same" => NetworkReconcileStatus::NoChange,
+                    "paused" => NetworkReconcileStatus::Deferred,
+                    "borrowed" | "detached" | "unmanaged" => NetworkReconcileStatus::Excluded,
+                    _ => NetworkReconcileStatus::Applied,
+                };
+                assert_eq!(status, expected);
+                assert_eq!(next.launch, record.launch);
+                assert_eq!(next.provider, original.provider);
+                assert_eq!(next.cwd, original.cwd);
+                assert_eq!(
+                    serde_json::to_value(&next.create).unwrap(),
+                    serde_json::to_value(&original.create).unwrap()
+                );
+                if scenario == "apply" {
+                    assert_eq!(
+                        smol::block_on(controller.reconcile_saved_network(&name(), &config))
+                            .unwrap()
+                            .0,
+                        NetworkReconcileStatus::NoChange
+                    );
+                    assert_eq!(*sends.lock().unwrap(), vec!["policy"]);
+                } else {
+                    assert!(sends.lock().unwrap().is_empty());
+                }
+            }
+        }
+    }
+
     fn enforced_instance(allow: bool) -> Value {
         let mut value = instance();
         value["networkTopology"] = json!(ENFORCED_TOPOLOGY);
@@ -1451,7 +2327,7 @@ mod tests {
                         policy: policy(false)
                     }
                 )),
-                Err(Error::Transport)
+                Err(Error::Transport(_))
             ));
         }
         let recovered = Controller::new(controller.store.state()).unwrap();
@@ -1762,12 +2638,24 @@ mod tests {
             }
             regular(method, path, headers)
         });
-        let (_temp, controller, saved) = setup(&server);
+        let (temp, controller, saved) = setup(&server);
         let record = create_ready(&controller, &saved);
-        let current =
-            smol::block_on(controller.prepare_attach(&name(), ResumePolicy::Refuse)).unwrap();
+        let config = SandboxStore::from_config_dir(&temp.path().join("config")).unwrap();
+        let current = smol::block_on(controller.prepare_attach_reviewed(
+            &name(),
+            ResumePolicy::Refuse,
+            None,
+            Some(&config),
+        ))
+        .unwrap();
         let other = other_holder.then(|| {
-            smol::block_on(controller.prepare_attach(&name(), ResumePolicy::Refuse)).unwrap()
+            smol::block_on(controller.prepare_attach_reviewed(
+                &name(),
+                ResumePolicy::Refuse,
+                None,
+                Some(&config),
+            ))
+            .unwrap()
         });
         assert!(matches!(
             smol::block_on(controller.action_at(
@@ -2000,10 +2888,10 @@ mod tests {
             Err(Error::ReviewChanged) | Err(Error::Daemon { status: 412, .. })
         ));
         if remote {
-            assert!(matches!(
-                smol::block_on(controller.action(&name(), LifecycleAction::Pause)),
-                Err(Error::Unresolved)
-            ));
+            assert_eq!(
+                controller.store.get(&name()).unwrap().revision().unwrap(),
+                record.revision().unwrap()
+            );
             smol::block_on(controller.inspect(&name())).unwrap();
         }
         assert_eq!(*mutations.lock().unwrap(), usize::from(remote));
@@ -2531,8 +3419,10 @@ mod tests {
                 })
                 .unwrap();
             Some((200, operation(&key, instance())))
-        } else {
+        } else if path.contains("/operations/") {
             Some((200, operation(path.rsplit('/').next().unwrap(), instance())))
+        } else {
+            Some((200, instance()))
         }
     }
 
@@ -2631,8 +3521,14 @@ mod tests {
         let server = Server::new(|method, path, _, headers| regular(method, path, headers));
         let (temp, controller, saved) = setup(&server);
         let record = create_ready(&controller, &saved);
-        let ticket =
-            smol::block_on(controller.prepare_attach(&name(), ResumePolicy::Refuse)).unwrap();
+        let config = SandboxStore::from_config_dir(&temp.path().join("config")).unwrap();
+        let ticket = smol::block_on(controller.prepare_attach_reviewed(
+            &name(),
+            ResumePolicy::Refuse,
+            None,
+            Some(&config),
+        ))
+        .unwrap();
         let (stored, lease) = controller
             .confirm_attachment(ticket, &binding(&record, ""))
             .unwrap();
@@ -2642,8 +3538,13 @@ mod tests {
             Err(Error::Busy)
         ));
         drop(lease);
-        let ticket =
-            smol::block_on(controller.prepare_attach(&name(), ResumePolicy::Refuse)).unwrap();
+        let ticket = smol::block_on(controller.prepare_attach_reviewed(
+            &name(),
+            ResumePolicy::Refuse,
+            None,
+            Some(&config),
+        ))
+        .unwrap();
         assert!(matches!(
             controller.confirm_attachment(ticket, &binding(&record, part)),
             Err(Error::Identity)

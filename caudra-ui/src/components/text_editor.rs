@@ -23,12 +23,15 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::Line;
 use ratatui::widgets::Paragraph;
 
-use super::scrollbar::{Scrollbar, ScrollbarMouse};
+use super::scrollbar::{self, Scrollbar, ScrollbarMouse};
 use crate::theme;
+use unicode_width::UnicodeWidthChar;
 
 /// How far a drag that has run off the top or bottom of the body scrolls per
 /// report, matching the workbench's own edge scroll.
 const EDGE_SCROLL_ROWS: i32 = 1;
+const MIN_GUTTER_BODY_WIDTH: u16 = 2;
+const NARROW_GLYPH: &str = "�";
 
 /// What a key left for the host to do.
 pub(crate) enum EditorKey {
@@ -91,7 +94,7 @@ impl TextEditor {
         self.buffer = Buffer::new(text.split('\n').map(str::to_owned).collect());
         self.history = History::default();
         self.scroll = 0;
-        self.dragging = false;
+        self.cancel_selection();
         self.follow_cursor = true;
     }
 
@@ -102,6 +105,66 @@ impl TextEditor {
     pub fn move_to_end(&mut self) {
         self.buffer.move_document_end(false);
         self.follow_cursor = true;
+    }
+
+    fn byte_len(&self) -> usize {
+        self.buffer.lines().iter().map(String::len).sum::<usize>()
+            + self.buffer.line_count().saturating_sub(1)
+    }
+
+    fn admits_insert(&self, bytes: usize, limit: usize) -> bool {
+        let removed = self.buffer.selected_text().map_or(0, |text| text.len());
+        self.byte_len()
+            .saturating_sub(removed)
+            .saturating_add(bytes)
+            <= limit
+    }
+
+    pub fn handle_paste_bounded(&mut self, text: &str, limit: usize) -> bool {
+        if !text.is_empty() && !self.admits_insert(text.len(), limit) {
+            return false;
+        }
+        self.handle_paste(text);
+        true
+    }
+
+    pub fn handle_key_bounded(&mut self, key: KeyEvent, limit: usize) -> Result<EditorKey, ()> {
+        let typing = (key.modifiers - KeyModifiers::SHIFT).is_empty();
+        if keys::PASTE.matches(key) {
+            if !self.clipboard.is_empty() && !self.admits_insert(self.clipboard.len(), limit) {
+                return Err(());
+            }
+        } else if let KeyCode::Char(character) = key.code {
+            if typing && !self.admits_insert(character.len_utf8(), limit) {
+                return Err(());
+            }
+        } else if (key.code == KeyCode::Enter && typing) || key.code == KeyCode::Tab {
+            let before = self.byte_len();
+            let cursor = self.buffer.cursor();
+            let selection = self.buffer.selection();
+            let edit = if key.code == KeyCode::Enter {
+                self.buffer.insert_newline()
+            } else {
+                self.buffer.insert_indent()
+            };
+            if let Some(edit) = edit {
+                let after = before
+                    .saturating_sub(edit.removed.len())
+                    .saturating_add(edit.inserted.len());
+                if after > limit {
+                    self.buffer.replay(&edit.inverted());
+                    if let Some((start, end)) = selection {
+                        self.buffer
+                            .set_cursor(if cursor == start { end } else { start }, false);
+                        self.buffer.set_cursor(cursor, true);
+                    }
+                    return Err(());
+                }
+                self.record(Some(edit));
+            }
+            return Ok(EditorKey::Consumed);
+        }
+        Ok(self.handle_key(key))
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> EditorKey {
@@ -222,15 +285,28 @@ impl TextEditor {
         }
     }
 
-    pub fn handle_mouse(&mut self, event: &MouseEvent) -> EditorMouse {
+    pub fn cancel_selection(&mut self) {
+        self.buffer.set_cursor(self.buffer.cursor(), false);
+        self.dragging = false;
+        self.clicks = Clicks::default();
+        self.scrollbar = Scrollbar::default();
+    }
+
+    pub fn handle_scrollbar_mouse(&mut self, event: &MouseEvent) -> bool {
         match self.scrollbar.handle(event) {
-            ScrollbarMouse::Ignored => {}
-            ScrollbarMouse::Consumed => return EditorMouse::Consumed,
+            ScrollbarMouse::Ignored => false,
+            ScrollbarMouse::Consumed => true,
             ScrollbarMouse::ScrollTo(top) => {
                 self.scroll = top as usize;
                 self.follow_cursor = false;
-                return EditorMouse::Consumed;
+                true
             }
+        }
+    }
+
+    pub fn handle_mouse(&mut self, event: &MouseEvent) -> EditorMouse {
+        if self.handle_scrollbar_mouse(event) {
+            return EditorMouse::Consumed;
         }
         let at = (event.column, event.row);
         match event.kind {
@@ -273,13 +349,11 @@ impl TextEditor {
             return EditorMouse::Passthrough;
         };
         match self.clicks.press(at, Instant::now()) {
-            1 => {
-                self.buffer.set_cursor(cursor, false);
-                self.dragging = true;
-            }
+            1 => self.buffer.set_cursor(cursor, false),
             2 => self.buffer.select_word_at(cursor),
             _ => self.buffer.select_line_at(cursor.line),
         }
+        self.dragging = true;
         self.follow_cursor = false;
         EditorMouse::Consumed
     }
@@ -291,15 +365,28 @@ impl TextEditor {
             return None;
         }
         let row = at.1.clamp(self.area.y, self.area.bottom() - 1);
-        let column = at.0.clamp(self.area.x, self.area.right() - 1);
+        let column = at.0.clamp(self.area.x, self.area.right());
         // The same walk the frame was painted from, so a press on a wrapped row
         // cannot land on a different half of the line than it points at.
         let rows = self.visual_rows();
         let visual = rows
             .get(self.scroll + usize::from(row - self.area.y))
             .or_else(|| rows.last())?;
-        let reached = visual.start + usize::from(column - self.area.x);
+        let reached = visual.start + usize::from(column - self.area.x).min(visual.span);
         let col = render::char_index(self.buffer.line(visual.line), reached);
+        if self.area.width == 1
+            && column == self.area.right()
+            && col == render::char_index(self.buffer.line(visual.line), visual.start)
+            && self
+                .buffer
+                .line(visual.line)
+                .chars()
+                .nth(col)
+                .and_then(UnicodeWidthChar::width)
+                .is_some_and(|width| width > 1)
+        {
+            return Some(Cursor::new(visual.line, col + 1));
+        }
         Some(Cursor::new(visual.line, col))
     }
 
@@ -311,18 +398,51 @@ impl TextEditor {
     }
 
     pub fn view(&mut self, frame: &mut Frame, area: Rect) {
-        self.paint(frame, area, false);
+        self.paint(frame, area, false, false);
+    }
+
+    pub fn view_json(&mut self, frame: &mut Frame, area: Rect) {
+        self.paint(frame, area, false, true);
     }
 
     pub fn view_masked(&mut self, frame: &mut Frame, area: Rect) {
-        self.paint(frame, area, true);
+        self.paint(frame, area, true, false);
     }
 
-    fn paint(&mut self, frame: &mut Frame, area: Rect, masked: bool) {
+    fn paint(&mut self, frame: &mut Frame, area: Rect, masked: bool, json: bool) {
         grab_scope!("text_editor", area);
-        self.area = area;
-        let rows = self.visual_rows();
         let height = usize::from(area.height.max(1));
+        let full_rows = self.visual_rows_at(area.width);
+        let gutter = scrollbar::enabled()
+            && area.width > MIN_GUTTER_BODY_WIDTH
+            && area.height > 0
+            && full_rows.len() > height;
+        let body = Rect {
+            width: area.width.saturating_sub(u16::from(gutter)),
+            ..area
+        };
+        let rows = if gutter {
+            self.visual_rows_at(body.width)
+        } else {
+            full_rows
+        };
+        if self.area.width != body.width
+            && !self.follow_cursor
+            && let Some(anchor) = self.visual_rows().get(self.scroll)
+        {
+            self.scroll = rows
+                .iter()
+                .rposition(|row| {
+                    row.line < anchor.line || (row.line == anchor.line && row.start <= anchor.start)
+                })
+                .unwrap_or(0);
+        }
+        if self.area != body {
+            self.dragging = false;
+            self.clicks = Clicks::default();
+            self.scrollbar = Scrollbar::default();
+        }
+        self.area = body;
         if self.follow_cursor {
             self.reveal_cursor(&rows, height);
         }
@@ -331,6 +451,8 @@ impl TextEditor {
         let theme = theme::current();
         let base = Style::new().fg(theme.foreground);
         let selection = Style::new().add_modifier(Modifier::REVERSED);
+        let mut syntax_line = None;
+        let mut syntax = Vec::new();
         let painted = rows
             .iter()
             .skip(self.scroll)
@@ -339,7 +461,27 @@ impl TextEditor {
                 let text = self.buffer.line(row.line);
                 let hidden = masked.then(|| "*".repeat(text.chars().count()));
                 let text = hidden.as_deref().unwrap_or(text);
-                let overlays = self.overlays(row.line, text, selection, theme.cursor);
+                if json && syntax_line != Some(row.line) {
+                    syntax_line = Some(row.line);
+                    syntax = super::json_text::overlays(text);
+                }
+                let mut overlays = syntax.clone();
+                overlays.extend(self.overlays(row.line, text, selection, theme.cursor));
+                if body.width == 1 {
+                    let index = render::char_index(text, row.start);
+                    if text
+                        .chars()
+                        .nth(index)
+                        .and_then(UnicodeWidthChar::width)
+                        .is_some_and(|width| width > 1)
+                    {
+                        let style = overlays
+                            .iter()
+                            .filter(|(range, _)| range.contains(&index))
+                            .fold(base, |style, (_, overlay)| style.patch(*overlay));
+                        return Line::styled(NARROW_GLYPH, style);
+                    }
+                }
                 render::Row {
                     text,
                     segments: None,
@@ -351,10 +493,10 @@ impl TextEditor {
             })
             .collect::<Vec<Line<'static>>>();
 
-        frame.render_widget(Paragraph::new(painted), area);
+        frame.render_widget(Paragraph::new(painted), body);
         self.scrollbar.draw(
             frame,
-            area,
+            if gutter { area } else { Rect::ZERO },
             rows.len().min(u32::MAX as usize) as u32,
             self.scroll.min(u32::MAX as usize) as u32,
         );
@@ -407,7 +549,11 @@ impl TextEditor {
     /// pasted blob rather than a file, so walking all of them per frame costs
     /// less than carrying a two-part scroll position.
     fn visual_rows(&self) -> Vec<VisualRow> {
-        let width = usize::from(self.area.width.max(1));
+        self.visual_rows_at(self.area.width)
+    }
+
+    fn visual_rows_at(&self, width: u16) -> Vec<VisualRow> {
+        let width = usize::from(width.max(1));
         let mut rows = Vec::with_capacity(self.buffer.line_count());
         for line in 0..self.buffer.line_count() {
             let starts = render::wrap_columns(self.buffer.line(line), width);
@@ -435,15 +581,362 @@ struct VisualRow {
 #[cfg(test)]
 mod tests {
     use super::{EditorKey, EditorMouse, TextEditor};
+    use crate::components::scrollbar;
+    use caudra_workbench::scroll::SCROLLBAR_THUMB;
     use crossterm::event::{
         KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
     };
     use ratatui::layout::Rect;
+    use ratatui::{Terminal, backend::TestBackend};
+    use std::{env, process::Command};
     use test_case::test_case;
+    use unicode_width::UnicodeWidthChar;
 
     const BODY: Rect = Rect::new(0, 0, 10, 4);
     const WRAPPED: &str = "hello world again";
     const WRAPPED_WORD_DELETED: &str = "hello world ";
+    const DISABLED_GUTTER_TEST: &str = "CAUDRA_EDITOR_DISABLED_GUTTER_TEST";
+
+    #[test_case("abcdefghijklmno", &["abcde", "fghij", "klmno"]; "unbroken_ascii")]
+    #[test_case("abcd界efgh界ij", &["abcd ", "界efg", "h界ij"]; "wide_boundary")]
+    fn gutter_preserves_every_content_column(text: &str, expected: &[&str]) {
+        let mut editor = editor(text);
+        let mut terminal = Terminal::new(TestBackend::new(6, 1)).unwrap();
+        terminal
+            .draw(|frame| editor.view(frame, frame.area()))
+            .unwrap();
+        assert_eq!(editor.area.width, 5);
+        assert_eq!(editor.visual_rows().len(), expected.len());
+        for (index, expected) in expected.iter().enumerate() {
+            editor.scroll = index;
+            editor.follow_cursor = false;
+            terminal
+                .draw(|frame| editor.view(frame, frame.area()))
+                .unwrap();
+            let shown = (0..5)
+                .filter_map(|x| {
+                    let cell = &terminal.backend().buffer()[(x, 0)];
+                    if x > 0
+                        && terminal.backend().buffer()[(x - 1, 0)]
+                            .symbol()
+                            .chars()
+                            .next()
+                            .is_some_and(|ch| ch.width() == Some(2))
+                    {
+                        None
+                    } else {
+                        Some(cell.symbol())
+                    }
+                })
+                .collect::<String>();
+            assert_eq!(shown, *expected);
+            assert_eq!(
+                terminal.backend().buffer()[(5, 0)].symbol(),
+                SCROLLBAR_THUMB
+            );
+        }
+        editor.scroll = 0;
+        terminal
+            .draw(|frame| editor.view(frame, frame.area()))
+            .unwrap();
+        press(&mut editor, 0, 0);
+        for _ in 0..editor.visual_rows().len() {
+            drag(&mut editor, 5, 1);
+            terminal
+                .draw(|frame| editor.view(frame, frame.area()))
+                .unwrap();
+        }
+        assert_eq!(copied(release(&mut editor, 5, 1)).as_deref(), Some(text));
+        assert_eq!(editor.text(), text);
+    }
+
+    #[test_case(0, 4; "wide_first_cell")]
+    #[test_case(1, 4; "wide_second_cell")]
+    #[test_case(2, 5; "after_wide_character")]
+    #[test_case(4, 7; "last_content_column")]
+    fn gutter_mouse_mapping_uses_the_rendered_unicode_wrap(column: u16, expected: usize) {
+        let mut editor = editor("abcd界efgh界ij");
+        let mut terminal = Terminal::new(TestBackend::new(6, 2)).unwrap();
+        terminal
+            .draw(|frame| editor.view(frame, frame.area()))
+            .unwrap();
+        assert_eq!(editor.area.width, 5);
+        press(&mut editor, column, 1);
+        assert_eq!(editor.buffer.cursor().col, expected);
+        assert_eq!(editor.buffer.cursor().line, 0);
+    }
+
+    #[test_case(0; "zero")]
+    #[test_case(1; "single_column")]
+    #[test_case(2; "wide_character_minimum")]
+    fn tiny_widths_keep_content_instead_of_spending_it_on_a_bar(width: u16) {
+        let mut editor = editor("界\nx");
+        let mut terminal = Terminal::new(TestBackend::new(width, 1)).unwrap();
+        terminal
+            .draw(|frame| editor.view(frame, frame.area()))
+            .unwrap();
+        assert_eq!(editor.area.width, width);
+        assert!(
+            terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .all(|cell| cell.symbol() != SCROLLBAR_THUMB)
+        );
+        if width > 0 {
+            assert_eq!(
+                terminal.backend().buffer()[(0, 0)].symbol(),
+                if width == 1 {
+                    super::NARROW_GLYPH
+                } else {
+                    "界"
+                }
+            );
+            press(&mut editor, 0, 0);
+            drag(&mut editor, width, 0);
+            assert_eq!(
+                copied(release(&mut editor, width, 0)).as_deref(),
+                Some("界")
+            );
+        }
+        assert_eq!(editor.text(), "界\nx");
+    }
+
+    #[test]
+    fn fitting_text_does_not_create_self_sustaining_gutter_overflow() {
+        let mut editor = editor("abcdefghij");
+        let mut terminal = Terminal::new(TestBackend::new(5, 2)).unwrap();
+        for _ in 0..3 {
+            terminal
+                .draw(|frame| editor.view(frame, frame.area()))
+                .unwrap();
+            assert_eq!(editor.area.width, 5);
+            assert_eq!(editor.scroll, 0);
+            assert_eq!(terminal.backend().buffer()[(4, 0)].symbol(), "e");
+            assert_eq!(terminal.backend().buffer()[(4, 1)].symbol(), "j");
+        }
+        editor.handle_key(key(KeyCode::Char('a'), KeyModifiers::CONTROL));
+        let EditorKey::Copy(text) =
+            editor.handle_key(key(KeyCode::Char('c'), KeyModifiers::CONTROL))
+        else {
+            panic!("copy selection")
+        };
+        assert_eq!(text, "abcdefghij");
+    }
+
+    #[test]
+    fn single_column_drag_stops_before_the_next_wrapped_wide_character() {
+        let mut editor = editor("a界");
+        let mut terminal = Terminal::new(TestBackend::new(1, 1)).unwrap();
+        terminal
+            .draw(|frame| editor.view(frame, frame.area()))
+            .unwrap();
+        press(&mut editor, 0, 0);
+        drag(&mut editor, 1, 0);
+        assert_eq!(copied(release(&mut editor, 1, 0)).as_deref(), Some("a"));
+    }
+
+    #[test]
+    fn preference_and_resize_reflow_preserve_source_anchor_and_exact_copy() {
+        if env::var_os(DISABLED_GUTTER_TEST).is_none() {
+            assert!(Command::new(env::current_exe().unwrap()).args(["--exact", "components::text_editor::tests::preference_and_resize_reflow_preserve_source_anchor_and_exact_copy"]).env(DISABLED_GUTTER_TEST, "1").status().unwrap().success());
+            return;
+        }
+        const SOURCE: &str = "abcdefghij界klmnopqrstuv";
+        let mut editor = editor(SOURCE);
+        let mut terminal = Terminal::new(TestBackend::new(6, 2)).unwrap();
+        terminal
+            .draw(|frame| editor.view(frame, frame.area()))
+            .unwrap();
+        editor.scroll(-2);
+        terminal
+            .draw(|frame| editor.view(frame, frame.area()))
+            .unwrap();
+        let anchor = editor.visual_rows()[editor.scroll].start;
+        scrollbar::set_enabled(false);
+        terminal
+            .draw(|frame| editor.view(frame, frame.area()))
+            .unwrap();
+        assert_eq!(editor.area.width, 6);
+        let rows = editor.visual_rows();
+        assert!(rows[editor.scroll].start <= anchor);
+        assert!(
+            rows.get(editor.scroll + 1)
+                .is_none_or(|row| row.start > anchor)
+        );
+        assert!(
+            terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .all(|cell| cell.symbol() != SCROLLBAR_THUMB)
+        );
+        editor.scroll(i32::MAX);
+        terminal
+            .draw(|frame| editor.view(frame, frame.area()))
+            .unwrap();
+        assert_eq!(terminal.backend().buffer()[(5, 0)].symbol(), "f");
+        press(&mut editor, 0, 0);
+        for _ in 0..editor.visual_rows().len() {
+            drag(&mut editor, 6, 2);
+            terminal
+                .draw(|frame| editor.view(frame, frame.area()))
+                .unwrap();
+        }
+        assert_eq!(copied(release(&mut editor, 6, 2)).as_deref(), Some(SOURCE));
+        scrollbar::set_enabled(true);
+        terminal
+            .draw(|frame| editor.view(frame, frame.area()))
+            .unwrap();
+        assert_eq!(editor.area.width, 5);
+        let mut wide = Terminal::new(TestBackend::new(40, 2)).unwrap();
+        wide.draw(|frame| editor.view(frame, frame.area())).unwrap();
+        assert_eq!(editor.area.width, 40);
+        assert_eq!(editor.scroll, 0);
+        let EditorKey::Copy(text) =
+            editor.handle_key(key(KeyCode::Char('c'), KeyModifiers::CONTROL))
+        else {
+            panic!("copy selection")
+        };
+        assert_eq!(text, SOURCE);
+    }
+
+    #[test_case("abcd", KeyCode::Char('X'), KeyModifiers::SHIFT, false; "shift_at_bound")]
+    #[test_case("abc", KeyCode::Char('é'), KeyModifiers::NONE, false; "multibyte_over_bound")]
+    #[test_case("ab", KeyCode::Char('é'), KeyModifiers::NONE, true; "multibyte_exact_bound")]
+    #[test_case("abcd", KeyCode::Enter, KeyModifiers::SHIFT, false; "shift_enter")]
+    #[test_case("abcd", KeyCode::Tab, KeyModifiers::NONE, false; "indent")]
+    fn bounded_key_admission(text: &str, code: KeyCode, modifiers: KeyModifiers, allowed: bool) {
+        const LIMIT: usize = 4;
+        let mut editor = editor(text);
+        editor.move_to_end();
+        let cursor = editor.buffer.cursor();
+        assert_eq!(
+            editor
+                .handle_key_bounded(KeyEvent::new(code, modifiers), LIMIT)
+                .is_ok(),
+            allowed
+        );
+        assert!(editor.text().len() <= LIMIT);
+        if !allowed {
+            assert_eq!(editor.text(), text);
+            assert_eq!(editor.buffer.cursor(), cursor);
+        }
+    }
+
+    #[test_case(false; "terminal_paste")]
+    #[test_case(true; "internal_clipboard")]
+    fn bounded_paste_replaces_selection_without_losing_rejected_selection(internal: bool) {
+        const TEXT: &str = "é界";
+        let mut editor = editor(TEXT);
+        editor.clipboard = TEXT.into();
+        editor.move_to_end();
+        let paste = |editor: &mut TextEditor| {
+            if internal {
+                editor
+                    .handle_key_bounded(
+                        KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL),
+                        TEXT.len(),
+                    )
+                    .is_ok()
+            } else {
+                editor.handle_paste_bounded(TEXT, TEXT.len())
+            }
+        };
+        assert!(!paste(&mut editor));
+        assert_eq!(editor.text(), TEXT);
+        editor.buffer.select_all();
+        let selection = editor.buffer.selection();
+        assert!(!editor.handle_paste_bounded("too long", TEXT.len()));
+        assert_eq!(editor.buffer.selection(), selection);
+        assert!(paste(&mut editor));
+        assert_eq!(editor.text(), TEXT);
+    }
+
+    #[test_case(KeyCode::Enter; "auto_indent")]
+    #[test_case(KeyCode::Tab; "selection_indent")]
+    fn bounded_indentation_preserves_selection_and_history_when_rejected(code: KeyCode) {
+        const TEXT: &str = "    a\n    b";
+        let mut editor = editor(TEXT);
+        editor.buffer.select_all();
+        let selection = editor.buffer.selection();
+        let limit = if code == KeyCode::Enter {
+            1
+        } else {
+            TEXT.len()
+        };
+        assert!(
+            editor
+                .handle_key_bounded(KeyEvent::new(code, KeyModifiers::NONE), limit)
+                .is_err()
+        );
+        assert_eq!(editor.text(), TEXT);
+        assert_eq!(editor.buffer.selection(), selection);
+        assert!(editor.history.undo().is_none());
+    }
+
+    #[test]
+    fn bounded_editor_can_delete_and_undo_over_limit_text() {
+        const TEXT: &str = "oversized";
+        let mut editor = editor(TEXT);
+        editor.buffer.select_all();
+        assert!(
+            editor
+                .handle_key_bounded(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE), 1)
+                .is_ok()
+        );
+        assert_eq!(editor.text(), "");
+        assert!(
+            editor
+                .handle_key_bounded(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL), 1)
+                .is_ok()
+        );
+        assert_eq!(editor.text(), TEXT);
+        editor.buffer.select_all();
+        assert!(
+            editor
+                .handle_key_bounded(
+                    KeyEvent::new(KeyCode::Char('é'), KeyModifiers::SHIFT),
+                    'é'.len_utf8()
+                )
+                .is_ok()
+        );
+        assert_eq!(editor.text(), "é");
+    }
+
+    #[test]
+    fn json_view_preserves_scrolling_and_unicode_selection() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        const JSON: &str = "Heading\n{\n  \"界\": true,\n  \"next\": null\n}\nEnd";
+        let mut editor = editor(JSON);
+        let mut terminal = Terminal::new(TestBackend::new(24, 3)).unwrap();
+        terminal
+            .draw(|frame| editor.view_json(frame, frame.area()))
+            .unwrap();
+        editor.scroll(-2);
+        terminal
+            .draw(|frame| editor.view_json(frame, frame.area()))
+            .unwrap();
+        assert_eq!(editor.scroll, 2);
+        assert_eq!(
+            terminal.backend().buffer()[(3, 0)].fg,
+            crate::theme::current().accent.fg.unwrap()
+        );
+        press(&mut editor, 2, 0);
+        drag(&mut editor, 6, 0);
+        terminal
+            .draw(|frame| editor.view_json(frame, frame.area()))
+            .unwrap();
+        assert!(
+            terminal.backend().buffer()[(3, 0)]
+                .modifier
+                .contains(ratatui::style::Modifier::REVERSED)
+        );
+        assert_eq!(editor.text(), JSON);
+    }
 
     fn editor(text: &str) -> TextEditor {
         let mut editor = TextEditor::new();
@@ -562,6 +1055,92 @@ mod tests {
         press(&mut editor, 1, 0);
         press(&mut editor, 1, 0);
         assert_eq!(editor.buffer.selected_text().as_deref(), Some("one\n"));
+    }
+
+    #[test_case(2, "hello"; "word")]
+    #[test_case(3, "hello world again\n"; "source_line_not_soft_wrap")]
+    fn multi_click_copies_on_release(clicks: usize, expected: &str) {
+        let mut editor = editor(&format!("{WRAPPED}\nnext"));
+        for _ in 1..clicks {
+            press(&mut editor, 2, 0);
+            release(&mut editor, 2, 0);
+        }
+        press(&mut editor, 2, 0);
+        assert_eq!(
+            copied(release(&mut editor, 2, 0)).as_deref(),
+            Some(expected)
+        );
+        assert!(copied(release(&mut editor, 2, 0)).is_none());
+    }
+
+    #[test]
+    fn scrollbar_only_drag_outside_masked_editor_never_selects_or_copies() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        const SECRET: &str = "masked-secret";
+        let source = SECRET.repeat(100);
+        let mut editor = editor(&source);
+        let mut terminal = Terminal::new(TestBackend::new(BODY.width, BODY.height)).unwrap();
+        terminal
+            .draw(|frame| editor.view_masked(frame, BODY))
+            .unwrap();
+        for (kind, column, row) in [
+            (
+                MouseEventKind::Down(MouseButton::Left),
+                BODY.right() - 1,
+                BODY.y,
+            ),
+            (
+                MouseEventKind::Drag(MouseButton::Left),
+                BODY.right() + 2,
+                BODY.bottom() + 2,
+            ),
+            (
+                MouseEventKind::Up(MouseButton::Left),
+                BODY.right() + 2,
+                BODY.bottom() + 2,
+            ),
+        ] {
+            assert!(editor.handle_scrollbar_mouse(&mouse(kind, column, row)));
+        }
+        assert!(editor.scroll > 0);
+        assert!(editor.buffer.selection().is_none());
+        assert!(editor.clipboard.is_empty());
+        assert_eq!(editor.text(), source);
+    }
+
+    #[test]
+    fn edge_drag_copies_offscreen_unicode_source_and_scroll_retains_selection() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        const LINE: &str = "界e\u{301}🙂 alpha beta gamma delta";
+        const TAIL: &str = "tail";
+        let source = format!("{LINE}\n{LINE}\n{TAIL}");
+        let mut editor = editor(&source);
+        let mut terminal = Terminal::new(TestBackend::new(BODY.width, BODY.height)).unwrap();
+        terminal.draw(|frame| editor.view(frame, BODY)).unwrap();
+        press(&mut editor, 0, 0);
+        for _ in 0..editor.visual_rows().len() {
+            drag(&mut editor, BODY.right() - 2, BODY.bottom());
+            terminal.draw(|frame| editor.view(frame, BODY)).unwrap();
+        }
+        assert_eq!(
+            copied(release(&mut editor, BODY.right() - 2, BODY.bottom())).as_deref(),
+            Some(source.as_str())
+        );
+        editor.scroll(i32::MAX);
+        terminal.draw(|frame| editor.view(frame, BODY)).unwrap();
+        let EditorKey::Copy(text) =
+            editor.handle_key(key(KeyCode::Char('c'), KeyModifiers::CONTROL))
+        else {
+            panic!("selection lost on scroll");
+        };
+        assert_eq!(text, source);
+        editor.cancel_selection();
+        assert!(matches!(
+            editor.handle_key(key(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            EditorKey::Passthrough
+        ));
     }
 
     #[test]

@@ -183,6 +183,15 @@ impl AgentHandles {
     }
 
     pub(crate) fn apply_to_app(&self, app: &mut App) {
+        let sandbox = app
+            .state
+            .session
+            .workspace_binding()
+            .and_then(|binding| binding.sandbox_record());
+        let gate = app.sandbox_live.network_gate.clone();
+        self.queue.set_dispatch_guard(Arc::new(move || {
+            sandbox.is_none_or(|id| gate.lock().is_ok_and(|gate| gate.blocker(id).is_none()))
+        }));
         app.answer_tx = Some(self.answer_tx.clone());
         app.cmd_tx = Some(self.cmd_tx.clone());
         app.shared_history = Some(Arc::clone(&self.history));
