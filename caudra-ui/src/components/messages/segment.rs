@@ -49,7 +49,6 @@ struct HighlightKey {
     input: Option<Arc<ToolInput>>,
     output: Option<Arc<ToolOutput>>,
     theme_gen: u64,
-    settled: bool,
     /// A child view changes which lines the range holds, so reusing across a
     /// fold would splice back the body the reader just put away.
     views: BatchViews,
@@ -66,7 +65,6 @@ struct HighlightKey {
 impl PartialEq for HighlightKey {
     fn eq(&self, other: &Self) -> bool {
         self.theme_gen == other.theme_gen
-            && self.settled == other.settled
             && self.views == other.views
             && self.scroll == other.scroll
             && self.child_scroll == other.child_scroll
@@ -95,7 +93,6 @@ impl HighlightKey {
             input: hl.and_then(|h| h.input.clone()),
             output: hl.and_then(|h| h.output.clone()),
             theme_gen: theme::generation(),
-            settled: hl.is_some_and(|h| h.limits.settled),
             views: hl.map(|h| h.limits.views.clone()).unwrap_or_default(),
             scroll: hl.and_then(|h| h.limits.scroll),
             child_scroll: hl
@@ -1101,9 +1098,6 @@ mod tests {
         assert_eq!(seg.buf_row(5), 3);
     }
 
-    const SETTLED_HIGHLIGHT_MSG: &str =
-        "settlement must not reuse live heading geometry from the highlight cache";
-
     #[test]
     fn reuse_highlight_keys_on_theme_and_width() {
         use crate::components::code_view::RenderLimits;
@@ -1150,13 +1144,6 @@ mod tests {
         assert!(
             seg.reuse_highlight(&key(RESIZED), (1, 3)).is_none(),
             "width mismatch must force a fresh highlight, not splice stale wrapping"
-        );
-
-        let mut settled = key(WIDTH);
-        settled.settled = true;
-        assert!(
-            seg.reuse_highlight(&settled, (1, 3)).is_none(),
-            "{SETTLED_HIGHLIGHT_MSG}"
         );
 
         theme::set(theme::load_by_name(OTHER_THEME).unwrap());

@@ -1309,10 +1309,7 @@ impl ToolLineBuilder {
             source: SourceTrace::default(),
             width,
             truncation: false,
-            limits: RenderLimits {
-                settled: !matches!(indicator, Indicator::InProgress),
-                ..limits
-            },
+            limits,
             markdown: false,
             indicator,
             head: 0,

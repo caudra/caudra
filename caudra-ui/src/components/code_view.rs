@@ -11,9 +11,9 @@ use crate::selection::wrap_breaks;
 use crate::theme;
 
 use super::tool_display::{
-    ScrollTail, TREE_BRANCH, TREE_GAP, TREE_LAST, TREE_TRUNK, batch_sigil_style, clamp_to_row,
-    compact_args_for, compact_sigil_label, header_spans, inflected_header, names_tool,
-    progress_lines, scroll_footer_text,
+    ScrollTail, TREE_BRANCH, TREE_GAP, TREE_LAST, TREE_TRUNK, batch_sigil_style, compact_args_for,
+    compact_sigil_label, header_spans, inflected_header, names_tool, progress_lines,
+    scroll_footer_text,
 };
 use super::{ToolProgress, environment_card, is_collapsible, workflow_card};
 use caudra_agent::tools::{PYTHON_EXECUTION_TOOL_NAME, SHELL_TOOL_NAME, TASK_TOOL_NAME};
@@ -995,13 +995,6 @@ fn option_lines(label: &str, picked: bool, t: &theme::Theme) -> Vec<Line<'static
 /// exactly where they are worst, since a long search header is what wraps.
 fn render_batch(entries: &[BatchToolEntry], highlight: bool, limits: &RenderLimits) -> BatchCard {
     let t = theme::current();
-    let running = !limits.settled
-        && entries.iter().any(|entry| {
-            matches!(
-                entry.status,
-                BatchToolStatus::Pending | BatchToolStatus::Running
-            )
-        });
     let mut lines = Vec::new();
     let mut rows = Vec::new();
     let mut spans_out = Vec::new();
@@ -1103,9 +1096,6 @@ fn render_batch(entries: &[BatchToolEntry], highlight: bool, limits: &RenderLimi
         }
         if body.is_none() && holds_a_body(entry) {
             spans.push(Span::styled(BATCH_FOLDED_MARK, t.tool_dim));
-        }
-        if running {
-            spans = clamp_to_row(spans, limits.width);
         }
         // A child is a section of the card, not another run of its output, so
         // its summary row copies as the heading that says whose output follows.
@@ -2748,7 +2738,6 @@ impl CardPolicy {
 #[derive(Clone, Default)]
 pub struct RenderLimits {
     pub budget: usize,
-    pub settled: bool,
     /// Present only for a card drawn as a fixed-height scroller. It replaces
     /// the budget and the notice under it: the window is the whole story of
     /// how much is shown, and the footer says where it sits.
@@ -2786,7 +2775,6 @@ impl RenderLimits {
     pub fn new(full: bool, budget: usize, views: BatchViews, tool_lines: ToolOutputLines) -> Self {
         Self {
             budget: if full { usize::MAX } else { budget },
-            settled: false,
             scroll: None,
             body_taken: false,
             policy: CardPolicy::default(),
@@ -2929,7 +2917,6 @@ impl RenderLimits {
         };
         Some(Self {
             budget,
-            settled: self.settled || entry.status.is_terminal(),
             scroll,
             // A child the reader opened draws whole, which is them asking for
             // what is under it too, so it hands the path on rather than
@@ -5911,33 +5898,22 @@ mod tests {
 
     const LIVE_HEADER_PATH: &str = "src/abcdefghijklmnopq.rs";
     const LIVE_HEADER_SIBLING: &str = "sibling";
-    const LIVE_HEADER_STABLE: &str =
-        "status changes must not move a batch sibling while the batch is running";
-    const SETTLED_HEADER_WRAPS: &str =
-        "settled batch headings must wrap again without losing their full summaries";
+    const LIVE_HEADER_WHOLE: &str = "a batch child's heading breaks to as many rows as its summary needs, whatever the \
+         call is doing, or a command is unreadable for as long as it is worth watching";
+    const LIVE_HEADER_BROKE: &str =
+        "the fixture must be narrow enough to break the summary, or it proves nothing";
 
-    fn batch_header_frame(status: BatchToolStatus, settled: bool, nested: bool) -> ToolContent {
+    fn batch_header_frame(status: BatchToolStatus, nested: bool) -> ToolContent {
         let mut entries = vec![
             BatchToolEntry {
                 tool: FILE_READ_TOOL_NAME.into(),
                 ..queued_entry(LIVE_HEADER_PATH, status)
             },
-            queued_entry(
-                LIVE_HEADER_SIBLING,
-                if settled {
-                    BatchToolStatus::Success
-                } else {
-                    BatchToolStatus::Pending
-                },
-            ),
+            queued_entry(LIVE_HEADER_SIBLING, BatchToolStatus::Pending),
         ];
         if nested {
             entries = vec![BatchToolEntry {
-                status: if settled {
-                    BatchToolStatus::Success
-                } else {
-                    BatchToolStatus::Running
-                },
+                status: BatchToolStatus::Running,
                 ..nested_batch_entry(entries)
             }];
         }
@@ -5952,56 +5928,47 @@ mod tests {
         )
     }
 
-    #[test_case(false; "batch_children")]
-    #[test_case(true; "nested_batch_children")]
-    fn live_batch_headers_keep_sibling_rows_through_status_changes(nested: bool) {
-        let mut positions = Vec::new();
-        for status in [
-            BatchToolStatus::Pending,
-            BatchToolStatus::Running,
-            BatchToolStatus::Success,
-            BatchToolStatus::Error,
-        ] {
-            let frame = batch_header_frame(status, false, nested);
-            positions.push(
-                frame
-                    .lines
-                    .iter()
-                    .position(|line| line_text(line).contains(LIVE_HEADER_SIBLING))
-                    .expect(LIVE_HEADER_STABLE),
-            );
-            assert_eq!(frame.lines.len(), frame.rows.len(), "{ROWS_PER_CARD_LINE}");
-            let source = frame.source.as_ref().expect(CARD_RECORDS_SOURCE);
-            assert!(
-                source.text.contains(LIVE_HEADER_PATH),
-                "{CARD_RECORDS_SOURCE}"
-            );
-            assert_eq!(source.rows.len(), frame.lines.len(), "{ROWS_PER_CARD_LINE}");
-        }
-        assert!(
-            positions.iter().all(|row| *row == 1 + usize::from(nested)),
-            "{LIVE_HEADER_STABLE}: {positions:?}"
-        );
-    }
+    /// The reported bug: a heading held to one row for as long as any sibling
+    /// was still running cut the path off the call the reader was watching
+    /// arrive. A call in the main conversation is read while it streams, so it
+    /// wraps at every status its children pass through.
+    #[test_case(BatchToolStatus::Pending, false ; "pending")]
+    #[test_case(BatchToolStatus::Running, false ; "running")]
+    #[test_case(BatchToolStatus::Success, false ; "success")]
+    #[test_case(BatchToolStatus::Error, false ; "error")]
+    #[test_case(BatchToolStatus::Running, true ; "nested_running")]
+    #[test_case(BatchToolStatus::Success, true ; "nested_success")]
+    fn a_batch_child_heading_wraps_to_its_whole_summary(status: BatchToolStatus, nested: bool) {
+        let frame = batch_header_frame(status, nested);
+        let drawn: Vec<String> = frame.lines.iter().map(line_text).collect();
+        // A break puts the trunk glyph between the halves of the summary, and
+        // those glyphs are the only non-ASCII on these rows, so dropping them
+        // rejoins the path wherever the width happened to split it.
+        let rejoined: String = drawn
+            .concat()
+            .chars()
+            .filter(|c| c.is_ascii() && !c.is_ascii_whitespace())
+            .collect();
 
-    #[test_case(false; "batch_children")]
-    #[test_case(true; "nested_batch_children")]
-    fn settled_batch_headers_restore_wrapped_detail(nested: bool) {
-        let running = batch_header_frame(BatchToolStatus::Running, false, nested);
-        let settled = batch_header_frame(BatchToolStatus::Success, true, nested);
         assert!(
-            settled.lines.len() > running.lines.len(),
-            "{SETTLED_HEADER_WRAPS}"
+            rejoined.contains(LIVE_HEADER_PATH),
+            "{LIVE_HEADER_WHOLE}: {drawn:#?}"
         );
         assert!(
-            settled
-                .source
-                .as_ref()
-                .expect(CARD_RECORDS_SOURCE)
-                .text
-                .contains(LIVE_HEADER_PATH),
-            "{SETTLED_HEADER_WRAPS}"
+            !drawn.iter().any(|row| row.contains(LIVE_HEADER_PATH)),
+            "{LIVE_HEADER_BROKE}: {drawn:#?}"
         );
+        assert!(
+            drawn.iter().any(|row| row.contains(LIVE_HEADER_SIBLING)),
+            "{LIVE_HEADER_WHOLE}: {drawn:#?}"
+        );
+        assert_eq!(frame.lines.len(), frame.rows.len(), "{ROWS_PER_CARD_LINE}");
+        let source = frame.source.as_ref().expect(CARD_RECORDS_SOURCE);
+        assert!(
+            source.text.contains(LIVE_HEADER_PATH),
+            "{CARD_RECORDS_SOURCE}"
+        );
+        assert_eq!(source.rows.len(), frame.lines.len(), "{ROWS_PER_CARD_LINE}");
     }
 
     /// While the arguments are still arriving the child list genuinely is not

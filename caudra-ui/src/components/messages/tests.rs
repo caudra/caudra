@@ -83,12 +83,11 @@ const BATCH_HEADER_NEXT: &str = "next";
 const BATCH_HEADER_SETUP_MSG: &str =
     "the narrow viewport must show the whole batch with transcript scrollback above it";
 const BATCH_HEADER_ROWS_MSG: &str =
-    "a live batch keeps one row per read-only child through status changes";
-const BATCH_HEADER_Y_MSG: &str = "a live batch's next sibling must stay on the same screen row";
+    "a live batch child must draw its whole path across as many rows as it takes";
 const BATCH_HEADER_STATUS_MSG: &str =
     "the batch must retain the requested child lifecycle and its pending sibling";
 const CANCELLED_HEADER_MSG: &str =
-    "a terminal batch must restore full wrapped headers even while children remain pending";
+    "a cancelled batch must keep full wrapped headers even while children remain pending";
 const BATCH_HEADER_HIGHLIGHT_SETUP_MSG: &str =
     "a fresh batch header phase must enqueue a real highlight";
 const BATCH_HEADER_HIGHLIGHT_TIMEOUT_MSG: &str =
@@ -10212,12 +10211,28 @@ fn wait_for_batch_header_highlights(panel: &mut MessagesPanel) -> bool {
     saw_pending
 }
 
+/// A child's heading with its breaks and indents taken out, so a summary can
+/// be looked for whole however the width happened to split it.
+fn header_path_across(seen: &str, rows: &[u16]) -> String {
+    rows.iter()
+        .flat_map(|row| {
+            seen.lines()
+                .nth(usize::from(*row))
+                .unwrap_or_default()
+                .chars()
+        })
+        .filter(|character| character.is_ascii() && !character.is_ascii_whitespace())
+        .collect()
+}
+
+/// The reported bug: a child's heading was held to one row for as long as any
+/// sibling was still pending, so the path a call was reading stayed cut off
+/// for exactly as long as the reader was watching it arrive.
 #[test_case(FILE_READ_TOOL_NAME; "read")]
 #[test_case(FILE_GREP_TOOL_NAME; "grep")]
-fn a_live_batch_keeps_child_header_rows_through_status_changes(tool: &str) {
+fn a_live_batch_child_header_draws_its_whole_path(tool: &str) {
     let _clock = FrozenSpinner::at(0);
     let mut panel = panel_with_pending_batch_headers(tool);
-    let mut sibling_rows = Vec::new();
     for status in [
         BatchToolStatus::Pending,
         BatchToolStatus::Running,
@@ -10253,23 +10268,29 @@ fn a_live_batch_keeps_child_header_rows_through_status_changes(tool: &str) {
                 }
             }
             let (seen, rows) = render_batch_header_frame(&mut panel);
-            assert_eq!(
-                rows.map(|rows| rows.len()),
-                [1, 1],
-                "{BATCH_HEADER_ROWS_MSG}: {status:?}, highlighted={highlighted}"
+            let drawn = format!("{status:?}, highlighted={highlighted}");
+            assert!(
+                rows[MIDDLE_CHILD].len() > 1,
+                "{BATCH_HEADER_ROWS_MSG}: {drawn}"
             );
-            sibling_rows.push(screen_row_of(&seen, BATCH_HEADER_NEXT).expect(BATCH_HEADER_Y_MSG));
+            assert!(
+                header_path_across(&seen, &rows[MIDDLE_CHILD]).contains(BATCH_HEADER_PATH),
+                "{BATCH_HEADER_ROWS_MSG}: {drawn}"
+            );
+            // The short sibling is what says the break is the summary's doing
+            // and not something every heading now pays.
+            assert_eq!(
+                rows[TAIL_CHILD].len(),
+                1,
+                "{BATCH_HEADER_ROWS_MSG}: {drawn}"
+            );
         }
     }
-    assert!(
-        sibling_rows.windows(2).all(|rows| rows[0] == rows[1]),
-        "{BATCH_HEADER_Y_MSG}: {sibling_rows:?}"
-    );
 }
 
 #[test_case(BatchToolStatus::Pending; "pending_child")]
 #[test_case(BatchToolStatus::Running; "running_child")]
-fn cancelling_a_batch_restores_wrapped_headers_with_pending_children(initial: BatchToolStatus) {
+fn cancelling_a_batch_keeps_wrapped_headers_with_pending_children(initial: BatchToolStatus) {
     let _clock = FrozenSpinner::at(0);
     let mut panel = panel_with_pending_batch_headers(FILE_READ_TOOL_NAME);
     panel.batch_progress(
@@ -10288,11 +10309,11 @@ fn cancelling_a_batch_restores_wrapped_headers_with_pending_children(initial: Ba
                 assert!(saw_pending, "{BATCH_HEADER_HIGHLIGHT_SETUP_MSG}");
             }
         }
-        let (_, rows) = render_batch_header_frame(&mut panel);
-        assert_eq!(
-            rows.map(|rows| rows.len()),
-            [1, 1],
-            "{BATCH_HEADER_ROWS_MSG}"
+        let (seen, rows) = render_batch_header_frame(&mut panel);
+        assert!(rows[MIDDLE_CHILD].len() > 1, "{CANCELLED_HEADER_MSG}");
+        assert!(
+            header_path_across(&seen, &rows[MIDDLE_CHILD]).contains(BATCH_HEADER_PATH),
+            "{CANCELLED_HEADER_MSG}"
         );
     }
 
@@ -10317,22 +10338,15 @@ fn cancelling_a_batch_restores_wrapped_headers_with_pending_children(initial: Ba
     );
     for highlighted in [false, true] {
         if highlighted {
-            assert!(
-                wait_for_batch_header_highlights(&mut panel),
-                "{BATCH_HEADER_HIGHLIGHT_SETUP_MSG}"
-            );
+            wait_for_batch_header_highlights(&mut panel);
         }
         let (seen, rows) = render_batch_header_frame(&mut panel);
         assert!(rows[MIDDLE_CHILD].len() > 1, "{CANCELLED_HEADER_MSG}");
         assert_eq!(rows[TAIL_CHILD].len(), 1, "{CANCELLED_HEADER_MSG}");
-        let restored: String = rows[MIDDLE_CHILD]
-            .iter()
-            .flat_map(|row| seen.lines().nth(usize::from(*row)).unwrap().chars())
-            .filter(|character| character.is_ascii() && !character.is_ascii_whitespace())
-            .collect();
+        let kept = header_path_across(&seen, &rows[MIDDLE_CHILD]);
         assert!(
-            restored.contains(BATCH_HEADER_PATH),
-            "{CANCELLED_HEADER_MSG}: {restored:?}, highlighted={highlighted}"
+            kept.contains(BATCH_HEADER_PATH),
+            "{CANCELLED_HEADER_MSG}: {kept:?}, highlighted={highlighted}"
         );
     }
 }
