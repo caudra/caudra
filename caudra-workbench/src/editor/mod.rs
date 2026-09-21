@@ -5,6 +5,7 @@ pub mod find;
 pub mod highlight;
 pub mod history;
 pub mod render;
+pub mod words;
 
 use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime};

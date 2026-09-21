@@ -2,6 +2,7 @@ use std::ops::Range;
 
 use caudra_workbench::buffer::{Buffer, Cursor, Edit};
 use caudra_workbench::history::History;
+use caudra_workbench::words::{component_boundary_left, component_boundary_right};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::highlight::TAB_SPACES;
@@ -664,13 +665,7 @@ impl InputDocument {
             return;
         }
         let chars: Vec<char> = self.lines()[self.y()].chars().collect();
-        let mut start = x;
-        while start > 0 && chars[start - 1].is_ascii_whitespace() {
-            start -= 1;
-        }
-        while start > 0 && !chars[start - 1].is_ascii_whitespace() {
-            start -= 1;
-        }
+        let start = component_boundary_left(&chars, x);
         self.replace(cursor - (x - start)..cursor, "");
     }
 
@@ -684,13 +679,7 @@ impl InputDocument {
             }
             return;
         }
-        let mut end = x;
-        while end < chars.len() && chars[end].is_ascii_whitespace() {
-            end += 1;
-        }
-        while end < chars.len() && !chars[end].is_ascii_whitespace() {
-            end += 1;
-        }
+        let end = component_boundary_right(&chars, x);
         self.replace(cursor..cursor + end - x, "");
     }
 
@@ -883,6 +872,18 @@ mod tests {
         document.handle_key(key(KeyCode::Backspace, KeyModifiers::CONTROL));
         assert_eq!(document.display_text(), "before  ");
         assert_eq!(document.expanded_text(), "before  ");
+    }
+
+    /// A path goes one component per press, the separator leaving with the
+    /// component it trails rather than costing a press of its own.
+    #[test]
+    fn word_deletion_takes_one_path_component() {
+        let mut document = InputDocument::from_plain("read @src/main.rs".into());
+        document.move_to_end();
+        for expected in ["read @src/", "read @", "read "] {
+            document.handle_key(key(KeyCode::Char('w'), KeyModifiers::CONTROL));
+            assert_eq!(document.display_text(), expected);
+        }
     }
 
     #[test]

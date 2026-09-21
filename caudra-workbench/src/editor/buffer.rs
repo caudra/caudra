@@ -10,6 +10,8 @@
 
 use std::ops::Range;
 
+use super::words::{component_boundary_left, component_boundary_right, is_word};
+
 const INDENT_WIDTH: usize = 4;
 const TAB: char = '\t';
 
@@ -350,7 +352,7 @@ impl Buffer {
         if self.has_selection() {
             return self.backspace();
         }
-        let start = self.word_boundary_left(self.cursor);
+        let start = self.component_left(self.cursor);
         if start == self.cursor {
             return None;
         }
@@ -361,7 +363,7 @@ impl Buffer {
         if self.has_selection() {
             return self.delete();
         }
-        let end = self.word_boundary_right(self.cursor);
+        let end = self.component_right(self.cursor);
         if end == self.cursor {
             return None;
         }
@@ -541,6 +543,25 @@ impl Buffer {
         }
     }
 
+    /// Where the component before `cursor` starts. A caret at the head of a
+    /// line has no component behind it, so it steps onto the line above and the
+    /// delete joins the two, exactly as the word boundaries do.
+    fn component_left(&self, cursor: Cursor) -> Cursor {
+        if cursor.col == 0 {
+            return self.previous_position(cursor);
+        }
+        let chars: Vec<char> = self.line(cursor.line).chars().collect();
+        Cursor::new(cursor.line, component_boundary_left(&chars, cursor.col))
+    }
+
+    fn component_right(&self, cursor: Cursor) -> Cursor {
+        if cursor.col >= self.line_len(cursor.line) {
+            return self.next_position(cursor);
+        }
+        let chars: Vec<char> = self.line(cursor.line).chars().collect();
+        Cursor::new(cursor.line, component_boundary_right(&chars, cursor.col))
+    }
+
     fn word_boundary_left(&self, cursor: Cursor) -> Cursor {
         if cursor.col == 0 {
             return self.previous_position(cursor);
@@ -571,12 +592,6 @@ impl Buffer {
         }
         Cursor::new(cursor.line, col)
     }
-}
-
-/// What counts as one word to word motion and to a double click, so the two
-/// never disagree about where a word ends.
-fn is_word(ch: char) -> bool {
-    ch.is_alphanumeric() || ch == '_'
 }
 
 fn slice(line: &str, range: Range<usize>) -> String {
@@ -833,6 +848,18 @@ mod tests {
         buffer.move_end(false);
         buffer.delete_word_left();
         assert_eq!(buffer.text(), "alpha beta ");
+    }
+
+    /// Word motion still stops on the slash, so the caret can sit between two
+    /// components even though one press of the delete takes both.
+    #[test]
+    fn deleting_a_path_takes_one_component_per_press() {
+        let mut buffer = buffer("use /foo/bar");
+        buffer.move_end(false);
+        for expected in ["use /foo/", "use /", "use "] {
+            buffer.delete_word_left();
+            assert_eq!(buffer.text(), expected);
+        }
     }
 
     #[test]

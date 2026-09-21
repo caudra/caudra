@@ -1,3 +1,4 @@
+use caudra_workbench::words::{component_boundary_left, component_boundary_right};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::highlight::TAB_SPACES;
@@ -192,7 +193,8 @@ impl TextBuffer {
             self.merge_with_next_line();
             return;
         }
-        let new_x = self.find_next_word_boundary(x);
+        let chars: Vec<char> = self.current_line().chars().collect();
+        let new_x = component_boundary_right(&chars, x);
         let byte_start = Self::char_to_byte(self.current_line(), x);
         let byte_end = Self::char_to_byte(self.current_line(), new_x);
         self.lines[self.cursor_y].replace_range(byte_start..byte_end, "");
@@ -209,7 +211,8 @@ impl TextBuffer {
             self.merge_with_previous_line();
             return;
         }
-        let new_x = self.find_prev_word_boundary(x);
+        let chars: Vec<char> = self.current_line().chars().collect();
+        let new_x = component_boundary_left(&chars, x);
         let line = self.current_line();
         let byte_start = Self::char_to_byte(line, new_x);
         let byte_end = Self::char_to_byte(line, x);
@@ -513,6 +516,17 @@ mod tests {
         buf.remove_word_before_cursor();
         assert_eq!(buf.value(), "abcd");
 
+        let mut buf = TextBuffer::new("open /path/to/file.rs".into());
+        buf.move_to_end();
+        buf.remove_word_before_cursor();
+        assert_eq!(buf.value(), "open /path/to/");
+        buf.remove_word_before_cursor();
+        assert_eq!(buf.value(), "open /path/");
+        buf.remove_word_before_cursor();
+        assert_eq!(buf.value(), "open /");
+        buf.remove_word_before_cursor();
+        assert_eq!(buf.value(), "open ");
+
         let mut buf = TextBuffer::new("hello ●●●".into());
         buf.move_to_end();
         buf.remove_word_before_cursor();
@@ -606,11 +620,13 @@ mod tests {
         assert_eq!(buf.x(), 4);
     }
 
+    /// Forward mirrors backward: the blank trailing a component leaves with
+    /// it, so chewing through a line never strands a space at the caret.
     #[test]
     fn delete_word_after_cursor() {
         let mut buf = TextBuffer::new("hello world".into());
         buf.delete_word_after_cursor();
-        assert_eq!(buf.value(), " world");
+        assert_eq!(buf.value(), "world");
 
         let mut buf = TextBuffer::new("hello world".into());
         buf.raw_x = 6;

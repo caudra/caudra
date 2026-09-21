@@ -21,7 +21,7 @@ mod style;
 mod view;
 
 pub use action::WorkbenchAction;
-pub use editor::{buffer, history, render};
+pub use editor::{buffer, history, render, words};
 pub use fs::backend::{
     BackendDriver, BackendError, BackendEvent, BackendRevision, ListResult, LoadedFile,
     LocalFilesystem, MutationGate, RequestId, ResourceEntry, SearchMatch, SearchResult,

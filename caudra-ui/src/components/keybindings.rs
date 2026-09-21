@@ -808,7 +808,7 @@ pub const KEYBINDS: &[Keybind] = &[
     },
     Keybind {
         label: KeyLabel::Alt(key::DELETE_WORD.label, mod_key!("Backspace")),
-        description: "Delete word backward",
+        description: "Delete the word or path component before the cursor",
         context: KeybindContext::Editing,
         platform: Platform::All,
     },
@@ -820,7 +820,7 @@ pub const KEYBINDS: &[Keybind] = &[
     },
     Keybind {
         label: KeyLabel::Single(mod_key!("Del")),
-        description: "Delete word forward",
+        description: "Delete the word or path component after the cursor",
         context: KeybindContext::Editing,
         platform: Platform::All,
     },
@@ -940,7 +940,7 @@ pub const KEYBINDS: &[Keybind] = &[
     },
     Keybind {
         label: KeyLabel::Alt(wb::DELETE_WORD.label, mod_key!("Backspace")),
-        description: "Delete word backward",
+        description: "Delete the word or path component before the cursor",
         context: KeybindContext::PasteEditor,
         platform: Platform::All,
     },
@@ -982,7 +982,7 @@ pub const KEYBINDS: &[Keybind] = &[
     },
     Keybind {
         label: KeyLabel::Alt(wb::DELETE_WORD.label, mod_key!("Backspace")),
-        description: "Delete word backward in a note",
+        description: "Delete the word or path component before the cursor",
         context: KeybindContext::Review,
         platform: Platform::All,
     },
@@ -1544,7 +1544,7 @@ pub const KEYBINDS: &[Keybind] = &[
     },
     Keybind {
         label: KeyLabel::Alt(wb::DELETE_WORD.label, mod_key!("Backspace")),
-        description: "Delete word backward",
+        description: "Delete the word or path component before the cursor",
         context: KeybindContext::WorkbenchEditor,
         platform: Platform::All,
     },
