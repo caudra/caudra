@@ -1,9 +1,15 @@
 use std::{env, fs, path::PathBuf, str::FromStr, time::Duration};
 
 use async_trait::async_trait;
+use caudra_agent::agent::tool_dispatch::{self, Emit};
+use caudra_agent::tools::{FileReadTracker, ToolEffect, ToolRegistry, interpreter_ctx};
+use caudra_agent::workspace_baseline::{BaselineGate, WorkspaceBaseline};
 use caudra_agent::{
-    AgentEvent, CancelToken, EventSender,
-    permissions::{PermissionAnswer, PermissionManager, PermissionSubject, PluginRuleStore},
+    AgentEvent, AgentMode, CancelToken, EventSender,
+    permissions::{
+        PermissionAnswer, PermissionAuthorityProfile, PermissionManager, PermissionResourceAccess,
+        PermissionResourceKind, PermissionSubject, PluginRuleStore, RemotePermissionIdentity,
+    },
     workspace_transfer::{
         CleanBufferLease, ComparisonKind, FileOutcome, LocalAccess, LocalRootIdentity,
         OrchestrationLimits, PlannedFile, PullBufferGuard, RemoteRootIdentity, TransferAction,
@@ -11,17 +17,20 @@ use caudra_agent::{
         TransferJournal, TransferPlan, TransferRoots,
     },
 };
-use caudra_config::PermissionsConfig;
 use caudra_config::sandbox::TransferPolicy;
 use caudra_config::workcell::{
     ExpectedWorkcellId, RemoteWorkcellSelection, WorkcellEndpoint, WorkcellSourceRef,
 };
+use caudra_config::{Effect, PermissionRule, PermissionsConfig, ToolKey};
 use caudra_storage::{
     StateDir,
     auth::{WorkcellCredential, WorkcellCredentialName, WorkcellCredentialRef},
+    id::CaudraId,
     remote_operation_journal::{RemoteOperationJournal, RemoteOperationState},
 };
-use caudra_workcell::{LocalTransferPublisher, ReviewedTransferHost, reviewed_workspace_transfer};
+use caudra_workcell::{
+    LocalTransferPublisher, RemoteWorkcellHost, ReviewedTransferHost, reviewed_workspace_transfer,
+};
 use caudra_workcell::{
     NamedBearerCredential, RemoteToolResultEnvelope, RemoteWorkcellClient, RemoteWorkcellError,
 };
@@ -74,6 +83,23 @@ const INVENTORY_RESTART: &str = "inventory-restart/deep/file.bin";
 const INVENTORY_CONTENT: &[u8] = b"\xff\0reviewed inventory bytes";
 const PRIVATE_STATE_MODE: u32 = 0o700;
 const NATIVE_FILE: &str = "native/deep/reviewed.txt";
+const ISOLATED_PYTHON_RESOURCE: &str = "isolated-python";
+const PYTHON_SUM: &str = "1 + 1";
+const PYTHON_SUM_RESULT: &str = "result: 2";
+const PYTHON_NO_HOST_ACCESS: &str =
+    "python_execution has no filesystem, network, or environment access";
+const PYTHON_NO_SOCKET: &str = "Cannot resolve imported module `socket`";
+const PERMISSION_DENIED: &str = "Permission denied";
+const BATCH_TIMEOUT: Duration = Duration::from_secs(15);
+const BATCH_POLL: Duration = Duration::from_millis(10);
+const BATCH_FIRST: &str = "batch-first.txt";
+const BATCH_SECOND: &str = "batch-second.txt";
+const BATCH_WRITE: &str = "batch-write.txt";
+const BATCH_CONTENT: &str = "batch completed";
+const PENDING_MUTATION: &str = "workspace mutation is blocked by pending operation";
+const BATCH_CANCELLED: &str = "batch-cancelled.txt";
+const REMOTE_PREPARATION_CAPACITY: usize = 64;
+const HELD_PREPARATIONS: usize = 4;
 
 struct TransferTestHost {
     root: PathBuf,
@@ -980,6 +1006,787 @@ async fn tool(
     panic!("{name}: operation exceeded bounded polling");
 }
 
+async fn isolated_python_permissions(client: &RemoteWorkcellClient, root: &Path, state: &StateDir) {
+    let registry = Arc::new(ToolRegistry::new());
+    RemoteWorkcellHost::new(client.clone())
+        .register(&registry)
+        .unwrap();
+    let config = PermissionsConfig::default();
+    assert!(!config.yolo);
+    let permissions = Arc::new(PermissionManager::new_nonpersistent(
+        config,
+        root.to_path_buf(),
+        Arc::default(),
+    ));
+    let policy = || {
+        permissions
+            .active_policy()
+            .into_iter()
+            .map(|entry| (entry.source, entry.rule))
+            .collect::<Vec<_>>()
+    };
+    let policy_before = policy();
+    let journal = RemoteOperationJournal::open(state).unwrap();
+    let snapshot = || {
+        let path = journal.path();
+        [
+            path.to_path_buf(),
+            PathBuf::from(format!("{}-wal", path.display())),
+        ]
+        .map(|path| fs::read(path).ok())
+    };
+    let journal_before = snapshot();
+    let (tx, rx) = flume::unbounded();
+    let (_response_tx, response_rx) = flume::unbounded();
+    let mut ctx = interpreter_ctx(
+        &AgentMode::Build,
+        &EventSender::new(tx, 0),
+        CancelToken::none(),
+        permissions.clone(),
+        Arc::new(FileReadTracker::new()),
+        Some(Arc::new(smol::lock::Mutex::new(response_rx))),
+        registry.clone(),
+    );
+    ctx.workspace_session = Some(
+        caudra_workspace::WorkspaceSession::new(
+            client.workspace_handle().unwrap(),
+            client.session_binding().clone(),
+            client.root_cursor().clone(),
+        )
+        .unwrap(),
+    );
+    let tool = registry.get("python_execution").unwrap();
+    let invocation = tool.tool.parse(&json!({"code":PYTHON_SUM})).unwrap();
+    let intent = invocation.preflight(&ctx).await.unwrap().unwrap();
+    assert_eq!(invocation.call_effect(tool.effect), ToolEffect::Isolated);
+    assert_eq!(intent.authority, PermissionAuthorityProfile::RemoteResource);
+    assert_eq!(intent.resources.len(), 1);
+    let resource = &intent.resources[0];
+    assert_eq!(
+        resource.kind,
+        PermissionResourceKind::RemoteResource {
+            identity: RemotePermissionIdentity::from_binding(client.session_binding()),
+            resource_kind: "code".into(),
+        }
+    );
+    assert!(!resource.value.is_empty());
+    assert_eq!(resource.access, Some(PermissionResourceAccess::Execute));
+    assert!(!resource.protected && !resource.requires_prompt);
+    assert_eq!(
+        resource.attributes["display_code"],
+        ISOLATED_PYTHON_RESOURCE
+    );
+    assert_eq!(resource.attributes["operation_kind"], "execute");
+    invocation.abandon(&ctx).await;
+
+    for (mode, answer, code) in [
+        (AgentMode::Build, PermissionAnswer::AllowOnce, PYTHON_SUM),
+        (AgentMode::Build, PermissionAnswer::Deny, PYTHON_SUM),
+        (
+            AgentMode::RemotePlan(caudra_workspace::PlanRef::new("python-plan").unwrap()),
+            PermissionAnswer::AllowOnce,
+            PYTHON_SUM,
+        ),
+        (
+            AgentMode::Build,
+            PermissionAnswer::AllowOnce,
+            "open('python-escape', 'w')",
+        ),
+        (
+            AgentMode::Build,
+            PermissionAnswer::AllowOnce,
+            "import socket\nsocket.socket()",
+        ),
+    ] {
+        ctx.mode = mode;
+        let denied = matches!(answer, PermissionAnswer::Deny);
+        let input = json!({"code":code});
+        let dispatch = tool_dispatch::run(
+            &registry,
+            None,
+            "ordinary-python".into(),
+            "python_execution",
+            &input,
+            &ctx,
+            Emit::Silent,
+        );
+        let respond = async {
+            loop {
+                let envelope = rx.recv_async().await.unwrap();
+                if let AgentEvent::PermissionRequest(request) = envelope.event {
+                    assert_eq!(request.resources, intent.resources);
+                    assert!(permissions.answer(&request.id, answer));
+                    return;
+                }
+            }
+        };
+        let done = futures_lite::future::race(
+            async { futures_lite::future::zip(dispatch, respond).await.0 },
+            async {
+                smol::Timer::after(Duration::from_secs(15)).await;
+                panic!("normal remote Python policy did not finish with exactly one prompt");
+            },
+        )
+        .await;
+        assert_eq!(done.is_error, denied, "{}", done.output.as_text());
+        if code != PYTHON_SUM {
+            let diagnostic = if code.starts_with("import") {
+                PYTHON_NO_SOCKET
+            } else {
+                PYTHON_NO_HOST_ACCESS
+            };
+            assert!(
+                done.output.as_text().contains(diagnostic),
+                "{}",
+                done.output.as_text()
+            );
+        } else if !denied {
+            assert_eq!(done.output.as_text().trim(), PYTHON_SUM_RESULT);
+        } else {
+            assert!(done.output.as_text().contains(PERMISSION_DENIED));
+        }
+        assert_eq!(policy(), policy_before);
+        assert!(
+            permissions
+                .structured_conversation_rules_snapshot()
+                .is_empty()
+        );
+        assert!(client.pending_remote_operations().is_empty());
+        assert_eq!(
+            snapshot(),
+            journal_before,
+            "isolated execution wrote the durable journal"
+        );
+    }
+    ctx.user_response_rx = None;
+    for (name, input) in [
+        ("shell", json!({"command":"touch python-shell-grant"})),
+        (
+            "file_write",
+            json!({"filePath":"python-file-grant", "content":"forbidden"}),
+        ),
+        ("python_execution", json!({"code":PYTHON_SUM})),
+    ] {
+        let done = tool_dispatch::run(
+            &registry,
+            None,
+            "no-broad-python-grant".into(),
+            name,
+            &input,
+            &ctx,
+            Emit::Silent,
+        )
+        .await;
+        assert!(done.is_error, "{name}: {}", done.output.as_text());
+        assert!(
+            done.output.as_text().contains(PERMISSION_DENIED),
+            "{}",
+            done.output.as_text()
+        );
+    }
+    assert!(!root.join("python-shell-grant").exists());
+    assert!(!root.join("python-file-grant").exists());
+    ctx.permissions = Arc::new(PermissionManager::new_nonpersistent(
+        PermissionsConfig {
+            rules: vec![PermissionRule {
+                tool: ToolKey::native("python_execution"),
+                scope: None,
+                effect: Effect::Deny,
+            }],
+            ..Default::default()
+        },
+        root.to_path_buf(),
+        Arc::default(),
+    ));
+    let (_response_tx, response_rx) = flume::unbounded();
+    ctx.user_response_rx = Some(Arc::new(smol::lock::Mutex::new(response_rx)));
+    let input = json!({"code":PYTHON_SUM});
+    let done = futures_lite::future::race(
+        tool_dispatch::run(
+            &registry,
+            None,
+            "configured-python-deny".into(),
+            "python_execution",
+            &input,
+            &ctx,
+            Emit::Silent,
+        ),
+        async {
+            loop {
+                if let AgentEvent::PermissionRequest(_) = rx.recv_async().await.unwrap().event {
+                    panic!("configured deny must not offer an approval prompt");
+                }
+            }
+        },
+    )
+    .await;
+    assert!(done.is_error);
+    assert!(done.output.as_text().contains(PERMISSION_DENIED));
+    assert_eq!(snapshot(), journal_before);
+    assert!(!root.join("python-escape").exists());
+    eprintln!(
+        "PASS non-yolo Python exact remote authority, AllowOnce, deny, plan, no persistent grants/journal, no filesystem/network access"
+    );
+}
+
+async fn concurrent_registry_regressions(
+    client: &RemoteWorkcellClient,
+    root: &Path,
+    selection: &RemoteWorkcellSelection,
+    credential: &NamedBearerCredential,
+    state: &StateDir,
+) {
+    let capacity_client = RemoteWorkcellClient::connect(
+        selection,
+        Some(credential.clone()),
+        SessionBindingId::new("capacity-session").unwrap(),
+        RemoteOperationJournal::open(state).unwrap(),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    let registry = Arc::new(ToolRegistry::new());
+    RemoteWorkcellHost::new(client.clone())
+        .register(&registry)
+        .unwrap();
+    let permissions = Arc::new(PermissionManager::new_nonpersistent(
+        PermissionsConfig {
+            yolo: true,
+            ..Default::default()
+        },
+        root.to_path_buf(),
+        Arc::default(),
+    ));
+    let (tx, rx) = flume::unbounded();
+    let mut ctx = interpreter_ctx(
+        &AgentMode::Build,
+        &EventSender::new(tx, 0),
+        CancelToken::none(),
+        permissions.clone(),
+        Arc::new(FileReadTracker::new()),
+        None,
+        registry.clone(),
+    );
+    ctx.workspace_session = Some(
+        caudra_workspace::WorkspaceSession::new(
+            client.workspace_handle().unwrap(),
+            client.session_binding().clone(),
+            client.root_cursor().clone(),
+        )
+        .unwrap(),
+    );
+    let fault = PathBuf::from(env::var_os("WORKCELL_TEST_FAULT").unwrap());
+    let gate = fault.with_file_name("batch-execute-gate");
+    let trace = fault.with_file_name("batch-rpc-trace");
+    let baseline_state = tempfile::tempdir().unwrap();
+    let baseline = WorkspaceBaseline::new_workspace_session(
+        StateDir::from_path(baseline_state.path().into()),
+        CaudraId::generate(),
+        ctx.workspace_session.clone().unwrap(),
+        client.stored_binding().clone(),
+        true,
+    );
+    ctx.baseline = Some(BaselineGate::new(baseline.clone(), None));
+    let first = json!({"command":format!("printf '{BATCH_CONTENT}' > {BATCH_FIRST}; printf '{BATCH_CONTENT}'")});
+    let second = json!({"command":format!("printf '{BATCH_CONTENT}' > {BATCH_SECOND}; printf '{BATCH_CONTENT}'")});
+    let write = json!({"filePath":BATCH_WRITE,"content":BATCH_CONTENT});
+    let run = |id: &'static str, name, input| {
+        tool_dispatch::run(&registry, None, id.into(), name, input, &ctx, Emit::Notify)
+    };
+    let exercise = async {
+        assert!(client.pending_remote_operations().is_empty());
+        fs::write(&trace, "").unwrap();
+        fs::write(&gate, "hold first execute before forwarding").unwrap();
+        let overlap = async {
+            while !gate.with_extension("entered").exists() {
+                smol::Timer::after(BATCH_POLL).await;
+            }
+            let pending = client.pending_remote_operations();
+            assert_eq!(pending.len(), 1);
+            assert!(!root.join(BATCH_FIRST).exists());
+            let queued = async {
+                let (shell, file) = futures_lite::future::zip(
+                    run("batch-second", "shell", &second),
+                    run("batch-write", "file_write", &write),
+                )
+                .await;
+                assert!(!shell.is_error, "{}", shell.output.as_text());
+                assert!(shell.output.as_text().contains(BATCH_CONTENT));
+                assert!(!file.is_error, "{}", file.output.as_text());
+            };
+            let release = async {
+                let mut started = BTreeSet::new();
+                while started.len() < 2 {
+                    if let AgentEvent::ToolStart(start) = rx.recv_async().await.unwrap().event
+                        && matches!(start.id.as_str(), "batch-second" | "batch-write")
+                    {
+                        started.insert(start.id);
+                    }
+                }
+                let diagnostics = fault.with_file_name("rpc-diagnostics");
+                fs::write(&diagnostics, "").unwrap();
+                let (cancel, token) = CancelToken::new();
+                let mut cancelled_ctx = ctx.clone();
+                cancelled_ctx.cancel = token;
+                let cancelled_input = json!({"filePath":BATCH_CANCELLED, "content":BATCH_CONTENT});
+                let cancelled = tool_dispatch::run(
+                    &registry,
+                    None,
+                    "batch-cancelled".into(),
+                    "file_write",
+                    &cancelled_input,
+                    &cancelled_ctx,
+                    Emit::Notify,
+                );
+                let cancel_when_full = async {
+                    loop {
+                        if let AgentEvent::ToolStart(start) = rx.recv_async().await.unwrap().event
+                            && start.id == "batch-cancelled"
+                        {
+                            break;
+                        }
+                    }
+                    let records = fs::read_to_string(&diagnostics).unwrap();
+                    let prepared: Value = records
+                        .lines()
+                        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+                        .find(|record| {
+                            record["method"] == "ai.workcell/prepare"
+                                && record["tool"] == "file_write"
+                        })
+                        .unwrap();
+                    let preparation_id = prepared["preparationId"].as_str().unwrap();
+                    let request = ToolPrepareRequest {
+                        name: "file_read".into(),
+                        input: json!({"filePath":"fixture.txt"}),
+                    };
+                    let mut fillers = Vec::new();
+                    for _ in HELD_PREPARATIONS..REMOTE_PREPARATION_CAPACITY {
+                        fillers.push(
+                            capacity_client
+                                .prepare_canonical_tool(
+                                    capacity_client.session_binding(),
+                                    capacity_client.root_cursor(),
+                                    &request,
+                                )
+                                .await
+                                .unwrap(),
+                        );
+                    }
+                    let full = capacity_client
+                        .prepare_canonical_tool(
+                            capacity_client.session_binding(),
+                            capacity_client.root_cursor(),
+                            &request,
+                        )
+                        .await;
+                    let error = full.err();
+                    assert!(matches!(error, Some(WorkspaceError::Conflict)), "{error:?}");
+                    assert!(!root.join(BATCH_CANCELLED).exists());
+                    cancel.cancel();
+                    loop {
+                        let released = fs::read_to_string(&diagnostics)
+                            .unwrap()
+                            .lines()
+                            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                            .any(|record| {
+                                record["method"] == "ai.workcell/release"
+                                    && record["preparationId"] == preparation_id
+                                    && record["result"]["released"] == true
+                            });
+                        if released {
+                            break;
+                        }
+                        smol::Timer::after(BATCH_POLL).await;
+                    }
+                    let replacement = capacity_client
+                        .prepare_canonical_tool(
+                            capacity_client.session_binding(),
+                            capacity_client.root_cursor(),
+                            &request,
+                        )
+                        .await
+                        .unwrap();
+                    fillers.push(replacement);
+                    for prepared in fillers {
+                        capacity_client
+                            .release_canonical_tool(
+                                capacity_client.session_binding(),
+                                capacity_client.root_cursor(),
+                                &prepared.prepared,
+                            )
+                            .await
+                            .unwrap();
+                    }
+                };
+                let (cancelled, ()) = futures_lite::future::zip(cancelled, cancel_when_full).await;
+                assert!(cancelled.is_error);
+                assert!(
+                    cancelled.output.as_text().to_lowercase().contains("cancel"),
+                    "{}",
+                    cancelled.output.as_text()
+                );
+                assert!(!root.join(BATCH_CANCELLED).exists());
+                assert_eq!(client.pending_remote_operations().len(), 1);
+                eprintln!(
+                    "PASS queued cancellation releases unsent preparation, full 64-slot ledger admits replacement, no cancelled file or new journal row"
+                );
+                assert!(!root.join(BATCH_SECOND).exists());
+                assert!(!root.join(BATCH_WRITE).exists());
+                let retained = client.pending_remote_operations();
+                assert_eq!(retained.len(), 1);
+                assert_eq!(retained[0].operation_id, pending[0].operation_id);
+                let records = fs::read_to_string(&trace).unwrap();
+                let records = records.lines().collect::<Vec<_>>();
+                assert_eq!(
+                    records.len(),
+                    1,
+                    "queued calls dispatched or reconciled before release: {records:?}"
+                );
+                let record: Value = serde_json::from_str(records[0]).unwrap();
+                assert_eq!(record["method"], "ai.workcell/execute");
+                fs::write(gate.with_extension("release"), "release").unwrap();
+            };
+            futures_lite::future::zip(queued, release).await;
+        };
+        futures_lite::future::zip(
+            async {
+                let first = run("batch-first", "shell", &first).await;
+                assert!(!first.is_error, "{}", first.output.as_text());
+                assert!(first.output.as_text().contains(BATCH_CONTENT));
+            },
+            overlap,
+        )
+        .await;
+        assert_eq!(
+            fs::read_to_string(root.join(BATCH_FIRST)).unwrap(),
+            BATCH_CONTENT
+        );
+        assert!(client.pending_remote_operations().is_empty());
+        assert!(baseline.is_captured());
+        for path in [BATCH_SECOND, BATCH_WRITE] {
+            assert_eq!(fs::read_to_string(root.join(path)).unwrap(), BATCH_CONTENT);
+        }
+        let mut next_ctx = ctx.clone();
+        let next_head = Some(CaudraId::generate());
+        next_ctx.baseline = Some(BaselineGate::new(baseline.clone(), next_head));
+        fs::write(
+            fault.with_file_name("batch-prepare-barrier"),
+            "three concurrent preparations",
+        )
+        .unwrap();
+        let next_write = tool_dispatch::run(
+            &registry,
+            None,
+            "batch-rewrite".into(),
+            "file_write",
+            &write,
+            &next_ctx,
+            Emit::Silent,
+        );
+        let (first_result, (second_result, write_result)) = futures_lite::future::zip(
+            run("batch-first-next-head", "shell", &first),
+            futures_lite::future::zip(run("batch-second-next-head", "shell", &second), next_write),
+        )
+        .await;
+        for (name, done) in [
+            ("first shell", first_result),
+            ("second shell", second_result),
+            ("file_write", write_result),
+        ] {
+            assert!(
+                !done.is_error,
+                "fresh snapshot concurrent {name}: {}",
+                done.output.as_text()
+            );
+        }
+        assert!(client.pending_remote_operations().is_empty());
+        assert!(baseline.remote_capture(next_head).unwrap().is_some());
+        assert!(
+            permissions
+                .structured_conversation_rules_snapshot()
+                .is_empty()
+        );
+    };
+    futures_lite::future::race(exercise, async {
+        smol::Timer::after(BATCH_TIMEOUT).await;
+        panic!(
+            "concurrent canonical dispatch did not finish: entered={}, trace={:?}",
+            gate.with_extension("entered").exists(),
+            fs::read_to_string(&trace)
+        );
+    })
+    .await;
+    eprintln!(
+        "PASS concurrent two-shell/file_write batch: same-client queue, no execute before release, all artifacts and shell output, no unresolved rows, unsynchronized fresh automatic snapshot"
+    );
+}
+
+async fn canonical_registry_regressions(client: &RemoteWorkcellClient, root: &Path) {
+    let registry = Arc::new(ToolRegistry::new());
+    RemoteWorkcellHost::new(client.clone())
+        .register(&registry)
+        .unwrap();
+    let (tx, _rx) = flume::unbounded();
+    let permissions = Arc::new(PermissionManager::new_nonpersistent(
+        PermissionsConfig {
+            yolo: true,
+            ..Default::default()
+        },
+        root.to_path_buf(),
+        Arc::default(),
+    ));
+    let mut ctx = interpreter_ctx(
+        &AgentMode::RemotePlan(caudra_workspace::PlanRef::new("fixture-plan").unwrap()),
+        &EventSender::new(tx, 0),
+        CancelToken::none(),
+        permissions,
+        Arc::new(FileReadTracker::new()),
+        None,
+        registry.clone(),
+    );
+    ctx.workspace_session = Some(
+        caudra_workspace::WorkspaceSession::new(
+            client.workspace_handle().unwrap(),
+            client.session_binding().clone(),
+            client.root_cursor().clone(),
+        )
+        .unwrap(),
+    );
+    for command in ["pwd", "ls", "pwd && ls"] {
+        let done = tool_dispatch::run(
+            &registry,
+            None,
+            "plan-read".into(),
+            "shell",
+            &json!({"command":command}),
+            &ctx,
+            Emit::Silent,
+        )
+        .await;
+        assert!(!done.is_error, "{command}: {}", done.output.as_text());
+    }
+    for command in [
+        "pwd > forbidden-plan-write",
+        "ls; touch forbidden-plan-write",
+        "ls $(touch forbidden-plan-write)",
+        "true",
+    ] {
+        let done = tool_dispatch::run(
+            &registry,
+            None,
+            "plan-write".into(),
+            "shell",
+            &json!({"command":command}),
+            &ctx,
+            Emit::Silent,
+        )
+        .await;
+        assert!(done.is_error, "{command}");
+        assert!(!root.join("forbidden-plan-write").exists());
+    }
+    let done = tool_dispatch::run(
+        &registry,
+        None,
+        "isolated-python".into(),
+        "python_execution",
+        &json!({"code":"1 + 1"}),
+        &ctx,
+        Emit::Silent,
+    )
+    .await;
+    assert!(!done.is_error, "{}", done.output.as_text());
+    assert!(client.pending_remote_operations().is_empty());
+    ctx.mode = AgentMode::Build;
+    let progress_fault =
+        PathBuf::from(env::var_os("WORKCELL_TEST_FAULT").unwrap()).with_extension("progress");
+    for lose_progress in [false, true] {
+        if lose_progress {
+            fs::write(&progress_fault, "lose progress, retain outcome").unwrap();
+        }
+        let invocation = registry
+            .get("shell")
+            .unwrap()
+            .tool
+            .parse(&json!({"command":"printf completed > progress-completed; seq 1 100000"}))
+            .unwrap();
+        invocation.preflight(&ctx).await.unwrap();
+        let done = invocation.execute(&ctx).await;
+        assert!(!done.is_error, "{:?}", done.output);
+        assert_eq!(
+            fs::read_to_string(root.join("progress-completed")).unwrap(),
+            "completed"
+        );
+        assert!(client.pending_remote_operations().is_empty());
+        if lose_progress {
+            assert!(
+                done.annotation
+                    .as_deref()
+                    .is_some_and(|annotation| annotation.contains("progress is partial"))
+            );
+            fs::remove_file(&progress_fault).unwrap();
+        }
+    }
+    let done = tool_dispatch::run(
+        &registry,
+        None,
+        "denied-fetch".into(),
+        "webfetch",
+        &json!({"url":"https://example.com/"}),
+        &ctx,
+        Emit::Silent,
+    )
+    .await;
+    assert!(done.is_error);
+    assert!(
+        !done.output.as_text().contains("indeterminate"),
+        "{}",
+        done.output.as_text()
+    );
+    eprintln!(
+        "PASS actual registry Python, read/write/unknown plan shell, large progress, definitive network denial"
+    );
+    let trace = PathBuf::from(env::var_os("WORKCELL_TEST_RPC_TRACE").unwrap());
+    fs::write(&trace, "").unwrap();
+    let invocation = registry
+        .get("shell")
+        .unwrap()
+        .tool
+        .parse(&json!({"command":"printf ready > dropped-started; sleep 60"}))
+        .unwrap();
+    invocation.preflight(&ctx).await.unwrap();
+    futures_lite::future::race(
+        async {
+            let result = invocation.execute(&ctx).await;
+            panic!("execution completed before drop: {:?}", result.output);
+        },
+        async {
+            loop {
+                if root.join("dropped-started").exists() {
+                    break;
+                }
+                smol::Timer::after(Duration::from_millis(20)).await;
+            }
+        },
+    )
+    .await;
+    futures_lite::future::race(
+        async {
+            loop {
+                let records = fs::read_to_string(&trace).unwrap();
+                let records = records
+                    .lines()
+                    .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                    .collect::<Vec<_>>();
+                let cancelled = records
+                    .iter()
+                    .any(|record| record["method"] == "ai.workcell/cancel");
+                let reconciled = records.iter().any(|record| {
+                    record["method"] == "ai.workcell/status"
+                        && record["result"]["state"] == "indeterminate"
+                });
+                if cancelled && reconciled {
+                    break;
+                }
+                smol::Timer::after(Duration::from_millis(20)).await;
+            }
+        },
+        async {
+            smol::Timer::after(Duration::from_secs(15)).await;
+            panic!("dropped invocation did not independently cancel and reconcile");
+        },
+    )
+    .await;
+    assert_eq!(client.pending_remote_operations().len(), 1);
+    let read = tool_dispatch::run(
+        &registry,
+        None,
+        "read-while-locked".into(),
+        "file_index",
+        &json!({"path":"."}),
+        &ctx,
+        Emit::Silent,
+    )
+    .await;
+    assert!(!read.is_error, "{}", read.output.as_text());
+    let isolated = tool_dispatch::run(
+        &registry,
+        None,
+        "python-while-locked".into(),
+        "python_execution",
+        &json!({"code":"2 + 2"}),
+        &ctx,
+        Emit::Silent,
+    )
+    .await;
+    assert!(!isolated.is_error, "{}", isolated.output.as_text());
+    let blocked = client
+        .prepare_canonical_tool(
+            client.session_binding(),
+            client.root_cursor(),
+            &ToolPrepareRequest {
+                name: "file_write".into(),
+                input: json!({"filePath":"blocked.txt", "content":"blocked"}),
+            },
+        )
+        .await;
+    let blocked = blocked.unwrap();
+    let result = client
+        .execute_canonical_tool(
+            client.session_binding(),
+            client.root_cursor(),
+            &blocked.prepared,
+        )
+        .await;
+    assert!(matches!(
+        result,
+        Err(WorkspaceError::PendingOperation { .. })
+    ));
+    client
+        .release_canonical_tool(
+            client.session_binding(),
+            client.root_cursor(),
+            &blocked.prepared,
+        )
+        .await
+        .unwrap();
+    assert!(!root.join("blocked.txt").exists());
+    let pending = client.pending_remote_operations();
+    let dispatch_trace = PathBuf::from(env::var_os("WORKCELL_TEST_FAULT").unwrap())
+        .with_file_name("batch-rpc-trace");
+    fs::write(&dispatch_trace, "").unwrap();
+    let blocked = registry
+        .get("file_write")
+        .unwrap()
+        .tool
+        .parse(&json!({"filePath":"blocked.txt", "content":"blocked"}))
+        .unwrap();
+    blocked.preflight(&ctx).await.unwrap();
+    let result = futures_lite::future::race(blocked.execute(&ctx), async {
+        smol::Timer::after(BATCH_TIMEOUT).await;
+        panic!("unresolved blocker must be refused, not queued indefinitely");
+    })
+    .await;
+    assert!(result.is_error);
+    let error = result.output.unwrap_err();
+    assert!(error.starts_with(PENDING_MUTATION), "{error}");
+    assert!(!error.contains("unknown"), "{error}");
+    assert!(!error.contains("indeterminate"), "{error}");
+    assert!(result.annotation.is_none());
+    assert!(fs::read_to_string(&dispatch_trace).unwrap().is_empty());
+    assert!(!root.join("blocked.txt").exists());
+    let retained = client.pending_remote_operations();
+    assert_eq!(retained.len(), 1);
+    assert_eq!(retained[0].operation_id, pending[0].operation_id);
+    // Only this fixture's operation is acknowledged; no user state is opened.
+    client
+        .acknowledge_pending_operation(&pending[0].operation_id)
+        .unwrap();
+    eprintln!(
+        "PASS dropped future sends cancel/status, retains uncertain effects lock, permits index and isolated Python, blocks writes"
+    );
+}
+
 #[test]
 fn unsupported_server() {
     if env::var("WORKCELL_TEST_UNSUPPORTED").as_deref() != Ok("1") {
@@ -1094,6 +1901,16 @@ fn authenticated_local() {
             );
         }
         eprintln!("PASS authenticated handshake, full catalog, validated workspace capabilities");
+        Box::pin(isolated_python_permissions(&client, &root, &state)).await;
+        Box::pin(concurrent_registry_regressions(
+            &client,
+            &root,
+            &selection,
+            &credential,
+            &state,
+        ))
+        .await;
+        Box::pin(canonical_registry_regressions(&client, &root)).await;
         let assets = WorkspaceAssetService::discover(&client, binding, cursor)
             .await
             .unwrap();

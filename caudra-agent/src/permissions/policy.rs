@@ -317,6 +317,7 @@ pub(super) struct ConfiguredPolicy {
     pub(super) remote_restrictive_default: Option<DefaultEffect>,
     pub(super) remote_policy_invalid: bool,
     pub(super) remote_permission_asset: Option<(ProjectAssetTrustKey, String)>,
+    remote_snapshot: Option<crate::remote_project_context::RemotePermissionAsset>,
     pub(super) remote_review_candidates: Vec<PermissionReviewCandidate>,
 }
 
@@ -330,6 +331,7 @@ impl ConfiguredPolicy {
         self.remote_default_allow = false;
         self.remote_review_candidates.clear();
         self.remote_permission_asset = None;
+        self.remote_snapshot = None;
         self.remote_policy_invalid = fail_closed;
     }
 }
@@ -603,6 +605,7 @@ pub(super) fn configured_policy(
         remote_restrictive_default: None,
         remote_policy_invalid: false,
         remote_permission_asset: None,
+        remote_snapshot: None,
         remote_review_candidates: Vec::new(),
     }
 }
@@ -786,6 +789,10 @@ impl PermissionManager {
             .configured
             .write()
             .unwrap_or_else(|error| error.into_inner());
+        if !current.remote_policy_invalid && current.remote_snapshot.as_ref() == asset {
+            before_install()?;
+            return Ok(());
+        }
         let mut configured = current.clone();
         configured.clear_remote(asset.is_some());
         let Some(asset) = asset else {
@@ -846,6 +853,7 @@ impl PermissionManager {
         configured.remote_permission_asset = (!configured.remote_review_candidates.is_empty())
             .then(|| (trust_key, asset.digest.clone()));
         configured.remote_policy_invalid = false;
+        configured.remote_snapshot = Some(asset.clone());
         before_install()?;
         *current = configured;
         *revision += 1;
@@ -2055,6 +2063,16 @@ mod tests {
                 .replace_remote_permission_asset(Some(&first))
                 .unwrap();
             manager.trust_project_permission_config().unwrap();
+            let revision = *manager.context_revision.read().unwrap();
+            let mut installed = false;
+            manager
+                .replace_remote_permission_asset_after(Some(&first), || {
+                    installed = true;
+                    Ok(())
+                })
+                .unwrap();
+            assert!(installed);
+            assert_eq!(*manager.context_revision.read().unwrap(), revision);
             assert!(manager.active_policy().iter().any(|entry| {
                 entry.rule.scope.as_deref() == Some("trusted-first")
                     && entry.rule.effect == Effect::Allow
@@ -2080,6 +2098,7 @@ mod tests {
             manager
                 .replace_remote_permission_asset(Some(&second))
                 .unwrap();
+            assert!(*manager.context_revision.read().unwrap() > revision);
             assert!(!manager.active_policy().iter().any(|entry| {
                 matches!(
                     entry.rule.scope.as_deref(),

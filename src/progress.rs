@@ -7,12 +7,14 @@
 //! part-migrated.
 
 use std::io::IsTerminal;
-use std::io::stderr;
+use std::io::{stderr, stdout};
 use std::sync::Mutex;
 use std::time::Duration;
 
 use caudra_storage::sessions::progress::{MIGRATION, MigrationEvent, PRUNE, PruneEvent};
 use indicatif::{HumanCount, HumanDuration, ProgressBar, ProgressDrawTarget, ProgressStyle};
+
+use crate::cli::Cli;
 
 /// Wide enough for `rewriting subagent_history_items`, the longest label, so the
 /// bar does not jump sideways when that phase starts.
@@ -21,6 +23,50 @@ const BAR_CHARS: &str = "=> ";
 const BAR_REFRESH: Duration = Duration::from_millis(100);
 const BACKUP_MESSAGE: &str = "backing up (pages)";
 const RECLAIM_MESSAGE: &str = "reclaiming (pages)";
+const SANDBOX_TEMPLATE: &str = "  {spinner} {msg} [{elapsed_precise}]";
+const SANDBOX_TICKS: &str = "|/-\\ ";
+
+pub struct SandboxProgress(ProgressBar);
+
+impl SandboxProgress {
+    pub fn start(cli: &Cli) -> Option<Self> {
+        let message = sandbox_message(cli, stdout().is_terminal(), stderr().is_terminal())?;
+        let progress = Self::new(message, ProgressDrawTarget::stderr());
+        progress.0.enable_steady_tick(BAR_REFRESH);
+        Some(progress)
+    }
+
+    fn new(message: String, target: ProgressDrawTarget) -> Self {
+        let bar = ProgressBar::new_spinner()
+            .with_style(
+                ProgressStyle::with_template(SANDBOX_TEMPLATE)
+                    .expect("static template")
+                    .tick_chars(SANDBOX_TICKS),
+            )
+            .with_message(message);
+        bar.set_draw_target(target);
+        bar.tick();
+        Self(bar)
+    }
+}
+
+impl Drop for SandboxProgress {
+    fn drop(&mut self) {
+        self.0.finish_and_clear();
+    }
+}
+
+fn sandbox_message(cli: &Cli, stdout_terminal: bool, stderr_terminal: bool) -> Option<String> {
+    if cli.print || cli.command.is_some() || !stdout_terminal || !stderr_terminal {
+        return None;
+    }
+    let name = cli.workcell.sandbox.as_deref()?;
+    Some(if cli.workcell.sandbox_resume {
+        format!("Resuming sandbox '{name}' and connecting to Workcell")
+    } else {
+        format!("Connecting to sandbox '{name}'")
+    })
+}
 
 /// Installs the console reporters, unless stderr is redirected. A progress bar
 /// drawn into a pipe is noise in a log, and headless callers own their output.
@@ -117,4 +163,82 @@ fn advance(bar: Option<&ProgressBar>, message: &str, done: u64, total: u64) {
         bar.set_message(message.to_owned());
     }
     bar.set_position(done);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{SandboxProgress, sandbox_message};
+    use crate::cli::Cli;
+    use clap::Parser;
+    use indicatif::ProgressDrawTarget;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use test_case::test_case;
+
+    const SANDBOX_NAME: &str = "saved-dev";
+    const CONNECT_MESSAGE: &str = "Connecting to sandbox 'saved-dev'";
+    const RESUME_MESSAGE: &str = "Resuming sandbox 'saved-dev' and connecting to Workcell";
+    const STARTUP_ERROR: &str = "startup failed";
+
+    #[test_case(false, CONNECT_MESSAGE; "connect")]
+    #[test_case(true, RESUME_MESSAGE; "resume")]
+    fn sandbox_label(resume: bool, expected: &str) {
+        let mut cli = Cli::parse_from(["caudra", "--sandbox", SANDBOX_NAME]);
+        cli.workcell.sandbox_resume = resume;
+        assert_eq!(sandbox_message(&cli, true, true).as_deref(), Some(expected));
+    }
+
+    #[test_case(&["caudra"], true, true, false; "no_sandbox")]
+    #[test_case(&["caudra", "--sandbox", SANDBOX_NAME], true, true, true; "interactive")]
+    #[test_case(&["caudra", "--sandbox", SANDBOX_NAME], false, true, false; "stdout_redirected")]
+    #[test_case(&["caudra", "--sandbox", SANDBOX_NAME], true, false, false; "stderr_redirected")]
+    #[test_case(&["caudra", "--sandbox", SANDBOX_NAME, "--print"], true, true, false; "print")]
+    #[test_case(&["caudra", "--sandbox", SANDBOX_NAME, "--print", "--input-format", "stream-json"], true, true, false; "sdk")]
+    #[test_case(&["caudra", "acp", "--sandbox", SANDBOX_NAME], true, true, false; "acp")]
+    fn sandbox_enablement(args: &[&str], stdout: bool, stderr: bool, enabled: bool) {
+        let cli = Cli::parse_from(args);
+        assert_eq!(sandbox_message(&cli, stdout, stderr).is_some(), enabled);
+    }
+
+    #[test_case(&["caudra", "--continue"]; "continue_session")]
+    #[test_case(&["caudra", "--session", "saved-session"]; "session")]
+    fn sandbox_label_uses_recovered_selector(args: &[&str]) {
+        let mut cli = Cli::parse_from(args);
+        assert!(sandbox_message(&cli, true, true).is_none());
+        cli.workcell.sandbox = Some(SANDBOX_NAME.to_owned());
+        assert_eq!(
+            sandbox_message(&cli, true, true).as_deref(),
+            Some(CONNECT_MESSAGE)
+        );
+    }
+
+    #[test_case(false; "success")]
+    #[test_case(true; "early_error")]
+    fn sandbox_cleanup(fail: bool) {
+        let progress =
+            SandboxProgress::new(CONNECT_MESSAGE.to_owned(), ProgressDrawTarget::hidden());
+        let bar = progress.0.clone();
+        assert!(!bar.is_finished());
+        let result = (move || {
+            let _progress = progress;
+            if fail {
+                Err(STARTUP_ERROR)?;
+            }
+            Ok::<_, &str>(())
+        })();
+        assert_eq!(result, if fail { Err(STARTUP_ERROR) } else { Ok(()) });
+        assert!(bar.is_finished());
+    }
+
+    #[test]
+    fn sandbox_cleanup_on_unwind() {
+        let progress =
+            SandboxProgress::new(CONNECT_MESSAGE.to_owned(), ProgressDrawTarget::hidden());
+        let bar = progress.0.clone();
+        let result = catch_unwind(AssertUnwindSafe(move || {
+            let _progress = progress;
+            panic!("{STARTUP_ERROR}");
+        }));
+        assert!(result.is_err());
+        assert!(bar.is_finished());
+    }
 }

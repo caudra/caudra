@@ -46,6 +46,7 @@ use crate::cmd::permissions::discover::{
     DiscoveryLimits, DiscoveryReport, RECOGNIZER_CAPACITY, RECOGNIZER_ORDER_BIAS,
     discover_for_project_cancellable,
 };
+use crate::progress::SandboxProgress;
 use crate::setup;
 
 const FALLBACK_MODEL_SPEC: &str = "anthropic/claude-sonnet-4-20250514";
@@ -1215,6 +1216,7 @@ pub fn run(mut cli: Cli) -> Result<ExitCode> {
     let resumed_sandbox =
         super::sandbox::recover_session_source(&mut cli, &persistent_storage, &cwd)?;
 
+    let sandbox_progress = SandboxProgress::start(&cli);
     let mut workcell_runtime = Arc::new(super::workcell_runtime::WorkcellRuntime::initialize(
         &cli.workcell,
         &cwd,
@@ -1227,6 +1229,7 @@ pub fn run(mut cli: Cli) -> Result<ExitCode> {
             workcell_runtime.stored_binding(),
         )?;
     }
+    drop(sandbox_progress);
     let workcell_runtime_ms = lap();
 
     let (mut stack, _) = build_stack(

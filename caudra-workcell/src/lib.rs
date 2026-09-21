@@ -17,6 +17,7 @@ pub use pattern_analysis::{
     PatternOmissionReason, PatternSourceObligation, PatternSourceObligations,
     analyze_pattern_calls,
 };
+use remote::RemoteToolExecutionError;
 pub use remote::{
     NamedBearerCredential, PendingRemoteOperation, RemoteConnectionStatus, RemoteEvent,
     RemotePreparedToolCall, RemoteToolResultEnvelope, RemoteWorkcellClient, RemoteWorkcellError,
@@ -83,9 +84,7 @@ use workcell::code_graph::{
     RankedSymbol, ReachedSymbol, SelectorRefusal, SymbolRef, crawl_filesystem_limits, fit,
 };
 use workcell::environment::{
-    ExecutionEnvironmentError, ExecutionEnvironmentExecution, ExecutionEnvironmentOutput,
-    ExecutionEnvironmentResult, OsDescriptor, SystemPackageManagerDescriptor, ToolGroupDisclosure,
-    WorkspaceDescriptor,
+    ExecutionEnvironmentError, ExecutionEnvironmentResult, ToolGroupDisclosure,
 };
 use workcell::files::{
     FileApplyPatchInput, FileApplyPatchOutput, FileDiff, FileEditInput, FileEditOutput,
@@ -137,7 +136,7 @@ const PROGRESS_MAX_BYTES: usize = 64 * 1024;
 const PROGRESS_TRUNCATED: &str = "[earlier output truncated]\n";
 const BYTES_PER_MIB: usize = 1024 * 1024;
 const NORMALIZED_COMMAND_ATTRIBUTE: &str = "normalized_command";
-const REMOTE_PROGRESS_GAP: &str = "remote progress gap";
+const REMOTE_PROGRESS_GAP: &str = "Remote progress is partial; earlier output was not retained. The final result is authoritative.";
 const REMOTE_INDETERMINATE: &str =
     "Remote Workcell outcome is indeterminate; do not retry automatically";
 const REMOTE_FORGOTTEN: &str =
@@ -155,6 +154,7 @@ const SHELL_EXECUTION_TIMEOUT: Duration =
     Duration::from_millis(workcell::shell::MAX_TIMEOUT_MS + SHELL_COMPLETION_ALLOWANCE_MS);
 const REMOTE_RECONCILE_TIMEOUT: Duration = Duration::from_secs(10);
 const REMOTE_RECONCILE_MAX_POLLS: usize = 4;
+const REMOTE_ADMISSION_EXPIRED: &str = "Remote Workcell execution deadline expired before dispatch";
 /// Caudra owns authorization, so Workcell always hands over the mutation
 /// tools and every write still passes through the permission layer first.
 /// Withholding them here would hide tools the user is allowed to approve.
@@ -1428,7 +1428,11 @@ impl RemoteWorkcellInvocation {
                     | ToolKind::CodeExpand => None,
                     ToolKind::Websearch => Some("query"),
                     ToolKind::Webfetch => Some("url"),
-                    ToolKind::Shell => Some("command"),
+                    ToolKind::Shell => match resource.access {
+                        host_contract::ResourceAccess::Traverse => None,
+                        host_contract::ResourceAccess::Inspect => Some("environment"),
+                        _ => Some("command"),
+                    },
                     ToolKind::Code => Some("code"),
                     ToolKind::Environment => Some("environment"),
                 };
@@ -1474,7 +1478,11 @@ impl RemoteWorkcellInvocation {
                 let display_attribute = match self.kind {
                     ToolKind::Websearch => "display_query",
                     ToolKind::Webfetch => "display_url",
-                    ToolKind::Shell => "display_command",
+                    ToolKind::Shell => match resource.access {
+                        host_contract::ResourceAccess::Traverse => "display_path",
+                        host_contract::ResourceAccess::Inspect => "display_environment",
+                        _ => "display_command",
+                    },
                     ToolKind::Code => "display_code",
                     ToolKind::Environment => "display_environment",
                     _ => "display_path",
@@ -1540,6 +1548,7 @@ impl RemoteWorkcellInvocation {
         &self,
         ctx: &ToolContext,
         call: RemotePreparedToolCall,
+        cleanup: &mut RemoteExecutionCleanup,
     ) -> ToolExecResult {
         let mut progress = RemoteProgress::new(ctx);
         let session = match ctx.workspace_session.as_ref() {
@@ -1560,28 +1569,49 @@ impl RemoteWorkcellInvocation {
             Err(_) => Duration::ZERO,
         };
         let deadline = Instant::now() + timeout;
-        let executed = ctx
+        let admission = ctx
             .cancel
             .race(future::race(
                 async {
-                    Some(
-                        self.client
-                            .execute_canonical_tool(
-                                session.binding(),
-                                session.cursor(),
-                                &call.prepared,
-                            )
-                            .await,
-                    )
+                    self.client
+                        .admit_canonical_tool(&call.prepared)
+                        .await
+                        .map_err(|error| error.to_string())
                 },
                 async {
                     smol::Timer::at(deadline).await;
-                    None
+                    Err(REMOTE_ADMISSION_EXPIRED.into())
                 },
             ))
             .await;
+        let _admission = match admission {
+            Ok(Ok(admission)) if Instant::now() < deadline && !ctx.cancel.is_cancelled() => {
+                admission
+            }
+            Ok(Err(error)) | Err(error) => return Err(error).into(),
+            _ => return Err(REMOTE_ADMISSION_EXPIRED.into()).into(),
+        };
+        let executed = race_remote_execution(
+            ctx,
+            deadline,
+            &mut cleanup.execution_started,
+            self.client.execute_canonical_tool_tracked(
+                session.binding(),
+                session.cursor(),
+                &call.prepared,
+            ),
+        )
+        .await;
         let mut status = match executed {
             Ok(Some(Ok(status))) => status,
+            Ok(Some(Err(RemoteToolExecutionError::BeforeDispatch(error)))) => {
+                cleanup.execution_started = false;
+                return Err(error.to_string()).into();
+            }
+            Err(error) if !cleanup.execution_started => return Err(error).into(),
+            Ok(None) if !cleanup.execution_started => {
+                return Err(REMOTE_ADMISSION_EXPIRED.into()).into();
+            }
             _ => match self.reconcile(&call, &mut progress).await {
                 Some(status) => status,
                 None => return indeterminate_result(&call.prepared, REMOTE_INDETERMINATE),
@@ -1637,7 +1667,12 @@ impl RemoteWorkcellInvocation {
             }
             match status.state {
                 OperationState::Completed { result, .. } => {
-                    return remote_result(self.kind, &self.input, result);
+                    let result = remote_result(self.kind, &self.input, result);
+                    return if progress.reported_gap.is_some() {
+                        result.with_annotation(Some(REMOTE_PROGRESS_GAP.into()))
+                    } else {
+                        result
+                    };
                 }
                 OperationState::Failed { error, .. } => {
                     return ToolExecResult::from(Err(error.message))
@@ -1714,8 +1749,140 @@ impl RemoteWorkcellInvocation {
     }
 }
 
+fn race_remote_execution<T>(
+    ctx: &ToolContext,
+    deadline: Instant,
+    execution_started: &mut bool,
+    execution: impl Future<Output = T>,
+) -> impl Future<Output = Result<Option<T>, String>> {
+    ctx.cancel.race(future::race(
+        async move {
+            if Instant::now() >= deadline {
+                return None;
+            }
+            *execution_started = true;
+            Some(execution.await)
+        },
+        async move {
+            smol::Timer::at(deadline).await;
+            None
+        },
+    ))
+}
+
 fn bounded_remote_display(value: &str) -> String {
     value.chars().take(REMOTE_DISPLAY_MAX_CHARS).collect()
+}
+
+fn remote_shell_plan_access(call: &RemotePreparedToolCall) -> PlanModeAccess {
+    let resources = &call.intent.resources;
+    let [cwd, command, startup] = resources.as_slice() else {
+        return PlanModeAccess::Refused;
+    };
+    if cwd.access != host_contract::ResourceAccess::Traverse
+        || command.access != host_contract::ResourceAccess::Execute
+        || startup.access != host_contract::ResourceAccess::Inspect
+    {
+        return PlanModeAccess::Refused;
+    }
+    let assumptions = BashContextAssumptions {
+        startup_preserves_cwd: true,
+        no_aliases_functions_or_command_not_found_hook: true,
+        no_traps: true,
+        default_shell_options: true,
+        standard_builtins: true,
+        directory_variables_are_standard: true,
+        cdpath_empty: true,
+        lastpipe_disabled: true,
+        logical_pwd_matches_initial: true,
+    };
+    if serde_json::from_str::<Value>(startup.display.as_str()).ok()
+        != serde_json::to_value(&assumptions).ok()
+    {
+        return PlanModeAccess::Refused;
+    }
+    let read_only = workcell::shell::bash::parse_bash(command.display.as_str())
+        .ok()
+        .is_some_and(|program| {
+            let contexts = program.command_contexts_with_assumptions(
+                &Path::new("/").join(cwd.display.as_str()),
+                assumptions,
+            );
+            let facts = pattern_analysis::shell_facts(&program, &contexts);
+            !facts.opaque
+                && !facts.commands.is_empty()
+                && facts
+                    .commands
+                    .iter()
+                    .all(|command| read_only_shell::scope_is_read_only(&command.scope))
+        });
+    if read_only {
+        PlanModeAccess::ReadOnly
+    } else {
+        PlanModeAccess::Prompted
+    }
+}
+
+struct RemoteExecutionCleanup {
+    client: RemoteWorkcellClient,
+    call: Option<RemotePreparedToolCall>,
+    execution_started: bool,
+}
+
+impl Drop for RemoteExecutionCleanup {
+    fn drop(&mut self) {
+        let Some(call) = self.call.take() else { return };
+        let client = self.client.clone();
+        if !self.execution_started {
+            smol::spawn(async move {
+                let _ = client
+                    .release_canonical_tool(&call.binding, &call.cursor, &call.prepared)
+                    .await;
+            })
+            .detach();
+            return;
+        }
+        smol::spawn(async move {
+            let _ = client.abandon_operation(&call.prepared.operation);
+            future::race(
+                async {
+                    let _ = client
+                        .cancel_canonical_tool(
+                            &call.binding,
+                            &call.cursor,
+                            &call.prepared.operation,
+                        )
+                        .await;
+                    let mut after = 0;
+                    for _ in 0..REMOTE_RECONCILE_MAX_POLLS {
+                        if let Ok(status) = client
+                            .canonical_tool_status_after(
+                                &call.binding,
+                                &call.cursor,
+                                &call.prepared.operation,
+                                Some(after),
+                            )
+                            .await
+                        {
+                            after = status.progress.last().map_or(after, |event| event.sequence);
+                            if !matches!(
+                                status.state,
+                                OperationState::Running | OperationState::Prepared
+                            ) {
+                                break;
+                            }
+                        }
+                        smol::Timer::after(REMOTE_POLL_INITIAL).await;
+                    }
+                },
+                async {
+                    smol::Timer::after(REMOTE_RECONCILE_TIMEOUT).await;
+                },
+            )
+            .await;
+        })
+        .detach();
+    }
 }
 
 /// A shell command may legitimately run for the whole deadline Workcell grants
@@ -1748,6 +1915,14 @@ impl ToolInvocation for RemoteWorkcellInvocation {
     }
 
     fn plan_mode_access(&self) -> PlanModeAccess {
+        if self.kind == ToolKind::Shell {
+            return self
+                .prepared
+                .try_lock()
+                .ok()
+                .and_then(|state| state.call.as_ref().map(remote_shell_plan_access))
+                .unwrap_or(PlanModeAccess::Refused);
+        }
         self.prepared
             .try_lock()
             .ok()
@@ -1762,6 +1937,13 @@ impl ToolInvocation for RemoteWorkcellInvocation {
     }
 
     fn call_effect(&self, registered: ToolEffect) -> ToolEffect {
+        if self.kind == ToolKind::Shell {
+            return if self.plan_mode_access() == PlanModeAccess::ReadOnly {
+                ToolEffect::ReadOnly
+            } else {
+                registered
+            };
+        }
         self.prepared
             .try_lock()
             .ok()
@@ -1769,6 +1951,8 @@ impl ToolInvocation for RemoteWorkcellInvocation {
             .map_or(registered, |mutating| {
                 if mutating {
                     registered
+                } else if self.kind == ToolKind::Code {
+                    ToolEffect::Isolated
                 } else {
                     ToolEffect::ReadOnly
                 }
@@ -1811,7 +1995,16 @@ impl ToolInvocation for RemoteWorkcellInvocation {
                 Ok(call) => call,
                 Err(error) => return Err(error).into(),
             };
-            self.execute_remote(ctx, call).await
+            let mut cleanup = RemoteExecutionCleanup {
+                client: self.client.clone(),
+                call: Some(call.clone()),
+                execution_started: false,
+            };
+            let result = self.execute_remote(ctx, call, &mut cleanup).await;
+            if cleanup.execution_started {
+                cleanup.call = None;
+            }
+            result
         })
     }
 }
@@ -1841,19 +2034,30 @@ impl RemoteProgress {
 
     fn publish(&mut self, status: &OperationStatus<RemoteToolResultEnvelope>) -> bool {
         let sink = &self.sink;
+        let terminal = matches!(
+            status.state,
+            OperationState::Completed { .. }
+                | OperationState::Failed { .. }
+                | OperationState::Cancelled { .. }
+        );
         let first = status.progress_metadata.first_retained_sequence;
         let gap = (status.progress_metadata.gap_before_first && self.next_sequence.is_none())
             || self
                 .next_sequence
                 .zip(first)
                 .is_some_and(|(expected, first)| first > expected);
-        if gap && self.reported_gap != first {
+        let gap_sequence = first.unwrap_or(status.progress_metadata.next_sequence);
+        if gap && self.reported_gap != Some(gap_sequence) {
             let _ = sink
                 .as_ref()
                 .map(|sink| sink.try_send(ToolLive::Annotation(REMOTE_PROGRESS_GAP.into())));
-            self.reported_gap = first;
+            self.reported_gap = Some(gap_sequence);
         }
         let mut expected = self.next_sequence.unwrap_or(1);
+        if status.progress_metadata.gap_before_first {
+            expected = expected.max(first.unwrap_or(status.progress_metadata.next_sequence));
+            self.next_sequence = Some(expected);
+        }
         for item in &status.progress {
             if item.sequence < expected {
                 continue;
@@ -1864,7 +2068,7 @@ impl RemoteProgress {
                     .map(|sink| sink.try_send(ToolLive::Annotation(REMOTE_PROGRESS_GAP.into())));
                 self.reported_gap = Some(item.sequence);
             }
-            if item.sequence > expected {
+            if item.sequence > expected && !status.progress_metadata.gap_before_first && !terminal {
                 return false;
             }
             expected = item.sequence.saturating_add(1);
@@ -1890,7 +2094,18 @@ impl RemoteProgress {
                 }
             }
         }
-        expected == status.progress_metadata.next_sequence
+        if terminal && expected != status.progress_metadata.next_sequence {
+            self.reported_gap = Some(status.progress_metadata.next_sequence);
+            let _ = sink
+                .as_ref()
+                .map(|sink| sink.try_send(ToolLive::Annotation(REMOTE_PROGRESS_GAP.into())));
+        }
+        if status.progress_metadata.gap_before_first || terminal {
+            self.next_sequence = Some(status.progress_metadata.next_sequence);
+            true
+        } else {
+            expected == status.progress_metadata.next_sequence
+        }
     }
 }
 
@@ -1970,12 +2185,8 @@ fn remote_result(
         | ToolKind::CodeExpand => {
             remote_code_graph_result(kind, structured_content, model_output.clone())
         }
-        ToolKind::Environment => Ok(text_result(
-            &structured_content,
-            markdown_code("json", &model_output),
-            true,
-            model_output.clone(),
-        )),
+        ToolKind::Environment => environment_card(&structured_content)
+            .map(|output| ToolExecResult::from(Ok::<_, String>(output))),
     };
     match parsed {
         Ok(result) => result
@@ -3324,10 +3535,6 @@ fn text_result(
     ToolExecResult::from(Ok::<_, String>(output)).with_model_output(Some(exact_model_text))
 }
 
-fn markdown_code(language: &str, text: &str) -> String {
-    format!("```{language}\n{}\n```", text.trim_end())
-}
-
 /// The record is what the card draws from; the model reads the rendering.
 /// `ReadCode` numbers its lines and names the offset that continues the file,
 /// which is the form the tool documents and the form a batched read has always
@@ -3876,30 +4083,124 @@ fn code_result(execution: CodeExecution) -> ToolExecResult {
 /// fourteen say, so the mapping renders the descriptor once and both the card
 /// and the model read that.
 fn environment_result(result: ExecutionEnvironmentResult) -> ToolExecResult {
-    let output = result.output;
+    serde_json::to_value(result.output)
+        .and_then(|value| environment_card(&value))
+        .map_err(|error| format!("invalid Workcell environment result: {error}"))
+        .into()
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct EnvironmentPresentation {
+    scope: String,
+    os: EnvironmentOs,
+    runtime: EnvironmentRuntime,
+    execution: EnvironmentExecution,
+    container: EnvironmentContainer,
+    workspace: EnvironmentWorkspace,
+    tool_groups: EnvironmentGroups,
+    commands: Vec<EnvironmentCommand>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct EnvironmentOs {
+    family: String,
+    architecture: String,
+    kernel_release: Option<String>,
+    distribution: Option<String>,
+    wsl: bool,
+    system_package_manager: EnvironmentSystemPackageManager,
+}
+
+#[derive(Deserialize)]
+struct EnvironmentRuntime {
+    name: String,
+    version: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct EnvironmentExecution {
+    shell: String,
+    sandbox: String,
+    network_access: String,
+    environment_inheritance: String,
+    privilege: EnvironmentPrivilege,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct EnvironmentPrivilege {
+    effective_root: Option<bool>,
+    non_interactive_sudo: String,
+}
+
+#[derive(Deserialize)]
+struct EnvironmentContainer {
+    kind: String,
+    evidence: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct EnvironmentSystemPackageManager {
+    name: String,
+    available: bool,
+    executable: Option<String>,
+    version: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct EnvironmentWorkspace {
+    git: EnvironmentGit,
+    package_manager: EnvironmentPackageManager,
+}
+
+#[derive(Deserialize)]
+struct EnvironmentGit {
+    repository: String,
+}
+
+#[derive(Deserialize)]
+struct EnvironmentPackageManager {
+    declared: Option<EnvironmentDeclaredPackageManager>,
+    inferred: Option<String>,
+    lockfiles: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct EnvironmentDeclaredPackageManager {
+    name: String,
+    version: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct EnvironmentGroups {
+    files: bool,
+    web: bool,
+    shell: bool,
+    code: bool,
+    code_graph: bool,
+}
+
+fn environment_card(value: &Value) -> Result<ToolOutput, serde_json::Error> {
+    let output = EnvironmentPresentation::deserialize(value)?;
     let headline = environment_headline(&output.os);
     let summary = environment_summary(&output.execution);
     let facts = environment_facts(&output);
-    let commands = output
-        .commands
-        .into_iter()
-        .map(|command| EnvironmentCommand {
-            id: command.id.to_owned(),
-            available: command.available,
-            version: command.version,
-        })
-        .collect();
-    ToolExecResult::from(Ok::<_, String>(ToolOutput::Environment {
+    Ok(ToolOutput::Environment {
         headline,
         summary,
         facts,
-        commands,
-    }))
+        commands: output.commands,
+    })
 }
 
 /// `ubuntu 24.04 · linux/x86_64 · kernel 6.18.5`. The distribution leads when
 /// there is one, because it is the name a reader recognises the host by.
-fn environment_headline(os: &OsDescriptor) -> String {
+fn environment_headline(os: &EnvironmentOs) -> String {
     let mut parts = Vec::new();
     if let Some(distribution) = &os.distribution {
         parts.push(distribution.clone());
@@ -3916,7 +4217,7 @@ fn environment_headline(os: &OsDescriptor) -> String {
 
 /// What a command runs in, what it can reach, and what it may do. The second
 /// line of the card, and the last one a collapsed card still shows.
-fn environment_summary(execution: &ExecutionEnvironmentExecution) -> String {
+fn environment_summary(execution: &EnvironmentExecution) -> String {
     let mut parts = vec![
         execution.shell.to_owned(),
         format!("{} sandbox", execution.sandbox),
@@ -3931,7 +4232,7 @@ fn environment_summary(execution: &ExecutionEnvironmentExecution) -> String {
     parts.join(ENVIRONMENT_SEPARATOR)
 }
 
-fn environment_facts(output: &ExecutionEnvironmentOutput) -> Vec<EnvironmentFact> {
+fn environment_facts(output: &EnvironmentPresentation) -> Vec<EnvironmentFact> {
     let runtime = format!(
         "{} {}{ENVIRONMENT_SEPARATOR}{}",
         output.runtime.name, output.runtime.version, output.scope
@@ -3957,7 +4258,7 @@ fn environment_facts(output: &ExecutionEnvironmentOutput) -> Vec<EnvironmentFact
             workspace_fact(&output.workspace),
         ),
     ];
-    let groups = enabled_tool_groups(output.tool_groups);
+    let groups = enabled_tool_groups(&output.tool_groups);
     if !groups.is_empty() {
         facts.push(fact(ENVIRONMENT_GROUPS_LABEL, groups.join(" ")));
     }
@@ -3977,7 +4278,7 @@ fn fact(label: &str, value: String) -> EnvironmentFact {
 
 /// `apt 2.8.3 (apt-get)`. The executable is named only when it differs from the
 /// manager, which is the case a caller would otherwise get wrong.
-fn system_package_manager_fact(manager: &SystemPackageManagerDescriptor) -> String {
+fn system_package_manager_fact(manager: &EnvironmentSystemPackageManager) -> String {
     if !manager.available {
         return ENVIRONMENT_NONE.to_owned();
     }
@@ -3985,16 +4286,16 @@ fn system_package_manager_fact(manager: &SystemPackageManagerDescriptor) -> Stri
     if let Some(version) = &manager.version {
         let _ = write!(value, " {version}");
     }
-    if let Some(executable) = manager.executable
-        && executable != manager.name
+    if let Some(executable) = &manager.executable
+        && executable != &manager.name
     {
         let _ = write!(value, " ({executable})");
     }
     value
 }
 
-fn workspace_fact(workspace: &WorkspaceDescriptor) -> String {
-    let mut parts = vec![match workspace.git.repository {
+fn workspace_fact(workspace: &EnvironmentWorkspace) -> String {
+    let mut parts = vec![match workspace.git.repository.as_str() {
         GIT_REPOSITORY_YES => "git repository".to_owned(),
         GIT_REPOSITORY_NO => "no git repository".to_owned(),
         other => format!("git {other}"),
@@ -4022,7 +4323,7 @@ fn workspace_fact(workspace: &WorkspaceDescriptor) -> String {
 }
 
 /// Only the groups that loaded. A disabled group is not a fact about the host.
-fn enabled_tool_groups(groups: ToolGroupDisclosure) -> Vec<&'static str> {
+fn enabled_tool_groups(groups: &EnvironmentGroups) -> Vec<&'static str> {
     [
         (groups.files, "files"),
         (groups.web, "web"),
@@ -4191,6 +4492,12 @@ mod tests {
     use std::sync::Arc;
     use tempfile::TempDir;
     use test_case::test_case;
+    use workcell::environment::{
+        CommandDescriptor, ContainerDescriptor, DeclaredPackageManager,
+        ExecutionEnvironmentExecution, ExecutionEnvironmentOutput, GitDescriptor, OsDescriptor,
+        PackageManagerDescriptor, PrivilegeDescriptor, RuntimeDescriptor,
+        SystemPackageManagerDescriptor, WorkspaceDescriptor,
+    };
 
     const PATCH: &str = "*** Begin Patch\n*** Add File: created.txt\n+hello\n*** End Patch";
     const PREVIEW_FLAG_MSG: &str = "a dry-run argument must fail the call rather than write";
@@ -4218,6 +4525,8 @@ mod tests {
     /// The descriptor pretty-prints to about 170 lines on a populated host; a
     /// rendering that ever approached that would have stopped being one.
     const ENVIRONMENT_MAX_MODEL_LINES: usize = 40;
+    const REMOTE_ENVIRONMENT_MODEL_TEXT: &str = "authoritative remote environment text";
+    const INVALID_REMOTE_RESULT: &str = "invalid remote Workcell result:";
 
     #[test]
     fn selected_remote_endpoint_cannot_also_be_generic_mcp() {
@@ -4290,6 +4599,57 @@ mod tests {
         remote_execution_ceiling(kind)
     }
 
+    #[test_case(true; "cancelled_before_first_execution_poll")]
+    #[test_case(false; "expired_before_first_execution_poll")]
+    fn unpolled_remote_execution_remains_releasable(cancelled: bool) {
+        let temp = TempDir::new().unwrap();
+        let (trigger, cancel) = CancelToken::new();
+        if cancelled {
+            trigger.cancel();
+        }
+        let ctx = context(temp.path(), Arc::new(ToolRegistry::new()), cancel);
+        let deadline = if cancelled {
+            Instant::now() + REMOTE_EXECUTION_TIMEOUT
+        } else {
+            Instant::now()
+        };
+        let mut started = false;
+        let mut polled = false;
+        let result = smol::block_on(race_remote_execution(&ctx, deadline, &mut started, async {
+            polled = true;
+        }));
+        assert!(!started);
+        assert!(!polled);
+        if cancelled {
+            const CANCELLED: &str = "cancelled";
+            assert_eq!(result.unwrap_err(), CANCELLED);
+        } else {
+            assert_eq!(result.unwrap(), None);
+        }
+    }
+
+    #[test]
+    fn polled_remote_execution_remains_uncertain_on_cancellation() {
+        const CANCELLED: &str = "cancelled";
+        let temp = TempDir::new().unwrap();
+        let (trigger, cancel) = CancelToken::new();
+        let ctx = context(temp.path(), Arc::new(ToolRegistry::new()), cancel);
+        let mut started = false;
+        let result = smol::block_on(async {
+            let mut execution = Box::pin(race_remote_execution(
+                &ctx,
+                Instant::now() + REMOTE_EXECUTION_TIMEOUT,
+                &mut started,
+                future::pending::<()>(),
+            ));
+            assert!(future::poll_once(&mut execution).await.is_none());
+            trigger.cancel();
+            execution.await
+        });
+        assert_eq!(result.unwrap_err(), CANCELLED);
+        assert!(started);
+    }
+
     #[test]
     fn remote_file_result_uses_the_embedded_specialized_adapter() {
         let output = FileReadOutput::File {
@@ -4323,6 +4683,179 @@ mod tests {
         );
         assert_eq!(remote.model_output.as_deref(), Some(model_output.as_str()));
         assert!(remote.remote_written_paths);
+    }
+
+    fn environment_fixture(populated: bool) -> ExecutionEnvironmentOutput {
+        ExecutionEnvironmentOutput {
+            version: "1",
+            snapshot_revision: "remote-snapshot".into(),
+            scope: "remote host",
+            os: OsDescriptor {
+                family: "remote-os",
+                architecture: "remote-arch",
+                path_style: "posix",
+                kernel_release: populated.then(|| "9.8.7".into()),
+                distribution: populated.then(|| "Remote Distribution".into()),
+                wsl: populated,
+                system_package_manager: SystemPackageManagerDescriptor {
+                    name: "apt",
+                    available: populated,
+                    executable: populated.then_some("apt-get"),
+                    version: populated.then(|| "2.8.3".into()),
+                },
+            },
+            runtime: RuntimeDescriptor {
+                name: "remote-runtime",
+                version: "9.8.7",
+            },
+            execution: ExecutionEnvironmentExecution {
+                shell: "remote-shell",
+                sandbox: "remote-sandbox",
+                network_access: "remote-network",
+                environment_inheritance: "remote-inheritance",
+                privilege: PrivilegeDescriptor {
+                    effective_root: populated.then_some(false),
+                    non_interactive_sudo: if populated {
+                        "available"
+                    } else {
+                        SUDO_NOT_APPLICABLE
+                    },
+                },
+            },
+            container: ContainerDescriptor {
+                kind: "remote-container",
+                evidence: if populated {
+                    vec!["cgroup", "marker"]
+                } else {
+                    vec![]
+                },
+            },
+            workspace: WorkspaceDescriptor {
+                git: GitDescriptor {
+                    available: populated,
+                    repository: if populated {
+                        GIT_REPOSITORY_YES
+                    } else {
+                        GIT_REPOSITORY_NO
+                    },
+                },
+                package_manager: PackageManagerDescriptor {
+                    declared: populated.then(|| DeclaredPackageManager {
+                        name: "pnpm".into(),
+                        version: Some("10.0.0".into()),
+                    }),
+                    inferred: Some("npm".into()),
+                    lockfiles: if populated {
+                        vec!["pnpm-lock.yaml"]
+                    } else {
+                        vec![]
+                    },
+                },
+            },
+            tool_groups: ToolGroupDisclosure {
+                files: populated,
+                web: populated,
+                shell: populated,
+                code: populated,
+                code_graph: populated,
+            },
+            commands: vec![
+                CommandDescriptor {
+                    id: "remote-command",
+                    available: true,
+                    version: Some("3.2.1".into()),
+                },
+                CommandDescriptor {
+                    id: "unversioned-command",
+                    available: true,
+                    version: None,
+                },
+                CommandDescriptor {
+                    id: "missing-command",
+                    available: false,
+                    version: None,
+                },
+            ],
+        }
+    }
+
+    #[test_case(true, false; "populated")]
+    #[test_case(false, false; "sparse")]
+    #[test_case(true, true; "remote_error_flag")]
+    fn remote_environment_card_matches_local_and_restores(populated: bool, is_error: bool) {
+        let output = environment_fixture(populated);
+        let structured_content = serde_json::to_value(&output).expect("serialized Workcell output");
+        let local = environment_result(ExecutionEnvironmentResult {
+            output,
+            model_text: REMOTE_ENVIRONMENT_MODEL_TEXT.into(),
+        });
+        let remote = remote_result(
+            ToolKind::Environment,
+            &Input::Environment,
+            RemoteToolResultEnvelope {
+                structured_content,
+                model_output: REMOTE_ENVIRONMENT_MODEL_TEXT.into(),
+                is_error,
+            },
+        );
+        assert_eq!(remote.is_error, is_error);
+        assert_eq!(
+            remote.model_output.as_deref(),
+            Some(REMOTE_ENVIRONMENT_MODEL_TEXT)
+        );
+        assert!(local.model_output.is_none());
+        let local = local.output.expect("local card");
+        let remote = remote.output.expect("remote card");
+        assert!(matches!(remote, ToolOutput::Environment { .. }));
+        assert_eq!(
+            serde_json::to_value(&remote).unwrap(),
+            serde_json::to_value(&local).unwrap()
+        );
+        assert_eq!(remote.as_text(), local.as_text());
+        let restored: ToolOutput =
+            serde_json::from_str(&serde_json::to_string(&remote).unwrap()).unwrap();
+        assert!(matches!(restored, ToolOutput::Environment { .. }));
+        assert_eq!(restored.as_text(), remote.as_text());
+        let text = restored.as_text();
+        for fact in [
+            "remote-os/remote-arch",
+            "remote-shell",
+            "remote-runtime",
+            "remote-container",
+            "remote-inheritance",
+            "remote-command",
+        ] {
+            assert!(text.contains(fact), "{text}");
+        }
+        if populated {
+            assert!(text.contains("apt 2.8.3 (apt-get)"), "{text}");
+            assert!(text.contains("pnpm 10.0.0 declared"), "{text}");
+        } else {
+            assert!(text.contains("npm inferred"), "{text}");
+        }
+    }
+
+    #[test_case(json!(null), false; "null")]
+    #[test_case(json!({}), false; "missing_fields")]
+    #[test_case(json!({"os": false}), false; "wrong_type")]
+    #[test_case(json!({"error": "unavailable"}), true; "remote_error_payload")]
+    fn malformed_remote_environment_is_an_error(structured_content: Value, is_error: bool) {
+        let result = remote_result(
+            ToolKind::Environment,
+            &Input::Environment,
+            RemoteToolResultEnvelope {
+                structured_content,
+                model_output: REMOTE_ENVIRONMENT_MODEL_TEXT.into(),
+                is_error,
+            },
+        );
+        assert!(result.is_error);
+        assert!(
+            result
+                .output
+                .unwrap_err()
+                .starts_with(INVALID_REMOTE_RESULT)
+        );
     }
 
     #[test_case(true; "retention_gap")]
@@ -4364,11 +4897,18 @@ mod tests {
             },
         };
         let mut progress = RemoteProgress::new(&ctx);
-        assert!(!progress.publish(&status));
+        assert_eq!(progress.publish(&status), retention_gap);
         assert!(matches!(
             receiver.recv().unwrap(),
             ToolLive::Annotation(message) if message == REMOTE_PROGRESS_GAP
         ));
+        if retention_gap {
+            assert!(matches!(receiver.recv().unwrap(), ToolLive::Buf(_)));
+            assert!(progress.publish(&status));
+            assert_eq!(progress.after_sequence(), 5);
+            assert!(receiver.try_recv().is_err());
+            return;
+        }
         assert!(!progress.publish(&status));
         assert!(receiver.try_recv().is_err());
         assert_eq!(progress.after_sequence(), 0);
@@ -4395,7 +4935,11 @@ mod tests {
         assert_eq!(progress.after_sequence(), 3);
     }
 
-    fn context(root: &Path, registry: Arc<ToolRegistry>, cancel: CancelToken) -> ToolContext {
+    pub(super) fn context(
+        root: &Path,
+        registry: Arc<ToolRegistry>,
+        cancel: CancelToken,
+    ) -> ToolContext {
         context_with_mode(
             root,
             registry,

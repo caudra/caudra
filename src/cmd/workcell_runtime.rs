@@ -65,6 +65,10 @@ pub struct WorkcellDisplay {
 pub enum WorkcellRuntimeError {
     #[error(transparent)]
     Sandbox(#[from] caudra_sandbox::Error),
+    #[error(
+        "--sandbox-resume requires a selected sandbox; use --sandbox NAME, or restore a sandbox session with --continue or --session"
+    )]
+    SandboxSelectionRequired,
     #[error("remote control requires a remote Workcell selection")]
     RemoteRequired,
     #[error("failed to load local Workcell profiles")]
@@ -151,7 +155,7 @@ impl WorkcellRuntime {
             );
         }
         if args.sandbox_resume {
-            return Err(caudra_sandbox::Error::ResumeRequired.into());
+            return Err(WorkcellRuntimeError::SandboxSelectionRequired);
         }
         let selection = resolve_selection(args)?;
 
@@ -599,6 +603,7 @@ mod tests {
     use std::net::TcpListener;
     use std::thread;
 
+    use crate::cli::WorkcellSelectorArgs;
     use caudra_agent::tools::{ToolRegistry, ToolSource};
     use caudra_config::workcell::{WorkcellProfiles, select_workcell};
     use caudra_storage::StateDir;
@@ -615,9 +620,34 @@ mod tests {
     const INVALID_DISCOVER_RESPONSE: &str = "{}";
     const MAX_TEST_REQUEST_BYTES: usize = 4096;
 
+    #[test_case::test_case(false; "session_initialization")]
+    #[test_case::test_case(true; "environment_initialization")]
+    fn resume_without_selection_fails_before_initializing_a_backend(load_environment: bool) {
+        let root = tempfile::tempdir().unwrap();
+        let storage = StateDir::from_path(root.path().join("state"));
+        let registry = ToolRegistry::new();
+        let args = WorkcellSelectorArgs {
+            sandbox_resume: true,
+            ..Default::default()
+        };
+        assert!(matches!(
+            WorkcellRuntime::initialize_environment(
+                &args,
+                root.path(),
+                &storage,
+                &registry,
+                load_environment,
+            ),
+            Err(WorkcellRuntimeError::SandboxSelectionRequired)
+        ));
+        for name in caudra_workcell::NATIVE_TOOL_NAMES {
+            assert!(registry.get(name).is_none());
+        }
+        assert!(!storage.path().exists());
+    }
+
     #[test]
     fn missing_sandbox_never_falls_back_or_registers_embedded_tools() {
-        use crate::cli::WorkcellSelectorArgs;
         let root = tempfile::tempdir().unwrap();
         let storage = StateDir::from_path(root.path().join("state"));
         let registry = ToolRegistry::new();

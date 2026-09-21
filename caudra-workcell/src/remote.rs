@@ -56,6 +56,7 @@ use isahc::{AsyncBody, HttpClient, ResponseExt};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
+use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 use tokio_util::sync::CancellationToken;
 use url::{Host, Url};
 use workcell::host_contract as contract;
@@ -195,6 +196,14 @@ pub struct RemotePreparedToolCall {
     pub intent: contract::OperationIntent,
     pub binding: SessionWorkspaceBinding,
     pub cursor: WorkspaceCursor,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum RemoteToolExecutionError {
+    #[error("{0}")]
+    BeforeDispatch(#[from] WorkspaceError),
+    #[error("{0}")]
+    PossiblyDispatched(WorkspaceError),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1478,6 +1487,7 @@ struct RemoteInner {
     cursors: Mutex<CursorRegistry>,
     watches: Mutex<BoundedMap<WatchSubscriptionId, WatchRecord>>,
     operations: Mutex<OperationRegistry>,
+    canonical_mutation_admission: Arc<AsyncMutex<()>>,
     mutation_journal: RemoteMutationJournal,
 }
 
@@ -1662,6 +1672,7 @@ impl RemoteWorkcellClient {
             }),
             watches: Mutex::new(BoundedMap::new(watch_limit, watch_ttl)),
             operations: Mutex::new(OperationRegistry::new(operation_limit)),
+            canonical_mutation_admission: Arc::new(AsyncMutex::new(())),
             mutation_journal,
         }));
         client.recover_pending_operations().await?;
@@ -1713,12 +1724,51 @@ impl RemoteWorkcellClient {
         })
     }
 
+    pub(crate) async fn admit_canonical_tool(
+        &self,
+        prepared: &PreparedToolCall,
+    ) -> Result<Option<OwnedMutexGuard<()>>, WorkspaceError> {
+        let journaled = self
+            .0
+            .operations
+            .lock()
+            .map_err(|_| WorkspaceError::Unavailable)?
+            .get(&prepared.operation)?
+            .journal
+            .is_some();
+        if journaled {
+            Ok(Some(
+                self.0
+                    .canonical_mutation_admission
+                    .clone()
+                    .lock_owned()
+                    .await,
+            ))
+        } else {
+            Ok(None)
+        }
+    }
+
     pub async fn execute_canonical_tool(
         &self,
         binding: &SessionWorkspaceBinding,
         cursor: &WorkspaceCursor,
         prepared: &PreparedToolCall,
     ) -> Result<OperationStatus<RemoteToolResultEnvelope>, WorkspaceError> {
+        self.execute_canonical_tool_tracked(binding, cursor, prepared)
+            .await
+            .map_err(|error| match error {
+                RemoteToolExecutionError::BeforeDispatch(error)
+                | RemoteToolExecutionError::PossiblyDispatched(error) => error,
+            })
+    }
+
+    pub(crate) async fn execute_canonical_tool_tracked(
+        &self,
+        binding: &SessionWorkspaceBinding,
+        cursor: &WorkspaceCursor,
+        prepared: &PreparedToolCall,
+    ) -> Result<OperationStatus<RemoteToolResultEnvelope>, RemoteToolExecutionError> {
         self.require_capability(WorkspaceCapability::ToolExecute)?;
         self.execute_tool_operation(binding, cursor, &prepared.operation)
             .await
@@ -1757,8 +1807,7 @@ impl RemoteWorkcellClient {
                 &self.0.cancellation.child_token(),
             )
             .await?;
-        self.convert_remote_tool_status(&response, operation, after_sequence.unwrap_or(0))
-            .await
+        self.convert_remote_tool_status(&response, operation).await
     }
 
     pub async fn cancel_canonical_tool(
@@ -2668,7 +2717,7 @@ impl RemoteWorkcellClient {
         binding: &SessionWorkspaceBinding,
         cursor: &WorkspaceCursor,
         operation: &OperationHandle,
-    ) -> Result<OperationStatus<RemoteToolResultEnvelope>, WorkspaceError> {
+    ) -> Result<OperationStatus<RemoteToolResultEnvelope>, RemoteToolExecutionError> {
         self.validate_prepared_context(binding, cursor, operation)?;
         let stored = self
             .0
@@ -2702,31 +2751,37 @@ impl RemoteWorkcellClient {
             .await
         {
             Ok(status) => {
-                let converted = self.convert_remote_tool_status(&status, operation, 0).await;
+                let converted = self.convert_remote_tool_status(&status, operation).await;
                 if converted.is_err()
                     && let Some(journal) = &stored.journal
                 {
                     self.0
                         .mutation_journal
-                        .mark_indeterminate(&journal.operation_id)?;
+                        .mark_indeterminate(&journal.operation_id)
+                        .map_err(RemoteToolExecutionError::PossiblyDispatched)?;
                 }
-                converted
+                converted.map_err(RemoteToolExecutionError::PossiblyDispatched)
             }
             Err(failure) if failure.dispatched => {
                 if let Some(journal) = &stored.journal {
                     self.0
                         .mutation_journal
-                        .mark_indeterminate(&journal.operation_id)?;
+                        .mark_indeterminate(&journal.operation_id)
+                        .map_err(RemoteToolExecutionError::PossiblyDispatched)?;
                 }
                 let recovery = self
                     .call::<_, contract::StatusResponse>(
                         contract::STATUS_METHOD,
-                        &status_request(operation, &self.host_binding())?,
+                        &status_request(operation, &self.host_binding())
+                            .map_err(RemoteToolExecutionError::PossiblyDispatched)?,
                         &CancellationToken::new(),
                     )
                     .await;
                 match recovery {
-                    Ok(status) => self.convert_remote_tool_status(&status, operation, 0).await,
+                    Ok(status) => self
+                        .convert_remote_tool_status(&status, operation)
+                        .await
+                        .map_err(RemoteToolExecutionError::PossiblyDispatched),
                     Err(_) => Ok(indeterminate_status(operation.clone())),
                 }
             }
@@ -2736,7 +2791,9 @@ impl RemoteWorkcellClient {
                         .mutation_journal
                         .release_before_dispatch(&journal.operation_id)?;
                 }
-                Err(self.workspace_error(failure.error))
+                Err(RemoteToolExecutionError::BeforeDispatch(
+                    self.workspace_error(failure.error),
+                ))
             }
         }
     }
@@ -2745,7 +2802,6 @@ impl RemoteWorkcellClient {
         &self,
         response: &contract::StatusResponse,
         operation: &OperationHandle,
-        after_sequence: u64,
     ) -> Result<OperationStatus<RemoteToolResultEnvelope>, WorkspaceError> {
         self.validate_status_limits(response)?;
         let expected_operation = self
@@ -2758,6 +2814,7 @@ impl RemoteWorkcellClient {
         let envelope = response
             .outcome
             .as_ref()
+            .filter(|outcome| outcome.kind == contract::OutcomeKind::Completed)
             .and_then(|outcome| outcome.result.as_ref())
             .map(remote_tool_result_envelope)
             .transpose()?;
@@ -2768,17 +2825,7 @@ impl RemoteWorkcellClient {
             Some(&expected_operation.binding),
             |_| envelope.clone().ok_or_else(invalid_response),
         )?;
-        let mut next = after_sequence.saturating_add(1);
-        for event in &response.progress {
-            if event.sequence == next {
-                next = next.saturating_add(1);
-            } else if event.sequence > next {
-                break;
-            }
-        }
-        let remove = if next != response.progress_metadata.next_sequence {
-            false
-        } else if let Some(journal) = &expected_operation.journal {
+        let remove = if let Some(journal) = &expected_operation.journal {
             self.0
                 .mutation_journal
                 .commit_terminal(&journal.operation_id, &status.state)?
@@ -6129,14 +6176,16 @@ fn canonical_journal_policy(
     intent: &contract::OperationIntent,
 ) -> Option<(String, bool)> {
     let known_mutation = matches!(tool_name, "file_write" | "file_edit" | "file_apply_patch");
-    (known_mutation || intent.mutating || intent.kind == contract::OperationKind::Execute).then(
-        || {
+    let isolated = tool_name == "python_execution" && !intent.mutating;
+    (known_mutation
+        || intent.mutating
+        || (intent.kind == contract::OperationKind::Execute && !isolated))
+        .then(|| {
             (
                 format!("{CANONICAL_OPERATION_PREFIX}{tool_name}"),
                 intent.kind == contract::OperationKind::Execute,
             )
-        },
-    )
+        })
 }
 
 fn broad_operation_kind(operation_kind: &str) -> bool {
@@ -6423,7 +6472,14 @@ fn failed_operation_error(
     match (&outcome.result, &outcome.error) {
         (Some(result), None) if result.is_error => Ok(OperationError {
             code: OperationId::new("tool_error").map_err(|_| invalid_response())?,
-            message: "remote tool returned an error result".to_owned(),
+            message: result
+                .content
+                .iter()
+                .map(|content| match content {
+                    contract::ToolResultContent::Text { text } => text.as_str(),
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
         }),
         (None, Some(error)) => Ok(OperationError {
             code: operation_id(&error.code)?,
@@ -7023,29 +7079,40 @@ mod tests {
     use std::collections::HashMap;
     use std::io::{BufRead, BufReader, Read, Write};
     use std::net::TcpListener;
+    use std::pin::pin;
     use std::str::FromStr;
-    use std::sync::Arc;
     use std::sync::mpsc;
+    use std::sync::{Arc, Mutex};
     use std::thread;
     use std::time::Duration;
 
+    use futures_lite::future;
     use serde_json::{Value, json};
     use test_case::test_case;
+    use tokio::sync::Mutex as AsyncMutex;
     use tokio_util::sync::CancellationToken;
 
     use super::{
         BoundedMap, CursorRecord, CursorRegistry, DIRECT_EXEC_KIND, JournalOperation, JsonRpcError,
         MAX_SSE_EVENT_BYTES, OperationRegistry, PreparedWorkspaceContext, RecoveryOperation,
-        RemoteEvent, RemoteMutationJournal, RemoteTransport, RemoteWorkcellClient,
-        RemoteWorkcellError, ResourceCache, SHELL_CONTRACT_ID, SHELL_EXECUTION_TIMEOUT,
-        StoredOperation, ToolListWire, WORKSPACE_MUTATION_KIND, canonical_journal_policy,
-        cleanup_preview_partitions, convert_status, execution_timeout, freeze_catalog,
-        join_workspace_path, map_rpc_error, numeric_loopback, pagination_flags,
-        parse_content_range, parse_snapshot_result, project_asset_kind, project_asset_trust,
-        recovery_status, require_full_remote_parity, require_nonzero_within,
-        same_descriptor_except_instance, same_unique_ids, serialized_items_bytes,
-        source_trust_anchor, validate_capabilities, validate_selector_id, watch_path_within,
+        RemoteEvent, RemoteInner, RemoteMutationJournal, RemotePreparedToolCall,
+        RemoteToolExecutionError, RemoteTransport, RemoteWorkcellClient, RemoteWorkcellError,
+        ResourceCache, SHELL_CONTRACT_ID, SHELL_EXECUTION_TIMEOUT, StoredOperation, ToolListWire,
+        WORKSPACE_MUTATION_KIND, canonical_journal_policy, cleanup_preview_partitions,
+        convert_status, execution_timeout, freeze_catalog, join_workspace_path, map_rpc_error,
+        numeric_loopback, pagination_flags, parse_content_range, parse_snapshot_result,
+        project_asset_kind, project_asset_trust, recovery_status, require_full_remote_parity,
+        require_nonzero_within, same_descriptor_except_instance, same_unique_ids,
+        serialized_items_bytes, source_trust_anchor, validate_capabilities, validate_selector_id,
+        watch_path_within, workspace_capabilities,
     };
+    use crate::transfer::PrivateStaging;
+    use crate::{
+        Input, REMOTE_ADMISSION_EXPIRED, RemoteExecutionCleanup, RemotePreparedState,
+        RemoteWorkcellInvocation, ToolKind,
+    };
+    use caudra_agent::cancel::CancelToken;
+    use caudra_agent::tools::{Deadline, ToolRegistry};
     use caudra_config::workcell::{
         RemoteWorkcellSelection, WorkcellEndpoint, WorkcellProfileName, WorkcellSourceRef,
     };
@@ -7056,11 +7123,11 @@ mod tests {
     };
     use caudra_storage::workspace_binding::StoredWorkspaceBinding;
     use caudra_workspace::{
-        CwdHandle, OperationHandle, OperationId, OperationState, ProjectAssetKind,
-        ProjectAssetTrust, ResourceId, ResourceRevision, ResourceScope, ResourceSelector,
-        RestoreId, SessionBindingId, SnapshotCleanupPreview, SnapshotId, SnapshotOperationPreview,
-        SnapshotRestorePreview, SnapshotUnrevertPreview, WorkspaceCapability, WorkspaceCursor,
-        WorkspaceError, WorkspacePath,
+        CwdHandle, OperationHandle, OperationId, OperationState, PreparedToolCall,
+        ProjectAssetKind, ProjectAssetTrust, ResourceId, ResourceRevision, ResourceScope,
+        ResourceSelector, RestoreId, SessionBindingId, SnapshotCleanupPreview, SnapshotId,
+        SnapshotOperationPreview, SnapshotRestorePreview, SnapshotUnrevertPreview,
+        WorkspaceCapability, WorkspaceCursor, WorkspaceError, WorkspacePath, WorkspaceSession,
     };
     use workcell::host_contract as contract;
 
@@ -7981,6 +8048,8 @@ mod tests {
         .unwrap();
 
         assert!(canonical_journal_policy("file_read", &read).is_none());
+        assert!(canonical_journal_policy("file_index", &read).is_none());
+        assert!(canonical_journal_policy("python_execution", &execute).is_none());
         assert_eq!(
             canonical_journal_policy("file_write", &read),
             Some(("canonical:file_write".to_owned(), false))
@@ -8088,6 +8157,220 @@ mod tests {
         ));
         coordinator.acknowledge(&shell.operation_id).unwrap();
         assert!(coordinator.pending().is_empty());
+    }
+
+    #[test_case("shell", RemoteOperationState::Reserved; "active_shell_blocks_shell")]
+    #[test_case("file_write", RemoteOperationState::Dispatched; "dispatched_shell_blocks_write")]
+    #[test_case("file_write", RemoteOperationState::Indeterminate; "uncertain_shell_blocks_write")]
+    fn canonical_journal_rejection_is_definitive(tool: &str, pending_state: RemoteOperationState) {
+        const CAPACITY: usize = 8;
+        let temp = tempfile::tempdir().unwrap();
+        let state_dir = StateDir::from_path(temp.path().join("state"));
+        let seed = StoredWorkspaceBinding::local_from_cwd("opaque-workspace");
+        let cursor = WorkspaceCursor::new(
+            seed.binding(),
+            ResourceScope::root(ResourceId::new("root").unwrap()),
+            0,
+            CwdHandle::new("cwd").unwrap(),
+        );
+        let stored_binding = seed.with_cursor(cursor.clone()).unwrap();
+        let binding = stored_binding.binding().clone();
+        let journal = RemoteOperationJournal::open(&state_dir).unwrap();
+        let coordinator = RemoteMutationJournal::new(journal, stored_binding.clone()).unwrap();
+        let active = journal_operation("active", "workspace", "canonical:shell", true);
+        coordinator.reserve(&active).unwrap();
+        if pending_state != RemoteOperationState::Reserved {
+            coordinator.mark_dispatched(&active.operation_id).unwrap();
+        }
+        if pending_state == RemoteOperationState::Indeterminate {
+            coordinator
+                .mark_indeterminate(&active.operation_id)
+                .unwrap();
+        }
+        let rejected = journal_operation(
+            "rejected",
+            "resource-a",
+            &format!("canonical:{tool}"),
+            tool == "shell",
+        );
+        let operation = OperationHandle {
+            preparation_id: rejected.preparation_id.clone(),
+            invocation_id: Some(rejected.invocation_id.clone()),
+            execution_id: None,
+            expires_at_unix_ms: Some(u64::MAX),
+        };
+        let mut operations = OperationRegistry::new(CAPACITY);
+        operations
+            .insert(
+                operation.preparation_id.clone(),
+                StoredOperation {
+                    transfer: None,
+                    binding: binding_for("test.v1"),
+                    context: None,
+                    invocation_id: rejected.invocation_id.clone(),
+                    expires_at_unix_ms: u64::MAX,
+                    journal: Some(rejected.clone()),
+                    persisted: false,
+                },
+            )
+            .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint =
+            WorkcellEndpoint::parse(&format!("http://{}/mcp", listener.local_addr().unwrap()))
+                .unwrap();
+        let (transport, events) = RemoteTransport::new(&endpoint, None).unwrap();
+        let descriptor = descriptor("instance", "generation");
+        let client = RemoteWorkcellClient(Arc::new(RemoteInner {
+            staging: PrivateStaging::new(super::transfer::negotiated_limits(
+                descriptor.capabilities.reviewed_transfer.as_ref(),
+            )),
+            transport,
+            capabilities: workspace_capabilities(&descriptor.capabilities),
+            descriptor,
+            host_binding: Mutex::new(host_binding()),
+            authority: binding.authority().clone(),
+            project: binding.project().clone(),
+            session_binding: binding.clone(),
+            stored_binding: stored_binding.clone(),
+            root_cursor: cursor.clone(),
+            manifest: freeze_catalog(tool_list("test")).unwrap(),
+            catalog: HashMap::new(),
+            events,
+            cancellation: CancellationToken::new(),
+            paths: Mutex::new(ResourceCache::new(CAPACITY, Duration::MAX)),
+            repositories: Mutex::new(BoundedMap::new(CAPACITY, Duration::MAX)),
+            cursors: Mutex::new(CursorRegistry {
+                records: HashMap::from([(
+                    cursor.cwd_handle().clone(),
+                    CursorRecord {
+                        cursor: cursor.clone(),
+                        path: WorkspacePath::root(),
+                    },
+                )]),
+                limit: CAPACITY,
+            }),
+            watches: Mutex::new(BoundedMap::new(CAPACITY, Duration::MAX)),
+            operations: Mutex::new(operations),
+            canonical_mutation_admission: Arc::new(AsyncMutex::new(())),
+            mutation_journal: coordinator,
+        }));
+        let raw_input = if tool == "shell" {
+            json!({"command":"true"})
+        } else {
+            json!({"filePath":"test", "content":"test"})
+        };
+        let call = RemotePreparedToolCall {
+            prepared: PreparedToolCall {
+                operation,
+                canonical_input: raw_input.clone(),
+                review: Value::Null,
+            },
+            intent: serde_json::from_value(
+                json!({"kind":"execute", "mutating":true, "resources":[]}),
+            )
+            .unwrap(),
+            binding: binding.clone(),
+            cursor: cursor.clone(),
+        };
+        smol::block_on(async {
+            let first = client.admit_canonical_tool(&call.prepared).await.unwrap();
+            for tool in ["file_read", "python_execution"] {
+                let mut bypass = call.prepared.clone();
+                bypass.operation.preparation_id = OperationId::new(tool).unwrap();
+                let mut stored = client
+                    .0
+                    .operations
+                    .lock()
+                    .unwrap()
+                    .get(&call.prepared.operation)
+                    .unwrap()
+                    .clone();
+                stored.journal = None;
+                client
+                    .0
+                    .operations
+                    .lock()
+                    .unwrap()
+                    .insert(bypass.operation.preparation_id.clone(), stored)
+                    .unwrap();
+                let mut admission = pin!(client.admit_canonical_tool(&bypass));
+                assert!(
+                    future::poll_once(&mut admission)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .is_none()
+                );
+            }
+            let cloned = client.clone();
+            let mut queued = pin!(cloned.admit_canonical_tool(&call.prepared));
+            assert!(future::poll_once(&mut queued).await.is_none());
+            drop(first);
+            let admitted = queued.await.unwrap();
+            assert!(admitted.is_some());
+        });
+        let failure = smol::block_on(client.execute_canonical_tool_tracked(
+            &binding,
+            &cursor,
+            &call.prepared,
+        ))
+        .unwrap_err();
+        assert!(
+            matches!(failure, RemoteToolExecutionError::BeforeDispatch(WorkspaceError::PendingOperation { ref operation_id }) if operation_id == active.operation_id.as_str())
+        );
+        let (trigger, cancel) = CancelToken::new();
+        let mut ctx = crate::tests::context(temp.path(), Arc::new(ToolRegistry::new()), cancel);
+        ctx.workspace_session = Some(
+            WorkspaceSession::new(client.workspace_handle().unwrap(), binding, cursor).unwrap(),
+        );
+        let kind = ToolKind::from_name(tool).unwrap();
+        let invocation = RemoteWorkcellInvocation {
+            client: client.clone(),
+            kind,
+            input: Input::parse(kind, raw_input.clone()).unwrap(),
+            raw_input,
+            prepared: AsyncMutex::new(RemotePreparedState::default()),
+        };
+        let mut cleanup = RemoteExecutionCleanup {
+            client: client.clone(),
+            call: None,
+            execution_started: false,
+        };
+        smol::block_on(async {
+            const CANCELLED: &str = "cancelled";
+            let first = client.admit_canonical_tool(&call.prepared).await.unwrap();
+            let mut queued = pin!(invocation.execute_remote(&ctx, call.clone(), &mut cleanup));
+            assert!(future::poll_once(&mut queued).await.is_none());
+            trigger.cancel();
+            assert_eq!(queued.await.output.unwrap_err(), CANCELLED);
+            drop(first);
+        });
+        assert!(!cleanup.execution_started);
+        ctx.cancel = CancelToken::none();
+        ctx.deadline = Deadline::after(Duration::ZERO);
+        let expired = smol::block_on(invocation.execute_remote(&ctx, call.clone(), &mut cleanup));
+        assert_eq!(expired.output.unwrap_err(), REMOTE_ADMISSION_EXPIRED);
+        assert!(!cleanup.execution_started);
+        ctx.deadline = Deadline::None;
+        let result = smol::block_on(invocation.execute_remote(&ctx, call, &mut cleanup));
+        assert_eq!(result.output.unwrap_err(), failure.to_string());
+        let pending = client.pending_remote_operations();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].operation_id, active.operation_id);
+        assert_eq!(pending[0].state, pending_state);
+        let journal = RemoteOperationJournal::open(&state_dir).unwrap();
+        let persisted = journal.list_pending(&stored_binding).unwrap();
+        assert_eq!(persisted.len(), 1);
+        assert_eq!(persisted[0].operation_id, active.operation_id);
+        assert!(
+            !client
+                .0
+                .mutation_journal
+                .contains(&rejected.operation_id)
+                .unwrap()
+        );
+        listener.set_nonblocking(true).unwrap();
+        assert!(listener.accept().is_err());
     }
 
     #[test_case(RemoteOperationState::Dispatched, OperationState::NeverSeen; "dispatched_never_seen")]

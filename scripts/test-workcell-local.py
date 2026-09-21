@@ -101,12 +101,17 @@ def main():
             lifecycle: ClassVar[dict] = {}
             lifecycle_calls: ClassVar[list[str]] = []
             mcp_methods: ClassVar[list[str]] = []
+            rpc_active: ClassVar[dict] = {}
+            operation_states: ClassVar[dict] = {}
+            operation_limits: ClassVar[dict] = {}
+            prepare_barrier: ClassVar[threading.Barrier | None] = None
 
             def log_message(self, format: str, *args: object) -> None:
                 pass
 
             def forward(self):
                 connection = http.client.HTTPConnection("127.0.0.1", port, timeout=35)
+                rpc_key = None
                 try:
                     length = int(self.headers.get("Content-Length", "0"))
                     if length > 8 * 1024 * 1024:
@@ -167,6 +172,40 @@ def main():
                     method = json.loads(request_body).get("method") if request_body and self.path == "/mcp" else None
                     if method:
                         self.mcp_methods.append(method)
+                        request = json.loads(request_body)
+                        rpc_key = f"{self.client_address[1]}:{request['id']}"
+                        with self.fault_lock:
+                            self.rpc_active[rpc_key] = {"method": method, "tool": request.get("params", {}).get("tool")}
+                    batch_gate = temp / "batch-execute-gate"
+                    if method == "ai.workcell/prepare":
+                        with self.fault_lock:
+                            arm = temp / "batch-prepare-barrier"
+                            if arm.exists():
+                                arm.unlink()
+                                type(self).prepare_barrier = threading.Barrier(3)
+                            barrier = self.prepare_barrier
+                        if barrier is not None:
+                            barrier.wait(timeout=15)
+                            with self.fault_lock:
+                                if self.prepare_barrier is barrier:
+                                    type(self).prepare_barrier = None
+                    if method in ("ai.workcell/execute", "ai.workcell/status", "ai.workcell/cancel"):
+                        with self.fault_lock, (temp / "batch-rpc-trace").open("a") as trace:
+                            trace.write(json.dumps({"method": method, "params": json.loads(request_body)["params"]}) + "\n")
+                    hold_execute = False
+                    if method == "ai.workcell/execute":
+                        with self.fault_lock:
+                            if batch_gate.exists():
+                                batch_gate.unlink()
+                                hold_execute = True
+                    if hold_execute:
+                        batch_gate.with_suffix(".entered").touch()
+                        deadline = time.monotonic() + 20
+                        while not batch_gate.with_suffix(".release").exists():
+                            if time.monotonic() >= deadline:
+                                self.send_error(504, "fixture execute gate timed out")
+                                return
+                            time.sleep(0.01)
                     if method == "ai.workcell/transfer/publicationStatus" and (temp / "drop-operation-response.unknown").exists():
                         request = json.loads(request_body)
                         body = json.dumps({"jsonrpc": "2.0", "id": request["id"], "result": {
@@ -196,6 +235,59 @@ def main():
                     connection.request(self.command, self.path, request_body, headers)
                     response = connection.getresponse()
                     body = response.read(16 * 1024 * 1024 + 1)
+                    if method:
+                        if response.getheader("Content-Type", "").startswith("text/event-stream"):
+                            messages = [json.loads(line[5:]) for line in body.splitlines() if line.startswith(b"data:")]
+                            payload = next((message for message in messages if "id" in message), {})
+                        else:
+                            payload = json.loads(body)
+                        result = payload.get("result", {})
+                        params = json.loads(request_body).get("params", {})
+                        with self.fault_lock:
+                            preparation_id = result.get("preparationId", params.get("preparationId"))
+                            if preparation_id and result.get("state"):
+                                self.operation_states[preparation_id] = result["state"]
+                            if method == "ai.workcell/prepare" and preparation_id and "error" not in payload:
+                                self.operation_states[preparation_id] = "prepared"
+                            if method == "ai.workcell/release" and preparation_id and result.get("released"):
+                                self.operation_states.pop(preparation_id, None)
+                            if method == "server/discover":
+                                pending = [result]
+                                while pending:
+                                    item = pending.pop()
+                                    if isinstance(item, dict):
+                                        if "maxLedgerBytes" in item:
+                                            self.operation_limits.update(item)
+                                        pending.extend(item.values())
+                                    elif isinstance(item, list):
+                                        pending.extend(item)
+                            with (temp / "rpc-diagnostics").open("a") as trace:
+                                trace.write(json.dumps({"method": method, "tool": params.get("tool"), "preparationId": preparation_id, "result": result if method == "ai.workcell/release" else {"state": result.get("state")}, "error": payload.get("error")}) + "\n")
+                            if payload.get("error", {}).get("data", {}).get("code") == "quota_exceeded":
+                                counts = {state: list(self.operation_states.values()).count(state) for state in set(self.operation_states.values())}
+                                print("Quota diagnostics:", json.dumps({"method": method, "tool": params.get("tool"), "limits": self.operation_limits, "in_flight": self.rpc_active, "observed_operation_states": counts}), flush=True)
+                            self.rpc_active.pop(rpc_key, None)
+                    if method == "ai.workcell/execute" and (temp / "drop-operation-response.progress").exists():
+                        def lose_progress(payload):
+                            result = payload.get("result", {})
+                            if result.get("state") == "completed":
+                                result["progress"] = []
+                                result["progressMetadata"]["firstRetainedSequence"] = None
+                                result["progressMetadata"]["gapBeforeFirst"] = True
+                            return json.dumps(payload).encode()
+
+                        if response.getheader("Content-Type", "").startswith("text/event-stream"):
+                            body = b"".join(b"data: " + lose_progress(json.loads(line[5:])) + b"\n" if line.startswith(b"data:") else line for line in body.splitlines(keepends=True))
+                        else:
+                            body = lose_progress(json.loads(body))
+                    if method in ("ai.workcell/cancel", "ai.workcell/status"):
+                        if response.getheader("Content-Type", "").startswith("text/event-stream"):
+                            messages = [json.loads(line[5:]) for line in body.decode().splitlines() if line.startswith("data:")]
+                            payload = next((message for message in messages if "id" in message), {})
+                        else:
+                            payload = json.loads(body)
+                        with self.fault_lock, (temp / "rpc-trace").open("a") as trace:
+                            trace.write(json.dumps({"method": method, "result": payload.get("result")}) + "\n")
                     if self.path.startswith("/files?reviewed=v1&download=") and body and (temp / "drop-operation-response.corrupt").exists():
                         body = bytes([body[0] ^ 1]) + body[1:]
                     if (temp / "drop-operation-response").exists() and method == "ai.workcell/execute":
@@ -206,7 +298,7 @@ def main():
                             self.connection.shutdown(socket.SHUT_RDWR)
                         return
                     if response.status >= 400 and self.headers.get("Authorization"):
-                        print("Authenticated upstream failure:", response.status, body[:2000].decode(errors="replace"), flush=True)
+                        print("Authenticated upstream failure:", method, response.status, body[:2000].decode(errors="replace"), flush=True)
                     if len(body) > 16 * 1024 * 1024:
                         self.send_error(502)
                         return
@@ -218,6 +310,9 @@ def main():
                     self.end_headers()
                     self.wfile.write(body)
                 finally:
+                    if rpc_key is not None:
+                        with self.fault_lock:
+                            self.rpc_active.pop(rpc_key, None)
                     connection.close()
 
             do_POST = forward
@@ -229,16 +324,30 @@ def main():
         proxy.socket = context.wrap_socket(proxy.socket, server_side=True)
         thread = threading.Thread(target=proxy.serve_forever)
         thread.start()
+        class DenyEgress(http.server.BaseHTTPRequestHandler):
+            def log_message(self, format: str, *args: object) -> None:
+                pass
+
+            def do_CONNECT(self):
+                self.send_error(403, "fixture egress denied")
+
+            do_GET = do_CONNECT
+
+        egress = http.server.ThreadingHTTPServer(("127.0.0.1", 0), DenyEgress)
+        egress_thread = threading.Thread(target=egress.serve_forever)
+        egress_thread.start()
         try:
             args = [str(binary), str(root), "--transport", "http", "--port", str(port),
                     "--http-token-file", str(token), "--allow-write", "--yolo",
-                    "--no-http-proxy", "--snapshot-root", str(temp / "snapshots")]
+                    "--http-proxy", f"http://127.0.0.1:{egress.server_port}", "--snapshot-root", str(temp / "snapshots")]
             for group in ("files", "code_graph", "web", "shell", "python_execution"):
                 args += ["--tool-group", group]
             for flag in ("server-id", "workspace-id", "workspace-generation", "root-project-id", "principal-id"):
                 args += ["--remote-" + flag, "integration-" + flag]
             server_env = {"PATH": os.environ["PATH"], "HOME": str(temp / "home"),
                           "XDG_CONFIG_HOME": str(temp / "config")}
+            if worker := os.environ.get("WORKCELL_MCP_CODE_WORKER"):
+                server_env["WORKCELL_MCP_CODE_WORKER"] = str(Path(worker).resolve(strict=True))
             with (temp / "server.log").open("w+") as log, contextlib.ExitStack() as servers:
                 def start_server():
                     process = servers.enter_context(child(args, env=server_env, stdout=log, stderr=log))
@@ -261,12 +370,17 @@ def main():
                     nonlocal server
                     os.killpg(server.pid, signal.SIGKILL)
                     server.wait(timeout=5)
+                    Proxy.rpc_active.clear()
+                    Proxy.operation_states.clear()
                     server = start_server()
 
                 env = os.environ.copy()
+                # The registry dispatch fixture nests large debug-build futures.
+                env.setdefault("RUST_MIN_STACK", str(16 * 1024 * 1024))
                 env.update(WORKCELL_TEST_ENDPOINT=f"https://127.0.0.1:{proxy.server_port}/mcp",
                            WORKCELL_TEST_TOKEN_FILE=str(token), WORKCELL_TEST_ROOT=str(root),
                            WORKCELL_TEST_STATE=str(temp / "state"), SSL_CERT_FILE=str(ca),
+                           WORKCELL_TEST_RPC_TRACE=str(temp / "rpc-trace"),
                            WORKCELL_TEST_FAULT=str(temp / "drop-operation-response"))
                 command = [str(repo / "scripts" / "dev-cargo.sh"), "test", "-p",
                            "caudra-workcell", "--test", "authenticated_local"]
@@ -278,7 +392,9 @@ def main():
                 args += ["--tool-group", "transfer", "--transfer-root", str(temp / "transfers")]
                 restart_server()
                 if not sandbox_only:
-                    with child([*command, "--", "--nocapture", "--test-threads=1", "--skip", "unsupported_server"], cwd=repo, env=env) as tests:
+                    test_filter = os.environ.get("WORKCELL_TEST_FILTER")
+                    selected = [test_filter] if test_filter else []
+                    with child([*command, *selected, "--", "--nocapture", "--test-threads=1", "--skip", "unsupported_server"], cwd=repo, env=env) as tests:
                         if tests.wait(timeout=600) != 0:
                             print("Fault execute requests:", Proxy.execute_requests, flush=True)
                             raise RuntimeError("authenticated local integration failed")
@@ -376,6 +492,9 @@ def main():
                     if failures:
                         raise RuntimeError("entrypoint checks failed: " + ", ".join(failures))
         finally:
+            egress.shutdown()
+            egress.server_close()
+            egress_thread.join(timeout=5)
             proxy.shutdown()
             proxy.server_close()
             thread.join(timeout=5)
