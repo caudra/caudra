@@ -119,6 +119,7 @@ enum DocumentMode {
     Import,
     Export,
     Compare,
+    LiveReport,
 }
 
 struct DocumentEditor {
@@ -293,7 +294,7 @@ impl SandboxManager {
     pub(crate) fn live_failed(&mut self, message: String) {
         if let Some(state) = self.state.as_mut() {
             state.live_pending = None;
-            state.status = message;
+            state.live_report(message);
         }
     }
 
@@ -339,19 +340,12 @@ impl SandboxManager {
             }
             Ok(LiveOutcome::Report(report)) => {
                 state.live_form = None;
-                let mut editor = TextEditor::new();
-                editor.set_text(report);
-                state.document = Some(DocumentEditor {
-                    mode: DocumentMode::Compare,
-                    editor,
-                    destination: None,
-                    export: None,
-                });
+                state.live_report(report);
                 state.status = "Action report. Esc returns; no automatic attachment, VM stop or local fallback.".into();
                 None
             }
             Err(error) => {
-                state.status = error;
+                state.live_report(error);
                 None
             }
         }
@@ -588,6 +582,21 @@ impl Overlay for SandboxManager {
 }
 
 impl Manager {
+    fn live_report(&mut self, report: String) {
+        self.status = report.clone();
+        if self.live_form.is_some() {
+            return;
+        }
+        let mut editor = TextEditor::new();
+        editor.set_text(format!("{report}\n\nEsc returns to the manager. No automatic retry or attachment. If the outcome is unknown, Reconcile before any new Create."));
+        self.document = Some(DocumentEditor {
+            mode: DocumentMode::LiveReport,
+            editor,
+            destination: None,
+            export: None,
+        });
+    }
+
     fn dirty(&self) -> bool {
         self.formatting.is_some()
             || self.form.as_ref().is_some_and(Form::dirty)
@@ -1916,7 +1925,7 @@ fn read_only_key(event: KeyEvent) -> bool {
 }
 
 #[cfg(all(test, unix))]
-mod tests {
+pub(crate) mod tests {
     use super::{
         CONFLICT, Confirmation, Control, DocumentMode, Focus, Form, Navigation, SAVED,
         SandboxAction, SandboxManager, SandboxView, StoreEffect, StoreReply, StoreResult,
@@ -2125,7 +2134,7 @@ on_exit = "detach"
         assert!(manager.state.as_ref().unwrap().confirmation.is_none());
     }
 
-    pub(super) fn live_instance(manager: &mut SandboxManager, borrowed: bool) {
+    pub(crate) fn live_instance(manager: &mut SandboxManager, borrowed: bool) {
         if manager
             .state
             .as_ref()
@@ -2343,7 +2352,7 @@ on_exit = "detach"
                 .is_none()
         );
         assert!(manager.pending());
-        assert!(manager.state.as_ref().unwrap().live_form.is_some());
+        assert!(manager.state.as_ref().unwrap().live_form.is_none());
         manager.receive_live(LiveReply {
             ticket: request.ticket,
             scope: request.scope,
@@ -2351,7 +2360,7 @@ on_exit = "detach"
         });
         assert!(!manager.pending());
         assert_eq!(manager.state.as_ref().unwrap().status, LIVE_ERROR);
-        assert!(manager.state.as_ref().unwrap().live_form.is_some());
+        assert!(manager.state.as_ref().unwrap().live_form.is_none());
     }
 
     #[test]
@@ -2519,7 +2528,7 @@ on_exit = "detach"
         assert!(manager.install_snapshot(&request, snapshot));
     }
 
-    pub(super) fn fixture() -> (TempDir, SandboxStore, SandboxManager) {
+    pub(crate) fn fixture() -> (TempDir, SandboxStore, SandboxManager) {
         let directory = Builder::new()
             .permissions(Permissions::from_mode(DIRECTORY_MODE))
             .tempdir()

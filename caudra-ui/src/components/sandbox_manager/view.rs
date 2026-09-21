@@ -104,6 +104,11 @@ impl Manager {
             panel.view(frame, body);
         } else if self.confirmation.is_some() {
             self.view_confirmation(frame, body);
+        } else if self.live_pending.is_some() {
+            frame.render_widget(
+                Paragraph::new(safe(&self.status)).wrap(Wrap { trim: false }),
+                body,
+            );
         } else if self.live_form.is_some() {
             self.view_live(frame, body);
         } else if self.references.is_some() {
@@ -116,6 +121,7 @@ impl Manager {
                     DocumentMode::Import => "Import configuration draft",
                     DocumentMode::Export => "Export preview · references only",
                     DocumentMode::Compare => "Baseline / Draft / External disk · read-only",
+                    DocumentMode::LiveReport => "Live action · status / result",
                 }
             };
             let block = Block::default().borders(Borders::ALL).title(title);
@@ -238,9 +244,11 @@ impl Manager {
                             "Test rules"
                         },
                     ),
-                    Hint::key("F6", KeyCode::F(6), "Discard action draft"),
                 ],
-                vec![Hint::key("Esc", KeyCode::Esc, "Close / retain draft")],
+                vec![
+                    Hint::key("F6", KeyCode::F(6), "Back / discard draft"),
+                    Hint::key("Esc", KeyCode::Esc, "Close / retain draft"),
+                ],
             ];
         }
         if let Some(document) = &self.document {
@@ -250,7 +258,9 @@ impl Manager {
                 match document.mode {
                     DocumentMode::Import => Hint::bind(key::SANDBOX_APPLY, "Apply import to draft"),
                     DocumentMode::Export => Hint::bind(key::SAVE, "Save as"),
-                    DocumentMode::Compare => Hint::inert("Ctrl+A/C", "Select / copy preview"),
+                    DocumentMode::Compare | DocumentMode::LiveReport => {
+                        Hint::inert("Ctrl+A/C", "Select / copy preview")
+                    }
                 }
             };
             return vec![vec![action], vec![Hint::key("Esc", KeyCode::Esc, "Back")]];

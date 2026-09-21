@@ -591,6 +591,7 @@ impl Manager {
         }
         if event.code == KeyCode::F(6) {
             self.live_form = None;
+            self.status = "Action draft discarded. No action submitted.".into();
             return SandboxAction::None;
         }
         if event.code == KeyCode::Enter && event.modifiers.contains(KeyModifiers::CONTROL) {
@@ -727,9 +728,10 @@ impl Manager {
             configuration_epoch: self.configuration_epoch,
         };
         self.live_pending = Some((ticket.clone(), scope.clone()));
-        self.status =
-            "Accepted live action. Esc closes, not cancels. Outcome remains durably recoverable."
-                .into();
+        if !matches!(operation, LiveOperation::ProbeImage(_)) {
+            self.live_form = None;
+        }
+        self.live_report("Action accepted; awaiting admission / lifecycle result.\nEsc closes the manager, NOT the operation. Do not resubmit Create; reconcile an unknown outcome.".into());
         SandboxAction::Live(Box::new(LiveRequest {
             ticket,
             scope,

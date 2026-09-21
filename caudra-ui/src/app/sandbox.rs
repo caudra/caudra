@@ -199,7 +199,10 @@ impl App {
                 }
                 Err(TryRecvError::Disconnected) => {
                     self.sandbox_live.reply = None;
-                    self.sandbox_manager.live_failed("Worker disconnected: outcome unknown. Draft retained. Reconcile; never replay Create.".into());
+                    self.sandbox_manager.live_failed(
+                        "Worker disconnected: outcome unknown. Reconcile; never replay Create."
+                            .into(),
+                    );
                     dirty = Dirty::YES;
                 }
                 Err(TryRecvError::Empty) => {}
@@ -278,10 +281,14 @@ mod tests {
     use crate::components::Status;
     use crate::components::keybindings::key;
     use crate::components::permission_prompt::PermissionDecision;
+    use crate::components::sandbox_manager::tests::{fixture, live_instance};
     use crate::components::sandbox_manager::{SandboxAction, SandboxView};
     use crate::repaint::Dirty;
     use crate::sandbox::transfer::{TransferCommand, TransferLink, transfer_permissions};
-    use crate::sandbox::{StoreReply, execute_store_effect};
+    use crate::sandbox::{
+        LiveOperation, LiveOutcome, LiveReply, SandboxSnapshot, SnapshotReply, SnapshotState,
+        StoreReply, execute_store_effect,
+    };
     use caudra_agent::permissions::{PermissionAnswer, PermissionManager, PluginRuleStore};
     use caudra_agent::workspace_transfer::{
         LocalAccess, LocalRootIdentity, RemoteRootIdentity, TransferAuthorization, TransferRoots,
@@ -295,12 +302,17 @@ mod tests {
     use caudra_workbench::{Workbench, WorkbenchStyles};
     use caudra_workcell::NativeTransferAuthorization;
     use caudra_workspace::WorkspacePath;
-    use crossterm::event::KeyEvent;
+    use crossterm::event::{
+        KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    };
     use futures_lite::future;
+    use ratatui::{Terminal, backend::TestBackend};
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
+    use std::sync::atomic::Ordering;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
+    use tempfile::TempDir;
     use test_case::test_case;
 
     const UNSAVED: &str = "unsent local draft";
@@ -314,6 +326,269 @@ mod tests {
     const DOTENV_KEY: &str = "CAUDRA_TRANSFER_TEST_NO_DOTENV";
     const PRIVATE_MODE: u32 = 0o700;
     static TRANSFER_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    const CREATE_NAME: &str = "reviewed-create";
+    const CREATE_REPORT: &str = "Fake lifecycle report: no VM was created";
+    const CREATE_ERROR: &str = "Fake lifecycle failure: outcome unknown; Reconcile before retrying";
+
+    fn sandbox_frame(app: &mut super::App) -> Vec<String> {
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| app.view(frame)).unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .chunks(80)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect())
+            .collect()
+    }
+
+    fn sandbox_key(app: &mut super::App, code: KeyCode) {
+        assert!(
+            app.update(Msg::Key(KeyEvent::new(code, KeyModifiers::NONE)))
+                .is_empty()
+        );
+    }
+
+    fn create_app() -> (TempDir, super::App) {
+        let (directory, _, manager) = fixture();
+        let mut app = test_app();
+        app.sandbox_manager = manager;
+        app.sandbox_manager
+            .open(app.state.session.id, SandboxView::Profiles);
+        live_instance(&mut app.sandbox_manager, false);
+        app.sandbox_manager
+            .open(app.state.session.id, SandboxView::Profiles);
+        sandbox_key(&mut app, KeyCode::Char('v'));
+        sandbox_key(&mut app, KeyCode::Tab);
+        app.update(Msg::Paste(CREATE_NAME.into()));
+        (directory, app)
+    }
+
+    #[test_case(false, false; "key_pending")]
+    #[test_case(true, false; "mouse_pending")]
+    #[test_case(false, true; "key_gate_rejection")]
+    #[test_case(true, true; "mouse_gate_rejection")]
+    fn create_acceptance_leaves_wizard_and_can_exit(mouse: bool, rejected: bool) {
+        let (_directory, mut app) = create_app();
+        app.update(Msg::Key(key::SANDBOX_APPLY.to_key_event()));
+        let review = sandbox_frame(&mut app);
+        assert!(review.iter().any(|line| line.contains(CREATE_NAME)));
+        assert!(app.sandbox_live.queued.is_none());
+        if mouse {
+            let row = review
+                .iter()
+                .position(|line| line.contains("Accept reviewed action"))
+                .unwrap();
+            let column = review[row].find("Accept reviewed action").unwrap();
+            for kind in [
+                MouseEventKind::Down(MouseButton::Left),
+                MouseEventKind::Up(MouseButton::Left),
+            ] {
+                app.update(Msg::Mouse(MouseEvent {
+                    kind,
+                    column: column as u16,
+                    row: row as u16,
+                    modifiers: KeyModifiers::NONE,
+                }));
+            }
+        } else {
+            sandbox_key(&mut app, KeyCode::Char('s'));
+        }
+        let request = app.sandbox_live.queued.take().expect("accepted request");
+        assert!(matches!(request.operation, LiveOperation::Create { .. }));
+        if rejected {
+            app.status = Status::Streaming;
+            let reason = app.sandbox_action_blocker(false).unwrap();
+            app.sandbox_failed(reason.into());
+            assert!(sandbox_frame(&mut app).join("\n").contains("active agent"));
+        }
+        assert!(
+            !sandbox_frame(&mut app)
+                .join("\n")
+                .contains("New instance name")
+        );
+        app.update(Msg::Key(key::SANDBOX_APPLY.to_key_event()));
+        sandbox_key(&mut app, KeyCode::Char('s'));
+        assert!(app.sandbox_live.queued.is_none());
+        app.restoring.store(true, Ordering::Relaxed);
+        sandbox_key(&mut app, KeyCode::Esc);
+        if app.sandbox_manager.is_open() {
+            sandbox_key(&mut app, KeyCode::Esc);
+        }
+        assert!(!app.sandbox_manager.is_open());
+        if !rejected {
+            assert!(app.sandbox_manager.pending());
+            let (sender, receiver) = flume::bounded(1);
+            app.sandbox_live.reply = Some(receiver);
+            sender
+                .send(LiveReply {
+                    ticket: request.ticket,
+                    scope: request.scope,
+                    result: Ok(LiveOutcome::Report(CREATE_REPORT.into())),
+                })
+                .unwrap();
+            assert_eq!(app.poll_sandbox_live(), Dirty::YES);
+            assert!(!app.sandbox_manager.pending());
+            assert!(!app.sandbox_manager.is_open());
+        }
+        assert!(app.workspace_session.is_none());
+    }
+
+    #[test_case(false; "report")]
+    #[test_case(true; "failure")]
+    fn create_worker_result_is_visible_and_back_does_not_resubmit(failed: bool) {
+        let (_directory, mut app) = create_app();
+        app.update(Msg::Key(key::SANDBOX_APPLY.to_key_event()));
+        sandbox_key(&mut app, KeyCode::Char('s'));
+        let request = app.sandbox_live.queued.take().unwrap();
+        let (snapshot_sender, snapshot_receiver) = flume::bounded(1);
+        app.sandbox_live.snapshot = Some(snapshot_receiver);
+        let (sender, receiver) = flume::bounded(1);
+        app.sandbox_live.reply = Some(receiver);
+        let report = if failed { CREATE_ERROR } else { CREATE_REPORT };
+        sender
+            .send(LiveReply {
+                ticket: request.ticket,
+                scope: request.scope,
+                result: if failed {
+                    Err(report.into())
+                } else {
+                    Ok(LiveOutcome::Report(report.into()))
+                },
+            })
+            .unwrap();
+        assert_eq!(app.poll_sandbox_live(), Dirty::YES);
+        assert!(!app.sandbox_manager.pending());
+        assert!(sandbox_frame(&mut app).join("\n").contains(report));
+        app.update(Msg::Key(key::SANDBOX_APPLY.to_key_event()));
+        sandbox_key(&mut app, KeyCode::Char('s'));
+        assert!(app.sandbox_live.queued.is_none());
+        sandbox_key(&mut app, KeyCode::Esc);
+        assert!(app.sandbox_manager.is_open());
+        assert!(
+            !sandbox_frame(&mut app)
+                .join("\n")
+                .contains("New instance name")
+        );
+        sandbox_key(&mut app, KeyCode::Esc);
+        assert!(!app.sandbox_manager.is_open());
+        drop(snapshot_sender);
+    }
+
+    #[test_case(false; "open")]
+    #[test_case(true; "closed")]
+    fn create_worker_disconnect_never_restores_submittable_form(closed: bool) {
+        let (_directory, mut app) = create_app();
+        app.update(Msg::Key(key::SANDBOX_APPLY.to_key_event()));
+        sandbox_key(&mut app, KeyCode::Char('s'));
+        let _request = app.sandbox_live.queued.take().unwrap();
+        let (snapshot_sender, snapshot_receiver) = flume::bounded(1);
+        app.sandbox_live.snapshot = Some(snapshot_receiver);
+        let (sender, receiver) = flume::bounded(1);
+        app.sandbox_live.reply = Some(receiver);
+        if closed {
+            sandbox_key(&mut app, KeyCode::Esc);
+        }
+        drop(sender);
+        assert_eq!(app.poll_sandbox_live(), Dirty::YES);
+        assert_eq!(app.sandbox_manager.is_open(), !closed);
+        assert!(!app.sandbox_manager.pending());
+        if !closed {
+            let frame = sandbox_frame(&mut app).join("\n");
+            assert!(frame.contains("Worker disconnected"));
+            assert!(!frame.contains("New instance name"));
+        }
+        drop(snapshot_sender);
+    }
+
+    #[test_case(false; "current_completion")]
+    #[test_case(true; "stale_completion")]
+    fn closed_create_late_snapshot_and_reply_never_reopen(stale: bool) {
+        let (_directory, mut app) = create_app();
+        app.update(Msg::Key(key::SANDBOX_APPLY.to_key_event()));
+        sandbox_key(&mut app, KeyCode::Char('s'));
+        let request = app.sandbox_live.queued.take().unwrap();
+        let (snapshot_sender, snapshot_receiver) = flume::bounded(1);
+        app.sandbox_live.snapshot = Some(snapshot_receiver);
+        sandbox_key(&mut app, KeyCode::Esc);
+        assert!(!app.sandbox_manager.is_open());
+        let (sender, receiver) = flume::bounded(1);
+        app.sandbox_live.reply = Some(receiver);
+        let mut ticket = request.ticket;
+        if stale {
+            ticket.operation += 1;
+        }
+        sender
+            .send(LiveReply {
+                ticket,
+                scope: request.scope.clone(),
+                result: Ok(LiveOutcome::Report(CREATE_REPORT.into())),
+            })
+            .unwrap();
+        snapshot_sender
+            .send(SnapshotReply {
+                request: request.scope,
+                snapshot: SandboxSnapshot {
+                    sequence: 2,
+                    instances: SnapshotState::Ready(Vec::new()),
+                    providers: Default::default(),
+                    failures: Default::default(),
+                    credentials: Vec::new(),
+                },
+            })
+            .unwrap();
+        assert_eq!(app.poll_sandbox_live(), Dirty::YES);
+        assert_eq!(app.sandbox_manager.pending(), stale);
+        assert!(!app.sandbox_manager.is_open());
+        assert!(app.sandbox_live.queued.is_none());
+        assert!(app.sandbox_live.attachment.is_none());
+        assert!(!sandbox_frame(&mut app).join("\n").contains("Sandboxes"));
+    }
+
+    #[test_case(false; "keyboard_back")]
+    #[test_case(true; "mouse_back")]
+    fn create_draft_close_retains_and_explicit_back_returns_to_manager(mouse: bool) {
+        let (_directory, mut app) = create_app();
+        app.update(Msg::Key(key::SANDBOX_APPLY.to_key_event()));
+        sandbox_key(&mut app, KeyCode::Esc);
+        assert!(app.sandbox_live.queued.is_none());
+        sandbox_key(&mut app, KeyCode::Esc);
+        assert!(!app.sandbox_manager.is_open());
+        app.sandbox_manager
+            .open(app.state.session.id, SandboxView::Profiles);
+        let frame = sandbox_frame(&mut app);
+        assert!(frame.iter().any(|line| line.contains(CREATE_NAME)));
+        if mouse {
+            let row = frame
+                .iter()
+                .position(|line| line.contains("Back / discard draft"))
+                .unwrap();
+            let column = frame[row].find("Back / discard draft").unwrap();
+            for kind in [
+                MouseEventKind::Down(MouseButton::Left),
+                MouseEventKind::Up(MouseButton::Left),
+            ] {
+                app.update(Msg::Mouse(MouseEvent {
+                    kind,
+                    column: column as u16,
+                    row: row as u16,
+                    modifiers: KeyModifiers::NONE,
+                }));
+            }
+        } else {
+            sandbox_key(&mut app, KeyCode::F(6));
+        }
+        assert!(app.sandbox_manager.is_open());
+        assert!(
+            !sandbox_frame(&mut app)
+                .join("\n")
+                .contains("New instance name")
+        );
+        assert!(app.sandbox_live.queued.is_none());
+        sandbox_key(&mut app, KeyCode::Esc);
+        assert!(!app.sandbox_manager.is_open());
+    }
 
     #[test_case(false, None, false; "project_a_active_remembers_only_b")]
     #[test_case(true, None, false; "remote_active_remembers_only_b")]
