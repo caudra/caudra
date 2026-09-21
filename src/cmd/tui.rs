@@ -1212,12 +1212,21 @@ pub fn run(mut cli: Cli) -> Result<ExitCode> {
     let cwd = env::current_dir().unwrap_or_else(|_| ".".into());
     let startup_project_env = project_env_present(&cwd);
 
-    let workcell_runtime = Arc::new(super::workcell_runtime::WorkcellRuntime::initialize(
+    let resumed_sandbox =
+        super::sandbox::recover_session_source(&mut cli, &persistent_storage, &cwd)?;
+
+    let mut workcell_runtime = Arc::new(super::workcell_runtime::WorkcellRuntime::initialize(
         &cli.workcell,
         &cwd,
         &persistent_storage,
         ToolRegistry::global(),
     )?);
+    if let Some(binding) = &resumed_sandbox {
+        StoredWorkspaceBinding::validate_resume_identity(
+            Some(binding),
+            workcell_runtime.stored_binding(),
+        )?;
+    }
     let workcell_runtime_ms = lap();
 
     let (mut stack, _) = build_stack(
@@ -1276,6 +1285,7 @@ pub fn run(mut cli: Cli) -> Result<ExitCode> {
             }),
         })
         .context("run sdk mode")?;
+        super::sandbox::remember_session_source(&storage, &cwd, workcell_runtime.stored_binding())?;
         return Ok(ExitCode::SUCCESS);
     }
 
@@ -1334,6 +1344,7 @@ pub fn run(mut cli: Cli) -> Result<ExitCode> {
         workcell_runtime.stored_binding(),
     )?;
     let resolve_sessions_ms = lap();
+    super::sandbox::remember_session_source(&storage, &cwd, workcell_runtime.stored_binding())?;
     tracing::info!(
         state_dir_ms,
         model_registry_ms,
@@ -1450,6 +1461,17 @@ pub fn run(mut cli: Cli) -> Result<ExitCode> {
                     .as_ref()
                     .map(|worker| Arc::clone(&worker.loader)),
                 permission_authority_factory: Some(permission_authority_factory),
+                sandbox_connector: Some(super::sandbox::connector(
+                    storage.clone(),
+                    runtime_cwd.clone(),
+                )),
+                transfer_connector: Some(super::sandbox::transfer_connector(storage.clone())),
+                sandbox_readiness: Some({
+                    let runtime = Arc::clone(&workcell_runtime);
+                    Arc::new(move || {
+                        runtime.connection_status() == Some(RemoteConnectionStatus::Connected)
+                    })
+                }),
                 timeouts: stack.timeouts(),
                 exit_on_done: cli.exit_on_done,
                 lua_command_reader: stack.plugin_host.command_reader(),
@@ -1477,6 +1499,98 @@ pub fn run(mut cli: Cli) -> Result<ExitCode> {
         })?;
 
         let (reloaded, f, relocation) = match outcome {
+            RunOutcome::SandboxControl {
+                tabs: stopped,
+                focused: stopped_focus,
+                control,
+            } => {
+                let reconnect = control.reconnects();
+                let name = control.name.clone();
+                let session_ids: Vec<_> = stopped.iter().map(|tab| tab.session.id).collect();
+                stack.plugin_host.shutdown_checked().context(
+                    "Sandbox control refused: source plugins did not stop; no control sent",
+                )?;
+                teardown.join();
+                drop(stopped);
+                drop(stack);
+                ToolRegistry::global().install_stopped_runtime(&ToolRegistry::default());
+                let runtime = Arc::try_unwrap(workcell_runtime).map_err(|_| eyre!("Sandbox control refused: runtime still has owners; no control sent. Sessions saved; reopen explicitly."))?;
+                drop(runtime);
+                let record = control.execute(&storage).map_err(|error| eyre!("Sandbox {name} is DETACHED; sessions are saved. Control failed: {error}. Inspect/Reconcile and explicitly acknowledge failure if needed before retrying. No automatic retry, reconnect or local fallback."))?;
+                if !reconnect {
+                    eprintln!(
+                        "Sandbox {name} is detached; sessions saved. No reconnect or local fallback. {}",
+                        serde_json::to_string_pretty(&record)?
+                    );
+                    return Ok(ExitCode::SUCCESS);
+                }
+                let registry = ToolRegistry::default();
+                let runtime = super::workcell_runtime::WorkcellRuntime::initialize_sandbox_reviewed(&name, false, &cwd, &storage, &registry, Some(&record.revision()?))
+                    .context("Control postconditions verified but Workcell reconnect failed. Sessions saved; runtime detached. Reopen --sandbox explicitly; no local fallback")?;
+                let restored = session_ids
+                    .into_iter()
+                    .map(|id| {
+                        let lease = Arc::new(SessionLease::acquire(&storage, id)?);
+                        let session = setup::load_session(id, &storage)?;
+                        StoredWorkspaceBinding::validate_resume_identity(
+                            session.workspace_binding(),
+                            runtime.stored_binding(),
+                        )?;
+                        Ok(SessionTab {
+                            session,
+                            lease,
+                            cursor: None,
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                ToolRegistry::global().install_stopped_runtime(&registry);
+                workcell_runtime = Arc::new(runtime);
+                let (new_stack, new_warnings) = build_stack(&cli, &cwd, &storage, None, true)
+                    .context("Control and Workcell identity verified; UI rebuild failed. Sessions saved; reopen --sandbox explicitly")?;
+                tabs = restored;
+                focused = stopped_focus;
+                warnings = new_warnings;
+                warnings.push(format!("Sandbox {name}: control postconditions and Workcell identity verified; runtime rebuilt."));
+                stack = new_stack;
+                continue;
+            }
+            RunOutcome::Sandbox {
+                tabs: stopped,
+                attachment,
+            } => {
+                let prepared = attachment.runtime.downcast::<super::sandbox::PreparedSandbox>().map_err(|_| eyre!("Sandbox transition returned an incompatible runtime; source sessions were preserved"))?;
+                StoredWorkspaceBinding::validate_resume_identity(
+                    Some(&attachment.binding),
+                    prepared.runtime.stored_binding(),
+                )?;
+                stack
+                    .plugin_host
+                    .shutdown_checked()
+                    .context("Sandbox transition refused: source plugins did not stop")?;
+                teardown.join();
+                ToolRegistry::global().install_stopped_runtime(&prepared.registry);
+                drop(stack);
+                workcell_runtime = Arc::new(prepared.runtime);
+                let (new_stack, new_warnings) = build_stack(&cli, &cwd, &storage, None, true).context("Sandbox runtime is verified; source sessions remain saved. Reopen --sandbox if UI setup failed")?;
+                let resolved = resolve_remote_sessions(
+                    false,
+                    None,
+                    &new_stack.model.spec(),
+                    &workcell_runtime.display().cwd,
+                    &storage,
+                    &attachment.binding,
+                )?;
+                super::sandbox::remember_session_source(&storage, &cwd, Some(&attachment.binding))?;
+                tabs = resolved.tabs;
+                focused = resolved.focused;
+                warnings = new_warnings;
+                warnings.push(format!("Attached {} in a new session. Source sessions are saved; no history, grants or files were copied. Exit detaches only.", attachment.name));
+                stack = new_stack;
+                sweeper = RetentionSweeper::spawn(storage.clone(), stack.config.storage.retention);
+                committed_relocation = None;
+                drop(stopped);
+                continue;
+            }
             RunOutcome::Exit { summary, code } => {
                 if let Some(summary) = summary {
                     let rich = io::stderr().is_terminal() && !cli.exit_on_done;
@@ -3098,6 +3212,40 @@ mod tests {
         if stored_remote {
             assert!(resolve_session(true, None, TEST_MODEL, ".", &storage).is_err());
         }
+    }
+
+    #[test]
+    fn explicit_sandbox_transition_creates_fresh_session_without_local_context_or_grants() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = StateDir::from_path(temp.path().join("state"));
+        let mut local = AppSession::new(TEST_MODEL, TEST_CWD);
+        local.meta.yolo = Some(true);
+        local.meta.input_draft = Some(INJECTED_CONFIG_FAILURE.into());
+        local.save(&storage).unwrap();
+        let binding = StoredWorkspaceBinding::local_from_cwd(TEST_CWD);
+        let remote: StoredWorkspaceBinding = serde_json::from_str(
+            &serde_json::to_string(&binding)
+                .unwrap()
+                .replace("caudra:local:v1", "https://sandbox.test"),
+        )
+        .unwrap();
+        let remote = remote.with_sandbox_record(CaudraId::generate()).unwrap();
+        let resolved =
+            resolve_remote_sessions(false, None, TEST_MODEL, ".", &storage, &remote).unwrap();
+        let session = &resolved.tabs[0].session;
+        assert_ne!(session.id, local.id);
+        assert_eq!(session.workspace_binding(), Some(&remote));
+        assert!(session.messages().is_empty());
+        assert!(session.meta.yolo.is_none());
+        assert!(session.meta.input_draft.is_none());
+        assert!(session.meta.structured_permission_rules.is_empty());
+        assert_eq!(
+            crate::setup::load_session(local.id, &storage)
+                .unwrap()
+                .meta
+                .input_draft,
+            local.meta.input_draft
+        );
     }
 
     #[test]

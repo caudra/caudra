@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::SHELL_EXECUTION_TIMEOUT;
+use crate::transfer::PrivateStaging;
 use async_trait::async_trait;
 use caudra_config::workcell::{RemoteWorkcellSelection, WorkcellEndpoint};
 use caudra_storage::auth::{WorkcellCredential, WorkcellCredentialName};
@@ -16,24 +17,23 @@ use caudra_storage::remote_operation_journal::{
 };
 use caudra_storage::workspace_binding::StoredWorkspaceBinding;
 use caudra_workspace::{
-    AuthenticatedPrincipalId, AuthorityIdentity, ByteContent, ByteRange, CancellationResult,
-    CheckpointId, CollectionRevision, ContinuationToken, CwdHandle, DirectoryNavigation,
-    ExecRequest, ListPage, ListRequest, Mutation, MutationCondition, MutationEntryResult,
-    MutationKind, MutationRequest, MutationResult, OperationError, OperationHandle, OperationId,
-    OperationPhase, OperationProgress, OperationProgressKind, OperationState, OperationStatus,
-    PreparedScmMutation, PreparedSnapshotOperation, PreparedToolCall, ProjectAsset,
-    ProjectAssetContent, ProjectAssetKind, ProjectAssetManifest, ProjectAssetTrust,
-    ProjectIdentity, ProjectKey, ReadBytesRequest, ReadTextRequest, ReleaseResult,
-    ResolvedWorkspaceDirectory, ResourceId, ResourceKind, ResourceRevision, ResourceScope,
-    ResourceSelector, RestoreId, ScmChangeKind, ScmCommit, ScmDiffLine, ScmDiffLineKind,
-    ScmDiffPage, ScmDiffRequest, ScmDiffTarget, ScmDiscoverRequest, ScmDiscoverResult, ScmLogPage,
-    ScmLogRequest, ScmMutation, ScmMutationPreview, ScmMutationResult, ScmReadSidePage,
-    ScmReadSideRequest, ScmRepository, ScmRepositoryRevisions, ScmRevision, ScmSide,
-    ScmStatusEntry, ScmStatusPage, ScmStatusRequest, SearchHit, SearchPage, SearchRequest,
-    SearchScanCounts, SequenceMetadata, SessionBindingId, SessionWorkspaceBinding,
-    SnapshotCaptureRequest, SnapshotCaptureResult, SnapshotChange, SnapshotChangeKind,
-    SnapshotCleanupPreview, SnapshotCleanupResult, SnapshotFile, SnapshotId, SnapshotInspectPage,
-    SnapshotInspectRequest, SnapshotOperationPreview, SnapshotOperationResult,
+    AuthenticatedPrincipalId, AuthorityIdentity, ByteContent, CancellationResult, CheckpointId,
+    CollectionRevision, ContinuationToken, CwdHandle, DirectoryNavigation, ExecRequest, ListPage,
+    ListRequest, Mutation, MutationCondition, MutationEntryResult, MutationKind, MutationRequest,
+    MutationResult, OperationError, OperationHandle, OperationId, OperationPhase,
+    OperationProgress, OperationProgressKind, OperationState, OperationStatus, PreparedScmMutation,
+    PreparedSnapshotOperation, PreparedToolCall, ProjectAsset, ProjectAssetContent,
+    ProjectAssetKind, ProjectAssetManifest, ProjectAssetTrust, ProjectIdentity, ProjectKey,
+    ReadBytesRequest, ReadTextRequest, ReleaseResult, ResolvedWorkspaceDirectory, ResourceId,
+    ResourceKind, ResourceRevision, ResourceScope, ResourceSelector, RestoreId, ScmChangeKind,
+    ScmCommit, ScmDiffLine, ScmDiffLineKind, ScmDiffPage, ScmDiffRequest, ScmDiffTarget,
+    ScmDiscoverRequest, ScmDiscoverResult, ScmLogPage, ScmLogRequest, ScmMutation,
+    ScmMutationPreview, ScmMutationResult, ScmReadSidePage, ScmReadSideRequest, ScmRepository,
+    ScmRepositoryRevisions, ScmRevision, ScmSide, ScmStatusEntry, ScmStatusPage, ScmStatusRequest,
+    SearchHit, SearchPage, SearchRequest, SearchScanCounts, SequenceMetadata, SessionBindingId,
+    SessionWorkspaceBinding, SnapshotCaptureRequest, SnapshotCaptureResult, SnapshotChange,
+    SnapshotChangeKind, SnapshotCleanupPreview, SnapshotCleanupResult, SnapshotFile, SnapshotId,
+    SnapshotInspectPage, SnapshotInspectRequest, SnapshotOperationPreview, SnapshotOperationResult,
     SnapshotRestorePreview, SnapshotRestoreState, SnapshotRestoreStatus, SnapshotState,
     SnapshotSummary, SnapshotUnrevertPreview, SourceTrustAnchor, TextContent, ToolPrepareRequest,
     WatchCloseResult, WatchCursor, WatchEventPage, WatchOpenRequest, WatchPollRequest,
@@ -45,13 +45,12 @@ use caudra_workspace::{
     WorkspaceSearchService, WorkspaceServices, WorkspaceSnapshotMutationService,
     WorkspaceSnapshotReadService, WorkspaceToolService, WorkspaceWatchService, WriteContent,
 };
+use caudra_workspace::{PreparedTransferPublication, WorkspaceTransferService};
 use flume::{Receiver, Sender};
 use futures_lite::future;
 use futures_lite::io::{AsyncReadExt, Cursor};
 use isahc::config::{Configurable, RedirectPolicy, VersionNegotiation};
-use isahc::http::header::{
-    ACCEPT, AUTHORIZATION, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, IF_MATCH, RANGE,
-};
+use isahc::http::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE};
 use isahc::http::{Method, Request, StatusCode};
 use isahc::{AsyncBody, HttpClient, ResponseExt};
 use serde::de::DeserializeOwned;
@@ -89,6 +88,8 @@ const SNAPSHOT_UNREVERT_KIND: &str = "snapshot_unrevert";
 const SNAPSHOT_CLEANUP_KIND: &str = "snapshot_cleanup";
 const MAX_CONTROL_OPERATIONS: usize = 32;
 const SHELL_CONTRACT_ID: &str = "shell.execution.v1";
+
+mod transfer;
 
 #[derive(Clone)]
 pub struct NamedBearerCredential {
@@ -176,6 +177,10 @@ pub enum RemoteWorkcellError {
     BindingMismatch,
     #[error("remote Workcell quota is exhausted")]
     QuotaExceeded,
+    #[error("remote transfer digest or size does not match")]
+    TransferIntegrity,
+    #[error("remote transfer quota is exhausted")]
+    TransferQuota,
     #[error("remote Workcell operation outcome is indeterminate")]
     Indeterminate,
     #[error("remote Workcell durable operation journal is unavailable")]
@@ -222,6 +227,8 @@ impl From<RemoteWorkcellError> for WorkspaceError {
             RemoteWorkcellError::PolicyDenied => Self::PolicyDenied,
             RemoteWorkcellError::BindingMismatch => Self::IdentityMismatch,
             RemoteWorkcellError::QuotaExceeded => Self::Conflict,
+            RemoteWorkcellError::TransferIntegrity => Self::TransferIntegrity,
+            RemoteWorkcellError::TransferQuota => Self::TransferQuota,
             RemoteWorkcellError::Indeterminate => Self::IndeterminateOutcome,
             RemoteWorkcellError::JournalUnavailable => Self::Unavailable,
             RemoteWorkcellError::RecoveryBindingMismatch { .. } => Self::IdentityMismatch,
@@ -301,13 +308,6 @@ struct ToolListWire {
 struct RequestFailure {
     error: RemoteWorkcellError,
     dispatched: bool,
-}
-
-struct TransferBody {
-    bytes: Vec<u8>,
-    start: u64,
-    end_exclusive: u64,
-    total: Option<u64>,
 }
 
 struct RemoteTransport {
@@ -549,167 +549,6 @@ impl RemoteTransport {
                 Err(error)
             }
         }
-    }
-
-    async fn transfer_get(
-        &self,
-        target: &str,
-        offset: u64,
-        max_bytes: u64,
-        expected_total: Option<u64>,
-        expected_revision: &str,
-        cancellation: &CancellationToken,
-    ) -> Result<TransferBody, RemoteWorkcellError> {
-        if max_bytes == 0 {
-            return Err(RemoteWorkcellError::InvalidProtocol);
-        }
-        let target = self
-            .endpoint
-            .join(target)
-            .map_err(|_| RemoteWorkcellError::InvalidProtocol)?;
-        if !same_url_origin(&self.endpoint, &target) {
-            return Err(RemoteWorkcellError::OriginMismatch);
-        }
-        let range_end = offset
-            .checked_add(max_bytes - 1)
-            .ok_or(RemoteWorkcellError::InvalidProtocol)?;
-        let mut builder = Request::builder()
-            .method(Method::GET)
-            .uri(target.as_str())
-            .header(ACCEPT, OCTET_STREAM)
-            .header(RANGE, format!("bytes={offset}-{range_end}"))
-            .header(IF_MATCH, format!("\"{expected_revision}\""));
-        if let Some(bearer) = &self.bearer {
-            builder = builder.header(AUTHORIZATION, format!("Bearer {bearer}"));
-        }
-        let request = builder
-            .body(Vec::new())
-            .map_err(|_| RemoteWorkcellError::InvalidProtocol)?;
-        let operation = async {
-            let mut response = self
-                .client
-                .send_async(request)
-                .await
-                .map_err(|_| RemoteWorkcellError::Transport)?;
-            if !same_origin(&target, response.effective_uri()) {
-                return Err(RemoteWorkcellError::OriginMismatch);
-            }
-            if matches!(
-                response.status(),
-                StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
-            ) {
-                return Err(RemoteWorkcellError::Authentication);
-            }
-            if response.status() == StatusCode::PRECONDITION_FAILED {
-                return Err(RemoteWorkcellError::StaleResource);
-            }
-            if !matches!(
-                response.status(),
-                StatusCode::OK | StatusCode::PARTIAL_CONTENT
-            ) {
-                return Err(RemoteWorkcellError::Transport);
-            }
-            if response
-                .headers()
-                .get(CONTENT_TYPE)
-                .and_then(|value| value.to_str().ok())
-                .and_then(|value| value.split(';').next())
-                != Some(OCTET_STREAM)
-            {
-                return Err(RemoteWorkcellError::InvalidProtocol);
-            }
-            let declared_length = response
-                .headers()
-                .get(CONTENT_LENGTH)
-                .and_then(|value| value.to_str().ok())
-                .map(str::parse::<u64>)
-                .transpose()
-                .map_err(|_| RemoteWorkcellError::InvalidProtocol)?;
-            let content_range = response
-                .headers()
-                .get(CONTENT_RANGE)
-                .and_then(|value| value.to_str().ok())
-                .map(parse_content_range)
-                .transpose()?;
-            let (response_start, response_end, total, read_limit) = match response.status() {
-                StatusCode::PARTIAL_CONTENT => {
-                    let (start, end_exclusive, total) =
-                        content_range.ok_or(RemoteWorkcellError::InvalidProtocol)?;
-                    if start != offset
-                        || end_exclusive <= start
-                        || end_exclusive - start > max_bytes
-                        || expected_total.is_some_and(|expected| total != Some(expected))
-                    {
-                        return Err(RemoteWorkcellError::InvalidProtocol);
-                    }
-                    (start, end_exclusive, total, end_exclusive - start)
-                }
-                _ => {
-                    if content_range.is_some() || offset > expected_total.unwrap_or(u64::MAX) {
-                        return Err(RemoteWorkcellError::InvalidProtocol);
-                    }
-                    let total = declared_length.or(expected_total);
-                    if expected_total.is_some_and(|expected| total != Some(expected)) {
-                        return Err(RemoteWorkcellError::InvalidProtocol);
-                    }
-                    let limit = total.ok_or(RemoteWorkcellError::InvalidProtocol)?;
-                    (0, limit, total, limit)
-                }
-            };
-            if declared_length.is_some_and(|length| length != read_limit) {
-                return Err(RemoteWorkcellError::InvalidProtocol);
-            }
-            let absolute_limit =
-                usize::try_from(read_limit).map_err(|_| RemoteWorkcellError::InvalidProtocol)?;
-            if absolute_limit > MAX_HTTP_RESPONSE_BYTES {
-                return Err(RemoteWorkcellError::InvalidProtocol);
-            }
-            let mut bytes = Vec::with_capacity(absolute_limit.min(8192));
-            let mut chunk = [0_u8; 8192];
-            loop {
-                let read = response
-                    .body_mut()
-                    .read(&mut chunk)
-                    .await
-                    .map_err(|_| RemoteWorkcellError::Transport)?;
-                if read == 0 {
-                    break;
-                }
-                if bytes.len().saturating_add(read) > absolute_limit {
-                    return Err(RemoteWorkcellError::InvalidProtocol);
-                }
-                bytes.extend_from_slice(&chunk[..read]);
-            }
-            if bytes.len() != absolute_limit {
-                return Err(RemoteWorkcellError::InvalidProtocol);
-            }
-            if response.status() == StatusCode::OK {
-                let start =
-                    usize::try_from(offset).map_err(|_| RemoteWorkcellError::InvalidProtocol)?;
-                if start > bytes.len() {
-                    return Err(RemoteWorkcellError::InvalidProtocol);
-                }
-                let requested = usize::try_from(max_bytes).unwrap_or(usize::MAX);
-                let end = start.saturating_add(requested).min(bytes.len());
-                return Ok(TransferBody {
-                    bytes: bytes[start..end].to_vec(),
-                    start: offset,
-                    end_exclusive: u64::try_from(end).unwrap_or(u64::MAX),
-                    total,
-                });
-            }
-            Ok(TransferBody {
-                bytes,
-                start: response_start,
-                end_exclusive: response_end,
-                total,
-            })
-        };
-        let cancelled = async {
-            cancellation.cancelled().await;
-            Err(RemoteWorkcellError::Cancelled)
-        };
-        future::race(operation, cancelled).await
     }
 
     async fn read_json(
@@ -1078,6 +917,7 @@ struct WatchRecord {
 
 #[derive(Clone)]
 struct StoredOperation {
+    transfer: Option<PreparedTransferPublication>,
     binding: contract::OperationBinding,
     context: Option<PreparedWorkspaceContext>,
     invocation_id: OperationId,
@@ -1100,6 +940,8 @@ impl PreparedWorkspaceContext {
 
 #[derive(Clone)]
 struct JournalOperation {
+    publication_cwd: Option<WorkspacePath>,
+    publication_id: Option<OperationId>,
     operation_id: OperationId,
     invocation_id: OperationId,
     preparation_id: OperationId,
@@ -1110,6 +952,8 @@ struct JournalOperation {
 }
 
 struct PendingJournalOperation {
+    publication_cwd: Option<WorkspacePath>,
+    publication_id: Option<OperationId>,
     invocation_id: OperationId,
     preparation_id: OperationId,
     operation_kind: String,
@@ -1127,6 +971,8 @@ struct RemoteJournalState {
 
 #[derive(Clone)]
 struct RecoveryOperation {
+    publication_cwd: Option<WorkspacePath>,
+    publication_id: Option<OperationId>,
     operation_id: OperationId,
     invocation_id: OperationId,
     preparation_id: OperationId,
@@ -1159,6 +1005,8 @@ impl RemoteMutationJournal {
                 Ok((
                     record.operation_id,
                     PendingJournalOperation {
+                        publication_cwd: record.publication_cwd,
+                        publication_id: record.publication_id,
                         invocation_id: record.invocation_id,
                         preparation_id: record.preparation_id,
                         operation_kind: record.operation_kind,
@@ -1214,6 +1062,8 @@ impl RemoteMutationJournal {
                 .pending
                 .entry(record.operation_id)
                 .or_insert(PendingJournalOperation {
+                    publication_cwd: record.publication_cwd,
+                    publication_id: record.publication_id,
                     invocation_id: record.invocation_id,
                     preparation_id: record.preparation_id,
                     operation_kind: record.operation_kind,
@@ -1240,6 +1090,9 @@ impl RemoteMutationJournal {
         state
             .journal
             .reserve_before_send(&RemoteOperationReservation {
+                publication_cwd: operation.publication_cwd.clone(),
+                broad_lock: operation.broad,
+                publication_id: operation.publication_id.clone(),
                 operation_id: operation.operation_id.clone(),
                 invocation_id: operation.invocation_id.clone(),
                 preparation_id: operation.preparation_id.clone(),
@@ -1249,10 +1102,17 @@ impl RemoteMutationJournal {
                 lock_keys: operation.lock_keys.clone(),
                 created_at: unix_millis(),
             })
-            .map_err(|_| WorkspaceError::Unavailable)?;
+            .map_err(|error| match error {
+                RemoteOperationJournalError::PendingOperation(operation_id) => {
+                    WorkspaceError::PendingOperation { operation_id }
+                }
+                _ => WorkspaceError::Unavailable,
+            })?;
         state.pending.insert(
             operation.operation_id.clone(),
             PendingJournalOperation {
+                publication_cwd: operation.publication_cwd.clone(),
+                publication_id: operation.publication_id.clone(),
                 invocation_id: operation.invocation_id.clone(),
                 preparation_id: operation.preparation_id.clone(),
                 operation_kind: operation.operation_kind.clone(),
@@ -1425,6 +1285,8 @@ impl RemoteMutationJournal {
             .pending
             .iter()
             .map(|(operation_id, pending)| RecoveryOperation {
+                publication_cwd: pending.publication_cwd.clone(),
+                publication_id: pending.publication_id.clone(),
                 operation_id: operation_id.clone(),
                 invocation_id: pending.invocation_id.clone(),
                 preparation_id: pending.preparation_id.clone(),
@@ -1597,6 +1459,7 @@ impl Drop for PreparationPermit {
 }
 
 struct RemoteInner {
+    staging: PrivateStaging,
     transport: RemoteTransport,
     descriptor: contract::RemoteHostDescriptor,
     host_binding: Mutex<contract::HostBinding>,
@@ -1662,10 +1525,6 @@ impl RemoteWorkcellClient {
             .cloned()
             .map(|tool| (tool.name.clone(), tool))
             .collect();
-        require_full_remote_parity(
-            &descriptor.capabilities,
-            catalog.contains_key("file_download"),
-        )?;
         let trust_anchor = source_trust_anchor(selection)?;
         let authority = AuthorityIdentity::new(
             trust_anchor,
@@ -1735,10 +1594,7 @@ impl RemoteWorkcellClient {
         )
         .map_err(|_| RemoteWorkcellError::IdentityMismatch)?;
         let mutation_journal = RemoteMutationJournal::new(journal, stored_binding.clone())?;
-        let capabilities = workspace_capabilities(
-            &descriptor.capabilities,
-            catalog.contains_key("file_download"),
-        );
+        let capabilities = workspace_capabilities(&descriptor.capabilities);
         capabilities
             .validate()
             .map_err(|_| RemoteWorkcellError::CapabilityMismatch)?;
@@ -1782,6 +1638,9 @@ impl RemoteWorkcellClient {
             },
         );
         let client = Self(Arc::new(RemoteInner {
+            staging: PrivateStaging::new(transfer::negotiated_limits(
+                descriptor.capabilities.reviewed_transfer.as_ref(),
+            )),
             transport,
             descriptor,
             host_binding: Mutex::new(host_binding),
@@ -1985,8 +1844,14 @@ impl RemoteWorkcellClient {
                 .any(|capability| self.0.capabilities.supports(*capability))
         };
         let services = WorkspaceServices {
+            transfer: self
+                .0
+                .capabilities
+                .supports(WorkspaceCapability::ReviewedTransfer)
+                .then(|| service.clone() as Arc<dyn WorkspaceTransferService>),
             control: Some(service.clone()),
-            read: (workspace.is_some() || capabilities.file_transfer.is_some())
+            read: workspace
+                .is_some()
                 .then(|| service.clone() as Arc<dyn WorkspaceReadService>),
             mutation: has_any(&[
                 WorkspaceCapability::MutationExecute,
@@ -2124,6 +1989,10 @@ impl RemoteWorkcellClient {
                 return Err(RemoteWorkcellError::RecoveryBindingMismatch {
                     operation_id: operation.operation_id.as_str().to_owned(),
                 });
+            }
+            if operation.publication_id.is_some() {
+                self.recover_transfer(&operation).await?;
+                continue;
             }
             let handle = OperationHandle {
                 preparation_id: operation.preparation_id.clone(),
@@ -2645,6 +2514,8 @@ impl RemoteWorkcellClient {
         let mut journal = journal_policy
             .map(|(operation_kind, broad)| {
                 Ok::<JournalOperation, WorkspaceError>(JournalOperation {
+                    publication_cwd: None,
+                    publication_id: None,
                     operation_id: OperationId::new(format!(
                         "caudra-journal-{}",
                         CaudraId::generate()
@@ -2697,6 +2568,7 @@ impl RemoteWorkcellClient {
         operations.insert(
             preparation_id,
             StoredOperation {
+                transfer: None,
                 binding: response.binding.clone(),
                 context,
                 invocation_id,
@@ -3388,127 +3260,7 @@ impl WorkspaceReadService for RemoteWorkcellClient {
         request: &ReadBytesRequest,
     ) -> Result<ByteContent, WorkspaceError> {
         self.require_capability(WorkspaceCapability::ReadBytes)?;
-        let transfer_limit = self
-            .0
-            .descriptor
-            .capabilities
-            .file_transfer
-            .as_ref()
-            .ok_or(WorkspaceError::UnsupportedCapability {
-                capability: WorkspaceCapability::ReadBytes,
-            })?
-            .limits
-            .max_bytes;
-        require_nonzero_within(
-            request.max_bytes,
-            transfer_limit.min(MAX_HTTP_RESPONSE_BYTES as u64),
-        )?;
-        let path = self.selector_path(cursor, &request.resource)?;
-        let pre = WorkspaceReadService::stat(self, binding, cursor, &request.resource).await?;
-        let pre_revision = pre.revision.clone().ok_or_else(invalid_response)?;
-        if request
-            .if_revision
-            .as_ref()
-            .is_some_and(|revision| revision != &pre_revision)
-        {
-            return Err(WorkspaceError::StaleResource {
-                resource_id: pre.scope.resource_id().clone(),
-            });
-        }
-        let spec =
-            self.0
-                .catalog
-                .get("file_download")
-                .ok_or(WorkspaceError::UnsupportedCapability {
-                    capability: WorkspaceCapability::ReadBytes,
-                })?;
-        let preparation_permit = self.reserve_preparation()?;
-        let prepare: contract::PrepareResponse = self
-            .call(
-                contract::PREPARE_METHOD,
-                &contract::PrepareRequest {
-                    cwd_handle: None,
-                    version: contract::ContractVersion::V1,
-                    host: self.host_binding(),
-                    tool: contract::ToolName::new(spec.name.clone())
-                        .map_err(|_| invalid_response())?,
-                    contract: contract_binding(spec)?,
-                    arguments: json!({"path": path.as_str()}),
-                },
-                &self.0.cancellation.child_token(),
-            )
-            .await?;
-        validate_contract_binding(&prepare.binding.contract, spec)?;
-        let operation = self.prepared_handle(
-            &prepare,
-            "download",
-            None,
-            Some(PreparedWorkspaceContext {
-                binding: binding.clone(),
-                cursor: cursor.clone(),
-            }),
-        )?;
-        drop(preparation_permit);
-        let status = self
-            .execute_operation(binding, cursor, &operation, |value| Ok(value.clone()))
-            .await?;
-        let Value::Object(result) = completed_result(&status)? else {
-            return Err(invalid_response());
-        };
-        let target = result
-            .get("url")
-            .and_then(Value::as_str)
-            .ok_or_else(invalid_response)?;
-        if result.get("path").and_then(Value::as_str) != Some(path.as_str()) {
-            return Err(invalid_path());
-        }
-        let total = result.get("bytes").and_then(Value::as_u64);
-        if total != pre.size_bytes {
-            return Err(invalid_response());
-        }
-        let transfer = self
-            .0
-            .transport
-            .transfer_get(
-                target,
-                request.byte_offset,
-                request.max_bytes,
-                total,
-                pre_revision.as_str(),
-                &self.0.cancellation.child_token(),
-            )
-            .await
-            .map_err(|error| {
-                if error == RemoteWorkcellError::StaleResource {
-                    WorkspaceError::StaleResource {
-                        resource_id: pre.scope.resource_id().clone(),
-                    }
-                } else {
-                    WorkspaceError::from(error)
-                }
-            })?;
-        let post = WorkspaceReadService::stat(self, binding, cursor, &request.resource).await?;
-        let post_revision = post.revision.ok_or_else(invalid_response)?;
-        if post.scope.resource_id() != pre.scope.resource_id() || post_revision != pre_revision {
-            return Err(WorkspaceError::StaleResource {
-                resource_id: pre.scope.resource_id().clone(),
-            });
-        }
-        let truncated = transfer
-            .total
-            .is_some_and(|total| transfer.end_exclusive < total);
-        Ok(ByteContent {
-            bytes: transfer.bytes,
-            resource_id: pre.scope.resource_id().clone(),
-            revision: post_revision,
-            range: ByteRange {
-                start: transfer.start,
-                end_exclusive: transfer.end_exclusive,
-            },
-            total_bytes: transfer.total,
-            truncated,
-            next_byte_offset: truncated.then_some(transfer.end_exclusive),
-        })
+        self.read_reviewed_bytes(binding, cursor, request).await
     }
 }
 
@@ -3832,6 +3584,17 @@ impl WorkspaceMutationService for RemoteWorkcellClient {
         request: &MutationRequest,
     ) -> Result<OperationStatus<MutationResult>, WorkspaceError> {
         self.require_capability(WorkspaceCapability::MutationExecute)?;
+        if request.mutations.iter().any(|mutation| {
+            matches!(
+                mutation,
+                Mutation::Write {
+                    content: WriteContent::Bytes(_),
+                    ..
+                }
+            )
+        }) {
+            return self.execute_binary_mutation(binding, cursor, request).await;
+        }
         let capability = self
             .0
             .descriptor
@@ -3909,6 +3672,19 @@ impl WorkspaceMutationService for RemoteWorkcellClient {
         operation: &OperationHandle,
     ) -> Result<OperationStatus<MutationResult>, WorkspaceError> {
         self.require_capability(WorkspaceCapability::MutationStatus)?;
+        let transfer = self
+            .0
+            .operations
+            .lock()
+            .map_err(|_| WorkspaceError::Unavailable)?
+            .get(operation)?
+            .transfer
+            .clone();
+        if let Some(prepared) = transfer {
+            return self
+                .binary_mutation_status(binding, cursor, &prepared)
+                .await;
+        }
         self.operation_status(binding, cursor, operation, parse_mutation_result_unbound)
             .await
     }
@@ -5205,12 +4981,22 @@ fn parse_content_range(value: &str) -> Result<(u64, u64, Option<u64>), RemoteWor
 }
 
 fn map_rpc_error(code: i64, data: Option<&Value>) -> RemoteWorkcellError {
-    let symbolic = data.and_then(Value::as_object).and_then(|data| {
-        data.get("code")
-            .and_then(Value::as_str)
-            .or_else(|| data.get("kind").and_then(Value::as_str))
-    });
+    let symbolic = data
+        .and_then(|data| data.get("code"))
+        .and_then(Value::as_str);
     match symbolic {
+        Some("transferIntegrityFailure") => RemoteWorkcellError::TransferIntegrity,
+        Some("transferLimitExceeded") => RemoteWorkcellError::TransferQuota,
+        Some(
+            "transferConflict"
+            | "transferMissing"
+            | "transferInvalidState"
+            | "transferPublicationReserved",
+        ) => RemoteWorkcellError::Conflict,
+        Some("transferBindingMismatch") => RemoteWorkcellError::BindingMismatch,
+        Some("transferCancelled") => RemoteWorkcellError::Cancelled,
+        Some("transferIndeterminate") => RemoteWorkcellError::Indeterminate,
+        Some("transferStorageUnavailable") => RemoteWorkcellError::Transport,
         Some("authentication") | Some("permission_denied") => RemoteWorkcellError::Authentication,
         Some("stale_resource") | Some("stale_repository") | Some("stale_prepared_operation") => {
             RemoteWorkcellError::StaleResource
@@ -5290,7 +5076,7 @@ fn validate_descriptor(
     {
         return Err(RemoteWorkcellError::IdentityMismatch);
     }
-    validate_capabilities(&descriptor.capabilities)
+    require_full_remote_parity(&descriptor.capabilities)
 }
 
 fn same_descriptor_except_instance(
@@ -5367,8 +5153,8 @@ fn validate_capabilities(
             return Err(RemoteWorkcellError::CapabilityMismatch);
         }
     }
-    if let Some(transfer) = &capabilities.file_transfer
-        && (transfer.version != contract::ContractVersion::V1 || transfer.limits.max_bytes == 0)
+    if capabilities.reviewed_transfer.is_some()
+        && !transfer::compatible(&capabilities.reviewed_transfer, &capabilities.operations)
     {
         return Err(RemoteWorkcellError::CapabilityMismatch);
     }
@@ -5495,8 +5281,8 @@ fn validate_capabilities(
 
 fn require_full_remote_parity(
     capabilities: &contract::RemoteHostCapabilities,
-    has_download_tool: bool,
 ) -> Result<(), RemoteWorkcellError> {
+    validate_capabilities(capabilities)?;
     let Some(operations) = capabilities.operations.as_ref() else {
         return Err(RemoteWorkcellError::CapabilityMismatch);
     };
@@ -5525,8 +5311,11 @@ fn require_full_remote_parity(
     let complete = capabilities.control_plane
         && capabilities.control_plane_missing.is_empty()
         && capabilities.execution_environment.is_some()
-        && capabilities.file_transfer.is_some()
-        && has_download_tool
+        && transfer::compatible(&capabilities.reviewed_transfer, &capabilities.operations)
+        && capabilities
+            .reviewed_transfer
+            .as_ref()
+            .is_some_and(|transfer| transfer.creates_directories && transfer.safe_inventory)
         && operations.exact_preparation
         && operation_methods.prepare
         && operation_methods.execute
@@ -5712,9 +5501,13 @@ fn contract_string<'a>(
 
 fn workspace_capabilities(
     capabilities: &contract::RemoteHostCapabilities,
-    has_download_tool: bool,
 ) -> WorkspaceCapabilities {
     let mut result = Vec::new();
+    push_if(
+        &mut result,
+        transfer::compatible(&capabilities.reviewed_transfer, &capabilities.operations),
+        WorkspaceCapability::ReviewedTransfer,
+    );
     if let Some(workspace) = &capabilities.workspace {
         push_if(
             &mut result,
@@ -5744,17 +5537,7 @@ fn workspace_capabilities(
     }
     push_if(
         &mut result,
-        capabilities.file_transfer.is_some()
-            && has_download_tool
-            && capabilities
-                .workspace
-                .as_ref()
-                .is_some_and(|workspace| workspace.methods.stat)
-            && capabilities.operations.as_ref().is_some_and(|operations| {
-                operations.methods.prepare
-                    && operations.methods.execute
-                    && operations.methods.status
-            }),
+        transfer::compatible(&capabilities.reviewed_transfer, &capabilities.operations),
         WorkspaceCapability::ReadBytes,
     );
     if let Some(operations) = &capabilities.operations {
@@ -6714,15 +6497,6 @@ fn operation_phase(state: contract::OperationState) -> OperationPhase {
     }
 }
 
-fn completed_result<T>(status: &OperationStatus<T>) -> Result<&T, WorkspaceError> {
-    match &status.state {
-        OperationState::Completed { result, .. } => Ok(result),
-        OperationState::Indeterminate { .. } => Err(WorkspaceError::IndeterminateOutcome),
-        OperationState::Cancelled { .. } => Err(WorkspaceError::Cancelled),
-        _ => Err(invalid_response()),
-    }
-}
-
 fn workspace_mutation(mutation: &Mutation) -> Result<contract::WorkspaceMutation, WorkspaceError> {
     match mutation {
         Mutation::Write {
@@ -7262,15 +7036,15 @@ mod tests {
     use super::{
         BoundedMap, CursorRecord, CursorRegistry, DIRECT_EXEC_KIND, JournalOperation, JsonRpcError,
         MAX_SSE_EVENT_BYTES, OperationRegistry, PreparedWorkspaceContext, RecoveryOperation,
-        RemoteEvent, RemoteMutationJournal, RemoteTransport, RemoteWorkcellError, ResourceCache,
-        SHELL_CONTRACT_ID, SHELL_EXECUTION_TIMEOUT, StoredOperation, ToolListWire,
-        WORKSPACE_MUTATION_KIND, canonical_journal_policy, cleanup_preview_partitions,
-        convert_status, execution_timeout, freeze_catalog, join_workspace_path, map_rpc_error,
-        numeric_loopback, pagination_flags, parse_content_range, parse_snapshot_result,
-        project_asset_kind, project_asset_trust, recovery_status, require_full_remote_parity,
-        require_nonzero_within, same_descriptor_except_instance, same_unique_ids,
-        serialized_items_bytes, source_trust_anchor, validate_capabilities, validate_selector_id,
-        watch_path_within,
+        RemoteEvent, RemoteMutationJournal, RemoteTransport, RemoteWorkcellClient,
+        RemoteWorkcellError, ResourceCache, SHELL_CONTRACT_ID, SHELL_EXECUTION_TIMEOUT,
+        StoredOperation, ToolListWire, WORKSPACE_MUTATION_KIND, canonical_journal_policy,
+        cleanup_preview_partitions, convert_status, execution_timeout, freeze_catalog,
+        join_workspace_path, map_rpc_error, numeric_loopback, pagination_flags,
+        parse_content_range, parse_snapshot_result, project_asset_kind, project_asset_trust,
+        recovery_status, require_full_remote_parity, require_nonzero_within,
+        same_descriptor_except_instance, same_unique_ids, serialized_items_bytes,
+        source_trust_anchor, validate_capabilities, validate_selector_id, watch_path_within,
     };
     use caudra_config::workcell::{
         RemoteWorkcellSelection, WorkcellEndpoint, WorkcellProfileName, WorkcellSourceRef,
@@ -7284,9 +7058,9 @@ mod tests {
     use caudra_workspace::{
         CwdHandle, OperationHandle, OperationId, OperationState, ProjectAssetKind,
         ProjectAssetTrust, ResourceId, ResourceRevision, ResourceScope, ResourceSelector,
-        RestoreId, SnapshotCleanupPreview, SnapshotId, SnapshotOperationPreview,
-        SnapshotRestorePreview, SnapshotUnrevertPreview, WorkspaceCursor, WorkspaceError,
-        WorkspacePath,
+        RestoreId, SessionBindingId, SnapshotCleanupPreview, SnapshotId, SnapshotOperationPreview,
+        SnapshotRestorePreview, SnapshotUnrevertPreview, WorkspaceCapability, WorkspaceCursor,
+        WorkspaceError, WorkspacePath,
     };
     use workcell::host_contract as contract;
 
@@ -7357,21 +7131,21 @@ mod tests {
     fn full_parity_accepts_bounded_transfers_and_journaled_nonatomic_snapshots() {
         let mut capabilities = full_capabilities();
         capabilities
-            .file_transfer
+            .reviewed_transfer
             .as_mut()
             .unwrap()
             .limits
-            .max_bytes = 64 * 1024 * 1024;
+            .max_file_bytes = 64 * 1024 * 1024;
         capabilities.snapshots.as_mut().unwrap().atomic_across_files = false;
         validate_capabilities(&capabilities).unwrap();
-        require_full_remote_parity(&capabilities, true).unwrap();
+        require_full_remote_parity(&capabilities).unwrap();
         capabilities
             .snapshots
             .as_mut()
             .unwrap()
             .durable_per_file_journal = false;
         assert_eq!(
-            require_full_remote_parity(&capabilities, true),
+            require_full_remote_parity(&capabilities),
             Err(RemoteWorkcellError::CapabilityMismatch)
         );
     }
@@ -7400,7 +7174,16 @@ mod tests {
             "toolCatalog":{"version":"v1","limits":{"maxRequestBytes":1}},
             "toolExecution":{"version":"v1","limits":{"maxRequestBytes":1}},
             "executionEnvironment":{"version":"v1","limits":{"maxRequestBytes":1}},
-            "fileTransfer":{"version":"v1","limits":{"maxBytes":1}},
+            "reviewedTransfer":{
+                "version":"v1","privateStaging":true,"sealedPublication":true,
+                "conditionalDownload":true,"singleRange":true,"durableOutcomes":true,
+                "createsDirectories":true,"safeInventory":true,
+                "atomicReplaceAgainstExternalWriters":false,
+                "limits":{"maxFileBytes":1,"maxStages":1,"maxReservedBytes":1,
+                    "maxConcurrentIo":1,"stageTtlMs":1,"ioTimeoutMs":1,"maxJournals":1,
+                    "maxJournalBytes":1,"maxJournalStorageBytes":1,"outcomeRetentionMs":1,
+                    "streamBufferBytes":1}
+            },
             "operations":{
                 "version":"v1","exactPreparation":true,
                 "methods":{"prepare":true,"execute":true,"release":true,"status":true,"cancel":true},
@@ -7533,11 +7316,11 @@ mod tests {
     fn full_remote_parity_rejects_every_missing_capability_family() {
         let capabilities = full_capabilities();
         assert!(validate_capabilities(&capabilities).is_ok());
-        assert!(require_full_remote_parity(&capabilities, true).is_ok());
+        assert!(require_full_remote_parity(&capabilities).is_ok());
 
         for family in [
             "executionEnvironment",
-            "fileTransfer",
+            "reviewedTransfer",
             "operations",
             "workspace",
             "watch",
@@ -7551,20 +7334,16 @@ mod tests {
             value[family] = Value::Null;
             let partial: contract::RemoteHostCapabilities = serde_json::from_value(value).unwrap();
             assert_eq!(
-                require_full_remote_parity(&partial, true),
+                require_full_remote_parity(&partial),
                 Err(RemoteWorkcellError::CapabilityMismatch),
                 "missing {family} was accepted"
             );
         }
-        assert_eq!(
-            require_full_remote_parity(&capabilities, false),
-            Err(RemoteWorkcellError::CapabilityMismatch)
-        );
         let mut no_replay = full_capabilities_value();
         no_replay["operations"]["exactPreparation"] = Value::Bool(false);
         let no_replay = serde_json::from_value(no_replay).unwrap();
         assert_eq!(
-            require_full_remote_parity(&no_replay, true),
+            require_full_remote_parity(&no_replay),
             Err(RemoteWorkcellError::CapabilityMismatch)
         );
         let mut no_progress = full_capabilities_value();
@@ -7576,8 +7355,86 @@ mod tests {
         );
     }
 
+    #[test_case("privateStaging")]
+    #[test_case("sealedPublication")]
+    #[test_case("conditionalDownload")]
+    #[test_case("singleRange")]
+    #[test_case("durableOutcomes")]
+    #[test_case("createsDirectories")]
+    #[test_case("safeInventory")]
+    fn full_remote_parity_requires_current_reviewed_transfer_guarantees(field: &str) {
+        let mut value = full_capabilities_value();
+        value["reviewedTransfer"][field] = json!(false);
+        let capabilities = serde_json::from_value(value).unwrap();
+        assert_eq!(
+            require_full_remote_parity(&capabilities),
+            Err(RemoteWorkcellError::CapabilityMismatch)
+        );
+    }
+
+    #[test_case("prepare")]
+    #[test_case("execute")]
+    #[test_case("status")]
+    #[test_case("release")]
+    #[test_case("cancel")]
+    fn binary_read_and_transfer_require_the_operation_lifecycle(method: &str) {
+        let mut value = full_capabilities_value();
+        value["operations"]["methods"][method] = json!(false);
+        let capabilities = serde_json::from_value(value).unwrap();
+        assert_eq!(
+            require_full_remote_parity(&capabilities),
+            Err(RemoteWorkcellError::CapabilityMismatch)
+        );
+        let supported = super::workspace_capabilities(&capabilities);
+        assert!(!supported.supports(WorkspaceCapability::ReadBytes));
+        assert!(!supported.supports(WorkspaceCapability::ReviewedTransfer));
+    }
+
+    #[test_case(false; "missing_reviewed_transfer")]
+    #[test_case(true; "obsolete_transfer_descriptor")]
+    fn unsupported_servers_fail_discovery_without_catalog_or_raw_transfer_downgrade(
+        obsolete: bool,
+    ) {
+        let mut descriptor = serde_json::to_value(descriptor("instance", "generation")).unwrap();
+        descriptor["capabilities"]
+            .as_object_mut()
+            .unwrap()
+            .remove("reviewedTransfer");
+        if obsolete {
+            descriptor["capabilities"]["fileTransfer"] =
+                json!({"version":"v1","limits":{"maxBytes":1}});
+        }
+        let body = json!({"jsonrpc":"2.0","id":"$ID","result":{
+            "resultType":"complete","ttlMs":0,"cacheScope":"private",
+            "supportedVersions":[super::PROTOCOL_VERSION],
+            "capabilities":{"extensions":{contract::EXTENSION_ID:descriptor}}
+        }})
+        .to_string()
+        .replace("\"$ID\"", "$ID");
+        let (endpoint, server) = serve_once(body, super::JSON_CONTENT_TYPE);
+        let selection = selection(endpoint.as_url().as_str(), WorkcellSourceRef::Direct, None);
+        let temp = tempfile::tempdir().unwrap();
+        let state = StateDir::from_path(temp.path().join("state"));
+        let result = smol::block_on(RemoteWorkcellClient::connect(
+            &selection,
+            None,
+            SessionBindingId::new("test").unwrap(),
+            RemoteOperationJournal::open(&state).unwrap(),
+            CancellationToken::new(),
+        ));
+        assert_eq!(
+            result.unwrap_err(),
+            if obsolete {
+                RemoteWorkcellError::InvalidProtocol
+            } else {
+                RemoteWorkcellError::CapabilityMismatch
+            }
+        );
+        server.join().unwrap();
+    }
+
     #[test]
-    fn real_rpc_error_response_prefers_symbolic_code_and_accepts_legacy_kind() {
+    fn real_rpc_error_response_uses_code_without_kind_alias() {
         let response: Value = serde_json::from_str(include_str!(
             "../tests/fixtures/remote_rpc_stale_resource.json"
         ))
@@ -7589,7 +7446,7 @@ mod tests {
         );
         assert_eq!(
             map_rpc_error(-32602, Some(&json!({"kind":"policy_denied"}))),
-            RemoteWorkcellError::PolicyDenied
+            RemoteWorkcellError::InvalidProtocol
         );
         assert_eq!(
             map_rpc_error(-32602, Some(&json!({"code":"quota_exceeded"}))),
@@ -7792,93 +7649,6 @@ mod tests {
         expected: Result<(u64, u64, Option<u64>), RemoteWorkcellError>,
     ) {
         assert_eq!(parse_content_range(value), expected);
-    }
-
-    #[test]
-    fn byte_transfer_sends_precondition_and_preserves_actual_range() {
-        const BODY: &[u8] = b"cde";
-        const REVISION: &str = "revision";
-
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let endpoint =
-            WorkcellEndpoint::parse(&format!("http://{}/mcp", listener.local_addr().unwrap()))
-                .unwrap();
-        let (observed, requests) = mpsc::channel();
-        let server = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut reader = BufReader::new(stream.try_clone().unwrap());
-            let mut headers = String::new();
-            loop {
-                let mut line = String::new();
-                reader.read_line(&mut line).unwrap();
-                if line == "\r\n" {
-                    break;
-                }
-                headers.push_str(&line.to_ascii_lowercase());
-            }
-            observed.send(headers).unwrap();
-            write!(
-                stream,
-                "HTTP/1.1 206 Partial Content\r\nContent-Type: application/octet-stream\r\nContent-Range: bytes 2-4/6\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                BODY.len()
-            )
-            .unwrap();
-            stream.write_all(BODY).unwrap();
-        });
-        let (transport, _) = RemoteTransport::new(&endpoint, None).unwrap();
-        let transfer = smol::block_on(transport.transfer_get(
-            "/download",
-            2,
-            3,
-            Some(6),
-            REVISION,
-            &CancellationToken::new(),
-        ))
-        .unwrap();
-        let request = requests.recv().unwrap();
-        assert!(request.starts_with("get /download http/1.1\r\n"));
-        assert!(request.contains("range: bytes=2-4\r\n"));
-        assert!(request.contains("if-match: \"revision\"\r\n"));
-        assert_eq!(transfer.bytes, BODY);
-        assert_eq!(transfer.start, 2);
-        assert_eq!(transfer.end_exclusive, 5);
-        assert_eq!(transfer.total, Some(6));
-        server.join().unwrap();
-    }
-
-    #[test]
-    fn byte_transfer_maps_failed_precondition_to_stale_resource() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let endpoint =
-            WorkcellEndpoint::parse(&format!("http://{}/mcp", listener.local_addr().unwrap()))
-                .unwrap();
-        let server = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut reader = BufReader::new(stream.try_clone().unwrap());
-            loop {
-                let mut line = String::new();
-                reader.read_line(&mut line).unwrap();
-                if line == "\r\n" {
-                    break;
-                }
-            }
-            write!(
-                stream,
-                "HTTP/1.1 412 Precondition Failed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-            )
-            .unwrap();
-        });
-        let (transport, _) = RemoteTransport::new(&endpoint, None).unwrap();
-        let result = smol::block_on(transport.transfer_get(
-            "/download",
-            0,
-            1,
-            Some(1),
-            "stale",
-            &CancellationToken::new(),
-        ));
-        assert!(matches!(result, Err(RemoteWorkcellError::StaleResource)));
-        server.join().unwrap();
     }
 
     #[test]
@@ -8143,6 +7913,7 @@ mod tests {
             .insert(
                 preparation_id.clone(),
                 StoredOperation {
+                    transfer: None,
                     binding: completed_status().binding.unwrap(),
                     context: None,
                     invocation_id: invocation_id.clone(),
@@ -8172,6 +7943,8 @@ mod tests {
         broad: bool,
     ) -> JournalOperation {
         JournalOperation {
+            publication_cwd: None,
+            publication_id: None,
             operation_id: OperationId::new(format!("operation-{id}")).unwrap(),
             invocation_id: OperationId::new(format!("invocation-{id}")).unwrap(),
             preparation_id: OperationId::new(format!("preparation-{id}")).unwrap(),
@@ -8514,6 +8287,8 @@ mod tests {
             .mark_dispatched(&operation.operation_id)
             .unwrap();
         let recovery = RecoveryOperation {
+            publication_cwd: None,
+            publication_id: None,
             operation_id: operation.operation_id.clone(),
             invocation_id: OperationId::new("invocation").unwrap(),
             preparation_id: OperationId::new("prepared").unwrap(),
@@ -8559,6 +8334,8 @@ mod tests {
         response.binding = None;
         response.outcome = None;
         let recovery = RecoveryOperation {
+            publication_cwd: None,
+            publication_id: None,
             operation_id: operation.operation_id.clone(),
             invocation_id: OperationId::new("invocation").unwrap(),
             preparation_id: OperationId::new("prepared").unwrap(),

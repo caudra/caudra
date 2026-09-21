@@ -254,8 +254,16 @@ impl Cli {
     }
 }
 
-#[derive(Args, Default)]
+#[derive(Args, Default, Clone)]
 pub struct WorkcellSelectorArgs {
+    /// Attach an existing saved sandbox. Never creates an instance implicitly.
+    #[arg(long, value_name = "NAME", global = true, conflicts_with_all = ["profile", "endpoint", "cwd", "credential_ref"])]
+    pub sandbox: Option<String>,
+
+    /// Explicitly permit cold-boot resume of a paused selected sandbox
+    #[arg(long, global = true)]
+    pub sandbox_resume: bool,
+
     /// Select [workcell.profiles.NAME] from the local user workcell.toml (version = 1)
     #[arg(
         long = "workcell-profile",
@@ -298,7 +306,8 @@ pub struct WorkcellSelectorArgs {
 
 impl WorkcellSelectorArgs {
     pub fn is_set(&self) -> bool {
-        self.profile.is_some()
+        self.sandbox.is_some()
+            || self.profile.is_some()
             || self.endpoint.is_some()
             || self.cwd.is_some()
             || self.credential_ref.is_some()
@@ -307,6 +316,11 @@ impl WorkcellSelectorArgs {
 
 #[derive(Subcommand)]
 pub enum Command {
+    /// Manage saved sandbox instances (daemon setup remains an operator action)
+    Sandbox {
+        #[command(subcommand)]
+        action: SandboxAction,
+    },
     /// Manage API authentication
     Auth {
         #[command(subcommand)]
@@ -772,6 +786,11 @@ pub enum McpAction {
 
 #[derive(Subcommand)]
 pub enum AuthAction {
+    /// Manage purpose-scoped sandbox lifecycle API keys (never Workcell traffic tokens)
+    Sandbox {
+        #[command(subcommand)]
+        action: SandboxAuthAction,
+    },
     /// Authenticate with a provider (interactive if no provider specified)
     Login {
         /// Provider slug (e.g. zai, openai, xai). Omit for interactive selection.
@@ -811,6 +830,152 @@ pub enum WorkcellAuthAction {
         /// Credential name
         name: WorkcellCredentialName,
     },
+}
+
+#[derive(Subcommand)]
+pub enum SandboxAuthAction {
+    /// Generate and save a 256-bit API namespace key; emits no secret
+    Generate {
+        name: WorkcellCredentialName,
+    },
+    /// Store a lifecycle key from a hidden prompt or bounded stdin
+    Set {
+        name: WorkcellCredentialName,
+        #[arg(long)]
+        stdin: bool,
+    },
+    /// List names without printing key values
+    List,
+    Delete {
+        name: WorkcellCredentialName,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum SandboxAction {
+    /// Reviewed file transfer. Emits JSON lines; never copies on attach or without confirmation.
+    Transfer(SandboxTransferArgs),
+    /// Read daemon capabilities and immutable catalog; does not start or install anything
+    Doctor {
+        #[arg(long)]
+        provider: String,
+        #[arg(long)]
+        local: bool,
+    },
+    /// Explicitly allocate from a saved profile, then verify live Workcell identity
+    Create {
+        name: String,
+        #[arg(long, id = "launch_profile")]
+        profile: String,
+    },
+    /// Show saved records, or live owner-scoped instances for an explicit provider
+    List {
+        #[arg(long)]
+        provider: Option<String>,
+    },
+    /// Reconcile by operation lookup, never replay an unknown create
+    #[command(alias = "reconcile")]
+    Inspect {
+        name: String,
+    },
+    /// Explicitly acknowledge an unresolved lifecycle failure; never claims success or retries
+    AcknowledgeFailure {
+        name: String,
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Verify a saved sandbox, or explicitly save a borrowed provider instance
+    Attach {
+        name: String,
+        #[arg(long, requires = "instance")]
+        provider: Option<String>,
+        #[arg(long, requires = "provider")]
+        instance: Option<String>,
+        #[arg(long, id = "attach_cwd", default_value = ".")]
+        cwd: String,
+    },
+    Resume {
+        name: String,
+        #[arg(long)]
+        lease_seconds: u32,
+        #[arg(long)]
+        yes: bool,
+    },
+    Pause {
+        name: String,
+    },
+    Extend {
+        name: String,
+        #[arg(long)]
+        lease_seconds: u32,
+    },
+    /// Delete owned disks only with --yes; borrowed records detach unless --destroy-borrowed
+    Delete {
+        name: String,
+        #[arg(long)]
+        yes: bool,
+        #[arg(long, requires = "yes")]
+        destroy_borrowed: bool,
+    },
+    /// Detach the local record; never stop the VM or delete its disk
+    Detach {
+        name: String,
+    },
+    /// Explicitly cancel an in-progress create, not a running instance
+    Cancel {
+        name: String,
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Preview a strict policy JSON file; Test evaluates rules without DNS or a real probe
+    Network {
+        name: String,
+        #[arg(long)]
+        policy: PathBuf,
+        #[arg(long)]
+        test: Option<String>,
+        #[arg(long, requires = "yes")]
+        apply: bool,
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Preview an import/build/gc/inspect local-admin JSON request; --yes executes offline
+    Images {
+        #[arg(long)]
+        provider: String,
+        #[arg(long)]
+        request: PathBuf,
+        #[arg(long)]
+        yes: bool,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, ValueEnum)]
+pub enum SandboxTransferMode {
+    Compare,
+    Seed,
+    Push,
+    Pull,
+    Reconcile,
+}
+
+#[derive(Args)]
+pub struct SandboxTransferArgs {
+    pub mode: SandboxTransferMode,
+    pub name: String,
+    #[arg(long)]
+    pub local_root: PathBuf,
+    /// Relative to the Workcell workspace root, independent of the agent cwd.
+    #[arg(long)]
+    pub remote_root: String,
+    /// Exact relative file paths, repeated for each selection. No implicit select-all.
+    #[arg(long = "select")]
+    pub selected: Vec<String>,
+    #[arg(long)]
+    pub dry_run: bool,
+    /// Headless replies must name the emitted request_id/plan_id; EOF always denies.
+    #[arg(long)]
+    pub json_input: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -1257,6 +1422,38 @@ mod tests {
         let cli = Cli::try_parse_from(["caudra"]).unwrap();
 
         assert_eq!(workcell_selection(&cli), Ok(WorkcellSelection::Embedded));
+    }
+
+    #[test_case(&["caudra", "sandbox", "create", "dev", "--profile", "rust"])]
+    #[test_case(&["caudra", "sandbox", "doctor", "--provider", "local", "--local"])]
+    #[test_case(&["caudra", "sandbox", "attach", "dev", "--provider", "local", "--instance", "vm-id"])]
+    #[test_case(&["caudra", "sandbox", "list"])]
+    #[test_case(&["caudra", "sandbox", "inspect", "dev"])]
+    #[test_case(&["caudra", "sandbox", "pause", "dev"])]
+    #[test_case(&["caudra", "sandbox", "resume", "dev", "--lease-seconds", "300", "--yes"])]
+    #[test_case(&["caudra", "sandbox", "extend", "dev", "--lease-seconds", "300"])]
+    #[test_case(&["caudra", "sandbox", "delete", "dev", "--yes"])]
+    #[test_case(&["caudra", "sandbox", "reconcile", "dev"])]
+    #[test_case(&["caudra", "sandbox", "detach", "dev"])]
+    #[test_case(&["caudra", "sandbox", "cancel", "dev", "--yes"])]
+    #[test_case(&["caudra", "sandbox", "network", "dev", "--policy", "/policy.json", "--test", "example.test"])]
+    #[test_case(&["caudra", "sandbox", "network", "dev", "--policy", "/policy.json", "--apply", "--yes"])]
+    #[test_case(&["caudra", "sandbox", "images", "--provider", "local", "--request", "/admin.json"])]
+    #[test_case(&["caudra", "auth", "sandbox", "generate", "local"])]
+    #[test_case(&["caudra", "auth", "sandbox", "set", "local", "--stdin"])]
+    #[test_case(&["caudra", "models", "--sandbox", "missing"])]
+    fn sandbox_commands_parse_without_remote_profile_collisions(args: &[&str]) {
+        assert!(Cli::try_parse_from(args).is_ok());
+    }
+
+    #[test_case(&["caudra", "sandbox", "create", "dev"])]
+    #[test_case(&["caudra", "sandbox", "create", "--profile", "rust"])]
+    #[test_case(&["caudra", "--sandbox", "dev", "--workcell-profile", "other"])]
+    #[test_case(&["caudra", "--sandbox", "dev", "--workcell-endpoint", "http://127.0.0.1:8080", "--workcell-cwd", "."])]
+    #[test_case(&["caudra", "auth", "sandbox", "set", "local", "secret"])]
+    #[test_case(&["caudra", "sandbox", "network", "dev", "--policy", "/policy.json", "--apply"])]
+    fn sandbox_commands_require_explicit_create_and_keep_secrets_out_of_argv(args: &[&str]) {
+        assert!(Cli::try_parse_from(args).is_err());
     }
 
     #[test]

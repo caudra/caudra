@@ -40,6 +40,7 @@ When interactive Caudra starts in a Herdr pane, it automatically reports native 
 | `--permission-mode` | no | no | yes |
 | `--include-partial-messages` | no | no | yes |
 | `--workcell-profile` or direct Workcell selectors | yes | yes | yes |
+| `--sandbox`, `--sandbox-resume` | yes | yes | yes |
 
 ### Shared flags (detail)
 
@@ -89,7 +90,16 @@ caudra --workcell-endpoint https://workcell.example/mcp \
 | `--workcell-cwd <PATH>` | Root-relative remote directory, such as `.` or `projects/app`. Requires `--workcell-endpoint` |
 | `--workcell-credential-ref <credential:NAME>` | Saved bearer credential. Requires both direct endpoint and cwd flags |
 
-These flags are global. A profile cannot be combined with any direct selector. With no selector, Caudra uses embedded Workcell. Selection errors and remote failures stop the operation without local fallback. See [Remote Workspaces](/docs/remote-workspaces/) for server setup, endpoint restrictions, and resume identity.
+These flags are global. A Workcell profile cannot be combined with any direct selector. A fresh run without a selector uses embedded Workcell. Selection errors and remote failures stop the operation without local fallback. See [Remote Workspaces](/docs/remote-workspaces/) for server setup, endpoint restrictions, and resume identity.
+
+### Managed sandbox selection
+
+| Flag | Description |
+|------|-------------|
+| `--sandbox <NAME>` | Attach the exact saved sandbox. Never creates a VM implicitly. Conflicts with the `--workcell-*` selectors |
+| `--sandbox-resume` | Explicitly permit cold-boot resume of a paused sandbox selected by `--sandbox` or recovered from session provenance |
+
+These selectors also work with ACP. `--session ID` restores a saved sandbox source before validating the workspace. `--continue` can recover the last sandbox used from the client directory. A fresh run remains local by default. See [Managed Sandboxes](/docs/sandboxes/#configure-and-connect) for setup, ownership and the current release-dependency limitation.
 
 ### Tool name lists
 
@@ -259,6 +269,17 @@ This is fresh destination authorization. It never transfers project-config trust
 
 Unlike CLI `rebind`, the TUI manager's Copy action leaves all source rules active. Revoking a copied source is a separate reviewed action. The CLI's selected-allow retirement behavior is unchanged.
 
+### `caudra sandbox`
+
+```bash
+caudra sandbox doctor --provider local --local
+caudra sandbox create dev --profile rust
+caudra sandbox attach dev
+caudra --sandbox dev
+```
+
+`create` and `attach` verify Workcell and print the saved instance record. `--sandbox` opens the workspace session. The `sandbox` subcommand also provides List, Inspect/Reconcile, Pause, Resume, Extend, Delete, Detach, Cancel create, Acknowledge failure, Network, Images and reviewed Transfer actions. Use the exact [lifecycle commands](/docs/sandboxes/#lifecycle-controls-and-failure-recovery), [image-admin request schema](/docs/sandboxes/#images-and-template-catalog) and [transfer commands and prompts](/docs/sandboxes/#exact-cli-commands-and-prompts). Transfers require explicit file selection and plan consent, with no `--yes` shortcut.
+
 ### `caudra remote`
 
 Inspect or recover the selected remote workspace without running a model:
@@ -282,6 +303,10 @@ caudra auth status
 caudra auth workcell set <NAME> [--stdin]
 caudra auth workcell list
 caudra auth workcell delete <NAME>
+caudra auth sandbox generate <NAME>
+caudra auth sandbox set <NAME> [--stdin]
+caudra auth sandbox list
+caudra auth sandbox delete <NAME>
 ```
 
 `login` stores credentials under the state directory and can write plan or base URL choices into `providers.toml` (see [Configuration](/docs/configuration/#directory-layout) for the platform path). The picker asks for subscription OAuth or an API key when you choose Anthropic or OpenAI. Named Anthropic and OpenAI logins default to OAuth. Pass `--method api-key` to store a key instead.
@@ -291,6 +316,8 @@ Anthropic OAuth is experimental. The command explains the Anthropic terms limita
 The TUI `/login` command offers the same method choice for Anthropic and OpenAI. `status` distinguishes saved OAuth, saved API keys, environment credentials, configured endpoints, and missing credentials.
 
 `auth workcell set` reads a bearer token from a hidden terminal prompt, or from stdin with `--stdin`. It stores or replaces a named credential, referenced as `credential:NAME`. `list` shows names and update times without bearer values. Credentials are stored in owner-only local files, without OS-keyring encryption. They are separate from provider login and MCP OAuth credentials.
+
+`auth sandbox` manages lifecycle keys in a separate purpose store, referenced as `sandbox-api:NAME`. `generate` saves a new 256-bit key without printing it. `set` uses a hidden prompt or bounded stdin, and `list` omits secret values. Deleting a credential does not delete sandbox resources. See [sandbox configuration](/docs/sandboxes/#configuration-schema).
 
 ### `caudra models`
 

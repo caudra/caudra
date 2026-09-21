@@ -812,8 +812,14 @@ fn print_model_jobs(model_arg: Option<&str>, config: &Config) -> Result<()> {
 pub fn models(cli: &Cli, jobs: bool) -> Result<()> {
     let cwd = env::current_dir().unwrap_or_else(|_| ".".into());
     let storage = StateDir::resolve().context("resolve data directory")?;
+    let local = crate::cli::WorkcellSelectorArgs::default();
+    let selection = if cli.workcell.sandbox.is_some() {
+        &local
+    } else {
+        &cli.workcell
+    };
     let runtime = super::workcell_runtime::WorkcellRuntime::initialize(
-        &cli.workcell,
+        selection,
         &cwd,
         &storage,
         ToolRegistry::global(),
@@ -915,7 +921,8 @@ pub fn remote_control(cli: &Cli, args: &[String]) -> Result<()> {
     let storage = StateDir::resolve().context("resolve data directory")?;
     let workspace = super::workcell_runtime::connect_control(&cli.workcell, &storage)?;
     let output = smol::block_on(caudra_workspace::execute_workspace_control(
-        &workspace, &args,
+        &workspace.workspace,
+        &args,
     ))
     .map_err(color_eyre::eyre::Error::msg)?;
     println!("{output}");

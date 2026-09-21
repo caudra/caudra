@@ -353,6 +353,12 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         max_args: 3,
         scope: ChatScope::MainOnly,
     },
+    BuiltinCommand {
+        name: "/sandbox",
+        description: "Manage live sandboxes, profiles, images and providers; explicit reviewed actions, Doctor and recovery",
+        max_args: 1,
+        scope: ChatScope::Any,
+    },
 ];
 
 pub struct ParsedCommand {

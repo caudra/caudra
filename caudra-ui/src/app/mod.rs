@@ -15,6 +15,7 @@ pub(crate) mod mode;
 mod mouse;
 pub(crate) mod permission_editor;
 mod queue;
+mod sandbox;
 mod session;
 pub(crate) mod session_state;
 pub(crate) mod shell;
@@ -68,6 +69,7 @@ use crate::components::queue_actions::{QueueActionKind, QueueActions, QueueActio
 use crate::components::queue_panel::{QueueHit, QueueHitTarget};
 use crate::components::review::{ReviewAction, ReviewModal};
 use crate::components::rewind_picker::{RewindPicker, RewindPickerAction};
+use crate::components::sandbox_manager::SandboxManager;
 use crate::components::scrollbar;
 use crate::components::search_modal::{SearchAction, SearchModal};
 use crate::components::session_picker::{SessionPicker, SessionRow};
@@ -94,6 +96,7 @@ use crate::components::{
 use crate::image;
 use crate::input_document::InputDraft;
 use crate::repaint::{Cadence, Dirty, Watch};
+use crate::sandbox::{SandboxWorkers, StoreReply};
 use crate::selection::{SelectionState, SelectionZone, ZoneRegistry};
 use crate::{AppSession, PatternDiscoveryMode, PatternDiscoveryOutcome, PatternSuggestionLoader};
 use arc_swap::{ArcSwap, ArcSwapOption};
@@ -351,6 +354,9 @@ pub struct App {
     pub(super) paste_editor: PasteEditor,
     pub(super) permission_prompt: PermissionPrompt,
     pub(super) permissions_picker: PermissionsPicker,
+    pub(super) sandbox_manager: SandboxManager,
+    sandbox_reply: Option<Receiver<StoreReply>>,
+    pub(crate) sandbox_live: SandboxWorkers,
     permission_ui: permission_editor::PermissionUi,
     parked_workbench: Option<Workbench>,
     permission_config_trust_deferred: bool,
@@ -584,6 +590,9 @@ impl App {
             paste_editor: PasteEditor::new(),
             permission_prompt: PermissionPrompt::new(),
             permissions_picker: PermissionsPicker::new(),
+            sandbox_manager: SandboxManager::default(),
+            sandbox_reply: None,
+            sandbox_live: SandboxWorkers::default(),
             permission_ui: permission_editor::PermissionUi::default(),
             parked_workbench: None,
             permission_config_trust_deferred: false,
@@ -1328,6 +1337,13 @@ impl App {
     }
 
     pub fn update(&mut self, msg: Msg) -> Vec<Action> {
+        if crate::sandbox::transfer::active()
+            && !self.permission_prompt.is_open()
+            && !(self.sandbox_manager.is_open() && self.sandbox_manager.transfer_open())
+            && matches!(msg, Msg::Key(_) | Msg::Paste(_) | Msg::Mouse(_))
+        {
+            return vec![];
+        }
         match msg {
             Msg::Key(key) => {
                 self.autoscroll = None;
@@ -1342,6 +1358,9 @@ impl App {
                 let text = text.replace("\r\n", "\n").replace('\r', "\n");
                 if self.permission_prompt.is_open() {
                     self.permission_prompt.handle_paste(&text);
+                    return vec![];
+                }
+                if self.sandbox_manager.handle_paste(&text) {
                     return vec![];
                 }
                 if self.permissions_picker.is_open() {
@@ -1727,6 +1746,11 @@ impl App {
     }
 
     fn dispatch_overlay(&mut self, key: KeyEvent) -> Option<Vec<Action>> {
+        if self.sandbox_manager.is_open() {
+            let action = self.sandbox_manager.handle_key(key);
+            self.handle_sandbox_action(action);
+            return Some(vec![]);
+        }
         macro_rules! guard_repeat {
             ($editing:expr) => {
                 if key.kind == KeyEventKind::Repeat && !Self::repeat_key_allowed(key, $editing) {
@@ -2680,9 +2704,12 @@ impl App {
         }
 
         // Suspend is checked ahead of the overlays so a wedged UI can always be
-        // backgrounded. The workbench is the one overlay that has to win it:
-        // Ctrl+Z there is undo, and losing an edit to SIGTSTP is unrecoverable.
-        if key::SUSPEND.matches(key) && cfg!(unix) && !self.workbench.is_open() {
+        // backgrounded. Editors that own Ctrl+Z for undo must win over SIGTSTP.
+        if key::SUSPEND.matches(key)
+            && cfg!(unix)
+            && !self.workbench.is_open()
+            && !self.sandbox_manager.is_open()
+        {
             return vec![Action::Suspend];
         }
 
@@ -4393,6 +4420,10 @@ impl App {
             "/remote" => {
                 vec![Action::RemoteControl(cmd.args)]
             }
+            "/sandbox" => {
+                self.open_sandbox(&cmd.args);
+                vec![]
+            }
             "/yolo" => {
                 let msg = if self.permissions.toggle_yolo() {
                     YOLO_ON_MSG
@@ -4731,7 +4762,7 @@ impl App {
         self.subagent_input_box.set_cwd(cwd);
     }
 
-    fn overlays(&self) -> [&dyn Overlay; 35] {
+    fn overlays(&self) -> [&dyn Overlay; 36] {
         [
             &self.workbench,
             &self.logs_modal,
@@ -4759,6 +4790,7 @@ impl App {
             &self.login_picker,
             &self.mcp_picker,
             &self.permissions_picker,
+            &self.sandbox_manager,
             &self.stash_picker,
             &self.memory_picker,
             &self.task_picker,
@@ -4771,7 +4803,7 @@ impl App {
         ]
     }
 
-    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 35] {
+    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 36] {
         [
             &mut self.workbench,
             &mut self.logs_modal,
@@ -4799,6 +4831,7 @@ impl App {
             &mut self.login_picker,
             &mut self.mcp_picker,
             &mut self.permissions_picker,
+            &mut self.sandbox_manager,
             &mut self.stash_picker,
             &mut self.memory_picker,
             &mut self.task_picker,
@@ -4825,6 +4858,17 @@ impl App {
     }
 
     pub(crate) fn lifecycle_blocker(&self) -> Option<&'static str> {
+        if crate::sandbox::transfer::active() {
+            return Some(
+                "Close/cancel the transfer and await cleanup before changing sessions or exiting",
+            );
+        }
+        if self.sandbox_manager.pending() {
+            return Some("Waiting for durable sandbox configuration acknowledgment");
+        }
+        if self.sandbox_manager.dirty() {
+            return Some("Open /sandbox and Save or Discard the unsaved configuration draft");
+        }
         if self.permission_mutation_pending() {
             return Some("Waiting for durable permission acknowledgment");
         }
@@ -4954,6 +4998,7 @@ impl App {
             | self.poll_snapshot_refusal()
             | self.poll_pattern_suggestions()
             | self.poll_permission_editor()
+            | self.poll_sandbox()
             | self.model_picker.refresh()
             | self.usage_modal.poll(&self.usage_slot)
             | self.storage_modal.poll(&self.storage_slot)
@@ -4990,7 +5035,7 @@ impl App {
                 self.status_bar.flash(flash);
             }
         }
-        if !self.workbench.is_open() {
+        if !self.workbench.is_open() && !self.workbench.is_busy() {
             return parked_dirty;
         }
         self.sync_workbench_theme();
@@ -5294,6 +5339,9 @@ impl App {
     }
 
     fn route_text_paste(&mut self, text: &str) {
+        if self.sandbox_manager.handle_paste(text) {
+            return;
+        }
         self.sync_subagent_input_target();
         if self.plan_form_active() {
             return;

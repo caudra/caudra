@@ -1,5 +1,18 @@
 use std::{env, fs, path::PathBuf, str::FromStr, time::Duration};
 
+use async_trait::async_trait;
+use caudra_agent::{
+    AgentEvent, CancelToken, EventSender,
+    permissions::{PermissionAnswer, PermissionManager, PermissionSubject, PluginRuleStore},
+    workspace_transfer::{
+        CleanBufferLease, ComparisonKind, FileOutcome, LocalAccess, LocalRootIdentity,
+        OrchestrationLimits, PlannedFile, PullBufferGuard, RemoteRootIdentity, TransferAction,
+        TransferAuthorization, TransferError, TransferEvent, TransferEvents, TransferFilters,
+        TransferJournal, TransferPlan, TransferRoots,
+    },
+};
+use caudra_config::PermissionsConfig;
+use caudra_config::sandbox::TransferPolicy;
 use caudra_config::workcell::{
     ExpectedWorkcellId, RemoteWorkcellSelection, WorkcellEndpoint, WorkcellSourceRef,
 };
@@ -8,8 +21,20 @@ use caudra_storage::{
     auth::{WorkcellCredential, WorkcellCredentialName, WorkcellCredentialRef},
     remote_operation_journal::{RemoteOperationJournal, RemoteOperationState},
 };
-use caudra_workcell::{NamedBearerCredential, RemoteToolResultEnvelope, RemoteWorkcellClient};
+use caudra_workcell::{LocalTransferPublisher, ReviewedTransferHost, reviewed_workspace_transfer};
+use caudra_workcell::{
+    NamedBearerCredential, RemoteToolResultEnvelope, RemoteWorkcellClient, RemoteWorkcellError,
+};
+use caudra_workcell::{TransferSession, TransferSessionHost};
+use caudra_workspace::PreparedTransferPublication;
 use caudra_workspace::WorkspaceError;
+use caudra_workspace::{
+    ByteRange, LocalTransferAuthorization, LocalTransferCondition, LocalTransferDestination,
+    LocalTransferPath, LocalTransferReview, LocalTransferService, LocalTransferSource, Mutation,
+    MutationCondition, MutationRequest, OperationId, TransferContent, TransferDigest, TransferMode,
+    TransferPublicationRequest, TransferPublicationState, WorkspaceCapability,
+    WorkspaceMutationService, WorkspaceTransferService, WriteContent,
+};
 use caudra_workspace::{
     CheckpointId, DirectoryNavigation, ListRequest, OperationState, ReadBytesRequest,
     ResourceSelector, ScmDiscoverRequest, ScmStatusRequest, SearchRequest, SessionBindingId,
@@ -22,14 +47,893 @@ use caudra_workspace::{
     ScmDiffRequest, ScmDiffTarget, ScmLogRequest, ScmMutation, ScmReadSideRequest, ScmSide,
     WorkspaceScmMutationService,
 };
+use futures_lite::io::{AsyncReadExt, repeat};
 use isahc::AsyncReadResponseExt;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
+use std::{
+    collections::BTreeSet,
+    os::unix::fs::PermissionsExt,
+    path::Path,
+    sync::atomic::{AtomicBool, Ordering},
+};
+use std::{fmt::Write as _, sync::Arc};
 use tokio_util::sync::CancellationToken;
 
 const LIMIT: u32 = 100;
 const EXECUTION_MARKER: &str = "executed\n";
 const RECOVERED_CONTENT: &str = "exactly once\n";
 const TOMBSTONE_CAPACITY: usize = 256;
+const BINARY_BYTES: u64 = 6 * 1024 * 1024;
+const BINARY_BYTE: u8 = 0xff;
+const TRANSFER_CHUNK: usize = 64 * 1024;
+const LOCAL_CANARY: &[u8] = b"client-owned canary";
+const INVENTORY_FIRST: &str = "inventory-seed/deep/first.bin";
+const INVENTORY_SECOND: &str = "inventory-seed/deep/second.bin";
+const INVENTORY_RESTART: &str = "inventory-restart/deep/file.bin";
+const INVENTORY_CONTENT: &[u8] = b"\xff\0reviewed inventory bytes";
+const PRIVATE_STATE_MODE: u32 = 0o700;
+const NATIVE_FILE: &str = "native/deep/reviewed.txt";
+
+struct TransferTestHost {
+    root: PathBuf,
+    fault: PathBuf,
+    lose_response: AtomicBool,
+}
+struct TransferCleanLease;
+impl CleanBufferLease for TransferCleanLease {}
+
+#[async_trait]
+impl TransferAuthorization for TransferTestHost {
+    async fn roots(&self, roots: &TransferRoots) -> Result<(), TransferError> {
+        if roots.local.canonical_path() == self.root {
+            Ok(())
+        } else {
+            Err(TransferError::Stale)
+        }
+    }
+    async fn local(
+        &self,
+        _: &TransferRoots,
+        _: &WorkspacePath,
+        _: LocalAccess,
+    ) -> Result<(), TransferError> {
+        Ok(())
+    }
+    async fn review_plan(&self, plan: &TransferPlan) -> Result<(), TransferError> {
+        assert!(!plan.review().atomic_across_files);
+        assert!(
+            plan.review()
+                .files
+                .iter()
+                .all(|file| file.path.as_str().starts_with("inventory-"))
+        );
+        Ok(())
+    }
+    async fn review_remote_publication(
+        &self,
+        _: &TransferPlan,
+        file: &PlannedFile,
+        prepared: &PreparedTransferPublication,
+    ) -> Result<(), TransferError> {
+        assert_eq!(prepared.request.create_directories, file.create_directories);
+        if self.lose_response.swap(false, Ordering::AcqRel) {
+            fs::write(
+                self.fault.with_extension("preparation"),
+                prepared.operation.preparation_id.as_str(),
+            )
+            .unwrap();
+            fs::write(&self.fault, b"lose reviewed inventory publication response").unwrap();
+        }
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl PullBufferGuard for TransferTestHost {
+    async fn lock_clean(
+        &self,
+        _: &LocalRootIdentity,
+        _: &WorkspacePath,
+    ) -> Result<Box<dyn CleanBufferLease>, TransferError> {
+        Ok(Box::new(TransferCleanLease))
+    }
+}
+impl TransferEvents for TransferTestHost {
+    fn emit(&self, _: TransferEvent) {}
+}
+
+struct FactoryLocalApproval;
+#[async_trait]
+impl LocalTransferAuthorization for FactoryLocalApproval {
+    async fn authorize(&self, review: &LocalTransferReview) -> Result<(), WorkspaceError> {
+        if review.destination.path.as_str() == INVENTORY_FIRST {
+            Ok(())
+        } else {
+            Err(WorkspaceError::PermissionDenied)
+        }
+    }
+}
+
+async fn production_inventory_transfer(
+    client: RemoteWorkcellClient,
+    remote_path: &Path,
+    fault: &Path,
+    selection: &RemoteWorkcellSelection,
+    credential: &NamedBearerCredential,
+    remote_state: &StateDir,
+) -> RemoteWorkcellClient {
+    let local = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    fs::set_permissions(state.path(), fs::Permissions::from_mode(PRIVATE_STATE_MODE)).unwrap();
+    fs::create_dir_all(local.path().join("inventory-seed/deep")).unwrap();
+    for name in [
+        INVENTORY_FIRST,
+        INVENTORY_SECOND,
+        ".env",
+        "local-only",
+        "remote-only",
+    ] {
+        fs::write(local.path().join(name), INVENTORY_CONTENT).unwrap();
+    }
+    fs::write(local.path().join(".gitignore"), "local-only\n").unwrap();
+    fs::write(remote_path.join(".gitignore"), "remote-only\n").unwrap();
+    fs::create_dir(local.path().join("target")).unwrap();
+    fs::write(local.path().join("target/not-selected"), INVENTORY_CONTENT).unwrap();
+    let approval = Arc::new(TransferTestHost {
+        root: local.path().to_owned(),
+        fault: fault.to_owned(),
+        lose_response: AtomicBool::new(false),
+    });
+    let build = |client: RemoteWorkcellClient| {
+        reviewed_workspace_transfer(
+            local.path().into(),
+            state.path().join("local-publications.json"),
+            client.clone(),
+            RemoteRootIdentity {
+                binding: client.session_binding().clone(),
+                cursor: client.root_cursor().clone(),
+                cwd: WorkspacePath::root(),
+            },
+            TransferFilters::new(&TransferPolicy::default(), &[]).unwrap(),
+            OrchestrationLimits::default(),
+            ReviewedTransferHost {
+                authorization: approval.clone(),
+                local_publication: Arc::new(FactoryLocalApproval),
+                buffers: approval.clone(),
+                events: approval.clone(),
+            },
+        )
+    };
+    let engine = build(client.clone()).await.unwrap();
+    let comparison = engine.compare(&CancelToken::none()).await.unwrap();
+    assert!(comparison.complete());
+    for name in [".env", "local-only", "remote-only", "target"] {
+        assert_eq!(
+            comparison
+                .rows()
+                .iter()
+                .find(|row| row.path.as_str() == name)
+                .unwrap()
+                .kind,
+            ComparisonKind::Excluded,
+            "{name}"
+        );
+    }
+    let selected = [
+        WorkspacePath::new(INVENTORY_FIRST).unwrap(),
+        WorkspacePath::new(INVENTORY_SECOND).unwrap(),
+    ];
+    let parents = BTreeSet::from([
+        WorkspacePath::new("inventory-seed").unwrap(),
+        WorkspacePath::new("inventory-seed/deep").unwrap(),
+    ]);
+    let plan = engine
+        .plan(
+            &comparison,
+            TransferAction::Seed,
+            &selected,
+            &parents,
+            &CancelToken::none(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        plan.review().files[0].create_directories.len(),
+        parents.len()
+    );
+    assert!(!remote_path.join("inventory-seed").exists());
+    let mut journal = TransferJournal::new(state.path().join("transfers.json")).unwrap();
+    let run = engine
+        .execute(&plan, &mut journal, &CancelToken::none())
+        .await;
+    assert!(run.stopped.is_none(), "{:?}", run.stopped);
+    assert_eq!(run.outcomes.len(), selected.len());
+    for name in [INVENTORY_FIRST, INVENTORY_SECOND] {
+        assert_eq!(fs::read(remote_path.join(name)).unwrap(), INVENTORY_CONTENT);
+    }
+    assert!(!remote_path.join(".env").exists());
+    assert!(!remote_path.join("target").exists());
+    fs::write(local.path().join(INVENTORY_FIRST), LOCAL_CANARY).unwrap();
+    let comparison = engine.compare(&CancelToken::none()).await.unwrap();
+    let pull = engine
+        .plan(
+            &comparison,
+            TransferAction::Pull,
+            &selected[..1],
+            &parents,
+            &CancelToken::none(),
+        )
+        .await
+        .unwrap();
+    let run = engine
+        .execute(&pull, &mut journal, &CancelToken::none())
+        .await;
+    assert!(run.stopped.is_none(), "{:?}", run.stopped);
+    assert_eq!(
+        fs::read(local.path().join(INVENTORY_FIRST)).unwrap(),
+        INVENTORY_CONTENT
+    );
+    fs::remove_dir_all(local.path().join("inventory-seed")).unwrap();
+    let comparison = engine.compare(&CancelToken::none()).await.unwrap();
+    let pull = engine
+        .plan(
+            &comparison,
+            TransferAction::Pull,
+            &selected[..1],
+            &parents,
+            &CancelToken::none(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        pull.review().files[0].create_directories.len(),
+        parents.len()
+    );
+    assert!(!local.path().join("inventory-seed").exists());
+    let run = engine
+        .execute(&pull, &mut journal, &CancelToken::none())
+        .await;
+    assert!(run.stopped.is_none(), "{:?}", run.stopped);
+    assert_eq!(
+        fs::read(local.path().join(INVENTORY_FIRST)).unwrap(),
+        INVENTORY_CONTENT
+    );
+    assert_eq!(
+        journal
+            .entries()
+            .unwrap()
+            .iter()
+            .find(|entry| entry.operation_id == pull.review().files[0].operation_id)
+            .unwrap()
+            .created_directories
+            .len(),
+        parents.len()
+    );
+    native_reviewed_session(&client, remote_path, approval.clone()).await;
+    fs::create_dir_all(local.path().join("inventory-restart/deep")).unwrap();
+    fs::write(local.path().join(INVENTORY_RESTART), INVENTORY_CONTENT).unwrap();
+    let comparison = engine.compare(&CancelToken::none()).await.unwrap();
+    let plan = engine
+        .plan(
+            &comparison,
+            TransferAction::Seed,
+            &[WorkspacePath::new(INVENTORY_RESTART).unwrap()],
+            &BTreeSet::from([
+                WorkspacePath::new("inventory-restart").unwrap(),
+                WorkspacePath::new("inventory-restart/deep").unwrap(),
+            ]),
+            &CancelToken::none(),
+        )
+        .await
+        .unwrap();
+    approval.lose_response.store(true, Ordering::Release);
+    let run = engine
+        .execute(&plan, &mut journal, &CancelToken::none())
+        .await;
+    assert_eq!(
+        run.outcomes[&plan.review().files[0].operation_id],
+        FileOutcome::Unknown
+    );
+    let count = fs::read_to_string(fault.with_extension("count")).unwrap();
+    fs::remove_file(fault).unwrap();
+    fs::write(
+        fault.with_extension("restart"),
+        b"restart standalone server",
+    )
+    .unwrap();
+    drop(engine);
+    drop(client);
+    let client = RemoteWorkcellClient::connect(
+        selection,
+        Some(credential.clone()),
+        SessionBindingId::new("transfer-session").unwrap(),
+        RemoteOperationJournal::open(remote_state).unwrap(),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    let reopened = build(client.clone()).await.unwrap();
+    let run = reopened.reconcile(&mut journal, &CancelToken::none()).await;
+    assert!(run.stopped.is_none(), "{:?}", run.stopped);
+    assert_eq!(
+        run.outcomes[&plan.review().files[0].operation_id],
+        FileOutcome::Confirmed
+    );
+    assert_eq!(
+        fs::read(remote_path.join(INVENTORY_RESTART)).unwrap(),
+        INVENTORY_CONTENT
+    );
+    assert_eq!(
+        fs::read_to_string(fault.with_extension("count")).unwrap(),
+        count
+    );
+    eprintln!(
+        "PASS production inventory, excluded files, reviewed nested directories, Pull, and per-file standalone restart recovery"
+    );
+    client
+}
+
+async fn native_reviewed_session(
+    client: &RemoteWorkcellClient,
+    remote_path: &Path,
+    buffers: Arc<TransferTestHost>,
+) {
+    let local = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    fs::set_permissions(state.path(), fs::Permissions::from_mode(PRIVATE_STATE_MODE)).unwrap();
+    fs::create_dir_all(local.path().join("native/deep")).unwrap();
+    fs::write(local.path().join(NATIVE_FILE), INVENTORY_CONTENT).unwrap();
+    let permissions = Arc::new(PermissionManager::new_nonpersistent(
+        PermissionsConfig::default(),
+        local.path().into(),
+        Arc::new(PluginRuleStore::default()),
+    ));
+    let (events, received) = flume::unbounded();
+    let deny = Arc::new(AtomicBool::new(false));
+    let prompts = smol::spawn({
+        let permissions = permissions.clone();
+        let deny = deny.clone();
+        async move {
+            let mut subjects = Vec::new();
+            while let Ok(envelope) = received.recv_async().await {
+                let caudra_agent::Envelope { event, .. } = envelope;
+                if let AgentEvent::PermissionRequest(request) = event {
+                    subjects.push(request.subject.clone());
+                    assert!(!request.resources.is_empty());
+                    if !permissions.answer(
+                        &request.id,
+                        if deny.load(Ordering::Acquire) {
+                            PermissionAnswer::Deny
+                        } else {
+                            PermissionAnswer::AllowOnce
+                        },
+                    ) {
+                        eprintln!("Rejected native decision: {request:?}");
+                        permissions.answer(&request.id, PermissionAnswer::Deny);
+                        break;
+                    }
+                }
+            }
+            subjects
+        }
+    });
+    let remote_root = WorkspacePath::new("inventory-seed").unwrap();
+    let resolved = client
+        .resolve_directory_cursor(client.session_binding(), client.root_cursor(), &remote_root)
+        .await
+        .unwrap();
+    let mut session = TransferSession::open(
+        local.path().into(),
+        client.clone(),
+        RemoteRootIdentity {
+            binding: client.session_binding().clone(),
+            cursor: resolved.cursor,
+            cwd: remote_root.clone(),
+        },
+        &TransferPolicy::default(),
+        &StateDir::from_path(state.path().into()),
+        TransferSessionHost {
+            permissions,
+            permission_events: EventSender::new(events, 0),
+            buffers: buffers.clone(),
+            progress: buffers,
+            cancel: CancelToken::none(),
+            validity: Arc::new(|| Ok(())),
+        },
+    )
+    .await
+    .unwrap();
+    let comparison = session.compare(&CancelToken::none()).await.unwrap();
+    assert!(comparison.complete());
+    let selected = [WorkspacePath::new(NATIVE_FILE).unwrap()];
+    let plan = session
+        .review(TransferAction::Seed, &selected, &CancelToken::none())
+        .await
+        .unwrap();
+    assert!(
+        !remote_path
+            .join(remote_root.as_str())
+            .join(NATIVE_FILE)
+            .exists()
+    );
+    deny.store(true, Ordering::Release);
+    let denied = session
+        .execute(plan.digest(), &CancelToken::none())
+        .await
+        .unwrap();
+    assert!(denied.stopped.is_some());
+    assert!(
+        !remote_path
+            .join(remote_root.as_str())
+            .join(NATIVE_FILE)
+            .exists()
+    );
+    deny.store(false, Ordering::Release);
+    session.compare(&CancelToken::none()).await.unwrap();
+    let plan = session
+        .review(TransferAction::Seed, &selected, &CancelToken::none())
+        .await
+        .unwrap();
+    let result = session
+        .execute(plan.digest(), &CancelToken::none())
+        .await
+        .unwrap();
+    assert!(result.stopped.is_none(), "{:?}", result.stopped);
+    assert_eq!(
+        fs::read(remote_path.join(remote_root.as_str()).join(NATIVE_FILE)).unwrap(),
+        INVENTORY_CONTENT
+    );
+    assert!(!remote_path.join(NATIVE_FILE).exists());
+    assert!(
+        session
+            .execute(plan.digest(), &CancelToken::none())
+            .await
+            .is_err()
+    );
+    drop(session);
+    let subjects = prompts.await;
+    assert!(
+        subjects
+            .iter()
+            .any(|subject| matches!(subject, PermissionSubject::Native { .. }))
+    );
+    assert!(
+        subjects
+            .iter()
+            .any(|subject| matches!(subject, PermissionSubject::RemoteNative { .. }))
+    );
+    eprintln!(
+        "PASS shared UI/CLI transfer session, independent nested root, explicit review, native both-end prompts, denial and consumed plan"
+    );
+}
+
+struct PullAuthorization;
+
+#[async_trait]
+impl LocalTransferAuthorization for PullAuthorization {
+    async fn authorize(&self, review: &LocalTransferReview) -> Result<(), WorkspaceError> {
+        if review.destination.path.as_str() == "pulled.bin" {
+            Ok(())
+        } else {
+            Err(WorkspaceError::PermissionDenied)
+        }
+    }
+}
+
+fn binary_content(size: u64) -> TransferContent {
+    let mut hash = Sha256::new();
+    let chunk = [BINARY_BYTE; TRANSFER_CHUNK];
+    let mut left = size;
+    while left > 0 {
+        let count = left.min(chunk.len() as u64) as usize;
+        hash.update(&chunk[..count]);
+        left -= count as u64;
+    }
+    let mut digest = String::from("sha256:");
+    for byte in hash.finalize() {
+        write!(digest, "{byte:02x}").unwrap();
+    }
+    TransferContent {
+        digest: TransferDigest::new(digest).unwrap(),
+        size_bytes: size,
+        mode: TransferMode::Regular,
+    }
+}
+
+async fn assert_binary(source: LocalTransferSource, expected: u64) {
+    let mut reader = source.into_reader();
+    let mut buffer = vec![0; TRANSFER_CHUNK].into_boxed_slice();
+    let mut received = 0u64;
+    loop {
+        let count = reader.read(&mut buffer).await.unwrap();
+        if count == 0 {
+            break;
+        }
+        assert!(buffer[..count].iter().all(|byte| *byte == BINARY_BYTE));
+        received += count as u64;
+        assert!(received <= expected);
+    }
+    assert_eq!(received, expected);
+}
+
+#[test]
+fn reviewed_transfer() {
+    if env::var_os("WORKCELL_TEST_ENDPOINT").is_none() {
+        return;
+    }
+    smol::block_on(async {
+        let endpoint = env::var("WORKCELL_TEST_ENDPOINT").unwrap();
+        let root = PathBuf::from(env::var_os("WORKCELL_TEST_ROOT").unwrap());
+        let state = StateDir::from_path(PathBuf::from(env::var_os("WORKCELL_TEST_STATE").unwrap()));
+        let fault = PathBuf::from(env::var_os("WORKCELL_TEST_FAULT").unwrap());
+        let selection = RemoteWorkcellSelection {
+            source: WorkcellSourceRef::Direct,
+            endpoint: WorkcellEndpoint::parse(&endpoint).unwrap(),
+            cwd: WorkspacePath::root(),
+            credential_ref: Some(
+                WorkcellCredentialRef::from_str("credential:integration").unwrap(),
+            ),
+            expected_server_id: Some(ExpectedWorkcellId::new("integration-server-id").unwrap()),
+            expected_workspace_id: Some(
+                ExpectedWorkcellId::new("integration-workspace-id").unwrap(),
+            ),
+        };
+        let credential = NamedBearerCredential::new(
+            WorkcellCredentialName::new("integration").unwrap(),
+            WorkcellCredential::new(
+                fs::read_to_string(env::var_os("WORKCELL_TEST_TOKEN_FILE").unwrap()).unwrap(),
+            )
+            .unwrap(),
+        );
+        let connect = || {
+            RemoteWorkcellClient::connect(
+                &selection,
+                Some(credential.clone()),
+                SessionBindingId::new("transfer-session").unwrap(),
+                RemoteOperationJournal::open(&state).unwrap(),
+                CancellationToken::new(),
+            )
+        };
+        let client = connect().await.unwrap();
+        let client =
+            production_inventory_transfer(client, &root, &fault, &selection, &credential, &state)
+                .await;
+        assert!(
+            client
+                .workspace_handle()
+                .unwrap()
+                .capabilities()
+                .supports(WorkspaceCapability::ReviewedTransfer)
+        );
+        assert!(
+            !client
+                .limits()
+                .unwrap()
+                .atomic_replace_against_external_writers
+        );
+        let local = tempfile::tempdir().unwrap();
+        fs::create_dir(local.path().join("nested")).unwrap();
+        fs::write(local.path().join("nested/transfer.bin"), LOCAL_CANARY).unwrap();
+        let binding = client.session_binding();
+        let cursor = client.root_cursor();
+        let content = binary_content(BINARY_BYTES);
+        let stage = client
+            .stage(
+                binding,
+                cursor,
+                LocalTransferSource::new(repeat(BINARY_BYTE).take(BINARY_BYTES)),
+                &content,
+            )
+            .await
+            .unwrap();
+        let sealed = client.seal(&stage).await.unwrap();
+        let prepared = client
+            .prepare_publication(
+                &sealed,
+                &TransferPublicationRequest {
+                    publication_id: OperationId::new("binary-publication").unwrap(),
+                    create_directories: Vec::new(),
+                    path: WorkspacePath::new("nested/transfer.bin").unwrap(),
+                    condition: MutationCondition::MustNotExist,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(!root.join("nested/transfer.bin").exists());
+        assert_eq!(prepared.review["mutating"], true);
+        let mut tampered = prepared.clone();
+        tampered.request.path = WorkspacePath::new("unreviewed.bin").unwrap();
+        assert!(matches!(
+            client.execute_publication(&tampered).await,
+            Err(WorkspaceError::Conflict)
+        ));
+        let result = client.execute_publication(&prepared).await.unwrap();
+        assert!(
+            matches!(result.state, OperationState::Completed { .. }),
+            "{result:?}"
+        );
+        assert_eq!(
+            client.publication_status(&prepared).await.unwrap().state,
+            TransferPublicationState::Completed
+        );
+        assert!(client.pending_remote_operations().is_empty());
+        client.release_stage(&stage).await.unwrap();
+        assert_eq!(
+            fs::read(local.path().join("nested/transfer.bin")).unwrap(),
+            LOCAL_CANARY
+        );
+        let file = WorkspaceTransferService::stat(&client, binding, cursor, &prepared.request.path)
+            .await
+            .unwrap();
+        assert_eq!(file.content, content);
+        fs::write(
+            fault.with_extension("corrupt"),
+            b"corrupt streamed response",
+        )
+        .unwrap();
+        assert!(matches!(
+            client.download(&file, None).await,
+            Err(WorkspaceError::TransferIntegrity)
+        ));
+        fs::remove_file(fault.with_extension("corrupt")).unwrap();
+        let range = ByteRange {
+            start: BINARY_BYTES - 1024,
+            end_exclusive: BINARY_BYTES,
+        };
+        let partial = client.download(&file, Some(range)).await.unwrap();
+        assert!(!partial.whole_file_verified);
+        assert_binary(partial.source, 1024).await;
+        let full = client.download(&file, None).await.unwrap();
+        assert!(full.whole_file_verified);
+        let publisher =
+            LocalTransferPublisher::new(local.path().to_owned(), Arc::new(PullAuthorization))
+                .await
+                .unwrap();
+        let pull = publisher
+            .prepare(
+                full.source,
+                LocalTransferDestination {
+                    create_directories: Vec::new(),
+                    path: LocalTransferPath::new("pulled.bin").unwrap(),
+                    condition: LocalTransferCondition::MustNotExist,
+                },
+                full.content,
+            )
+            .await
+            .unwrap();
+        assert!(!local.path().join("pulled.bin").exists());
+        publisher.execute(&pull).await.unwrap();
+        assert_binary(
+            LocalTransferSource::new(
+                smol::fs::File::open(local.path().join("pulled.bin"))
+                    .await
+                    .unwrap(),
+            ),
+            BINARY_BYTES,
+        )
+        .await;
+        let read = WorkspaceReadService::read_bytes(
+            &client,
+            binding,
+            cursor,
+            &ReadBytesRequest {
+                resource: ResourceSelector::Path(prepared.request.path.clone()),
+                byte_offset: range.start,
+                max_bytes: 1024,
+                if_revision: Some(file.revision.clone()),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(read.bytes, vec![BINARY_BYTE; 1024]);
+        let short = binary_content(1024);
+        let stage = client
+            .stage(
+                binding,
+                cursor,
+                LocalTransferSource::new(repeat(BINARY_BYTE).take(1024)),
+                &short,
+            )
+            .await
+            .unwrap();
+        let sealed = client.seal(&stage).await.unwrap();
+        let mut request = TransferPublicationRequest {
+            publication_id: OperationId::new("must-not-replace").unwrap(),
+            create_directories: Vec::new(),
+            path: prepared.request.path.clone(),
+            condition: MutationCondition::MustNotExist,
+        };
+        assert!(matches!(
+            client.prepare_publication(&sealed, &request).await,
+            Err(WorkspaceError::Conflict)
+        ));
+        request.publication_id = OperationId::new("stale-replace").unwrap();
+        request.condition = MutationCondition::Matches(file.revision.clone());
+        let stale = client.prepare_publication(&sealed, &request).await.unwrap();
+        fs::write(root.join("nested/transfer.bin"), LOCAL_CANARY).unwrap();
+        assert!(matches!(
+            client.download(&file, None).await,
+            Err(WorkspaceError::Conflict)
+        ));
+        let result = client.execute_publication(&stale).await.unwrap();
+        assert!(
+            matches!(
+                result.state,
+                OperationState::Failed {
+                    side_effects_possible: false,
+                    ..
+                }
+            ),
+            "{result:?}"
+        );
+        assert_eq!(
+            fs::read(root.join("nested/transfer.bin")).unwrap(),
+            LOCAL_CANARY
+        );
+        client.release_stage(&stage).await.unwrap();
+        let abandoned = client
+            .stage(
+                binding,
+                cursor,
+                LocalTransferSource::new(repeat(BINARY_BYTE).take(1024)),
+                &short,
+            )
+            .await
+            .unwrap();
+        client.seal(&abandoned).await.unwrap();
+        client.release_stage(&abandoned).await.unwrap();
+        assert!(client.seal(&abandoned).await.is_err());
+        let mismatch = client
+            .stage(
+                binding,
+                cursor,
+                LocalTransferSource::new(repeat(0).take(1024)),
+                &short,
+            )
+            .await;
+        assert!(matches!(mismatch, Err(WorkspaceError::TransferIntegrity)));
+        let image = WorkspaceMutationService::execute(
+            &client,
+            binding,
+            cursor,
+            &MutationRequest {
+                mutations: vec![Mutation::Write {
+                    path: WorkspacePath::new("image.png").unwrap(),
+                    content: WriteContent::Bytes(vec![BINARY_BYTE; BINARY_BYTES as usize]),
+                    condition: MutationCondition::MustNotExist,
+                }],
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(image.state, OperationState::Completed { .. }),
+            "{image:?}"
+        );
+        assert_eq!(
+            fs::metadata(root.join("image.png")).unwrap().len(),
+            BINARY_BYTES
+        );
+        eprintln!(
+            "PASS 6MiB binary Push/Pull, review, Range/If-Match, stale and no-replace, local canary, image binary compatibility"
+        );
+        for restart in [false, true] {
+            let client = connect().await.unwrap();
+            let nested = client
+                .resolve_directory_cursor(
+                    client.session_binding(),
+                    client.root_cursor(),
+                    &WorkspacePath::new("nested").unwrap(),
+                )
+                .await
+                .unwrap();
+            let stage = client
+                .stage(
+                    client.session_binding(),
+                    &nested.cursor,
+                    LocalTransferSource::new(repeat(BINARY_BYTE).take(1024)),
+                    &short,
+                )
+                .await
+                .unwrap();
+            let sealed = client.seal(&stage).await.unwrap();
+            let name = if restart { "restart.bin" } else { "lost.bin" };
+            let prepared = client
+                .prepare_publication(
+                    &sealed,
+                    &TransferPublicationRequest {
+                        publication_id: OperationId::new(name).unwrap(),
+                        create_directories: Vec::new(),
+                        path: WorkspacePath::new(name).unwrap(),
+                        condition: MutationCondition::MustNotExist,
+                    },
+                )
+                .await
+                .unwrap();
+            fs::write(
+                fault.with_extension("preparation"),
+                prepared.operation.preparation_id.as_str(),
+            )
+            .unwrap();
+            fs::write(&fault, b"lose execute response").unwrap();
+            let result = client.execute_publication(&prepared).await.unwrap();
+            assert!(matches!(result.state, OperationState::Indeterminate { .. }));
+            assert_eq!(client.pending_remote_operations().len(), 1);
+            assert!(matches!(
+                client.execute_publication(&prepared).await,
+                Err(WorkspaceError::PendingOperation { .. })
+            ));
+            let overlap = client.prepare_canonical_tool(client.session_binding(), client.root_cursor(), &ToolPrepareRequest { name: "file_write".into(), input: json!({"filePath":format!("nested/{name}"),"content":"forbidden overlapping write"}) }).await.unwrap();
+            assert!(matches!(
+                client
+                    .execute_canonical_tool(
+                        client.session_binding(),
+                        client.root_cursor(),
+                        &overlap.prepared
+                    )
+                    .await,
+                Err(WorkspaceError::PendingOperation { .. })
+            ));
+            client
+                .release_canonical_tool(
+                    client.session_binding(),
+                    client.root_cursor(),
+                    &overlap.prepared,
+                )
+                .await
+                .unwrap();
+            let count = fs::read_to_string(fault.with_extension("count")).unwrap();
+            fs::remove_file(&fault).unwrap();
+            if restart {
+                fs::write(fault.with_extension("restart"), b"restart").unwrap();
+            }
+            fs::write(fault.with_extension("unknown"), b"forget durable result").unwrap();
+            drop(client);
+            let recovered = connect().await.unwrap();
+            assert_eq!(recovered.pending_remote_operations().len(), 1);
+            let restored =
+                serde_json::from_value(serde_json::to_value(&prepared).unwrap()).unwrap();
+            assert_eq!(
+                recovered.publication_status(&restored).await.unwrap().state,
+                TransferPublicationState::Unknown
+            );
+            fs::remove_file(fault.with_extension("unknown")).unwrap();
+            recovered
+                .reconnect(&CancellationToken::new())
+                .await
+                .unwrap();
+            assert!(recovered.pending_remote_operations().is_empty());
+            let status = recovered.publication_status(&restored).await.unwrap();
+            assert_eq!(status.state, TransferPublicationState::Completed);
+            assert_binary(
+                recovered
+                    .download(&status.file.unwrap(), None)
+                    .await
+                    .unwrap()
+                    .source,
+                1024,
+            )
+            .await;
+            assert_eq!(
+                fs::read_to_string(fault.with_extension("count")).unwrap(),
+                count
+            );
+            assert_binary(
+                LocalTransferSource::new(
+                    smol::fs::File::open(root.join("nested").join(name))
+                        .await
+                        .unwrap(),
+                ),
+                1024,
+            )
+            .await;
+        }
+        eprintln!(
+            "PASS lost execute, durable restart recovery, cross-cursor locks, Unknown retains lock, no replay"
+        );
+    });
+}
 
 async fn tool(
     client: &RemoteWorkcellClient,
@@ -74,6 +978,38 @@ async fn tool(
             .unwrap();
     }
     panic!("{name}: operation exceeded bounded polling");
+}
+
+#[test]
+fn unsupported_server() {
+    if env::var("WORKCELL_TEST_UNSUPPORTED").as_deref() != Ok("1") {
+        return;
+    }
+    let selection = RemoteWorkcellSelection {
+        source: WorkcellSourceRef::Direct,
+        endpoint: WorkcellEndpoint::parse(&env::var("WORKCELL_TEST_ENDPOINT").unwrap()).unwrap(),
+        cwd: WorkspacePath::root(),
+        credential_ref: Some(WorkcellCredentialRef::from_str("credential:integration").unwrap()),
+        expected_server_id: None,
+        expected_workspace_id: None,
+    };
+    let credential = NamedBearerCredential::new(
+        WorkcellCredentialName::new("integration").unwrap(),
+        WorkcellCredential::new(
+            fs::read_to_string(env::var_os("WORKCELL_TEST_TOKEN_FILE").unwrap()).unwrap(),
+        )
+        .unwrap(),
+    );
+    let state = StateDir::from_path(PathBuf::from(env::var_os("WORKCELL_TEST_STATE").unwrap()));
+    let result = smol::block_on(RemoteWorkcellClient::connect(
+        &selection,
+        Some(credential),
+        SessionBindingId::new("unsupported-session").unwrap(),
+        RemoteOperationJournal::open(&state).unwrap(),
+        CancellationToken::new(),
+    ));
+    assert_eq!(result.unwrap_err(), RemoteWorkcellError::CapabilityMismatch);
+    eprintln!("PASS unsupported server refused before catalog or transfer downgrade");
 }
 
 #[test]
@@ -125,7 +1061,14 @@ fn authenticated_local() {
             .await
             .unwrap();
         assert_eq!(resolved_root.cursor.scope(), cursor.scope());
-        assert_eq!(client.canonical_catalog().len(), 19);
+        assert_eq!(client.canonical_catalog().len(), 17);
+        assert!(
+            client
+                .workspace_handle()
+                .unwrap()
+                .capabilities()
+                .supports(WorkspaceCapability::ReviewedTransfer)
+        );
         for name in [
             "file_read",
             "file_glob",
@@ -134,8 +1077,6 @@ fn authenticated_local() {
             "file_edit",
             "file_apply_patch",
             "shell",
-            "file_download",
-            "file_upload",
             "file_index",
             "code_map",
             "code_context",

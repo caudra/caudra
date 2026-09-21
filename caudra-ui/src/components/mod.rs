@@ -34,6 +34,7 @@ pub(crate) mod queue_actions;
 pub mod queue_panel;
 pub(crate) mod review;
 pub(crate) mod rewind_picker;
+pub(crate) mod sandbox_manager;
 pub(crate) mod scrollbar;
 pub(crate) mod search_modal;
 pub(crate) mod session_picker;

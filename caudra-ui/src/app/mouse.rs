@@ -64,6 +64,14 @@ fn autoscroll_rows(distance: i32) -> i32 {
 
 impl App {
     pub(super) fn handle_mouse(&mut self, event: MouseEvent) -> Vec<crate::components::Action> {
+        if self.sandbox_manager.is_open() {
+            self.clear_control_hovers();
+            self.autoscroll = None;
+            self.selection_state = None;
+            let action = self.sandbox_manager.handle_mouse(event);
+            self.handle_sandbox_action(action);
+            return Vec::new();
+        }
         let at = Position::new(event.column, event.row);
         #[cfg(debug_assertions)]
         if let Some(actions) = self.handle_grab_mouse(event) {
@@ -738,6 +746,11 @@ impl App {
     }
 
     pub(super) fn handle_scroll(&mut self, column: u16, row: u16, delta: i32) {
+        if self.sandbox_manager.is_open() {
+            self.sandbox_manager
+                .scroll_at(Position::new(column, row), delta);
+            return;
+        }
         if self.permissions_picker.is_open() {
             self.permissions_picker
                 .scroll_at(Position::new(column, row), delta);

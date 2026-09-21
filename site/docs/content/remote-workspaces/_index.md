@@ -9,20 +9,37 @@ group = "Guides"
 
 Connect Caudra to a Workcell server when the repository and execution environment live on another host. Caudra keeps its terminal UI, model connections, and session state on the client. Workspace operations run at the selected endpoint.
 
-The pinned Workcell dependency includes the remote host contract used by this checkout. Build the server from the same Workcell revision pinned in `Cargo.toml`. A matching version label alone does not establish compatibility.
+Use compatible client and server builds. A matching version label alone does not establish compatibility. The pinned Workcell dependency includes reviewed-transfer contracts, with a hard break from older remote contracts. Incompatible persisted state fails without migration. See [compatibility and release status](/docs/sandboxes/#compatibility-and-release-status) for the exact pin and supported state formats.
 
-Caudra does not create, start, stop, or delete VMs or containers. E2B sandbox lifecycle management is outside this feature. Provision the host, install Workcell, and manage its process, credentials, TLS, and storage yourself. A failed remote connection never switches execution to the local checkout.
+This guide covers direct Workcell connections, where you provision the host and manage its process, credentials, TLS and storage. For optional e2b-libvirt lifecycle management, profiles, the template catalog and reviewed file transfers, use [Managed Sandboxes](/docs/sandboxes/). A failed remote connection never switches execution to the local checkout.
 
 ## Prepare the server
 
-Use a matching Workcell build with a working Python execution worker. A generic MCP endpoint or a read-only Workcell server is insufficient. Caudra requires the full first-party catalog with matching schemas, contract and result versions, annotations, and presentation metadata. It also requires workspace reads and mutations, recursive watches, project assets, direct execution, SCM, file transfer, execution-environment disclosure, and durable snapshot lifecycle support. Operation preparation, status, cancellation, release, and bounded progress replay must be available.
+Use a matching Workcell build with a working Python execution worker. A generic MCP endpoint or a read-only Workcell server is insufficient. Caudra requires the full first-party catalog with matching schemas, contract and result versions, annotations, and presentation metadata.
+
+Live discovery must advertise these capabilities. Capability contracts use version `v1`, and declared limits must pass Caudra's bounds checks. Listed methods and guarantees must be enabled unless stated otherwise.
+
+| Capability | Required methods and guarantees |
+|------------|---------------------------------|
+| Control plane | `controlPlane = true`, empty `controlPlaneMissing`, and `executionEnvironment` disclosure |
+| `operations` | `exactPreparation`, methods `prepare`, `execute`, `status`, `cancel`, `release`, and nonzero ledger and bounded progress-replay limits |
+| `workspace` | `resolveDirectory`, `stat`, `list`, `readText`, `searchText` |
+| `workspaceMutation` | `prepared` and `rollbackOnFailure` |
+| `directExec` | `prepared` and `interactive = false` |
+| `watch` | `open`, `poll`, `close`, and `recursive` |
+| `projectAssets` | `discover` and `read` |
+| `scm` | `discover`, `status`, `log`, `diff`, `readSide`, `stage`, `unstage`, `discard`, and `preparedMutations` |
+| `snapshots` | `capture`, `inspect`, `status`, `prepareRestore`, `prepareUnrevert`, `acknowledge`, `prepareCleanup`, and `durablePerFileJournal` |
+| `reviewedTransfer` | `privateStaging`, `sealedPublication`, `conditionalDownload`, `singleRange`, `durableOutcomes`, `createsDirectories`, and `safeInventory` |
+
+Reviewed transfer also requires positive file, staging, I/O, lifetime, buffer and journal limits, with `maxJournalStorageBytes >= maxJournalBytes`. Binary reads use reviewed downloads. The old raw upload/download tools cannot substitute for these capabilities.
 
 Missing capabilities fail startup, even if you disable the corresponding model tools. Keep execution-environment disclosure enabled. Do not pass `--no-expose-execution-environment`.
 
-On the server, create a private snapshot directory outside the exposed workspace. The paths below are examples to replace with your deployment paths. The token file must contain a bearer token of at least 32 bytes, supplied through your secret-management process.
+On the server, create private snapshot and transfer directories outside the exposed workspace. The paths below are examples to replace with your deployment paths. The token file must contain a bearer token of at least 32 bytes, supplied through your secret-management process.
 
 ```bash
-install -d -m 700 /var/lib/workcell/snapshots
+install -d -m 700 /var/lib/workcell/snapshots /var/lib/workcell/transfers
 workcell-mcp /srv/workspaces \
   --transport http --http-bind loopback --port 3001 \
   --http-token-file /etc/workcell/token \
@@ -34,7 +51,8 @@ workcell-mcp /srv/workspaces \
   --remote-workspace-generation generation-1 \
   --remote-root-project-id dev-project \
   --remote-principal-id developer \
-  --snapshot-root /var/lib/workcell/snapshots
+  --snapshot-root /var/lib/workcell/snapshots \
+  --transfer-root /var/lib/workcell/transfers
 ```
 
 The snapshot directory must already exist, be absolute, belong to the server process identity, have no symlink components, and be inaccessible to group and other users on Unix. It must not overlap the workspace. Snapshot blobs and restore journals stay there, separate from client session records.

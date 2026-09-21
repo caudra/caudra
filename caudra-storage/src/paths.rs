@@ -270,6 +270,10 @@ pub fn config_dir() -> Result<PathBuf, std::io::Error> {
     active_path(|paths| &paths.config)
 }
 
+pub fn config_dir_path() -> Result<PathBuf, std::io::Error> {
+    Ok(resolve().map_err(err)?.config.clone())
+}
+
 pub fn data_dir() -> Result<PathBuf, std::io::Error> {
     active_path(|paths| &paths.data)
 }

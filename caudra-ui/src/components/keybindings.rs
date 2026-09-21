@@ -291,6 +291,11 @@ pub mod key {
     pub const DELETE_WORD: Bind = Bind::from_workbench(wb::DELETE_WORD);
     pub const CUT: Bind = Bind::from_workbench(wb::CUT);
     pub const SAVE: Bind = Bind::from_workbench(wb::SAVE);
+    pub const SANDBOX_APPLY: Bind = Bind {
+        code: KeyCode::Enter,
+        modifiers: KeyModifiers::CONTROL,
+        label: "Ctrl+Enter",
+    };
     pub const SELECT_ALL: Bind = Bind::from_workbench(wb::SELECT_ALL);
     pub const UNDO: Bind = Bind::from_workbench(wb::UNDO);
 }
@@ -369,6 +374,7 @@ pub enum KeybindContext {
     SessionRelocation,
     WorkflowInspector,
     WorkflowCatalogPicker,
+    SandboxManager,
     Workbench,
     WorkbenchExplorer,
     WorkbenchEditor,
@@ -401,6 +407,7 @@ impl KeybindContext {
             Self::SessionRelocation => "Session Relocation",
             Self::WorkflowInspector => "Workflow Inspector",
             Self::WorkflowCatalogPicker => "Workflow Catalog",
+            Self::SandboxManager => "Sandbox Manager",
             Self::Workbench => "Workbench",
             Self::WorkbenchExplorer => "Workbench Explorer",
             Self::WorkbenchEditor => "Workbench Editor",
@@ -535,6 +542,114 @@ pub struct Keybind {
 }
 
 pub const KEYBINDS: &[Keybind] = &[
+    Keybind {
+        label: KeyLabel::Single(key::SAVE.label),
+        description: "Validate and save sandbox defaults; export preview saves as a new file",
+        context: KeybindContext::SandboxManager,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Alt("Tab", "Shift+Tab"),
+        description: "Move focus between sandbox list and form fields (never insert a tab)",
+        context: KeybindContext::SandboxManager,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Single("Enter"),
+        description: "Inspect/edit; confirmations default to Keep, not Accept",
+        context: KeybindContext::SandboxManager,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Single(key::SANDBOX_APPLY.label),
+        description: "Apply to draft, or preview a live action for separate confirmation",
+        context: KeybindContext::SandboxManager,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Single("F2"),
+        description: "Choose provider, image, policy or purpose-store credential reference",
+        context: KeybindContext::SandboxManager,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Single("Esc"),
+        description: "Close, not cancel operations; retain live drafts; offer Save/Discard for configuration",
+        context: KeybindContext::SandboxManager,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Multi(&["1", "2", "3", "4"]),
+        description: "Switch Instances, Profiles, Images, Providers when not editing text",
+        context: KeybindContext::SandboxManager,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Single("/"),
+        description: "Search the sandbox master list",
+        context: KeybindContext::SandboxManager,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Multi(&["n", "d", "Delete"]),
+        description: "Profiles: new, duplicate or stage deletion; Instances: d detaches, Delete reviews deletion",
+        context: KeybindContext::SandboxManager,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Alt("g", "t"),
+        description: "Browse and edit reusable Network or Transfer policies from Profiles",
+        context: KeybindContext::SandboxManager,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Alt("i", "x"),
+        description: "Import a strict configuration draft or preview a reference-only export",
+        context: KeybindContext::SandboxManager,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Multi(&["c", "r", "a"]),
+        description: "Compare baseline/draft/external file, reload, or save as a new private file",
+        context: KeybindContext::SandboxManager,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Alt(key::UNDO.label, "Ctrl+Y"),
+        description: "Undo/redo sandbox field text; paste and mouse selection use the shared editor",
+        context: KeybindContext::SandboxManager,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Multi(&["a", "u", "p", "e"]),
+        description: "Instances: review Attach, Resume, Pause or Extend",
+        context: KeybindContext::SandboxManager,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Multi(&["v", "r", "z"]),
+        description: "Profiles: Create VM; Instances: Reconcile or explicitly Cancel create",
+        context: KeybindContext::SandboxManager,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Alt("h", "k"),
+        description: "Doctor; Providers: edit lifecycle credential in its purpose store",
+        context: KeybindContext::SandboxManager,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Multi(&["i", "b", "g", "l"]),
+        description: "Images: approved offline Import, Build, GC or Inspect",
+        context: KeybindContext::SandboxManager,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Multi(&["g", "F4", "F6"]),
+        description: "Live network preview/apply; Test rules (no probe); discard action draft",
+        context: KeybindContext::SandboxManager,
+        platform: Platform::All,
+    },
     Keybind {
         label: KeyLabel::Single(key::QUIT.label),
         description: "Quit / clear input (copies instead when text is selected)",

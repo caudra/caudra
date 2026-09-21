@@ -1,6 +1,6 @@
 use std::fmt;
 
-use crate::sessions::SessionError;
+use crate::{id::CaudraId, sessions::SessionError};
 use caudra_workspace::{
     AuthenticatedPrincipalId, AuthorityIdentity, CwdHandle, ProjectIdentity, ProjectKey,
     SessionBindingId, SessionWorkspaceBinding, SourceTrustAnchor, WorkspaceCursor,
@@ -32,6 +32,7 @@ pub struct StoredWorkspaceBinding {
     cwd_handle: CwdHandle,
     cursor_label: Option<String>,
     cursor: Option<WorkspaceCursor>,
+    sandbox_record: Option<CaudraId>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -43,6 +44,8 @@ struct StoredWorkspaceBindingWire {
     cursor_label: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     cursor: Option<WorkspaceCursor>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sandbox_record: Option<CaudraId>,
 }
 
 impl StoredWorkspaceBinding {
@@ -88,6 +91,7 @@ impl StoredWorkspaceBinding {
             cwd_handle,
             cursor_label,
             cursor: None,
+            sandbox_record: None,
         })
     }
 
@@ -105,6 +109,7 @@ impl StoredWorkspaceBinding {
             binding,
             cursor_label,
             cursor: Some(cursor),
+            sandbox_record: None,
         })
     }
 
@@ -142,6 +147,7 @@ impl StoredWorkspaceBinding {
                 .expect("hashed local cursor"),
             cursor_label: None,
             cursor: None,
+            sandbox_record: None,
         }
     }
 
@@ -162,7 +168,22 @@ impl StoredWorkspaceBinding {
     }
 
     pub fn with_cursor(&self, cursor: WorkspaceCursor) -> Result<Self, WorkspaceBindingError> {
-        Self::new_with_cursor(self.binding.clone(), cursor, self.cursor_label.clone())
+        let mut binding =
+            Self::new_with_cursor(self.binding.clone(), cursor, self.cursor_label.clone())?;
+        binding.sandbox_record = self.sandbox_record;
+        Ok(binding)
+    }
+
+    pub fn sandbox_record(&self) -> Option<CaudraId> {
+        self.sandbox_record
+    }
+
+    pub fn with_sandbox_record(mut self, record: CaudraId) -> Result<Self, WorkspaceBindingError> {
+        if self.is_local() || self.sandbox_record.is_some_and(|current| current != record) {
+            return Err(WorkspaceBindingError::IdentityMismatch);
+        }
+        self.sandbox_record = Some(record);
+        Ok(self)
     }
 
     pub fn trust_anchor(&self) -> &SourceTrustAnchor {
@@ -256,6 +277,7 @@ impl From<StoredWorkspaceBinding> for StoredWorkspaceBindingWire {
             cwd_handle: binding.cwd_handle,
             cursor_label: binding.cursor_label,
             cursor: binding.cursor,
+            sandbox_record: binding.sandbox_record,
         }
     }
 }
@@ -266,12 +288,15 @@ impl<'de> Deserialize<'de> for StoredWorkspaceBinding {
         D: serde::Deserializer<'de>,
     {
         let wire = StoredWorkspaceBindingWire::deserialize(deserializer)?;
-        if wire.version != BINDING_VERSION && wire.version != 1 {
+        if wire.version != BINDING_VERSION
+            && !(wire.version == 1
+                && wire.binding.authority().trust_anchor().as_str() == LOCAL_SOURCE)
+        {
             return Err(serde::de::Error::custom(
                 WorkspaceBindingError::UnsupportedVersion(wire.version),
             ));
         }
-        match wire.cursor {
+        let binding = match wire.cursor {
             Some(cursor) if cursor.cwd_handle() != &wire.cwd_handle => Err(
                 serde::de::Error::custom(WorkspaceBindingError::IdentityMismatch),
             ),
@@ -279,6 +304,12 @@ impl<'de> Deserialize<'de> for StoredWorkspaceBinding {
                 .map_err(serde::de::Error::custom),
             None => Self::new(wire.binding, wire.cwd_handle, wire.cursor_label)
                 .map_err(serde::de::Error::custom),
+        }?;
+        match wire.sandbox_record {
+            Some(record) => binding
+                .with_sandbox_record(record)
+                .map_err(serde::de::Error::custom),
+            None => Ok(binding),
         }
     }
 }
@@ -401,6 +432,18 @@ mod tests {
         assert!(serde_json::from_value::<StoredWorkspaceBinding>(value).is_err());
     }
 
+    #[test_case(1; "old_remote_version")]
+    #[test_case(3; "future_remote_version")]
+    fn unsupported_remote_binding_versions_are_rejected(version: u32) {
+        let mut value = serde_json::to_value(resume_binding("remote").unwrap()).unwrap();
+        value["version"] = serde_json::json!(version);
+        let error = serde_json::from_value::<StoredWorkspaceBinding>(value).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            WorkspaceBindingError::UnsupportedVersion(version).to_string()
+        );
+    }
+
     #[test]
     fn old_local_workspace_bindings_still_load_with_their_existing_storage_key() {
         let binding = StoredWorkspaceBinding::local_from_cwd(MISSING_CWD);
@@ -436,6 +479,30 @@ mod tests {
         assert_eq!(restored.cwd_handle(), cursor.cwd_handle());
         assert!(restored.exact_scope_eq(&changed));
         assert!(!restored.exact_scope_eq(&root));
+    }
+
+    #[test]
+    fn sandbox_provenance_survives_cursor_and_wire_roundtrip_without_changing_authority() {
+        let original = resume_binding("remote").unwrap();
+        let id = CaudraId::generate();
+        let tagged = original.clone().with_sandbox_record(id).unwrap();
+        let cursor = WorkspaceCursor::new(
+            tagged.binding(),
+            ResourceScope::root(ResourceId::new("sandbox-root").unwrap()),
+            0,
+            tagged.cwd_handle().clone(),
+        );
+        let tagged = tagged.with_cursor(cursor).unwrap();
+        let restored: StoredWorkspaceBinding =
+            serde_json::from_slice(&serde_json::to_vec(&tagged).unwrap()).unwrap();
+        assert_eq!(restored.sandbox_record(), Some(id));
+        assert!(restored.same_workspace_identity(&original));
+        assert!(restored.with_sandbox_record(CaudraId::generate()).is_err());
+        assert!(
+            StoredWorkspaceBinding::local_from_cwd(MISSING_CWD)
+                .with_sandbox_record(id)
+                .is_err()
+        );
     }
 
     #[test]

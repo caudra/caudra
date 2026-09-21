@@ -2432,6 +2432,8 @@ mod tests {
     const PARENT_KEY: &str = "parent_tool_use_id";
     const WORKSPACE_REBIND_REQUIRED: &str =
         "session workspace identity changed; fork or explicitly rebind the session";
+    const FORK_HISTORY: &str = "history retained without source authority";
+    const SOURCE_PLAN: &str = "/source/plan.md";
 
     fn permission_manager() -> Arc<PermissionManager> {
         Arc::new(PermissionManager::new_nonpersistent(
@@ -2940,6 +2942,73 @@ mod tests {
             (session.meta.structured_permission_rules.clone(), Some(true))
         );
         assert_eq!(forked, (Vec::new(), None));
+    }
+
+    #[test_case(false; "fork_to_local")]
+    #[test_case(true; "fork_to_explicit_sandbox")]
+    fn sdk_fork_persistence_rebinds_without_source_grants_or_plan(remote_target: bool) {
+        let directory = TempDir::new().unwrap();
+        let storage = StateDir::from_path(directory.path().join("state"));
+        let local = StoredWorkspaceBinding::local_from_cwd("/source");
+        let remote = serde_json::from_str::<StoredWorkspaceBinding>(
+            &serde_json::to_string(&local)
+                .unwrap()
+                .replace(local.trust_anchor().as_str(), "https://sandbox.test"),
+        )
+        .unwrap();
+        let mut source = StoredSession::new_with_workspace(
+            "provider/model",
+            "/source",
+            remote
+                .clone()
+                .with_sandbox_record(SessionRef::generate().id())
+                .unwrap(),
+        );
+        source.meta.structured_permission_rules = vec![stored_structured_rule()];
+        source.meta.yolo = Some(true);
+        source.meta.mode = Some(StoredMode::Plan);
+        source.meta.plan_path = Some(SOURCE_PLAN.into());
+        source.meta.plan_target = Some(StoredPlanTarget::LocalPath {
+            path: SOURCE_PLAN.into(),
+        });
+        let binding = remote_target.then(|| {
+            remote
+                .with_sandbox_record(SessionRef::generate().id())
+                .unwrap()
+        });
+        let history = History::new(vec![Message::user(FORK_HISTORY.into())]).into_items();
+        let target = SessionRef::generate();
+        let cwd = if remote_target {
+            "."
+        } else {
+            directory.path().to_str().unwrap()
+        };
+        save_sdk_fork(
+            &storage,
+            &source,
+            &target,
+            &history,
+            HashMap::new(),
+            binding.as_ref(),
+            cwd,
+        )
+        .unwrap();
+        let fork = crate::setup::load_session(target.id(), &storage).unwrap();
+        StoredWorkspaceBinding::validate_resume_identity(
+            fork.workspace_binding(),
+            binding.as_ref(),
+        )
+        .unwrap();
+        assert_ne!(fork.workspace_binding(), source.workspace_binding());
+        assert!(fork.meta.structured_permission_rules.is_empty());
+        assert_eq!(fork.meta.yolo, None);
+        assert_eq!(fork.meta.plan_target, None);
+        assert_eq!(fork.meta.plan_path, None);
+        assert_ne!(fork.meta.mode, Some(StoredMode::Plan));
+        assert_eq!(
+            crate::setup::active_session_history(&fork).unwrap(),
+            history
+        );
     }
 
     #[test]

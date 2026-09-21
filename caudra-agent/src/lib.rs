@@ -47,6 +47,7 @@ pub use tools::ToolFilter;
 pub mod types;
 pub mod workflow;
 pub mod workspace_baseline;
+pub mod workspace_transfer;
 pub use stored_session::{
     StoredSession, latest_stored_session, load_stored_session, open_stored_session,
     open_stored_session_with_cursor, resolve_resume_workspace, resume_workspace_session,

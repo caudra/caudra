@@ -61,6 +61,7 @@ Commands marked Main only act on the main session's turn or history. They stay l
 | `/reload` | Reload plugins and config |  |
 | `/workbench` | Open the file explorer, editor and source control view |  |
 | `/remote` | Remote status, pending operations, reconnect, reconcile or explicit acknowledgement | Main only |
+| `/sandbox` | Manage live sandboxes, profiles, images and providers; explicit reviewed actions, Doctor and recovery |  |
 
 ## Resuming after an interruption
 

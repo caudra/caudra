@@ -1,0 +1,28 @@
+[package]
+name = "caudra-sandbox"
+description = "Managed sandbox lifecycle, durable intents, and attach authority for Caudra."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+
+[dependencies]
+caudra-config.workspace = true
+caudra-storage.workspace = true
+caudra-workspace.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+isahc.workspace = true
+futures-lite.workspace = true
+smol.workspace = true
+url.workspace = true
+uuid.workspace = true
+getrandom.workspace = true
+jiff.workspace = true
+wait-timeout.workspace = true
+libc.workspace = true
+
+[dev-dependencies]
+test-case.workspace = true
+tempfile.workspace = true

@@ -25,6 +25,7 @@ mod markdown;
 mod provenance;
 mod render_worker;
 pub mod repaint;
+pub mod sandbox;
 mod selection;
 pub mod splash;
 mod storage_writer;
@@ -248,6 +249,15 @@ pub enum RunOutcome {
         focused: usize,
         relocation: SessionRelocationHandoff,
     },
+    Sandbox {
+        tabs: Vec<SessionTab>,
+        attachment: sandbox::SandboxAttachment,
+    },
+    SandboxControl {
+        tabs: Vec<SessionTab>,
+        focused: usize,
+        control: sandbox::SandboxControl,
+    },
 }
 
 /// Paints one frame before the event loop is built, because building it
@@ -321,6 +331,19 @@ pub fn run(params: EventLoopParams, initial_prompt: Option<String>) -> Result<Ru
             tabs: report.tabs,
             focused: report.focused,
             relocation,
+        });
+    }
+    if let Some(attachment) = report.sandbox {
+        return Ok(RunOutcome::Sandbox {
+            tabs: report.tabs,
+            attachment,
+        });
+    }
+    if let Some(control) = report.sandbox_control {
+        return Ok(RunOutcome::SandboxControl {
+            tabs: report.tabs,
+            focused: report.focused,
+            control,
         });
     }
     Ok(match report.exit {

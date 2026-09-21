@@ -2527,9 +2527,11 @@ pub async fn spawn_prepared_interactive(
 
             // Active runs are interrupted and their agents drained before the
             // session is saved, so nothing writes to it afterwards.
+            base.subagent_cancels.cancel_all();
             if let Some(runtime) = runtime {
                 runtime.shutdown().await;
             }
+            drop(base);
             drop(agent_tx);
             event_forwarder.await;
             if let Some(store) = &mut *store.lock().await {

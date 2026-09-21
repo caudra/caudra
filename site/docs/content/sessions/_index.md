@@ -11,6 +11,8 @@ Caudra stores conversation history as parent-linked items. User prompts, assista
 
 For remote sessions, transcripts stay on the client and workspace snapshots stay on the Workcell server. Resume requires the original remote workspace identity and generation. See [Remote session identity and recovery](/docs/remote-workspaces/#cwd-and-resume) before moving an endpoint, replacing a workspace, or recovering an interrupted mutation. The `storage` subcommand is disabled when a remote Workcell selector is supplied.
 
+Managed sandbox sessions retain their sandbox source. `caudra --session ID` resolves it before validating the remote workspace, and a paused VM requires explicit resume approval. See [sandbox conversation and VM resume](/docs/sandboxes/#resume-a-conversation-or-vm). Saving or deleting conversation history does not delete the VM or extend its disk-retention deadline.
+
 ## Active sessions
 
 One Caudra runtime can own a session ID at a time. Opening that session from
@@ -44,6 +46,8 @@ Run `caudra --ephemeral` for a session that leaves no session record behind. Set
 Caudra creates a private temporary state root under `XDG_RUNTIME_DIR` or the system temporary directory. Session rows, tool outputs, snapshots, input history, and stashed prompts use that root. It is removed when Caudra exits through its normal success or error paths. A forced process kill can leave the temporary root for the operating system to clean up.
 
 Credentials, configuration, trust, model preferences, plans, memory notes, and logs keep their normal persistent locations. Project and global permission decisions remain durable. Ephemeral mode starts with an empty session store, so saved sessions and the persisted tab layout are unavailable during that run.
+
+Managed sandbox lifecycle records and transfer recovery journals also remain persistent. `--ephemeral` is not a disposable-VM or automatic-delete policy.
 
 What the run spends is still recorded in the persistent [usage ledger](/docs/token-economy/#lifetime-spend), labelled as ephemeral, so an ephemeral run stays visible in your spending totals.
 

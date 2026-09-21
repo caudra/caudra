@@ -46,6 +46,10 @@ pub enum WorkspaceError {
     PolicyDenied,
     #[error("workspace operation conflicts with current state")]
     Conflict,
+    #[error("transfer content does not match its expected digest or size")]
+    TransferIntegrity,
+    #[error("transfer staging or I/O quota is exhausted")]
+    TransferQuota,
     #[error("workspace mutation is blocked by pending operation {operation_id}")]
     PendingOperation { operation_id: String },
     #[error("workspace operation was cancelled")]

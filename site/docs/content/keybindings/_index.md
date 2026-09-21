@@ -136,6 +136,31 @@ Holding `Alt` while turning the wheel scrolls four times as far. A middle-click 
 | `Home` / `End` | First / last item |
 | `Ctrl+U` | Scroll page up |
 
+## Sandbox Manager
+
+| Key | Action |
+|-----|--------|
+| `Ctrl+S` | Validate and save sandbox defaults; export preview saves as a new file |
+| `Tab` / `Shift+Tab` | Move focus between sandbox list and form fields (never insert a tab) |
+| `Enter` | Inspect/edit; confirmations default to Keep, not Accept |
+| `Ctrl+Enter` | Apply to draft, or preview a live action for separate confirmation |
+| `F2` | Choose provider, image, policy or purpose-store credential reference |
+| `Esc` | Close, not cancel operations; retain live drafts; offer Save/Discard for configuration |
+| `1` / `2` / `3` / `4` | Switch Instances, Profiles, Images, Providers when not editing text |
+| `/` | Search the sandbox master list |
+| `n` / `d` / `Delete` | Profiles: new, duplicate or stage deletion; Instances: d detaches, Delete reviews deletion |
+| `g` / `t` | Browse and edit reusable Network or Transfer policies from Profiles |
+| `i` / `x` | Import a strict configuration draft or preview a reference-only export |
+| `c` / `r` / `a` | Compare baseline/draft/external file, reload, or save as a new private file |
+| `Ctrl+Z` / `Ctrl+Y` | Undo/redo sandbox field text; paste and mouse selection use the shared editor |
+| `a` / `u` / `p` / `e` | Instances: review Attach, Resume, Pause or Extend |
+| `v` / `r` / `z` | Profiles: Create VM; Instances: Reconcile or explicitly Cancel create |
+| `h` / `k` | Doctor; Providers: edit lifecycle credential in its purpose store |
+| `i` / `b` / `g` / `l` | Images: approved offline Import, Build, GC or Inspect |
+| `g` / `F4` / `F6` | Live network preview/apply; Test rules (no probe); discard action draft |
+
+See [Managed Sandboxes](/docs/sandboxes/#tui-manager) for instance actions and [image forms](/docs/sandboxes/#images-and-template-catalog) for the host picker and approved probe. The [Transfer panel](/docs/sandboxes/#tui-transfer-review) has separate controls. Escape there requests cancellation and waits for cleanup, unlike closing a lifecycle action.
+
 ## Workbench
 
 | Key | Action |

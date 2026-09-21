@@ -9,7 +9,7 @@ use crate::{
     AuthorityIdentity, CheckpointId, CollectionRevision, ContinuationToken, DirectoryNavigation,
     OperationId, ResourceId, ResourceRevision, RestoreId, ScmRevision, SessionWorkspaceBinding,
     SnapshotId, WatchCursor, WatchSubscriptionId, WorkspaceCapabilities, WorkspaceCapability,
-    WorkspaceCursor, WorkspaceError, WorkspacePath, WorkspaceResource,
+    WorkspaceCursor, WorkspaceError, WorkspacePath, WorkspaceResource, WorkspaceTransferService,
 };
 
 const MAX_COMMAND_BYTES: usize = 64 * 1024;
@@ -1324,6 +1324,7 @@ pub trait WorkspaceToolService: Send + Sync {
 
 #[derive(Default)]
 pub struct WorkspaceServices {
+    pub transfer: Option<Arc<dyn WorkspaceTransferService>>,
     pub control: Option<Arc<dyn WorkspaceControlService>>,
     pub read: Option<Arc<dyn WorkspaceReadService>>,
     pub mutation: Option<Arc<dyn WorkspaceMutationService>>,
@@ -1397,6 +1398,7 @@ impl WorkspaceServices {
         use WorkspaceCapability as Capability;
 
         match capability {
+            Capability::ReviewedTransfer => self.transfer.is_some(),
             Capability::Resolve
             | Capability::Stat
             | Capability::List

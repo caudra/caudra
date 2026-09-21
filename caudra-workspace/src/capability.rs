@@ -13,6 +13,7 @@ pub enum WorkspaceCapability {
     List,
     ReadText,
     ReadBytes,
+    ReviewedTransfer,
     MutationExecute,
     MutationStatus,
     MutationCancel,

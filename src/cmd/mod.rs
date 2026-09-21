@@ -1,6 +1,8 @@
 mod acp;
 mod logs;
 mod permissions;
+mod sandbox;
+mod sandbox_transfer;
 mod storage;
 mod subcmd;
 mod tui;
@@ -114,6 +116,10 @@ fn configure_native_tools(agent: &caudra_config::AgentConfig) {
 pub fn dispatch(mut cli: Cli) -> Result<ExitCode> {
     caudra_storage::paths::check_namespace_override()?;
     match cli.command.take() {
+        Some(Command::Sandbox { action }) => {
+            let storage = StateDir::resolve().context("resolve data directory")?;
+            sandbox::run(action, &storage)?;
+        }
         Some(Command::Permissions { action, database }) => {
             if cli.workcell.is_set() || cli.ephemeral {
                 return Err(color_eyre::eyre::eyre!(
@@ -125,6 +131,7 @@ pub fn dispatch(mut cli: Cli) -> Result<ExitCode> {
         Some(Command::Auth { action }) => {
             let storage = StateDir::resolve().context("resolve data directory")?;
             match action {
+                AuthAction::Sandbox { action } => sandbox::auth(action, &storage)?,
                 AuthAction::Login { provider, method } => {
                     subcmd::auth_login(provider.as_deref(), method, &storage)?
                 }

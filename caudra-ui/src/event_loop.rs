@@ -18,6 +18,9 @@ use arc_swap::{ArcSwap, ArcSwapOption};
 use color_eyre::Result;
 use color_eyre::eyre::{Context, eyre};
 
+use crate::sandbox::{
+    LiveOperation, SandboxAttachment, SandboxConnector, SandboxControl, SandboxReadiness,
+};
 use caudra_agent::command::CustomCommand;
 use caudra_agent::permissions::PermissionManager;
 use caudra_agent::prompt::profile::{
@@ -40,6 +43,7 @@ use caudra_providers::{HistoryItem, Message, Model};
 use caudra_storage::StateDir;
 use caudra_storage::StorageError;
 use caudra_storage::id::{CaudraId, CaudraIdParseError, SessionRef};
+use caudra_storage::remote_operation_journal::RemoteOperationJournal;
 use caudra_storage::sessions::{
     SessionDatabase, SessionError, SessionLease, SessionLocation, SessionRelocation, StoredImage,
     TitleSource, normalize_title,
@@ -139,6 +143,8 @@ pub(crate) struct ShutdownReport {
     /// reports the time since the reload rather than since launch.
     pub run_time: Duration,
     pub relocation: Option<SessionRelocationHandoff>,
+    pub sandbox: Option<SandboxAttachment>,
+    pub sandbox_control: Option<SandboxControl>,
 }
 
 pub struct EventLoopParams {
@@ -159,6 +165,9 @@ pub struct EventLoopParams {
     pub permissions: Arc<PermissionManager>,
     pub pattern_suggestion_loader: Option<PatternSuggestionLoader>,
     pub permission_authority_factory: Option<PermissionAuthorityFactory>,
+    pub sandbox_connector: Option<SandboxConnector>,
+    pub transfer_connector: Option<crate::sandbox::transfer::TransferConnector>,
+    pub sandbox_readiness: Option<SandboxReadiness>,
     pub timeouts: Timeouts,
     pub exit_on_done: bool,
     pub lua_command_reader: LuaCommandReader,
@@ -925,6 +934,9 @@ struct SpawnCtx {
     permissions: Arc<PermissionManager>,
     pattern_suggestion_loader: Option<PatternSuggestionLoader>,
     permission_authority_factory: Option<PermissionAuthorityFactory>,
+    sandbox_connector: Option<SandboxConnector>,
+    transfer_connector: Option<crate::sandbox::transfer::TransferConnector>,
+    sandbox_readiness: Option<SandboxReadiness>,
     timeouts: Timeouts,
     custom_commands: Arc<[CustomCommand]>,
     no_commands: bool,
@@ -1162,6 +1174,9 @@ impl SpawnCtx {
             workspace_session.clone(),
         );
         app.local_documents = self.local_documents.clone();
+        app.sandbox_live.connector = self.sandbox_connector.clone();
+        app.sandbox_live.transfer_connector = self.transfer_connector.clone();
+        app.sandbox_live.readiness = self.sandbox_readiness.clone();
         app.conversation_permissions = conversation_permissions;
         app.permission_authority_factory = self.permission_authority_factory.clone();
         app.sync_permission_authority()
@@ -1325,6 +1340,9 @@ pub(crate) struct EventLoop<'t> {
     herdr_reporter: Option<HerdrReporterHandle>,
     _model_fetch_task: smol::Task<()>,
     relocation: Option<PendingRelocation>,
+    sandbox: Option<SandboxAttachment>,
+    sandbox_control: Option<SandboxControl>,
+    sandbox_workflows: Vec<WorkflowTransition>,
 }
 
 struct PendingRelocation {
@@ -1466,6 +1484,9 @@ impl<'t> EventLoop<'t> {
             permissions,
             pattern_suggestion_loader,
             permission_authority_factory,
+            sandbox_connector,
+            transfer_connector,
+            sandbox_readiness,
             timeouts,
             exit_on_done,
             lua_command_reader,
@@ -1547,6 +1568,9 @@ impl<'t> EventLoop<'t> {
             permissions,
             pattern_suggestion_loader,
             permission_authority_factory,
+            sandbox_connector,
+            transfer_connector,
+            sandbox_readiness,
             timeouts,
             custom_commands: Arc::from(commands),
             no_commands,
@@ -1635,6 +1659,9 @@ impl<'t> EventLoop<'t> {
             herdr_reporter,
             _model_fetch_task: bg.task,
             relocation: None,
+            sandbox: None,
+            sandbox_control: None,
+            sandbox_workflows: Vec::new(),
         })
     }
 
@@ -1653,15 +1680,19 @@ impl<'t> EventLoop<'t> {
         let mut limiter = FrameLimiter::default();
         let mut urgent = false;
         let result = loop {
-            if self.relocation.is_some() {
+            if self.relocation.is_some() || self.sandbox.is_some() || self.sandbox_control.is_some()
+            {
                 break Ok(());
             }
             dirty |= self.tick();
+            if self.sandbox_control.is_some() {
+                break Ok(());
+            }
             match self.drain_channels() {
                 Ok(d) => dirty |= d,
                 Err(e) => break Err(e),
             }
-            if self.relocation.is_some() {
+            if self.relocation.is_some() || self.sandbox.is_some() {
                 break Ok(());
             }
             if self.focused_app().lifecycle_blocker().is_none()
@@ -1901,6 +1932,177 @@ impl<'t> EventLoop<'t> {
                 dirty |= rt.app.tick();
             } else {
                 let _ = rt.app.float_mgr.tick();
+                dirty |= rt.app.poll_sandbox();
+            }
+        }
+        dirty |= self.poll_sandbox_actions();
+        dirty
+    }
+
+    fn sandbox_gate(&mut self, transition: bool) -> Result<Vec<WorkflowTransition>, String> {
+        if self
+            .sessions
+            .iter()
+            .any(|runtime| !runtime.work_quiescent())
+        {
+            return Err(
+                "Wait for agents, queues, background tasks and shells before a sandbox action"
+                    .into(),
+            );
+        }
+        for runtime in &self.sessions {
+            if let Some(reason) = runtime.app.sandbox_action_blocker(transition) {
+                return Err(reason.into());
+            }
+            if let Some(binding) = runtime.app.state.session.workspace_binding()
+                && !RemoteOperationJournal::open(&self.ctx.storage)
+                    .map_err(|error| error.to_string())?
+                    .list_pending(binding)
+                    .map_err(|error| error.to_string())?
+                    .is_empty()
+            {
+                return Err("Reconcile pending Workcell mutations before a sandbox action".into());
+            }
+            check_relocation_journals(&self.ctx.storage, runtime.id())?;
+        }
+        let mut workflows = Vec::new();
+        for runtime in &self.sessions {
+            if let Some(workflow) = runtime.handles.workflow_handle() {
+                workflows
+                    .push(smol::block_on(workflow.suspend()).map_err(|error| error.to_string())?);
+            }
+        }
+        let database =
+            SessionDatabase::open_state(&self.ctx.storage).map_err(|error| error.to_string())?;
+        for runtime in &self.sessions {
+            if database
+                .load_workflow_runs(runtime.id())
+                .map_err(|error| error.to_string())?
+                .iter()
+                .any(|run| {
+                    matches!(
+                        run.status,
+                        WorkflowRunStatus::Active
+                            | WorkflowRunStatus::Paused
+                            | WorkflowRunStatus::BudgetLimited
+                    ) || run.outbox_pending
+                })
+            {
+                return Err("Finish or explicitly cancel active/pending workflows before changing sandbox authority".into());
+            }
+        }
+        if transition {
+            for runtime in &mut self.sessions {
+                runtime.app.checkpoint_now();
+                self.ctx
+                    .storage_writer
+                    .save_sync_timeout(
+                        Arc::clone(&runtime.app.state.session),
+                        AGENT_SHUTDOWN_TIMEOUT,
+                    )
+                    .map_err(|error| {
+                        format!("Session save failed; workspace unchanged: {error}")
+                    })?;
+            }
+        }
+        Ok(workflows)
+    }
+
+    fn poll_sandbox_actions(&mut self) -> Dirty {
+        let mut dirty = Dirty::NO;
+        for index in 0..self.sessions.len() {
+            if let Some(command) = self.sessions[index].app.sandbox_live.transfer_queued.take() {
+                let admitted = if matches!(
+                    command,
+                    crate::sandbox::transfer::TransferCommand::Open { .. }
+                ) {
+                    self.sandbox_gate(false).map(|_| ())
+                } else {
+                    Ok(())
+                };
+                match admitted {
+                    Ok(()) => self.sessions[index].app.start_transfer(command),
+                    Err(error) => self.sessions[index].app.transfer_failed(error),
+                }
+                dirty = Dirty::YES;
+            }
+            if let Some(request) = self.sessions[index].app.sandbox_live.queued.take() {
+                if let Some(control) = request.control() {
+                    let result = caudra_sandbox::Controller::new(&self.ctx.storage)
+                        .and_then(|controller| controller.store().get(&control.name));
+                    match result {
+                        Ok(record)
+                            if self.sessions[index]
+                                .app
+                                .state
+                                .session
+                                .workspace_binding()
+                                .and_then(StoredWorkspaceBinding::sandbox_record)
+                                == Some(record.id) =>
+                        {
+                            let other_holder =
+                                self.sessions.iter().enumerate().any(|(other, runtime)| {
+                                    other != index
+                                        && runtime
+                                            .app
+                                            .state
+                                            .session
+                                            .workspace_binding()
+                                            .and_then(StoredWorkspaceBinding::sandbox_record)
+                                            == Some(record.id)
+                                });
+                            let admitted = if other_holder {
+                                Err("Another tab holds this sandbox; close it before exclusive control".into())
+                            } else {
+                                self.sandbox_gate(true)
+                            };
+                            match admitted {
+                                Ok(workflows) => {
+                                    self.sandbox_workflows = workflows;
+                                    self.sandbox_control = Some(control);
+                                    return Dirty::YES;
+                                }
+                                Err(error) => self.sessions[index].app.sandbox_failed(error),
+                            }
+                            continue;
+                        }
+                        Err(error) => {
+                            self.sessions[index].app.sandbox_failed(error.to_string());
+                            continue;
+                        }
+                        _ => {}
+                    }
+                }
+                let transition = matches!(
+                    request.operation,
+                    LiveOperation::Attach { .. } | LiveOperation::Borrow { .. }
+                );
+                let readonly = matches!(
+                    request.operation,
+                    LiveOperation::Doctor { .. }
+                        | LiveOperation::Reconcile { .. }
+                        | LiveOperation::Credential { .. }
+                );
+                let admitted = if readonly {
+                    Ok(Vec::new())
+                } else {
+                    self.sandbox_gate(transition)
+                };
+                match admitted {
+                    Ok(_workflows) => self.sessions[index].app.start_sandbox_live(*request),
+                    Err(error) => self.sessions[index].app.sandbox_failed(error),
+                }
+                dirty = Dirty::YES;
+            }
+            if let Some(attachment) = self.sessions[index].app.sandbox_live.attachment.take() {
+                match self.sandbox_gate(true) {
+                    Ok(workflows) => {
+                        self.sandbox_workflows = workflows;
+                        self.sandbox = Some(attachment);
+                    }
+                    Err(error) => self.sessions[index].app.sandbox_failed(error),
+                }
+                dirty = Dirty::YES;
             }
         }
         dirty
@@ -3673,7 +3875,8 @@ impl<'t> EventLoop<'t> {
 
     fn shutdown(mut self) -> Result<ShutdownReport> {
         let started = Instant::now();
-        let relocating = self.relocation.is_some();
+        let relocating =
+            self.relocation.is_some() || self.sandbox.is_some() || self.sandbox_control.is_some();
         let mut relocation_error = None;
         let mut phase_start = started;
         let mut lap = || {
@@ -3829,6 +4032,8 @@ impl<'t> EventLoop<'t> {
             focused: self.focused,
             run_time: self.started.elapsed(),
             relocation: self.relocation.map(|pending| pending.handoff),
+            sandbox: self.sandbox,
+            sandbox_control: self.sandbox_control,
         })
     }
 }

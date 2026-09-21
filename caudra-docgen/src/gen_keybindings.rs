@@ -18,6 +18,7 @@ const MAIN_CONTEXTS: &[KeybindContext] = &[
     KeybindContext::Streaming,
     KeybindContext::FormInput,
     KeybindContext::Picker,
+    KeybindContext::SandboxManager,
     KeybindContext::Workbench,
 ];
 
@@ -54,6 +55,15 @@ fn write_section(out: &mut String, ctx: KeybindContext) {
 
     if !rows.is_empty() {
         write_table_2col(out, &rows);
+    }
+    if ctx == KeybindContext::SandboxManager {
+        out.push_str(
+            "\nSee [Managed Sandboxes](/docs/sandboxes/#tui-manager) for instance actions and \
+             [image forms](/docs/sandboxes/#images-and-template-catalog) for the host picker and \
+             approved probe. The [Transfer panel](/docs/sandboxes/#tui-transfer-review) has \
+             separate controls. Escape there requests cancellation and waits for cleanup, \
+             unlike closing a lifecycle action.\n",
+        );
     }
 }
 

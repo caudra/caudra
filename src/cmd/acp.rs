@@ -1,7 +1,9 @@
 use std::env;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
+use caudra_acp::{AcpRuntime, AcpRuntimeGuard, AcpRuntimeResolver};
 use color_eyre::Result;
 use color_eyre::eyre::Context;
 
@@ -11,8 +13,105 @@ use caudra_config::load_permissions;
 use caudra_lua::PluginHost;
 use caudra_storage::StateDir;
 use caudra_storage::sessions::StoredMode;
+use caudra_storage::workspace_binding::StoredWorkspaceBinding;
 
+use super::workcell_runtime::WorkcellRuntime;
+use crate::cli::WorkcellSelectorArgs;
 use crate::setup;
+
+struct SessionResources {
+    plugin_host: Option<PluginHost>,
+    _runtime: WorkcellRuntime,
+}
+
+impl AcpRuntimeGuard for SessionResources {
+    fn shutdown(&mut self) -> std::result::Result<(), String> {
+        if let Some(mut host) = self.plugin_host.take() {
+            host.shutdown_checked().map_err(|error| error.to_string())?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for SessionResources {
+    fn drop(&mut self) {
+        if let Err(error) = self.shutdown() {
+            tracing::error!(%error, "ACP plugin shutdown failed");
+        }
+    }
+}
+
+fn runtime_resolver(
+    storage: StateDir,
+    selection: WorkcellSelectorArgs,
+    no_plugins: bool,
+    no_jit: bool,
+) -> AcpRuntimeResolver {
+    Arc::new(
+        move |cwd: PathBuf, stored: Option<StoredWorkspaceBinding>| {
+            let resolve = || -> Result<AcpRuntime> {
+                let mut selection = selection.clone();
+                if let Some(binding) = &stored {
+                    super::sandbox::recover_binding_source(&mut selection, &storage, binding)?;
+                }
+                let registry = Arc::new(ToolRegistry::default());
+                let runtime =
+                    WorkcellRuntime::initialize_session(&selection, &cwd, &storage, &registry)?;
+                if stored.is_some() {
+                    StoredWorkspaceBinding::validate_resume_identity(
+                        stored.as_ref(),
+                        runtime.stored_binding(),
+                    )?;
+                }
+                let mut plugin_host = PluginHost::with_jit(Arc::clone(&registry), !no_jit)?;
+                let raw = if runtime.is_remote() {
+                    plugin_host.load_global_init_file_or_skip(no_plugins)
+                } else {
+                    plugin_host.load_init_files_or_skip(no_plugins, &cwd)
+                }?;
+                let mut config = raw.unwrap_or_default().into_config(false)?;
+                config.permissions = if runtime.is_remote() {
+                    caudra_config::load_global_permissions()
+                } else {
+                    load_permissions(&cwd)
+                };
+                config.permissions.yolo |= config.always_yolo;
+                config.validate()?;
+                super::configure_native_tools(&config.agent);
+                super::install_native_permission_rules(&plugin_host.plugin_rules(), &cwd);
+                plugin_host.load_production_builtins(&config.plugins)?;
+                Ok(AcpRuntime {
+                    prompt_slots: Arc::new(
+                        plugin_host
+                            .event_handle()
+                            .collect_prompt_slots(&config.agent),
+                    ),
+                    config: config.agent,
+                    permissions_config: config.permissions,
+                    plugin_rules: plugin_host.plugin_rules(),
+                    registry,
+                    workspace_binding: runtime.stored_binding().cloned(),
+                    workspace_session: runtime.workspace_session().cloned(),
+                    remote_project_context: runtime.remote_project_context().cloned(),
+                    local_documents: runtime.local_documents().cloned(),
+                    remote_environment: runtime.is_remote().then(|| {
+                        caudra_agent::headless::RemoteEnvironment {
+                            cwd: runtime.display().cwd.clone(),
+                            platform: runtime.display().platform.clone(),
+                        }
+                    }),
+                    guard: Some(Box::new(SessionResources {
+                        plugin_host: Some(plugin_host),
+                        _runtime: runtime,
+                    })),
+                })
+            };
+            resolve().map_err(|error| {
+                format!("ACP runtime resolution failed; detached, no local fallback: {error}")
+            })
+        },
+    )
+}
 
 pub fn run(
     model_arg: Option<&str>,
@@ -39,33 +138,20 @@ pub fn run(
     let model_registry_ms = lap();
 
     let cwd = env::current_dir().unwrap_or_else(|_| ".".into());
-    let workcell_runtime = super::workcell_runtime::WorkcellRuntime::initialize(
-        workcell,
-        &cwd,
-        &storage,
-        ToolRegistry::global(),
-    )?;
-    let workcell_runtime_ms = lap();
+    caudra_config::load_global_env_file();
 
-    let mut plugin_host = PluginHost::with_jit(Arc::clone(ToolRegistry::global_arc()), !no_jit)
+    let mut plugin_host = PluginHost::with_jit(Arc::new(ToolRegistry::default()), !no_jit)
         .context("initialize lua plugin host")?;
 
-    let raw_config = if workcell_runtime.is_remote() {
-        plugin_host.load_global_init_file_or_skip(no_plugins)
-    } else {
-        plugin_host.load_init_files_or_skip(no_plugins, &cwd)
-    }
-    .context("load init.lua files")?;
+    let raw_config = plugin_host
+        .load_global_init_file_or_skip(no_plugins)
+        .context("load init.lua files")?;
 
     let mut config = raw_config
         .unwrap_or_default()
         .into_config(false)
         .context("invalid config")?;
-    config.permissions = if workcell_runtime.is_remote() {
-        caudra_config::load_global_permissions()
-    } else {
-        load_permissions(&cwd)
-    };
+    config.permissions = caudra_config::load_global_permissions();
 
     if yolo || config.always_yolo {
         config.permissions.yolo = true;
@@ -97,16 +183,12 @@ pub fn run(
     tracing::info!(
         state_dir_ms,
         model_registry_ms,
-        workcell_runtime_ms,
         build_stack_ms,
         init_logging_ms,
         total_ms = started.elapsed().as_millis() as u64,
         "startup phases"
     );
 
-    let prompt_slots = plugin_host
-        .event_handle()
-        .collect_prompt_slots(&config.agent);
     let prompt_profiles = Arc::new(PromptProfileCatalog::discover_user());
     let thinking = config
         .always_thinking
@@ -114,32 +196,16 @@ pub fn run(
         .map(caudra_providers::ThinkingConfig::from)
         .unwrap_or_default();
 
+    plugin_host.shutdown_checked()?;
     caudra_acp::run(caudra_acp::AcpParams {
         model,
-        config: config.agent,
-        permissions_config: config.permissions,
         timeouts,
-        initial_wd: if workcell_runtime.is_remote() {
-            workcell_runtime.display().cwd.clone().into()
-        } else {
-            cwd
-        },
-        prompt_slots: Arc::new(prompt_slots),
+        initial_wd: cwd,
         thinking,
         prompt_profiles,
         system_prompt_profile_override: profile_arg.map(str::to_owned),
         yolo,
         model_policy: Arc::new(config.provider.model_policy.clone()),
-        plugin_rules: plugin_host.plugin_rules(),
-        workspace_binding: workcell_runtime.stored_binding().cloned(),
-        workspace_session: workcell_runtime.workspace_session().cloned(),
-        remote_project_context: workcell_runtime.remote_project_context().cloned(),
-        local_documents: workcell_runtime.local_documents().cloned(),
-        remote_environment: workcell_runtime.is_remote().then(|| {
-            caudra_agent::headless::RemoteEnvironment {
-                cwd: workcell_runtime.display().cwd.clone(),
-                platform: workcell_runtime.display().platform.clone(),
-            }
-        }),
+        runtime_resolver: runtime_resolver(storage, workcell.clone(), no_plugins, no_jit),
     })
 }

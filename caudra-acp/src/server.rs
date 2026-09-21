@@ -22,7 +22,7 @@ use caudra_agent::mcp::config::{McpServerStatus, RawHttpFields, RawStdioFields, 
 use caudra_agent::mcp::{self, McpHandle};
 use caudra_agent::permissions::{PermissionAnswer, PermissionRequest as CaudraPermissionRequest};
 use caudra_agent::prompt::profile::{BUILTIN_PROFILE_NAME, SystemPromptProfile};
-use caudra_agent::tools::{LocalToolFn, LocalTools, QUESTION_TOOL_NAME, local_tool};
+use caudra_agent::tools::{LocalToolFn, LocalTools, QUESTION_TOOL_NAME, ToolRegistry, local_tool};
 use caudra_agent::types::AgentEvent;
 use caudra_agent::{
     AgentInput, AgentMode, Envelope, History, ImageMediaType, ImageSource, open_stored_session,
@@ -49,10 +49,13 @@ use serde_json::Value;
 use smol::io::AsyncBufReadExt;
 use tracing::{debug, warn};
 
-use crate::{AcpParams, elicitation, methods, permissions, translate};
+use crate::{
+    AcpParams, AcpRuntime, AcpRuntimeResolver, elicitation, methods, permissions, translate,
+};
 
 const FIRST_OUTGOING_REQUEST_ID: i64 = 1000;
 const SESSION_IN_USE_ERROR_CODE: i32 = -32001;
+const RUNTIME_SHUTDOWN_FAILED: &str = "Previous runtime did not shut down; its lease is retained. Restart the ACP server before selecting another runtime.";
 /// Client that asks questions through `session/request_permission` instead of
 /// form elicitation. Its convention is not ACP, so it is matched by name.
 const PERMISSION_QUESTION_CLIENT: &str = "openmausbot";
@@ -91,6 +94,7 @@ struct SessionState {
     /// Resolves the relative paths an `@` mention names in a prompt.
     cwd: PathBuf,
     remote: bool,
+    runtime: AcpRuntime,
 }
 
 struct SessionInitialState {
@@ -98,6 +102,7 @@ struct SessionInitialState {
     remote: bool,
     cost: Option<f64>,
     mode: AgentMode,
+    runtime: AcpRuntime,
 }
 
 struct Server {
@@ -108,6 +113,7 @@ struct Server {
     client_elicits_form: bool,
     client_asks_via_permission: bool,
     session: Option<SessionState>,
+    failed_runtime: Option<AcpRuntime>,
 }
 
 impl Server {
@@ -143,6 +149,7 @@ pub async fn serve(params: AcpParams) -> color_eyre::Result<()> {
         client_elicits_form: false,
         client_asks_via_permission: false,
         session: None,
+        failed_runtime: None,
     };
 
     let (in_tx, in_rx) = flume::unbounded::<Incoming>();
@@ -157,6 +164,9 @@ pub async fn serve(params: AcpParams) -> color_eyre::Result<()> {
         }
     }
 
+    close_session(&mut server)
+        .await
+        .map_err(|error| color_eyre::eyre::eyre!("ACP runtime shutdown failed: {error}"))?;
     drop(server);
     writer_task.await;
     reader_task.await.context("read stdin")?;
@@ -295,16 +305,24 @@ async fn new_session(
     let req: NewSessionRequest = parse_params(raw)?;
     let session_id = SessionRef::generate();
     let session_lease = acquire_session_lease(session_id.id())?;
-    let (profile_name, profile) = resolve_prompt_profile(params, None)?;
-    let remote = params.remote_environment.is_some();
+    close_session(srv).await?;
+    let mut runtime =
+        resolve_runtime(&params.runtime_resolver, req.cwd.clone(), None, false).await?;
+    let (profile_name, profile) = resolve_prompt_profile(
+        params,
+        None,
+        runtime.config.system_prompt_profile.as_deref(),
+    )?;
+    let remote = runtime.remote_environment.is_some();
     preflight_mcp(&req.cwd, &req.mcp_servers, remote).await?;
-    let cwd = params.remote_environment.as_ref().map_or_else(
+    let cwd = runtime.remote_environment.as_ref().map_or_else(
         || req.cwd.clone(),
         |environment| environment.cwd.clone().into(),
     );
     let (mut prepared, pending) = prepare_session(
         srv,
         params,
+        &mut runtime,
         SessionStart {
             cwd: cwd.clone(),
             session_id,
@@ -316,7 +334,6 @@ async fn new_session(
         },
     )
     .await?;
-    close_session(srv).await;
     let mcp = start_mcp(&cwd, &req.mcp_servers, remote).await;
     prepared.set_mcp_handle(mcp.clone());
     let handle = headless::spawn_prepared_interactive(prepared)
@@ -341,6 +358,7 @@ async fn new_session(
             remote,
             cost: None,
             mode: AgentMode::Build,
+            runtime,
         },
     );
     Ok(AgentResponse::NewSessionResponse(resp))
@@ -368,33 +386,35 @@ async fn load_session(
     }
     let session_lease = acquire_session_lease(session_ref.id())?;
     let mut restored = load_history(session_ref.id())?;
-    if StoredWorkspaceBinding::validate_resume_identity(
-        restored.workspace_binding.as_ref(),
-        params.workspace_binding.as_ref(),
-    )
-    .is_err()
-    {
-        return Err(AcpError::invalid_params().data(json_str(
-            "session workspace identity changed; fork or explicitly rebind the session",
-        )));
-    }
-    let (profile_name, profile) =
-        resolve_prompt_profile(params, restored.system_prompt_profile.as_deref())?;
     let history = History::restored(restored.history)
         .map_err(|error| AcpError::internal_error().data(json_str(&error)))?;
-    let remote = params.remote_environment.is_some();
+    close_session(srv).await?;
+    let mut runtime = resolve_runtime(
+        &params.runtime_resolver,
+        req.cwd.clone(),
+        restored.workspace_binding.clone(),
+        true,
+    )
+    .await?;
+    let (profile_name, profile) = resolve_prompt_profile(
+        params,
+        restored.system_prompt_profile.as_deref(),
+        runtime.config.system_prompt_profile.as_deref(),
+    )?;
+    let remote = runtime.remote_environment.is_some();
     preflight_mcp(&req.cwd, &req.mcp_servers, remote).await?;
     let sid = SessionId::from(session_ref.to_string());
     let home = caudra_storage::paths::home();
     let replay_cwd = restored.cwd.as_deref().unwrap_or(&req.cwd);
     let replay_updates = translate::replay_history(history.as_slice(), replay_cwd, home.as_deref());
-    let cwd = params.remote_environment.as_ref().map_or_else(
+    let cwd = runtime.remote_environment.as_ref().map_or_else(
         || req.cwd.clone(),
         |environment| environment.cwd.clone().into(),
     );
     let (mut prepared, pending) = prepare_session(
         srv,
         params,
+        &mut runtime,
         SessionStart {
             cwd: cwd.clone(),
             session_id: session_ref.clone(),
@@ -409,7 +429,6 @@ async fn load_session(
         },
     )
     .await?;
-    close_session(srv).await;
     let mcp = start_mcp(&cwd, &req.mcp_servers, remote).await;
     prepared.set_mcp_handle(mcp.clone());
     let handle = headless::spawn_prepared_interactive(prepared)
@@ -438,10 +457,10 @@ async fn load_session(
         restored.plan_target.as_ref(),
         restored.plan_path.as_deref(),
     ) {
-        (Some(StoredMode::Plan), Some(StoredPlanTarget::PlanRef { reference }), _) => params
+        (Some(StoredMode::Plan), Some(StoredPlanTarget::PlanRef { reference }), _) => runtime
             .workspace_session
             .as_ref()
-            .zip(params.local_documents.as_ref())
+            .zip(runtime.local_documents.as_ref())
             .and_then(|(workspace, store)| {
                 store
                     .read(
@@ -454,12 +473,12 @@ async fn load_session(
             })
             .unwrap_or(AgentMode::Build),
         (Some(StoredMode::Plan), Some(StoredPlanTarget::LocalPath { path }), _)
-            if params.workspace_session.is_some() =>
+            if runtime.workspace_session.is_some() =>
         {
-            params
+            runtime
                 .workspace_session
                 .as_ref()
-                .zip(params.local_documents.as_ref())
+                .zip(runtime.local_documents.as_ref())
                 .and_then(|(workspace, store)| {
                     store
                         .adopt_legacy_plan(
@@ -478,10 +497,10 @@ async fn load_session(
             AgentMode::Plan(path.into())
         }
         (Some(StoredMode::Plan), None, Some(path)) if Path::new(path).is_file() => {
-            if let Some((workspace, store)) = params
+            if let Some((workspace, store)) = runtime
                 .workspace_session
                 .as_ref()
-                .zip(params.local_documents.as_ref())
+                .zip(runtime.local_documents.as_ref())
             {
                 store
                     .adopt_legacy_plan(
@@ -516,6 +535,7 @@ async fn load_session(
             remote,
             cost: restored_cost.billed,
             mode: restored_mode,
+            runtime,
         },
     );
     Ok(AgentResponse::LoadSessionResponse(resp))
@@ -534,6 +554,7 @@ struct SessionStart {
 async fn prepare_session(
     srv: &Server,
     params: &AcpParams,
+    runtime: &mut AcpRuntime,
     start: SessionStart,
 ) -> Result<(headless::PreparedInteractive, PendingState), AcpError> {
     let pending = PendingState::default();
@@ -554,12 +575,13 @@ async fn prepare_session(
     };
     let (structured_permission_rules, session_yolo) = start.permissions;
     let (system_prompt_profile_name, system_prompt_profile) = start.profile;
+    ToolRegistry::global().install_stopped_runtime(&runtime.registry);
     let prepared = headless::prepare_interactive(InteractiveParams {
         model: params.model.clone(),
-        config: params.config.clone(),
-        permissions_config: params.permissions_config.clone(),
+        config: runtime.config.clone(),
+        permissions_config: runtime.permissions_config.clone(),
         timeouts: params.timeouts,
-        prompt_slots: Arc::clone(&params.prompt_slots),
+        prompt_slots: Arc::clone(&runtime.prompt_slots),
         thinking: params.thinking.clone(),
         system_prompt_profile,
         system_prompt_profile_name: Some(system_prompt_profile_name),
@@ -577,16 +599,16 @@ async fn prepare_session(
         system_prompt_override: None,
         append_system_prompt: None,
         model_policy: Arc::clone(&params.model_policy),
-        plugin_rules: Arc::clone(&params.plugin_rules),
+        plugin_rules: Arc::clone(&runtime.plugin_rules),
         local_tools,
         // ACP has no wire shape for workflow runs, so a session under it
         // gets no runtime and the `workflow` tool reports unavailable.
         workflow_mode: None,
-        workspace_binding: params.workspace_binding.clone(),
-        remote_environment: params.remote_environment.clone(),
-        workspace_session: params.workspace_session.clone(),
-        remote_project_context: params.remote_project_context.clone(),
-        local_documents: params.local_documents.clone(),
+        workspace_binding: runtime.workspace_binding.clone(),
+        remote_environment: runtime.remote_environment.clone(),
+        workspace_session: runtime.workspace_session.clone(),
+        remote_project_context: runtime.remote_project_context.clone(),
+        local_documents: runtime.local_documents.clone(),
     })
     .await
     .map_err(|error| AcpError::internal_error().data(json_str(&error)))?;
@@ -596,12 +618,13 @@ async fn prepare_session(
 fn resolve_prompt_profile(
     params: &AcpParams,
     stored_name: Option<&str>,
+    configured_name: Option<&str>,
 ) -> Result<(String, Option<Arc<SystemPromptProfile>>), AcpError> {
     let requested_name = params
         .system_prompt_profile_override
         .as_deref()
         .or(stored_name)
-        .or(params.config.system_prompt_profile.as_deref());
+        .or(configured_name);
     let profile = params
         .prompt_profiles
         .resolve(requested_name)
@@ -810,10 +833,38 @@ fn session_lease_error(error: SessionError) -> AcpError {
     }
 }
 
+async fn resolve_runtime(
+    resolver: &AcpRuntimeResolver,
+    cwd: PathBuf,
+    stored: Option<StoredWorkspaceBinding>,
+    restoring: bool,
+) -> Result<AcpRuntime, AcpError> {
+    let resolver = Arc::clone(resolver);
+    let expected = stored.clone();
+    let runtime = smol::unblock(move || resolver(cwd, stored))
+        .await
+        .map_err(|error| AcpError::invalid_params().data(json_str(&error)))?;
+    if restoring
+        && StoredWorkspaceBinding::validate_resume_identity(
+            expected.as_ref(),
+            runtime.workspace_binding.as_ref(),
+        )
+        .is_err()
+    {
+        return Err(AcpError::invalid_params().data(json_str(
+            "session workspace identity changed; runtime detached, no local fallback",
+        )));
+    }
+    Ok(runtime)
+}
+
 /// Stop the installed session and release its per-session resources.
-async fn close_session(srv: &mut Server) {
+async fn close_session(srv: &mut Server) -> Result<(), AcpError> {
+    if srv.failed_runtime.is_some() {
+        return Err(AcpError::internal_error().data(json_str(RUNTIME_SHUTDOWN_FAILED)));
+    }
     let Some(state) = srv.session.take() else {
-        return;
+        return Ok(());
     };
     // The event pump dies with the session, so the prompt it owed an answer to
     // has to be answered here or the client waits on it forever.
@@ -824,10 +875,28 @@ async fn close_session(srv: &mut Server) {
             Response::new(id, Ok(AgentResponse::PromptResponse(resp))),
         );
     }
-    state.handle.task.cancel().await;
+    let InteractiveHandle {
+        input_tx,
+        cancel_tx,
+        task,
+        ..
+    } = state.handle;
+    let _ = cancel_tx.try_send(());
+    drop(input_tx);
+    task.await;
     if let Some(mcp) = state.mcp {
         mcp.shutdown().await;
     }
+    let mut runtime = state.runtime;
+    if let Some(guard) = &mut runtime.guard
+        && let Err(error) = guard.shutdown()
+    {
+        srv.failed_runtime = Some(runtime);
+        return Err(AcpError::internal_error()
+            .data(json_str(&format!("{RUNTIME_SHUTDOWN_FAILED} {error}"))));
+    }
+    ToolRegistry::global().install_stopped_runtime(&ToolRegistry::default());
+    Ok(())
 }
 
 fn install_session(
@@ -855,6 +924,7 @@ fn install_session(
         pending,
         cwd: initial.cwd,
         remote: initial.remote,
+        runtime: initial.runtime,
     });
 }
 
@@ -964,7 +1034,7 @@ fn handle_prompt(srv: &mut Server, raw: &Value, id: &RequestId) -> Result<(), Ac
 fn handle_set_mode(
     srv: &mut Server,
     raw: &Value,
-    params: &AcpParams,
+    _params: &AcpParams,
 ) -> Result<AgentResponse, AcpError> {
     let req: SetSessionModeRequest = parse_params(raw)?;
     let mode_str = req.mode_id.0.to_string();
@@ -972,8 +1042,8 @@ fn handle_set_mode(
     session.current_mode = methods::mode_id_to_agent_mode_for_session(
         &mode_str,
         &session.cwd,
-        params.workspace_session.as_ref(),
-        params.local_documents.as_deref(),
+        session.runtime.workspace_session.as_ref(),
+        session.runtime.local_documents.as_deref(),
         session.handle.session_id.as_str(),
     )
     .ok_or_else(|| AcpError::new(-32602, format!("unknown mode: {mode_str}")))?;
@@ -1341,6 +1411,7 @@ fn json_str(e: &(impl std::fmt::Display + ?Sized)) -> Value {
 
 #[cfg(test)]
 mod tests {
+    use crate::AcpRuntimeGuard;
     use caudra_agent::permissions::{PermissionLifetime, PermissionManager, PermissionRequest};
     use caudra_agent::tools::PermissionScopes;
     use caudra_providers::{ContentBlock as MsgBlock, Role, TokenUsage};
@@ -1363,6 +1434,95 @@ mod tests {
     const RETIRED_SPEC: &str = "retired-vendor/retired-model-9000";
     const RETIRED_MODEL_ID: &str = "retired-model-9000";
     const RECORDED_COST: f64 = 1.25;
+
+    #[test_case(false; "fresh_server_restores_sandbox_provenance")]
+    #[test_case(true; "mismatched_runtime_is_refused")]
+    fn runtime_resolver_precedes_restore_identity_validation(mismatch: bool) {
+        let temp = TempDir::new().unwrap();
+        let storage = StateDir::from_path(temp.path().join("state"));
+        let local = StoredWorkspaceBinding::local_from_cwd(".");
+        let remote = serde_json::from_str::<StoredWorkspaceBinding>(
+            &serde_json::to_string(&local)
+                .unwrap()
+                .replace(local.trust_anchor().as_str(), "https://sandbox.test"),
+        )
+        .unwrap()
+        .with_sandbox_record(CaudraId::generate())
+        .unwrap();
+        let mut session =
+            caudra_agent::StoredSession::new_with_workspace(OFFLINE_SPEC, ".", remote.clone());
+        session.save(&storage).unwrap();
+        let restored = load_history_from(&storage, session.id).unwrap();
+        let expected = remote.clone();
+        let resolver: AcpRuntimeResolver = Arc::new(move |_, stored| {
+            assert_eq!(stored.as_ref(), Some(&expected));
+            Ok(AcpRuntime {
+                workspace_binding: (!mismatch).then(|| expected.clone()),
+                ..Default::default()
+            })
+        });
+        let result = smol::block_on(resolve_runtime(
+            &resolver,
+            temp.path().to_path_buf(),
+            restored.workspace_binding,
+            true,
+        ));
+        assert_eq!(result.is_err(), mismatch);
+        if let Ok(runtime) = result {
+            assert_eq!(runtime.workspace_binding, Some(remote));
+        }
+    }
+
+    #[test_case(false; "new_local_default")]
+    #[test_case(true; "legacy_local_restore")]
+    fn injected_local_runtime_remains_local(restoring: bool) {
+        let resolver: AcpRuntimeResolver = Arc::new(|_, stored| {
+            assert!(stored.is_none());
+            Ok(AcpRuntime::default())
+        });
+        let runtime = smol::block_on(resolve_runtime(
+            &resolver,
+            PathBuf::from("."),
+            None,
+            restoring,
+        ))
+        .unwrap();
+        assert!(runtime.workspace_binding.is_none());
+        assert!(runtime.remote_environment.is_none());
+    }
+
+    #[test]
+    fn replacing_session_waits_for_old_agent_and_releases_lease() {
+        let (mut server, _, _) = server_with_asks(permission_manager(), HashMap::new());
+        let state = server.session.as_mut().unwrap();
+        let lease = Arc::downgrade(&state.handle.session_lease);
+        let (finished, observed) = flume::bounded(1);
+        state.handle.task = smol::spawn(async move {
+            finished.send_async(()).await.unwrap();
+        });
+        smol::block_on(close_session(&mut server)).unwrap();
+        assert_eq!(observed.try_recv(), Ok(()));
+        assert!(lease.upgrade().is_none());
+        assert!(server.session.is_none());
+    }
+
+    #[test]
+    fn failed_runtime_shutdown_retains_guard_and_refuses_replacement() {
+        struct RefusingGuard;
+        impl AcpRuntimeGuard for RefusingGuard {
+            fn shutdown(&mut self) -> Result<(), String> {
+                Err(RUNTIME_SHUTDOWN_FAILED.into())
+            }
+        }
+        let (mut server, _, _) = server_with_asks(permission_manager(), HashMap::new());
+        server.session.as_mut().unwrap().runtime.guard = Some(Box::new(RefusingGuard));
+        assert!(smol::block_on(close_session(&mut server)).is_err());
+        assert!(server.failed_runtime.is_some());
+        assert_eq!(
+            smol::block_on(close_session(&mut server)).unwrap_err().data,
+            Some(json_str(RUNTIME_SHUTDOWN_FAILED))
+        );
+    }
 
     fn history_items(messages: &[Message]) -> Vec<HistoryItem> {
         let mut items = Vec::new();
@@ -1451,6 +1611,7 @@ mod tests {
             thinking: Default::default(),
             client_elicits_form: false,
             client_asks_via_permission: false,
+            failed_runtime: None,
             session: Some(SessionState {
                 handle,
                 mcp: None,
@@ -1459,6 +1620,7 @@ mod tests {
                 pending: Arc::new(Mutex::new(Pending { prompt: None, asks })),
                 cwd: PathBuf::new(),
                 remote: false,
+                runtime: AcpRuntime::default(),
             }),
         };
         (server, answer_rx, out_rx)

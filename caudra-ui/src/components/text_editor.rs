@@ -311,6 +311,14 @@ impl TextEditor {
     }
 
     pub fn view(&mut self, frame: &mut Frame, area: Rect) {
+        self.paint(frame, area, false);
+    }
+
+    pub fn view_masked(&mut self, frame: &mut Frame, area: Rect) {
+        self.paint(frame, area, true);
+    }
+
+    fn paint(&mut self, frame: &mut Frame, area: Rect, masked: bool) {
         grab_scope!("text_editor", area);
         self.area = area;
         let rows = self.visual_rows();
@@ -329,6 +337,8 @@ impl TextEditor {
             .take(height)
             .map(|row| {
                 let text = self.buffer.line(row.line);
+                let hidden = masked.then(|| "*".repeat(text.chars().count()));
+                let text = hidden.as_deref().unwrap_or(text);
                 let overlays = self.overlays(row.line, text, selection, theme.cursor);
                 render::Row {
                     text,

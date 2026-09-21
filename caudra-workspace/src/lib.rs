@@ -9,6 +9,7 @@ mod identity;
 mod path;
 mod resource;
 mod service;
+mod transfer;
 
 pub use attachment::{
     ClientAttachment, ClientAttachmentContent, ClientAttachmentId, LocalDocumentRef, MemoryRef,
@@ -28,3 +29,11 @@ pub use resource::{
     WorkspaceCursor, WorkspaceResource,
 };
 pub use service::*;
+pub use transfer::{
+    DownloadedTransfer, LocalPublicationState, LocalTransferAuthorization, LocalTransferCondition,
+    LocalTransferDestination, LocalTransferPath, LocalTransferReview, LocalTransferRevision,
+    LocalTransferService, LocalTransferSource, PreparedLocalTransfer, PreparedTransferPublication,
+    RemoteTransferFile, RemoteTransferStage, SealedTransfer, TransferContent, TransferDigest,
+    TransferLimits, TransferMode, TransferPublicationRequest, TransferPublicationState,
+    TransferPublicationStatus, WorkspaceTransferService,
+};

@@ -5,6 +5,10 @@ mod native_redirect;
 mod pattern_analysis;
 mod read_only_shell;
 mod remote;
+mod transfer;
+mod transfer_authorization;
+mod transfer_inventory;
+mod transfer_session;
 
 pub use pattern_analysis::{
     BashContextAssumptions, BashContextIssue, BashOperatorKind, BashSpan,
@@ -16,6 +20,14 @@ pub use pattern_analysis::{
 pub use remote::{
     NamedBearerCredential, PendingRemoteOperation, RemoteConnectionStatus, RemoteEvent,
     RemotePreparedToolCall, RemoteToolResultEnvelope, RemoteWorkcellClient, RemoteWorkcellError,
+};
+pub use transfer::LocalTransferPublisher;
+pub use transfer_authorization::NativeTransferAuthorization;
+pub use transfer_inventory::{
+    ReviewedTransferHost, RootedTransferInventory, reviewed_workspace_transfer,
+};
+pub use transfer_session::{
+    TransferReport, TransferSession, TransferSessionHost, TransferValidity,
 };
 pub use workcell::host_contract;
 

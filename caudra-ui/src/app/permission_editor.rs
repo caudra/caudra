@@ -543,11 +543,22 @@ impl App {
         + Send
         + 'static,
     ) -> bool {
+        self.permission_job_for(Arc::clone(&self.permissions), revision, mutation, work)
+    }
+
+    fn permission_job_for(
+        &mut self,
+        manager: Arc<PermissionManager>,
+        revision: Option<u64>,
+        mutation: bool,
+        work: impl FnOnce(Arc<PermissionManager>) -> Result<PermissionReply, PermissionEditError>
+        + Send
+        + 'static,
+    ) -> bool {
         if self.permission_ui.pending.is_some() {
             self.flash(PERMISSION_WORKER_BUSY.into());
             return false;
         }
-        let manager = Arc::clone(&self.permissions);
         let guard = PermissionReplyGuard {
             owner: Arc::downgrade(&manager),
             session: self.state.session.id,
@@ -946,11 +957,15 @@ impl App {
     }
 
     pub(super) fn request_permission_answer(&mut self, decision: PermissionDecision) {
-        if self
-            .permissions
-            .pending_request(&decision.request_id)
-            .is_none()
-        {
+        let manager = self
+            .sandbox_live
+            .transfer
+            .as_ref()
+            .map(|worker| &worker.permissions)
+            .filter(|manager| manager.pending_request(&decision.request_id).is_some())
+            .unwrap_or(&self.permissions)
+            .clone();
+        if manager.pending_request(&decision.request_id).is_none() {
             self.permission_prompt.resolve(&decision.request_id);
             return;
         }
@@ -960,7 +975,7 @@ impl App {
             }
             return;
         }
-        self.permission_job(None, true, move |manager| {
+        self.permission_job_for(manager, None, true, move |manager| {
             let transient = matches!(
                 decision.answer,
                 PermissionAnswer::AllowOnce
@@ -1076,6 +1091,27 @@ impl App {
         let Some(pending) = self.permission_ui.pending.take() else {
             return Dirty::NO;
         };
+        if let Ok(PermissionReply::Answered { request, accepted }) = &result
+            && !pending
+                .guard
+                .owner
+                .ptr_eq(&Arc::downgrade(&self.permissions))
+        {
+            let current = self.sandbox_live.transfer.as_ref().is_some_and(|worker| {
+                pending.guard.session == self.state.session.id
+                    && pending
+                        .guard
+                        .owner
+                        .ptr_eq(&Arc::downgrade(&worker.permissions))
+                    && pending.guard.context == worker.permissions.pattern_candidate_context()
+            });
+            if *accepted || !current {
+                self.permission_prompt.resolve(request);
+            } else {
+                self.flash("Could not save permission decision".into());
+            }
+            return Dirty::YES;
+        }
         let valid_authority = match &result {
             Ok(PermissionReply::Rebound {
                 authority,
@@ -1678,6 +1714,20 @@ mod tests {
             let _ = app.tick_workbench();
             thread::yield_now();
         }
+    }
+
+    #[test]
+    fn hidden_remote_workbench_drains_before_sandbox_control() {
+        let mut app = test_app();
+        let (workspace, _, _) = source_remote_workspace();
+        app.workbench.toggle_workspace(workspace).unwrap();
+        app.workbench.close();
+        assert!(!app.workbench.is_open());
+        assert!(app.workbench.is_busy());
+        assert!(app.sandbox_action_blocker(true).is_some());
+        settle_source_workbenches(&mut app);
+        assert!(app.sandbox_action_blocker(true).is_none());
+        assert!(!app.workbench.is_open());
     }
 
     fn source_key(app: &mut App, binding: workbench_keys::Bind) {

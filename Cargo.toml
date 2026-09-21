@@ -19,10 +19,12 @@ name = "caudra"
 path = "src/main.rs"
 
 [dependencies]
+async-trait = { workspace = true }
 caudra-ui = { workspace = true }
 caudra-agent = { workspace = true }
 caudra-acp = { workspace = true }
 caudra-config = { workspace = true }
+caudra-sandbox = { workspace = true }
 caudra-providers = { workspace = true }
 caudra-storage = { workspace = true }
 caudra-lua = { workspace = true }
@@ -58,6 +60,7 @@ members = [
   "caudra-acp",
   "caudra-agent",
   "caudra-config",
+  "caudra-sandbox",
   "caudra-diff",
   "caudra-docgen",
   "caudra-grab",
@@ -92,6 +95,7 @@ rust-version = "1.98"
 caudra-agent = { path = "caudra-agent" }
 caudra-acp = { path = "caudra-acp" }
 caudra-config = { path = "caudra-config" }
+caudra-sandbox = { path = "caudra-sandbox" }
 caudra-diff = { path = "caudra-diff" }
 caudra-interpreter = { path = "caudra-interpreter" }
 caudra-providers = { path = "caudra-providers" }
@@ -108,7 +112,7 @@ caudra-workbench = { path = "caudra-workbench" }
 caudra-workcell = { path = "caudra-workcell" }
 caudra-workspace = { path = "caudra-workspace" }
 caudra-workflow = { path = "caudra-workflow" }
-workcell = { git = "https://github.com/tensorninja/workcell-mcp", rev = "92a3c11a1d9490468a73565b8b8b5b92792d56f9", default-features = false, features = ["files-index", "web", "shell", "code-bundled", "code-graph-git", "environment", "host-contract"] }
+workcell = { git = "https://github.com/tensorninja/workcell-mcp", rev = "3194bbb3c974b99cfbe147554a60f4ba3805fd9b", default-features = false, features = ["files-index", "web", "shell", "code-bundled", "code-graph-git", "environment", "host-contract"] }
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
 rusqlite = { version = "0.40", default-features = false, features = ["backup", "bundled", "cache", "limits"] }

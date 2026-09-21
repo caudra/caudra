@@ -811,6 +811,17 @@ impl ToolRegistry {
         self.authority_revision.fetch_add(1, Ordering::Release);
     }
 
+    /// Installs a preflighted runtime only after the caller has joined every old
+    /// agent, MCP client and plugin. Session permissions must be recreated too.
+    pub fn install_stopped_runtime(&self, prepared: &Self) {
+        let _authority = self
+            .authority_gate
+            .write()
+            .unwrap_or_else(|error| error.into_inner());
+        self.tools.store(prepared.tools.load_full());
+        self.authority_revision.fetch_add(1, Ordering::Release);
+    }
+
     pub fn replace_plugin(
         &self,
         plugin: &str,
@@ -1046,6 +1057,32 @@ mod tests {
     const SNIPPET: &str = "batch { file_read }";
     const EDITOR_TOOL: &str = "permission-editor-tool";
     const EDITOR_PLUGIN: &str = "permission-editor-plugin";
+
+    #[test]
+    fn stopped_runtime_swap_removes_old_tools_and_advances_authority() {
+        let registry = ToolRegistry::new();
+        registry
+            .register(mock(EDITOR_TOOL), lua_source(EDITOR_PLUGIN))
+            .unwrap();
+        let old = registry.authority_snapshot().revision();
+        let prepared = ToolRegistry::new();
+        prepared
+            .register(
+                mock(SNIPPET),
+                ToolSource::Native {
+                    owner: "prepared".into(),
+                    contract: "test/v1".into(),
+                    trusted: true,
+                },
+            )
+            .unwrap();
+        registry.install_stopped_runtime(&prepared);
+        let current = registry.authority_snapshot();
+        assert!(current.revision() > old);
+        assert_eq!(current.tools().len(), 1);
+        assert_eq!(current.tools()[0].name(), SNIPPET);
+        assert!(!registry.has(EDITOR_TOOL));
+    }
 
     #[test]
     fn authority_lease_fences_registry_reloads() {

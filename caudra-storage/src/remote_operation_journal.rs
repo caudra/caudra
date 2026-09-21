@@ -1,12 +1,12 @@
 use std::fmt;
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io;
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use caudra_workspace::OperationId;
+use caudra_workspace::{OperationId, WorkspacePath};
 use rusqlite::limits::Limit;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
@@ -14,10 +14,14 @@ use serde::{Deserialize, Serialize};
 use crate::StateDir;
 use crate::workspace_binding::StoredWorkspaceBinding;
 
+mod admission;
+
+use admission::JournalAdmission;
+
 pub const REMOTE_OPERATION_JOURNAL_FILE: &str = "remote-operations.sqlite3";
 const JOURNAL_DIR: &str = "recovery";
 const APPLICATION_ID: i64 = i32::from_be_bytes(*b"CAUR") as i64;
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 const OWNER_FILE_MODE: u32 = 0o600;
 const OWNER_DIR_MODE: u32 = 0o700;
 const PAGE_SIZE: i64 = 4096;
@@ -31,12 +35,16 @@ const SHA256_DIGEST_BYTES: usize = 71;
 const MAX_LOCK_KEYS: usize = 64;
 const MAX_LOCK_KEY_BYTES: usize = 512;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_SCHEMA_OBJECTS: i64 = 16;
 
 const SCHEMA: &str = r#"
 CREATE TABLE remote_operations (
     operation_id         TEXT PRIMARY KEY,
     invocation_id        TEXT NOT NULL UNIQUE,
     preparation_id       TEXT NOT NULL UNIQUE,
+    publication_id       TEXT,
+    publication_cwd      TEXT,
+    broad_lock           INTEGER NOT NULL DEFAULT 0 CHECK(broad_lock IN (0, 1)),
     binding              TEXT NOT NULL CHECK(json_valid(binding)),
     source                TEXT NOT NULL,
     server                TEXT NOT NULL,
@@ -81,6 +89,8 @@ pub enum RemoteOperationJournalError {
     Json(#[from] serde_json::Error),
     #[error("duplicate remote operation idempotency identity")]
     DuplicateId,
+    #[error("remote mutation is blocked by pending operation {0}")]
+    PendingOperation(String),
     #[error("remote operation {0} was not found")]
     NotFound(String),
     #[error("remote operation cannot transition from {from:?} to {to:?}")]
@@ -94,10 +104,18 @@ pub enum RemoteOperationJournalError {
     JournalFull,
     #[error("remote operation journal schema version {0} is unsupported")]
     UnsupportedVersion(i64),
+    #[error("remote operation journal changed during admission; retry opening it")]
+    AdmissionChanged,
     #[error("remote operation journal contains invalid data in {0}")]
     CorruptData(&'static str),
     #[error("pending remote operation {0} belongs to a different workspace generation")]
     PendingBindingMismatch(String),
+}
+
+impl From<io::Error> for RemoteOperationJournalError {
+    fn from(error: io::Error) -> Self {
+        Self::PersistentStateUnavailable(error)
+    }
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -233,6 +251,9 @@ impl RemoteOperationState {
 
 #[derive(Debug, Clone)]
 pub struct RemoteOperationReservation {
+    pub publication_cwd: Option<WorkspacePath>,
+    pub broad_lock: bool,
+    pub publication_id: Option<OperationId>,
     pub operation_id: OperationId,
     pub invocation_id: OperationId,
     pub preparation_id: OperationId,
@@ -245,6 +266,8 @@ pub struct RemoteOperationReservation {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemoteOperationRecord {
+    pub publication_cwd: Option<WorkspacePath>,
+    pub publication_id: Option<OperationId>,
     pub operation_id: OperationId,
     pub invocation_id: OperationId,
     pub preparation_id: OperationId,
@@ -269,10 +292,22 @@ pub struct RemoteOperationJournal {
 impl RemoteOperationJournal {
     pub fn open(state_dir: &StateDir) -> Result<Self, RemoteOperationJournalError> {
         let directory = state_dir.persistent_path().join(JOURNAL_DIR);
-        ensure_private_directory(&directory)?;
+        verify_directory(&directory)?;
         let path = directory.join(REMOTE_OPERATION_JOURNAL_FILE);
-        create_owner_only(&path)?;
-        verify_sidecars(&path)?;
+        let admission = JournalAdmission::inspect(&path)?;
+        let fresh = admission.is_new();
+        // Cooperating openers serialize only after the original state is accepted.
+        let _admission_lock = if fresh {
+            admission.recheck(&path)?;
+            ensure_private_directory(&directory)?;
+            let file = create_owner_only(&path)?;
+            file.lock()?;
+            file
+        } else {
+            let file = admission.lock_existing(&path)?;
+            ensure_private_directory(&directory)?;
+            file
+        };
         let connection = Connection::open_with_flags(
             &path,
             OpenFlags::SQLITE_OPEN_READ_WRITE
@@ -284,7 +319,7 @@ impl RemoteOperationJournal {
         })?;
         connection.busy_timeout(BUSY_TIMEOUT)?;
         connection.set_limit(Limit::SQLITE_LIMIT_LENGTH, MAX_SQLITE_VALUE_BYTES)?;
-        initialize(&connection)?;
+        initialize(&connection, fresh)?;
         verify_sidecars(&path)?;
         Ok(Self { connection, path })
     }
@@ -327,14 +362,41 @@ impl RemoteOperationJournal {
         if duplicate {
             return Err(RemoteOperationJournalError::DuplicateId);
         }
+        let conflict: Option<String> = transaction
+            .query_row(
+                "SELECT operation_id FROM remote_operations
+             WHERE source = ?1 AND server = ?2 AND workspace = ?3
+               AND resource_namespace = ?4 AND principal = ?5 AND project = ?6
+               AND state IN ('reserved', 'dispatched', 'indeterminate') AND acknowledged_at IS NULL
+               AND (workspace_generation != ?7 OR broad_lock = 1 OR ?8 OR EXISTS (
+                   SELECT 1 FROM json_each(remote_operations.lock_keys) pending
+                   JOIN json_each(?9) requested ON pending.value = requested.value))
+             ORDER BY created_at, operation_id LIMIT 1",
+                params![
+                    reservation.binding.trust_anchor().as_str(),
+                    reservation.binding.server_id(),
+                    reservation.binding.workspace_id(),
+                    reservation.binding.resource_namespace_version(),
+                    reservation.binding.principal_id(),
+                    reservation.binding.project_key().as_str(),
+                    reservation.binding.workspace_generation(),
+                    reservation.broad_lock,
+                    lock_keys
+                ],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(operation_id) = conflict {
+            return Err(RemoteOperationJournalError::PendingOperation(operation_id));
+        }
         transaction.execute(
             "INSERT INTO remote_operations (
                  operation_id, invocation_id, preparation_id, binding, source, server,
                  workspace, workspace_generation, resource_namespace, principal, project,
                  cwd_handle, cursor_label, operation_kind, request_digest, lock_keys, state,
-                 created_at, updated_at, side_effects_possible
+                 created_at, updated_at, side_effects_possible, publication_id, broad_lock, publication_cwd
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
-                       ?15, ?16, 'reserved', ?17, ?17, 0)",
+                       ?15, ?16, 'reserved', ?17, ?17, 0, ?18, ?19, ?20)",
             params![
                 reservation.operation_id.as_str(),
                 reservation.invocation_id.as_str(),
@@ -353,6 +415,9 @@ impl RemoteOperationJournal {
                 reservation.request_digest.as_str(),
                 lock_keys,
                 created_at,
+                reservation.publication_id.as_ref().map(OperationId::as_str),
+                reservation.broad_lock,
+                reservation.publication_cwd.as_ref().map(WorkspacePath::as_str),
             ],
         )?;
         transaction.commit()?;
@@ -449,7 +514,7 @@ impl RemoteOperationJournal {
         let mut statement = self.connection.prepare(
             "SELECT operation_id, invocation_id, preparation_id, binding, operation_kind,
                     request_digest, lock_keys, state, created_at, updated_at, dispatched_at,
-                    terminal_at, acknowledged_at, side_effects_possible
+                    terminal_at, acknowledged_at, side_effects_possible, publication_id, publication_cwd
              FROM remote_operations WHERE source = ?1 AND server = ?2 AND workspace = ?3
                    AND workspace_generation = ?4 AND resource_namespace = ?5
                    AND principal = ?6 AND project = ?7
@@ -594,22 +659,9 @@ impl RemoteOperationJournal {
     }
 }
 
-fn initialize(connection: &Connection) -> Result<(), RemoteOperationJournalError> {
-    connection.execute_batch(&format!(
-        "PRAGMA page_size = {PAGE_SIZE};
-         PRAGMA max_page_count = {MAX_PAGE_COUNT};
-         PRAGMA journal_mode = WAL;
-         PRAGMA synchronous = FULL;
-         PRAGMA trusted_schema = OFF;"
-    ))?;
+fn validate_schema(connection: &Connection) -> Result<(), RemoteOperationJournalError> {
     let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
-    if version == 0 {
-        let transaction = connection.unchecked_transaction()?;
-        transaction.execute_batch(SCHEMA)?;
-        transaction.pragma_update(None, "application_id", APPLICATION_ID)?;
-        transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
-        transaction.commit()?;
-    } else if version != SCHEMA_VERSION {
+    if version != SCHEMA_VERSION {
         return Err(RemoteOperationJournalError::UnsupportedVersion(version));
     }
     let application_id: i64 =
@@ -619,10 +671,50 @@ fn initialize(connection: &Connection) -> Result<(), RemoteOperationJournalError
             "unexpected SQLite application id".into(),
         ));
     }
+    let expected = Connection::open_in_memory()?;
+    expected.execute_batch(SCHEMA)?;
+    if schema_objects(connection)? != schema_objects(&expected)? {
+        return Err(RemoteOperationJournalError::UnsafeStorage(
+            "unexpected SQLite schema".into(),
+        ));
+    }
     Ok(())
 }
 
-fn ensure_private_directory(path: &Path) -> Result<(), RemoteOperationJournalError> {
+fn schema_objects(connection: &Connection) -> Result<Vec<[String; 4]>, rusqlite::Error> {
+    connection
+        .prepare(
+            "SELECT type, name, tbl_name, coalesce(sql, '') FROM sqlite_schema
+             ORDER BY type, name LIMIT ?1",
+        )?
+        .query_map([MAX_SCHEMA_OBJECTS], |row| {
+            Ok([row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?])
+        })?
+        .collect()
+}
+
+fn initialize(connection: &Connection, fresh: bool) -> Result<(), RemoteOperationJournalError> {
+    if !fresh {
+        validate_schema(connection)?;
+    }
+    connection.execute_batch(&format!(
+        "PRAGMA page_size = {PAGE_SIZE};
+         PRAGMA max_page_count = {MAX_PAGE_COUNT};
+         PRAGMA journal_mode = WAL;
+         PRAGMA synchronous = FULL;
+         PRAGMA trusted_schema = OFF;"
+    ))?;
+    if fresh {
+        let transaction = connection.unchecked_transaction()?;
+        transaction.execute_batch(SCHEMA)?;
+        transaction.pragma_update(None, "application_id", APPLICATION_ID)?;
+        transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+        transaction.commit()?;
+    }
+    Ok(())
+}
+
+fn verify_directory(path: &Path) -> Result<(), RemoteOperationJournalError> {
     match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
             return Err(RemoteOperationJournalError::UnsafeStorage(format!(
@@ -630,17 +722,28 @@ fn ensure_private_directory(path: &Path) -> Result<(), RemoteOperationJournalErr
                 path.display()
             )));
         }
-        Ok(_) => {}
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            fs::create_dir_all(path)
-                .map_err(RemoteOperationJournalError::PersistentStateUnavailable)?;
+        Ok(metadata) =>
+        {
+            #[cfg(unix)]
+            if metadata.uid() != rustix::process::geteuid().as_raw() {
+                return Err(RemoteOperationJournalError::UnsafeStorage(
+                    "journal directory must be owned by the current user".into(),
+                ));
+            }
         }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => {
             return Err(RemoteOperationJournalError::PersistentStateUnavailable(
                 error,
             ));
         }
     }
+    Ok(())
+}
+
+fn ensure_private_directory(path: &Path) -> Result<(), RemoteOperationJournalError> {
+    verify_directory(path)?;
+    fs::create_dir_all(path)?;
     #[cfg(unix)]
     {
         fs::set_permissions(path, fs::Permissions::from_mode(OWNER_DIR_MODE))
@@ -658,33 +761,14 @@ fn ensure_private_directory(path: &Path) -> Result<(), RemoteOperationJournalErr
     Ok(())
 }
 
-fn create_owner_only(path: &Path) -> Result<(), RemoteOperationJournalError> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
-            return Err(RemoteOperationJournalError::UnsafeStorage(format!(
-                "{} is not a regular non-symlink file",
-                path.display()
-            )));
-        }
-        Ok(metadata) => verify_owner_only(&metadata)?,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            let mut options = OpenOptions::new();
-            options.write(true).create_new(true);
-            #[cfg(unix)]
-            options
-                .mode(OWNER_FILE_MODE)
-                .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32);
-            options
-                .open(path)
-                .map_err(RemoteOperationJournalError::PersistentStateUnavailable)?;
-        }
-        Err(error) => {
-            return Err(RemoteOperationJournalError::PersistentStateUnavailable(
-                error,
-            ));
-        }
-    }
-    Ok(())
+fn create_owner_only(path: &Path) -> Result<File, RemoteOperationJournalError> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options
+        .mode(OWNER_FILE_MODE)
+        .custom_flags(rustix::fs::OFlags::NOFOLLOW.bits() as i32);
+    Ok(options.open(path)?)
 }
 
 fn verify_owner_only(metadata: &fs::Metadata) -> Result<(), RemoteOperationJournalError> {
@@ -700,7 +784,7 @@ fn verify_owner_only(metadata: &fs::Metadata) -> Result<(), RemoteOperationJourn
 }
 
 fn verify_sidecars(path: &Path) -> Result<(), RemoteOperationJournalError> {
-    for suffix in ["-wal", "-shm"] {
+    for suffix in ["-wal", "-shm", "-journal"] {
         let sidecar = sidecar(path, suffix);
         match fs::symlink_metadata(&sidecar) {
             Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
@@ -776,6 +860,21 @@ fn record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RemoteOperationR
         )
     })?;
     Ok(RemoteOperationRecord {
+        publication_cwd: row
+            .get::<_, Option<String>>(15)?
+            .map(WorkspacePath::new)
+            .transpose()
+            .map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    15,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })?,
+        publication_id: row
+            .get::<_, Option<String>>(14)?
+            .map(|id| parse_operation_id(id, 14))
+            .transpose()?,
         operation_id,
         invocation_id,
         preparation_id,
@@ -864,7 +963,16 @@ mod tests {
         AuthenticatedPrincipalId, AuthorityIdentity, CwdHandle, ProjectIdentity, ProjectKey,
         SessionBindingId, SessionWorkspaceBinding, SourceTrustAnchor,
     };
+    use std::{
+        env,
+        fs::Permissions,
+        process::{self, Command},
+        sync::{Arc, Barrier},
+        thread,
+        time::SystemTime,
+    };
     use tempfile::TempDir;
+    use test_case::test_case;
 
     use super::*;
 
@@ -872,6 +980,324 @@ mod tests {
     const REQUEST_DIGEST: &str =
         "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
     const RAW_LOCK_KEY: &str = "opaque-lock-value";
+    const CRASH_PATH_ENV: &str = "CAUDRA_TEST_JOURNAL_CRASH_PATH";
+    const CRASH_SQL_ENV: &str = "CAUDRA_TEST_JOURNAL_CRASH_SQL";
+    const HOT_JOURNAL_MAGIC: &[u8] = b"\xd9\xd5\x05\xf9\x20\xa1\x63\xd7";
+    const SPILL_TRANSACTION: &str = "
+        PRAGMA cache_size=1; BEGIN IMMEDIATE;
+        UPDATE remote_operations SET updated_at=20;
+        CREATE TABLE uncommitted_spill(value BLOB);
+        WITH RECURSIVE seq(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM seq WHERE x<100)
+        INSERT INTO uncommitted_spill SELECT zeroblob(4096) FROM seq;";
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct JournalSnapshot {
+        files: Vec<(PathBuf, Vec<u8>, Permissions, SystemTime)>,
+        directory_permissions: Permissions,
+    }
+
+    fn journal_snapshot(path: &Path) -> JournalSnapshot {
+        let directory = path.parent().unwrap();
+        let mut files = fs::read_dir(directory)
+            .unwrap()
+            .map(|entry| {
+                let path = entry.unwrap().path();
+                let metadata = fs::symlink_metadata(&path).unwrap();
+                (
+                    path.clone(),
+                    fs::read(&path).unwrap(),
+                    metadata.permissions(),
+                    metadata.modified().unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        files.sort_by(|a, b| a.0.cmp(&b.0));
+        JournalSnapshot {
+            files,
+            directory_permissions: fs::metadata(directory).unwrap().permissions(),
+        }
+    }
+
+    fn crash_journal(path: &Path, sql: &str) {
+        let output = Command::new(env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "remote_operation_journal::tests::journal_crash_child",
+                "--nocapture",
+            ])
+            .env(CRASH_PATH_ENV, path)
+            .env(CRASH_SQL_ENV, sql)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+    }
+
+    #[test]
+    fn journal_crash_child() {
+        let Some(path) = env::var_os(CRASH_PATH_ENV) else {
+            return;
+        };
+        let connection = Connection::open(path).unwrap();
+        connection
+            .execute_batch(&env::var(CRASH_SQL_ENV).unwrap())
+            .unwrap();
+        process::exit(0);
+    }
+
+    #[test_case("future_wal", Some(4); "newer_version_only_in_wal")]
+    #[test_case("future_wal_without_shm", Some(4); "newer_version_only_in_wal_without_shm")]
+    #[test_case("old_hot", Some(2); "old_schema_hot_rollback")]
+    #[test_case("application_wal", None; "wrong_application_only_in_wal")]
+    #[test_case("schema_wal", None; "wrong_schema_only_in_wal")]
+    fn rejected_crash_state_is_not_recovered_or_chmodded(kind: &str, version: Option<i64>) {
+        let temp = TempDir::new().unwrap();
+        let state = StateDir::from_path(temp.path().join("state"));
+        let mut journal = RemoteOperationJournal::open(&state).unwrap();
+        journal
+            .reserve_before_send(&reservation("retained", default_binding()))
+            .unwrap();
+        let path = journal.path().to_owned();
+        drop(journal);
+        let script = match kind {
+            "future_wal" | "future_wal_without_shm" => {
+                "PRAGMA wal_autocheckpoint=0; PRAGMA user_version=4;".to_owned()
+            }
+            "application_wal" => "PRAGMA wal_autocheckpoint=0; PRAGMA application_id=0;".to_owned(),
+            "schema_wal" => "PRAGMA wal_autocheckpoint=0; DROP TABLE remote_operations;".to_owned(),
+            "old_hot" => format!(
+                "PRAGMA journal_mode=DELETE;
+                 ALTER TABLE remote_operations DROP COLUMN publication_id;
+                 ALTER TABLE remote_operations DROP COLUMN publication_cwd;
+                 ALTER TABLE remote_operations DROP COLUMN broad_lock;
+                 PRAGMA user_version=2; {SPILL_TRANSACTION}"
+            ),
+            _ => unreachable!(),
+        };
+        crash_journal(&path, &script);
+        if kind == "future_wal_without_shm" {
+            fs::remove_file(sidecar(&path, "-shm")).unwrap();
+        }
+        let header = fs::read(&path).unwrap();
+        let main_version = i64::from(u32::from_be_bytes(header[60..64].try_into().unwrap()));
+        assert_eq!(
+            main_version,
+            if kind == "old_hot" { 2 } else { SCHEMA_VERSION }
+        );
+        let recovery = fs::read(sidecar(
+            &path,
+            if kind == "old_hot" {
+                "-journal"
+            } else {
+                "-wal"
+            },
+        ))
+        .unwrap();
+        assert!(!recovery.is_empty());
+        if kind == "old_hot" {
+            assert_eq!(&recovery[..8], HOT_JOURNAL_MAGIC);
+        }
+        #[cfg(unix)]
+        fs::set_permissions(path.parent().unwrap(), Permissions::from_mode(0o750)).unwrap();
+        let before = journal_snapshot(&path);
+        for _ in 0..2 {
+            let result = RemoteOperationJournal::open(&state);
+            match version {
+                Some(expected) => assert!(matches!(result,
+                    Err(RemoteOperationJournalError::UnsupportedVersion(found)) if found == expected)),
+                None => assert!(matches!(
+                    result,
+                    Err(RemoteOperationJournalError::UnsafeStorage(_))
+                )),
+            }
+            assert_eq!(journal_snapshot(&path), before);
+        }
+    }
+
+    #[test_case(false; "existing_empty_file")]
+    #[test_case(true; "unrelated_unversioned_database")]
+    fn existing_version_zero_is_not_an_initialization_candidate(populated: bool) {
+        let temp = TempDir::new().unwrap();
+        let state = StateDir::from_path(temp.path().join("state"));
+        let directory = state.persistent_path().join(JOURNAL_DIR);
+        ensure_private_directory(&directory).unwrap();
+        let path = directory.join(REMOTE_OPERATION_JOURNAL_FILE);
+        create_owner_only(&path).unwrap();
+        if populated {
+            let connection = Connection::open(&path).unwrap();
+            connection.execute_batch(
+                "CREATE TABLE unrelated(value TEXT); INSERT INTO unrelated VALUES ('retained');"
+            ).unwrap();
+        }
+        let before = journal_snapshot(&path);
+        assert!(matches!(
+            RemoteOperationJournal::open(&state),
+            Err(RemoteOperationJournalError::UnsupportedVersion(0))
+        ));
+        assert_eq!(journal_snapshot(&path), before);
+    }
+
+    #[test_case(false, false; "current_committed_wal")]
+    #[test_case(false, true; "current_committed_wal_without_shm")]
+    #[test_case(true, false; "current_hot_rollback")]
+    fn current_crash_state_recovers_after_side_effect_free_preflight(
+        rollback: bool,
+        missing_shm: bool,
+    ) {
+        let temp = TempDir::new().unwrap();
+        let state = StateDir::from_path(temp.path().join("state"));
+        let mut journal = RemoteOperationJournal::open(&state).unwrap();
+        journal
+            .reserve_before_send(&reservation("retained", default_binding()))
+            .unwrap();
+        let path = journal.path().to_owned();
+        drop(journal);
+        let sql = if rollback {
+            format!("PRAGMA journal_mode=DELETE; {SPILL_TRANSACTION}")
+        } else {
+            "PRAGMA wal_autocheckpoint=0; UPDATE remote_operations SET updated_at=20;".into()
+        };
+        crash_journal(&path, &sql);
+        if missing_shm {
+            fs::remove_file(sidecar(&path, "-shm")).unwrap();
+        }
+        let recovery =
+            fs::read(sidecar(&path, if rollback { "-journal" } else { "-wal" })).unwrap();
+        assert!(!recovery.is_empty());
+        if rollback {
+            assert_eq!(&recovery[..8], HOT_JOURNAL_MAGIC);
+        }
+        let before = journal_snapshot(&path);
+        JournalAdmission::inspect(&path).unwrap();
+        assert_eq!(journal_snapshot(&path), before);
+        let journal = RemoteOperationJournal::open(&state).unwrap();
+        let records = journal.list_pending(&default_binding()).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].operation_id,
+            OperationId::new("operation-retained").unwrap()
+        );
+        assert_eq!(records[0].updated_at, if rollback { 10 } else { 20 });
+        validate_schema(&journal.connection).unwrap();
+        for suffix in ["", "-wal", "-shm"] {
+            verify_owner_only(&fs::metadata(sidecar(&path, suffix)).unwrap()).unwrap();
+        }
+    }
+
+    #[test]
+    fn exclusive_creation_does_not_adopt_a_racing_empty_file() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join(REMOTE_OPERATION_JOURNAL_FILE);
+        let admission = JournalAdmission::inspect(&path).unwrap();
+        assert!(admission.is_new());
+        create_owner_only(&path).unwrap();
+        let before = journal_snapshot(&path);
+        assert!(matches!(
+            admission.recheck(&path),
+            Err(RemoteOperationJournalError::AdmissionChanged)
+        ));
+        assert!(matches!(create_owner_only(&path),
+            Err(RemoteOperationJournalError::PersistentStateUnavailable(error)) if error.kind() == io::ErrorKind::AlreadyExists));
+        assert_eq!(journal_snapshot(&path), before);
+    }
+
+    #[test_case(false; "same_resource_across_cursors")]
+    #[test_case(true; "broad_lock_across_cursors")]
+    fn reservations_are_atomic_across_independent_journal_connections(broad: bool) {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("state");
+        RemoteOperationJournal::open(&StateDir::from_path(path.clone())).unwrap();
+        let barrier = Arc::new(Barrier::new(2));
+        let tasks = ["root", "nested"]
+            .into_iter()
+            .map(|cursor| {
+                let path = path.clone();
+                let barrier = barrier.clone();
+                thread::spawn(move || {
+                    let mut journal =
+                        RemoteOperationJournal::open(&StateDir::from_path(path)).unwrap();
+                    let mut reservation = reservation(
+                        cursor,
+                        binding("source", "authority", "principal", "project", cursor),
+                    );
+                    if broad {
+                        reservation.broad_lock = cursor == "root";
+                        reservation.lock_keys = vec![OpaqueLockKey::new(cursor).unwrap()];
+                    }
+                    barrier.wait();
+                    match journal.reserve_before_send(&reservation) {
+                        Ok(()) => true,
+                        Err(RemoteOperationJournalError::PendingOperation(_)) => false,
+                        Err(error) => panic!("unexpected reservation error: {error}"),
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            tasks
+                .into_iter()
+                .map(|task| usize::from(task.join().unwrap()))
+                .sum::<usize>(),
+            1
+        );
+    }
+
+    #[test]
+    fn transfer_recovery_metadata_and_broad_locks_survive_reopen() {
+        let temp = TempDir::new().unwrap();
+        let state = StateDir::from_path(temp.path().join("state"));
+        let mut journal = RemoteOperationJournal::open(&state).unwrap();
+        let mut reserved = reservation("publication", default_binding());
+        reserved.operation_kind = "canonical:shell".into();
+        reserved.broad_lock = true;
+        reserved.publication_id = Some(OperationId::new("publication").unwrap());
+        reserved.publication_cwd = Some(WorkspacePath::new("nested").unwrap());
+        journal.reserve_before_send(&reserved).unwrap();
+        journal.mark_dispatched(&reserved.operation_id, 11).unwrap();
+        drop(journal);
+        let mut journal = RemoteOperationJournal::open(&state).unwrap();
+        let pending = journal.list_pending(&default_binding()).unwrap();
+        assert_eq!(pending[0].publication_id, reserved.publication_id);
+        assert_eq!(pending[0].publication_cwd, reserved.publication_cwd);
+        assert_eq!(pending[0].state, RemoteOperationState::Dispatched);
+        let mut other = reservation("another", default_binding());
+        other.lock_keys = vec![OpaqueLockKey::new("unrelated-resource").unwrap()];
+        assert!(matches!(
+            journal.reserve_before_send(&other),
+            Err(RemoteOperationJournalError::PendingOperation(_))
+        ));
+    }
+
+    #[test_case(1; "v1")]
+    #[test_case(2; "v2")]
+    #[test_case(4; "future")]
+    fn unsupported_journal_versions_are_rejected_without_rewriting(version: i64) {
+        let temp = TempDir::new().unwrap();
+        let state = StateDir::from_path(temp.path().join("state"));
+        let mut journal = RemoteOperationJournal::open(&state).unwrap();
+        journal
+            .reserve_before_send(&reservation("retained", default_binding()))
+            .unwrap();
+        let path = journal.path().to_owned();
+        journal
+            .connection
+            .execute_batch(
+                "ALTER TABLE remote_operations DROP COLUMN publication_id;
+             ALTER TABLE remote_operations DROP COLUMN publication_cwd;
+             ALTER TABLE remote_operations DROP COLUMN broad_lock;
+             PRAGMA journal_mode = DELETE;",
+            )
+            .unwrap();
+        journal
+            .connection
+            .pragma_update(None, "user_version", version)
+            .unwrap();
+        drop(journal);
+        let before = fs::read(&path).unwrap();
+        assert!(matches!(RemoteOperationJournal::open(&state),
+            Err(RemoteOperationJournalError::UnsupportedVersion(found)) if found == version));
+        assert_eq!(fs::read(&path).unwrap(), before);
+        assert!(!sidecar(&path, "-wal").exists());
+    }
 
     fn binding(
         source: &str,
@@ -926,6 +1352,9 @@ mod tests {
 
     fn reservation(id: &str, binding: StoredWorkspaceBinding) -> RemoteOperationReservation {
         RemoteOperationReservation {
+            publication_cwd: None,
+            broad_lock: false,
+            publication_id: None,
             operation_id: OperationId::new(format!("operation-{id}")).unwrap(),
             invocation_id: OperationId::new(format!("invocation-{id}")).unwrap(),
             preparation_id: OperationId::new(format!("preparation-{id}")).unwrap(),
@@ -1072,7 +1501,8 @@ mod tests {
         let state_dir = StateDir::from_path(temp.path().join("state"));
         let binding = default_binding();
         let first = reservation("first", binding.clone());
-        let second = reservation("second", binding.clone());
+        let mut second = reservation("second", binding.clone());
+        second.lock_keys = vec![OpaqueLockKey::new("other-resource").unwrap()];
         let mut journal = RemoteOperationJournal::open(&state_dir).unwrap();
         journal.reserve_before_send(&first).unwrap();
         journal.reserve_before_send(&second).unwrap();

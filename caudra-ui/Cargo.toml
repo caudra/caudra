@@ -8,6 +8,7 @@ authors.workspace = true
 [dependencies]
 caudra-agent = { workspace = true }
 caudra-config = { workspace = true }
+caudra-sandbox = { workspace = true }
 caudra-diff = { workspace = true }
 caudra-grab = { workspace = true }
 caudra-otel = { workspace = true }
@@ -17,6 +18,7 @@ caudra-providers = { workspace = true }
 caudra-lua = { workspace = true }
 caudra-storage = { workspace = true }
 caudra-workspace = { workspace = true }
+caudra-workcell = { workspace = true }
 caudra-workbench = { workspace = true }
 caudra-workflow = { workspace = true }
 ratatui = { workspace = true }

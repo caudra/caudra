@@ -496,6 +496,7 @@ impl App {
         render_if_open!(self.workflow_catalog_picker);
         render_if_open!(self.session_picker);
         render_if_open!(self.session_relocation_picker);
+        render_if_open!(self.sandbox_manager);
 
         overlay_rect
     }

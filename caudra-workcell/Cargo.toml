@@ -20,7 +20,9 @@ isahc = { workspace = true }
 jiff = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 smol = { workspace = true }
+tempfile = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
@@ -29,5 +31,4 @@ url = { workspace = true }
 workcell = { workspace = true }
 
 [dev-dependencies]
-tempfile = { workspace = true }
 test-case = { workspace = true }

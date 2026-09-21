@@ -42,6 +42,7 @@ const PROCESS_ONLY_ENV_VARS: &[&str] = &[
 ];
 
 pub mod providers;
+pub mod sandbox;
 pub mod steering;
 pub mod workcell;
 

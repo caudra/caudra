@@ -1241,8 +1241,17 @@ where
 
     pub fn replace_workspace_cursor(
         &mut self,
-        binding: StoredWorkspaceBinding,
+        mut binding: StoredWorkspaceBinding,
     ) -> Result<(), SessionError> {
+        if let Some(record) = self
+            .workspace_binding
+            .as_ref()
+            .and_then(|binding| binding.sandbox_record())
+        {
+            binding = binding
+                .with_sandbox_record(record)
+                .map_err(|_| SessionError::WorkspaceIdentityImmutable)?;
+        }
         match self.workspace_binding.as_deref() {
             Some(current) if !current.same_workspace_identity(&binding) => {
                 Err(SessionError::WorkspaceIdentityImmutable)
