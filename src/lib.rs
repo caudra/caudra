@@ -56,6 +56,7 @@ pub async fn run(
             },
             max_transfer_bytes: options.max_transfer_bytes,
             snapshot_root: options.snapshot_root.as_deref(),
+            transfer_root: options.transfer_root.as_deref(),
             snapshot_exclusions: snapshot_exclusions.as_slice(),
         },
     )

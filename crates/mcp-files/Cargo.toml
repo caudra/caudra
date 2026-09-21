@@ -21,6 +21,7 @@ dunce.workspace = true
 file-format.workspace = true
 notify.workspace = true
 regex.workspace = true
+rustix.workspace = true
 rmcp = { workspace = true, optional = true }
 schemars.workspace = true
 serde.workspace = true

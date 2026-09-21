@@ -44,11 +44,8 @@ use workcell_mcp_web::{PreparedWebfetchOperation, PreparedWebsearchOperation};
 use workcell_workspace_scm::PreparedScmMutation;
 use workcell_workspace_snapshot::{PreparedSnapshotCleanup, PreparedSnapshotRestore};
 
-use crate::{
-    execution_environment::{
-        PreparedExecutionEnvironment, TOOL_NAME as EXECUTION_ENVIRONMENT_TOOL,
-    },
-    transfer::PreparedTransfer,
+use crate::execution_environment::{
+    PreparedExecutionEnvironment, TOOL_NAME as EXECUTION_ENVIRONMENT_TOOL,
 };
 
 const PREPARATION_TTL: Duration = Duration::from_secs(120);
@@ -124,10 +121,10 @@ pub(crate) enum PreparedRemoteOperation {
     Webfetch(PreparedWebfetchOperation),
     Shell(PreparedShell),
     PythonExecution(PreparedCode),
-    FileDownload(PreparedTransfer),
-    FileUpload(PreparedTransfer),
     ExecutionEnvironment(PreparedExecutionEnvironment),
     WorkspaceMutation(PreparedWorkspaceMutation),
+    #[cfg(unix)]
+    TransferPublication(crate::transfer::reviewed::PreparedPublication),
     ScmMutation(PreparedScmMutation),
     SnapshotRestore(PreparedSnapshotRestore),
     SnapshotUnrevert(PreparedSnapshotRestore),
@@ -156,8 +153,6 @@ impl PreparedRemoteOperation {
                 | "webfetch"
                 | "shell"
                 | "python_execution"
-                | "file_download"
-                | "file_upload"
                 | EXECUTION_ENVIRONMENT_TOOL
         )
     }
@@ -181,9 +176,10 @@ impl PreparedRemoteOperation {
             Self::Webfetch(prepared) => prepared.retained_bytes(),
             Self::Shell(prepared) => prepared.retained_bytes(),
             Self::PythonExecution(prepared) => prepared.retained_bytes(),
-            Self::FileDownload(prepared) | Self::FileUpload(prepared) => prepared.retained_bytes(),
             Self::ExecutionEnvironment(prepared) => prepared.retained_bytes(),
             Self::WorkspaceMutation(prepared) => prepared.retained_bytes(),
+            #[cfg(unix)]
+            Self::TransferPublication(prepared) => prepared.retained_bytes(),
             Self::ScmMutation(prepared) => prepared.retained_bytes(),
             Self::SnapshotRestore(prepared) | Self::SnapshotUnrevert(prepared) => {
                 prepared.retained_bytes()
@@ -2888,7 +2884,7 @@ mod tests {
                     },
                 },
                 execution_environment: None,
-                file_transfer: None,
+                reviewed_transfer: None,
                 operations: None,
                 workspace: None,
                 watch: None,

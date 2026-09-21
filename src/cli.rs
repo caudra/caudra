@@ -206,6 +206,9 @@ pub struct RawOptions {
     /// Existing private directory used for server-side workspace snapshots.
     #[arg(long)]
     pub snapshot_root: Option<PathBuf>,
+    /// Existing private directory for reviewed-transfer staging and durable outcomes (Unix).
+    #[arg(long)]
+    pub transfer_root: Option<PathBuf>,
 }
 
 pub struct CliOptions {
@@ -233,6 +236,7 @@ pub struct CliOptions {
     pub max_transfer_bytes: usize,
     pub remote_host: Option<RemoteHostConfiguration>,
     pub snapshot_root: Option<PathBuf>,
+    pub transfer_root: Option<PathBuf>,
 }
 
 impl fmt::Debug for CliOptions {
@@ -316,6 +320,7 @@ pub enum CliError {
     SnapshotRequiresRemoteHost,
     SnapshotRequiresWrite,
     SnapshotRequiresFiles,
+    InvalidTransferRoot,
 }
 
 impl fmt::Display for CliError {
@@ -374,6 +379,7 @@ impl fmt::Display for CliError {
             Self::SnapshotRequiresFiles => {
                 "--snapshot-root requires the files tool group"
             }
+            Self::InvalidTransferRoot => "--transfer-root requires Unix, authenticated remote-host discovery, --allow-write, and the transfer tool group",
         })
     }
 }
@@ -601,6 +607,18 @@ impl RawOptions {
         if snapshot_root.is_some() && !groups.contains(&ToolGroup::Files) {
             return Err(CliError::SnapshotRequiresFiles);
         }
+        let transfer_root =
+            self.transfer_root.or(
+                environment_value(environment, "WORKCELL_MCP_TRANSFER_ROOT")?.map(PathBuf::from),
+            );
+        if transfer_root.is_some()
+            && (!cfg!(unix)
+                || remote_host.is_none()
+                || !self.allow_write
+                || !groups.contains(&ToolGroup::Transfer))
+        {
+            return Err(CliError::InvalidTransferRoot);
+        }
 
         // Transfer and code_graph both resolve every path through a confined `FileToolGroup`, so
         // they need a root for the same reason the files tools do.
@@ -685,6 +703,7 @@ impl RawOptions {
             max_transfer_bytes,
             remote_host,
             snapshot_root,
+            transfer_root,
         })
     }
 }
@@ -1049,6 +1068,56 @@ mod tests {
             raw.resolve(&environment).unwrap_err(),
             CliError::TransferOptionRequiresTransfer
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reviewed_transfer_storage_requires_explicit_remote_write_authority_and_stays_redacted() {
+        let environment = StartupEnvironment::load(None).unwrap();
+        let base = [
+            "workcell-mcp",
+            "--transport",
+            "http",
+            "--tool-group",
+            "transfer",
+            "--transfer-root",
+            "/private/reviewed",
+            ".",
+        ];
+        assert_eq!(
+            RawOptions::try_parse_from(base)
+                .unwrap()
+                .resolve(&environment)
+                .unwrap_err(),
+            CliError::InvalidTransferRoot
+        );
+        let mut arguments = base.to_vec();
+        arguments.extend([
+            "--remote-server-id",
+            "server",
+            "--remote-workspace-id",
+            "workspace",
+            "--remote-workspace-generation",
+            "generation",
+            "--remote-root-project-id",
+            "project",
+            "--remote-principal-id",
+            "principal",
+        ]);
+        assert_eq!(
+            RawOptions::try_parse_from(&arguments)
+                .unwrap()
+                .resolve(&environment)
+                .unwrap_err(),
+            CliError::InvalidTransferRoot
+        );
+        arguments.push("--allow-write");
+        let configured = RawOptions::try_parse_from(arguments)
+            .unwrap()
+            .resolve(&environment)
+            .unwrap();
+        assert!(configured.transfer_root.is_some());
+        assert!(!format!("{configured:?}").contains("/private/reviewed"));
     }
 
     #[test]

@@ -4,6 +4,8 @@ use std::{
     time::Duration,
 };
 
+#[cfg(unix)]
+use axum::routing::get;
 use axum::{
     Router,
     extract::{Request, State},
@@ -11,7 +13,6 @@ use axum::{
     middleware,
     middleware::Next,
     response::Response,
-    routing::get,
 };
 use rmcp::transport::streamable_http_server::{
     StreamableHttpServerConfig, StreamableHttpService, session::never::NeverSessionManager,
@@ -39,6 +40,9 @@ const SSE_KEEP_ALIVE: Duration = Duration::from_secs(15);
 const SSE_RETRY: Duration = Duration::from_secs(3);
 const MIN_TOKEN_BYTES: usize = 32;
 const MAX_TOKEN_BYTES: usize = 4_096;
+
+#[derive(Clone)]
+pub(crate) struct Authenticated;
 
 #[derive(Clone)]
 pub struct HttpAuthentication(Arc<[u8; 32]>);
@@ -158,8 +162,7 @@ impl HttpServer {
                 transport_config,
             );
         let mut router = Router::new().nest_service(http_policy::ENDPOINT_PATH, service);
-        // Mounted only when the group exists, so the route and the tools that advertise it are
-        // enabled by the same decision.
+        #[cfg(unix)]
         if let Some(group) = transfer {
             router = router.route(
                 transfer::ENDPOINT_PATH,
@@ -304,6 +307,7 @@ async fn authenticate(
                 .is_some_and(|token| authentication.accepts(token));
             if accepted {
                 request.headers_mut().remove(AUTHORIZATION);
+                request.extensions_mut().insert(Authenticated);
                 next.run(request).await
             } else {
                 http_policy::path_error(

@@ -34,21 +34,20 @@ use workcell_host_contract::{
     OperationKind, OutcomeKind, PROJECT_ASSET_MANIFEST_VERSION, ProjectAssetCapability,
     ProjectAssetLimits, ProjectAssetMethods, RemoteHostCapabilities, RemoteHostCwd,
     RemoteHostDescriptor, RemoteHostRevisions, RemoteHostToolCapability, RemoteHostToolLimits,
-    RemoteHostTransferCapability, RemoteHostTransferLimits, RemoteOperationCapability,
-    RemoteOperationMethods, ResourceAccess, ResourceId, ResourceIntent, Revision, SCM_DIFF_METHOD,
-    SCM_DISCOVER_METHOD, SCM_LOG_METHOD, SCM_MUTATION_CONTRACT_ID, SCM_PREPARE_MUTATION_METHOD,
-    SCM_READ_SIDE_METHOD, SCM_STATUS_METHOD, SNAPSHOT_ACKNOWLEDGE_METHOD, SNAPSHOT_CAPTURE_METHOD,
-    SNAPSHOT_CLEANUP_CONTRACT_ID, SNAPSHOT_INSPECT_METHOD, SNAPSHOT_PREPARE_CLEANUP_METHOD,
-    SNAPSHOT_PREPARE_RESTORE_METHOD, SNAPSHOT_PREPARE_UNREVERT_METHOD,
-    SNAPSHOT_RESTORE_CONTRACT_ID, SNAPSHOT_STATUS_METHOD, SNAPSHOT_UNREVERT_CONTRACT_ID,
-    ScmCapability, ScmDiffRequest, ScmDiscoverRequest, ScmLimits, ScmLogRequest, ScmMethods,
-    ScmMutation, ScmPrepareMutationRequest, ScmPrepareMutationResponse, ScmReadSideRequest,
-    ScmStatusRequest, SnapshotAcknowledgeRequest, SnapshotCaptureRequest, SnapshotInspectRequest,
-    SnapshotPrepareCleanupRequest, SnapshotPrepareCleanupResponse, SnapshotPrepareRestoreRequest,
-    SnapshotPrepareRestoreResponse, SnapshotPrepareUnrevertRequest, SnapshotRestorePreview,
-    SnapshotStatusRequest, StructuredOutcome, ToolResultContent, ToolResultEnvelope,
-    ToolResultText, WORKSPACE_MUTATION_CONTRACT_ID, WorkspaceCapability, WorkspaceLimits,
-    WorkspaceMethods, WorkspaceMutationCapability, WorkspaceRequestBinding,
+    RemoteOperationCapability, RemoteOperationMethods, ResourceAccess, ResourceId, ResourceIntent,
+    Revision, SCM_DIFF_METHOD, SCM_DISCOVER_METHOD, SCM_LOG_METHOD, SCM_MUTATION_CONTRACT_ID,
+    SCM_PREPARE_MUTATION_METHOD, SCM_READ_SIDE_METHOD, SCM_STATUS_METHOD,
+    SNAPSHOT_ACKNOWLEDGE_METHOD, SNAPSHOT_CAPTURE_METHOD, SNAPSHOT_CLEANUP_CONTRACT_ID,
+    SNAPSHOT_INSPECT_METHOD, SNAPSHOT_PREPARE_CLEANUP_METHOD, SNAPSHOT_PREPARE_RESTORE_METHOD,
+    SNAPSHOT_PREPARE_UNREVERT_METHOD, SNAPSHOT_RESTORE_CONTRACT_ID, SNAPSHOT_STATUS_METHOD,
+    SNAPSHOT_UNREVERT_CONTRACT_ID, ScmCapability, ScmDiffRequest, ScmDiscoverRequest, ScmLimits,
+    ScmLogRequest, ScmMethods, ScmMutation, ScmPrepareMutationRequest, ScmPrepareMutationResponse,
+    ScmReadSideRequest, ScmStatusRequest, SnapshotAcknowledgeRequest, SnapshotCaptureRequest,
+    SnapshotInspectRequest, SnapshotPrepareCleanupRequest, SnapshotPrepareCleanupResponse,
+    SnapshotPrepareRestoreRequest, SnapshotPrepareRestoreResponse, SnapshotPrepareUnrevertRequest,
+    SnapshotRestorePreview, SnapshotStatusRequest, StructuredOutcome, ToolResultContent,
+    ToolResultEnvelope, ToolResultText, WORKSPACE_MUTATION_CONTRACT_ID, WorkspaceCapability,
+    WorkspaceLimits, WorkspaceMethods, WorkspaceMutationCapability, WorkspaceRequestBinding,
     WorkspaceWatchCapability, WorkspaceWatchLimits, WorkspaceWatchMethods,
 };
 use workcell_mcp_code::{CodeBuildError, CodeConfiguration, CodeInput, CodeToolGroup};
@@ -74,6 +73,10 @@ use workcell_tool_contract::{CatalogRevision, ToolManifest, ToolSpec};
 use workcell_workspace_scm::{ScmError, ScmGroup};
 use workcell_workspace_snapshot::{SnapshotError, SnapshotManager};
 
+#[cfg(unix)]
+#[path = "transfer/host.rs"]
+mod reviewed_host;
+
 use crate::{
     cli::ToolGroup,
     execution_environment::{
@@ -94,7 +97,7 @@ use crate::{
         SearchTextRequest, StatRequest, StatusRequest, WATCH_CLOSE_METHOD, WATCH_OPEN_METHOD,
         WATCH_POLL_METHOD, WatchCloseRequest, WatchOpenRequest, WatchPollRequest,
     },
-    transfer::TransferToolGroup,
+    transfer::TransferGroup,
 };
 
 const MODERN_PROTOCOLS: &[ProtocolVersion] = &[ProtocolVersion::V_2026_07_28];
@@ -133,6 +136,7 @@ pub struct ToolConfiguration<'a> {
     pub code: CodeConfiguration<'a>,
     pub max_transfer_bytes: usize,
     pub snapshot_root: Option<&'a Path>,
+    pub transfer_root: Option<&'a Path>,
     pub snapshot_exclusions: &'a [PathBuf],
 }
 
@@ -149,9 +153,7 @@ pub struct WorkcellServer {
     // The code group owns a worker pool, which is shared rather than cloned so every server clone
     // draws on the same bounded set of subprocesses.
     code: Option<Arc<CodeToolGroup>>,
-    // Server-only: the tools here mint URLs for the `/files` route, so this group exists solely
-    // because the binary owns an HTTP transport. A native embedder never sees it.
-    transfer: Option<TransferToolGroup>,
+    transfer: Option<TransferGroup>,
     execution_environment: Option<ExecutionEnvironmentDisclosure>,
     catalog: Arc<[Tool]>,
     manifest: Arc<ToolManifest>,
@@ -162,6 +164,7 @@ pub struct WorkcellServer {
     remote_host: Option<RemoteHostState>,
     snapshots: Option<SnapshotManager>,
     snapshot_root: Option<Arc<PathBuf>>,
+    transfer_root: Option<Arc<PathBuf>>,
     snapshot_exclusions: Arc<[PathBuf]>,
     modern_only: bool,
 }
@@ -174,6 +177,7 @@ pub enum ServerBuildError {
     CatalogSerialization,
     IncompleteExactPreparation,
     SnapshotStorage,
+    TransferStorage,
 }
 
 impl fmt::Display for ServerBuildError {
@@ -195,6 +199,9 @@ impl fmt::Display for ServerBuildError {
             }
             Self::SnapshotStorage => {
                 formatter.write_str("workspace snapshot storage is invalid or unhealthy")
+            }
+            Self::TransferStorage => {
+                formatter.write_str("reviewed transfer storage could not be initialized")
             }
         }
     }
@@ -228,6 +235,7 @@ impl WorkcellServer {
             "codeTypeCheck": groups.contains(&ToolGroup::PythonExecution).then_some(tools.code.type_check),
             "maxTransferBytes": groups.contains(&ToolGroup::Transfer).then_some(tools.max_transfer_bytes),
             "snapshots": tools.snapshot_root.is_some(),
+            "reviewedTransfer": tools.transfer_root.is_some(),
         }))
         .map_err(|_| ServerBuildError::CatalogSerialization)?;
         let filesystem_limits = FilesystemLimits {
@@ -294,9 +302,9 @@ impl WorkcellServer {
         } else {
             None
         };
-        let transfer = if groups.contains(&ToolGroup::Transfer) {
+        let mut transfer = if groups.contains(&ToolGroup::Transfer) {
             Some(
-                TransferToolGroup::new(
+                TransferGroup::new(
                     root.ok_or(ServerBuildError::Filesystem)?,
                     tools.allow_write,
                     tools.max_transfer_bytes,
@@ -307,6 +315,9 @@ impl WorkcellServer {
         } else {
             None
         };
+        if let (Some(transfer), Some(files)) = (&mut transfer, &files) {
+            transfer.share_files(files.clone());
+        }
         let manifest = ToolManifest::new(&compose_specs([
             if groups.contains(&ToolGroup::Files) {
                 workcell_mcp_files::specs(tools.allow_write)
@@ -326,11 +337,6 @@ impl WorkcellServer {
                 .contains(&ToolGroup::PythonExecution)
                 .then(workcell_mcp_code::specs)
                 .unwrap_or_default(),
-            if groups.contains(&ToolGroup::Transfer) {
-                crate::transfer::catalog::specs(tools.allow_write)
-            } else {
-                Vec::new()
-            },
             if behavior.expose_execution_environment {
                 vec![execution_environment_spec()]
             } else {
@@ -350,9 +356,6 @@ impl WorkcellServer {
                 .as_ref()
                 .map_or_else(Vec::new, ShellToolGroup::catalog),
             code.as_ref().map_or_else(Vec::new, |group| group.catalog()),
-            transfer
-                .as_ref()
-                .map_or_else(Vec::new, TransferToolGroup::catalog),
             if behavior.expose_execution_environment {
                 vec![execution_environment_tool()]
             } else {
@@ -390,6 +393,7 @@ impl WorkcellServer {
             remote_host: None,
             snapshots: None,
             snapshot_root: tools.snapshot_root.map(|path| Arc::new(path.to_path_buf())),
+            transfer_root: tools.transfer_root.map(|path| Arc::new(path.to_path_buf())),
             snapshot_exclusions: tools.snapshot_exclusions.to_vec().into(),
             modern_only: behavior.modern_only,
         })
@@ -440,6 +444,8 @@ impl WorkcellServer {
         let root = self.root.as_ref().ok_or(ServerBuildError::Filesystem)?;
         let workspace_files = if let Some(files) = &self.files {
             files.clone()
+        } else if let Some(transfer) = &self.transfer {
+            transfer.files().clone()
         } else {
             FileToolGroup::new(root.as_ref(), false, None)
                 .await
@@ -524,6 +530,27 @@ impl WorkcellServer {
             catalog_revision: catalog_revision.clone(),
             policy_revision: policy_revision.clone(),
         };
+        #[cfg(unix)]
+        if let Some(root) = &self.transfer_root {
+            let transfer = self
+                .transfer
+                .as_mut()
+                .ok_or(ServerBuildError::TransferStorage)?;
+            transfer.reviewed = Some(
+                crate::transfer::reviewed::ReviewedTransfers::open(
+                    workspace_files.clone(),
+                    binding.clone(),
+                    transfer.max_transfer_bytes() as u64,
+                    root,
+                    &workspace_binding,
+                )
+                .map_err(|_| ServerBuildError::TransferStorage)?,
+            );
+        }
+        #[cfg(not(unix))]
+        if self.transfer_root.is_some() {
+            return Err(ServerBuildError::TransferStorage);
+        }
         let descriptor = RemoteHostDescriptor {
             version: ContractVersion::V1,
             server_id: configuration.server_id,
@@ -556,15 +583,19 @@ impl WorkcellServer {
                         limits: tool_limits,
                     }
                 }),
-                file_transfer: self.transfer.as_ref().map(|transfer| {
-                    RemoteHostTransferCapability {
-                        version: ContractVersion::V1,
-                        limits: RemoteHostTransferLimits {
-                            max_bytes: u64::try_from(transfer.max_transfer_bytes())
-                                .unwrap_or(u64::MAX),
-                        },
+                reviewed_transfer: {
+                    #[cfg(unix)]
+                    {
+                        self.transfer
+                            .as_ref()
+                            .and_then(|transfer| transfer.reviewed.as_ref())
+                            .map(|manager| manager.capability())
                     }
-                }),
+                    #[cfg(not(unix))]
+                    {
+                        None
+                    }
+                },
                 operations: Some(RemoteOperationCapability {
                     version: ContractVersion::V1,
                     exact_preparation: true,
@@ -738,11 +769,10 @@ impl WorkcellServer {
         self.modern_only
     }
 
-    /// Lets the HTTP transport mount the byte-moving route for exactly the group it built. Returns
-    /// `None` when transfer is not enabled, and the transport must then mount no route at all.
+    /// The byte route is available only after authenticated remote-host setup opens private storage.
     #[must_use]
-    pub const fn transfer(&self) -> Option<&TransferToolGroup> {
-        self.transfer.as_ref()
+    pub(crate) fn transfer(&self) -> Option<&TransferGroup> {
+        self.transfer.as_ref().filter(|transfer| transfer.enabled())
     }
 
     fn validate_request_context(
@@ -845,11 +875,6 @@ impl WorkcellServer {
             && let Some(result) = code
                 .dispatch(name, arguments.clone(), cancellation.clone())
                 .await
-        {
-            return result;
-        }
-        if let Some(transfer) = &self.transfer
-            && let Some(result) = transfer.dispatch(name, arguments.clone()).await
         {
             return result;
         }
@@ -1248,10 +1273,17 @@ impl WorkcellServer {
         {
             BeginExecution::Terminal(status) | BeginExecution::Running(status) => Ok(*status),
             BeginExecution::Start {
-                operation,
+                mut operation,
                 cancellation,
                 lease,
             } => {
+                #[cfg(unix)]
+                if let PreparedRemoteOperation::TransferPublication(prepared) = operation.as_mut() {
+                    prepared.bind_execution(
+                        request.preparation_id.clone(),
+                        request.invocation_id.clone(),
+                    );
+                }
                 let progress = Some(ToolProgressContext {
                     mcp: context
                         .meta
@@ -1632,27 +1664,6 @@ impl WorkcellServer {
                     Vec::new(),
                 )
             }
-            "file_download" | "file_upload" => {
-                let prepared = self
-                    .transfer
-                    .as_ref()
-                    .ok_or_else(invalid)?
-                    .prepare(name, arguments)
-                    .await
-                    .map_err(|_| invalid())?;
-                let resource = file_intent(prepared.resource())?;
-                let operation = if name == "file_download" {
-                    PreparedRemoteOperation::FileDownload(prepared)
-                } else {
-                    PreparedRemoteOperation::FileUpload(prepared)
-                };
-                (
-                    operation,
-                    OperationKind::Transfer,
-                    name == "file_upload",
-                    vec![resource],
-                )
-            }
             EXECUTION_ENVIRONMENT_TOOL if matches!(arguments, Value::Object(values) if values.is_empty()) =>
             {
                 let prepared = self
@@ -1847,14 +1858,6 @@ impl WorkcellServer {
                     Err(error) => Ok(tool_error_result(error)),
                 }
             }
-            PreparedRemoteOperation::FileDownload(prepared)
-            | PreparedRemoteOperation::FileUpload(prepared) => {
-                self.transfer
-                    .as_ref()
-                    .ok_or_else(remote_invalid)?
-                    .execute_prepared(prepared)
-                    .await
-            }
             PreparedRemoteOperation::ExecutionEnvironment(prepared) => {
                 match self
                     .execution_environment
@@ -1876,6 +1879,15 @@ impl WorkcellServer {
                     .await
                 {
                     Ok(output) => typed_tool_result(&output, "Workspace mutation completed".into()),
+                    Err(error) => operation_error_result(error.code(), error.to_string()),
+                }
+            }
+            #[cfg(unix)]
+            PreparedRemoteOperation::TransferPublication(prepared) => {
+                match prepared.execute(&cancellation).await {
+                    Ok(output) => {
+                        typed_tool_result(&output, "Reviewed binary publication completed".into())
+                    }
                     Err(error) => operation_error_result(error.code(), error.to_string()),
                 }
             }
@@ -2099,39 +2111,51 @@ impl ServerHandler for WorkcellServer {
         request: CustomRequest,
         context: RequestContext<RoleServer>,
     ) -> Result<CustomResult, ErrorData> {
-        if !matches!(
-            request.method.as_str(),
-            PREPARE_METHOD
-                | EXECUTE_METHOD
-                | RELEASE_METHOD
-                | STATUS_METHOD
-                | CANCEL_METHOD
-                | RESOLVE_DIRECTORY_METHOD
-                | STAT_METHOD
-                | LIST_METHOD
-                | READ_TEXT_METHOD
-                | SEARCH_TEXT_METHOD
-                | WATCH_OPEN_METHOD
-                | WATCH_POLL_METHOD
-                | WATCH_CLOSE_METHOD
-                | DISCOVER_PROJECT_ASSETS_METHOD
-                | READ_PROJECT_ASSET_METHOD
-                | PREPARE_MUTATION_METHOD
-                | PREPARE_EXEC_METHOD
-                | SCM_DISCOVER_METHOD
-                | SCM_STATUS_METHOD
-                | SCM_LOG_METHOD
-                | SCM_DIFF_METHOD
-                | SCM_READ_SIDE_METHOD
-                | SCM_PREPARE_MUTATION_METHOD
-                | SNAPSHOT_CAPTURE_METHOD
-                | SNAPSHOT_INSPECT_METHOD
-                | SNAPSHOT_STATUS_METHOD
-                | SNAPSHOT_PREPARE_RESTORE_METHOD
-                | SNAPSHOT_PREPARE_UNREVERT_METHOD
-                | SNAPSHOT_ACKNOWLEDGE_METHOD
-                | SNAPSHOT_PREPARE_CLEANUP_METHOD
-        ) {
+        let reviewed_method = {
+            #[cfg(unix)]
+            {
+                reviewed_host::is_method(request.method.as_str())
+            }
+            #[cfg(not(unix))]
+            {
+                false
+            }
+        };
+        if !reviewed_method
+            && !matches!(
+                request.method.as_str(),
+                PREPARE_METHOD
+                    | EXECUTE_METHOD
+                    | RELEASE_METHOD
+                    | STATUS_METHOD
+                    | CANCEL_METHOD
+                    | RESOLVE_DIRECTORY_METHOD
+                    | STAT_METHOD
+                    | LIST_METHOD
+                    | READ_TEXT_METHOD
+                    | SEARCH_TEXT_METHOD
+                    | WATCH_OPEN_METHOD
+                    | WATCH_POLL_METHOD
+                    | WATCH_CLOSE_METHOD
+                    | DISCOVER_PROJECT_ASSETS_METHOD
+                    | READ_PROJECT_ASSET_METHOD
+                    | PREPARE_MUTATION_METHOD
+                    | PREPARE_EXEC_METHOD
+                    | SCM_DISCOVER_METHOD
+                    | SCM_STATUS_METHOD
+                    | SCM_LOG_METHOD
+                    | SCM_DIFF_METHOD
+                    | SCM_READ_SIDE_METHOD
+                    | SCM_PREPARE_MUTATION_METHOD
+                    | SNAPSHOT_CAPTURE_METHOD
+                    | SNAPSHOT_INSPECT_METHOD
+                    | SNAPSHOT_STATUS_METHOD
+                    | SNAPSHOT_PREPARE_RESTORE_METHOD
+                    | SNAPSHOT_PREPARE_UNREVERT_METHOD
+                    | SNAPSHOT_ACKNOWLEDGE_METHOD
+                    | SNAPSHOT_PREPARE_CLEANUP_METHOD
+            )
+        {
             return Err(ErrorData::new(
                 ErrorCode::METHOD_NOT_FOUND,
                 "Method not found",
@@ -2146,6 +2170,12 @@ impl ServerHandler for WorkcellServer {
             return Err(method_not_found());
         }
         let params = request.params.unwrap_or(Value::Null);
+        #[cfg(unix)]
+        if reviewed_method {
+            return self
+                .reviewed_request(remote, request.method.as_str(), params, &context.ct)
+                .await;
+        }
         let value = match request.method.as_str() {
             PREPARE_METHOD => {
                 let request = parse_custom::<PrepareRequest>(params)?;
@@ -2487,11 +2517,15 @@ enum FailureEffectPolicy {
     ScmMutation,
     SnapshotRestore,
     SnapshotCleanup,
+    #[cfg(unix)]
+    TransferPublication,
 }
 
 impl FailureEffectPolicy {
     fn for_operation(operation: &PreparedRemoteOperation) -> Self {
         match operation {
+            #[cfg(unix)]
+            PreparedRemoteOperation::TransferPublication(_) => Self::TransferPublication,
             PreparedRemoteOperation::FileWrite(_)
             | PreparedRemoteOperation::FileEdit(_)
             | PreparedRemoteOperation::FileApplyPatch(_) => Self::FileMutation,
@@ -2519,6 +2553,8 @@ impl FailureEffectPolicy {
         }
         match self {
             Self::None => false,
+            #[cfg(unix)]
+            Self::TransferPublication => matches!(error_code, Some("transferIndeterminate") | None),
             Self::FileMutation => true,
             Self::Shell => true,
             Self::WorkspaceMutation => {
@@ -2732,7 +2768,6 @@ fn cwd_tool_arguments(name: &str, mut arguments: Value, cwd: &str) -> Result<Val
         "file_read" | "file_write" | "file_edit" => Some(("filePath", false)),
         "file_glob" | "file_grep" | "file_index" | "code_map" | "code_context" | "code_refs"
         | "code_impact" | "code_expand" => Some(("path", true)),
-        "file_download" | "file_upload" => Some(("path", false)),
         "shell" => Some(("workdir", true)),
         _ => None,
     };
@@ -3402,6 +3437,7 @@ mod tests {
             },
             max_transfer_bytes: crate::cli::DEFAULT_MAX_TRANSFER_BYTES,
             snapshot_root: None,
+            transfer_root: None,
             snapshot_exclusions: &[],
         }
     }
@@ -3505,7 +3541,6 @@ mod tests {
             web_catalog(2026, &WebsearchExecutionConfiguration::unconfigured()),
             workcell_mcp_shell::catalog(),
             workcell_mcp_code::catalog(),
-            crate::transfer::catalog::catalog(true),
             vec![execution_environment_tool()],
         ])
         .unwrap();
@@ -3534,9 +3569,6 @@ mod tests {
             .into_iter()
             .map(|tool| tool.name.to_string())
             .collect::<Vec<_>>();
-        // Order is a compatibility contract. The code-graph tools follow the files group because
-        // they answer the same question at repository scale, `python_execution` follows `shell`,
-        // the server-only transfer tools follow it, and the host-owned disclosure tool stays last.
         assert_eq!(
             names,
             [
@@ -3556,8 +3588,6 @@ mod tests {
                 "webfetch",
                 "shell",
                 "python_execution",
-                "file_download",
-                "file_upload",
                 "execution_environment",
             ]
         );
@@ -3779,9 +3809,6 @@ mod tests {
         )
         .await
         .unwrap();
-        tokio::fs::write(root.path().join("payload.bin"), b"payload")
-            .await
-            .unwrap();
         let mut tools = test_tools();
         tools.allow_write = true;
         tools.shell_policy = ShellPermissionPolicy::yolo();
@@ -3865,18 +3892,6 @@ mod tests {
             .unwrap();
         assert_eq!(result.structured_content.unwrap()["path"], "scope");
 
-        let operation = stored_operation(
-            &server,
-            "file_download",
-            serde_json::json!({"path":"payload.bin"}),
-        )
-        .await;
-        let result = server
-            .execute_prepared_operation(operation, CancellationToken::new(), None)
-            .await
-            .unwrap();
-        assert_eq!(result.structured_content.unwrap()["path"], "payload.bin");
-
         let operation =
             stored_operation(&server, EXECUTION_ENVIRONMENT_TOOL, serde_json::json!({})).await;
         let result = server
@@ -3896,9 +3911,6 @@ mod tests {
 
         let root = tempfile::tempdir().unwrap();
         tokio::fs::write(root.path().join("mutable.txt"), "before")
-            .await
-            .unwrap();
-        tokio::fs::write(root.path().join("transfer.bin"), "before")
             .await
             .unwrap();
         tokio::fs::create_dir(root.path().join("graph"))
@@ -3941,12 +3953,6 @@ mod tests {
             serde_json::json!({"filePath":"mutable.txt","content":"prepared"}),
         )
         .await;
-        let transfer = stored_operation(
-            &server,
-            "file_download",
-            serde_json::json!({"path":"transfer.bin"}),
-        )
-        .await;
         let graph =
             stored_operation(&server, "code_map", serde_json::json!({"path":"graph"})).await;
         let shell = stored_operation(
@@ -3965,9 +3971,6 @@ mod tests {
         tokio::fs::write(root.path().join("mutable.txt"), "changed")
             .await
             .unwrap();
-        tokio::fs::write(root.path().join("transfer.bin"), "changed")
-            .await
-            .unwrap();
         tokio::fs::rename(root.path().join("graph"), root.path().join("graph-moved"))
             .await
             .unwrap();
@@ -3977,7 +3980,7 @@ mod tests {
         symlink("work-b", root.path().join("work")).unwrap();
         server.web.as_ref().unwrap().clear_configuration();
 
-        for operation in [file, transfer, graph, shell, web] {
+        for operation in [file, graph, shell, web] {
             let result = server
                 .execute_prepared_operation(operation, CancellationToken::new(), None)
                 .await

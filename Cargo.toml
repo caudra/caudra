@@ -157,6 +157,8 @@ serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 subtle.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
 tokio.workspace = true
 tokio-util = { workspace = true, features = ["io"] }
 tracing.workspace = true
@@ -177,6 +179,7 @@ workcell-mcp-web = { workspace = true, features = ["mcp"] }
 [dev-dependencies]
 reqwest.workspace = true
 tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
 workcell-mcp-code = { workspace = true, features = ["mcp"] }
 
 [lints]

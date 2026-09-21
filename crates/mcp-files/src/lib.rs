@@ -2,6 +2,8 @@
 
 //! Typed confined or host-managed filesystem tools with an optional MCP adapter.
 
+#[cfg(unix)]
+mod binary;
 mod catalog;
 mod diff;
 mod error;
@@ -20,9 +22,16 @@ mod path_policy;
 mod prepared;
 mod read_operations;
 mod text;
+#[cfg(unix)]
+mod transfer_inventory;
 mod types;
 mod workspace;
 
+#[cfg(unix)]
+pub use binary::{
+    BinaryError, BinaryPublicationContent, PreparedBinaryPublication, VerifiedBinaryFile,
+    digest_file,
+};
 #[cfg(feature = "mcp")]
 pub use catalog::catalog;
 pub use catalog::specs;

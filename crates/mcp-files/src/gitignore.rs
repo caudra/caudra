@@ -161,7 +161,17 @@ pub(crate) async fn extend_scope(
     let Some(contents) = read_bounded(&directory.join(".gitignore"), limits, budget).await else {
         return parent;
     };
-    let (patterns, complete) = parse_patterns(&contents, limits);
+    compile_scope(&contents, prefix, parent, limits, budget)
+}
+
+pub(crate) fn compile_scope(
+    contents: &str,
+    prefix: &str,
+    parent: Option<Arc<IgnoreScope>>,
+    limits: &FilesystemLimits,
+    budget: &mut IgnoreBudget,
+) -> Option<Arc<IgnoreScope>> {
+    let (patterns, complete) = parse_patterns(contents, limits);
     if !complete {
         budget.complete = false;
     }

@@ -67,14 +67,13 @@ sequenceDiagram
 | Web | `websearch`, `webfetch` | Search defaults to credential-free Exa; fetch applies SSRF and response bounds. |
 | Shell | `shell` | Applies immutable command policy, then executes with ordered progress and a cleaned environment. |
 | Python execution | `python_execution` | Runs a Python snippet in a separate worker process with no filesystem, network, or environment access. |
-| Transfer | `file_download`, `file_upload` | HTTP transport only. Prepares a byte transfer over `/files`; `file_upload` needs `--allow-write`. |
 | Server | `execution_environment` | Returns fresh sanitized platform, privilege, package-manager, and command observations. |
 
 All groups except transfer are enabled by default. Use repeatable
 `--tool-group files|code_graph|web|shell|python_execution|transfer` arguments to expose a subset.
-Files, code graph, shell, and transfer require a positional root. Transfer additionally requires
-`--transport http`, because its tools mint URLs for a route only the HTTP transport serves;
-requesting it over stdio is a startup error.
+Files, code graph, shell, and transfer require a positional root. Transfer uses authenticated
+remote-host methods rather than model tools. Its byte route requires `--transport http`, remote-host
+discovery, `--allow-write`, and private `--transfer-root` storage; requesting it over stdio is a startup error.
 
 The filesystem tools enforce a canonical root. The shell tool uses that root as its initial working
 directory, but shell commands can deliberately access any path, network, or process visible inside the
@@ -125,33 +124,120 @@ workcell-mcp --transport http --port 3001 --allow-write /absolute/workspace/root
 ```
 
 The only HTTP MCP endpoint is `POST /mcp`. HTTP is stateless and emits one readiness JSON line on
-stdout after binding. Enabling the transfer group adds exactly one further route, `GET|POST /files`,
-which moves raw bytes rather than JSON-RPC. It is absent unless that group is enabled.
+stdout after binding. Configuring reviewed transfer adds exactly one further route, `GET|POST /files`,
+which moves bytes rather than JSON-RPC. It is absent without authenticated remote-host setup and
+private transfer storage, even when the transfer group is selected.
 
 ### File Transfer
 
-MCP results are bounded at tens of kilobytes, so a real file cannot be base64-encoded through a tool
-result. Transfer therefore splits the operation: the tool authorizes a path and returns a URL, and the
-harness moves the bytes.
+MCP results are bounded at tens of kilobytes, so file bytes use a separate authenticated transport.
+Remote-host methods select a revision or stage bytes for reviewed publication; ordinary MCP tools and
+embedded filesystem APIs remain independent of this transfer contract.
 
 ```mermaid
 sequenceDiagram
     participant H as Harness
     participant M as POST /mcp
     participant F as GET/POST /files
-    H->>M: tools/call file_download {path}
-    M-->>H: {"method":"GET","url":"/files?path=...","bytes":N}
+    H->>M: ai.workcell/transfer/download {path, revision, digest, host, cwdHandle}
+    M-->>H: {downloadId, downloadPath, file, expiresAtUnixMs}
     Note over H,M: no bytes have moved yet
-    H->>F: GET /files?path=... (same bearer token)
+    H->>F: GET downloadPath (same bearer, X-Workcell-Cwd, If-Match)
     F-->>H: application/octet-stream
 ```
 
-`url` is relative because only the harness knows the externally reachable origin, which may differ
-from the bind address behind a proxy or port mapping. The URL carries no signature and is not a
-capability: `/files` re-resolves and re-authorizes the path on every request, so it grants nothing the
-caller's existing credentials did not already grant. Uploads must send
-`Content-Type: application/octet-stream`, are bounded by `--max-transfer-bytes` (default 64 MiB), and
-are published by an atomic rename, so an interrupted transfer never leaves a truncated file.
+`uploadPath` and `downloadPath` are relative because only the harness knows the externally reachable
+origin. They carry no independent authority. `/files` accepts only `reviewed=v1` with exactly one
+`stage` selector for POST or `download` selector for GET. Unknown queries, raw `path` requests, and
+mixed selectors are refused before any file or directory creation. There are no `file_upload` or
+`file_download` model tools or raw-transfer fallback.
+
+On Unix, `--transfer-root` (or `WORKCELL_MCP_TRANSFER_ROOT`) enables `reviewedTransfer: v1` in the
+authenticated `ai.workcell/remote-host` descriptor. It requires the transfer group, `--allow-write`,
+and an existing absolute private directory outside the workspace, owned by the process with mode
+0700. A generation/principal-bound subdirectory holds durable outcomes and an exclusive process lock.
+The capability is absent without this configuration; startup fails if configured storage is invalid
+or already in use. No additional HTTP endpoint, signing key, or bearer-replacing token is involved.
+
+The neutral request and response types live in `workcell-host-contract`. These custom methods use
+`POST /mcp`, modern remote-host negotiation, `version: "v1"`, `host`, and `cwdHandle`:
+
+| Method | Additional request fields | Result |
+| --- | --- | --- |
+| `ai.workcell/transfer/stage` | `sizeBytes`, `digest` | `stageId`, relative `uploadPath`, deadline |
+| `ai.workcell/transfer/seal` | `stageId` | Verified SHA-256 digest and exact byte length |
+| `ai.workcell/transfer/release` | `stageId` (also accepts a download ID) | Release/cancel volatile byte state |
+| `ai.workcell/transfer/stat` | `path` | Regular-file identity/content revision, digest, length, safe mode |
+| `ai.workcell/transfer/download` | `path`, `revision`, `digest` | Selected revision's `downloadId`, relative `downloadPath`, deadline |
+| `ai.workcell/transfer/preparePublication` | `publicationId`, `stageId`, `digest`, `sizeBytes`, `path`, `createDirectories`, `precondition`, `mode` | Exact common-ledger `operation` for review |
+| `ai.workcell/transfer/publicationStatus` | `publicationId` | Durable per-file outcome, request digest and operation IDs |
+| `ai.workcell/transfer/inventory` | `policy`, optional `inspect` | Root-only bounded entries, revision, ignore digest, completeness and optional inspection; requires `safeInventory` |
+
+Digests are lowercase `sha256:` plus 64 hex digits. A publication precondition is
+`{"kind":"mustNotExist"}` or `{"kind":"revision","revision":"<transfer/stat revision>"}`.
+Modes are `regular` (0644) and `executable` (0755); ownership, special bits, ACLs and xattrs are not
+copied. Only regular files are supported. Missing parents must be named explicitly in the required
+`createDirectories` array, shallowest first; use `[]` when none are needed. Each creation is reviewed
+and conditional. Symlinks and protected paths are refused. No archives are extracted and no directories
+are implicitly created. File metadata includes `createdDirectories` pairs of path and resource ID.
+
+The byte sequence is `stage -> POST uploadPath -> seal -> preparePublication -> review -> execute`.
+Every byte request uses the same approved origin and bearer and must send `X-Workcell-Cwd` with the
+stage's cwd handle. Upload uses `application/octet-stream` and is single-use, including interrupted
+uploads. Its successful response says `staged: true, published: false`. Anonymous private staging is
+sealed only when both observed length and digest match; publication hashes the source again. A sealed
+stage can be consumed by one preparation. Common `ai.workcell/execute`, `ai.workcell/status`,
+`ai.workcell/cancel` and `ai.workcell/release` methods operate on the returned preparation, using contract
+`ai.workcell/transfer-publication`, version/result version `v1`. Byte-state release cancels an unexecuted
+publication using that stage; it is not undo for an already published file.
+
+The operation preview includes canonical target and ancestor resource IDs/scopes, the existing target
+revision when replacing, and parent write effects for same-filesystem staging. Publication shares the
+file/workspace/snapshot mutation lock, checks ancestor identities and the destination again, and uses
+atomic no-replace creation or atomic replacement. Replacement is **not** a filesystem compare-and-swap
+against external writers: a write between the final revision check and rename remains a race. An
+ancestor moved after descriptor validation may receive the publication at its moved location, but a
+symlink substitution is not followed. Workcell is not isolation from other processes running as its UID.
+
+Downloads require `If-Match` (428 when absent, 412 on mismatch). Strong tag lists and `*` are accepted,
+but the resource must still match the revision and digest selected over MCP. Weak tags do not match.
+One `bytes=start-end`, `bytes=start-`, or `bytes=-suffix` range is supported (206); invalid, multiple or
+unsatisfiable ranges return 416 with `Content-Range: bytes */N`. Matching ETag `If-Range` honors the range;
+other values return the full selected representation. Responses include ETag, `Accept-Ranges: bytes`,
+length, and `X-Workcell-Sha256`. Stat and validation hash bounded streams, including files larger than
+the text limit; a small range does not buffer the whole file. A pinned descriptor does not prevent
+in-place external writes during streaming. Clients must verify the assembled full length/digest in
+their own private staging before independently authorized local publication.
+
+Advertised limits are 32 combined upload/download records, 512 MiB reserved upload bytes, four
+concurrent I/O operations, a ten-minute stage lifetime, a 60-second I/O deadline, and 64 KiB hash/read
+buffers. Each file is also bounded by `min(--max-transfer-bytes, 512 MiB)`. Released records remain
+charged while an in-flight operation retains them. The journal allows 256 records, 32 KiB each, at most
+8 MiB. Publication uses additional temporary workspace disk space, up to the staged content size.
+
+Persist client intent before execute and use a unique `publicationId`. The durable journal records
+publishing before workspace effects and the outcome after syncing publication. Same-invocation execute
+replays use the common ledger; after restart, reacquire cwd/host bindings and query `publicationStatus`
+instead of executing an old preparation or blindly restaging. A crash in the publication window is
+`indeterminate`, even if destination bytes happen to match. Incomplete preparations become cancelled;
+private upload bytes disappear on close/crash. Completed/failed/cancelled journal records may be pruned
+after 24 hours; unresolved outcomes are never automatically pruned and can exhaust the journal quota.
+`unknown` is history loss, not proof that no effect occurred. Crash-left publication sibling files may
+remain for operator reconciliation; they are not automatically deleted through an uncertain path.
+There is no automatic backup, whole-transfer transaction, or rollback guarantee. Incompatible private
+journal records fail startup before any existing record is rewritten or cleaned up; there is no
+migration or alternate legacy format. Incomplete or incompatible pending records require operator
+reconciliation rather than automatic deletion.
+
+The descriptor's `capabilities.reviewedTransfer` object reports `version: "v1"`, `privateStaging`,
+`sealedPublication`, `conditionalDownload`, `singleRange`, `durableOutcomes`, and `createsDirectories`
+as true. `safeInventory` is true on Linux; unsupported hosts refuse inventory.
+`atomicReplaceAgainstExternalWriters` is false. `limits` carries `maxFileBytes`, `maxStages`,
+`maxReservedBytes`, `maxConcurrentIo`, `stageTtlMs`, `ioTimeoutMs`, `maxJournals`, `maxJournalBytes`,
+`maxJournalStorageBytes`, `outcomeRetentionMs`, and `streamBufferBytes`. There is no `fileTransfer`
+descriptor field. Publication status is distinct from common operation status: its fields are
+`version`, `publicationId`, `state`, `preparationId`, `invocationId`, `requestDigest`, and `file`;
+nullable fields remain present as null rather than being omitted.
 
 ## Client Configuration
 

@@ -90,7 +90,7 @@ worker lease for the full pool lifetime; hosts supply cache and source policy, n
 - Prepared operations must disclose every resource they would touch before any effect occurs, so a
   native host can authorize them.
 - Container HTTP bind must remain authenticated. Do not add an unauthenticated wildcard bind.
-- HTTP exposes `POST /mcp`, and `GET|POST /files` when the transfer group is enabled. Both are
+- HTTP exposes `POST /mcp`, and `GET|POST /files` only with authenticated reviewed transfer and private storage. Both are
   documented in `SECURITY.md`. New control or administrative endpoints require a documented threat
   model and explicit maintainer approval.
 - A minted transfer URL is an affordance, not a capability. `/files` must re-resolve and re-authorize
@@ -114,8 +114,8 @@ worker lease for the full pool lifetime; hosts supply cache and source policy, n
 ## Protocol Contracts
 
 - The supported MCP version is explicit and pinned in the server and SDK dependency.
-- Preserve stable catalog order: files, code graph, web, shell, python_execution, transfer, execution
-  environment.
+- Preserve stable catalog order: files, code graph, web, shell, python_execution, execution environment.
+  Reviewed transfer uses remote-host methods, never model tools or raw path byte routes.
 - Within files, `file_index` follows `file_apply_patch` and precedes every web tool when enabled. The five
   code-graph tools follow `file_index` in the order `code_map`, `code_context`, `code_refs`, `code_impact`,
   `code_expand`.

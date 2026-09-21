@@ -2,6 +2,9 @@
 
 use std::{fmt, marker::PhantomData, ops::Deref};
 
+mod transfer;
+pub use transfer::*;
+
 use serde::{Deserialize, Deserializer, Serialize, de::SeqAccess};
 use serde_json::Value;
 
@@ -416,7 +419,8 @@ pub struct RemoteHostCapabilities {
     pub tool_catalog: RemoteHostToolCapability,
     pub tool_execution: RemoteHostToolCapability,
     pub execution_environment: Option<RemoteHostToolCapability>,
-    pub file_transfer: Option<RemoteHostTransferCapability>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reviewed_transfer: Option<ReviewedTransferCapability>,
     pub operations: Option<RemoteOperationCapability>,
     pub workspace: Option<WorkspaceCapability>,
     pub watch: Option<WorkspaceWatchCapability>,
@@ -1145,19 +1149,6 @@ pub struct RemoteHostToolCapability {
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct RemoteHostToolLimits {
     pub max_request_bytes: u64,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub struct RemoteHostTransferCapability {
-    pub version: ContractVersion,
-    pub limits: RemoteHostTransferLimits,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub struct RemoteHostTransferLimits {
-    pub max_bytes: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

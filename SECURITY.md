@@ -54,34 +54,48 @@ names, and the filesystem crate denies direct native calls independently. No too
 this, and the mutation schemas reject unknown fields so a stale argument cannot be dropped into an
 unintended write.
 
-The optional transfer tool group is the only feature that adds an HTTP route, `GET|POST /files`. It
-exists because MCP tool results are bounded at tens of kilobytes, so a real file cannot be carried
-through JSON-RPC. `file_download` and `file_upload` move no bytes: they authorize a path and return a
-relative URL that the caller fetches over the same listener. The route is a byte channel, not a second
-control plane.
+Reviewed transfer adds the byte route `GET|POST /files` because file bytes do not fit bounded MCP tool
+results. It requires an operator-owned `--transfer-root`, authenticated remote-host discovery, a
+configured workspace root, write authority, and the transfer group on Unix. Without that setup the
+capability and route are absent. Ordinary MCP tools remain available without transfer configuration.
+The transfer methods use `POST /mcp`; no additional listener or control plane is involved.
 
-The minted URL is an affordance, not a capability. It carries no signature, expiry, or nonce, and
-confers no authority of its own. `/files` re-resolves the path through the same filesystem confinement
-the file tools use, and re-checks write authority, on every request, so a stale, replayed, or
-hand-written URL is treated exactly like a fresh one and a guessed one grants nothing. Authentication
-is unchanged and shared: without the process bearer that `POST /mcp` requires, `/files` returns 401.
-The route is registered only when the transfer group is built, and a server without it answers `/files`
-identically to any other unknown path, so a deployment does not disclose that the route could exist.
-Transfer requires the HTTP transport; requesting it over stdio is a startup error rather than a group
-that hands out unreachable URLs.
+The `/files?reviewed=v1&stage=...` and `download=...` IDs name bounded
+server-held records bound to the principal, workspace generation, process, policy/catalog and cwd.
+They never replace the bearer; every byte request must authenticate and repeat the cwd handle. Only
+the exact reviewed selectors are accepted. Raw `path` queries, unknown parameters, mixed selectors,
+and the removed `file_upload`/`file_download` tool names are refused without workspace writes or mkdir.
+There is no raw-transfer fallback. Origin-bearing browser requests remain forbidden and credentials are removed by
+authentication before dispatch. Neither tokens nor IDs/paths/queries enter request logs.
 
-Consequences an operator should weigh: enabling transfer makes the root readable, and with
-`--allow-write` writable, as raw bytes by anything holding the bearer token, without the size and
-rendering bounds the file tools apply. That is the intent, and it is the same authority the bearer
-already had through `file_read` and `file_write`, but it is materially easier to exercise at volume.
-Uploads are bounded by `--max-transfer-bytes`, streamed rather than buffered so the bound holds for
-chunked bodies with no declared length, staged in a hidden sibling file, and published by an atomic
-same-filesystem rename, so a failed or abandoned transfer leaves no truncated file at the destination.
-Uploads must declare `Content-Type: application/octet-stream`; multipart, `Range` requests, directory
-transfer, and extended-attribute metadata are deliberately not implemented. `Content-Disposition` file
-names are restricted to printable ASCII with quoting and path characters removed, so a hostile file
-name cannot inject header structure or a traversal into a client's save path. Requests are logged
-without paths, queries, or file names.
+Upload bytes are anonymous private files, not workspace paths. Quotas reserve declared size before
+admission and remain charged through active leases. Seal checks observed digest and length; execution
+rehashes the content and consumes a typed prepared publication through the shared ledger and file
+mutation lock. The preview names canonical target/ancestor scopes and parent staging effects. Only
+regular files, nonsymlink parents, 0644/0755 metadata, and explicit absent/revision
+preconditions are supported. Missing ancestors require explicit reviewed `createDirectories` entries;
+the byte POST never creates them. The resolver remains `mcp-files`; descriptor-relative no-follow opens
+reinforce its policy rather than adding server-side path resolution. No archive extraction, permission
+policy override, or arbitrary destination in the byte POST is supported.
+
+The private journal is process-locked and generation/principal scoped, with count and byte ceilings.
+Publishing is durable before the effect, completed outcomes follow file/directory sync, and an
+interrupted publication is indeterminate rather than retried or inferred successful from matching
+bytes. Terminal records have finite retention; unknown history does not authorize a retry. Unresolved
+records are not silently reclaimed. Every existing private record, including pending files, is
+validated before recovery or cleanup; incompatible formats fail startup without migration, rewriting,
+or deletion. Workspace temporary files may survive a process crash and need
+operator reconciliation. There is no cross-file transaction or implicit undo.
+
+Atomic no-replace publication refuses a destination created at the last instant. Replacement still has
+a revision-check/rename race against external writers; descriptor anchoring prevents following a
+rebound symlink but cannot stop an ancestor being moved. The mutation lock coordinates this server's
+file, workspace, snapshot, and reviewed-publication paths, not shell children or other processes. Streaming
+downloads validate a selected revision/digest and implement strong If-Match and single-range semantics
+without full buffering. An external writer can still change an open inode during the stream. A client
+must verify the complete digest and length before local publication. Same-UID hostile processes and
+network filesystems that do not honor the required locking/rename/fsync semantics are outside these
+guarantees. The descriptor explicitly does not advertise external-writer atomic replacement.
 
 The optional `ai.workcell/remote-host` discovery extension is served only through authenticated
 `POST /mcp` after the operator configures one server, workspace, workspace-generation, root-project,
@@ -400,12 +414,11 @@ appropriate. Protocol headers are routing and consistency checks, not authentica
 - Credential-free Exa MCP search is not private or an availability guarantee. Queries leave the
   execution boundary, and normalized results can still contain inaccurate or malicious web content.
 - A bearer token authenticates one process endpoint. It does not express per-tool, per-user, or
-  per-request authorization. With the transfer group enabled, that one token also authorizes raw byte
-  reads of the root, and raw byte writes under `--allow-write`, over `/files`.
-- Transfer inherits the filesystem time-of-check/time-of-use window and widens it: a path authorized
-  by `file_download` is re-resolved when the caller fetches it, so the bytes delivered are whatever the
-  path resolves to at fetch time, not at authorization time. The reported size may likewise differ from
-  the delivered body if the file changes in between.
+  per-request authorization. A token holder can select downloads and prepare/execute publications
+  when reviewed transfer is configured. Client-side review is not a second server-side credential.
+- Selected transfers check identity and content before publication or streaming, but cannot isolate
+  the filesystem from external writers. Clients must verify downloaded length and digest before
+  publishing locally, and replacement retains the revision-check/rename race described above.
 - Monty is pre-1.0 software on a `0.0.x` line with a version-coupled worker protocol. Workcell pins the
   `monty-pool` dependency and the installed worker to the same release and they must be upgraded
   together; the build fails when the pins diverge and the pool reports any remaining skew as a fatal

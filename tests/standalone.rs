@@ -8,6 +8,10 @@ use std::{
 use reqwest::{Client, Response, StatusCode, header};
 use rmcp::ServiceExt;
 use serde_json::{Value, json};
+#[cfg(unix)]
+use sha2::{Digest, Sha256};
+#[cfg(unix)]
+use std::{fmt::Write as _, path::Path};
 use tempfile::TempDir;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use workcell_mcp::{
@@ -77,6 +81,7 @@ async fn fixture_server_with_options(
             },
             max_transfer_bytes: workcell_mcp::cli::DEFAULT_MAX_TRANSFER_BYTES,
             snapshot_root: None,
+            transfer_root: None,
             snapshot_exclusions: &[],
         },
     )
@@ -777,7 +782,8 @@ async fn authenticated_http_discovers_one_opt_in_remote_environment() {
         descriptor["capabilities"]["toolExecution"]["limits"]["maxRequestBytes"],
         workcell_mcp::http_policy::MAX_JSON_BODY_BYTES
     );
-    assert!(descriptor["capabilities"]["fileTransfer"].is_null());
+    assert!(descriptor["capabilities"].get("fileTransfer").is_none());
+    assert!(descriptor["capabilities"].get("reviewedTransfer").is_none());
 
     let second = post_rpc(
         &client,
@@ -826,6 +832,7 @@ async fn authenticated_snapshot_restore_is_negotiated_and_uses_the_common_ledger
             },
             max_transfer_bytes: workcell_mcp::cli::DEFAULT_MAX_TRANSFER_BYTES,
             snapshot_root: Some(snapshot_root.path()),
+            transfer_root: None,
             snapshot_exclusions: &[],
         },
     )
@@ -1023,6 +1030,7 @@ async fn authenticated_snapshot_restore_is_negotiated_and_uses_the_common_ledger
             },
             max_transfer_bytes: workcell_mcp::cli::DEFAULT_MAX_TRANSFER_BYTES,
             snapshot_root: Some(snapshot_root.path()),
+            transfer_root: None,
             snapshot_exclusions: &[],
         },
     )
@@ -1118,6 +1126,7 @@ async fn authenticated_remote_mutation_is_prepared_once_replayed_and_released() 
             },
             max_transfer_bytes: workcell_mcp::cli::DEFAULT_MAX_TRANSFER_BYTES,
             snapshot_root: None,
+            transfer_root: None,
             snapshot_exclusions: &[],
         },
     )
@@ -1342,6 +1351,7 @@ async fn authenticated_scm_is_negotiated_structured_and_uses_the_common_ledger()
             },
             max_transfer_bytes: workcell_mcp::cli::DEFAULT_MAX_TRANSFER_BYTES,
             snapshot_root: None,
+            transfer_root: None,
             snapshot_exclusions: &[],
         },
     )
@@ -1543,6 +1553,7 @@ async fn authenticated_workspace_operations_bind_cursors_mutations_and_direct_ex
             },
             max_transfer_bytes: workcell_mcp::cli::DEFAULT_MAX_TRANSFER_BYTES,
             snapshot_root: None,
+            transfer_root: None,
             snapshot_exclusions: &[],
         },
     )
@@ -1979,6 +1990,7 @@ async fn authenticated_watch_replays_changes_and_assets_remain_allowlisted_bytes
             },
             max_transfer_bytes: workcell_mcp::cli::DEFAULT_MAX_TRANSFER_BYTES,
             snapshot_root: None,
+            transfer_root: None,
             snapshot_exclusions: &[],
         },
     )
@@ -2923,6 +2935,7 @@ async fn stdio_serves_the_full_catalog_including_python_execution() {
             },
             max_transfer_bytes: workcell_mcp::cli::DEFAULT_MAX_TRANSFER_BYTES,
             snapshot_root: None,
+            transfer_root: None,
             snapshot_exclusions: &[],
         },
     )
@@ -3030,6 +3043,7 @@ async fn write_authority_decides_whether_mutation_tools_exist_at_all() {
                 },
                 max_transfer_bytes: workcell_mcp::cli::DEFAULT_MAX_TRANSFER_BYTES,
                 snapshot_root: None,
+                transfer_root: None,
                 snapshot_exclusions: &[],
             },
         )
@@ -3062,139 +3076,6 @@ async fn write_authority_decides_whether_mutation_tools_exist_at_all() {
             "file_index",
         ]
     );
-}
-
-/// The full hybrid transfer: MCP mints a relative URL that moves no bytes, and the caller's existing
-/// credentials are what authorize the byte-moving request. The minted URL is an affordance, not a
-/// capability, so it grants nothing an unauthenticated caller could use.
-#[tokio::test]
-async fn transfer_tools_mint_urls_that_the_files_route_serves_under_the_same_credentials() {
-    let root = tempfile::tempdir().expect("temporary root");
-    tokio::fs::write(root.path().join("payload.bin"), b"downloaded bytes")
-        .await
-        .expect("fixture file");
-    let server = WorkcellServer::configured(
-        Some(root.path()),
-        &[ToolGroup::Files, ToolGroup::Transfer],
-        ServerBehavior {
-            expose_execution_environment: false,
-            modern_only: false,
-        },
-        ToolConfiguration {
-            allow_write: true,
-            web: WebsearchExecutionConfiguration::unconfigured(),
-            web_icons: false,
-            proxy: ProxyConfiguration::direct(),
-            shell_policy: ShellPermissionPolicy::restricted(),
-            shell_output_filter: true,
-            honor_gitignore: true,
-            code: CodeConfiguration {
-                worker: WorkerSource::Discover {
-                    bundled_cache_root: None,
-                },
-                type_check: true,
-            },
-            max_transfer_bytes: 4096,
-            snapshot_root: None,
-            snapshot_exclusions: &[],
-        },
-    )
-    .await
-    .expect("server");
-    let http = HttpServer::start(
-        server,
-        0,
-        HttpConfiguration {
-            bind_mode: HttpBindMode::Loopback,
-            allowed_hosts: vec!["127.0.0.1".into()],
-            authentication: Some(HttpAuthentication::new(TOKEN).unwrap()),
-            remote_host: None,
-        },
-    )
-    .await
-    .expect("HTTP server");
-    let origin = format!("http://{}", http.address());
-    let endpoint = format!("{origin}/mcp");
-    let client = Client::new();
-
-    let prepared = post_rpc(
-        &client,
-        &endpoint,
-        Some(TOKEN),
-        mcp_request(
-            1,
-            "tools/call",
-            json!({"name": "file_download", "arguments": {"path": "payload.bin"}}),
-        ),
-    )
-    .await;
-    assert_eq!(prepared.status(), StatusCode::OK);
-    let structured = final_sse_json(prepared).await["result"]["structuredContent"].clone();
-    assert_eq!(structured["bytes"], 16);
-    let url = structured["url"].as_str().expect("minted url").to_owned();
-    assert!(url.starts_with("/files?path="), "{url}");
-
-    // Without credentials the minted URL is worthless.
-    let anonymous = client.get(format!("{origin}{url}")).send().await.unwrap();
-    assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
-
-    let downloaded = client
-        .get(format!("{origin}{url}"))
-        .bearer_auth(TOKEN)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(downloaded.status(), StatusCode::OK);
-    assert_eq!(
-        downloaded.bytes().await.unwrap().as_ref(),
-        b"downloaded bytes"
-    );
-
-    let prepared_upload = post_rpc(
-        &client,
-        &endpoint,
-        Some(TOKEN),
-        mcp_request(
-            2,
-            "tools/call",
-            json!({"name": "file_upload", "arguments": {"path": "nested/received.bin"}}),
-        ),
-    )
-    .await;
-    let upload_url = final_sse_json(prepared_upload).await["result"]["structuredContent"]["url"]
-        .as_str()
-        .expect("minted url")
-        .to_owned();
-    // Preparing an upload writes nothing.
-    assert!(!root.path().join("nested/received.bin").exists());
-
-    let uploaded = client
-        .post(format!("{origin}{upload_url}"))
-        .bearer_auth(TOKEN)
-        .header(header::CONTENT_TYPE, "application/octet-stream")
-        .body(b"uploaded bytes".to_vec())
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(uploaded.status(), StatusCode::OK);
-    assert_eq!(
-        tokio::fs::read(root.path().join("nested/received.bin"))
-            .await
-            .expect("published"),
-        b"uploaded bytes"
-    );
-
-    // The transfer route admits exactly GET and POST, and says so.
-    let deleted = client
-        .delete(format!("{origin}/files?path=payload.bin"))
-        .bearer_auth(TOKEN)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(deleted.status(), StatusCode::METHOD_NOT_ALLOWED);
-    assert_eq!(deleted.headers().get(header::ALLOW).unwrap(), "GET, POST");
-
-    assert_eq!(http.shutdown().await, ShutdownOutcome::Completed);
 }
 
 /// A server built without the transfer group must answer `/files` exactly as it answers any other
@@ -3231,4 +3112,533 @@ async fn the_files_route_is_absent_when_the_transfer_group_is_not_enabled() {
     assert_eq!(absent.status(), unknown.status());
     assert_eq!(absent.text().await.unwrap(), unknown.text().await.unwrap());
     assert_eq!(http.shutdown().await, ShutdownOutcome::Completed);
+}
+
+#[cfg(unix)]
+async fn transfer_server(root: &Path, private: Option<&Path>, allow_write: bool) -> WorkcellServer {
+    WorkcellServer::configured(
+        Some(root),
+        &[ToolGroup::Files, ToolGroup::Transfer],
+        ServerBehavior {
+            expose_execution_environment: false,
+            modern_only: true,
+        },
+        ToolConfiguration {
+            allow_write,
+            web: WebsearchExecutionConfiguration::unconfigured(),
+            web_icons: false,
+            proxy: ProxyConfiguration::direct(),
+            shell_policy: ShellPermissionPolicy::restricted(),
+            shell_output_filter: true,
+            honor_gitignore: true,
+            code: CodeConfiguration {
+                worker: WorkerSource::Discover {
+                    bundled_cache_root: None,
+                },
+                type_check: true,
+            },
+            max_transfer_bytes: workcell_mcp::cli::DEFAULT_MAX_TRANSFER_BYTES,
+            snapshot_root: None,
+            transfer_root: private,
+            snapshot_exclusions: &[],
+        },
+    )
+    .await
+    .unwrap()
+}
+
+#[cfg(unix)]
+fn transfer_http_configuration() -> HttpConfiguration {
+    HttpConfiguration {
+        bind_mode: HttpBindMode::Loopback,
+        allowed_hosts: vec!["127.0.0.1".into()],
+        authentication: Some(HttpAuthentication::new(TOKEN).unwrap()),
+        remote_host: Some(
+            RemoteHostConfiguration::new(
+                "transfer-server".into(),
+                "transfer-workspace".into(),
+                "transfer-generation".into(),
+                "transfer-project".into(),
+                "transfer-principal".into(),
+            )
+            .unwrap(),
+        ),
+    }
+}
+
+#[cfg(unix)]
+async fn reviewed_transfer_server(root: &Path, private: &Path) -> HttpServer {
+    HttpServer::start(
+        transfer_server(root, Some(private), true).await,
+        0,
+        transfer_http_configuration(),
+    )
+    .await
+    .unwrap()
+}
+
+#[cfg(unix)]
+async fn reviewed_rpc(client: &Client, endpoint: &str, method: &str, params: Value) -> Value {
+    final_sse_json(
+        post_rpc(
+            client,
+            endpoint,
+            Some(TOKEN),
+            remote_request(1, method, params),
+        )
+        .await,
+    )
+    .await
+}
+
+#[cfg(unix)]
+async fn reviewed_discovery(client: &Client, endpoint: &str) -> Value {
+    let result = final_sse_json(
+        post_rpc(
+            client,
+            endpoint,
+            Some(TOKEN),
+            discover_request(
+                1,
+                json!({"extensions":{"ai.workcell/remote-host":{"versions":["v1"]}}}),
+            ),
+        )
+        .await,
+    )
+    .await;
+    result["result"]["capabilities"]["extensions"]["ai.workcell/remote-host"].clone()
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn transfer_capabilities_and_routes_require_authenticated_rooted_private_storage() {
+    for (authenticated, remote, storage, writable) in [
+        (false, false, false, true),
+        (true, false, false, true),
+        (true, true, false, true),
+        (true, false, true, true),
+        (false, true, true, true),
+        (true, true, true, false),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let private = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(private.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let server =
+            transfer_server(root.path(), storage.then_some(private.path()), writable).await;
+        let mut configuration = transfer_http_configuration();
+        if !authenticated {
+            configuration.authentication = None;
+        }
+        if !remote {
+            configuration.remote_host = None;
+        }
+        let started = HttpServer::start(server, 0, configuration).await;
+        if remote && (!authenticated || !writable) {
+            assert!(started.is_err());
+        } else {
+            let http = started.unwrap();
+            let client = Client::new();
+            let origin = format!("http://{}", http.address());
+            let endpoint = format!("{origin}/mcp");
+            if remote {
+                let descriptor = reviewed_discovery(&client, &endpoint).await;
+                assert!(descriptor["capabilities"].is_object(), "{descriptor}");
+                assert!(descriptor["capabilities"].get("reviewedTransfer").is_none());
+                assert!(descriptor["capabilities"].get("fileTransfer").is_none());
+            }
+            for method in [
+                "stage",
+                "seal",
+                "release",
+                "stat",
+                "download",
+                "preparePublication",
+                "publicationStatus",
+                "inventory",
+            ] {
+                let refused = final_sse_json(
+                    post_rpc(
+                        &client,
+                        &endpoint,
+                        authenticated.then_some(TOKEN),
+                        remote_request(1, &format!("ai.workcell/transfer/{method}"), json!({})),
+                    )
+                    .await,
+                )
+                .await;
+                assert_eq!(refused["error"]["code"], -32601, "{refused}");
+            }
+            for query in ["?path=missing/file.bin", "?reviewed=v1&stage=unknown"] {
+                let refused = client
+                    .post(format!("{origin}/files{query}"))
+                    .bearer_auth(TOKEN)
+                    .body("no effect")
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(refused.status(), StatusCode::NOT_FOUND);
+            }
+            let tools = final_sse_json(
+                post_rpc(
+                    &client,
+                    &endpoint,
+                    authenticated.then_some(TOKEN),
+                    mcp_request(1, "tools/list", json!({})),
+                )
+                .await,
+            )
+            .await;
+            assert!(
+                tools["result"]["tools"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|tool| tool["name"] == "file_read")
+            );
+            assert_eq!(http.shutdown().await, ShutdownOutcome::Completed);
+        }
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+        assert_eq!(std::fs::read_dir(private.path()).unwrap().count(), 0);
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn raw_transfer_routes_are_refused_without_workspace_or_private_store_effects() {
+    const ORIGINAL: &[u8] = b"unchanged binary\0\xff";
+    let root = tempfile::tempdir().unwrap();
+    let private = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(private.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::write(root.path().join("existing.bin"), ORIGINAL).unwrap();
+    let http = reviewed_transfer_server(root.path(), private.path()).await;
+    let origin = format!("http://{}", http.address());
+    let client = Client::new();
+    let store = std::fs::read_dir(private.path())
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let before = std::fs::read_dir(&store)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect::<Vec<_>>();
+    for query in [
+        "?path=existing.bin",
+        "?path=missing/received.bin",
+        "?path=existing.bin&unknown=value",
+        "",
+        "?unknown=value",
+        "?reviewed=v0&stage=unknown",
+        "?reviewed=v1&stage=unknown&path=missing/received.bin",
+        "?reviewed=v1&download=unknown&path=existing.bin",
+        "?reviewed=v1&stage=unknown&stage=duplicate",
+        "?stage=unknown",
+        "?download=unknown",
+    ] {
+        for method in [reqwest::Method::GET, reqwest::Method::POST] {
+            let response = client
+                .request(method.clone(), format!("{origin}/files{query}"))
+                .bearer_auth(TOKEN)
+                .header(header::CONTENT_TYPE, "application/octet-stream")
+                .body("must not publish")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                std::fs::read(root.path().join("existing.bin")).unwrap(),
+                ORIGINAL
+            );
+            assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
+            assert_eq!(
+                std::fs::read_dir(&store)
+                    .unwrap()
+                    .map(|entry| entry.unwrap().file_name())
+                    .collect::<Vec<_>>(),
+                before
+            );
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "{method} {query}"
+            );
+        }
+    }
+    assert_eq!(http.shutdown().await, ShutdownOutcome::Completed);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn raw_transfer_tool_names_are_absent_and_undispatchable_while_plain_mcp_files_work() {
+    let root = tempfile::tempdir().unwrap();
+    let private = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(private.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::write(root.path().join("existing.txt"), "ordinary text").unwrap();
+    let http = reviewed_transfer_server(root.path(), private.path()).await;
+    let endpoint = format!("http://{}/mcp", http.address());
+    let client = Client::new();
+    let descriptor = reviewed_discovery(&client, &endpoint).await;
+    let listed = final_sse_json(
+        post_rpc(
+            &client,
+            &endpoint,
+            Some(TOKEN),
+            mcp_request(1, "tools/list", json!({})),
+        )
+        .await,
+    )
+    .await;
+    for (name, contract) in [
+        ("file_upload", "transfer.upload.v1"),
+        ("file_download", "transfer.download.v1"),
+    ] {
+        let result = final_sse_json(
+            post_rpc(
+                &client,
+                &endpoint,
+                Some(TOKEN),
+                mcp_request(
+                    1,
+                    "tools/call",
+                    json!({"name":name,"arguments":{"path":"missing/received.bin"}}),
+                ),
+            )
+            .await,
+        )
+        .await;
+        assert!(result["error"].is_object(), "{result}");
+        let prepared = reviewed_rpc(&client, &endpoint, "ai.workcell/prepare", json!({"version":"v1","host":remote_host_binding(&descriptor),"tool":name,"contract":{"id":contract,"version":"v1","resultVersion":"v1"},"arguments":{"path":"missing/received.bin"}})).await;
+        assert!(prepared["error"].is_object(), "{prepared}");
+        assert!(
+            !listed["result"]["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|tool| tool["name"] == name)
+        );
+    }
+    assert!(descriptor["capabilities"].get("fileTransfer").is_none());
+    assert!(!root.path().join("missing").exists());
+    let result = final_sse_json(
+        post_rpc(
+            &client,
+            &endpoint,
+            Some(TOKEN),
+            mcp_request(
+                1,
+                "tools/call",
+                json!({"name":"file_read","arguments":{"filePath":"existing.txt"}}),
+            ),
+        )
+        .await,
+    )
+    .await;
+    assert!(result.get("error").is_none(), "{result}");
+    assert_ne!(result["result"]["isError"], true, "{result}");
+    assert!(result["result"].to_string().contains("ordinary text"));
+    let result = final_sse_json(post_rpc(&client, &endpoint, Some(TOKEN), mcp_request(1, "tools/call", json!({"name":"file_write","arguments":{"filePath":"ordinary.txt","content":"ordinary write"}}))).await).await;
+    assert!(result.get("error").is_none(), "{result}");
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("ordinary.txt")).unwrap(),
+        "ordinary write"
+    );
+    assert_eq!(http.shutdown().await, ShutdownOutcome::Completed);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn reviewed_binary_transfer_uses_authenticated_bytes_exact_ledger_execution_and_durable_recovery()
+ {
+    const LARGE_BYTES: usize = 6 * 1024 * 1024;
+    const CWD: &str = "x-workcell-cwd";
+    let root = tempfile::tempdir().unwrap();
+    let private = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(private.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let http = reviewed_transfer_server(root.path(), private.path()).await;
+    let origin = format!("http://{}", http.address());
+    let endpoint = format!("{origin}/mcp");
+    let client = Client::new();
+    let descriptor = reviewed_discovery(&client, &endpoint).await;
+    assert_eq!(
+        descriptor["capabilities"]["reviewedTransfer"]["version"],
+        "v1"
+    );
+    assert_eq!(
+        descriptor["capabilities"]["reviewedTransfer"]["atomicReplaceAgainstExternalWriters"],
+        false
+    );
+    let binding = json!({"version":"v1", "host":remote_host_binding(&descriptor), "cwdHandle":descriptor["cwd"]["handle"]});
+    let scoped = |extra: Value| {
+        let mut params = binding.clone();
+        params
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        params
+    };
+    let bytes = vec![0xff; LARGE_BYTES];
+    let mut digest = String::from("sha256:");
+    for byte in Sha256::digest(&bytes) {
+        write!(digest, "{byte:02x}").unwrap();
+    }
+    let staged = reviewed_rpc(
+        &client,
+        &endpoint,
+        "ai.workcell/transfer/stage",
+        scoped(json!({"sizeBytes":LARGE_BYTES,"digest":digest})),
+    )
+    .await;
+    let staged: workcell_host_contract::TransferStageResponse =
+        serde_json::from_value(staged["result"].clone()).unwrap();
+    let prepare_params = scoped(
+        json!({"stageId":staged.stage_id,"digest":digest,"sizeBytes":LARGE_BYTES,"publicationId":"binary-publication","path":"binary.bin","createDirectories":[],"precondition":{"kind":"mustNotExist"},"mode":"regular"}),
+    );
+    let premature = reviewed_rpc(
+        &client,
+        &endpoint,
+        "ai.workcell/transfer/preparePublication",
+        prepare_params.clone(),
+    )
+    .await;
+    assert_eq!(premature["error"]["data"]["code"], "transferInvalidState");
+    let upload_url = format!("{origin}{}", staged.upload_path);
+    assert_eq!(
+        client
+            .post(&upload_url)
+            .body(bytes.clone())
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        client
+            .post(&upload_url)
+            .bearer_auth(TOKEN)
+            .header(header::ORIGIN, &origin)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    let upload = client
+        .post(&upload_url)
+        .bearer_auth(TOKEN)
+        .header(CWD, binding["cwdHandle"].as_str().unwrap())
+        .header(header::CONTENT_TYPE, "application/octet-stream")
+        .body(bytes.clone())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(upload.status(), StatusCode::OK);
+    assert_eq!(upload.json::<Value>().await.unwrap()["published"], false);
+    assert!(!root.path().join("binary.bin").exists());
+    let selector = scoped(json!({"stageId":staged.stage_id}));
+    let mut other = selector.clone();
+    other["host"]["principalId"] = json!("other-principal");
+    assert_eq!(
+        reviewed_rpc(&client, &endpoint, "ai.workcell/transfer/seal", other).await["error"]["data"]
+            ["code"],
+        "transferBindingMismatch"
+    );
+    let sealed = reviewed_rpc(&client, &endpoint, "ai.workcell/transfer/seal", selector).await;
+    assert_eq!(sealed["result"]["digest"], digest);
+    let prepared = reviewed_rpc(
+        &client,
+        &endpoint,
+        "ai.workcell/transfer/preparePublication",
+        prepare_params,
+    )
+    .await;
+    let prepared: workcell_host_contract::TransferPrepareResponse =
+        serde_json::from_value(prepared["result"].clone()).unwrap();
+    prepared.operation.intent.validate().unwrap();
+    assert_eq!(prepared.operation.intent.resources.len(), 2);
+    assert!(!root.path().join("binary.bin").exists());
+    let execute = json!({"version":"v1", "host":remote_host_binding(&descriptor), "preparationId":prepared.operation.preparation_id,"invocationId":"binary-invocation"});
+    let completed = reviewed_rpc(&client, &endpoint, "ai.workcell/execute", execute.clone()).await;
+    assert_eq!(completed["result"]["state"], "completed", "{completed}");
+    assert_eq!(
+        tokio::fs::read(root.path().join("binary.bin"))
+            .await
+            .unwrap(),
+        bytes
+    );
+    let stat = reviewed_rpc(
+        &client,
+        &endpoint,
+        "ai.workcell/transfer/stat",
+        scoped(json!({"path":"binary.bin"})),
+    )
+    .await;
+    let file = &stat["result"]["file"];
+    assert_eq!(file["sizeBytes"], LARGE_BYTES);
+    assert_eq!(file["digest"], digest);
+    let selected = reviewed_rpc(
+        &client,
+        &endpoint,
+        "ai.workcell/transfer/download",
+        scoped(json!({"path":"binary.bin","revision":file["revision"],"digest":file["digest"]})),
+    )
+    .await;
+    let download = format!(
+        "{origin}{}",
+        selected["result"]["downloadPath"].as_str().unwrap()
+    );
+    let response = client
+        .get(&download)
+        .bearer_auth(TOKEN)
+        .header(CWD, binding["cwdHandle"].as_str().unwrap())
+        .header(
+            header::IF_MATCH,
+            format!("\"{}\"", file["revision"].as_str().unwrap()),
+        )
+        .header(header::RANGE, "bytes=1048576-1048583")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(response.bytes().await.unwrap().as_ref(), &[0xff; 8]);
+    tokio::fs::write(root.path().join("binary.bin"), b"later external edit")
+        .await
+        .unwrap();
+    assert_eq!(
+        reviewed_rpc(&client, &endpoint, "ai.workcell/execute", execute).await["result"],
+        completed["result"]
+    );
+    assert_eq!(
+        tokio::fs::read(root.path().join("binary.bin"))
+            .await
+            .unwrap(),
+        b"later external edit"
+    );
+    let malformed = client
+        .post(format!("{origin}/files?reviewed=v1&path=must-not-publish"))
+        .bearer_auth(TOKEN)
+        .header(header::CONTENT_TYPE, "application/octet-stream")
+        .body("no fallback")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(malformed.status(), StatusCode::BAD_REQUEST);
+    assert!(!root.path().join("must-not-publish").exists());
+    let status_params = scoped(json!({"publicationId":"binary-publication"}));
+    let durable = reviewed_rpc(
+        &client,
+        &endpoint,
+        "ai.workcell/transfer/publicationStatus",
+        status_params,
+    )
+    .await["result"]
+        .clone();
+    assert_eq!(durable["state"], "completed");
+    assert_eq!(http.shutdown().await, ShutdownOutcome::Completed);
+    let restarted = reviewed_transfer_server(root.path(), private.path()).await;
+    let endpoint = format!("http://{}/mcp", restarted.address());
+    let descriptor = reviewed_discovery(&client, &endpoint).await;
+    let status = reviewed_rpc(&client, &endpoint, "ai.workcell/transfer/publicationStatus", json!({"version":"v1","host":remote_host_binding(&descriptor),"cwdHandle":descriptor["cwd"]["handle"],"publicationId":"binary-publication"})).await;
+    assert_eq!(status["result"], durable);
+    assert_eq!(restarted.shutdown().await, ShutdownOutcome::Completed);
 }

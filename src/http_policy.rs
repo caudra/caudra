@@ -30,7 +30,7 @@ pub struct HttpPolicy {
 }
 
 impl HttpPolicy {
-    /// `transfer` must match whether the transfer tool group was actually built. When it is false the
+    /// `transfer` must match whether authenticated reviewed transfer is ready. When it is false the
     /// transfer route is indistinguishable from any other unknown path, so a deployment without the
     /// group does not disclose that the route exists.
     #[must_use]
@@ -513,7 +513,7 @@ mod tests {
         // arbitrarily large, so admitting it through the same path would cap every upload at this
         // bound and buffer it entirely in memory.
         const { assert!(MAX_JSON_BODY_BYTES < crate::cli::DEFAULT_MAX_TRANSFER_BYTES) };
-        let request = Request::post("/files?path=a.bin")
+        let request = Request::post("/files?reviewed=v1&stage=selected")
             .header(CONTENT_TYPE, "application/octet-stream")
             .body(Body::from(vec![0_u8; 32]))
             .expect("request");
