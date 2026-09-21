@@ -242,7 +242,7 @@ pub fn generate() -> String {
     .unwrap();
     writeln!(
         out,
-        "- **`/thinking`**: extended thinking. Optional arg: `off`, `adaptive`, an effort level (`minimal` … `max`), or a token budget number. The level is remembered across restarts. Config: `always_thinking` overrides the remembered level. The status bar names the level it resolved to, shortened to its first two letters on a narrow terminal (`[xh]` for `xhigh`); a token budget keeps every digit."
+        "- **`/thinking`**: extended thinking. Optional arg: `off`, `adaptive`, an effort level (`minimal` … `max`), or a token budget number. The level is remembered across restarts. Config: `always_thinking` overrides the remembered level. The status bar names the level it resolved to, shortened to its first two letters on a narrow terminal (`[xh]` for `xhigh`). A token budget keeps every digit. A task footer names the level that task runs at, which its own model resolved and a system prompt profile may have overridden. The setting behind the chip belongs to the session, so on a task the chip is a label rather than a control."
     )
     .unwrap();
     writeln!(

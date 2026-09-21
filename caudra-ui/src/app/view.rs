@@ -619,18 +619,24 @@ impl App {
         // turn end and the bar no longer jumps between two ways of measuring.
         let effective_context = main_chat.then(|| self.main_context_snapshot()).flatten();
         // What the request will actually carry, not what was asked for: a
-        // model can refuse to stop reasoning, and the badge has to say so.
-        let thinking = (main_chat && model.supports_thinking()).then(|| {
-            RequestOptions {
-                thinking: self.state.thinking.clone(),
-                fast: self.state.fast,
-            }
-            .clamped(model)
-            .thinking
-            .resolve(model)
-            .to_string()
-            .into()
-        });
+        // model can refuse to stop reasoning, and the badge has to say so. A
+        // task resolved its own level against its own model, which a profile
+        // may have overridden, so its footer draws what it carries rather than
+        // what the session asked for.
+        let thinking = match main_chat {
+            true => model.supports_thinking().then(|| {
+                RequestOptions {
+                    thinking: self.state.thinking.clone(),
+                    fast: self.state.fast,
+                }
+                .clamped(model)
+                .thinking
+                .resolve(model)
+                .to_string()
+                .into()
+            }),
+            false => chat.thinking.clone().map(Cow::Owned),
+        };
         // A toggle swaps the selection to the model its mode was left on, and
         // neither the mode nor the swap reaches the agent until the next message
         // carries them. Until it does, the slot names the model still in force
@@ -681,7 +687,7 @@ impl App {
             main_chat,
             retry_info: chat.retry(),
             thinking,
-            fast: self.state.fast,
+            fast: if main_chat { self.state.fast } else { chat.fast },
             workflows: workflow_chip(self.workflow.runs()),
             yolo: self.permissions.is_yolo(),
             restoring: self.restoring.load(Ordering::Relaxed),

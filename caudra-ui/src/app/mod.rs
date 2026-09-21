@@ -3652,6 +3652,8 @@ impl App {
                             name: name.clone(),
                             prompt: None,
                             model: Some(model.clone()),
+                            thinking: None,
+                            fast: false,
                             answer_tx: None,
                             steer_tx: None,
                         })
@@ -3675,6 +3677,8 @@ impl App {
                         root_tool_use_id: Some(root_tool_use_id.clone()),
                         name: name.clone(),
                         model: Some(model.clone()),
+                        thinking: None,
+                        fast: false,
                         outcome: caudra_storage::sessions::StoredSubagentOutcome::Unknown,
                     });
                 }
@@ -4214,6 +4218,8 @@ impl App {
             let chat = &mut self.chats[idx];
             chat.name.clone_from(&subagent.name);
             chat.model_id.clone_from(&subagent.model);
+            chat.thinking.clone_from(&subagent.thinking);
+            chat.fast = subagent.fast;
             self.chat_index.insert(task_id.clone(), idx);
             self.sync_subagents();
             return idx;
@@ -4226,6 +4232,8 @@ impl App {
                 chat.resume();
                 chat.name.clone_from(&subagent.name);
                 chat.model_id.clone_from(&subagent.model);
+                chat.thinking.clone_from(&subagent.thinking);
+                chat.fast = subagent.fast;
                 if let Some(ref prompt) = subagent.prompt {
                     chat.push_user_message(prompt);
                 }
@@ -4243,6 +4251,8 @@ impl App {
             chat.resume();
             chat.name.clone_from(&subagent.name);
             chat.model_id.clone_from(&subagent.model);
+            chat.thinking.clone_from(&subagent.thinking);
+            chat.fast = subagent.fast;
             if let Some(ref prompt) = subagent.prompt {
                 chat.push_user_message(prompt);
             }
@@ -4257,6 +4267,8 @@ impl App {
             chat.set_parent_tool_use_id(parent_tool_use_id.clone());
             chat.set_restore_channel(self.restore_event_tx.clone());
             chat.model_id = subagent.model.clone();
+            chat.thinking = subagent.thinking.clone();
+            chat.fast = subagent.fast;
             if let Some(ref prompt) = subagent.prompt {
                 chat.push_user_message(prompt);
             }

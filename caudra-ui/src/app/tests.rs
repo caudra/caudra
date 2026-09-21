@@ -196,6 +196,15 @@ const RETRY_COUNTDOWN_PREFIX: &str = "retrying in";
 const COUNTDOWN_DRAWN_FOR_THE_WRONG_CHAT: &str = "the bar draws the backoff of the chat on screen";
 const BAR_CLAIMS_THE_COUNTDOWN: &str = "the bar borrows a countdown to draw, it does not own it";
 const RETRY_CONTROL_MISPLACED: &str = "only the main chat's countdown can be clicked";
+const TASK_THINKING: &str = "xhigh";
+const FAST_CHIP: &str = "[fast]";
+/// Wide enough that no chip has to abbreviate, so a footer assertion reads the
+/// level rather than the ladder.
+const FOOTER_WIDTH: u16 = 120;
+const TASK_LEVEL_MISSING: &str = "a task footer must name the level that task runs at";
+const TASK_FAST_MISSING: &str = "a task footer must report the task's own fast flag";
+const TASK_UNSTORED: &str = "a live task must reach the session record";
+const TASK_UNRESTORED: &str = "a stored task must come back as a chat";
 const MISSING_DIR: &str = "gone";
 const RESUMED_PROMPT: &str = "carry me over";
 const CONVERSATION_PERMISSION_PATTERN: &str = "just *";
@@ -457,6 +466,8 @@ fn subagent_info_with_tx(
         name: name.into(),
         prompt: None,
         model: None,
+        thinking: None,
+        fast: false,
         answer_tx,
         steer_tx: None,
     }
@@ -5236,6 +5247,70 @@ fn releasing_off_the_sandbox_chip_opens_nothing() {
     ));
 
     assert!(!app.sandbox_manager.is_open());
+}
+
+/// A task whose subagent resolved a level and a fast flag of its own, neither
+/// of which the session is running under.
+fn task_app_at_level() -> App {
+    let mut app = streaming_app();
+    let mut info = subagent_info(TASK_ID, RESEARCH_NAME);
+    info.thinking = Some(TASK_THINKING.into());
+    info.fast = true;
+    app.update(subagent_msg_with_info(
+        AgentEvent::TextDelta { text: "x".into() },
+        info,
+    ));
+    app
+}
+
+/// A task resolves its level against its own model, and a profile can override
+/// it, so a task footer names what that task carries rather than what the
+/// session asked for.
+#[test]
+fn a_subagent_footer_names_the_level_its_own_task_runs_at() {
+    let mut app = task_app_at_level();
+    let main = thinking_chip(&mut app);
+    assert!(main.contains(THINKING_OFF), "{main}");
+    assert!(!rendered_wide(&mut app, FOOTER_WIDTH).contains(FAST_CHIP));
+
+    app.focus_task(TASK_ID).unwrap();
+    let footer = rendered_wide(&mut app, FOOTER_WIDTH);
+
+    assert!(
+        footer.contains(&format!("[{TASK_THINKING}]")),
+        "{TASK_LEVEL_MISSING}: {footer}"
+    );
+    assert!(footer.contains(FAST_CHIP), "{TASK_FAST_MISSING}: {footer}");
+}
+
+/// What a task ran at is part of its record, so reopening the session leaves
+/// its footer naming the same level rather than nothing.
+#[test]
+fn a_restored_task_keeps_the_level_it_ran_at() {
+    let mut app = task_app_at_level();
+    close_subagent_transcript(&mut app, TASK_ID);
+    let stored = app
+        .state
+        .session
+        .subagents()
+        .iter()
+        .find(|subagent| subagent.tool_use_id == TASK_ID)
+        .expect(TASK_UNSTORED)
+        .clone();
+    assert_eq!(stored.thinking.as_deref(), Some(TASK_THINKING));
+    assert!(stored.fast);
+
+    let mut restored = test_app();
+    restored.state.session = Arc::clone(&app.state.session);
+    restored.restore_display();
+
+    let chat = restored
+        .chats
+        .iter()
+        .find(|chat| chat.task_id().is_some_and(|id| id.as_ref() == TASK_ID))
+        .expect(TASK_UNRESTORED);
+    assert_eq!(chat.thinking.as_deref(), Some(TASK_THINKING));
+    assert!(chat.fast);
 }
 
 /// The footer draws no price until a turn has been billed, and no price means
@@ -10216,6 +10291,8 @@ fn fork_copies_only_reachable_tool_and_subagent_state_without_mutating_source() 
             root_tool_use_id: Some("task-live".into()),
             name: "live".into(),
             model: Some("test-model".into()),
+            thinking: None,
+            fast: false,
             outcome: StoredSubagentOutcome::Done,
         },
         StoredSubagent {
@@ -10224,6 +10301,8 @@ fn fork_copies_only_reachable_tool_and_subagent_state_without_mutating_source() 
             root_tool_use_id: Some("task-late".into()),
             name: "late".into(),
             model: None,
+            thinking: None,
+            fast: false,
             outcome: StoredSubagentOutcome::Unknown,
         },
     ]);

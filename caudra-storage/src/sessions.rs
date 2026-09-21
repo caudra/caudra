@@ -697,6 +697,12 @@ pub struct StoredSubagent {
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// The reasoning level this task's own requests carried, as the subagent
+    /// resolved it against its own model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub fast: bool,
     pub outcome: StoredSubagentOutcome,
 }
 
@@ -1718,6 +1724,8 @@ mod tests {
                 root_tool_use_id: None,
                 name: "sub".into(),
                 model: None,
+                thinking: None,
+                fast: false,
                 outcome: StoredSubagentOutcome::Unknown,
             }
         }
@@ -1920,6 +1928,8 @@ mod tests {
             root_tool_use_id: None,
             name: "child".into(),
             model: None,
+            thinking: None,
+            fast: false,
             outcome: StoredSubagentOutcome::Done,
         }]);
         session.add_model_usage("m", usage(7, None));

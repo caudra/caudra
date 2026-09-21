@@ -509,6 +509,12 @@ impl Subagent {
                 name: self.name.clone(),
                 prompt: message.clone(),
                 model: Some(self.params.model.spec()),
+                thinking: self
+                    .params
+                    .model
+                    .supports_thinking()
+                    .then(|| self.thinking.resolve(&self.params.model).to_string()),
+                fast: self.fast,
                 answer_tx: self.answer_tx.take(),
                 steer_tx: self.steer_tx.take(),
             });
@@ -1573,6 +1579,8 @@ mod tests {
             name: "research".into(),
             prompt: None,
             model: None,
+            thinking: None,
+            fast: false,
             answer_tx: None,
             steer_tx: None,
         })

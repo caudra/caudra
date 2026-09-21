@@ -503,6 +503,8 @@ impl App {
                     root_tool_use_id: roots.get(task_id.as_ref()).cloned().flatten(),
                     name: chat.name.clone(),
                     model: chat.model_id.clone(),
+                    thinking: chat.thinking.clone(),
+                    fast: chat.fast,
                     outcome: stored_subagent_outcome(chat.task_outcome()),
                 })
             })
@@ -798,6 +800,8 @@ impl App {
             }
             chat.set_restore_channel(self.restore_event_tx.clone());
             chat.model_id = sa.model;
+            chat.thinking = sa.thinking;
+            chat.fast = sa.fast;
             chat.load_messages(display);
             let (outcome, text) = restored_subagent_outcome(sa.outcome);
             chat.mark_finished(outcome, text);

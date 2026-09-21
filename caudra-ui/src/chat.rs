@@ -85,6 +85,12 @@ pub struct Chat {
     pub context_size: u32,
     pub context_window: u32,
     pub model_id: Option<String>,
+    /// What a task's own requests carry: the reasoning level its subagent
+    /// resolved against its own model, and whether it runs fast. The footer
+    /// draws both for whichever chat is on screen, so neither can be read off
+    /// the session.
+    pub thinking: Option<String>,
+    pub fast: bool,
     pending_turn_usage: Option<String>,
     messages_panel: MessagesPanel,
     /// The ending and the index of the bubble announcing it, so a later, better
@@ -122,6 +128,8 @@ impl Chat {
             context_size: 0,
             context_window: 0,
             model_id: None,
+            thinking: None,
+            fast: false,
             pending_turn_usage: None,
             show_reminders: ui_config.show_reminders,
             stall_row: None,

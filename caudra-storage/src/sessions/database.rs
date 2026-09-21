@@ -77,7 +77,7 @@ use crate::{
 pub const SESSIONS_DB_FILE: &str = "caudra.sqlite";
 pub const SESSIONS_DB_LOCK_FILE: &str = "caudra.sqlite.lock";
 
-const SCHEMA_VERSION: i64 = 10;
+const SCHEMA_VERSION: i64 = 11;
 const APPLICATION_ID: i64 = i32::from_be_bytes(*b"CAUD") as i64;
 /// Pages copied per step of the pre-migration backup. The whole file is copied
 /// under the initialization lock, so this only bounds how long the backup holds
@@ -556,7 +556,43 @@ const MIGRATIONS: &[Migration] = &[
         to: 10,
         sql: PAYLOAD_COMPRESSION_SCHEMA,
     },
+    Migration {
+        from: 10,
+        to: 11,
+        sql: SUBAGENT_REQUEST_COLUMNS,
+    },
 ];
+
+/// What a task's own requests carried, so a restored task footer names the
+/// level it ran at rather than the session's. The table is rebuilt rather than
+/// altered because `ALTER TABLE ADD COLUMN` appends past the table constraints,
+/// and a migrated schema has to read back byte for byte as a fresh one.
+const SUBAGENT_REQUEST_COLUMNS: &str = r#"
+ALTER TABLE subagents RENAME TO subagents_v10;
+
+CREATE TABLE subagents (
+    session_id         BLOB NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    ordinal            INTEGER NOT NULL,
+    tool_use_id        TEXT NOT NULL,
+    parent_tool_use_id TEXT,
+    root_tool_use_id   TEXT,
+    name               TEXT NOT NULL,
+    model              TEXT,
+    outcome            TEXT CHECK(outcome IS NULL OR outcome IN ('unknown', 'done', 'killed', 'error')),
+    thinking           TEXT,
+    fast               INTEGER NOT NULL DEFAULT 0 CHECK(fast IN (0, 1)),
+    PRIMARY KEY(session_id, ordinal),
+    UNIQUE(session_id, tool_use_id)
+) STRICT, WITHOUT ROWID;
+
+INSERT INTO subagents (
+    session_id, ordinal, tool_use_id, parent_tool_use_id, root_tool_use_id, name, model, outcome
+)
+SELECT session_id, ordinal, tool_use_id, parent_tool_use_id, root_tool_use_id, name, model, outcome
+FROM subagents_v10;
+
+DROP TABLE subagents_v10;
+"#;
 
 const PERMISSION_REVISION_SCHEMA: &str = r#"
 ALTER TABLE sessions ADD COLUMN permission_generation INTEGER NOT NULL DEFAULT 0 CHECK(permission_generation >= 0);
@@ -718,6 +754,8 @@ CREATE TABLE subagents (
     name               TEXT NOT NULL,
     model              TEXT,
     outcome            TEXT CHECK(outcome IS NULL OR outcome IN ('unknown', 'done', 'killed', 'error')),
+    thinking           TEXT,
+    fast               INTEGER NOT NULL DEFAULT 0 CHECK(fast IN (0, 1)),
     PRIMARY KEY(session_id, ordinal),
     UNIQUE(session_id, tool_use_id)
 ) STRICT, WITHOUT ROWID;
@@ -4632,6 +4670,9 @@ fn validate_scalars<M, U, T>(session: &Session<M, U, T>) -> Result<(), SessionEr
         if let Some(model) = &subagent.model {
             validate_identifier("subagent model", model)?;
         }
+        if let Some(thinking) = &subagent.thinking {
+            validate_identifier("subagent thinking", thinking)?;
+        }
     }
     if let Some(profile) = &session.meta.system_prompt_profile {
         validate_identifier("system prompt profile", profile)?;
@@ -5214,8 +5255,8 @@ fn replace_auxiliary<M, U, T>(
         transaction.execute(
             "INSERT INTO subagents (\
                  session_id, ordinal, tool_use_id, parent_tool_use_id, root_tool_use_id, name, model,\
-                 outcome\
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                 outcome, thinking, fast\
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 session.id.as_bytes().as_slice(),
                 to_i64(ordinal, "subagent ordinal")?,
@@ -5225,6 +5266,8 @@ fn replace_auxiliary<M, U, T>(
                 subagent.name,
                 subagent.model,
                 subagent.outcome.storage_name(),
+                subagent.thinking,
+                subagent.fast,
             ],
         )?;
     }
@@ -5341,7 +5384,8 @@ fn query_subagents(
     id: CaudraId,
 ) -> Result<Vec<StoredSubagent>, SessionError> {
     let mut statement = connection.prepare(
-        "SELECT tool_use_id, parent_tool_use_id, root_tool_use_id, name, model, outcome \
+        "SELECT tool_use_id, parent_tool_use_id, root_tool_use_id, name, model, outcome,\
+                thinking, fast \
          FROM subagents WHERE session_id = ?1 ORDER BY ordinal",
     )?;
     let mut rows = statement.query(params![id.as_bytes().as_slice()])?;
@@ -5363,6 +5407,8 @@ fn query_subagents(
             root_tool_use_id: row.get(2)?,
             name: row.get(3)?,
             model: row.get(4)?,
+            thinking: row.get(6)?,
+            fast: row.get(7)?,
             outcome,
         });
     }
@@ -5639,6 +5685,7 @@ mod tests {
     const REMOTE_CWD: &str = ".";
     const MISSING_LEGACY_CWD: &str = "/definitely/missing/legacy/project";
     const MODEL: &str = "test/model";
+    const SUBAGENT_THINKING: &str = "xhigh";
     const NEXT_GENERATION: &str = "next-generation";
     const ARTIFACT_NAME: &str = "artifact";
     const LARGE_OUTPUT_ID: &str = "large";
@@ -5668,6 +5715,9 @@ mod tests {
     const BYTE_COUNT_IS_UNCOMPRESSED: &str =
         "byte_count must stay the uncompressed length that trim and the history bounds read";
     const COMPRESSION_PREVIOUS_SCHEMA: i64 = 9;
+    const REQUEST_COLUMNS_PREVIOUS_SCHEMA: i64 = 10;
+    const MIGRATION_KEEPS_SUBAGENTS: &str =
+        "rebuilding the subagents table must carry every row across unchanged";
     const BACKUP_KEEPS_ORIGIN: &str =
         "the pre-migration backup must stay readable by the version that wrote it";
     const PARTIAL_MIGRATION: &str = "a failed step must leave a version some binary can open";
@@ -6296,6 +6346,8 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
             root_tool_use_id: Some(id.into()),
             name: format!("task {id}"),
             model: Some(MODEL.into()),
+            thinking: Some(SUBAGENT_THINKING.into()),
+            fast: true,
             outcome,
         }
     }
@@ -9021,6 +9073,127 @@ CREATE TABLE subagent_history_items (
             .unwrap();
         drop(connection);
         (session.id, payload)
+    }
+
+    /// The `subagents` table as schema 10 left it, without the two columns
+    /// naming what a task's own requests carried.
+    const SUBAGENTS_BEFORE_REQUEST_COLUMNS: &str = r#"
+DROP TABLE subagents;
+
+CREATE TABLE subagents (
+    session_id         BLOB NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    ordinal            INTEGER NOT NULL,
+    tool_use_id        TEXT NOT NULL,
+    parent_tool_use_id TEXT,
+    root_tool_use_id   TEXT,
+    name               TEXT NOT NULL,
+    model              TEXT,
+    outcome            TEXT CHECK(outcome IS NULL OR outcome IN ('unknown', 'done', 'killed', 'error')),
+    PRIMARY KEY(session_id, ordinal),
+    UNIQUE(session_id, tool_use_id)
+) STRICT, WITHOUT ROWID;
+"#;
+
+    /// A database as the release before the request columns left it: schema 10,
+    /// carrying one session with a task that recorded no level of its own.
+    fn seed_v10_database(state_dir: &StateDir) -> CaudraId {
+        let path = state_dir.path().join(SESSIONS_DB_FILE);
+        create_owner_only(&path).unwrap();
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .pragma_update(None, "auto_vacuum", "INCREMENTAL")
+            .unwrap();
+        connection.execute_batch("VACUUM").unwrap();
+        connection.execute_batch(&full_schema()).unwrap();
+        connection
+            .execute_batch(SUBAGENTS_BEFORE_REQUEST_COLUMNS)
+            .unwrap();
+
+        let session = TestSession::new(MODEL, CWD);
+        let serialized = SerializedSession::new(&session).unwrap();
+        let transaction = connection.unchecked_transaction().unwrap();
+        insert_root(&transaction, &session, &serialized).unwrap();
+        transaction.commit().unwrap();
+        connection
+            .execute(
+                "INSERT INTO subagents (\
+                     session_id, ordinal, tool_use_id, parent_tool_use_id, root_tool_use_id, name,\
+                     model, outcome\
+                 ) VALUES (?1, 0, ?2, ?2, ?2, ?3, ?4, 'done')",
+                params![
+                    session.id.as_bytes().as_slice(),
+                    SMALL_OUTPUT_ID,
+                    ARTIFACT_NAME,
+                    MODEL
+                ],
+            )
+            .unwrap();
+        connection
+            .pragma_update(None, "application_id", APPLICATION_ID)
+            .unwrap();
+        connection
+            .pragma_update(None, "user_version", REQUEST_COLUMNS_PREVIOUS_SCHEMA)
+            .unwrap();
+        drop(connection);
+        session.id
+    }
+
+    /// The columns are added by rebuilding the table, so what matters is that
+    /// the rows it already held come across and read as a task that recorded
+    /// nothing about its requests.
+    #[test]
+    fn migrating_a_v10_database_keeps_its_subagents() {
+        let (_migrated_temp, migrated_dir) = state_dir();
+        let (_fresh_temp, fresh_dir) = state_dir();
+        let id = seed_v10_database(&migrated_dir);
+
+        let migrated = SessionDatabase::open(&migrated_dir).unwrap();
+        let fresh = SessionDatabase::open(&fresh_dir).unwrap();
+
+        assert_eq!(migrated.stats().unwrap().schema_version, SCHEMA_VERSION);
+        assert_eq!(
+            schema_objects(&migrated),
+            schema_objects(&fresh),
+            "{MIGRATED_MATCHES_FRESH}"
+        );
+        let loaded = migrated.load::<TestMessage, Value, Value>(id).unwrap();
+        assert_eq!(
+            loaded.subagents(),
+            [StoredSubagent {
+                tool_use_id: SMALL_OUTPUT_ID.into(),
+                parent_tool_use_id: Some(SMALL_OUTPUT_ID.into()),
+                root_tool_use_id: Some(SMALL_OUTPUT_ID.into()),
+                name: ARTIFACT_NAME.into(),
+                model: Some(MODEL.into()),
+                thinking: None,
+                fast: false,
+                outcome: StoredSubagentOutcome::Done,
+            }],
+            "{MIGRATION_KEEPS_SUBAGENTS}"
+        );
+    }
+
+    /// A task that recorded a level sits beside one that recorded none, so the
+    /// nullable column and the flag's default are both read back.
+    #[test]
+    fn subagent_request_settings_round_trip() {
+        let (_temp, state_dir) = state_dir();
+        let mut database = SessionDatabase::open(&state_dir).unwrap();
+        let mut session = TestSession::new(MODEL, CWD);
+        let bare = StoredSubagent {
+            thinking: None,
+            fast: false,
+            ..stored_subagent("bare", StoredSubagentOutcome::Done)
+        };
+        let subagents = vec![stored_subagent("levelled", StoredSubagentOutcome::Done), bare];
+        session.set_subagents(subagents.clone());
+
+        database.save(&session, None).unwrap();
+
+        let loaded = database
+            .load::<TestMessage, Value, Value>(session.id)
+            .unwrap();
+        assert_eq!(loaded.subagents(), subagents);
     }
 
     fn stored_payload(database: &SessionDatabase, sql: &str) -> Vec<u8> {

@@ -573,6 +573,8 @@ impl SessionStore {
                         root_tool_use_id: Some(root_tool_use_id.clone()),
                         name: name.clone(),
                         model: Some(model.clone()),
+                        thinking: None,
+                        fast: false,
                         outcome: StoredSubagentOutcome::Unknown,
                     });
                 }
@@ -3454,6 +3456,8 @@ mod tests {
                 root_tool_use_id: Some("generic-root".into()),
                 name: "root".into(),
                 model: None,
+                thinking: None,
+                fast: false,
                 outcome: StoredSubagentOutcome::Unknown,
             },
             StoredSubagent {
@@ -3462,6 +3466,8 @@ mod tests {
                 root_tool_use_id: Some("generic-root".into()),
                 name: "nested".into(),
                 model: None,
+                thinking: None,
+                fast: false,
                 outcome: StoredSubagentOutcome::Unknown,
             },
         ]);

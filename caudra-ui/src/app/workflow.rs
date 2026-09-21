@@ -1056,6 +1056,8 @@ mod tests {
                 name: AGENT_LABEL.into(),
                 prompt: None,
                 model: None,
+                thinking: None,
+                fast: false,
                 answer_tx: None,
                 steer_tx: None,
             }),

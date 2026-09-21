@@ -2195,6 +2195,12 @@ pub struct SubagentInfo {
     pub prompt: Option<String>,
     #[serde(rename = "parent_model", skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// The level this task's own requests carry, already snapped against its
+    /// own model. `None` when that model cannot reason at all.
+    #[serde(rename = "parent_thinking", skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<String>,
+    #[serde(rename = "parent_fast", skip_serializing_if = "std::ops::Not::not")]
+    pub fast: bool,
     #[serde(skip)]
     pub answer_tx: Option<flume::Sender<String>>,
     #[serde(skip)]

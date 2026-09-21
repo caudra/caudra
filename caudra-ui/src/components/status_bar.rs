@@ -158,9 +158,9 @@ impl StatusBarHitTarget {
     /// it opens so the bar cannot refuse a click the palette would accept.
     ///
     /// [`Self::Thinking`] is main-only although `/thinking` is [`ChatScope::Any`]:
-    /// the command edits a session setting, while the chip renders and cycles
-    /// the effective level of the session model, which is not the model a task
-    /// runs.
+    /// the chip names the level whichever chat is on screen runs at, and a task
+    /// runs at the one its own model resolved. Clicking would edit the session
+    /// setting instead, so on a task the chip is a label.
     ///
     /// [`Self::Retry`] is main-only although every chat draws its own countdown:
     /// asking for an immediate retry reaches the top-level agent alone, so on a
@@ -1676,6 +1676,8 @@ mod tests {
     const UNCLICKABLE_LABEL_MSG: &str = "the bar drew the resume label without a hit to click it";
     const MISSING_YOLO_HIT_MSG: &str = "a bypassed session must be switchable back from the footer";
     const UNCLICKABLE_YOLO_MSG: &str = "the bar drew the yolo chip without a hit to click it";
+    const TASK_LEVEL_MISSING: &str = "a task footer must name the level that task runs at";
+    const TASK_LEVEL_CLICKABLE: &str = "a task footer's level is a label, not a control";
     const SANDBOX_INSTANCE: &str = "sandbox-7a2f";
     const SANDBOX_CHIP: &str = "[sandbox: sandbox-7a2f]";
     const MISSING_SANDBOX_HIT_MSG: &str =
@@ -2770,6 +2772,27 @@ mod tests {
             styles[start..end]
                 .iter()
                 .all(|style| style.add_modifier.contains(Modifier::REVERSED))
+        );
+    }
+
+    /// A task runs at a level of its own, so its footer names one. The setting
+    /// behind the chip is still the session's, so the label answers nothing.
+    #[test]
+    fn a_subagent_footer_names_its_level_without_offering_a_control() {
+        let (text, hits, _) = render_at(Fixture {
+            main_chat: false,
+            ..Default::default()
+        });
+
+        assert!(
+            text.contains(&format!("[{THINKING_LEVEL}]")),
+            "{TASK_LEVEL_MISSING}: {text}"
+        );
+        assert_eq!(StatusBarHitTarget::Thinking.scope(), ChatScope::MainOnly);
+        assert!(
+            hits.iter()
+                .all(|hit| hit.target != StatusBarHitTarget::Thinking),
+            "{TASK_LEVEL_CLICKABLE}"
         );
     }
 
