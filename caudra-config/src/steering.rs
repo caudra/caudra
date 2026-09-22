@@ -134,11 +134,6 @@ rule!(ToolPlanningConfig, ToolPlanningPolicy, {
     after_responses: usize = 3, 1..=MAX_COUNT;
     cooldown: u32 = 3, 1..=MAX_COUNT;
 });
-rule!(NoToolUseConfig, NoToolUsePolicy, {
-    after_responses: usize = 3, 1..=MAX_COUNT;
-    window: usize = 8, 1..=MAX_WINDOW;
-    cooldown: u32 = 3, 1..=MAX_COUNT;
-});
 
 macro_rules! rules {
     ($($field:ident: $config:ident => $policy:ident),+ $(,)?) => {
@@ -181,12 +176,6 @@ macro_rules! rules {
                     MAX_WINDOW,
                 )?;
                 validate_range(
-                    &format!("{path}.no_tool_use.window"),
-                    self.no_tool_use.window,
-                    self.no_tool_use.after_responses,
-                    MAX_WINDOW,
-                )?;
-                validate_range(
                     &format!("{path}.tool_planning.after_calls"),
                     self.tool_planning.after_calls,
                     self.tool_planning.after_responses,
@@ -206,7 +195,6 @@ rules! {
     abandoned_turn: AbandonedTurnConfig => AbandonedTurnPolicy,
     repetition: RepetitionConfig => RepetitionPolicy,
     tool_planning: ToolPlanningConfig => ToolPlanningPolicy,
-    no_tool_use: NoToolUseConfig => NoToolUsePolicy,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -392,10 +380,10 @@ mod tests {
     const OTHER_MODEL: &str = "provider/other";
     const PROMPT: &str = "  Reassess the next useful action. {{literal}}  ";
     const GLOBAL_PROMPT: &str = "Global guidance";
-    const INVALID_FIELD: &str = "rules.no_tool_use.window";
+    const INVALID_FIELD: &str = "rules.repetition.text_window";
     const INVALID_MESSAGE: &str = "must be between 3 and 4096, got 2";
     const UNKNOWN_FIELD: &str = "unknown field";
-    const RULES: [&str; 9] = [
+    const RULES: [&str; 8] = [
         "truncation",
         "empty_response",
         "repeated_tool_call",
@@ -404,7 +392,6 @@ mod tests {
         "abandoned_turn",
         "repetition",
         "tool_planning",
-        "no_tool_use",
     ];
 
     fn config(value: Value) -> SteeringConfig {
@@ -437,10 +424,6 @@ mod tests {
                     "tool_planning": {
                         "enabled": true, "prompt": null, "after_calls": 6,
                         "after_responses": 3, "cooldown": 3
-                    },
-                    "no_tool_use": {
-                        "enabled": true, "prompt": null, "after_responses": 3,
-                        "window": 8, "cooldown": 3
                     }
                 }
             })
@@ -457,7 +440,7 @@ mod tests {
             "max_advisories": 0,
             "rules": {
                 "repetition": {"enabled": global},
-                "no_tool_use": {"enabled": false, "after_responses": 4},
+                "tool_planning": {"enabled": false, "after_responses": 4},
                 "empty_response": {"max_idle": 5, "prompt": GLOBAL_PROMPT}
             },
             "models": {(MODEL): {
@@ -465,7 +448,7 @@ mod tests {
                 "max_recoveries": 0,
                 "rules": {
                     "repetition": {"enabled": model},
-                    "no_tool_use": {"after_responses": 6},
+                    "tool_planning": {"after_responses": 6},
                     "empty_response": {"prompt": PROMPT}
                 }
             }}
@@ -476,15 +459,15 @@ mod tests {
         assert_eq!(policy.max_recoveries, 0);
         assert_eq!(policy.max_advisories, 0);
         assert_eq!(policy.rules.repetition.enabled, model);
-        assert!(!policy.rules.no_tool_use.enabled);
-        assert_eq!(policy.rules.no_tool_use.after_responses, 6);
+        assert!(!policy.rules.tool_planning.enabled);
+        assert_eq!(policy.rules.tool_planning.after_responses, 6);
         assert_eq!(policy.rules.empty_response.max_idle, 5);
         assert_eq!(policy.rules.empty_response.prompt.as_deref(), Some(PROMPT));
         let unmatched = config.resolve(OTHER_MODEL);
         assert_eq!(unmatched.rules.repetition.enabled, global);
         assert!(!unmatched.enabled);
         assert_eq!(unmatched.max_recoveries, 7);
-        assert_eq!(unmatched.rules.no_tool_use.after_responses, 4);
+        assert_eq!(unmatched.rules.tool_planning.after_responses, 4);
         assert_eq!(
             unmatched.rules.empty_response.prompt.as_deref(),
             Some(GLOBAL_PROMPT)
@@ -497,9 +480,9 @@ mod tests {
     #[test_case("other/model", true; "not_suffix")]
     fn model_matching_is_exact(model: &str, enabled: bool) {
         let config = config(json!({"models": {(MODEL): {"rules": {
-            "no_tool_use": {"enabled": false}
+            "tool_planning": {"enabled": false}
         }}}}));
-        assert_eq!(config.resolve(model).rules.no_tool_use.enabled, enabled);
+        assert_eq!(config.resolve(model).rules.tool_planning.enabled, enabled);
     }
 
     #[test_case(true; "omitted")]
@@ -507,7 +490,7 @@ mod tests {
     fn raw_merge_preserves_inheritance_and_explicit_values(omitted: bool) {
         let mut base: RawConfig = serde_json::from_value(json!({"agent": {"steering": {
             "rules": {
-                "no_tool_use": {"after_responses": 4, "prompt": GLOBAL_PROMPT},
+                "tool_planning": {"after_responses": 4, "prompt": GLOBAL_PROMPT},
                 "truncation": {"max_attempts": 5, "prompt": GLOBAL_PROMPT}
             },
             "models": {
@@ -525,7 +508,7 @@ mod tests {
             json!({"agent": {"steering": {
                 "enabled": false, "max_recoveries": 0, "max_advisories": 0,
                 "rules": {
-                    "no_tool_use": {"enabled": false},
+                    "tool_planning": {"enabled": false},
                     "truncation": {"enabled": false}
                 },
                 "models": {(MODEL): {
@@ -561,10 +544,10 @@ mod tests {
         );
         assert_eq!(policy.enabled, omitted);
         assert_eq!(policy.rules.empty_response.enabled, omitted);
-        assert_eq!(policy.rules.no_tool_use.enabled, omitted);
-        assert_eq!(policy.rules.no_tool_use.after_responses, 4);
+        assert_eq!(policy.rules.tool_planning.enabled, omitted);
+        assert_eq!(policy.rules.tool_planning.after_responses, 4);
         assert_eq!(
-            policy.rules.no_tool_use.prompt.as_deref(),
+            policy.rules.tool_planning.prompt.as_deref(),
             Some(GLOBAL_PROMPT)
         );
         assert_eq!(policy.rules.empty_response.prompt.as_deref(), Some(PROMPT));
@@ -602,7 +585,7 @@ mod tests {
     #[test_case(r#"{"rules":{"empty_response":{"threshold":3}}}"#; "wrong_rule_parameter")]
     #[test_case(r#"{"models":{"provider/model":{"unknown":true}}}"#; "model")]
     #[test_case(r#"{"models":{"provider/model":{"models":{}}}}"#; "recursive_models")]
-    #[test_case(r#"{"models":{"provider/model":{"rules":{"no_tool_use":{"unknown":3}}}}}"#; "model_rule")]
+    #[test_case(r#"{"models":{"provider/model":{"rules":{"tool_planning":{"unknown":3}}}}}"#; "model_rule")]
     #[test_case(r#"{"max_recoveries":-1}"#; "negative_budget")]
     #[test_case(r#"{"rules":{"repetition":{"window":1.5}}}"#; "fractional_count")]
     #[test_case(r#"{"rules":{"truncation":{"max_attempts":-1}}}"#; "negative_attempts")]
@@ -670,10 +653,8 @@ mod tests {
     #[test_case("repetition", "text_repeats", 1; "single_text_repeat")]
     #[test_case("repetition", "cooldown", 0; "repetition_cooldown_zero")]
     #[test_case("tool_planning", "cooldown", 0; "planning_cooldown_zero")]
-    #[test_case("no_tool_use", "cooldown", 0; "no_tool_cooldown_zero")]
     #[test_case("tool_planning", "after_calls", MAX_COUNT + 1; "oversized_count")]
     #[test_case("tool_planning", "after_responses", 0; "planning_zero_responses")]
-    #[test_case("no_tool_use", "after_responses", 0; "no_tool_zero_responses")]
     fn rejects_invalid_rule_ranges(rule: &str, field: &str, value: usize) {
         for model_override in [false, true] {
             let invalid = json!({"enabled": false, "rules": {(rule): {(field): value}}});
@@ -697,8 +678,6 @@ mod tests {
     #[test_case("repetition", "window", 12, true; "cycle_fits")]
     #[test_case("repetition", "text_window", 2, false; "text_does_not_fit")]
     #[test_case("repetition", "text_window", 3, true; "text_fits")]
-    #[test_case("no_tool_use", "window", 2, false; "no_tool_does_not_fit")]
-    #[test_case("no_tool_use", "window", 3, true; "no_tool_fits")]
     #[test_case("tool_planning", "after_calls", 2, false; "responses_exceed_calls")]
     #[test_case("tool_planning", "after_calls", 3, true; "responses_equal_calls")]
     fn validates_combination_boundaries(rule: &str, field: &str, value: usize, valid: bool) {
@@ -719,7 +698,7 @@ mod tests {
                     json!({(field): value})
                 };
                 let mut raw: RawConfig = serde_json::from_value(json!({"agent": {"steering": {
-                    "models": {(MODEL): {"rules": {"no_tool_use": {"enabled": false}}}}
+                    "models": {(MODEL): {"rules": {"tool_planning": {"enabled": false}}}}
                 }}}))
                 .unwrap();
                 raw.merge(
@@ -785,10 +764,10 @@ mod tests {
     fn raw_conversion_validates_merged_windows(window: usize, valid: bool) {
         for model_override in [false, true] {
             let mut raw: RawConfig = serde_json::from_value(json!({"agent": {"steering": {
-                "rules": {"no_tool_use": {"after_responses": 3}}
+                "rules": {"repetition": {"text_repeats": 3}}
             }}}))
             .unwrap();
-            let overlay = json!({"rules": {"no_tool_use": {"window": window}}});
+            let overlay = json!({"rules": {"repetition": {"text_window": window}}});
             let steering = if model_override {
                 json!({"models": {(MODEL): overlay}})
             } else {
@@ -798,8 +777,8 @@ mod tests {
             let result = raw.into_config(false);
             if valid {
                 let policy = result.unwrap().agent.steering.resolve(MODEL);
-                assert_eq!(policy.rules.no_tool_use.window, window);
-                assert_eq!(policy.rules.no_tool_use.after_responses, 3);
+                assert_eq!(policy.rules.repetition.text_window, window);
+                assert_eq!(policy.rules.repetition.text_repeats, 3);
             } else {
                 let expected = if model_override {
                     format!("models[{MODEL:?}].{INVALID_FIELD}")
@@ -913,11 +892,11 @@ mod tests {
     #[test_case(true; "resolved_model")]
     fn config_validation_checks_inherited_combinations(model_override: bool) {
         let steering = if model_override {
-            json!({"rules": {"no_tool_use": {"after_responses": 3}}, "models": {
-                (MODEL): {"rules": {"no_tool_use": {"window": 2}}}
+            json!({"rules": {"repetition": {"text_repeats": 3}}, "models": {
+                (MODEL): {"rules": {"repetition": {"text_window": 2}}}
             }})
         } else {
-            json!({"rules": {"no_tool_use": {"window": 2}}})
+            json!({"rules": {"repetition": {"text_window": 2}}})
         };
         let mut config = RawConfig::default().into_config(false).unwrap();
         config.agent.steering = self::config(steering).into();

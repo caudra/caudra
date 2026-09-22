@@ -8,6 +8,7 @@ use caudra_providers::{
 use regex::Regex;
 use tracing::info;
 
+use super::history::is_user_turn;
 use super::tool_dispatch::{ToolObservation, ToolOutcome};
 use crate::AgentError;
 
@@ -25,7 +26,6 @@ const ABANDONED_FACT: &str =
 const ABANDONED_PROMPT: &str = "Carry out what you said you would do now, using tool calls. Do not restate the plan. When the work is done, end with the report the task asked for.";
 const REPETITION_PROMPT: &str = "Recent responses repeat the same text or tool-call pattern. Reconsider the next useful action and change approach if this repetition is not helping. Legitimate verification or polling may continue.";
 const PLANNING_PROMPT: &str = "Recent responses repeatedly use the same tool with repeated calls or errors. Reassess your tool choices and choose a useful next action; change approach if these calls are not helping.";
-const NO_TOOL_PROMPT: &str = "Recent assistant responses have not attempted tools. Use available tools when useful and consistent with the user's instructions; otherwise answer directly.";
 const HISTORY_SCAN_LIMIT: usize = 16_384;
 const TEXT_BYTES_LIMIT: usize = 8_192;
 const MIN_REPEATED_TEXT_CHARS: usize = 32;
@@ -41,7 +41,6 @@ const TRUNCATION_RULE: &str = "truncation";
 const TOOL_REPAIR_RULE: &str = "tool_repair";
 const REPETITION_RULE: &str = "repetition";
 const PLANNING_RULE: &str = "tool_planning";
-const NO_TOOL_RULE: &str = "no_tool_use";
 pub(super) const NO_PROGRESS_RULE: &str = "no_progress";
 
 /// Code spans and quoted prose carry other people's sentences. Matching inside
@@ -431,22 +430,23 @@ impl Steering {
         if !self.policy.enabled
             || self.advisories >= self.policy.max_advisories
             || !has_tools
-            || !(rules.repetition.enabled
-                || rules.tool_planning.enabled
-                || rules.no_tool_use.enabled)
+            || !(rules.repetition.enabled || rules.tool_planning.enabled)
         {
             return None;
         }
         // Provenance, rather than prompt text, restores advisory cadence on the
-        // active branch. Synthetic input also cuts off the retained tail behind
-        // a compaction continuation, including when a fresh Agent reads it.
+        // active branch. A user turn ends the evidence as firmly as a compaction
+        // does: a new prompt is new information, and answering it in text is the
+        // expected response, not a stall worth steering. Synthetic input also
+        // cuts off the retained tail behind a compaction continuation, including
+        // when a fresh Agent reads it.
         let history: Vec<_> = history
             .iter()
             .rev()
             .take(HISTORY_SCAN_LIMIT)
             .take_while(|message| {
                 !message.is_compaction_summary
-                    && !synthetic_boundary(message)
+                    && !request_boundary(message)
                     && message.reasoning_source.as_ref().is_none_or(|source| {
                         source.provider == model.provider.as_ref() && source.model == model.id
                     })
@@ -485,24 +485,6 @@ impl Steering {
                     .prompt
                     .as_deref()
                     .unwrap_or(PLANNING_PROMPT),
-            ))
-        } else if rules.no_tool_use.enabled
-            && history
-                .iter()
-                .filter(|message| eligible_response(message))
-                .take(rules.no_tool_use.window)
-                .take_while(|message| !message.has_tool_calls())
-                .count()
-                >= rules.no_tool_use.after_responses
-            && cooldown_ready(&history, NO_TOOL_RULE, rules.no_tool_use.cooldown)
-        {
-            Some((
-                NO_TOOL_RULE,
-                rules
-                    .no_tool_use
-                    .prompt
-                    .as_deref()
-                    .unwrap_or(NO_TOOL_PROMPT),
             ))
         } else {
             None
@@ -591,14 +573,20 @@ fn eligible_response(message: &Message) -> bool {
             .any(|block| matches!(block, ContentBlock::ToolResult { .. }))
 }
 
-fn synthetic_boundary(message: &Message) -> bool {
-    matches!(message.role, Role::User)
-        && message.display_text.as_deref() == Some("")
-        && message.steering.is_none()
-        && message
-            .content
-            .iter()
-            .all(|block| matches!(block, ContentBlock::Text { .. }))
+/// Where the request in flight began. A hint is evidence about what the model
+/// did with the request it is answering, so nothing earlier than the prompt
+/// that opened it counts. Tool results ride in a user message of their own,
+/// which [`is_user_turn`] excludes, so a tool-using request is still walked
+/// end to end.
+fn request_boundary(message: &Message) -> bool {
+    is_user_turn(message)
+        || (matches!(message.role, Role::User)
+            && message.display_text.as_deref() == Some("")
+            && message.steering.is_none()
+            && message
+                .content
+                .iter()
+                .all(|block| matches!(block, ContentBlock::Text { .. })))
 }
 
 pub(super) fn visible_text(message: &Message) -> Option<String> {
@@ -720,8 +708,8 @@ mod tests {
     use test_case::test_case;
 
     use super::{
-        ABANDONED_FACT, ABANDONED_RULE, EMPTY_IDLE, EMPTY_RULE, Intervention, NO_TOOL_RULE,
-        Observed, PLANNING_RULE, PROTOCOL_FACT, PROTOCOL_RULE, REPETITION_RULE, REPORT_RULE,
+        ABANDONED_FACT, ABANDONED_RULE, EMPTY_IDLE, EMPTY_RULE, Intervention, Observed,
+        PLANNING_RULE, PROTOCOL_FACT, PROTOCOL_RULE, REPETITION_RULE, REPORT_RULE,
         REPORT_STRUCTURED, REPORT_SUMMARY, Recovery, RecoveryAction, Steering, TEXT_BYTES_LIMIT,
         TRUNCATION_FACT, TRUNCATION_PROMPT, TRUNCATION_RULE, abandons_turn, eligible_response,
         normalized_message,
@@ -731,6 +719,7 @@ mod tests {
 
     const MODEL: &str = "anthropic/claude-sonnet-4-6";
     const TEXT: &str = "This is the same substantial response repeated for testing.";
+    const PROMPT: &str = "A question the user typed.";
     const CUSTOM: &str = "Custom guidance, not a rule identity.";
     const TOOL: &str = "file_read";
     const EXPECTED_CONTINUE: &str = "a charged recovery continues";
@@ -1112,13 +1101,12 @@ mod tests {
     #[test_case(3, true; "exact_boundary")]
     fn advisory_cooldown_restores_from_metadata(responses: usize, expected: bool) {
         let mut state = default_state();
-        state.policy.rules.no_tool_use.prompt = Some(CUSTOM.into());
-        state.policy.rules.repetition.enabled = false;
+        state.policy.rules.repetition.prompt = Some(CUSTOM.into());
         let model = Model::from_spec(MODEL).unwrap();
         let mut history = vec![assistant(TEXT); 3];
         history.push(Message::steering(
             CUSTOM.into(),
-            NO_TOOL_RULE,
+            REPETITION_RULE,
             SteeringKind::Advisory,
         ));
         history.extend((0..responses).map(|_| assistant(TEXT)));
@@ -1127,9 +1115,8 @@ mod tests {
 
     #[test_case(false; "no_inventory")]
     #[test_case(true; "inventory")]
-    fn no_tool_advisory_has_a_separate_allowance(has_tools: bool) {
+    fn advisories_have_a_separate_allowance(has_tools: bool) {
         let mut state = default_state();
-        state.policy.rules.repetition.enabled = false;
         let model = Model::from_spec(MODEL).unwrap();
         let history = vec![assistant(TEXT); 3];
         for _ in 0..4 {
@@ -1167,13 +1154,32 @@ mod tests {
     #[test_case(Message { is_compaction_summary: true, ..assistant(TEXT) }; "summary")]
     #[test_case(Message { content: vec![ContentBlock::thinking(TEXT.into(), None)], ..assistant(TEXT) }; "reasoning_only")]
     #[test_case(assistant(" \n\t "); "whitespace")]
-    fn no_tool_history_excludes_host_and_invisible_messages(message: Message) {
+    fn advisory_history_excludes_host_and_invisible_messages(message: Message) {
         assert!(!eligible_response(&message));
         let mut state = default_state();
         assert!(
             state
                 .advisory(&vec![message; 3], &Model::from_spec(MODEL).unwrap(), true)
                 .is_none()
+        );
+    }
+
+    /// The nudge is about what the model did with the request it is answering.
+    /// Responses to earlier questions are not evidence about this one.
+    #[test_case(false, true; "responses_after_the_prompt")]
+    #[test_case(true, false; "prompt_is_newest")]
+    fn advisory_evidence_stops_at_the_last_user_turn(newest: bool, expected: bool) {
+        let mut state = default_state();
+        let mut history = vec![Message::user(PROMPT.into())];
+        history.extend(vec![assistant(TEXT); 3]);
+        if newest {
+            history.push(Message::user(PROMPT.into()));
+        }
+        assert_eq!(
+            state
+                .advisory(&history, &Model::from_spec(MODEL).unwrap(), true)
+                .is_some(),
+            expected
         );
     }
 

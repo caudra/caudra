@@ -5735,10 +5735,6 @@ mod tests {
                 }])]),
                 &mut history,
             );
-            Arc::make_mut(&mut agent.config.steering)
-                .rules
-                .no_tool_use
-                .after_responses = Some(1);
             agent.tools = serde_json::json!([{"name":"shell"}]);
             assert_eq!(
                 agent.run(default_input()).await.unwrap(),
@@ -5756,9 +5752,10 @@ mod tests {
         });
     }
 
-    #[test_case(false; "no_visible_tools")]
-    #[test_case(true; "visible_tools")]
-    fn no_tool_hint_crosses_user_turns_without_reopening_them(has_tools: bool) {
+    /// Prose answers to earlier questions are not evidence about the question
+    /// being answered now, so an ordinary conversation is never steered.
+    #[test]
+    fn conversational_turns_are_never_advised() {
         smol::block_on(async {
             let mut history = History::new(
                 (0..3)
@@ -5775,22 +5772,18 @@ mod tests {
                     MockProvider::new(vec![text_response(StopReason::EndTurn)]),
                     &mut history,
                 );
-                if has_tools {
-                    agent.tools = serde_json::json!([{"name":"shell"}]);
-                }
+                agent.tools = serde_json::json!([{"name":"shell"}]);
                 assert_eq!(
                     agent.run(default_input()).await.unwrap(),
                     DoneReason::EndTurn
                 );
                 assert_eq!(agent.num_turns, 1);
-                assert_eq!(
-                    agent
+                assert!(
+                    !agent
                         .history
                         .as_slice()
                         .iter()
-                        .filter(|message| message.steering.is_some())
-                        .count(),
-                    usize::from(has_tools),
+                        .any(|message| message.steering.is_some()),
                     "{run}"
                 );
             }
@@ -6127,7 +6120,6 @@ mod tests {
             let config = Arc::make_mut(&mut agent.config.steering);
             config.max_recoveries = Some(budget);
             config.rules.truncation.prompt = Some(STEERING_CUSTOM.into());
-            config.rules.no_tool_use.after_responses = Some(1);
             let result = agent.run(default_input()).await;
             if succeeds {
                 assert_eq!(result.unwrap(), DoneReason::EndTurn);

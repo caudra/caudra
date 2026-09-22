@@ -328,7 +328,7 @@ fn write_steering_section(out: &mut String) {
     out.push_str(
         r###"### `agent.steering`
 
-Automatic steering repairs unusable model output and can add bounded guidance about repeated behavior. All nine rules are enabled by default. Configure overrides inside `agent` in `caudra.setup()`. All fields are optional.
+Automatic steering repairs unusable model output and can add bounded guidance about repeated behavior. All eight rules are enabled by default. Configure overrides inside `agent` in `caudra.setup()`. All fields are optional.
 
 | Field | Type | Default | Limits and meaning |
 |-------|------|---------|--------------------|
@@ -351,7 +351,6 @@ Automatic steering repairs unusable model output and can add bounded guidance ab
 | `abandoned_turn` | `true` | Continue a turn that ended by announcing work the response never performed, up to 2 continuations per episode. Spending the allowance accepts the text rather than failing the turn. |
 | `repetition` | `true` | Advise on short exact tool cycles, including normalized native batch leaf calls, or repeated normalized assistant text. |
 | `tool_planning` | `true` | Advise after repeated narrow tool choice across responses, with repeated-call/cycle or repeated-error evidence. Successful reads of different files alone are insufficient. |
-| `no_tool_use` | `true` | Suggest tools when useful after eligible responses without tool attempts, only when the effective tool inventory is nonempty. |
 
 Recovery and advisory budgets are separate. Advisory rules allow at most 4 total injections per invocation, with a default cooldown of 3 completed model responses for each rule.
 
@@ -392,36 +391,32 @@ The remaining fields are integers. All ranges are inclusive. Set `enabled = fals
 | `tool_planning.after_calls` | `6` | 1–1024 | Uses of the same canonical tool, with repetition or error evidence. |
 | `tool_planning.after_responses` | `3` | 1–1024 | Completed model responses across which those tool uses must occur. |
 | `tool_planning.cooldown` | `3` | 1–1024 | Completed model responses between this rule's advisories. |
-| `no_tool_use.after_responses` | `3` | 1–1024 | Eligible completed assistant responses without tool attempts. |
-| `no_tool_use.window` | `8` | 1–4096 | Recent assistant responses inspected for the no-tool pattern. |
-| `no_tool_use.cooldown` | `3` | 1–1024 | Completed model responses between this rule's advisories. |
 
 Validation also requires:
 
 - `repetition.window >= repetition.max_cycle * repetition.cycle_repeats`.
 - `repetition.text_window >= repetition.text_repeats`.
-- `no_tool_use.window >= no_tool_use.after_responses`.
 - `tool_planning.after_calls >= tool_planning.after_responses`.
 
-Unknown fields, invalid types, out-of-range values, and impossible threshold/window combinations are rejected, even for disabled rules. Cooldowns count completed model responses, not seconds, stream chunks, tool children, or injected messages. No-tool eligibility excludes synthetic messages, empty markers, reasoning-only padding, and private title, compaction, or evaluator requests. Recent-pattern windows reset after compaction or a model change without refilling an active invocation's budgets.
+Unknown fields, invalid types, out-of-range values, and impossible threshold/window combinations are rejected, even for disabled rules. Cooldowns count completed model responses, not seconds, stream chunks, tool children, or injected messages. Advisory eligibility excludes synthetic messages, empty markers, reasoning-only padding, and private title, compaction, or evaluator requests. Advisory evidence is the responses to the request in flight: a new user message ends it, as a compaction or a model change does, so an ordinary conversation is never advised. Recent-pattern windows reset with it, without refilling an active invocation's budgets.
 
-Tool-planning guidance asks the model to reconsider its tool choices and identify the next useful action. It does not switch Plan Mode or require a todo list. No-tool guidance permits a direct answer when tools are unnecessary or contrary to the user's instructions.
+Tool-planning guidance asks the model to reconsider its tool choices and identify the next useful action. It does not switch Plan Mode or require a todo list.
 
 #### Global and exact-model overrides
 
-This example disables no-tool guidance globally, then enables it with a higher threshold for one exact model and adjusts that model's tool-planning guidance:
+This example disables repetition guidance globally, then enables it with a higher threshold for one exact model and adjusts that model's tool-planning guidance:
 
 ```lua
 caudra.setup({
     agent = {
         steering = {
             rules = {
-                no_tool_use = { enabled = false },
+                repetition = { enabled = false },
             },
             models = {
                 ["openai/gpt-5"] = {
                     rules = {
-                        no_tool_use = { enabled = true, after_responses = 4 },
+                        repetition = { enabled = true, text_repeats = 4 },
                         tool_planning = {
                             after_calls = 8,
                             prompt = "Reassess your recent tool choices. Choose a different useful action if these calls are not helping.",
@@ -456,7 +451,7 @@ Charge one recovery for a completed-response-to-next-request transition caused b
 
 A mixed batch with useful successful siblings proceeds normally. It is not replayed or charged once per child. Transport and authentication retries, ordinary tool execution failures, permission denials, normal successful tool progress, explicit goal evaluation, and manual steering are separate from model-format recovery. The recovery budget does not bound every possible agent loop. Outer turn limits and cancellation still apply.
 
-At most one supplemental steering message is added per request. Recovery takes priority, then repetition, tool planning, and no-tool guidance. Advisory exhaustion only suppresses hints. Recovery exhaustion with an unmet output contract reports a failure and retains partial output, except for `abandoned_turn`, which stops intervening and lets the turn end. A valid captured structured task report remains usable after an empty tail, but cancellation, transport/permission failures, and hard outer-limit failures do not become success.
+At most one supplemental steering message is added per request. Recovery takes priority, then repetition and tool planning. Advisory exhaustion only suppresses hints. Recovery exhaustion with an unmet output contract reports a failure and retains partial output, except for `abandoned_turn`, which stops intervening and lets the turn end. A valid captured structured task report remains usable after an empty tail, but cancellation, transport/permission failures, and hard outer-limit failures do not become success.
 
 `abandoned_turn` reads the tail of a response that called no tool and would otherwise end the turn. It fires on a text stopping at a bare colon, or on a last sentence that opens on an intent to act. It does not fire on a question, an offer, a completion, or a promise deferred behind another event, and code spans and quoted prose are removed before any of that is matched. Tool-looking prose is not executed here either; the rule only decides whether to ask for one more response.
 
