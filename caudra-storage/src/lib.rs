@@ -30,6 +30,7 @@ pub mod tool_outputs;
 pub mod usage_ledger;
 pub mod version;
 pub mod view;
+pub(crate) mod words;
 pub mod workbench;
 #[path = "sessions/workflow.rs"]
 pub mod workflow;

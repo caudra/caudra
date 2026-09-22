@@ -1,14 +1,17 @@
 //! Where a project's own state lives.
 //!
-//! Every value here is a compatibility surface: the directory name is derived
+//! Every state directory here is a compatibility surface: the name is derived
 //! from a hash of the project root, so any drift silently orphans notes and
-//! plans a user already wrote.
+//! plans a user already wrote. The scratch names are not. They point at a temp
+//! root nothing outlives, which is what lets them be spelled for a reader
+//! rather than for permanence.
 
 use std::fmt;
 use std::path::{Path, PathBuf};
 
 use caudra_workspace::{ProjectKey, SessionWorkspaceBinding};
 
+use crate::words::derived_phrase;
 use crate::workspace_binding::opaque_hash;
 use crate::{StateClass, StateDir, StorageError};
 
@@ -19,6 +22,7 @@ const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 const DOCUMENT_SCOPE_DOMAIN: &str = "remote-local-documents.v1";
 const REMOTE_SCRATCH_DOMAIN: &str = "remote-scratch-directory.v1";
+const PROJECT_SCRATCH_DOMAIN: &str = "project-scratch-directory.v1";
 
 #[derive(Clone)]
 pub(crate) enum DocumentProjectScope {
@@ -108,14 +112,15 @@ fn remote_identity(binding: &SessionWorkspaceBinding) -> Vec<u8> {
 /// remote identity rather than by any local path, because no local path is
 /// meaningful on the host the tools actually run on.
 ///
-/// The hash is base58, so the whole name is alphanumeric behind a fixed
-/// prefix: nothing in it can be read as an option, a path separator, or a
-/// shell metacharacter by the remote command that creates it.
+/// A phrase rather than a digest, because this path is quoted back to a model
+/// on every mention and a base58 digest costs several times what three words
+/// do. It carries no name the remote host supplied: that value is declared by
+/// the far side, reaches the creating command unquoted, and for a sandbox is an
+/// instance id no reader recognizes anyway. Lowercase words and hyphens leave
+/// nothing in the name that command can read as an option, a path separator or
+/// a shell metacharacter.
 pub fn remote_scratch_id(binding: &SessionWorkspaceBinding) -> String {
-    format!(
-        "remote-{}",
-        opaque_hash(REMOTE_SCRATCH_DOMAIN, &remote_identity(binding))
-    )
+    derived_phrase(REMOTE_SCRATCH_DOMAIN, &remote_identity(binding))
 }
 
 /// FNV-1a over the raw bytes, lowercase hex. The Lua original split the state
@@ -128,14 +133,39 @@ fn fnv1a_64(data: &str) -> String {
     format!("{hash:016x}")
 }
 
+fn root_basename(root: &Path) -> &str {
+    root.file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("root")
+}
+
 /// Readable prefix plus a hash: two checkouts of the same repo need different
 /// directories, and the user still wants to recognize theirs on disk.
+///
+/// This names the project's *state*, which holds memories and plans, so the
+/// hash is pinned by [`fnv1a_64`] and cannot be restyled. Scratch parted ways
+/// with it and is named by [`project_scratch_name`].
 pub fn project_id(root: &Path) -> String {
-    let base = root
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("root");
-    format!("{base}-{}", fnv1a_64(&root.to_string_lossy()))
+    format!(
+        "{}-{}",
+        root_basename(root),
+        fnv1a_64(&root.to_string_lossy())
+    )
+}
+
+/// The same readable prefix, then a phrase in place of the hash.
+///
+/// Scratch is the one project directory a model is told about and asked to
+/// approve, so its name is paid for in tokens every time it comes up, and
+/// sixteen hex characters buy nothing a reader can hold on to. Derived rather
+/// than drawn at random: a project must land on one directory on every run, or
+/// each launch strands the last one in the temp root.
+pub fn project_scratch_name(root: &Path) -> String {
+    format!(
+        "{}-{}",
+        root_basename(root),
+        derived_phrase(PROJECT_SCRATCH_DOMAIN, root.to_string_lossy().as_bytes())
+    )
 }
 
 /// The project root is the enclosing repository, so state follows the checkout
@@ -158,8 +188,8 @@ pub fn project_subdir(cwd: &Path) -> PathBuf {
     Path::new(PROJECTS_DIR).join(project_id(&project_root(cwd)))
 }
 
-/// A project's own corner of the scratch root, keyed the way its state is, so
-/// two checkouts writing the same filename do not collide.
+/// A project's own corner of the scratch root, keyed on the same root its
+/// state is, so two checkouts writing the same filename do not collide.
 ///
 /// The scratch root holds nothing but these, so they sit directly inside it
 /// rather than under a `projects` level. Keying on the repository rather than
@@ -167,7 +197,7 @@ pub fn project_subdir(cwd: &Path) -> PathBuf {
 /// scratch, which is the same reason [`project_root`] exists.
 pub fn project_scratch_dir(cwd: &Path) -> Result<PathBuf, std::io::Error> {
     let root = crate::paths::scratch_root()?;
-    crate::paths::ensure_private_dir(&root.join(project_id(&project_root(cwd))))
+    crate::paths::ensure_private_dir(&root.join(project_scratch_name(&project_root(cwd))))
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -342,6 +372,18 @@ mod tests {
             scratch.parent(),
             Some(crate::paths::scratch_root().unwrap().as_path())
         );
+    }
+
+    /// Scratch keeps the readable prefix and drops the hash, so it names the
+    /// checkout without costing what sixteen hex characters cost to quote.
+    #[test]
+    fn a_scratch_name_is_the_directory_name_and_a_phrase() {
+        let root = Path::new("/home/user/app");
+        let name = project_scratch_name(root);
+
+        assert!(name.starts_with("app-"), "{name}");
+        assert_eq!(name.split('-').count(), 4, "{name}");
+        assert_ne!(name, project_id(root));
     }
 
     /// Two checkouts named the same are the case the hash in `project_id`

@@ -483,7 +483,7 @@ mod tests {
     #[test]
     fn the_environment_block_names_the_remote_scratch_directory_in_remote_mode() {
         const REMOTE_ROOT: &str = "/var/folders/xy/caudra";
-        const REMOTE_PROJECT: &str = "/var/folders/xy/caudra/remote-abc";
+        const REMOTE_PROJECT: &str = "/var/folders/xy/caudra/happy-cute-tick";
         const LOCAL_PATH_STAYS_OUT: &str =
             "a local temp directory must not be offered to remote tools";
 

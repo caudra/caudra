@@ -160,8 +160,9 @@ async fn create_remote(session: &WorkspaceSession) -> Option<RemoteScratch> {
 /// predict, so an entry planted there ahead of Caudra would otherwise redirect
 /// every pre-allowed write at once. `umask` makes what is created owner-only.
 ///
-/// `namespace` and `id` are Caudra's own alphanumeric directory names, so the
-/// only value that needs quoting is the host's `TMPDIR`.
+/// `namespace` and `id` are Caudra's own directory names, built from lowercase
+/// ASCII and interior hyphens and never from anything the remote host
+/// declared, so the only value that needs quoting is the host's `TMPDIR`.
 fn setup_command(namespace: &str, id: &str) -> String {
     format!(
         "umask 077; \
@@ -298,7 +299,8 @@ mod tests {
 
     const NAMESPACE: &str = "caudra";
     const CREATED_ROOT: &str = "/var/folders/xy/caudra";
-    const CREATED: &str = "/var/folders/xy/caudra/remote-abc";
+    const CREATED: &str = "/var/folders/xy/caudra/happy-cute-tick";
+    const CREATED_NAME: &str = "happy-cute-tick";
     const FAILURE: &str = "boom";
     const TMPDIR_CLAIM: &str = "is where `TMPDIR` points";
     const ADVERTISED_IS_CREATED: &str = "the advertised path must be the one the host printed";
@@ -443,7 +445,7 @@ mod tests {
     #[test_case("${TMPDIR:-/tmp}" => true ; "temp_root_is_the_remote_hosts")]
     #[test_case("umask 077" => true ; "directories_are_owner_only")]
     fn the_setup_command(fragment: &str) -> bool {
-        setup_command(NAMESPACE, "remote-abc").contains(fragment)
+        setup_command(NAMESPACE, CREATED_NAME).contains(fragment)
     }
 
     /// The advertised directory is the one the remote host printed, and the

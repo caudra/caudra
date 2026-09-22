@@ -2332,7 +2332,7 @@ mod tests {
     #[test]
     fn builtin_rules_follow_the_remote_scratch_root_when_tools_run_remotely() {
         const REMOTE_ROOT: &str = "/var/folders/xy/caudra";
-        const REMOTE_PROJECT: &str = "/var/folders/xy/caudra/remote-abc";
+        const REMOTE_PROJECT: &str = "/var/folders/xy/caudra/happy-cute-tick";
         const REMOTE_TEMP: &str = "/var/folders/xy";
         const REMOTE_IS_COVERED: &str = "the advertised remote directory must be pre-allowed";
         const LOCAL_IS_NOT: &str = "a local scratch root no remote tool can reach must not be";
