@@ -60,6 +60,13 @@ pub enum WorkspaceError {
     ResponseTooLarge { limit_bytes: u64 },
     #[error("workspace response is invalid: {violation:?}")]
     InvalidResponse { violation: InvalidResponseKind },
+    /// A well-formed refusal whose reason this client has no mapping for.
+    ///
+    /// Distinct from `InvalidResponse`: the authority answered correctly and
+    /// said why, and reporting that as malformed would blame the wire for a
+    /// decision the authority made deliberately.
+    #[error("workspace authority refused the request with code {code}, reason {symbolic}")]
+    Refused { code: i64, symbolic: String },
     #[error("workspace transport failed: {kind:?}")]
     Transport { kind: TransportErrorKind },
 }

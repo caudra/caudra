@@ -77,6 +77,7 @@ const CONNECTION_CONNECTED: u8 = 0;
 const CONNECTION_DISCONNECTED: u8 = 1;
 const CONNECTION_RECONNECTING: u8 = 2;
 const RESOURCE_NAMESPACE_VERSION: &str = "v1";
+const NO_SYMBOLIC_REASON: &str = "<none>";
 const PATH_STYLE: &str = "root-relative-posix";
 const TOOL_MANIFEST_VERSION: &str = "v2";
 const JSON_SCHEMA_VERSION: &str = "http://json-schema.org/draft-07/schema#";
@@ -189,6 +190,11 @@ pub enum RemoteWorkcellError {
     JournalUnavailable,
     #[error("pending remote operation {operation_id} belongs to a different workspace generation")]
     RecoveryBindingMismatch { operation_id: String },
+    /// A refusal that arrived well formed and carried a reason this client has
+    /// no mapping for. The host's prose stays at the transport boundary; the
+    /// numeric and symbolic codes travel so the caller learns what was refused.
+    #[error("remote Workcell refused the request with code {code}, reason {symbolic}")]
+    UnmappedRefusal { code: i64, symbolic: String },
 }
 
 #[derive(Clone)]
@@ -260,6 +266,9 @@ impl From<RemoteWorkcellError> for WorkspaceError {
             | RemoteWorkcellError::CatalogMismatch => Self::InvalidResponse {
                 violation: caudra_workspace::InvalidResponseKind::Malformed,
             },
+            RemoteWorkcellError::UnmappedRefusal { code, symbolic } => {
+                Self::Refused { code, symbolic }
+            }
             RemoteWorkcellError::Transport => Self::Transport {
                 kind: caudra_workspace::TransportErrorKind::Disconnected,
             },
@@ -1638,16 +1647,18 @@ impl RemoteWorkcellClient {
             .map_or(DEFAULT_CACHE_TTL, |watch| {
                 Duration::from_millis(watch.limits.subscription_ttl_ms)
             });
-        let operation_limit = descriptor
+        // Defaulting to one operation made a host that never declared the
+        // capability look like a host that allows a single call at a time, so
+        // the second concurrent tool call conflicted for no stated reason.
+        let operations = descriptor
             .capabilities
             .operations
             .as_ref()
-            .map_or(1, |operations| {
-                operations
-                    .limits
-                    .max_operations
-                    .min(operations.limits.max_preparations) as usize
-            });
+            .ok_or(RemoteWorkcellError::CapabilityMismatch)?;
+        let operation_limit = operations
+            .limits
+            .max_operations
+            .min(operations.limits.max_preparations) as usize;
         let mut paths = ResourceCache::new(path_limit, DEFAULT_CACHE_TTL);
         paths.insert(root_id, selection.cwd.clone());
         let mut cursors = HashMap::new();
@@ -5073,9 +5084,9 @@ fn map_rpc_error(error: &JsonRpcError) -> RemoteWorkcellError {
         Some("timed_out") => RemoteWorkcellError::Timeout,
         _ if matches!(error.code, 401 | 403) => RemoteWorkcellError::Authentication,
         // A refusal we have no symbolic mapping for still arrived well formed,
-        // and the error this becomes can only say the response was invalid.
-        // The host's own explanation is private diagnostic material, so it is
-        // logged at the transport boundary rather than carried outwards.
+        // so calling it invalid blames the wire for a decision the host made.
+        // The host's own explanation is private diagnostic material and stays
+        // in this log; the codes travel so the caller learns what was refused.
         _ => {
             warn!(
                 code = error.code,
@@ -5083,7 +5094,10 @@ fn map_rpc_error(error: &JsonRpcError) -> RemoteWorkcellError {
                 message = %error.message,
                 "remote Workcell refusal has no symbolic mapping"
             );
-            RemoteWorkcellError::InvalidProtocol
+            RemoteWorkcellError::UnmappedRefusal {
+                code: error.code,
+                symbolic: symbolic.unwrap_or(NO_SYMBOLIC_REASON).to_owned(),
+            }
         }
     }
 }
@@ -7537,11 +7551,42 @@ mod tests {
         assert_eq!(map_rpc_error(&error), RemoteWorkcellError::StaleResource);
         assert_eq!(
             map_rpc_error(&rpc_error(json!({"kind":"policy_denied"}))),
-            RemoteWorkcellError::InvalidProtocol
+            RemoteWorkcellError::UnmappedRefusal {
+                code: UNMAPPED_RPC_CODE,
+                symbolic: super::NO_SYMBOLIC_REASON.to_owned(),
+            }
         );
         assert_eq!(
             map_rpc_error(&rpc_error(json!({"code":"quota_exceeded"}))),
             RemoteWorkcellError::QuotaExceeded
+        );
+    }
+
+    /// The host answered, and said why. Reporting that as a malformed response
+    /// blames the wire and leaves the caller with nothing to act on, which is
+    /// how a correct `file_read` surfaced as "invalid response".
+    #[test_case(json!({"code":"capability_unavailable"}), "capability_unavailable" ; "absent_group")]
+    #[test_case(json!({"code":"not_found"}), "not_found" ; "missing_path")]
+    #[test_case(json!({}), crate::remote::NO_SYMBOLIC_REASON ; "no_symbolic_code")]
+    fn an_unmapped_refusal_carries_its_reason_instead_of_claiming_malformed(
+        data: Value,
+        expected: &str,
+    ) {
+        let error = map_rpc_error(&rpc_error(data));
+
+        assert_eq!(
+            error,
+            RemoteWorkcellError::UnmappedRefusal {
+                code: UNMAPPED_RPC_CODE,
+                symbolic: expected.to_owned(),
+            }
+        );
+        assert_eq!(
+            WorkspaceError::from(error),
+            WorkspaceError::Refused {
+                code: UNMAPPED_RPC_CODE,
+                symbolic: expected.to_owned(),
+            }
         );
     }
 
