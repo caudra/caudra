@@ -9185,7 +9185,10 @@ CREATE TABLE subagents (
             fast: false,
             ..stored_subagent("bare", StoredSubagentOutcome::Done)
         };
-        let subagents = vec![stored_subagent("levelled", StoredSubagentOutcome::Done), bare];
+        let subagents = vec![
+            stored_subagent("levelled", StoredSubagentOutcome::Done),
+            bare,
+        ];
         session.set_subagents(subagents.clone());
 
         database.save(&session, None).unwrap();
