@@ -1090,9 +1090,22 @@ impl Controller {
         revision: Option<&Revision>,
         saved: Option<&SandboxStore>,
     ) -> Result<AttachTicket> {
-        let mut record = self.inspect(name).await?;
-        if revision.is_some_and(|revision| record.revision().ok().as_ref() != Some(revision)) {
+        // Pinned against the durable record, the way every other reviewed
+        // operation pins. A record's revision digests the whole record,
+        // including the instance last observed, so comparing after `inspect`
+        // refreshed it would demand that nothing the daemon reports has moved
+        // since the review. An egress policy becoming effective after an apply
+        // moves exactly that, which turned a healthy reconnect into a refusal.
+        let reviewed = self.store.get(name)?;
+        if revision.is_some_and(|expected| reviewed.revision().ok().as_ref() != Some(expected)) {
             return Err(Error::ReviewChanged);
+        }
+        let mut record = self.inspect(name).await?;
+        // What the pin still has to guarantee about the live sandbox: it is the
+        // execution that was reviewed, refused before asking for credentials
+        // rather than after.
+        if revision.is_some() && !same_execution(&reviewed, &record) {
+            return Err(Error::Identity);
         }
         if record
             .lifecycle
@@ -1412,6 +1425,14 @@ fn validate_lifecycle_result(intent: &LifecycleIntent, instance: &Instance) -> R
     Ok(())
 }
 
+fn same_execution(reviewed: &InstanceRecord, observed: &InstanceRecord) -> bool {
+    match (&reviewed.instance, &observed.instance) {
+        (Some(reviewed), Some(observed)) => reviewed.execution_id == observed.execution_id,
+        (Some(_), None) => false,
+        (None, _) => true,
+    }
+}
+
 fn validate_instance(record: &InstanceRecord, instance: &Instance) -> Result<()> {
     instance.validate(&record.owner_id)?;
     if instance.template.id != record.template.manifest.id
@@ -1508,6 +1529,7 @@ mod tests {
     const PRIVATE_MODE: u32 = 0o700;
     const DOMAIN: &str = "example.test";
     const CHANGED_EXECUTION: &str = "execution-resumed";
+    const SETTLED_REVISION: u64 = 2;
     const ENFORCED_TOPOLOGY: &str = "slirp-enforced";
     const SHORT_LEASE: &str = "2026-09-20T12:01:00Z";
     const DENY_REVISION: &str = "fb44c0f5ba3bfc047e139e764fc03a852d08600a8777ea16ef62c2892c9503d9";
@@ -2783,6 +2805,8 @@ mod tests {
         assert_eq!(controller.snapshots().unwrap().is_empty(), changed);
     }
 
+    /// A replaced execution is an identity failure, not a stale review: no
+    /// amount of refreshing brings the reviewed sandbox back.
     #[test]
     fn reviewed_attach_refuses_changed_live_execution_without_credentials() {
         let server = Server::new(move |method, path, _, headers| {
@@ -2799,8 +2823,48 @@ mod tests {
         let record = create_ready(&controller, &saved);
         assert!(matches!(
             smol::block_on(controller.prepare_attach_at(&name(), &record.revision().unwrap())),
-            Err(Error::ReviewChanged)
+            Err(Error::Identity)
         ));
+    }
+
+    /// A reviewed revision pins the durable record, not the daemon's next
+    /// observation of the sandbox. Applying a network policy from the TUI ends
+    /// the run, applies, and reconnects pinned to the record the apply wrote;
+    /// a daemon that has since recorded its own transition reports a newer
+    /// instance, and refusing that ended the attached session for nothing.
+    #[test]
+    fn a_reviewed_attach_tolerates_a_daemon_observation_newer_than_the_review() {
+        let server = Server::new(|method, path, _, headers| {
+            let mut current = instance();
+            current["revision"] = json!(SETTLED_REVISION);
+            if path.ends_with("/credentials") {
+                return Some((200, credentials(current)));
+            }
+            if method == "GET"
+                && !path.ends_with("/discover")
+                && !path.starts_with("/daemon/v1/templates/")
+            {
+                return Some(if path.contains("/operations/") {
+                    (200, operation(path.rsplit('/').next().unwrap(), current))
+                } else {
+                    (200, current)
+                });
+            }
+            regular(method, path, headers)
+        });
+        let (temp, controller, saved) = setup(&server);
+        let record = create_ready(&controller, &saved);
+        let config = SandboxStore::from_config_dir(&temp.path().join("config")).unwrap();
+
+        let ticket = smol::block_on(controller.prepare_attach_reviewed(
+            &name(),
+            ResumePolicy::Refuse,
+            Some(&record.revision().unwrap()),
+            Some(&config),
+        ))
+        .unwrap();
+
+        assert_eq!(ticket.record.instance.unwrap().revision, SETTLED_REVISION);
     }
 
     #[test_case("pause"; "pause")]
@@ -3288,6 +3352,9 @@ mod tests {
             "template":{"id":"base","revision":DIGEST,"imageIdentity":DIGEST},"resources":{"cpuCount":2,"memoryMB":1024,"diskSizeMB":1024},"networkTopology":"slirp-unrestricted","persistent":true,"pauseUnclean":false,"leaseDeadline":LATER,
             "retention":{"pausedDiskMaxAgeSeconds":0,"deadline":null},"egress":{"enforced":false,"revision":"unrestricted","effectiveRevision":"unrestricted","policy":null}})
     }
+    fn credentials(instance: Value) -> Value {
+        json!({"instance":instance,"trafficAccessToken":"b".repeat(64),"mcpPath":format!("/sandboxes/{INSTANCE}/mcp"),"filesPath":"/files","credentialScope":"sandbox_lifetime"})
+    }
     fn operation(key: &str, instance: Value) -> Value {
         json!({"operationID":key,"ownerID":OWNER,"sandboxID":INSTANCE,"executionID":EXECUTION,"requestDigest":REQUEST_DIGEST,"status":"succeeded","cancelRequested":false,"createdAt":NOW,"updatedAt":NOW,"historyDeadline":null,"instance":instance})
     }
@@ -3405,10 +3472,7 @@ mod tests {
         } else if path.starts_with("/daemon/v1/templates/") {
             Some((200, template()))
         } else if path.ends_with("/credentials") {
-            Some((
-                200,
-                json!({"instance":instance(),"trafficAccessToken":"b".repeat(64),"mcpPath":format!("/sandboxes/{INSTANCE}/mcp"),"filesPath":"/files","credentialScope":"sandbox_lifetime"}),
-            ))
+            Some((200, credentials(instance())))
         } else if method == "POST" {
             let key = headers
                 .lines()
