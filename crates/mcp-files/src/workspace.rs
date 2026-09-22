@@ -585,7 +585,7 @@ async fn rollback_action(core: &FilesystemCore, action: Rollback) -> Result<(), 
 
 impl WorkspaceError {
     #[must_use]
-    pub const fn code(&self) -> &'static str {
+    pub fn code(&self) -> &'static str {
         match self {
             Self::InvalidRequest => "invalid_request",
             Self::StaleCwd => "stale_cwd",
@@ -597,7 +597,7 @@ impl WorkspaceError {
             Self::UnsupportedRepository => "unsupported_repository",
             Self::RolledBack(_) => "rolled_back",
             Self::PartialFailure(_) => "partial_failure",
-            Self::Filesystem(_) => "filesystem_error",
+            Self::Filesystem(error) => error.code(),
         }
     }
 }

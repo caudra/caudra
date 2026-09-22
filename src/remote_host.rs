@@ -906,6 +906,7 @@ fn unknown_status(
         expires_at_unix_ms: None,
         binding: None,
         outcome: None,
+        tombstones_evicted_through_unix_ms: None,
         progress_metadata: ProgressMetadata {
             first_retained_sequence: None,
             next_sequence: 1,
@@ -1062,6 +1063,12 @@ struct Ledger {
     reserved_bytes: usize,
     running_bytes: usize,
     reservations: usize,
+    /// Wall clock of the newest tombstone this ledger has evicted. Eviction is
+    /// oldest first, so every dropped tombstone was forgotten at or before this
+    /// instant and every surviving one after it. Reporting the boundary instead
+    /// of a latched flag keeps `NeverSeen` meaningful: a caller can still prove
+    /// its own operation was too recent to have been dropped.
+    evicted_through_unix_ms: Option<u64>,
 }
 
 struct Record {
@@ -1089,6 +1096,7 @@ struct Tombstone {
     state: OperationState,
     progress_metadata: ProgressMetadata,
     forgotten_at: Instant,
+    forgotten_at_unix_ms: u64,
 }
 
 impl Ledger {
@@ -1288,22 +1296,28 @@ impl Ledger {
         now: Instant,
     ) -> Result<StatusResponse, RemoteOperationError> {
         self.prune(now);
-        let Some(record) = self.records.get(preparation_id) else {
-            if let Some(tombstone) = self.tombstone(preparation_id) {
-                return tombstone.status(invocation_id);
+        let evicted_through = self.evicted_through_unix_ms;
+        if let Some(record) = self.records.get(preparation_id) {
+            if let Some(invocation_id) = invocation_id
+                && record.invocation_id.as_ref() != Some(invocation_id)
+            {
+                return Err(RemoteOperationError::InvocationMismatch);
             }
-            return Ok(unknown_status(
+            let mut response = record.status();
+            response.tombstones_evicted_through_unix_ms = evicted_through;
+            return Ok(response);
+        }
+        let mut response = if let Some(tombstone) = self.tombstone(preparation_id) {
+            tombstone.status(invocation_id)?
+        } else {
+            unknown_status(
                 OperationState::NeverSeen,
                 preparation_id.clone(),
                 invocation_id.cloned(),
-            ));
+            )
         };
-        if let Some(invocation_id) = invocation_id
-            && record.invocation_id.as_ref() != Some(invocation_id)
-        {
-            return Err(RemoteOperationError::InvocationMismatch);
-        }
-        Ok(record.status())
+        response.tombstones_evicted_through_unix_ms = evicted_through;
+        Ok(response)
     }
 
     fn release(
@@ -1313,6 +1327,7 @@ impl Ledger {
         now: Instant,
     ) -> Result<ReleaseResponse, RemoteOperationError> {
         self.prune(now);
+        let evicted_through = self.evicted_through_unix_ms;
         let Some(record) = self.records.get(preparation_id) else {
             if let Some(tombstone) = self.tombstone(preparation_id) {
                 tombstone.validate_invocation(invocation_id)?;
@@ -1320,12 +1335,14 @@ impl Ledger {
                     version: ContractVersion::V1,
                     state: tombstone.state,
                     released: false,
+                    tombstones_evicted_through_unix_ms: evicted_through,
                 });
             }
             return Ok(ReleaseResponse {
                 version: ContractVersion::V1,
                 state: OperationState::NeverSeen,
                 released: false,
+                tombstones_evicted_through_unix_ms: evicted_through,
             });
         };
         if let Some(invocation_id) = invocation_id
@@ -1342,6 +1359,7 @@ impl Ledger {
             version: ContractVersion::V1,
             state,
             released: true,
+            tombstones_evicted_through_unix_ms: evicted_through,
         })
     }
 
@@ -1442,12 +1460,28 @@ impl Ledger {
             .is_some_and(|entry| now.duration_since(entry.forgotten_at) >= RETENTION_TTL)
             || self.tombstones.len() > MAX_TOMBSTONES
         {
-            self.tombstones.pop_front();
+            let Some(evicted) = self.tombstones.pop_front() else {
+                break;
+            };
+            self.note_eviction(&evicted);
         }
         self.refresh_bytes();
-        while self.total_bytes() > MAX_LEDGER_BYTES && self.tombstones.pop_front().is_some() {
+        while self.total_bytes() > MAX_LEDGER_BYTES {
+            let Some(evicted) = self.tombstones.pop_front() else {
+                break;
+            };
+            self.note_eviction(&evicted);
             self.refresh_bytes();
         }
+    }
+
+    fn note_eviction(&mut self, evicted: &Tombstone) {
+        self.evicted_through_unix_ms = Some(
+            self.evicted_through_unix_ms
+                .map_or(evicted.forgotten_at_unix_ms, |through| {
+                    through.max(evicted.forgotten_at_unix_ms)
+                }),
+        );
     }
 
     fn forget(&mut self, preparation_id: &Identifier, state: OperationState, now: Instant) {
@@ -1457,8 +1491,10 @@ impl Ledger {
             if progress_metadata.next_sequence != 1 {
                 progress_metadata.gap_before_first = true;
             }
-            if self.tombstones.len() == MAX_TOMBSTONES {
-                self.tombstones.pop_front();
+            if self.tombstones.len() == MAX_TOMBSTONES
+                && let Some(evicted) = self.tombstones.pop_front()
+            {
+                self.note_eviction(&evicted);
             }
             self.tombstones.push_back(Tombstone {
                 preparation_id: preparation_id.clone(),
@@ -1466,6 +1502,7 @@ impl Ledger {
                 state,
                 progress_metadata,
                 forgotten_at: now,
+                forgotten_at_unix_ms: unix_ms(),
             });
         }
         self.records.shrink_to_fit();
@@ -1653,6 +1690,7 @@ impl Record {
             expires_at_unix_ms: Some(self.expires_at_unix_ms),
             binding: Some(self.binding.clone()),
             outcome: self.outcome.clone(),
+            tombstones_evicted_through_unix_ms: None,
             progress_metadata: self.progress_metadata(),
             progress: self.progress.iter().cloned().collect(),
         }

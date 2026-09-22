@@ -2084,6 +2084,11 @@ pub struct StatusResponse {
     pub expires_at_unix_ms: Option<u64>,
     pub binding: Option<OperationBinding>,
     pub outcome: Option<StructuredOutcome>,
+    /// Wall clock of the newest tombstone this ledger has evicted, if any.
+    /// Tombstones are evicted oldest first and an operation cannot be forgotten
+    /// before it was dispatched, so a caller whose operation was dispatched
+    /// after this instant can trust `NeverSeen` to mean the operation never ran.
+    pub tombstones_evicted_through_unix_ms: Option<u64>,
     pub progress_metadata: ProgressMetadata,
     #[serde(deserialize_with = "deserialize_progress_events")]
     pub progress: Vec<ProgressEvent>,
@@ -2150,6 +2155,8 @@ pub struct ReleaseResponse {
     pub version: ContractVersion,
     pub state: OperationState,
     pub released: bool,
+    /// See [`StatusResponse::tombstones_evicted_through_unix_ms`].
+    pub tombstones_evicted_through_unix_ms: Option<u64>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
