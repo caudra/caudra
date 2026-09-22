@@ -192,6 +192,13 @@ impl Completion {
     /// `row` turns one match and whether it is selected into the line drawn for
     /// it; `width` measures a match in cells, since a row may be painted wider
     /// than the string it came from.
+    ///
+    /// `scope` names the component for the layout grabber. Every other caller of
+    /// `grab_scope!` passes a literal, which no longer exists in release; this
+    /// one is a parameter, so it survives as a binding with nothing left to read
+    /// it. The attribute is the same one `caudra_grab` puts on the functions the
+    /// macro wraps.
+    #[cfg_attr(not(debug_assertions), allow(unused_variables))]
     pub fn view(
         &mut self,
         frame: &mut Frame,
