@@ -713,6 +713,11 @@ pub struct ScmCommit {
     pub author_email: ScmText,
     pub committed_unix_seconds: i64,
     pub summary: ScmText,
+    /// The message past its subject line. Optional so a host that predates the
+    /// field still deserializes: `None` means the server did not report one,
+    /// which a reader must not confuse with a commit whose message is a subject
+    /// and nothing else.
+    pub body: Option<ScmText>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -2822,6 +2827,40 @@ mod tests {
             "paths":vec![path; MAX_SCM_PATHS + 1]
         });
         assert!(serde_json::from_value::<ScmMutation>(rejected).is_err());
+    }
+
+    #[test]
+    fn a_commit_payload_without_a_body_key_is_absent_rather_than_empty() {
+        let without_body = json!({
+            "id":"sha256:commit",
+            "parents":[],
+            "authorName":"Workcell Test",
+            "authorEmail":"workcell@example.invalid",
+            "committedUnixSeconds":1,
+            "summary":"subject line"
+        });
+        let absent = serde_json::from_value::<ScmCommit>(without_body.clone()).unwrap();
+        assert_eq!(absent.body, None);
+
+        let mut empty = absent.clone();
+        empty.body = Some(ScmText::new("").unwrap());
+        let mut populated = absent.clone();
+        populated.body = Some(ScmText::new("first body line\nsecond body line").unwrap());
+        assert_ne!(empty, absent);
+
+        for value in [absent, empty, populated] {
+            assert_eq!(
+                serde_json::from_value::<ScmCommit>(serde_json::to_value(&value).unwrap()).unwrap(),
+                value
+            );
+        }
+
+        let mut null_body = without_body;
+        null_body["body"] = json!(null);
+        assert_eq!(
+            serde_json::from_value::<ScmCommit>(null_body).unwrap().body,
+            None
+        );
     }
 
     fn binding() -> HostBinding {

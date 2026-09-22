@@ -44,6 +44,9 @@ const MAX_WORKTREE_REVISION_BYTES: usize = 64 * 1_024 * 1_024;
 const MAX_DIFF_SOURCE_BYTES: usize = 8 * 1_024 * 1_024;
 const MAX_COMMIT_PARENTS: usize = 64;
 const MAX_COMMIT_SUMMARY_BYTES: usize = 4_096;
+/// A commit body is prose a person wrote, so it is allowed more room than the
+/// subject line while still being bounded: a log page carries many of them.
+const MAX_COMMIT_BODY_BYTES: usize = 16_384;
 const GIT_TIMEOUT: Duration = Duration::from_secs(30);
 const GIT_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_GIT_VERSION_BYTES: usize = 128;
@@ -1962,6 +1965,11 @@ fn commit_dto(
         std::str::from_utf8(decoded.message).map_err(|_| ScmError::UnsupportedEncoding)?;
     let summary = message.lines().next().unwrap_or_default();
     let summary = truncate_utf8(summary, MAX_COMMIT_SUMMARY_BYTES);
+    let body = message
+        .split_once('\n')
+        .map(|(_, body)| body.trim())
+        .unwrap_or_default();
+    let body = truncate_utf8(body, MAX_COMMIT_BODY_BYTES);
     Ok(ScmCommit {
         id: Revision::new(id.to_string()).map_err(|_| ScmError::OperationFailed)?,
         parents: decoded
@@ -1978,6 +1986,7 @@ fn commit_dto(
         .map_err(|_| ScmError::LimitExceeded)?,
         committed_unix_seconds: time.seconds,
         summary: ScmText::new(summary).map_err(|_| ScmError::LimitExceeded)?,
+        body: Some(ScmText::new(body).map_err(|_| ScmError::LimitExceeded)?),
     })
 }
 
@@ -3427,6 +3436,37 @@ mod tests {
         assert_eq!(log.commits[0].summary.as_str(), "third");
         assert_eq!(log.commits[1].id.as_str(), boundary);
         assert!(!log.truncated);
+    }
+
+    #[tokio::test]
+    async fn a_commit_body_is_the_trimmed_message_past_its_subject_and_is_empty_rather_than_absent()
+    {
+        let fixture = fixture(true).await;
+        git(
+            fixture._root.path(),
+            &[
+                "commit",
+                "--allow-empty",
+                "-m",
+                "subject line",
+                "-m",
+                "first body line\nsecond body line",
+            ],
+        );
+
+        let log = fixture
+            .group
+            .log(&log_request(&fixture, 10), &CancellationToken::new())
+            .await
+            .unwrap();
+
+        assert_eq!(log.commits[0].summary.as_str(), "subject line");
+        assert_eq!(
+            log.commits[0].body.as_ref().unwrap().as_str(),
+            "first body line\nsecond body line"
+        );
+        assert_eq!(log.commits[1].summary.as_str(), "initial");
+        assert_eq!(log.commits[1].body.as_ref().unwrap().as_str(), "");
     }
 
     #[tokio::test]
