@@ -52,9 +52,18 @@ const PLAIN_MODEL_FLOOR: usize = 1;
 const CHAT_NAME_MAX_WIDTH: usize = 24;
 const CHAT_NAME_WIDTH_DIVISOR: usize = 4;
 const SANDBOX_PREFIX: &str = "[sandbox: ";
+const SANDBOX_BARE_PREFIX: &str = "[";
 const SANDBOX_SUFFIX: &str = "]";
-const SANDBOX_MAX_WIDTH: usize = 24;
-const SANDBOX_FLOOR: usize = BRACKET_WIDTH + TRUNCATE_PREFIX.len() + 1;
+/// The chip's rungs, widest first: `[sandbox: name]`, then `[name]`, then the
+/// nothing a bar too narrow for either gets. The word goes before the name
+/// because it reads the same in every session, while the name is the half that
+/// says which sandbox this one is on; below the bare name all that is left to
+/// draw is a stub naming no instance at all.
+const SANDBOX_TIERS: [&str; 2] = [SANDBOX_PREFIX, SANDBOX_BARE_PREFIX];
+/// Columns the instance name keeps at either rung, the slot the chat name gets:
+/// a name is bounded at 64 bytes, and one left-side name taking the bar would
+/// leave the other with nothing.
+const SANDBOX_NAME_MAX_WIDTH: usize = CHAT_NAME_MAX_WIDTH;
 const MARQUEE_STEP: Duration = Duration::from_millis(120);
 const MARQUEE_PAUSE: Duration = Duration::from_millis(600);
 /// Marks a figure a subscription already covers. One column is all the bar can
@@ -241,9 +250,10 @@ pub struct StatusBarContext<'a> {
     pub stats: UsageStats,
     pub auto_scroll: bool,
     pub chat_name: Option<&'a str>,
-    /// The sandbox instance the runtime is attached to. `None` unless this
-    /// runtime's own authenticated connection is up, so the chip cannot claim a
-    /// sandbox that is merely running.
+    /// The sandbox instance the runtime is attached to, named as the manager
+    /// names it, or identified by id when nothing on this side has read the
+    /// name yet. `None` unless this runtime's own authenticated connection is
+    /// up, so the chip cannot claim a sandbox that is merely running.
     pub sandbox: Option<&'a str>,
     pub main_chat: bool,
     pub retry_info: Option<&'a RetryInfo>,
@@ -810,8 +820,7 @@ impl StatusBar {
             let offset = left_spans.iter().map(Span::width).sum::<usize>() + " ".width();
             let budget = (area.width as usize)
                 .saturating_sub(offset)
-                .saturating_sub(critical_right(ctx))
-                .min(SANDBOX_MAX_WIDTH);
+                .saturating_sub(critical_right(ctx));
             if let Some(label) = sandbox_label(name, budget) {
                 let width = label.width();
                 left_spans.push(Span::raw(" "));
@@ -1319,14 +1328,15 @@ fn critical_right(ctx: &StatusBarContext<'_>) -> usize {
         }
 }
 
-/// `[sandbox: name]`, then `[name]`, then `[na..]`, then nothing. The head is
+/// The widest rung the columns hold, with the name cut into its own slot first
+/// so a long one narrows the chip rather than the rest of the bar. The head is
 /// kept because an instance name separates on its prefix.
 fn sandbox_label(name: &str, budget: usize) -> Option<String> {
-    let full = format!("{SANDBOX_PREFIX}{name}{SANDBOX_SUFFIX}");
-    if full.width() <= budget {
-        return Some(full);
-    }
-    (budget >= SANDBOX_FLOOR).then(|| format!("[{}]", truncate_head(name, budget - BRACKET_WIDTH)))
+    let name = truncate_head(name, SANDBOX_NAME_MAX_WIDTH);
+    SANDBOX_TIERS.into_iter().find_map(|prefix| {
+        (prefix.width() + name.width() + SANDBOX_SUFFIX.width() <= budget)
+            .then(|| format!("{prefix}{name}{SANDBOX_SUFFIX}"))
+    })
 }
 
 fn model_floor(ctx: &StatusBarContext<'_>) -> usize {
@@ -1678,13 +1688,21 @@ mod tests {
     const UNCLICKABLE_YOLO_MSG: &str = "the bar drew the yolo chip without a hit to click it";
     const TASK_LEVEL_MISSING: &str = "a task footer must name the level that task runs at";
     const TASK_LEVEL_CLICKABLE: &str = "a task footer's level is a label, not a control";
-    const SANDBOX_INSTANCE: &str = "sandbox-7a2f";
-    const SANDBOX_CHIP: &str = "[sandbox: sandbox-7a2f]";
+    const SANDBOX_NAME: &str = "prowlix-instance";
+    const SANDBOX_CHIP: &str = "[sandbox: prowlix-instance]";
+    const SANDBOX_BARE_CHIP: &str = "[prowlix-instance]";
+    /// Longer than the name's slot, so the chip has to cut it rather than take
+    /// the columns the rest of the left side is drawn in.
+    const LONG_SANDBOX_NAME: &str = "prowlix-instance-with-a-very-long-name";
+    const LONG_SANDBOX_CHIP: &str = "[sandbox: prowlix-instance-with-..]";
+    const LONG_SANDBOX_BARE_CHIP: &str = "[prowlix-instance-with-..]";
     const MISSING_SANDBOX_HIT_MSG: &str =
         "an attached session must reach its sandbox from the footer";
     const SANDBOX_CLIPPED_MSG: &str =
         "the bar drew part of the sandbox chip with no hit to click it";
     const SANDBOX_CROWDED_MSG: &str = "the sandbox chip pushed a footer control off the bar";
+    const SANDBOX_GREW_MSG: &str = "narrowing the bar widened the sandbox chip";
+    const NO_SHORT_MODE_MSG: &str = "no width drew the short mode label beside the sandbox chip";
 
     /// The glyphs a hit claims, read back out of the bar it was measured on.
     fn bar_glyphs(text: &str, hit: &StatusBarHit) -> String {
@@ -2843,7 +2861,7 @@ mod tests {
     #[test]
     fn an_attached_session_names_its_sandbox() {
         let (text, hits, _) = render_at(Fixture {
-            sandbox: Some(SANDBOX_INSTANCE),
+            sandbox: Some(SANDBOX_NAME),
             ..Default::default()
         });
         let hit = hits
@@ -2873,7 +2891,7 @@ mod tests {
     #[test]
     fn hovering_the_sandbox_control_highlights_its_chip_alone() {
         let (_, hits, styles) = render_at(Fixture {
-            sandbox: Some(SANDBOX_INSTANCE),
+            sandbox: Some(SANDBOX_NAME),
             hovered: Some(StatusBarHitTarget::Sandbox),
             ..Default::default()
         });
@@ -2895,7 +2913,7 @@ mod tests {
     #[test]
     fn the_sandbox_chip_is_plain_without_the_pointer() {
         let (_, hits, styles) = render_at(Fixture {
-            sandbox: Some(SANDBOX_INSTANCE),
+            sandbox: Some(SANDBOX_NAME),
             ..Default::default()
         });
         let hit = hits
@@ -2915,7 +2933,7 @@ mod tests {
     #[test]
     fn a_subagent_footer_names_the_sandbox() {
         let (_, hits, _) = render_at(Fixture {
-            sandbox: Some(SANDBOX_INSTANCE),
+            sandbox: Some(SANDBOX_NAME),
             main_chat: false,
             ..Default::default()
         });
@@ -2931,38 +2949,33 @@ mod tests {
     /// and whatever survives keeps a hit that covers exactly what was drawn. A
     /// bar too narrow drops it rather than crowding the mode and model controls
     /// the rest of the footer is built around.
-    #[test_case(12        ; "no_room_beside_the_model")]
-    #[test_case(24        ; "truncated_name")]
-    #[test_case(32        ; "bare_name")]
-    #[test_case(48        ; "named_in_full")]
-    #[test_case(BAR_WIDTH ; "wide")]
-    fn a_narrow_bar_squeezes_the_sandbox_chip_before_dropping_it(width: u16) {
+    #[test_case(12,        None                    ; "no_room_beside_the_model")]
+    #[test_case(29,        None                    ; "too_narrow_for_the_bare_name")]
+    #[test_case(30,        Some(SANDBOX_BARE_CHIP) ; "bare_name_exactly_fits")]
+    #[test_case(38,        Some(SANDBOX_BARE_CHIP) ; "word_dropped_for_the_name")]
+    #[test_case(39,        Some(SANDBOX_CHIP)      ; "named_in_full_exactly_fits")]
+    #[test_case(BAR_WIDTH, Some(SANDBOX_CHIP)      ; "wide")]
+    fn a_narrow_bar_squeezes_the_sandbox_chip_before_dropping_it(
+        width: u16,
+        expected: Option<&str>,
+    ) {
         let (text, hits, _) = render_at(Fixture {
             width,
-            sandbox: Some(SANDBOX_INSTANCE),
+            sandbox: Some(SANDBOX_NAME),
             ..Default::default()
         });
-
-        match hits
+        let drawn = hits
             .iter()
             .find(|hit| hit.target == StatusBarHitTarget::Sandbox)
-        {
-            Some(hit) => {
-                let glyphs = bar_glyphs(&text, hit);
-                assert!(glyphs.starts_with('['), "{STALE_HIT_MSG}: {glyphs:?}");
-                assert!(
-                    glyphs.ends_with(SANDBOX_SUFFIX),
-                    "{STALE_HIT_MSG}: {glyphs:?}"
-                );
-                assert!(glyphs.width() <= SANDBOX_MAX_WIDTH, "{glyphs:?}");
-            }
-            None => {
-                assert!(
-                    !text.contains(SANDBOX_PREFIX.trim()),
-                    "{SANDBOX_CLIPPED_MSG}"
-                );
-                assert!(!text.contains(SANDBOX_INSTANCE), "{SANDBOX_CLIPPED_MSG}");
-            }
+            .map(|hit| bar_glyphs(&text, hit));
+
+        assert_eq!(drawn.as_deref(), expected, "{STALE_HIT_MSG}");
+        if expected.is_none() {
+            assert!(
+                !text.contains(SANDBOX_PREFIX.trim()),
+                "{SANDBOX_CLIPPED_MSG}"
+            );
+            assert!(!text.contains(SANDBOX_NAME), "{SANDBOX_CLIPPED_MSG}");
         }
         for target in [StatusBarHitTarget::Mode, StatusBarHitTarget::Model] {
             assert!(
@@ -2972,15 +2985,82 @@ mod tests {
         }
     }
 
-    #[test_case(48, Some(SANDBOX_CHIP)       ; "named_in_full")]
-    #[test_case(23, Some(SANDBOX_CHIP)       ; "exactly_fits")]
-    #[test_case(14, Some("[sandbox-7a2f]")   ; "word_dropped_for_the_name")]
-    #[test_case(13, Some("[sandbox-7..]")    ; "name_truncated_from_the_head")]
-    #[test_case(5,  Some("[s..]")            ; "floor")]
-    #[test_case(4,  None                     ; "below_the_floor")]
-    #[test_case(0,  None                     ; "no_columns")]
+    /// Shortening the mode label moves every left-hand control that follows it,
+    /// so the chip's hit has to travel with its glyphs rather than stay on the
+    /// columns another control now draws.
+    #[test]
+    fn the_sandbox_hit_follows_a_shortened_mode_label() {
+        let short_mode = format!(" {MODE_SHORT_LABEL}");
+        let mut checked = 0;
+        for width in 1..=BAR_WIDTH {
+            let (text, hits, _) = render_at(Fixture {
+                width,
+                sandbox: Some(SANDBOX_NAME),
+                ..Default::default()
+            });
+            let Some(hit) = hits
+                .iter()
+                .find(|hit| hit.target == StatusBarHitTarget::Sandbox)
+                .filter(|_| text.starts_with(&short_mode))
+            else {
+                continue;
+            };
+            let glyphs = bar_glyphs(&text, hit);
+
+            assert!(
+                [SANDBOX_CHIP, SANDBOX_BARE_CHIP].contains(&glyphs.as_str()),
+                "{STALE_HIT_MSG}: {glyphs:?}"
+            );
+            checked += 1;
+        }
+
+        assert!(checked > 0, "{NO_SHORT_MODE_MSG}");
+    }
+
+    /// Taking columns away can only cost the chip glyphs, never buy it any. A
+    /// rung that came back on a narrower bar would mean something other than
+    /// the width was deciding what fits.
+    #[test]
+    fn narrowing_the_bar_never_widens_the_sandbox_chip() {
+        let mut widest = usize::MAX;
+        for width in (1..=BAR_WIDTH).rev() {
+            let (_, hits, _) = render_at(Fixture {
+                width,
+                sandbox: Some(SANDBOX_NAME),
+                ..Default::default()
+            });
+            let drawn = hits
+                .iter()
+                .find(|hit| hit.target == StatusBarHitTarget::Sandbox)
+                .map_or(0, |hit| usize::from(hit.area.width));
+
+            assert!(drawn <= widest, "{SANDBOX_GREW_MSG}: {width} holds {drawn}");
+            widest = drawn;
+        }
+    }
+
+    #[test_case(48, Some(SANDBOX_CHIP)      ; "named_in_full")]
+    #[test_case(27, Some(SANDBOX_CHIP)      ; "named_exactly_fits")]
+    #[test_case(26, Some(SANDBOX_BARE_CHIP) ; "word_dropped_for_the_name")]
+    #[test_case(18, Some(SANDBOX_BARE_CHIP) ; "bare_name_exactly_fits")]
+    #[test_case(17, None                    ; "below_the_bare_name")]
+    #[test_case(0,  None                    ; "no_columns")]
     fn sandbox_label_cases(budget: usize, expected: Option<&str>) {
-        assert_eq!(sandbox_label(SANDBOX_INSTANCE, budget).as_deref(), expected);
+        assert_eq!(sandbox_label(SANDBOX_NAME, budget).as_deref(), expected);
+    }
+
+    /// A name past its slot is cut before any rung is measured, so the chip
+    /// stays a chip however long the instance was called: the columns beyond
+    /// the slot belong to the rest of the bar, not to one more syllable.
+    #[test_case(48, Some(LONG_SANDBOX_CHIP)      ; "named_in_full")]
+    #[test_case(35, Some(LONG_SANDBOX_CHIP)      ; "named_exactly_fits")]
+    #[test_case(34, Some(LONG_SANDBOX_BARE_CHIP) ; "word_dropped_for_the_name")]
+    #[test_case(25, None                         ; "below_the_bare_name")]
+    fn a_long_instance_name_is_cut_into_the_chips_slot(budget: usize, expected: Option<&str>) {
+        assert_eq!(
+            sandbox_label(LONG_SANDBOX_NAME, budget).as_deref(),
+            expected
+        );
     }
 
     #[test]

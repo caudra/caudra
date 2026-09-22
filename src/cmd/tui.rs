@@ -18,6 +18,7 @@ use caudra_agent::command::{self, CustomCommand};
 use caudra_agent::permissions::pattern_recognition::{PatternCandidate, RecognitionExclusion};
 use caudra_agent::prompt::profile::{PromptProfileCatalog, SystemPromptProfile};
 use caudra_agent::tools::{ToolAudience, ToolFilter, ToolRegistry};
+use caudra_config::sandbox::SandboxName;
 use caudra_config::{Config, RetentionConfig};
 use caudra_lua::PluginHost;
 use caudra_providers::model::Model;
@@ -1247,6 +1248,13 @@ pub fn run(mut cli: Cli) -> Result<ExitCode> {
             workcell_runtime.stored_binding(),
         )?;
     }
+    // The runtime refused to start unless this parsed, and the footer falls back
+    // to the binding's record id rather than claiming a name it does not have.
+    let mut sandbox_name = cli
+        .workcell
+        .sandbox
+        .as_deref()
+        .and_then(|name| SandboxName::parse(name).ok());
     drop(sandbox_progress);
     let workcell_runtime_ms = lap();
 
@@ -1493,6 +1501,7 @@ pub fn run(mut cli: Cli) -> Result<ExitCode> {
                         runtime.connection_status() == Some(RemoteConnectionStatus::Connected)
                     })
                 }),
+                sandbox_name: sandbox_name.clone(),
                 timeouts: stack.timeouts(),
                 exit_on_done: cli.exit_on_done,
                 lua_command_reader: stack.plugin_host.command_reader(),
@@ -1594,6 +1603,7 @@ pub fn run(mut cli: Cli) -> Result<ExitCode> {
                 )?;
                 ToolRegistry::global().install_stopped_runtime(&registry);
                 workcell_runtime = Arc::new(runtime);
+                sandbox_name = Some(name.clone());
                 let (new_stack, new_warnings) =
                     sandbox_phase(name.as_str(), "rebuilding TUI", || {
                         build_stack(&cli, &cwd, &storage, None, true)
@@ -1622,6 +1632,7 @@ pub fn run(mut cli: Cli) -> Result<ExitCode> {
                 ToolRegistry::global().install_stopped_runtime(&prepared.registry);
                 drop(stack);
                 workcell_runtime = Arc::new(prepared.runtime);
+                sandbox_name = Some(attachment.name.clone());
                 let (new_stack, new_warnings) = build_stack(&cli, &cwd, &storage, None, true).context("Sandbox runtime is verified; source sessions remain saved. Reopen --sandbox if UI setup failed")?;
                 let resolved = resolve_remote_sessions(
                     false,

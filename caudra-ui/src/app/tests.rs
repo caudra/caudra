@@ -47,6 +47,7 @@ use caudra_agent::{
     SubagentActivity, SubagentProgress, ToolAccounting, ToolDoneEvent, ToolOutput, ToolStartEvent,
     TurnCompleteEvent,
 };
+use caudra_config::sandbox::SandboxName;
 use caudra_config::{
     Effect, PermissionReviewCandidate, PermissionReviewKind, PermissionRule, PermissionSource,
     PermissionsConfig, ToolKey, UiConfig,
@@ -126,6 +127,11 @@ const RELOCATION_PROJECT_USAGE: &str = "Include historical project usage";
 /// the session's own provider the way a real one does.
 const TEST_PROVIDER: &str = "anthropic";
 const MISSING_ZONE: &str = "the transcript must have registered a zone";
+/// The instance from the reported bug, named the way `/sandbox` lists it.
+const SANDBOX_INSTANCE_NAME: &str = "prowlix-instance";
+const UNNAMED_SANDBOX_MSG: &str = "the footer must name the sandbox the runtime attached to";
+const MANAGER_LOADED_MSG: &str = "naming the footer must not build the sandbox manager";
+const DAEMON_POLLED_MSG: &str = "naming the footer must not start a live instance snapshot";
 const BAR_IGNORED: &str = "the pointer moved the view somewhere it should not have";
 const ARMING_LEADER_IS_INERT_MSG: &str = "arming the leader waits for a second key, it never acts";
 const MENTION_POPUP_CLOSED: &str = "typing @ over a matching path must open the popup";
@@ -5260,6 +5266,18 @@ fn sandboxed_app(connected: bool) -> App {
     app
 }
 
+/// What `caudra --sandbox NAME` hands the runtime: a session attached to the
+/// named instance, with nothing having opened `/sandbox`.
+fn attached_at_startup() -> App {
+    let mut app = sandboxed_app(true);
+    app.sandbox_live.name = Some(SandboxName::parse(SANDBOX_INSTANCE_NAME).unwrap());
+    app
+}
+
+fn footer_sandbox(app: &App) -> Option<&str> {
+    attached_sandbox_instance(&app.state.session, &app.sandbox_live)
+}
+
 /// Both halves of the manager's own readiness have to hold: a sandbox that is
 /// merely running, with no authenticated connection to this runtime, is not one
 /// the footer may call attached.
@@ -5281,10 +5299,54 @@ fn the_footer_names_a_sandbox_only_once_it_is_attached(bound: bool, connected: b
             .any(|hit| hit.target == StatusBarHitTarget::Sandbox),
         bound && connected
     );
-    assert_eq!(
-        attached_sandbox_instance(&app.state.session, &app.sandbox_live).is_some(),
-        bound && connected
+    assert_eq!(footer_sandbox(&app).is_some(), bound && connected);
+}
+
+/// The reported bug. `caudra --sandbox prowlix-instance --sandbox-resume`
+/// attaches before anything opens `/sandbox`, and the footer still has to name
+/// the instance rather than the opaque server id the session is bound by.
+#[test]
+fn a_session_attached_at_startup_names_its_sandbox_without_opening_the_manager() {
+    let mut app = attached_at_startup();
+
+    let frame = rendered(&mut app);
+
+    assert!(!app.sandbox_manager.allocated(), "{MANAGER_LOADED_MSG}");
+    assert_eq!(footer_sandbox(&app), Some(SANDBOX_INSTANCE_NAME));
+    assert!(
+        frame.contains(&format!("[sandbox: {SANDBOX_INSTANCE_NAME}]")),
+        "{UNNAMED_SANDBOX_MSG}"
     );
+}
+
+/// The name is local: it came from the selection that built the runtime. The
+/// live instance state is a daemon query, and naming the footer must not start
+/// one, so the snapshot poll stays gated on the manager being open.
+#[test]
+fn naming_the_sandbox_never_queries_the_daemon() {
+    let mut app = attached_at_startup();
+
+    let frame = rendered(&mut app);
+
+    assert_eq!(app.poll_sandbox(), Dirty::NO);
+    assert!(
+        frame.contains(SANDBOX_INSTANCE_NAME),
+        "{UNNAMED_SANDBOX_MSG}"
+    );
+    assert!(!app.sandbox_manager.is_open());
+    assert!(app.sandbox_live.snapshot.is_none(), "{DAEMON_POLLED_MSG}");
+    assert!(app.sandbox_live.scope.is_none(), "{DAEMON_POLLED_MSG}");
+}
+
+/// A runtime handed no name is still attached, so the footer says so with the
+/// id it does have. Dropping the chip would claim a detachment that is not
+/// there.
+#[test]
+fn a_runtime_without_a_name_falls_back_to_the_instance_id() {
+    let app = sandboxed_app(true);
+    let expected = app.state.session.workspace_binding().unwrap().server_id();
+
+    assert_eq!(footer_sandbox(&app), Some(expected));
 }
 
 /// The chip opens what `/sandbox` opens, so there is one way into the manager

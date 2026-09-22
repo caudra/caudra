@@ -59,6 +59,10 @@ pub(crate) struct SandboxWorkers {
     pub reply: Option<Receiver<LiveReply>>,
     pub connector: Option<SandboxConnector>,
     pub readiness: Option<SandboxReadiness>,
+    /// The sandbox this runtime was built on, kept from the selection that
+    /// built it so the footer can name the instance without reading the saved
+    /// records back. `None` for a runtime that is not on a sandbox.
+    pub name: Option<SandboxName>,
     pub attachment: Option<SandboxAttachment>,
     pub transfer_connector: Option<transfer::TransferConnector>,
     pub transfer_queued: Option<transfer::TransferCommand>,

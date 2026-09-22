@@ -675,7 +675,11 @@ impl App {
             main_chat,
             retry_info: chat.retry(),
             thinking,
-            fast: if main_chat { self.state.fast } else { chat.fast },
+            fast: if main_chat {
+                self.state.fast
+            } else {
+                chat.fast
+            },
             workflows: workflow_chip(self.workflow.runs()),
             yolo: self.permissions.is_yolo(),
             restoring: self.restoring.load(Ordering::Relaxed),

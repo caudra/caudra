@@ -33,6 +33,7 @@ use caudra_agent::workspace_baseline::WorkspaceBaseline;
 use caudra_agent::{
     AgentConfig, AgentEvent, CancelToken, Envelope, McpCommand, McpConfigErrors, McpHandle, mcp,
 };
+use caudra_config::sandbox::SandboxName;
 use caudra_config::{ModelPolicy, SnapshotsConfig, UiConfig, load_permissions};
 use caudra_lua::{
     EventHandle, HintReader, KeymapReader, LuaCommandReader, ModelRequest, SessionRequest,
@@ -169,6 +170,10 @@ pub struct EventLoopParams {
     pub sandbox_connector: Option<SandboxConnector>,
     pub transfer_connector: Option<crate::sandbox::transfer::TransferConnector>,
     pub sandbox_readiness: Option<SandboxReadiness>,
+    /// The sandbox the runtime was built on. Carried rather than looked up,
+    /// because the selection that built the runtime already named it and the
+    /// binding a session stores keeps only an opaque record id.
+    pub sandbox_name: Option<SandboxName>,
     pub timeouts: Timeouts,
     pub exit_on_done: bool,
     pub lua_command_reader: LuaCommandReader,
@@ -938,6 +943,7 @@ struct SpawnCtx {
     sandbox_connector: Option<SandboxConnector>,
     transfer_connector: Option<crate::sandbox::transfer::TransferConnector>,
     sandbox_readiness: Option<SandboxReadiness>,
+    sandbox_name: Option<SandboxName>,
     network_gate: Arc<Mutex<NetworkGate>>,
     timeouts: Timeouts,
     custom_commands: Arc<[CustomCommand]>,
@@ -1179,6 +1185,7 @@ impl SpawnCtx {
         app.sandbox_live.connector = self.sandbox_connector.clone();
         app.sandbox_live.transfer_connector = self.transfer_connector.clone();
         app.sandbox_live.readiness = self.sandbox_readiness.clone();
+        app.sandbox_live.name = self.sandbox_name.clone();
         app.sandbox_live.network_gate = self.network_gate.clone();
         app.conversation_permissions = conversation_permissions;
         app.permission_authority_factory = self.permission_authority_factory.clone();
@@ -1490,6 +1497,7 @@ impl<'t> EventLoop<'t> {
             sandbox_connector,
             transfer_connector,
             sandbox_readiness,
+            sandbox_name,
             timeouts,
             exit_on_done,
             lua_command_reader,
@@ -1574,6 +1582,7 @@ impl<'t> EventLoop<'t> {
             sandbox_connector,
             transfer_connector,
             sandbox_readiness,
+            sandbox_name,
             timeouts,
             custom_commands: Arc::from(commands),
             network_gate: Arc::default(),

@@ -12,6 +12,7 @@ use crate::sandbox::{
 };
 use crate::sandbox::{SandboxSnapshot, SandboxSnapshotRequest, SandboxWorkers, start_store_effect};
 use caudra_agent::AgentEvent;
+use caudra_config::sandbox::SandboxName;
 use flume::TryRecvError;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -25,16 +26,26 @@ const UNSAVED_DRAFT_ERR: &str =
 /// instance, and this runtime's authenticated connection says the session is
 /// attached to it rather than the instance merely running. Takes its two halves
 /// apart so a caller already holding the bar can still ask.
+///
+/// The name is the runtime's own, captured from the selection that built it,
+/// because the binding a session stores keeps only an opaque record id and
+/// resolving one costs a read of the saved records. A runtime handed no name
+/// falls back to that id: it identifies the same instance less legibly, while
+/// saying nothing would claim a detachment that is not there.
 pub(crate) fn attached_sandbox_instance<'a>(
     session: &'a AppSession,
-    live: &SandboxWorkers,
+    live: &'a SandboxWorkers,
 ) -> Option<&'a str> {
     let binding = session.workspace_binding()?;
     binding.sandbox_record()?;
     live.readiness
         .as_ref()
         .is_some_and(|ready| ready())
-        .then(|| binding.server_id())
+        .then(|| {
+            live.name
+                .as_ref()
+                .map_or_else(|| binding.server_id(), SandboxName::as_str)
+        })
 }
 
 impl App {
