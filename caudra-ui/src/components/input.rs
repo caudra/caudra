@@ -1186,7 +1186,10 @@ fn slice_styled_spans(
 /// Repaints `range` as selected, splitting spans at its edges. Selection is a
 /// modifier on top of whatever colour a span already carries, so a selected
 /// paste chip or shell keyword still reads as one.
-fn apply_selection(spans: Vec<Span<'static>>, range: &Range<usize>) -> Vec<Span<'static>> {
+pub(crate) fn apply_selection(
+    spans: Vec<Span<'static>>,
+    range: &Range<usize>,
+) -> Vec<Span<'static>> {
     let mut result = Vec::with_capacity(spans.len() + 2);
     let mut pos = 0;
     for span in spans {

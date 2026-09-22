@@ -82,9 +82,7 @@ use crate::components::stash_picker::StashPicker;
 use crate::components::status_bar::{StatusBar, StatusBarHit, StatusBarHitTarget};
 use crate::components::storage_modal::{StorageFetchState, StorageModal};
 use crate::components::stream_modal::{StreamAction, StreamModal};
-use crate::components::system_prompt_modal::{
-    COPIED as SYSTEM_PROMPT_COPIED, SystemPromptAction, SystemPromptModal,
-};
+use crate::components::system_prompt_modal::{SystemPromptAction, SystemPromptModal};
 use crate::components::task_picker::TaskPicker;
 use crate::components::theme_picker::{ThemePicker, ThemePickerAction};
 use crate::components::thinking_picker::{ThinkingPicker, ThinkingPickerAction};
@@ -3252,9 +3250,9 @@ impl App {
     fn handle_system_prompt_action(&mut self, action: SystemPromptAction) {
         match action {
             SystemPromptAction::Consumed => {}
-            SystemPromptAction::Copy(text) => match self.clipboard.copy_text(&text) {
+            SystemPromptAction::Copy { text, label } => match self.clipboard.copy_text(&text) {
                 Ok(CopyResult::Noop) => {}
-                Ok(CopyResult::Copied) => self.flash(SYSTEM_PROMPT_COPIED.into()),
+                Ok(CopyResult::Copied) => self.flash(label.into()),
                 Err(e) => self.flash(format!("{COPY_FAILED}{e}")),
             },
             SystemPromptAction::Profile => {
