@@ -705,7 +705,7 @@ mod tests {
     const MODEL: &str = "provider/model";
     const HEADING: &str = "### `agent.steering`";
     const PROMPT_ROW: &str = "| `prompt` | string | `nil` |";
-    const RULE_COUNT: usize = 9;
+    const RULE_COUNT: usize = 8;
 
     #[test]
     fn steering_reference_matches_resolved_defaults() {
