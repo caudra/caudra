@@ -1274,6 +1274,7 @@ pub fn run(mut cli: Cli, tightened: Vec<PathBuf>) -> Result<ExitCode> {
 
     let _logging = setup::init_logging(&stack.config.storage);
     let init_logging_ms = lap();
+    setup::apply_storage_limits(&stack.config.storage);
     setup::init_telemetry(&stack.config.telemetry);
     setup::install_panic_log_hook();
     setup::warn_ignored_provider_fields();

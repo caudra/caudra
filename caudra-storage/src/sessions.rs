@@ -39,7 +39,7 @@ pub use database::{
     CheckpointResult, HistoryReadLimits, HistoryReadReport, HistoryRecord,
     HistorySessionReadReport, LedgerEntry, SESSIONS_DB_FILE, SESSIONS_DB_LOCK_FILE, SessionCursor,
     SessionDatabase, SessionRecreation, SessionStorageStats, ToolBucket, ToolLedgerEntry,
-    TrimReport, UsageBucket, WAL_RETENTION_LIMIT_BYTES,
+    TrimReport, UsageBucket, WAL_RETENTION_LIMIT_BYTES, eager_load_limit, set_eager_load_limit,
 };
 pub(crate) use database::{from_i64, to_i64};
 pub use lease::SessionLease;
@@ -121,7 +121,11 @@ pub enum SessionError {
         actual: usize,
         maximum: usize,
     },
-    #[error("session {id} requires {logical_bytes} bytes, eager-load limit is {maximum}")]
+    #[error(
+        "session {id} requires {logical_bytes} bytes, eager-load limit is {maximum}; \
+         raise storage.max_eager_load_mb, or run `caudra storage trim {id}` to drop its \
+         large tool outputs, snapshots and rewind archives"
+    )]
     LoadBudgetExceeded {
         id: CaudraId,
         logical_bytes: usize,

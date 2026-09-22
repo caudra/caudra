@@ -26,6 +26,7 @@ use caudra_storage::permission_state::mutation::{
 use caudra_storage::sessions::SESSIONS_DB_FILE;
 use caudra_storage::sessions::{
     SessionCursor, SessionDatabase, SessionError, SessionRecreation, WAL_RETENTION_LIMIT_BYTES,
+    eager_load_limit,
 };
 use caudra_storage::state::{WorkspaceTabs, write_workspace_tabs};
 use caudra_storage::tool_ledger::{ToolCall, ToolLedger};
@@ -43,6 +44,11 @@ const STORAGE_WARNING_BYTES: u64 = 1024 * 1024 * 1024;
 /// alarm set there would fire on every burst. Only a WAL that has outgrown what
 /// a reset is allowed to keep says checkpoints are not getting through.
 const WAL_WARNING_BYTES: u64 = 2 * WAL_RETENTION_LIMIT_BYTES;
+/// How much of the load ceiling a session may reach before it is worth saying
+/// so. A session only ever grows while it is open, and once it crosses the
+/// ceiling it stops loading, so the warning has to arrive with enough room left
+/// to act on it.
+const SESSION_LOAD_WARNING_PERCENT: usize = 80;
 const CHECKPOINT_COMMIT_INTERVAL: u32 = 128;
 const CHECKPOINT_STALL_WARNING_COUNT: u32 = 2;
 const WRITER_UNAVAILABLE: &str = "storage writer unavailable";
@@ -180,6 +186,7 @@ impl StorageWriter {
                     failing: HashSet::new(),
                     workspace_tabs_errors: HashMap::new(),
                     size_warning_level: 0,
+                    session_size_warned: HashSet::new(),
                     wal_warning_active: false,
                     commits_since_checkpoint: 0,
                     checkpoint_stalls: 0,
@@ -430,6 +437,9 @@ struct Writer {
     failing: HashSet<CaudraId>,
     workspace_tabs_errors: HashMap<PathBuf, SessionError>,
     size_warning_level: u32,
+    /// Sessions already warned about approaching the load ceiling, so one that
+    /// keeps growing says so once rather than once per save.
+    session_size_warned: HashSet<CaudraId>,
     wal_warning_active: bool,
     commits_since_checkpoint: u32,
     checkpoint_stalls: u32,
@@ -748,6 +758,7 @@ impl Writer {
             database.save(session, self.cursors.get(&session.id))?
         };
         self.deleted_sessions.remove(&session.id);
+        self.report_session_growth(session.id, saved.logical_bytes());
         self.cursors.insert(session.id, saved);
         self.commits_since_checkpoint = self.commits_since_checkpoint.saturating_add(1);
         self.checkpoint(false);
@@ -852,6 +863,26 @@ impl Writer {
         }
     }
 
+    /// Latches per session, and rearms only when a trim or a rewrite brings it
+    /// back under the threshold, so a session that keeps growing warns once.
+    fn report_session_growth(&mut self, id: CaudraId, logical_bytes: usize) {
+        let limit = eager_load_limit();
+        let threshold = limit / 100 * SESSION_LOAD_WARNING_PERCENT;
+        if logical_bytes < threshold {
+            self.session_size_warned.remove(&id);
+            return;
+        }
+        if !self.session_size_warned.insert(id) {
+            return;
+        }
+        let _ = self.warn_tx.send(format!(
+            "Session is {} MiB of the {} MiB it can still be opened at; \
+             run `caudra storage trim {id}` or start a new session",
+            mib(logical_bytes as u64),
+            mib(limit as u64)
+        ));
+    }
+
     /// Latches, so one burst warns once. It clears at the retention limit
     /// rather than at half the alarm: `journal_size_limit` holds the file
     /// there, so a lower clearing point is never reached and the warning could
@@ -936,6 +967,11 @@ mod tests {
     const WAL_GROWTH_SILENT: &str = "a WAL past the alarm must be announced";
     const WAL_WARNED_TWICE: &str = "one burst must warn once, not once per commit";
     const WAL_LATCH_STUCK: &str = "falling back to the retention limit must re-arm the warning";
+    const SIZE_WARNED_TOO_EARLY: &str = "a session with room left to grow must stay quiet";
+    const SIZE_GROWTH_SILENT: &str = "a session approaching the load ceiling must be announced";
+    const SIZE_REMEDY_MISSING: &str = "the warning must name the session to trim";
+    const SIZE_WARNED_TWICE: &str = "a growing session must warn once, not once per save";
+    const SIZE_LATCH_STUCK: &str = "a trimmed session must be able to warn again";
     const WORKSPACE: &str = "workspace";
     const OTHER_WORKSPACE: &str = "other-workspace";
     const BLOCKED_PARENT: &str = "blocked-parent";
@@ -1271,6 +1307,7 @@ mod tests {
             failing: HashSet::new(),
             workspace_tabs_errors: HashMap::new(),
             size_warning_level: 0,
+            session_size_warned: HashSet::new(),
             wal_warning_active: false,
             commits_since_checkpoint: 0,
             checkpoint_stalls: 0,
@@ -2362,6 +2399,36 @@ mod tests {
             writer.wal_outgrew_its_limit(WAL_WARNING_BYTES),
             "{WAL_LATCH_STUCK}"
         );
+    }
+
+    /// A session past the ceiling stops opening, so the warning has to arrive
+    /// while there is still room to trim or fork, and has to say which session
+    /// to act on without repeating itself on every save.
+    #[test]
+    fn the_session_size_warning_arrives_once_before_the_ceiling() {
+        let (_tmp, dir) = state_dir();
+        let (warn_tx, warn_rx) = flume::unbounded();
+        let mut writer = bare_writer(&dir, warn_tx);
+        let limit = eager_load_limit();
+        let over = limit / 100 * SESSION_LOAD_WARNING_PERCENT;
+        let id = CaudraId::generate();
+
+        writer.report_session_growth(id, over - 1);
+        assert!(warn_rx.try_recv().is_err(), "{SIZE_WARNED_TOO_EARLY}");
+
+        writer.report_session_growth(id, over);
+        let warning = warn_rx.try_recv().expect(SIZE_GROWTH_SILENT);
+        assert!(
+            warning.contains(&format!("caudra storage trim {id}")),
+            "{SIZE_REMEDY_MISSING}"
+        );
+
+        writer.report_session_growth(id, limit);
+        assert!(warn_rx.try_recv().is_err(), "{SIZE_WARNED_TWICE}");
+
+        writer.report_session_growth(id, 0);
+        writer.report_session_growth(id, over);
+        assert!(warn_rx.try_recv().is_ok(), "{SIZE_LATCH_STUCK}");
     }
 
     /// A delete invalidates the ordinary cursor and creates a tombstone. The

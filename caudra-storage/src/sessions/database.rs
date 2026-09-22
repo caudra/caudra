@@ -26,7 +26,7 @@ use std::ops::ControlFlow;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf, absolute};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use std::thread::{self, available_parallelism};
 use std::time::Duration;
 
@@ -100,7 +100,12 @@ const MAX_JSON_DEPTH: usize = 64;
 const MAX_IMAGES_PER_ITEM: usize = 16;
 const MAX_DECODED_IMAGE_BYTES: usize = 24 * 1024 * 1024;
 const MAX_SQLITE_VALUE_BYTES: i32 = 40 * 1024 * 1024;
-const MAX_EAGER_LOAD_BYTES: usize = 512 * 1024 * 1024;
+/// Ceiling on `logical_bytes` a session may hydrate at. That figure is the sum
+/// of uncompressed payload lengths, so it is a proxy for hydration work rather
+/// than for resident bytes: the rows reach memory compressed and land as typed
+/// structures. Configurable because the right ceiling is a property of the
+/// machine, which this crate cannot see.
+const DEFAULT_MAX_EAGER_LOAD_BYTES: usize = 1024 * 1024 * 1024;
 /// Level 3 won the codec gate in `benches/payload_codecs.rs`: its ratio ties
 /// gzip-6 to within a few percent on every size band, while decompressing 2.4x
 /// to 3.2x faster, and decompression is what a session load waits on. Level 9
@@ -166,6 +171,19 @@ const RELOCATION_METADATA_FIELDS: [&str; 6] = [
     "yolo",
     "snapshots_unavailable",
 ];
+
+static EAGER_LOAD_LIMIT: AtomicUsize = AtomicUsize::new(DEFAULT_MAX_EAGER_LOAD_BYTES);
+
+/// Applies the configured ceiling. A process global rather than a field because
+/// `caudra-config` depends on this crate, so the value can only arrive from
+/// above, and every `SessionDatabase::open` would otherwise have to carry it.
+pub fn set_eager_load_limit(bytes: usize) {
+    EAGER_LOAD_LIMIT.store(bytes, Ordering::Relaxed);
+}
+
+pub fn eager_load_limit() -> usize {
+    EAGER_LOAD_LIMIT.load(Ordering::Relaxed)
+}
 
 /// Lifetime spend, aggregated into hourly buckets. Deliberately carries no
 /// `session_id` and no foreign key: forgetting a session must not erase what it
@@ -2269,7 +2287,7 @@ impl SessionDatabase {
         // Root counters, payload rows, and the resulting cursor must describe
         // one snapshot; mixing autocommit reads can lose references.
         let transaction = self.connection.unchecked_transaction()?;
-        let loaded = load_on(&transaction, id)?;
+        let loaded = load_on(&transaction, id, eager_load_limit())?;
         transaction.commit()?;
         Ok(loaded)
     }
@@ -3465,6 +3483,7 @@ fn local_session_locations_on(
 fn load_on<M, U, T>(
     connection: &Connection,
     id: CaudraId,
+    limit: usize,
 ) -> Result<(Session<M, U, T>, SessionCursor), SessionError>
 where
     M: DeserializeOwned + Send,
@@ -3478,11 +3497,11 @@ where
             expected: SESSION_VERSION,
         });
     }
-    if root.logical_bytes > MAX_EAGER_LOAD_BYTES {
+    if root.logical_bytes > limit {
         return Err(SessionError::LoadBudgetExceeded {
             id,
             logical_bytes: root.logical_bytes,
-            maximum: MAX_EAGER_LOAD_BYTES,
+            maximum: limit,
         });
     }
     // Ordinals are authoritative in storage; provider-owned graph IDs remain
@@ -3727,6 +3746,12 @@ impl SessionCursor {
 
     pub fn write_version(&self) -> i64 {
         self.write_version
+    }
+
+    /// What the next load of this session will weigh itself against, so a
+    /// writer can see the ceiling coming instead of discovering it on resume.
+    pub fn logical_bytes(&self) -> usize {
+        self.logical_bytes
     }
 
     /// Queue ordering can advance a snapshot across an in-flight commit only
@@ -5689,6 +5714,12 @@ mod tests {
     const NEXT_GENERATION: &str = "next-generation";
     const ARTIFACT_NAME: &str = "artifact";
     const LARGE_OUTPUT_ID: &str = "large";
+    /// The `#[error]` attribute takes a literal, so the key it names cannot be
+    /// shared with this assertion any other way.
+    const EAGER_LOAD_CONFIG_KEY: &str = "storage.max_eager_load_mb";
+    const CEILING_REFUSED_AT_OR_BELOW: &str = "a session at or below the ceiling must still load";
+    const CEILING_ADMITTED_ABOVE: &str = "a session above the ceiling must be refused";
+    const REMEDY_MISSING: &str = "the refusal must name a way out of it";
     const FOREIGN_APPLICATION_ID: i64 = 1;
     const INITIALIZER_COUNT: usize = 2;
     const PERMISSION_PREVIOUS_SCHEMA: i64 = 7;
@@ -8209,6 +8240,76 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
             validate_json_depth(&nested),
             Err(SessionError::LimitExceeded { .. })
         ));
+    }
+
+    /// A session only grows through saves, which carry no budget of their own,
+    /// so the load ceiling is the one place it can lock a user out. Exercised
+    /// through the parameterised path, which leaves the process global alone.
+    #[test_case(0, false; "exactly_at_the_ceiling")]
+    #[test_case(1, true; "one_byte_over")]
+    fn load_refuses_only_above_its_ceiling(slack: usize, refused: bool) {
+        let (_temp, state_dir) = state_dir();
+        let mut database = SessionDatabase::open(&state_dir).unwrap();
+        let mut session = TestSession::new(MODEL, CWD);
+        session.push_message(TestMessage(ARTIFACT_NAME.into()));
+        database.save(&session, None).unwrap();
+        let stored = root_on(&database.connection, session.id)
+            .unwrap()
+            .logical_bytes;
+
+        let loaded =
+            load_on::<TestMessage, Value, Value>(&database.connection, session.id, stored - slack);
+
+        match loaded {
+            Err(SessionError::LoadBudgetExceeded { maximum, .. }) => {
+                assert!(refused, "{CEILING_REFUSED_AT_OR_BELOW}");
+                assert_eq!(maximum, stored - slack);
+            }
+            Ok(_) => assert!(!refused, "{CEILING_ADMITTED_ABOVE}"),
+            Err(error) => panic!("{error}"),
+        }
+    }
+
+    /// The refusal is a dead end unless it says how to get out of it.
+    #[test]
+    fn load_budget_refusal_names_its_remedies() {
+        let id = CaudraId::generate();
+        let message = SessionError::LoadBudgetExceeded {
+            id,
+            logical_bytes: DEFAULT_MAX_EAGER_LOAD_BYTES + 1,
+            maximum: DEFAULT_MAX_EAGER_LOAD_BYTES,
+        }
+        .to_string();
+
+        assert!(message.contains(EAGER_LOAD_CONFIG_KEY), "{REMEDY_MISSING}");
+        assert!(
+            message.contains(&format!("caudra storage trim {id}")),
+            "{REMEDY_MISSING}"
+        );
+    }
+
+    /// The configured ceiling has to reach the public load path, which is the
+    /// only consumer of the global.
+    #[test]
+    fn configured_ceiling_governs_the_public_load() {
+        let (_temp, state_dir) = state_dir();
+        let mut database = SessionDatabase::open(&state_dir).unwrap();
+        let mut session = TestSession::new(MODEL, CWD);
+        session.push_message(TestMessage(ARTIFACT_NAME.into()));
+        database.save(&session, None).unwrap();
+        assert_eq!(eager_load_limit(), DEFAULT_MAX_EAGER_LOAD_BYTES);
+
+        set_eager_load_limit(1);
+        let refused = database.load::<TestMessage, Value, Value>(session.id);
+        set_eager_load_limit(DEFAULT_MAX_EAGER_LOAD_BYTES);
+
+        assert!(
+            matches!(refused, Err(SessionError::LoadBudgetExceeded { .. })),
+            "{CEILING_ADMITTED_ABOVE}"
+        );
+        database
+            .load::<TestMessage, Value, Value>(session.id)
+            .unwrap();
     }
 
     #[cfg(unix)]

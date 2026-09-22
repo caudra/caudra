@@ -99,6 +99,14 @@ Each retained output is capped at 100 MiB. Deleting a session deletes its retain
 
 If a failed deletion or interrupted write leaves output without a session, output-store startup cleanup removes it after a seven-day grace period. Retained outputs belonging to a live session remain untouched.
 
+## Size ceiling
+
+Opening a session hydrates all of it at once: the conversation, every rich tool output record, and every subagent transcript. `storage.max_eager_load_mb` caps what Caudra will hydrate that way, at 1024 MB by default. A session above the cap refuses to open and names both ways out of it.
+
+The figure measured is the sum of uncompressed payload sizes, which is a proxy for the work of loading rather than for disk or memory. Compression usually puts the file itself at a fraction of that number.
+
+Saving carries no such cap, so a long session can grow past one that is set too low. The storage writer warns once when a session reaches 80 percent of the ceiling, while there is still room to act. Trim that session, fork it to carry the useful part forward, or raise the ceiling. `CAUDRA_MAX_EAGER_LOAD_MB` raises it for a single run, which is the quickest way to reach a session that already refuses to open.
+
 ## Retention
 
 Sessions have two tiers. A **full** session keeps everything: the conversation, rich tool output records, retained tool output files, rewind archives, and file snapshots. A **transcript** session keeps the conversation, subagent transcripts, usage, model, mode, drafts, queue, and permission rules, and can still be resumed. It has no file revert, no `tool_output_read` access to old outputs, and renders old tool calls from their model-facing text. Small structured records such as todo lists stay.

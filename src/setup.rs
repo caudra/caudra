@@ -11,12 +11,13 @@ use caudra_storage::StateDir;
 use caudra_storage::id::CaudraId;
 use caudra_storage::log::{LogSinkGuard, RotatingFileWriter};
 use caudra_storage::model::read_model;
-use caudra_storage::sessions::StoredMode;
+use caudra_storage::sessions::{StoredMode, set_eager_load_limit};
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, Layer};
 
 const RUST_LOG: &str = "RUST_LOG";
+const MAX_EAGER_LOAD_MB: &str = "CAUDRA_MAX_EAGER_LOAD_MB";
 const EVENT_STARTED: &str = "caudra_started";
 pub const MODE_TUI: &str = "tui";
 pub const MODE_ACP: &str = "acp";
@@ -190,6 +191,30 @@ pub fn init_telemetry(config: &caudra_config::TelemetryConfig) {
     if let Err(error) = caudra_otel::init(config) {
         tracing::warn!(%error, "telemetry disabled");
     }
+}
+
+/// Pushes the configured session load ceiling into storage, which cannot read
+/// the config itself: `caudra-config` depends on `caudra-storage`. Call this
+/// after `init_logging` and before anything opens a session, so a rejected
+/// override has somewhere to complain.
+pub fn apply_storage_limits(storage_config: &caudra_config::StorageConfig) {
+    let configured = storage_config.max_eager_load_bytes;
+    let megabytes = match std::env::var(MAX_EAGER_LOAD_MB) {
+        Err(_) => configured / (1024 * 1024),
+        Ok(raw) => match raw.trim().parse::<u64>() {
+            Ok(parsed) if parsed >= caudra_config::MIN_MAX_EAGER_LOAD_MB => parsed,
+            _ => {
+                tracing::warn!(
+                    env = MAX_EAGER_LOAD_MB,
+                    value = %raw,
+                    minimum = caudra_config::MIN_MAX_EAGER_LOAD_MB,
+                    "ignoring unusable session load ceiling override"
+                );
+                configured / (1024 * 1024)
+            }
+        },
+    };
+    set_eager_load_limit(megabytes.saturating_mul(1024 * 1024) as usize);
 }
 
 /// Headless runs without a session id still count, they just stay

@@ -176,6 +176,7 @@ pub fn run(
 
     let _logging = setup::init_logging(&config.storage);
     let init_logging_ms = lap();
+    setup::apply_storage_limits(&config.storage);
     setup::init_telemetry(&config.telemetry);
     setup::install_panic_log_hook();
     setup::warn_ignored_provider_fields();

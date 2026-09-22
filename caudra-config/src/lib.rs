@@ -71,6 +71,7 @@ pub const DEFAULT_STREAM_TIMEOUT_SECS: u64 = 300;
 
 pub const DEFAULT_MAX_LOG_BYTES_MB: u64 = 200;
 pub const DEFAULT_MAX_LOG_FILES: u32 = 10;
+pub const DEFAULT_MAX_EAGER_LOAD_MB: u64 = 1024;
 pub const DEFAULT_LOG_LEVEL: LogLevel = LogLevel::Info;
 pub const DEFAULT_INPUT_HISTORY_SIZE: usize = 100;
 pub const DEFAULT_EPHEMERAL: bool = false;
@@ -92,6 +93,7 @@ pub const MIN_MOUSE_SCROLL_LINES: u32 = 1;
 pub const MIN_TOOL_OUTPUT_LINES: usize = 1;
 pub const MIN_MAX_LOG_BYTES_MB: u64 = 1;
 pub const MIN_MAX_LOG_FILES: u32 = 1;
+pub const MIN_MAX_EAGER_LOAD_MB: u64 = 64;
 pub const MIN_INPUT_HISTORY_SIZE: usize = 10;
 pub const MIN_CONNECT_TIMEOUT_SECS: u64 = 1;
 pub const MIN_STREAM_TIMEOUT_SECS: u64 = 10;
@@ -1053,6 +1055,7 @@ impl ProviderFileConfig {
 pub struct StorageFileConfig {
     pub max_log_bytes_mb: Option<u64>,
     pub max_log_files: Option<u32>,
+    pub max_eager_load_mb: Option<u64>,
     pub log_level: Option<LogLevel>,
     pub input_history_size: Option<usize>,
     pub ephemeral: Option<bool>,
@@ -1067,6 +1070,7 @@ impl StorageFileConfig {
             overlay,
             max_log_bytes_mb,
             max_log_files,
+            max_eager_load_mb,
             log_level,
             input_history_size,
             ephemeral
@@ -2120,6 +2124,12 @@ pub struct StorageConfig {
              desc = "Max number of log files to keep")]
     pub max_log_files: u32,
 
+    #[config(key = "max_eager_load_mb", ty = "u64", default = DEFAULT_MAX_EAGER_LOAD_MB,
+             min = MIN_MAX_EAGER_LOAD_MB, val = "self.max_eager_load_bytes / (1024 * 1024)",
+             env = "CAUDRA_MAX_EAGER_LOAD_MB",
+             desc = "Largest session Caudra will hydrate when opening one (MB), counted in uncompressed payload bytes rather than disk or memory. A session past this refuses to load; trim it or raise this")]
+    pub max_eager_load_bytes: u64,
+
     #[config(default = DEFAULT_LOG_LEVEL, ty = "string", default_doc = "info",
              desc = "Minimum severity written to the log file: trace, debug, info, warn, or error. RUST_LOG overrides it")]
     pub log_level: LogLevel,
@@ -2144,6 +2154,7 @@ impl Default for StorageConfig {
         Self {
             max_log_bytes: DEFAULT_MAX_LOG_BYTES_MB * 1024 * 1024,
             max_log_files: DEFAULT_MAX_LOG_FILES,
+            max_eager_load_bytes: DEFAULT_MAX_EAGER_LOAD_MB * 1024 * 1024,
             log_level: DEFAULT_LOG_LEVEL,
             input_history_size: DEFAULT_INPUT_HISTORY_SIZE,
             ephemeral: DEFAULT_EPHEMERAL,
@@ -2158,6 +2169,9 @@ impl StorageConfig {
         Self {
             max_log_bytes: f.max_log_bytes_mb.unwrap_or(DEFAULT_MAX_LOG_BYTES_MB) * 1024 * 1024,
             max_log_files: f.max_log_files.unwrap_or(DEFAULT_MAX_LOG_FILES),
+            max_eager_load_bytes: f.max_eager_load_mb.unwrap_or(DEFAULT_MAX_EAGER_LOAD_MB)
+                * 1024
+                * 1024,
             log_level: f.log_level.unwrap_or(DEFAULT_LOG_LEVEL),
             input_history_size: f.input_history_size.unwrap_or(DEFAULT_INPUT_HISTORY_SIZE),
             ephemeral: f.ephemeral.unwrap_or(DEFAULT_EPHEMERAL),
@@ -3254,6 +3268,28 @@ mod tests {
             config.storage.max_log_bytes,
             DEFAULT_MAX_LOG_BYTES_MB * 1024 * 1024
         );
+        assert_eq!(
+            config.storage.max_eager_load_bytes,
+            DEFAULT_MAX_EAGER_LOAD_MB * 1024 * 1024
+        );
+    }
+
+    /// The ceiling is the only thing standing between a long session and a
+    /// refusal to open it, so a user must be able to move it.
+    #[test_case(Some(2048), true; "raised")]
+    #[test_case(Some(MIN_MAX_EAGER_LOAD_MB - 1), false; "below_the_floor")]
+    #[test_case(None, true; "left_alone")]
+    fn eager_load_ceiling_is_configurable(megabytes: Option<u64>, valid: bool) {
+        let storage = StorageConfig::from_file(StorageFileConfig {
+            max_eager_load_mb: megabytes,
+            ..StorageFileConfig::default()
+        });
+
+        assert_eq!(
+            storage.max_eager_load_bytes,
+            megabytes.unwrap_or(DEFAULT_MAX_EAGER_LOAD_MB) * 1024 * 1024
+        );
+        assert_eq!(storage.validate().is_ok(), valid);
     }
 
     #[test_case("auto", NotificationMethod::Auto ; "auto")]

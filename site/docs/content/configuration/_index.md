@@ -308,13 +308,14 @@ Disabling the master switch or setting `rules.truncation.enabled = false` stops 
 
 ### `storage`
 
-| Field | Type | Default | Min | Description |
-|-------|------|---------|-----|-------------|
-| `max_log_bytes_mb` | u64 | `200` | 1 | Max total log size (MB) |
-| `max_log_files` | u32 | `10` | 1 | Max number of log files to keep |
-| `log_level` | string | `info` | - | Minimum severity written to the log file: trace, debug, info, warn, or error. RUST_LOG overrides it |
-| `input_history_size` | usize | `100` | 10 | Number of input history entries to retain |
-| `ephemeral` | bool | `false` | - | Store session data in a temporary directory removed when Caudra exits |
+| Field | Type | Default | Env | Min | Description |
+|-------|------|---------|-----|-----|-------------|
+| `max_log_bytes_mb` | u64 | `200` | - | 1 | Max total log size (MB) |
+| `max_log_files` | u32 | `10` | - | 1 | Max number of log files to keep |
+| `max_eager_load_mb` | u64 | `1024` | `CAUDRA_MAX_EAGER_LOAD_MB` | 64 | Largest session Caudra will hydrate when opening one (MB), counted in uncompressed payload bytes rather than disk or memory. A session past this refuses to load; trim it or raise this |
+| `log_level` | string | `info` | - | - | Minimum severity written to the log file: trace, debug, info, warn, or error. RUST_LOG overrides it |
+| `input_history_size` | usize | `100` | - | 10 | Number of input history entries to retain |
+| `ephemeral` | bool | `false` | - | - | Store session data in a temporary directory removed when Caudra exits |
 
 ### `storage.retention`
 
