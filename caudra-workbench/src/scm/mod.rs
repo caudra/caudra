@@ -1117,6 +1117,23 @@ impl Scm {
         }
     }
 
+    /// Puts the cursor on the commit `id` abbreviates, if the graph is showing
+    /// it. Reports whether it found one, so a caller can say so rather than
+    /// moving the reader somewhere they did not ask to go.
+    pub fn reveal_commit(&mut self, id: &str) -> bool {
+        let Some(row) = (0..self.sections[Section::Graph.index()].rows.len()).find(|row| {
+            self.identity(Section::Graph, *row)
+                .is_some_and(|identity| identity.starts_with(id) || id.starts_with(&identity))
+        }) else {
+            return false;
+        };
+        self.cursor = Cursor {
+            section: Section::Graph,
+            row: Some(row),
+        };
+        true
+    }
+
     fn anchor(&self) -> Option<Anchor> {
         let section = self.cursor.section;
         Some(Anchor {
@@ -1316,6 +1333,7 @@ mod tests {
                 author_email: "author@example.test".to_owned(),
                 committed_unix_seconds: 1,
                 summary: "summary".to_owned(),
+                body: None,
             }],
             warnings: vec!["Remote status is incomplete".to_owned()],
         };

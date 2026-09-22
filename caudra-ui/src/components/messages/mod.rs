@@ -27,6 +27,7 @@ use super::{
 };
 use crate::animation::spinner_str;
 use crate::chat::batch_child_id;
+use crate::components::commit_popup::CommitIndex;
 use crate::components::keybindings::key;
 use crate::components::prompt_progress::{self, PromptProgress, PromptRate};
 use crate::markdown::{
@@ -55,6 +56,7 @@ use crossterm::event::MouseEvent;
 
 use super::scrollbar::{ScrollHint, Scrollbar, ScrollbarMouse};
 use super::streaming_content::StreamingContent;
+use caudra_agent::commits::{self, CommitRef};
 use caudra_agent::mentions::{self, Mention};
 use caudra_agent::tools::{BATCH_TOOL_NAME, SHELL_TOOL_NAME, ToolEffect};
 use caudra_agent::{
@@ -159,6 +161,7 @@ const MATH_BRACKET_OPEN: &str = "\\[";
 enum HoverTarget {
     Link(Arc<str>),
     Mention(Mention),
+    Commit(CommitRef),
     MessageAction(usize),
     CachedThinking(usize),
     StreamingThinking,
@@ -978,6 +981,9 @@ pub struct MessagesPanel {
     prompt_progress: Option<PromptProgress>,
     prompt_rate: PromptRate,
     hover: Option<HoverTarget>,
+    /// Resolves the hashes a sent `#` names, so the transcript agrees with the
+    /// composer about which of them were ever commits.
+    commit_index: CommitIndex,
     message_action_hits: Vec<MessageActionHit>,
     terminal_links: Vec<TerminalLink>,
     /// Cards whose message changed since the last frame and whose segment is
@@ -1080,6 +1086,7 @@ impl MessagesPanel {
             prompt_progress: None,
             prompt_rate: PromptRate::default(),
             hover: None,
+            commit_index: CommitIndex::default(),
             message_action_hits: Vec::new(),
             terminal_links: Vec::new(),
             dirty_cards: HashSet::new(),
@@ -2719,6 +2726,11 @@ impl MessagesPanel {
         match &self.hover {
             Some(HoverTarget::Link(target)) => Some(target),
             Some(HoverTarget::Mention(mention)) => Some(&mention.raw),
+            // A hash names nothing on its own, so the bar shows the subject the
+            // reader would otherwise have to open the commit to read.
+            Some(HoverTarget::Commit(commit)) => {
+                Some(self.commit_index.subject(&commit.id).unwrap_or(&commit.raw))
+            }
             _ => None,
         }
     }
@@ -2762,14 +2774,25 @@ impl MessagesPanel {
         self.mention_at_mode(row, col, area, Path::new(""), true)
     }
 
-    fn mention_at_mode(
-        &self,
-        row: u16,
-        col: u16,
-        area: Rect,
-        cwd: &Path,
-        remote: bool,
-    ) -> Option<Mention> {
+    /// The commit a sent `#hash` names, under the pointer. Only the reader's
+    /// own messages answer, for the same reason mentions do: a hash the model
+    /// happens to write was never a request to open anything.
+    pub(crate) fn commit_at(&self, row: u16, col: u16, area: Rect) -> Option<CommitRef> {
+        let (source, offset) = self.source_under(row, col, area)?;
+        commits::scan(&source, |id| self.commit_index.resolves(id))
+            .into_iter()
+            .find(|(range, _)| range.contains(&offset))
+            .map(|(_, commit)| commit)
+    }
+
+    pub(crate) fn set_commit_index(&mut self, index: CommitIndex) {
+        self.commit_index = index;
+    }
+
+    /// The text of the reader's own message under the pointer, and how far into
+    /// it the pointer is. Shared by everything that resolves a token in the
+    /// transcript, so none of them can disagree about what is clickable.
+    fn source_under(&self, row: u16, col: u16, area: Rect) -> Option<(Arc<str>, usize)> {
         if area.height == 0
             || row < area.y
             || row >= area.bottom()
@@ -2788,6 +2811,18 @@ impl MessagesPanel {
         let (source, byte) = segment.source_at(rel_row, col - area.x, width)?;
         // Provenance counts bytes and the scanner counts chars.
         let offset = source.get(..byte as usize)?.chars().count();
+        Some((source, offset))
+    }
+
+    fn mention_at_mode(
+        &self,
+        row: u16,
+        col: u16,
+        area: Rect,
+        cwd: &Path,
+        remote: bool,
+    ) -> Option<Mention> {
+        let (source, offset) = self.source_under(row, col, area)?;
         let mentions = if remote {
             mentions::scan_remote(&source)
         } else {
@@ -2845,6 +2880,9 @@ impl MessagesPanel {
         };
         if let Some(mention) = mention {
             return Some(HoverTarget::Mention(mention));
+        }
+        if let Some(commit) = self.commit_at(row, col, area) {
+            return Some(HoverTarget::Commit(commit));
         }
         let Some(tool_id) = segment.tool_id.as_deref() else {
             let msg_index = segment.msg_index?;
@@ -2924,6 +2962,7 @@ impl MessagesPanel {
             | Some(HoverTarget::MessageAction(_))
             | Some(HoverTarget::Link(_))
             | Some(HoverTarget::Mention(_))
+            | Some(HoverTarget::Commit(_))
             | Some(HoverTarget::StreamingThinking)
             | Some(HoverTarget::Tool { .. })
             | Some(HoverTarget::Diagram(_))

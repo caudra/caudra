@@ -649,6 +649,7 @@ impl App {
             text: text.clone(),
             images: input.images.clone(),
             mentions: input.mentions.clone(),
+            commits: input.commits.clone(),
             paste_ranges: paste_ranges.clone(),
         };
         match self.submit_prompt_with_admission(message(), PromptAdmission::Interrupt) {
@@ -812,6 +813,7 @@ impl App {
                 text: item.text.clone(),
                 images: Vec::new(),
                 mentions: Vec::new(),
+                commits: Vec::new(),
                 paste_ranges: Vec::new(),
             },
             PromptAdmission::Queue,
@@ -937,6 +939,7 @@ impl App {
             text: condition.to_owned(),
             images: Vec::new(),
             mentions: Vec::new(),
+            commits: Vec::new(),
             paste_ranges: Vec::new(),
         };
         let mut input = self.build_agent_input(&msg);
@@ -1095,6 +1098,7 @@ impl App {
             self.queue_with_admission(
                 QueuedMessage {
                     mentions: self.scan_mentions(&prompt.text),
+                    commits: self.scan_commits(&prompt.text),
                     text: prompt.text,
                     images,
                     paste_ranges: prompt
@@ -1169,6 +1173,7 @@ impl App {
             text: String::new(),
             images: Vec::new(),
             mentions: Vec::new(),
+            commits: Vec::new(),
             paste_ranges: Vec::new(),
         });
         input.preamble = preamble;
@@ -1207,6 +1212,7 @@ impl App {
             text: String::new(),
             images: Vec::new(),
             mentions: Vec::new(),
+            commits: Vec::new(),
             paste_ranges: Vec::new(),
         });
         input.resume = true;
@@ -1222,6 +1228,7 @@ impl App {
             text: String::new(),
             images: Vec::new(),
             mentions: Vec::new(),
+            commits: Vec::new(),
             paste_ranges: Vec::new(),
         });
         input.preamble.push(caudra_providers::Message::synthetic(

@@ -3580,6 +3580,20 @@ impl Workbench {
         self.sidebar_collapsed = false;
     }
 
+    /// Opens source control on the commit `id` abbreviates, which is where a
+    /// click on a `#hash` in the transcript lands. A commit the graph is not
+    /// showing says so rather than opening the pane on something else.
+    pub fn open_at_commit(&mut self, root: &Path, id: &str) {
+        if !self.open || self.root != root {
+            self.open(root);
+        }
+        self.sidebar = SidebarView::SourceControl;
+        self.sidebar_collapsed = false;
+        if !self.scm.reveal_commit(id) {
+            self.flash = Some(format!("{id} is not in the recent log"));
+        }
+    }
+
     /// Points both sidebars at whatever the editor is showing: the explorer
     /// expands down to the file, and source control lands on its change when it
     /// has one.

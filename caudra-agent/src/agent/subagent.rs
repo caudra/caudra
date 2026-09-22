@@ -551,6 +551,7 @@ impl Subagent {
                 mode: self.mode.clone(),
                 images: Vec::new(),
                 mentions: Vec::new(),
+                commits: Vec::new(),
                 preamble,
                 thinking: self.thinking.clone(),
                 fast: self.fast,

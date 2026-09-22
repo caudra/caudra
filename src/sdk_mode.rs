@@ -1002,11 +1002,16 @@ pub fn run(params: SdkParams) -> Result<()> {
                         .map(|(_, mention)| mention)
                         .collect()
                 };
+                let commits = caudra_agent::commits::scan(&prompt, |_| true)
+                    .into_iter()
+                    .map(|(_, commit)| commit)
+                    .collect();
                 let input = AgentInput {
                     message: prompt,
                     mode,
                     images,
                     mentions,
+                    commits,
                     preamble: Vec::new(),
                     thinking: thinking.clone(),
                     fast,

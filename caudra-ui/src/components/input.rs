@@ -10,6 +10,7 @@ use crate::text_buffer::{EditResult, TextBuffer, is_newline_key};
 use crate::theme;
 
 use caudra_agent::PromptAdmission;
+use caudra_agent::commits::{self, CommitRef};
 use caudra_agent::mentions::{self, Mention};
 use caudra_grab::grab_scope;
 use caudra_storage::input_history::InputHistory;
@@ -26,6 +27,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Paragraph};
 
+use super::commit_popup::CommitIndex;
 use super::scrollbar::{Scrollbar, ScrollbarMouse};
 use super::{apply_scroll_delta, hover_style};
 
@@ -136,6 +138,7 @@ pub struct Submission {
     pub text: String,
     pub images: Vec<ImageSource>,
     pub mentions: Vec<Mention>,
+    pub commits: Vec<CommitRef>,
     pub(crate) draft: InputDraft,
 }
 
@@ -160,6 +163,7 @@ impl Submission {
             text: String::new(),
             images: Vec::new(),
             mentions: Vec::new(),
+            commits: Vec::new(),
             draft: InputDraft::default(),
         }
     }
@@ -177,6 +181,7 @@ impl Submission {
             text,
             images: Vec::new(),
             mentions: Vec::new(),
+            commits: Vec::new(),
         }
     }
 }
@@ -199,6 +204,10 @@ pub struct InputBox {
     /// the app hands the composer the session's working directory.
     cwd: PathBuf,
     remote_workspace: bool,
+    /// Resolves the hashes a commit mention names. Empty until the app loads
+    /// the session's log, which is what keeps `#` prose in a project that has
+    /// no repository.
+    commit_index: CommitIndex,
 }
 
 impl InputBox {
@@ -321,6 +330,7 @@ impl InputBox {
             hover: None,
             cwd: PathBuf::new(),
             remote_workspace: false,
+            commit_index: CommitIndex::default(),
         }
     }
 
@@ -348,6 +358,23 @@ impl InputBox {
         } else {
             mentions::scan_in(&self.buffer.display_text(), &self.cwd)
         }
+    }
+
+    /// The commits the composer text resolves, derived on demand for the same
+    /// reasons as [`Self::mentions`]. The predicate is the loaded log window,
+    /// so this costs a scan of a short list rather than a repository read.
+    pub(crate) fn commits(&self) -> Vec<(Range<usize>, CommitRef)> {
+        commits::scan(&self.buffer.display_text(), |id| {
+            self.commit_index.resolves(id)
+        })
+    }
+
+    pub(crate) fn set_commit_index(&mut self, index: CommitIndex) {
+        self.commit_index = index;
+    }
+
+    pub(crate) fn commit_index(&self) -> &CommitIndex {
+        &self.commit_index
     }
 
     pub fn selected_text(&self) -> Option<String> {
@@ -406,6 +433,8 @@ impl InputBox {
         }
         let mut mentions: Vec<Mention> = self.mentions().into_iter().map(|(_, m)| m).collect();
         mentions.dedup_by(|left, right| left.target == right.target && left.lines == right.lines);
+        let mut commits: Vec<CommitRef> = self.commits().into_iter().map(|(_, c)| c).collect();
+        commits.dedup_by(|left, right| left.id == right.id);
         if record_history {
             self.history.push(text.clone());
         }
@@ -414,6 +443,7 @@ impl InputBox {
             text,
             images,
             mentions,
+            commits,
             draft,
         })
     }
@@ -578,11 +608,16 @@ impl InputBox {
         self.scroll_y = self.scroll_y.min(max_scroll);
 
         let is_empty = self.buffer.display_text().is_empty();
-        let mention_ranges: Vec<Range<usize>> = self
+        // Commits mark themselves exactly as mentions do, so one list carries
+        // both: the two kinds cannot overlap, because each consumes its own
+        // text, and neither sigil can open inside the other's run.
+        let mut mention_ranges: Vec<Range<usize>> = self
             .mentions()
             .into_iter()
             .map(|(range, _)| range)
+            .chain(self.commits().into_iter().map(|(range, _)| range))
             .collect();
+        mention_ranges.sort_by_key(|range| range.start);
         let mut styled_lines: Vec<Line> = if is_empty && self.pending_images.is_empty() {
             let base = theme::current().input_placeholder;
             let (head, tail) = match placeholder {

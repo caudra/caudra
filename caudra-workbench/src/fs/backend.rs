@@ -2216,6 +2216,7 @@ pub(crate) mod tests {
                     author_email: "author@example.test".into(),
                     committed_unix_seconds: 1,
                     summary: "remote commit".into(),
+                    body: None,
                 }],
                 truncated: false,
                 incomplete: false,

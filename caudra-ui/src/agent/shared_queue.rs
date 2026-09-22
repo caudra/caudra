@@ -12,9 +12,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use caudra_agent::{
-    AgentInput, AgentMode, EditableQueue, EditableQueueReceiver, ExtractedCommand, ImageSource,
-    InterruptSource, Mention, PromptAdmission, QueueDelivery, QueueItemId, QueuedInterrupt,
-    editable_queue,
+    AgentInput, AgentMode, CommitRef, EditableQueue, EditableQueueReceiver, ExtractedCommand,
+    ImageSource, InterruptSource, Mention, PromptAdmission, QueueDelivery, QueueItemId,
+    QueuedInterrupt, editable_queue,
 };
 
 use crate::components::input::{InputState, Submission};
@@ -28,6 +28,7 @@ pub(crate) struct QueuedMessage {
     pub(crate) text: String,
     pub(crate) images: Vec<ImageSource>,
     pub(crate) mentions: Vec<Mention>,
+    pub(crate) commits: Vec<CommitRef>,
     pub(crate) paste_ranges: Vec<Range<usize>>,
 }
 
@@ -57,6 +58,7 @@ impl From<Submission> for QueuedMessage {
             text: sub.text,
             images: sub.images,
             mentions: sub.mentions,
+            commits: sub.commits,
             paste_ranges,
         }
     }
@@ -713,6 +715,7 @@ mod tests {
                 mode,
                 images: Vec::new(),
                 mentions: Vec::new(),
+                commits: Vec::new(),
                 preamble: Vec::new(),
                 thinking: Default::default(),
                 fast: false,
@@ -746,6 +749,7 @@ mod tests {
             text: PADDED_DRAFT.trim().into(),
             images: Vec::new(),
             mentions: Vec::new(),
+            commits: Vec::new(),
             draft: InputDraft {
                 text: PADDED_DRAFT.into(),
                 paste_ranges: vec![range],

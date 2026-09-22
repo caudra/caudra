@@ -144,6 +144,13 @@ const MENTION_ATE_SELECTION: &str = "a drag across a mention must still select t
 const MENTION_UNRESOLVED: &str = "a completed path must resolve to a mention";
 const MENTION_DROPPED_A_PASTE: &str =
     "completing a mention must splice a range, not replace the buffer";
+const COMMIT_ID: &str = "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678";
+const COMMIT_SUBJECT: &str = "Fix login crash";
+const COMMIT_AUTHOR: &str = "Ada Lovelace";
+const COMMIT_POPUP_CLOSED: &str = "typing # over a loaded log must open the popup";
+const COMMIT_POPUP_LINGERED: &str = "choosing a commit must close the popup";
+const COMMIT_UNRESOLVED: &str = "a completed hash must resolve to a commit";
+const COMMIT_NOT_OPENED: &str = "clicking a commit must open the workbench on source control";
 const OTHER_PROVIDER: &str = "openrouter";
 const QUEUE_MENU_MISSING: &str = "the three-dot affordance must open the queue menu";
 const QUEUE_MENU_ENTRY_MISSING: &str = "the queue menu did not offer the action under test";
@@ -1506,6 +1513,7 @@ fn queued_msg(text: &str) -> QueuedMessage {
         text: text.into(),
         images: vec![],
         mentions: Vec::new(),
+        commits: Vec::new(),
         paste_ranges: Vec::new(),
     }
 }
@@ -7613,6 +7621,7 @@ fn checkpoint_persists_queued_submission_images_and_paste_ranges() {
             text: QUEUED_TEXT.into(),
             images: vec![image],
             mentions: Vec::new(),
+            commits: Vec::new(),
             draft: InputDraft {
                 text: draft_text.clone(),
                 paste_ranges: std::iter::once(0..draft_text.len()).collect(),
@@ -9710,6 +9719,7 @@ fn a_run_that_writes_nothing_leaves_no_revert_point() {
         text: "next prompt".into(),
         images: Vec::new(),
         mentions: Vec::new(),
+        commits: Vec::new(),
         paste_ranges: Vec::new(),
     });
     app.update(done_event());
@@ -9735,6 +9745,7 @@ fn run_snapshots_are_complete_and_associated_with_atomic_heads() {
         text: "next prompt".into(),
         images: Vec::new(),
         mentions: Vec::new(),
+        commits: Vec::new(),
         paste_ranges: Vec::new(),
     });
     arm_revert_point(&app);
@@ -14274,6 +14285,7 @@ fn a_toggled_mode_reads_as_pending_until_a_message_carries_it() {
         text: "go".into(),
         images: Vec::new(),
         mentions: Vec::new(),
+        commits: Vec::new(),
         paste_ranges: Vec::new(),
     });
     assert_eq!(&*app.mode_label().full, "[BUILD]");
@@ -14421,6 +14433,7 @@ fn sending_a_message_settles_the_model_alongside_the_mode() {
         text: "go".into(),
         images: Vec::new(),
         mentions: Vec::new(),
+        commits: Vec::new(),
         paste_ranges: Vec::new(),
     });
 
@@ -16950,6 +16963,98 @@ fn clicking_the_composer_closes_the_mention_popup() {
     ));
 
     assert!(!app.mention_popup.is_open(), "{MENTION_POPUP_LINGERED}");
+}
+
+/// A one-commit log window. No repository is created: the index is the whole
+/// source of truth, which is the property the `#` scanner rests on.
+fn commit_index() -> CommitIndex {
+    CommitIndex::Local(
+        vec![caudra_agent::commits::repo::CommitSummary {
+            id: COMMIT_ID.to_owned(),
+            subject: COMMIT_SUBJECT.to_owned(),
+            author: COMMIT_AUTHOR.to_owned(),
+            committed_unix_seconds: 1_700_000_000,
+        }]
+        .into(),
+    )
+}
+
+fn commit_popup_at(app: &mut App, query: &str) {
+    app.set_commit_index(commit_index());
+    for character in query.chars() {
+        app.update(Msg::Key(key(KeyCode::Char(character))));
+    }
+    app.commit_popup.settle();
+}
+
+#[test]
+fn typing_a_hash_sigil_opens_the_commit_popup_and_completing_splices_in_place() {
+    let mut app = test_app();
+
+    commit_popup_at(&mut app, "landed in #a1b2");
+    assert!(app.commit_popup.is_open(), "{COMMIT_POPUP_CLOSED}");
+
+    app.update(Msg::Key(key(KeyCode::Enter)));
+
+    assert_eq!(app.input_box.buffer.display_text(), "landed in #a1b2c3d");
+    assert!(!app.commit_popup.is_open(), "{COMMIT_POPUP_LINGERED}");
+    let commits = app.input_box.commits();
+    assert_eq!(commits.len(), 1, "{COMMIT_UNRESOLVED}");
+    assert_eq!(commits[0].1.id, "a1b2c3d");
+}
+
+/// Clicking away moves the caret out of the query, and the popup has no
+/// business outliving it.
+#[test]
+fn clicking_the_composer_closes_the_commit_popup() {
+    let mut app = test_app();
+
+    commit_popup_at(&mut app, "landed in #a1b2");
+    let (row, column) = screen_hit(&mut app, "landed in #a1b2");
+
+    app.update(mouse_event(
+        MouseEventKind::Down(MouseButton::Left),
+        column,
+        row,
+    ));
+
+    assert!(!app.commit_popup.is_open(), "{COMMIT_POPUP_LINGERED}");
+}
+
+/// Prose that merely contains a `#` is not a revision, so nothing opens and
+/// nothing is sent as context.
+#[test]
+fn a_heading_in_the_composer_is_never_a_commit() {
+    let mut app = test_app();
+
+    commit_popup_at(&mut app, "# Notes");
+
+    assert!(!app.commit_popup.is_open(), "{COMMIT_POPUP_LINGERED}");
+    assert!(app.input_box.commits().is_empty(), "{COMMIT_UNRESOLVED}");
+}
+
+/// A sent hash is a click target the way a sent path is, and it lands on
+/// source control rather than the explorer.
+#[test]
+fn clicking_a_commit_in_the_transcript_opens_source_control() {
+    let mut app = test_app();
+    app.set_commit_index(commit_index());
+    app.main_chat()
+        .push_user_message("landed in #a1b2c3d".to_owned());
+    let (row, column) = screen_hit(&mut app, "#a1b2c3d");
+
+    app.update(mouse_event(
+        MouseEventKind::Down(MouseButton::Left),
+        column,
+        row,
+    ));
+    app.update(mouse_event(
+        MouseEventKind::Up(MouseButton::Left),
+        column,
+        row,
+    ));
+
+    assert!(app.workbench.is_open(), "{COMMIT_NOT_OPENED}");
 }
 
 #[test]

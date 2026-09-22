@@ -13,8 +13,11 @@ pub use mcp::protocol::PromptRole;
 pub use mcp::{
     McpCommand, McpHandle, McpPromptArg, McpPromptInfo, McpSession, McpSnapshot, McpSnapshotReader,
 };
+pub mod commits;
+pub use commits::CommitRef;
 pub mod mentions;
 pub use mentions::Mention;
+pub(crate) mod sigil;
 pub(crate) mod task_set;
 pub use agent::{
     Agent, AgentParams, AgentRunParams, COMPACTION_ANCHOR, DEFAULT_GOAL_CONTINUATION_LIMIT,
@@ -152,6 +155,10 @@ pub struct AgentInput {
     /// of `message`: `@` is too common in prose for a scan to be safe here, and
     /// the composer already knows which of them resolved to a real path.
     pub mentions: Vec<Mention>,
+    /// Commits the caller asked to have inlined, declared for the same reason
+    /// and resolved the same way: the composer already matched each hash
+    /// against the log window it searched.
+    pub commits: Vec<CommitRef>,
     pub preamble: Vec<Message>,
     pub thinking: ThinkingConfig,
     pub fast: bool,

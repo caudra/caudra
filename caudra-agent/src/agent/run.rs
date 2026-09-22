@@ -18,6 +18,7 @@ use caudra_providers::{
     RequestOptions, Role, StopReason, StreamResponse, Timeouts, TokenUsage, estimate_tokens_cached,
 };
 
+use super::commit_preamble;
 use super::compaction;
 use super::goal::{
     Evaluator, GoalApply, GoalHandle, GoalStatus, ResolvedEvaluator, continuation_message,
@@ -50,7 +51,7 @@ use crate::tools::{Deadline, FileReadTracker, LocalTools, PathLocks, ToolAudienc
 use crate::workflow::WorkflowHandle;
 use crate::workspace_baseline::BaselineGate;
 use crate::{
-    AgentConfig, AgentError, AgentEvent, AgentInput, AgentMode, DoneReason, EventSender,
+    AgentConfig, AgentError, AgentEvent, AgentInput, AgentMode, CommitRef, DoneReason, EventSender,
     ExtractedCommand, InterruptSource, Mention, QueueConsumedItem, SessionMailbox,
     SubagentHistoryStore, TurnCompleteEvent,
 };
@@ -809,10 +810,15 @@ impl<'h> Agent<'h> {
             fast: latest.fast,
         };
 
+        // One budget for every attachment the turn carries, spent in the order
+        // the caller declared them, so files and commits compete for the same
+        // ceiling instead of each getting their own.
+        let mut budget = mention_preamble::MAX_TOTAL_BYTES;
         let mut arrivals = Vec::new();
         for input in &mut inputs {
             arrivals.append(&mut input.preamble);
-            standing.append(&mut self.mention_preamble(&input.mentions).await);
+            standing.append(&mut self.mention_preamble(&input.mentions, &mut budget).await);
+            standing.append(&mut self.commit_preamble(&input.commits, &mut budget).await);
         }
         self.push_arrivals(arrivals);
 
@@ -841,7 +847,7 @@ impl<'h> Agent<'h> {
     /// throwaway file tracker because Workcell records every successful read
     /// against the tracker it is given, and seeing 20 lines must not clear a
     /// later edit's staleness check on the whole file.
-    async fn mention_preamble(&self, mentions: &[Mention]) -> Vec<Message> {
+    async fn mention_preamble(&self, mentions: &[Mention], budget: &mut usize) -> Vec<Message> {
         if mentions.is_empty() {
             return Vec::new();
         }
@@ -859,6 +865,25 @@ impl<'h> Agent<'h> {
                 vision: self.model.supports_vision(),
                 remote_context: self.remote_project_context.as_ref(),
             },
+            budget,
+        )
+        .await
+    }
+
+    /// Resolves the caller's commit references into hidden context. Unlike a
+    /// file a commit cannot change, so this needs no tracker of its own: there
+    /// is no staleness for a later edit to check.
+    async fn commit_preamble(&self, commits: &[CommitRef], budget: &mut usize) -> Vec<Message> {
+        if commits.is_empty() {
+            return Vec::new();
+        }
+        commit_preamble::build(
+            commits,
+            commit_preamble::Resolution {
+                root: &self.permissions.project_cwd(),
+                context: &self.tool_context(),
+            },
+            budget,
         )
         .await
     }
@@ -2812,6 +2837,7 @@ mod tests {
             mode: AgentMode::Build,
             images: Vec::new(),
             mentions: Vec::new(),
+            commits: Vec::new(),
             preamble: Vec::new(),
             thinking: Default::default(),
             fast: false,

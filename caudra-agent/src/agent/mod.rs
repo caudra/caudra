@@ -1,3 +1,4 @@
+pub mod commit_preamble;
 mod compaction;
 mod goal;
 mod history;

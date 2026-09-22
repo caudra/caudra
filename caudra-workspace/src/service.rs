@@ -678,6 +678,10 @@ pub struct ScmCommit {
     pub author_email: String,
     pub committed_unix_seconds: i64,
     pub summary: String,
+    /// The message past its subject line. `None` means the workspace did not
+    /// report one, which is not the same as a commit whose message is a
+    /// subject and nothing else.
+    pub body: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

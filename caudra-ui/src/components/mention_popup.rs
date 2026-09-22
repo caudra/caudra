@@ -1,47 +1,38 @@
-//! Path completion for `@` mentions.
+//! The `@path` completion popup.
 //!
-//! Opens while the cursor sits inside an `@query` the user is typing, matches
+//! Typing `@` in the composer opens a list of project paths, fuzzy-matched
 //! against the same project walk the file picker uses, and splices the choice
-//! back over the query in place. Unlike the command palette, which replaces the
-//! whole buffer to complete, this must edit a range: the composer may hold
-//! paste tokens that a whole-buffer replacement would silently drop.
+//! back over the query that opened it. A remote session lists the workspace
+//! through the workbench backend instead of walking a local directory.
+//!
+//! Everything about being a list — matching, selection, scrolling, hit testing
+//! and painting — lives in [`crate::components::completion`]. What is here is
+//! what makes the list one of paths: where the rows come from, and the fact
+//! that a directory drills in rather than finishing the mention.
 
+use caudra_workbench::{
+    BackendDriver, BackendEvent, ResourceEntry, WorkbenchBackend, WorkbenchPath,
+};
+use caudra_workspace::{ResourceKind, WorkspacePath, WorkspaceSession};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent};
+use nucleo::{Config, Utf32String};
+use ratatui::Frame;
+use ratatui::layout::{Position, Rect};
+use ratatui::text::{Line, Span};
 use std::collections::HashMap;
 use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
-use nucleo::pattern::{CaseMatching, Normalization};
-use nucleo::{Config, Nucleo, Utf32String};
-use ratatui::Frame;
-use ratatui::layout::{Position, Rect};
-use ratatui::style::Modifier;
-use ratatui::text::{Line, Span};
-use ratatui::widgets::{Clear, Paragraph, Widget};
-
-use caudra_grab::grab_scope;
-use caudra_workbench::{
-    BackendDriver, BackendEvent, ResourceEntry, WorkbenchBackend, WorkbenchPath,
-};
-use caudra_workspace::{ResourceKind, WorkspacePath, WorkspaceSession};
-
+use crate::components::completion::{self, Completion, MouseOutcome, PAD};
 use crate::components::file_walk::{self, Walk};
 use crate::repaint::Dirty;
 use crate::theme;
 
 const SIGIL: char = '@';
 const SEPARATOR: char = std::path::MAIN_SEPARATOR;
-const MAX_ROWS: usize = 10;
-/// Matching a whole project on every keystroke is wasted work when the reader
-/// can only see ten rows; nucleo is asked for a little more so scrolling has
-/// somewhere to go.
-const MAX_MATCHES: usize = 64;
-const PAD: u16 = 1;
-/// How long a settling tick waits on the matcher before looking again.
-#[cfg(test)]
-const POLL_MS: u64 = 10;
+const SCOPE: &str = "mention_popup";
 
 pub(crate) enum MentionAction {
     Consumed,
@@ -56,23 +47,11 @@ pub(crate) enum MentionAction {
 }
 
 struct Session {
-    nucleo: Nucleo<()>,
-    matches: Vec<String>,
-    selected: usize,
-    scroll_offset: usize,
+    completion: Completion,
     cancel: Arc<AtomicBool>,
     done_rx: Option<flume::Receiver<Walk>>,
     backend: Option<BackendDriver>,
     remote_resources: HashMap<String, ResourceEntry>,
-    walk: Walk,
-    query: String,
-    /// Where the rows were last drawn, so the pointer can find them. Cleared
-    /// on a frame that draws nothing, because a stale rectangle would keep
-    /// answering clicks for rows that are no longer on screen.
-    area: Rect,
-    /// The path the button went down on. A release only takes a row when it is
-    /// the row the press started on.
-    pressed: Option<String>,
 }
 
 impl Drop for Session {
@@ -98,7 +77,7 @@ impl MentionPopup {
     pub fn is_open(&self) -> bool {
         self.session
             .as_ref()
-            .is_some_and(|session| !session.matches.is_empty())
+            .is_some_and(|session| !session.completion.is_empty())
     }
 
     pub fn close(&mut self) {
@@ -111,7 +90,7 @@ impl MentionPopup {
     pub fn contains(&self, position: Position) -> bool {
         self.session
             .as_ref()
-            .is_some_and(|session| session.area.contains(position))
+            .is_some_and(|session| session.completion.contains(position))
     }
 
     /// The wheel walks the list. The viewport follows the selection on every
@@ -129,17 +108,14 @@ impl MentionPopup {
         cwd: &str,
         workspace: Option<WorkspaceSession>,
     ) {
-        let Some((range, query)) = trigger_at(text, cursor) else {
+        let Some((range, query)) = completion::trigger_at(text, cursor, SIGIL) else {
             self.close();
             return;
         };
         self.trigger = Some(range);
         match &mut self.session {
-            Some(session) if session.query == query => {}
-            Some(session) => {
-                session.query = query;
-                reparse(session);
-            }
+            Some(session) if session.completion.query() == query => {}
+            Some(session) => session.completion.set_query(query),
             None => match workspace {
                 Some(workspace) => self.start_workspace(workspace, query),
                 None => self.start(cwd, query),
@@ -148,55 +124,45 @@ impl MentionPopup {
     }
 
     fn start(&mut self, cwd: &str, query: String) {
-        let nucleo = Nucleo::new(Config::DEFAULT.match_paths(), Arc::new(|| {}), None, 1);
+        let completion = Completion::new(Config::DEFAULT.match_paths(), query);
         let cancel = Arc::new(AtomicBool::new(false));
-        let Some(done_rx) =
-            file_walk::spawn(PathBuf::from(cwd), nucleo.injector(), Arc::clone(&cancel))
-        else {
+        let Some(done_rx) = file_walk::spawn(
+            PathBuf::from(cwd),
+            completion.injector(),
+            Arc::clone(&cancel),
+        ) else {
             return;
         };
-        let mut session = Session {
-            nucleo,
-            matches: Vec::new(),
-            selected: 0,
-            scroll_offset: 0,
+        self.open(Session {
+            completion,
             cancel,
             done_rx: Some(done_rx),
             backend: None,
             remote_resources: HashMap::new(),
-            walk: Walk::Running,
-            query,
-            area: Rect::default(),
-            pressed: None,
-        };
-        reparse(&mut session);
-        self.session = Some(session);
+        });
     }
 
     fn start_workspace(&mut self, workspace: WorkspaceSession, query: String) {
-        let nucleo = Nucleo::new(Config::DEFAULT.match_paths(), Arc::new(|| {}), None, 1);
-        let cancel = Arc::new(AtomicBool::new(false));
         let root = WorkbenchPath::Remote(WorkspacePath::root());
         let Ok(backend) = WorkbenchBackend::workspace(workspace) else {
             return;
         };
         let mut backend = BackendDriver::new(backend, root.clone());
         backend.list(root, true);
-        let mut session = Session {
-            nucleo,
-            matches: Vec::new(),
-            selected: 0,
-            scroll_offset: 0,
-            cancel,
+        self.open(Session {
+            completion: Completion::new(Config::DEFAULT.match_paths(), query),
+            cancel: Arc::new(AtomicBool::new(false)),
             done_rx: None,
             backend: Some(backend),
             remote_resources: HashMap::new(),
-            walk: Walk::Running,
-            query,
-            area: Rect::default(),
-            pressed: None,
-        };
-        reparse(&mut session);
+        });
+    }
+
+    /// Runs the query the session was built with before the popup adopts it, so
+    /// the first frame shows matches rather than the whole project.
+    fn open(&mut self, mut session: Session) {
+        let query = session.completion.query().to_owned();
+        session.completion.set_query(query);
         self.session = Some(session);
     }
 
@@ -206,10 +172,8 @@ impl MentionPopup {
         let Some(session) = &mut self.session else {
             return Dirty::NO;
         };
-        if let Some(done_rx) = &session.done_rx
-            && let Ok(walk) = done_rx.try_recv()
-        {
-            session.walk = walk;
+        if let Some(done_rx) = &session.done_rx {
+            let _ = done_rx.try_recv();
         }
         if let Some(backend) = &mut session.backend {
             for event in backend.drain() {
@@ -217,7 +181,7 @@ impl MentionPopup {
                     result: Ok(result), ..
                 } = event
                 {
-                    let injector = session.nucleo.injector();
+                    let injector = session.completion.injector();
                     for entry in result.entries {
                         let mut path = entry.path.display();
                         if entry.kind == ResourceKind::Directory {
@@ -228,17 +192,10 @@ impl MentionPopup {
                         });
                         session.remote_resources.insert(path, entry);
                     }
-                    session.walk = Walk::Listed;
                 }
             }
         }
-        let before = session.matches.len();
-        session.nucleo.tick(0);
-        refresh(session);
-        match session.matches.len() == before {
-            true => Dirty::NO,
-            false => Dirty::YES,
-        }
+        session.completion.tick()
     }
 
     /// Waits for the walk to finish and the matcher to drain, so a test can
@@ -248,13 +205,10 @@ impl MentionPopup {
         let Some(session) = &mut self.session else {
             return;
         };
-        if let Some(done_rx) = &session.done_rx
-            && let Ok(walk) = done_rx.recv()
-        {
-            session.walk = walk;
+        if let Some(done_rx) = &session.done_rx {
+            let _ = done_rx.recv();
         }
-        while session.nucleo.tick(POLL_MS).running {}
-        refresh(session);
+        session.completion.settle();
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> MentionAction {
@@ -279,53 +233,21 @@ impl MentionPopup {
     /// over one highlights it, and a press and release on the same row takes
     /// it. Anything outside the drawn rows is left for the composer.
     pub fn handle_mouse(&mut self, event: MouseEvent) -> MentionAction {
-        let position = Position::new(event.column, event.row);
         let Some(session) = &mut self.session else {
             return MentionAction::Passthrough;
         };
-        if !session.area.contains(position) {
-            session.pressed = None;
-            return MentionAction::Passthrough;
-        }
-        match event.kind {
-            MouseEventKind::Down(MouseButton::Left) => {
-                session.pressed = None;
-                if let Some(index) = row_at(session, position) {
-                    session.selected = index;
-                    session.pressed = Some(session.matches[index].clone());
-                }
-                MentionAction::Consumed
-            }
-            MouseEventKind::Drag(MouseButton::Left) => {
-                session.pressed = None;
-                MentionAction::Consumed
-            }
-            MouseEventKind::Moved => {
-                if let Some(index) = row_at(session, position) {
-                    session.selected = index;
-                }
-                MentionAction::Consumed
-            }
-            MouseEventKind::Up(MouseButton::Left) => {
-                let pressed = session.pressed.take();
-                let landed = row_at(session, position);
-                let Some(index) =
-                    landed.filter(|&index| pressed == Some(session.matches[index].clone()))
-                else {
-                    return MentionAction::Consumed;
-                };
-                session.selected = index;
-                // One click carries no second intent, so a directory always
-                // drills in and only a file finishes the mention.
-                self.choose(true)
-            }
-            _ => MentionAction::Consumed,
+        match session.completion.handle_mouse(event) {
+            MouseOutcome::Outside => MentionAction::Passthrough,
+            MouseOutcome::Consumed => MentionAction::Consumed,
+            // One click carries no second intent, so a directory always drills
+            // in and only a file finishes the mention.
+            MouseOutcome::Chosen => self.choose(true),
         }
     }
 
     fn step(&mut self, delta: isize) -> MentionAction {
         if let Some(session) = &mut self.session {
-            move_selection(session, delta);
+            session.completion.step(delta);
         }
         MentionAction::Consumed
     }
@@ -337,7 +259,7 @@ impl MentionPopup {
         let (Some(session), Some(range)) = (self.session.as_mut(), self.trigger.clone()) else {
             return MentionAction::Passthrough;
         };
-        let Some(chosen) = session.matches.get(session.selected).cloned() else {
+        let Some(chosen) = session.completion.selected().map(str::to_owned) else {
             return MentionAction::Passthrough;
         };
         if session.backend.is_some() && !session.remote_resources.contains_key(&chosen) {
@@ -346,8 +268,7 @@ impl MentionPopup {
         let path = format!("{SIGIL}{chosen}");
         match drill && chosen.ends_with(SEPARATOR) {
             true => {
-                session.query = chosen;
-                reparse(session);
+                session.completion.set_query(chosen);
                 self.trigger = Some(range.start..range.start + path.chars().count());
             }
             false => self.close(),
@@ -357,126 +278,27 @@ impl MentionPopup {
 
     pub fn view(&mut self, frame: &mut Frame, input_area: Rect) -> Option<Rect> {
         let session = self.session.as_mut()?;
-        session.area = Rect::default();
-        if session.matches.is_empty() {
-            return None;
-        }
-        let height = (session.matches.len().min(MAX_ROWS) as u16).min(input_area.y);
-        if height == 0 {
-            return None;
-        }
-        session.scroll_offset = session
-            .scroll_offset
-            .min(session.selected)
-            .max((session.selected + 1).saturating_sub(height as usize));
-
-        let width = session
-            .matches
-            .iter()
-            .map(|path| path.chars().count() as u16 + PAD * 2)
-            .max()
-            .unwrap_or(0)
-            .min(input_area.width);
-        let area = Rect {
-            x: input_area.x,
-            y: input_area.y.saturating_sub(height),
-            width,
-            height,
-        };
-        session.area = area;
-
-        grab_scope!("mention_popup", area);
         let theme = theme::current();
-        let rows: Vec<Line> = session
-            .matches
-            .iter()
-            .enumerate()
-            .skip(session.scroll_offset)
-            .take(height as usize)
-            .map(|(index, path)| {
-                let style = match index == session.selected {
+        session.completion.view(
+            frame,
+            input_area,
+            SCOPE,
+            |path| path.chars().count() as u16 + PAD * 2,
+            move |path, selected| {
+                let style = match selected {
                     true => theme.item_selected,
                     false => theme.item,
                 };
                 Line::from(Span::styled(format!(" {path} "), style))
-            })
-            .collect();
-
-        Clear.render(area, frame.buffer_mut());
-        frame.render_widget(
-            Paragraph::new(rows).style(theme.item.add_modifier(Modifier::empty())),
-            area,
-        );
-        Some(area)
+            },
+        )
     }
-}
-
-/// The `@query` under `cursor`, if there is one. The sigil has to start a word
-/// and the query has to reach the cursor without whitespace, which is what
-/// stops an old mention earlier in the line from reopening the popup.
-fn trigger_at(text: &str, cursor: usize) -> Option<(Range<usize>, String)> {
-    let chars: Vec<char> = text.chars().collect();
-    if cursor > chars.len() {
-        return None;
-    }
-    let start = chars[..cursor].iter().rposition(|&c| c == SIGIL)?;
-    if start > 0 && !chars[start - 1].is_whitespace() {
-        return None;
-    }
-    let query: String = chars[start + 1..cursor].iter().collect();
-    match query.chars().any(char::is_whitespace) {
-        true => None,
-        false => Some((start..cursor, query)),
-    }
-}
-
-fn reparse(session: &mut Session) {
-    session.nucleo.pattern.reparse(
-        0,
-        &session.query,
-        CaseMatching::Smart,
-        Normalization::Smart,
-        false,
-    );
-    session.selected = 0;
-    session.scroll_offset = 0;
-    session.nucleo.tick(0);
-    refresh(session);
-}
-
-fn refresh(session: &mut Session) {
-    let snapshot = session.nucleo.snapshot();
-    let count = snapshot.matched_item_count().min(MAX_MATCHES as u32);
-    session.matches = snapshot
-        .matched_items(0..count)
-        .map(|item| item.matcher_columns[0].to_string())
-        .collect();
-    session.selected = session
-        .selected
-        .min(session.matches.len().saturating_sub(1));
-}
-
-/// Which match the pointer is over. Rows are one line tall and drawn from
-/// `scroll_offset`, so the row is arithmetic rather than a stored hit list.
-/// A frame that draws fewer rows than the area is tall leaves blank rows,
-/// which belong to no match.
-fn row_at(session: &Session, position: Position) -> Option<usize> {
-    let row = position.y.checked_sub(session.area.y)? as usize;
-    let index = session.scroll_offset + row;
-    (index < session.matches.len()).then_some(index)
-}
-
-fn move_selection(session: &mut Session, delta: isize) {
-    if session.matches.is_empty() {
-        return;
-    }
-    let len = session.matches.len() as isize;
-    session.selected = (session.selected as isize + delta).rem_euclid(len) as usize;
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crossterm::event::{MouseButton, MouseEventKind};
     use test_case::test_case;
 
     const ROWS: [&str; 3] = ["src/lib.rs", "src/main.rs", "docs/"];
@@ -499,18 +321,11 @@ mod tests {
         let (_tx, done_rx) = flume::bounded(1);
         MentionPopup {
             session: Some(Session {
-                nucleo: Nucleo::new(Config::DEFAULT.match_paths(), Arc::new(|| {}), None, 1),
-                matches: rows.iter().map(|row| (*row).to_owned()).collect(),
-                selected: 0,
-                scroll_offset: 0,
+                completion: completion::seeded(rows, area),
                 cancel: Arc::new(AtomicBool::new(false)),
                 done_rx: Some(done_rx),
                 backend: None,
                 remote_resources: HashMap::new(),
-                walk: Walk::Listed,
-                query: String::new(),
-                area,
-                pressed: None,
             }),
             trigger: Some(0..1),
         }
@@ -533,7 +348,12 @@ mod tests {
     }
 
     fn selected(popup: &MentionPopup) -> usize {
-        popup.session.as_ref().expect(NO_SESSION).selected
+        popup
+            .session
+            .as_ref()
+            .expect(NO_SESSION)
+            .completion
+            .selected_index()
     }
 
     #[test_case(0 ; "first")]
@@ -648,7 +468,7 @@ mod tests {
     #[test_case("@src now", 8, None ; "whitespace_closes_it")]
     #[test_case("plain", 5, None ; "no_sigil")]
     fn trigger_follows_the_cursor(text: &str, cursor: usize, expected: Option<(usize, &str)>) {
-        let found = trigger_at(text, cursor);
+        let found = completion::trigger_at(text, cursor, SIGIL);
         assert_eq!(
             found
                 .as_ref()

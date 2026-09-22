@@ -9,6 +9,7 @@ use std::time::Duration;
 use crossterm::event::MouseEvent;
 
 use crate::app::tasks::{TaskOutcome, TaskStatus};
+use crate::components::commit_popup::CommitIndex;
 use crate::components::messages::MessagesPanel;
 use crate::components::prompt_progress::PromptProgress;
 use crate::components::tool_display::append_annotation;
@@ -26,8 +27,8 @@ use caudra_agent::tools::{
 };
 use caudra_agent::types::{Answer, QuestionEvent, WorkflowRunCard};
 use caudra_agent::{
-    AgentEvent, BatchToolEntry, BufferSnapshot, COMPACTION_ANCHOR, EMPTY_RESPONSE_RULE, Mention,
-    SubagentProgress, ToolDoneEvent, ToolOutput, ToolStartEvent,
+    AgentEvent, BatchToolEntry, BufferSnapshot, COMPACTION_ANCHOR, CommitRef, EMPTY_RESPONSE_RULE,
+    Mention, SubagentProgress, ToolDoneEvent, ToolOutput, ToolStartEvent,
 };
 use caudra_config::{ToolOutputLines, UiConfig};
 use caudra_lua::WinView;
@@ -587,6 +588,14 @@ impl Chat {
 
     pub(crate) fn mention_at_remote(&self, row: u16, col: u16, area: Rect) -> Option<Mention> {
         self.messages_panel.mention_at_remote(row, col, area)
+    }
+
+    pub(crate) fn commit_at(&self, row: u16, col: u16, area: Rect) -> Option<CommitRef> {
+        self.messages_panel.commit_at(row, col, area)
+    }
+
+    pub(crate) fn set_commit_index(&mut self, index: CommitIndex) {
+        self.messages_panel.set_commit_index(index);
     }
 
     pub(crate) fn message_action_at(

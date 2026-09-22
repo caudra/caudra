@@ -70,6 +70,35 @@ A mention marks itself as the pointer passes over it, the way a paste label does
 
 A mention you already sent stays clickable in the transcript. Hovering one puts the path in the status bar, the way a hovered link does, and clicking it opens the same workbench view. Only your own messages answer, so a path the model writes with an `@` is left as text. A mention wrapped in emphasis, a code span, or link text is left as text too: what reaches the screen there is no longer the path you typed.
 
+## Mention a commit with #
+
+Typing `#` opens a completion popup over the project's recent log. The fuzzy match runs across the hash, the subject, and the author together, so `#login` finds the commit that fixed login and `#ada` finds the ones Ada wrote. The keys and the pointer behave as they do in the file popup. Picking a row writes the abbreviated hash into your message.
+
+At send time Caudra reads the commit and puts it in the request ahead of your message:
+
+```xml
+<commit hash="a1b2c3d" author="Ada Lovelace <ada@example.com>" date="2024-03-11T09:41:02Z">
+<subject>Fix login crash on empty session</subject>
+<message>
+The guard read the session before the store had it...
+</message>
+<files>
+M src/auth.rs
+A src/guard.rs
+</files>
+</commit>
+```
+
+The file list carries the same letters git uses: `A` added, `D` deleted, `M` modified, `R` renamed, `C` copied, `T` type changed, `U` unmerged. Diff text is not included. Ask for the parts you want and the model will run `git show` itself, which keeps a large commit from filling the window.
+
+A `#` resolves only when the hash names a commit in the log window Caudra loaded at session start, and the check runs against that list rather than the repository. So a `#` in prose costs nothing, and `# Heading`, `#1234` and a CSS colour such as `#a1b2c3` stay text. The hash itself must be 7 to 40 hex characters. Symbolic revisions like `HEAD~3`, branch names, tags, and ranges are not mentions, because they mean different things on different days.
+
+Mentioned files and mentioned commits share one budget per turn, so a message carrying both cannot send more than a message carrying either. A commit past the budget, or one the log no longer holds, is reported to the model as a short note rather than dropped in silence.
+
+A sent hash stays clickable in the transcript. Hovering one puts the commit subject in the status bar, which is more use than the hash you are already looking at, and clicking it opens [source control](/docs/workbench/) in the workbench with the cursor on that commit. Only your own messages answer, so a hash the model quotes back is left as text.
+
+In a [remote workspace](/docs/remote-workspaces/) there is no local log to list, so the popup does not open. A hash you spell out in full still resolves: Caudra asks the workspace for it when you send, and the workspace answers with the commit or says it does not know it.
+
 ## Instruction files
 
 At session start Caudra walks from the project git root down to the working directory (no `.git` root, only the cwd). In each directory it loads **one** project instruction file, first match wins:

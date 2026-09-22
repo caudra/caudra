@@ -40,6 +40,13 @@ const MENTION_PROSE: &str = "look at @src/lib.rs please";
 const MENTION_MISSED: &str = "the pointer sat on a mention the panel did not resolve";
 const MENTION_CLAIMED: &str = "a message the reader did not write answered with a mention";
 const MENTION_MARKED_GLYPHS: &str = "a hovered mention repainted the message around it";
+const COMMIT_ID: &str = "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678";
+const COMMIT_HASH: &str = "#a1b2c3d";
+const COMMIT_PROSE: &str = "landed in #a1b2c3d yesterday";
+const COMMIT_SUBJECT: &str = "Fix login crash";
+const COMMIT_MISSED: &str = "the pointer sat on a commit the panel did not resolve";
+const COMMIT_CLAIMED: &str = "a message the reader did not write answered with a commit";
+const COMMIT_MARKED_GLYPHS: &str = "a hovered commit repainted the message around it";
 /// A read-only tool the `always_collapsed` default deliberately leaves out, so
 /// a card built on it answers the view mode rather than the reader's collapse
 /// list. It shares `file_grep`'s row budget, so a test that moved off grep to
@@ -2824,10 +2831,9 @@ fn message_link_hit_testing_accounts_for_segment_chrome() {
     assert_eq!(panel.hovered_hint(), None);
 }
 
-/// Places the pointer over the mention in a one-message transcript and reports
-/// what the panel makes of it. The project is this crate, so `src/lib.rs`
-/// resolves without a temporary directory.
-fn mention_hover(role: DisplayRole, text: &str) -> (MessagesPanel, Rect, u16, u16) {
+/// Places the pointer over `needle` in a one-message transcript and reports
+/// what the panel makes of it.
+fn pointer_at(role: DisplayRole, text: &str, needle: &str) -> (MessagesPanel, Rect, u16, u16) {
     let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
     panel.push(DisplayMessage::new(role, text.into()));
     panel.viewport_width = 80;
@@ -2836,7 +2842,29 @@ fn mention_hover(role: DisplayRole, text: &str) -> (MessagesPanel, Rect, u16, u1
     let area = Rect::new(5, 7, 80, 5);
     let chrome = panel.cache.get(0).expect("a segment").chrome(80);
     let row = area.y + chrome.content_start();
-    let column = area.x + chrome.left + text.find(MENTION).expect("a mention") as u16;
+    let column = area.x + chrome.left + text.find(needle).expect("the needle") as u16;
+    (panel, area, row, column)
+}
+
+/// The project is this crate, so `src/lib.rs` resolves without a temporary
+/// directory.
+fn mention_hover(role: DisplayRole, text: &str) -> (MessagesPanel, Rect, u16, u16) {
+    pointer_at(role, text, MENTION)
+}
+
+/// The panel carries the log window the composer validated against, so the
+/// hover answers from memory rather than opening the repository.
+fn commit_hover(role: DisplayRole) -> (MessagesPanel, Rect, u16, u16) {
+    let (mut panel, area, row, column) = pointer_at(role, COMMIT_PROSE, COMMIT_HASH);
+    panel.set_commit_index(CommitIndex::Local(
+        vec![caudra_agent::commits::repo::CommitSummary {
+            id: COMMIT_ID.to_owned(),
+            subject: COMMIT_SUBJECT.to_owned(),
+            author: "Ada Lovelace".to_owned(),
+            committed_unix_seconds: 1_700_000_000,
+        }]
+        .into(),
+    ));
     (panel, area, row, column)
 }
 
@@ -2883,6 +2911,62 @@ fn hovering_a_mention_marks_the_status_bar_and_no_glyph() {
     assert!(
         panel.hover_feedback_for_segment(segment).is_none(),
         "{MENTION_MARKED_GLYPHS}"
+    );
+}
+
+#[test]
+fn a_commit_in_a_user_message_answers_the_pointer() {
+    let (panel, area, row, column) = commit_hover(DisplayRole::User);
+
+    let commit = panel.commit_at(row, column, area);
+
+    assert_eq!(
+        commit.map(|commit| commit.id),
+        Some("a1b2c3d".to_owned()),
+        "{COMMIT_MISSED}"
+    );
+}
+
+/// A hash the model quotes back was never a request to open anything.
+#[test]
+fn a_commit_the_model_wrote_is_left_alone() {
+    let (panel, area, row, column) = commit_hover(DisplayRole::Assistant);
+
+    assert!(
+        panel.commit_at(row, column, area).is_none(),
+        "{COMMIT_CLAIMED}"
+    );
+}
+
+/// A hash names nothing on its own, so the bar shows the subject, and the
+/// message itself stays exactly as it was drawn.
+#[test]
+fn hovering_a_commit_shows_its_subject_and_marks_no_glyph() {
+    let (mut panel, area, row, column) = commit_hover(DisplayRole::User);
+
+    panel.update_hover(row, column, area, false, Path::new(NO_PROJECT));
+
+    assert_eq!(
+        panel.hovered_hint(),
+        Some(COMMIT_SUBJECT),
+        "{COMMIT_MISSED}"
+    );
+    let segment = panel.cache.get(0).expect("a segment");
+    assert!(
+        panel.hover_feedback_for_segment(segment).is_none(),
+        "{COMMIT_MARKED_GLYPHS}"
+    );
+}
+
+/// Without the log window the same text is prose, which is what keeps a `#`
+/// in a project that has no repository from becoming a click target.
+#[test]
+fn a_hash_outside_the_log_window_is_prose() {
+    let (panel, area, row, column) = pointer_at(DisplayRole::User, COMMIT_PROSE, COMMIT_HASH);
+
+    assert!(
+        panel.commit_at(row, column, area).is_none(),
+        "{COMMIT_CLAIMED}"
     );
 }
 

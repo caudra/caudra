@@ -8152,6 +8152,7 @@ mod tests {
         };
         let tracker = Arc::clone(&whole_file.file_tracker);
 
+        let mut budget = mention_preamble::MAX_TOTAL_BYTES;
         let messages = smol::block_on(mention_preamble::build(
             &[Mention::new(CONTENT_FILE, lines)],
             mention_preamble::Resolution {
@@ -8162,6 +8163,7 @@ mod tests {
                 vision: false,
                 remote_context: None,
             },
+            &mut budget,
         ));
 
         assert_eq!(messages.len(), 1);
@@ -8183,6 +8185,7 @@ mod tests {
         let (_host, registry) = host_and_registry(root.path());
         let ctx = context(root.path(), Arc::clone(&registry), CancelToken::none());
 
+        let mut budget = mention_preamble::MAX_TOTAL_BYTES;
         let messages = smol::block_on(mention_preamble::build(
             &[Mention::new("absent.txt", None)],
             mention_preamble::Resolution {
@@ -8193,6 +8196,7 @@ mod tests {
                 vision: false,
                 remote_context: None,
             },
+            &mut budget,
         ));
 
         let text = message_text(&messages[0]);

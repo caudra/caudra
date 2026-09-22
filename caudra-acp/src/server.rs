@@ -1015,6 +1015,7 @@ fn handle_prompt(srv: &mut Server, raw: &Value, id: &RequestId) -> Result<(), Ac
         mode: session.current_mode.clone(),
         images,
         mentions,
+        commits: Vec::new(),
         preamble: Vec::new(),
         thinking: srv.thinking.clone(),
         fast: false,

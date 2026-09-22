@@ -917,6 +917,7 @@ mod tests {
                     author_email: "author@example.test".to_owned(),
                     committed_unix_seconds: 1,
                     summary: id.to_owned(),
+                    body: None,
                 }],
                 truncated: !second,
                 incomplete: false,

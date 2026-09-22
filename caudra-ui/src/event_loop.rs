@@ -2783,6 +2783,7 @@ impl<'t> EventLoop<'t> {
             text,
             images: Vec::new(),
             mentions: Vec::new(),
+            commits: Vec::new(),
             paste_ranges: Vec::new(),
         };
         match self.sessions[idx]

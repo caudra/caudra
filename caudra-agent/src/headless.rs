@@ -46,6 +46,7 @@ use crate::agent::task_runner::{
 };
 use crate::agent::{self, History};
 use crate::cancel::{CancelMap, CancelToken};
+use crate::commits;
 use crate::mentions;
 use crate::permissions::editor::{PermissionEditError, PermissionPublication};
 use crate::permissions::{PermissionManager, PluginRuleStore};
@@ -1482,12 +1483,22 @@ pub fn spawn(mut params: HeadlessParams) -> HeadlessHandle {
                     .map(|(_, mention)| mention)
                     .collect()
             };
+            // Every well-formed hash is admitted here rather than checked
+            // against a log window. A headless prompt is scanned once and named
+            // a revision on purpose, so an unknown one is worth an error note;
+            // the composer is the surface that must not misread prose, because
+            // it rescans on every keystroke.
+            let commits = commits::scan(&params.prompt, |_| true)
+                .into_iter()
+                .map(|(_, commit)| commit)
+                .collect();
             let result = agent
                 .run(AgentInput {
                     message: params.prompt,
                     mode,
                     images: params.images,
                     mentions,
+                    commits,
                     preamble: Vec::new(),
                     thinking: params.thinking,
                     fast,
@@ -4027,6 +4038,7 @@ complete(#{ report: first.output });
             mode: AgentMode::Build,
             images: Vec::new(),
             mentions: Vec::new(),
+            commits: Vec::new(),
             preamble: Vec::new(),
             thinking: crate::ThinkingConfig::default(),
             fast: false,

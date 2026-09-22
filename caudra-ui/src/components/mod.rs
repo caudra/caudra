@@ -1,6 +1,8 @@
 pub(crate) mod code_view;
 pub mod command;
 pub(crate) mod command_modal;
+pub(crate) mod commit_popup;
+pub(crate) mod completion;
 pub(crate) mod context_modal;
 pub(crate) mod environment_card;
 pub(crate) mod file_picker;

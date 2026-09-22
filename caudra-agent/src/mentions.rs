@@ -14,19 +14,13 @@ use std::path::{Path, PathBuf};
 use caudra_workspace::WorkspacePath;
 use serde::{Deserialize, Serialize};
 
+use crate::sigil::{MAX_CANDIDATES, TRAILING_PUNCTUATION, opens_after};
+
 const SIGIL: char = '@';
 const RANGE_SEPARATOR: char = ':';
 const LINE_PREFIXES: [char; 2] = ['L', 'l'];
 const RANGE_SPAN: char = '-';
 const QUOTE: char = '"';
-const TRAILING_PUNCTUATION: [char; 9] = ['.', ',', ';', ':', '!', '?', ')', ']', '}'];
-/// Characters a mention may follow, alongside whitespace and the start of the
-/// text. Excluding everything else is what keeps `user@host` and `HEAD@{1}`
-/// from ever reaching the existence check.
-const OPENING_DELIMITERS: [char; 3] = ['(', '[', '{'];
-/// How many candidates [`scan_in`] will stat. A prompt full of `@` must not
-/// turn one keystroke or one mouse move into a burst of syscalls.
-const MAX_CANDIDATES: usize = 32;
 
 /// A resolved reference to a file, with the source text that produced it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -180,7 +174,7 @@ pub fn scan(text: &str, mut exists: impl FnMut(&Path) -> bool) -> Vec<(Range<usi
             boundary = false;
             continue;
         }
-        boundary = character.is_whitespace() || OPENING_DELIMITERS.contains(&character);
+        boundary = opens_after(character);
     }
     found
 }
@@ -211,7 +205,7 @@ pub fn scan_remote(text: &str) -> Vec<(Range<usize>, Mention)> {
                 continue;
             }
         }
-        boundary = character.is_whitespace() || OPENING_DELIMITERS.contains(&character);
+        boundary = opens_after(character);
     }
     found
 }

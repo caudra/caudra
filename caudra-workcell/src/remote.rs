@@ -6802,6 +6802,7 @@ fn scm_commit(commit: &contract::ScmCommit) -> Result<ScmCommit, WorkspaceError>
         author_email: commit.author_email.as_str().to_owned(),
         committed_unix_seconds: commit.committed_unix_seconds,
         summary: commit.summary.as_str().to_owned(),
+        body: commit.body.as_ref().map(|body| body.as_str().to_owned()),
     })
 }
 

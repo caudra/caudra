@@ -5,7 +5,7 @@ use crate::components::Status;
 use crate::components::status_bar::ModeLabel;
 use crate::theme;
 use caudra_agent::mentions;
-use caudra_agent::{AgentInput, AgentMode, Mention};
+use caudra_agent::{AgentInput, AgentMode, CommitRef, Mention, commits};
 use caudra_providers::ModelPurpose;
 use caudra_providers::model_registry;
 use caudra_storage::StateDir;
@@ -260,6 +260,17 @@ impl App {
             .collect()
     }
 
+    /// Commit references in text the composer did not hand us already resolved.
+    /// Validated against the loaded log window, so a queue entry restored into
+    /// a different project resolves nothing rather than the wrong revision.
+    pub(crate) fn scan_commits(&self, text: &str) -> Vec<CommitRef> {
+        let index = self.input_box.commit_index();
+        commits::scan(text, |id| index.resolves(id))
+            .into_iter()
+            .map(|(_, commit)| commit)
+            .collect()
+    }
+
     /// The one place the mode is committed to the agent, so it is also where a
     /// pending toggle stops being pending. The model the toggle swapped in
     /// settles with it, having reached the agent by the same message.
@@ -271,6 +282,7 @@ impl App {
             mode: self.agent_mode(),
             images: msg.images.clone(),
             mentions: msg.mentions.clone(),
+            commits: msg.commits.clone(),
             preamble: Vec::new(),
             thinking: self.state.thinking.clone(),
             fast: self.state.fast,

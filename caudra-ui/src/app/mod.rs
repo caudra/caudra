@@ -42,6 +42,7 @@ use crate::chat::{CANCELLED_TEXT, ChatEventResult, DONE_TEXT, ERROR_TEXT};
 use crate::clipboard::{ClipboardState, CopyResult};
 use crate::components::command::{CommandAction, CommandPalette, ParsedCommand};
 use crate::components::command_modal::{CommandModal, CommandModalAction};
+use crate::components::commit_popup::{CommitAction, CommitIndex, CommitPopup};
 use crate::components::context_modal::ContextModal;
 use crate::components::file_picker::{FilePickerModal, FilePickerModalAction};
 use crate::components::goal_modal::GoalModal;
@@ -115,9 +116,9 @@ use caudra_agent::snapshots::{
 use caudra_agent::types::WorkflowProvenance;
 use caudra_agent::workspace_baseline::WorkspaceBaseline;
 use caudra_agent::{
-    AgentEvent, AgentInput, AgentMode, Envelope, GoalVerdict, ImageSource, McpConfigErrors,
-    McpPromptInfo, McpSnapshotReader, Mention, PromptAdmission, QueueItemId, SharedHistory,
-    SteeringQueue, SubagentInfo,
+    AgentEvent, AgentInput, AgentMode, CommitRef, Envelope, GoalVerdict, ImageSource,
+    McpConfigErrors, McpPromptInfo, McpSnapshotReader, Mention, PromptAdmission, QueueItemId,
+    SharedHistory, SteeringQueue, SubagentInfo,
 };
 use caudra_config::{ModelPolicy, PermissionsConfig, SnapshotsConfig, UiConfig};
 use caudra_lua::{
@@ -357,6 +358,7 @@ pub struct App {
     pub(super) search_modal: SearchModal,
     pub(super) file_picker: FilePickerModal,
     pub(super) mention_popup: MentionPopup,
+    pub(super) commit_popup: CommitPopup,
     pub(super) paste_editor: PasteEditor,
     pub(super) permission_prompt: PermissionPrompt,
     pub(super) permissions_picker: PermissionsPicker,
@@ -413,6 +415,7 @@ pub struct App {
     pub(super) message_action_mouse_down: Option<MessageActionTarget>,
     pub(super) link_mouse_down: Option<Arc<str>>,
     pub(super) mention_mouse_down: Option<Mention>,
+    pub(super) commit_mouse_down: Option<CommitRef>,
     pub(super) key_focus: KeyFocus,
     pub status: Status,
     pub(crate) state: session_state::SessionState,
@@ -596,6 +599,7 @@ impl App {
             search_modal: SearchModal::new(),
             file_picker: FilePickerModal::new(),
             mention_popup: MentionPopup::new(),
+            commit_popup: CommitPopup::new(),
             paste_editor: PasteEditor::new(),
             permission_prompt: PermissionPrompt::new(),
             permissions_picker: PermissionsPicker::new(),
@@ -640,6 +644,7 @@ impl App {
             message_action_mouse_down: None,
             link_mouse_down: None,
             mention_mouse_down: None,
+            commit_mouse_down: None,
             key_focus: KeyFocus::Composer,
             status: Status::Idle,
             state,
@@ -1107,6 +1112,17 @@ impl App {
         self.command_palette.sync(text, task_focused);
     }
 
+    /// Hands the log window to everything that has to agree about which `#`
+    /// hashes are commits: the two composers decide what to highlight and send,
+    /// and every transcript decides what is clickable.
+    pub(super) fn set_commit_index(&mut self, index: CommitIndex) {
+        self.input_box.set_commit_index(index.clone());
+        self.subagent_input_box.set_commit_index(index.clone());
+        for chat in &mut self.chats {
+            chat.set_commit_index(index.clone());
+        }
+    }
+
     fn resync_dropdowns(&mut self) {
         let text = self.active_input_box().palette_text();
         self.sync_dropdowns(&text);
@@ -1119,8 +1135,10 @@ impl App {
         let cwd = self.state.session.cwd.clone();
         let input = self.active_input_box();
         let (text, cursor) = (input.buffer.display_text(), input.buffer.cursor_offset());
+        let index = input.commit_index().clone();
         self.mention_popup
             .sync_workspace(&text, cursor, &cwd, self.workspace_session.clone());
+        self.commit_popup.sync(&text, cursor, &index);
     }
 
     /// Splices a completed path over the `@query` that opened the popup. The
@@ -1143,6 +1161,17 @@ impl App {
                 Some(Vec::new())
             }
             MentionAction::Passthrough => None,
+        }
+    }
+
+    fn handle_commit_action(&mut self, action: CommitAction) -> Option<Vec<Action>> {
+        match action {
+            CommitAction::Consumed => Some(Vec::new()),
+            CommitAction::Insert { range, hash } => {
+                self.complete_mention(range, &hash);
+                Some(Vec::new())
+            }
+            CommitAction::Passthrough => None,
         }
     }
 
@@ -1595,6 +1624,10 @@ impl App {
         }
         if self.mention_popup.contains(pos) {
             self.mention_popup.scroll(delta);
+            return None;
+        }
+        if self.commit_popup.contains(pos) {
+            self.commit_popup.scroll(delta);
             return None;
         }
         let zone = self.zone_at(row, column)?.zone;
@@ -2654,6 +2687,14 @@ impl App {
         self.workbench_layout = Some(layout);
     }
 
+    /// Opens source control on a commit the transcript named, the way a
+    /// mention opens its file.
+    pub(crate) fn open_workbench_commit(&mut self, commit: &CommitRef) {
+        self.sync_workbench_theme();
+        let cwd = PathBuf::from(&self.state.session.cwd);
+        self.workbench.open_at_commit(&cwd, &commit.id);
+    }
+
     /// Where a click on a mention lands, from the composer or the transcript.
     /// The stored layout is skipped: the reader asked for one file, and opening
     /// a session's worth of tabs around it would bury the answer.
@@ -3064,9 +3105,10 @@ impl App {
             text,
             images,
             mentions,
+            commits,
             draft,
         } = sub;
-        self.steer_task(&task_id, text, images, mentions, draft)
+        self.steer_task(&task_id, text, images, mentions, commits, draft)
     }
 
     /// The one place a steer reaches a running task, shared by the composer
@@ -3079,6 +3121,7 @@ impl App {
         text: String,
         images: Vec<ImageSource>,
         mentions: Vec<Mention>,
+        commits: Vec<CommitRef>,
         draft: InputDraft,
     ) -> Vec<Action> {
         let Some(tx) = self.subagent_steers.get(task_id) else {
@@ -3090,6 +3133,7 @@ impl App {
             mode: AgentMode::Build,
             images,
             mentions,
+            commits,
             preamble: Vec::new(),
             thinking: self.state.thinking.clone(),
             fast: self.state.fast,
@@ -3277,6 +3321,11 @@ impl App {
 
         let mention_action = self.mention_popup.handle_key(key);
         if let Some(actions) = self.handle_mention_action(mention_action) {
+            return actions;
+        }
+
+        let commit_action = self.commit_popup.handle_key(key);
+        if let Some(actions) = self.handle_commit_action(commit_action) {
             return actions;
         }
 
@@ -4623,6 +4672,7 @@ impl App {
             text: display_text.clone(),
             images: Vec::new(),
             mentions: Vec::new(),
+            commits: Vec::new(),
             paste_ranges: Vec::new(),
         });
         input.prompt = Some(Box::new(prompt_ref));
@@ -4669,15 +4719,24 @@ impl App {
         };
         let text = cmd.render(args);
         let mentions = self.scan_mentions(&text);
+        let commits = self.scan_commits(&text);
         if let Some(task_id) = self.active_subagent_id().map(str::to_owned)
             && self.subagent_steers.contains_key(&task_id)
         {
-            return self.steer_task(&task_id, text, Vec::new(), mentions, InputDraft::default());
+            return self.steer_task(
+                &task_id,
+                text,
+                Vec::new(),
+                mentions,
+                commits,
+                InputDraft::default(),
+            );
         }
         self.submit_or_queue(QueuedMessage {
             text,
             images: Vec::new(),
             mentions,
+            commits,
             paste_ranges: Vec::new(),
         })
     }
@@ -4735,6 +4794,8 @@ impl App {
         self.release_remote_restore_confirmation();
         self.file_picker.close();
         self.mention_popup.close();
+        self.commit_popup.close();
+        self.set_commit_index(CommitIndex::load(cwd));
         self.parked_workbench
             .as_mut()
             .unwrap_or(&mut self.workbench)
@@ -4776,6 +4837,7 @@ impl App {
         self.release_remote_restore_confirmation();
         self.file_picker.close();
         self.mention_popup.close();
+        self.commit_popup.close();
         self.state.session = candidate;
         self.command_palette
             .set_custom_commands(if self.no_commands {
@@ -4819,11 +4881,13 @@ impl App {
         if self.workspace_session.is_some() {
             self.input_box.set_remote_cwd();
             self.subagent_input_box.set_remote_cwd();
+            self.set_commit_index(CommitIndex::Remote);
             return;
         }
         let cwd = PathBuf::from(&self.state.session.cwd);
         self.input_box.set_cwd(cwd.clone());
-        self.subagent_input_box.set_cwd(cwd);
+        self.subagent_input_box.set_cwd(cwd.clone());
+        self.set_commit_index(CommitIndex::load(&cwd));
     }
 
     fn overlays(&self) -> [&dyn Overlay; 37] {
@@ -5078,6 +5142,7 @@ impl App {
             | self.hints.poll(self.hint_reader.load_full())
             | self.tick_file_picker()
             | self.mention_popup.tick()
+            | self.commit_popup.tick()
             | self.refresh_memory_picker_if_stale()
             | self.refresh_session_picker()
             | self.poll_workflow_replies()
@@ -5589,6 +5654,7 @@ impl App {
             text,
             images: vec![],
             mentions: Vec::new(),
+            commits: Vec::new(),
             paste_ranges: Vec::new(),
         };
         actions.extend(self.start_from_queue(&msg));

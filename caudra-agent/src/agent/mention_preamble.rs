@@ -24,10 +24,11 @@ use crate::tools::image_bytes;
 use crate::tools::{ToolContext, ToolRegistry};
 
 const READ_TOOL: &str = "file_read";
-/// Total inlined bytes one turn may spend. A mention past this is announced
-/// rather than dropped, so the model never silently reasons from a gap.
-const MAX_TOTAL_BYTES: usize = 96 * 1024;
-const BUDGET_ERROR: &str = "not inlined: this turn's mention budget was already spent";
+/// Total inlined bytes one turn may spend across every kind of attachment. One
+/// ceiling rather than one per kind, so a prompt that mixes files and commits
+/// cannot quietly spend twice what either alone is allowed.
+pub const MAX_TOTAL_BYTES: usize = 96 * 1024;
+pub(crate) const BUDGET_ERROR: &str = "not inlined: this turn's mention budget was already spent";
 const UNAVAILABLE_ERROR: &str = "not inlined: the file_read tool is not registered";
 const NO_VISION_ERROR: &str = "not inlined: this model cannot read images";
 
@@ -46,9 +47,12 @@ pub struct Resolution<'a> {
     pub remote_context: Option<&'a Arc<RemoteProjectContext>>,
 }
 
-pub async fn build(mentions: &[Mention], resolution: Resolution<'_>) -> Vec<Message> {
+pub async fn build(
+    mentions: &[Mention],
+    resolution: Resolution<'_>,
+    budget: &mut usize,
+) -> Vec<Message> {
     let mut seen: Vec<&Mention> = Vec::with_capacity(mentions.len());
-    let mut budget = MAX_TOTAL_BYTES;
     let mut messages = Vec::new();
     for mention in mentions {
         if seen
@@ -58,7 +62,7 @@ pub async fn build(mentions: &[Mention], resolution: Resolution<'_>) -> Vec<Mess
             continue;
         }
         seen.push(mention);
-        messages.push(resolve(mention, &resolution, &mut budget).await);
+        messages.push(resolve(mention, &resolution, budget).await);
     }
     messages
 }

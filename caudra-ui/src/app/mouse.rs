@@ -12,7 +12,7 @@ use crate::components::status_bar::{StatusBarHit, StatusBarHitTarget};
 use crate::components::stream_modal::StreamAction;
 use crate::components::workflow_card::CardHit;
 use crate::selection::{self, ContentRegion, EdgeScroll, Selection, SelectionState, SelectionZone};
-use caudra_agent::Mention;
+use caudra_agent::{CommitRef, Mention};
 use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::{Position, Rect};
 use std::path::PathBuf;
@@ -394,6 +394,12 @@ impl App {
                 self.clear_control_hovers();
                 return actions;
             }
+        } else if self.commit_popup.is_open() {
+            let action = self.commit_popup.handle_mouse(event);
+            if let Some(actions) = self.handle_commit_action(action) {
+                self.clear_control_hovers();
+                return actions;
+            }
         }
         // Docked and not modal, so it is asked last and only acts on what it
         // drew: a drag that selected text releases as a selection rather than
@@ -528,6 +534,7 @@ impl App {
                         // workbench is ours to open.
                         self.mention_mouse_down =
                             self.transcript_mention_at(event.row, event.column);
+                        self.commit_mouse_down = self.transcript_commit_at(event.row, event.column);
                         if crate::terminal::local_url_opener_available() {
                             self.link_mouse_down = self.chats[self.active_chat].link_at(
                                 event.row,
@@ -644,6 +651,18 @@ impl App {
                             self.queue_mouse_down = None;
                             self.status_mouse_down = None;
                             self.open_workbench_at(&pressed);
+                            return Vec::new();
+                        }
+                        if zone == SelectionZone::Messages
+                            && !self.has_modal_overlay()
+                            && let Some(pressed) = self.commit_mouse_down.take()
+                            && self.transcript_commit_at(event.row, event.column)
+                                == Some(pressed.clone())
+                        {
+                            self.message_action_mouse_down = None;
+                            self.queue_mouse_down = None;
+                            self.status_mouse_down = None;
+                            self.open_workbench_commit(&pressed);
                             return Vec::new();
                         }
                         self.message_action_mouse_down = None;
@@ -1325,6 +1344,13 @@ impl App {
             let cwd = PathBuf::from(&self.state.session.cwd);
             self.chats[self.active_chat].update_hover(row, col, area, known_task_target, &cwd);
         }
+    }
+
+    /// The commit under the pointer in the transcript. A reference is
+    /// client-local by construction: the hash names a revision, not a path, so
+    /// there is no remote spelling to choose between.
+    fn transcript_commit_at(&self, row: u16, col: u16) -> Option<CommitRef> {
+        self.chats[self.active_chat].commit_at(row, col, self.msg_area())
     }
 
     /// The mention under the pointer in the transcript.
