@@ -143,6 +143,49 @@ impl App {
         }
     }
 
+    /// A remote session's plan lives in the client-owned document store, never
+    /// on the host filesystem. A host path left in `PlanState` is announced to
+    /// the model as the plan file, which then writes it through the remote
+    /// workspace tools, where the path does not exist.
+    ///
+    /// Session restore cannot decide this itself: the document store is
+    /// attached to the app after its state is built, so every path that
+    /// rebuilds `SessionState` has to reconcile afterwards.
+    pub(crate) fn reconcile_plan_target(&mut self) {
+        if self.workspace_session.is_none()
+            || self.state.mode != Mode::Plan
+            || self.state.plan.reference().is_some()
+        {
+            return;
+        }
+        let was_ready = self.state.plan.is_ready();
+        let adopted = self
+            .state
+            .plan
+            .path()
+            .zip(self.workspace_session.as_ref())
+            .zip(self.local_documents.as_ref())
+            .and_then(|((path, workspace), store)| {
+                store
+                    .adopt_legacy_plan(
+                        workspace.binding().project().key(),
+                        &self.state.session.id.to_string(),
+                        path,
+                    )
+                    .ok()
+            });
+        self.state.plan = adopted.map_or(PlanState::None, |reference| {
+            if was_ready {
+                PlanState::RemoteReady(reference)
+            } else {
+                PlanState::RemoteDrafting(reference)
+            }
+        });
+        if matches!(self.state.plan, PlanState::None) {
+            self.enter_plan();
+        }
+    }
+
     pub(crate) fn enter_plan(&mut self) {
         if let (Some(store), Some(workspace)) = (&self.local_documents, &self.workspace_session) {
             if let Err(error) = self.state.plan.allocate_remote(
@@ -277,5 +320,118 @@ impl App {
         } else {
             Style::new().fg(self.effective_mode_color())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use caudra_workspace::{
+        AuthenticatedPrincipalId, AuthorityIdentity, CwdHandle, ProjectIdentity, ProjectKey,
+        ResourceId, ResourceScope, SessionBindingId, SessionWorkspaceBinding, SourceTrustAnchor,
+        WorkspaceCapabilities, WorkspaceCursor, WorkspaceHandle, WorkspaceServices,
+    };
+    use test_case::test_case;
+
+    use super::{AgentMode, LocalDocumentStore, Mode, PathBuf, PlanState, WorkspaceSession};
+    use crate::app::tests::test_app;
+
+    const HOST_PLAN: &str = "/home/someone/.caudra/plans/woolly-singing-puppy.md";
+
+    fn workspace() -> WorkspaceSession {
+        let authority = AuthorityIdentity::new(
+            SourceTrustAnchor::new("origin").expect("anchor"),
+            "server",
+            "workspace",
+            "generation",
+            "namespace",
+        )
+        .expect("authority");
+        let binding = SessionWorkspaceBinding::new(
+            SessionBindingId::new("binding").expect("binding id"),
+            authority.clone(),
+            AuthenticatedPrincipalId::new(authority.clone(), "principal").expect("principal"),
+            ProjectIdentity::new(
+                authority.clone(),
+                ProjectKey::new("project").expect("project"),
+            ),
+        )
+        .expect("binding");
+        let cursor = WorkspaceCursor::new(
+            &binding,
+            ResourceScope::root(ResourceId::new("root").expect("root")),
+            1,
+            CwdHandle::new("cwd").expect("cwd"),
+        );
+        let handle = WorkspaceHandle::new(
+            authority,
+            WorkspaceCapabilities::new([]),
+            WorkspaceServices::default(),
+        )
+        .expect("handle");
+        WorkspaceSession::new(handle, binding, cursor).expect("workspace")
+    }
+
+    /// A restored host path would be announced to the model as the plan file,
+    /// which then writes it through the remote workspace tools, where it does
+    /// not exist.
+    #[test_case(PlanState::Drafting(PathBuf::from(HOST_PLAN)) ; "drafting_host_path")]
+    #[test_case(PlanState::Ready(PathBuf::from(HOST_PLAN)) ; "ready_host_path")]
+    #[test_case(PlanState::None ; "no_target_at_all")]
+    fn a_remote_plan_session_never_keeps_a_host_plan_path(restored: PlanState) {
+        let mut app = test_app();
+        let owner = workspace();
+        app.local_documents = Some(Arc::new(LocalDocumentStore::remote(
+            app.storage.clone(),
+            owner.binding(),
+        )));
+        app.workspace_session = Some(owner);
+        app.state.mode = Mode::Plan;
+        app.state.plan = restored;
+
+        app.reconcile_plan_target();
+
+        assert!(app.state.plan.path().is_none());
+        assert!(app.state.plan.reference().is_some());
+        assert!(matches!(app.agent_mode(), AgentMode::RemotePlan(_)));
+    }
+
+    /// A plan document is filed under a session id, so allocating one before
+    /// the replacement session is installed hands it to the session being
+    /// retired, and every later read looks for it under the wrong id.
+    #[test]
+    fn a_reset_remote_session_files_its_plan_under_the_replacement() {
+        let mut app = test_app();
+        let owner = workspace();
+        let store = Arc::new(LocalDocumentStore::remote(
+            app.storage.clone(),
+            owner.binding(),
+        ));
+        app.local_documents = Some(Arc::clone(&store));
+        app.workspace_session = Some(owner);
+        app.state.mode = Mode::Plan;
+        let retired = app.state.session.id.to_string();
+
+        app.reset_session();
+
+        let reference = app.state.plan.document_ref().expect("remote plan");
+        let project = store.project_key();
+        let owner_id = app.state.session.id.to_string();
+        assert_ne!(owner_id, retired);
+        assert!(store.read(project, Some(&owner_id), &reference).is_ok());
+        assert!(store.read(project, Some(&retired), &reference).is_err());
+    }
+
+    #[test]
+    fn a_local_plan_session_keeps_its_host_plan_path() {
+        let mut app = test_app();
+        let plan = PathBuf::from(HOST_PLAN);
+        app.state.mode = Mode::Plan;
+        app.state.plan = PlanState::Drafting(plan.clone());
+
+        app.reconcile_plan_target();
+
+        assert_eq!(app.state.plan, PlanState::Drafting(plan));
     }
 }

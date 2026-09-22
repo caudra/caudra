@@ -58,6 +58,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 use tokio_util::sync::CancellationToken;
+use tracing::warn;
 use url::{Host, Url};
 use workcell::host_contract as contract;
 use workcell::{CatalogRevision, OwnedToolSpec, ToolAnnotations, ToolManifest};
@@ -728,7 +729,7 @@ impl RemoteTransport {
             if error.message.is_empty() {
                 return Err(RemoteWorkcellError::InvalidProtocol);
             }
-            return Err(map_rpc_error(error.code, error.data.as_ref()));
+            return Err(map_rpc_error(&error));
         }
         Ok(object.get("result").cloned())
     }
@@ -5027,8 +5028,10 @@ fn parse_content_range(value: &str) -> Result<(u64, u64, Option<u64>), RemoteWor
     Ok((start, end_exclusive, total))
 }
 
-fn map_rpc_error(code: i64, data: Option<&Value>) -> RemoteWorkcellError {
-    let symbolic = data
+fn map_rpc_error(error: &JsonRpcError) -> RemoteWorkcellError {
+    let symbolic = error
+        .data
+        .as_ref()
         .and_then(|data| data.get("code"))
         .and_then(Value::as_str);
     match symbolic {
@@ -5068,8 +5071,20 @@ fn map_rpc_error(code: i64, data: Option<&Value>) -> RemoteWorkcellError {
         Some("indeterminate") => RemoteWorkcellError::Indeterminate,
         Some("cancelled") => RemoteWorkcellError::Cancelled,
         Some("timed_out") => RemoteWorkcellError::Timeout,
-        _ if matches!(code, 401 | 403) => RemoteWorkcellError::Authentication,
-        _ => RemoteWorkcellError::InvalidProtocol,
+        _ if matches!(error.code, 401 | 403) => RemoteWorkcellError::Authentication,
+        // A refusal we have no symbolic mapping for still arrived well formed,
+        // and the error this becomes can only say the response was invalid.
+        // The host's own explanation is private diagnostic material, so it is
+        // logged at the transport boundary rather than carried outwards.
+        _ => {
+            warn!(
+                code = error.code,
+                symbolic = symbolic.unwrap_or_default(),
+                message = %error.message,
+                "remote Workcell refusal has no symbolic mapping"
+            );
+            RemoteWorkcellError::InvalidProtocol
+        }
     }
 }
 
@@ -7144,6 +7159,8 @@ mod tests {
         "a bearer may ride plaintext only to a numeric loopback literal";
     const TEST_REQUEST_DIGEST: &str =
         "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const UNMAPPED_RPC_CODE: i64 = -32602;
+    const UNMAPPED_RPC_MESSAGE: &str = "path escapes the workspace root";
 
     #[test]
     fn authoritative_cursors_survive_capacity_pressure_and_reject_rebinding() {
@@ -7516,18 +7533,23 @@ mod tests {
         ))
         .unwrap();
         let error: JsonRpcError = serde_json::from_value(response["error"].clone()).unwrap();
+        assert_eq!(map_rpc_error(&error), RemoteWorkcellError::StaleResource);
         assert_eq!(
-            map_rpc_error(error.code, error.data.as_ref()),
-            RemoteWorkcellError::StaleResource
-        );
-        assert_eq!(
-            map_rpc_error(-32602, Some(&json!({"kind":"policy_denied"}))),
+            map_rpc_error(&rpc_error(json!({"kind":"policy_denied"}))),
             RemoteWorkcellError::InvalidProtocol
         );
         assert_eq!(
-            map_rpc_error(-32602, Some(&json!({"code":"quota_exceeded"}))),
+            map_rpc_error(&rpc_error(json!({"code":"quota_exceeded"}))),
             RemoteWorkcellError::QuotaExceeded
         );
+    }
+
+    fn rpc_error(data: Value) -> JsonRpcError {
+        JsonRpcError {
+            code: UNMAPPED_RPC_CODE,
+            message: UNMAPPED_RPC_MESSAGE.to_owned(),
+            data: Some(data),
+        }
     }
 
     fn serve_once(body: String, content_type: &str) -> (WorkcellEndpoint, thread::JoinHandle<()>) {

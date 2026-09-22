@@ -1193,37 +1193,7 @@ impl SpawnCtx {
             .map_err(|error| error.to_string())?;
         app.no_commands = self.no_commands;
         app.remote_project_context = remote_project_context;
-        if app.workspace_session.is_some()
-            && app.state.mode == crate::app::Mode::Plan
-            && app.state.plan.reference().is_none()
-        {
-            let was_ready = app.state.plan.is_ready();
-            let adopted = app
-                .state
-                .plan
-                .path()
-                .zip(app.workspace_session.as_ref())
-                .zip(app.local_documents.as_ref())
-                .and_then(|((path, workspace), store)| {
-                    store
-                        .adopt_legacy_plan(
-                            workspace.binding().project().key(),
-                            &app.state.session.id.to_string(),
-                            path,
-                        )
-                        .ok()
-                });
-            app.state.plan = adopted.map_or(crate::app::PlanState::None, |reference| {
-                if was_ready {
-                    crate::app::PlanState::RemoteReady(reference)
-                } else {
-                    crate::app::PlanState::RemoteDrafting(reference)
-                }
-            });
-            if matches!(app.state.plan, crate::app::PlanState::None) {
-                app.enter_plan();
-            }
-        }
+        app.reconcile_plan_target();
         let app_new_ms = lap();
         app.snapshots_config = self.snapshots;
         app.live_sessions = Arc::clone(&self.live_sessions);

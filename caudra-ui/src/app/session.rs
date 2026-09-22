@@ -945,15 +945,17 @@ impl App {
         self.goal_deferred = false;
         self.state.plan = PlanState::None;
         self.permissions.set_session_yolo(None);
-        if self.state.mode == Mode::Plan {
-            self.enter_plan();
-        }
         // Fire before the swap. A handler cleaning up after the session
         // that just ended needs its id, and the stamp always reads
         // whichever session is current.
         self.fire_session_autocmd("SessionReset", serde_json::json!({}));
         let replacement_cwd = PathBuf::from(&replacement.cwd);
         self.state.session = Arc::new(replacement);
+        // After the swap: a remote plan document is filed under the session id
+        // that will own it, and the retiring session must not be handed one.
+        if self.state.mode == Mode::Plan {
+            self.enter_plan();
+        }
         if let (Some(workspace), Some(binding)) = (
             self.workspace_session.clone(),
             self.state.session.workspace_binding().cloned(),
@@ -2154,6 +2156,7 @@ impl App {
             let cwd = PathBuf::from(&self.state.session.cwd);
             self.rebind_workspace_baseline(snapshot_store, cwd);
         }
+        self.reconcile_plan_target();
         for w in self.state.warnings.drain(..) {
             self.status_bar.flash(w);
         }
