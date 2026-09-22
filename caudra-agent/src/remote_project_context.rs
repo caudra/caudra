@@ -7,7 +7,7 @@ use caudra_workflow::{WORKFLOW_ABI_VERSION, WORKFLOW_LANGUAGE_VERSION, WorkflowM
 use caudra_workspace::{
     AuthenticatedPrincipalId, AuthorityIdentity, CollectionRevision, ProjectAsset,
     ProjectAssetKind, ProjectAssetTrust, ProjectIdentity, ResourceId, ResourceRevision,
-    WorkspacePath, WorkspaceSession,
+    WorkspaceError, WorkspacePath, WorkspaceSession,
 };
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -40,8 +40,16 @@ const COMMAND_ROOTS: &[&str] = &[".caudra", ".claude", ".opencode"];
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum RemoteProjectContextError {
-    #[error("remote project assets are unavailable")]
+    #[error("the remote workspace exposes no project asset service")]
     Unavailable,
+    #[error("remote project asset discovery failed")]
+    Discovery(#[source] WorkspaceError),
+    #[error("remote project asset {path} could not be read")]
+    AssetUnreadable {
+        path: String,
+        #[source]
+        cause: WorkspaceError,
+    },
     #[error("remote project asset manifest is invalid")]
     InvalidManifest,
     #[error("remote project asset declaration is invalid for {0}")]
@@ -310,7 +318,7 @@ impl RemoteProjectContextLoader {
         let manifest = service
             .discover(session.binding(), session.cursor())
             .await
-            .map_err(|_| RemoteProjectContextError::Unavailable)?;
+            .map_err(RemoteProjectContextError::Discovery)?;
         validate_manifest(&manifest)?;
         let key = ContextKey {
             authority: session.binding().authority().clone(),
@@ -358,7 +366,10 @@ impl RemoteProjectContextLoader {
             let content = service
                 .read(session.binding(), session.cursor(), &asset, max_bytes)
                 .await
-                .map_err(|_| RemoteProjectContextError::StaleAsset(asset.path.to_string()))?;
+                .map_err(|cause| RemoteProjectContextError::AssetUnreadable {
+                    path: asset.path.to_string(),
+                    cause,
+                })?;
             if content.asset != asset || content.truncated {
                 return Err(RemoteProjectContextError::StaleAsset(
                     asset.path.to_string(),

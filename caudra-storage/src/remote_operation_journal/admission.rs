@@ -103,7 +103,7 @@ impl JournalAdmission {
         )?;
         connection.set_limit(Limit::SQLITE_LIMIT_LENGTH, MAX_SQLITE_VALUE_BYTES)?;
         connection.pragma_update(None, "trusted_schema", false)?;
-        validate_schema(&connection)?;
+        validate_schema(&connection, path)?;
         admission.recheck(path)?;
         Ok(admission)
     }

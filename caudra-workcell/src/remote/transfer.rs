@@ -655,7 +655,7 @@ impl RemoteWorkcellClient {
             && self
                 .0
                 .mutation_journal
-                .reconcile_recovery(&operation.operation_id, &state)?
+                .reconcile_recovery(&operation.operation_id, &state, true)?
         {
             self.0
                 .operations
@@ -1126,7 +1126,7 @@ impl WorkspaceTransferService for RemoteWorkcellClient {
                 {
                     self.0
                         .mutation_journal
-                        .reconcile_recovery(&operation.operation_id, &state)
+                        .reconcile_recovery(&operation.operation_id, &state, true)
                         .map_err(WorkspaceError::from)?;
                     self.0
                         .operations

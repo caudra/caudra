@@ -98,7 +98,6 @@ const BATCH_FIRST: &str = "batch-first.txt";
 const BATCH_SECOND: &str = "batch-second.txt";
 const BATCH_WRITE: &str = "batch-write.txt";
 const BATCH_CONTENT: &str = "batch completed";
-const PENDING_MUTATION: &str = "workspace mutation is blocked by pending operation";
 const BATCH_CANCELLED: &str = "batch-cancelled.txt";
 const LAPSED_FILE: &str = "lapsed-preparation.txt";
 const LAPSED_TTL_MS: u64 = 1_500;
@@ -1907,70 +1906,43 @@ async fn canonical_registry_regressions(client: &RemoteWorkcellClient, root: &Pa
     )
     .await;
     assert!(!isolated.is_error, "{}", isolated.output.as_text());
-    let blocked = client
+    let pending = client.pending_remote_operations();
+    assert_eq!(pending.len(), 1);
+    let unblocked = client
         .prepare_canonical_tool(
             client.session_binding(),
             client.root_cursor(),
             &ToolPrepareRequest {
                 name: "file_write".into(),
-                input: json!({"filePath":"blocked.txt", "content":"blocked"}),
+                input: json!({"filePath":"unblocked.txt", "content":"unblocked"}),
             },
         )
-        .await;
-    let blocked = blocked.unwrap();
+        .await
+        .unwrap();
     let result = client
         .execute_canonical_tool(
             client.session_binding(),
             client.root_cursor(),
-            &blocked.prepared,
-        )
-        .await;
-    assert!(matches!(
-        result,
-        Err(WorkspaceError::PendingOperation { .. })
-    ));
-    client
-        .release_canonical_tool(
-            client.session_binding(),
-            client.root_cursor(),
-            &blocked.prepared,
+            &unblocked.prepared,
         )
         .await
         .unwrap();
-    assert!(!root.join("blocked.txt").exists());
-    let pending = client.pending_remote_operations();
-    let dispatch_trace = PathBuf::from(env::var_os("WORKCELL_TEST_FAULT").unwrap())
-        .with_file_name("batch-rpc-trace");
-    fs::write(&dispatch_trace, "").unwrap();
-    let blocked = registry
-        .get("file_write")
-        .unwrap()
-        .tool
-        .parse(&json!({"filePath":"blocked.txt", "content":"blocked"}))
-        .unwrap();
-    blocked.preflight(&ctx).await.unwrap();
-    let result = futures_lite::future::race(blocked.execute(&ctx), async {
-        smol::Timer::after(BATCH_TIMEOUT).await;
-        panic!("unresolved blocker must be refused, not queued indefinitely");
-    })
-    .await;
-    assert!(result.is_error);
-    let error = result.output.unwrap_err();
-    assert!(error.starts_with(PENDING_MUTATION), "{error}");
-    assert!(!error.contains("unknown"), "{error}");
-    assert!(!error.contains("indeterminate"), "{error}");
-    assert!(result.annotation.is_none());
-    assert!(fs::read_to_string(&dispatch_trace).unwrap().is_empty());
-    assert!(!root.join("blocked.txt").exists());
+    assert!(
+        matches!(result.state, OperationState::Completed { .. }),
+        "an indeterminate broad_lock must not block an unrelated write"
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("unblocked.txt")).unwrap(),
+        "unblocked"
+    );
     let retained = client.pending_remote_operations();
     assert_eq!(retained.len(), 1);
     assert_eq!(retained[0].operation_id, pending[0].operation_id);
-    // Only this fixture's operation is acknowledged; no user state is opened.
     client
         .acknowledge_pending_operation(&pending[0].operation_id)
         .unwrap();
     eprintln!(
-        "PASS dropped future sends cancel/status, retains uncertain effects lock, permits index and isolated Python, blocks writes"
+        "PASS dropped future sends cancel/status, retains uncertain effects lock, permits index and isolated Python, unblocked writes proceed"
     );
 }
 
@@ -3005,16 +2977,14 @@ fn authenticated_local() {
                 )
                 .await
                 .unwrap();
-            assert!(matches!(
-                recovered
-                    .execute_canonical_tool(
-                        recovered.session_binding(),
-                        recovered.root_cursor(),
-                        &overlap.prepared
-                    )
-                    .await,
-                Err(WorkspaceError::PendingOperation { .. })
-            ));
+            recovered
+                .execute_canonical_tool(
+                    recovered.session_binding(),
+                    recovered.root_cursor(),
+                    &overlap.prepared,
+                )
+                .await
+                .expect("an indeterminate broad_lock must not block unrelated writes");
             let session = caudra_workspace::WorkspaceSession::new(
                 recovered.workspace_handle().unwrap(),
                 recovered.session_binding().clone(),

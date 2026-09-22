@@ -3867,6 +3867,7 @@ mod tests {
                 publication_cwd: None,
                 broad_lock: true,
                 publication_id: None,
+                host_instance_id: "test-instance".to_owned(),
             })
             .unwrap();
         assert!(matches!(

@@ -976,6 +976,7 @@ impl PreparedWorkspaceContext {
 struct JournalOperation {
     publication_cwd: Option<WorkspacePath>,
     publication_id: Option<OperationId>,
+    host_instance_id: String,
     operation_id: OperationId,
     invocation_id: OperationId,
     preparation_id: OperationId,
@@ -988,6 +989,7 @@ struct JournalOperation {
 struct PendingJournalOperation {
     publication_cwd: Option<WorkspacePath>,
     publication_id: Option<OperationId>,
+    host_instance_id: String,
     invocation_id: OperationId,
     preparation_id: OperationId,
     operation_kind: String,
@@ -995,6 +997,7 @@ struct PendingJournalOperation {
     lock_keys: Vec<OpaqueLockKey>,
     state: RemoteOperationState,
     broad: bool,
+    dispatched_at: Option<u64>,
     cursor: WorkspaceCursor,
 }
 
@@ -1007,10 +1010,12 @@ struct RemoteJournalState {
 struct RecoveryOperation {
     publication_cwd: Option<WorkspacePath>,
     publication_id: Option<OperationId>,
+    host_instance_id: String,
     operation_id: OperationId,
     invocation_id: OperationId,
     preparation_id: OperationId,
     request_digest: RequestDigest,
+    dispatched_at: Option<u64>,
     cursor: WorkspaceCursor,
 }
 
@@ -1041,6 +1046,7 @@ impl RemoteMutationJournal {
                     PendingJournalOperation {
                         publication_cwd: record.publication_cwd,
                         publication_id: record.publication_id,
+                        host_instance_id: record.host_instance_id,
                         invocation_id: record.invocation_id,
                         preparation_id: record.preparation_id,
                         operation_kind: record.operation_kind,
@@ -1048,6 +1054,7 @@ impl RemoteMutationJournal {
                         lock_keys: record.lock_keys,
                         state: record.state,
                         broad,
+                        dispatched_at: record.dispatched_at,
                         cursor,
                     },
                 ))
@@ -1098,6 +1105,7 @@ impl RemoteMutationJournal {
                 .or_insert(PendingJournalOperation {
                     publication_cwd: record.publication_cwd,
                     publication_id: record.publication_id,
+                    host_instance_id: record.host_instance_id,
                     invocation_id: record.invocation_id,
                     preparation_id: record.preparation_id,
                     operation_kind: record.operation_kind,
@@ -1105,6 +1113,7 @@ impl RemoteMutationJournal {
                     lock_keys: record.lock_keys,
                     state: record.state,
                     broad,
+                    dispatched_at: record.dispatched_at,
                     cursor,
                 });
         }
@@ -1126,6 +1135,7 @@ impl RemoteMutationJournal {
             .reserve_before_send(&RemoteOperationReservation {
                 publication_cwd: operation.publication_cwd.clone(),
                 broad_lock: operation.broad,
+                host_instance_id: operation.host_instance_id.clone(),
                 publication_id: operation.publication_id.clone(),
                 operation_id: operation.operation_id.clone(),
                 invocation_id: operation.invocation_id.clone(),
@@ -1147,6 +1157,7 @@ impl RemoteMutationJournal {
             PendingJournalOperation {
                 publication_cwd: operation.publication_cwd.clone(),
                 publication_id: operation.publication_id.clone(),
+                host_instance_id: operation.host_instance_id.clone(),
                 invocation_id: operation.invocation_id.clone(),
                 preparation_id: operation.preparation_id.clone(),
                 operation_kind: operation.operation_kind.clone(),
@@ -1154,6 +1165,7 @@ impl RemoteMutationJournal {
                 lock_keys: operation.lock_keys.clone(),
                 state: RemoteOperationState::Reserved,
                 broad: operation.broad,
+                dispatched_at: None,
                 cursor,
             },
         );
@@ -1179,15 +1191,17 @@ impl RemoteMutationJournal {
             .state
             .lock()
             .map_err(|_| RemoteWorkcellError::JournalUnavailable)?;
+        let dispatched_at = unix_millis();
         state
             .journal
-            .mark_dispatched(operation_id, unix_millis())
+            .mark_dispatched(operation_id, dispatched_at)
             .map_err(|_| RemoteWorkcellError::JournalUnavailable)?;
         let pending = state
             .pending
             .get_mut(operation_id)
             .ok_or(RemoteWorkcellError::JournalUnavailable)?;
         pending.state = RemoteOperationState::Dispatched;
+        pending.dispatched_at = Some(dispatched_at);
         Ok(())
     }
 
@@ -1321,10 +1335,12 @@ impl RemoteMutationJournal {
             .map(|(operation_id, pending)| RecoveryOperation {
                 publication_cwd: pending.publication_cwd.clone(),
                 publication_id: pending.publication_id.clone(),
+                host_instance_id: pending.host_instance_id.clone(),
                 operation_id: operation_id.clone(),
                 invocation_id: pending.invocation_id.clone(),
                 preparation_id: pending.preparation_id.clone(),
                 request_digest: pending.request_digest.clone(),
+                dispatched_at: pending.dispatched_at,
                 cursor: pending.cursor.clone(),
             })
             .collect())
@@ -1334,9 +1350,12 @@ impl RemoteMutationJournal {
         &self,
         operation_id: &OperationId,
         status: &OperationState<T>,
+        absence_is_proof: bool,
     ) -> Result<bool, RemoteWorkcellError> {
-        if matches!(status, OperationState::NeverSeen | OperationState::Prepared) {
-            return self.reconcile_not_dispatched(operation_id);
+        if absence_is_proof
+            && matches!(status, OperationState::NeverSeen | OperationState::Prepared)
+        {
+            return self.reconcile_host_absent(operation_id);
         }
         let Some((terminal, side_effects_possible)) = journal_terminal_state(status) else {
             return Ok(false);
@@ -1353,7 +1372,14 @@ impl RemoteMutationJournal {
         Ok(true)
     }
 
-    fn reconcile_not_dispatched(
+    /// The host reports NeverSeen or Prepared, and its absence is proof: the
+    /// query reached the same instance the client dispatched to, and that
+    /// instance has not evicted any tombstone recent enough to have covered
+    /// this operation. The local dispatch fence (mark_dispatched fires before
+    /// the send) proves intent, not delivery, so the host's assertion is
+    /// strictly stronger, and the operation is safe to cancel regardless of
+    /// the local fence state.
+    fn reconcile_host_absent(
         &self,
         operation_id: &OperationId,
     ) -> Result<bool, RemoteWorkcellError> {
@@ -1361,13 +1387,8 @@ impl RemoteMutationJournal {
             .state
             .lock()
             .map_err(|_| RemoteWorkcellError::JournalUnavailable)?;
-        let pending = state
-            .pending
-            .get(operation_id)
-            .ok_or(RemoteWorkcellError::JournalUnavailable)?;
-        // Only the durable local dispatch fence proves execution was never sent.
-        if pending.state != RemoteOperationState::Reserved {
-            return Ok(false);
+        if !state.pending.contains_key(operation_id) {
+            return Err(RemoteWorkcellError::JournalUnavailable);
         }
         state
             .journal
@@ -2086,22 +2107,28 @@ impl RemoteWorkcellClient {
                 execution_id: None,
                 expires_at_unix_ms: None,
             };
+            let host = self.host_binding();
+            let same_instance = operation.host_instance_id == host.instance_id.as_str();
             let response = self
                 .call::<_, contract::StatusResponse>(
                     contract::STATUS_METHOD,
-                    &status_request(&handle, &self.host_binding())
+                    &status_request(&handle, &host)
                         .map_err(|_| RemoteWorkcellError::InvalidProtocol)?,
                     &CancellationToken::new(),
                 )
                 .await;
-            let status = response
-                .and_then(|response| recovery_status(&response, &operation, &self.host_binding()));
+            let status = response.and_then(|response| {
+                let evicted_through = response.tombstones_evicted_through_unix_ms;
+                recovery_status(&response, &operation, &host)
+                    .map(|status| (status, evicted_through))
+            });
             match status {
-                Ok(status)
-                    if self
-                        .0
-                        .mutation_journal
-                        .reconcile_recovery(&operation.operation_id, &status.state)? =>
+                Ok((status, evicted_through))
+                    if self.0.mutation_journal.reconcile_recovery(
+                        &operation.operation_id,
+                        &status.state,
+                        same_instance && absence_is_proof(&operation, evicted_through),
+                    )? =>
                 {
                     self.release_confirmed_operation(
                         &operation.preparation_id,
@@ -2672,6 +2699,7 @@ impl RemoteWorkcellClient {
                 Ok::<JournalOperation, WorkspaceError>(JournalOperation {
                     publication_cwd: None,
                     publication_id: None,
+                    host_instance_id: self.host_binding().instance_id.as_str().to_owned(),
                     operation_id: OperationId::new(format!(
                         "caudra-journal-{}",
                         CaudraId::generate()
@@ -6368,12 +6396,26 @@ fn broad_operation_kind(operation_kind: &str) -> bool {
 }
 
 fn mutation_locks_overlap(operation: &JournalOperation, pending: &PendingJournalOperation) -> bool {
+    let pending_broad = pending.broad && pending.state != RemoteOperationState::Indeterminate;
     operation.broad
-        || pending.broad
+        || pending_broad
         || operation
             .lock_keys
             .iter()
             .any(|key| pending.lock_keys.contains(key))
+}
+
+/// Whether a host's "no record" answer proves the operation never ran.
+///
+/// The host evicts tombstones oldest first and cannot forget an operation
+/// before it was dispatched, so an operation dispatched after the reported
+/// eviction boundary would still be retained if it had ever existed. An
+/// operation that was never dispatched trivially qualifies. Without a boundary
+/// the ledger has dropped nothing and every absence is authoritative.
+fn absence_is_proof(operation: &RecoveryOperation, evicted_through: Option<u64>) -> bool {
+    operation
+        .dispatched_at
+        .is_none_or(|dispatched| evicted_through.is_none_or(|through| dispatched > through))
 }
 
 fn journal_terminal_state<T>(state: &OperationState<T>) -> Option<(RemoteOperationState, bool)> {
@@ -8275,6 +8317,7 @@ mod tests {
         JournalOperation {
             publication_cwd: None,
             publication_id: None,
+            host_instance_id: "instance".to_owned(),
             operation_id: OperationId::new(format!("operation-{id}")).unwrap(),
             invocation_id: OperationId::new(format!("invocation-{id}")).unwrap(),
             preparation_id: OperationId::new(format!("preparation-{id}")).unwrap(),
@@ -8422,9 +8465,30 @@ mod tests {
         assert!(coordinator.pending().is_empty());
     }
 
+    /// An indeterminate shell command used to block every mutation because its
+    /// broad_lock stayed active. A cancelled-then-reconnected session would
+    /// report "blocked by pending operation" for every write until the user
+    /// manually acknowledged it. Now: reserved/dispatched broad_lock blocks;
+    /// indeterminate broad_lock does not.
+    #[test]
+    fn an_indeterminate_broad_lock_does_not_block_new_reservations() {
+        let temp = tempfile::tempdir().unwrap();
+        let state_dir = StateDir::from_path(temp.path().join("state"));
+        let binding = StoredWorkspaceBinding::local_from_cwd("opaque-workspace");
+        let journal = RemoteOperationJournal::open(&state_dir).unwrap();
+        let coordinator = RemoteMutationJournal::new(journal, binding).unwrap();
+        let shell = journal_operation("shell", "workspace", "canonical:shell", true);
+        coordinator.reserve(&shell).unwrap();
+        coordinator.mark_dispatched(&shell.operation_id).unwrap();
+        coordinator.mark_indeterminate(&shell.operation_id).unwrap();
+        let write = journal_operation("write", "resource-a", WORKSPACE_MUTATION_KIND, false);
+        coordinator.reserve(&write).unwrap();
+        coordinator.acknowledge(&shell.operation_id).unwrap();
+        coordinator.acknowledge(&write.operation_id).unwrap();
+    }
+
     #[test_case("shell", RemoteOperationState::Reserved; "active_shell_blocks_shell")]
     #[test_case("file_write", RemoteOperationState::Dispatched; "dispatched_shell_blocks_write")]
-    #[test_case("file_write", RemoteOperationState::Indeterminate; "uncertain_shell_blocks_write")]
     fn canonical_journal_rejection_is_definitive(tool: &str, pending_state: RemoteOperationState) {
         const CAPACITY: usize = 8;
         let temp = tempfile::tempdir().unwrap();
@@ -9012,10 +9076,14 @@ mod tests {
         assert_eq!(client.0.operations.lock().unwrap().len(), 0);
     }
 
+    /// A pending operation from a nested cursor is recovered at the root
+    /// scope. When the host says NeverSeen or Prepared (same instance), the
+    /// local dispatch fence is weaker than the host's assertion, so the
+    /// operation resolves to cancelled and stops blocking.
     #[test_case(RemoteOperationState::Dispatched, OperationState::NeverSeen; "dispatched_never_seen")]
     #[test_case(RemoteOperationState::Indeterminate, OperationState::NeverSeen; "indeterminate_never_seen")]
     #[test_case(RemoteOperationState::Dispatched, OperationState::Prepared; "dispatched_prepared")]
-    fn persisted_nested_cursor_operation_blocks_after_root_scoped_reconnect(
+    fn nested_cursor_operation_the_host_never_saw_resolves_at_root_scope(
         local_state: RemoteOperationState,
         server_state: OperationState<Value>,
     ) {
@@ -9055,39 +9123,16 @@ mod tests {
         let journal = RemoteOperationJournal::open(&state_dir).unwrap();
         let coordinator = RemoteMutationJournal::new(journal, root.clone()).unwrap();
         assert!(
-            !coordinator
-                .reconcile_recovery(&pending.operation_id, &server_state)
+            coordinator
+                .reconcile_recovery(&pending.operation_id, &server_state, true)
                 .unwrap()
         );
-        coordinator
-            .recovery_indeterminate(&pending.operation_id)
-            .unwrap();
-        drop(coordinator);
-        let journal = RemoteOperationJournal::open(&state_dir).unwrap();
-        let records = journal.list_pending(&root).unwrap();
-        assert_eq!(records.len(), 1);
-        assert!(records[0].side_effects_possible);
-        assert!(records[0].acknowledged_at.is_none());
-        let coordinator = RemoteMutationJournal::new(journal, root.clone()).unwrap();
-        assert_eq!(
-            coordinator.pending()[0].state,
-            RemoteOperationState::Indeterminate
-        );
-        let overlap = journal_operation("overlap", "resource", "workspace_mutation", false);
-        assert!(matches!(
-            coordinator.reserve_at(&overlap, root.binding(), root.cursor().unwrap()),
-            Err(WorkspaceError::PendingOperation { operation_id })
-                if operation_id == pending.operation_id.as_str()
-        ));
-        coordinator.acknowledge(&pending.operation_id).unwrap();
-        coordinator
-            .reserve_at(&overlap, root.binding(), root.cursor().unwrap())
-            .unwrap();
+        assert!(coordinator.pending().is_empty());
     }
 
     #[test_case(OperationState::NeverSeen; "never_seen")]
     #[test_case(OperationState::Prepared; "prepared")]
-    fn recovery_releases_only_durable_undispatched_reservations(
+    fn a_reserved_operation_the_host_never_saw_resolves_to_cancelled(
         server_state: OperationState<Value>,
     ) {
         let temp = tempfile::tempdir().unwrap();
@@ -9102,7 +9147,7 @@ mod tests {
         let coordinator = RemoteMutationJournal::new(journal, binding.clone()).unwrap();
         assert!(
             coordinator
-                .reconcile_recovery(&operation.operation_id, &server_state)
+                .reconcile_recovery(&operation.operation_id, &server_state, true)
                 .unwrap()
         );
         assert!(coordinator.pending().is_empty());
@@ -9114,6 +9159,38 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    /// The local dispatch fence fires before the send, so `dispatched` proves
+    /// intent, not delivery. When the same host instance reports `NeverSeen`,
+    /// the host's assertion is strictly stronger: the request never arrived.
+    /// Refusing to resolve here is what wedged a cancelled shell command into
+    /// an indeterminate state that blocked every subsequent mutation.
+    #[test_case(OperationState::NeverSeen; "never_seen")]
+    #[test_case(OperationState::Prepared; "prepared")]
+    fn a_dispatched_operation_the_host_never_saw_resolves_to_cancelled(
+        server_state: OperationState<Value>,
+    ) {
+        let temp = tempfile::tempdir().unwrap();
+        let state_dir = StateDir::from_path(temp.path().join("state"));
+        let binding = StoredWorkspaceBinding::local_from_cwd("opaque-workspace");
+        let operation =
+            journal_operation("dispatched", "resource-a", WORKSPACE_MUTATION_KIND, false);
+        let journal = RemoteOperationJournal::open(&state_dir).unwrap();
+        let coordinator = RemoteMutationJournal::new(journal, binding.clone()).unwrap();
+        coordinator.reserve(&operation).unwrap();
+        coordinator
+            .mark_dispatched(&operation.operation_id)
+            .unwrap();
+        drop(coordinator);
+        let journal = RemoteOperationJournal::open(&state_dir).unwrap();
+        let coordinator = RemoteMutationJournal::new(journal, binding.clone()).unwrap();
+        assert!(
+            coordinator
+                .reconcile_recovery(&operation.operation_id, &server_state, true)
+                .unwrap()
+        );
+        assert!(coordinator.pending().is_empty());
     }
 
     #[test_case(false; "dispatched")]
@@ -9208,27 +9285,26 @@ mod tests {
         coordinator
             .mark_dispatched(&operation.operation_id)
             .unwrap();
+        let (dispatched_at, cursor) = {
+            let state = coordinator.state.lock().unwrap();
+            let pending = state.pending.get(&operation.operation_id).unwrap();
+            (pending.dispatched_at, pending.cursor.clone())
+        };
         let recovery = RecoveryOperation {
             publication_cwd: None,
             publication_id: None,
+            host_instance_id: "instance".to_owned(),
             operation_id: operation.operation_id.clone(),
             invocation_id: OperationId::new("invocation").unwrap(),
             preparation_id: OperationId::new("prepared").unwrap(),
             request_digest: RequestDigest::sha256(TEST_REQUEST_DIGEST).unwrap(),
-            cursor: coordinator
-                .state
-                .lock()
-                .unwrap()
-                .pending
-                .get(&operation.operation_id)
-                .unwrap()
-                .cursor
-                .clone(),
+            dispatched_at,
+            cursor,
         };
         let status = recovery_status(&completed_status(), &recovery, &host_binding()).unwrap();
         assert!(
             coordinator
-                .reconcile_recovery(&operation.operation_id, &status.state)
+                .reconcile_recovery(&operation.operation_id, &status.state, true)
                 .unwrap()
         );
         assert!(coordinator.pending().is_empty());
@@ -9255,22 +9331,21 @@ mod tests {
         response.expires_at_unix_ms = None;
         response.binding = None;
         response.outcome = None;
+        let (dispatched_at, cursor) = {
+            let state = coordinator.state.lock().unwrap();
+            let pending = state.pending.get(&operation.operation_id).unwrap();
+            (pending.dispatched_at, pending.cursor.clone())
+        };
         let recovery = RecoveryOperation {
             publication_cwd: None,
             publication_id: None,
+            host_instance_id: "instance".to_owned(),
             operation_id: operation.operation_id.clone(),
             invocation_id: OperationId::new("invocation").unwrap(),
             preparation_id: OperationId::new("prepared").unwrap(),
             request_digest: RequestDigest::sha256(TEST_REQUEST_DIGEST).unwrap(),
-            cursor: coordinator
-                .state
-                .lock()
-                .unwrap()
-                .pending
-                .get(&operation.operation_id)
-                .unwrap()
-                .cursor
-                .clone(),
+            dispatched_at,
+            cursor,
         };
         let status = recovery_status(&response, &recovery, &host_binding()).unwrap();
         assert!(matches!(status.state, OperationState::Forgotten));

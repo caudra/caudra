@@ -91,8 +91,8 @@
           "sha256-P4PgqfYykkZrWGg5G3WQo070lORLEhmXQUQPx3+Yslo=";
         "git+https://github.com/crossterm-rs/crossterm?rev=3ca54292d2b1f1c58e200a06122ddaf5dd6b5c77#3ca54292d2b1f1c58e200a06122ddaf5dd6b5c77" =
           "sha256-A5lgiEEi7mktf7m2GljdAxst7Fdl7Uqko29Xq6o90Ow=";
-        "git+https://github.com/tensorninja/workcell-mcp?rev=f5a9f69831514685888805cc3cb55dac797fb3db#f5a9f69831514685888805cc3cb55dac797fb3db" =
-          "sha256-BBPtbAkW9/F3AuTDnHn1Pj4bwFEAluwdzgFzqfvgBLg=";
+        "git+https://github.com/tensorninja/workcell-mcp?rev=f75812492588ddd56df7fc21e58a3c6783e51c1b#f75812492588ddd56df7fc21e58a3c6783e51c1b" =
+          "sha256-FoPPM2LkVFu797C/Sy3pUDpVCB3QkG72JmNMYXGtY14=";
       };
 
       missingGitDepHashes = builtins.filter (s: !(builtins.hasAttr s gitDepHashes)) gitDepSources;

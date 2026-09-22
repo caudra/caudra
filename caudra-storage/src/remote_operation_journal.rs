@@ -21,7 +21,7 @@ use admission::JournalAdmission;
 pub const REMOTE_OPERATION_JOURNAL_FILE: &str = "remote-operations.sqlite3";
 const JOURNAL_DIR: &str = "recovery";
 const APPLICATION_ID: i64 = i32::from_be_bytes(*b"CAUR") as i64;
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 const OWNER_FILE_MODE: u32 = 0o600;
 const OWNER_DIR_MODE: u32 = 0o700;
 const PAGE_SIZE: i64 = 4096;
@@ -48,6 +48,7 @@ CREATE TABLE remote_operations (
     binding              TEXT NOT NULL CHECK(json_valid(binding)),
     source                TEXT NOT NULL,
     server                TEXT NOT NULL,
+    host_instance_id      TEXT NOT NULL,
     workspace             TEXT NOT NULL,
     workspace_generation  TEXT NOT NULL,
     resource_namespace    TEXT NOT NULL,
@@ -102,8 +103,17 @@ pub enum RemoteOperationJournalError {
     LimitExceeded { field: &'static str },
     #[error("remote operation journal reached its row or byte bound")]
     JournalFull,
-    #[error("remote operation journal schema version {0} is unsupported")]
-    UnsupportedVersion(i64),
+    #[error(
+        "remote operation journal at {} has schema version {found}, but this build requires {supported}; \
+         it records only in-flight remote operations, so deleting the file restores service and loses \
+         nothing beyond the ability to reconcile operations that were still unresolved",
+        path.display()
+    )]
+    UnsupportedVersion {
+        path: PathBuf,
+        found: i64,
+        supported: i64,
+    },
     #[error("remote operation journal changed during admission; retry opening it")]
     AdmissionChanged,
     #[error("remote operation journal contains invalid data in {0}")]
@@ -253,6 +263,7 @@ impl RemoteOperationState {
 pub struct RemoteOperationReservation {
     pub publication_cwd: Option<WorkspacePath>,
     pub broad_lock: bool,
+    pub host_instance_id: String,
     pub publication_id: Option<OperationId>,
     pub operation_id: OperationId,
     pub invocation_id: OperationId,
@@ -268,6 +279,7 @@ pub struct RemoteOperationReservation {
 pub struct RemoteOperationRecord {
     pub publication_cwd: Option<WorkspacePath>,
     pub publication_id: Option<OperationId>,
+    pub host_instance_id: String,
     pub operation_id: OperationId,
     pub invocation_id: OperationId,
     pub preparation_id: OperationId,
@@ -319,7 +331,7 @@ impl RemoteOperationJournal {
         })?;
         connection.busy_timeout(BUSY_TIMEOUT)?;
         connection.set_limit(Limit::SQLITE_LIMIT_LENGTH, MAX_SQLITE_VALUE_BYTES)?;
-        initialize(&connection, fresh)?;
+        initialize(&connection, &path, fresh)?;
         verify_sidecars(&path)?;
         Ok(Self { connection, path })
     }
@@ -368,7 +380,9 @@ impl RemoteOperationJournal {
              WHERE source = ?1 AND server = ?2 AND workspace = ?3
                AND resource_namespace = ?4 AND principal = ?5 AND project = ?6
                AND state IN ('reserved', 'dispatched', 'indeterminate') AND acknowledged_at IS NULL
-               AND (workspace_generation != ?7 OR broad_lock = 1 OR ?8 OR EXISTS (
+               AND (workspace_generation != ?7
+                    OR (broad_lock = 1 AND state != 'indeterminate')
+                    OR ?8 OR EXISTS (
                    SELECT 1 FROM json_each(remote_operations.lock_keys) pending
                    JOIN json_each(?9) requested ON pending.value = requested.value))
              ORDER BY created_at, operation_id LIMIT 1",
@@ -392,11 +406,11 @@ impl RemoteOperationJournal {
         transaction.execute(
             "INSERT INTO remote_operations (
                  operation_id, invocation_id, preparation_id, binding, source, server,
-                 workspace, workspace_generation, resource_namespace, principal, project,
+                 host_instance_id, workspace, workspace_generation, resource_namespace, principal, project,
                  cwd_handle, cursor_label, operation_kind, request_digest, lock_keys, state,
                  created_at, updated_at, side_effects_possible, publication_id, broad_lock, publication_cwd
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
-                       ?15, ?16, 'reserved', ?17, ?17, 0, ?18, ?19, ?20)",
+                       ?15, ?16, ?17, 'reserved', ?18, ?18, 0, ?19, ?20, ?21)",
             params![
                 reservation.operation_id.as_str(),
                 reservation.invocation_id.as_str(),
@@ -404,6 +418,7 @@ impl RemoteOperationJournal {
                 binding,
                 reservation.binding.trust_anchor().as_str(),
                 reservation.binding.server_id(),
+                reservation.host_instance_id,
                 reservation.binding.workspace_id(),
                 reservation.binding.workspace_generation(),
                 reservation.binding.resource_namespace_version(),
@@ -514,7 +529,8 @@ impl RemoteOperationJournal {
         let mut statement = self.connection.prepare(
             "SELECT operation_id, invocation_id, preparation_id, binding, operation_kind,
                     request_digest, lock_keys, state, created_at, updated_at, dispatched_at,
-                    terminal_at, acknowledged_at, side_effects_possible, publication_id, publication_cwd
+                    terminal_at, acknowledged_at, side_effects_possible, publication_id, publication_cwd,
+                    host_instance_id
              FROM remote_operations WHERE source = ?1 AND server = ?2 AND workspace = ?3
                    AND workspace_generation = ?4 AND resource_namespace = ?5
                    AND principal = ?6 AND project = ?7
@@ -659,10 +675,17 @@ impl RemoteOperationJournal {
     }
 }
 
-fn validate_schema(connection: &Connection) -> Result<(), RemoteOperationJournalError> {
+fn validate_schema(
+    connection: &Connection,
+    path: &Path,
+) -> Result<(), RemoteOperationJournalError> {
     let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
     if version != SCHEMA_VERSION {
-        return Err(RemoteOperationJournalError::UnsupportedVersion(version));
+        return Err(RemoteOperationJournalError::UnsupportedVersion {
+            path: path.to_path_buf(),
+            found: version,
+            supported: SCHEMA_VERSION,
+        });
     }
     let application_id: i64 =
         connection.pragma_query_value(None, "application_id", |row| row.get(0))?;
@@ -693,9 +716,13 @@ fn schema_objects(connection: &Connection) -> Result<Vec<[String; 4]>, rusqlite:
         .collect()
 }
 
-fn initialize(connection: &Connection, fresh: bool) -> Result<(), RemoteOperationJournalError> {
+fn initialize(
+    connection: &Connection,
+    path: &Path,
+    fresh: bool,
+) -> Result<(), RemoteOperationJournalError> {
     if !fresh {
-        validate_schema(connection)?;
+        validate_schema(connection, path)?;
     }
     connection.execute_batch(&format!(
         "PRAGMA page_size = {PAGE_SIZE};
@@ -875,6 +902,7 @@ fn record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RemoteOperationR
             .get::<_, Option<String>>(14)?
             .map(|id| parse_operation_id(id, 14))
             .transpose()?,
+        host_instance_id: row.get(16)?,
         operation_id,
         invocation_id,
         preparation_id,
@@ -980,6 +1008,9 @@ mod tests {
     const REQUEST_DIGEST: &str =
         "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
     const RAW_LOCK_KEY: &str = "opaque-lock-value";
+    const UNSUPPORTED_VERSION_EXPECTED: &str =
+        "an unreadable journal must be refused with its path and the supported version";
+    const FUTURE_SCHEMA_VERSION: i64 = SCHEMA_VERSION + 1;
     const CRASH_PATH_ENV: &str = "CAUDRA_TEST_JOURNAL_CRASH_PATH";
     const CRASH_SQL_ENV: &str = "CAUDRA_TEST_JOURNAL_CRASH_SQL";
     const HOT_JOURNAL_MAGIC: &[u8] = b"\xd9\xd5\x05\xf9\x20\xa1\x63\xd7";
@@ -1044,8 +1075,8 @@ mod tests {
         process::exit(0);
     }
 
-    #[test_case("future_wal", Some(4); "newer_version_only_in_wal")]
-    #[test_case("future_wal_without_shm", Some(4); "newer_version_only_in_wal_without_shm")]
+    #[test_case("future_wal", Some(FUTURE_SCHEMA_VERSION); "newer_version_only_in_wal")]
+    #[test_case("future_wal_without_shm", Some(FUTURE_SCHEMA_VERSION); "newer_version_only_in_wal_without_shm")]
     #[test_case("old_hot", Some(2); "old_schema_hot_rollback")]
     #[test_case("application_wal", None; "wrong_application_only_in_wal")]
     #[test_case("schema_wal", None; "wrong_schema_only_in_wal")]
@@ -1060,7 +1091,7 @@ mod tests {
         drop(journal);
         let script = match kind {
             "future_wal" | "future_wal_without_shm" => {
-                "PRAGMA wal_autocheckpoint=0; PRAGMA user_version=4;".to_owned()
+                format!("PRAGMA wal_autocheckpoint=0; PRAGMA user_version={FUTURE_SCHEMA_VERSION};")
             }
             "application_wal" => "PRAGMA wal_autocheckpoint=0; PRAGMA application_id=0;".to_owned(),
             "schema_wal" => "PRAGMA wal_autocheckpoint=0; DROP TABLE remote_operations;".to_owned(),
@@ -1102,8 +1133,19 @@ mod tests {
         for _ in 0..2 {
             let result = RemoteOperationJournal::open(&state);
             match version {
-                Some(expected) => assert!(matches!(result,
-                    Err(RemoteOperationJournalError::UnsupportedVersion(found)) if found == expected)),
+                Some(expected) => {
+                    let Err(RemoteOperationJournalError::UnsupportedVersion {
+                        path: reported,
+                        found,
+                        supported,
+                    }) = result
+                    else {
+                        panic!("{UNSUPPORTED_VERSION_EXPECTED}");
+                    };
+                    assert_eq!(found, expected);
+                    assert_eq!(supported, SCHEMA_VERSION);
+                    assert_eq!(reported, path);
+                }
                 None => assert!(matches!(
                     result,
                     Err(RemoteOperationJournalError::UnsafeStorage(_))
@@ -1129,10 +1171,17 @@ mod tests {
             ).unwrap();
         }
         let before = journal_snapshot(&path);
-        assert!(matches!(
-            RemoteOperationJournal::open(&state),
-            Err(RemoteOperationJournalError::UnsupportedVersion(0))
-        ));
+        let Err(RemoteOperationJournalError::UnsupportedVersion {
+            path: reported,
+            found,
+            supported,
+        }) = RemoteOperationJournal::open(&state)
+        else {
+            panic!("{UNSUPPORTED_VERSION_EXPECTED}");
+        };
+        assert_eq!(found, 0);
+        assert_eq!(supported, SCHEMA_VERSION);
+        assert_eq!(reported, path);
         assert_eq!(journal_snapshot(&path), before);
     }
 
@@ -1177,7 +1226,7 @@ mod tests {
             OperationId::new("operation-retained").unwrap()
         );
         assert_eq!(records[0].updated_at, if rollback { 10 } else { 20 });
-        validate_schema(&journal.connection).unwrap();
+        validate_schema(&journal.connection, journal.path()).unwrap();
         for suffix in ["", "-wal", "-shm"] {
             verify_owner_only(&fs::metadata(sidecar(&path, suffix)).unwrap()).unwrap();
         }
@@ -1269,7 +1318,8 @@ mod tests {
 
     #[test_case(1; "v1")]
     #[test_case(2; "v2")]
-    #[test_case(4; "future")]
+    #[test_case(3; "v3")]
+    #[test_case(FUTURE_SCHEMA_VERSION; "future")]
     fn unsupported_journal_versions_are_rejected_without_rewriting(version: i64) {
         let temp = TempDir::new().unwrap();
         let state = StateDir::from_path(temp.path().join("state"));
@@ -1284,6 +1334,7 @@ mod tests {
                 "ALTER TABLE remote_operations DROP COLUMN publication_id;
              ALTER TABLE remote_operations DROP COLUMN publication_cwd;
              ALTER TABLE remote_operations DROP COLUMN broad_lock;
+             ALTER TABLE remote_operations DROP COLUMN host_instance_id;
              PRAGMA journal_mode = DELETE;",
             )
             .unwrap();
@@ -1293,8 +1344,17 @@ mod tests {
             .unwrap();
         drop(journal);
         let before = fs::read(&path).unwrap();
-        assert!(matches!(RemoteOperationJournal::open(&state),
-            Err(RemoteOperationJournalError::UnsupportedVersion(found)) if found == version));
+        let Err(RemoteOperationJournalError::UnsupportedVersion {
+            path: reported,
+            found,
+            supported,
+        }) = RemoteOperationJournal::open(&state)
+        else {
+            panic!("{UNSUPPORTED_VERSION_EXPECTED}");
+        };
+        assert_eq!(found, version);
+        assert_eq!(supported, SCHEMA_VERSION);
+        assert_eq!(reported, path);
         assert_eq!(fs::read(&path).unwrap(), before);
         assert!(!sidecar(&path, "-wal").exists());
     }
@@ -1354,6 +1414,7 @@ mod tests {
         RemoteOperationReservation {
             publication_cwd: None,
             broad_lock: false,
+            host_instance_id: "test-instance".to_owned(),
             publication_id: None,
             operation_id: OperationId::new(format!("operation-{id}")).unwrap(),
             invocation_id: OperationId::new(format!("invocation-{id}")).unwrap(),
@@ -1608,13 +1669,13 @@ mod tests {
                  )
                  INSERT INTO remote_operations (
                      operation_id, invocation_id, preparation_id, binding, source, server,
-                     workspace, workspace_generation, resource_namespace, principal, project,
-                     cwd_handle, operation_kind, request_digest, lock_keys, state, created_at,
-                     updated_at, side_effects_possible
+                     host_instance_id, workspace, workspace_generation, resource_namespace,
+                     principal, project, cwd_handle, operation_kind, request_digest, lock_keys,
+                     state, created_at, updated_at, side_effects_possible
                   ) SELECT 'operation-' || value, 'invocation-' || value,
-                           'preparation-' || value, '{}', 'source', 'authority', 'workspace',
-                           'generation', 'namespace', 'principal', 'project', 'cursor',
-                           'tool_mutation', ?2, '[]', 'failed', 1, 1, 0
+                           'preparation-' || value, '{}', 'source', 'authority', 'instance',
+                           'workspace', 'generation', 'namespace', 'principal', 'project',
+                           'cursor', 'tool_mutation', ?2, '[]', 'failed', 1, 1, 0
                    FROM seq",
                 params![MAX_ROWS as i64, REQUEST_DIGEST],
             )
