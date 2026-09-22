@@ -43,7 +43,7 @@ pub struct Diff {
 }
 
 impl Diff {
-    fn push(&mut self, text: String, kind: DiffKind) {
+    pub(super) fn push(&mut self, text: String, kind: DiffKind) {
         self.rows.push(DiffRow {
             text,
             kind,

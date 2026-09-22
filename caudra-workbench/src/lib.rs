@@ -54,6 +54,7 @@ use quick_open::QuickOpen;
 use scm::backend::{
     CommitFilesResult, DiffResult as RemoteDiffResult, Driver as ScmDriver, Event as ScmEvent,
 };
+use scm::repo::Commit;
 use scm::{MIN_SECTION_ROWS, Scm, Section};
 use scroll::{Scrollbar, ScrollbarMouse};
 use search::Search;
@@ -88,6 +89,9 @@ const RENAME_PROMPT: &str = "Rename: ";
 const NEW_FILE_PROMPT: &str = "New file: ";
 const NEW_FOLDER_PROMPT: &str = "New folder: ";
 const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
+/// Where a workspace session files the tabs it synthesises from the repository,
+/// which name no path the workspace itself would serve.
+const SCM_SYNTHETIC_ROOT: &str = ".caudra-scm";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -445,6 +449,10 @@ pub struct Workbench {
     pending_count: HashMap<RequestId, WorkbenchPath>,
     pending_lines: HashMap<WorkbenchPath, RangeInclusive<usize>>,
     deferred_open: HashMap<WorkbenchPath, OpenPurpose>,
+    /// The commit whose detail tab is waiting on the asynchronous walk that
+    /// lists what it changed. Only a workspace session ever sets it; a local
+    /// repository answers the same question in the same breath.
+    pending_commit_detail: Option<String>,
     delete_target: Option<ResourceEntry>,
     remote_invalidated: HashSet<WorkbenchPath>,
     /// Started when the workbench opens and dropped when it closes, so a tree
@@ -520,6 +528,7 @@ impl Workbench {
             pending_count: HashMap::new(),
             pending_lines: HashMap::new(),
             deferred_open: HashMap::new(),
+            pending_commit_detail: None,
             delete_target: None,
             remote_invalidated: HashSet::new(),
             watch: None,
@@ -2902,7 +2911,12 @@ impl Workbench {
             return;
         }
         if keys::OPEN_DIFF.matches(key) {
-            self.activate_scm();
+            // On a commit this means `git show` rather than a second `Enter`:
+            // the row has room for a subject and the tab has room for the rest.
+            match self.scm.selected_commit().is_some() {
+                true => self.open_commit_detail(),
+                false => self.activate_scm(),
+            }
             return;
         }
         let page = self.scm_rows().max(1) as isize;
@@ -3167,6 +3181,60 @@ impl Workbench {
         self.reveal_active();
     }
 
+    /// Opens the commit under the cursor as a read-only tab: everything the
+    /// graph row had no width to say, which is the whole message.
+    ///
+    /// The tab is filed under the hash alone, the directory the commit's file
+    /// tabs already hang beneath, so it displaces none of them.
+    fn open_commit_detail(&mut self) {
+        let Some(commit) = self.scm.selected_commit().cloned() else {
+            return;
+        };
+        // Listing what a commit changed is what opening it means here, so the
+        // detail tab and the graph read it once between them. A local
+        // repository answers in this breath; a workspace session draws the tab
+        // now and again when the walk lands.
+        if self.scm.commit_files(&commit.id).is_none() {
+            match self.remote_scm.is_some() {
+                true => {
+                    self.pending_commit_detail = Some(commit.id.clone());
+                    self.expand_remote_commit();
+                }
+                false => self.scm.expand_commit(&commit.id),
+            }
+        }
+        self.push_commit_detail(&commit);
+    }
+
+    fn push_commit_detail(&mut self, commit: &Commit) {
+        let rendered = scm::commit::detail(commit, self.scm.commit_files(&commit.id));
+        let Some(path) = self.commit_detail_path(&commit.id) else {
+            return;
+        };
+        self.editor.push(Tab::synthetic_backend(
+            path,
+            format!("{}{}", scm::commit::TITLE, commit.id),
+            rendered.rows,
+            self.theme_generation,
+        ));
+        self.focus = Focus::Editor;
+    }
+
+    /// Where a commit's detail tab is filed: the hash alone, which is the
+    /// directory its file tabs already hang beneath, so the two never displace
+    /// each other in [`Editor::push`].
+    fn commit_detail_path(&self, id: &str) -> Option<WorkbenchPath> {
+        match self.scm.workdir() {
+            Some(workdir) => Some(WorkbenchPath::Local(workdir.join(id))),
+            None => WorkspacePath::new(format!(
+                "{SCM_SYNTHETIC_ROOT}/{}",
+                opaque_path_component(id)
+            ))
+            .ok()
+            .map(WorkbenchPath::Remote),
+        }
+    }
+
     /// Opens one path of a commit as a read-only diff tab.
     ///
     /// The tab is filed under the commit's own hash rather than the worktree
@@ -3291,7 +3359,7 @@ impl Workbench {
             ),
             ScmDiffTarget::Tree { target, .. } => {
                 let synthetic = WorkspacePath::new(format!(
-                    ".caudra-scm/{}/{}",
+                    "{SCM_SYNTHETIC_ROOT}/{}/{}",
                     opaque_path_component(target.as_str()),
                     path.as_str()
                 ))
@@ -3332,9 +3400,29 @@ impl Workbench {
         };
         self.scm
             .open_workspace_commit(result.commit.as_str(), files);
+        self.redraw_pending_commit_detail(result.commit.as_str());
         if result.truncated || result.incomplete {
             self.flash = Some("Remote commit file list is incomplete".to_owned());
         }
+    }
+
+    /// A detail tab opened before its file list arrived is drawn again now that
+    /// it has, so the reader ends up with the same tab either way.
+    fn redraw_pending_commit_detail(&mut self, id: &str) {
+        if self.pending_commit_detail.as_deref() != Some(id) {
+            return;
+        }
+        self.pending_commit_detail = None;
+        let Some(commit) = self
+            .scm
+            .log()
+            .iter()
+            .find(|commit| commit.id == id)
+            .cloned()
+        else {
+            return;
+        };
+        self.push_commit_detail(&commit);
     }
 
     /// A discard rewrote a file underneath whatever was showing it, so any tab
@@ -3983,6 +4071,10 @@ mod tests {
     const DIFF_EDITABLE: &str = "a diff tab must be read-only";
     const REMOTE_SETTLE_TIMEOUT: Duration = Duration::from_secs(10);
     const COMMIT_OPENED_WHOLE: &str = "a commit must open into its paths, not into one document";
+    const MESSAGE_NOT_SHOWN: &str = "the commit tab does not say what the commit says";
+    const INITIAL_MESSAGE: &str = "initial";
+    const SUBJECT: &str = "rewrite the scheduler";
+    const BODY: &str = "The old one woke every tick.";
     const COMMIT_NOT_LISTED: &str = "the graph does not list what the commit changed";
     const DIFF_DISPLACED: &str = "a commit's diff replaced the working tree's diff of that path";
     const DISCARD_UNARMED: &str = "a discard must take exactly two goes at the same row";
@@ -5604,6 +5696,10 @@ mod tests {
     /// environment has no git identity, so the signature is spelled out rather
     /// than inherited.
     fn commit_all(workbench: &mut Workbench) {
+        commit_message(workbench, INITIAL_MESSAGE);
+    }
+
+    fn commit_message(workbench: &mut Workbench, message: &str) {
         let workdir = workbench.scm.workdir().expect("a repository").to_path_buf();
         let repo = gix::open(&workdir).expect("a repository");
         let index = repo.index_or_empty().expect("an index");
@@ -5624,7 +5720,7 @@ mod tests {
             email: "test@example.invalid".into(),
             time: "1700000000 +0000",
         };
-        repo.commit_as(who, who, "HEAD", "initial", id, repo.head_id().ok())
+        repo.commit_as(who, who, "HEAD", message, id, repo.head_id().ok())
             .expect("a commit");
         workbench.handle_key(key(keys::REFRESH.code));
     }
@@ -6613,6 +6709,81 @@ mod tests {
             1,
             "{COMMIT_NOT_LISTED}"
         );
+    }
+
+    /// A body of text with `D` on it, which the row never had the width for.
+    #[test]
+    fn the_diff_key_on_a_commit_opens_the_whole_message() {
+        let (_dir, mut workbench) = repository();
+        workbench.handle_key(key(keys::STAGE_TOGGLE.code));
+        commit_message(&mut workbench, &format!("{SUBJECT}\n\n{BODY}"));
+        workbench.scm.select(Section::Graph, Some(0));
+
+        workbench.handle_key(press(keys::OPEN_DIFF));
+
+        let tab = workbench.editor.active().expect("a commit detail tab");
+        assert!(!tab.is_editable(), "{DIFF_EDITABLE}");
+        let text = tab.buffer.lines().join("\n");
+        assert!(text.contains(SUBJECT), "{MESSAGE_NOT_SHOWN}");
+        assert!(text.contains(BODY), "{MESSAGE_NOT_SHOWN}");
+        assert!(text.contains(OPENED_FILE), "{MESSAGE_NOT_SHOWN}");
+    }
+
+    /// `Enter` folds and `D` shows. Overloading one key with both would leave
+    /// no way to read a commit without also rearranging the graph.
+    #[test]
+    fn enter_on_a_commit_still_folds_rather_than_opening_the_message() {
+        let (_dir, mut workbench) = repository();
+        workbench.handle_key(key(keys::STAGE_TOGGLE.code));
+        commit_all(&mut workbench);
+        workbench.scm.select(Section::Graph, Some(0));
+
+        workbench.handle_key(key(KeyCode::Enter));
+
+        assert!(workbench.editor.active().is_none(), "{COMMIT_OPENED_WHOLE}");
+    }
+
+    #[test]
+    fn a_commit_detail_does_not_displace_the_diff_of_a_path_it_changed() {
+        let (_dir, mut workbench) = repository();
+        workbench.handle_key(key(keys::STAGE_TOGGLE.code));
+        commit_all(&mut workbench);
+        workbench.scm.select(Section::Graph, Some(0));
+        workbench.handle_key(press(keys::OPEN_DIFF));
+
+        // The detail tab took the focus with it, the way every opened tab does.
+        workbench.handle_leader(press(keys::VIEW_SOURCE_CONTROL));
+        workbench.scm.select(Section::Graph, Some(1));
+        workbench.handle_key(key(KeyCode::Enter));
+
+        assert_eq!(workbench.editor.tabs().len(), 2, "{DIFF_DISPLACED}");
+    }
+
+    #[test]
+    fn a_commit_detail_tab_is_left_out_of_the_stored_layout() {
+        let (_dir, mut workbench) = repository();
+        workbench.handle_key(key(keys::STAGE_TOGGLE.code));
+        commit_all(&mut workbench);
+        workbench.scm.select(Section::Graph, Some(0));
+
+        workbench.handle_key(press(keys::OPEN_DIFF));
+
+        assert!(workbench.layout().tabs.is_empty(), "{LAYOUT_LOST}");
+    }
+
+    #[test]
+    fn the_diff_key_on_a_path_under_a_commit_still_opens_that_path() {
+        let (_dir, mut workbench) = repository();
+        workbench.handle_key(key(keys::STAGE_TOGGLE.code));
+        commit_all(&mut workbench);
+        workbench.scm.select(Section::Graph, Some(0));
+        workbench.handle_key(key(KeyCode::Enter));
+        workbench.scm.select(Section::Graph, Some(1));
+
+        workbench.handle_key(press(keys::OPEN_DIFF));
+
+        let tab = workbench.editor.active().expect("a commit file tab");
+        assert!(tab.title.starts_with(OPENED_FILE), "{COMMIT_NOT_LISTED}");
     }
 
     #[test]

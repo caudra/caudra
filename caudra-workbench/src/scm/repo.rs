@@ -20,7 +20,6 @@ use gix::status::tree_index::TrackRenames;
 use crate::fs::tree::GitMark;
 
 const LOG_LIMIT: usize = 200;
-const SUMMARY_LIMIT: usize = 72;
 const ID_LENGTH: usize = 7;
 /// How many paths of one commit are diffed. A merge or a formatting sweep can
 /// touch thousands, and a tab nobody can scroll to the end of is worse than one
@@ -53,11 +52,21 @@ pub struct Change {
 /// One commit of the walk. `parents` carries the same shortened hexadecimal as
 /// `id` so the graph can join a commit to its parents by looking no further
 /// than the window it is drawing.
+///
+/// The message is kept whole. A workspace session only ever learns a body from
+/// the log page it already asked for, so a body dropped here is one no later
+/// read can recover.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Commit {
     pub id: String,
     pub summary: String,
+    /// The message past its subject. `None` is a commit whose message is a
+    /// subject and nothing else.
+    pub body: Option<String>,
     pub author: String,
+    pub email: String,
+    /// Seconds since the Unix epoch, the unit the workspace protocol reports.
+    pub committed: i64,
     pub parents: Vec<String>,
 }
 
@@ -177,13 +186,21 @@ impl Repo {
             let message = commit
                 .message()
                 .map_err(|error| ScmError::Read(error.to_string()))?;
+            let author = commit.author().ok();
             log.push(Commit {
                 id: short(info.id),
-                summary: shorten(&message.summary().to_str_lossy()),
-                author: commit
-                    .author()
+                summary: message.summary().to_str_lossy().into_owned(),
+                // The raw remainder rather than `body()`, which parses trailers
+                // off the end: a `Signed-off-by` is part of what a reader came
+                // to read.
+                body: message.body.map(|body| body.to_str_lossy().into_owned()),
+                author: author
                     .map(|author| author.name.to_str_lossy().into_owned())
                     .unwrap_or_default(),
+                email: author
+                    .map(|author| author.email.to_str_lossy().into_owned())
+                    .unwrap_or_default(),
+                committed: author.map(|author| author.seconds()).unwrap_or_default(),
                 parents: commit.parent_ids().map(|id| short(id.detach())).collect(),
             });
         }
@@ -522,13 +539,6 @@ fn worktree_mark(item: &WorktreeItem) -> Option<GitMark> {
     })
 }
 
-fn shorten(summary: &str) -> String {
-    match summary.chars().count() > SUMMARY_LIMIT {
-        true => summary.chars().take(SUMMARY_LIMIT - 1).collect::<String>() + "\u{2026}",
-        false => summary.to_owned(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::{GitMark, ID_LENGTH, Repo};
@@ -542,7 +552,14 @@ mod tests {
     const TEST_AUTHOR: &str = "Workbench Test";
     const TEST_EMAIL: &str = "test@example.invalid";
     const TEST_TIME: &str = "1700000000 +0000";
+    const TEST_SECONDS: i64 = 1_700_000_000;
     const NO_PARENT: &str = "the commit does not name the parents it was built on";
+    const NO_MESSAGE: &str = "the commit does not say what its message says";
+    const SUBJECT: &str = "rewrite the scheduler";
+    const BODY: &str = "The old one woke every tick.\nThis one sleeps until there is work.";
+    const TRAILER: &str = "Signed-off-by: Ada <ada@example.invalid>";
+    /// Comfortably past the 72 characters the log used to clip a subject at.
+    const LONG_SUBJECT: usize = 120;
 
     /// A repository with one committed file, so both `HEAD` and the index have
     /// something to say.
@@ -719,6 +736,62 @@ mod tests {
         assert_eq!(log.len(), 1);
         assert_eq!(log[0].summary, "initial");
         assert_eq!(log[0].id.len(), ID_LENGTH);
+    }
+
+    #[test]
+    fn the_log_keeps_the_message_past_its_subject() {
+        let (tmp, repo) = repository();
+        fs::write(tmp.path().join("tracked.txt"), "one\nthree\n").unwrap();
+        repo.stage("tracked.txt").unwrap();
+        commit(tmp.path(), &format!("{SUBJECT}\n\n{BODY}"));
+
+        let log = repo.log().unwrap();
+
+        assert_eq!(log[0].summary, SUBJECT, "{NO_MESSAGE}");
+        assert_eq!(log[0].body.as_deref(), Some(BODY), "{NO_MESSAGE}");
+    }
+
+    #[test]
+    fn a_commit_that_is_all_subject_has_no_body() {
+        let (_tmp, repo) = repository();
+        assert_eq!(repo.log().unwrap()[0].body, None, "{NO_MESSAGE}");
+    }
+
+    /// A body ends where the message does, trailers included: the reader opened
+    /// the commit to read them.
+    #[test]
+    fn a_trailer_stays_part_of_the_body() {
+        let (tmp, repo) = repository();
+        fs::write(tmp.path().join("tracked.txt"), "one\nthree\n").unwrap();
+        repo.stage("tracked.txt").unwrap();
+        commit(tmp.path(), &format!("{SUBJECT}\n\n{BODY}\n\n{TRAILER}"));
+
+        let body = repo.log().unwrap()[0].body.clone().expect("a body");
+
+        assert!(body.ends_with(TRAILER), "{NO_MESSAGE}");
+    }
+
+    /// The row fits the subject to the width it has, so clipping it this far
+    /// upstream only cost the detail view the true subject.
+    #[test]
+    fn a_long_subject_is_not_clipped_on_the_way_in() {
+        let (tmp, repo) = repository();
+        let subject = "s".repeat(LONG_SUBJECT);
+        fs::write(tmp.path().join("tracked.txt"), "one\nthree\n").unwrap();
+        repo.stage("tracked.txt").unwrap();
+        commit(tmp.path(), &subject);
+
+        assert_eq!(repo.log().unwrap()[0].summary, subject, "{NO_MESSAGE}");
+    }
+
+    #[test]
+    fn the_log_names_who_made_the_commit_and_when() {
+        let (_tmp, repo) = repository();
+        let log = repo.log().unwrap();
+
+        assert_eq!(log[0].author, TEST_AUTHOR, "{NO_MESSAGE}");
+        assert_eq!(log[0].email, TEST_EMAIL, "{NO_MESSAGE}");
+        assert_eq!(log[0].committed, TEST_SECONDS, "{NO_MESSAGE}");
     }
 
     #[test]

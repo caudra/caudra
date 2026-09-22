@@ -68,6 +68,9 @@ const DIRTY_MARK: &str = "\u{25cf}";
 const AGENT_MARK: &str = "\u{25e6}";
 const EXPANDED_MARK: &str = "\u{25be} ";
 const COLLAPSED_MARK: &str = "\u{25b8} ";
+/// Trails the subject of a commit whose message says more than its subject, so
+/// the graph says which rows are worth opening.
+const BODY_MARK: &str = " \u{00b6}";
 const LEAF_INDENT: &str = "  ";
 const DEPTH_INDENT: usize = 2;
 /// One nesting level of the explorer, drawn as a rule rather than as air so a
@@ -1658,8 +1661,13 @@ fn commit_row(
         false => COLLAPSED_MARK,
     };
     let mark = rail_mark(rail);
-    let budget = (width as usize)
-        .saturating_sub(commit.id.len() + mark.width() + fold.width() + SUMMARY_GAP.len());
+    let body = match commit.body.is_some() {
+        true => BODY_MARK,
+        false => "",
+    };
+    let budget = (width as usize).saturating_sub(
+        commit.id.len() + mark.width() + fold.width() + SUMMARY_GAP.len() + body.width(),
+    );
     let left = vec![
         Span::styled(mark, styles.dim),
         Span::styled(fold, styles.dim),
@@ -1668,6 +1676,7 @@ fn commit_row(
             format!("{SUMMARY_GAP}{}", chrome::fit(&commit.summary, budget)),
             style,
         ),
+        Span::styled(body, styles.dim),
     ];
     let right = vec![Span::styled(commit.author.clone(), styles.dim)];
     chrome::status_line(left, right, width, styles.background)
@@ -2439,7 +2448,10 @@ mod tests {
         Commit {
             id: id.to_owned(),
             summary: "did a thing".to_owned(),
+            body: None,
             author: "Tester".to_owned(),
+            email: String::new(),
+            committed: 0,
             parents: Vec::new(),
         }
     }

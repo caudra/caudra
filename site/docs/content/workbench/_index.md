@@ -165,12 +165,15 @@ Rows in `GRAPH` carry a rail glyph: `●` for a commit on the chain of first par
 
 `Enter` on a commit opens it into the paths it changed, laid out as a tree under it and marked with the same git letters the change sections use. `Enter` on one of those paths opens the diff for that path alone, read against the commit's first parent. Only the path you open is read, so a commit touching hundreds of files costs one tree walk to list and one file to show. The listing stops at 100 paths and says so.
 
-Any number of commits can stay open at once, and a folder folded under one commit stays open under another. A commit's diff and the working tree's diff of the same path are separate tabs.
+A row has width for a subject and no more, so a commit whose message says more than its subject carries a `¶` after it. `D` on a commit opens the whole message as a read-only tab: the hash, who wrote it and when, the parents it was built on, the message laid out as it was written, and the paths it touched. The tab is ordinary text, so `Ctrl+F` searches it and `Ctrl+C` copies from it. Long lines are left alone rather than rewrapped, because a message may hold a code fence or a table; `Ctrl+X z` wraps them if you would rather read it that way.
+
+Any number of commits can stay open at once, and a folder folded under one commit stays open under another. A commit's message, a commit's diff, and the working tree's diff of the same path are all separate tabs.
 
 | Key | Action |
 |-----|--------|
 | `Space` | Stage or unstage the file, the folder, or the whole section |
-| `D` or `Enter` | Open the diff, or fold what the cursor is on |
+| `Enter` | Open the diff, or fold what the cursor is on |
+| `D` | Open the diff, or the whole message when the cursor is on a commit |
 | `X` | Discard changes, twice to confirm |
 | `T` | Switch between tree and flat |
 | `Left` / `Right` | Fold and unfold a folder, a commit, or a section |

@@ -66,7 +66,10 @@ mod tests {
         Commit {
             id: id.to_owned(),
             summary: String::new(),
+            body: None,
             author: String::new(),
+            email: String::new(),
+            committed: 0,
             parents: parents.iter().map(|id| (*id).to_owned()).collect(),
         }
     }

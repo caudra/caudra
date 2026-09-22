@@ -22,6 +22,7 @@ grep-matcher = { workspace = true }
 grep-regex = { workspace = true }
 grep-searcher = { workspace = true }
 ignore = { workspace = true }
+jiff = { workspace = true }
 memchr = { workspace = true }
 notify = { workspace = true }
 nucleo = { workspace = true }

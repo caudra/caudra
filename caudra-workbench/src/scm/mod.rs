@@ -11,6 +11,7 @@
 //! inspect the client host repository.
 
 pub mod backend;
+pub mod commit;
 pub mod diff;
 pub mod graph;
 pub mod repo;
@@ -235,7 +236,10 @@ impl Scm {
             .map(|commit| Commit {
                 id: commit.id.as_str().to_owned(),
                 summary: commit.summary,
+                body: commit.body,
                 author: commit.author_name,
+                email: commit.author_email,
+                committed: commit.committed_unix_seconds,
                 parents: commit
                     .parents
                     .into_iter()
@@ -436,6 +440,12 @@ impl Scm {
     pub fn commit_file(&self, commit: usize, index: usize) -> Option<&CommitPath> {
         let id = &self.log.get(commit)?.id;
         self.opened.get(id)?.files.get(index)
+    }
+
+    /// What an expanded commit changed, or `None` for one nobody has opened. A
+    /// workspace session only has this once the asynchronous walk has landed.
+    pub fn commit_files(&self, id: &str) -> Option<&CommitFiles> {
+        self.opened.get(id)
     }
 
     /// Whether a commit is showing what it changed, which is what its row's
@@ -1116,6 +1126,14 @@ impl Scm {
         true
     }
 
+    /// Opens a commit by id rather than by row, so the detail tab and the
+    /// graph share one read of what it changed.
+    pub fn expand_commit(&mut self, id: &str) {
+        if let Some(index) = self.log.iter().position(|commit| commit.id == id) {
+            self.fold_commit(index, false);
+        }
+    }
+
     fn commit_at(&self, section: Section, row: usize) -> Option<usize> {
         match self.row_at(section, row)? {
             Row::Commit(index) => Some(index),
@@ -1285,6 +1303,9 @@ mod tests {
     const CURSOR_MOVED: &str = "the cursor must stay where the reader left it";
     const ONE: &str = "one";
     const TWO: &str = "two";
+    const NO_MESSAGE: &str = "the commit does not say what its message says";
+    const AUTHOR_EMAIL: &str = "author@example.test";
+    const COMMITTED: i64 = 1_700_000_000;
 
     fn scm_revision(value: &str) -> ScmRevision {
         ScmRevision::new(value).expect("valid revision")
@@ -1363,6 +1384,52 @@ mod tests {
                 .expect("repository state")
                 .contains("incomplete")
         );
+    }
+
+    /// A workspace log page and nothing else, which is all the message tests
+    /// need: the body only ever arrives with the log.
+    fn commit_snapshot(commits: Vec<ScmCommit>) -> super::backend::Snapshot {
+        super::backend::Snapshot {
+            repository: ScmRepository {
+                handle: ResourceId::new("repo-handle").expect("valid handle"),
+                resource_id: ResourceId::new("repo-resource").expect("valid resource"),
+                root: WorkspacePath::root(),
+                identity: scm_revision("repo-identity"),
+                revisions: ScmRepositoryRevisions {
+                    repository: scm_revision("repository-1"),
+                    head: scm_revision("head-1"),
+                    index: scm_revision("index-1"),
+                    worktree: scm_revision("worktree-1"),
+                },
+            },
+            status: Vec::new(),
+            commits,
+            warnings: Vec::new(),
+        }
+    }
+
+    /// The workspace protocol has no read that returns one commit, so a body
+    /// dropped here is one no later request can recover.
+    #[test]
+    fn a_workspace_snapshot_keeps_the_whole_message_and_who_wrote_it() {
+        let mut scm = Scm::default();
+        scm.open_workspace();
+
+        scm.apply_workspace_snapshot(commit_snapshot(vec![ScmCommit {
+            id: scm_revision("commit-1"),
+            parents: vec![scm_revision("parent-1")],
+            author_name: "Author".to_owned(),
+            author_email: AUTHOR_EMAIL.to_owned(),
+            committed_unix_seconds: COMMITTED,
+            summary: ONE.to_owned(),
+            body: Some(TWO.to_owned()),
+        }]));
+
+        let commit = scm.commit(0).expect("the commit");
+        assert_eq!(commit.summary, ONE, "{NO_MESSAGE}");
+        assert_eq!(commit.body.as_deref(), Some(TWO), "{NO_MESSAGE}");
+        assert_eq!(commit.email, AUTHOR_EMAIL, "{NO_MESSAGE}");
+        assert_eq!(commit.committed, COMMITTED, "{NO_MESSAGE}");
     }
 
     fn change(relative: &str, staged: bool, mark: GitMark) -> Change {
@@ -1775,7 +1842,10 @@ mod tests {
         Commit {
             id: id.to_owned(),
             summary: format!("{id} summary"),
+            body: None,
             author: "Tester".to_owned(),
+            email: String::new(),
+            committed: 0,
             parents: Vec::new(),
         }
     }
