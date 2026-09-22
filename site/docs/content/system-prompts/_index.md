@@ -132,9 +132,13 @@ caudra --system-prompt-profile review --print "Review this change"
 caudra --system-prompt-profile review prompt system
 ```
 
-Inside the TUI, run `/system-prompt` to switch the current session. The selected name is stored with the session. Profile content stays in the config directory, so edits apply when the session is resumed or Caudra is reloaded.
+Inside the TUI, run `/system-prompt` to read the prompt the current session is sending. The modal shows the text the agent bound, so it matches what the provider received rather than a fresh assembly of it. Press `r` to swap between rendered markdown and the source, `y` to copy the source, and `p` to open the profile picker.
 
-An explicit CLI profile takes precedence over the stored session profile and the configured default. It applies only to that invocation, so `/system-prompt` cannot switch profiles until the next invocation.
+Line numbers count source lines in both views. A rendered row is numbered by the line it draws from, so a heading row and the code inside a fence point at the text you would find at that line in the profile file.
+
+Switching a profile from that picker stores the selected name with the session. Profile content stays in the config directory, so edits apply when the session is resumed or Caudra is reloaded.
+
+An explicit CLI profile takes precedence over the stored session profile and the configured default. It applies only to that invocation, so the picker cannot switch profiles until the next invocation.
 
 `--system-prompt-profile` and the raw SDK `--system-prompt` override cannot be used together. A raw SDK override continues to replace normal prompt assembly.
 

@@ -157,6 +157,12 @@ impl App {
             self.storage_modal.handle_mouse(event);
             return Vec::new();
         }
+        if self.system_prompt_modal.is_open() && !self.permission_prompt.is_open() {
+            self.clear_control_hovers();
+            let action = self.system_prompt_modal.handle_mouse(event);
+            self.handle_system_prompt_action(action);
+            return Vec::new();
+        }
         // The goal footer names session commands rather than modal state, and
         // `/goal-model` opens a picker this modal is drawn over, so the click
         // closes the modal before the command runs.
@@ -742,6 +748,8 @@ impl App {
             self.tools_modal.pan(delta);
         } else if self.help_modal.is_open() {
             self.help_modal.pan(delta);
+        } else if self.system_prompt_modal.is_open() {
+            self.system_prompt_modal.pan(delta);
         }
     }
 
@@ -1160,6 +1168,7 @@ impl App {
         dismiss!(self.tools_modal);
         dismiss!(self.skills_modal);
         dismiss!(self.storage_modal);
+        dismiss!(self.system_prompt_modal);
         dismiss!(self.goal_modal);
 
         dismiss!(self.command_modal);

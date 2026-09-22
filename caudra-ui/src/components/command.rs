@@ -223,7 +223,7 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
     },
     BuiltinCommand {
         name: "/system-prompt",
-        description: "Switch system prompt profile",
+        description: "Inspect the system prompt and switch profile",
         max_args: 0,
         scope: ChatScope::MainOnly,
     },

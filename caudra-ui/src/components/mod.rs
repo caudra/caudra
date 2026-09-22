@@ -47,6 +47,7 @@ pub mod status_bar;
 pub(crate) mod storage_modal;
 pub(crate) mod stream_modal;
 pub(crate) mod streaming_content;
+pub(crate) mod system_prompt_modal;
 pub(crate) mod task_picker;
 pub(crate) mod text_editor;
 pub(crate) mod theme_picker;

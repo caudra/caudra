@@ -81,6 +81,9 @@ use crate::components::stash_picker::StashPicker;
 use crate::components::status_bar::{StatusBar, StatusBarHit, StatusBarHitTarget};
 use crate::components::storage_modal::{StorageFetchState, StorageModal};
 use crate::components::stream_modal::{StreamAction, StreamModal};
+use crate::components::system_prompt_modal::{
+    COPIED as SYSTEM_PROMPT_COPIED, SystemPromptAction, SystemPromptModal,
+};
 use crate::components::task_picker::TaskPicker;
 use crate::components::theme_picker::{ThemePicker, ThemePickerAction};
 use crate::components::thinking_picker::{ThinkingPicker, ThinkingPickerAction};
@@ -340,6 +343,7 @@ pub struct App {
     pub(super) tools_modal: ToolsModal,
     pub(super) skills_modal: SkillsModal,
     pub(super) storage_modal: StorageModal,
+    pub(super) system_prompt_modal: SystemPromptModal,
     context_snapshot: Watch<ContextSnapshot>,
     /// Read from the ledger when the modal asks for it, not on every frame:
     /// the table outlives sessions and only grows.
@@ -582,6 +586,7 @@ impl App {
             tools_modal: ToolsModal::new(),
             skills_modal: SkillsModal::new(),
             storage_modal: StorageModal::new(),
+            system_prompt_modal: SystemPromptModal::default(),
             context_snapshot: Watch::default(),
             lifetime_usage: None,
             tool_stats: None,
@@ -1520,6 +1525,10 @@ impl App {
             self.storage_modal.scroll(delta);
             return None;
         }
+        if self.system_prompt_modal.is_open() {
+            self.system_prompt_modal.scroll(delta);
+            return None;
+        }
         if self.goal_modal.is_open() {
             self.goal_modal.scroll(delta);
             return None;
@@ -1842,6 +1851,13 @@ impl App {
         if self.storage_modal.is_open() {
             guard_repeat!(false);
             self.storage_modal.handle_key(key);
+            return Some(vec![]);
+        }
+
+        if self.system_prompt_modal.is_open() {
+            guard_repeat!(false);
+            let action = self.system_prompt_modal.handle_key(key);
+            self.handle_system_prompt_action(action);
             return Some(vec![]);
         }
 
@@ -3177,6 +3193,34 @@ impl App {
         self.skills_modal.open();
     }
 
+    /// Shows the prompt the run bound, which is empty only until the agent has
+    /// published one. Rebuilding it here would show a prompt nothing was sent.
+    fn execute_system_prompt(&mut self) {
+        let system = self
+            .btw_prompt
+            .as_ref()
+            .map(|prompt| Arc::from(prompt.load().system.as_str()))
+            .unwrap_or_else(|| Arc::from(""));
+        self.system_prompt_modal
+            .open(system, &self.state.system_prompt_profile_name);
+    }
+
+    fn handle_system_prompt_action(&mut self, action: SystemPromptAction) {
+        match action {
+            SystemPromptAction::Consumed => {}
+            SystemPromptAction::Copy(text) => match self.clipboard.copy_text(&text) {
+                Ok(CopyResult::Noop) => {}
+                Ok(CopyResult::Copied) => self.flash(SYSTEM_PROMPT_COPIED.into()),
+                Err(e) => self.flash(format!("{COPY_FAILED}{e}")),
+            },
+            SystemPromptAction::Profile => {
+                self.system_prompt_modal.close();
+                self.prompt_profile_picker
+                    .open(&self.state.system_prompt_profile_name);
+            }
+        }
+    }
+
     fn preserve_unconsumed_steers(&mut self, task_id: &str) {
         let remaining = self
             .subagent_steers
@@ -4076,6 +4120,7 @@ impl App {
             self.tools_modal.close();
             self.skills_modal.close();
             self.storage_modal.close();
+            self.system_prompt_modal.close();
             if self.permissions_picker.is_open() {
                 self.suspend_permission_editor();
                 self.permission_config_trust_deferred =
@@ -4406,8 +4451,7 @@ impl App {
                 vec![Action::RefreshModels]
             }
             "/system-prompt" => {
-                self.prompt_profile_picker
-                    .open(&self.state.system_prompt_profile_name);
+                self.execute_system_prompt();
                 vec![]
             }
             "/review" => self.run_builtin(BuiltinAction::Review),
@@ -4782,7 +4826,7 @@ impl App {
         self.subagent_input_box.set_cwd(cwd);
     }
 
-    fn overlays(&self) -> [&dyn Overlay; 36] {
+    fn overlays(&self) -> [&dyn Overlay; 37] {
         [
             &self.workbench,
             &self.logs_modal,
@@ -4792,6 +4836,7 @@ impl App {
             &self.tools_modal,
             &self.skills_modal,
             &self.storage_modal,
+            &self.system_prompt_modal,
             &self.goal_modal,
             &self.stream_modal,
             &self.float_mgr,
@@ -4823,7 +4868,7 @@ impl App {
         ]
     }
 
-    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 36] {
+    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 37] {
         [
             &mut self.workbench,
             &mut self.logs_modal,
@@ -4833,6 +4878,7 @@ impl App {
             &mut self.tools_modal,
             &mut self.skills_modal,
             &mut self.storage_modal,
+            &mut self.system_prompt_modal,
             &mut self.goal_modal,
             &mut self.stream_modal,
             &mut self.float_mgr,

@@ -4602,9 +4602,22 @@ fn model_list_arriving_in_the_background_owes_a_frame() {
 }
 
 #[test]
-fn system_prompt_command_opens_profile_picker() {
+fn system_prompt_command_opens_the_viewer() {
     let mut app = test_app();
     app.execute_command(cmd("/system-prompt"), 0);
+    assert!(app.system_prompt_modal.is_open());
+    assert!(!app.prompt_profile_picker.is_open());
+}
+
+/// The viewer is where a profile switch now starts, so its footer has to reach
+/// the picker the command used to open directly.
+#[test]
+fn the_system_prompt_viewer_hands_off_to_the_profile_picker() {
+    let mut app = test_app();
+    app.execute_command(cmd("/system-prompt"), 0);
+    app.update(Msg::Key(key(KeyCode::Char('p'))));
+
+    assert!(!app.system_prompt_modal.is_open());
     assert!(app.prompt_profile_picker.is_open());
 }
 
@@ -13097,6 +13110,10 @@ fn open_storage_modal(app: &mut App) {
     app.storage_modal.open(false);
 }
 
+fn open_system_prompt_modal(app: &mut App) {
+    app.execute_command(cmd("/system-prompt"), 0);
+}
+
 fn open_goal_modal(app: &mut App) {
     app.goal_modal.open();
 }
@@ -13123,6 +13140,7 @@ fn open_argument_prompt(app: &mut App) {
 #[test_case(open_tools_modal   ; "tools_modal")]
 #[test_case(open_skills_modal  ; "skills_modal")]
 #[test_case(open_storage_modal ; "storage_modal")]
+#[test_case(open_system_prompt_modal ; "system_prompt_modal")]
 #[test_case(open_goal_modal    ; "goal_modal")]
 #[test_case(open_model_picker  ; "model_picker")]
 #[test_case(open_command_modal ; "command_modal")]
@@ -13151,6 +13169,7 @@ fn a_press_outside_a_modal_dismisses_it(open: fn(&mut App)) {
 #[test_case(open_tools_modal   ; "tools_modal")]
 #[test_case(open_skills_modal  ; "skills_modal")]
 #[test_case(open_storage_modal ; "storage_modal")]
+#[test_case(open_system_prompt_modal ; "system_prompt_modal")]
 #[test_case(open_goal_modal    ; "goal_modal")]
 #[test_case(open_model_picker  ; "model_picker")]
 #[test_case(open_command_modal ; "command_modal")]
@@ -15113,6 +15132,7 @@ fn open_permission_test_leader(app: &mut App) {
 #[test_case(open_tools_modal; "tools")]
 #[test_case(open_skills_modal; "skills")]
 #[test_case(open_storage_modal; "storage")]
+#[test_case(open_system_prompt_modal; "system_prompt")]
 #[test_case(open_goal_modal; "goal")]
 #[test_case(open_model_picker; "model_picker")]
 #[test_case(open_command_modal; "command_modal")]

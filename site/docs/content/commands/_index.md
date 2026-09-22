@@ -39,7 +39,7 @@ Commands marked Main only act on the main session's turn or history. They stay l
 | `/sessions` | Browse and switch sessions |  |
 | `/rename` | Rename the current session |  |
 | `/model` | Switch chat model or assign job models | Main only |
-| `/system-prompt` | Switch system prompt profile | Main only |
+| `/system-prompt` | Inspect the system prompt and switch profile | Main only |
 | `/review` | Review the last reply passage by passage |  |
 | `/theme` | Switch color theme |  |
 | `/view` | Cycle transcript: auto / compact / expanded |  |
