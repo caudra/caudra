@@ -225,15 +225,45 @@ impl InstructionScope {
     }
 }
 
+/// Which filesystem a block came from. Only a sandbox session has two of them,
+/// so the attribute is omitted otherwise and a local prompt stays byte-identical
+/// to the one the previous release produced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstructionOrigin {
+    Host,
+    Workspace,
+}
+
+impl InstructionOrigin {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Host => "host",
+            Self::Workspace => "workspace",
+        }
+    }
+}
+
+struct InstructionFile {
+    scope: InstructionScope,
+    origin: Option<InstructionOrigin>,
+    path: String,
+    content: String,
+}
+
 /// Delimited so the model can tell a project's instructions from Caudra's own,
 /// and so a file that opens with a heading cannot read as a new prompt section.
-fn render(files: Vec<(InstructionScope, String, String)>) -> String {
+fn render(files: Vec<InstructionFile>) -> String {
     let mut text = String::new();
-    for (scope, path, content) in files {
+    for file in files {
+        let origin = file
+            .origin
+            .map(|origin| format!(" origin=\"{}\"", origin.as_str()))
+            .unwrap_or_default();
         text.push_str(&format!(
-            "\n\n<instructions scope=\"{}\" path=\"{path}\">\n{}\n</instructions>",
-            scope.as_str(),
-            content.trim_end()
+            "\n\n<instructions scope=\"{}\"{origin} path=\"{}\">\n{}\n</instructions>",
+            file.scope.as_str(),
+            file.path,
+            file.content.trim_end()
         ));
     }
     text
@@ -241,9 +271,9 @@ fn render(files: Vec<(InstructionScope, String, String)>) -> String {
 
 fn collect_instruction_files(
     cwd: &str,
-    xdg_config: Option<&Path>,
+    origin: Option<InstructionOrigin>,
     loaded: &LoadedInstructions,
-) -> Vec<(InstructionScope, String, String)> {
+) -> Vec<InstructionFile> {
     let mut out = Vec::new();
 
     let ancestor_dirs: Vec<_> = find_project_ancestor_dirs(Path::new(cwd)).collect();
@@ -258,11 +288,12 @@ fn collect_instruction_files(
     for dir in project_dirs.into_iter().rev() {
         for filename in INSTRUCTION_FILES {
             if let Some((canonical, content)) = read_instruction(&dir.join(filename), loaded) {
-                out.push((
-                    InstructionScope::Project,
-                    canonical.display().to_string(),
+                out.push(InstructionFile {
+                    scope: InstructionScope::Project,
+                    origin,
+                    path: canonical.display().to_string(),
                     content,
-                ));
+                });
                 break;
             }
         }
@@ -270,25 +301,43 @@ fn collect_instruction_files(
         if let Some((canonical, content)) =
             read_instruction(&dir.join(LOCAL_INSTRUCTION_FILE), loaded)
         {
-            out.push((
-                InstructionScope::Local,
-                canonical.display().to_string(),
+            out.push(InstructionFile {
+                scope: InstructionScope::Local,
+                origin,
+                path: canonical.display().to_string(),
                 content,
-            ));
+            });
         }
     }
 
-    if let Some(path) = caudra_storage::paths::user_config_dir(xdg_config, "AGENTS.md")
-        && let Some((canonical, content)) = read_instruction(&path, loaded)
-    {
-        out.push((
-            InstructionScope::Global,
-            canonical.display().to_string(),
-            content,
-        ));
-    }
-
     out
+}
+
+/// Always read from the host, in both modes: it is the user's own standing
+/// preference, not the project's, and a sandbox has no copy of it.
+fn global_instruction_file(
+    xdg_config: Option<&Path>,
+    origin: Option<InstructionOrigin>,
+    loaded: &LoadedInstructions,
+) -> Option<InstructionFile> {
+    let path = caudra_storage::paths::user_config_dir(xdg_config, "AGENTS.md")?;
+    let (canonical, content) = read_instruction(&path, loaded)?;
+    Some(InstructionFile {
+        scope: InstructionScope::Global,
+        origin,
+        path: canonical.display().to_string(),
+        content,
+    })
+}
+
+fn local_instruction_files(
+    cwd: &str,
+    xdg_config: Option<&Path>,
+    loaded: &LoadedInstructions,
+) -> Vec<InstructionFile> {
+    let mut files = collect_instruction_files(cwd, None, loaded);
+    files.extend(global_instruction_file(xdg_config, None, loaded));
+    files
 }
 
 pub fn load_instruction_text(cwd: &str) -> String {
@@ -297,7 +346,7 @@ pub fn load_instruction_text(cwd: &str) -> String {
 
 pub(crate) fn load_instruction_text_in(cwd: &str, xdg_config: Option<&Path>) -> String {
     let loaded = LoadedInstructions::new();
-    render(collect_instruction_files(cwd, xdg_config, &loaded))
+    render(local_instruction_files(cwd, xdg_config, &loaded))
 }
 
 pub fn load_instructions(cwd: &str) -> Instructions {
@@ -306,16 +355,27 @@ pub fn load_instructions(cwd: &str) -> Instructions {
 
 pub(crate) fn load_instructions_in(cwd: &str, xdg_config: Option<&Path>) -> Instructions {
     let mut instr = Instructions::default();
-    instr.text = render(collect_instruction_files(cwd, xdg_config, &instr.loaded));
+    instr.text = render(local_instruction_files(cwd, xdg_config, &instr.loaded));
     instr
 }
 
-pub fn load_remote_instructions(context: &RemoteProjectContext) -> Instructions {
-    load_remote_instructions_in(context, caudra_storage::paths::config_dir().ok().as_deref())
+/// A sandbox session reads from two filesystems. `host_cwd` is the directory
+/// Caudra itself runs in, which is not the `{cwd}` the model sees: that one
+/// names a path inside the VM. Pass `None` where no host directory applies.
+pub fn load_remote_instructions(
+    context: &RemoteProjectContext,
+    host_cwd: Option<&Path>,
+) -> Instructions {
+    load_remote_instructions_in(
+        context,
+        host_cwd,
+        caudra_storage::paths::config_dir().ok().as_deref(),
+    )
 }
 
 pub(crate) fn load_remote_instructions_in(
     context: &RemoteProjectContext,
+    host_cwd: Option<&Path>,
     xdg_config: Option<&Path>,
 ) -> Instructions {
     let mut instructions = Instructions::default();
@@ -327,27 +387,44 @@ pub(crate) fn load_remote_instructions_in(
         ) {
             continue;
         }
-        files.push((
-            if instruction.is_personal_overlay() {
+        files.push(InstructionFile {
+            scope: if instruction.is_personal_overlay() {
                 InstructionScope::Local
             } else {
                 InstructionScope::Project
             },
-            instruction.source.source_label(),
-            instruction.content.clone(),
-        ));
+            origin: Some(InstructionOrigin::Workspace),
+            // The workspace path alone. A resource id and a content digest
+            // would add 80 characters per block that tell the model nothing,
+            // and the digest changes with the file, so every edit would
+            // invalidate the cached prefix twice over.
+            path: instruction.source.path.to_string(),
+            content: instruction.content.clone(),
+        });
     }
+
+    // The host checkout usually seeded the workspace, so most of its files are
+    // the same text twice. Matching by path would miss a renamed or relocated
+    // copy and would trust a coincidence of naming, so compare the content that
+    // actually reaches the model, normalised the way `render` normalises it.
+    let mut host = host_cwd.map_or_else(Vec::new, |cwd| {
+        collect_instruction_files(
+            &cwd.to_string_lossy(),
+            Some(InstructionOrigin::Host),
+            &instructions.loaded,
+        )
+    });
+    let workspace_rules: HashSet<&str> = files.iter().map(|file| file.content.trim_end()).collect();
+    host.retain(|file| !workspace_rules.contains(file.content.trim_end()));
+    files.extend(host);
+
     // Last, as in the local walk: the global file is the weakest claim and the
     // one a project's own files should be read as overriding.
-    if let Some(path) = caudra_storage::paths::user_config_dir(xdg_config, "AGENTS.md")
-        && let Some((canonical, content)) = read_instruction(&path, &instructions.loaded)
-    {
-        files.push((
-            InstructionScope::Global,
-            canonical.display().to_string(),
-            content,
-        ));
-    }
+    files.extend(global_instruction_file(
+        xdg_config,
+        Some(InstructionOrigin::Host),
+        &instructions.loaded,
+    ));
     instructions.text = render(files);
     if !context.skills().is_empty() {
         instructions.text.push_str("\n\n<available_skills>\n");
@@ -377,7 +454,7 @@ pub fn find_remote_nested_instructions(
         })
         .map(|instruction| {
             (
-                instruction.source.source_label(),
+                instruction.source.path.to_string(),
                 instruction.content.clone(),
             )
         })
@@ -423,6 +500,7 @@ mod tests {
     use test_case::test_case;
 
     use super::*;
+    use crate::remote_project_context::tests::AssetService;
 
     const PLAN_PATH: &str = ".caudra/plans/123.md";
     const BASELINE_TEXT: &str = "# Code guidelines\n";
@@ -433,6 +511,15 @@ mod tests {
     const EXPECTED_DRIFT_NOTICE: &str = "an edited instruction file should be announced";
     const EXPECTED_APPEARANCE_NOTICE: &str = "a created instruction file should be announced";
     const EPOCH: u64 = 7;
+    const WORKSPACE_RULE: &str = "rules the workspace carries";
+    const HOST_OVERLAY: &str = "gitignored personal preferences";
+    const HOST_DIVERGED: &str = "rules the host alone carries";
+    const GLOBAL_RULE: &str = "standing user preferences";
+    const ORIGIN_ATTRIBUTE: &str = "origin=";
+    const DIGEST_PREFIX: &str = "sha256:";
+    const RESOURCE_LABEL: &str = "resource ";
+    const ORIGIN_HOST: &str = "origin=\"host\"";
+    const ORIGIN_WORKSPACE: &str = "origin=\"workspace\"";
 
     fn system_prompt() -> String {
         build_system_prompt(
@@ -924,6 +1011,105 @@ mod tests {
             second.is_empty(),
             "should not return same file twice across calls"
         );
+    }
+
+    /// A sandbox session reads from two filesystems. The workspace supplies the
+    /// project's own rules; the host supplies what a transfer respecting
+    /// gitignore could never have carried, plus the user's global file.
+    #[test]
+    fn a_remote_session_layers_the_host_overlay_and_global_over_the_workspace() {
+        let host = tempfile::tempdir().unwrap();
+        let config = tempfile::tempdir().unwrap();
+        fs::write(host.path().join("AGENTS.md"), WORKSPACE_RULE).unwrap();
+        fs::write(host.path().join("AGENTS.local.md"), HOST_OVERLAY).unwrap();
+        fs::write(config.path().join("AGENTS.md"), GLOBAL_RULE).unwrap();
+        let context = AssetService::instruction_fixture(&[("AGENTS.md", WORKSPACE_RULE)]);
+
+        let text =
+            load_remote_instructions_in(&context, Some(host.path()), Some(config.path())).text;
+
+        // The host `AGENTS.md` is the same text the workspace already supplied,
+        // so it is dropped rather than said twice.
+        assert_eq!(text.matches(WORKSPACE_RULE).count(), 1, "{text}");
+        assert!(text.contains(HOST_OVERLAY), "{text}");
+        assert!(
+            text.find(WORKSPACE_RULE).unwrap() < text.find(HOST_OVERLAY).unwrap(),
+            "{text}"
+        );
+        assert!(
+            text.find(HOST_OVERLAY).unwrap() < text.find(GLOBAL_RULE).unwrap(),
+            "the global file is the weakest claim and renders last: {text}"
+        );
+    }
+
+    /// Matching by path would miss a relocated copy and would trust a
+    /// coincidence of naming, so the comparison is the text itself.
+    #[test]
+    fn a_host_file_survives_only_when_its_content_differs_from_the_workspace() {
+        let host = tempfile::tempdir().unwrap();
+        fs::write(host.path().join("AGENTS.md"), HOST_DIVERGED).unwrap();
+        let context = AssetService::instruction_fixture(&[("AGENTS.md", WORKSPACE_RULE)]);
+
+        let text = load_remote_instructions_in(&context, Some(host.path()), None).text;
+
+        assert!(text.contains(WORKSPACE_RULE), "{text}");
+        assert!(text.contains(HOST_DIVERGED), "{text}");
+    }
+
+    /// Trailing whitespace never reaches the model, because `render` trims it,
+    /// so it must not be what makes a duplicate look like a difference.
+    #[test]
+    fn trailing_whitespace_alone_does_not_make_a_host_file_differ() {
+        let host = tempfile::tempdir().unwrap();
+        fs::write(
+            host.path().join("AGENTS.md"),
+            format!("{WORKSPACE_RULE}\n\n"),
+        )
+        .unwrap();
+        let context = AssetService::instruction_fixture(&[("AGENTS.md", WORKSPACE_RULE)]);
+
+        let text = load_remote_instructions_in(&context, Some(host.path()), None).text;
+
+        assert_eq!(text.matches(WORKSPACE_RULE).count(), 1, "{text}");
+    }
+
+    /// The attribute is what lets the model tell a rule about the sandbox from
+    /// one about the machine it is driving the sandbox from.
+    #[test]
+    fn origin_marks_remote_blocks_and_never_appears_in_a_local_render() {
+        let host = tempfile::tempdir().unwrap();
+        fs::write(host.path().join("AGENTS.md"), HOST_DIVERGED).unwrap();
+        let context = AssetService::instruction_fixture(&[("AGENTS.md", WORKSPACE_RULE)]);
+
+        let remote = load_remote_instructions_in(&context, Some(host.path()), None).text;
+        assert!(remote.contains(ORIGIN_WORKSPACE), "{remote}");
+        assert!(remote.contains(ORIGIN_HOST), "{remote}");
+
+        // Local prompts stay byte-identical to the previous release's, so an
+        // upgrade does not invalidate every cached prefix.
+        let local = load_instructions_in(host.path().to_str().unwrap(), None).text;
+        assert!(!local.contains(ORIGIN_ATTRIBUTE), "{local}");
+    }
+
+    /// Workspace identity is bookkeeping. Naming it in the prompt would cost
+    /// tokens on every request and, because the digest tracks the content,
+    /// would change the system prompt on every edit of the file it names.
+    #[test]
+    fn workspace_identity_never_reaches_the_prompt() {
+        let context = AssetService::instruction_fixture(&[("AGENTS.md", WORKSPACE_RULE)]);
+
+        let text = load_remote_instructions_in(&context, None, None).text;
+        let nested = find_remote_nested_instructions(
+            &context,
+            &WorkspacePath::new("src/lib.rs").unwrap(),
+            &LoadedInstructions::new(),
+        );
+
+        assert!(text.contains("path=\"AGENTS.md\""), "{text}");
+        assert!(!text.contains(DIGEST_PREFIX), "{text}");
+        assert!(!text.contains(RESOURCE_LABEL), "{text}");
+        assert_eq!(nested.len(), 1);
+        assert_eq!(nested[0].0, "AGENTS.md");
     }
 
     #[test]

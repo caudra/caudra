@@ -1402,7 +1402,7 @@ pub fn prompt(
 
     let cwd_str = cwd.to_string_lossy();
     let instructions = if let Some(context) = runtime.remote_project_context() {
-        caudra_agent::agent::load_remote_instructions(context).text
+        caudra_agent::agent::load_remote_instructions(context, Some(&cwd)).text
     } else {
         load_instruction_text(&cwd_str)
     };

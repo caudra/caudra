@@ -965,6 +965,10 @@ struct SpawnCtx {
     /// session, so the loop publishes the rest here for the picker to read.
     live_sessions: Arc<ArcSwap<Vec<SessionRow>>>,
     workspace_session: Option<caudra_workspace::WorkspaceSession>,
+    /// The directory Caudra itself runs in, kept only for a sandbox session:
+    /// there `{cwd}` names a path inside the VM, and the host checkout is a
+    /// second, separate source of instruction files.
+    host_cwd: Option<PathBuf>,
     local_documents: Option<Arc<caudra_storage::local_documents::LocalDocumentStore>>,
 }
 
@@ -1149,6 +1153,7 @@ impl SpawnCtx {
             Arc::clone(&workspace_baseline),
             workspace_session.clone(),
             remote_project_context.clone(),
+            self.host_cwd.clone(),
             self.local_documents.clone(),
         );
         let agent_spawn_ms = lap();
@@ -1577,6 +1582,7 @@ impl<'t> EventLoop<'t> {
             default_prompt_profile,
             prompt_profile_override,
             live_sessions: Arc::default(),
+            host_cwd: workspace_session.as_ref().map(|_| cwd.clone()),
             workspace_session,
             local_documents,
         };

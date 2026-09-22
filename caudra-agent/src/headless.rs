@@ -766,6 +766,9 @@ pub struct HeadlessParams {
     pub remote_environment: Option<RemoteEnvironment>,
     pub workspace_session: Option<WorkspaceSession>,
     pub remote_project_context: Option<Arc<crate::remote_project_context::RemoteProjectContext>>,
+    /// The directory Caudra itself runs in. Set only in a sandbox session,
+    /// where `{cwd}` names a path inside the VM and this one does not.
+    pub host_cwd: Option<PathBuf>,
     pub local_documents: Option<Arc<LocalDocumentStore>>,
 }
 
@@ -1139,6 +1142,7 @@ struct TaskDescriptionContext<'a> {
     timeouts: Timeouts,
     remote_workspace: bool,
     remote_project_context: Option<&'a Arc<crate::remote_project_context::RemoteProjectContext>>,
+    host_cwd: Option<&'a Path>,
 }
 
 fn setup(
@@ -1158,7 +1162,7 @@ fn setup(
         template::env_vars()
     };
     let instructions = match task.remote_project_context {
-        Some(context) => agent::load_remote_instructions(context),
+        Some(context) => agent::load_remote_instructions(context, task.host_cwd),
         None if remote_environment.is_none() => agent::load_instructions(&vars.apply("{cwd}")),
         None => agent::Instructions::default(),
     };
@@ -1303,6 +1307,7 @@ pub fn spawn(mut params: HeadlessParams) -> HeadlessHandle {
             timeouts: params.timeouts,
             remote_workspace: params.workspace_session.is_some(),
             remote_project_context: params.remote_project_context.as_ref(),
+            host_cwd: params.host_cwd.as_deref(),
         },
         params.remote_environment.as_ref(),
         params.workspace_session.is_some(),
@@ -1434,6 +1439,7 @@ pub fn spawn(mut params: HeadlessParams) -> HeadlessHandle {
                     cache_key: Some(CacheKey::session(&session_ref_clone)),
                     workspace_session: params.workspace_session.clone(),
                     remote_project_context: params.remote_project_context.clone(),
+                    host_cwd: params.host_cwd.clone(),
                     local_documents: params.local_documents.clone(),
                     task_environment: vars.clone(),
                     root_tool_use_id: None,
@@ -1566,6 +1572,9 @@ pub struct InteractiveParams {
     pub remote_environment: Option<RemoteEnvironment>,
     pub workspace_session: Option<WorkspaceSession>,
     pub remote_project_context: Option<Arc<crate::remote_project_context::RemoteProjectContext>>,
+    /// The directory Caudra itself runs in. Set only in a sandbox session,
+    /// where `{cwd}` names a path inside the VM and this one does not.
+    pub host_cwd: Option<PathBuf>,
     pub local_documents: Option<Arc<LocalDocumentStore>>,
 }
 
@@ -1915,6 +1924,7 @@ pub async fn spawn_prepared_interactive(
             timeouts: params.timeouts,
             remote_workspace: params.workspace_session.is_some(),
             remote_project_context: params.remote_project_context.as_ref(),
+            host_cwd: params.host_cwd.as_deref(),
         },
         params.remote_environment.as_ref(),
         params.workspace_session.is_some(),
@@ -2010,6 +2020,7 @@ pub async fn spawn_prepared_interactive(
         cache_key: Some(CacheKey::session(&session_ref)),
         workspace_session: params.workspace_session.clone(),
         remote_project_context: params.remote_project_context.clone(),
+        host_cwd: params.host_cwd.clone(),
         local_documents: params.local_documents.clone(),
         task_environment: vars.clone(),
         root_tool_use_id: None,
@@ -2433,12 +2444,15 @@ pub async fn spawn_prepared_interactive(
                         timeouts: params.timeouts,
                         remote_workspace: params.workspace_session.is_some(),
                         remote_project_context: params.remote_project_context.as_ref(),
+                        host_cwd: params.host_cwd.as_deref(),
                     },
                 );
 
                 let instructions = {
                     let current = match &params.remote_project_context {
-                        Some(context) => agent::load_remote_instructions(context),
+                        Some(context) => {
+                            agent::load_remote_instructions(context, params.host_cwd.as_deref())
+                        }
                         None => {
                             let cwd = vars.apply("{cwd}").into_owned();
                             smol::unblock(move || agent::load_instructions(&cwd)).await
@@ -3844,6 +3858,7 @@ complete(#{ report: first.output });
                 }),
                 workspace_session: workspace,
                 remote_project_context: context,
+                host_cwd: None,
                 local_documents: None,
             };
             spawn_prepared_interactive(PreparedInteractive {

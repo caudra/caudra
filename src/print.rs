@@ -230,6 +230,12 @@ pub fn run(
         prompt_profiles,
         excluded_tools: vec![QUESTION_TOOL_NAME],
         mcp_handle,
+        // `cwd` is the sandbox's path once a remote environment exists, so the
+        // host checkout has to be named separately.
+        host_cwd: remote_environment
+            .is_some()
+            .then(|| std::env::current_dir().ok())
+            .flatten(),
         initial_wd: cwd,
         fast,
         model_policy,

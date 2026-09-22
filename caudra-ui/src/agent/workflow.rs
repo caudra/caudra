@@ -3,6 +3,7 @@
 //! session id, so a run keeps going through a model switch or a revert.
 
 use std::env;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -70,6 +71,9 @@ pub(crate) struct WorkflowSpawn<'a> {
     pub(crate) workspace_session: Option<WorkspaceSession>,
     pub(crate) remote_project_context:
         Option<Arc<caudra_agent::remote_project_context::RemoteProjectContext>>,
+    /// The directory Caudra itself runs in. Set only in a sandbox session,
+    /// where `{cwd}` names a path inside the VM and this one does not.
+    pub(crate) host_cwd: Option<PathBuf>,
     pub(crate) local_documents: Option<Arc<LocalDocumentStore>>,
 }
 
@@ -126,6 +130,7 @@ impl WorkflowSession {
             cache_key: Some(CacheKey::session(&session_ref)),
             workspace_session: spawn.workspace_session,
             remote_project_context: spawn.remote_project_context.clone(),
+            host_cwd: spawn.host_cwd.clone(),
             local_documents: spawn.local_documents,
             task_environment: caudra_agent::template::env_vars()
                 .set("{cwd}", cwd.to_string_lossy().into_owned()),
@@ -170,7 +175,7 @@ impl WorkflowSession {
         let started = Instant::now();
         let loaded_instructions = spawn.remote_project_context.as_ref().map_or_else(
             || agent::load_instructions(&cwd.to_string_lossy()).loaded,
-            |context| agent::load_remote_instructions(context).loaded,
+            |context| agent::load_remote_instructions(context, spawn.host_cwd.as_deref()).loaded,
         );
         let instructions_ms = started.elapsed().as_millis() as u64;
         let runtime_start = Instant::now();

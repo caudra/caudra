@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::{env, sync::Arc};
 
 use arc_swap::ArcSwap;
@@ -88,6 +89,9 @@ pub(super) struct AgentLoop {
     baseline: Arc<WorkspaceBaseline>,
     workspace_session: Option<WorkspaceSession>,
     remote_project_context: Option<Arc<caudra_agent::remote_project_context::RemoteProjectContext>>,
+    /// The directory Caudra itself runs in. Set only in a sandbox session,
+    /// where `{cwd}` names a path inside the VM and this one does not.
+    host_cwd: Option<PathBuf>,
     local_documents: Option<Arc<LocalDocumentStore>>,
 }
 
@@ -128,6 +132,7 @@ impl AgentLoop {
         remote_project_context: Option<
             Arc<caudra_agent::remote_project_context::RemoteProjectContext>,
         >,
+        host_cwd: Option<PathBuf>,
         local_documents: Option<Arc<LocalDocumentStore>>,
     ) -> Self {
         let restored_history = History::restored(initial_history);
@@ -188,6 +193,7 @@ impl AgentLoop {
             baseline,
             workspace_session,
             remote_project_context,
+            host_cwd,
             local_documents,
         }
     }
@@ -567,6 +573,7 @@ impl AgentLoop {
                 cache_key: self.session_id.as_ref().map(CacheKey::session),
                 workspace_session: self.workspace_session.clone(),
                 remote_project_context: self.remote_project_context.clone(),
+                host_cwd: self.host_cwd.clone(),
                 local_documents: self.local_documents.clone(),
                 task_environment: caudra_agent::template::env_vars(),
                 root_tool_use_id: None,
@@ -730,7 +737,7 @@ impl AgentLoop {
                     tool: "remote_permissions".into(),
                     message: format!("Remote permission policy unavailable: {error}"),
                 })?;
-            let instructions = agent::load_remote_instructions(&context);
+            let instructions = agent::load_remote_instructions(&context, self.host_cwd.as_deref());
             self.remote_project_context = Some(context);
             if let Some(transition) = transition {
                 transition

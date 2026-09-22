@@ -847,6 +847,12 @@ pub fn run(params: SdkParams) -> Result<()> {
         remote_environment: remote_environment.clone(),
         workspace_session,
         remote_project_context,
+        // `cwd` is the sandbox's path once a remote environment exists, so the
+        // host checkout has to be named separately.
+        host_cwd: remote_environment
+            .is_some()
+            .then(|| std::env::current_dir().ok())
+            .flatten(),
         local_documents,
     }))
     .map_err(|error| eyre!(error))?;

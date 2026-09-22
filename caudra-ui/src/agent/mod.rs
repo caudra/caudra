@@ -6,6 +6,7 @@ mod workflow;
 
 use std::collections::HashSet;
 use std::mem;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -100,6 +101,9 @@ pub(crate) struct AgentHandles {
     workflow: Option<WorkflowSession>,
     workspace_session: Option<WorkspaceSession>,
     remote_project_context: Option<Arc<caudra_agent::remote_project_context::RemoteProjectContext>>,
+    /// The directory Caudra itself runs in. Set only in a sandbox session,
+    /// where `{cwd}` names a path inside the VM and this one does not.
+    host_cwd: Option<PathBuf>,
     local_documents: Option<Arc<LocalDocumentStore>>,
     task: smol::Task<()>,
 }
@@ -134,6 +138,7 @@ impl AgentHandles {
         remote_project_context: Option<
             Arc<caudra_agent::remote_project_context::RemoteProjectContext>,
         >,
+        host_cwd: Option<PathBuf>,
         local_documents: Option<Arc<LocalDocumentStore>>,
     ) -> Self {
         spawn_agent_internal(
@@ -159,6 +164,7 @@ impl AgentHandles {
             baseline,
             workspace_session,
             remote_project_context,
+            host_cwd,
             local_documents,
         )
     }
@@ -321,6 +327,7 @@ impl AgentHandles {
             Arc::clone(&app.workspace_baseline),
             self.workspace_session.clone(),
             self.remote_project_context.clone(),
+            self.host_cwd.clone(),
             self.local_documents.clone(),
         );
         let old = mem::replace(self, new);
@@ -405,6 +412,7 @@ fn spawn_agent_internal(
     baseline: Arc<WorkspaceBaseline>,
     workspace_session: Option<WorkspaceSession>,
     remote_project_context: Option<Arc<caudra_agent::remote_project_context::RemoteProjectContext>>,
+    host_cwd: Option<PathBuf>,
     local_documents: Option<Arc<LocalDocumentStore>>,
 ) -> AgentHandles {
     let (cmd_tx, cmd_rx) = flume::unbounded::<AgentCommand>();
@@ -474,6 +482,7 @@ fn spawn_agent_internal(
                         baseline: Some(BaselineGate::new(Arc::clone(&baseline), None)),
                         workspace_session: workspace_session.clone(),
                         remote_project_context: remote_project_context.clone(),
+                        host_cwd: host_cwd.clone(),
                         local_documents: local_documents.clone(),
                     })
                 })
@@ -524,6 +533,7 @@ fn spawn_agent_internal(
         baseline,
         workspace_session.clone(),
         remote_project_context.clone(),
+        host_cwd.clone(),
         local_documents.clone(),
     );
 
@@ -553,6 +563,7 @@ fn spawn_agent_internal(
         workflow,
         workspace_session,
         remote_project_context,
+        host_cwd,
         local_documents,
         task,
     }
@@ -780,6 +791,7 @@ mod tests {
                 PathBuf::from("/tmp"),
                 true,
             ),
+            None,
             None,
             None,
             None,

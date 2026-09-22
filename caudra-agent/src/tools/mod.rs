@@ -479,6 +479,9 @@ pub struct ToolContext {
     pub session_id: Option<SessionRef>,
     pub workspace_session: Option<WorkspaceSession>,
     pub remote_project_context: Option<Arc<crate::remote_project_context::RemoteProjectContext>>,
+    /// The directory Caudra itself runs in. Set only in a sandbox session,
+    /// where `{cwd}` names a path inside the VM and this one does not.
+    pub host_cwd: Option<PathBuf>,
     pub local_documents: Option<Arc<LocalDocumentStore>>,
     pub task_environment: Vars,
     pub context_publisher: Option<ContextPublisher>,
@@ -755,6 +758,7 @@ pub fn interpreter_ctx(
         session_id: None,
         workspace_session: None,
         remote_project_context: None,
+        host_cwd: None,
         local_documents: None,
         task_environment: crate::template::env_vars(),
         context_publisher: None,

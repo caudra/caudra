@@ -608,6 +608,9 @@ async fn prepare_session(
         remote_environment: runtime.remote_environment.clone(),
         workspace_session: runtime.workspace_session.clone(),
         remote_project_context: runtime.remote_project_context.clone(),
+        // An editor launches ACP from a directory that need not be the project
+        // the sandbox holds, so a host overlay here would be a guess.
+        host_cwd: None,
         local_documents: runtime.local_documents.clone(),
     })
     .await

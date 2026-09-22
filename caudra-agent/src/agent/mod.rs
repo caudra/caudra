@@ -35,8 +35,8 @@ pub use history::{
 };
 pub(crate) use instructions::{INSTRUCTION_FILES, LOCAL_INSTRUCTION_FILE};
 pub use instructions::{
-    InstructionBaseline, InstructionScope, InstructionSource, Instructions, LoadedInstructions,
-    build_system_prompt, build_system_prompt_for_remote, environment_block,
+    InstructionBaseline, InstructionOrigin, InstructionScope, InstructionSource, Instructions,
+    LoadedInstructions, build_system_prompt, build_system_prompt_for_remote, environment_block,
     find_remote_nested_instructions, find_subdirectory_instructions, is_instruction_file,
     load_instruction_text, load_instructions, load_remote_instructions,
 };

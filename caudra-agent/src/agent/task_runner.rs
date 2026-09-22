@@ -10,6 +10,7 @@
 //! failure the caller has to retry.
 
 use std::future::Future;
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
@@ -476,6 +477,9 @@ pub struct WorkflowHostContext {
     pub session_id: Option<SessionRef>,
     pub workspace_session: Option<WorkspaceSession>,
     pub remote_project_context: Option<Arc<crate::remote_project_context::RemoteProjectContext>>,
+    /// The directory Caudra itself runs in. Set only in a sandbox session,
+    /// where `{cwd}` names a path inside the VM and this one does not.
+    pub host_cwd: Option<PathBuf>,
     pub local_documents: Option<Arc<LocalDocumentStore>>,
     pub task_environment: Vars,
     pub loaded_instructions: LoadedInstructions,
@@ -526,6 +530,7 @@ impl WorkflowHostContext {
             session_id: params.session_id.clone(),
             workspace_session: params.workspace_session.clone(),
             remote_project_context: params.remote_project_context.clone(),
+            host_cwd: params.host_cwd.clone(),
             local_documents: params.local_documents.clone(),
             task_environment: params.task_environment.clone(),
             loaded_instructions: extras.loaded_instructions,
@@ -564,6 +569,7 @@ impl WorkflowHostContext {
             session_id: ctx.session_id.clone(),
             workspace_session: ctx.workspace_session.clone(),
             remote_project_context: ctx.remote_project_context.clone(),
+            host_cwd: ctx.host_cwd.clone(),
             local_documents: ctx.local_documents.clone(),
             task_environment: ctx.task_environment.clone(),
             loaded_instructions: ctx.loaded_instructions.clone(),
@@ -617,6 +623,7 @@ impl WorkflowHostContext {
             session_id: self.session_id.clone(),
             workspace_session: self.workspace_session.clone(),
             remote_project_context: self.remote_project_context.clone(),
+            host_cwd: self.host_cwd.clone(),
             local_documents: self.local_documents.clone(),
             task_environment: self.task_environment.clone(),
             context_publisher: self.context_publisher.clone(),
@@ -690,7 +697,8 @@ impl TaskRunner for SubagentTaskRunner {
         host.remote_project_context = Some(Arc::clone(&workspace.context));
         host.task_environment = host.task_environment.set("{cwd}", workspace.cwd.clone());
         host.loaded_instructions =
-            crate::agent::load_remote_instructions(&workspace.context).loaded;
+            crate::agent::load_remote_instructions(&workspace.context, host.host_cwd.as_deref())
+                .loaded;
         host.path_locks = PathLocks::fresh();
         Ok(Arc::new(Self::new(Arc::new(host))))
     }

@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 use std::env;
+use std::path::PathBuf;
 use std::slice;
 use std::sync::{
     Arc, Mutex,
@@ -250,6 +251,9 @@ pub struct AgentParams {
     pub cache_key: Option<CacheKey>,
     pub workspace_session: Option<WorkspaceSession>,
     pub remote_project_context: Option<Arc<crate::remote_project_context::RemoteProjectContext>>,
+    /// The directory Caudra itself runs in. Set only in a sandbox session,
+    /// where `{cwd}` names a path inside the VM and this one does not.
+    pub host_cwd: Option<PathBuf>,
     pub local_documents: Option<Arc<LocalDocumentStore>>,
     pub task_environment: Vars,
     pub root_tool_use_id: Option<String>,
@@ -344,6 +348,7 @@ pub struct Agent<'h> {
     cache_key: Option<CacheKey>,
     workspace_session: Option<WorkspaceSession>,
     remote_project_context: Option<Arc<crate::remote_project_context::RemoteProjectContext>>,
+    host_cwd: Option<PathBuf>,
     local_documents: Option<Arc<LocalDocumentStore>>,
     task_environment: Vars,
     /// Numbers each turn so every log line inside one can be correlated.
@@ -445,6 +450,7 @@ impl<'h> Agent<'h> {
             cache_key: params.cache_key,
             workspace_session: params.workspace_session,
             remote_project_context: params.remote_project_context,
+            host_cwd: params.host_cwd,
             local_documents: params.local_documents,
             task_environment: params.task_environment,
             turn_id: 0,
@@ -1814,6 +1820,7 @@ impl<'h> Agent<'h> {
             session_id: self.session_id.clone(),
             workspace_session: self.workspace_session.clone(),
             remote_project_context: self.remote_project_context.clone(),
+            host_cwd: self.host_cwd.clone(),
             local_documents: self.local_documents.clone(),
             task_environment: self.task_environment.clone(),
             context_publisher: self.context_publisher.clone(),
@@ -2784,6 +2791,7 @@ mod tests {
                 cache_key: None,
                 workspace_session: None,
                 remote_project_context: None,
+                host_cwd: None,
                 local_documents: None,
                 task_environment: crate::template::env_vars(),
                 root_tool_use_id: None,

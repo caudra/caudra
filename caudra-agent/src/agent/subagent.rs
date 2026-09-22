@@ -782,7 +782,9 @@ pub async fn open_task(ctx: &ToolContext, opts: TaskOptions) -> Result<Subagent,
         bindings.task_tool_summary(BUILTIN_TASK_PROFILE_DESCRIPTION),
     );
     let instructions = match &ctx.remote_project_context {
-        Some(context) => crate::agent::load_remote_instructions(context).text,
+        Some(context) => {
+            crate::agent::load_remote_instructions(context, ctx.host_cwd.as_deref()).text
+        }
         None => {
             let cwd = vars.apply("{cwd}").into_owned();
             smol::unblock(move || crate::agent::load_instruction_text(&cwd)).await
@@ -1085,6 +1087,7 @@ fn build(
             cache_key: Some(CacheKey::task(ctx.session_id.as_ref(), &resolved.task_id)),
             workspace_session: ctx.workspace_session.clone(),
             remote_project_context: ctx.remote_project_context.clone(),
+            host_cwd: ctx.host_cwd.clone(),
             local_documents: ctx.local_documents.clone(),
             task_environment: ctx.task_environment.clone(),
             root_tool_use_id: Some(ids.root_tool_use_id.clone()),

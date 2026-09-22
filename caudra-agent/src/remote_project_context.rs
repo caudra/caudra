@@ -927,6 +927,34 @@ pub(crate) mod tests {
             (session(service.clone(), "permission-runtime"), service)
         }
 
+        /// A loaded context holding exactly the named instruction files, for
+        /// tests about how instructions render rather than how they load.
+        pub(crate) fn instruction_fixture(
+            files: &[(&str, &'static str)],
+        ) -> Arc<RemoteProjectContext> {
+            let assets = files
+                .iter()
+                .enumerate()
+                .map(|(index, (path, content))| {
+                    (
+                        asset(
+                            path,
+                            &format!("asset-{index}"),
+                            ProjectAssetKind::Instructions,
+                            ProjectAssetTrust::Declarative,
+                            content.len() as u64,
+                        ),
+                        *content,
+                    )
+                })
+                .collect();
+            smol::block_on(
+                RemoteProjectContextLoader::new()
+                    .load(&session(Self::new(assets), "instruction-fixture")),
+            )
+            .unwrap()
+        }
+
         pub(crate) fn remove_permissions(&self) {
             let mut state = self.state.lock().unwrap();
             state.manifest.revision = CollectionRevision::new("removed").unwrap();
