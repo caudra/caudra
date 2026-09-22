@@ -1,6 +1,6 @@
 use crate::components::form::{footer_row, render_form, selected_prefix};
 use crate::components::keybindings::key;
-use crate::components::{Hint, HintBar};
+use crate::components::{Hint, HintBar, VisualRows, hanging_lines, visual_rows};
 use crate::theme;
 
 use caudra_grab::grab_scope;
@@ -8,9 +8,16 @@ use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKin
 use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
 use ratatui::text::{Line, Span};
+use unicode_width::UnicodeWidthStr;
 
 const FORM_LABEL: &str = " Plan complete ";
 const HINT_LABEL: &str = "Plan";
+
+/// Separates a description from the label it follows on one row, and the
+/// column it hangs under once it needs rows of its own.
+const DESC_GAP: &str = "  ";
+const DESC_INDENT: &str = "    ";
+const PARALLEL_MARK: &str = " (parallel)";
 
 const DISMISS_KEYS: &str = if cfg!(target_os = "macos") {
     "⌃T/Esc"
@@ -34,24 +41,26 @@ struct MenuItem {
 const MENU: &[MenuItem] = &[
     MenuItem {
         label: "Refine plan",
-        desc: "  Dismiss and keep editing the plan",
+        desc: "Dismiss and keep editing the plan",
         action: || PlanFormAction::Hide,
     },
     MenuItem {
         label: "Clear context and implement",
-        desc: "  Start fresh session, then implement the plan",
+        desc: "Start fresh session, then implement the plan",
         action: || PlanFormAction::ClearAndImplement,
     },
     MenuItem {
         label: "Implement plan",
-        desc: "  Keep current context, implement the plan",
+        desc: "Keep current context, implement the plan",
         action: || PlanFormAction::Implement,
     },
 ];
 
 // 2 borders + 1 empty line + 1 hint bar
 const CHROME_LINES: u16 = 4;
-const FORM_HEIGHT: u16 = MENU.len() as u16 + CHROME_LINES;
+/// The form wraps to fit, so a narrow terminal must not hand the whole screen
+/// to three options. The layout clamps this again against the room it has.
+const MAX_HEIGHT_PERCENT: u16 = 75;
 
 #[derive(Debug, PartialEq)]
 pub enum PlanFormAction {
@@ -147,13 +156,28 @@ impl PlanForm {
         (self.visibility == Visibility::UserDismissed).then_some(HINT_LABEL)
     }
 
-    pub fn height(&self) -> u16 {
-        if self.is_visible() { FORM_HEIGHT } else { 0 }
+    /// The rows the form wants at this width, so the layout reserves what the
+    /// form will actually draw rather than one row per option. A wrapped
+    /// description costs rows, and reserving without measuring is what used to
+    /// push the last option off the bottom.
+    pub fn height(&self, width: u16, available: u16) -> u16 {
+        if !self.is_visible() {
+            return 0;
+        }
+        let body_width = width.saturating_sub(2);
+        visual_rows(&self.body(body_width).0, body_width)
+            .total
+            .saturating_add(CHROME_LINES)
+            .min(available.saturating_mul(MAX_HEIGHT_PERCENT) / 100)
+            .max(CHROME_LINES + 1)
     }
 
     #[cfg(test)]
     pub(crate) fn row_area(&self, index: usize) -> Option<Rect> {
-        self.row_hits.get(index).map(|hit| hit.area)
+        self.row_hits
+            .iter()
+            .find(|hit| hit.menu_index == index)
+            .map(|hit| hit.area)
     }
 
     pub fn handle_key(&mut self, key_event: KeyEvent) -> PlanFormAction {
@@ -256,33 +280,113 @@ impl PlanForm {
 
         grab_scope!("plan_form", area);
         let t = theme::current();
-        let mut lines: Vec<Line<'static>> = Vec::with_capacity(MENU.len() + 1);
-
-        for (i, item) in MENU.iter().enumerate() {
-            let (prefix, style) = selected_prefix(&t, i == self.selected);
-            let mut spans = vec![
-                Span::styled(prefix, t.tool_dim),
-                Span::styled(item.label, style),
-                Span::styled(item.desc, t.tool_dim),
-            ];
-            if self.parallel {
-                spans.push(Span::styled(" (parallel)", t.tool_dim.bold()));
-            }
-            lines.push(Line::from(spans));
-        }
+        let width = area.width.saturating_sub(2);
+        let (lines, owners) = self.body(width);
+        let rows = visual_rows(&lines, width);
+        let visible = area.height.saturating_sub(CHROME_LINES);
+        let scroll = self.scroll(&rows, &owners, visible);
         let footer = self.hints.line(footer_row(area), HINTS.to_vec());
 
-        render_form(&t, FORM_LABEL, frame, area, lines, (0, 0), Some(footer));
+        render_form(
+            &t,
+            FORM_LABEL,
+            frame,
+            area,
+            lines,
+            (scroll, 0),
+            Some(footer),
+        );
 
+        self.record_row_hits(&rows, &owners, area, visible, scroll);
+    }
+
+    /// The menu as lines, paired with the option each line belongs to.
+    /// Measuring and drawing both read this, so the rows reserved and the rows
+    /// drawn can never disagree, and a click can name the option under it
+    /// however the text wrapped.
+    ///
+    /// A description rides on its label's row while it fits and hangs under a
+    /// fixed indent when it does not. Hanging under the label itself would
+    /// indent by the label's own width, which leaves nothing to wrap into on a
+    /// narrow terminal.
+    fn body(&self, width: u16) -> (Vec<Line<'static>>, Vec<usize>) {
+        let t = theme::current();
+        let mut lines = Vec::with_capacity(MENU.len());
+        let mut owners = Vec::with_capacity(MENU.len());
+        for (index, item) in MENU.iter().enumerate() {
+            let (prefix, style) = selected_prefix(&t, index == self.selected);
+            let mut head = vec![
+                Span::styled(prefix, t.tool_dim),
+                Span::styled(item.label, style),
+            ];
+            if self.parallel {
+                head.push(Span::styled(PARALLEL_MARK, t.tool_dim.bold()));
+            }
+            let head_width: usize = head.iter().map(|span| span.content.width()).sum();
+            let inline = head_width + DESC_GAP.width() + item.desc.width();
+            if inline <= usize::from(width) {
+                head.push(Span::styled(format!("{DESC_GAP}{}", item.desc), t.tool_dim));
+                lines.push(Line::from(head));
+                owners.push(index);
+                continue;
+            }
+            lines.push(Line::from(head));
+            owners.push(index);
+            for line in hanging_lines(
+                Span::styled(DESC_INDENT, t.tool_dim),
+                Span::styled(item.desc, t.tool_dim),
+                width,
+            ) {
+                lines.push(line);
+                owners.push(index);
+            }
+        }
+        (lines, owners)
+    }
+
+    /// The first row to draw, so the selected option stays on screen however
+    /// the menu wrapped and however little room the layout left. An option
+    /// taller than the viewport is shown from its top rather than its end.
+    fn scroll(&self, rows: &VisualRows, owners: &[usize], visible: u16) -> u16 {
+        let Some(first) = owners.iter().position(|&owner| owner == self.selected) else {
+            return 0;
+        };
+        let count = owners[first..]
+            .iter()
+            .take_while(|&&owner| owner == self.selected)
+            .count();
+        let top = rows.row_of(first as u16);
+        let bottom = rows.row_of((first + count) as u16).saturating_sub(1);
+        bottom.saturating_sub(visible.saturating_sub(1)).min(top)
+    }
+
+    /// Where each option landed on screen, clipped to the viewport. A row
+    /// scrolled past the fold records nothing: it must not stay clickable
+    /// through whatever is drawn over it.
+    fn record_row_hits(
+        &mut self,
+        rows: &VisualRows,
+        owners: &[usize],
+        area: Rect,
+        visible: u16,
+        scroll: u16,
+    ) {
         self.row_hits.clear();
-        let content_bottom = area.bottom().saturating_sub(1);
-        for menu_index in 0..MENU.len() {
-            let y = area.y.saturating_add(1 + menu_index as u16);
-            if y >= content_bottom || area.width <= 2 {
-                break;
+        if area.width <= 2 {
+            return;
+        }
+        for (line, &menu_index) in owners.iter().enumerate() {
+            let Some(offset) = rows.row_of(line as u16).checked_sub(scroll) else {
+                continue;
+            };
+            let height = rows
+                .height_of(line as u16)
+                .min(visible.saturating_sub(offset));
+            if height == 0 {
+                continue;
             }
             self.row_hits.push(PlanRowHit {
-                area: Rect::new(area.x + 1, y, area.width - 2, 1),
+                area: Rect::new(area.x + 1, area.y + 1 + offset, area.width - 2, height),
                 menu_index,
             });
         }
@@ -298,12 +402,19 @@ impl PlanForm {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::components::key;
+    use crate::components::{buffer_text, key};
     use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+    use ratatui::buffer::Buffer;
     use test_case::test_case;
 
     const LAST: usize = MENU.len() - 1;
-    const FORM_AREA: Rect = Rect::new(2, 2, 76, FORM_HEIGHT);
+    /// What an 80-column terminal leaves the form once the gutter is taken.
+    /// `Clear context and implement` no longer fits on one row here, which is
+    /// the width the last option used to vanish at.
+    const NARROW: u16 = 76;
+    const WIDE: u16 = 120;
+    const ROOM: u16 = 23;
+    const MISSING_OPTION: &str = "every option must be drawn";
 
     fn mouse(kind: MouseEventKind, area: Rect) -> MouseEvent {
         MouseEvent {
@@ -314,14 +425,29 @@ mod tests {
         }
     }
 
-    fn render(form: &mut PlanForm) {
-        let backend = ratatui::backend::TestBackend::new(80, 24);
+    fn area_of(form: &PlanForm, width: u16) -> Rect {
+        Rect::new(2, 2, width, form.height(width, ROOM))
+    }
+
+    fn draw(form: &mut PlanForm, area: Rect) -> Buffer {
+        let backend = ratatui::backend::TestBackend::new(area.right() + 2, area.bottom() + 2);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
-        terminal
-            .draw(|frame| {
-                form.view(frame, FORM_AREA);
-            })
-            .unwrap();
+        terminal.draw(|frame| form.view(frame, area)).unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    fn render_at(form: &mut PlanForm, width: u16) -> Buffer {
+        draw(form, area_of(form, width))
+    }
+
+    fn render(form: &mut PlanForm) -> Buffer {
+        render_at(form, NARROW)
+    }
+
+    fn row_text(buffer: &Buffer, y: u16) -> String {
+        (buffer.area.x..buffer.area.right())
+            .map(|x| buffer[(x, y)].symbol())
+            .collect()
     }
 
     #[test]
@@ -389,11 +515,72 @@ mod tests {
     #[test]
     fn height_reflects_visibility() {
         let mut form = PlanForm::new();
-        assert_eq!(form.height(), 0);
+        assert_eq!(form.height(WIDE, ROOM), 0);
         form.on_plan_ready();
-        assert_eq!(form.height(), FORM_HEIGHT);
+        assert_eq!(form.height(WIDE, ROOM), MENU.len() as u16 + CHROME_LINES);
         form.hide();
-        assert_eq!(form.height(), 0);
+        assert_eq!(form.height(WIDE, ROOM), 0);
+    }
+
+    /// The bug this form used to have: the layout reserved one row per option
+    /// while the widget drew a wrapped description over two, so the last
+    /// option was pushed off the bottom while staying selectable.
+    #[test]
+    fn height_grows_when_a_description_wraps() {
+        let mut form = PlanForm::new();
+        form.on_plan_ready();
+
+        assert!(form.height(NARROW, ROOM) > form.height(WIDE, ROOM));
+    }
+
+    #[test_case(NARROW, false ; "narrow")]
+    #[test_case(NARROW, true  ; "narrow_parallel")]
+    #[test_case(WIDE, false   ; "wide")]
+    #[test_case(WIDE, true    ; "wide_parallel")]
+    fn every_option_is_drawn(width: u16, parallel: bool) {
+        let mut form = PlanForm::new();
+        form.on_plan_ready();
+        form.parallel = parallel;
+
+        let screen = buffer_text(&render_at(&mut form, width));
+
+        for item in MENU {
+            assert!(
+                screen.contains(item.label),
+                "{MISSING_OPTION}: {}",
+                item.label
+            );
+        }
+    }
+
+    /// A wrapped description takes a row of its own, so a rect placed by
+    /// counting options rather than rows lands a click on the wrong action.
+    #[test_case(0 ; "first")]
+    #[test_case(1 ; "second")]
+    #[test_case(2 ; "third")]
+    fn a_row_hit_covers_the_option_it_names(index: usize) {
+        let mut form = PlanForm::new();
+        form.on_plan_ready();
+        let buffer = render(&mut form);
+        let hit = form.row_area(index).expect(MISSING_OPTION);
+
+        assert!(row_text(&buffer, hit.y).contains(MENU[index].label));
+    }
+
+    /// The layout clamps the form on a short terminal, so the viewport has to
+    /// follow the selection rather than leaving it below the fold.
+    #[test_case(0 ; "first")]
+    #[test_case(1 ; "second")]
+    #[test_case(2 ; "third")]
+    fn the_selected_option_stays_visible_when_clamped(selected: usize) {
+        let mut form = PlanForm::new();
+        form.on_plan_ready();
+        form.selected = selected;
+
+        let area = Rect::new(2, 2, NARROW, CHROME_LINES + 1);
+        let screen = buffer_text(&draw(&mut form, area));
+
+        assert!(screen.contains(MENU[selected].label), "{MISSING_OPTION}");
     }
 
     #[test_case(0, KeyCode::Up,   0    ; "up_at_zero_stays")]
@@ -490,13 +677,13 @@ mod tests {
         let mut form = PlanForm::new();
         form.on_plan_ready();
         render(&mut form);
-        let hit = form.row_hits[2];
+        let hit = form.row_area(LAST).expect(MISSING_OPTION);
 
         assert_eq!(
-            form.handle_mouse(mouse(MouseEventKind::Moved, hit.area)),
+            form.handle_mouse(mouse(MouseEventKind::Moved, hit)),
             PlanFormAction::Consumed
         );
-        assert_eq!(form.selected, 2);
+        assert_eq!(form.selected, LAST);
     }
 
     #[test]
@@ -504,10 +691,10 @@ mod tests {
         let mut form = PlanForm::new();
         form.on_plan_ready();
         render(&mut form);
-        let hit = form.row_hits[1];
+        let hit = form.row_area(1).expect(MISSING_OPTION);
 
-        form.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), hit.area));
-        let action = form.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), hit.area));
+        form.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), hit));
+        let action = form.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), hit));
 
         assert_eq!(action, PlanFormAction::ClearAndImplement);
     }
@@ -517,11 +704,11 @@ mod tests {
         let mut form = PlanForm::new();
         form.on_plan_ready();
         render(&mut form);
-        let first = form.row_hits[0];
-        let second = form.row_hits[1];
+        let first = form.row_area(0).expect(MISSING_OPTION);
+        let second = form.row_area(1).expect(MISSING_OPTION);
 
-        form.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), first.area));
-        let action = form.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), second.area));
+        form.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), first));
+        let action = form.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), second));
 
         assert_eq!(action, PlanFormAction::Consumed);
     }
@@ -531,11 +718,11 @@ mod tests {
         let mut form = PlanForm::new();
         form.on_plan_ready();
         render(&mut form);
-        let hit = form.row_hits[0];
+        let hit = form.row_area(0).expect(MISSING_OPTION);
 
-        form.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), hit.area));
-        form.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), hit.area));
-        let action = form.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), hit.area));
+        form.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), hit));
+        form.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), hit));
+        let action = form.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), hit));
 
         assert_eq!(action, PlanFormAction::Consumed);
     }
@@ -546,7 +733,7 @@ mod tests {
         form.on_plan_ready();
         form.selected = 1;
         render(&mut form);
-        let hits = crate::components::hint_hits(&HINTS, footer_row(FORM_AREA));
+        let hits = crate::components::hint_hits(&HINTS, footer_row(area_of(&form, NARROW)));
         let (group, confirm) = (hits[0], hits[2]);
 
         assert_eq!(
@@ -572,13 +759,13 @@ mod tests {
         let mut form = PlanForm::new();
         form.on_plan_ready();
         render(&mut form);
-        let stale = form.row_hits[0];
-        form.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), stale.area));
+        let stale = form.row_area(0).expect(MISSING_OPTION);
+        form.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), stale));
 
         form.hide();
 
         assert_eq!(
-            form.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), stale.area)),
+            form.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), stale)),
             PlanFormAction::Passthrough
         );
         assert!(form.row_hits.is_empty());

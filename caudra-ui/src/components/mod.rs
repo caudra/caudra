@@ -342,9 +342,15 @@ impl HintBar {
     /// The bar as it should be drawn in `area`, with the hint under the
     /// pointer marked. Recording the geometry here is what makes the next
     /// click land on what was drawn rather than on what was drawn before.
+    ///
+    /// A hint that does not fit is dropped rather than drawn and clipped
+    /// mid-glyph, so the bar advertises exactly the controls [`hint_hits`]
+    /// says a pointer can reach.
     pub(crate) fn line(&mut self, area: Rect, hints: Vec<Hint>) -> Line<'static> {
+        let hits = hint_hits(&hints, area);
         self.hints = hints;
-        self.hits.set(hint_hits(&self.hints, area));
+        self.hints.truncate(hits.len());
+        self.hits.set(hits);
         hint_line_hovered(&self.hints, self.hovered())
     }
 
@@ -1926,6 +1932,7 @@ mod tests {
     ];
     const HINT_ROW: Rect = Rect::new(4, 9, 40, 1);
     const GROUP_HINT_ACTED: &str = "a group hint names no key, so a click on it must do nothing";
+    const CLIPPED_HINT: &str = "a hint the row cannot hold whole must not be drawn at all";
 
     /// The cells one hint occupies, gap excluded. Every hint here is ASCII,
     /// so a byte is a column.
@@ -1959,6 +1966,27 @@ mod tests {
         let row = Rect { width, ..HINT_ROW };
 
         assert_eq!(hint_hits(&HINTS, row).len(), 1);
+    }
+
+    /// Drawing the full list let the widget clip the overflow mid-glyph while
+    /// [`hint_hits`] had already dropped it, so the row advertised a control
+    /// no pointer could reach.
+    #[test]
+    fn a_bar_drops_the_hint_it_cannot_hit_instead_of_clipping_it() {
+        let width = hint_gap_width() + control_width(HINTS[0]) + hint_gap_width();
+        let row = Rect { width, ..HINT_ROW };
+        let mut bar = HintBar::default();
+
+        let line = bar.line(row, HINTS.to_vec());
+        let drawn: String = line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+
+        assert!(drawn.contains(HINTS[0].description));
+        assert!(!drawn.contains(HINTS[1].description), "{CLIPPED_HINT}");
+        assert!(line.width() <= usize::from(row.width), "{CLIPPED_HINT}");
     }
 
     #[test]
