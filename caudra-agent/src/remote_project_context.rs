@@ -13,6 +13,7 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+use crate::agent::{INSTRUCTION_FILES, LOCAL_INSTRUCTION_FILE};
 use crate::command::{CustomCommand, parse_remote_command};
 use crate::tools::native::skill::parse_frontmatter;
 
@@ -31,17 +32,9 @@ const SKIPPED_ASSETS_WARNING: &str = "Remote project assets Caudra does not reco
 static REMOTE_CONTEXT_LOADER: LazyLock<RemoteProjectContextLoader> =
     LazyLock::new(RemoteProjectContextLoader::new);
 
-const INSTRUCTION_FILES: &[&str] = &[
-    "AGENTS.md",
-    "CLAUDE.md",
-    "COPILOT.md",
-    ".cursorrules",
-    ".windsurfrules",
-    ".clinerules",
-    "CONVENTIONS.md",
-    "GEMINI.md",
-    "CODING_AGENT.md",
-];
+/// Ranked after every file in [`INSTRUCTION_FILES`], and matched by full path
+/// only, so it governs the project root wherever a workspace puts it.
+const CAUDRA_INSTRUCTIONS: &str = ".caudra/instructions";
 const SKILL_ROOTS: &[&str] = &[".caudra", ".claude", ".opencode", ".agents"];
 const COMMAND_ROOTS: &[&str] = &[".caudra", ".claude", ".opencode"];
 
@@ -100,6 +93,14 @@ impl RemoteAssetIdentity {
 pub struct RemoteInstruction {
     pub source: RemoteAssetIdentity,
     pub content: String,
+}
+
+impl RemoteInstruction {
+    /// True for a workspace `AGENTS.local.md`, which is rendered at local scope
+    /// so the model reads it the same way it reads the host's own overlay.
+    pub fn is_personal_overlay(&self) -> bool {
+        ranked_instruction(self.source.path.as_str()).is_none()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -230,25 +231,44 @@ impl RemoteProjectContext {
                 .rsplit_once('/')
                 .map_or(".", |(parent, _)| parent)
         };
-        let mut by_directory: BTreeMap<&str, &RemoteInstruction> = BTreeMap::new();
+        let mut ranked: BTreeMap<&str, (usize, &RemoteInstruction)> = BTreeMap::new();
+        let mut local: BTreeMap<&str, &RemoteInstruction> = BTreeMap::new();
         for instruction in self
             .instructions
             .iter()
             .filter(|instruction| instruction_applies(&instruction.source.path, target_dir))
         {
-            let directory = instruction_directory(instruction.source.path.as_str());
-            match by_directory.get(directory) {
-                Some(selected)
-                    if instruction_rank(selected.source.path.as_str())
-                        <= instruction_rank(instruction.source.path.as_str()) => {}
-                _ => {
-                    by_directory.insert(directory, instruction);
+            let path = instruction.source.path.as_str();
+            let directory = instruction_directory(path);
+            // A directory's personal overlay layers on top of whichever ranked
+            // file it chose, rather than competing for the single slot.
+            match ranked_instruction(path) {
+                Some((rank, _)) => match ranked.get(directory) {
+                    Some((selected, _)) if *selected <= rank => {}
+                    _ => {
+                        ranked.insert(directory, (rank, instruction));
+                    }
+                },
+                None => {
+                    local.insert(directory, instruction);
                 }
             }
         }
-        let mut applicable: Vec<_> = by_directory.into_values().collect();
-        applicable.sort_by_key(|instruction| instruction.source.path.as_str().matches('/').count());
-        applicable
+
+        let mut directories: Vec<_> = ranked.keys().chain(local.keys()).copied().collect();
+        directories.sort_unstable();
+        directories.dedup();
+        directories.sort_by_key(|directory| directory_depth(directory));
+        directories
+            .into_iter()
+            .flat_map(|directory| {
+                ranked
+                    .get(directory)
+                    .map(|(_, instruction)| *instruction)
+                    .into_iter()
+                    .chain(local.get(directory).copied())
+            })
+            .collect()
     }
 
     pub fn permission_digest(&self) -> Option<&str> {
@@ -583,10 +603,30 @@ fn asset_limit(asset: &ProjectAsset) -> Result<u32, RemoteProjectContextError> {
 }
 
 fn is_instruction_path(path: &str) -> bool {
-    let name = path.rsplit('/').next().unwrap_or(path);
-    INSTRUCTION_FILES.contains(&name)
-        || path == ".github/copilot-instructions.md"
-        || path == ".caudra/instructions"
+    ranked_instruction(path).is_some() || ends_with_component(path, LOCAL_INSTRUCTION_FILE)
+}
+
+/// A candidate names a file (`AGENTS.md`) or a path (`.github/copilot-instructions.md`).
+/// Either way it must sit on a directory boundary, so `src/copilot-instructions.md`
+/// is an ordinary file while `src/.github/copilot-instructions.md` is not.
+fn ends_with_component(path: &str, candidate: &str) -> bool {
+    path == candidate
+        || path
+            .strip_suffix(candidate)
+            .is_some_and(|parent| parent.ends_with('/'))
+}
+
+/// The rank a path competes at, and the candidate it matched, which is what
+/// tells `.github/copilot-instructions.md` apart from the directory holding it.
+fn ranked_instruction(path: &str) -> Option<(usize, &'static str)> {
+    INSTRUCTION_FILES
+        .iter()
+        .position(|candidate| ends_with_component(path, candidate))
+        .map(|rank| (rank, INSTRUCTION_FILES[rank]))
+        .or_else(|| {
+            ends_with_component(path, CAUDRA_INSTRUCTIONS)
+                .then_some((INSTRUCTION_FILES.len(), CAUDRA_INSTRUCTIONS))
+        })
 }
 
 fn is_skill_path(path: &str) -> bool {
@@ -641,27 +681,26 @@ fn instruction_applies(instruction: &WorkspacePath, target_dir: &str) -> bool {
     directory == "." || target_dir == directory || target_dir.starts_with(&format!("{directory}/"))
 }
 
+/// The directory an instruction governs, which is the one holding it unless the
+/// candidate is path-shaped: `.github/copilot-instructions.md` governs the
+/// project root, not `.github`.
 fn instruction_directory(path: &str) -> &str {
-    if matches!(
-        path,
-        ".github/copilot-instructions.md" | ".caudra/instructions"
-    ) {
-        "."
-    } else {
-        path.rsplit_once('/').map_or(".", |(parent, _)| parent)
+    let candidate = ranked_instruction(path).map_or(LOCAL_INSTRUCTION_FILE, |(_, name)| name);
+    match path
+        .strip_suffix(candidate)
+        .and_then(|parent| parent.strip_suffix('/'))
+    {
+        Some(parent) if !parent.is_empty() => parent,
+        _ => ".",
     }
 }
 
-fn instruction_rank(path: &str) -> usize {
-    let name = path.rsplit('/').next().unwrap_or(path);
-    INSTRUCTION_FILES
-        .iter()
-        .position(|candidate| *candidate == name)
-        .unwrap_or_else(|| match path {
-            ".github/copilot-instructions.md" => INSTRUCTION_FILES.len(),
-            ".caudra/instructions" => INSTRUCTION_FILES.len() + 1,
-            _ => usize::MAX,
-        })
+fn directory_depth(directory: &str) -> usize {
+    if directory == "." {
+        0
+    } else {
+        directory.matches('/').count() + 1
+    }
 }
 
 fn sha256(bytes: &[u8]) -> String {
@@ -842,6 +881,22 @@ pub(crate) mod tests {
     const SHADOWED_RULE: &str = "shadowed rule";
     const MANIFEST_REVISION: &str = "manifest-1";
     const UNKNOWN_INSTRUCTION: &str = "docs/NOTES.md";
+    const PERSONAL_RULE: &str = "personal rule";
+    /// Pinned copy of `INSTRUCTION_FILES` in
+    /// `workcell-mcp/crates/mcp-files/src/workspace.rs`. Update it deliberately,
+    /// after teaching Caudra to accept whatever Workcell started declaring.
+    const WORKCELL_INSTRUCTION_FILES: &[&str] = &[
+        "AGENTS.md",
+        "AGENTS.local.md",
+        "CLAUDE.md",
+        "COPILOT.md",
+        ".cursorrules",
+        ".windsurfrules",
+        ".clinerules",
+        "CONVENTIONS.md",
+        "GEMINI.md",
+        "CODING_AGENT.md",
+    ];
 
     struct AssetState {
         manifest: ProjectAssetManifest,
@@ -1327,6 +1382,119 @@ pub(crate) mod tests {
         assert_eq!(nested.len(), 2);
         assert_eq!(nested[0].content, ROOT_RULE);
         assert_eq!(nested[1].content, NESTED_RULE);
+    }
+
+    /// The overlay is personal, not a competitor: a directory that has both must
+    /// contribute both, ranked file first.
+    #[test]
+    fn a_personal_overlay_layers_on_top_of_the_ranked_file_beside_it() {
+        let instruction = |path: &str, revision: &str, body: &'static str| {
+            (
+                asset(
+                    path,
+                    revision,
+                    ProjectAssetKind::Instructions,
+                    ProjectAssetTrust::Declarative,
+                    body.len() as u64,
+                ),
+                body,
+            )
+        };
+        let service = AssetService::new(vec![
+            instruction("AGENTS.md", "root", ROOT_RULE),
+            instruction("AGENTS.local.md", "overlay", PERSONAL_RULE),
+            instruction("src/AGENTS.local.md", "nested-overlay", NESTED_RULE),
+        ]);
+        let context =
+            smol::block_on(RemoteProjectContextLoader::new().load(&session(service, "alice")))
+                .unwrap();
+
+        let root = context.applicable_instructions(&WorkspacePath::new("README.md").unwrap());
+        assert_eq!(
+            root.iter().map(|i| i.content.as_str()).collect::<Vec<_>>(),
+            [ROOT_RULE, PERSONAL_RULE]
+        );
+        assert!(!root[0].is_personal_overlay());
+        assert!(root[1].is_personal_overlay());
+
+        let nested = context.applicable_instructions(&WorkspacePath::new("src/lib.rs").unwrap());
+        assert_eq!(
+            nested
+                .iter()
+                .map(|i| i.content.as_str())
+                .collect::<Vec<_>>(),
+            [ROOT_RULE, PERSONAL_RULE, NESTED_RULE]
+        );
+    }
+
+    /// Precedence is shared with the local walk, so a project cannot be governed
+    /// by one file on the host and a different one inside a sandbox.
+    #[test]
+    fn ranked_precedence_follows_the_shared_list() {
+        for (better, worse) in INSTRUCTION_FILES
+            .iter()
+            .zip(INSTRUCTION_FILES.iter().skip(1))
+        {
+            let service = AssetService::new(vec![
+                (
+                    asset(
+                        worse,
+                        "worse",
+                        ProjectAssetKind::Instructions,
+                        ProjectAssetTrust::Declarative,
+                        SHADOWED_RULE.len() as u64,
+                    ),
+                    SHADOWED_RULE,
+                ),
+                (
+                    asset(
+                        better,
+                        "better",
+                        ProjectAssetKind::Instructions,
+                        ProjectAssetTrust::Declarative,
+                        ROOT_RULE.len() as u64,
+                    ),
+                    ROOT_RULE,
+                ),
+            ]);
+            let context =
+                smol::block_on(RemoteProjectContextLoader::new().load(&session(service, "alice")))
+                    .unwrap();
+
+            let applicable = context.applicable_instructions(&WorkspacePath::root());
+            assert_eq!(applicable.len(), 1, "{better} beside {worse}");
+            assert_eq!(applicable[0].content, ROOT_RULE, "{better} beside {worse}");
+        }
+    }
+
+    /// `.github/copilot-instructions.md` is matched by path, so a file that
+    /// merely shares its basename stays an ordinary file.
+    #[test]
+    fn a_path_shaped_candidate_governs_the_root_and_matches_nothing_else() {
+        assert!(is_instruction_path(".github/copilot-instructions.md"));
+        assert_eq!(
+            instruction_directory(".github/copilot-instructions.md"),
+            "."
+        );
+        assert!(is_instruction_path("src/.github/copilot-instructions.md"));
+        assert_eq!(
+            instruction_directory("src/.github/copilot-instructions.md"),
+            "src"
+        );
+        assert!(!is_instruction_path("src/copilot-instructions.md"));
+        assert!(!is_instruction_path("docs/XAGENTS.md"));
+    }
+
+    /// Workcell walks the workspace and declares what it finds; Caudra decides
+    /// what it will accept. The two lists are separate copies, so pin Workcell's
+    /// here: this test is what makes the next addition visible instead of
+    /// costing a session its whole project context.
+    #[test]
+    fn every_basename_workcell_declares_is_accepted() {
+        for name in WORKCELL_INSTRUCTION_FILES {
+            assert!(is_instruction_path(name), "{name}");
+            assert!(is_instruction_path(&format!("src/{name}")), "{name}");
+        }
     }
 
     #[test]

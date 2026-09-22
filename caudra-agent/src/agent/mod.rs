@@ -33,6 +33,7 @@ pub use history::{
     History, HistorySnapshot, SharedHistory, UNAVAILABLE_RESULT, close_dangling_tool_calls,
     is_run_failure_marker,
 };
+pub(crate) use instructions::{INSTRUCTION_FILES, LOCAL_INSTRUCTION_FILE};
 pub use instructions::{
     InstructionBaseline, InstructionScope, InstructionSource, Instructions, LoadedInstructions,
     build_system_prompt, build_system_prompt_for_remote, environment_block,

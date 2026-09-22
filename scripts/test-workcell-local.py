@@ -48,6 +48,9 @@ def initialize_fixture_root(root, home):
     (root / "fixture.txt").write_text("original\n")
     (root / "nested" / "fixture.txt").write_text("nested original\n")
     (root / "AGENTS.md").write_text("Remote integration instruction sentinel.\n")
+    # Workcell declares this basename; a Caudra that cannot account for it used
+    # to lose the whole manifest, so the fixture carries one.
+    (root / "AGENTS.local.md").write_text("Remote integration overlay sentinel.\n")
     (root / ".agents" / "skills" / "fixture").mkdir(parents=True)
     (root / ".agents" / "skills" / "fixture" / "SKILL.md").write_text(
         "---\nname: fixture\ndescription: Integration sentinel\n---\nFixture skill body.\n")

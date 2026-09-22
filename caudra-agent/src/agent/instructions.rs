@@ -11,7 +11,9 @@ use crate::prompt::profile::SystemPromptProfile;
 use crate::remote_project_context::RemoteProjectContext;
 use crate::template::Vars;
 
-const INSTRUCTION_FILES: &[&str] = &[
+/// Ranked by precedence, and shared with the remote loader so a project cannot
+/// be governed by one file on the host and a different one inside a sandbox.
+pub(crate) const INSTRUCTION_FILES: &[&str] = &[
     "AGENTS.md",
     "CLAUDE.md",
     ".github/copilot-instructions.md",
@@ -24,7 +26,9 @@ const INSTRUCTION_FILES: &[&str] = &[
     "CODING_AGENT.md",
 ];
 
-const LOCAL_INSTRUCTION_FILE: &str = "AGENTS.local.md";
+/// Personal, per-project, and gitignored by convention. It never competes with
+/// the ranked files; it is layered on top of whichever one a directory supplies.
+pub(crate) const LOCAL_INSTRUCTION_FILE: &str = "AGENTS.local.md";
 /// The drift diff spans every instruction file at once, so it names the section
 /// of the system prompt it patches rather than any one path.
 const INSTRUCTIONS_DISPLAY_PATH: &str = "instructions";
@@ -316,15 +320,6 @@ pub(crate) fn load_remote_instructions_in(
 ) -> Instructions {
     let mut instructions = Instructions::default();
     let mut files = Vec::new();
-    if let Some(path) = caudra_storage::paths::user_config_dir(xdg_config, "AGENTS.md")
-        && let Some((canonical, content)) = read_instruction(&path, &instructions.loaded)
-    {
-        files.push((
-            InstructionScope::Global,
-            canonical.display().to_string(),
-            content,
-        ));
-    }
     for instruction in context.applicable_instructions(&WorkspacePath::root()) {
         if instructions.loaded.contains_or_insert_remote(
             instruction.source.resource_id.clone(),
@@ -333,9 +328,24 @@ pub(crate) fn load_remote_instructions_in(
             continue;
         }
         files.push((
-            InstructionScope::Project,
+            if instruction.is_personal_overlay() {
+                InstructionScope::Local
+            } else {
+                InstructionScope::Project
+            },
             instruction.source.source_label(),
             instruction.content.clone(),
+        ));
+    }
+    // Last, as in the local walk: the global file is the weakest claim and the
+    // one a project's own files should be read as overriding.
+    if let Some(path) = caudra_storage::paths::user_config_dir(xdg_config, "AGENTS.md")
+        && let Some((canonical, content)) = read_instruction(&path, &instructions.loaded)
+    {
+        files.push((
+            InstructionScope::Global,
+            canonical.display().to_string(),
+            content,
         ));
     }
     instructions.text = render(files);

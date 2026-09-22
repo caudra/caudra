@@ -2312,7 +2312,13 @@ fn authenticated_local() {
             .await
             .unwrap();
         assert_eq!(context.skills().len(), 1);
-        assert_eq!(context.instructions().len(), 1);
+        assert!(context.skipped().is_empty(), "{:?}", context.skipped());
+        // The overlay layers on top of the ranked file rather than displacing
+        // it, and neither one costs the manifest the rest of its assets.
+        let applicable = context.applicable_instructions(&WorkspacePath::root());
+        assert_eq!(applicable.len(), 2);
+        assert_eq!(applicable[0].source.path.as_str(), "AGENTS.md");
+        assert!(applicable[1].is_personal_overlay());
         for command in ["status", "pending", "reconnect", "reconcile"] {
             let status = caudra_workspace::execute_workspace_control(&session, command)
                 .await
