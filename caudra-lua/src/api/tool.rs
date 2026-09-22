@@ -325,7 +325,7 @@ impl ToolInvocation for LuaToolInvocation {
         match self.start_annotation.as_ref()? {
             StartAnnotation::Timeout(field) => {
                 let secs = self.input.get(field.as_ref())?.as_u64()?;
-                Some(timeout_annotation(secs))
+                Some(timeout_annotation(Duration::from_secs(secs)))
             }
             StartAnnotation::Count(field) => {
                 let field = field.as_ref();
@@ -1967,7 +1967,7 @@ mod tests {
         }
     }
 
-    #[test_case::test_case(serde_json::json!({"timeout": 90}), Some(timeout_annotation(90)) ; "present")]
+    #[test_case::test_case(serde_json::json!({"timeout": 90}), Some(timeout_annotation(Duration::from_secs(90))) ; "present")]
     #[test_case::test_case(serde_json::json!({}),              None                        ; "absent")]
     fn start_annotation_timeout(input: Value, expected: Option<String>) {
         let inv = LuaToolInvocation {

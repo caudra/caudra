@@ -34,9 +34,10 @@ use caudra_agent::{
     tools::{
         FILE_READ_TOOL_NAME, FILE_WRITE_TOOL_NAME, LOCAL_DOCUMENT_WRITE_TOOL_NAME,
         MEMORY_TOOL_NAME, PYTHON_EXECUTION_TOOL_NAME, SHELL_TOOL_NAME, TASK_TOOL_NAME,
-        humanize_duration,
+        humanize_duration, timeout_annotation,
     },
 };
+use caudra_workcell::effective_timeout;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
@@ -238,14 +239,16 @@ const MILLIS_PER_SECOND: u64 = 1_000;
 const DURATION_SEPARATOR: &str = " · ";
 
 /// Duration inputs and the millis one of their units is worth, so a bracket
-/// reads `10m` instead of `600000`. `timeout` is milliseconds to a subprocess
-/// and seconds to a fetch, so the unit belongs to the tool rather than to the
+/// reads `1m` instead of `60`. The unit belongs to the tool rather than to the
 /// key, and reading it off the name alone would be wrong by a factor of a
-/// thousand. A key that names its own unit still gets a row, because the tool
-/// it belongs to is what says the name is a duration at all.
+/// thousand: `timeout` is seconds to a fetch and milliseconds to the two tools
+/// that run something. A key that names its own unit still gets a row, because
+/// the tool it belongs to is what says the name is a duration at all.
+///
+/// The two command runners are absent on purpose. Their deadline is always on
+/// the row, default and all, so it is annotated rather than bracketed and
+/// folded away by `header_keys`.
 const DURATION_ARGS: &[(&str, &str, u64)] = &[
-    ("shell", "timeout", 1),
-    ("python_execution", "timeout", 1),
     ("webfetch", "timeout", MILLIS_PER_SECOND),
     ("websearch", "timeoutSec", MILLIS_PER_SECOND),
 ];
@@ -254,8 +257,9 @@ const QUALIFIER: [char; 3] = ['_', '.', '-'];
 
 /// How a tool names itself on a compact row. The `name> ` prefix is gone
 /// there, so the label is what identifies the call, and `header_keys` are the
-/// inputs already folded into the header text so the `[k=v]` suffix can skip
-/// them. Tools missing from the table fall back to their registered name.
+/// inputs the row already shows elsewhere -- in the header text, or in the
+/// annotation a timeout is named by -- so the `[k=v]` suffix can skip them.
+/// Tools missing from the table fall back to their registered name.
 ///
 /// The label is inflected, so the row says what the call is doing rather than
 /// only what it is. `memory` and `sessions` keep a noun in all three slots:
@@ -370,8 +374,8 @@ const COMPACT_TOOLS: &[(&str, CompactTool)] = &[
     tool_row("file_index", '≡', INDEX, &["path"]),
     tool_row("websearch", '◈', SEARCH, &["query"]),
     tool_row("webfetch", '↓', FETCH, &["url"]),
-    tool_row("shell", '$', RUN, &["command"]),
-    tool_row("python_execution", 'λ', COMPUTE, &["code"]),
+    tool_row("shell", '$', RUN, &["command", "timeout"]),
+    tool_row("python_execution", 'λ', COMPUTE, &["code", "timeout"]),
     tool_row("code_map", '◇', MAP, &["path"]),
     tool_row("code_context", '◇', LOCATE, &["task", "path"]),
     tool_row("code_refs", '◇', TRACE, &["symbol", "path"]),
@@ -2185,7 +2189,10 @@ pub fn build_tool_lines(
         ),
     );
     b.apply_output_format(msg.tool_output.as_deref());
-    let annotation = header_annotation(msg);
+    let mut annotation = header_annotation(msg);
+    if let Some(timeout) = header_timeout(tool_name, msg.tool_raw_input.as_deref()) {
+        append_annotation(&mut annotation, &timeout_annotation(timeout));
+    }
     let annotation = annotation.as_deref();
     if rctx.compact {
         b.push_compact_header(
@@ -2342,6 +2349,21 @@ pub fn build_tool_lines(
 pub fn truncate_to_header(text: &mut String) {
     let end = text.find('\n').unwrap_or(text.len());
     text.truncate(end);
+}
+
+/// The deadline a command runs under, for the header to name while there is
+/// still something to name it about.
+///
+/// Read from the stored input rather than pushed from the call, so a restored
+/// card says what a live one said. The row is resolved first because a call
+/// wrapped by an MCP server arrives qualified, and the executor's rules are
+/// keyed by the canonical name.
+pub(super) fn header_timeout(
+    tool: &str,
+    raw_input: Option<&serde_json::Value>,
+) -> Option<Duration> {
+    let (tool, _) = compact_row(tool)?;
+    effective_timeout(tool, raw_input?)
 }
 
 pub(crate) fn append_annotation(ann: &mut Option<String>, suffix: &str) {
@@ -6085,16 +6107,19 @@ mod tests {
 
     const DURATION_MSG: &str = "a duration input reads as one, in the unit its tool quotes";
 
-    /// `timeout` is milliseconds to a subprocess and seconds to a fetch, so
-    /// the same key and the same number have to come out a thousand-fold
-    /// apart. A count is left alone: only the table says a number is a span
-    /// of time, which is why an untabled tool cannot turn one into `2m`.
+    /// `timeout` is seconds to a fetch, so the same key and the same number
+    /// have to come out a thousand-fold apart from a tool quoting millis. A
+    /// count is left alone: only the table says a number is a span of time,
+    /// which is why an untabled tool cannot turn one into `2m`.
+    ///
+    /// The two command runners name their deadline in the annotation instead,
+    /// default and all, so a bracket repeating it would say it twice.
     #[test_case(
-        "shell", serde_json::json!({ "timeout": 600_000 }), Some(" [timeout=10m]")
-        ; "a subprocess quotes its timeout in millis"
+        "shell", serde_json::json!({ "timeout": 600_000 }), None
+        ; "a command runner leaves its timeout to the annotation"
     )]
     #[test_case(
-        "python_execution", serde_json::json!({ "timeout": 5_000 }), Some(" [timeout=5s]")
+        "python_execution", serde_json::json!({ "timeout": 5_000 }), None
         ; "so does the code worker"
     )]
     #[test_case(
@@ -6106,8 +6131,8 @@ mod tests {
         ; "a key naming its unit still answers to its tool"
     )]
     #[test_case(
-        "mcp_Shell", serde_json::json!({ "timeout": 120_000 }), Some(" [timeout=2m]")
-        ; "a qualified tool reads the same unit"
+        "mcp_Shell", serde_json::json!({ "timeout": 120_000 }), None
+        ; "a qualified command runner folds it the same way"
     )]
     #[test_case(
         "file_read", serde_json::json!({ "limit": 200 }), Some(" [limit=200]")
@@ -6126,6 +6151,95 @@ mod tests {
             compact_args_for(tool, "", Some(&raw_input), None).as_deref(),
             expected,
             "{DURATION_MSG}"
+        );
+    }
+
+    const DEADLINE_MSG: &str = "a command card names the deadline it will run under, typed or not";
+    const DEADLINE_ONCE_MSG: &str = "a closed row says the deadline once, in the annotation";
+    const DEADLINE_COMMAND: &str = "cargo test";
+    const TIMEOUT_WORD: &str = "timeout";
+    const TIMEOUT_BRACKET: &str = "[timeout=";
+    const SHELL_MAX_SHOWN: &str = "(30m timeout)";
+
+    fn deadline_msg(tool: &str, raw_input: Option<serde_json::Value>) -> DisplayMessage {
+        let mut msg = bash_msg(DEADLINE_COMMAND, ToolStatus::Success, None, None);
+        let DisplayRole::Tool(role) = &mut msg.role else {
+            unreachable!()
+        };
+        role.name = tool.into();
+        msg.tool_raw_input = raw_input.map(Arc::new);
+        msg
+    }
+
+    /// The deadline nobody typed is the one most likely to surprise a reader
+    /// watching a command sit there, so it is named too. The value is read from
+    /// the stored input, which is what a reloaded session still has.
+    #[test_case(
+        SHELL_TOOL_NAME, Some(serde_json::json!({})), Some("(2m timeout)")
+        ; "an unasked deadline is still the one in force"
+    )]
+    #[test_case(
+        SHELL_TOOL_NAME, None, None
+        ; "a card with no stored input promises nothing"
+    )]
+    #[test_case(
+        SHELL_TOOL_NAME, Some(serde_json::json!({ "timeout": 0 })), Some(SHELL_MAX_SHOWN)
+        ; "zero reads as the longest wait the shell allows"
+    )]
+    #[test_case(
+        SHELL_TOOL_NAME, Some(serde_json::json!({ "timeout": 90_000 })), Some("(1m30s timeout)")
+        ; "an asked deadline is quoted as asked"
+    )]
+    #[test_case(
+        SHELL_TOOL_NAME, Some(serde_json::json!({ "timeout": 3_600_000 })), None
+        ; "a deadline the executor will refuse is not promised"
+    )]
+    #[test_case(
+        PYTHON_EXECUTION_TOOL_NAME, Some(serde_json::json!({})), Some("(5s timeout)")
+        ; "the code worker names its own default"
+    )]
+    #[test_case(
+        PYTHON_EXECUTION_TOOL_NAME, Some(serde_json::json!({ "timeout": 0 })), None
+        ; "zero is not a deadline the code worker would take"
+    )]
+    fn a_command_card_names_the_deadline_it_will_run_under(
+        tool: &str,
+        raw_input: Option<serde_json::Value>,
+        expected: Option<&str>,
+    ) {
+        let text = lines_text(&build_tool_lines(
+            &deadline_msg(tool, raw_input),
+            ToolStatus::Success,
+            &test_rctx(UNBROKEN),
+            Some(Disclosure::default()),
+        ));
+        match expected {
+            Some(shown) => assert!(text.contains(shown), "{DEADLINE_MSG}: {text:?}"),
+            None => assert!(!text.contains(TIMEOUT_WORD), "{DEADLINE_MSG}: {text:?}"),
+        }
+    }
+
+    /// The bracket and the annotation would otherwise both quote the same
+    /// number on the one row that has least space for it. A width that has to
+    /// break the row still says it whole, rather than trading the deadline for
+    /// the space.
+    #[test_case(UNBROKEN ; "with room to spare")]
+    #[test_case(SETTLED_TALLY_WIDTH ; "and with none")]
+    fn a_closed_command_row_does_not_quote_its_deadline_twice(width: u16) {
+        let tl = build_tool_lines(
+            &deadline_msg(SHELL_TOOL_NAME, Some(serde_json::json!({ "timeout": 0 }))),
+            ToolStatus::Success,
+            &compact_rctx(width),
+            None,
+        );
+        let text = lines_text(&tl);
+        assert!(
+            text.contains(SHELL_MAX_SHOWN),
+            "{DEADLINE_ONCE_MSG}: {text:?}"
+        );
+        assert!(
+            !text.contains(TIMEOUT_BRACKET),
+            "{DEADLINE_ONCE_MSG}: {text:?}"
         );
     }
 

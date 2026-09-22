@@ -49,10 +49,10 @@ use caudra_agent::permissions::{
     filesystem_permission_resource, prepared_command_binding, shell_permission_scope,
 };
 use caudra_agent::tools::{
-    BoxFuture, DescriptionContext, ExecFuture, HeaderFuture, HeaderResult, ParseError,
-    PermissionIntent, PermissionScopes, PlanModeAccess, RegistryError, Tool, ToolAudience,
-    ToolContext, ToolEffect, ToolExecResult, ToolInvocation, ToolLive, ToolRegistry, ToolSource,
-    expand_tilde,
+    BoxFuture, DescriptionContext, ExecFuture, HeaderFuture, HeaderResult,
+    PYTHON_EXECUTION_TOOL_NAME, ParseError, PermissionIntent, PermissionScopes, PlanModeAccess,
+    RegistryError, SHELL_TOOL_NAME, Tool, ToolAudience, ToolContext, ToolEffect, ToolExecResult,
+    ToolInvocation, ToolLive, ToolRegistry, ToolSource, expand_tilde,
 };
 use caudra_agent::{
     AgentEvent, CodeGraphRow, CodeGraphSource, EnvironmentCommand, EnvironmentFact, GrepFileEntry,
@@ -77,7 +77,10 @@ use tokio::runtime::{Builder, Runtime};
 use tokio_util::sync::CancellationToken;
 #[cfg(test)]
 use workcell::code::bundled_worker_available;
-use workcell::code::{CodeConfiguration, CodeExecution, CodeInput, Outcome, WorkerSource};
+use workcell::code::{
+    CodeConfiguration, CodeExecution, CodeInput, DEFAULT_TIMEOUT_MS as CODE_DEFAULT_TIMEOUT_MS,
+    MAX_TIMEOUT_MS as CODE_MAX_TIMEOUT_MS, Outcome, WorkerSource,
+};
 use workcell::code_graph::{
     CodeContextInput, CodeExpandInput, CodeGraphLimits, CodeGraphToolGroup, CodeImpactInput,
     CodeMapInput, CodeRefsInput, GraphProgress, GraphProgressSink, ModelText as CodeGraphModelText,
@@ -96,6 +99,7 @@ use workcell::files::{
 };
 use workcell::output_filter::RowRenderer;
 use workcell::shell::{
+    DEFAULT_TIMEOUT_MS as SHELL_DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS as SHELL_MAX_TIMEOUT_MS,
     PreparedShell, ShellExecution, ShellFilterInfo as WorkcellShellFilterInfo, ShellInput,
     ShellOutput as WorkcellShellOutput, ShellProgressChunk, ShellProgressSink, ShellStream,
     ShellToolGroup,
@@ -1370,6 +1374,33 @@ fn input_header(input: &Input) -> String {
         Input::CodeExpand(input) => search_header(&input.symbol, input.path.as_deref()),
         Input::Environment => "execution environment".into(),
     }
+}
+
+/// The deadline a command will really run under, so a header can name it
+/// before it fires rather than after. `tool` is the canonical name; the caller
+/// resolves whatever qualifier the call arrived with.
+///
+/// `None` when the executor would refuse the value, because naming a deadline
+/// that never applies is worse than naming none. The rules belong to the two
+/// executors and differ: only the shell reads zero as its maximum.
+pub fn effective_timeout(tool: &str, raw_input: &Value) -> Option<Duration> {
+    let (default, max) = match tool {
+        SHELL_TOOL_NAME => (SHELL_DEFAULT_TIMEOUT_MS, SHELL_MAX_TIMEOUT_MS),
+        PYTHON_EXECUTION_TOOL_NAME => (CODE_DEFAULT_TIMEOUT_MS, CODE_MAX_TIMEOUT_MS),
+        _ => return None,
+    };
+    // An explicit null is how an omitted optional field arrives from some
+    // models, and it deserializes to the same absent value.
+    let millis = match raw_input.get("timeout") {
+        None | Some(Value::Null) => default,
+        Some(value) => match value.as_u64()? {
+            0 if tool == SHELL_TOOL_NAME => max,
+            0 => return None,
+            requested if requested > max => return None,
+            requested => requested,
+        },
+    };
+    Some(Duration::from_millis(millis))
 }
 
 fn input_start_input(input: &Input) -> Option<ToolInput> {
@@ -4641,6 +4672,29 @@ mod tests {
     #[test_case(ToolKind::Code => REMOTE_EXECUTION_TIMEOUT ; "so does the code worker, which bounds itself")]
     fn the_execution_ceiling_is_raised_only_for_the_shell(kind: ToolKind) -> Duration {
         remote_execution_ceiling(kind)
+    }
+
+    /// What a header may promise is exactly what the executor will enforce, so
+    /// the two rules are read from the same place. They are not the same rule:
+    /// the shell reads zero as its maximum, the code worker refuses it.
+    #[test_case(SHELL_TOOL_NAME, json!({}) => Some(Duration::from_millis(SHELL_DEFAULT_TIMEOUT_MS)) ; "an omitted shell deadline is the default one")]
+    #[test_case(SHELL_TOOL_NAME, json!({ "timeout": Value::Null }) => Some(Duration::from_millis(SHELL_DEFAULT_TIMEOUT_MS)) ; "an explicit null arrives as omitted")]
+    #[test_case(SHELL_TOOL_NAME, json!({ "timeout": 0 }) => Some(Duration::from_millis(SHELL_MAX_TIMEOUT_MS)) ; "zero selects the shell maximum")]
+    #[test_case(SHELL_TOOL_NAME, json!({ "timeout": 1 }) => Some(Duration::from_millis(1)) ; "the smallest shell deadline is kept as asked")]
+    #[test_case(SHELL_TOOL_NAME, json!({ "timeout": SHELL_MAX_TIMEOUT_MS }) => Some(Duration::from_millis(SHELL_MAX_TIMEOUT_MS)) ; "the shell maximum is itself allowed")]
+    #[test_case(SHELL_TOOL_NAME, json!({ "timeout": SHELL_MAX_TIMEOUT_MS + 1 }) => None ; "a shell deadline past the maximum is refused rather than clamped")]
+    #[test_case(SHELL_TOOL_NAME, json!({ "timeout": -1 }) => None ; "a negative deadline names nothing")]
+    #[test_case(SHELL_TOOL_NAME, json!({ "timeout": "30m" }) => None ; "a deadline that is not a number names nothing")]
+    #[test_case(PYTHON_EXECUTION_TOOL_NAME, json!({}) => Some(Duration::from_millis(CODE_DEFAULT_TIMEOUT_MS)) ; "an omitted code deadline is its own default")]
+    #[test_case(PYTHON_EXECUTION_TOOL_NAME, json!({ "timeout": 0 }) => None ; "zero is refused by the code worker")]
+    #[test_case(PYTHON_EXECUTION_TOOL_NAME, json!({ "timeout": CODE_MAX_TIMEOUT_MS }) => Some(Duration::from_millis(CODE_MAX_TIMEOUT_MS)) ; "the code maximum is allowed")]
+    #[test_case(PYTHON_EXECUTION_TOOL_NAME, json!({ "timeout": CODE_MAX_TIMEOUT_MS + 1 }) => None ; "a code deadline past the maximum is refused")]
+    #[test_case("file_read", json!({ "timeout": 1 }) => None ; "a tool without a deadline has none to report")]
+    fn a_header_deadline_is_the_one_the_executor_will_enforce(
+        tool: &str,
+        raw_input: Value,
+    ) -> Option<Duration> {
+        effective_timeout(tool, &raw_input)
     }
 
     #[test_case(true; "cancelled_before_first_execution_poll")]

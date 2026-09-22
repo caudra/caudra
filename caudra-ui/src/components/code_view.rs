@@ -11,12 +11,14 @@ use crate::selection::wrap_breaks;
 use crate::theme;
 
 use super::tool_display::{
-    ScrollTail, TREE_BRANCH, TREE_GAP, TREE_LAST, TREE_TRUNK, batch_sigil_style, compact_args_for,
-    compact_sigil_label, header_spans, inflected_header, names_tool, progress_lines,
-    scroll_footer_text,
+    ScrollTail, TREE_BRANCH, TREE_GAP, TREE_LAST, TREE_TRUNK, append_annotation, batch_sigil_style,
+    compact_args_for, compact_sigil_label, header_spans, header_timeout, inflected_header,
+    names_tool, progress_lines, scroll_footer_text,
 };
 use super::{ToolProgress, environment_card, is_collapsible, workflow_card};
-use caudra_agent::tools::{PYTHON_EXECUTION_TOOL_NAME, SHELL_TOOL_NAME, TASK_TOOL_NAME};
+use caudra_agent::tools::{
+    PYTHON_EXECUTION_TOOL_NAME, SHELL_TOOL_NAME, TASK_TOOL_NAME, timeout_annotation,
+};
 use caudra_agent::types::Answer;
 use caudra_agent::types::{TodoItem, TodoStatus};
 use caudra_agent::{
@@ -1242,11 +1244,17 @@ fn child_annotation(entry: &BatchToolEntry, progress: Option<&ToolProgress>) -> 
     });
     let tally =
         progress.map(|progress| SubagentProgress::tally(progress.report.tools, progress.elapsed()));
-    match (tally, own) {
+    let mut annotation = match (tally, own) {
         (Some(tally), Some(own)) => Some(format!("{tally}{CHILD_ACTIVITY_SEPARATOR}{own}")),
         (Some(only), None) | (None, Some(only)) => Some(only),
         (None, None) => None,
+    };
+    // The same deadline a standalone card names, on the same terms: a child is
+    // a whole call, and the one folded out of its brackets to be said here.
+    if let Some(timeout) = header_timeout(&entry.tool, entry.raw_input.as_ref()) {
+        append_annotation(&mut annotation, &timeout_annotation(timeout));
     }
+    annotation
 }
 
 /// A child's clock, on the same terms a standalone card keeps one: wall time
@@ -6191,25 +6199,35 @@ mod tests {
     }
 
     const CHILD_TIMEOUT: u32 = 120_000;
-    const CHILD_TIMEOUT_SHOWN: &str = "timeout=2m";
+    const CHILD_TIMEOUT_SHOWN: &str = "2m timeout";
+    const CHILD_WORKDIR: &str = "crates/core";
+    const CHILD_WORKDIR_SHOWN: &str = "workdir=crates/core";
     const COMMAND_KEY: &str = "command=";
+    const TIMEOUT_KEY: &str = "timeout=";
     const CHILD_ARGS_MSG: &str = "a child's brackets carry what its own header does not show";
 
     /// The same filter a standalone row uses, reached through the same table,
-    /// so a child cannot print the command it has already drawn. The timeout
-    /// is there to prove the brackets are still drawn at all, and that a child
-    /// reaches the same table a standalone row does to read its unit.
+    /// so a child cannot print the command it has already drawn. The workdir
+    /// proves the brackets are still drawn at all, and the timeout that a
+    /// child names its deadline where a standalone card names it: once, in
+    /// the annotation, rather than a second time in brackets.
     #[test]
     fn a_child_row_never_repeats_its_header_in_brackets() {
         let mut entry = batch_entry(SHELL_WIRE_CHILD, 0);
         let summary = entry.summary.clone();
         entry.raw_input = Some(serde_json::json!({
             "command": summary,
+            "workdir": CHILD_WORKDIR,
             "timeout": CHILD_TIMEOUT,
         }));
 
         let row = child_row(entry);
         assert!(!row.contains(COMMAND_KEY), "{CHILD_ARGS_MSG}: {row:?}");
+        assert!(
+            row.contains(CHILD_WORKDIR_SHOWN),
+            "{CHILD_ARGS_MSG}: {row:?}"
+        );
+        assert!(!row.contains(TIMEOUT_KEY), "{CHILD_ARGS_MSG}: {row:?}");
         assert!(
             row.contains(CHILD_TIMEOUT_SHOWN),
             "{CHILD_ARGS_MSG}: {row:?}"

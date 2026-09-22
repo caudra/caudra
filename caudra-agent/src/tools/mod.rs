@@ -422,8 +422,8 @@ pub fn humanize_duration(duration: Duration) -> String {
         .collect()
 }
 
-pub fn timeout_annotation(secs: u64) -> String {
-    format!("{} timeout", humanize_duration(Duration::from_secs(secs)))
+pub fn timeout_annotation(timeout: Duration) -> String {
+    format!("{} timeout", humanize_duration(timeout))
 }
 
 pub type LocalToolResult = BoxFuture<'static, Result<String, String>>;
@@ -1122,7 +1122,7 @@ mod tests {
     #[test_case(120, "2m timeout"    ; "minutes_only")]
     #[test_case(90,  "1m30s timeout" ; "mixed")]
     fn timeout_annotation_cases(secs: u64, expected: &str) {
-        assert_eq!(timeout_annotation(secs), expected);
+        assert_eq!(timeout_annotation(Duration::from_secs(secs)), expected);
     }
 
     /// Sub-second input is what separates this from `timeout_annotation`,

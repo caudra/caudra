@@ -5165,7 +5165,10 @@ fn start_annotation_timeout_happy_path() {
         .tool
         .parse(&serde_json::json!({"timeout": 90}))
         .expect("parse failed");
-    assert_eq!(inv.start_annotation(), Some(timeout_annotation(90)));
+    assert_eq!(
+        inv.start_annotation(),
+        Some(timeout_annotation(Duration::from_secs(90)))
+    );
 }
 
 #[test]
