@@ -1075,7 +1075,7 @@ fn render_batch(entries: &[BatchToolEntry], highlight: bool, limits: &RenderLimi
         ) {
             spans.push(Span::styled(args, t.tool_dim));
         }
-        if let Some(annotation) = child_annotation(entry) {
+        if let Some(annotation) = child_annotation(entry, limits.progress.get(&index)) {
             spans.push(Span::styled(format!(" ({annotation})"), t.tool_annotation));
         }
         if let Some(elapsed) = child_elapsed(entry, limits.started.get(&index)) {
@@ -1085,12 +1085,6 @@ fn render_batch(entries: &[BatchToolEntry], highlight: bool, limits: &RenderLimi
             };
             spans.push(Span::styled(
                 format!("{CHILD_ACTIVITY_SEPARATOR}{clock}"),
-                t.tool_dim,
-            ));
-        }
-        if let Some(tally) = limits.progress.get(&index).and_then(settled_tally) {
-            spans.push(Span::styled(
-                format!("{CHILD_ACTIVITY_SEPARATOR}{tally}"),
                 t.tool_dim,
             ));
         }
@@ -1234,14 +1228,24 @@ fn holds_a_body(entry: &BatchToolEntry) -> bool {
 /// A child that has not started says so. It reads the same as a failure
 /// otherwise: both are drawn in the plain tense, so with nothing to separate
 /// them a batch cut short looks like a batch that went wrong.
-fn child_annotation(entry: &BatchToolEntry) -> Option<String> {
-    if let Some(annotation) = &entry.annotation {
-        return Some(annotation.clone());
-    }
-    match entry.status {
+///
+/// A dispatching child's tally leads, so a row reads the way its own card's
+/// header does: what the run did, then what the call has to say about it. It
+/// rides the row running as well as settled, because hung off the child as a
+/// node it would be a branch of the tree holding nothing but a clock, with the
+/// child's own body drawn to the left of it.
+fn child_annotation(entry: &BatchToolEntry, progress: Option<&ToolProgress>) -> Option<String> {
+    let own = entry.annotation.clone().or_else(|| match entry.status {
         BatchToolStatus::Pending => Some(QUEUED_ANNOTATION.to_owned()),
         BatchToolStatus::Success => entry.output.as_ref().and_then(ToolOutput::annotation),
         BatchToolStatus::Running | BatchToolStatus::Error => None,
+    });
+    let tally =
+        progress.map(|progress| SubagentProgress::tally(progress.report.tools, progress.elapsed()));
+    match (tally, own) {
+        (Some(tally), Some(own)) => Some(format!("{tally}{CHILD_ACTIVITY_SEPARATOR}{own}")),
+        (Some(only), None) | (None, Some(only)) => Some(only),
+        (None, None) => None,
     }
 }
 
@@ -1261,20 +1265,6 @@ fn child_elapsed(entry: &BatchToolEntry, started: Option<&Instant>) -> Option<Du
     match entry.output.as_ref() {
         Some(ToolOutput::Shell(output)) => Some(Duration::from_millis(output.duration_ms)),
         _ => None,
-    }
-}
-
-/// What a settled child's dispatch is still worth saying. Its output already
-/// carries the result, so only the tally survives, and it rides the child's
-/// own row: hung off it as a node it would be a branch of the tree holding
-/// nothing but a clock, with the child's body drawn to the left of it.
-fn settled_tally(progress: &ToolProgress) -> Option<String> {
-    match progress.is_live() {
-        true => None,
-        false => Some(SubagentProgress::tally(
-            progress.report.tools,
-            progress.elapsed(),
-        )),
     }
 }
 
@@ -5484,7 +5474,7 @@ mod tests {
             .map(|(line, _)| line_text(line))
             .collect();
         let tally = SubagentProgress::tally(BATCHING_TOOLS, Duration::ZERO);
-        assert!(owned[0].ends_with(&tally), "{SETTLED_MSG}: {owned:?}");
+        assert!(owned[0].contains(&tally), "{SETTLED_MSG}: {owned:?}");
         let body_indent = format!("{TREE_TRUNK}{BATCH_BODY_PAD}");
         assert!(
             owned[1..].iter().all(|row| row.starts_with(&body_indent)),
@@ -5807,11 +5797,11 @@ mod tests {
         assert_eq!(
             drawn,
             [
-                format!("{TREE_BRANCH}\u{2756} Delegated {TASK_TOOL_NAME} summary"),
                 format!(
-                    "{TREE_TRUNK}{TREE_LAST}\u{21f6} Batching {BATCHING_SUMMARY}{CHILD_ACTIVITY_SEPARATOR}{}",
+                    "{TREE_BRANCH}\u{2756} Delegated {TASK_TOOL_NAME} summary ({})",
                     SubagentProgress::tally(BATCHING_TOOLS, Duration::ZERO)
                 ),
+                format!("{TREE_TRUNK}{TREE_LAST}\u{21f6} Batching {BATCHING_SUMMARY}"),
                 format!("{TREE_TRUNK}{TREE_GAP}{TREE_BRANCH}$ Running cargo check"),
                 format!("{TREE_TRUNK}{TREE_GAP}{TREE_LAST}⌕ Grepped fn main"),
             ],

@@ -11056,10 +11056,15 @@ fn same_call_batch_updates_retain_phase_rows_and_known_children(child: bool) {
             usize::from(permission),
             "{HISTORY_PHASE_MSG}"
         );
+        let lowered = seen.to_lowercase();
+        let permission_rows = lowered
+            .matches(SubagentActivity::AwaitingPermission.label())
+            .count()
+            + lowered
+                .matches(SubagentActivity::AwaitingPermission.past_label())
+                .count();
         assert_eq!(
-            seen.to_lowercase()
-                .matches(SubagentActivity::AwaitingPermission.label())
-                .count(),
+            permission_rows,
             usize::from(permission),
             "{HISTORY_PHASE_MSG}"
         );

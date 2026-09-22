@@ -57,6 +57,14 @@ const RESPONDING_LABEL: &str = "responding";
 const COMPACTING_LABEL: &str = "compacting";
 const RETRYING_LABEL: &str = "retrying";
 const AWAITING_PERMISSION_LABEL: &str = "awaiting permission";
+/// What each phase is called once a later one has replaced it. A tool answers
+/// the same question from its own inflection table; a phase has no table, so
+/// its two spellings live beside each other here.
+const THINKING_PAST_LABEL: &str = "thought";
+const RESPONDING_PAST_LABEL: &str = "responded";
+const COMPACTING_PAST_LABEL: &str = "compacted";
+const RETRYING_PAST_LABEL: &str = "retried";
+const AWAITING_PERMISSION_PAST_LABEL: &str = "awaited permission";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GrepFileEntry {
@@ -2087,6 +2095,19 @@ impl SubagentActivity {
             Self::Compacting => COMPACTING_LABEL,
             Self::Retrying => RETRYING_LABEL,
             Self::AwaitingPermission => AWAITING_PERMISSION_LABEL,
+        }
+    }
+
+    /// The same word for a phase a later activity has replaced. A tool is
+    /// absent because its own inflection table already spells all three tenses.
+    pub fn past_label(&self) -> &str {
+        match self {
+            Self::Thinking { .. } => THINKING_PAST_LABEL,
+            Self::Responding => RESPONDING_PAST_LABEL,
+            Self::Tool { name, .. } => name,
+            Self::Compacting => COMPACTING_PAST_LABEL,
+            Self::Retrying => RETRYING_PAST_LABEL,
+            Self::AwaitingPermission => AWAITING_PERMISSION_PAST_LABEL,
         }
     }
 

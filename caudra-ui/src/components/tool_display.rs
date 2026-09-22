@@ -170,9 +170,8 @@ pub(crate) const SPINNER_STYLE_NAME: &str = "spinner";
 pub(crate) const SPINNER_STYLE_PREFIX: &str = "spinner:";
 
 const CODE_OUTPUT_DIVIDER: &str = "  ────────────";
-/// The progress row is the only node under a card header, and `tree` draws a
-/// lone child with the closing connector.
-const ACTIVITY_PREFIX: &str = "  └── ";
+/// What separates the parts of a row that reports several things at once: a
+/// header's tally from its spend, and a compact row's header from its activity.
 const ACTIVITY_SEPARATOR: &str = " · ";
 /// One tree level, all four columns wide so a connector and the gap below it
 /// occupy the same span. Shared with `code_view` and the workflow inspector,
@@ -502,15 +501,16 @@ fn query_key(name: &str) -> Option<&'static str> {
 /// name the table has never heard of answers with itself, which is all there
 /// is to say about it.
 ///
-/// Always the present tense. The row reports what the agent is doing, or was
-/// doing when it stopped, and the past tense would assert that a call finished
-/// when the agent may well have been cut off mid-way through it.
-pub(super) fn activity_label(activity: &SubagentActivity) -> String {
+/// The current row stays in the present tense: the call may yet be cut off, and
+/// the past tense would assert it finished. A row a later activity replaced is
+/// finished by construction, so it takes the past and reads like the settled
+/// rows of the batch roster drawn under it.
+pub(super) fn activity_label(activity: &SubagentActivity, tense: Tense) -> String {
+    let past = matches!(tense, Tense::Past);
     match activity {
-        SubagentActivity::Tool { name, .. } => compact_tool(name).map_or_else(
-            || name.to_string(),
-            |entry| entry.label(Tense::Present).to_owned(),
-        ),
+        SubagentActivity::Tool { name, .. } => compact_tool(name)
+            .map_or_else(|| name.to_string(), |entry| entry.label(tense).to_owned()),
+        phase if past => capitalized(phase.past_label()),
         phase => capitalized(phase.label()),
     }
 }
@@ -524,9 +524,9 @@ pub(super) fn activity_detail(activity: &SubagentActivity) -> Option<String> {
 /// The sigil an activity row opens on, so it reads like the row above it and
 /// the rows below it. A phase that is not a call has no tool to name, and
 /// falling back to the unknown-tool sigil would assert one that never ran.
-pub(super) fn activity_sigil(activity: &SubagentActivity) -> Option<char> {
+pub(super) fn activity_sigil(activity: &SubagentActivity, tense: Tense) -> Option<char> {
     match activity {
-        SubagentActivity::Tool { name, .. } => Some(compact_sigil_label(name, Tense::Present).0),
+        SubagentActivity::Tool { name, .. } => Some(compact_sigil_label(name, tense).0),
         _ => None,
     }
 }
@@ -553,12 +553,19 @@ pub(super) fn activity_child_spans(child: &ActivityChild, prefix: String) -> Vec
     spans
 }
 
-fn append_activity_spans(activity: &SubagentActivity, spans: &mut Vec<Span<'static>>) {
+fn append_activity_spans(
+    activity: &SubagentActivity,
+    tense: Tense,
+    spans: &mut Vec<Span<'static>>,
+) {
     let theme = theme::current();
-    if let Some(sigil) = activity_sigil(activity) {
+    if let Some(sigil) = activity_sigil(activity, tense) {
         spans.push(Span::styled(format!("{sigil} "), theme.tool_prefix));
     }
-    spans.push(Span::styled(activity_label(activity), theme.tool_prefix));
+    spans.push(Span::styled(
+        activity_label(activity, tense),
+        theme.tool_prefix,
+    ));
     if let Some(detail) = activity_detail(activity) {
         spans.push(Span::styled(format!(" {detail}"), theme.tool_dim));
     }
@@ -582,16 +589,11 @@ pub(super) fn progress_lines(
             format!("{continuation}{connector}"),
             theme.tool_dim,
         )];
-        append_activity_spans(activity, &mut spans);
-        if current {
-            spans.push(Span::styled(
-                format!(
-                    "{ACTIVITY_SEPARATOR}{}",
-                    SubagentProgress::tally(progress.report.tools, progress.elapsed())
-                ),
-                theme.tool_dim,
-            ));
-        }
+        let tense = match current {
+            true => Tense::Present,
+            false => Tense::Past,
+        };
+        append_activity_spans(activity, tense, &mut spans);
         lines.push(Line::from(clamp_to_row(spans, width)));
         let children = activity.children();
         for (index, child) in children.iter().enumerate() {
@@ -1517,31 +1519,18 @@ impl ToolLineBuilder {
         matches!(self.indicator, Indicator::InProgress)
     }
 
-    /// A running call reports what it is doing and how far it has got; a
-    /// finished one is described by its output, so only the tally survives.
-    fn progress_spans(&self, progress: &ToolProgress, out: &mut Vec<Span<'static>>) {
-        let theme = theme::current();
-        if self.is_in_progress() {
-            append_activity_spans(&progress.report.activity, out);
-            out.push(Span::styled(ACTIVITY_SEPARATOR, theme.tool_dim));
-        }
-        out.push(Span::styled(
-            SubagentProgress::tally(progress.report.tools, progress.elapsed()),
-            theme.tool_dim,
-        ));
-    }
-
     /// Must run after `prepend_indicator`, which owns row 0 and shifts the
     /// spinner spans sitting on it.
+    ///
+    /// A running call reports what it is doing; a finished one is described by
+    /// its output, and the tally both of them answer for sits in the header, so
+    /// a settled card has nothing left to draw here.
     fn push_progress(&mut self, progress: &ToolProgress) {
-        if self.is_in_progress() {
-            self.lines
-                .extend(progress_lines(progress, TOOL_BODY_INDENT, self.width));
+        if !self.is_in_progress() {
             return;
         }
-        let mut spans = vec![Span::styled(ACTIVITY_PREFIX, theme::current().tool_dim)];
-        self.progress_spans(progress, &mut spans);
-        self.lines.push(Line::from(spans));
+        self.lines
+            .extend(progress_lines(progress, TOOL_BODY_INDENT, self.width));
     }
 
     fn push_progress_body(
@@ -1595,11 +1584,11 @@ impl ToolLineBuilder {
     /// A compact row is one line by contract, so progress joins the header
     /// instead of sitting under it.
     fn append_progress(&mut self, progress: &ToolProgress) {
-        if self.lines.is_empty() {
+        if self.lines.is_empty() || !self.is_in_progress() {
             return;
         }
         let mut spans = vec![Span::styled(ACTIVITY_SEPARATOR, theme::current().tool_dim)];
-        self.progress_spans(progress, &mut spans);
+        append_activity_spans(&progress.report.activity, Tense::Present, &mut spans);
         self.lines[0].spans.append(&mut spans);
     }
 
@@ -2146,6 +2135,25 @@ pub(super) fn shell_elapsed(msg: &DisplayMessage, status: ToolStatus) -> Option<
     }
 }
 
+/// What the header says in parentheses: how much work the call has done, then
+/// what it spent doing it.
+///
+/// Composed here rather than stored, because a running subagent's clock keeps
+/// counting past its last report and a stored string would show it stopped.
+/// The card is rebuilt every frame for the spinner, so this is measured as
+/// often as it is drawn.
+fn header_annotation(msg: &DisplayMessage) -> Option<String> {
+    let tally = msg
+        .progress
+        .as_ref()
+        .map(|progress| SubagentProgress::tally(progress.report.tools, progress.elapsed()));
+    match (tally, msg.annotation.clone()) {
+        (Some(tally), Some(spend)) => Some(format!("{tally}{ACTIVITY_SEPARATOR}{spend}")),
+        (Some(only), None) | (None, Some(only)) => Some(only),
+        (None, None) => None,
+    }
+}
+
 /// `expansion` is `None` on a compact row the reader has not opened, which is
 /// the only state that draws a header with no body.
 pub fn build_tool_lines(
@@ -2177,11 +2185,13 @@ pub fn build_tool_lines(
         ),
     );
     b.apply_output_format(msg.tool_output.as_deref());
+    let annotation = header_annotation(msg);
+    let annotation = annotation.as_deref();
     if rctx.compact {
         b.push_compact_header(
             tool_name,
             header,
-            msg.annotation.as_deref(),
+            annotation,
             msg.tool_raw_input.as_deref(),
             msg.tool_output.as_deref(),
         );
@@ -2200,7 +2210,7 @@ pub fn build_tool_lines(
         b.push_header(
             tool_name,
             shown,
-            msg.annotation.as_deref(),
+            annotation,
             msg.render_header.as_ref(),
             msg.tool_output.as_deref(),
             msg.tool_raw_input.as_deref(),
@@ -4587,6 +4597,14 @@ mod tests {
         }
     }
 
+    /// What three tools and `SUBAGENT_ELAPSED` spell, which is what the header
+    /// reports for every case built on `running_tool_report(3)`.
+    const SUBAGENT_TALLY: &str = "3 tools · 1m 3.4s";
+    const TALLY_IN_HEADER_MSG: &str =
+        "a subagent's tally sits in the header parentheses, beside what the run spent";
+    const SETTLED_HAS_NO_ROW_MSG: &str =
+        "a settled subagent is described by its output and its header, so it draws no tree row";
+
     fn running_tool_report(tools: u32) -> SubagentProgress {
         report(
             SubagentActivity::tool(Arc::from(SHELL_TOOL_NAME), "cargo nextest run"),
@@ -4610,6 +4628,9 @@ mod tests {
 
     /// A collapsed row hides the body but not the progress: it is the only
     /// sign that the subagent behind it is alive.
+    ///
+    /// The row says what the subagent is doing; how much it has done is the
+    /// header's to report, in the parentheses it already keeps for the spend.
     #[test_case(None                        ; "collapsed")]
     #[test_case(Some(Disclosure::default()) ; "expanded")]
     fn a_running_subagent_reports_its_tool_under_the_header(expansion: Option<Disclosure>) {
@@ -4618,14 +4639,11 @@ mod tests {
         let tl = build_tool_lines(&msg, ToolStatus::InProgress, &test_rctx(80), expansion);
 
         assert_eq!(tl.lines.len(), 2, "{}", lines_text(&tl));
-        let progress_line: String = tl.lines[1]
-            .spans
-            .iter()
-            .map(|span| span.content.as_ref())
-            .collect();
-        assert_eq!(
-            progress_line,
-            "  └── $ Running cargo nextest run · 3 tools · 1m 3.4s"
+        assert_eq!(line_text(&tl.lines[1]), "  └── $ Running cargo nextest run");
+        assert!(
+            line_text(&tl.lines[0]).contains(&format!("({SUBAGENT_TALLY})")),
+            "{TALLY_IN_HEADER_MSG}: {}",
+            line_text(&tl.lines[0])
         );
     }
 
@@ -4697,15 +4715,23 @@ mod tests {
     const HISTORY_RUN: &str = "history command";
     const HISTORY_GREP: &str = "history pattern";
     const HISTORY_THINKING: &str = "Thinking";
+    /// The same phase once a later activity has replaced it.
+    const HISTORY_THOUGHT: &str = "Thought";
     const HISTORY_TOOLS: u32 = 7;
+    /// The tally as an activity row used to carry it. Nothing spells this now,
+    /// which is what the history cases assert.
     const HISTORY_TALLY: &str = " · 7 tools · ";
+    /// The tally as the header opens it. Stops short of the clock, which runs
+    /// while the case does.
+    const HISTORY_HEADER_TALLY: &str = "(7 tools · ";
     const HISTORY_WINDOW: u32 = 4;
     const HISTORY_WIDTH: u16 = 80;
     const HISTORY_ROWS: usize = 8;
     const HISTORY_OUTPUT: &str = "output before the history\noutput beside the history";
     const HISTORY_ANSWER: &str = "the settled answer";
     const HISTORY_TREE_MSG: &str = "retained batches keep their statuses and continuing trunks";
-    const HISTORY_CURRENT_MSG: &str = "the current phase and tally appear exactly once";
+    const HISTORY_CURRENT_MSG: &str = "the current phase appears exactly once, and the tally it \
+        used to carry is the header's to report";
     const HISTORY_WINDOW_MSG: &str = "one task body owns output, history, and one scroll span";
     const HISTORY_WORKER_MSG: &str = "live history must not be overwritten by a highlight result";
     const HISTORY_LINK_MSG: &str =
@@ -4775,23 +4801,21 @@ mod tests {
         assert_eq!(
             rows,
             [
-                format!("{continuation}{TREE_BRANCH}⇶ Batching {HISTORY_FIRST}"),
+                format!("{continuation}{TREE_BRANCH}⇶ Batched {HISTORY_FIRST}"),
                 format!("{continuation}{TREE_TRUNK}{TREE_BRANCH}→ Reading {HISTORY_READ}"),
                 format!("{continuation}{TREE_TRUNK}{TREE_BRANCH}$ Run {HISTORY_RUN}"),
                 format!("{continuation}{TREE_TRUNK}{TREE_LAST}⌕ Grep {HISTORY_GREP}"),
-                format!("{continuation}{TREE_BRANCH}{HISTORY_THINKING}"),
-                format!("{continuation}{TREE_BRANCH}⇶ Batching {HISTORY_SECOND}"),
+                format!("{continuation}{TREE_BRANCH}{HISTORY_THOUGHT}"),
+                format!("{continuation}{TREE_BRANCH}⇶ Batched {HISTORY_SECOND}"),
                 format!("{continuation}{TREE_TRUNK}{TREE_LAST}$ Running {LONG_SUMMARY}"),
                 format!("{continuation}{TREE_LAST}{HISTORY_THINKING}"),
             ],
             "{HISTORY_TREE_MSG}"
         );
-        assert_eq!(
-            lines
+        assert!(
+            !lines
                 .iter()
-                .filter(|line| line_text(line).contains(HISTORY_TALLY))
-                .count(),
-            1,
+                .any(|line| line_text(line).contains(HISTORY_TALLY)),
             "{HISTORY_CURRENT_MSG}"
         );
         assert_eq!(
@@ -4813,7 +4837,27 @@ mod tests {
             &test_rctx(width),
             Some(exp(true)),
         );
-        let expected: Vec<_> = whole.lines.iter().skip(1).map(history_text).collect();
+        let windowed = |window| {
+            build_tool_lines(
+                &msg,
+                ToolStatus::InProgress,
+                &scroll_rctx(width, HISTORY_WINDOW, window),
+                Some(Disclosure::default()),
+            )
+        };
+        let header_rows = windowed(ScrollWindow {
+            height: HISTORY_WINDOW as usize,
+            offset: 0,
+            follow: false,
+        })
+        .scroll_spans[0]
+            .first;
+        let expected: Vec<_> = whole
+            .lines
+            .iter()
+            .skip(header_rows)
+            .map(history_text)
+            .collect();
         let history_start = expected.len() - HISTORY_ROWS;
         assert!(whole.scroll_spans.is_empty(), "{HISTORY_WINDOW_MSG}");
         for offset in 0..expected.len() {
@@ -4823,12 +4867,7 @@ mod tests {
                 follow: false,
             };
             let (start, end) = window.range(expected.len());
-            let tl = build_tool_lines(
-                &msg,
-                ToolStatus::InProgress,
-                &scroll_rctx(width, HISTORY_WINDOW, window),
-                Some(Disclosure::default()),
-            );
+            let tl = windowed(window);
             assert_eq!(tl.scroll_spans.len(), 1, "{HISTORY_WINDOW_MSG}");
             let span = tl.scroll_spans[0];
             assert_eq!(span.extent_lines, span.lines, "{HISTORY_WINDOW_MSG}");
@@ -4839,7 +4878,7 @@ mod tests {
             );
             assert_eq!(
                 (span.child, span.first, span.lines, span.total, span.offset),
-                (None, 1, end - start, expected.len(), start),
+                (None, header_rows, end - start, expected.len(), start),
                 "{HISTORY_WINDOW_MSG}"
             );
             let shown: Vec<_> = tl.lines[span.first..span.first + span.lines]
@@ -4855,7 +4894,7 @@ mod tests {
             assert_eq!(tl.rows.len(), tl.lines.len(), "{HISTORY_WINDOW_MSG}");
             assert_eq!(
                 tl.links.rows[span.first..span.first + span.lines],
-                whole.links.rows[start + 1..end + 1],
+                whole.links.rows[start + header_rows..end + header_rows],
                 "{HISTORY_LINK_MSG}"
             );
             assert!(tl.highlight.is_none(), "{HISTORY_WORKER_MSG}");
@@ -4891,13 +4930,12 @@ mod tests {
             "{HISTORY_WINDOW_MSG}: {text}"
         );
         assert_eq!(
-            text.matches(&format!("{HISTORY_THINKING}{HISTORY_TALLY}"))
-                .count(),
+            text.matches(HISTORY_THINKING).count(),
             1,
             "{HISTORY_CURRENT_MSG}"
         );
         assert_eq!(
-            text.matches(HISTORY_TALLY).count(),
+            text.matches(HISTORY_HEADER_TALLY).count(),
             1,
             "{HISTORY_CURRENT_MSG}"
         );
@@ -4934,8 +4972,12 @@ mod tests {
             "{HISTORY_WINDOW_MSG}"
         );
         assert_eq!(
-            text.matches(&format!("{HISTORY_THINKING}{HISTORY_TALLY}"))
-                .count(),
+            text.matches(HISTORY_THINKING).count(),
+            1,
+            "{HISTORY_CURRENT_MSG}"
+        );
+        assert_eq!(
+            text.matches(HISTORY_HEADER_TALLY).count(),
             1,
             "{HISTORY_CURRENT_MSG}"
         );
@@ -4983,7 +5025,7 @@ mod tests {
         assert_eq!(
             rows,
             [
-                "  └── ⇶ Batching 3 tools · 3 tools · 1m 3.4s",
+                "  └── ⇶ Batching 3 tools",
                 "      ├── → Read a.rs",
                 "      ├── $ Running cargo check",
                 "      └── ⌕ Grep fn main",
@@ -5179,13 +5221,11 @@ mod tests {
 
         let tl = build_tool_lines(&msg, ToolStatus::InProgress, &test_rctx(80), None);
 
-        assert_eq!(
-            line_text(&tl.lines[1]),
-            "  └── Responding · 2 tools · 1m 3.4s"
-        );
+        assert_eq!(line_text(&tl.lines[1]), "  └── Responding");
     }
 
-    /// What it was doing is stale the moment it stops; what it did is not.
+    /// What it was doing is stale the moment it stops; what it did is not, and
+    /// the header is where it is said.
     #[test_case(ToolStatus::Success ; "success")]
     #[test_case(ToolStatus::Error   ; "error")]
     fn a_settled_subagent_keeps_only_its_tally(status: ToolStatus) {
@@ -5194,8 +5234,12 @@ mod tests {
         let tl = build_tool_lines(&msg, status, &test_rctx(80), Some(Disclosure::default()));
 
         let text = lines_text(&tl);
-        assert!(text.contains("└── 7 tools · 1m 3.4s"), "{text}");
+        assert!(
+            line_text(&tl.lines[0]).contains("(7 tools · 1m 3.4s)"),
+            "{TALLY_IN_HEADER_MSG}: {text}"
+        );
         assert!(!text.contains("cargo nextest run"), "{text}");
+        assert!(!text.contains('└'), "{SETTLED_HAS_NO_ROW_MSG}: {text}");
     }
 
     #[test_case(0, "1m 3.4s"          ; "nothing_run_yet_reports_only_the_clock")]
@@ -5215,9 +5259,35 @@ mod tests {
         );
 
         assert!(
-            lines_text(&tl).contains(&format!("└── {expected}")),
-            "{}",
+            line_text(&tl.lines[0]).contains(&format!("({expected})")),
+            "{TALLY_IN_HEADER_MSG}: {}",
             lines_text(&tl)
+        );
+    }
+
+    /// What a dispatch spends, as the usage annotation already spells it.
+    const SUBAGENT_SPEND: &str = "12.3k↑ 456↓ Σ$1.500";
+
+    /// The reported bug: the tally sat on its own activity row while the spend
+    /// sat in the header, so one call reported itself in two places.
+    #[test]
+    fn a_header_reads_the_tally_before_the_spend() {
+        let mut msg = subagent_msg(ToolStatus::InProgress, Some(running_tool_report(3)));
+        msg.annotation = Some(SUBAGENT_SPEND.to_owned());
+
+        let tl = build_tool_lines(
+            &msg,
+            ToolStatus::InProgress,
+            &test_rctx(120),
+            Some(Disclosure::default()),
+        );
+
+        let header = line_text(&tl.lines[0]);
+        assert!(
+            header.contains(&format!(
+                "({SUBAGENT_TALLY}{ACTIVITY_SEPARATOR}{SUBAGENT_SPEND})"
+            )),
+            "{TALLY_IN_HEADER_MSG}: {header}"
         );
     }
 
@@ -5247,9 +5317,10 @@ mod tests {
 
         assert_eq!(tl.lines.len(), 1);
         let text = lines_text(&tl);
+        assert!(text.contains(" · $ Running cargo nextest run"), "{text}");
         assert!(
-            text.contains(" · $ Running cargo nextest run · 3 tools · 1m 3.4s"),
-            "{text}"
+            text.contains(&format!("({SUBAGENT_TALLY})")),
+            "{TALLY_IN_HEADER_MSG}: {text}"
         );
     }
 
@@ -5319,25 +5390,61 @@ mod tests {
     const DETAIL_ESCAPE_MSG: &str =
         "a summary is built from tool input, so the row must not pass its controls on";
 
+    const SUPERSEDED_MSG: &str = "a row a later activity replaced is finished, so it reads in the \
+        past tense the settled batch rows under it already use";
+
     #[test_case("shell", "Running" ; "shell")]
     #[test_case("file_read", "Reading" ; "read")]
     #[test_case("file_grep", "Grepping" ; "grep")]
     #[test_case("task", "Delegating" ; "task")]
     fn an_activity_names_its_tool_by_verb(tool: &str, expected: &str) {
         let activity = SubagentActivity::tool(Arc::from(tool), "");
-        assert_eq!(activity_label(&activity), expected, "{ACTIVITY_VERB_MSG}");
+        assert_eq!(
+            activity_label(&activity, Tense::Present),
+            expected,
+            "{ACTIVITY_VERB_MSG}"
+        );
+    }
+
+    #[test_case("shell", "Ran" ; "shell")]
+    #[test_case("file_read", "Read" ; "read")]
+    #[test_case("file_grep", "Grepped" ; "grep")]
+    #[test_case("task", "Delegated" ; "task")]
+    fn a_superseded_activity_names_its_tool_in_the_past(tool: &str, expected: &str) {
+        let activity = SubagentActivity::tool(Arc::from(tool), "");
+        assert_eq!(
+            activity_label(&activity, Tense::Past),
+            expected,
+            "{SUPERSEDED_MSG}"
+        );
+    }
+
+    #[test_case(SubagentActivity::Thinking { title: None }, "Thought" ; "thinking")]
+    #[test_case(SubagentActivity::Responding, "Responded" ; "responding")]
+    #[test_case(SubagentActivity::Compacting, "Compacted" ; "compacting")]
+    #[test_case(SubagentActivity::Retrying, "Retried" ; "retrying")]
+    fn a_superseded_phase_reads_in_the_past(activity: SubagentActivity, expected: &str) {
+        assert_eq!(
+            activity_label(&activity, Tense::Past),
+            expected,
+            "{SUPERSEDED_MSG}"
+        );
     }
 
     #[test]
     fn an_untabled_tool_answers_with_its_own_name() {
         let activity = SubagentActivity::tool(Arc::from(UNTABLED_TOOL), "");
-        assert_eq!(activity_label(&activity), UNTABLED_TOOL, "{UNTABLED_MSG}");
+        assert_eq!(
+            activity_label(&activity, Tense::Present),
+            UNTABLED_TOOL,
+            "{UNTABLED_MSG}"
+        );
     }
 
     #[test]
     fn a_phase_is_capitalised_like_the_verbs_beside_it() {
         assert_eq!(
-            activity_label(&SubagentActivity::Responding),
+            activity_label(&SubagentActivity::Responding, Tense::Present),
             "Responding",
             "{PHASE_CASE_MSG}"
         );

@@ -33,7 +33,8 @@ use crate::animation::{animation_elapsed_ms, spinner_str};
 use crate::components::modal::{FooterHits, FooterLine, Modal};
 use crate::components::scrollbar::{ScrollHint, Scrollbar, ScrollbarMouse};
 use crate::components::tool_display::{
-    TREE_BRANCH, TREE_LAST, activity_child_spans, activity_detail, activity_label, activity_sigil,
+    TREE_BRANCH, TREE_LAST, Tense, activity_child_spans, activity_detail, activity_label,
+    activity_sigil,
 };
 use crate::components::workflow_card::{
     AGENTS_SUFFIX, TOKENS_SUFFIX, phase_strip_line, status_span,
@@ -2313,12 +2314,16 @@ fn activity_spans(progress: &ToolProgress, state: RosterState) -> Vec<Span<'stat
         true => t.tool_prefix,
         false => t.tool_dim,
     };
+    let tense = match running {
+        true => Tense::Present,
+        false => Tense::Past,
+    };
     let mut spans = vec![Span::raw(SEPARATOR)];
-    if let Some(sigil) = activity_sigil(&progress.report.activity) {
+    if let Some(sigil) = activity_sigil(&progress.report.activity, tense) {
         spans.push(Span::styled(format!("{sigil} "), label));
     }
     spans.push(Span::styled(
-        activity_label(&progress.report.activity),
+        activity_label(&progress.report.activity, tense),
         label,
     ));
     if let Some(detail) = activity_detail(&progress.report.activity) {
@@ -2717,6 +2722,8 @@ mod tests {
     const RUNNING_TOOL: &str = "shell";
     /// The verb the row shows for `RUNNING_TOOL`, which names itself nowhere.
     const RUNNING_LABEL: &str = "Running";
+    /// The same verb once the agent holding the call has stopped.
+    const RAN_LABEL: &str = "Ran";
     const TOOL_SUMMARY: &str = "cargo nextest run";
     const TOOLS_RUN: u32 = 3;
     const TOOLS_TALLY: &str = "3 tools";
@@ -3880,7 +3887,7 @@ mod tests {
         let text = section_text(&mut inspector, '3');
 
         assert!(
-            text.contains(RUNNING_LABEL),
+            text.contains(RAN_LABEL),
             "{ACTIVITY_OUTLIVES_ITS_AGENT}: {text}"
         );
     }
