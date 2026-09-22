@@ -2,7 +2,7 @@
 //! highlighted, missing outputs fall back to plain text from `ToolResult`.
 
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -840,6 +840,11 @@ impl Chat {
     /// The run, or the scratch file, whose card a click at `row` landed on.
     pub(crate) fn workflow_hit_at(&self, row: u16, area: Rect) -> Option<CardHit> {
         self.messages_panel.workflow_hit_at(row, area)
+    }
+
+    /// The memory note whose card row a click at `row` landed on.
+    pub(crate) fn memory_hit_at(&self, row: u16, area: Rect) -> Option<PathBuf> {
+        self.messages_panel.memory_hit_at(row, area)
     }
 
     #[cfg(test)]

@@ -15,7 +15,7 @@ use super::tool_display::{
     compact_args_for, compact_sigil_label, header_spans, header_timeout, inflected_header,
     names_tool, progress_lines, scroll_footer_text,
 };
-use super::{ToolProgress, environment_card, is_collapsible, workflow_card};
+use super::{ToolProgress, environment_card, is_collapsible, memory_card, workflow_card};
 use caudra_agent::tools::{
     PYTHON_EXECUTION_TOOL_NAME, SHELL_TOOL_NAME, TASK_TOOL_NAME, timeout_annotation,
 };
@@ -2131,6 +2131,16 @@ pub(super) fn within(total: usize, room: usize) -> (usize, usize) {
     }
 }
 
+/// How much of a body fits under `room`, given that the notice about the rest
+/// costs a row of its own and has to come out of the same budget.
+pub(super) fn body_window(total: usize, room: usize) -> (usize, usize) {
+    let (shown, hidden) = within(total, room);
+    if hidden == 0 {
+        return (shown, hidden);
+    }
+    within(total, room.saturating_sub(1))
+}
+
 /// What a reader wants first from a grep they cannot see all of is its shape:
 /// how much matched and where. Match text answers a different question, and
 /// is a click away. The totals are left to the card header, which already
@@ -3120,6 +3130,12 @@ pub fn render_tool_content(
         ),
         Some(ToolOutput::Index(output @ IndexOutput::Directory { .. })) => {
             render_index_directory(output, limits.budget)
+        }
+        Some(ToolOutput::Memory(output)) => {
+            let (card_lines, rows, truncated) =
+                memory_card::render(output, limits.bounded_budget(), limits.width);
+            output_rows = rows;
+            (card_lines, truncated)
         }
         Some(ToolOutput::Instructions { blocks }) => {
             let mut instruction_lines = Vec::new();

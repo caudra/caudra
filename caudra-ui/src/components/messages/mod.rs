@@ -22,7 +22,7 @@ use super::{
         BatchLiveMap, BatchProgressMap, BatchStartedMap, BatchViewMap, CardPolicy, Disclosure,
         RowTarget, ScrollSpan, ScrollWindow,
     },
-    review, workflow_card,
+    memory_card, review, workflow_card,
     workflow_card::CardHit,
 };
 use crate::animation::spinner_str;
@@ -1896,6 +1896,32 @@ impl MessagesPanel {
             (Some(path), Some(_)) => Some(CardHit::ScratchFile(PathBuf::from(path))),
             _ => Some(CardHit::Run(card.run_id.clone())),
         }
+    }
+
+    /// The note a click at `row` on a memory card names, when the row is one of
+    /// a note held on this host. A row answering for nothing leaves the click
+    /// to the card's own control.
+    pub(crate) fn memory_hit_at(&self, row: u16, area: Rect) -> Option<PathBuf> {
+        if area.height == 0 {
+            return None;
+        }
+        let width = self.viewport_width;
+        let doc_row = self.doc_row(row, area);
+        let (_, segment, start) = self.cache.segment_at_row(doc_row, width)?;
+        let rel = u16::try_from(doc_row - start).ok()?;
+        if rel < segment.chrome(width).margin_top {
+            return None;
+        }
+        let tool_id = segment.tool_id.as_deref()?;
+        let output = self
+            .messages
+            .iter()
+            .rfind(|msg| matches!(&msg.role, DisplayRole::Tool(tool) if tool.id == tool_id))
+            .and_then(|msg| match msg.tool_output.as_deref() {
+                Some(ToolOutput::Memory(output)) => Some(output),
+                _ => None,
+            })?;
+        memory_card::note_path(output, segment.row_target_at(rel, width)?)
     }
 
     /// A dispatched batch child reporting in. Its id is the batch's own with

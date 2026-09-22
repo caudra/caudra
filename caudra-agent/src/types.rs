@@ -5,7 +5,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use caudra_providers::{AgentError, Billing, ContentBlock, Message, Role, StopReason, TokenUsage};
+use caudra_providers::{
+    AgentError, Billing, ContentBlock, Message, Role, StopReason, TokenUsage, token_label,
+};
 use caudra_storage::tool_ledger::ToolOutcome;
 use caudra_storage::tool_outputs::ToolOutputRef;
 use caudra_storage::usage_ledger::LedgerPurpose;
@@ -45,6 +47,19 @@ pub const ENVIRONMENT_MISSING_LABEL: &str = "missing";
 /// parser declining the output says nothing about the command being there.
 pub const ENVIRONMENT_NO_VERSION: &str = "(no version)";
 const ENVIRONMENT_LIST_SEPARATOR: &str = ", ";
+
+/// How a memory browse names the notes directory. Only a browse reports it,
+/// because it is how the model reaches a note with `file_edit`.
+pub const MEMORY_DIRECTORY_LABEL: &str = "dir: ";
+/// How a note held by reference names itself, in both the card and the text.
+pub const MEMORY_REFERENCE_LABEL: &str = "memory_ref: ";
+pub const MEMORY_REVISION_LABEL: &str = "revision: ";
+pub const MEMORY_TAG_SEPARATOR: &str = ", ";
+const MEMORY_INDEX_BULLET: &str = "  - ";
+const MEMORY_NOTE_SEPARATOR: &str = "\n\n";
+const MEMORY_INDEX_SEPARATOR: &str = "\n";
+const MEMORY_NOTE_NOUN: &str = "note";
+const MEMORY_TAG_NOUN: &str = "tag";
 
 const MILLIS_PER_SECOND: u128 = 1_000;
 const SECONDS_PER_MINUTE: u64 = 60;
@@ -481,6 +496,231 @@ pub struct CodeGraphSource {
     pub whole_file_reason: Option<String>,
 }
 
+/// Where a note lives: what a click can open, and what the model needs to
+/// change it. A remote workspace holds notes by reference, so there is no host
+/// path to name and the reference and its revision take that place.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum MemoryOrigin {
+    File { path: String },
+    Document { reference: String, revision: String },
+}
+
+impl MemoryOrigin {
+    /// The note's file on this host, or `None` for one held by reference.
+    pub fn path(&self) -> Option<&str> {
+        match self {
+            Self::File { path } => Some(path),
+            Self::Document { .. } => None,
+        }
+    }
+
+    /// The lines that name a remote note, which is how the model reaches it
+    /// with `local_document_read` and replaces it with `local_document_write`.
+    fn locator_lines(&self) -> Vec<String> {
+        match self {
+            Self::File { .. } => Vec::new(),
+            Self::Document {
+                reference,
+                revision,
+            } => Vec::from([
+                format!("{MEMORY_REFERENCE_LABEL}{reference}"),
+                format!("{MEMORY_REVISION_LABEL}{revision}"),
+            ]),
+        }
+    }
+
+    /// What an index row appends to name a note it cannot name by path.
+    fn index_suffix(&self) -> String {
+        match self {
+            Self::File { .. } => String::new(),
+            Self::Document { reference, .. } => format!(" [{MEMORY_REFERENCE_LABEL}{reference}]"),
+        }
+    }
+}
+
+/// One note a read returned: what it is called, what its body costs, what
+/// reaches it, and where it lives. The body has its frontmatter stripped, so
+/// `tags` is the only place tags are stated and the token count is what the
+/// model is actually charged.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryNote {
+    pub name: String,
+    pub tokens: u32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
+    pub origin: MemoryOrigin,
+    pub body: String,
+}
+
+impl MemoryNote {
+    /// `name (1.2k tokens) [arch, ui]`, the row a card draws and the line the
+    /// model reads the body under.
+    pub fn headline(&self) -> String {
+        let tags = match self.tags.is_empty() {
+            true => String::new(),
+            false => format!(" [{}]", self.tags.join(MEMORY_TAG_SEPARATOR)),
+        };
+        format!("{} ({}){tags}", self.name, token_label(self.tokens))
+    }
+
+    fn as_text(&self) -> String {
+        let mut out = vec![self.headline()];
+        out.extend(self.origin.locator_lines());
+        format!("{}\n\n{}", out.join("\n"), self.body)
+    }
+}
+
+/// One note in a tag index. A list never reads a body, so it carries none
+/// rather than an empty one it would have to be believed about.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryNoteEntry {
+    pub name: String,
+    pub tokens: u32,
+    pub origin: MemoryOrigin,
+}
+
+impl MemoryNoteEntry {
+    fn as_text(&self) -> String {
+        format!(
+            "{MEMORY_INDEX_BULLET}{} ({}){}",
+            self.name,
+            token_label(self.tokens),
+            self.origin.index_suffix()
+        )
+    }
+}
+
+/// A tag and the notes it reaches. A note carrying several tags appears under
+/// each of them, which is how `/memory` and the prompt's tag line already
+/// present the same index.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryTagGroup {
+    pub tag: String,
+    pub notes: Vec<MemoryNoteEntry>,
+}
+
+/// What a memory browse answered with: whole notes for `read`, the tag index
+/// that reaches them for `list`.
+///
+/// `notices` are the lines that qualify the answer — tags ignored, files that
+/// would not read, nothing matched — and they lead, so a card can draw them
+/// apart from the notes and the model reads them before what they qualify.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum MemoryOutput {
+    Notes {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        directory: Option<String>,
+        notes: Vec<MemoryNote>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        notices: Vec<String>,
+    },
+    Index {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        directory: Option<String>,
+        groups: Vec<MemoryTagGroup>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        notices: Vec<String>,
+    },
+}
+
+impl MemoryOutput {
+    pub fn directory(&self) -> Option<&str> {
+        let (Self::Notes { directory, .. } | Self::Index { directory, .. }) = self;
+        directory.as_deref()
+    }
+
+    pub fn notices(&self) -> &[String] {
+        let (Self::Notes { notices, .. } | Self::Index { notices, .. }) = self;
+        notices
+    }
+
+    pub fn is_empty(&self) -> bool {
+        match self {
+            Self::Notes { notes, .. } => notes.is_empty(),
+            Self::Index { groups, .. } => groups.is_empty(),
+        }
+    }
+
+    /// `3 notes · 4.2k tokens` for a read, `18 notes · 7 tags` for a list.
+    /// A list counts distinct notes, because one carrying three tags is filed
+    /// three times and is still one note.
+    pub fn annotation(&self) -> String {
+        match self {
+            Self::Notes { notes, .. } => format!(
+                "{}{CARD_ANNOTATION_SEPARATOR}{}",
+                counted(notes.len(), MEMORY_NOTE_NOUN),
+                token_label(notes.iter().map(|note| note.tokens).sum())
+            ),
+            Self::Index { groups, .. } => {
+                let mut names: Vec<&str> = groups
+                    .iter()
+                    .flat_map(|group| group.notes.iter().map(|note| note.name.as_str()))
+                    .collect();
+                names.sort_unstable();
+                names.dedup();
+                format!(
+                    "{}{CARD_ANNOTATION_SEPARATOR}{}",
+                    counted(names.len(), MEMORY_NOTE_NOUN),
+                    counted(groups.len(), MEMORY_TAG_NOUN)
+                )
+            }
+        }
+    }
+
+    /// The one rendering of this answer as text: what the model reads, and what
+    /// a reader copies out of the card.
+    ///
+    /// The two shapes separate their parts differently because a note's body is
+    /// prose that needs air around it, while an index is already a list.
+    pub fn as_display_text(&self) -> String {
+        let (separator, body) = match self {
+            Self::Notes { notes, .. } => (
+                MEMORY_NOTE_SEPARATOR,
+                notes.iter().map(MemoryNote::as_text).collect::<Vec<_>>(),
+            ),
+            Self::Index { groups, .. } => (
+                MEMORY_INDEX_SEPARATOR,
+                groups
+                    .iter()
+                    .map(|group| {
+                        let mut rows = vec![
+                            format!("{} ({})", group.tag, group.notes.len()),
+                            String::new(),
+                        ];
+                        rows.splice(1..1, group.notes.iter().map(MemoryNoteEntry::as_text));
+                        rows.join("\n")
+                    })
+                    .collect(),
+            ),
+        };
+        let directory = self
+            .directory()
+            .map(|directory| format!("{MEMORY_DIRECTORY_LABEL}{directory}"));
+        let listed = self
+            .notices()
+            .iter()
+            .cloned()
+            .chain(body)
+            .collect::<Vec<_>>()
+            .join(separator);
+        match directory {
+            Some(directory) => format!("{directory}{MEMORY_NOTE_SEPARATOR}{listed}"),
+            None => listed,
+        }
+    }
+}
+
+/// `1 note`, `3 notes`. Small enough to inline everywhere it is needed, and
+/// wrong often enough when it is.
+fn counted(count: usize, noun: &str) -> String {
+    match count {
+        1 => format!("{count} {noun}"),
+        _ => format!("{count} {noun}s"),
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum IndexOutput {
@@ -748,6 +988,10 @@ pub enum ToolOutput {
         capped: Option<SearchCap>,
     },
     Index(IndexOutput),
+    /// What a memory browse found. Carried structurally rather than as the
+    /// markdown it used to be, so a card can tell one note from the next and a
+    /// collapsed one can still say which notes came back.
+    Memory(MemoryOutput),
     /// A code-graph answer: a headline, ranked or reached rows, an optional
     /// body, and the footer describing the graph they came from.
     ///
@@ -895,6 +1139,7 @@ impl ToolOutput {
             } else {
                 format!("{total_count} entries")
             }),
+            Self::Memory(output) => Some(output.annotation()),
             Self::Shell(output) => Some(if output.timed_out {
                 "timed out".into()
             } else if output.output_limit_exceeded {
@@ -982,6 +1227,7 @@ impl ToolOutput {
             | Self::WriteCode { .. }
             | Self::GrepResult { .. }
             | Self::Index(_)
+            | Self::Memory(_)
             | Self::CodeGraph { .. }
             | Self::Shell(_)
             | Self::TodoList(_)
@@ -998,6 +1244,7 @@ impl ToolOutput {
             Self::Index(IndexOutput::File { skeleton, .. }) => skeleton.is_empty(),
             Self::Index(IndexOutput::Directory { listing, .. }) => listing.is_empty(),
             Self::Shell(output) => output.stdout.is_empty() && output.stderr.is_empty(),
+            Self::Memory(output) => output.is_empty(),
             Self::Plain(t) | Self::Markdown(t) | Self::ReadDir(t) => t.text.is_empty(),
             _ => false,
         }
@@ -1094,6 +1341,7 @@ impl ToolOutput {
             }
             Self::Index(IndexOutput::File { skeleton, .. }) => skeleton.clone(),
             Self::Index(IndexOutput::Directory { listing, .. }) => listing.clone(),
+            Self::Memory(output) => output.as_display_text(),
             Self::Shell(output) => output.raw_text(),
             Self::ReadCode {
                 start_line,
@@ -2420,6 +2668,139 @@ mod tests {
 
         assert_eq!(output.as_text(), ENVIRONMENT_TEXT);
         assert_eq!(output.annotation().as_deref(), Some(ENVIRONMENT_HEADLINE));
+    }
+
+    const MEMORY_DIRECTORY: &str = "/notes";
+    const MEMORY_BODY: &str = "the body";
+    const MEMORY_TAG: &str = "workcell";
+
+    fn memory_note(name: &str, tokens: u32) -> MemoryNote {
+        MemoryNote {
+            name: name.to_owned(),
+            tokens,
+            tags: Vec::from([MEMORY_TAG.to_owned()]),
+            origin: MemoryOrigin::File {
+                path: format!("{MEMORY_DIRECTORY}/{name}"),
+            },
+            body: MEMORY_BODY.to_owned(),
+        }
+    }
+
+    /// Lines are what a markdown blob could count, and they said nothing about
+    /// a browse. Notes and what they cost are what a reader is deciding on.
+    #[test]
+    fn a_read_annotates_itself_with_notes_and_what_they_cost() {
+        let output = ToolOutput::Memory(MemoryOutput::Notes {
+            directory: Some(MEMORY_DIRECTORY.into()),
+            notes: Vec::from([memory_note("a.md", 400), memory_note("b.md", 600)]),
+            notices: Vec::new(),
+        });
+
+        assert_eq!(
+            output.annotation().as_deref(),
+            Some(format!("2 notes{CARD_ANNOTATION_SEPARATOR}{}", token_label(1_000)).as_str())
+        );
+    }
+
+    /// A note filed under three tags is listed three times and is still one
+    /// note, so the count a reader is given is of notes rather than of rows.
+    #[test]
+    fn a_list_annotates_distinct_notes_rather_than_filings() {
+        let entry = MemoryNoteEntry {
+            name: "a.md".into(),
+            tokens: 1,
+            origin: MemoryOrigin::File {
+                path: format!("{MEMORY_DIRECTORY}/a.md"),
+            },
+        };
+        let output = ToolOutput::Memory(MemoryOutput::Index {
+            directory: Some(MEMORY_DIRECTORY.into()),
+            groups: Vec::from([
+                MemoryTagGroup {
+                    tag: MEMORY_TAG.into(),
+                    notes: Vec::from([entry.clone()]),
+                },
+                MemoryTagGroup {
+                    tag: "ui".into(),
+                    notes: Vec::from([entry]),
+                },
+            ]),
+            notices: Vec::new(),
+        });
+
+        assert_eq!(
+            output.annotation().as_deref(),
+            Some(format!("1 note{CARD_ANNOTATION_SEPARATOR}2 tags").as_str())
+        );
+    }
+
+    /// The directory leads, because it is how the model reaches a note with
+    /// `file_edit`, and a notice qualifies what follows it rather than trailing
+    /// the note it was about.
+    #[test]
+    fn a_browse_renders_as_the_one_text_both_sides_read() {
+        const NOTICE: &str = "warning: unreadable memory files: c.md";
+        let output = ToolOutput::Memory(MemoryOutput::Notes {
+            directory: Some(MEMORY_DIRECTORY.into()),
+            notes: Vec::from([memory_note("a.md", 1)]),
+            notices: Vec::from([NOTICE.to_owned()]),
+        });
+
+        assert_eq!(
+            output.as_text(),
+            format!(
+                "{MEMORY_DIRECTORY_LABEL}{MEMORY_DIRECTORY}\n\n\
+                 {NOTICE}\n\n\
+                 a.md ({}) [{MEMORY_TAG}]\n\n{MEMORY_BODY}",
+                token_label(1)
+            )
+        );
+    }
+
+    /// A card is rebuilt from the stored output when a session reopens, so the
+    /// structure has to survive the store rather than the text it replaced.
+    #[test]
+    fn a_browse_survives_being_stored_and_reopened() {
+        let output = ToolOutput::Memory(MemoryOutput::Notes {
+            directory: Some(MEMORY_DIRECTORY.into()),
+            notes: Vec::from([memory_note("a.md", 1)]),
+            notices: Vec::new(),
+        });
+
+        let stored = serde_json::to_string(&output).expect("a browse serializes");
+        let restored: ToolOutput = serde_json::from_str(&stored).expect("and loads back");
+
+        assert_eq!(restored.as_text(), output.as_text());
+        assert_eq!(restored.annotation(), output.annotation());
+    }
+
+    /// A remote note has no path to name, so the reference and revision that
+    /// reach it take that place and must survive into the text.
+    #[test]
+    fn a_remote_note_carries_the_locator_that_reaches_it() {
+        const REFERENCE: &str = "memory-aaaa";
+        const REVISION: &str = "bbbb";
+        let output = ToolOutput::Memory(MemoryOutput::Notes {
+            directory: None,
+            notes: Vec::from([MemoryNote {
+                origin: MemoryOrigin::Document {
+                    reference: REFERENCE.into(),
+                    revision: REVISION.into(),
+                },
+                ..memory_note("a.md", 1)
+            }]),
+            notices: Vec::new(),
+        });
+
+        assert_eq!(
+            output.as_text(),
+            format!(
+                "a.md ({}) [{MEMORY_TAG}]\n\
+                 {MEMORY_REFERENCE_LABEL}{REFERENCE}\n\
+                 {MEMORY_REVISION_LABEL}{REVISION}\n\n{MEMORY_BODY}",
+                token_label(1)
+            )
+        );
     }
 
     #[test]

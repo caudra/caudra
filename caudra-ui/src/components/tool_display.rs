@@ -993,6 +993,9 @@ impl HighlightRequest {
             | ToolOutput::Answers(_)
             | ToolOutput::Shell(_)
             | ToolOutput::Environment { .. }
+            // A note is markdown, and the renderer that paints it already
+            // highlights the fences inside it.
+            | ToolOutput::Memory(_)
             | ToolOutput::WorkflowRun(_)
             | ToolOutput::Image { .. } => None,
             // Children carry their own code and diffs, so a batch reaches the
@@ -2844,6 +2847,45 @@ mod tests {
                 None
             ),
             None
+        );
+    }
+
+    const NOTE_ONCE_MSG: &str = "a note is drawn from its structure, and only from it";
+
+    /// A browse used to settle as `ToolOutput::Markdown`, which put its text
+    /// into the card's own `msg.text` as well. Drawing the structure while
+    /// that text was still there would draw every note twice.
+    #[test]
+    fn a_settled_note_is_drawn_once() {
+        const NOTE_TEXT: &str = "the one body";
+        let mut msg = memory_msg(&format!("read {MEMORY_NOTE}"), None, ToolStatus::Success);
+        msg.tool_output = Some(Arc::new(ToolOutput::Memory(
+            caudra_agent::MemoryOutput::Notes {
+                directory: None,
+                notes: Vec::from([caudra_agent::MemoryNote {
+                    name: MEMORY_NOTE.into(),
+                    tokens: 1,
+                    tags: Vec::new(),
+                    origin: caudra_agent::MemoryOrigin::File {
+                        path: format!("/notes/{MEMORY_NOTE}"),
+                    },
+                    body: NOTE_TEXT.into(),
+                }]),
+                notices: Vec::new(),
+            },
+        )));
+
+        let text = open_card(&msg, ToolStatus::Success);
+
+        assert_eq!(
+            text.matches(NOTE_TEXT).count(),
+            1,
+            "{NOTE_ONCE_MSG}: {text}"
+        );
+        assert_eq!(
+            text.matches(MEMORY_NOTE).count(),
+            2,
+            "the header names it, and so does its own row: {text}"
         );
     }
 

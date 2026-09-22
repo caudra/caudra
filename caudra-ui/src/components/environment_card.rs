@@ -11,7 +11,7 @@ use caudra_agent::{
 use ratatui::text::{Line, Span};
 use unicode_width::UnicodeWidthStr;
 
-use crate::components::code_view::{truncation_line, within};
+use crate::components::code_view::{body_window, truncation_line};
 use crate::components::escape_terminal_controls;
 use crate::theme;
 
@@ -88,16 +88,6 @@ pub(crate) fn render(
         lines.push(truncation_line(hidden));
     }
     (lines, hidden > 0)
-}
-
-/// How much of the body fits, given that the notice about the rest costs a row
-/// of its own.
-fn body_window(total: usize, room: usize) -> (usize, usize) {
-    let (shown, hidden) = within(total, room);
-    if hidden == 0 {
-        return (shown, hidden);
-    }
-    within(total, room.saturating_sub(1))
 }
 
 /// The label leads its first row; the rows under it line up beneath the value.

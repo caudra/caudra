@@ -9,7 +9,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use caudra_providers::{estimate_tokens, token_label};
+use caudra_providers::estimate_tokens;
 
 pub const MAX_TAGS: usize = 50;
 pub const MAX_FILE_BYTES: usize = 20 * 1024;
@@ -156,7 +156,7 @@ pub fn parse_frontmatter(content: &str) -> (Option<serde_yaml::Value>, &str) {
     (serde_yaml::from_str(&rest[..end]).ok(), body.trim_end())
 }
 
-fn tags_from_frontmatter(frontmatter: Option<&serde_yaml::Value>) -> Option<Vec<String>> {
+pub fn tags_from_frontmatter(frontmatter: Option<&serde_yaml::Value>) -> Option<Vec<String>> {
     let raw = frontmatter?.get("tags")?;
     let listed = match raw {
         serde_yaml::Value::String(one) => vec![one.clone()],
@@ -309,35 +309,10 @@ pub fn encode_frontmatter(tags: &[String]) -> String {
     format!("---\n{yaml}---\n")
 }
 
-/// Counts the body rather than the file: frontmatter is stripped here and never
-/// reaches the model, so charging the reader for it would overstate every
-/// tagged note.
-pub fn format_entry(name: &str, content: &str) -> String {
-    let (frontmatter, body) = parse_frontmatter(content);
-    let tags = tags_from_frontmatter(frontmatter.as_ref()).unwrap_or_default();
-    let suffix = if tags.is_empty() {
-        String::new()
-    } else {
-        format!(" [{}]", tags.join(", "))
-    };
-    format!(
-        "{name} ({}){suffix}\n\n{body}",
-        token_label(estimate_tokens(body))
-    )
-}
-
-pub fn join_parts(separator: &str, parts: &[Option<String>]) -> String {
-    parts
-        .iter()
-        .flatten()
-        .map(String::as_str)
-        .collect::<Vec<_>>()
-        .join(separator)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use caudra_providers::token_label;
     use test_case::test_case;
 
     #[test_case("Architecture", "architecture" ; "lowercased")]
@@ -564,34 +539,6 @@ mod tests {
     fn an_oversized_write_is_refused_before_it_reaches_disk() {
         assert!(write_size_error(&"x".repeat(MAX_FILE_BYTES + 1)).is_some());
         assert!(write_size_error(&"x".repeat(MAX_FILE_BYTES)).is_none());
-    }
-
-    #[test]
-    fn a_formatted_entry_leads_with_its_name_token_count_and_tags() {
-        let entry = format_entry("a.md", "---\ntags: [arch]\n---\nbody");
-        assert_eq!(entry, format!("a.md ({}) [arch]\n\nbody", token_label(1)));
-    }
-
-    #[test]
-    fn an_untagged_entry_omits_the_bracket() {
-        assert_eq!(
-            format_entry("a.md", "body"),
-            format!("a.md ({})\n\nbody", token_label(1))
-        );
-    }
-
-    /// Frontmatter is stripped before the model sees the note, so a bulky
-    /// header must not inflate the advertised cost of a small body.
-    #[test]
-    fn a_formatted_entry_counts_the_body_without_the_frontmatter() {
-        let tags: Vec<String> = (0..40).map(|i| format!("tag_number_{i}")).collect();
-        let content = format!("{}body", encode_frontmatter(&tags));
-        assert!(content.len() > 400, "frontmatter should dwarf the body");
-        assert_eq!(estimate_tokens("body"), 1);
-        assert!(
-            format_entry("a.md", &content).contains(&format!("a.md ({})", token_label(1))),
-            "{content}"
-        );
     }
 
     #[test_case(0, "~0 tokens" ; "an_empty_note_reports_zero")]

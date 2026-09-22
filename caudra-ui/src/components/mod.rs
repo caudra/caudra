@@ -18,6 +18,7 @@ pub(crate) mod login_picker;
 pub(crate) mod logs_modal;
 pub(crate) mod lua_float;
 pub(crate) mod mcp_picker;
+pub(crate) mod memory_card;
 pub(crate) mod memory_picker;
 pub(crate) mod mention_popup;
 pub(crate) mod message_actions;

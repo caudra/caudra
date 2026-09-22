@@ -695,6 +695,12 @@ impl App {
                                 return Vec::new();
                             }
                             if self.active_chat == 0
+                                && let Some(path) = self.chats[0].memory_hit_at(event.row, area)
+                            {
+                                self.open_workbench_file(&path, None);
+                                return Vec::new();
+                            }
+                            if self.active_chat == 0
                                 && let Some(task_id) = self.task_id_at(event.row, area)
                                 && self.focus_task(&task_id).is_ok()
                             {
