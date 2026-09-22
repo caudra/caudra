@@ -575,6 +575,7 @@ mod tests {
     const PERMISSION_TIMEOUT: Duration = Duration::from_secs(10);
     const DOTENV_KEY: &str = "CAUDRA_TRANSFER_TEST_NO_DOTENV";
     const PRIVATE_MODE: u32 = 0o700;
+    const SANDBOXES: &str = "sandboxes.toml";
     static TRANSFER_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     const CREATE_NAME: &str = "reviewed-create";
@@ -616,7 +617,7 @@ mod tests {
 
     #[test_case(PrivateFileError::DurabilityUnknown, true; "published_but_not_durable")]
     #[test_case(PrivateFileError::Busy, false; "prepublication_lock_failure")]
-    #[test_case(PrivateFileError::Permissions, false; "prepublication_permission_failure")]
+    #[test_case(PrivateFileError::Permissions { path: SANDBOXES.into(), mode: PRIVATE_MODE }, false; "prepublication_permission_failure")]
     fn network_save_failure_preserves_uncertain_publication_through_manager_close(
         error: PrivateFileError,
         published: bool,

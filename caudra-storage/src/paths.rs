@@ -10,6 +10,7 @@ use etcetera::base_strategy::BaseStrategy;
 
 const NAMESPACE_ENV: &str = "CAUDRA_NAMESPACE";
 const DIRECTORY_MODE: u32 = 0o700;
+const GROUP_OTHER_WRITE: u32 = 0o022;
 
 /// Debug builds get their own directory so a development run never shares
 /// config, sessions, auth, logs, or caches with an installed release.
@@ -273,9 +274,17 @@ pub fn check_namespace_override() -> Result<(), NamespaceError> {
     }
 }
 
+/// Parents belong to the platform and keep whatever mode it gives them; the
+/// directory Caudra owns is created owner-only so that what lands on disk does
+/// not depend on the umask of whichever run happened to create it first.
+/// [`PrivateFile`](crate::private_file::PrivateFile) refuses to read through a
+/// group-writable ancestor, so a permissive umask here makes config, auth, and
+/// sandbox state unreadable.
 fn ensure(path: &Path) -> Result<PathBuf, std::io::Error> {
-    fs::create_dir_all(path)?;
-    Ok(path.to_path_buf())
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    ensure_private_dir(path)
 }
 
 /// Create one owner-only directory, refusing to accept an entry somebody else
@@ -285,8 +294,8 @@ fn ensure(path: &Path) -> Result<PathBuf, std::io::Error> {
 /// directory under a predictable name, `TMPDIR` aims every child process at it,
 /// and permission policy pre-allows writes below it. A local user who wins the
 /// race and leaves a symlink behind would redirect all three. `create_dir_all`
-/// follows such a link without complaint, so the scratch levels are created one
-/// at a time through this instead.
+/// follows such a link without complaint, so every directory Caudra owns is
+/// created one at a time through this instead.
 pub(crate) fn ensure_private_dir(path: &Path) -> Result<PathBuf, std::io::Error> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
@@ -306,10 +315,76 @@ pub(crate) fn ensure_private_dir(path: &Path) -> Result<PathBuf, std::io::Error>
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
-            format!("refusing scratch access through {}", path.display()),
+            format!("refusing to use {} as a private directory", path.display()),
         ));
     }
     Ok(path.to_path_buf())
+}
+
+/// Repair the directories Caudra created for itself before it guaranteed their
+/// mode, returning the ones actually changed so startup can say so.
+///
+/// Only Caudra's own directories are touched. An ancestor such as `~/.config`
+/// is shared with every other application and its mode is not ours to decide,
+/// and a directory owned by somebody else is a refusal to report rather than a
+/// permission to change. Duplicates need no filtering: a path repaired once is
+/// already owner-only when it is reached again as another role.
+pub fn tighten_private_dirs() -> Vec<PathBuf> {
+    let Ok(paths) = resolve() else {
+        return Vec::new();
+    };
+    [
+        &paths.config,
+        &paths.data,
+        &paths.state,
+        &paths.logs,
+        &paths.cache,
+    ]
+    .into_iter()
+    .filter(|path| tighten_private_dir(path))
+    .cloned()
+    .collect()
+}
+
+#[cfg(unix)]
+fn tighten_private_dir(path: &Path) -> bool {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let Ok(metadata) = fs::symlink_metadata(path) else {
+        return false;
+    };
+    let mode = metadata.mode() & 0o777;
+    if !metadata.is_dir()
+        || metadata.uid() != rustix::process::geteuid().as_raw()
+        || mode & GROUP_OTHER_WRITE == 0
+    {
+        return false;
+    }
+    match fs::set_permissions(path, fs::Permissions::from_mode(DIRECTORY_MODE)) {
+        Ok(()) => {
+            tracing::warn!(
+                path = %path.display(),
+                previous_mode = format!("{mode:o}"),
+                mode = format!("{DIRECTORY_MODE:o}"),
+                "tightened a group-writable Caudra directory to owner-only"
+            );
+            true
+        }
+        Err(error) => {
+            tracing::warn!(
+                path = %path.display(),
+                previous_mode = format!("{mode:o}"),
+                %error,
+                "cannot tighten a group-writable Caudra directory; private files under it stay unreadable"
+            );
+            false
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn tighten_private_dir(_path: &Path) -> bool {
+    false
 }
 
 fn active_path(field: fn(&Paths) -> &Path) -> Result<PathBuf, std::io::Error> {
@@ -387,6 +462,10 @@ mod tests {
     use test_case::test_case;
 
     use super::*;
+
+    const MODE_MASK: u32 = 0o777;
+    const SHARED_MODE: u32 = 0o755;
+    const GROUP_WRITABLE_MODE: u32 = 0o775;
 
     struct TestStrategy {
         home: PathBuf,
@@ -485,8 +564,92 @@ mod tests {
         let created = ensure_private_dir(&dir).unwrap();
         let mode = std::fs::metadata(&created).unwrap().permissions().mode();
 
-        assert_eq!(mode & 0o777, DIRECTORY_MODE);
+        assert_eq!(mode & MODE_MASK, DIRECTORY_MODE);
         assert_eq!(ensure_private_dir(&dir).unwrap(), created);
+    }
+
+    /// The parent is somebody else's directory — `~/.config` is shared with
+    /// every other application — so creating ours must not restyle it, while
+    /// ours lands owner-only whatever umask the run happened to have.
+    #[test]
+    #[cfg(unix)]
+    fn ensure_creates_the_parent_without_deciding_its_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let parent = root.path().join("config");
+        let ours = parent.join(APP_DIR_NAME);
+        fs::create_dir(&parent).unwrap();
+        fs::set_permissions(&parent, fs::Permissions::from_mode(SHARED_MODE)).unwrap();
+
+        let created = ensure(&ours).unwrap();
+
+        assert_eq!(mode_of(&created), DIRECTORY_MODE);
+        assert_eq!(mode_of(&parent), SHARED_MODE);
+    }
+
+    #[cfg(unix)]
+    fn mode_of(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+
+        fs::metadata(path).unwrap().permissions().mode() & MODE_MASK
+    }
+
+    #[cfg(unix)]
+    #[test_case(0o775 ; "group writable")]
+    #[test_case(0o777 ; "world writable")]
+    #[test_case(0o702 ; "other write only")]
+    fn a_writable_directory_is_repaired_without_touching_its_parent(mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let parent = root.path().join("config");
+        let ours = parent.join(APP_DIR_NAME);
+        fs::create_dir_all(&ours).unwrap();
+        fs::set_permissions(&parent, fs::Permissions::from_mode(SHARED_MODE)).unwrap();
+        fs::set_permissions(&ours, fs::Permissions::from_mode(mode)).unwrap();
+
+        assert!(tighten_private_dir(&ours));
+
+        assert_eq!(mode_of(&ours), DIRECTORY_MODE);
+        assert_eq!(mode_of(&parent), SHARED_MODE);
+    }
+
+    /// Only write is rejected, so a group-readable directory is sound and stays
+    /// as the user left it. Tightening it would be a preference, not a repair.
+    #[cfg(unix)]
+    #[test_case(DIRECTORY_MODE ; "already owner only")]
+    #[test_case(0o750 ; "group readable but not writable")]
+    fn a_sound_directory_is_left_as_the_user_left_it(mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join(APP_DIR_NAME);
+        fs::create_dir(&dir).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(mode)).unwrap();
+
+        assert!(!tighten_private_dir(&dir));
+        assert_eq!(mode_of(&dir), mode);
+    }
+
+    /// A symlink is [`ensure_private_dir`]'s refusal to report rather than a
+    /// mode to repair, and chasing it would tighten a directory Caudra does not
+    /// own. An absent directory is created owner-only, never chmodded.
+    #[test]
+    #[cfg(unix)]
+    fn a_planted_symlink_and_an_absent_directory_are_not_repaired() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let elsewhere = root.path().join("elsewhere");
+        let planted = root.path().join("planted");
+        fs::create_dir(&elsewhere).unwrap();
+        fs::set_permissions(&elsewhere, fs::Permissions::from_mode(GROUP_WRITABLE_MODE)).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &planted).unwrap();
+
+        assert!(!tighten_private_dir(&planted));
+        assert!(!tighten_private_dir(&root.path().join("absent")));
+        assert_eq!(mode_of(&elsewhere), GROUP_WRITABLE_MODE);
     }
 
     #[test]

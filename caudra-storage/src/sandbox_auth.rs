@@ -276,6 +276,7 @@ mod tests {
         const NAME: &str = "local";
         const OWNER_MODE: u32 = 0o600;
         const DIRECTORY_MODE: u32 = 0o700;
+        const GROUP_READABLE_MODE: u32 = 0o644;
 
         fn tempdir() -> io::Result<TempDir> {
             Builder::new()
@@ -361,15 +362,18 @@ mod tests {
             let key = SandboxApiKey::new(CANARY.into()).unwrap();
             save_sandbox_api_key(&dir, &reference, &key).unwrap();
             let file = credential_file(&dir, &reference).unwrap();
-            fs::set_permissions(file.path(), Permissions::from_mode(0o644)).unwrap();
-            assert!(matches!(
-                load_sandbox_api_key(&dir, &reference),
-                Err(SandboxCredentialError::File(PrivateFileError::Permissions))
-            ));
+            fs::set_permissions(file.path(), Permissions::from_mode(GROUP_READABLE_MODE)).unwrap();
+            let refused = || {
+                SandboxCredentialError::File(PrivateFileError::Permissions {
+                    path: file.path().to_path_buf(),
+                    mode: GROUP_READABLE_MODE,
+                })
+            };
             assert_eq!(
-                save_sandbox_api_key(&dir, &reference, &key),
-                Err(SandboxCredentialError::File(PrivateFileError::Permissions))
+                load_sandbox_api_key(&dir, &reference).err(),
+                Some(refused())
             );
+            assert_eq!(save_sandbox_api_key(&dir, &reference, &key), Err(refused()));
             fs::remove_file(file.path()).unwrap();
             symlink(temp.path().join("absent"), file.path()).unwrap();
             assert_eq!(

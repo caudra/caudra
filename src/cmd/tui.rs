@@ -52,6 +52,8 @@ use crate::setup;
 
 const FALLBACK_MODEL_SPEC: &str = "anthropic/claude-sonnet-4-20250514";
 const CONFIG_FALLBACK_WARNING: &str = "config reload failed, using previous config";
+const TIGHTENED_DIRS_WARNING: &str =
+    "Caudra directories were group- or world-writable and have been set to owner-only";
 const MODEL_FALLBACK_WARNING: &str = "model resolution failed, keeping previous model";
 /// The first sweep waits for startup and the first prompt to settle.
 const SWEEP_STARTUP_DELAY: Duration = Duration::from_secs(60);
@@ -1213,7 +1215,7 @@ fn after_runtime_release<T, U>(
     operation()
 }
 
-pub fn run(mut cli: Cli) -> Result<ExitCode> {
+pub fn run(mut cli: Cli, tightened: Vec<PathBuf>) -> Result<ExitCode> {
     // Every phase up to `init_logging` runs without a subscriber, so its cost is
     // invisible unless it is measured here and reported once the sink exists.
     let started = Instant::now();
@@ -1389,6 +1391,16 @@ pub fn run(mut cli: Cli) -> Result<ExitCode> {
     let mut tabs = resolved.tabs;
     let mut focused = resolved.focused;
     let mut warnings = resolved.warnings;
+    if !tightened.is_empty() {
+        warnings.push(format!(
+            "{TIGHTENED_DIRS_WARNING}: {}",
+            tightened
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
     let mut teardown = Teardown::default();
     let mut herdr_reporter = HerdrReporter::from_env();
     let mut sweeper = RetentionSweeper::spawn(storage.clone(), stack.config.storage.retention);

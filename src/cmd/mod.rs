@@ -159,6 +159,9 @@ fn redirect_temp_dir() {
 
 pub fn dispatch(mut cli: Cli) -> Result<ExitCode> {
     caudra_storage::paths::check_namespace_override()?;
+    // Before anything opens a private file through one of these directories,
+    // and before the scratch redirect creates any more of them.
+    let tightened = caudra_storage::paths::tighten_private_dirs();
     redirect_temp_dir();
     match cli.command.take() {
         Some(Command::Sandbox { action }) => {
@@ -298,7 +301,7 @@ pub fn dispatch(mut cli: Cli) -> Result<ExitCode> {
                 &cli.workcell,
             )?;
         }
-        None => return tui::run(cli),
+        None => return tui::run(cli, tightened),
     }
     Ok(ExitCode::SUCCESS)
 }

@@ -216,6 +216,9 @@ mod tests {
 
     const FILE_MODE: u32 = 0o600;
     const DIRECTORY_MODE: u32 = 0o700;
+    const GROUP_READABLE_MODE: u32 = 0o644;
+    const GROUP_WRITABLE_MODE: u32 = 0o775;
+    const CONFIG_DIR: &str = "caudra";
     const GLOBAL_PATH_TEST: &str = "CAUDRA_SANDBOX_GLOBAL_PATH_TEST";
     const GLOBAL_PATH_TEST_NAME: &str = "sandbox::persistence::tests::user_global_load_is_inert";
     const CHANGED_COMMENT: &str = "# external edit\n";
@@ -232,6 +235,31 @@ mod tests {
         let path = directory.join(SANDBOX_FILE);
         fs::write(&path, text).unwrap();
         fs::set_permissions(path, Permissions::from_mode(FILE_MODE)).unwrap();
+    }
+
+    /// The reported failure. A `sandboxes.toml` copied in with exactly the
+    /// right mode is still unreadable when the directory holding it was created
+    /// under a permissive umask, so the refusal has to name the directory rather
+    /// than send the user looking at the file.
+    #[test]
+    fn a_group_writable_config_directory_refuses_an_owner_only_file() {
+        let temp = tempdir().unwrap();
+        let directory = temp.path().join(CONFIG_DIR);
+        fs::create_dir(&directory).unwrap();
+        fs::set_permissions(&directory, Permissions::from_mode(GROUP_WRITABLE_MODE)).unwrap();
+        write(&directory, SAMPLE);
+        let store = SandboxStore::from_config_dir(&directory).unwrap();
+
+        assert_eq!(
+            store.load().unwrap_err(),
+            SandboxStoreError::File(PrivateFileError::DirectoryPermissions {
+                path: directory.clone(),
+                mode: GROUP_WRITABLE_MODE,
+            })
+        );
+
+        fs::set_permissions(&directory, Permissions::from_mode(DIRECTORY_MODE)).unwrap();
+        store.load().unwrap();
     }
 
     #[test]
@@ -430,12 +458,15 @@ mod tests {
         write(temp.path(), SAMPLE);
         fs::set_permissions(
             temp.path().join(SANDBOX_FILE),
-            Permissions::from_mode(0o644),
+            Permissions::from_mode(GROUP_READABLE_MODE),
         )
         .unwrap();
         assert_eq!(
             store.load().unwrap_err(),
-            SandboxStoreError::File(PrivateFileError::Permissions)
+            SandboxStoreError::File(PrivateFileError::Permissions {
+                path: temp.path().join(SANDBOX_FILE),
+                mode: GROUP_READABLE_MODE,
+            })
         );
         write(temp.path(), &"x".repeat(MAX_SANDBOX_FILE_BYTES + 1));
         assert_eq!(

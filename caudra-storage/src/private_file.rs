@@ -27,10 +27,10 @@ pub enum PrivateFileError {
     UnsafePath,
     #[error("private file must be a regular, singly linked file")]
     NotRegular,
-    #[error("private file must be owner-only and owned by the current user")]
-    Permissions,
-    #[error("private file directory has unsafe ownership or permissions")]
-    DirectoryPermissions,
+    #[error("private file {0} must be owner-only and owned by the current user (mode {1:o}); try: chmod 600 {0}", .path.display(), .mode)]
+    Permissions { path: PathBuf, mode: u32 },
+    #[error("private file directory {0} must be owner-only (mode {1:o}); try: chmod 700 {0}", .path.display(), .mode)]
+    DirectoryPermissions { path: PathBuf, mode: u32 },
     #[error("private file exceeds its size limit")]
     TooLarge,
     #[error("private file changed since it was loaded; reload or save as a new name")]
@@ -157,13 +157,14 @@ mod unix {
     use std::fs::{File, Metadata};
     use std::io::{Read, Write};
     use std::os::unix::fs::MetadataExt;
-    use std::path::{Component, Path};
+    use std::path::{Component, Path, PathBuf};
 
     const FILE_MODE: u32 = 0o600;
     const DIRECTORY_MODE: u32 = 0o700;
     const OTHER_ACCESS: u32 = 0o077;
     const OTHER_WRITE: u32 = 0o022;
     const STICKY: u32 = 0o1000;
+    const MODE_MASK: u32 = 0o777;
     const DIRECTORY_FLAGS: OFlags = OFlags::RDONLY
         .union(OFlags::DIRECTORY)
         .union(OFlags::NOFOLLOW)
@@ -172,8 +173,11 @@ mod unix {
         .union(OFlags::NONBLOCK)
         .union(OFlags::CLOEXEC);
 
+    /// `path` is the validated parent directory, kept so a refusal can name the
+    /// file it is about instead of leaving the caller to walk the tree by hand.
     pub(super) struct Directory {
         file: File,
+        path: PathBuf,
         name: OsString,
     }
 
@@ -184,27 +188,37 @@ mod unix {
         }
     }
 
-    fn validate_file(metadata: &Metadata) -> Result<(), PrivateFileError> {
+    fn validate_file(path: &Path, metadata: &Metadata) -> Result<(), PrivateFileError> {
         if !metadata.is_file() || metadata.nlink() != 1 {
             return Err(PrivateFileError::NotRegular);
         }
-        validate_file_owner(metadata.uid(), metadata.mode())
+        validate_file_owner(path, metadata.uid(), metadata.mode())
     }
 
-    pub(super) fn validate_file_owner(owner: u32, mode: u32) -> Result<(), PrivateFileError> {
+    pub(super) fn validate_file_owner(
+        path: &Path,
+        owner: u32,
+        mode: u32,
+    ) -> Result<(), PrivateFileError> {
         if owner != geteuid().as_raw() || mode & OTHER_ACCESS != 0 {
-            return Err(PrivateFileError::Permissions);
+            return Err(PrivateFileError::Permissions {
+                path: path.to_path_buf(),
+                mode: mode & MODE_MASK,
+            });
         }
         Ok(())
     }
 
-    fn validate_directory(file: &File, leaf: bool) -> Result<(), PrivateFileError> {
+    fn validate_directory(file: &File, path: &Path, leaf: bool) -> Result<(), PrivateFileError> {
         let metadata = file.metadata()?;
         let owner = metadata.uid();
         let trusted_owner = owner == geteuid().as_raw() || (!leaf && owner == 0);
         let trusted_sticky = !leaf && owner == 0 && metadata.mode() & STICKY != 0;
         if !trusted_owner || (metadata.mode() & OTHER_WRITE != 0 && !trusted_sticky) {
-            return Err(PrivateFileError::DirectoryPermissions);
+            return Err(PrivateFileError::DirectoryPermissions {
+                path: path.to_path_buf(),
+                mode: metadata.mode() & MODE_MASK,
+            });
         }
         Ok(())
     }
@@ -214,13 +228,14 @@ mod unix {
             let parent = path.parent().ok_or(PrivateFileError::UnsafePath)?;
             let mut directory =
                 File::from(fs::open("/", DIRECTORY_FLAGS, Mode::empty()).map_err(syscall)?);
+            let mut walked = PathBuf::from(Component::RootDir.as_os_str());
             for component in parent.components() {
                 let name = match component {
                     Component::RootDir => continue,
                     Component::Normal(name) => name,
                     _ => return Err(PrivateFileError::UnsafePath),
                 };
-                validate_directory(&directory, false)?;
+                validate_directory(&directory, &walked, false)?;
                 let child = match fs::openat(&directory, name, DIRECTORY_FLAGS, Mode::empty()) {
                     Ok(child) => child,
                     Err(Errno::NOENT) if create => {
@@ -236,10 +251,12 @@ mod unix {
                     Err(error) => return Err(syscall(error)),
                 };
                 directory = File::from(child);
+                walked.push(name);
             }
-            validate_directory(&directory, true)?;
+            validate_directory(&directory, &walked, true)?;
             Ok(Some(Self {
                 file: directory,
+                path: walked,
                 name: path.file_name().ok_or(PrivateFileError::UnsafePath)?.into(),
             }))
         }
@@ -255,7 +272,7 @@ mod unix {
                 Err(Errno::NOENT) => return Ok(None),
                 Err(error) => return Err(syscall(error)),
             };
-            validate_file(&file.metadata()?)?;
+            validate_file(&self.path.join(name), &file.metadata()?)?;
             Ok(Some(file))
         }
 
@@ -335,6 +352,7 @@ mod tests {
     use std::fs::{self, File, Permissions};
     use std::io::{self, Read};
     use std::os::unix::fs::{PermissionsExt, symlink};
+    use std::path::{Path, PathBuf};
     use std::sync::Barrier;
     use std::thread;
     use tempfile::{Builder, TempDir};
@@ -347,6 +365,7 @@ mod tests {
     const OWNER_MODE: u32 = 0o600;
     const MODE_MASK: u32 = 0o777;
     const DIRECTORY_MODE: u32 = 0o700;
+    const WORLD_WRITABLE_MODE: u32 = 0o777;
 
     fn tempdir() -> io::Result<TempDir> {
         Builder::new()
@@ -416,10 +435,14 @@ mod tests {
             .compare_exchange(&FileRevision::Missing, Some(ORIGINAL))
             .unwrap();
         fs::set_permissions(file.path(), Permissions::from_mode(mode)).unwrap();
-        assert_eq!(file.load().err(), Some(PrivateFileError::Permissions));
+        let refused = || PrivateFileError::Permissions {
+            path: file.path().to_path_buf(),
+            mode,
+        };
+        assert_eq!(file.load().err(), Some(refused()));
         assert_eq!(
             file.compare_exchange(&revision, Some(UPDATED)),
-            Err(PrivateFileError::Permissions)
+            Err(refused())
         );
         assert_eq!(fs::read(file.path()).unwrap(), ORIGINAL);
     }
@@ -477,17 +500,18 @@ mod tests {
         let temp = tempdir().unwrap();
         let directory = temp.path().join("directory");
         fs::create_dir(&directory).unwrap();
-        fs::set_permissions(&directory, Permissions::from_mode(0o777)).unwrap();
+        fs::set_permissions(&directory, Permissions::from_mode(WORLD_WRITABLE_MODE)).unwrap();
         let file = PrivateFile::new(directory.join(FILE_NAME), LIMIT).unwrap();
-        assert_eq!(
-            file.load().err(),
-            Some(PrivateFileError::DirectoryPermissions)
-        );
+        let refused = || PrivateFileError::DirectoryPermissions {
+            path: directory.clone(),
+            mode: WORLD_WRITABLE_MODE,
+        };
+        assert_eq!(file.load().err(), Some(refused()));
         assert_eq!(
             file.compare_exchange(&FileRevision::Missing, Some(UPDATED)),
-            Err(PrivateFileError::DirectoryPermissions)
+            Err(refused())
         );
-        fs::set_permissions(&directory, Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(&directory, Permissions::from_mode(DIRECTORY_MODE)).unwrap();
         let revision = file
             .compare_exchange(&FileRevision::Missing, Some(ORIGINAL))
             .unwrap();
@@ -518,8 +542,15 @@ mod tests {
     #[test]
     fn rejects_wrong_owner_even_with_private_mode() {
         assert_eq!(
-            unix::validate_file_owner(geteuid().as_raw().wrapping_add(1), OWNER_MODE),
-            Err(PrivateFileError::Permissions)
+            unix::validate_file_owner(
+                Path::new(FILE_NAME),
+                geteuid().as_raw().wrapping_add(1),
+                OWNER_MODE
+            ),
+            Err(PrivateFileError::Permissions {
+                path: PathBuf::from(FILE_NAME),
+                mode: OWNER_MODE,
+            })
         );
     }
 
