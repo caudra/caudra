@@ -976,7 +976,7 @@ impl WorkspaceTransferService for RemoteWorkcellClient {
             return Err(WorkspaceError::Unavailable);
         }
         let stage = &sealed.stage;
-        let _permit = self.reserve_preparation()?;
+        let _permit = self.reserve_preparation().await?;
         let wire = contract::TransferPrepareRequest {
             version: contract::ContractVersion::V1,
             binding: self.stage_selector(stage)?.binding,

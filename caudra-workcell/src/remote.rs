@@ -46,6 +46,7 @@ use caudra_workspace::{
     WorkspaceSnapshotReadService, WorkspaceToolService, WorkspaceWatchService, WriteContent,
 };
 use caudra_workspace::{PreparedTransferPublication, WorkspaceTransferService};
+use event_listener::{Event, EventListener};
 use flume::{Receiver, Sender};
 use futures_lite::future;
 use futures_lite::io::{AsyncReadExt, Cursor};
@@ -78,6 +79,10 @@ const CONNECTION_DISCONNECTED: u8 = 1;
 const CONNECTION_RECONNECTING: u8 = 2;
 const RESOURCE_NAMESPACE_VERSION: &str = "v1";
 const NO_SYMBOLIC_REASON: &str = "<none>";
+const RESERVATION_WAIT: Duration = Duration::from_secs(10);
+/// Caps a single park so a slot freed by the clock rather than by a release is
+/// still noticed: expiry notifies nobody.
+const RESERVATION_POLL: Duration = Duration::from_millis(250);
 const PATH_STYLE: &str = "root-relative-posix";
 const TOOL_MANIFEST_VERSION: &str = "v2";
 const JSON_SCHEMA_VERSION: &str = "http://json-schema.org/draft-07/schema#";
@@ -1407,13 +1412,29 @@ impl OperationRegistry {
             .retain(|_, operation| operation.persisted || operation.expires_at_unix_ms > now);
     }
 
-    fn reserve(&mut self) -> Result<(), WorkspaceError> {
+    fn reserve(&mut self) -> bool {
         self.expire_confirmed();
         if self.entries.len().saturating_add(self.pending) >= self.limit {
-            return Err(WorkspaceError::Conflict);
+            return false;
         }
         self.pending = self.pending.saturating_add(1);
-        Ok(())
+        true
+    }
+
+    /// Journal-backed entries a sweep may be able to reclaim. Expiry exempts
+    /// them because the journal, not the clock, decides when their operation
+    /// is over, so nothing else ever drops one.
+    fn settled_candidates(&self) -> Vec<OperationId> {
+        self.entries
+            .values()
+            .filter(|operation| operation.persisted)
+            .filter_map(|operation| {
+                operation
+                    .journal
+                    .as_ref()
+                    .map(|journal| journal.operation_id.clone())
+            })
+            .collect()
     }
 
     fn finish_reservation(&mut self) {
@@ -1484,6 +1505,7 @@ impl Drop for PreparationPermit {
         if let Ok(mut operations) = self.0.operations.lock() {
             operations.finish_reservation();
         }
+        self.0.operation_slots.notify(1);
     }
 }
 
@@ -1507,6 +1529,7 @@ struct RemoteInner {
     cursors: Mutex<CursorRegistry>,
     watches: Mutex<BoundedMap<WatchSubscriptionId, WatchRecord>>,
     operations: Mutex<OperationRegistry>,
+    operation_slots: Event,
     canonical_mutation_admission: Arc<AsyncMutex<()>>,
     mutation_journal: RemoteMutationJournal,
 }
@@ -1694,6 +1717,7 @@ impl RemoteWorkcellClient {
             }),
             watches: Mutex::new(BoundedMap::new(watch_limit, watch_ttl)),
             operations: Mutex::new(OperationRegistry::new(operation_limit)),
+            operation_slots: Event::new(),
             canonical_mutation_admission: Arc::new(AsyncMutex::new(())),
             mutation_journal,
         }));
@@ -1873,6 +1897,7 @@ impl RemoteWorkcellClient {
             .lock()
             .map_err(|_| RemoteWorkcellError::JournalUnavailable)?
             .remove_journal_operation(operation_id);
+        self.0.operation_slots.notify(1);
         Ok(())
     }
 
@@ -2363,13 +2388,83 @@ impl RemoteWorkcellClient {
             .map_err(|_| invalid_response())
     }
 
-    fn reserve_preparation(&self) -> Result<PreparationPermit, WorkspaceError> {
-        self.0
+    fn try_reserve_preparation(&self) -> Result<Option<PreparationPermit>, WorkspaceError> {
+        let reserved = self
+            .0
             .operations
             .lock()
             .map_err(|_| WorkspaceError::Unavailable)?
-            .reserve()?;
-        Ok(PreparationPermit(self.0.clone()))
+            .reserve();
+        Ok(reserved.then(|| PreparationPermit(self.0.clone())))
+    }
+
+    /// A persisted entry is exempt from expiry, and nothing reclaimed it when
+    /// its journal operation settled, so a slot could stay held for the life of
+    /// the process. Swept only under capacity pressure: while slots are free
+    /// the journal read costs more than the slot is worth.
+    ///
+    /// The operations lock is released before each journal read, because the
+    /// journal takes its own lock and the two must never nest.
+    fn reclaim_settled_operations(&self) -> Result<(), WorkspaceError> {
+        let candidates = self
+            .0
+            .operations
+            .lock()
+            .map_err(|_| WorkspaceError::Unavailable)?
+            .settled_candidates();
+        for operation_id in candidates {
+            if self.0.mutation_journal.contains(&operation_id)? {
+                continue;
+            }
+            self.0
+                .operations
+                .lock()
+                .map_err(|_| WorkspaceError::Unavailable)?
+                .remove_journal_operation(&operation_id);
+            self.0.operation_slots.notify(1);
+        }
+        Ok(())
+    }
+
+    /// Waits for a slot rather than refusing the moment the host's operation
+    /// limit is reached: a second concurrent tool call is normal, and failing
+    /// it outright made a limit the user never chose look like a conflict they
+    /// caused.
+    ///
+    /// The listener is registered before each retry, so a slot released between
+    /// the check and the park wakes this caller instead of being missed, and
+    /// waiters are woken in the order they arrived.
+    async fn reserve_preparation(&self) -> Result<PreparationPermit, WorkspaceError> {
+        if let Some(permit) = self.try_reserve_preparation()? {
+            return Ok(permit);
+        }
+        self.reclaim_settled_operations()?;
+        let deadline = Instant::now() + RESERVATION_WAIT;
+        loop {
+            let listener = self.0.operation_slots.listen();
+            if let Some(permit) = self.try_reserve_preparation()? {
+                return Ok(permit);
+            }
+            match park_for_slot(listener, &self.0.cancellation, deadline).await {
+                SlotWait::Retry => {}
+                SlotWait::Cancelled => return Err(WorkspaceError::Cancelled),
+                SlotWait::Exhausted => {
+                    warn!(
+                        limit = self.operation_limit(),
+                        waited_ms = RESERVATION_WAIT.as_millis(),
+                        "remote Workcell operation slots stayed exhausted for the whole wait"
+                    );
+                    return Err(WorkspaceError::Conflict);
+                }
+            }
+        }
+    }
+
+    fn operation_limit(&self) -> usize {
+        self.0
+            .operations
+            .lock()
+            .map_or(0, |operations| operations.limit)
     }
 
     fn request_limit(&self, method: &str) -> u64 {
@@ -2850,6 +2945,7 @@ impl RemoteWorkcellClient {
                 .lock()
                 .map_err(|_| WorkspaceError::Unavailable)?
                 .remove(&operation.preparation_id);
+            self.0.operation_slots.notify(1);
             self.release_confirmed_operation(
                 &operation.preparation_id,
                 &expected_operation.invocation_id,
@@ -2923,6 +3019,7 @@ impl RemoteWorkcellClient {
                 .lock()
                 .map_err(|_| WorkspaceError::Unavailable)?
                 .remove(&operation.preparation_id);
+            self.0.operation_slots.notify(1);
             self.release_confirmed_operation(
                 &operation.preparation_id,
                 &expected_operation.invocation_id,
@@ -2993,6 +3090,7 @@ impl RemoteWorkcellClient {
                 .lock()
                 .map_err(|_| WorkspaceError::Unavailable)?
                 .remove(&operation.preparation_id);
+            self.0.operation_slots.notify(1);
         }
         Ok(CancellationResult {
             state,
@@ -3042,6 +3140,7 @@ impl RemoteWorkcellClient {
                 .lock()
                 .map_err(|_| WorkspaceError::Unavailable)?
                 .remove(&operation.preparation_id);
+            self.0.operation_slots.notify(1);
         }
         Ok(ReleaseResult {
             state: operation_phase(response.state),
@@ -3681,7 +3780,7 @@ impl WorkspaceMutationService for RemoteWorkcellClient {
         if content_bytes > capability.max_content_bytes as usize {
             return Err(invalid_response());
         }
-        let preparation_permit = self.reserve_preparation()?;
+        let preparation_permit = self.reserve_preparation().await?;
         let response: contract::PrepareResponse = self
             .call(
                 contract::PREPARE_MUTATION_METHOD,
@@ -3782,7 +3881,7 @@ impl WorkspaceExecService for RemoteWorkcellClient {
         {
             return Err(invalid_response());
         }
-        let preparation_permit = self.reserve_preparation()?;
+        let preparation_permit = self.reserve_preparation().await?;
         let response: contract::PrepareResponse = self
             .call(
                 contract::PREPARE_EXEC_METHOD,
@@ -4006,7 +4105,7 @@ impl WorkspaceToolService for RemoteWorkcellClient {
         };
         wire.validate(max_arguments)
             .map_err(|_| invalid_response())?;
-        let _permit = self.reserve_preparation()?;
+        let _permit = self.reserve_preparation().await?;
         let response: contract::PrepareResponse = self
             .call(
                 contract::PREPARE_METHOD,
@@ -4441,7 +4540,7 @@ impl WorkspaceScmMutationService for RemoteWorkcellClient {
             return Err(invalid_response());
         }
         let wire_mutation = scm_mutation_contract(mutation)?;
-        let _permit = self.reserve_preparation()?;
+        let _permit = self.reserve_preparation().await?;
         let response: contract::ScmPrepareMutationResponse = self
             .call(
                 contract::SCM_PREPARE_MUTATION_METHOD,
@@ -4691,7 +4790,7 @@ impl WorkspaceSnapshotMutationService for RemoteWorkcellClient {
         snapshot_id: &SnapshotId,
     ) -> Result<PreparedSnapshotOperation, WorkspaceError> {
         self.require_capability(WorkspaceCapability::SnapshotPrepareRestore)?;
-        let _permit = self.reserve_preparation()?;
+        let _permit = self.reserve_preparation().await?;
         let response: contract::SnapshotPrepareRestoreResponse = self
             .call(
                 contract::SNAPSHOT_PREPARE_RESTORE_METHOD,
@@ -4733,7 +4832,7 @@ impl WorkspaceSnapshotMutationService for RemoteWorkcellClient {
         restore_id: &RestoreId,
     ) -> Result<PreparedSnapshotOperation, WorkspaceError> {
         self.require_capability(WorkspaceCapability::SnapshotPrepareUnrevert)?;
-        let _permit = self.reserve_preparation()?;
+        let _permit = self.reserve_preparation().await?;
         let response: contract::SnapshotPrepareRestoreResponse = self
             .call(
                 contract::SNAPSHOT_PREPARE_UNREVERT_METHOD,
@@ -4786,7 +4885,7 @@ impl WorkspaceSnapshotMutationService for RemoteWorkcellClient {
         if snapshot_ids.is_empty() || snapshot_ids.len() > limit {
             return Err(invalid_response());
         }
-        let _permit = self.reserve_preparation()?;
+        let _permit = self.reserve_preparation().await?;
         let response: contract::SnapshotPrepareCleanupResponse = self
             .call(
                 contract::SNAPSHOT_PREPARE_CLEANUP_METHOD,
@@ -5890,6 +5989,43 @@ fn validate_v1(version: contract::ContractVersion) -> Result<(), WorkspaceError>
     (version == contract::ContractVersion::V1)
         .then_some(())
         .ok_or_else(invalid_response)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SlotWait {
+    Retry,
+    Cancelled,
+    Exhausted,
+}
+
+/// Parks a caller waiting for an operation slot without holding the registry
+/// lock, so a release can actually happen while it waits. Returns as soon as a
+/// slot is released, the poll interval lapses, or the caller is cancelled.
+async fn park_for_slot(
+    listener: EventListener,
+    cancellation: &CancellationToken,
+    deadline: Instant,
+) -> SlotWait {
+    let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+        return SlotWait::Exhausted;
+    };
+    future::or(
+        async {
+            listener.await;
+            SlotWait::Retry
+        },
+        future::or(
+            async {
+                smol::Timer::after(remaining.min(RESERVATION_POLL)).await;
+                SlotWait::Retry
+            },
+            async {
+                cancellation.cancelled().await;
+                SlotWait::Cancelled
+            },
+        ),
+    )
+    .await
 }
 
 fn invalid_response() -> WorkspaceError {
@@ -8050,8 +8186,8 @@ mod tests {
         let invocation_id = OperationId::new("invocation").unwrap();
         let expires_at_unix_ms = 0;
         let mut registry = OperationRegistry::new(1);
-        registry.reserve().unwrap();
-        assert_eq!(registry.reserve(), Err(WorkspaceError::Conflict));
+        assert!(registry.reserve());
+        assert!(!registry.reserve());
         registry.finish_reservation();
         registry
             .insert(
@@ -8067,7 +8203,7 @@ mod tests {
                 },
             )
             .unwrap();
-        assert_eq!(registry.reserve(), Err(WorkspaceError::Conflict));
+        assert!(!registry.reserve());
         assert_eq!(registry.len(), 1);
         let handle = OperationHandle {
             preparation_id: preparation_id.clone(),
@@ -8077,7 +8213,57 @@ mod tests {
         };
         assert!(registry.get(&handle).is_ok());
         registry.remove(&preparation_id);
-        assert!(registry.reserve().is_ok());
+        assert!(registry.reserve());
+    }
+
+    /// Refusing the moment the host's limit is reached made a second
+    /// concurrent tool call look like a conflict the user caused, so a waiting
+    /// caller has to be woken by the release rather than left to time out.
+    #[test]
+    fn a_parked_reservation_wakes_when_a_slot_is_released() {
+        smol::block_on(async {
+            let slots = super::Event::new();
+            let listener = slots.listen();
+            slots.notify(1);
+
+            assert_eq!(
+                super::park_for_slot(listener, &CancellationToken::new(), far_deadline()).await,
+                super::SlotWait::Retry
+            );
+        });
+    }
+
+    #[test]
+    fn a_parked_reservation_gives_up_when_the_caller_is_cancelled() {
+        smol::block_on(async {
+            let slots = super::Event::new();
+            let listener = slots.listen();
+            let cancellation = CancellationToken::new();
+            cancellation.cancel();
+
+            assert_eq!(
+                super::park_for_slot(listener, &cancellation, far_deadline()).await,
+                super::SlotWait::Cancelled
+            );
+        });
+    }
+
+    #[test]
+    fn a_parked_reservation_reports_exhaustion_past_its_deadline() {
+        smol::block_on(async {
+            let slots = super::Event::new();
+            let listener = slots.listen();
+
+            assert_eq!(
+                super::park_for_slot(listener, &CancellationToken::new(), super::Instant::now())
+                    .await,
+                super::SlotWait::Exhausted
+            );
+        });
+    }
+
+    fn far_deadline() -> super::Instant {
+        super::Instant::now() + super::RESERVATION_WAIT
     }
 
     fn journal_operation(
@@ -8328,6 +8514,7 @@ mod tests {
             }),
             watches: Mutex::new(BoundedMap::new(CAPACITY, Duration::MAX)),
             operations: Mutex::new(operations),
+            operation_slots: super::Event::new(),
             canonical_mutation_admission: Arc::new(AsyncMutex::new(())),
             mutation_journal: coordinator,
         }));
@@ -8758,6 +8945,7 @@ mod tests {
             }),
             watches: Mutex::new(BoundedMap::new(8, Duration::MAX)),
             operations: Mutex::new(OperationRegistry::new(8)),
+            operation_slots: super::Event::new(),
             canonical_mutation_admission: Arc::new(AsyncMutex::new(())),
             mutation_journal: coordinator,
         }));

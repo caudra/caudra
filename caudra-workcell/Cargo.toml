@@ -14,6 +14,7 @@ caudra-config = { workspace = true }
 caudra-storage = { workspace = true }
 caudra-workspace = { workspace = true }
 async-trait = { workspace = true }
+event-listener = { workspace = true }
 futures-lite = { workspace = true }
 flume = { workspace = true }
 isahc = { workspace = true }
