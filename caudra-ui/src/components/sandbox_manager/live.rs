@@ -38,6 +38,12 @@ const LIVE_FIELD_ROWS: u16 = 6;
 const RECOVERY_REQUIRED: &str = "Pending or unknown outcome: Inspect / Reconcile first; acknowledging failure is separate from retrying.";
 const PERSISTENT_REQUIRED: &str =
     "Requires a persistent disk. Stop never silently deletes an ephemeral instance.";
+const LIVE_KEYS: &str = "Ctrl+Enter previews (does not execute). Esc goes back one level and keeps this draft; F6 discards it. Tab changes field; Alt+Home/End selects first/last field. Network F4 evaluates rules only.";
+const DRAFT_NEW: &str = "Live action draft.";
+const DRAFT_RESTORED: &str = "Retained action draft; nothing was submitted while it was set aside.";
+const DRAFT_KEPT: &str =
+    "Action draft kept; nothing submitted. Reopening the same action restores it.";
+const DRAFT_DISCARDED: &str = "Action draft discarded. No action submitted.";
 const PAUSE_REVIEW: &str = "PAUSE / STOP: stop execution, preserve the persistent disk. Memory/process state is not saved; Resume is a cold boot. The running lease ends; paused-disk retention still applies. When attached, save conversations and drain active work before detaching; the active TUI then closes.";
 const RESTART_REVIEW: &str = "RESTART: stop then cold boot the SAME persistent disk with the reviewed new lease. No delete or recreate. Memory/process state is lost. If stop or boot is uncertain, reconcile; never automatically retry. When attached, save conversations and drain active work before detaching. Only after verified success, reconstruct the verified sandbox runtime and restore the same saved conversations; never switch to a new local workspace.";
 const ACK_REVIEW: &str = "Acknowledge FAILURE only. No remote action or automatic resume/retry. Inspect / Reconcile first when possible; a later Resume requires a fresh, separate review. Attached sessions exit detached.";
@@ -104,6 +110,13 @@ pub(super) struct LiveForm {
     target: Option<SandboxInstanceSnapshot>,
     pub picker: Option<image::HostPicker>,
     pub probe: Option<ProbedImage>,
+    pub(super) origin: Option<usize>,
+}
+
+pub(super) struct RetainedLive {
+    view: SandboxView,
+    entry: String,
+    form: LiveForm,
 }
 
 impl LiveForm {
@@ -187,7 +200,6 @@ impl Manager {
                 self.status = reason;
                 return SandboxAction::None;
             }
-            self.instance_action = None;
             self.open_live(kind.clone())
         } else {
             self.instance_action = None;
@@ -243,6 +255,18 @@ impl Manager {
             .get(self.selected)
             .cloned()
             .unwrap_or_default();
+        let origin = self.instance_action.take();
+        let view = self.view.clone();
+        if let Some(retained) = self.retained_live.take_if(|retained| {
+            retained.form.kind == kind && retained.view == view && retained.entry == selected
+        }) {
+            self.live_form = Some(LiveForm {
+                origin,
+                ..retained.form
+            });
+            self.show_live(DRAFT_RESTORED);
+            return SandboxAction::None;
+        }
         let target = self
             .snapshot
             .as_ref()
@@ -394,18 +418,44 @@ impl Manager {
             target,
             picker: None,
             probe: None,
+            origin,
         });
+        self.show_live(DRAFT_NEW);
+        SandboxAction::None
+    }
+
+    fn show_live(&mut self, lead: &str) {
         self.detail_scroll = 0;
-        self.status = "Live action draft. Ctrl+Enter previews (does not execute). Esc closes and retains this draft; F6 explicitly discards it. Tab changes field; Alt+Home/End selects first/last field. Network F4 evaluates rules only.".into();
-        if self.live_form.as_ref().is_some_and(|form| {
+        self.status = if self.live_form.as_ref().is_some_and(|form| {
             matches!(
                 form.kind,
                 Kind::ImportImage | Kind::Build | Kind::Gc | Kind::InspectImage
             )
         }) {
-            self.status = image::ADMIN_NOTICE.into();
-        }
-        SandboxAction::None
+            image::ADMIN_NOTICE.into()
+        } else {
+            format!("{lead} {LIVE_KEYS}")
+        };
+    }
+
+    fn leave_live(&mut self, retain: bool) {
+        let Some(form) = self.live_form.take() else {
+            return;
+        };
+        self.instance_action = form.origin;
+        self.reveal_reference = true;
+        self.detail_scroll = 0;
+        let entry = self
+            .entries()
+            .get(self.selected)
+            .cloned()
+            .unwrap_or_default();
+        self.retained_live = retain.then(|| RetainedLive {
+            view: self.view.clone(),
+            entry,
+            form,
+        });
+        self.status = if retain { DRAFT_KEPT } else { DRAFT_DISCARDED }.into();
     }
 
     fn prepare_live(&self) -> Result<(LiveOperation, String), String> {
@@ -709,13 +759,8 @@ impl Manager {
             }
             return SandboxAction::None;
         }
-        if event.code == KeyCode::Esc {
-            self.open = false;
-            return SandboxAction::None;
-        }
-        if event.code == KeyCode::F(6) {
-            self.live_form = None;
-            self.status = "Action draft discarded. No action submitted.".into();
+        if matches!(event.code, KeyCode::Esc | KeyCode::F(6)) {
+            self.leave_live(event.code == KeyCode::Esc);
             return SandboxAction::None;
         }
         if event.code == KeyCode::Enter && event.modifiers.contains(KeyModifiers::CONTROL) {
@@ -892,7 +937,7 @@ impl Manager {
             return;
         }
         if form.fields.is_empty() {
-            self.readers[ReadSurface::Body as usize].view(frame, area, "Ctrl+Enter reviews this action. No action runs until the separate confirmation is accepted. Escape closes, F6 discards the action draft.".into());
+            self.readers[ReadSurface::Body as usize].view(frame, area, "Ctrl+Enter reviews this action. No action runs until the separate confirmation is accepted. Escape goes back and keeps the action draft; F6 discards it.".into());
             return;
         }
         let help = if form.kind == Kind::Network {
@@ -1284,6 +1329,7 @@ mod tests {
             target: None,
             picker: None,
             probe: None,
+            origin: None,
         }
     }
 

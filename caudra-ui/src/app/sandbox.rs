@@ -1217,25 +1217,33 @@ mod tests {
         assert!(!sandbox_frame(&mut app).join("\n").contains("Sandboxes"));
     }
 
-    #[test_case(false; "keyboard_back")]
-    #[test_case(true; "mouse_back")]
-    fn create_draft_close_retains_and_explicit_back_returns_to_manager(mouse: bool) {
+    #[test_case(false; "keyboard_discard")]
+    #[test_case(true; "mouse_discard")]
+    fn create_draft_back_retains_and_explicit_discard_drops_it(mouse: bool) {
         let (_directory, mut app) = create_app();
         app.update(Msg::Key(key::SANDBOX_APPLY.to_key_event()));
         sandbox_key(&mut app, KeyCode::Esc);
         assert!(app.sandbox_live.queued.is_none());
         sandbox_key(&mut app, KeyCode::Esc);
+        assert!(app.sandbox_manager.is_open());
+        assert!(
+            !sandbox_frame(&mut app)
+                .join("\n")
+                .contains("New instance name")
+        );
+        sandbox_key(&mut app, KeyCode::Esc);
         assert!(!app.sandbox_manager.is_open());
         app.sandbox_manager
             .open(app.state.session.id, SandboxView::Profiles);
+        sandbox_key(&mut app, KeyCode::Char('v'));
         let frame = sandbox_frame(&mut app);
         assert!(frame.iter().any(|line| line.contains(CREATE_NAME)));
         if mouse {
             let row = frame
                 .iter()
-                .position(|line| line.contains("Back / discard draft"))
+                .position(|line| line.contains("Discard draft"))
                 .unwrap();
-            let column = frame[row].find("Back / discard draft").unwrap();
+            let column = frame[row].find("Discard draft").unwrap();
             for kind in [
                 MouseEventKind::Down(MouseButton::Left),
                 MouseEventKind::Up(MouseButton::Left),
@@ -1257,6 +1265,10 @@ mod tests {
                 .contains("New instance name")
         );
         assert!(app.sandbox_live.queued.is_none());
+        sandbox_key(&mut app, KeyCode::Char('v'));
+        assert!(!sandbox_frame(&mut app).join("\n").contains(CREATE_NAME));
+        sandbox_key(&mut app, KeyCode::Esc);
+        assert!(app.sandbox_manager.is_open());
         sandbox_key(&mut app, KeyCode::Esc);
         assert!(!app.sandbox_manager.is_open());
     }

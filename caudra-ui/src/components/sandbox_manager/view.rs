@@ -296,8 +296,8 @@ impl Manager {
                     ),
                 ],
                 vec![
-                    Hint::key("F6", KeyCode::F(6), "Back / discard draft"),
-                    Hint::key("Esc", KeyCode::Esc, "Close / retain draft"),
+                    Hint::key("F6", KeyCode::F(6), "Discard draft"),
+                    Hint::key("Esc", KeyCode::Esc, "Back · keeps draft"),
                 ],
             ];
         }
@@ -1541,7 +1541,7 @@ mod tests {
         };
         if surface == "fieldless" {
             assert!(copied.starts_with("Ctrl+Enter reviews this action."));
-            assert!(copied.ends_with("F6 discards the action draft."));
+            assert!(copied.ends_with("keeps the action draft; F6 discards it."));
         } else {
             assert_eq!(copied, text);
         }

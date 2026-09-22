@@ -23,7 +23,7 @@ use crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use form::Form;
-use live::LiveForm;
+use live::{LiveForm, RetainedLive};
 use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
 use std::collections::hash_map::DefaultHasher;
@@ -243,6 +243,7 @@ struct Manager {
     live_pending: Option<(StoreTicket, SandboxSnapshotRequest)>,
     live_form: Option<LiveForm>,
     report_draft: Option<LiveForm>,
+    retained_live: Option<RetainedLive>,
     transfer: Option<transfer::TransferPanel>,
     conflict: Option<Result<Arc<LoadedSandboxes>, String>>,
     snapshot: Option<SandboxSnapshot>,
@@ -326,6 +327,7 @@ impl SandboxManager {
             live_pending: None,
             live_form: None,
             report_draft: None,
+            retained_live: None,
             transfer: None,
             conflict: None,
             snapshot: None,
@@ -2539,6 +2541,7 @@ fn read_only_key(event: KeyEvent) -> bool {
 
 #[cfg(all(test, unix))]
 pub(crate) mod tests {
+    use super::live::{INSTANCE_ACTIONS, Kind};
     use super::{
         CONFLICT, Confirmation, Control, DocumentMode, Focus, Form, Navigation, SAVED,
         SandboxAction, SandboxManager, SandboxView, StoreEffect, StoreReply, StoreResult,
@@ -2604,7 +2607,10 @@ persistent = true
 running_ttl_seconds = 3600
 on_exit = "detach"
 "#;
+    const PROVIDER: &str = "local";
+    const SAVED_TTL: &str = "3600";
     const NEW_TTL: &str = "7200";
+    const LEASE: &str = "Lease seconds";
     const NEWER_TTL: &str = "8100";
     const SECRET: &str = "never-export-this-api-token";
     const DIRECTORY_MODE: u32 = 0o700;
@@ -3078,6 +3084,133 @@ on_exit = "detach"
     }
 
     #[test]
+    fn escape_unwinds_one_level_per_press_and_closes_only_at_the_root() {
+        let (_directory, _store, mut manager) = fixture();
+        live_instance(&mut manager, false);
+        let extend = INSTANCE_ACTIONS
+            .iter()
+            .position(|(_, kind)| kind.as_ref() == Some(&Kind::Extend))
+            .expect("extend action");
+        open_instance_action(&mut manager, extend);
+        manager.handle_key(key::SELECT_ALL.to_key_event());
+        manager.handle_paste(NEW_TTL);
+        manager.handle_key(key::SANDBOX_APPLY.to_key_event());
+        assert!(matches!(
+            manager.state.as_ref().unwrap().confirmation,
+            Some(Confirmation::Live { .. })
+        ));
+        press(&mut manager, KeyCode::Esc);
+        let state = manager.state.as_ref().unwrap();
+        assert!(state.confirmation.is_none());
+        assert_eq!(state.live_form.as_ref().unwrap().field(LEASE), NEW_TTL);
+        press(&mut manager, KeyCode::Esc);
+        let state = manager.state.as_ref().unwrap();
+        assert!(state.live_form.is_none());
+        assert_eq!(state.instance_action, Some(extend));
+        press(&mut manager, KeyCode::Esc);
+        assert_eq!(manager.state.as_ref().unwrap().instance_action, None);
+        assert!(manager.is_open());
+        press(&mut manager, KeyCode::Esc);
+        assert!(!manager.is_open());
+        assert!(!manager.pending());
+        let conversation = manager.state.as_ref().unwrap().conversation;
+        manager.open(conversation, SandboxView::Instances);
+        press(&mut manager, KeyCode::Char('e'));
+        let form = manager.state.as_ref().unwrap().live_form.as_ref().unwrap();
+        assert_eq!(form.field(LEASE), NEW_TTL);
+        assert_eq!(form.origin, None);
+        press(&mut manager, KeyCode::Esc);
+        assert_eq!(manager.state.as_ref().unwrap().instance_action, None);
+        open_instance_action(&mut manager, extend);
+        assert_eq!(
+            manager
+                .state
+                .as_ref()
+                .unwrap()
+                .live_form
+                .as_ref()
+                .unwrap()
+                .field(LEASE),
+            NEW_TTL
+        );
+        press(&mut manager, KeyCode::F(6));
+        let state = manager.state.as_ref().unwrap();
+        assert!(state.live_form.is_none());
+        assert_eq!(state.instance_action, Some(extend));
+        press(&mut manager, KeyCode::Esc);
+        press(&mut manager, KeyCode::Char('e'));
+        assert_eq!(
+            manager
+                .state
+                .as_ref()
+                .unwrap()
+                .live_form
+                .as_ref()
+                .unwrap()
+                .field(LEASE),
+            SAVED_TTL
+        );
+        assert!(!manager.pending());
+    }
+
+    #[test]
+    fn retained_draft_is_single_slot_and_never_follows_another_target() {
+        const WRONG: &str = "wrong-provider";
+        let (_directory, _store, mut manager) = fixture();
+        press(&mut manager, KeyCode::Char('h'));
+        manager.handle_key(key::SELECT_ALL.to_key_event());
+        manager.handle_paste(WRONG);
+        assert_eq!(
+            manager
+                .state
+                .as_ref()
+                .unwrap()
+                .live_form
+                .as_ref()
+                .unwrap()
+                .field(super::image::PROVIDER),
+            WRONG
+        );
+        press(&mut manager, KeyCode::Esc);
+        press(&mut manager, KeyCode::Char('4'));
+        press(&mut manager, KeyCode::Char('h'));
+        assert_eq!(
+            manager
+                .state
+                .as_ref()
+                .unwrap()
+                .live_form
+                .as_ref()
+                .unwrap()
+                .field(super::image::PROVIDER),
+            PROVIDER
+        );
+        press(&mut manager, KeyCode::Esc);
+        press(&mut manager, KeyCode::Char('2'));
+        press(&mut manager, KeyCode::Char('h'));
+        assert_eq!(
+            manager
+                .state
+                .as_ref()
+                .unwrap()
+                .live_form
+                .as_ref()
+                .unwrap()
+                .field(super::image::PROVIDER),
+            PROVIDER
+        );
+    }
+
+    fn open_instance_action(manager: &mut SandboxManager, index: usize) {
+        press(manager, KeyCode::F(3));
+        for _ in 0..index {
+            press(manager, KeyCode::Down);
+        }
+        assert_eq!(manager.state.as_ref().unwrap().instance_action, Some(index));
+        press(manager, KeyCode::Enter);
+    }
+
+    #[test]
     fn live_editor_focus_masking_and_paste_never_export_credential() {
         let (_directory, _, mut manager) = fixture();
         press(&mut manager, KeyCode::Char('4'));
@@ -3102,22 +3235,35 @@ on_exit = "detach"
         assert!(!preview.contains(&secret));
         assert!(preview.contains("sandbox-api:test"));
         press(&mut manager, KeyCode::Esc);
+        assert!(manager.state.as_ref().unwrap().live_form.is_some());
         press(&mut manager, KeyCode::Esc);
-        let conversation = manager.state.as_ref().unwrap().conversation;
-        manager.open(conversation, SandboxView::Providers);
-        assert_eq!(
-            manager
-                .state
-                .as_ref()
-                .unwrap()
-                .live_form
-                .as_ref()
-                .unwrap()
-                .focus,
-            1
-        );
+        assert!(manager.is_open());
+        assert!(manager.state.as_ref().unwrap().live_form.is_none());
+        press(&mut manager, KeyCode::Char('k'));
+        let form = manager
+            .state
+            .as_ref()
+            .unwrap()
+            .live_form
+            .as_ref()
+            .expect("retained credential draft");
+        assert_eq!(form.focus, 1);
+        assert_eq!(form.fields[1].editor.text(), secret);
+        for (width, height) in [(120, 35), (35, 16), (1, 1)] {
+            assert!(!render(&mut manager, width, height).contains(&secret));
+        }
         press(&mut manager, KeyCode::F(6));
         assert!(manager.state.as_ref().unwrap().live_form.is_none());
+        press(&mut manager, KeyCode::Char('k'));
+        let form = manager
+            .state
+            .as_ref()
+            .unwrap()
+            .live_form
+            .as_ref()
+            .expect("fresh credential draft");
+        assert_eq!(form.focus, 0);
+        assert!(form.fields[1].editor.text().is_empty());
     }
 
     #[test]
