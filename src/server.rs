@@ -52,14 +52,15 @@ use workcell_host_contract::{
 };
 use workcell_mcp_code::{CodeBuildError, CodeConfiguration, CodeInput, CodeToolGroup};
 use workcell_mcp_code_graph::{
-    CodeContextInput, CodeExpandInput, CodeGraphLimits, CodeGraphToolGroup, CodeImpactInput,
-    CodeMapInput, CodeRefsInput, GraphProgress, GraphProgressSink, ModelText as GraphModelText,
-    SelectorRefusal, Shrinkable,
+    CodeContextInput, CodeExpandInput, CodeGraphError, CodeGraphLimits, CodeGraphToolGroup,
+    CodeImpactInput, CodeMapInput, CodeRefsInput, GraphProgress, GraphProgressSink,
+    ModelText as GraphModelText, SelectorRefusal, Shrinkable,
 };
 use workcell_mcp_files::{
     FileApplyPatchInput, FileEditInput, FileGlobInput, FileGrepInput, FileReadInput, FileResource,
-    FileResourceAccess, FileToolGroup, FileWriteInput, FilesystemLimits, IndexInput,
-    ModelText as FileModelText, RootResourceKind, WorkspaceError, root_relative_resource_id,
+    FileResourceAccess, FileToolGroup, FileWriteInput, FilesystemError, FilesystemLimits,
+    IndexInput, ModelText as FileModelText, RootResourceKind, WorkspaceError,
+    root_relative_resource_id,
 };
 use workcell_mcp_shell::{
     ShellInput, ShellPermissionPolicy, ShellProgressChunk, ShellProgressSink, ShellToolGroup,
@@ -105,6 +106,18 @@ const DUAL_ERA_PROTOCOLS: &[ProtocolVersion] =
     &[ProtocolVersion::V_2026_07_28, ProtocolVersion::V_2025_11_25];
 const RESOURCE_NAMESPACE_VERSION: &str = "v1";
 const ISOLATED_PYTHON_RESOURCE: &str = "isolated-python";
+const INVALID_ARGUMENTS_CODE: &str = "invalid_arguments";
+const CAPABILITY_UNAVAILABLE_CODE: &str = "capability_unavailable";
+const UNKNOWN_OPERATION_CODE: &str = "unknown_operation";
+const CODE_GRAPH_DENIED_CODE: &str = "code_graph_denied";
+const CODE_GRAPH_INVALID_CODE: &str = "code_graph_invalid";
+const CODE_GRAPH_INTERNAL_CODE: &str = "code_graph_internal";
+const CANCELLED_CODE: &str = "cancelled";
+const WEB_PREPARATION_FAILED_CODE: &str = "web_preparation_failed";
+const SHELL_PREPARATION_FAILED_CODE: &str = "shell_preparation_failed";
+const SHELL_COMMAND_REFUSED_CODE: &str = "shell_command_refused";
+const PYTHON_PREPARATION_FAILED_CODE: &str = "python_preparation_failed";
+const PREPARATION_INTERNAL_CODE: &str = "preparation_internal_error";
 static PROCESS_INSTANCE_ID: OnceLock<Arc<str>> = OnceLock::new();
 
 pub(crate) fn protocol_versions(modern_only: bool) -> &'static [ProtocolVersion] {
@@ -1388,23 +1401,50 @@ impl WorkcellServer {
         name: &str,
         arguments: Value,
     ) -> Result<(PreparedRemoteOperation, OperationIntent), ErrorData> {
-        let invalid = || {
-            ErrorData::invalid_params(
+        // One closure for every failure told the caller its arguments were bad
+        // even when the tool group was absent or the preparation itself failed,
+        // and carried no symbolic code, so a client had nothing to branch on.
+        let invalid_arguments = || {
+            symbolic_invalid_params(
                 format!("Invalid arguments for remote preparation of {name}"),
-                None,
+                INVALID_ARGUMENTS_CODE,
             )
+        };
+        let unavailable = || {
+            symbolic_invalid_params(
+                format!(
+                    "Remote preparation of {name} is unavailable: its tool group is not configured on this host"
+                ),
+                CAPABILITY_UNAVAILABLE_CODE,
+            )
+        };
+        let failed = |code: &str, error: &dyn fmt::Display| {
+            symbolic_invalid_params(
+                format!("Remote preparation of {name} failed: {error}"),
+                code,
+            )
+        };
+        let files_failed = |error: FilesystemError| failed(error.code(), &error);
+        let graph_failed = |error: CodeGraphError| {
+            let code = match &error {
+                CodeGraphError::Denied(_) => CODE_GRAPH_DENIED_CODE,
+                CodeGraphError::Invalid(_) => CODE_GRAPH_INVALID_CODE,
+                CodeGraphError::Aborted => CANCELLED_CODE,
+                CodeGraphError::Internal(_) => CODE_GRAPH_INTERNAL_CODE,
+            };
+            failed(code, &error)
         };
         let token = CancellationToken::new();
         let (operation, kind, mutating, resources) = match name {
             "file_read" => {
-                let input = parse::<FileReadInput>(arguments).map_err(|_| invalid())?;
+                let input = parse::<FileReadInput>(arguments).map_err(|_| invalid_arguments())?;
                 let prepared = self
                     .files
                     .as_ref()
-                    .ok_or_else(invalid)?
+                    .ok_or_else(unavailable)?
                     .prepare_read(input, &token)
                     .await
-                    .map_err(|_| invalid())?;
+                    .map_err(files_failed)?;
                 (
                     PreparedRemoteOperation::FileRead(prepared),
                     OperationKind::Read,
@@ -1413,14 +1453,14 @@ impl WorkcellServer {
                 )
             }
             "file_glob" => {
-                let input = parse::<FileGlobInput>(arguments).map_err(|_| invalid())?;
+                let input = parse::<FileGlobInput>(arguments).map_err(|_| invalid_arguments())?;
                 let prepared = self
                     .files
                     .as_ref()
-                    .ok_or_else(invalid)?
+                    .ok_or_else(unavailable)?
                     .prepare_glob(input, &token)
                     .await
-                    .map_err(|_| invalid())?;
+                    .map_err(files_failed)?;
                 (
                     PreparedRemoteOperation::FileGlob(prepared),
                     OperationKind::Search,
@@ -1429,14 +1469,14 @@ impl WorkcellServer {
                 )
             }
             "file_grep" => {
-                let input = parse::<FileGrepInput>(arguments).map_err(|_| invalid())?;
+                let input = parse::<FileGrepInput>(arguments).map_err(|_| invalid_arguments())?;
                 let prepared = self
                     .files
                     .as_ref()
-                    .ok_or_else(invalid)?
+                    .ok_or_else(unavailable)?
                     .prepare_grep(input, &token)
                     .await
-                    .map_err(|_| invalid())?;
+                    .map_err(files_failed)?;
                 (
                     PreparedRemoteOperation::FileGrep(prepared),
                     OperationKind::Search,
@@ -1445,14 +1485,14 @@ impl WorkcellServer {
                 )
             }
             "file_write" => {
-                let input = parse::<FileWriteInput>(arguments).map_err(|_| invalid())?;
+                let input = parse::<FileWriteInput>(arguments).map_err(|_| invalid_arguments())?;
                 let prepared = self
                     .files
                     .as_ref()
-                    .ok_or_else(invalid)?
+                    .ok_or_else(unavailable)?
                     .prepare_write_bounded(input, MEDIUM_PREPARATION_RESERVATION_BYTES, &token)
                     .await
-                    .map_err(|_| invalid())?;
+                    .map_err(files_failed)?;
                 (
                     PreparedRemoteOperation::FileWrite(prepared),
                     OperationKind::Mutate,
@@ -1461,14 +1501,14 @@ impl WorkcellServer {
                 )
             }
             "file_edit" => {
-                let input = parse::<FileEditInput>(arguments).map_err(|_| invalid())?;
+                let input = parse::<FileEditInput>(arguments).map_err(|_| invalid_arguments())?;
                 let prepared = self
                     .files
                     .as_ref()
-                    .ok_or_else(invalid)?
+                    .ok_or_else(unavailable)?
                     .prepare_edit_bounded(input, MEDIUM_PREPARATION_RESERVATION_BYTES, &token)
                     .await
-                    .map_err(|_| invalid())?;
+                    .map_err(files_failed)?;
                 (
                     PreparedRemoteOperation::FileEdit(prepared),
                     OperationKind::Mutate,
@@ -1477,14 +1517,15 @@ impl WorkcellServer {
                 )
             }
             "file_apply_patch" => {
-                let input = parse::<FileApplyPatchInput>(arguments).map_err(|_| invalid())?;
+                let input =
+                    parse::<FileApplyPatchInput>(arguments).map_err(|_| invalid_arguments())?;
                 let prepared = self
                     .files
                     .as_ref()
-                    .ok_or_else(invalid)?
+                    .ok_or_else(unavailable)?
                     .prepare_apply_patch_bounded(input, MAX_PREPARED_OPERATION_BYTES, &token)
                     .await
-                    .map_err(|_| invalid())?;
+                    .map_err(files_failed)?;
                 (
                     PreparedRemoteOperation::FileApplyPatch(prepared),
                     OperationKind::Mutate,
@@ -1493,14 +1534,14 @@ impl WorkcellServer {
                 )
             }
             "file_index" => {
-                let input = parse::<IndexInput>(arguments).map_err(|_| invalid())?;
+                let input = parse::<IndexInput>(arguments).map_err(|_| invalid_arguments())?;
                 let prepared = self
                     .files
                     .as_ref()
-                    .ok_or_else(invalid)?
+                    .ok_or_else(unavailable)?
                     .prepare_index(input, &token)
                     .await
-                    .map_err(|_| invalid())?;
+                    .map_err(files_failed)?;
                 (
                     PreparedRemoteOperation::FileIndex(prepared),
                     OperationKind::Inspect,
@@ -1509,15 +1550,13 @@ impl WorkcellServer {
                 )
             }
             "code_map" => {
-                let input = parse::<CodeMapInput>(arguments).map_err(|_| invalid())?;
-                let graph = self.code_graph.as_ref().ok_or_else(invalid)?;
+                let input = parse::<CodeMapInput>(arguments).map_err(|_| invalid_arguments())?;
+                let graph = self.code_graph.as_ref().ok_or_else(unavailable)?;
                 let scope = graph
                     .inspect_scope(input.path.as_deref())
                     .await
-                    .map_err(|_| invalid())?;
-                let prepared = graph
-                    .prepare_code_map(input, scope)
-                    .map_err(|_| invalid())?;
+                    .map_err(graph_failed)?;
+                let prepared = graph.prepare_code_map(input, scope).map_err(graph_failed)?;
                 (
                     PreparedRemoteOperation::CodeMap(prepared),
                     OperationKind::Search,
@@ -1526,15 +1565,16 @@ impl WorkcellServer {
                 )
             }
             "code_context" => {
-                let input = parse::<CodeContextInput>(arguments).map_err(|_| invalid())?;
-                let graph = self.code_graph.as_ref().ok_or_else(invalid)?;
+                let input =
+                    parse::<CodeContextInput>(arguments).map_err(|_| invalid_arguments())?;
+                let graph = self.code_graph.as_ref().ok_or_else(unavailable)?;
                 let scope = graph
                     .inspect_scope(input.path.as_deref())
                     .await
-                    .map_err(|_| invalid())?;
+                    .map_err(graph_failed)?;
                 let prepared = graph
                     .prepare_code_context(input, scope)
-                    .map_err(|_| invalid())?;
+                    .map_err(graph_failed)?;
                 (
                     PreparedRemoteOperation::CodeContext(prepared),
                     OperationKind::Search,
@@ -1543,15 +1583,15 @@ impl WorkcellServer {
                 )
             }
             "code_refs" => {
-                let input = parse::<CodeRefsInput>(arguments).map_err(|_| invalid())?;
-                let graph = self.code_graph.as_ref().ok_or_else(invalid)?;
+                let input = parse::<CodeRefsInput>(arguments).map_err(|_| invalid_arguments())?;
+                let graph = self.code_graph.as_ref().ok_or_else(unavailable)?;
                 let scope = graph
                     .inspect_scope(input.path.as_deref())
                     .await
-                    .map_err(|_| invalid())?;
+                    .map_err(graph_failed)?;
                 let prepared = graph
                     .prepare_code_refs(input, scope)
-                    .map_err(|_| invalid())?;
+                    .map_err(graph_failed)?;
                 (
                     PreparedRemoteOperation::CodeRefs(prepared),
                     OperationKind::Search,
@@ -1560,15 +1600,15 @@ impl WorkcellServer {
                 )
             }
             "code_impact" => {
-                let input = parse::<CodeImpactInput>(arguments).map_err(|_| invalid())?;
-                let graph = self.code_graph.as_ref().ok_or_else(invalid)?;
+                let input = parse::<CodeImpactInput>(arguments).map_err(|_| invalid_arguments())?;
+                let graph = self.code_graph.as_ref().ok_or_else(unavailable)?;
                 let scope = graph
                     .inspect_scope(input.path.as_deref())
                     .await
-                    .map_err(|_| invalid())?;
+                    .map_err(graph_failed)?;
                 let prepared = graph
                     .prepare_code_impact(input, scope)
-                    .map_err(|_| invalid())?;
+                    .map_err(graph_failed)?;
                 (
                     PreparedRemoteOperation::CodeImpact(prepared),
                     OperationKind::Search,
@@ -1577,15 +1617,15 @@ impl WorkcellServer {
                 )
             }
             "code_expand" => {
-                let input = parse::<CodeExpandInput>(arguments).map_err(|_| invalid())?;
-                let graph = self.code_graph.as_ref().ok_or_else(invalid)?;
+                let input = parse::<CodeExpandInput>(arguments).map_err(|_| invalid_arguments())?;
+                let graph = self.code_graph.as_ref().ok_or_else(unavailable)?;
                 let scope = graph
                     .inspect_scope(input.path.as_deref())
                     .await
-                    .map_err(|_| invalid())?;
+                    .map_err(graph_failed)?;
                 let prepared = graph
                     .prepare_code_expand(input, scope)
-                    .map_err(|_| invalid())?;
+                    .map_err(graph_failed)?;
                 (
                     PreparedRemoteOperation::CodeExpand(prepared),
                     OperationKind::Read,
@@ -1594,13 +1634,13 @@ impl WorkcellServer {
                 )
             }
             "websearch" => {
-                let input = parse::<WebsearchInput>(arguments).map_err(|_| invalid())?;
+                let input = parse::<WebsearchInput>(arguments).map_err(|_| invalid_arguments())?;
                 let prepared = self
                     .web
                     .as_ref()
-                    .ok_or_else(invalid)?
+                    .ok_or_else(unavailable)?
                     .prepare_websearch_operation(input)
-                    .map_err(|_| invalid())?;
+                    .map_err(|error| failed(WEB_PREPARATION_FAILED_CODE, &error))?;
                 let PreparedWebOperation::Websearch(prepared) = prepared else {
                     return Err(remote_invalid());
                 };
@@ -1624,13 +1664,13 @@ impl WorkcellServer {
                 )
             }
             "webfetch" => {
-                let input = parse::<WebfetchInput>(arguments).map_err(|_| invalid())?;
+                let input = parse::<WebfetchInput>(arguments).map_err(|_| invalid_arguments())?;
                 let prepared = self
                     .web
                     .as_ref()
-                    .ok_or_else(invalid)?
+                    .ok_or_else(unavailable)?
                     .prepare_webfetch_operation(input)
-                    .map_err(|_| invalid())?;
+                    .map_err(|error| failed(WEB_PREPARATION_FAILED_CODE, &error))?;
                 let PreparedWebOperation::Webfetch(prepared) = prepared else {
                     return Err(remote_invalid());
                 };
@@ -1643,17 +1683,23 @@ impl WorkcellServer {
                 )
             }
             "shell" => {
-                let input = parse::<ShellInput>(arguments).map_err(|_| invalid())?;
-                let shell = self.shell.as_ref().ok_or_else(invalid)?;
-                let prepared = shell.prepare(input).await.map_err(|_| invalid())?;
-                shell.authorize_prepared(&prepared).map_err(|_| invalid())?;
+                let input = parse::<ShellInput>(arguments).map_err(|_| invalid_arguments())?;
+                let shell = self.shell.as_ref().ok_or_else(unavailable)?;
+                let prepared = shell
+                    .prepare(input)
+                    .await
+                    .map_err(|error| failed(SHELL_PREPARATION_FAILED_CODE, &error))?;
+                shell
+                    .authorize_prepared(&prepared)
+                    .map_err(|error| failed(SHELL_COMMAND_REFUSED_CODE, &error))?;
                 let mut intents = vec![
                     resource_intent(prepared.relative_workdir(), ResourceAccess::Traverse)?,
                     resource_intent(prepared.command(), ResourceAccess::Execute)?,
                 ];
                 if let Ok(contexts) = prepared.bash_command_contexts() {
                     intents.push(resource_intent(
-                        &serde_json::to_string(&contexts.assumptions).map_err(|_| invalid())?,
+                        &serde_json::to_string(&contexts.assumptions)
+                            .map_err(|error| failed(PREPARATION_INTERNAL_CODE, &error))?,
                         ResourceAccess::Inspect,
                     )?);
                 }
@@ -1665,13 +1711,13 @@ impl WorkcellServer {
                 )
             }
             "python_execution" => {
-                let input = parse::<CodeInput>(arguments).map_err(|_| invalid())?;
+                let input = parse::<CodeInput>(arguments).map_err(|_| invalid_arguments())?;
                 let prepared = self
                     .code
                     .as_ref()
-                    .ok_or_else(invalid)?
+                    .ok_or_else(unavailable)?
                     .prepare(input)
-                    .map_err(|_| invalid())?;
+                    .map_err(|error| failed(PYTHON_PREPARATION_FAILED_CODE, &error))?;
                 (
                     PreparedRemoteOperation::PythonExecution(prepared),
                     OperationKind::Execute,
@@ -1682,12 +1728,14 @@ impl WorkcellServer {
                     )?],
                 )
             }
-            EXECUTION_ENVIRONMENT_TOOL if matches!(arguments, Value::Object(values) if values.is_empty()) =>
-            {
+            EXECUTION_ENVIRONMENT_TOOL => {
+                if !matches!(&arguments, Value::Object(values) if values.is_empty()) {
+                    return Err(invalid_arguments());
+                }
                 let prepared = self
                     .execution_environment
                     .as_ref()
-                    .ok_or_else(invalid)?
+                    .ok_or_else(unavailable)?
                     .prepare(self.tool_group_disclosure());
                 (
                     PreparedRemoteOperation::ExecutionEnvironment(prepared),
@@ -1699,7 +1747,12 @@ impl WorkcellServer {
                     )?],
                 )
             }
-            _ => return Err(invalid()),
+            _ => {
+                return Err(symbolic_invalid_params(
+                    format!("{name} is not a preparable remote operation on this host"),
+                    UNKNOWN_OPERATION_CODE,
+                ));
+            }
         };
         let resources = if resources.is_empty() {
             operation_file_intents(&operation)?
@@ -3266,6 +3319,13 @@ fn remote_error(error: crate::remote_host::RemoteOperationError) -> ErrorData {
     )
 }
 
+/// A refusal whose cause survives the wire as a token, because a client that
+/// only receives prose has to guess, and a numeric code alone cannot tell bad
+/// arguments apart from an absent tool group or a failed preparation.
+fn symbolic_invalid_params(message: String, code: &str) -> ErrorData {
+    ErrorData::invalid_params(message, Some(serde_json::json!({"code": code})))
+}
+
 fn workspace_error(error: WorkspaceError) -> ErrorData {
     let code = error.code();
     let message = match error {
@@ -3423,6 +3483,9 @@ mod tests {
 
     use super::*;
     use serde_json::json;
+
+    const PATH_OUTSIDE_ROOT_CODE: &str = "path_outside_root";
+    const NOT_FOUND_CODE: &str = "not_found";
 
     #[test]
     fn canonical_cwd_rebases_paths_and_patch_directives_not_content() {
@@ -4174,6 +4237,93 @@ mod tests {
                 "message": "remote operation request is invalid",
                 "data": {"code": "invalid_request"},
             })
+        );
+    }
+
+    async fn preparation_refusal(groups: &[ToolGroup], name: &str, arguments: Value) -> String {
+        let root = tempfile::tempdir().unwrap();
+        let server =
+            WorkcellServer::configured(Some(root.path()), groups, ServerBehavior::default(), {
+                let mut tools = test_tools();
+                tools.allow_write = true;
+                tools
+            })
+            .await
+            .unwrap();
+        let Err(error) = server.prepare_operation(name, arguments).await else {
+            panic!("preparation of {name} was expected to be refused")
+        };
+        let symbolic = error
+            .data
+            .as_ref()
+            .and_then(|data| data.get("code"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        server.shutdown().await;
+        symbolic
+    }
+
+    #[tokio::test]
+    async fn an_absent_tool_group_is_a_capability_problem_not_bad_arguments() {
+        assert_eq!(
+            preparation_refusal(&[], "file_read", serde_json::json!({"filePath": "a.txt"})).await,
+            CAPABILITY_UNAVAILABLE_CODE
+        );
+        assert_eq!(
+            preparation_refusal(&[], "code_map", serde_json::json!({})).await,
+            CAPABILITY_UNAVAILABLE_CODE
+        );
+        assert_eq!(
+            preparation_refusal(&[], "shell", serde_json::json!({"command": "true"})).await,
+            CAPABILITY_UNAVAILABLE_CODE
+        );
+    }
+
+    #[tokio::test]
+    async fn arguments_that_do_not_parse_are_the_only_invalid_arguments() {
+        assert_eq!(
+            preparation_refusal(&[ToolGroup::Files], "file_read", serde_json::json!({})).await,
+            INVALID_ARGUMENTS_CODE
+        );
+        assert_eq!(
+            preparation_refusal(
+                &[ToolGroup::Files],
+                "file_read",
+                serde_json::json!({"filePath": 7})
+            )
+            .await,
+            INVALID_ARGUMENTS_CODE
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_file_preparation_carries_its_own_reason() {
+        assert_eq!(
+            preparation_refusal(
+                &[ToolGroup::Files],
+                "file_read",
+                serde_json::json!({"filePath": "../outside.txt"})
+            )
+            .await,
+            PATH_OUTSIDE_ROOT_CODE
+        );
+        assert_eq!(
+            preparation_refusal(
+                &[ToolGroup::Files],
+                "file_read",
+                serde_json::json!({"filePath": "absent.txt"})
+            )
+            .await,
+            NOT_FOUND_CODE
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tool_this_host_cannot_prepare_says_so() {
+        assert_eq!(
+            preparation_refusal(&[ToolGroup::Files], "no_such_tool", serde_json::json!({})).await,
+            UNKNOWN_OPERATION_CODE
         );
     }
 

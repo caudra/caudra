@@ -733,7 +733,7 @@ impl FileToolGroup {
         let path = self.core.policy.resolve(&input.path).await?;
         let metadata = tokio::fs::metadata(&path).await.map_err(|error| {
             if error.kind() == std::io::ErrorKind::NotFound {
-                FilesystemError::message(format!("Path not found: {}", input.path))
+                FilesystemError::not_found(format!("Path not found: {}", input.path))
             } else {
                 FilesystemError::io_path("Cannot inspect", &path, error)
             }
@@ -933,7 +933,7 @@ async fn inspect_existing(
 ) -> Result<std::fs::Metadata, FilesystemError> {
     tokio::fs::metadata(path).await.map_err(|error| {
         if error.kind() == std::io::ErrorKind::NotFound {
-            FilesystemError::message(format!("Path not found: {requested_path}"))
+            FilesystemError::not_found(format!("Path not found: {requested_path}"))
         } else {
             FilesystemError::io_path("Cannot inspect", path, error)
         }

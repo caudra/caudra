@@ -47,7 +47,9 @@ impl From<FilesystemError> for CodeGraphError {
             FilesystemError::RootEscape(message) | FilesystemError::ProtectedPath(message) => {
                 Self::Denied(message)
             }
-            FilesystemError::Operation(message) => Self::Invalid(message),
+            FilesystemError::Operation(message) | FilesystemError::NotFound(message) => {
+                Self::Invalid(message)
+            }
             // The context string is the action and path the filesystem crate already chose to
             // surface; the io::Error itself is dropped rather than forwarded.
             FilesystemError::Io { context, .. } => Self::Invalid(context),

@@ -8,6 +8,10 @@ pub enum FilesystemError {
     ProtectedPath(String),
     #[error("{0}")]
     Operation(String),
+    /// The path does not exist. Distinct from `Operation` because a caller that
+    /// has to read prose to learn a file is simply absent cannot branch on it.
+    #[error("{0}")]
+    NotFound(String),
     #[error("Operation aborted")]
     Aborted,
     #[error("{context}: {source}")]
@@ -19,8 +23,31 @@ pub enum FilesystemError {
 }
 
 impl FilesystemError {
+    /// The symbolic token a remote caller branches on. The human message is
+    /// diagnostic text a client may decline to surface, so the cause has to
+    /// survive independently of it.
+    #[must_use]
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::RootEscape(_) => "path_outside_root",
+            Self::ProtectedPath(_) => "protected_path",
+            Self::Operation(_) => "invalid_operation",
+            Self::NotFound(_) => "not_found",
+            Self::Aborted => "cancelled",
+            Self::Io { source, .. } if source.kind() == io::ErrorKind::NotFound => "not_found",
+            Self::Io { source, .. } if source.kind() == io::ErrorKind::PermissionDenied => {
+                "filesystem_permission_denied"
+            }
+            Self::Io { .. } => "filesystem_io",
+        }
+    }
+
     pub(crate) fn message(message: impl Into<String>) -> Self {
         Self::Operation(message.into())
+    }
+
+    pub(crate) fn not_found(message: impl Into<String>) -> Self {
+        Self::NotFound(message.into())
     }
 
     pub(crate) fn io(context: impl Into<String>, source: io::Error) -> Self {
@@ -35,9 +62,10 @@ impl FilesystemError {
     }
 
     pub(crate) fn is_not_found(&self) -> bool {
-        matches!(
-            self,
-            Self::Io { source, .. } if source.kind() == io::ErrorKind::NotFound
-        )
+        match self {
+            Self::NotFound(_) => true,
+            Self::Io { source, .. } => source.kind() == io::ErrorKind::NotFound,
+            _ => false,
+        }
     }
 }

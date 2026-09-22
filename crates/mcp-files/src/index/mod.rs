@@ -151,7 +151,7 @@ impl FilesystemCore {
         let path = self.policy.resolve(&input.path).await?;
         let metadata = fs::metadata(&path).await.map_err(|error| {
             if error.kind() == std::io::ErrorKind::NotFound {
-                FilesystemError::message(format!("Path not found: {}", input.path))
+                FilesystemError::not_found(format!("Path not found: {}", input.path))
             } else {
                 FilesystemError::io_path("Cannot inspect", &path, error)
             }
