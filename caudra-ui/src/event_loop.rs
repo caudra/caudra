@@ -1192,6 +1192,12 @@ impl SpawnCtx {
         app.sync_permission_authority()
             .map_err(|error| error.to_string())?;
         app.no_commands = self.no_commands;
+        if let Some(warning) = remote_project_context
+            .as_ref()
+            .and_then(|context| context.skipped_warning())
+        {
+            app.state.warnings.push(warning);
+        }
         app.remote_project_context = remote_project_context;
         app.reconcile_plan_target();
         let app_new_ms = lap();

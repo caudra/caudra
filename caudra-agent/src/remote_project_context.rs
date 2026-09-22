@@ -25,6 +25,8 @@ const MAX_COMMAND_BYTES: u32 = 64 * 1024;
 const MAX_SKILL_BYTES: u32 = 128 * 1024;
 const MAX_PERMISSION_BYTES: u32 = 128 * 1024;
 const SHA256_HEX_LEN: usize = 64;
+const MAX_NAMED_SKIPS: usize = 4;
+const SKIPPED_ASSETS_WARNING: &str = "Remote project assets Caudra does not recognise were skipped";
 
 static REMOTE_CONTEXT_LOADER: LazyLock<RemoteProjectContextLoader> =
     LazyLock::new(RemoteProjectContextLoader::new);
@@ -168,6 +170,7 @@ pub struct RemoteProjectContext {
     skills: Vec<RemoteSkill>,
     workflows: Vec<RemoteWorkflow>,
     permissions: Option<RemotePermissionAsset>,
+    skipped: Vec<WorkspacePath>,
 }
 
 impl RemoteProjectContext {
@@ -193,6 +196,30 @@ impl RemoteProjectContext {
 
     pub fn permissions(&self) -> Option<&RemotePermissionAsset> {
         self.permissions.as_ref()
+    }
+
+    /// Declared assets Caudra could not account for and therefore never read.
+    /// Worth saying out loud once: the project meant them to apply.
+    pub fn skipped(&self) -> &[WorkspacePath] {
+        &self.skipped
+    }
+
+    pub fn skipped_warning(&self) -> Option<String> {
+        if self.skipped.is_empty() {
+            return None;
+        }
+        let named: Vec<_> = self
+            .skipped
+            .iter()
+            .take(MAX_NAMED_SKIPS)
+            .map(WorkspacePath::as_str)
+            .collect();
+        let rest = self.skipped.len() - named.len();
+        let mut warning = format!("{SKIPPED_ASSETS_WARNING}: {}", named.join(", "));
+        if rest > 0 {
+            warning.push_str(&format!(" and {rest} more"));
+        }
+        Some(warning)
     }
 
     pub fn applicable_instructions(&self, path: &WorkspacePath) -> Vec<&RemoteInstruction> {
@@ -283,8 +310,30 @@ impl RemoteProjectContextLoader {
         }
 
         let mut builder = ContextBuilder::new(manifest.revision);
-        let mut total_bytes = 0u64;
+        let mut declared_bytes = 0u64;
+        let mut admitted = Vec::new();
         for asset in manifest.assets {
+            // Skipping an asset costs context; loading one whose declaration
+            // Caudra cannot account for costs more. A permission policy is the
+            // exception, because a session that quietly runs without the
+            // project's restrictive rules is weaker than one that refuses.
+            match validate_asset(&asset) {
+                Ok(()) => {}
+                Err(error) if asset.kind == ProjectAssetKind::Permissions => return Err(error),
+                Err(_) => {
+                    builder.skip(asset.path);
+                    continue;
+                }
+            }
+            declared_bytes = declared_bytes.saturating_add(asset.size_bytes);
+            if declared_bytes > MAX_TOTAL_BYTES {
+                return Err(RemoteProjectContextError::InvalidManifest);
+            }
+            admitted.push(asset);
+        }
+
+        let mut total_bytes = 0u64;
+        for asset in admitted {
             let max_bytes = asset_limit(&asset)?;
             let content = service
                 .read(session.binding(), session.cursor(), &asset, max_bytes)
@@ -309,6 +358,13 @@ impl RemoteProjectContextLoader {
             builder.push(session, asset, content.content)?;
         }
         let context = Arc::new(builder.finish());
+        if let Some(warning) = context.skipped_warning() {
+            tracing::warn!(
+                skipped = context.skipped().len(),
+                detail = %warning,
+                "remote project assets skipped"
+            );
+        }
         let mut cache = self.cache.lock().unwrap_or_else(|error| error.into_inner());
         if cache.len() >= MAX_CONTEXTS {
             cache.clear();
@@ -333,6 +389,7 @@ struct ContextBuilder {
     skill_tier: Option<&'static str>,
     workflows: Vec<RemoteWorkflow>,
     permissions: Option<RemotePermissionAsset>,
+    skipped: Vec<WorkspacePath>,
 }
 
 impl ContextBuilder {
@@ -346,7 +403,12 @@ impl ContextBuilder {
             skill_tier: None,
             workflows: Vec::new(),
             permissions: None,
+            skipped: Vec::new(),
         }
+    }
+
+    fn skip(&mut self, path: WorkspacePath) {
+        self.skipped.push(path);
     }
 
     fn push(
@@ -457,6 +519,7 @@ impl ContextBuilder {
             .sort_by(|left, right| left.source.path.cmp(&right.source.path));
         self.workflows
             .sort_by(|left, right| left.source.path.cmp(&right.source.path));
+        self.skipped.sort();
         RemoteProjectContext {
             manifest_revision: self.revision,
             instructions: self.instructions,
@@ -464,6 +527,7 @@ impl ContextBuilder {
             skills: self.skills.into_values().collect(),
             workflows: self.workflows,
             permissions: self.permissions,
+            skipped: self.skipped,
         }
     }
 }
@@ -476,14 +540,8 @@ fn validate_manifest(
     }
     let mut paths = HashSet::new();
     let mut resources = HashSet::new();
-    let mut total = 0u64;
     for asset in &manifest.assets {
-        validate_asset(asset)?;
         if !paths.insert(asset.path.clone()) || !resources.insert(asset.resource_id.clone()) {
-            return Err(RemoteProjectContextError::InvalidManifest);
-        }
-        total = total.saturating_add(asset.size_bytes);
-        if total > MAX_TOTAL_BYTES {
             return Err(RemoteProjectContextError::InvalidManifest);
         }
     }
@@ -783,6 +841,7 @@ pub(crate) mod tests {
     const NESTED_RULE: &str = "nested rule";
     const SHADOWED_RULE: &str = "shadowed rule";
     const MANIFEST_REVISION: &str = "manifest-1";
+    const UNKNOWN_INSTRUCTION: &str = "docs/NOTES.md";
 
     struct AssetState {
         manifest: ProjectAssetManifest,
@@ -988,13 +1047,81 @@ pub(crate) mod tests {
                 ),
                 "x",
             )]);
-            let error = smol::block_on(
+            let context = smol::block_on(
                 RemoteProjectContextLoader::new().load(&session(Arc::clone(&service), "alice")),
             )
-            .unwrap_err();
-            assert!(matches!(error, RemoteProjectContextError::InvalidAsset(_)));
+            .unwrap();
+            assert_eq!(context.skipped(), [WorkspacePath::new(path).unwrap()]);
+            assert!(context.instructions().is_empty());
             assert_eq!(service.reads.load(Ordering::Relaxed), 0, "requested {path}");
         }
+    }
+
+    /// One file a project happens to keep must never cost the session every
+    /// instruction, skill, command, and permission rule the project declares.
+    #[test]
+    fn an_unrecognised_asset_is_skipped_and_named_while_the_rest_load() {
+        let service = AssetService::new(vec![
+            (
+                asset(
+                    "AGENTS.md",
+                    "asset-1",
+                    ProjectAssetKind::Instructions,
+                    ProjectAssetTrust::Declarative,
+                    ROOT_RULE.len() as u64,
+                ),
+                ROOT_RULE,
+            ),
+            (
+                asset(
+                    UNKNOWN_INSTRUCTION,
+                    "asset-2",
+                    ProjectAssetKind::Instructions,
+                    ProjectAssetTrust::Declarative,
+                    NESTED_RULE.len() as u64,
+                ),
+                NESTED_RULE,
+            ),
+        ]);
+        let context = smol::block_on(
+            RemoteProjectContextLoader::new().load(&session(Arc::clone(&service), "alice")),
+        )
+        .unwrap();
+
+        assert_eq!(context.instructions().len(), 1);
+        assert_eq!(context.instructions()[0].content, ROOT_RULE);
+        assert_eq!(
+            context.skipped(),
+            [WorkspacePath::new(UNKNOWN_INSTRUCTION).unwrap()]
+        );
+        let warning = context.skipped_warning().unwrap();
+        assert!(warning.starts_with(SKIPPED_ASSETS_WARNING), "{warning}");
+        assert!(warning.contains(UNKNOWN_INSTRUCTION), "{warning}");
+        assert_eq!(service.reads.load(Ordering::Relaxed), 1);
+    }
+
+    /// Skipping costs context. Skipping a permission policy costs the project's
+    /// restrictions, so that one refuses instead.
+    #[test]
+    fn a_permission_asset_that_fails_validation_still_refuses_the_context() {
+        let service = AssetService::new(vec![(
+            asset(
+                ".caudra/permissions.toml",
+                "asset-1",
+                ProjectAssetKind::Permissions,
+                ProjectAssetTrust::Declarative,
+                1,
+            ),
+            "x",
+        )]);
+
+        let error = smol::block_on(
+            RemoteProjectContextLoader::new().load(&session(Arc::clone(&service), "alice")),
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, RemoteProjectContextError::InvalidAsset(_)));
+        assert_eq!(service.reads.load(Ordering::Relaxed), 0);
     }
 
     #[test]
@@ -1047,7 +1174,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn oversized_assets_fail_before_any_content_is_requested() {
+    fn oversized_assets_are_skipped_before_any_content_is_requested() {
         let service = AssetService::new(vec![(
             asset(
                 "AGENTS.md",
@@ -1058,11 +1185,15 @@ pub(crate) mod tests {
             ),
             ROOT_RULE,
         )]);
-        let error = smol::block_on(
+        let context = smol::block_on(
             RemoteProjectContextLoader::new().load(&session(Arc::clone(&service), "alice")),
         )
-        .unwrap_err();
-        assert!(matches!(error, RemoteProjectContextError::InvalidAsset(_)));
+        .unwrap();
+        assert!(context.instructions().is_empty());
+        assert_eq!(
+            context.skipped(),
+            [WorkspacePath::new("AGENTS.md").unwrap()]
+        );
         assert_eq!(service.reads.load(Ordering::Relaxed), 0);
     }
 

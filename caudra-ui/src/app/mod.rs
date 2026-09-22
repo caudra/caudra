@@ -4869,6 +4869,11 @@ impl App {
         {
             tracing::warn!(%error, "remote workbench backend rebind failed");
         }
+        // Said once per manifest revision rather than once per turn: a rebind
+        // is the only edge on which the declared assets can have changed.
+        if let Some(warning) = change.context.skipped_warning() {
+            self.flash(warning);
+        }
         self.remote_project_context = Some(change.context);
         self.pending_pattern_suggestions = None;
         self.status_bar.set_remote_cwd(change.display_path);
