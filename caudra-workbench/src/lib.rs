@@ -1205,6 +1205,25 @@ impl Workbench {
         }
     }
 
+    /// Re-reads source control on request. The host calls this for the composer's
+    /// `#hash` index, which needs the same history the pane shows and has no
+    /// other way to walk a remote log. Repeated calls coalesce in the driver.
+    pub fn refresh_scm(&mut self) {
+        self.refresh_remote_scm();
+    }
+
+    /// Whether source control still owes an answer, so a caller waiting on the
+    /// log knows to look again. Narrower than [`Self::is_busy`], which also
+    /// counts searches and scrolling.
+    pub fn scm_refreshing(&self) -> bool {
+        self.remote_scm.as_ref().is_some_and(ScmDriver::is_busy)
+    }
+
+    /// The commits source control is showing, newest first.
+    pub fn scm_log(&self) -> &[scm::repo::Commit] {
+        self.scm.log()
+    }
+
     /// Folds what moved on disk into the panes: tabs catch up or raise a
     /// conflict, the tree marks what Caudra touched, and source control
     /// recounts.
@@ -3972,6 +3991,8 @@ mod tests {
     const STALE_RESULTS: &str = "the pane disagrees about whether its results are current";
     const WRONG_CLICK: &str = "the pointer landed somewhere other than where it was pointing";
     const STALE_TAB: &str = "the tab is still showing what the file no longer says";
+    const NO_REMOTE_LOG: &str = "a bound workspace must surface the commits it paged";
+    const REFRESH_IGNORED: &str = "a requested source-control refresh never reached the workspace";
     const FALSE_CONFLICT: &str = "a tab with nothing to lose raised a conflict anyway";
     const NO_CONFLICT: &str = "unsaved work was overwritten without a word";
     const LOST_EDIT: &str = "a reload threw away work the user had not saved";
@@ -8186,6 +8207,45 @@ mod tests {
                 tab.buffer.line(0) == REPLACEMENT && !tab.is_dirty() && !tab.conflict
             })
         });
+    }
+
+    /// The composer's `#hash` index has no way to walk a remote log of its own,
+    /// so it reads the one source control already paged. A refresh on request is
+    /// what lets a commit made during the session be mentioned.
+    #[test]
+    fn a_bound_workspace_surfaces_its_log_and_refreshes_it_on_request() {
+        const REMOTE_COMMIT: &str = "remote commit";
+
+        let (session, control) = crate::fs::backend::tests::widget_fixture();
+        let mut workbench = Workbench::new(WorkbenchStyles::default());
+        workbench.bind_workspace(session).unwrap();
+        settle_remote(&mut workbench, |workbench| !workbench.scm_refreshing());
+
+        assert_eq!(
+            workbench
+                .scm_log()
+                .iter()
+                .map(|commit| commit.summary.as_str())
+                .collect::<Vec<_>>(),
+            [REMOTE_COMMIT],
+            "{NO_REMOTE_LOG}"
+        );
+
+        let before = control.scm_calls();
+        workbench.refresh_scm();
+        assert!(workbench.scm_refreshing(), "{REFRESH_IGNORED}");
+        settle_remote(&mut workbench, |workbench| !workbench.scm_refreshing());
+        assert!(control.scm_calls() > before, "{REFRESH_IGNORED}");
+    }
+
+    /// A local session has no remote driver, so there is nothing to wait on and
+    /// nothing to ask. The host reads that as "no history here".
+    #[test]
+    fn an_unbound_workbench_owes_no_source_control_answer() {
+        let mut workbench = Workbench::new(WorkbenchStyles::default());
+        workbench.refresh_scm();
+        assert!(!workbench.scm_refreshing());
+        assert!(workbench.scm_log().is_empty());
     }
 
     #[test]

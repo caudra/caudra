@@ -151,6 +151,12 @@ const COMMIT_POPUP_CLOSED: &str = "typing # over a loaded log must open the popu
 const COMMIT_POPUP_LINGERED: &str = "choosing a commit must close the popup";
 const COMMIT_UNRESOLVED: &str = "a completed hash must resolve to a commit";
 const COMMIT_NOT_OPENED: &str = "clicking a commit must open the workbench on source control";
+const COMMIT_LOADING_CAPTURES: &str = "a popup with no rows must not capture keys or clicks";
+const COMMIT_LOADING_LINGERED: &str = "the spinner outlived the window it was waiting for";
+const COMMIT_WINDOW_STALE: &str = "a fresh read must replace the window, not be discarded";
+const COMMIT_READ_LOCALLY: &str = "a remote log must be read through the workbench";
+const COMMIT_RELOAD_STALLED: &str = "the log read never landed";
+const COMMIT_RELOAD_TIMEOUT: Duration = Duration::from_secs(10);
 const OTHER_PROVIDER: &str = "openrouter";
 const QUEUE_MENU_MISSING: &str = "the three-dot affordance must open the queue menu";
 const QUEUE_MENU_ENTRY_MISSING: &str = "the queue menu did not offer the action under test";
@@ -16968,22 +16974,23 @@ fn clicking_the_composer_closes_the_mention_popup() {
 /// A one-commit log window. No repository is created: the index is the whole
 /// source of truth, which is the property the `#` scanner rests on.
 fn commit_index() -> CommitIndex {
-    CommitIndex::Local(
-        vec![caudra_agent::commits::repo::CommitSummary {
-            id: COMMIT_ID.to_owned(),
-            subject: COMMIT_SUBJECT.to_owned(),
-            author: COMMIT_AUTHOR.to_owned(),
-            committed_unix_seconds: 1_700_000_000,
-        }]
-        .into(),
-    )
+    CommitIndex::loaded(vec![caudra_agent::commits::repo::CommitSummary {
+        id: COMMIT_ID.to_owned(),
+        subject: COMMIT_SUBJECT.to_owned(),
+        author: COMMIT_AUTHOR.to_owned(),
+    }])
 }
 
+/// Types `query` and then supplies the window the `#` asked for, which is what
+/// the reload would have delivered. The read itself is dropped: these tests are
+/// about the popup, and `repo::log` answers for itself elsewhere.
 fn commit_popup_at(app: &mut App, query: &str) {
-    app.set_commit_index(commit_index());
     for character in query.chars() {
         app.update(Msg::Key(key(KeyCode::Char(character))));
     }
+    app.commit_reload = CommitReload::Idle;
+    app.set_commit_index(commit_index());
+    app.resync_dropdowns();
     app.commit_popup.settle();
 }
 
@@ -17031,6 +17038,92 @@ fn a_heading_in_the_composer_is_never_a_commit() {
 
     assert!(!app.commit_popup.is_open(), "{COMMIT_POPUP_LINGERED}");
     assert!(app.input_box.commits().is_empty(), "{COMMIT_UNRESOLVED}");
+}
+
+/// Ticks until the log the `#` asked for has landed, the way the event loop
+/// would.
+#[track_caller]
+fn settle_commit_reload(app: &mut App) {
+    let deadline = Instant::now() + COMMIT_RELOAD_TIMEOUT;
+    while !matches!(app.commit_reload, CommitReload::Idle) {
+        assert!(Instant::now() < deadline, "{COMMIT_RELOAD_STALLED}");
+        let _ = app.tick();
+        std::thread::yield_now();
+    }
+}
+
+/// A project whose history is a round trip away must still answer the `#` on the
+/// frame it was typed on, which is what the spinner is for.
+#[test]
+fn a_hash_typed_before_the_log_arrives_draws_a_spinner_and_then_the_list() {
+    let mut app = test_app();
+
+    app.update(Msg::Key(key(KeyCode::Char('#'))));
+
+    assert!(app.commit_popup.is_loading(), "{COMMIT_POPUP_CLOSED}");
+    assert!(!app.commit_popup.is_open(), "{COMMIT_LOADING_CAPTURES}");
+
+    app.commit_reload = CommitReload::Idle;
+    app.set_commit_index(commit_index());
+    app.resync_dropdowns();
+    app.commit_popup.settle();
+
+    assert!(app.commit_popup.is_open(), "{COMMIT_POPUP_CLOSED}");
+    assert!(!app.commit_popup.is_loading(), "{COMMIT_LOADING_LINGERED}");
+}
+
+/// The window is read when the reader asks for it, not once at startup, so a
+/// commit made during the session is mentionable without leaving it.
+#[test]
+fn typing_a_hash_rereads_the_log_and_replaces_the_window_it_was_holding() {
+    let directory = TempDir::new().expect("a temporary directory");
+    let mut app = test_app();
+    app.state.session_mut().cwd = directory.path().to_string_lossy().into_owned();
+    app.set_commit_index(commit_index());
+
+    app.update(Msg::Key(key(KeyCode::Char('#'))));
+    settle_commit_reload(&mut app);
+
+    // The directory is not a repository, so the fresh read is empty. What
+    // matters is that it replaced the stale window rather than being ignored.
+    assert!(
+        app.input_box.commit_index().commits().is_empty(),
+        "{COMMIT_WINDOW_STALE}"
+    );
+    assert!(!app.commit_popup.is_active(), "{COMMIT_POPUP_LINGERED}");
+    assert!(app.input_box.commits().is_empty(), "{COMMIT_UNRESOLVED}");
+}
+
+/// A remote workspace has no log this process can walk, so the request goes to
+/// the workbench, which owns the only client that can page one.
+#[test]
+fn a_remote_session_asks_the_workbench_for_its_log_rather_than_reading_locally() {
+    let mut app = test_app();
+    app.workspace_session = Some(remote_workspace_session());
+
+    app.update(Msg::Key(key(KeyCode::Char('#'))));
+
+    assert!(
+        matches!(app.commit_reload, CommitReload::Workbench),
+        "{COMMIT_READ_LOCALLY}"
+    );
+}
+
+/// A second `#` while a read is in flight rides on it. Stacking reads would
+/// hammer a remote workspace for every keystroke that reopens the popup.
+#[test]
+fn a_reload_already_in_flight_is_not_started_again() {
+    let mut app = test_app();
+    app.workspace_session = Some(remote_workspace_session());
+
+    app.update(Msg::Key(key(KeyCode::Char('#'))));
+    app.update(Msg::Key(key(KeyCode::Backspace)));
+    app.update(Msg::Key(key(KeyCode::Char('#'))));
+
+    assert!(
+        matches!(app.commit_reload, CommitReload::Workbench),
+        "{COMMIT_READ_LOCALLY}"
+    );
 }
 
 /// A sent hash is a click target the way a sent path is, and it lands on

@@ -427,6 +427,12 @@ impl Scm {
         self.log.get(index)
     }
 
+    /// The graph's commits, newest first. Read by the host to answer for a
+    /// `#hash` in the composer, which needs the same history the pane shows.
+    pub fn log(&self) -> &[Commit] {
+        &self.log
+    }
+
     pub fn commit_file(&self, commit: usize, index: usize) -> Option<&CommitPath> {
         let id = &self.log.get(commit)?.id;
         self.opened.get(id)?.files.get(index)

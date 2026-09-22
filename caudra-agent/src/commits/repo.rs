@@ -13,11 +13,15 @@ use caudra_workspace::ScmChangeKind;
 use gix::bstr::ByteSlice;
 use gix::object::tree::diff::{Action, Change as TreeChange};
 
-/// How far back the composer's popup can search. The same ceiling the workbench
-/// walks, so the two surfaces agree on what "recent" means.
-pub const LOG_LIMIT: usize = 200;
+/// How far back a commit mention can reach. One number governs the local read,
+/// the window a remote workspace is asked for, and the search send-time
+/// resolution runs, so the popup can only ever offer a commit that resolves.
+pub const LOG_WINDOW: usize = 200;
 /// Digits of an abbreviated hash, matching what the workbench displays.
 pub const ID_LENGTH: usize = 7;
+/// Characters of a full hash. A run this long is not plausible prose, which is
+/// what lets one resolve before any log has been read.
+pub const FULL_ID_LENGTH: usize = 40;
 /// Paths one commit may list. A merge or a formatting sweep can touch
 /// thousands, and a list nobody will read is not worth the turn's budget.
 const COMMIT_FILES: usize = 100;
@@ -41,7 +45,6 @@ pub struct CommitSummary {
     pub id: String,
     pub subject: String,
     pub author: String,
-    pub committed_unix_seconds: i64,
 }
 
 impl CommitSummary {
@@ -93,7 +96,6 @@ pub fn log(root: &Path, limit: usize) -> Result<Vec<CommitSummary>, CommitError>
             id: info.id.to_string(),
             subject: subject_of(&commit)?,
             author: signature.name.to_str_lossy().trim().to_owned(),
-            committed_unix_seconds: commit.time().map(|time| time.seconds).unwrap_or_default(),
         });
     }
     Ok(log)
@@ -296,14 +298,14 @@ mod tests {
     #[test]
     fn a_repository_with_no_commits_logs_nothing() {
         let fixture = fixture();
-        assert!(log(&fixture.root, LOG_LIMIT).expect("a log").is_empty());
+        assert!(log(&fixture.root, LOG_WINDOW).expect("a log").is_empty());
     }
 
     #[test]
     fn a_path_outside_a_repository_is_named_as_such() {
         let dir = tempfile::tempdir().expect("a temporary directory");
         assert!(matches!(
-            log(dir.path(), LOG_LIMIT),
+            log(dir.path(), LOG_WINDOW),
             Err(CommitError::NotARepository(_))
         ));
     }
@@ -312,7 +314,7 @@ mod tests {
     fn the_log_reads_newest_first() {
         let fixture = fixture();
         let (root, tip) = two_commits(&fixture);
-        let log = log(&fixture.root, LOG_LIMIT).expect("a log");
+        let log = log(&fixture.root, LOG_WINDOW).expect("a log");
         assert_eq!(
             log.iter()
                 .map(|entry| entry.id.as_str())

@@ -2856,15 +2856,13 @@ fn mention_hover(role: DisplayRole, text: &str) -> (MessagesPanel, Rect, u16, u1
 /// hover answers from memory rather than opening the repository.
 fn commit_hover(role: DisplayRole) -> (MessagesPanel, Rect, u16, u16) {
     let (mut panel, area, row, column) = pointer_at(role, COMMIT_PROSE, COMMIT_HASH);
-    panel.set_commit_index(CommitIndex::Local(
-        vec![caudra_agent::commits::repo::CommitSummary {
+    panel.set_commit_index(CommitIndex::loaded(vec![
+        caudra_agent::commits::repo::CommitSummary {
             id: COMMIT_ID.to_owned(),
             subject: COMMIT_SUBJECT.to_owned(),
             author: "Ada Lovelace".to_owned(),
-            committed_unix_seconds: 1_700_000_000,
-        }]
-        .into(),
-    ));
+        },
+    ]));
     (panel, area, row, column)
 }
 

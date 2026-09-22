@@ -15,15 +15,18 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use caudra_agent::commits::repo::{self, CommitSummary};
+use caudra_grab::grab_scope;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent};
 use nucleo::{Config, Utf32String};
 use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
 use ratatui::text::{Line, Span};
+use ratatui::widgets::{Clear, Paragraph, Widget};
 use unicode_width::UnicodeWidthStr;
 
+use crate::animation::{animation_elapsed_ms, spinner_str};
 use crate::components::completion::{self, Completion, MouseOutcome, PAD};
-use crate::repaint::Dirty;
+use crate::repaint::{Cadence, Dirty};
 use crate::theme;
 
 const SIGIL: char = '#';
@@ -32,6 +35,9 @@ const SCOPE: &str = "commit_popup";
 /// would be pushed off a narrow composer.
 const SUBJECT_WIDTH: usize = 60;
 const GAP: &str = "  ";
+/// Shown while the log is being read, so a `#` answers at once in a project
+/// whose history is a round trip away.
+const LOADING: &str = "reading the log";
 
 pub(crate) enum CommitAction {
     Consumed,
@@ -45,60 +51,62 @@ pub(crate) enum CommitAction {
 
 /// What the popup lists and the composer validates against.
 ///
-/// Cheap to clone: every surface that needs it shares one load.
+/// Where the rows came from is the host's business, so the variants say only
+/// what this index knows. Cheap to clone: every surface shares one load.
 #[derive(Clone, Default)]
 pub(crate) enum CommitIndex {
-    /// No repository, or none read yet. Nothing lists and nothing resolves,
-    /// which is what leaves `#` as prose in a project without git.
-    #[default]
-    Absent,
-    /// The local log window. Lists rows, and resolves exactly what it lists.
-    Local(Arc<[CommitSummary]>),
-    /// A remote workspace, whose log this process cannot walk.
+    /// Not asked yet, or a read is in flight. Nothing lists, so the popup says
+    /// it is loading rather than showing an empty list.
     ///
-    /// Nothing lists, so there is no popup. A hash the reader spells out in
-    /// full still resolves, because the workspace can be asked about it at send
-    /// time and will say so if it does not know it. Admitting an unknown hash
-    /// here costs one error note; refusing every hash would make a remote
-    /// session unable to reference a commit at all.
-    Remote,
+    /// A hash spelled out in full still resolves. Forty hex characters in a row
+    /// is not plausible prose, and whoever pasted one meant a commit, so the
+    /// reference survives to send time where it can be looked up for real. An
+    /// abbreviation waits for the window, because `#abcdefg` is also a word.
+    #[default]
+    Pending,
+    /// Asked, and there is no history to offer. Nothing resolves, which is what
+    /// leaves `#` as prose in a project without a repository.
+    Absent,
+    /// A log window, however it was read. Resolves exactly what it lists.
+    Loaded(Arc<[CommitSummary]>),
 }
 
 impl CommitIndex {
-    /// Reads the recent log of the repository `root` sits in. A directory that
-    /// is not inside one yields [`Self::Absent`], which is not an error: most
-    /// prose containing a `#` is not about a commit either way.
-    pub fn load(root: &std::path::Path) -> Self {
-        match repo::log(root, repo::LOG_LIMIT) {
-            Ok(commits) if !commits.is_empty() => Self::Local(commits.into()),
-            _ => Self::Absent,
+    /// Adopts a window read from somewhere. An empty one collapses to
+    /// [`Self::Absent`]: a repository with no commits offers nothing, and that
+    /// is an answer rather than an error.
+    pub fn loaded(commits: Vec<CommitSummary>) -> Self {
+        match commits.is_empty() {
+            true => Self::Absent,
+            false => Self::Loaded(commits.into()),
         }
     }
 
-    fn commits(&self) -> &[CommitSummary] {
+    pub fn commits(&self) -> &[CommitSummary] {
         match self {
-            Self::Local(commits) => commits,
-            Self::Absent | Self::Remote => &[],
+            Self::Loaded(commits) => commits,
+            Self::Pending | Self::Absent => &[],
         }
     }
 
-    /// Whether there is nothing to list, which is what keeps the popup shut.
-    pub fn is_empty(&self) -> bool {
-        self.commits().is_empty()
+    /// Whether there is nothing to wait for and nothing to show, which is what
+    /// keeps the popup shut in a project that has no history.
+    pub fn is_absent(&self) -> bool {
+        matches!(self, Self::Absent)
     }
 
     /// Whether `id` names a commit worth resolving, which is the predicate the
-    /// composer's scanner runs on every edit.
+    /// composer's scanner runs on every edit. Never a repository read.
     pub fn resolves(&self, id: &str) -> bool {
         match self {
+            Self::Pending => id.len() == repo::FULL_ID_LENGTH,
             Self::Absent => false,
-            Self::Remote => true,
-            Self::Local(commits) => commits.iter().any(|commit| commit.id.starts_with(id)),
+            Self::Loaded(commits) => commits.iter().any(|commit| commit.id.starts_with(id)),
         }
     }
 
-    /// The subject of the commit `id` abbreviates, for the status bar. A remote
-    /// index knows no subjects, so a hovered hash there shows itself.
+    /// The subject of the commit `id` abbreviates, for the status bar. A window
+    /// that has not arrived knows no subjects, so a hovered hash shows itself.
     pub fn subject(&self, id: &str) -> Option<&str> {
         self.commits()
             .iter()
@@ -112,6 +120,20 @@ struct Session {
     /// The row text each match came from, so choosing one recovers its hash
     /// without re-parsing the rendered row.
     hashes: HashMap<String, String>,
+    /// The window the rows were seeded from, compared by pointer. A refresh
+    /// replaces the window wholesale, so this is how an open popup notices one
+    /// landing behind it instead of listing a stale log.
+    sourced: Option<Arc<[CommitSummary]>>,
+}
+
+impl Session {
+    fn sourced_from(&self, index: &CommitIndex) -> bool {
+        match (&self.sourced, index) {
+            (Some(held), CommitIndex::Loaded(current)) => Arc::ptr_eq(held, current),
+            (None, CommitIndex::Pending) => true,
+            _ => false,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -127,10 +149,32 @@ impl CommitPopup {
         Self::default()
     }
 
+    /// Whether the popup has rows, which is what makes it take keys and clicks.
+    /// A loading popup draws but captures nothing, so rows arriving mid-keystroke
+    /// cannot change what a key was about to do.
     pub fn is_open(&self) -> bool {
         self.session
             .as_ref()
             .is_some_and(|session| !session.completion.is_empty())
+    }
+
+    /// Whether the popup is drawing a spinner in place of a list.
+    pub fn is_loading(&self) -> bool {
+        self.session
+            .as_ref()
+            .is_some_and(|session| session.sourced.is_none())
+    }
+
+    /// Whether the reader is inside a `#query` at all, listing or loading. The
+    /// edge into this is what asks for a fresh log.
+    pub fn is_active(&self) -> bool {
+        self.session.is_some()
+    }
+
+    /// The spinner turns on the clock alone, so the popup has to ask for the
+    /// frames that move it. A list moves only when the reader does.
+    pub fn cadence(&self) -> Cadence {
+        Cadence::when(self.is_loading(), Cadence::SPINNER)
     }
 
     pub fn close(&mut self) {
@@ -151,6 +195,9 @@ impl CommitPopup {
     /// Re-reads the composer after an edit. Opens when the cursor is inside a
     /// `#query` and the query could still become a hash, re-queries while it
     /// grows, and closes as soon as it is not.
+    ///
+    /// A pending index opens the popup anyway, on a spinner: the reader asked a
+    /// question and the answer is on its way.
     pub fn sync(&mut self, text: &str, cursor: usize, index: &CommitIndex) {
         let Some((range, query)) = completion::trigger_at(text, cursor, SIGIL) else {
             self.close();
@@ -158,18 +205,26 @@ impl CommitPopup {
         };
         // A heading, a list marker or an issue number all start `#` too. Only a
         // run that could still grow into a hash is worth a popup.
-        if index.is_empty() || !query.chars().all(|c| c.is_ascii_hexdigit()) {
+        if index.is_absent() || !query.chars().all(|c| c.is_ascii_hexdigit()) {
             self.close();
             return;
         }
         self.trigger = Some(range);
-        match &mut self.session {
-            Some(session) if session.completion.query() == query => {}
-            Some(session) => session.completion.set_query(query),
-            None => self.start(query, index),
+        let restart = match &self.session {
+            Some(session) => !session.sourced_from(index),
+            None => true,
+        };
+        match (restart, &mut self.session) {
+            (true, _) => self.start(query, index),
+            (false, Some(session)) if session.completion.query() != query => {
+                session.completion.set_query(query)
+            }
+            (false, _) => {}
         }
     }
 
+    /// Seeds a list from whatever the index holds. A pending index seeds nothing
+    /// and the session stands as the placeholder until a window lands.
     fn start(&mut self, query: String, index: &CommitIndex) {
         let completion = Completion::new(Config::DEFAULT, query.clone());
         let injector = completion.injector();
@@ -181,13 +236,21 @@ impl CommitPopup {
             });
             hashes.insert(row, commit.short().to_owned());
         }
-        let mut session = Session { completion, hashes };
+        let sourced = match index {
+            CommitIndex::Loaded(commits) => Some(Arc::clone(commits)),
+            CommitIndex::Pending | CommitIndex::Absent => None,
+        };
+        let mut session = Session {
+            completion,
+            hashes,
+            sourced,
+        };
         session.completion.set_query(query);
         self.session = Some(session);
     }
 
-    /// The log is loaded up front rather than walked in the background, so a
-    /// tick only has to drain the matcher.
+    /// The window is seeded up front rather than streamed, so a tick only has to
+    /// drain the matcher.
     pub fn tick(&mut self) -> Dirty {
         match &mut self.session {
             Some(session) => session.completion.tick(),
@@ -258,6 +321,9 @@ impl CommitPopup {
     }
 
     pub fn view(&mut self, frame: &mut Frame, input_area: Rect) -> Option<Rect> {
+        if self.is_loading() {
+            return loading_view(frame, input_area);
+        }
         let session = self.session.as_mut()?;
         let theme = theme::current();
         session.completion.view(
@@ -278,6 +344,30 @@ impl CommitPopup {
             },
         )
     }
+}
+
+/// One row where the list will be, so the `#` is answered on the frame it was
+/// typed on. Drawn here rather than through [`Completion`], which has no rows to
+/// lay out yet.
+fn loading_view(frame: &mut Frame, input_area: Rect) -> Option<Rect> {
+    let line = format!(" {} {LOADING} ", spinner_str(animation_elapsed_ms()));
+    let width = (UnicodeWidthStr::width(line.as_str()) as u16).min(input_area.width);
+    if input_area.y == 0 || width == 0 {
+        return None;
+    }
+    let area = Rect {
+        x: input_area.x,
+        y: input_area.y - 1,
+        width,
+        height: 1,
+    };
+    grab_scope!(SCOPE, area);
+    Clear.render(area, frame.buffer_mut());
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(line, theme::current().spinner))),
+        area,
+    );
+    Some(area)
 }
 
 /// What the matcher searches and the row displays: the abbreviated hash, the
@@ -314,18 +404,27 @@ mod tests {
     const NO_SESSION: &str = "the popup dropped the session it was given";
     const NOT_INSERTED: &str = "the click did not take the row it landed on";
     const EXPECT_CLOSED: &str = "the popup stayed open over text that cannot be a hash";
+    const THIRD: &str = "c3d4e5f60718293a4b5c6d7e8f90123456789abc";
+    const EXPECT_LOADING: &str = "a `#` typed before the log arrives must still answer";
+    const LOADING_CAPTURES: &str = "a popup with no rows must not capture keys or clicks";
+    const EXPECT_LISTED: &str = "the window that arrived did not become rows";
+    const LOADING_LINGERED: &str = "the spinner outlived the window it was waiting for";
+    const STALE_WINDOW: &str = "the popup kept listing the log from before the refresh";
+    const SPINNER_FROZEN: &str = "a spinning popup must ask for the frames that turn it";
 
     fn summary(id: &str, subject: &str) -> CommitSummary {
         CommitSummary {
             id: id.to_owned(),
             subject: subject.to_owned(),
             author: AUTHOR.to_owned(),
-            committed_unix_seconds: 1_700_000_000,
         }
     }
 
     fn index() -> CommitIndex {
-        CommitIndex::Local(vec![summary(FIRST, SUBJECT), summary(SECOND, "Earlier work")].into())
+        CommitIndex::loaded(vec![
+            summary(FIRST, SUBJECT),
+            summary(SECOND, "Earlier work"),
+        ])
     }
 
     fn opened() -> CommitPopup {
@@ -370,21 +469,106 @@ mod tests {
         assert!(!popup.is_open(), "{EXPECT_CLOSED}: {text}");
     }
 
-    /// Without a repository there is nothing to complete, so `#` stays prose.
-    #[test_case(CommitIndex::Absent ; "no_repository")]
-    #[test_case(CommitIndex::Remote ; "remote_workspace")]
-    fn an_index_with_nothing_to_list_never_opens_the_popup(index: CommitIndex) {
+    /// Without a repository there is nothing to complete and nothing to wait
+    /// for, so `#` stays prose.
+    #[test]
+    fn an_absent_index_never_opens_the_popup() {
         let mut popup = CommitPopup::new();
-        popup.sync("#a1b2", 5, &index);
-        assert!(!popup.is_open(), "{EXPECT_CLOSED}");
+        popup.sync("#a1b2", 5, &CommitIndex::Absent);
+        assert!(!popup.is_active(), "{EXPECT_CLOSED}");
     }
 
-    /// A remote session cannot list commits, but a hash spelled out in full
-    /// must still reach the workspace, which is the only thing that can answer.
-    #[test_case(CommitIndex::Absent, false ; "no_repository_resolves_nothing")]
-    #[test_case(CommitIndex::Remote, true ; "remote_admits_any_hash")]
-    fn an_unlistable_index_still_decides_what_resolves(index: CommitIndex, expected: bool) {
-        assert_eq!(index.resolves("deadbeef"), expected);
+    /// A project whose history is a round trip away still answers the `#` on the
+    /// frame it was typed on, which is what the spinner is for.
+    #[test]
+    fn a_pending_index_opens_the_popup_on_a_spinner() {
+        let mut popup = CommitPopup::new();
+        popup.sync("#a1b2", 5, &CommitIndex::Pending);
+        assert!(popup.is_loading(), "{EXPECT_LOADING}");
+        assert!(!popup.is_open(), "{LOADING_CAPTURES}");
+    }
+
+    /// A window landing behind an open popup replaces its rows. Without this the
+    /// spinner would never become a list.
+    #[test]
+    fn a_window_arriving_behind_a_loading_popup_becomes_its_rows() {
+        let mut popup = CommitPopup::new();
+        popup.sync("#a1b2", 5, &CommitIndex::Pending);
+        popup.sync("#a1b2", 5, &index());
+        popup.settle();
+        assert!(popup.is_open(), "{EXPECT_LISTED}");
+        assert!(!popup.is_loading(), "{LOADING_LINGERED}");
+    }
+
+    /// A refresh replaces the window, and an open popup has to notice: listing
+    /// the log from before the reader's own commit is the bug this guards.
+    #[test]
+    fn a_refreshed_window_reseeds_an_open_popup() {
+        let mut popup = CommitPopup::new();
+        popup.sync("#", 1, &index());
+        popup.settle();
+        let refreshed = CommitIndex::loaded(vec![
+            summary(THIRD, "Newest work"),
+            summary(FIRST, SUBJECT),
+            summary(SECOND, "Earlier work"),
+        ]);
+        popup.sync("#", 1, &refreshed);
+        popup.settle();
+        assert_eq!(
+            popup.session.as_ref().expect(NO_SESSION).hashes.len(),
+            3,
+            "{STALE_WINDOW}"
+        );
+    }
+
+    /// A key that arrives while the spinner is up belongs to the composer. Rows
+    /// landing mid-keystroke must not change what it does.
+    #[test]
+    fn a_loading_popup_passes_keys_through() {
+        let mut popup = CommitPopup::new();
+        popup.sync("#a1b2", 5, &CommitIndex::Pending);
+        assert!(matches!(
+            popup.handle_key(crate::components::key(KeyCode::Enter)),
+            CommitAction::Passthrough
+        ));
+    }
+
+    /// Nothing is known yet, so a hash nobody could have typed by accident is
+    /// admitted and an abbreviation waits for the window.
+    #[test_case(CommitIndex::Pending, FIRST, true ; "pending_admits_a_full_hash")]
+    #[test_case(CommitIndex::Pending, "a1b2c3d", false ; "pending_refuses_an_abbreviation")]
+    #[test_case(CommitIndex::Absent, FIRST, false ; "absent_refuses_even_a_full_hash")]
+    #[test_case(CommitIndex::Absent, "a1b2c3d", false ; "absent_refuses_an_abbreviation")]
+    fn an_index_without_rows_still_decides_what_resolves(
+        index: CommitIndex,
+        id: &str,
+        expected: bool,
+    ) {
+        assert_eq!(index.resolves(id), expected);
+    }
+
+    /// The spinner turns on the clock alone, so a loading popup has to ask for
+    /// frames. A list does not: nothing about it moves until the reader moves.
+    #[test]
+    fn only_a_loading_popup_asks_for_frames() {
+        let mut popup = CommitPopup::new();
+        assert_eq!(popup.cadence(), Cadence::IDLE);
+
+        popup.sync("#a1b2", 5, &CommitIndex::Pending);
+        assert_eq!(popup.cadence(), Cadence::SPINNER, "{SPINNER_FROZEN}");
+
+        popup.sync("#a1b2", 5, &index());
+        popup.settle();
+        assert_eq!(popup.cadence(), Cadence::IDLE, "{LOADING_LINGERED}");
+    }
+
+    /// A repository with no commits is an answer, not a wait: unlike a pending
+    /// index it refuses even a full hash, because there is nothing coming.
+    #[test]
+    fn an_empty_window_is_absent_rather_than_pending() {
+        let index = CommitIndex::loaded(Vec::new());
+        assert!(index.is_absent());
+        assert!(!index.resolves(FIRST));
     }
 
     #[test]

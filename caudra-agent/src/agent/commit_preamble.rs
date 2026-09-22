@@ -29,10 +29,6 @@ use crate::tools::ToolContext;
 const MAX_COMMIT_BYTES: usize = 16 * 1024;
 const UNAVAILABLE_ERROR: &str = "not inlined: source control is unavailable for this workspace";
 const NO_BODY_NOTE: &str = "this workspace did not report the message body";
-/// How many commits of the remote log are searched for the abbreviation. The
-/// composer matched it against a window of the same shape, so a reference that
-/// resolved there resolves here.
-const REMOTE_LOG_PAGE: u32 = 256;
 /// Lines of the remote tree diff read to recover the path list. Only the file
 /// headers are kept, but the service counts every line it walks.
 const REMOTE_DIFF_LINES: u32 = 4 * 1024;
@@ -111,7 +107,9 @@ async fn remote_detail(
             session.cursor(),
             &ScmLogRequest {
                 repository_handle: repository.handle.clone(),
-                page_size: REMOTE_LOG_PAGE,
+                // The same window the composer listed, so a reference that
+                // resolved there resolves here.
+                page_size: repo::LOG_WINDOW as u32,
                 continuation: None,
             },
         )

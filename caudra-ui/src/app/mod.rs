@@ -104,6 +104,7 @@ use crate::sandbox::{SandboxWorkers, StoreReply};
 use crate::selection::{SelectionState, SelectionZone, ZoneRegistry};
 use crate::{AppSession, PatternDiscoveryMode, PatternDiscoveryOutcome, PatternSuggestionLoader};
 use arc_swap::{ArcSwap, ArcSwapOption};
+use caudra_agent::commits::repo;
 use caudra_agent::context::{ContextKey, ContextSnapshot, ContextStore};
 use caudra_agent::mentions;
 use caudra_agent::permissions::{PermissionManager, PermissionPolicyError};
@@ -303,6 +304,18 @@ pub enum Msg {
     Agent(Box<Envelope>),
 }
 
+/// A log read the `#` popup is waiting on. At most one runs at a time, so a
+/// second `#` while one is in flight rides on it rather than stacking work.
+enum CommitReload {
+    Idle,
+    /// A local `gix` walk on a blocking thread, since a repository read has no
+    /// business happening on the thread that draws.
+    Local(Receiver<Vec<repo::CommitSummary>>),
+    /// A remote refresh the bound workbench is running. It owns the only client
+    /// that can page a remote log, so its answer is the composer's answer.
+    Workbench,
+}
+
 /// Who `PageUp`, `PageDown`, `Home` and `End` act on once no overlay has
 /// claimed them. Everything else keeps reaching the composer, and any key that
 /// does hands the focus straight back, so the transcript can never hold the
@@ -357,6 +370,7 @@ pub struct App {
     pub(super) file_picker: FilePickerModal,
     pub(super) mention_popup: MentionPopup,
     pub(super) commit_popup: CommitPopup,
+    commit_reload: CommitReload,
     pub(super) paste_editor: PasteEditor,
     pub(super) permission_prompt: PermissionPrompt,
     pub(super) permissions_picker: PermissionsPicker,
@@ -598,6 +612,7 @@ impl App {
             file_picker: FilePickerModal::new(),
             mention_popup: MentionPopup::new(),
             commit_popup: CommitPopup::new(),
+            commit_reload: CommitReload::Idle,
             paste_editor: PasteEditor::new(),
             permission_prompt: PermissionPrompt::new(),
             permissions_picker: PermissionsPicker::new(),
@@ -1121,6 +1136,76 @@ impl App {
         }
     }
 
+    /// Re-reads the log behind the `#` the reader just typed, so a commit made
+    /// during the session can be mentioned without leaving it. A window already
+    /// held stays on screen while this runs: stale rows beat a spinner.
+    fn reload_commit_index(&mut self) {
+        if !matches!(self.commit_reload, CommitReload::Idle) {
+            return;
+        }
+        if self.workspace_session.is_some() {
+            // Only the workbench can walk a remote log, and it already does on
+            // bind, so the composer reads its answer instead of asking twice.
+            self.bound_workbench_mut().refresh_scm();
+            self.commit_reload = CommitReload::Workbench;
+            return;
+        }
+        let cwd = PathBuf::from(&self.state.session.cwd);
+        let (sender, receiver) = flume::bounded(1);
+        smol::spawn(async move {
+            let commits = smol::unblock(move || repo::log(&cwd, repo::LOG_WINDOW)).await;
+            let _ = sender.send(commits.unwrap_or_default());
+        })
+        .detach();
+        self.commit_reload = CommitReload::Local(receiver);
+    }
+
+    /// Adopts a window once its read lands. The index is replaced wholesale, so
+    /// an open popup notices the new one and re-seeds its rows.
+    fn poll_commit_index(&mut self) -> Dirty {
+        let commits = match &self.commit_reload {
+            CommitReload::Idle => return Dirty::NO,
+            CommitReload::Local(receiver) => match receiver.try_recv() {
+                Ok(commits) => commits,
+                Err(_) => return Dirty::NO,
+            },
+            CommitReload::Workbench => {
+                if self.bound_workbench().scm_refreshing() {
+                    return Dirty::NO;
+                }
+                self.bound_workbench()
+                    .scm_log()
+                    .iter()
+                    .take(repo::LOG_WINDOW)
+                    .map(|commit| repo::CommitSummary {
+                        id: commit.id.clone(),
+                        subject: commit.summary.clone(),
+                        author: commit.author.clone(),
+                    })
+                    .collect()
+            }
+        };
+        self.commit_reload = CommitReload::Idle;
+        self.set_commit_index(CommitIndex::loaded(commits));
+        // An open popup is waiting on this. Nothing else will touch it until the
+        // next keystroke, and a spinner that never becomes a list is a hang.
+        self.resync_dropdowns();
+        Dirty::YES
+    }
+
+    /// The workbench holding the session's binding. The permission-source editor
+    /// parks it and puts a local one in its place, so the parked one is the one
+    /// that can answer for the project.
+    fn bound_workbench(&self) -> &Workbench {
+        self.parked_workbench.as_ref().unwrap_or(&self.workbench)
+    }
+
+    fn bound_workbench_mut(&mut self) -> &mut Workbench {
+        self.parked_workbench
+            .as_mut()
+            .unwrap_or(&mut self.workbench)
+    }
+
     fn resync_dropdowns(&mut self) {
         let text = self.active_input_box().palette_text();
         self.sync_dropdowns(&text);
@@ -1136,7 +1221,13 @@ impl App {
         let index = input.commit_index().clone();
         self.mention_popup
             .sync_workspace(&text, cursor, &cwd, self.workspace_session.clone());
+        let was_active = self.commit_popup.is_active();
         self.commit_popup.sync(&text, cursor, &index);
+        // The `#` itself is the request for a log. Reading on the edge rather
+        // than on every keystroke is what keeps the scanner free.
+        if !was_active && self.commit_popup.is_active() {
+            self.reload_commit_index();
+        }
     }
 
     /// Splices a completed path over the `@query` that opened the popup. The
@@ -4793,11 +4884,10 @@ impl App {
         self.file_picker.close();
         self.mention_popup.close();
         self.commit_popup.close();
-        self.set_commit_index(CommitIndex::load(cwd));
-        self.parked_workbench
-            .as_mut()
-            .unwrap_or(&mut self.workbench)
-            .bind_local();
+        // Another project, another history. The next `#` reads it.
+        self.commit_reload = CommitReload::Idle;
+        self.set_commit_index(CommitIndex::Pending);
+        self.bound_workbench_mut().bind_local();
         self.suspend_permission_editor();
         self.permission_config_trust_deferred = false;
         self.permissions.set_project_with_config(cwd, permissions);
@@ -4881,16 +4971,17 @@ impl App {
     /// Points both composers at the session's working directory, which is what
     /// decides whether an `@path` resolves to a file or stays prose.
     fn sync_composer_cwd(&mut self) {
+        // The log window belongs to the project, so moving to another one
+        // retires it. Nothing is read here: the next `#` asks.
+        self.set_commit_index(CommitIndex::Pending);
         if self.workspace_session.is_some() {
             self.input_box.set_remote_cwd();
             self.subagent_input_box.set_remote_cwd();
-            self.set_commit_index(CommitIndex::Remote);
             return;
         }
         let cwd = PathBuf::from(&self.state.session.cwd);
         self.input_box.set_cwd(cwd.clone());
-        self.subagent_input_box.set_cwd(cwd.clone());
-        self.set_commit_index(CommitIndex::load(&cwd));
+        self.subagent_input_box.set_cwd(cwd);
     }
 
     fn overlays(&self) -> [&dyn Overlay; 37] {
@@ -5150,6 +5241,7 @@ impl App {
             | self.refresh_session_picker()
             | self.poll_workflow_replies()
             | self.tick_workbench()
+            | self.poll_commit_index()
             | self.thinking_picker.tick()
             | Dirty::any(self.chats.iter_mut().map(Chat::tick))
     }
@@ -5436,6 +5528,9 @@ impl App {
             Cadence::when(self.autoscroll.is_some(), Cadence::SMOOTH),
             Cadence::any(self.chats.iter().map(Chat::cadence)),
             self.which_key.cadence(),
+            // The `#` popup is not an overlay, so its spinner has to be asked
+            // for here rather than through `overlays`.
+            self.commit_popup.cadence(),
         ])
     }
 
