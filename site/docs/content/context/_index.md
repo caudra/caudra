@@ -144,6 +144,30 @@ Putting a file back the way it was withdraws the announcement rather than leavin
 
 Put coding conventions, repo quirks, and off-limits directories in these files. Keep them short, for the reason the next section gives.
 
+### In a sandbox
+
+A [remote workspace](/docs/remote-workspaces/) or [managed sandbox](/docs/sandboxes/) session has two filesystems. The workspace holds the project the model works on. Your own machine holds the checkout you launched Caudra from. Caudra reads instruction files from both.
+
+The workspace goes first, walked with the same table and the same one-per-directory rule as above. Your machine goes second, walked the same way again. `~/.config/caudra/AGENTS.md` comes last, and it always comes from your machine, because a workspace has no copy of it.
+
+Most files arrive twice, since the host checkout usually seeded the workspace. Caudra compares the text of each host file against every workspace file, ignoring trailing whitespace, and drops the ones that already arrived. The comparison is on content rather than path, because two filesystems have no reason to agree on where a file sits.
+
+What survives is what the workspace does not have. `AGENTS.local.md` is the common case: keeping it gitignored is the recommendation above, and transfers respect gitignore, so it never reaches the workspace. A host file that has drifted from its workspace copy also survives, and you will see both versions.
+
+Blocks carry one extra attribute in these sessions:
+
+```
+<instructions scope="local" origin="host" path="/home/you/repo/AGENTS.local.md">
+...
+</instructions>
+```
+
+`origin` is `workspace` for a file the workspace supplied and `host` for one read from your machine. Local sessions have a single filesystem, so they omit the attribute and their prompts stay byte-identical across upgrades.
+
+Read the `host` blocks with that difference in mind. Your global file describes your machine, so a rule about an installed toolchain, an absolute path, or a local binary may not hold inside the workspace. The same caution applies to any host project file, especially when you started Caudra in a directory unrelated to the workspace you attached to. Nothing checks that the two are the same project.
+
+A declared workspace file Caudra does not recognise is skipped, and the session warns you with its path. The rest of the project context still loads. The exception is `.caudra/permissions.toml`, which fails the session outright when it does not validate, since running without the restrictions a project asked for is worse than not running.
+
 ## What Caudra writes on your behalf
 
 Part of what the model reads was written by Caudra rather than typed by you. These messages carry your role, because that is the only role a provider accepts for them, and each one is wrapped in a `<system-reminder>` tag so the model can tell it apart from something you asked for.
