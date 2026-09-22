@@ -4,7 +4,7 @@ use crate::agent::AgentCommand;
 use crate::clipboard::CopyResult;
 use crate::components::Overlay;
 use crate::components::command::ChatScope;
-use crate::components::input::InputHit;
+use crate::components::input::{ChordHint, InputHit};
 use crate::components::paste_editor::PasteEditorAction;
 use crate::components::permission_prompt::PromptMouse;
 use crate::components::queue_panel::{QueueAction, QueueHit, QueueHitTarget};
@@ -449,7 +449,7 @@ impl App {
             }
             MouseEventKind::Down(MouseButton::Left) => {
                 self.admission_mouse_down = None;
-                self.task_hint_mouse_down = false;
+                self.chord_hint_down = None;
                 self.queue_mouse_down = None;
                 self.status_mouse_down = None;
                 self.message_action_mouse_down = None;
@@ -457,7 +457,7 @@ impl App {
                 self.mention_mouse_down = None;
                 if !self.has_modal_overlay() {
                     self.admission_mouse_down = self.admission_hit_at(event.row, event.column);
-                    self.task_hint_mouse_down = self.task_hint_hit_at(event.row, event.column);
+                    self.chord_hint_down = self.chord_hint_at(event.row, event.column);
                     self.status_mouse_down = self
                         .status_hit_at(event.row, event.column)
                         .filter(|hit| hit.target.accepts_click());
@@ -554,7 +554,7 @@ impl App {
             MouseEventKind::Drag(MouseButton::Left) => {
                 self.clear_control_hovers();
                 self.admission_mouse_down = None;
-                self.task_hint_mouse_down = false;
+                self.chord_hint_down = None;
                 self.queue_mouse_down = None;
                 self.status_mouse_down = None;
                 self.message_action_mouse_down = None;
@@ -572,19 +572,19 @@ impl App {
                     self.message_action_mouse_down = None;
                     self.link_mouse_down = None;
                     self.mention_mouse_down = None;
-                    self.task_hint_mouse_down = false;
+                    self.chord_hint_down = None;
                     return self.handle_streaming_admission(pressed.admission);
                 }
                 if !self.has_modal_overlay()
-                    && std::mem::take(&mut self.task_hint_mouse_down)
-                    && self.task_hint_hit_at(event.row, event.column)
+                    && let Some(pressed) = self.chord_hint_down.take()
+                    && self.chord_hint_at(event.row, event.column) == Some(pressed)
                 {
                     self.queue_mouse_down = None;
                     self.status_mouse_down = None;
                     self.message_action_mouse_down = None;
                     self.link_mouse_down = None;
                     self.mention_mouse_down = None;
-                    return self.tasks_browse();
+                    return self.press_chord_hint(pressed);
                 }
                 if !self.has_modal_overlay()
                     && self
@@ -686,7 +686,7 @@ impl App {
                     }
                 }
                 self.admission_mouse_down = None;
-                self.task_hint_mouse_down = false;
+                self.chord_hint_down = None;
                 self.queue_mouse_down = None;
                 self.status_mouse_down = None;
                 self.message_action_mouse_down = None;
@@ -701,7 +701,7 @@ impl App {
                 self.admission_hover = self
                     .admission_hit_at(event.row, event.column)
                     .map(|hit| hit.admission);
-                self.task_hint_hover = self.task_hint_hit_at(event.row, event.column);
+                self.chord_hint_hover = self.chord_hint_at(event.row, event.column);
                 self.queue_hover = self
                     .queue_hit_at(event.row, event.column)
                     .map(|hit| hit.target);
@@ -991,8 +991,23 @@ impl App {
             .copied()
     }
 
-    fn task_hint_hit_at(&self, row: u16, col: u16) -> bool {
-        self.task_hint_hit.contains(Position::new(col, row))
+    fn chord_hint_at(&self, row: u16, col: u16) -> Option<ChordHint> {
+        let hit = self.chord_hint_hit?;
+        hit.area
+            .contains(Position::new(col, row))
+            .then_some(hit.target)
+    }
+
+    /// A click stands in for the chord the hint names, so the two paths can
+    /// never advertise one thing and do another.
+    fn press_chord_hint(&mut self, target: ChordHint) -> Vec<crate::components::Action> {
+        match target {
+            ChordHint::Tasks => self.tasks_browse(),
+            ChordHint::PlanOrTodo => {
+                self.toggle_plan_or_todo();
+                Vec::new()
+            }
+        }
     }
 
     fn status_hit_at(&self, row: u16, col: u16) -> Option<StatusBarHit> {
@@ -1235,7 +1250,7 @@ impl App {
 
     fn clear_control_hovers(&mut self) {
         self.admission_hover = None;
-        self.task_hint_hover = false;
+        self.chord_hint_hover = None;
         self.queue_hover = None;
         self.status_hover = None;
         self.input_box.clear_hover();

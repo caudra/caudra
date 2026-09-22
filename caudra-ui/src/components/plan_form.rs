@@ -1,5 +1,5 @@
 use crate::components::form::{footer_row, render_form, selected_prefix};
-use crate::components::keybindings::{key, leader};
+use crate::components::keybindings::key;
 use crate::components::{Hint, HintBar};
 use crate::theme;
 
@@ -7,10 +7,10 @@ use caudra_grab::grab_scope;
 use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
-use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 
 const FORM_LABEL: &str = " Plan complete ";
+const HINT_LABEL: &str = "Plan";
 
 const DISMISS_KEYS: &str = if cfg!(target_os = "macos") {
     "⌃T/Esc"
@@ -141,16 +141,10 @@ impl PlanForm {
         self.selected = 0;
     }
 
-    pub fn hint_line(&self) -> Option<Line<'static>> {
-        if self.visibility != Visibility::UserDismissed {
-            return None;
-        }
-        let t = theme::current();
-        Some(Line::from(vec![
-            Span::styled(" Plan ", Style::new().fg(t.foreground)),
-            Span::styled(leader::PLAN_TOGGLE.label, t.keybind_key),
-            Span::raw(" "),
-        ]))
+    /// What the composer's top row reads while the form is dismissed, so the
+    /// plan stays reachable from the chord it names.
+    pub fn hint_label(&self) -> Option<&'static str> {
+        (self.visibility == Visibility::UserDismissed).then_some(HINT_LABEL)
     }
 
     pub fn height(&self) -> u16 {
@@ -383,13 +377,13 @@ mod tests {
     }
 
     #[test]
-    fn hint_line_only_when_dismissed() {
+    fn hint_label_only_when_dismissed() {
         let mut form = PlanForm::new();
-        assert!(form.hint_line().is_none());
+        assert!(form.hint_label().is_none());
         form.on_plan_ready();
-        assert!(form.hint_line().is_none());
+        assert!(form.hint_label().is_none());
         form.hide();
-        assert!(form.hint_line().is_some());
+        assert_eq!(form.hint_label(), Some(HINT_LABEL));
     }
 
     #[test]

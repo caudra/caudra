@@ -39,6 +39,8 @@ const COMPOSER_RAIL_WIDTH: u16 = 1;
 const COMPOSER_VERTICAL_PADDING: u16 = 1;
 const ADMISSION_SEPARATOR: &str = "  ";
 const ADMISSION_DESCRIPTION_GAP: &str = " ";
+const HINT_PAD: &str = " ";
+const HINT_KEY_GAP: &str = " ";
 const PLACEHOLDER_SUGGESTIONS: &[&str] = &[
     "research how something works",
     "fix a bug",
@@ -74,6 +76,30 @@ const ADMISSION_OPTIONS: [(&str, &str, PromptAdmission); 3] = [
 pub(crate) struct AdmissionHit {
     pub area: Rect,
     pub admission: PromptAdmission,
+}
+
+/// A chord the composer's top row advertises when nothing louder wants it.
+/// The key travels with the target, so a click can never press something other
+/// than what the hint reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ChordHint {
+    Tasks,
+    PlanOrTodo,
+}
+
+impl ChordHint {
+    pub(crate) fn key_label(self) -> &'static str {
+        match self {
+            Self::Tasks => leader::TASKS.label,
+            Self::PlanOrTodo => leader::PLAN_TOGGLE.label,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ChordHintHit {
+    pub area: Rect,
+    pub target: ChordHint,
 }
 
 #[derive(Clone, Copy)]
@@ -917,6 +943,53 @@ pub(crate) fn admission_hint(
     }
 
     (Line::from(spans), hits)
+}
+
+/// A `text key` control right-aligned into [`top_right_hint_area`], and the
+/// cells it occupies. The padding on either side is separator rather than
+/// control, so it neither takes the click nor lights up under the pointer. A
+/// region too narrow to hold the control leaves a zero-width rect, which no
+/// pointer can be inside.
+pub(crate) fn chord_hint(
+    area: Rect,
+    text: &str,
+    target: ChordHint,
+    hovered: bool,
+) -> (Line<'static>, ChordHintHit) {
+    let theme = theme::current();
+    let key_label = target.key_label();
+    let control_width = text.width() + HINT_KEY_GAP.width() + key_label.width();
+    let line = Line::from(vec![
+        Span::raw(HINT_PAD),
+        Span::styled(
+            text.to_string(),
+            hover_style(Style::new().fg(theme.foreground), hovered),
+        ),
+        Span::styled(
+            format!("{HINT_KEY_GAP}{key_label}"),
+            hover_style(theme.keybind_key, hovered),
+        ),
+        Span::raw(HINT_PAD),
+    ]);
+
+    let hint_area = top_right_hint_area(area);
+    let full_width = control_width + HINT_PAD.width() * 2;
+    let left = if full_width <= hint_area.width as usize {
+        hint_area.right().saturating_sub(full_width as u16)
+    } else {
+        hint_area.x
+    };
+    let x = left.saturating_add(HINT_PAD.width() as u16);
+    let hit = ChordHintHit {
+        area: Rect::new(
+            x,
+            hint_area.y,
+            (control_width as u16).min(hint_area.right().saturating_sub(x)),
+            hint_area.height.min(1),
+        ),
+        target,
+    };
+    (line, hit)
 }
 
 pub(crate) fn top_right_hint_area(area: Rect) -> Rect {

@@ -46,7 +46,9 @@ use crate::components::context_modal::ContextModal;
 use crate::components::file_picker::{FilePickerModal, FilePickerModalAction};
 use crate::components::goal_modal::GoalModal;
 use crate::components::help_modal::HelpModal;
-use crate::components::input::{AdmissionHit, InputAction, InputBox, Submission};
+use crate::components::input::{
+    AdmissionHit, ChordHint, ChordHintHit, InputAction, InputBox, Submission,
+};
 use crate::components::keybindings::{self, KeybindContext, key, leader};
 use crate::components::login_picker::{LoginPicker, LoginPickerAction};
 use crate::components::logs_modal::{LogsAction, LogsModal};
@@ -133,7 +135,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent
 use flume::{Receiver, TryRecvError};
 
 use crate::storage_writer::StorageWriter;
-use ratatui::layout::{Position, Rect};
+use ratatui::layout::Position;
 
 pub(crate) use crate::agent::QueuedMessage;
 pub use crate::components::RestoreMode;
@@ -397,11 +399,13 @@ pub struct App {
     pub(super) admission_hits: Vec<AdmissionHit>,
     pub(super) admission_mouse_down: Option<AdmissionHit>,
     pub(super) admission_hover: Option<PromptAdmission>,
-    /// Zero-sized whenever the task hint is not on screen, so the pointer
-    /// cannot land on a hint that a higher-priority one replaced.
-    pub(super) task_hint_hit: Rect,
-    pub(super) task_hint_mouse_down: bool,
-    pub(super) task_hint_hover: bool,
+    /// `None` whenever no chord hint is on screen, so the pointer cannot land
+    /// on a hint that a higher-priority one replaced. A press and a hover are
+    /// tagged with the hint they were taken against, so neither can act on a
+    /// different hint that takes the row before the release or the next frame.
+    pub(super) chord_hint_hit: Option<ChordHintHit>,
+    pub(super) chord_hint_down: Option<ChordHint>,
+    pub(super) chord_hint_hover: Option<ChordHint>,
     pub(super) message_action_mouse_down: Option<MessageActionTarget>,
     pub(super) link_mouse_down: Option<Arc<str>>,
     pub(super) mention_mouse_down: Option<Mention>,
@@ -625,9 +629,9 @@ impl App {
             admission_hits: Vec::new(),
             admission_mouse_down: None,
             admission_hover: None,
-            task_hint_hit: Rect::ZERO,
-            task_hint_mouse_down: false,
-            task_hint_hover: false,
+            chord_hint_hit: None,
+            chord_hint_down: None,
+            chord_hint_hover: None,
             message_action_mouse_down: None,
             link_mouse_down: None,
             mention_mouse_down: None,

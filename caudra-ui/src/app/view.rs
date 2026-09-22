@@ -2,7 +2,7 @@ use std::borrow::Cow;
 use std::sync::atomic::Ordering;
 
 use crate::components::Overlay;
-use crate::components::input::{self, Placeholder};
+use crate::components::input::{self, ChordHint, Placeholder};
 use crate::components::keybindings;
 #[cfg(test)]
 use crate::components::keybindings::KeybindContext;
@@ -65,7 +65,7 @@ impl App {
         self.sync_subagent_input_target();
         self.queue_hits.clear();
         self.admission_hits.clear();
-        self.task_hint_hit = Rect::ZERO;
+        self.chord_hint_hit = None;
         if self.workbench.is_open() {
             self.render_workbench(frame);
             return;
@@ -414,20 +414,8 @@ impl App {
                 self.admission_hits = hits;
                 Some(hint)
             } else {
-                let panel = (self.state.mode == Mode::Plan)
-                    .then(|| self.plan_form.hint_line())
-                    .flatten()
-                    .or_else(|| self.todo_panel.hint_line());
-                match panel {
-                    Some(hint) => Some(hint),
-                    None => match self.task_hint(layout.input_area) {
-                        Some((hint, hit)) => {
-                            self.task_hint_hit = hit;
-                            Some(hint)
-                        }
-                        None => self.lua_hint_line(),
-                    },
-                }
+                self.chord_hint(layout.input_area)
+                    .or_else(|| self.lua_hint_line())
             };
             self.input_box.view(
                 frame,
@@ -801,6 +789,26 @@ impl App {
             layout.input_area,
             layout.splits,
         )
+    }
+
+    /// The chord the composer's top row offers, and the cells it takes. Only
+    /// one is ever drawn: a ready plan speaks before the todo count, and both
+    /// before the task picker, so the hit recorded here is the only control the
+    /// row holds this frame.
+    fn chord_hint(&mut self, area: Rect) -> Option<Line<'static>> {
+        let (target, text) = if self.state.mode == Mode::Plan
+            && let Some(label) = self.plan_form.hint_label()
+        {
+            (ChordHint::PlanOrTodo, label.to_string())
+        } else if let Some(progress) = self.todo_panel.hint_label() {
+            (ChordHint::PlanOrTodo, progress)
+        } else {
+            (ChordHint::Tasks, self.task_hint_text()?)
+        };
+        let hovered = self.chord_hint_hover == Some(target);
+        let (line, hit) = input::chord_hint(area, &text, target, hovered);
+        self.chord_hint_hit = Some(hit);
+        Some(line)
     }
 
     fn lua_hint_line(&self) -> Option<Line<'static>> {

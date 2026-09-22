@@ -17,7 +17,6 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph};
 use unicode_width::UnicodeWidthStr;
 
-use crate::components::keybindings::leader;
 use crate::components::{apply_scroll_delta, hover_style};
 use crate::theme;
 
@@ -34,7 +33,7 @@ const CHROME_ROWS: u16 = 2;
 /// The panel is the user's to open. The model supplies rows and nothing more:
 /// neither a new list nor a restored session may put it on screen, so a box
 /// the model ticks can never take rows from the transcript.
-/// [`TodoPanel::hint_line`] carries the count while it is closed, and only a
+/// [`TodoPanel::hint_label`] carries the count while it is closed, and only a
 /// new session clears the flag.
 #[derive(Default)]
 pub struct TodoPanel {
@@ -97,20 +96,13 @@ impl TodoPanel {
     }
 
     /// The counter shown next to the chord while the panel is closed, so
-    /// progress stays readable without occupying rows.
-    pub fn hint_line(&self) -> Option<Line<'static>> {
+    /// progress stays readable without occupying rows. The composer draws it
+    /// as the control the chord belongs to.
+    pub fn hint_label(&self) -> Option<String> {
         if self.items.is_empty() || self.revealed {
             return None;
         }
-        let t = theme::current();
-        Some(Line::from(vec![
-            Span::styled(
-                format!(" {}/{} ", self.completed(), self.items.len()),
-                Style::new().fg(t.foreground),
-            ),
-            Span::styled(leader::PLAN_TOGGLE.label, t.keybind_key),
-            Span::raw(" "),
-        ]))
+        Some(format!("{}/{}", self.completed(), self.items.len()))
     }
 
     fn completed(&self) -> usize {
@@ -299,6 +291,7 @@ mod tests {
 
     const OPENED_UNASKED: &str = "only the user may open the todo panel";
     const HINT_STALE: &str = "the hint row must track the list while the panel is closed";
+    const PROGRESS: &str = "1/2";
     const WIDE: u16 = 40;
 
     fn todo(content: &str, status: TodoStatus) -> TodoItem {
@@ -360,7 +353,7 @@ mod tests {
 
         assert!(!panel.is_visible(), "{OPENED_UNASKED}");
         assert_eq!(panel.height(), 0);
-        assert!(panel.hint_line().is_some(), "the list is still reachable");
+        assert!(panel.hint_label().is_some(), "the list is still reachable");
     }
 
     #[test]
@@ -368,7 +361,7 @@ mod tests {
         let mut panel = panel(&[TodoStatus::Pending]);
         assert!(panel.toggle());
         assert_eq!(panel.height(), 0);
-        assert!(panel.hint_line().is_some(), "the list is still there");
+        assert!(panel.hint_label().is_some(), "the list is still there");
     }
 
     #[test]
@@ -404,10 +397,11 @@ mod tests {
             todo("b", TodoStatus::InProgress),
         ]);
 
-        let hint = panel.hint_line().expect(HINT_STALE);
-        let text: String = hint.spans.iter().map(|s| s.content.as_ref()).collect();
-        assert!(text.contains("1/2"), "{HINT_STALE}");
-        assert!(text.contains(leader::PLAN_TOGGLE.label), "{HINT_STALE}");
+        assert_eq!(
+            panel.hint_label().as_deref(),
+            Some(PROGRESS),
+            "{HINT_STALE}"
+        );
     }
 
     /// A new session starts clean, which means closed: the list a restore
@@ -434,14 +428,17 @@ mod tests {
     fn the_hint_appears_only_while_closed() {
         let mut panel = TodoPanel::default();
         panel.set_items(items(&[TodoStatus::Completed, TodoStatus::Pending]));
-        let hint = panel.hint_line().expect(HINT_STALE);
-        assert!(hint.spans[0].content.contains("1/2"), "{hint:?}");
+        assert_eq!(
+            panel.hint_label().as_deref(),
+            Some(PROGRESS),
+            "{HINT_STALE}"
+        );
 
         panel.toggle();
-        assert!(panel.hint_line().is_none(), "an open panel needs no hint");
+        assert!(panel.hint_label().is_none(), "an open panel needs no hint");
 
         panel.toggle();
-        assert!(panel.hint_line().is_some(), "{HINT_STALE}");
+        assert!(panel.hint_label().is_some(), "{HINT_STALE}");
     }
 
     #[test]
@@ -508,7 +505,7 @@ mod tests {
         let mut panel = panel(&[TodoStatus::Pending]);
         panel.reset();
         assert_eq!(panel.height(), 0);
-        assert!(panel.hint_line().is_none());
+        assert!(panel.hint_label().is_none());
     }
 
     fn mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
@@ -583,7 +580,7 @@ mod tests {
         let header = panel.header;
         assert!(click(&mut panel, header.x, header.y));
         assert!(!panel.is_visible());
-        assert!(panel.hint_line().is_some(), "the list is still reachable");
+        assert!(panel.hint_label().is_some(), "the list is still reachable");
     }
 
     /// The press and release must land on the same control, or a drag that

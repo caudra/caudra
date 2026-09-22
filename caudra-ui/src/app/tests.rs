@@ -9,6 +9,7 @@ use crate::components::context_modal::{
 };
 use crate::components::file_walk::UNREADABLE_DIR_MSG;
 use crate::components::goal_modal::GoalTarget;
+use crate::components::input::ChordHint;
 use crate::components::keybindings::{Bind, KeybindContext, key as kb, leader as chord};
 use crate::components::messages::{ASSISTANT_LABEL, ReviewTarget};
 use crate::components::queue_actions::QueueActionKind;
@@ -38,6 +39,7 @@ use caudra_agent::permissions::{
 };
 use caudra_agent::snapshots::{RestoreFailureKind, RestoreStatus};
 use caudra_agent::tools::ToolEffect;
+use caudra_agent::types::{TodoItem, TodoPriority, TodoStatus};
 use caudra_agent::workspace_baseline::BaselineOutcome;
 use caudra_agent::{
     DoneReason, GoalResult, GoalStatus, GoalVerdict, HistorySnapshot, ImageMediaType,
@@ -4862,35 +4864,49 @@ fn click_admission(app: &mut App, admission: caudra_agent::PromptAdmission) -> V
     ))
 }
 
+const HINT_MISSING: &str = "the composer drew no chord hint";
+const WRONG_HINT: &str = "another hint took the composer's top row";
+
 /// The hint only reaches the composer's top row once nothing louder wants it,
-/// so every task-hint test renders first and aims at where the frame put it.
-fn task_hint(app: &mut App) -> Rect {
-    const TASK_HINT_MISSING: &str = "task hint was not rendered";
+/// so every chord-hint test renders first and aims at where the frame put it.
+fn chord_hint(app: &mut App, target: ChordHint) -> Rect {
     app.status = Status::Idle;
     let _ = rendered(app);
-    let hit = app.task_hint_hit;
-    assert!(hit.width > 0, "{TASK_HINT_MISSING}");
-    hit
+    let hit = app.chord_hint_hit.expect(HINT_MISSING);
+    assert_eq!(hit.target, target, "{WRONG_HINT}");
+    assert!(hit.area.width > 0, "{HINT_MISSING}");
+    hit.area
 }
 
-#[test]
-fn clicking_the_task_hint_opens_the_task_picker() {
-    let mut app = app_with_subagent();
-    let hit = task_hint(&mut app);
-
+fn click_at(app: &mut App, hit: Rect) -> Vec<Action> {
     app.update(mouse_event(
         MouseEventKind::Down(MouseButton::Left),
         hit.x,
         hit.y,
     ));
-    assert!(
-        app.update(mouse_event(
-            MouseEventKind::Up(MouseButton::Left),
-            hit.x,
-            hit.y
-        ))
-        .is_empty()
-    );
+    app.update(mouse_event(
+        MouseEventKind::Up(MouseButton::Left),
+        hit.x,
+        hit.y,
+    ))
+}
+
+fn app_with_todos() -> App {
+    let mut app = test_app();
+    app.todo_panel.set_items(vec![TodoItem {
+        content: "write the test".into(),
+        status: TodoStatus::Pending,
+        priority: TodoPriority::default(),
+    }]);
+    app
+}
+
+#[test]
+fn clicking_the_task_hint_opens_the_task_picker() {
+    let mut app = app_with_subagent();
+    let hit = chord_hint(&mut app, ChordHint::Tasks);
+
+    assert!(click_at(&mut app, hit).is_empty());
 
     assert!(app.task_picker.is_open());
 }
@@ -4898,7 +4914,7 @@ fn clicking_the_task_hint_opens_the_task_picker() {
 #[test]
 fn releasing_off_the_task_hint_leaves_the_picker_shut() {
     let mut app = app_with_subagent();
-    let hit = task_hint(&mut app);
+    let hit = chord_hint(&mut app, ChordHint::Tasks);
 
     app.update(mouse_event(
         MouseEventKind::Down(MouseButton::Left),
@@ -4911,35 +4927,103 @@ fn releasing_off_the_task_hint_leaves_the_picker_shut() {
 }
 
 #[test]
-fn task_hint_hover_excludes_the_padding_around_it() {
-    let mut app = app_with_subagent();
-    let hit = task_hint(&mut app);
+fn clicking_the_todo_hint_opens_the_panel() {
+    let mut app = app_with_todos();
+    let hit = chord_hint(&mut app, ChordHint::PlanOrTodo);
+
+    assert!(click_at(&mut app, hit).is_empty());
+
+    assert!(app.todo_panel.is_visible());
+}
+
+#[test]
+fn releasing_off_the_todo_hint_leaves_the_panel_closed() {
+    let mut app = app_with_todos();
+    let hit = chord_hint(&mut app, ChordHint::PlanOrTodo);
+
+    app.update(mouse_event(
+        MouseEventKind::Down(MouseButton::Left),
+        hit.x,
+        hit.y,
+    ));
+    app.update(mouse_event(MouseEventKind::Up(MouseButton::Left), 0, 0));
+
+    assert!(!app.todo_panel.is_visible());
+}
+
+/// A dismissed plan is reachable from the same row the todo count uses, and a
+/// click on it means what the chord means.
+#[test]
+fn clicking_the_plan_hint_reopens_the_dismissed_form() {
+    let mut app = plan_app();
+    app.plan_form.hide();
+    let hit = chord_hint(&mut app, ChordHint::PlanOrTodo);
+
+    assert!(click_at(&mut app, hit).is_empty());
+
+    assert!(app.plan_form.is_visible());
+}
+
+#[test_case(ChordHint::Tasks, app_with_subagent ; "tasks")]
+#[test_case(ChordHint::PlanOrTodo, app_with_todos ; "todos")]
+fn chord_hint_hover_excludes_the_padding_around_it(target: ChordHint, build: fn() -> App) {
+    let mut app = build();
+    let hit = chord_hint(&mut app, target);
 
     app.update(mouse_event(MouseEventKind::Moved, hit.x, hit.y));
-    assert!(app.task_hint_hover);
+    assert_eq!(app.chord_hint_hover, Some(target));
 
     app.update(mouse_event(
         MouseEventKind::Moved,
         hit.x.saturating_sub(1),
         hit.y,
     ));
-    assert!(!app.task_hint_hover);
+    assert_eq!(app.chord_hint_hover, None);
 
     app.update(mouse_event(MouseEventKind::Moved, hit.right(), hit.y));
-    assert!(!app.task_hint_hover);
+    assert_eq!(app.chord_hint_hover, None);
 }
 
-/// Streaming hands the same row to the admission controls, so the stale task
-/// hit has to go with the hint that no longer renders.
+/// Streaming hands the same row to the admission controls, so the stale hit
+/// has to go with the hint that no longer renders.
 #[test]
-fn the_task_hint_stops_taking_clicks_once_streaming_takes_the_row() {
+fn the_chord_hint_stops_taking_clicks_once_streaming_takes_the_row() {
     let mut app = app_with_subagent();
-    let _ = task_hint(&mut app);
+    let _ = chord_hint(&mut app, ChordHint::Tasks);
 
     app.status = Status::Streaming;
     let _ = rendered(&mut app);
 
-    assert_eq!(app.task_hint_hit, Rect::ZERO);
+    assert!(app.chord_hint_hit.is_none());
+}
+
+/// The row holds one control at a time, so a press taken against one hint can
+/// never press the chord of whichever hint replaced it before the release.
+#[test]
+fn a_press_never_fires_the_hint_that_replaced_the_one_it_landed_on() {
+    const FIRED_ANYWAY: &str = "a press outlived the hint it was taken against";
+    let mut app = app_with_subagent();
+    let pressed = chord_hint(&mut app, ChordHint::Tasks);
+    app.update(mouse_event(
+        MouseEventKind::Down(MouseButton::Left),
+        pressed.x,
+        pressed.y,
+    ));
+
+    app.todo_panel.set_items(vec![TodoItem {
+        content: "take the row".into(),
+        status: TodoStatus::Pending,
+        priority: TodoPriority::default(),
+    }]);
+    let hit = chord_hint(&mut app, ChordHint::PlanOrTodo);
+    app.update(mouse_event(
+        MouseEventKind::Up(MouseButton::Left),
+        hit.x,
+        hit.y,
+    ));
+
+    assert!(!app.task_picker.is_open(), "{FIRED_ANYWAY}");
+    assert!(!app.todo_panel.is_visible(), "{FIRED_ANYWAY}");
 }
 
 pub(crate) fn status_hit(
