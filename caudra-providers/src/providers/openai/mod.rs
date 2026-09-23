@@ -6,7 +6,7 @@ pub(crate) mod responses;
 pub use platform::OpenAi;
 
 use crate::model::{
-    ModelEntry, ModelFamily, ModelGeneration, ModelPricing, StaticReasoningOption,
+    FastPricing, ModelEntry, ModelFamily, ModelGeneration, ModelPricing, StaticReasoningOption,
 };
 
 /// Working window for the long-context OpenAI models: gpt-5.6 luna/terra/sol
@@ -100,7 +100,12 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
                 output: 0.50,
                 cache_write: 0.125,
                 cache_read: 0.01,
-                fast: None,
+                fast: Some(FastPricing {
+                    input: 0.20,
+                    output: 1.00,
+                    cache_write: 0.25,
+                    cache_read: 0.02,
+                }),
                 tiers: Vec::new(),
             },
             max_output_tokens: Some(WIDE_MAX_OUTPUT_TOKENS),
@@ -118,7 +123,12 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
                 output: 10.00,
                 cache_write: 2.50,
                 cache_read: 0.20,
-                fast: None,
+                fast: Some(FastPricing {
+                    input: 4.00,
+                    output: 20.00,
+                    cache_write: 5.00,
+                    cache_read: 0.40,
+                }),
                 tiers: Vec::new(),
             },
             max_output_tokens: Some(WIDE_MAX_OUTPUT_TOKENS),

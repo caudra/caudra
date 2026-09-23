@@ -2772,7 +2772,7 @@ Answers with the new state, in the same shape `get` returns.
 
   (`"minimal"` to `"max"`), a token budget, or `""` to toggle it on and off;
 
-  - `fast` (`boolean`) Anthropic fast mode.
+  - `fast` (`boolean`) fast mode, on a model that sells a fast tier.
 
 **Returns:** (`table|nil`, `string|nil`) The new state, or nil and an error.
 

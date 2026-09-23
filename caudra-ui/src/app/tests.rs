@@ -14955,8 +14955,8 @@ fn stale_batched_subagent_history_uses_active_root_call() {
     );
 }
 
-#[test_case(SONNET_SPEC ; "non_opus_anthropic")]
-#[test_case("openai/gpt-5.5" ; "non_anthropic")]
+#[test_case(SONNET_SPEC ; "anthropic_model_without_a_fast_tier")]
+#[test_case("openai/gpt-5.5" ; "openai_model_without_a_fast_tier")]
 fn fast_flashes_error_on_ineligible_model(spec: &str) {
     let mut app = test_app();
     app.state.model = caudra_providers::Model::from_spec(spec).unwrap();

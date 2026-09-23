@@ -6,14 +6,14 @@ use caudra_storage::auth::OAuthTokens;
 use caudra_storage::log::{outcome, target};
 use flume::Sender;
 use serde::Deserialize;
-use serde_json::Value;
+use serde_json::{Value, json};
 use tracing::{debug, info, warn};
 
 use crate::model::{Billing, Model, ModelInfo};
 use crate::provider::{BoxFuture, Provider};
 use crate::{
     AgentError, CacheKey, Message, ProviderEvent, ProviderUsage, RequestOptions, StreamResponse,
-    ThinkingConfig, UsageLimit,
+    UsageLimit,
 };
 
 use super::auth;
@@ -58,6 +58,9 @@ const USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
 /// The header the Codex backend derives cache affinity from; Codex CLI sends
 /// its thread id here alongside the body's `prompt_cache_key`.
 const CODEX_SESSION_HEADER: &str = "session-id";
+/// How OpenAI spells fast mode: a service tier on the request body, where
+/// Anthropic uses a `speed` field and a beta header.
+const PRIORITY_SERVICE_TIER: &str = "priority";
 const EMPTY_USAGE_ERROR: &str =
     "OpenAI usage response contained no plan or rate limits; the endpoint schema likely changed";
 const MILLIS_PER_SECOND: u64 = 1_000;
@@ -78,6 +81,15 @@ struct AuthState {
 
 fn is_codex_model(model_id: &str) -> bool {
     coding_plan_context_window(model_id).is_some()
+}
+
+/// Asks for the priority tier when fast mode is on. `supports_fast()` is
+/// re-checked here rather than trusting `opts.fast` alone, so a stale UI flag
+/// can never bill an ineligible model at the premium rate.
+fn apply_fast_mode(body: &mut Value, model: &Model, opts: &RequestOptions) {
+    if opts.fast && model.supports_fast() {
+        body["service_tier"] = json!(PRIORITY_SERVICE_TIER);
+    }
 }
 
 fn supports_explicit_cache(model_id: &str) -> bool {
@@ -438,15 +450,16 @@ impl OpenAi {
         messages: &[Message],
         system: &str,
         tools: &Value,
-        thinking: &ThinkingConfig,
+        opts: &RequestOptions,
         cache_key: Option<&CacheKey>,
     ) -> Value {
         let mut body = super::responses::build_body(model, messages, system, tools);
         if supports_explicit_cache(&model.id) && !self.is_oauth() {
             super::responses::apply_system_breakpoint(&mut body);
         }
-        super::responses::apply_responses_reasoning(&mut body, thinking, model);
+        super::responses::apply_responses_reasoning(&mut body, &opts.thinking, model);
         apply_prompt_cache_key(&mut body, cache_key);
+        apply_fast_mode(&mut body, model, opts);
         body
     }
 }
@@ -557,8 +570,7 @@ impl Provider for OpenAi {
             let system = super::super::with_prefix(&self.system_prefix, system, &mut buf);
 
             if is_codex_model(&model.id) {
-                let body =
-                    self.responses_body(model, messages, system, tools, &opts.thinking, cache_key);
+                let body = self.responses_body(model, messages, system, tools, &opts, cache_key);
                 let stream_timeout = self.compat.stream_timeout();
                 return self
                     .with_oauth_stream_retry(true, event_tx, |codex_auth, attempt_tx| {
@@ -582,6 +594,7 @@ impl Provider for OpenAi {
             let mut body = self.compat.build_body(model, messages, system, tools);
             opts.thinking.apply_reasoning_effort(&mut body, model);
             apply_prompt_cache_key(&mut body, cache_key);
+            apply_fast_mode(&mut body, model, &opts);
             self.with_oauth_stream_retry(false, event_tx, |auth, attempt_tx| {
                 let body = body.clone();
                 async move {
@@ -699,11 +712,11 @@ impl Provider for OpenAi {
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use serde_json::json;
     use test_case::test_case;
 
     use super::super::responses;
     use super::*;
+    use crate::ThinkingConfig;
 
     const TEST_ACCESS: &str = "test-access";
     const TEST_REFRESH: &str = "test-refresh";
@@ -801,7 +814,7 @@ mod tests {
             &[],
             SYSTEM_PROMPT,
             &Value::Null,
-            &ThinkingConfig::Off,
+            &RequestOptions::default(),
             None,
         );
 
@@ -847,6 +860,26 @@ mod tests {
             ids.windows(2).all(|pair| pair[0] != pair[1]),
             "{DUPLICATE_PLAN_MODEL}"
         );
+    }
+
+    #[test_case("openai/gpt-6-sol", true, Some(PRIORITY_SERVICE_TIER) ; "fast_asks_for_the_priority_tier")]
+    #[test_case("openai/gpt-6-luna", true, Some(PRIORITY_SERVICE_TIER) ; "luna_sells_a_fast_tier_too")]
+    #[test_case("openai/gpt-6-sol", false, None ; "standard_sends_no_tier")]
+    #[test_case("openai/gpt-5.6-sol", true, None ; "a_model_without_fast_pricing_stays_standard")]
+    fn fast_mode_sets_the_service_tier(spec: &str, fast: bool, expected: Option<&str>) {
+        let model = Model::from_spec(spec).unwrap();
+        let mut body = json!({});
+
+        apply_fast_mode(
+            &mut body,
+            &model,
+            &RequestOptions {
+                fast,
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(body.get("service_tier").and_then(Value::as_str), expected);
     }
 
     #[test]

@@ -88,9 +88,9 @@ pub struct ModelPricing {
     pub output: f64,
     pub cache_write: f64,
     pub cache_read: f64,
-    /// Anthropic fast mode charges a premium that differs per model. `None`
-    /// means the model has no fast tier, so asking for fast mode quietly falls
-    /// back to standard rates instead of overcharging.
+    /// Fast mode charges a premium that differs per model. `None` means the
+    /// model has no fast tier, so asking for fast mode quietly falls back to
+    /// standard rates instead of overcharging.
     #[serde(default)]
     pub fast: Option<FastPricing>,
     /// Context-size tiers, ascending by `above`. Empty for the flat majority.
@@ -655,14 +655,14 @@ impl Model {
         id.contains(GPT_PREFIX) || CODEX_TRAINED_PREFIXES.iter().any(|p| id.starts_with(p))
     }
 
-    /// A model supports fast mode exactly when it carries fast-tier pricing, so
-    /// capability and billing can never disagree. The provider gate keeps fast
-    /// mode to Anthropic-based providers, resolved through the base manifest so
-    /// oauth scripts keep it; Bedrock separately ignores `opts.fast` at request
-    /// time.
+    /// A model supports fast mode exactly when it carries fast-tier pricing and
+    /// its provider knows how to ask for it, so capability and billing can never
+    /// disagree. The manifest is resolved through the base provider, which is
+    /// how an oauth script keeps fast mode. Bedrock separately ignores
+    /// `opts.fast` at request time.
     pub fn supports_fast(&self) -> bool {
         self.pricing.fast.is_some()
-            && ManifestRegistry::for_slug(&self.provider).is_some_and(|m| m.slug == ANTHROPIC_SLUG)
+            && ManifestRegistry::for_slug(&self.provider).is_some_and(|m| m.serves_fast_mode)
     }
 
     pub fn spec(&self) -> String {
@@ -1777,8 +1777,10 @@ mod tests {
         assert_eq!(model.list_cost(&usage, true), Some(0.40));
     }
 
+    /// A rate with no way to ask for it is a premium nobody can buy, so the
+    /// provider has to serve fast mode before pricing alone can enable it.
     #[test]
-    fn supports_fast_false_for_non_anthropic_even_with_fast_pricing() {
+    fn supports_fast_false_when_the_provider_cannot_ask_for_it() {
         let mut model = Model::from_base(
             ManifestRegistry::get("google").unwrap(),
             "google",

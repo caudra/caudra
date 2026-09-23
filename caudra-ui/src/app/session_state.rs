@@ -307,8 +307,8 @@ mod tests {
         assert_eq!(state.cost, Some(RECORDED_COST));
     }
 
-    /// Fast pricing only counts on Anthropic, so this is the one provider a
-    /// fast-rate test can use.
+    /// Fast pricing only counts where the provider can ask for the tier, so a
+    /// fast-rate test has to build on one that can.
     fn fast_priced_model() -> Model {
         Model {
             pricing: ModelPricing {

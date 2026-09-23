@@ -390,7 +390,7 @@ pub const TOP_LEVEL_FIELDS: &[ConfigField] = &[
         default: ConfigValue::Bool(false),
         min: None,
         env: None,
-        description: "Start every session with Anthropic fast mode (Opus only; ignored otherwise)",
+        description: "Start every session with fast mode, on the models that sell a fast tier (ignored otherwise)",
     },
     ConfigField {
         name: "always_thinking",

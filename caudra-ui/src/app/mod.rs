@@ -177,7 +177,7 @@ const FLASH_NO_PLAN: &str = "No plan file";
 const NO_FILE_REVERT_MSG: &str = "No file revert for this workspace";
 const NO_FILE_CHANGES_MSG: &str =
     "Nothing has written to this workspace, so there are no file changes to revert";
-const FAST_UNSUPPORTED_MSG: &str = "Fast mode requires an Anthropic Opus 4.6+ model (API only)";
+const FAST_UNSUPPORTED_MSG: &str = "Fast mode needs a model that sells a fast tier (API only)";
 const THINKING_UNSUPPORTED_MSG: &str = "Thinking requires a model that supports it";
 const FAST_ON_MSG: &str = "Fast mode: on";
 const FAST_OFF_MSG: &str = "Fast mode: off";

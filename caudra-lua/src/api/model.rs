@@ -55,7 +55,7 @@ async fn available(lua: Lua, #[ctx] tx: Option<flume::Sender<UiAction>>) -> LuaR
 ///   `spec` (string) `"provider/id"`, as listed by `available()`;
 ///   `thinking` (string|number) `"off"`, `"adaptive"`, an effort level
 ///   (`"minimal"` to `"max"`), a token budget, or `""` to toggle it on and off;
-///   `fast` (boolean) Anthropic fast mode.
+///   `fast` (boolean) fast mode, on a model that sells a fast tier.
 /// @return (table|nil, string|nil) The new state, or nil and an error.
 /// @example
 /// caudra.model.set("anthropic/claude-opus-4-6")

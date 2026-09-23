@@ -25,6 +25,10 @@ pub struct ProviderManifest {
     /// `gpt-6-sol` moves Fast to `gpt-6-luna`. Empty for every provider that
     /// has never shipped two lines worth telling apart.
     pub generations: &'static [ModelGeneration],
+    /// Whether this provider knows how to ask for fast mode. A fast rate on its
+    /// own is not enough: a premium nobody can request would bill a standard
+    /// turn at the premium price.
+    pub serves_fast_mode: bool,
     /// Set by the providers whose rates move with the wall clock, so the hours
     /// sit next to the prices they scale. Everyone else bills flat.
     pub pricing_schedule: Option<&'static PricingSchedule>,
@@ -78,6 +82,7 @@ const ANTHROPIC: ProviderManifest = ProviderManifest {
     fallback_context_window: 200_000,
     models: anthropic::models(),
     generations: &[],
+    serves_fast_mode: true,
     pricing_schedule: None,
     catalog_slug: Some("anthropic"),
 };
@@ -92,6 +97,7 @@ const OPENAI: ProviderManifest = ProviderManifest {
     fallback_context_window: 200_000,
     models: openai::models(),
     generations: openai::generations(),
+    serves_fast_mode: true,
     pricing_schedule: None,
     catalog_slug: Some("openai"),
 };
@@ -106,6 +112,7 @@ const GOOGLE: ProviderManifest = ProviderManifest {
     fallback_context_window: 1_000_000,
     models: google::models(),
     generations: &[],
+    serves_fast_mode: false,
     pricing_schedule: None,
     catalog_slug: Some("google"),
 };
@@ -120,6 +127,7 @@ const COPILOT: ProviderManifest = ProviderManifest {
     fallback_context_window: 200_000,
     models: copilot::models(),
     generations: &[],
+    serves_fast_mode: false,
     pricing_schedule: None,
     catalog_slug: Some("github-copilot"),
 };
@@ -134,6 +142,7 @@ const OLLAMA: ProviderManifest = ProviderManifest {
     fallback_context_window: 128_000,
     models: ollama::models(),
     generations: &[],
+    serves_fast_mode: false,
     pricing_schedule: None,
     catalog_slug: None,
 };
@@ -148,6 +157,7 @@ const LLAMA_CPP: ProviderManifest = ProviderManifest {
     fallback_context_window: 128_000,
     models: llama_cpp::models(),
     generations: &[],
+    serves_fast_mode: false,
     pricing_schedule: None,
     catalog_slug: None,
 };
@@ -162,6 +172,7 @@ const MISTRAL: ProviderManifest = ProviderManifest {
     fallback_context_window: 128_000,
     models: mistral::models(),
     generations: &[],
+    serves_fast_mode: false,
     pricing_schedule: None,
     catalog_slug: Some("mistral"),
 };
@@ -176,6 +187,7 @@ const ZAI: ProviderManifest = ProviderManifest {
     fallback_context_window: 128_000,
     models: zai::models(),
     generations: &[],
+    serves_fast_mode: false,
     pricing_schedule: None,
     catalog_slug: Some("zai"),
 };
@@ -190,6 +202,7 @@ const DEEPSEEK: ProviderManifest = ProviderManifest {
     fallback_context_window: 1_000_000,
     models: deepseek::models(),
     generations: &[],
+    serves_fast_mode: false,
     pricing_schedule: Some(&deepseek::PEAK_HOURS),
     catalog_slug: Some("deepseek"),
 };
@@ -204,6 +217,7 @@ const OPENROUTER: ProviderManifest = ProviderManifest {
     fallback_context_window: 200_000,
     models: openrouter::models(),
     generations: &[],
+    serves_fast_mode: false,
     pricing_schedule: None,
     catalog_slug: Some("openrouter"),
 };
@@ -218,6 +232,7 @@ const SYNTHETIC: ProviderManifest = ProviderManifest {
     fallback_context_window: 128_000,
     models: synthetic::models(),
     generations: &[],
+    serves_fast_mode: false,
     pricing_schedule: None,
     catalog_slug: Some("synthetic"),
 };
@@ -232,6 +247,7 @@ const TENSORX: ProviderManifest = ProviderManifest {
     fallback_context_window: 200_000,
     models: tensorx::models(),
     generations: &[],
+    serves_fast_mode: false,
     pricing_schedule: None,
     catalog_slug: Some("tensorx"),
 };
@@ -246,6 +262,7 @@ const OPENCODE: ProviderManifest = ProviderManifest {
     fallback_context_window: 256_000,
     models: &[],
     generations: &[],
+    serves_fast_mode: false,
     pricing_schedule: None,
     catalog_slug: Some("opencode"),
 };
@@ -260,6 +277,7 @@ const XAI: ProviderManifest = ProviderManifest {
     fallback_context_window: 500_000,
     models: xai::models(),
     generations: &[],
+    serves_fast_mode: false,
     pricing_schedule: None,
     catalog_slug: Some("xai"),
 };
@@ -274,6 +292,7 @@ const OPENCODE_GO: ProviderManifest = ProviderManifest {
     fallback_context_window: 128_000,
     models: &[],
     generations: &[],
+    serves_fast_mode: false,
     pricing_schedule: None,
     catalog_slug: Some("opencode-go"),
 };
@@ -288,6 +307,7 @@ const APERTURE: ProviderManifest = ProviderManifest {
     fallback_context_window: 128_000,
     models: aperture::models(),
     generations: &[],
+    serves_fast_mode: false,
     pricing_schedule: None,
     catalog_slug: None,
 };

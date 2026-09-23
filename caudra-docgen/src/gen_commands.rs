@@ -247,7 +247,7 @@ pub fn generate() -> String {
     .unwrap();
     writeln!(
         out,
-        "- **`/fast`**: Anthropic fast mode (Opus only; ignored on other models). Config: `always_fast = true`."
+        "- **`/fast`**: fast mode, a premium tier that answers quicker for more per token. Anthropic Opus sells one and so do GPT-6 Sol and Luna, where it is OpenAI's priority tier. Ignored on a model without one, and unavailable on a subscription. Config: `always_fast = true`."
     )
     .unwrap();
     writeln!(
