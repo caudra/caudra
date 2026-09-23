@@ -4,13 +4,15 @@ mod segment;
 mod selection;
 #[cfg(test)]
 mod tests;
+mod thinking;
 
 use self::render::{EXPAND_AFFORDANCE, HoverFeedback, Placement, RenderCursor, RenderFeedback};
 use self::segment::{Segment, SegmentCache, wrapped_line_count};
+use self::thinking::ThinkingWindow;
 use layout::{SegmentChrome, SegmentKind};
 
 use super::tool_display::{
-    RenderCtx, ToolLines, append_annotation, append_right_info, assistant_style,
+    RenderCtx, ScrollTail, ToolLines, append_annotation, append_right_info, assistant_style,
     build_instructions_lines, build_tool_lines, done_style, draws_live_script, error_style,
     format_timestamp_now, names_tool, notice_style, shell_elapsed, thinking_style,
     truncate_to_header, user_style,
@@ -31,10 +33,10 @@ use crate::components::commit_popup::CommitIndex;
 use crate::components::keybindings::key;
 use crate::components::prompt_progress::{self, PromptProgress, PromptRate};
 use crate::markdown::{
-    DiagramSpan, LinkMap, TerminalLink, hr_line, plain_lines, text_to_painted, truncate_output,
-    truncate_output_tail,
+    DiagramSpan, LinkMap, TerminalLink, hr_line, plain_lines, text_to_painted, text_to_rows,
+    truncate_output, truncate_output_tail,
 };
-use crate::provenance::{LineProvenance, Provenance};
+use crate::provenance::Provenance;
 use crate::render_worker::RenderWorker;
 use crate::selection::Selection;
 use crate::splash::{ColorTransition, Splash};
@@ -46,6 +48,7 @@ use caudra_grab::grab_leaf;
 use caudra_markdown::render::SpanSource;
 use caudra_workflow::RunSnapshot;
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::mem;
 use std::path::{Path, PathBuf};
@@ -721,17 +724,34 @@ impl CardWindow {
     }
 }
 
-/// Every window this segment drew, with the screen rows each took.
+/// Whether the row `rel` rows into `seg` is the footer that re-pins its window.
+fn on_scroll_footer(seg: &Segment, rel: u16, width: u16) -> bool {
+    seg.scroll_footer_line
+        .is_some_and(|line| seg.source_line_at(rel, width) == Some(line))
+}
+
+/// What a segment's windows are filed under: its call for a card, its message
+/// for a reasoning block. `None` for a segment that draws no window.
+fn window_key(seg: &Segment) -> Option<Cow<'_, str>> {
+    match (seg.tool_id.as_deref(), seg.msg_index) {
+        (Some(tool_id), _) => Some(Cow::Borrowed(tool_id)),
+        (None, Some(msg_index)) if !seg.scroll_spans.is_empty() => {
+            Some(Cow::Owned(ThinkingWindow::Settled(msg_index).key()))
+        }
+        _ => None,
+    }
+}
+
+/// Every window this segment drew, with the screen rows each took, filed under
+/// `key` and a child's index after it.
 fn collect_card_windows(
-    seg: &segment::Segment,
+    seg: &Segment,
+    key: &str,
     at: Placement,
     width: u16,
     viewport: Rect,
     out: &mut Vec<CardWindow>,
 ) {
-    let Some(tool_id) = seg.tool_id.as_deref() else {
-        return;
-    };
     let chrome = seg.chrome(width);
     let inner = chrome.content_width(width);
     if inner == 0 {
@@ -751,8 +771,8 @@ fn collect_card_windows(
         };
         out.push(CardWindow {
             key: match span.child {
-                Some(index) => child_scroll_id(tool_id, index),
-                None => tool_id.to_owned(),
+                Some(index) => child_scroll_id(key, index),
+                None => key.to_owned(),
             },
             body: Rect::new(viewport.x + chrome.left, y, inner, height),
             total: span.total as u32,
@@ -961,6 +981,8 @@ pub struct MessagesPanel {
     lua_event_handle: EventHandle,
     restore_event_tx: Option<EventSender>,
     show_thinking: bool,
+    /// Rows of a reasoning block's window. Zero draws every block whole.
+    thinking_lines: u32,
     /// The live reasoning block's override, in the same tri-state as a card's.
     streaming_reasoning_open: Option<bool>,
     /// Live-turn stand-in for the persisted reasoning duration: the agent only
@@ -1029,7 +1051,8 @@ impl MessagesPanel {
                 thinking.text_style,
                 thinking.prefix_style,
                 ms,
-            ),
+            )
+            .wrapping(ui_config.thinking_lines > 0),
             streaming_text: StreamingContent::new(
                 assistant.prefix,
                 assistant.text_style,
@@ -1077,6 +1100,7 @@ impl MessagesPanel {
             lua_event_handle,
             restore_event_tx: None,
             show_thinking: ui_config.show_thinking,
+            thinking_lines: ui_config.thinking_lines,
             streaming_reasoning_open: None,
             thinking_started: None,
             view: ViewMode::default(),
@@ -1265,6 +1289,16 @@ impl MessagesPanel {
     ///
     /// `delta` is positive upwards, as everywhere else in the app.
     fn scroll_window(&mut self, key: &str, delta: i32) -> i32 {
+        if let Some(block) = ThinkingWindow::parse(key) {
+            let Some(span) = self.thinking_span(block) else {
+                return delta;
+            };
+            let Some(left) = self.step_window(block.key(), &span, delta) else {
+                return delta;
+            };
+            self.redraw_thinking(block);
+            return left;
+        }
         let Some((_, rebuild)) = self.window_body(key) else {
             return delta;
         };
@@ -1322,6 +1356,14 @@ impl MessagesPanel {
     /// for. Landing on the last row re-arms following, exactly as scrolling
     /// back to the bottom does.
     fn jump_window(&mut self, key: &str, offset: usize) {
+        if let Some(block) = ThinkingWindow::parse(key) {
+            if let Some(span) = self.thinking_span(block) {
+                let scroll = CardScroll::at_offset(offset, &span);
+                self.card_scroll.insert(block.key(), scroll);
+                self.redraw_thinking(block);
+            }
+            return;
+        }
         let Some((_, rebuild)) = self.window_body(key) else {
             return;
         };
@@ -1336,12 +1378,23 @@ impl MessagesPanel {
     /// `rebuild` is the card to redraw, which for a child is the parent whose
     /// body it is drawn inside.
     fn move_window(&mut self, key: String, rebuild: &str, delta: i32) -> i32 {
-        let Some(span) = self.keyed_window_span(&key, rebuild) else {
+        let Some(span) = self.keyed_window_span(&key, rebuild).copied() else {
             return delta;
         };
+        let Some(left) = self.step_window(key, &span, delta) else {
+            return delta;
+        };
+        self.rebuild_expanded_tool(rebuild);
+        left
+    }
+
+    /// Moves the window filed under `key` by `delta` notches over `span`, and
+    /// reports the notches it could not use. `None` when it did not move, so
+    /// the owner has nothing to redraw and the burst is the transcript's.
+    fn step_window(&mut self, key: String, span: &ScrollSpan, delta: i32) -> Option<i32> {
         let max_offset = span.total.saturating_sub(span.extent_lines);
         if max_offset == 0 || delta == 0 {
-            return delta;
+            return None;
         }
         let offset = span.offset;
         // Upwards is towards the start of the body, which is a lower offset.
@@ -1350,11 +1403,96 @@ impl MessagesPanel {
         let used = offset.abs_diff(landed) as i32;
         let scroll = CardScroll::at_offset(landed, span);
         if used == 0 && self.card_scroll.get(&key).copied().unwrap_or_default() == scroll {
-            return delta;
+            return None;
         }
         self.card_scroll.insert(key, scroll);
-        self.rebuild_expanded_tool(rebuild);
-        (delta.abs() - used) * delta.signum()
+        Some((delta.abs() - used) * delta.signum())
+    }
+
+    /// The window a reasoning block's body is drawn in, or `None` when the
+    /// reader turned windows off and every block draws whole.
+    fn thinking_window(&self, block: ThinkingWindow) -> Option<ScrollWindow> {
+        (self.thinking_lines > 0).then(|| {
+            let at = self
+                .card_scroll
+                .get(&block.key())
+                .copied()
+                .unwrap_or_default();
+            ScrollWindow {
+                height: self.thinking_lines as usize,
+                offset: at.offset,
+                follow: at.follow,
+            }
+        })
+    }
+
+    /// Where a reasoning block's window was last drawn. A settled block keeps
+    /// it on its segment; the live one has no segment, so it is rebuilt from
+    /// the same rows the frame paints.
+    fn thinking_span(&self, block: ThinkingWindow) -> Option<ScrollSpan> {
+        match block {
+            ThinkingWindow::Live if self.streaming_thinking_collapsed() => None,
+            ThinkingWindow::Live => self
+                .streaming_thinking_segment()
+                .scroll_spans
+                .first()
+                .copied(),
+            ThinkingWindow::Settled(msg_index) => self
+                .cache
+                .segments()
+                .iter()
+                .find(|seg| seg.msg_index == Some(msg_index) && seg.tool_id.is_none())?
+                .scroll_spans
+                .first()
+                .copied(),
+        }
+    }
+
+    /// Only a settled block has lines to redraw: the live one is rebuilt by
+    /// every frame anyway.
+    fn redraw_thinking(&mut self, block: ThinkingWindow) {
+        if let ThinkingWindow::Settled(msg_index) = block {
+            self.rebuild_thinking_segment(msg_index, self.viewport_width);
+        }
+    }
+
+    /// Re-pins a reasoning block's window to its newest rows, which is where an
+    /// absent entry rests.
+    fn follow_thinking(&mut self, block: ThinkingWindow) {
+        self.card_scroll.remove(&block.key());
+        self.redraw_thinking(block);
+    }
+
+    /// Files one window's place, bar and arming under a new key, so a block
+    /// that changes identity keeps the reader where they were.
+    fn rekey_window(&mut self, from: &str, to: String) {
+        if let Some(scroll) = self.card_scroll.remove(from) {
+            self.card_scroll.insert(to.clone(), scroll);
+        }
+        if let Some(bar) = self.card_bars.remove(from) {
+            self.card_bars.insert(to.clone(), bar);
+        }
+        for window in self
+            .card_windows
+            .iter_mut()
+            .filter(|window| window.key == from)
+        {
+            window.key.clone_from(&to);
+        }
+        if self.armed_card.as_deref() == Some(from) {
+            self.armed_card = Some(to);
+        }
+    }
+
+    /// Drops every reasoning window `stale` names, wherever a window is kept.
+    fn forget_thinking_windows(&mut self, stale: impl Fn(ThinkingWindow) -> bool) {
+        let keep = |key: &str| !ThinkingWindow::parse(key).is_some_and(&stale);
+        self.card_scroll.retain(|key, _| keep(key));
+        self.card_bars.retain(|key, _| keep(key));
+        self.card_windows.retain(|window| keep(&window.key));
+        if self.armed_card.as_deref().is_some_and(|key| !keep(key)) {
+            self.armed_card = None;
+        }
     }
 
     fn clear_history_anchors(&mut self, tool_id: &str) {
@@ -1514,8 +1652,11 @@ impl MessagesPanel {
         self.cache.clear();
         self.auto_open = None;
         // Every index above `index` now names a different message, which is
-        // exactly what the anchor is holding.
+        // exactly what the anchor and a reasoning window's key are holding.
         self.held_anchor = None;
+        self.forget_thinking_windows(
+            |block| matches!(block, ThinkingWindow::Settled(msg_index) if msg_index >= index),
+        );
     }
 
     /// Drops the newest harness notice reading `text`. Found by content rather
@@ -1550,6 +1691,7 @@ impl MessagesPanel {
         for scroll in self.card_scroll.values_mut() {
             scroll.history_base = None;
         }
+        self.forget_thinking_windows(|block| matches!(block, ThinkingWindow::Settled(_)));
         self.card_bars.clear();
         self.card_windows.clear();
         self.armed_card = None;
@@ -2356,6 +2498,7 @@ impl MessagesPanel {
         self.streaming_role = DisplayRole::Assistant;
         self.streaming_reasoning_open = None;
         self.thinking_started = None;
+        self.forget_thinking_windows(|block| block == ThinkingWindow::Live);
         self.cancel_in_progress();
     }
 
@@ -3065,12 +3208,13 @@ impl MessagesPanel {
             let chrome = SegmentChrome::for_kind(kind, width, 0);
             let content_width = chrome.content_width(width);
             if kind == SegmentKind::Thinking && !collapsed {
-                let (lines, links) = self.build_streaming_expanded_lines();
-                let height = wrapped_line_count(&lines, content_width) as u32;
+                let segment = self.streaming_thinking_segment();
+                let lines = segment.lines();
+                let height = wrapped_line_count(lines, content_width) as u32;
                 if (block_start..block_start + height).contains(&doc_row) {
                     let row = u16::try_from(doc_row - block_start).ok()?;
                     let col = col.checked_sub(chrome.left)?;
-                    return links.target_at(&lines, content_width, row, col);
+                    return segment.links().target_at(lines, content_width, row, col);
                 }
                 block_start = block_start.saturating_add(height);
                 has_previous = true;
@@ -3247,7 +3391,8 @@ impl MessagesPanel {
         // belongs to the still-streaming indicator, and a segment without a
         // tool_id is a finished message's text.
         let Some((_, seg, seg_start)) = self.cache.segment_at_row(doc_row, width) else {
-            return self.try_toggle_collapsed_thinking(doc_row, width);
+            return self.try_follow_streaming_thinking(doc_row, width)
+                || self.try_toggle_collapsed_thinking(doc_row, width);
         };
         let rel = u16::try_from(doc_row - seg_start).unwrap_or(u16::MAX);
         if rel < seg.chrome(width).margin_top {
@@ -3255,6 +3400,14 @@ impl MessagesPanel {
         }
         let Some(tool_id) = seg.tool_id.as_deref() else {
             let msg_idx = seg.msg_index;
+            // A reasoning window's footer is its follow control, as a card's
+            // is, so it takes the window back to the tail instead of folding.
+            if let Some(msg_idx) = msg_idx
+                && on_scroll_footer(seg, rel, width)
+            {
+                self.follow_thinking(ThinkingWindow::Settled(msg_idx));
+                return true;
+            }
             return self.try_toggle_cached_thinking(msg_idx, width);
         };
 
@@ -3607,12 +3760,12 @@ impl MessagesPanel {
             {
                 self.clear_hover();
             }
-            expanded_thinking = Some(self.build_streaming_expanded_lines());
-            let lines = &expanded_thinking.as_ref().unwrap().0;
+            let segment = self.streaming_thinking_segment();
             if cached_count > 0 {
                 streaming_heights.push(1);
             }
-            streaming_heights.push(wrapped_line_count(lines, content_width));
+            streaming_heights.push(wrapped_line_count(segment.lines(), content_width));
+            expanded_thinking = Some(segment);
         }
 
         if !self.streaming_text.is_empty() {
@@ -3706,7 +3859,9 @@ impl MessagesPanel {
             );
             if let Some(placement) = placement {
                 grab_leaf!(seg.kind().grab_name(), placement.rect(viewport));
-                collect_card_windows(seg, placement, width, viewport, &mut windows);
+                if let Some(key) = window_key(seg) {
+                    collect_card_windows(seg, &key, placement, width, viewport, &mut windows);
+                }
             }
             if let (Some(area), Some(source)) = (action_area, source) {
                 message_action_hits.push(MessageActionHit {
@@ -3719,7 +3874,6 @@ impl MessagesPanel {
             }
         }
         self.message_action_hits = message_action_hits;
-        self.place_card_windows(windows, frame);
 
         let mut height_idx = 0usize;
         let streamed: [(&StreamingContent, bool, SegmentKind); 2] = [
@@ -3755,7 +3909,6 @@ impl MessagesPanel {
             if height_idx < streaming_heights.len() {
                 let h = streaming_heights[height_idx];
                 height_idx += 1;
-                #[cfg(debug_assertions)]
                 let placement = cursor.placement(h);
                 if collapsed {
                     let hover = matches!(self.hover, Some(HoverTarget::StreamingThinking))
@@ -3771,29 +3924,37 @@ impl MessagesPanel {
                         },
                         frame,
                     );
-                } else {
-                    if kind == SegmentKind::Thinking {
-                        let (lines, links) = expanded_thinking.as_ref().unwrap();
-                        let _ = cursor.render(
-                            (lines, Some(links)),
-                            h,
-                            SegmentChrome::for_kind(kind, width, 0),
-                            (None, None),
-                            RenderFeedback::default(),
-                            frame,
-                        );
-                    } else {
-                        let _ = cursor.render(
-                            (sc.cached_lines(), Some(sc.links())),
-                            h,
-                            SegmentChrome::for_kind(kind, width, 0),
-                            // Streaming text and reasoning, never a tool row,
-                            // so compactness has no arm to reach here.
-                            segment_styles(kind, accent, false),
-                            RenderFeedback::default(),
-                            frame,
+                } else if let (SegmentKind::Thinking, Some(segment)) = (kind, &expanded_thinking) {
+                    let _ = cursor.render(
+                        (segment.lines(), Some(segment.links())),
+                        h,
+                        segment.chrome(width),
+                        (None, None),
+                        RenderFeedback::default(),
+                        frame,
+                    );
+                    if let Some(placement) = placement {
+                        let key = ThinkingWindow::Live.key();
+                        collect_card_windows(
+                            segment,
+                            &key,
+                            placement,
+                            width,
+                            viewport,
+                            &mut windows,
                         );
                     }
+                } else {
+                    let _ = cursor.render(
+                        (sc.cached_lines(), Some(sc.links())),
+                        h,
+                        SegmentChrome::for_kind(kind, width, 0),
+                        // Streaming text and reasoning, never a tool row,
+                        // so compactness has no arm to reach here.
+                        segment_styles(kind, accent, false),
+                        RenderFeedback::default(),
+                        frame,
+                    );
                 }
                 grab_leaf!(
                     kind.grab_name(),
@@ -3801,6 +3962,8 @@ impl MessagesPanel {
                 );
             }
         }
+        // After the live blocks, so the live reasoning window gets its bar too.
+        self.place_card_windows(windows, frame);
         self.terminal_links = cursor.into_terminal_links();
 
         if let Some(progress) = self.prompt_progress
@@ -4056,26 +4219,18 @@ impl MessagesPanel {
         let mut segment_start = self.cache.total_height(width);
 
         if !self.streaming_thinking.is_empty() {
-            let collapsed = self.streaming_thinking_collapsed();
-            let (lines, provenance) = if collapsed {
-                (self.build_streaming_collapsed_lines(), None)
+            let mut segment = if self.streaming_thinking_collapsed() {
+                let mut segment = Segment::with_lines(
+                    self.build_streaming_collapsed_lines(),
+                    String::new(),
+                    None,
+                );
+                segment.set_kind(SegmentKind::Thinking);
+                segment
             } else {
-                let (lines, _) = self.build_streaming_expanded_lines();
-                let mut provenance = if self.streaming_reasoning().body.is_empty() {
-                    None
-                } else {
-                    self.streaming_thinking.provenance().cloned()
-                };
-                if let Some(provenance) = provenance.as_mut() {
-                    provenance.prepend_chrome_line(0);
-                    provenance.prepend_chrome_line(lines[0].spans.len());
-                }
-                (lines, provenance)
+                self.streaming_thinking_segment()
             };
-            let mut segment = Segment::with_lines(lines, String::new(), None);
-            segment.set_kind(SegmentKind::Thinking);
             segment.set_margin_top(u16::from(cached_count > 0));
-            segment.set_provenance(provenance);
             if let Some(fragment) =
                 selection::extract_segment_fragment(&segment, segment_start, width, sel, msg_area)
             {
@@ -4651,6 +4806,12 @@ impl MessagesPanel {
             DisplayMessage::new(DisplayRole::Thinking, self.streaming_thinking.take_all());
         msg.body_open = self.streaming_reasoning_open.take();
         msg.thinking_duration = started.map(|started| started.elapsed());
+        // Where the reader left the live window is theirs, not the stream's, so
+        // the settled block opens on the same rows with the wheel still armed.
+        self.rekey_window(
+            &ThinkingWindow::Live.key(),
+            ThinkingWindow::Settled(self.messages.len()).key(),
+        );
         self.messages.push(msg);
     }
 
@@ -4672,25 +4833,38 @@ impl MessagesPanel {
         )
     }
 
-    fn build_streaming_expanded_lines(&self) -> (Vec<Line<'static>>, LinkMap) {
+    /// The open live block as the segment it will settle into: the rows, links,
+    /// source and window that the paint, the pointer and copy all read, so none
+    /// of them can disagree about which rows the window took.
+    fn streaming_thinking_segment(&self) -> Segment {
         let summary = self.streaming_reasoning();
-        let mut lines = thought_line(
+        let header = thought_line(
             summary.title,
             self.thinking_started.map(|started| started.elapsed()),
             false,
         );
-        let mut links = LinkMap::none_for(&lines);
+        let content = &self.streaming_thinking;
         // A body with nothing in it still renders one line, which would leave
         // the card a row taller than the header it draws.
-        if !summary.body.is_empty() && !self.streaming_thinking.cached_lines().is_empty() {
-            lines.push(Line::from(""));
-            links.rows.push(Vec::new());
-            lines.extend_from_slice(self.streaming_thinking.cached_lines());
-            links
-                .rows
-                .extend(self.streaming_thinking.links().rows.iter().cloned());
-        }
-        (lines, links)
+        let built = if summary.body.is_empty() || content.cached_lines().is_empty() {
+            BuiltMessage::bare(header, String::new())
+        } else {
+            thinking::assemble(
+                header,
+                thinking::Body {
+                    lines: content.cached_lines(),
+                    links: content.links(),
+                    provenance: content.provenance(),
+                    diagrams: &[],
+                },
+                self.thinking_window(ThinkingWindow::Live),
+                ScrollTail::Resumable,
+            )
+        };
+        let mut segment = Segment::default();
+        segment.set_kind(SegmentKind::Thinking);
+        install_built(&mut segment, built);
+        segment
     }
 
     fn build_cached_thinking_indicator(
@@ -4704,17 +4878,36 @@ impl MessagesPanel {
     /// The one row a folded message draws, plus the text search still has to
     /// match against. Both fold paths read it so a rebuild cannot disagree with
     /// a reflow about what a closed block looks like.
-    fn folded_lines(&self, msg: &DisplayMessage) -> (Vec<Line<'static>>, String) {
+    fn folded_message(&self, msg: &DisplayMessage) -> BuiltMessage {
         match msg.role {
-            DisplayRole::Injected => (
+            DisplayRole::Injected => BuiltMessage::bare(
                 injected_line(&msg.text),
                 format!("{INJECTED_SEARCH_PREFIX}{}", msg.text),
             ),
-            _ => (
+            _ => BuiltMessage::bare(
                 self.build_cached_thinking_indicator(&msg.text, msg.thinking_duration),
                 format!("{THINKING_SEARCH_PREFIX}{}", msg.text),
             ),
         }
+    }
+
+    /// A message as its segment draws it at `width`: folded to its one row, or
+    /// whole with its diagram pans and, for reasoning, the window the reader
+    /// left it at.
+    fn built_message(&self, msg_index: usize, width: u16) -> Option<BuiltMessage> {
+        let msg = self.messages.get(msg_index)?;
+        if Self::has_foldable_body(msg) && !self.body_open(msg) {
+            return Some(self.folded_message(msg));
+        }
+        let window = matches!(msg.role, DisplayRole::Thinking)
+            .then(|| self.thinking_window(ThinkingWindow::Settled(msg_index)))
+            .flatten();
+        Some(build_message_lines(
+            msg,
+            width,
+            self.pans_for(msg_index),
+            window,
+        ))
     }
 
     fn try_toggle_collapsed_thinking(&mut self, doc_row: u32, width: u16) -> bool {
@@ -4722,6 +4915,27 @@ impl MessagesPanel {
             return false;
         }
         self.streaming_reasoning_open = Some(true);
+        true
+    }
+
+    /// The live window's footer re-pins it to the newest rows, as a settled
+    /// block's does.
+    fn try_follow_streaming_thinking(&mut self, doc_row: u32, width: u16) -> bool {
+        if self.streaming_thinking.is_empty() || self.streaming_thinking_collapsed() {
+            return false;
+        }
+        let spacer = u32::from(self.cache.len() > 0);
+        let thinking_start = self.cache.total_height(width) + spacer;
+        let Some(rel) = doc_row
+            .checked_sub(thinking_start)
+            .and_then(|rel| u16::try_from(rel).ok())
+        else {
+            return false;
+        };
+        if !on_scroll_footer(&self.streaming_thinking_segment(), rel, width) {
+            return false;
+        }
+        self.follow_thinking(ThinkingWindow::Live);
         true
     }
 
@@ -4753,35 +4967,16 @@ impl MessagesPanel {
     }
 
     fn rebuild_thinking_segment(&mut self, msg_idx: usize, width: u16) {
-        let Some(message) = self.messages.get(msg_idx).cloned() else {
+        let Some(built) = self.built_message(msg_idx, width) else {
             return;
         };
-        let (lines, links, provenance, diagrams, search_text) = if !self.body_open(&message) {
-            let (lines, search_text) = self.folded_lines(&message);
-            let links = LinkMap::none_for(&lines);
-            (lines, links, None, Vec::new(), search_text)
-        } else {
-            let built = build_message_lines(&message, width, self.pans_for(msg_idx));
-            (
-                built.lines,
-                built.links,
-                built.provenance,
-                built.diagrams,
-                built.search_text,
-            )
-        };
-        let seg_idx = self
+        if let Some(seg) = self
             .cache
-            .segments()
-            .iter()
-            .position(|s| s.msg_index == Some(msg_idx) && s.tool_id.is_none());
-        let Some(seg_idx) = seg_idx else { return };
-        if let Some(seg) = self.cache.get_mut(seg_idx) {
-            seg.set_lines(lines);
-            seg.set_links(links);
-            seg.set_provenance(provenance);
-            seg.set_diagrams(diagrams);
-            seg.search_text = search_text;
+            .segments_mut()
+            .iter_mut()
+            .find(|s| s.msg_index == Some(msg_idx) && s.tool_id.is_none())
+        {
+            install_built(seg, built);
         }
     }
 
@@ -4914,20 +5109,13 @@ impl MessagesPanel {
                     self.upsert_instruction_segment(&id, &blocks, last_idx);
                 }
             } else {
-                if Self::has_foldable_body(msg) && !self.body_open(msg) {
-                    let (lines, search_text) = self.folded_lines(msg);
-                    let mut segment = Segment::with_lines(lines, search_text, Some(i));
-                    segment.set_links(LinkMap::none_for(segment.lines()));
-                    segment.set_kind(segment_kind(&msg.role));
-                    self.cache.push(segment);
+                let kind = segment_kind(&msg.role);
+                let Some(built) = self.built_message(i, self.viewport_width) else {
                     continue;
-                }
-                let built = build_message_lines(msg, self.viewport_width, self.pans_for(i));
-                let mut segment = Segment::with_lines(built.lines, built.search_text, Some(i));
-                segment.set_kind(segment_kind(&msg.role));
-                segment.set_provenance(built.provenance);
-                segment.set_diagrams(built.diagrams);
-                segment.set_links(built.links);
+                };
+                let mut segment = Segment::with_lines(Vec::new(), String::new(), Some(i));
+                segment.set_kind(kind);
+                install_built(&mut segment, built);
                 self.cache.push(segment);
             }
         }
@@ -5079,49 +5267,30 @@ impl MessagesPanel {
             return;
         };
         seg.stale = false;
-        let (tool_id, msg_idx) = (seg.tool_id.clone(), seg.msg_index);
 
-        if let Some(tid) = tool_id {
+        if let Some(tid) = seg.tool_id.clone() {
             let parent = segment::instruction_parent(&tid)
                 .map(str::to_string)
                 .unwrap_or(tid);
             self.rebuild_tool_segment(&parent);
             return;
         }
-
-        let Some(msg_idx) = msg_idx else {
-            return;
-        };
-
-        let collapsed = self
-            .messages
-            .get(msg_idx)
-            .is_some_and(|m| Self::has_foldable_body(m) && !self.body_open(m));
-        if collapsed {
-            // Geometry is width-independent, but `width_changed` also fires on
-            // theme changes; rebuild so spans pick up the new palette.
-            self.rebuild_thinking_segment(msg_idx, width);
-        } else {
-            self.reflow_text_segment(seg_idx, width);
-        }
+        // A folded block's geometry is width-independent, but `width_changed`
+        // also fires on theme changes, so it is rebuilt all the same to pick
+        // up the new palette.
+        self.reflow_text_segment(seg_idx, width);
     }
 
     fn reflow_text_segment(&mut self, seg_idx: usize, width: u16) {
         let Some(msg_idx) = self.cache.get(seg_idx).and_then(|s| s.msg_index) else {
             return;
         };
-        let Some(msg) = self.messages.get(msg_idx) else {
+        let Some(built) = self.built_message(msg_idx, width) else {
             return;
         };
-        let built = build_message_lines(msg, width, self.pans_for(msg_idx));
-        let Some(seg) = self.cache.get_mut(seg_idx) else {
-            return;
-        };
-        seg.set_lines(built.lines);
-        seg.set_provenance(built.provenance);
-        seg.set_diagrams(built.diagrams);
-        seg.set_links(built.links);
-        seg.search_text = built.search_text;
+        if let Some(seg) = self.cache.get_mut(seg_idx) {
+            install_built(seg, built);
+        }
     }
 
     /// Pans for one message, indexed by diagram id. Empty when nothing in
@@ -5289,10 +5458,18 @@ fn segment_styles(
 /// given width, returning the lines and search text. Shared by
 /// `rebuild_line_cache` (new messages) and `reflow_text_segment` (stale-on-resize
 /// messages) so both paths produce identical segments.
-fn build_message_lines(msg: &DisplayMessage, width: u16, diagram_pans: Vec<u16>) -> BuiltMessage {
+///
+/// `window` is where reasoning draws its body, and is ignored for any other
+/// role.
+fn build_message_lines(
+    msg: &DisplayMessage,
+    width: u16,
+    diagram_pans: Vec<u16>,
+    window: Option<ScrollWindow>,
+) -> BuiltMessage {
     let width = SegmentChrome::for_kind(segment_kind(&msg.role), width, 0).content_width(width);
     if matches!(msg.role, DisplayRole::Thinking) {
-        return build_thinking_lines(msg, width, diagram_pans);
+        return build_thinking_lines(msg, width, diagram_pans, window);
     }
     let style = match &msg.role {
         DisplayRole::User => user_style(),
@@ -5319,6 +5496,8 @@ fn build_message_lines(msg: &DisplayMessage, width: u16, diagram_pans: Vec<u16>)
             lines,
             provenance: Some(Provenance::new(msg.text.as_str().into(), provenance)),
             diagrams: Vec::new(),
+            scroll_span: None,
+            scroll_footer_line: None,
         };
     }
     let (mut lines, mut provenance, mut diagrams, mut links) = if style.use_markdown {
@@ -5403,18 +5582,30 @@ fn build_message_lines(msg: &DisplayMessage, width: u16, diagram_pans: Vec<u16>)
         provenance,
         diagrams,
         links,
+        scroll_span: None,
+        scroll_footer_line: None,
     }
 }
 
-fn build_thinking_lines(msg: &DisplayMessage, width: u16, diagram_pans: Vec<u16>) -> BuiltMessage {
+/// A window breaks the body to the width itself, so each line is one row and
+/// the window can cut rows rather than paragraphs. Without one the body keeps
+/// the path it always took, and ratatui breaks the paragraphs as it paints.
+fn build_thinking_lines(
+    msg: &DisplayMessage,
+    width: u16,
+    diagram_pans: Vec<u16>,
+    window: Option<ScrollWindow>,
+) -> BuiltMessage {
     let summary = reasoning_summary(&msg.text);
-    let mut lines = thought_line(summary.title, msg.thinking_duration, true);
-    let mut links = LinkMap::none_for(&lines);
-    let mut provenance = None;
-    let mut diagrams = Vec::new();
-    if !summary.body.is_empty() {
-        let style = thinking_style();
-        let (painted, parsed) = text_to_painted(
+    let header = thought_line(summary.title, msg.thinking_duration, true);
+    let search_text = format!("{THINKING_SEARCH_PREFIX}{}", msg.text);
+    if summary.body.is_empty() {
+        return BuiltMessage::bare(header, search_text);
+    }
+    let style = thinking_style();
+    let (painted, parsed) = match window {
+        Some(_) => text_to_rows(summary.body, style.text_style, width, diagram_pans),
+        None => text_to_painted(
             summary.body,
             "",
             style.text_style,
@@ -5422,31 +5613,18 @@ fn build_thinking_lines(msg: &DisplayMessage, width: u16, diagram_pans: Vec<u16>
             width,
             style.max_line_bytes,
             diagram_pans,
-        );
-        lines.push(Line::from(""));
-        links.rows.push(Vec::new());
-        lines.extend(painted.lines);
-        links.rows.extend(painted.links.rows);
-        diagrams = painted
-            .diagrams
-            .into_iter()
-            .map(|mut diagram| {
-                diagram.rows = diagram.rows.start + 2..diagram.rows.end + 2;
-                diagram
-            })
-            .collect();
-        let mut painted_provenance = Vec::with_capacity(painted.provenance.len() + 2);
-        painted_provenance.push(LineProvenance::chrome(lines[0].spans.len()));
-        painted_provenance.push(LineProvenance::chrome(0));
-        painted_provenance.extend(painted.provenance);
-        provenance = Some(Provenance::new(parsed, painted_provenance));
-    }
+        ),
+    };
+    let provenance = Provenance::new(parsed, painted.provenance);
+    let body = thinking::Body {
+        lines: &painted.lines,
+        links: &painted.links,
+        provenance: Some(&provenance),
+        diagrams: &painted.diagrams,
+    };
     BuiltMessage {
-        lines,
-        links,
-        provenance,
-        diagrams,
-        search_text: format!("thinking> {}", msg.text),
+        search_text,
+        ..thinking::assemble(header, body, window, ScrollTail::Settled)
     }
 }
 
@@ -5456,6 +5634,37 @@ struct BuiltMessage {
     provenance: Option<Provenance>,
     diagrams: Vec<DiagramSpan>,
     links: LinkMap,
+    /// The window a reasoning body is drawn in, present only while it hides
+    /// rows, and the footer row that says which.
+    scroll_span: Option<ScrollSpan>,
+    scroll_footer_line: Option<usize>,
+}
+
+impl BuiltMessage {
+    /// Lines with nothing behind them: no link, no source to copy, no window.
+    fn bare(lines: Vec<Line<'static>>, search_text: String) -> Self {
+        Self {
+            links: LinkMap::none_for(&lines),
+            lines,
+            search_text,
+            provenance: None,
+            diagrams: Vec::new(),
+            scroll_span: None,
+            scroll_footer_line: None,
+        }
+    }
+}
+
+/// Replaces everything a message's segment draws with what was just built. A
+/// window rides along, so a block that stopped hiding rows drops its bar.
+fn install_built(seg: &mut Segment, built: BuiltMessage) {
+    seg.set_lines(built.lines);
+    seg.set_links(built.links);
+    seg.set_provenance(built.provenance);
+    seg.set_diagrams(built.diagrams);
+    seg.search_text = built.search_text;
+    seg.scroll_spans = built.scroll_span.into_iter().collect();
+    seg.scroll_footer_line = built.scroll_footer_line;
 }
 
 /// Search should reach what the card shows, not the tags behind it.

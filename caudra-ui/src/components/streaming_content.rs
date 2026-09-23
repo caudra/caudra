@@ -127,6 +127,7 @@ pub(crate) struct StreamingContent {
     text_style: Style,
     prefix_style: Style,
     interactive_links: bool,
+    wrap_paragraphs: bool,
 }
 
 impl StreamingContent {
@@ -163,6 +164,22 @@ impl StreamingContent {
             text_style,
             prefix_style,
             interactive_links,
+            wrap_paragraphs: false,
+        }
+    }
+
+    /// Breaks paragraphs to the render width, so each cached line is one row.
+    pub fn wrapping(mut self, wrap_paragraphs: bool) -> Self {
+        self.wrap_paragraphs = wrap_paragraphs;
+        self.renderer = self.fresh_renderer();
+        self
+    }
+
+    fn fresh_renderer(&self) -> Renderer {
+        if self.wrap_paragraphs {
+            Renderer::new()
+        } else {
+            Renderer::unwrapped()
         }
     }
 
@@ -173,12 +190,12 @@ impl StreamingContent {
     pub fn clear(&mut self) {
         self.typewriter.clear();
         self.cache.invalidate();
-        self.renderer = Renderer::unwrapped();
+        self.renderer = self.fresh_renderer();
     }
 
     pub fn take_all(&mut self) -> String {
         self.cache.invalidate();
-        self.renderer = Renderer::unwrapped();
+        self.renderer = self.fresh_renderer();
         self.typewriter.take_all()
     }
 
@@ -220,6 +237,7 @@ impl StreamingContent {
             text_style,
             prefix_style,
             interactive_links,
+            ..
         } = self;
         cache.get_or_update_with_links(
             renderer,
@@ -706,5 +724,28 @@ mod tests {
             after_both, expected,
             "renderer state must produce correct output across updates"
         );
+    }
+
+    const LONG_PARAGRAPH: &str =
+        "one two three four five six seven eight nine ten eleven twelve thirteen";
+    const NARROW_WIDTH: u16 = 16;
+
+    #[test_case(true ; "wrapping_breaks_every_row_to_the_width")]
+    #[test_case(false ; "unwrapped_keeps_the_paragraph_on_one_line")]
+    fn wrapping_mode_survives_a_clear(wrap_paragraphs: bool) {
+        let style = Style::default();
+        let mut content = StreamingContent::new("", style, style, 0).wrapping(wrap_paragraphs);
+        for _ in 0..2 {
+            content.set_buffer(LONG_PARAGRAPH);
+            let lines = content.render_lines(NARROW_WIDTH);
+            assert_eq!(lines.len() > 1, wrap_paragraphs);
+            assert_eq!(
+                lines
+                    .iter()
+                    .all(|line| line.width() <= usize::from(NARROW_WIDTH)),
+                wrap_paragraphs
+            );
+            content.clear();
+        }
     }
 }

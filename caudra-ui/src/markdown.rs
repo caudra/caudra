@@ -602,6 +602,21 @@ pub(crate) fn text_to_wrapped(
     (paint_semantic(&semantic, "", style, style), parsed)
 }
 
+/// Renders markdown with every paragraph broken to `width` and no line cap, so
+/// each painted line is one terminal row and a window over the rows is a plain
+/// slice of the lines, their links and their provenance.
+pub(crate) fn text_to_rows(
+    text: &str,
+    style: Style,
+    width: u16,
+    diagram_pans: Vec<u16>,
+) -> (Painted, Arc<str>) {
+    let semantic = render::Renderer::new()
+        .with_diagram_pans(diagram_pans)
+        .render(text, width, 0);
+    (paint_semantic(&semantic, "", style, style), text.into())
+}
+
 /// Paints a fragment whose provenance has to point into a larger document.
 /// Every recorded range is shifted by `base`, the offset of `text` inside that
 /// document, so a copy reaches the original bytes.

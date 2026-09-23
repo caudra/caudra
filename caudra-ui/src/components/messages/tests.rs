@@ -5,7 +5,7 @@ use crate::chat::{DONE_TEXT, ERROR_TEXT};
 use crate::components::code_view::ScrollSpan;
 use crate::components::prompt_progress::PROMPT_PROGRESS_LABEL;
 use crate::components::tool_display::{
-    AWAITING_APPROVAL, FOLLOWING, NOTICE_PREFIX, PAUSED, WRITING_PROMPT,
+    AWAITING_APPROVAL, FOLLOWING, NOTICE_PREFIX, PAUSED, WRITING_PROMPT, scroll_footer_text,
 };
 use crate::repaint::expect::{OWED, QUIET};
 use crate::selection::{Selection, SelectionZone};
@@ -26,6 +26,7 @@ use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::style::Modifier;
 use std::collections::HashSet;
+use std::ops::Range;
 use std::path::Path;
 use std::thread;
 use std::time::Duration;
@@ -5180,7 +5181,7 @@ fn expanded_reasoning_diagram_rows_follow_the_header() {
         DisplayRole::Thinking,
         format!("**Mapping**\n\n{WIDE_CHART}"),
     );
-    let built = build_thinking_lines(&message, 40, Vec::new());
+    let built = build_thinking_lines(&message, 40, Vec::new(), None);
 
     assert!(!built.diagrams.is_empty());
     assert!(built.diagrams[0].rows.start >= 2);
@@ -11395,4 +11396,349 @@ fn same_call_batch_updates_retain_phase_rows_and_known_children(child: bool) {
             .all(|rows| rows[1].0 >= rows[0].0 && rows[1].1 >= rows[0].1),
         "{HISTORY_PHASE_MSG}: body/card heights={heights:?}"
     );
+}
+
+const THINKING_WINDOW_ROWS: u32 = 4;
+const THINKING_STEPS: usize = 12;
+const THINKING_GROWN_STEPS: usize = 16;
+const THINKING_FITTING_STEPS: usize = 2;
+const THINKING_NOTCHES: i32 = 3;
+const THINKING_VIEW_WIDTH: u16 = 80;
+const THINKING_VIEW_HEIGHT: u16 = 40;
+const THINKING_TITLE: &str = "Planning";
+const THINKING_REPLY: &str = "the answer";
+const THINKING_QUESTION: &str = "a question";
+/// The header row and the blank row under it, above a reasoning body.
+const THINKING_HEAD_ROWS: usize = 2;
+const THINKING_HEADER_ROW: u16 = 0;
+const THINKING_FIRST_BODY_ROW: u16 = 2;
+const THINKING_TAIL_MSG: &str = "a live reasoning window follows its newest rows";
+const THINKING_PAUSE_MSG: &str =
+    "scrolling a reasoning window up pauses it where the reader left it";
+const THINKING_FOLLOW_MSG: &str = "clicking a reasoning footer takes the window back to the tail";
+const THINKING_SAVED_MSG: &str =
+    "saving the live block keeps the reader's place in it and the wheel on it";
+const THINKING_RELOAD_MSG: &str =
+    "a reloaded block rests on its tail with a footer that names no edge";
+const THINKING_DRAG_MSG: &str =
+    "a reasoning bar moves its window, and the wheel spills at either edge";
+const THINKING_OFF_MSG: &str = "zero draws every reasoning block whole with nothing to scroll";
+const THINKING_FOLD_MSG: &str =
+    "a click that reaches a reasoning block folds it and leaves no window behind";
+const THINKING_COPY_MSG: &str = "copying a windowed block copies the rows it shows";
+
+fn thinking_panel(thinking_lines: u32) -> MessagesPanel {
+    MessagesPanel::new(
+        UiConfig {
+            thinking_lines,
+            show_thinking: true,
+            typewriter_ms_per_char: 0,
+            ..UiConfig::default()
+        },
+        EventHandle::disconnected_for_test(),
+    )
+}
+
+fn step_label(step: usize) -> String {
+    format!("step {step:02}")
+}
+
+/// A titled block whose body is one row per step, numbered so a test can name
+/// the rows a window shows.
+fn reasoning_steps(steps: usize) -> String {
+    let body: String = (0..steps)
+        .map(|step| format!("- {}\n", step_label(step)))
+        .collect();
+    format!("**{THINKING_TITLE}**\n\n{body}")
+}
+
+/// The steps `text` shows, in order.
+fn shown_steps(text: &str) -> Vec<usize> {
+    (0..THINKING_GROWN_STEPS)
+        .filter(|&step| text.contains(&step_label(step)))
+        .collect()
+}
+
+fn step_range(steps: Range<usize>) -> Vec<usize> {
+    steps.collect()
+}
+
+/// The last `THINKING_WINDOW_ROWS` of `steps`.
+fn tail_steps(steps: usize) -> Vec<usize> {
+    step_range(steps - THINKING_WINDOW_ROWS as usize..steps)
+}
+
+fn thinking_text(panel: &mut MessagesPanel) -> String {
+    buffer_text(&render(panel, THINKING_VIEW_WIDTH, THINKING_VIEW_HEIGHT))
+}
+
+fn thinking_area() -> Rect {
+    Rect::new(0, 0, THINKING_VIEW_WIDTH, THINKING_VIEW_HEIGHT)
+}
+
+fn settled_thinking(steps: usize, thinking_lines: u32) -> MessagesPanel {
+    let mut panel = thinking_panel(thinking_lines);
+    panel.push(DisplayMessage::new(
+        DisplayRole::Thinking,
+        reasoning_steps(steps),
+    ));
+    render(&mut panel, THINKING_VIEW_WIDTH, THINKING_VIEW_HEIGHT);
+    panel
+}
+
+fn live_thinking(steps: usize) -> MessagesPanel {
+    let mut panel = thinking_panel(THINKING_WINDOW_ROWS);
+    panel.streaming_thinking.set_buffer(&reasoning_steps(steps));
+    render(&mut panel, THINKING_VIEW_WIDTH, THINKING_VIEW_HEIGHT);
+    panel
+}
+
+/// The rows of the one window on screen.
+fn thinking_window_body(panel: &MessagesPanel) -> Rect {
+    assert_eq!(panel.card_windows.len(), 1, "{THINKING_TAIL_MSG}");
+    panel.card_windows[0].body
+}
+
+/// Presses inside the window and offers it a burst, the way a reader reaches
+/// one, and reports what the window left for the transcript.
+fn wheel_thinking(panel: &mut MessagesPanel, notches: i32) -> i32 {
+    let body = thinking_window_body(panel);
+    assert!(panel.arm_card_at(body.x, body.y), "{ARM_MSG}");
+    panel.scroll_card_at(body.x, body.y, notches)
+}
+
+#[test]
+fn a_live_reasoning_window_follows_its_newest_rows() {
+    let mut panel = live_thinking(THINKING_STEPS);
+    let text = thinking_text(&mut panel);
+    let body = thinking_window_body(&panel);
+
+    assert_eq!(
+        shown_steps(&text),
+        tail_steps(THINKING_STEPS),
+        "{THINKING_TAIL_MSG}: {text}"
+    );
+    assert!(text.contains(FOLLOWING), "{THINKING_TAIL_MSG}: {text}");
+    assert_eq!(
+        panel.streaming_thinking_segment().lines().len(),
+        THINKING_HEAD_ROWS + THINKING_WINDOW_ROWS as usize + 1,
+        "{THINKING_TAIL_MSG}: header, blank row, window and footer"
+    );
+    assert_eq!(
+        panel.card_window_key_at(body.x, body.y),
+        Some(ThinkingWindow::Live.key().as_str()),
+        "{THINKING_TAIL_MSG}"
+    );
+}
+
+#[test]
+fn scrolling_a_live_window_up_pauses_it_until_its_footer_is_clicked() {
+    let mut panel = live_thinking(THINKING_STEPS);
+    let paused_from = THINKING_STEPS - THINKING_WINDOW_ROWS as usize - THINKING_NOTCHES as usize;
+    let paused = step_range(paused_from..paused_from + THINKING_WINDOW_ROWS as usize);
+
+    assert_eq!(
+        wheel_thinking(&mut panel, THINKING_NOTCHES),
+        0,
+        "{THINKING_PAUSE_MSG}"
+    );
+    panel
+        .streaming_thinking
+        .set_buffer(&reasoning_steps(THINKING_GROWN_STEPS));
+    let text = thinking_text(&mut panel);
+    assert_eq!(shown_steps(&text), paused, "{THINKING_PAUSE_MSG}: {text}");
+    assert!(text.contains(PAUSED), "{THINKING_PAUSE_MSG}: {text}");
+
+    let footer = thinking_window_body(&panel).bottom();
+    assert!(
+        panel.handle_click(footer, thinking_area()),
+        "{THINKING_FOLLOW_MSG}"
+    );
+    let text = thinking_text(&mut panel);
+    assert_eq!(
+        shown_steps(&text),
+        tail_steps(THINKING_GROWN_STEPS),
+        "{THINKING_FOLLOW_MSG}: {text}"
+    );
+    assert!(text.contains(FOLLOWING), "{THINKING_FOLLOW_MSG}: {text}");
+}
+
+#[test_case(MessagesPanel::thinking_boundary ; "thinking_boundary")]
+#[test_case(|panel: &mut MessagesPanel| panel.text_delta(THINKING_REPLY) ; "text_delta")]
+fn saving_a_paused_live_block_keeps_its_place_and_the_wheel(save: fn(&mut MessagesPanel)) {
+    let mut panel = live_thinking(THINKING_STEPS);
+    wheel_thinking(&mut panel, THINKING_NOTCHES);
+    let paused = shown_steps(&thinking_text(&mut panel));
+
+    save(&mut panel);
+    let text = thinking_text(&mut panel);
+
+    assert_eq!(shown_steps(&text), paused, "{THINKING_SAVED_MSG}: {text}");
+    assert!(!text.contains(PAUSED), "{THINKING_SAVED_MSG}: {text}");
+    assert_eq!(
+        panel.armed_card_key(),
+        Some(ThinkingWindow::Settled(0).key().as_str()),
+        "{THINKING_SAVED_MSG}"
+    );
+}
+
+#[test]
+fn a_reloaded_block_rests_on_its_tail() {
+    let mut panel = settled_thinking(THINKING_STEPS, THINKING_WINDOW_ROWS);
+    wheel_thinking(&mut panel, THINKING_NOTCHES);
+
+    panel.load_messages(vec![DisplayMessage::new(
+        DisplayRole::Thinking,
+        reasoning_steps(THINKING_STEPS),
+    )]);
+    let text = thinking_text(&mut panel);
+
+    assert_eq!(
+        shown_steps(&text),
+        tail_steps(THINKING_STEPS),
+        "{THINKING_RELOAD_MSG}: {text}"
+    );
+    let footer = scroll_footer_text(
+        THINKING_STEPS - THINKING_WINDOW_ROWS as usize,
+        0,
+        ScrollTail::Settled,
+    )
+    .expect("an overflowing block has a footer");
+    assert!(text.contains(&footer), "{THINKING_RELOAD_MSG}: {text}");
+    assert!(
+        !text.contains(FOLLOWING) && !text.contains(PAUSED),
+        "{THINKING_RELOAD_MSG}: {text}"
+    );
+}
+
+#[test]
+fn a_settled_window_moves_by_its_bar_and_spills_the_wheel_at_either_edge() {
+    let mut panel = settled_thinking(THINKING_STEPS, THINKING_WINDOW_ROWS);
+    let strip = panel.card_windows[0].strip();
+
+    assert!(
+        panel.handle_card_scrollbar(&press_at(strip.x, strip.y)),
+        "{THINKING_DRAG_MSG}"
+    );
+    let text = thinking_text(&mut panel);
+    assert_eq!(
+        shown_steps(&text),
+        step_range(0..THINKING_WINDOW_ROWS as usize),
+        "{THINKING_DRAG_MSG}: {text}"
+    );
+
+    assert_eq!(
+        wheel_thinking(&mut panel, THINKING_NOTCHES),
+        THINKING_NOTCHES,
+        "{THINKING_DRAG_MSG}: the top edge has no travel to give"
+    );
+    let travel = (THINKING_STEPS - THINKING_WINDOW_ROWS as usize) as i32;
+    assert_eq!(
+        wheel_thinking(&mut panel, -(travel + THINKING_NOTCHES)),
+        -THINKING_NOTCHES,
+        "{THINKING_DRAG_MSG}: the bottom edge spills what it could not use"
+    );
+    let text = thinking_text(&mut panel);
+    assert_eq!(
+        shown_steps(&text),
+        tail_steps(THINKING_STEPS),
+        "{THINKING_DRAG_MSG}: {text}"
+    );
+}
+
+#[test]
+fn zero_draws_every_reasoning_block_whole() {
+    let mut panel = settled_thinking(THINKING_STEPS, 0);
+    panel
+        .streaming_thinking
+        .set_buffer(&reasoning_steps(THINKING_STEPS));
+    let text = thinking_text(&mut panel);
+    let whole = THINKING_HEAD_ROWS + THINKING_STEPS;
+
+    assert_eq!(
+        shown_steps(&text),
+        step_range(0..THINKING_STEPS),
+        "{THINKING_OFF_MSG}: {text}"
+    );
+    assert!(!text.contains(FOLLOWING), "{THINKING_OFF_MSG}: {text}");
+    assert!(panel.card_windows.is_empty(), "{THINKING_OFF_MSG}");
+    assert_eq!(
+        panel.cache.get(0).map(|segment| segment.lines().len()),
+        Some(whole),
+        "{THINKING_OFF_MSG}"
+    );
+    assert_eq!(
+        panel.streaming_thinking_segment().lines().len(),
+        whole,
+        "{THINKING_OFF_MSG}"
+    );
+}
+
+#[test_case(THINKING_FITTING_STEPS, THINKING_FIRST_BODY_ROW, false ; "fitting_body_folds_from_its_body")]
+#[test_case(THINKING_STEPS, THINKING_HEADER_ROW, true ; "windowed_block_folds_from_its_header")]
+fn clicking_a_reasoning_block_folds_it_and_leaves_no_window_behind(
+    steps: usize,
+    row: u16,
+    windowed: bool,
+) {
+    let mut panel = settled_thinking(steps, THINKING_WINDOW_ROWS);
+    assert_eq!(
+        panel.card_windows.is_empty(),
+        !windowed,
+        "{THINKING_FOLD_MSG}"
+    );
+    assert!(!panel.arm_card_at(0, row), "{THINKING_FOLD_MSG}");
+
+    assert!(
+        panel.handle_click(row, thinking_area()),
+        "{THINKING_FOLD_MSG}"
+    );
+    render(&mut panel, THINKING_VIEW_WIDTH, THINKING_VIEW_HEIGHT);
+
+    assert_eq!(
+        panel.messages[0].body_open,
+        Some(false),
+        "{THINKING_FOLD_MSG}"
+    );
+    let segment = panel.cache.get(0).expect("a folded block keeps its row");
+    assert!(
+        segment.scroll_spans.is_empty() && segment.scroll_footer_line.is_none(),
+        "{THINKING_FOLD_MSG}"
+    );
+    assert!(
+        panel.card_windows.is_empty() && panel.card_bars.is_empty(),
+        "{THINKING_FOLD_MSG}"
+    );
+}
+
+#[test]
+fn copying_a_windowed_block_copies_the_rows_it_shows() {
+    let mut panel = thinking_panel(THINKING_WINDOW_ROWS);
+    panel.push(DisplayMessage::new(
+        DisplayRole::User,
+        THINKING_QUESTION.into(),
+    ));
+    panel.push(DisplayMessage::new(
+        DisplayRole::Thinking,
+        reasoning_steps(THINKING_STEPS),
+    ));
+
+    let copied = extract_entire_document(&mut panel);
+
+    assert_eq!(
+        shown_steps(&copied),
+        tail_steps(THINKING_STEPS),
+        "{THINKING_COPY_MSG}: {copied}"
+    );
+    assert!(
+        copied.contains(&format!("Thinking: {THINKING_TITLE}")),
+        "{THINKING_COPY_MSG}: {copied}"
+    );
+    let footer = scroll_footer_text(
+        THINKING_STEPS - THINKING_WINDOW_ROWS as usize,
+        0,
+        ScrollTail::Settled,
+    )
+    .expect("an overflowing block has a footer");
+    assert!(!copied.contains(&footer), "{THINKING_COPY_MSG}: {copied}");
 }

@@ -59,6 +59,7 @@ pub const DEFAULT_TYPEWRITER_MS_PER_CHAR: u64 = 4;
 pub const DEFAULT_WHICH_KEY_DELAY_MS: u64 = 250;
 pub const DEFAULT_MOUSE_SCROLL_LINES: u32 = 3;
 pub const DEFAULT_SCROLL_CARD_LINES: u32 = 10;
+pub const DEFAULT_THINKING_LINES: u32 = 10;
 pub const DEFAULT_MAX_INPUT_LINES: u32 = 20;
 
 pub const MIN_MAX_INPUT_LINES: u32 = 1;
@@ -716,6 +717,7 @@ pub struct UiFileConfig {
     pub scroll_card_lines: Option<u32>,
     pub always_collapsed: Option<Vec<String>>,
     pub show_thinking: Option<bool>,
+    pub thinking_lines: Option<u32>,
     pub show_reminders: Option<bool>,
     pub theme: Option<String>,
     pub theme_light: Option<String>,
@@ -743,6 +745,7 @@ impl UiFileConfig {
             scroll_card_lines,
             always_collapsed,
             show_thinking,
+            thinking_lines,
             show_reminders,
             theme,
             theme_light,
@@ -1587,6 +1590,12 @@ pub struct UiConfig {
     pub show_thinking: bool,
 
     #[config(
+        default = DEFAULT_THINKING_LINES,
+        desc = "Rows of body an open reasoning block draws. The window follows the reasoning while it streams and pauses when scrolled up, and a footer reports how much sits above and below. Click inside a window to give it the wheel, which passes back to the transcript at either edge, and drag the bar in its last column to move it directly. Click the footer to follow again. A finished block rests on its last rows until you move it. `0` draws every block whole"
+    )]
+    pub thinking_lines: u32,
+
+    #[config(
         default = true,
         desc = "Show the messages Caudra writes into the conversation on your behalf: standing reminders, goal check-ins, nudges, and continuations. Each is one dim row that expands on click to the exact text the model was sent. Turn this off to keep the transcript to the conversation alone"
     )]
@@ -1644,6 +1653,7 @@ impl UiConfig {
             }),
             max_input_lines: f.max_input_lines.unwrap_or(DEFAULT_MAX_INPUT_LINES),
             show_thinking: f.show_thinking.unwrap_or(true),
+            thinking_lines: f.thinking_lines.unwrap_or(DEFAULT_THINKING_LINES),
             show_reminders: f.show_reminders.unwrap_or(true),
             clock_format: f.clock_format.unwrap_or_default(),
             update_check: f.update_check.unwrap_or(false),
@@ -4671,10 +4681,11 @@ mod tests {
     const SCROLL_CARD_LINES_OFF: u32 = 0;
     const CONFIGURED_SCROLL_CARD_LINES: u32 = 40;
 
-    /// Most readers never write a `[ui]` table, so these two defaults are what
-    /// the transcript actually looks like. Losing either silently changes every
-    /// session: an empty collapse list reopens every read, and a zero window
-    /// turns the fixed shell and write cards back into unbounded bodies.
+    /// Most readers never write a `[ui]` table, so these defaults are what the
+    /// transcript actually looks like. Losing any of them silently changes
+    /// every session: an empty collapse list reopens every read, and a zero
+    /// window turns the fixed shell cards and reasoning blocks back into
+    /// unbounded bodies.
     #[test]
     fn card_display_defaults_survive_a_config_that_names_neither() {
         let config: RawConfig = toml::from_str("").unwrap();
@@ -4686,6 +4697,10 @@ mod tests {
         );
         assert_eq!(
             config.ui.scroll_card_lines, DEFAULT_SCROLL_CARD_LINES,
+            "{CARD_DEFAULTS_MSG}"
+        );
+        assert_eq!(
+            config.ui.thinking_lines, DEFAULT_THINKING_LINES,
             "{CARD_DEFAULTS_MSG}"
         );
     }
@@ -4722,24 +4737,43 @@ mod tests {
         );
     }
 
-    /// Both fields ride the same `merge_option!` list, and a field left off it
+    /// The reasoning window follows the same rule: `0` asks for every block
+    /// whole, and reading it as unset would hand the window straight back.
+    #[test_case(SCROLL_CARD_LINES_OFF ; "scrolling_off")]
+    #[test_case(CONFIGURED_SCROLL_CARD_LINES ; "taller_window")]
+    fn thinking_lines_takes_the_configured_height(lines: u32) {
+        let raw: RawConfig = toml::from_str(&format!("[ui]\nthinking_lines = {lines}\n")).unwrap();
+        let config = raw.into_config(false).unwrap();
+
+        assert_eq!(
+            config.ui.thinking_lines, lines,
+            "{SCROLL_CARD_CONFIGURED_MSG}"
+        );
+    }
+
+    /// Every field rides the same `merge_option!` list, and a field left off it
     /// is not a compile error — it just silently pins the global value, so a
-    /// project could never soften or tighten either setting.
+    /// project could never soften or tighten any of these settings.
     #[test]
     fn card_display_overlay_wins_over_the_layer_below() {
         let mut base: RawConfig = toml::from_str(&format!(
-            "[ui]\nscroll_card_lines = {CONFIGURED_SCROLL_CARD_LINES}\nalways_collapsed = []\n"
+            "[ui]\nscroll_card_lines = {CONFIGURED_SCROLL_CARD_LINES}\nthinking_lines = {CONFIGURED_SCROLL_CARD_LINES}\nalways_collapsed = []\n"
         ))
         .unwrap();
         base.merge(
             toml::from_str(&format!(
-                "[ui]\nscroll_card_lines = {SCROLL_CARD_LINES_OFF}\nalways_collapsed = [\"{COLLAPSE_OVERRIDE_TOOL}\"]\n"
+                "[ui]\nscroll_card_lines = {SCROLL_CARD_LINES_OFF}\nthinking_lines = {SCROLL_CARD_LINES_OFF}\nalways_collapsed = [\"{COLLAPSE_OVERRIDE_TOOL}\"]\n"
             ))
             .unwrap(),
         );
 
         assert_eq!(
             base.ui.scroll_card_lines,
+            Some(SCROLL_CARD_LINES_OFF),
+            "{CARD_OVERLAY_MSG}"
+        );
+        assert_eq!(
+            base.ui.thinking_lines,
             Some(SCROLL_CARD_LINES_OFF),
             "{CARD_OVERLAY_MSG}"
         );
