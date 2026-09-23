@@ -2860,7 +2860,10 @@ mod tests {
 
         assert!(text.contains(FAST_LABEL.trim()));
         assert_eq!(StatusBarHitTarget::Fast.scope(), ChatScope::MainOnly);
-        assert!(hits.iter().all(|hit| hit.target != StatusBarHitTarget::Fast));
+        assert!(
+            hits.iter()
+                .all(|hit| hit.target != StatusBarHitTarget::Fast)
+        );
     }
 
     /// A task runs at a level of its own, so its footer names one. The setting

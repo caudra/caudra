@@ -206,14 +206,12 @@ fn model_from_def(def: &ProviderDef, kind: ProviderKind, slug: &str, model_id: &
             output: m.pricing_output.unwrap_or(0.0),
             cache_write: m.pricing_cache_write.unwrap_or(0.0),
             cache_read: m.pricing_cache_read.unwrap_or(0.0),
-            fast: Some(m)
-                .filter(|d| d.has_fast_pricing())
-                .map(|d| {
-                    FastPricing::derived(
-                        d.pricing_fast_input.unwrap_or(0.0),
-                        d.pricing_fast_output.unwrap_or(0.0),
-                    )
-                }),
+            fast: Some(m).filter(|d| d.has_fast_pricing()).map(|d| {
+                FastPricing::derived(
+                    d.pricing_fast_input.unwrap_or(0.0),
+                    d.pricing_fast_output.unwrap_or(0.0),
+                )
+            }),
             tiers: ModelPricing::UNTIERED,
         })
         .unwrap_or_default();

@@ -1672,7 +1672,10 @@ mod tests {
     fn openai_bills_past_272k_from_the_table(fast: bool, expected: f64) {
         let model = Model::from_spec(GPT_6_SOL_SPEC).unwrap();
         let cost = model.billed_cost(&LONG_OPENAI_REQUEST, fast).unwrap();
-        assert!((cost - expected).abs() < EPSILON, "{cost} is not {expected}");
+        assert!(
+            (cost - expected).abs() < EPSILON,
+            "{cost} is not {expected}"
+        );
     }
 
     #[test]

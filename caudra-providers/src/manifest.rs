@@ -608,7 +608,8 @@ mod tests {
     fn a_line_reorders_the_candidates_without_dropping_any() {
         let manifest = ManifestRegistry::get("openai").unwrap();
         let wide = ManifestRegistry::prefixes_from_manifest(manifest, ModelPurpose::Fast, None);
-        let lined = ManifestRegistry::prefixes_for_purpose("openai", ModelPurpose::Fast, "gpt-5.6-sol");
+        let lined =
+            ManifestRegistry::prefixes_for_purpose("openai", ModelPurpose::Fast, "gpt-5.6-sol");
 
         assert_eq!(lined.first().copied(), Some("gpt-5.6-luna"));
         assert_eq!(wide.first().copied(), Some("gpt-6-luna"));

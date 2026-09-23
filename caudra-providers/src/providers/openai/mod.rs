@@ -673,7 +673,11 @@ mod tests {
     #[test_case("gpt-5.2", false)]
     fn only_long_context_models_state_a_tier(model_id: &str, tiered: bool) {
         let entry = lookup_entry(models(), model_id).unwrap();
-        assert_eq!(!entry.pricing.tiers.is_empty(), tiered, "{LONG_CONTEXT_RULE}");
+        assert_eq!(
+            !entry.pricing.tiers.is_empty(),
+            tiered,
+            "{LONG_CONTEXT_RULE}"
+        );
     }
 
     #[test_case("gpt-5.6-luna", true, 0.2, 0.02, 0.25, 1.2)]
