@@ -65,6 +65,9 @@ pub(crate) struct WorkflowSpawn<'a> {
     pub(crate) context_publisher: ContextPublisher,
     pub(crate) answer: AnswerChannel,
     pub(crate) events: flume::Sender<Envelope>,
+    /// The agent loop's own, or a workflow agent and the user's run could
+    /// both edit one file at once and the later write would drop the other.
+    pub(crate) path_locks: Arc<PathLocks>,
     /// The session's, not the runtime's: a workflow agent's write has to be
     /// recoverable through the same revert point as the user's own run.
     pub(crate) baseline: Option<BaselineGate>,
@@ -139,7 +142,7 @@ impl WorkflowSession {
             context_publisher: Some(spawn.context_publisher),
             timeouts: spawn.timeouts,
             file_tracker: FileReadTracker::fresh(),
-            path_locks: PathLocks::fresh(),
+            path_locks: spawn.path_locks,
             baseline: spawn.baseline.clone(),
             prompt_slots: Arc::new(spawn.lua_handle.collect_prompt_slots(spawn.config)),
             prompt_profiles: Arc::clone(spawn.prompt_profiles),

@@ -15,6 +15,7 @@ use caudra_agent::context::{ContextKey, ContextStore};
 use caudra_agent::permissions::PermissionManager;
 use caudra_agent::prompt::profile::PromptProfileCatalog;
 use caudra_agent::prompt::profile::{BUILTIN_PROFILE_NAME, SystemPromptProfile};
+use caudra_agent::tools::PathLocks;
 use caudra_agent::workflow::WorkflowHandle;
 use caudra_agent::{
     AgentConfig, AgentMode, BaselineGate, CancelMap, CancelToken, Envelope, HistorySnapshot,
@@ -99,6 +100,10 @@ pub(crate) struct AgentHandles {
     /// Session-lifetime: `respawn` carries it over untouched and only a change
     /// of session id replaces it.
     workflow: Option<WorkflowSession>,
+    /// Tab-lifetime, like the output channel: the loop being replaced and the
+    /// workflow agents that outlive it may still be writing, so every
+    /// generation queues on the same per-file locks.
+    path_locks: Arc<PathLocks>,
     workspace_session: Option<WorkspaceSession>,
     remote_project_context: Option<Arc<caudra_agent::remote_project_context::RemoteProjectContext>>,
     /// The directory Caudra itself runs in. Set only in a sandbox session,
@@ -161,6 +166,7 @@ impl AgentHandles {
             system_prompt_profile,
             Arc::clone(&prompt_profiles),
             WorkflowSlot::Fresh(state_dir),
+            PathLocks::fresh(),
             baseline,
             workspace_session,
             remote_project_context,
@@ -324,6 +330,7 @@ impl AgentHandles {
             app.state.system_prompt_profile.clone(),
             Arc::clone(&self.prompt_profiles),
             workflow,
+            Arc::clone(&self.path_locks),
             Arc::clone(&app.workspace_baseline),
             self.workspace_session.clone(),
             self.remote_project_context.clone(),
@@ -409,6 +416,7 @@ fn spawn_agent_internal(
     system_prompt_profile: Option<Arc<SystemPromptProfile>>,
     prompt_profiles: Arc<PromptProfileCatalog>,
     workflow: WorkflowSlot,
+    path_locks: Arc<PathLocks>,
     baseline: Arc<WorkspaceBaseline>,
     workspace_session: Option<WorkspaceSession>,
     remote_project_context: Option<Arc<caudra_agent::remote_project_context::RemoteProjectContext>>,
@@ -479,6 +487,7 @@ fn spawn_agent_internal(
                         context_publisher: context_publisher.clone(),
                         answer: (answer_tx.clone(), Arc::clone(&answer_rx)),
                         events: agent_tx.clone(),
+                        path_locks: Arc::clone(&path_locks),
                         baseline: Some(BaselineGate::new(Arc::clone(&baseline), None)),
                         workspace_session: workspace_session.clone(),
                         remote_project_context: remote_project_context.clone(),
@@ -530,6 +539,7 @@ fn spawn_agent_internal(
         Arc::clone(&prompt_profiles),
         workflow.as_ref().map(WorkflowSession::handle),
         mode,
+        Arc::clone(&path_locks),
         baseline,
         workspace_session.clone(),
         remote_project_context.clone(),
@@ -561,6 +571,7 @@ fn spawn_agent_internal(
         prompt_profiles,
         mailbox,
         workflow,
+        path_locks,
         workspace_session,
         remote_project_context,
         host_cwd,
@@ -903,6 +914,17 @@ mod tests {
             app.queue.text_messages().is_empty(),
             "no duplicate of the restored item is left queued"
         );
+    }
+
+    /// The loop being replaced may still be finishing a write when the new one
+    /// starts its own, so both have to queue on the same locks.
+    #[test]
+    fn respawn_keeps_the_lock_domain() {
+        let (mut handles, model_slot, permissions) = stub_spawn();
+        let before = Arc::clone(&handles.path_locks);
+        let mut app = crate::app::tests::test_app();
+        respawn(&mut handles, &model_slot, &permissions, &mut app);
+        assert!(Arc::ptr_eq(&handles.path_locks, &before));
     }
 
     /// If the seeded empty snapshot ever outlived `spawn`, the next checkpoint

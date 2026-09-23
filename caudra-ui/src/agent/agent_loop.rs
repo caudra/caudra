@@ -127,6 +127,7 @@ impl AgentLoop {
         prompt_profiles: Arc<PromptProfileCatalog>,
         workflow: Option<WorkflowHandle>,
         mode: SharedMode,
+        path_locks: Arc<PathLocks>,
         baseline: Arc<WorkspaceBaseline>,
         workspace_session: Option<WorkspaceSession>,
         remote_project_context: Option<
@@ -173,7 +174,7 @@ impl AgentLoop {
             init_cancel,
             permissions,
             file_tracker: FileReadTracker::fresh(),
-            path_locks: PathLocks::fresh(),
+            path_locks,
             min_run_id: 0,
             agent_tx,
             answer_rx,

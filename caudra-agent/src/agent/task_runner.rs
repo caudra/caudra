@@ -699,7 +699,6 @@ impl TaskRunner for SubagentTaskRunner {
         host.loaded_instructions =
             crate::agent::load_remote_instructions(&workspace.context, host.host_cwd.as_deref())
                 .loaded;
-        host.path_locks = PathLocks::fresh();
         Ok(Arc::new(Self::new(Arc::new(host))))
     }
 
@@ -793,7 +792,11 @@ mod tests {
         cache_read: 0,
     };
 
-    struct CursorProbe(Arc<Mutex<Vec<(String, String)>>>);
+    #[derive(Clone, Default)]
+    struct CursorProbe {
+        cursors: Arc<Mutex<Vec<(String, String)>>>,
+        lock_domains: Arc<Mutex<Vec<Arc<PathLocks>>>>,
+    }
 
     impl Tool for CursorProbe {
         fn name(&self) -> &str {
@@ -806,7 +809,7 @@ mod tests {
             json!({"type":"object","properties":{}})
         }
         fn parse(&self, _: &Value) -> Result<Box<dyn ToolInvocation>, ParseError> {
-            Ok(Box::new(Self(Arc::clone(&self.0))))
+            Ok(Box::new(self.clone()))
         }
     }
 
@@ -818,10 +821,14 @@ mod tests {
             Box::pin(async move {
                 let workspace = ctx.workspace_session.as_ref().unwrap();
                 let cwd = crate::workspace_logical_cwd(workspace).await.unwrap();
-                self.0
+                self.cursors
                     .lock()
                     .unwrap()
                     .push((workspace.cursor().cwd_handle().as_str().into(), cwd.clone()));
+                self.lock_domains
+                    .lock()
+                    .unwrap()
+                    .push(Arc::clone(&ctx.path_locks));
                 Ok(crate::ToolOutput::Plain(crate::TextOutput {
                     text: cwd,
                     instructions: None,
@@ -867,10 +874,10 @@ mod tests {
             ctx.remote_project_context = Some(Arc::clone(&context));
             ctx.permissions.set_session_yolo(Some(true));
             ctx.registry = Arc::new(ToolRegistry::new());
-            let observed = Arc::new(Mutex::new(Vec::new()));
+            let probe = CursorProbe::default();
             ctx.registry
                 .register_audited(
-                    Arc::new(CursorProbe(Arc::clone(&observed))),
+                    Arc::new(probe.clone()),
                     ToolSource::Native {
                         owner: CURSOR_PROBE.into(),
                         contract: CURSOR_PROBE.into(),
@@ -977,11 +984,17 @@ mod tests {
                 }
             }
             assert_eq!(
-                *observed.lock().unwrap(),
+                *probe.cursors.lock().unwrap(),
                 vec![(
                     nested.cursor().cwd_handle().as_str().into(),
                     "nested".into()
                 )]
+            );
+            let lock_domains = std::mem::take(&mut *probe.lock_domains.lock().unwrap());
+            assert_eq!(lock_domains.len(), 1);
+            assert!(
+                Arc::ptr_eq(&lock_domains[0], &ctx.path_locks),
+                "a rebound workflow agent must queue its writes on the session's locks"
             );
             runtime.shutdown().await;
         });
