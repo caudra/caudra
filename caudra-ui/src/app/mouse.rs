@@ -20,7 +20,7 @@ use std::path::PathBuf;
 use crate::repaint::Dirty;
 
 use super::tasks::MAIN_TASK_ID;
-use super::{App, KeyFocus, YOLO_OFF_MSG};
+use super::{App, FAST_OFF_MSG, KeyFocus, YOLO_OFF_MSG};
 
 pub(super) const EDGE_SCROLL_LINES: i32 = 1;
 pub(super) const EDGE_SCROLL_INTERVAL: Duration = Duration::from_millis(25);
@@ -1110,6 +1110,16 @@ impl App {
                 self.clear_control_hovers();
                 self.permissions.set_session_yolo(Some(false));
                 self.flash(YOLO_OFF_MSG.into());
+                Vec::new()
+            }
+            // Off only, on the same terms as yolo: the chip is drawn from the
+            // state it reports, so a click can only ever retire it. Turning
+            // fast back on goes through `/fast`, which is where the model's
+            // eligibility is answered.
+            StatusBarHitTarget::Fast => {
+                self.clear_control_hovers();
+                self.state.fast = false;
+                self.flash(FAST_OFF_MSG.into());
                 Vec::new()
             }
             // The countdown is cleared here rather than left to the next event:

@@ -14782,6 +14782,28 @@ fn fast_toggle_on_off_on_opus() {
     assert_eq!(app.status_bar.flash_text(), Some(FAST_OFF_MSG));
 }
 
+#[test]
+fn clicking_the_fast_chip_turns_it_off() {
+    let mut app = test_app();
+    set_opus_model(&mut app);
+    app.execute_command(cmd("/fast"), 0);
+    let hit = status_hit(&mut app, StatusBarHitTarget::Fast);
+    app.update(mouse_event(MouseEventKind::Moved, hit.area.x, hit.area.y));
+    assert_eq!(app.status_hover, Some(StatusBarHitTarget::Fast));
+
+    assert!(click_status(&mut app, StatusBarHitTarget::Fast).is_empty());
+
+    assert!(!app.state.fast);
+    assert_eq!(app.status_bar.flash_text(), Some(FAST_OFF_MSG));
+    assert_eq!(app.status_hover, None);
+    let _ = rendered(&mut app);
+    assert!(
+        app.status_hits
+            .iter()
+            .all(|hit| hit.target != StatusBarHitTarget::Fast)
+    );
+}
+
 /// Sessions spawned from Lua have synthetic ids that no ToolDone matches, so
 /// SubagentHistory is what finishes their chat.
 #[test]

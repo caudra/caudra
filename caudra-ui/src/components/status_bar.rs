@@ -159,6 +159,7 @@ pub enum StatusBarHitTarget {
     Cwd,
     ResumeAutoScroll,
     Yolo,
+    Fast,
     Sandbox,
 }
 
@@ -175,6 +176,10 @@ impl StatusBarHitTarget {
     /// asking for an immediate retry reaches the top-level agent alone, so on a
     /// task the chip is a label and a click there would shorten the main
     /// conversation's backoff instead of the one on screen.
+    ///
+    /// [`Self::Fast`] is main-only for the same reason as [`Self::Thinking`]:
+    /// a task draws the fast flag it runs under, which its spawner chose, so a
+    /// click there would turn the session's fast mode off instead.
     pub fn scope(self) -> ChatScope {
         match self {
             Self::BackToMain
@@ -190,6 +195,7 @@ impl StatusBarHitTarget {
             | Self::Thinking
             | Self::Goal
             | Self::Workflows
+            | Self::Fast
             | Self::Retry => ChatScope::MainOnly,
         }
     }
@@ -1135,7 +1141,12 @@ fn right_side_animated<'a>(
         );
     }
     if ctx.fast && fit.fast {
-        chips.push(Span::styled(FAST_LABEL, theme::current().status_dim));
+        control(
+            &mut chips,
+            StatusBarHitTarget::Fast,
+            FAST_LABEL,
+            control_style(ctx, StatusBarHitTarget::Fast),
+        );
     }
     if let Some(label) = fit.workflow_label(ctx) {
         control(
@@ -1685,6 +1696,7 @@ mod tests {
     const MISSING_RESUME_HIT_MSG: &str = "a paused transcript must be resumable from the footer";
     const UNCLICKABLE_LABEL_MSG: &str = "the bar drew the resume label without a hit to click it";
     const MISSING_YOLO_HIT_MSG: &str = "a bypassed session must be switchable back from the footer";
+    const MISSING_FAST_HIT_MSG: &str = "a fast session must be switchable back from the footer";
     const UNCLICKABLE_YOLO_MSG: &str = "the bar drew the yolo chip without a hit to click it";
     const TASK_LEVEL_MISSING: &str = "a task footer must name the level that task runs at";
     const TASK_LEVEL_CLICKABLE: &str = "a task footer's level is a label, not a control";
@@ -1765,6 +1777,7 @@ mod tests {
         global_cost: Option<f64>,
         show_global: bool,
         yolo: bool,
+        fast: bool,
         hovered: Option<StatusBarHitTarget>,
         hover_hint: Option<&'a str>,
         goal: Option<&'a GoalSnapshot>,
@@ -1785,6 +1798,7 @@ mod tests {
                 global_cost: None,
                 show_global: false,
                 yolo: false,
+                fast: false,
                 hovered: None,
                 hover_hint: None,
                 goal: None,
@@ -1806,6 +1820,7 @@ mod tests {
             global_cost,
             show_global,
             yolo,
+            fast,
             hovered,
             hover_hint,
             goal,
@@ -1846,7 +1861,7 @@ mod tests {
             main_chat,
             retry_info,
             thinking: Some(THINKING_LEVEL.into()),
-            fast: false,
+            fast,
             workflows,
             yolo,
             restoring: false,
@@ -2791,6 +2806,61 @@ mod tests {
                 .iter()
                 .all(|style| style.add_modifier.contains(Modifier::REVERSED))
         );
+    }
+
+    /// The chip is the whole control, exactly as the yolo one is: the space
+    /// ahead of it separates it from the level chip and must not answer.
+    #[test]
+    fn a_fast_session_offers_a_fast_control() {
+        let (text, hits, _) = render_at(Fixture {
+            fast: true,
+            ..Default::default()
+        });
+        let hit = hits
+            .iter()
+            .find(|hit| hit.target == StatusBarHitTarget::Fast)
+            .expect(MISSING_FAST_HIT_MSG);
+
+        assert_eq!(bar_glyphs(&text, hit), FAST_LABEL.trim());
+        assert_eq!(text.chars().nth(usize::from(hit.area.x) - 1), Some(' '));
+        assert!(hit.target.accepts_click());
+    }
+
+    #[test]
+    fn hovering_the_fast_control_highlights_its_chip_alone() {
+        let (_, hits, styles) = render_at(Fixture {
+            fast: true,
+            hovered: Some(StatusBarHitTarget::Fast),
+            ..Default::default()
+        });
+        let hit = hits
+            .iter()
+            .find(|hit| hit.target == StatusBarHitTarget::Fast)
+            .expect(MISSING_FAST_HIT_MSG);
+        let start = usize::from(hit.area.x);
+        let end = usize::from(hit.area.right());
+
+        assert!(!styles[start - 1].add_modifier.contains(Modifier::REVERSED));
+        assert!(
+            styles[start..end]
+                .iter()
+                .all(|style| style.add_modifier.contains(Modifier::REVERSED))
+        );
+    }
+
+    /// A task draws the fast flag its spawner chose, so the chip is a label
+    /// there and the bar must not measure a hit a click could land on.
+    #[test]
+    fn a_subagent_footer_names_fast_mode_without_offering_a_control() {
+        let (text, hits, _) = render_at(Fixture {
+            fast: true,
+            main_chat: false,
+            ..Default::default()
+        });
+
+        assert!(text.contains(FAST_LABEL.trim()));
+        assert_eq!(StatusBarHitTarget::Fast.scope(), ChatScope::MainOnly);
+        assert!(hits.iter().all(|hit| hit.target != StatusBarHitTarget::Fast));
     }
 
     /// A task runs at a level of its own, so its footer names one. The setting
