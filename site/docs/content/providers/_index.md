@@ -100,7 +100,9 @@ The built-in provider still owns the slug, so `protocol`, `api_key_env`, `discov
 |  | claude-opus-4-6 | $5.00 / $25.00 | 372K ctx / 128K out |
 |  | claude-opus-4-7 | $5.00 / $25.00 | 372K ctx / 128K out |
 |  | claude-opus-4-8 | $5.00 / $25.00 | 372K ctx / 128K out |
+|  | claude-opus-5-5 | $4.00 / $20.00 | 372K ctx / 128K out |
 |  | claude-opus-5 | $5.00 / $25.00 | 372K ctx / 128K out |
+|  | claude-fable-5-1 | $10.00 / $50.00 | 372K ctx / 128K out |
 | Best | **claude-fable-5** (default) | $10.00 / $50.00 | 372K ctx / 128K out |
 |  | claude-opus-4-0, claude-opus-4-1 | $15.00 / $75.00 | 200K ctx / 32K out |
 
@@ -134,11 +136,13 @@ You can override the model with `ANTHROPIC_MODEL` and the endpoint with `ANTHROP
 
 | Marker | Models | Pricing (in/out per 1M tokens) | Context |
 |---------|--------|-------------------------------|---------|
+| Small | gpt-6-luna | $0.10 / $0.50 | 372K ctx / 128K out |
 | Fast | **gpt-5.6-luna** (default) | $1.00 / $6.00 | 372K ctx / 128K out |
 | Small | gpt-5.4-nano | $0.20 / $1.25 | 400K ctx / 128K out |
 | Small | gpt-5.4-mini | $0.75 / $4.50 | 400K ctx / 128K out |
 | Small | gpt-4.1-nano | $0.10 / $0.40 | 1047K ctx / 32K out |
 |  | gpt-6-astra | $10.00 / $50.00 | 372K ctx / 128K out |
+|  | gpt-6-sol | $2.00 / $10.00 | 372K ctx / 128K out |
 |  | gpt-5.6-terra | $2.50 / $15.00 | 372K ctx / 128K out |
 | Best | **gpt-5.6-sol** (default) | $5.00 / $30.00 | 372K ctx / 128K out |
 |  | gpt-4.1-mini | $0.40 / $1.60 | 1047K ctx / 32K out |
@@ -184,6 +188,7 @@ Routing defaults: gemini-2.0-flash-lite (Fast), gemini-2.5-pro (Best)
 | Small | claude-haiku-4.5 | $1.00 / $5.00 | 200K ctx / 64K out |
 | Small | gemini-3.5-flash | $1.50 / $9.00 | 200K ctx / 65K out |
 | Small | mai-code-1-flash-picker | $0.75 / $4.50 | 200K ctx / 100K out |
+| Small | gpt-6-luna | $0.10 / $0.50 | 200K ctx / 100K out |
 | Fast | **gpt-5.6-luna** (default) | $0.20 / $1.20 | 200K ctx / 100K out |
 |  | gemini-3.6-flash | $0.75 / $3.75 | 200K ctx / 65K out |
 |  | gemini-3.7-flash | $0.75 / $3.75 | 200K ctx / 65K out |
@@ -193,10 +198,12 @@ Routing defaults: gemini-2.0-flash-lite (Fast), gemini-2.5-pro (Best)
 |  | kimi-k2.7-code | $0.95 / $4.00 | 200K ctx / 100K out |
 |  | kimi-k3 | $3.00 / $15.00 | 200K ctx / 100K out |
 |  | gemini-3.1-pro-preview | $2.00 / $12.00 | 200K ctx / 65K out |
+|  | gpt-6-sol | $2.00 / $10.00 | 200K ctx / 100K out |
 |  | gpt-5.4 | $2.50 / $15.00 | 200K ctx / 100K out |
 |  | gpt-5.6-sol | $5.00 / $30.00 | 200K ctx / 100K out |
 |  | gpt-5.6-terra | $2.00 / $12.00 | 200K ctx / 100K out |
 |  | gpt-5.3-codex | $1.75 / $14.00 | 200K ctx / 100K out |
+|  | claude-opus-5.5 | $4.00 / $20.00 | 200K ctx / 128K out |
 | Best | **claude-opus-5, claude-opus-4.8, claude-opus-4.7, claude-opus-4.6, claude-opus-4.5** (default) | $5.00 / $25.00 | 200K ctx / 64K out |
 |  | claude-opus-4.8-fast, claude-fable-5 | $10.00 / $50.00 | 200K ctx / 100K out |
 |  | grok-4.5 | $2.00 / $6.00 | 200K ctx / 100K out |

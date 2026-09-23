@@ -312,10 +312,7 @@ mod tests {
     fn fast_priced_model() -> Model {
         Model {
             pricing: ModelPricing {
-                fast: Some(FastPricing {
-                    input: FAST_INPUT_RATE,
-                    output: test_pricing().output,
-                }),
+                fast: Some(FastPricing::derived(FAST_INPUT_RATE, test_pricing().output)),
                 ..test_pricing()
             },
             ..test_model()

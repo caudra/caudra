@@ -35,6 +35,8 @@ static CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
 // `coding_plan_context_window`, so they never need listing here.
 pub(crate) const PLAN_MODELS: &[&str] = &[
     "gpt-6-astra",
+    "gpt-6-sol",
+    "gpt-6-luna",
     "gpt-5.6-luna",
     "gpt-5.6-terra",
     "gpt-5.6-sol",
@@ -811,6 +813,8 @@ mod tests {
     }
 
     #[test_case("gpt-6-astra", Some(372_000))]
+    #[test_case("gpt-6-sol", Some(372_000))]
+    #[test_case("gpt-6-luna", Some(372_000))]
     #[test_case("gpt-5.6-luna", Some(372_000))]
     #[test_case("gpt-5.6-terra", Some(372_000))]
     #[test_case("gpt-5.6-sol", Some(372_000))]

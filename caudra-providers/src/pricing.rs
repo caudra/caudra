@@ -530,10 +530,7 @@ mod tests {
         entries: &[(&str, Option<f64>)],
     ) -> Option<f64> {
         let mut current = model(CURRENT, INPUT_RATE);
-        current.pricing.fast = Some(FastPricing {
-            input: FAST_INPUT_RATE,
-            output: 0.0,
-        });
+        current.pricing.fast = Some(FastPricing::derived(FAST_INPUT_RATE, 0.0));
         let total = TokenUsage {
             input: ONE_MILLION,
             ..Default::default()

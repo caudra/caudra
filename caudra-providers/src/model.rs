@@ -130,13 +130,30 @@ impl ModelInfo {
     }
 }
 
-/// Cache rates are missing on purpose: Anthropic derives them from `input` with
-/// the same multipliers it uses for standard pricing, so storing them would just
-/// invite the two copies to drift apart.
+/// Cache rates are stated rather than derived from `input`, because the ratio
+/// is the model's own: Opus 5.5 reads cache at a twentieth of its input rate
+/// where every model before it read at a tenth, so deriving would double the
+/// bill on the tokens agentic work is mostly made of.
 #[derive(Debug, Clone, Deserialize)]
 pub struct FastPricing {
     pub input: f64,
     pub output: f64,
+    pub cache_write: f64,
+    pub cache_read: f64,
+}
+
+impl FastPricing {
+    /// Rates for a source that publishes only the two headline numbers, such as
+    /// a `providers.toml` endpoint: cache follows input with the multipliers
+    /// Anthropic applies to its standard rates.
+    pub fn derived(input: f64, output: f64) -> Self {
+        Self {
+            input,
+            output,
+            cache_write: input * ModelPricing::CACHE_WRITE_MULTIPLIER,
+            cache_read: input * ModelPricing::CACHE_READ_MULTIPLIER,
+        }
+    }
 }
 
 impl ModelPricing {
@@ -993,12 +1010,7 @@ impl TokenUsage {
     pub(crate) fn cost(&self, pricing: &ModelPricing, fast: bool) -> f64 {
         let (input, output, cache_write, cache_read) = match &pricing.fast {
             // Fast mode quotes one flat premium, so it never reads tiers.
-            Some(f) if fast => (
-                f.input,
-                f.output,
-                f.input * ModelPricing::CACHE_WRITE_MULTIPLIER,
-                f.input * ModelPricing::CACHE_READ_MULTIPLIER,
-            ),
+            Some(f) if fast => (f.input, f.output, f.cache_write, f.cache_read),
             // The tier boundary is on prompt size, which is everything the
             // model read: fresh input plus whatever came from cache.
             _ => pricing.rates_at(self.input + self.cache_read + self.cache_creation),
@@ -1425,6 +1437,8 @@ mod tests {
             fast: Some(FastPricing {
                 input: 30.00,
                 output: 150.00,
+                cache_write: 37.50,
+                cache_read: 3.00,
             }),
             tiers: Vec::new(),
         };
@@ -1467,7 +1481,10 @@ mod tests {
                     continue;
                 };
                 assert!(
-                    fast.input >= entry.pricing.input && fast.output >= entry.pricing.output,
+                    fast.input >= entry.pricing.input
+                        && fast.output >= entry.pricing.output
+                        && fast.cache_write >= entry.pricing.cache_write
+                        && fast.cache_read >= entry.pricing.cache_read,
                     "{}/{}: fast pricing must not be cheaper than standard",
                     manifest.slug,
                     entry.prefixes[0],
@@ -1604,6 +1621,7 @@ mod tests {
     }
 
     #[test_case("claude-opus-5",    true  ; "entry_with_fast_pricing")]
+    #[test_case("claude-opus-5-5",  true  ; "opus_5_5_is_fast_capable")]
     #[test_case("claude-opus-5-1m", true  ; "long_context_suffix_still_matches_prefix")]
     #[test_case("claude-opus-4-7",  false ; "fast_withdrawn_from_the_table")]
     #[test_case("claude-sonnet-5",  false ; "entry_without_fast_pricing")]
@@ -1617,6 +1635,51 @@ mod tests {
         assert_eq!(model.supports_fast(), expected);
     }
 
+    /// A longer id must not inherit the shorter prefix's rates. Both of these
+    /// are cheaper than the entry that would otherwise swallow them, so the
+    /// failure is silent overbilling rather than an error.
+    #[test_case("claude-opus-5-5",  (4.00, 20.00, 5.00, 0.20)   ; "opus_5_5_does_not_inherit_opus_5")]
+    #[test_case("claude-opus-5",    (5.00, 25.00, 6.25, 0.50)   ; "opus_5_keeps_its_own")]
+    #[test_case("claude-fable-5-1", (10.00, 50.00, 12.50, 0.25) ; "fable_5_1_does_not_inherit_fable_5")]
+    #[test_case("claude-fable-5",   (10.00, 50.00, 12.50, 1.00) ; "fable_5_keeps_its_own")]
+    fn anthropic_rates_come_from_the_most_specific_prefix(
+        model_id: &str,
+        expected: (f64, f64, f64, f64),
+    ) {
+        let pricing = Model::from_base(
+            ManifestRegistry::get("anthropic").unwrap(),
+            "anthropic",
+            model_id,
+        )
+        .pricing;
+        assert_eq!(
+            (
+                pricing.input,
+                pricing.output,
+                pricing.cache_write,
+                pricing.cache_read
+            ),
+            expected
+        );
+    }
+
+    /// Opus 5.5 reads cache at a twentieth of input, so deriving the fast rate
+    /// from the 0.10 multiplier every earlier model used would double the bill
+    /// on the tokens agentic work is mostly made of.
+    #[test]
+    fn opus_5_5_fast_cache_reads_are_not_derived_from_input() {
+        let model = Model::from_base(
+            ManifestRegistry::get("anthropic").unwrap(),
+            "anthropic",
+            "claude-opus-5-5",
+        );
+        let usage = TokenUsage {
+            cache_read: 1_000_000,
+            ..Default::default()
+        };
+        assert_eq!(model.list_cost(&usage, true), Some(0.40));
+    }
+
     #[test]
     fn supports_fast_false_for_non_anthropic_even_with_fast_pricing() {
         let mut model = Model::from_base(
@@ -1624,10 +1687,7 @@ mod tests {
             "google",
             "gemini-2.5-pro",
         );
-        model.pricing.fast = Some(FastPricing {
-            input: 30.0,
-            output: 150.0,
-        });
+        model.pricing.fast = Some(FastPricing::derived(30.0, 150.0));
         assert!(!model.supports_fast());
     }
 

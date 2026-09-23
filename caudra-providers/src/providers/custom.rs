@@ -208,9 +208,11 @@ fn model_from_def(def: &ProviderDef, kind: ProviderKind, slug: &str, model_id: &
             cache_read: m.pricing_cache_read.unwrap_or(0.0),
             fast: Some(m)
                 .filter(|d| d.has_fast_pricing())
-                .map(|d| FastPricing {
-                    input: d.pricing_fast_input.unwrap_or(0.0),
-                    output: d.pricing_fast_output.unwrap_or(0.0),
+                .map(|d| {
+                    FastPricing::derived(
+                        d.pricing_fast_input.unwrap_or(0.0),
+                        d.pricing_fast_output.unwrap_or(0.0),
+                    )
                 }),
             tiers: Vec::new(),
         })

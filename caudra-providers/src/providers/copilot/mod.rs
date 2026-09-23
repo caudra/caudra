@@ -45,6 +45,10 @@ const RESPONSES_PATH: &str = "/responses";
 const MESSAGES_PATH: &str = "/v1/messages";
 const MODELS_PATH: &str = "/models";
 
+/// OpenAI families Copilot serves over the Responses API. Matched as substrings
+/// so `gpt-6-sol` and `gpt-5.3-codex` both route without naming every release.
+const RESPONSES_FAMILIES: &[&str] = &["gpt-5", "gpt-6", "codex"];
+
 /// Scales `/models` AI-credit prices (1 credit = $0.01) to USD per 1M tokens.
 const AIC_TO_USD_PER_MILLION: f64 = 10_000.0;
 
@@ -357,6 +361,42 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
             reasoning_options: Some(GEMINI_PRO_32K),
         },
         ModelEntry {
+            prefixes: &["gpt-6-luna"],
+            small: true,
+            family: ModelFamily::Generic,
+            vision: true,
+            default: false,
+            pricing: ModelPricing {
+                input: 0.10,
+                output: 0.50,
+                cache_write: 0.125,
+                cache_read: 0.01,
+                fast: None,
+                tiers: Vec::new(),
+            },
+            max_output_tokens: Some(100_000),
+            context_window: 200_000,
+            reasoning_options: Some(EFFORT_WITH_MAX),
+        },
+        ModelEntry {
+            prefixes: &["gpt-6-sol"],
+            small: false,
+            family: ModelFamily::Generic,
+            vision: true,
+            default: false,
+            pricing: ModelPricing {
+                input: 2.00,
+                output: 10.00,
+                cache_write: 2.50,
+                cache_read: 0.20,
+                fast: None,
+                tiers: Vec::new(),
+            },
+            max_output_tokens: Some(100_000),
+            context_window: 200_000,
+            reasoning_options: Some(EFFORT_WITH_MAX),
+        },
+        ModelEntry {
             prefixes: &["gpt-5.6-luna"],
             small: true,
             family: ModelFamily::Generic,
@@ -445,6 +485,24 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
             max_output_tokens: Some(100_000),
             context_window: 200_000,
             reasoning_options: Some(EFFORT_TO_XHIGH_NO_NONE),
+        },
+        ModelEntry {
+            prefixes: &["claude-opus-5.5"],
+            small: false,
+            family: ModelFamily::Generic,
+            vision: true,
+            default: false,
+            pricing: ModelPricing {
+                input: 4.00,
+                output: 20.00,
+                cache_write: 5.00,
+                cache_read: 0.20,
+                fast: None,
+                tiers: Vec::new(),
+            },
+            max_output_tokens: Some(128_000),
+            context_window: 200_000,
+            reasoning_options: Some(CLAUDE_EFFORT_MAX),
         },
         ModelEntry {
             prefixes: &[
@@ -1094,7 +1152,7 @@ fn anthropic_messages(messages: &[Message]) -> Value {
 fn guess_endpoint(model_id: &str) -> Endpoint {
     if model_id.starts_with("claude-") {
         Endpoint::Messages
-    } else if model_id.contains("gpt-5") || model_id.contains("codex") {
+    } else if RESPONSES_FAMILIES.iter().any(|f| model_id.contains(f)) {
         Endpoint::Responses
     } else {
         Endpoint::ChatCompletions
@@ -1210,6 +1268,16 @@ mod tests {
         assert_eq!(model.endpoint(), Endpoint::ChatCompletions);
     }
 
+    #[test_case("claude-opus-5.5", Endpoint::Messages ; "claude_takes_messages")]
+    #[test_case("gpt-6-sol", Endpoint::Responses ; "gpt_6_takes_responses")]
+    #[test_case("gpt-6-luna", Endpoint::Responses ; "gpt_6_luna_takes_responses")]
+    #[test_case("gpt-5.6-sol", Endpoint::Responses ; "gpt_5_takes_responses")]
+    #[test_case("gpt-5.3-codex", Endpoint::Responses ; "codex_takes_responses")]
+    #[test_case("gemini-3.1-pro-preview", Endpoint::ChatCompletions ; "everything_else_takes_chat")]
+    fn guess_endpoint_covers_every_openai_family(model_id: &str, expected: Endpoint) {
+        assert_eq!(guess_endpoint(model_id), expected);
+    }
+
     #[test]
     fn parses_discovered_capabilities() {
         let model: CopilotModel = serde_json::from_value(json!({
@@ -1287,6 +1355,9 @@ mod tests {
     #[test_case("copilot/gpt-5.6-luna", 1_000_000, 1_000_000, 0.20 + 1.20; "luna default rates")]
     #[test_case("copilot/gpt-5.4-mini", 100_000, 100_000, 0.075 + 0.45; "gpt-5.4-mini beats gpt-5.4 prefix")]
     #[test_case("copilot/claude-opus-4.8-fast", 100_000, 100_000, 1.00 + 5.00; "opus 4.8 fast beats opus prefix")]
+    #[test_case("copilot/claude-opus-5.5", 1_000_000, 1_000_000, 4.00 + 20.00; "opus 5.5 beats opus 5 prefix")]
+    #[test_case("copilot/gpt-6-sol", 1_000_000, 1_000_000, 2.00 + 10.00; "gpt 6 sol has its own rates")]
+    #[test_case("copilot/gpt-6-luna", 1_000_000, 1_000_000, 0.10 + 0.50; "gpt 6 luna has its own rates")]
     fn manifest_models_report_cost(spec: &str, input: u32, output: u32, expected: f64) {
         let usage = TokenUsage {
             input,
