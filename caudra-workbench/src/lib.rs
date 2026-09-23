@@ -21,7 +21,8 @@ mod style;
 mod view;
 
 pub use action::WorkbenchAction;
-pub use editor::{buffer, history, render, words};
+pub use editor::rendered::PaintMarkdown;
+pub use editor::{DocumentKey, TabLabel, buffer, history, render, words};
 pub use fs::backend::{
     BackendDriver, BackendError, BackendEvent, BackendRevision, ListResult, LoadedFile,
     LocalFilesystem, MutationGate, RequestId, ResourceEntry, SearchMatch, SearchResult,
@@ -92,6 +93,30 @@ const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
 /// Where a workspace session files the tabs it synthesises from the repository,
 /// which name no path the workspace itself would serve.
 const SCM_SYNTHETIC_ROOT: &str = ".caudra-scm";
+/// Where the host's documents are filed. Nothing is read or written under it;
+/// the path only gives each document a name of its own.
+const DOCUMENT_ROOT: &str = ".caudra-document";
+/// Every document is Markdown, which is what earns it a rendered view.
+const DOCUMENT_EXTENSION: &str = "md";
+const RENDERED_READ_ONLY: &str = "The rendered view is read-only";
+const NO_RENDERED_VIEW: &str = "Only a Markdown file has a rendered view";
+/// Chords that land the caret somewhere in the text. The rendered view has no
+/// caret to show where, so they go back to the source first.
+const SOURCE_CHORDS: [keys::Bind; 4] = [
+    keys::FIND,
+    keys::FIND_NEXT,
+    keys::FIND_PREV,
+    keys::GOTO_LINE,
+];
+/// Chords that change or select the text, which the rendered view refuses:
+/// what they did would happen out of sight.
+const EDIT_CHORDS: [keys::Bind; 5] = [
+    keys::UNDO,
+    keys::REDO,
+    keys::SELECT_ALL,
+    keys::KILL_LINE,
+    keys::DELETE_WORD,
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -430,6 +455,9 @@ pub struct Workbench {
     scrollbars: bool,
     /// Bumped on every palette change so open tabs know to rehighlight.
     theme_generation: u64,
+    /// The host's Markdown painter, lent for the rendered view. Without one no
+    /// tab is offered that view and its chord stays the host's.
+    markdown: Option<PaintMarkdown>,
     panes: PaneRects,
     /// One per bar drawn, so a grab knows which pane it is holding and a drag
     /// survives the pointer wandering out of that pane's column.
@@ -511,6 +539,7 @@ impl Workbench {
             styles,
             scrollbars: true,
             theme_generation: 0,
+            markdown: None,
             panes: PaneRects::default(),
             bars: Bars::default(),
             tree: Tree::default(),
@@ -578,6 +607,10 @@ impl Workbench {
     pub fn close(&mut self) {
         self.open = false;
         self.watch = None;
+        // A clean document says nothing the host does not already hold, and
+        // left open it would go stale behind the next change to the host's copy.
+        self.editor
+            .close_where(&|tab| tab.document.is_some() && !tab.is_dirty());
         if let Some(backend) = &mut self.remote_backend {
             backend.close_watch();
         }
@@ -724,6 +757,12 @@ impl Workbench {
             self.scm.open(root);
         }
         let scm_ms = lap();
+        // The watch was down while the workbench was closed, so whatever was
+        // written in the meantime is only on disk.
+        for tab in self.editor.tabs_mut() {
+            let _ = tab.refresh_if_changed();
+        }
+        let tabs_ms = lap();
         self.watch = Watch::start(&self.root);
         let watch_ms = lap();
         self.apply_marks();
@@ -732,6 +771,7 @@ impl Workbench {
             reused,
             tree_ms,
             scm_ms,
+            tabs_ms,
             watch_ms,
             marks_ms = lap(),
             total_ms = started.elapsed().as_millis() as u64,
@@ -798,6 +838,124 @@ impl Workbench {
         self.show_explorer();
     }
 
+    /// Opens a file the host keeps for itself, such as the plan, under a name
+    /// that says what it is. Unlike a mention it leaves the cursor where the
+    /// reader last had it and the sidebar on whatever it was showing, because
+    /// coming back to the plan is picking up where the reading stopped.
+    ///
+    /// A workbench on a remote workspace refuses rather than flashing, because
+    /// it stays closed and a closed workbench says nothing until it next opens.
+    pub fn open_labelled(
+        &mut self,
+        root: &Path,
+        path: &Path,
+        label: TabLabel,
+    ) -> Result<(), BackendError> {
+        if self.remote_backend.is_some() {
+            return Err(BackendError::WrongBackend);
+        }
+        if !self.open || self.root != root {
+            self.open(root);
+        }
+        self.open_path(path);
+        self.editor
+            .label(&WorkbenchPath::Local(path.to_path_buf()), label);
+        Ok(())
+    }
+
+    /// Rereads the tabs on files something wrote where the watch cannot see,
+    /// such as the plan the agent keeps outside the project. A clean tab takes
+    /// the new text and a dirty one raises its conflict, as a watched write
+    /// would.
+    pub fn reload_paths<'a>(&mut self, paths: impl IntoIterator<Item = &'a Path>) {
+        for path in paths {
+            self.reload_tab(path);
+        }
+    }
+
+    /// Whether the tab on `path` holds edits that are not on disk yet.
+    pub fn has_unsaved(&self, path: &Path) -> bool {
+        let identity = WorkbenchPath::Local(path.to_path_buf());
+        self.editor
+            .tabs()
+            .iter()
+            .any(|tab| tab.path == identity && tab.is_dirty())
+    }
+
+    /// Opens text the host keeps for itself, such as a prompt draft, in a tab
+    /// of its own, or raises the one already open. Edits there that were never
+    /// handed back are the reader's and stay; a clean tab takes `text`, since
+    /// the host's copy may have moved on.
+    ///
+    /// Saving the tab hands the text back as [`WorkbenchAction::SaveDocument`].
+    /// The host opens the workbench itself, because only it knows whether
+    /// that means a local root or a workspace session.
+    pub fn open_document(&mut self, key: DocumentKey, label: TabLabel, text: &str) {
+        match self.editor.document(&key) {
+            Some(index) => {
+                self.editor.select(index);
+                let tab = &mut self.editor.tabs_mut()[index];
+                if !tab.is_dirty() {
+                    tab.replace_text(text);
+                }
+                tab.label = Some(label);
+            }
+            None => {
+                let name = format!("{}.{DOCUMENT_EXTENSION}", opaque_path_component(&key.0));
+                let path = Path::new(DOCUMENT_ROOT).join(name);
+                let tab = Tab::document(&path, key, label, text, self.theme_generation);
+                self.editor.push(tab);
+            }
+        }
+        self.focus = Focus::Editor;
+        self.follow_cursor();
+    }
+
+    /// The host kept what a [`WorkbenchAction::SaveDocument`] handed it, so
+    /// the document's tab has nothing unsaved left.
+    pub fn document_saved(&mut self, key: &DocumentKey) {
+        if let Some(index) = self.editor.document(key) {
+            self.editor.tabs_mut()[index].mark_saved();
+        }
+    }
+
+    pub fn has_document(&self, key: &DocumentKey) -> bool {
+        self.editor.document(key).is_some()
+    }
+
+    /// Whether the document's tab holds edits the host has not kept yet.
+    pub fn has_unsaved_document(&self, key: &DocumentKey) -> bool {
+        self.editor
+            .document(key)
+            .is_some_and(|index| self.editor.tabs()[index].is_dirty())
+    }
+
+    /// The host's copy moved on without the reader, the way a file does when
+    /// the agent writes it. A clean tab takes `text` in place, and one with
+    /// unsaved edits keeps them and flies the conflict instead. Reports
+    /// whether the tab took the text.
+    pub fn replace_document(&mut self, key: &DocumentKey, text: &str) -> bool {
+        let Some(index) = self.editor.document(key) else {
+            return false;
+        };
+        let tab = &mut self.editor.tabs_mut()[index];
+        if tab.is_dirty() {
+            tab.conflict = true;
+            return false;
+        }
+        tab.replace_text(text);
+        true
+    }
+
+    /// The host's answer to [`WorkbenchAction::RevertDocument`]: the tab
+    /// throws its edits away and takes `text`.
+    pub fn revert_document(&mut self, key: &DocumentKey, text: &str) {
+        if let Some(index) = self.editor.document(key) {
+            self.editor.tabs_mut()[index].replace_text(text);
+            self.follow_cursor();
+        }
+    }
+
     pub fn set_styles(&mut self, styles: WorkbenchStyles) {
         self.styles = styles;
         self.theme_generation += 1;
@@ -806,6 +964,12 @@ impl Workbench {
 
     pub fn set_scrollbars(&mut self, scrollbars: bool) {
         self.scrollbars = scrollbars;
+    }
+
+    /// Lends the workbench the host's Markdown painter, which is what offers a
+    /// Markdown tab its rendered view.
+    pub fn set_markdown_painter(&mut self, paint: PaintMarkdown) {
+        self.markdown = Some(paint);
     }
 
     /// Whether a background worker owes an answer, so the host knows to look
@@ -1293,7 +1457,7 @@ impl Workbench {
         let mut tabs = Vec::new();
         let mut active = 0;
         for (index, tab) in self.editor.tabs().iter().enumerate() {
-            if tab.diff_rows().is_some() {
+            if !tab.is_file() {
                 continue;
             }
             if index == active_tab {
@@ -1364,16 +1528,17 @@ impl Workbench {
         self.palette.is_open()
             || self.goto.is_some()
             || match self.focus {
-                Focus::Editor => self
-                    .editor
-                    .active()
-                    .is_some_and(|tab| tab.find.is_open() || tab.is_editable()),
+                Focus::Editor => self.editor.active().is_some_and(|tab| {
+                    tab.find.is_open() || (tab.is_editable() && !tab.is_rendered())
+                }),
                 Focus::Sidebar => self.sidebar == SidebarView::Search,
             }
     }
 
     /// Inserts text the host pulled out of a bracketed paste. Reports whether
-    /// anything took it, so the host can fall back to its own composer.
+    /// anything took it, so the host can fall back to its own composer. The
+    /// rendered view takes it only to refuse it, since the composer it would
+    /// otherwise reach is hidden behind the workbench.
     pub fn paste(&mut self, text: &str) -> bool {
         if self.focus != Focus::Editor {
             return false;
@@ -1381,6 +1546,10 @@ impl Workbench {
         let Some(tab) = self.editor.active_mut() else {
             return false;
         };
+        if tab.is_rendered() {
+            self.flash = Some(RENDERED_READ_ONLY.to_owned());
+            return true;
+        }
         if !tab.is_editable() {
             return false;
         }
@@ -1483,10 +1652,14 @@ impl Workbench {
             return Some(WorkbenchAction::Consumed);
         }
         if let Some(offset) = taken(self.bars.text.handle(event)) {
+            let rows = self.panes.text.height as usize;
             if let Some(offset) = offset
                 && let Some(tab) = self.editor.active_mut()
             {
-                tab.set_scroll(offset as usize);
+                match tab.rendered_mut() {
+                    Some(view) => view.scroll_to(offset as usize, rows),
+                    None => tab.set_scroll(offset as usize),
+                }
             }
             return Some(WorkbenchAction::Consumed);
         }
@@ -1547,7 +1720,10 @@ impl Workbench {
             let text = self.panes.text;
             let wrap = self.wrap;
             if let Some(tab) = self.editor.active_mut() {
-                tab.scroll_by(delta, text.height as usize, text.width as usize, wrap);
+                match tab.rendered_mut() {
+                    Some(view) => view.scroll_by(delta, text.height as usize),
+                    None => tab.scroll_by(delta, text.height as usize, text.width as usize, wrap),
+                }
             }
         }
     }
@@ -1562,7 +1738,9 @@ impl Workbench {
         if self.wrap || !text.contains(at.into()) {
             return;
         }
-        if let Some(tab) = self.editor.active_mut() {
+        if let Some(tab) = self.editor.active_mut()
+            && !tab.is_rendered()
+        {
             tab.h_scroll_by(delta, text.height as usize, text.width as usize);
         }
     }
@@ -1575,7 +1753,7 @@ impl Workbench {
             if self.panes.confirm.contains(position)
                 && let Some(choice) = view::confirm_at(at.0, self.panes.confirm.x, confirm.ask)
             {
-                self.resolve(confirm.ask, choice);
+                return self.resolve(confirm.ask, choice);
             }
             return WorkbenchAction::Consumed;
         }
@@ -1670,7 +1848,7 @@ impl Workbench {
                 .editor
                 .tabs()
                 .get(hit.index)
-                .map(|tab| Menu::for_tab(tab, hit.index, at));
+                .map(|tab| Menu::for_tab(tab, hit.index, at, self.renders(tab)));
             return;
         }
         if self.sidebar != SidebarView::Explorer || !self.panes.rows.contains(position) {
@@ -1711,7 +1889,7 @@ impl Workbench {
                     .editor
                     .tabs()
                     .get(index)
-                    .map(|tab| Menu::for_tab(tab, index, at));
+                    .map(|tab| Menu::for_tab(tab, index, at, self.renders(tab)));
             }
             _ => {}
         }
@@ -1923,7 +2101,12 @@ impl Workbench {
             MenuAction::Save => {
                 self.cancel_pending_opens();
                 self.editor.select(index);
-                self.save_active();
+                return self.save_active();
+            }
+            MenuAction::ShowRendered | MenuAction::ShowSource => {
+                self.cancel_pending_opens();
+                self.editor.select(index);
+                self.toggle_rendered();
             }
             MenuAction::RevealInExplorer => {
                 self.show_explorer();
@@ -2151,9 +2334,13 @@ impl Workbench {
     }
 
     /// A press on the buffer. One click drops the cursor and starts a drag,
-    /// two take the word under it, three take the whole line.
+    /// two take the word under it, three take the whole line. The rendered
+    /// view has no caret to drop, so a press there only focuses it.
     fn press_text(&mut self, at: (u16, u16), clicks: u8) {
         self.focus = Focus::Editor;
+        if self.editor.active().is_some_and(Tab::is_rendered) {
+            return;
+        }
         let Some(cursor) = self.cursor_at(at) else {
             return;
         };
@@ -2453,8 +2640,16 @@ impl Workbench {
         }
         if keys::REFRESH.matches(key) {
             if self.remote_backend.is_some() {
-                self.remote_invalidated
-                    .extend(self.editor.tabs().iter().map(|tab| tab.path.clone()));
+                // Only what the workspace serves can be asked for again. Anything
+                // else, such as a host's document, would read as a path it no
+                // longer lists and be closed.
+                self.remote_invalidated.extend(
+                    self.editor
+                        .tabs()
+                        .iter()
+                        .filter(|tab| tab.path.remote().is_some())
+                        .map(|tab| tab.path.clone()),
+                );
                 self.refresh_remote_tree();
             } else {
                 self.tree.reload();
@@ -2465,8 +2660,7 @@ impl Workbench {
             return Some(WorkbenchAction::Consumed);
         }
         if keys::SAVE.matches(key) {
-            self.save_active();
-            return Some(WorkbenchAction::Consumed);
+            return Some(self.save_active());
         }
         for (bind, delta) in [(keys::NEXT_TAB, 1), (keys::PREV_TAB, -1)] {
             if bind.matches(key) {
@@ -2530,6 +2724,10 @@ impl Workbench {
             // The caret was measured against the old shape of the pane, so it
             // is put back on screen before anything else reads the scroll.
             self.follow_cursor();
+            return WorkbenchAction::Consumed;
+        }
+        if self.markdown.is_some() && keys::TOGGLE_RENDERED.matches(key) {
+            self.toggle_rendered();
             return WorkbenchAction::Consumed;
         }
         for (bind, step) in [
@@ -2619,6 +2817,14 @@ impl Workbench {
     }
 
     fn buffer_key(&mut self, key: KeyEvent) -> Option<WorkbenchAction> {
+        let rendered = self.editor.active().is_some_and(Tab::is_rendered);
+        if rendered && EDIT_CHORDS.iter().any(|bind| bind.matches(key)) {
+            self.flash = Some(RENDERED_READ_ONLY.to_owned());
+            return Some(WorkbenchAction::Consumed);
+        }
+        if rendered && SOURCE_CHORDS.iter().any(|bind| bind.matches(key)) {
+            self.editor.active_mut()?.show_source();
+        }
         if keys::UNDO.matches(key) || keys::REDO.matches(key) {
             let undo = keys::UNDO.matches(key);
             let tab = self.editor.active_mut()?;
@@ -2635,6 +2841,9 @@ impl Workbench {
         if keys::REVERT.matches(key) {
             // The only way out of a conflict that keeps the other writer's
             // work, so it throws the buffer away rather than merging.
+            if let Some(document) = self.editor.active()?.document.clone() {
+                return Some(WorkbenchAction::RevertDocument(document));
+            }
             if self.remote_backend.is_some() {
                 let path = self.editor.active()?.path.clone();
                 let Some(entry) = self
@@ -2761,7 +2970,7 @@ impl Workbench {
             KeyCode::Esc => self.confirm = None,
             KeyCode::Left | KeyCode::BackTab => self.confirm = Some(confirm.step(-1)),
             KeyCode::Right | KeyCode::Tab => self.confirm = Some(confirm.step(1)),
-            KeyCode::Enter => self.resolve(confirm.ask, confirm.choice),
+            KeyCode::Enter => return Some(self.resolve(confirm.ask, confirm.choice)),
             // Modifiers are ruled out so `Ctrl+C` over a live selection cannot
             // be read as the `Cancel` accelerator.
             KeyCode::Char(typed) if key.modifiers == KeyModifiers::NONE => {
@@ -2771,7 +2980,7 @@ impl Workbench {
                     .iter()
                     .find(|choice| choice.accelerator() == typed.to_ascii_lowercase())
                 {
-                    self.resolve(confirm.ask, *picked);
+                    return Some(self.resolve(confirm.ask, *picked));
                 }
             }
             _ => {}
@@ -3486,6 +3695,12 @@ impl Workbench {
         let Some(tab) = self.editor.active_mut() else {
             return WorkbenchAction::Consumed;
         };
+        if let Some(view) = tab.rendered_mut() {
+            if !view.scroll_key(key, rows) {
+                self.flash = Some(RENDERED_READ_ONLY.to_owned());
+            }
+            return WorkbenchAction::Consumed;
+        }
         let before = tab.revision();
         if tab.edit_key(key, rows) {
             if tab.revision() != before {
@@ -3497,6 +3712,18 @@ impl Workbench {
             self.follow_cursor();
         }
         WorkbenchAction::Consumed
+    }
+
+    /// Whether `tab` can be shown rendered, which takes both Markdown in the
+    /// tab and a painter from the host.
+    fn renders(&self, tab: &Tab) -> bool {
+        self.markdown.is_some() && tab.is_markdown()
+    }
+
+    fn toggle_rendered(&mut self) {
+        if !self.editor.active_mut().is_some_and(Tab::toggle_rendered) {
+            self.flash = Some(NO_RENDERED_VIEW.to_owned());
+        }
     }
 
     fn open_selected(&mut self) {
@@ -3592,13 +3819,14 @@ impl Workbench {
     }
 
     /// Takes the dialog down and acts on the answer it was given.
-    fn resolve(&mut self, ask: Ask, choice: Choice) {
+    fn resolve(&mut self, ask: Ask, choice: Choice) -> WorkbenchAction {
         self.confirm = None;
         match ask {
-            Ask::Close => self.resolve_close(choice),
+            Ask::Close => return self.resolve_close(choice),
             Ask::Revert => self.resolve_revert(choice),
             Ask::Delete(_) => self.resolve_delete(choice),
         }
+        WorkbenchAction::Consumed
     }
 
     /// The path is the tree's own selection, which the menu landed on before
@@ -3647,23 +3875,27 @@ impl Workbench {
 
     /// A save that fails keeps the tab open with the reason in the status row,
     /// because throwing the buffer away after failing to write it is the one
-    /// outcome nobody asked for.
-    fn resolve_close(&mut self, choice: Choice) {
-        let closing = match choice {
-            Choice::Cancel => false,
-            Choice::Save => self.save_active(),
-            Choice::Discard => true,
+    /// outcome nobody asked for. So does one still waiting on its answer.
+    fn resolve_close(&mut self, choice: Choice) -> WorkbenchAction {
+        let (closing, action) = match choice {
+            Choice::Cancel => (false, WorkbenchAction::Consumed),
+            Choice::Save => {
+                let action = self.save_active();
+                (!self.editor.active().is_some_and(Tab::is_dirty), action)
+            }
+            Choice::Discard => (true, WorkbenchAction::Consumed),
         };
         if !closing {
             // Whatever stopped this tab stops the batch behind it: carrying on
             // would ask the same question about the next tab and read this
             // answer as covering that one too.
             self.closing.clear();
-            return;
+            return action;
         }
         self.editor.close_active();
         self.reveal_active();
         self.close_next();
+        action
     }
 
     fn resolve_revert(&mut self, choice: Choice) {
@@ -3739,39 +3971,43 @@ impl Workbench {
         }
     }
 
-    /// Reports whether the write landed, which is what tells the unsaved-changes
-    /// dialog that closing the tab is now safe.
-    fn save_active(&mut self) -> bool {
+    /// Writes the active tab, or hands a host's document back to the host to
+    /// keep. Only a local write lands at once; the tab stays unsaved until the
+    /// rest are answered, which is what the unsaved-changes dialog reads to
+    /// know whether closing it is safe yet.
+    fn save_active(&mut self) -> WorkbenchAction {
         let Some(tab) = self.editor.active_mut() else {
-            return false;
+            return WorkbenchAction::Consumed;
         };
+        if let Some(action) = hand_back(tab, false) {
+            return action;
+        }
         if tab.path.remote().is_some() {
             let Some(entry) = tab.resource.clone() else {
                 self.flash = Some(BackendError::MissingRevision.to_string());
-                return false;
+                return WorkbenchAction::Consumed;
             };
             let path = tab.path.clone();
             let contents = tab.contents();
             let Some(backend) = &mut self.remote_backend else {
                 self.flash = Some(BackendError::WrongBackend.to_string());
-                return false;
+                return WorkbenchAction::Consumed;
             };
             let request = backend.save(entry, contents);
             self.remote_pending.insert(request);
             self.pending_save.insert(request, path);
-            return false;
+            return WorkbenchAction::Consumed;
         }
-        self.flash = match tab.save() {
-            Ok(()) => return true,
-            Err(error) => Some(error.to_string()),
-        };
-        false
+        if let Err(error) = tab.save() {
+            self.flash = Some(error.to_string());
+        }
+        WorkbenchAction::Consumed
     }
 
     fn active_title(&self) -> String {
         self.editor
             .active()
-            .map(|tab| tab.title.clone())
+            .map(|tab| tab.heading().to_owned())
             .unwrap_or_default()
     }
 
@@ -3798,7 +4034,8 @@ impl Workbench {
     }
 
     /// What `Ctrl+X Enter` hands the composer: the tree's selection from the
-    /// sidebar, and the cursor's line span from the editor.
+    /// sidebar, and the cursor's line span from the editor. A host's document
+    /// has no lines worth naming, so it goes back whole, to be kept and left.
     fn reference(&self) -> Option<WorkbenchAction> {
         if self.focus == Focus::Sidebar {
             if self.sidebar == SidebarView::Search {
@@ -3817,6 +4054,13 @@ impl Workbench {
             return Some(self.mention(path, None));
         }
         let tab = self.editor.active()?;
+        if let Some(action) = hand_back(tab, true) {
+            return Some(action);
+        }
+        // The rendered view has no caret, so it points at no line in the file.
+        if tab.is_rendered() {
+            return Some(self.mention(&tab.path, None));
+        }
         let lines = match tab.buffer.selection() {
             Some((from, to)) => from.line + 1..=to.line + 1,
             None => {
@@ -3908,6 +4152,17 @@ impl Workbench {
     fn set_sidebar_width(&mut self, width: u16) {
         self.sidebar_width = width.clamp(MIN_SIDEBAR_WIDTH, MAX_SIDEBAR_WIDTH);
     }
+}
+
+/// Hands the text of a host's document back to the host, which is what saving
+/// one means. `close` asks to go back to the transcript as well. A tab over a
+/// file has nothing to hand back.
+fn hand_back(tab: &Tab, close: bool) -> Option<WorkbenchAction> {
+    Some(WorkbenchAction::SaveDocument {
+        key: tab.document.clone()?,
+        text: tab.contents(),
+        close,
+    })
 }
 
 fn opaque_path_component(value: &str) -> String {
@@ -4013,11 +4268,12 @@ fn layout_sections(
 #[cfg(test)]
 mod tests {
     use super::{
-        Ask, Choice, Confirm, Cursor, DEFAULT_SIDEBAR_WIDTH, DISCARD_LABEL, Drag,
+        Ask, Choice, Confirm, Cursor, DEFAULT_SIDEBAR_WIDTH, DISCARD_LABEL, DocumentKey, Drag,
         EDGE_SCROLL_LINES, Focus, Input, InputKind, Layout, LocalSourceError, MAX_SIDEBAR_WIDTH,
         MIN_EDITOR_WIDTH, MIN_SECTION_ROWS, MIN_SIDEBAR_WIDTH, MenuAction, NEW_FILE_PROMPT,
-        SCROLL_COLUMNS, SCROLL_LINES, ScmLayout, Section, SidebarView, Target, Toggle, Workbench,
-        WorkbenchAction, WorkbenchPath, WorkbenchStyles, keys, layout, layout_sections, scm,
+        NO_RENDERED_VIEW, RENDERED_READ_ONLY, SCROLL_COLUMNS, SCROLL_LINES, ScmLayout, Section,
+        SidebarView, Tab, TabLabel, Target, Toggle, Workbench, WorkbenchAction, WorkbenchPath,
+        WorkbenchStyles, keys, layout, layout_sections, scm,
     };
     use crate::chrome::ELLIPSIS;
     use crate::editor::{VisualRow, render};
@@ -4027,8 +4283,8 @@ mod tests {
     use crate::search;
     use crate::view::{
         CARET, Control, MENU_HINTS, MENU_MARK, MORE_LEFT, MORE_RIGHT, NAME_HINTS, NOT_A_REPOSITORY,
-        OPEN_MARK, REVERT_MARK, STAGE_MARK, TabHit, TabPart, UNSTAGE_MARK, button_at, confirm_at,
-        header_at, on_menu_mark, tab_at, toggle_at, visible_range,
+        OPEN_MARK, RENDERED_STATUS, REVERT_MARK, STAGE_MARK, TabHit, TabPart, UNSTAGE_MARK,
+        button_at, confirm_at, header_at, on_menu_mark, tab_at, toggle_at, visible_range,
     };
     #[cfg(unix)]
     use caudra_workspace::WorkspacePath;
@@ -4041,13 +4297,14 @@ mod tests {
     use ratatui::buffer::{Buffer as Surface, Cell};
     use ratatui::layout::Rect;
     use ratatui::style::Style;
+    use ratatui::text::Line;
     use std::collections::BTreeMap;
     use std::fs;
     use std::ops::RangeInclusive;
     #[cfg(unix)]
     use std::os::unix::fs::symlink;
     use std::path::{Path, PathBuf};
-    use std::time::{Duration, Instant};
+    use std::time::{Duration, Instant, SystemTime};
     use tempfile::TempDir;
     use test_case::test_case;
     use unicode_width::UnicodeWidthStr;
@@ -4192,6 +4449,42 @@ mod tests {
     const MADE_NAME: &str = "made.txt";
     /// One keystroke of unsaved work, which is what makes a close ask.
     const EDIT: char = 'X';
+    const PLAN_FILE: &str = "civil.md";
+    const NEWER_PLAN_FILE: &str = "newer.md";
+    const PLAN_TITLE: &str = "Plan";
+    const PLAN_STATUS: &str = "Plan · civil.md";
+    const NOT_LABELLED: &str = "the tab is not going by the name the host gave it";
+    const LABEL_SHARED: &str = "the name the host gave one tab is still on another";
+    const CURSOR_MOVED: &str = "coming back to a labelled tab moved the reader";
+    const SIDEBAR_MOVED: &str = "coming back to a labelled tab switched the sidebar";
+    const LOCAL_OPEN: &str = "a local workbench opens a local file";
+    const MARKDOWN_FILE: &str = "notes.md";
+    /// The first line of [`INDEXED_TEXT`].
+    const FIRST_LINE: &str = "one";
+    const PAINTED: &str = "» ";
+    const TALL_LINES: usize = 60;
+    const READ_TO: usize = 30;
+    const WIDE_TERMINAL_WIDTH: u16 = 160;
+    const NOT_RENDERED: &str = "the tab is not showing what the painter made of it";
+    const EDITED_RENDERED: &str = "the rendered view let a key change or select the text";
+    const NOT_REFUSED: &str = "a refused key did not say why";
+    const STILL_RENDERED: &str = "the tab did not go back to its source";
+    const CHORD_TAKEN: &str = "without a painter the chord and the view must stay out of sight";
+    const PLACE_LOST: &str = "the toggle did not keep the reader's place through the document";
+    const OFF_THE_END: &str = "the rendered view scrolled past its last full pane";
+    const DRAFT_KEY: &str = "prompt:main";
+    const DRAFT_TITLE: &str = "Prompt";
+    const DRAFT_STATUS: &str = "Prompt · main";
+    const DRAFT_TEXT: &str = "# ask\nwhy\n";
+    const NEWER_DRAFT: &str = "# ask again\n";
+    const NOT_HANDED_BACK: &str = "saving a document must hand its text to the host";
+    const SAVED_TOO_SOON: &str = "a document must stay unsaved until the host says it kept it";
+    const DOCUMENT_STORED: &str = "a document has no path to reopen, so it must not be stored";
+    const FILE_ITEMS: &str = "a document has no file to copy, reveal or read back";
+    const DOCUMENT_LOST: &str = "the document's tab went away with work in it";
+    const STALE_DOCUMENT: &str =
+        "a clean document is still showing what the host has moved on from";
+    const NOT_ASKED_BACK: &str = "reverting a document must ask the host for its copy";
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
@@ -4621,7 +4914,8 @@ mod tests {
         .unwrap();
         local.editor_key(key(KeyCode::Char(EDIT)));
         let local_contents = local.editor.active().expect(NO_TAB).contents();
-        assert!(local.save_active());
+        local.save_active();
+        assert!(!local.editor.active().expect(NO_TAB).is_dirty());
         local.close();
 
         let tab = remote.editor.active().expect(NO_TAB);
@@ -7023,6 +7317,605 @@ mod tests {
         let tab = workbench.editor.active().expect("a tab");
         assert_eq!(tab.buffer.line(0), "rewritten", "{STALE_TAB}");
         assert!(!tab.conflict && !tab.is_dirty(), "{FALSE_CONFLICT}");
+    }
+
+    /// Writes `text` and moves the file's time well away from when it was
+    /// read, so a check against that time cannot miss the write for landing in
+    /// the same clock tick as the read.
+    fn rewrite(path: &Path, text: &str) {
+        fs::write(path, text).expect("a file");
+        fs::File::options()
+            .write(true)
+            .open(path)
+            .expect("the file")
+            .set_modified(SystemTime::UNIX_EPOCH)
+            .expect("a file time");
+    }
+
+    /// A file kept beside the project rather than in it, the way Caudra keeps
+    /// its plans, so no watch on the project can see it change.
+    fn outside_plan() -> (TempDir, PathBuf) {
+        let state = TempDir::new().expect("a temporary directory");
+        let plan = state.path().join(PLAN_FILE);
+        fs::write(&plan, INDEXED_TEXT).expect("a plan");
+        (state, plan)
+    }
+
+    /// Opens `plan` the way the host opens its own, under [`PLAN_TITLE`].
+    fn open_plan(workbench: &mut Workbench, root: &Path, plan: &Path) {
+        let label = TabLabel {
+            title: PLAN_TITLE.to_owned(),
+            status: PLAN_STATUS.to_owned(),
+        };
+        workbench
+            .open_labelled(root, plan, label)
+            .expect(LOCAL_OPEN);
+    }
+
+    /// Checks the tab took up [`REWRITTEN_TEXT`] when it was clean, and kept
+    /// the edit and raised its conflict when it was not.
+    fn assert_caught_up(tab: &Tab, dirty: bool) {
+        match dirty {
+            true => {
+                assert!(tab.conflict, "{NO_CONFLICT}");
+                assert!(tab.buffer.line(0).starts_with(EDIT), "{LOST_EDIT}");
+            }
+            false => {
+                assert!(!tab.conflict, "{FALSE_CONFLICT}");
+                assert_eq!(tab.buffer.line(0), REWRITTEN_TEXT.trim_end(), "{STALE_TAB}");
+            }
+        }
+    }
+
+    #[test_case(false ; "a clean tab rereads")]
+    #[test_case(true ; "a dirty tab raises its conflict")]
+    fn reopening_catches_up_with_a_write_made_while_closed(dirty: bool) {
+        let (dir, mut workbench) = project();
+        open_file(&dir, &mut workbench);
+        if dirty {
+            workbench.handle_key(key(KeyCode::Char(EDIT)));
+        }
+        workbench.close();
+        rewrite(&dir.path().join(OPENED_FILE), REWRITTEN_TEXT);
+
+        workbench.open(dir.path());
+
+        assert_caught_up(workbench.editor.active().expect(NO_TAB), dirty);
+    }
+
+    #[test]
+    fn opening_an_open_file_again_shows_what_it_says_now() {
+        let (dir, mut workbench) = project();
+        open_file(&dir, &mut workbench);
+        rewrite(&dir.path().join(OPENED_FILE), REWRITTEN_TEXT);
+
+        workbench.open_path(&dir.path().join(OPENED_FILE));
+
+        assert_caught_up(workbench.editor.active().expect(NO_TAB), false);
+    }
+
+    #[test_case(false ; "a clean tab rereads")]
+    #[test_case(true ; "a dirty tab raises its conflict")]
+    fn a_reported_write_outside_the_tree_reaches_its_tab(dirty: bool) {
+        let (dir, mut workbench) = project();
+        let (_state, plan) = outside_plan();
+        open_plan(&mut workbench, dir.path(), &plan);
+        if dirty {
+            workbench.handle_key(key(KeyCode::Char(EDIT)));
+        }
+        fs::write(&plan, REWRITTEN_TEXT).expect("a plan");
+
+        workbench.reload_paths([plan.as_path()]);
+
+        assert_caught_up(workbench.editor.active().expect(NO_TAB), dirty);
+        assert_eq!(workbench.has_unsaved(&plan), dirty, "{LOST_EDIT}");
+    }
+
+    #[test]
+    fn a_labelled_tab_goes_by_its_label_and_no_other_tab_keeps_it() {
+        let (dir, mut workbench) = project();
+        let (state, plan) = outside_plan();
+        open_plan(&mut workbench, dir.path(), &plan);
+
+        let surface = paint(&mut workbench, TERMINAL_WIDTH, TERMINAL_HEIGHT);
+        assert!(
+            row_of(&surface, workbench.panes.tabs, 0).contains(PLAN_TITLE),
+            "{NOT_LABELLED}"
+        );
+        assert!(
+            row_of(&surface, workbench.panes.status, 0).contains(PLAN_STATUS),
+            "{NOT_LABELLED}"
+        );
+
+        let newer = state.path().join(NEWER_PLAN_FILE);
+        fs::write(&newer, INDEXED_TEXT).expect("a plan");
+        open_plan(&mut workbench, dir.path(), &newer);
+        let headings: Vec<&str> = workbench.editor.tabs().iter().map(Tab::heading).collect();
+        assert_eq!(headings, [PLAN_FILE, PLAN_TITLE], "{LABEL_SHARED}");
+    }
+
+    #[test]
+    fn coming_back_to_a_labelled_tab_keeps_the_reader_where_they_were() {
+        let (dir, mut workbench) = project();
+        let (_state, plan) = outside_plan();
+        open_plan(&mut workbench, dir.path(), &plan);
+        workbench.handle_key(key(KeyCode::Down));
+        workbench.handle_key(key(KeyCode::Down));
+        let cursor = workbench.editor.active().expect(NO_TAB).buffer.cursor();
+        workbench.handle_leader(press(keys::VIEW_SOURCE_CONTROL));
+
+        open_plan(&mut workbench, dir.path(), &plan);
+
+        let tab = workbench.editor.active().expect(NO_TAB);
+        assert_eq!(tab.buffer.cursor(), cursor, "{CURSOR_MOVED}");
+        assert_eq!(
+            workbench.sidebar,
+            SidebarView::SourceControl,
+            "{SIDEBAR_MOVED}"
+        );
+    }
+
+    /// Stands in for the host's renderer, marking every row it paints so a
+    /// frame shows which view drew it.
+    fn painter(text: &str, _width: u16) -> Vec<Line<'static>> {
+        text.lines().map(|line| Line::from(painted(line))).collect()
+    }
+
+    /// A project holding one Markdown file, open in a workbench lent a painter.
+    fn markdown_project(text: &str) -> (TempDir, Workbench) {
+        let dir = TempDir::new().expect("a temporary directory");
+        fs::write(dir.path().join(MARKDOWN_FILE), text).expect("a file");
+        let mut workbench = Workbench::new(WorkbenchStyles::default());
+        workbench.set_markdown_painter(painter);
+        workbench.open(dir.path());
+        workbench.open_path(&dir.path().join(MARKDOWN_FILE));
+        (dir, workbench)
+    }
+
+    /// Line `number` of [`tall_markdown`], counting from one.
+    fn tall_line(number: usize) -> String {
+        format!("line {number}")
+    }
+
+    fn tall_markdown() -> String {
+        (1..=TALL_LINES)
+            .map(|number| tall_line(number) + "\n")
+            .collect()
+    }
+
+    fn toggle_rendered(workbench: &mut Workbench) -> WorkbenchAction {
+        workbench.handle_leader(press(keys::TOGGLE_RENDERED))
+    }
+
+    fn rendered(workbench: &Workbench) -> bool {
+        workbench.editor.active().expect(NO_TAB).is_rendered()
+    }
+
+    /// The text pane's first row, as a fresh frame paints it.
+    fn first_row(workbench: &mut Workbench) -> String {
+        let surface = paint(workbench, TERMINAL_WIDTH, TERMINAL_HEIGHT);
+        row_of(&surface, workbench.panes.text, 0)
+    }
+
+    fn painted(line: &str) -> String {
+        format!("{PAINTED}{line}")
+    }
+
+    #[test]
+    fn the_chord_flips_a_markdown_tab_between_its_source_and_its_rendered_view() {
+        let (_dir, mut workbench) = markdown_project(INDEXED_TEXT);
+
+        assert_eq!(toggle_rendered(&mut workbench), WorkbenchAction::Consumed);
+        let surface = paint(&mut workbench, WIDE_TERMINAL_WIDTH, TERMINAL_HEIGHT);
+        assert!(
+            row_of(&surface, workbench.panes.text, 0).starts_with(&painted(FIRST_LINE)),
+            "{NOT_RENDERED}"
+        );
+        assert!(
+            row_of(&surface, workbench.panes.status, 0).contains(RENDERED_STATUS),
+            "{NOT_RENDERED}"
+        );
+
+        toggle_rendered(&mut workbench);
+        assert!(
+            first_row(&mut workbench).starts_with(FIRST_LINE),
+            "{STILL_RENDERED}"
+        );
+    }
+
+    #[test]
+    fn the_chord_on_a_file_that_is_not_markdown_says_why() {
+        let (dir, mut workbench) = markdown_project(INDEXED_TEXT);
+        fs::write(dir.path().join(OPENED_FILE), INDEXED_TEXT).expect("a file");
+        workbench.open_path(&dir.path().join(OPENED_FILE));
+
+        assert_eq!(toggle_rendered(&mut workbench), WorkbenchAction::Consumed);
+
+        assert!(!rendered(&workbench), "{NOT_REFUSED}");
+        assert_eq!(
+            workbench.flash.as_deref(),
+            Some(NO_RENDERED_VIEW),
+            "{NOT_REFUSED}"
+        );
+    }
+
+    #[test_case(key(KeyCode::Char(EDIT)) ; "typing")]
+    #[test_case(key(KeyCode::Enter) ; "a new line")]
+    #[test_case(key(KeyCode::Backspace) ; "a deletion")]
+    #[test_case(press(keys::UNDO) ; "undo")]
+    #[test_case(press(keys::KILL_LINE) ; "a kill")]
+    #[test_case(press(keys::SELECT_ALL) ; "a selection")]
+    #[test_case(press(keys::PASTE) ; "a paste")]
+    fn the_rendered_view_refuses_what_would_edit_it(refused: KeyEvent) {
+        let (_dir, mut workbench) = markdown_project(INDEXED_TEXT);
+        workbench.clipboard = REWRITTEN_TEXT.to_owned();
+        toggle_rendered(&mut workbench);
+
+        assert_eq!(workbench.handle_key(refused), WorkbenchAction::Consumed);
+
+        let tab = workbench.editor.active().expect(NO_TAB);
+        assert!(!tab.is_dirty(), "{EDITED_RENDERED}");
+        assert!(!tab.buffer.has_selection(), "{EDITED_RENDERED}");
+        assert_eq!(
+            workbench.flash.as_deref(),
+            Some(RENDERED_READ_ONLY),
+            "{NOT_REFUSED}"
+        );
+    }
+
+    #[test]
+    fn find_goes_back_to_the_source_to_look() {
+        let (_dir, mut workbench) = markdown_project(INDEXED_TEXT);
+        toggle_rendered(&mut workbench);
+
+        workbench.handle_key(press(keys::FIND));
+
+        assert!(!rendered(&workbench), "{STILL_RENDERED}");
+        assert!(workbench.editor.active().expect(NO_TAB).find.is_open());
+    }
+
+    #[test]
+    fn a_write_underneath_repaints_the_rendered_view() {
+        let (dir, mut workbench) = markdown_project(INDEXED_TEXT);
+        toggle_rendered(&mut workbench);
+        first_row(&mut workbench);
+        let file = dir.path().join(MARKDOWN_FILE);
+        fs::write(&file, REWRITTEN_TEXT).expect("a file");
+
+        workbench.reload_paths([file.as_path()]);
+
+        assert!(
+            first_row(&mut workbench).starts_with(&painted(REWRITTEN_TEXT.trim_end())),
+            "{STALE_TAB}"
+        );
+    }
+
+    #[test]
+    fn the_toggle_keeps_the_readers_place_both_ways() {
+        let (_dir, mut workbench) = markdown_project(&tall_markdown());
+        paint(&mut workbench, TERMINAL_WIDTH, TERMINAL_HEIGHT);
+        workbench
+            .editor
+            .active_mut()
+            .expect(NO_TAB)
+            .set_scroll(READ_TO);
+
+        toggle_rendered(&mut workbench);
+        let line = tall_line(READ_TO + 1);
+        assert!(
+            first_row(&mut workbench).starts_with(&painted(&line)),
+            "{PLACE_LOST}"
+        );
+
+        workbench.handle_key(key(KeyCode::Down));
+        toggle_rendered(&mut workbench);
+        let tab = workbench.editor.active().expect(NO_TAB);
+        assert_eq!(tab.scroll(), READ_TO + 1, "{PLACE_LOST}");
+    }
+
+    #[test]
+    fn the_rendered_view_scrolls_no_further_than_its_last_full_pane() {
+        let (_dir, mut workbench) = markdown_project(&tall_markdown());
+        toggle_rendered(&mut workbench);
+        paint(&mut workbench, TERMINAL_WIDTH, TERMINAL_HEIGHT);
+
+        workbench.handle_key(key(KeyCode::End));
+        workbench.handle_key(key(KeyCode::Down));
+        let text = workbench.panes.text;
+        workbench.handle_mouse(wheel(text.x, text.y));
+
+        let line = tall_line(TALL_LINES - text.height as usize + 1);
+        assert!(
+            first_row(&mut workbench).starts_with(&painted(&line)),
+            "{OFF_THE_END}"
+        );
+    }
+
+    #[test]
+    fn a_drag_across_the_rendered_view_selects_and_copies_nothing() {
+        let (_dir, mut workbench) = markdown_project(INDEXED_TEXT);
+        toggle_rendered(&mut workbench);
+        paint(&mut workbench, TERMINAL_WIDTH, TERMINAL_HEIGHT);
+        let text = workbench.panes.text;
+
+        workbench.handle_mouse(click(text.x, text.y));
+        workbench.handle_mouse(drag(text.right() - 1, text.y + 1));
+        let released = workbench.handle_mouse(release(text.right() - 1, text.y + 1));
+
+        assert_eq!(released, WorkbenchAction::Consumed, "{EDITED_RENDERED}");
+        let tab = workbench.editor.active().expect(NO_TAB);
+        assert!(!tab.buffer.has_selection(), "{EDITED_RENDERED}");
+    }
+
+    #[test]
+    fn the_tab_menu_shows_the_view_that_is_hidden() {
+        let (_dir, mut workbench) = markdown_project(INDEXED_TEXT);
+        workbench.handle_leader(press(keys::MENU));
+
+        menu_action(&mut workbench, MenuAction::ShowRendered);
+        assert!(rendered(&workbench), "{NOT_RENDERED}");
+
+        workbench.handle_leader(press(keys::MENU));
+        menu_action(&mut workbench, MenuAction::ShowSource);
+        assert!(!rendered(&workbench), "{STILL_RENDERED}");
+    }
+
+    #[test]
+    fn without_a_painter_there_is_no_rendered_view() {
+        let (dir, mut workbench) = project();
+        let file = dir.path().join(MARKDOWN_FILE);
+        fs::write(&file, INDEXED_TEXT).expect("a file");
+        workbench.open_path(&file);
+
+        assert_eq!(
+            toggle_rendered(&mut workbench),
+            WorkbenchAction::Passthrough,
+            "{CHORD_TAKEN}"
+        );
+        workbench.handle_leader(press(keys::MENU));
+        let menu = workbench.menu.as_ref().expect(NO_MENU);
+        assert!(
+            !menu
+                .items()
+                .contains(&MenuItem::Action(MenuAction::ShowRendered)),
+            "{CHORD_TAKEN}"
+        );
+    }
+
+    fn draft_key() -> DocumentKey {
+        DocumentKey(DRAFT_KEY.to_owned())
+    }
+
+    /// Opens `text` the way the host opens a prompt draft.
+    fn open_draft(workbench: &mut Workbench, text: &str) {
+        let label = TabLabel {
+            title: DRAFT_TITLE.to_owned(),
+            status: DRAFT_STATUS.to_owned(),
+        };
+        workbench.open_document(draft_key(), label, text);
+    }
+
+    fn draft(workbench: &Workbench) -> Option<&Tab> {
+        let index = workbench.editor.document(&draft_key())?;
+        workbench.editor.tabs().get(index)
+    }
+
+    /// [`DRAFT_TEXT`] after the one keystroke of [`EDIT`].
+    fn edited_draft() -> String {
+        format!("{EDIT}{DRAFT_TEXT}")
+    }
+
+    fn save_chord(workbench: &mut Workbench) -> WorkbenchAction {
+        workbench.handle_key(press(keys::SAVE))
+    }
+
+    fn menu_save(workbench: &mut Workbench) -> WorkbenchAction {
+        workbench.handle_leader(press(keys::MENU));
+        menu_action(workbench, MenuAction::Save)
+    }
+
+    fn send_chord(workbench: &mut Workbench) -> WorkbenchAction {
+        workbench.handle_leader(press(keys::SEND_TO_COMPOSER))
+    }
+
+    #[test_case(save_chord, false ; "the save chord")]
+    #[test_case(menu_save, false ; "the menu")]
+    #[test_case(send_chord, true ; "the send chord, which also leaves")]
+    fn saving_a_document_hands_its_text_back_and_waits_for_the_host(
+        save: fn(&mut Workbench) -> WorkbenchAction,
+        close: bool,
+    ) {
+        let (_dir, mut workbench) = project();
+        open_draft(&mut workbench, DRAFT_TEXT);
+        workbench.handle_key(key(KeyCode::Char(EDIT)));
+
+        let action = save(&mut workbench);
+
+        let expected = WorkbenchAction::SaveDocument {
+            key: draft_key(),
+            text: edited_draft(),
+            close,
+        };
+        assert_eq!(action, expected, "{NOT_HANDED_BACK}");
+        assert!(
+            draft(&workbench).expect(NO_TAB).is_dirty(),
+            "{SAVED_TOO_SOON}"
+        );
+        workbench.document_saved(&draft_key());
+        assert!(
+            !draft(&workbench).expect(NO_TAB).is_dirty(),
+            "{SAVED_TOO_SOON}"
+        );
+    }
+
+    #[test]
+    fn closing_an_unsaved_document_asks_and_its_save_hands_the_text_back() {
+        let (_dir, mut workbench) = project();
+        open_draft(&mut workbench, DRAFT_TEXT);
+        workbench.handle_key(key(KeyCode::Char(EDIT)));
+
+        workbench.handle_leader(press(keys::CLOSE_TAB));
+        assert_eq!(answer(&workbench), Some(Choice::Save), "{NOT_ASKED}");
+        let action = workbench.handle_key(key(KeyCode::Enter));
+
+        let expected = WorkbenchAction::SaveDocument {
+            key: draft_key(),
+            text: edited_draft(),
+            close: false,
+        };
+        assert_eq!(action, expected, "{NOT_HANDED_BACK}");
+        assert!(draft(&workbench).is_some(), "{DOCUMENT_LOST}");
+    }
+
+    #[test_case(false ; "a clean tab takes the host's text")]
+    #[test_case(true ; "an unsaved tab keeps what was typed")]
+    fn opening_a_document_again_raises_its_one_tab(dirty: bool) {
+        let (_dir, mut workbench) = project();
+        open_draft(&mut workbench, DRAFT_TEXT);
+        if dirty {
+            workbench.handle_key(key(KeyCode::Char(EDIT)));
+        }
+
+        open_draft(&mut workbench, NEWER_DRAFT);
+
+        assert_eq!(workbench.editor.tabs().len(), 1, "{WRONG_TABS}");
+        let tab = workbench.editor.active().expect(NO_TAB);
+        assert_eq!(tab.heading(), DRAFT_TITLE, "{NOT_LABELLED}");
+        let expected = match dirty {
+            true => edited_draft(),
+            false => NEWER_DRAFT.to_owned(),
+        };
+        assert_eq!(tab.contents(), expected, "{STALE_DOCUMENT}");
+    }
+
+    #[test]
+    fn a_document_is_left_out_of_the_stored_layout() {
+        let (dir, mut workbench) = project();
+        open_file(&dir, &mut workbench);
+        open_draft(&mut workbench, DRAFT_TEXT);
+
+        let layout = workbench.layout();
+
+        assert_eq!(
+            layout.tabs,
+            [dir.path().join(OPENED_FILE)],
+            "{DOCUMENT_STORED}"
+        );
+    }
+
+    #[test]
+    fn a_document_offers_nothing_that_needs_a_file_behind_it() {
+        let (_dir, mut workbench) = project();
+        open_draft(&mut workbench, DRAFT_TEXT);
+        workbench.handle_key(key(KeyCode::Char(EDIT)));
+
+        workbench.handle_leader(press(keys::MENU));
+        let items = workbench.menu.as_ref().expect(NO_MENU).items();
+        assert!(
+            items.contains(&MenuItem::Action(MenuAction::Save)),
+            "{WRONG_TARGET}"
+        );
+        for named in [
+            MenuAction::CopyPath,
+            MenuAction::CopyRelative,
+            MenuAction::RevealInExplorer,
+        ] {
+            assert!(
+                !items.contains(&MenuItem::Action(named)),
+                "{FILE_ITEMS}: {named:?}"
+            );
+        }
+    }
+
+    /// A document's other copy is the host's, so the key that takes the
+    /// other writer's copy of a file asks the host for it instead.
+    #[test]
+    fn reverting_a_document_takes_the_copy_the_host_hands_over() {
+        let (_dir, mut workbench) = project();
+        open_draft(&mut workbench, DRAFT_TEXT);
+        workbench.handle_key(key(KeyCode::Char(EDIT)));
+
+        let action = workbench.handle_key(press(keys::REVERT));
+
+        assert_eq!(
+            action,
+            WorkbenchAction::RevertDocument(draft_key()),
+            "{NOT_ASKED_BACK}"
+        );
+        assert!(
+            draft(&workbench).expect(NO_TAB).is_dirty(),
+            "{SAVED_TOO_SOON}"
+        );
+        workbench.revert_document(&draft_key(), NEWER_DRAFT);
+        let tab = draft(&workbench).expect(NO_TAB);
+        assert_eq!(tab.contents(), NEWER_DRAFT, "{STALE_DOCUMENT}");
+        assert!(!tab.is_dirty() && !tab.conflict, "{FALSE_CONFLICT}");
+    }
+
+    /// The host's copy moving on is a write underneath the tab, and it is
+    /// treated the way a watched file treats one.
+    #[test_case(false ; "a clean tab takes the new copy")]
+    #[test_case(true ; "an unsaved tab keeps its edits and flies the conflict")]
+    fn a_newer_host_copy_reaches_a_document_as_a_write_reaches_a_file(dirty: bool) {
+        let (_dir, mut workbench) = project();
+        open_draft(&mut workbench, DRAFT_TEXT);
+        if dirty {
+            workbench.handle_key(key(KeyCode::Char(EDIT)));
+        }
+
+        let took = workbench.replace_document(&draft_key(), NEWER_DRAFT);
+
+        let tab = draft(&workbench).expect(NO_TAB);
+        let expected = match dirty {
+            true => edited_draft(),
+            false => NEWER_DRAFT.to_owned(),
+        };
+        assert_eq!(tab.contents(), expected, "{STALE_DOCUMENT}");
+        assert_eq!(took, !dirty, "{STALE_DOCUMENT}");
+        assert_eq!(tab.conflict, dirty, "{NO_CONFLICT}");
+        assert_eq!(
+            workbench.has_unsaved_document(&draft_key()),
+            dirty,
+            "{DOCUMENT_LOST}"
+        );
+    }
+
+    #[test]
+    fn a_document_reads_as_markdown() {
+        let (_dir, mut workbench) = markdown_project(INDEXED_TEXT);
+        open_draft(&mut workbench, DRAFT_TEXT);
+
+        toggle_rendered(&mut workbench);
+
+        assert!(rendered(&workbench), "{NOT_RENDERED}");
+    }
+
+    #[test_case(false ; "a clean document goes")]
+    #[test_case(true ; "an unsaved one stays")]
+    fn closing_the_workbench_keeps_only_documents_with_work_in_them(dirty: bool) {
+        let (_dir, mut workbench) = project();
+        open_draft(&mut workbench, DRAFT_TEXT);
+        if dirty {
+            workbench.handle_key(key(KeyCode::Char(EDIT)));
+        }
+
+        workbench.close();
+
+        assert_eq!(draft(&workbench).is_some(), dirty, "{DOCUMENT_LOST}");
+    }
+
+    #[test]
+    fn a_refresh_in_a_workspace_keeps_the_hosts_document() {
+        let (session, _control) = crate::fs::backend::tests::widget_fixture();
+        let mut workbench = Workbench::new(WorkbenchStyles::default());
+        workbench.toggle_workspace(session).unwrap();
+        settle_remote(&mut workbench, |workbench| !workbench.is_busy());
+        open_draft(&mut workbench, DRAFT_TEXT);
+
+        workbench.handle_key(press(keys::REFRESH));
+        settle_remote(&mut workbench, |workbench| !workbench.is_busy());
+
+        assert!(draft(&workbench).is_some(), "{DOCUMENT_LOST}");
     }
 
     #[test]

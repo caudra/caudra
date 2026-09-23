@@ -5,6 +5,7 @@
 
 use std::ops::RangeInclusive;
 
+use crate::editor::DocumentKey;
 use crate::fs::backend::WorkbenchPath;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -23,6 +24,19 @@ pub enum WorkbenchAction {
         path: WorkbenchPath,
         lines: Option<RangeInclusive<usize>>,
     },
+    /// Hand a document's text back to the host that keeps it, which is what
+    /// saving one means. `close` also asks to return to the transcript, the
+    /// way `Ctrl+X Enter` does. The tab stays unsaved until the host answers
+    /// with [`document_saved`](crate::Workbench::document_saved).
+    SaveDocument {
+        key: DocumentKey,
+        text: String,
+        close: bool,
+    },
+    /// Throw a document's edits away for the host's own copy, which is what
+    /// `Ctrl+R` means over a file. The host answers with
+    /// [`revert_document`](crate::Workbench::revert_document).
+    RevertDocument(DocumentKey),
     /// Put text on the system clipboard.
     Copy(String),
     /// Say something in the status bar.

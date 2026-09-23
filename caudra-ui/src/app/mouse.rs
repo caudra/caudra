@@ -703,7 +703,7 @@ impl App {
                             if self.active_chat == 0
                                 && let Some(path) = self.chats[0].memory_hit_at(event.row, area)
                             {
-                                self.open_workbench_file(&path, None);
+                                self.open_memory_note(&path);
                                 return Vec::new();
                             }
                             if self.active_chat == 0

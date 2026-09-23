@@ -158,6 +158,14 @@ pub fn load(path: &Path) -> Result<Loaded, LoadError> {
     Ok(decode(&text, modified))
 }
 
+/// When `path` was last written, or `None` when it cannot be read at all. A
+/// tab always knows its own time, so a file that has gone reads as a change.
+pub fn modified(path: &Path) -> Option<SystemTime> {
+    fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .ok()
+}
+
 pub(crate) fn load_local_source(
     path: &Path,
     verify: impl FnOnce(&[u8]) -> Result<(), String>,
@@ -247,7 +255,7 @@ fn rejected(read_only: ReadOnly, modified: Option<SystemTime>) -> Loaded {
 
 /// A file's dominant line ending wins, so a stray `\n` in a CRLF file does not
 /// rewrite every line on the next save.
-fn decode(text: &str, modified: Option<SystemTime>) -> Loaded {
+pub(crate) fn decode(text: &str, modified: Option<SystemTime>) -> Loaded {
     let crlf = text.matches("\r\n").count();
     let lf = text.matches('\n').count();
     let line_ending = if crlf * 2 > lf {

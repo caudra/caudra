@@ -442,7 +442,7 @@ pub(crate) fn mouse_event(kind: MouseEventKind, column: u16, row: u16) -> Msg {
     })
 }
 
-fn agent_msg(event: AgentEvent) -> Msg {
+pub(crate) fn agent_msg(event: AgentEvent) -> Msg {
     agent_msg_with_run_id(event, 1)
 }
 
@@ -1552,7 +1552,7 @@ fn app_with_queued_message() -> App {
 
 /// Arms the leader and plays the chord's second key, returning what the chord
 /// itself produced. Arming never yields actions of its own.
-fn press_chord(app: &mut App, chord: Bind) -> Vec<Action> {
+pub(crate) fn press_chord(app: &mut App, chord: Bind) -> Vec<Action> {
     let armed = app.update(Msg::Key(kb::LEADER.to_key_event()));
     assert!(armed.is_empty(), "{ARMING_LEADER_IS_INERT_MSG}");
     app.update(Msg::Key(chord.to_key_event()))
@@ -3054,7 +3054,7 @@ fn subagent_paste_submits_expanded() {
 
 /// A running task focused with its composer live, handing back the child
 /// queue so a test can see what the composer actually steered.
-fn focused_task_composer() -> (App, caudra_agent::SteeringQueue) {
+pub(crate) fn focused_task_composer() -> (App, caudra_agent::SteeringQueue) {
     let mut app = test_app();
     app.run_id = 1;
     let (steer_tx, _steer_rx) = caudra_agent::steering_queue();
@@ -3186,18 +3186,6 @@ fn file_picker_inserts_into_the_focused_task_composer() {
     app.handle_file_picker_action(FilePickerModalAction::Select(PATH.into()));
 
     assert!(app.subagent_input_box.buffer.value().contains(PATH));
-    assert!(app.input_box.is_empty(), "the main draft must be untouched");
-}
-
-#[test]
-fn external_editor_edits_the_focused_task_composer() {
-    const EDITED: &str = "rewritten steer";
-    let (mut app, _steer_tx) = focused_task_composer();
-
-    let previous = app.active_input_text();
-    app.apply_external_input(&previous, EDITED.into());
-
-    assert_eq!(app.subagent_input_box.buffer.value(), EDITED);
     assert!(app.input_box.is_empty(), "the main draft must be untouched");
 }
 
@@ -4842,7 +4830,7 @@ fn hidden_context_modal_does_not_repaint_for_publications() {
     assert_eq!(app.tick(), Dirty::NO, "{QUIET}");
 }
 
-fn rendered(app: &mut App) -> String {
+pub(crate) fn rendered(app: &mut App) -> String {
     rendered_wide(app, 80)
 }
 
@@ -12676,33 +12664,6 @@ fn paste_routing(setup: fn(&mut App), expected_input: &str) {
     assert_eq!(app.input_box.buffer.value(), expected_input);
 }
 
-#[test_case(PlanState::None,                                       true  ; "no_plan")]
-#[test_case(PlanState::Drafting(PathBuf::from("/tmp/plan.md")),     false ; "plan_drafting")]
-#[test_case(PlanState::Ready(PathBuf::from("/tmp/plan.md")),       false ; "plan_ready")]
-fn open_editor(plan: PlanState, expect_flash: bool) {
-    let mut app = test_app();
-    let plan_path = plan.path().map(Path::to_path_buf);
-    app.state.plan = plan;
-    let actions = app.update(Msg::Key(kb::OPEN_EDITOR.to_key_event()));
-    if expect_flash {
-        assert!(actions.is_empty());
-        assert_eq!(app.status_bar.flash_text().unwrap(), FLASH_NO_PLAN);
-        assert!(!app.plan_form.is_visible());
-    } else {
-        let expected = plan_path.unwrap();
-        assert!(matches!(&actions[..], [Action::OpenEditor(p)] if p == &expected));
-        assert!(!app.plan_form.is_visible());
-    }
-}
-
-#[test]
-fn the_edit_chord_opens_the_editor_for_input() {
-    let mut app = test_app();
-    app.input_box.buffer.insert_text("hello");
-    let actions = press_chord(&mut app, chord::EDIT_INPUT);
-    assert!(matches!(&actions[..], [Action::EditInputInEditor]));
-}
-
 #[test]
 fn btw_empty_flashes_error() {
     let mut app = test_app();
@@ -14008,15 +13969,6 @@ fn plan_form_implement_toggled_parallel() {
             .iter()
             .any(|a| matches!(a, Action::SendMessage(i) if i.message == expected_msg))
     );
-}
-
-#[test]
-fn plan_form_open_editor() {
-    let mut app = plan_app();
-
-    let actions = app.update(Msg::Key(kb::OPEN_EDITOR.to_key_event()));
-    assert!(app.plan_form.is_visible());
-    assert!(matches!(&actions[..], [Action::OpenEditor(p)] if p == Path::new("test-plan.md")));
 }
 
 fn rewrite_plan(app: &mut App) {

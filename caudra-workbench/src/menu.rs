@@ -11,7 +11,7 @@ use crate::fs::tree::Row;
 
 /// Room for the widest list either target builds, so opening a menu is one
 /// allocation.
-const ITEMS: usize = 12;
+const ITEMS: usize = 13;
 
 /// One thing a menu can do. What it does is read from the target the menu was
 /// opened on, so the same action covers a row and a tab where they agree.
@@ -32,6 +32,8 @@ pub(crate) enum Action {
     CloseAll,
     KeepOpen,
     Save,
+    ShowRendered,
+    ShowSource,
     RevealInExplorer,
 }
 
@@ -53,6 +55,8 @@ impl Action {
             Self::CloseAll => "Close All",
             Self::KeepOpen => "Keep Open",
             Self::Save => "Save",
+            Self::ShowRendered => "Show Rendered",
+            Self::ShowSource => "Show Source",
             Self::RevealInExplorer => "Reveal in Explorer",
         }
     }
@@ -105,10 +109,12 @@ impl Menu {
         Self::new(items, at, Target::Row(row.path.clone()))
     }
 
-    /// The menu for a tab. A diff has no file behind it, so it offers nothing
-    /// that names one.
-    pub(crate) fn for_tab(tab: &Tab, index: usize, at: (u16, u16)) -> Self {
-        let on_disk = tab.diff_rows().is_none();
+    /// The menu for a tab. A diff or a host's document has no file behind it,
+    /// so it offers nothing that names one. `renderable` says whether the
+    /// workbench can paint the tab's rendered view, in which case it offers
+    /// whichever view is hidden.
+    pub(crate) fn for_tab(tab: &Tab, index: usize, at: (u16, u16), renderable: bool) -> Self {
+        let on_disk = tab.is_file();
         let mut items = Vec::with_capacity(ITEMS);
         items.extend([
             Item::Action(Action::Close),
@@ -117,9 +123,14 @@ impl Menu {
             Item::Action(Action::CloseSaved),
             Item::Action(Action::CloseAll),
         ]);
+        let other_view = match tab.is_rendered() {
+            true => Action::ShowSource,
+            false => Action::ShowRendered,
+        };
         let about_this_tab = [
             (tab.preview, Action::KeepOpen),
             (tab.is_dirty(), Action::Save),
+            (renderable, other_view),
             (on_disk, Action::RevealInExplorer),
         ];
         let mut offered = about_this_tab
@@ -237,6 +248,8 @@ mod tests {
     const WRONG_WIDTH: &str = "the panel is not as wide as the longest thing in it";
     const ANYWHERE: (u16, u16) = (0, 0);
     const FILE_NAME: &str = "a.rs";
+    const MARKDOWN_NAME: &str = "a.md";
+    const MARKDOWN_TEXT: &str = "# one\n";
 
     fn row(kind: EntryKind) -> Row {
         Row {
@@ -304,7 +317,7 @@ mod tests {
     #[test]
     fn a_saved_tab_offers_nothing_to_save_and_nothing_to_keep() {
         let dir = TempDir::new().expect("a temporary directory");
-        let offered = actions(&Menu::for_tab(&tab(&dir), 0, ANYWHERE));
+        let offered = actions(&Menu::for_tab(&tab(&dir), 0, ANYWHERE, false));
 
         assert!(!offered.contains(&Action::Save), "{WRONG_ITEMS}");
         assert!(!offered.contains(&Action::KeepOpen), "{WRONG_ITEMS}");
@@ -320,10 +333,34 @@ mod tests {
         let edit = tab.buffer.insert("x");
         tab.record(edit);
 
-        let offered = actions(&Menu::for_tab(&tab, 0, ANYWHERE));
+        let offered = actions(&Menu::for_tab(&tab, 0, ANYWHERE, false));
 
         assert!(offered.contains(&Action::KeepOpen), "{WRONG_ITEMS}");
         assert!(offered.contains(&Action::Save), "{WRONG_ITEMS}");
+    }
+
+    #[test_case(false, false, &[] ; "nothing to render with")]
+    #[test_case(true, false, &[Action::ShowRendered] ; "showing its source")]
+    #[test_case(true, true, &[Action::ShowSource] ; "showing its rendered view")]
+    fn a_markdown_tab_offers_the_view_it_is_not_showing(
+        renderable: bool,
+        rendered: bool,
+        expected: &[Action],
+    ) {
+        let dir = TempDir::new().expect("a temporary directory");
+        let path = dir.path().join(MARKDOWN_NAME);
+        fs::write(&path, MARKDOWN_TEXT).expect("a file");
+        let mut tab = Tab::open(&path, 0).expect("a tab");
+        if rendered {
+            tab.toggle_rendered();
+        }
+
+        let offered: Vec<Action> = actions(&Menu::for_tab(&tab, 0, ANYWHERE, renderable))
+            .into_iter()
+            .filter(|action| matches!(action, Action::ShowRendered | Action::ShowSource))
+            .collect();
+
+        assert_eq!(offered, expected, "{WRONG_ITEMS}");
     }
 
     /// A diff is built from the repository rather than read from a path, so
@@ -332,7 +369,7 @@ mod tests {
     fn a_diff_tab_offers_only_the_closes() {
         let tab = Tab::synthetic(Path::new(FILE_NAME), FILE_NAME.to_owned(), Vec::new(), 0);
 
-        let offered = actions(&Menu::for_tab(&tab, 1, ANYWHERE));
+        let offered = actions(&Menu::for_tab(&tab, 1, ANYWHERE, false));
 
         assert_eq!(
             offered,

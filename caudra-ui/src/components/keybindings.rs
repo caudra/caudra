@@ -706,7 +706,7 @@ pub const KEYBINDS: &[Keybind] = &[
     },
     Keybind {
         label: KeyLabel::Alt(key::OPEN_EDITOR.label, leader::PLAN_EDITOR.label),
-        description: "Open plan in editor",
+        description: "Open the plan in the workbench",
         context: KeybindContext::General,
         platform: Platform::All,
     },
@@ -910,7 +910,7 @@ pub const KEYBINDS: &[Keybind] = &[
     },
     Keybind {
         label: KeyLabel::Single(leader::EDIT_INPUT.label),
-        description: "Edit input in external editor",
+        description: "Edit the prompt in the workbench",
         context: KeybindContext::Editing,
         platform: Platform::All,
     },
@@ -1563,6 +1563,12 @@ pub const KEYBINDS: &[Keybind] = &[
     Keybind {
         label: KeyLabel::Single(wb::CLOSE_TAB.label),
         description: "Close the active tab",
+        context: KeybindContext::WorkbenchEditor,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Single(wb::TOGGLE_RENDERED.label),
+        description: "Show a Markdown file rendered, or its source again",
         context: KeybindContext::WorkbenchEditor,
         platform: Platform::All,
     },

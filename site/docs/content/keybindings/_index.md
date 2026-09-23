@@ -38,7 +38,7 @@ Holding `Alt` while turning the wheel scrolls four times as far. A middle-click 
 | `Ctrl+X y` | Copy last reply as markdown |
 | `Ctrl+X r` | Review the last reply |
 | `Ctrl+S` / `Ctrl+X f` | File picker |
-| `Ctrl+O` / `Ctrl+X o` | Open plan in editor |
+| `Ctrl+O` / `Ctrl+X o` | Open the plan in the workbench |
 | `Ctrl+X t` | Toggle plan / todo panel |
 | `Ctrl+X a` | Open tasks |
 | `Ctrl+X k` | Open the workflow inspector |
@@ -78,7 +78,7 @@ Holding `Alt` while turning the wheel scrolls four times as far. A middle-click 
 | `Ctrl+B` | Scroll to bottom |
 | `Ctrl+Q` / `Ctrl+X q` | Pop queue |
 | `Esc Esc` | Rewind |
-| `Ctrl+X e` | Edit input in external editor |
+| `Ctrl+X e` | Edit the prompt in the workbench |
 
 ## Pasted Text
 
@@ -230,6 +230,7 @@ Some pickers add extra bindings on top of the defaults:
 | Workbench Editor | `Ctrl+X z` | Wrap long lines onto more rows |
 | Workbench Editor | `Ctrl+PageUp` / `Ctrl+PageDown` | Previous / next tab |
 | Workbench Editor | `Ctrl+X k` | Close the active tab |
+| Workbench Editor | `Ctrl+X v` | Show a Markdown file rendered, or its source again |
 | Workbench Source Control | `Space` | Stage or unstage the file, folder, or whole section |
 | Workbench Source Control | `D` | Open the diff, or the commit under the cursor |
 | Workbench Source Control | `X` | Discard changes (press twice) |

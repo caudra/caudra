@@ -5,8 +5,10 @@ pub mod find;
 pub mod highlight;
 pub mod history;
 pub mod render;
+pub mod rendered;
 pub mod words;
 
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime};
 
@@ -18,10 +20,14 @@ use caudra_highlight::StyledSegment;
 use find::Find;
 use highlight::ViewportHighlighter;
 use history::History;
+use rendered::{PaintMarkdown, Painting, Rendered};
 
 use crate::fs::backend::{LoadedFile, ResourceEntry, WorkbenchPath};
 use crate::fs::read::{self, LineEnding, LoadError, ReadOnly, SaveError, Source};
 use crate::scm::diff::DiffRow;
+
+/// The extensions a tab is read as Markdown by, matched without regard to case.
+const MARKDOWN_EXTENSIONS: [&str; 2] = ["md", "markdown"];
 
 /// What a line is, in a diff tab. A source tab has none of these and is
 /// syntax-highlighted from its own buffer instead. Source control is what
@@ -39,10 +45,27 @@ pub enum DiffKind {
     Header,
 }
 
+/// What the host calls a file it opened for a reason of its own, such as the
+/// plan, in place of a file name and a path that say nothing about why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TabLabel {
+    pub title: String,
+    pub status: String,
+}
+
+/// Names text the host keeps for itself, such as a prompt draft, so the host
+/// can find its tab again and knows what a save hands back.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct DocumentKey(pub String);
+
 pub struct Tab {
     pub path: WorkbenchPath,
     pub resource: Option<ResourceEntry>,
     pub title: String,
+    pub label: Option<TabLabel>,
+    /// Set on a tab over text the host keeps rather than a file. Saving hands
+    /// the text back to the host, and nothing on disk is read into it.
+    pub document: Option<DocumentKey>,
     pub buffer: Buffer,
     pub find: Find,
     history: History,
@@ -61,6 +84,8 @@ pub struct Tab {
     /// A tab one click put up, which the next one takes over. Asking for the
     /// file again or typing in it pins the tab for good.
     pub preview: bool,
+    /// Set while a Markdown tab shows its rendered view instead of its source.
+    rendered: Option<Rendered>,
     revision: u64,
     scroll: usize,
     /// Which visual row of `scroll` sits at the top of the pane. Always zero
@@ -86,6 +111,8 @@ impl Tab {
             title: title_of(path),
             path: WorkbenchPath::Local(path.to_path_buf()),
             resource: None,
+            label: None,
+            document: None,
             buffer: Buffer::new(loaded.lines),
             find: Find::default(),
             history: History::default(),
@@ -98,6 +125,7 @@ impl Tab {
             source: None,
             conflict: false,
             preview: false,
+            rendered: None,
             revision: 0,
             scroll: 0,
             scroll_row: 0,
@@ -137,6 +165,8 @@ impl Tab {
             title: path.file_name(),
             path,
             resource: Some(loaded.entry),
+            label: None,
+            document: None,
             buffer: Buffer::new(loaded.lines),
             find: Find::default(),
             history: History::default(),
@@ -149,6 +179,7 @@ impl Tab {
             source: None,
             conflict: false,
             preview: false,
+            rendered: None,
             revision: 0,
             scroll: 0,
             scroll_row: 0,
@@ -183,6 +214,8 @@ impl Tab {
             title,
             path,
             resource: None,
+            label: None,
+            document: None,
             buffer: Buffer::new(rows.iter().map(|row| row.text.clone()).collect()),
             find: Find::default(),
             history: History::default(),
@@ -195,11 +228,29 @@ impl Tab {
             source: None,
             conflict: false,
             preview: false,
+            rendered: None,
             revision: 0,
             scroll: 0,
             scroll_row: 0,
             h_scroll: 0,
         }
+    }
+
+    /// A tab over text the host keeps, filed under `path`: a name no file has
+    /// that still says Markdown, so the text highlights and renders the way a
+    /// note on disk would.
+    pub fn document(
+        path: &Path,
+        key: DocumentKey,
+        label: TabLabel,
+        text: &str,
+        theme_generation: u64,
+    ) -> Self {
+        let mut tab = Self::from_load(path, read::decode(text, None), theme_generation);
+        tab.title = label.title.clone();
+        tab.label = Some(label);
+        tab.document = Some(key);
+        tab
     }
 
     /// Points the tab at where its file went. The language is read from the
@@ -217,10 +268,97 @@ impl Tab {
         if resource.is_some() {
             self.resource = resource;
         }
+        if !self.is_markdown() {
+            self.rendered = None;
+        }
     }
 
     pub fn is_editable(&self) -> bool {
         self.notice.is_none() && self.diff_rows.is_none()
+    }
+
+    /// Whether the tab stands for a file, which a diff and a host's document
+    /// do not: neither has a path worth copying, revealing or reopening.
+    pub fn is_file(&self) -> bool {
+        self.diff_rows.is_none() && self.document.is_none()
+    }
+
+    /// Whether the tab holds Markdown text, which is what a rendered view can
+    /// be offered for. A diff or a file that is not text has none to render.
+    pub fn is_markdown(&self) -> bool {
+        self.is_editable()
+            && Path::new(&self.path.file_name())
+                .extension()
+                .and_then(OsStr::to_str)
+                .is_some_and(|extension| {
+                    MARKDOWN_EXTENSIONS
+                        .iter()
+                        .any(|markdown| extension.eq_ignore_ascii_case(markdown))
+                })
+    }
+
+    pub fn is_rendered(&self) -> bool {
+        self.rendered.is_some()
+    }
+
+    pub(crate) fn rendered_mut(&mut self) -> Option<&mut Rendered> {
+        self.rendered.as_mut()
+    }
+
+    /// Flips between the source and the rendered view, keeping the reader at
+    /// about the same point through the document. Reports whether it could:
+    /// a tab with no Markdown in it has nothing to render.
+    ///
+    /// The rendered view has no caret, so a selection or a find bar left open
+    /// over the source would act on text the reader cannot see.
+    pub fn toggle_rendered(&mut self) -> bool {
+        if self.is_rendered() {
+            self.show_source();
+            return true;
+        }
+        if !self.is_markdown() {
+            return false;
+        }
+        self.buffer.clear_selection();
+        self.find.close();
+        self.rendered = Some(Rendered::entered_at(self.scroll, self.buffer.line_count()));
+        true
+    }
+
+    /// Leaves the rendered view for the source, scrolled to the same point
+    /// through the document. The caret stays where it was, as it does under a
+    /// wheel, so the next motion picks up from it.
+    pub fn show_source(&mut self) {
+        if let Some(view) = self.rendered.take() {
+            self.set_scroll(view.source_line(self.buffer.line_count()));
+        }
+    }
+
+    /// The rendered view brought up to date with the text, `width` and the
+    /// theme, painting only when one of them moved. A tab showing its source
+    /// has none.
+    pub(crate) fn rendered(
+        &mut self,
+        width: u16,
+        theme_generation: u64,
+        paint: PaintMarkdown,
+    ) -> Option<&Rendered> {
+        let painting = Painting {
+            revision: self.revision,
+            width,
+            theme_generation,
+        };
+        let view = self.rendered.as_mut()?;
+        view.paint(painting, || self.buffer.lines().join("\n"), paint);
+        Some(view)
+    }
+
+    /// What the strip and the unsaved-changes question call the tab: the
+    /// host's name for it when it gave one, the file name otherwise.
+    pub fn heading(&self) -> &str {
+        self.label
+            .as_ref()
+            .map_or(&self.title, |label| &label.title)
     }
 
     pub fn notice(&self) -> Option<ReadOnly> {
@@ -407,7 +545,24 @@ impl Tab {
         self.reload(false)
     }
 
+    /// Catches a write no watch was there to see, because the workbench was
+    /// closed or the file lives outside the tree it watches. A file whose time
+    /// has not moved costs one stat and keeps its undo history.
+    pub fn refresh_if_changed(&mut self) -> Result<bool, LoadError> {
+        let Some(path) = self.path.local() else {
+            return Ok(false);
+        };
+        if !self.is_editable() || read::modified(path) == self.modified {
+            return Ok(false);
+        }
+        self.reload(false)
+    }
+
     fn reload(&mut self, discard: bool) -> Result<bool, LoadError> {
+        // A document's text lives with the host, so nothing on disk is newer.
+        if self.document.is_some() {
+            return Ok(false);
+        }
         if self.is_dirty() && !discard {
             self.conflict = true;
             return Ok(false);
@@ -419,13 +574,35 @@ impl Tab {
             Some(source) => read::reload_local_source(source, path),
             None => read::load(path),
         };
-        let loaded = match loaded {
-            Ok(loaded) => loaded,
+        match loaded {
+            Ok(loaded) => {
+                self.take(loaded);
+                Ok(true)
+            }
             Err(error) => {
                 self.conflict = true;
-                return Err(error);
+                Err(error)
             }
-        };
+        }
+    }
+
+    /// Hands a document the host's newer copy of its text, the way a reload
+    /// hands a file tab what is on disk: the reader keeps their place.
+    pub fn replace_text(&mut self, text: &str) {
+        self.take(read::decode(text, None));
+    }
+
+    /// The host kept what a save of this document handed it, so nothing in
+    /// the tab is unsaved any more.
+    pub fn mark_saved(&mut self) {
+        self.history.mark_saved();
+        self.conflict = false;
+    }
+
+    /// Swaps in text from outside the buffer, keeping the caret and the
+    /// scroll where they still fit. The undo history described the old text,
+    /// so it goes with it.
+    fn take(&mut self, loaded: read::Loaded) {
         let cursor = self.buffer.cursor();
         let scroll = self.scroll;
         self.line_ending = loaded.line_ending;
@@ -433,13 +610,13 @@ impl Tab {
         self.notice = loaded.read_only;
         self.modified = loaded.modified;
         self.buffer = Buffer::new(loaded.lines);
+        self.revision += 1;
         self.buffer.set_cursor(cursor, false);
         self.scroll = scroll.min(self.buffer.line_count().saturating_sub(1));
         self.scroll_row = 0;
         self.history = History::default();
         self.highlighter.invalidate_from(0);
         self.conflict = false;
-        Ok(true)
     }
 
     /// Throws the buffer away and takes what is on disk, which is the only way
@@ -471,6 +648,7 @@ impl Tab {
         self.line_ending = loaded.line_ending;
         self.trailing_newline = loaded.trailing_newline;
         self.buffer = Buffer::new(loaded.lines);
+        self.revision += 1;
         self.buffer.set_cursor(cursor, false);
         self.scroll = scroll.min(self.buffer.line_count().saturating_sub(1));
         self.scroll_row = 0;
@@ -662,12 +840,11 @@ impl Editor {
 
     /// Opening a file already open raises its tab instead of duplicating it,
     /// which also protects the one buffer per path invariant the watcher and
-    /// the save path both rely on.
+    /// the save path both rely on. The raised tab catches up with its file
+    /// first, so asking for a file never shows what it used to say.
     pub fn open(&mut self, path: &Path, theme_generation: u64) -> Result<(), LoadError> {
-        let identity = WorkbenchPath::Local(path.to_path_buf());
-        if let Some(index) = self.tabs.iter().position(|tab| tab.path == identity) {
-            self.active = index;
-            self.tabs[index].preview = false;
+        if let Some(tab) = self.raise(path) {
+            tab.preview = false;
             return Ok(());
         }
         self.tabs.push(Tab::open(path, theme_generation)?);
@@ -679,9 +856,7 @@ impl Editor {
     /// next one takes over rather than stacking beside it. A file already open
     /// is raised as it stands, so a tab that was pinned stays pinned.
     pub fn preview(&mut self, path: &Path, theme_generation: u64) -> Result<(), LoadError> {
-        let identity = WorkbenchPath::Local(path.to_path_buf());
-        if let Some(index) = self.tabs.iter().position(|tab| tab.path == identity) {
-            self.active = index;
+        if self.raise(path).is_some() {
             return Ok(());
         }
         let mut tab = Tab::open(path, theme_generation)?;
@@ -697,6 +872,42 @@ impl Editor {
             }
         };
         Ok(())
+    }
+
+    /// Makes the tab on `path` the active one and brings it up to date with
+    /// its file. A read that fails has already flown the tab's conflict, which
+    /// is what the reader needs to see, so there is nothing to pass back.
+    fn raise(&mut self, path: &Path) -> Option<&mut Tab> {
+        let identity = WorkbenchPath::Local(path.to_path_buf());
+        let index = self.tabs.iter().position(|tab| tab.path == identity)?;
+        self.active = index;
+        let tab = &mut self.tabs[index];
+        let _ = tab.refresh_if_changed();
+        Some(tab)
+    }
+
+    /// Where the host's document `key` is open, if it is.
+    pub fn document(&self, key: &DocumentKey) -> Option<usize> {
+        self.tabs
+            .iter()
+            .position(|tab| tab.document.as_ref() == Some(key))
+    }
+
+    /// Names the tab on `path` the way the host asked, and takes that name off
+    /// any other tab, so two tabs never both claim to be the plan.
+    pub fn label(&mut self, path: &WorkbenchPath, label: TabLabel) {
+        for tab in &mut self.tabs {
+            if tab
+                .label
+                .as_ref()
+                .is_some_and(|held| held.title == label.title)
+            {
+                tab.label = None;
+            }
+        }
+        if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.path == *path) {
+            tab.label = Some(label);
+        }
     }
 
     /// Adds a tab the workbench built rather than read, replacing any tab
@@ -811,10 +1022,18 @@ impl Editor {
 #[cfg(test)]
 mod tests {
     use super::buffer::Cursor;
-    use super::{DiffKind, DiffRow, Editor, Tab};
+    use super::{DiffKind, DiffRow, Editor, Tab, WorkbenchPath};
     use std::fs;
+    use std::path::Path;
     use tempfile::TempDir;
+    use test_case::test_case;
 
+    const MARKDOWN_FILE: &str = "notes.md";
+    const MARKDOWN: &str = "# Title\n\nSome *prose*.\n";
+    const NOT_TEXT: &[u8] = b"\0\0\0";
+    const RENAMED_TEXT_FILE: &str = "notes.txt";
+    const WRONG_ELIGIBILITY: &str = "the rendered view is offered to the wrong tabs";
+    const STILL_RENDERED: &str = "a tab that stopped being Markdown is still rendered";
     const RAISED: &str = "opening an open file must raise its tab, not open a second one";
     const CLEAN_START: &str = "a freshly opened file must not claim to be dirty";
     const DIRTY_AFTER_EDIT: &str = "an edited buffer must claim to be dirty until it is saved";
@@ -1201,5 +1420,53 @@ mod tests {
 
         assert_eq!(editor.tabs().len(), 1, "{RAISED}");
         assert_eq!(editor.active().expect(NO_ACTIVE).title, "main.rs (diff)");
+    }
+
+    #[test_case("notes.md", true ; "markdown")]
+    #[test_case("README.MD", true ; "markdown in capitals")]
+    #[test_case("guide.markdown", true ; "the long extension")]
+    #[test_case("main.rs", false ; "source code")]
+    #[test_case("md", false ; "a name that is only the extension")]
+    fn only_markdown_has_a_rendered_view(name: &str, expected: bool) {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join(name);
+        fs::write(&path, MARKDOWN).unwrap();
+        let mut tab = Tab::open(&path, 0).unwrap();
+
+        assert_eq!(tab.toggle_rendered(), expected, "{WRONG_ELIGIBILITY}");
+        assert_eq!(tab.is_rendered(), expected, "{WRONG_ELIGIBILITY}");
+    }
+
+    fn not_text(path: &Path) -> Tab {
+        fs::write(path, NOT_TEXT).unwrap();
+        Tab::open(path, 0).unwrap()
+    }
+
+    fn diff(path: &Path) -> Tab {
+        let rows = vec![diff_row(MARKDOWN, DiffKind::Added)];
+        Tab::synthetic(path, MARKDOWN_FILE.to_owned(), rows, 0)
+    }
+
+    #[test_case(not_text ; "a file that is not text")]
+    #[test_case(diff ; "a diff")]
+    fn a_markdown_name_is_not_enough_to_render(build: fn(&Path) -> Tab) {
+        let tmp = TempDir::new().unwrap();
+        let mut tab = build(&tmp.path().join(MARKDOWN_FILE));
+
+        assert!(!tab.toggle_rendered(), "{WRONG_ELIGIBILITY}");
+    }
+
+    #[test]
+    fn renaming_away_from_markdown_goes_back_to_the_source() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join(MARKDOWN_FILE);
+        fs::write(&path, MARKDOWN).unwrap();
+        let mut tab = Tab::open(&path, 0).unwrap();
+        tab.toggle_rendered();
+
+        let renamed = WorkbenchPath::Local(tmp.path().join(RENAMED_TEXT_FILE));
+        tab.rename(renamed, None, 0);
+
+        assert!(!tab.is_rendered(), "{STILL_RENDERED}");
     }
 }

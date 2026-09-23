@@ -1316,7 +1316,7 @@ impl App {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use std::borrow::Cow;
     use std::collections::{BTreeMap, BTreeSet};
     use std::fs;
@@ -1696,6 +1696,12 @@ mod tests {
             service,
             writes,
         )
+    }
+
+    /// A remote workspace a workbench can open on, for the app's other tests
+    /// that need the workbench up rather than any file in it.
+    pub(in crate::app) fn workbench_workspace() -> WorkspaceSession {
+        source_remote_workspace().0
     }
 
     fn source_screen(app: &mut App) -> String {

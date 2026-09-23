@@ -226,20 +226,56 @@ impl LocalDocumentStore {
         expected_revision: &DocumentRevision,
         edits: &[PatchEdit],
     ) -> Result<DocumentRevision, LocalDocumentError> {
+        self.rewrite(
+            project,
+            session_id,
+            reference,
+            expected_revision,
+            |mut content| {
+                for edit in edits {
+                    if edit.old.is_empty() || content.match_indices(&edit.old).count() != 1 {
+                        return Err(LocalDocumentError::PatchConflict);
+                    }
+                    content = content.replacen(&edit.old, &edit.new, 1);
+                }
+                Ok(content)
+            },
+        )
+    }
+
+    /// Writes `content` over the whole document, provided nothing else wrote
+    /// it since `expected_revision`, so a reader's save never undoes a change
+    /// they did not see.
+    pub fn replace(
+        &self,
+        project: &ProjectKey,
+        session_id: Option<&str>,
+        reference: &LocalDocumentRef,
+        expected_revision: &DocumentRevision,
+        content: &str,
+    ) -> Result<DocumentRevision, LocalDocumentError> {
+        self.rewrite(project, session_id, reference, expected_revision, |_| {
+            Ok(content.to_owned())
+        })
+    }
+
+    fn rewrite(
+        &self,
+        project: &ProjectKey,
+        session_id: Option<&str>,
+        reference: &LocalDocumentRef,
+        expected_revision: &DocumentRevision,
+        edit: impl FnOnce(String) -> Result<String, LocalDocumentError>,
+    ) -> Result<DocumentRevision, LocalDocumentError> {
         self.validate_project(project)?;
         let (path, _) = self.resolve(project, session_id, reference)?;
-        let mut content = read_secure(&path)?;
-        if revision(&content) != *expected_revision {
+        let current = read_secure(&path)?;
+        if revision(&current) != *expected_revision {
             return Err(LocalDocumentError::StaleRevision {
                 expected: expected_revision.as_str().to_owned(),
             });
         }
-        for edit in edits {
-            if edit.old.is_empty() || content.match_indices(&edit.old).count() != 1 {
-                return Err(LocalDocumentError::PatchConflict);
-            }
-            content = content.replacen(&edit.old, &edit.new, 1);
-        }
+        let content = edit(current)?;
         validate_size(&content)?;
         write_secure(&path, &content)?;
         Ok(revision(&content))
@@ -639,6 +675,10 @@ mod tests {
     const NOTE: &str = "note.md";
     const CANARY: &str = "local legacy secret";
     const REMOTE_CONTENT: &str = "remote note";
+    const REPLACED: &str = "a reader's edit";
+    const NEWER: &str = "written in between";
+    const WRONG_TEXT: &str = "the document holds the wrong text after a replace";
+    const STALE_REPLACED: &str = "a replace went over a revision it never read";
 
     fn binding(fields: [&str; 7], session: &str) -> SessionWorkspaceBinding {
         let [
@@ -874,6 +914,44 @@ mod tests {
             ),
             Err(LocalDocumentError::StaleRevision { .. })
         ));
+    }
+
+    /// A reader's save names the revision their text came from, and one that
+    /// is no longer current would undo whatever replaced it.
+    #[test_case(false ; "a current revision is written over")]
+    #[test_case(true ; "a stale revision leaves the newer text")]
+    fn replace_writes_only_over_the_revision_it_names(stale: bool) {
+        let (_root, store, project) = store();
+        let reference =
+            LocalDocumentRef::Plan(store.create_plan(&project, SESSION).expect("create plan"));
+        let read = store
+            .read(&project, Some(SESSION), &reference)
+            .expect("initial read")
+            .revision;
+        if stale {
+            store
+                .write(&project, Some(SESSION), &reference, NEWER)
+                .expect("write in between");
+        }
+
+        let replaced = store.replace(&project, Some(SESSION), &reference, &read, REPLACED);
+
+        let current = store
+            .read(&project, Some(SESSION), &reference)
+            .expect("read back");
+        match stale {
+            true => {
+                assert!(
+                    matches!(replaced, Err(LocalDocumentError::StaleRevision { .. })),
+                    "{STALE_REPLACED}"
+                );
+                assert_eq!(current.content, NEWER, "{WRONG_TEXT}");
+            }
+            false => {
+                assert_eq!(replaced.ok(), Some(current.revision), "{WRONG_TEXT}");
+                assert_eq!(current.content, REPLACED, "{WRONG_TEXT}");
+            }
+        }
     }
 
     #[test]

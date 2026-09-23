@@ -495,6 +495,11 @@ pub enum UiAction {
         path: PathBuf,
         reply_tx: flume::Sender<i32>,
     },
+    /// `line` is 1-based, the way a mention counts.
+    OpenWorkbench {
+        path: PathBuf,
+        line: Option<usize>,
+    },
     Session {
         req: SessionRequest,
         reply_tx: flume::Sender<UiReply>,

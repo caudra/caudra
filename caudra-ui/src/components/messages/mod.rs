@@ -5333,10 +5333,7 @@ fn build_message_lines(msg: &DisplayMessage, width: u16, diagram_pans: Vec<u16>)
             provenance.push_chrome_line(lines.last().unwrap().spans.len());
         }
         lines.push(Line::from(Span::styled(
-            format!(
-                "{} to open in editor ($VISUAL / $EDITOR)",
-                key::OPEN_EDITOR.label
-            ),
+            format!("{} to open in the workbench", key::OPEN_EDITOR.label),
             theme::current().tool_dim,
         )));
         links

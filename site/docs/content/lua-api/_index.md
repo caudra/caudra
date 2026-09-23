@@ -4579,6 +4579,7 @@ caudra.ui.open_editor({path})
 Opens {path} in the user's `$EDITOR` (e.g. vim, nano) and waits for
 it to close. This suspends the TUI while the editor is running.
 Returns the editor's exit code so you can check if the user saved.
+To open a file without leaving Caudra, use `caudra.ui.open_workbench`.
 
 **Parameters:**
 
@@ -4593,6 +4594,31 @@ local code = caudra.ui.open_editor("/tmp/scratch.lua")
 if code == 0 then
   caudra.ui.flash("File saved")
 end
+```
+
+---
+
+### `caudra.ui.open_workbench()` {#caudra-ui-open_workbench}
+
+```lua
+caudra.ui.open_workbench({path}, {opts?})
+```
+
+Opens {path} in the workbench, Caudra's built-in editor, and returns
+straight away. A relative path is resolved against the project root,
+the way a clicked `@path` mention is. The TUI stays up throughout.
+
+**Parameters:**
+
+- `{path}` (`string`) File to open.
+- `{opts?}` (`table?`) `line` (integer, 1-based): the line to put the cursor on.
+
+**Returns:** (`boolean|nil`, `string|nil`) `true` once the UI has the request, or nil and an error message.
+
+**Example:**
+
+```lua
+caudra.ui.open_workbench("src/main.rs", { line = 42 })
 ```
 
 ---

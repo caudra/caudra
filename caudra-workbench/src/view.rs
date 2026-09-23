@@ -13,8 +13,10 @@ use ratatui::buffer::Buffer as Surface;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
+use ratatui::widgets::Widget;
 use unicode_width::UnicodeWidthStr;
 
+use crate::editor::rendered::PaintMarkdown;
 use crate::editor::{DiffKind, Editor, Tab, VisualRow, render};
 use crate::fs::backend::WorkbenchPath;
 use crate::fs::tree::{GitMark, Row as TreeRow};
@@ -34,6 +36,9 @@ use crate::{
 
 const HINT_GAP: &str = "  ";
 const EMPTY_EDITOR_HINT: &str = "No file open";
+/// Stands where the caret's line and column would, since the rendered view has
+/// neither.
+pub(crate) const RENDERED_STATUS: &str = "Rendered";
 const NO_CHANGES: &str = "No changes";
 pub(crate) const NOT_A_REPOSITORY: &str = "Not a git repository";
 const SEARCH_PROMPT: &str = "Search  ";
@@ -800,7 +805,7 @@ impl Workbench {
             if tab.is_dirty() {
                 spans.push(Span::styled(DIRTY_MARK, self.styles.accent));
             }
-            spans.push(Span::styled(format!("{}{TAB_GAP}", tab.title), style));
+            spans.push(Span::styled(format!("{}{TAB_GAP}", tab.heading()), style));
             spans.push(Span::styled(CLOSE_MARK, close));
             spans.push(Span::styled(TAB_GAP, self.styles.background));
         }
@@ -862,6 +867,12 @@ impl Workbench {
             placeholder(buf, area, notice.reason(), self.styles.dim);
             return;
         }
+        if tab.is_rendered()
+            && let Some(paint) = self.markdown
+        {
+            self.render_rendered(buf, area, paint);
+            return;
+        }
 
         let lines = tab.buffer.line_count();
         let columns = tab
@@ -909,6 +920,33 @@ impl Workbench {
         self.scrollbar(buf, Bar::Text, bar, lines, first);
     }
 
+    /// The active tab painted the way the transcript shows Markdown. There is
+    /// no gutter, since a painted row is no source line to number.
+    fn render_rendered(&mut self, buf: &mut Surface, area: Rect, paint: PaintMarkdown) {
+        // Wrapped as though the bar were up, so a document that grows past the
+        // pane never rewraps under the reader.
+        let (text, _) = scroll_column(self.scrollbars, area, usize::MAX);
+        self.panes.text = text;
+        let rows = text.height as usize;
+        let theme_generation = self.theme_generation;
+        let Some(view) = self
+            .editor
+            .active_mut()
+            .and_then(|tab| tab.rendered(text.width, theme_generation, paint))
+        else {
+            return;
+        };
+        let (top, total) = (view.top(rows), view.lines().len());
+        for (offset, line) in view.lines()[top..].iter().take(rows).enumerate() {
+            line.render(line_at(text, offset), buf);
+        }
+        let (_, bar) = scroll_column(self.scrollbars, area, total);
+        self.bars
+            .text
+            .set_hint(ScrollHint::lines(top as u32 + 1, total as u32));
+        self.scrollbar(buf, Bar::Text, bar, total, top);
+    }
+
     fn render_prompt(&self, buf: &mut Surface, area: Rect, label: &str, input: &str, caret: bool) {
         grab_scope!("workbench_prompt", area);
         let mut left = vec![Span::styled(label.to_owned(), self.styles.accent)];
@@ -947,7 +985,11 @@ impl Workbench {
                 )]
             }
             (None, Some(tab)) => {
-                status_left(tab, &self.relative_path(&tab.path), &self.styles, half)
+                let named = match &tab.label {
+                    Some(label) => label.status.clone(),
+                    None => self.relative_path(&tab.path),
+                };
+                status_left(tab, &named, &self.styles, half)
             }
             (None, None) => vec![Span::styled(
                 chrome::fit_end(&self.backend_root().display(), half),
@@ -956,6 +998,7 @@ impl Workbench {
         };
 
         let mut right = match self.editor.active() {
+            Some(tab) if tab.is_rendered() => vec![Span::styled(RENDERED_STATUS, self.styles.dim)],
             Some(tab) => {
                 let cursor = tab.buffer.cursor();
                 vec![Span::styled(
@@ -1019,12 +1062,19 @@ impl Workbench {
             ];
         }
         if self.focus == Focus::Editor {
-            return vec![
-                (keys::SAVE.label, "save"),
-                (keys::FIND.label, "find"),
+            let mut offered = vec![(keys::SAVE.label, "save"), (keys::FIND.label, "find")];
+            if let Some(tab) = self.editor.active().filter(|tab| self.renders(tab)) {
+                let other = match tab.is_rendered() {
+                    true => "source",
+                    false => "rendered",
+                };
+                offered.push((keys::TOGGLE_RENDERED.label, other));
+            }
+            offered.extend([
                 (keys::SEND_TO_COMPOSER.label, "send"),
                 (keys::CLOSE.label, "back"),
-            ];
+            ]);
+            return offered;
         }
         vec![
             (keys::VIEW_EXPLORER.label, "explorer"),
@@ -1074,7 +1124,7 @@ fn tab_width(tab: &Tab) -> usize {
     TAB_GAP.len() * 4
         + MENU_MARK.chars().count()
         + usize::from(tab.is_dirty())
-        + tab.title.chars().count()
+        + tab.heading().chars().count()
         + CLOSE_MARK.chars().count()
 }
 

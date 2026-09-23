@@ -133,7 +133,7 @@ Each `task` subagent has a separate transcript. Open the task picker with `/task
 
 An input box appears while the focused task is running. Press Enter to queue guidance for its next turn boundary. Pending guidance stays visible above the input until the subagent consumes it. Task transcripts survive session reloads, and later `task` calls can continue one by passing its `task_id`.
 
-That input box is a full composer. Typing `/` opens the palette, `Ctrl+S` inserts a file path, `Ctrl+X e` edits the draft in your editor, and `Ctrl+V` attaches an image to the guidance. A custom `/project:` or `/user:` command expands its template and steers the focused task rather than the main session.
+That input box is a full composer. Typing `/` opens the palette, `Ctrl+S` inserts a file path, `Ctrl+X e` edits the draft in the [workbench](/docs/workbench/#plans-memory-notes-and-prompt-drafts), and `Ctrl+V` attaches an image to the guidance. A custom `/project:` or `/user:` command expands its template and steers the focused task rather than the main session.
 
 Commands that reach the main session's turn or history have no task equivalent, so `/compact`, `/continue`, `/model`, `/system-prompt`, `/projection`, `/btw`, `/extract`, the `/goal` family, the workflow commands, and MCP prompts are drawn dimmed and report their scope when run. Return to Main to use them. `/context`, `/tools`, `/skills`, `/queue`, `/review`, and the stash commands already follow the focused transcript."#;
 
@@ -279,7 +279,7 @@ pub fn generate() -> String {
     .unwrap();
     writeln!(
         out,
-        "- **`/memory`**: open the memory file picker (view / edit / delete). See the `memory` tool under [Tools](/docs/tools/)."
+        "- **`/memory`**: open the memory file picker. `Enter` opens a note in the [workbench](/docs/workbench/#plans-memory-notes-and-prompt-drafts) to read or edit, and a note can be deleted from the list. See the `memory` tool under [Tools](/docs/tools/)."
     )
     .unwrap();
 

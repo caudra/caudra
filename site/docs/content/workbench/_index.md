@@ -131,6 +131,16 @@ A tab with unsaved edits keeps them and raises a conflict instead. The status ro
 
 Bursts of writes settle before the panes react, so a build or a `git checkout` costs one refresh rather than one per file.
 
+The watch covers the project and stops while the workbench is closed. A file outside the project, such as the [plan](#plans-memory-notes-and-prompt-drafts), reloads when the agent's own tool call writes it, under the same rules. Reopening the workbench rereads every tab whose file changed while it was closed, and so does opening a file that already has a tab.
+
+## Rendered Markdown
+
+A Markdown file can be read the way the transcript shows Markdown, with headings, lists, tables, and code blocks drawn out and the syntax gone. `Ctrl+X v` switches the active tab between its source and its rendered view. The tab's [context menu](#context-menu) does the same with `Show Rendered` or `Show Source`, whichever view is hidden. Files ending in `.md` or `.markdown` have a rendered view, and so does the [prompt draft](#plans-memory-notes-and-prompt-drafts).
+
+The rendered view is for reading. The arrow keys, `PageUp`, `PageDown`, `Home`, `End`, the wheel, and the scrollbar move it, and typing flashes that it is read-only. Each view opens at the same point through the document that the other one showed, and the cursor stays where you left it in the source. A reload, a theme change, or a resize shows up in the view at once. On a file, `Ctrl+X Enter` sends a mention without a line number, because the rendered view has no cursor.
+
+`Ctrl+X v` switches the transcript view everywhere else, and only belongs to the rendered view while the workbench is open.
+
 ## Source control
 
 `Ctrl+X 2` shows three stacked sections, with the current branch in the sidebar header.
@@ -214,15 +224,29 @@ The walk respects `.gitignore` and skips `.git`, binaries, and files above the s
 
 This is the fastest way to say "look at this" without typing the path or the line numbers. When you send the prompt, Caudra reads the lines a mention names and puts them in the request, so the agent starts with them rather than calling `file_read`.
 
+## Plans, memory notes, and prompt drafts
+
+Caudra opens its own text here as well. Each tab is named for what it holds, and the status row says the rest: `Plan · <file>`, `Memory · <note>`, or `Prompt · <chat>`.
+
+- **The plan.** `Ctrl+O` or `Ctrl+X o` opens it in a tab named `Plan`, and so does `Ctrl+O` on the plan form. `Ctrl+S` saves your edits. Implementing reads the plan from disk, so while its tab holds unsaved edits, Implement brings the tab back and asks you to save first. The plan form stays up behind the workbench and leaves every key to it. A plan the agent has not written yet has nothing to open, and the status bar says so.
+- **Memory notes.** `Enter` on a note in `/memory`, or a click on a note the `memory` tool shows in the transcript, opens it in a tab named after the note.
+- **The prompt draft.** `Ctrl+X e` in the composer opens what you have typed in a tab named `Prompt`, with every folded paste spelled out. `Ctrl+S` puts the draft back in the composer and keeps the workbench open. `Ctrl+X Enter` puts it back and closes the workbench, so you can send it.
+
+The plan and the notes live in the state directory, outside the project. When the agent rewrites the plan or saves a note, its tab reloads from that tool call, under the same rules as a [watched file](#when-the-agent-writes-the-same-file).
+
+In a [remote workspace](/docs/remote-workspaces/) the plan and the notes stay on your machine, as documents addressed by reference rather than by path. They open here all the same, and `Ctrl+S` writes them back to where they came from. The plan's status row shows the start of its reference where a local plan shows its file name. A save only goes through when nothing else has written the document since its tab last read it. Otherwise the status bar says the document changed, your edits stay in the tab, and `Ctrl+R` replaces them with the newer copy.
+
+A prompt draft is not a file. Each chat has its own, and a draft only goes back to the composer it came from. Saving one while another chat is in front flashes a reminder, and the tab keeps your edits until you switch back. Leaving the workbench drops a draft with nothing unsaved in it, so the next `Ctrl+X e` starts again from the composer. A draft with unsaved edits stays, and `Ctrl+X e` brings it back as you left it.
+
 ## What is remembered
 
-Open tabs, the active tab, the sidebar view, its width, whether hidden files are shown, and how the source control sections were sized and folded are stored per project directory. Reopening the workbench in the same checkout restores them once per run. Files that have since been deleted are skipped. Diff tabs are not restored, because they are built from the repository rather than read from a path.
+Open tabs, the active tab, the sidebar view, its width, whether hidden files are shown, and how the source control sections were sized and folded are stored per project directory. Reopening the workbench in the same checkout restores them once per run. Files that have since been deleted are skipped. Diff tabs are not restored, because they are built from the repository rather than read from a path. Prompt drafts and the plan and notes of a remote workspace are not stored either, and a restored plan tab is named after its file.
 
 Two clones of the same repository keep separate layouts.
 
 ## Limits
 
-The workbench is an editor beside an agent, not a replacement for your own. There is no language server, no completion, no split panes, and no modal editing. Search does not replace. Staging is per file.
+The workbench is an editor beside an agent, not a replacement for your own. There is no language server, no completion, no split panes, and no modal editing. Search does not replace. Staging is per file. The rendered view is read-only and has no selection, so copy from the source.
 
 ## Keys
 

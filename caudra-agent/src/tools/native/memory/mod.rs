@@ -705,9 +705,9 @@ impl ToolInvocation for MemoryCall {
         }
     }
 
-    fn execute<'a>(self: Box<Self>, _ctx: &'a ToolContext) -> ExecFuture<'a> {
+    fn execute<'a>(self: Box<Self>, ctx: &'a ToolContext) -> ExecFuture<'a> {
         Box::pin(async move {
-            let answer = match self.run_for_context(_ctx) {
+            let answer = match self.run_for_context(ctx) {
                 Ok(answer) => answer,
                 Err(error) => return ToolExecResult::from(Err(format!("error: {error}"))),
             };
@@ -727,11 +727,18 @@ impl ToolInvocation for MemoryCall {
                 .then_some(self.content.as_deref())
                 .flatten()
                 .filter(|content| !content.trim().is_empty());
+            // Notes live outside the project, where no watch sees them change,
+            // so the host learns of the change from the result.
+            let changed = self
+                .mutation_targets(ctx)
+                .pop()
+                .map(|path| path.to_string_lossy().into_owned());
             match note {
                 Some(note) => ToolExecResult::from(Ok(ToolOutput::Markdown(note.into())))
                     .with_model_output(Some(receipt)),
                 None => ToolExecResult::from(Ok(ToolOutput::Markdown(receipt.into()))),
             }
+            .with_written_path(changed)
         })
     }
 }
@@ -1302,6 +1309,28 @@ mod tests {
             output.as_display_text().contains(MEMORY_DIRECTORY_LABEL),
             "{BROWSE_MSG}"
         );
+    }
+
+    const CHANGED_NOTE_MSG: &str = "a local change names its note, and nothing else names one";
+
+    /// The notes live outside the project, so the host only learns a tab on
+    /// one is stale from the call that changed it.
+    #[test_case(json!({ "command": "write", "path": "a.md", "content": "y" }), true ; "a write")]
+    #[test_case(json!({ "command": "delete", "path": "a.md" }), true ; "a delete")]
+    #[test_case(json!({ "command": "read", "path": "a.md" }), false ; "a read")]
+    fn a_local_change_names_the_note_it_changed(input: Value, changes: bool) {
+        let temp = tempfile::tempdir().unwrap();
+        run(
+            json!({ "command": "write", "path": "a.md", "content": "x" }),
+            temp.path(),
+        )
+        .unwrap();
+
+        let out = execute_in(input, temp.path());
+
+        let note = temp.path().join("a.md");
+        let expected = changes.then(|| note.to_string_lossy().into_owned());
+        assert_eq!(out.written_path, expected, "{CHANGED_NOTE_MSG}");
     }
 
     #[test]

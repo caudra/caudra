@@ -405,12 +405,15 @@ mod tests {
     use crate::AgentMode;
     use crate::agent::tool_dispatch::{Emit, run};
     use crate::tools::ToolRegistry;
+    use crate::tools::native::memory::MemoryTool;
     use crate::tools::test_support::stub_ctx;
 
     const PROJECT: &str = "project-a";
     const PLAN: &str = "finished plan";
     const WRONG_OWNER: &str = "local document does not belong to this project or session";
     const RENDERED: &str = "the reader sees the document, the model sees the receipt";
+    const HOST_PATH_NAMED: &str = "a remote note has no host path to report";
+    const REMOTE_WRITE_FAILED: &str = "a remote note is written to the client's store";
 
     fn workspace() -> WorkspaceSession {
         workspace_for_principal("principal")
@@ -680,6 +683,26 @@ mod tests {
                 PLAN
             );
         });
+    }
+
+    /// A remote note lives in the client's store, and the host path a local
+    /// write reports would name nothing on it.
+    #[test]
+    fn a_remote_memory_write_names_no_host_file() {
+        let Remote {
+            root: _root,
+            mut ctx,
+            ..
+        } = remote();
+        ctx.mode = AgentMode::Build;
+        let write = MemoryTool
+            .parse(&json!({"command": "write", "path": "note.md", "content": PLAN}))
+            .expect("a well-formed write");
+
+        let result = smol::block_on(write.execute(&ctx));
+
+        result.output.as_ref().expect(REMOTE_WRITE_FAILED);
+        assert_eq!(result.written_path, None, "{HOST_PATH_NAMED}");
     }
 
     #[test]

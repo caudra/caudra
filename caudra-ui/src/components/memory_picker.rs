@@ -52,10 +52,6 @@ impl PickerItem for MemoryItem {
 pub struct MemoryPicker {
     picker: ListPicker<MemoryItem>,
     pending_delete: Option<String>,
-    /// Set when an editor was launched from here. The editor runs
-    /// synchronously in the event loop, so by the next tick it has exited and
-    /// the note on disk may have changed.
-    stale: bool,
 }
 
 impl MemoryPicker {
@@ -67,16 +63,14 @@ impl MemoryPicker {
         Self {
             picker,
             pending_delete: None,
-            stale: false,
         }
     }
 
     pub fn open(&mut self, entries: Vec<BrowseEntry>) {
         let items = build_items(entries);
         self.pending_delete = None;
-        self.stale = false;
         self.picker.set_info_text(None);
-        // Replacing keeps the live search query, so a refresh after an edit
+        // Replacing keeps the live search query, so a refresh after a delete
         // does not throw away what the user typed.
         if self.picker.is_open() {
             self.picker.replace_items(items);
@@ -92,7 +86,6 @@ impl MemoryPicker {
     pub fn close(&mut self) {
         self.picker.close();
         self.pending_delete = None;
-        self.stale = false;
     }
 
     pub fn contains(&self, pos: Position) -> bool {
@@ -101,11 +94,6 @@ impl MemoryPicker {
 
     pub fn scroll(&mut self, delta: i32) {
         self.picker.scroll(delta);
-    }
-
-    /// True once, after the editor this picker launched has exited.
-    pub fn take_stale(&mut self) -> bool {
-        std::mem::take(&mut self.stale)
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> MemoryPickerAction {
@@ -143,10 +131,7 @@ impl MemoryPicker {
 
     fn open_selected(&mut self) -> MemoryPickerAction {
         match self.picker.selected_item().map(|item| item.name.clone()) {
-            Some(name) => {
-                self.stale = true;
-                MemoryPickerAction::Open(name)
-            }
+            Some(name) => MemoryPickerAction::Open(name),
             None => MemoryPickerAction::Consumed,
         }
     }
@@ -175,10 +160,7 @@ impl MemoryPicker {
     fn map_action(&mut self, action: PickerAction<MemoryItem>) -> MemoryPickerAction {
         match action {
             PickerAction::Consumed | PickerAction::Toggle(..) => MemoryPickerAction::Consumed,
-            PickerAction::Select(item) => {
-                self.stale = true;
-                MemoryPickerAction::Open(item.name)
-            }
+            PickerAction::Select(item) => MemoryPickerAction::Open(item.name),
             PickerAction::Close => {
                 self.pending_delete = None;
                 MemoryPickerAction::Closed
@@ -272,23 +254,6 @@ mod tests {
             panic!("the editor binding opens the selection");
         };
         assert_eq!(name, "a.md");
-    }
-
-    /// The editor runs outside the TUI, so the list it came from is suspect
-    /// the moment it returns.
-    #[test]
-    fn opening_a_note_marks_the_list_stale_exactly_once() {
-        let mut picker = opened(vec![entry("a.md", "arch", 1)]);
-        picker.handle_key(key_event(KeyCode::Enter));
-        assert!(picker.take_stale());
-        assert!(!picker.take_stale(), "staleness is consumed");
-    }
-
-    #[test]
-    fn merely_moving_the_cursor_does_not_mark_the_list_stale() {
-        let mut picker = opened(vec![entry("a.md", "arch", 2), entry("b.md", "arch", 2)]);
-        picker.handle_key(key_event(KeyCode::Down));
-        assert!(!picker.take_stale());
     }
 
     #[test]

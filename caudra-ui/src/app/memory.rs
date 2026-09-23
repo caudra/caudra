@@ -3,7 +3,7 @@
 //! The notes themselves belong to the `memory` tool; this is only the picker's
 //! side of the conversation. Every list is rebuilt from disk rather than
 //! cached here, because the model writes notes mid-session and the user edits
-//! them in an external editor.
+//! them in the workbench.
 
 use std::path::{Path, PathBuf};
 
@@ -14,13 +14,10 @@ use caudra_workspace::MemoryRef;
 use super::App;
 use crate::components::Action;
 use crate::components::memory_picker::MemoryPickerAction;
-use crate::repaint::Dirty;
 
 const UNRESOLVED: &str = "Cannot resolve memory directory";
 const EMPTY: &str = "No memories yet";
 const NOTE_GONE: &str = "Note is already gone";
-const REMOTE_EDITOR: &str =
-    "Use local_document_read/write with the memory reference to view or edit this note";
 
 impl App {
     pub(super) fn memory_browse(&mut self) -> Vec<Action> {
@@ -39,7 +36,9 @@ impl App {
         Vec::new()
     }
 
-    fn remote_memory_store(&self) -> Option<&LocalDocumentStore> {
+    /// Where a remote workspace keeps its plans and notes, provided it still
+    /// belongs to the workspace in front.
+    pub(super) fn remote_document_store(&self) -> Option<&LocalDocumentStore> {
         let workspace = self.workspace_session.as_ref()?;
         let store = self.local_documents.as_deref()?;
         store.validate_binding(workspace.binding()).ok()?;
@@ -48,7 +47,7 @@ impl App {
 
     fn memory_notes(&self) -> Option<(Vec<memory::BrowseEntry>, usize)> {
         if self.workspace_session.is_some() {
-            let entries = memory::browse_store(self.remote_memory_store()?).ok()?;
+            let entries = memory::browse_store(self.remote_document_store()?).ok()?;
             return Some((entries.into_iter().map(|(_, entry)| entry).collect(), 0));
         }
         memory::browse(Path::new(&self.state.session.cwd))
@@ -70,29 +69,26 @@ impl App {
         }
     }
 
-    /// The editor runs synchronously in the event loop, so a tick that sees
-    /// the stale flag is already past it and can trust the disk.
-    pub(super) fn refresh_memory_picker_if_stale(&mut self) -> Dirty {
-        if !self.memory_picker.is_open() || !self.memory_picker.take_stale() {
-            return Dirty::NO;
-        }
-        self.memory_refresh();
-        Dirty::YES
-    }
-
     pub(super) fn handle_memory_picker_action(
         &mut self,
         action: MemoryPickerAction,
     ) -> Vec<Action> {
         match action {
             MemoryPickerAction::Consumed | MemoryPickerAction::Closed => Vec::new(),
-            MemoryPickerAction::Open(_) if self.workspace_session.is_some() => {
-                self.flash(REMOTE_EDITOR.into());
+            MemoryPickerAction::Open(name) if self.workspace_session.is_some() => {
+                let reference = self
+                    .remote_document_store()
+                    .ok_or_else(|| UNRESOLVED.to_owned())
+                    .and_then(|store| remote_memory_ref(store, &name));
+                match reference {
+                    Ok(reference) => self.open_stored_note(reference),
+                    Err(error) => self.flash(error),
+                }
                 Vec::new()
             }
             MemoryPickerAction::Delete(name) if self.workspace_session.is_some() => {
                 let result = self
-                    .remote_memory_store()
+                    .remote_document_store()
                     .ok_or_else(|| UNRESOLVED.to_owned())
                     .and_then(|store| delete_remote_memory(store, &name));
                 match result {
@@ -102,13 +98,13 @@ impl App {
                 self.memory_refresh();
                 Vec::new()
             }
-            MemoryPickerAction::Open(name) => match self.memory_note_path(&name) {
-                Some(path) => vec![Action::OpenEditor(path)],
-                None => {
-                    self.flash(NOTE_GONE.into());
-                    Vec::new()
+            MemoryPickerAction::Open(name) => {
+                match self.memory_note_path(&name).filter(|path| path.is_file()) {
+                    Some(path) => self.open_memory_note(&path),
+                    None => self.flash(NOTE_GONE.into()),
                 }
-            },
+                Vec::new()
+            }
             MemoryPickerAction::Delete(name) => {
                 match self.memory_note_path(&name).map(std::fs::remove_file) {
                     Some(Ok(())) => self.flash(format!("Deleted {name}")),
@@ -127,17 +123,23 @@ impl App {
         if self.workspace_session.is_some() {
             return None;
         }
-        let (dir, ..) = memory::browse(Path::new(&self.state.session.cwd))?;
+        let dir = memory::paths::state_dir(Path::new(&self.state.session.cwd))?;
         memory::paths::safe_resolve(&dir, name).ok()
     }
 }
 
-fn delete_remote_memory(store: &LocalDocumentStore, selection: &str) -> Result<(), String> {
-    let reference: MemoryRef = memory::browse_store(store)?
+/// The note a picker row names. A remote row is labelled with its reference,
+/// which is the only way back to the note it came from.
+fn remote_memory_ref(store: &LocalDocumentStore, selection: &str) -> Result<MemoryRef, String> {
+    memory::browse_store(store)?
         .into_iter()
         .find(|(_, entry)| entry.name == selection)
         .map(|(reference, _)| reference)
-        .ok_or_else(|| NOTE_GONE.to_owned())?;
+        .ok_or_else(|| NOTE_GONE.to_owned())
+}
+
+fn delete_remote_memory(store: &LocalDocumentStore, selection: &str) -> Result<(), String> {
+    let reference = remote_memory_ref(store, selection)?;
     store
         .delete_memory_ref(store.project_key(), &reference)
         .map_err(|error| error.to_string())

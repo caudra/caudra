@@ -154,7 +154,7 @@ Only global client MCP configuration is loaded. Local stdio extensions require e
 
 ## Client-owned documents and state
 
-Conversation records, retained tool output, credentials, approval records, and the remote-operation journal stay on the client. Plans and memory notes also stay local, scoped to the remote workspace identity. They are not remote repository paths.
+Conversation records, retained tool output, credentials, approval records, and the remote-operation journal stay on the client. Plans and memory notes also stay local, scoped to the remote workspace identity. They are not remote repository paths. `Ctrl+O` and `/memory` open them in the [workbench](/docs/workbench/#plans-memory-notes-and-prompt-drafts), which saves them back to the same local store.
 
 Remote sessions expose `local_document_read`, `local_document_write`, and `local_document_apply_patch` for these documents. They accept opaque document references, not arbitrary local filenames. Patches require the revision from the latest read and reject stale edits. A remote `file_write` cannot be used to edit a client plan.
 

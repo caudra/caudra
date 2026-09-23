@@ -100,7 +100,7 @@ Each `task` subagent has a separate transcript. Open the task picker with `/task
 
 An input box appears while the focused task is running. Press Enter to queue guidance for its next turn boundary. Pending guidance stays visible above the input until the subagent consumes it. Task transcripts survive session reloads, and later `task` calls can continue one by passing its `task_id`.
 
-That input box is a full composer. Typing `/` opens the palette, `Ctrl+S` inserts a file path, `Ctrl+X e` edits the draft in your editor, and `Ctrl+V` attaches an image to the guidance. A custom `/project:` or `/user:` command expands its template and steers the focused task rather than the main session.
+That input box is a full composer. Typing `/` opens the palette, `Ctrl+S` inserts a file path, `Ctrl+X e` edits the draft in the [workbench](/docs/workbench/#plans-memory-notes-and-prompt-drafts), and `Ctrl+V` attaches an image to the guidance. A custom `/project:` or `/user:` command expands its template and steers the focused task rather than the main session.
 
 Commands that reach the main session's turn or history have no task equivalent, so `/compact`, `/continue`, `/model`, `/system-prompt`, `/projection`, `/btw`, `/extract`, the `/goal` family, the workflow commands, and MCP prompts are drawn dimmed and report their scope when run. Return to Main to use them. `/context`, `/tools`, `/skills`, `/queue`, `/review`, and the stash commands already follow the focused transcript.
 
@@ -200,7 +200,7 @@ Extract is a [model job](/docs/providers/#model-jobs) and follows Fast unless bo
 - **`/reload`**: rebuild plugins and config without leaving the app.
 - **`/btw`**: a side question over the conversation so far, with follow-ups in the same thread. The answer streams into a modal that reports elapsed time while it waits, and how much of the prompt has been prefilled when the provider says. Type under it and press `Enter` or click `Send a follow-up` to ask the next question, which is queued if the previous answer is still streaming; `Ctrl+Y` copies the answer, `Ctrl+C` stops it without losing the thread, and `Esc` or `Close` closes. No tool runs, nothing enters history, and a marker in the transcript shows where the thread's view of the conversation ends.
 - **`/extract`**: list every requirement the session has gathered so far. See [Requirements](#requirements).
-- **`/memory`**: open the memory file picker (view / edit / delete). See the `memory` tool under [Tools](/docs/tools/).
+- **`/memory`**: open the memory file picker. `Enter` opens a note in the [workbench](/docs/workbench/#plans-memory-notes-and-prompt-drafts) to read or edit, and a note can be deleted from the list. See the `memory` tool under [Tools](/docs/tools/).
 
 ## Custom commands
 

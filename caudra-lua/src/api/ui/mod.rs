@@ -12,7 +12,7 @@ use crate::api::util::command::{
     Anchor, Border, BuiltinAction, Dimension, FloatConfig, HintEntries, HintWriter, Split,
     TitlePos, UiAction, WinCommand, WinEvent, ui_send,
 };
-use crate::api::util::pair::{Pair, try_pair};
+use crate::api::util::pair::{Pair, err_pair, try_pair};
 use crate::docs::{FnDoc, ParamDoc};
 pub(crate) mod blit;
 pub(crate) mod buf;
@@ -20,6 +20,9 @@ pub(crate) mod win;
 
 use crate::runtime::with_task_bufs;
 use win::WinHandle;
+
+const LINE_OPTION: &str = "line";
+const LINE_NOT_ONE_BASED: &str = "line is 1-based: the first line is 1";
 
 pub(crate) struct HintStore {
     hints: BTreeMap<Arc<str>, Vec<(String, String)>>,
@@ -307,6 +310,7 @@ fn action(_lua: &Lua, #[ctx] tx: flume::Sender<UiAction>, name: String) -> LuaRe
 /// Opens {path} in the user's `$EDITOR` (e.g. vim, nano) and waits for
 /// it to close. This suspends the TUI while the editor is running.
 /// Returns the editor's exit code so you can check if the user saved.
+/// To open a file without leaving Caudra, use `caudra.ui.open_workbench`.
 ///
 /// @param path string File to open.
 /// @return (integer) Editor exit code, or -1 if the action could not be dispatched.
@@ -332,6 +336,34 @@ async fn open_editor(
         return Ok(-1);
     }
     Ok(reply_rx.recv_async().await.unwrap_or(-1))
+}
+
+/// Opens {path} in the workbench, Caudra's built-in editor, and returns
+/// straight away. A relative path is resolved against the project root,
+/// the way a clicked `@path` mention is. The TUI stays up throughout.
+///
+/// @param path string File to open.
+/// @param opts table? `line` (integer, 1-based): the line to put the cursor on.
+/// @return (boolean|nil, string|nil) `true` once the UI has the request, or nil and an error message.
+/// @example
+/// caudra.ui.open_workbench("src/main.rs", { line = 42 })
+#[lua_fn]
+fn open_workbench(
+    _lua: &Lua,
+    #[ctx] tx: flume::Sender<UiAction>,
+    path: String,
+    opts: Option<Table>,
+) -> LuaResult<Pair<bool>> {
+    let line = match &opts {
+        Some(opts) => opts.get::<Option<usize>>(LINE_OPTION)?,
+        None => None,
+    };
+    if line == Some(0) {
+        return Ok(err_pair(LINE_NOT_ONE_BASED));
+    }
+    let path = PathBuf::from(path);
+    try_pair!(ui_send(Some(&tx), UiAction::OpenWorkbench { path, line }));
+    Ok((Some(true), None))
 }
 
 /// Opens a floating or split window that displays the contents of {buf}.
@@ -481,8 +513,8 @@ lua_table! {
     extend "caudra.ui" => pub(crate) fn add_ui_fns(), DOCS [
         buf, theme_color, highlight, markdown, humantime, terminal_size,
         display_width, truncate_text,
-        manual flash, manual action, manual open_editor, manual open_win, manual set_status_hint,
-        manual set_window_title,
+        manual flash, manual action, manual open_editor, manual open_workbench, manual open_win,
+        manual set_status_hint, manual set_window_title,
     ]
 }
 
@@ -499,6 +531,7 @@ pub(crate) fn create_ui_table(
         set_window_title__register(&t, lua, tx.clone())?;
         action__register(&t, lua, tx.clone())?;
         open_editor__register(&t, lua, tx.clone())?;
+        open_workbench__register(&t, lua, tx.clone())?;
         open_win__register(&t, lua, tx)?;
     }
 
@@ -699,6 +732,54 @@ mod tests {
     const MISSING_KEY: &str = "missing";
     const ORANGE_HEX: &str = "#ff8000";
     const ACTION_DOC_MARKER: &str = "/// Valid names:";
+    const WORKBENCH_FILE: &str = "src/lib.rs";
+    const WORKBENCH_LINE: usize = 12;
+    const NOT_FORWARDED: &str = "open_workbench did not hand the UI its request";
+    const WRONG_REPLY: &str = "open_workbench answered with the wrong pair";
+    const ZERO_FORWARDED: &str = "a 0-based line reached the UI";
+
+    fn open_workbench_from_lua(line: Option<usize>) -> (Pair<bool>, flume::Receiver<UiAction>) {
+        let (tx, rx) = flume::unbounded();
+        let lua = Lua::new();
+        let ui = lua.create_table().unwrap();
+        open_workbench__register(&ui, &lua, tx).unwrap();
+        lua.globals().set("ui", ui).unwrap();
+        let opts = line
+            .map(|line| format!(", {{ {LINE_OPTION} = {line} }}"))
+            .unwrap_or_default();
+        let reply = lua
+            .load(format!(
+                "return ui.open_workbench({WORKBENCH_FILE:?}{opts})"
+            ))
+            .eval()
+            .unwrap();
+        (reply, rx)
+    }
+
+    #[test_case(None ; "without a line")]
+    #[test_case(Some(WORKBENCH_LINE) ; "at a line")]
+    fn open_workbench_hands_the_ui_its_path_and_line(line: Option<usize>) {
+        let (reply, rx) = open_workbench_from_lua(line);
+
+        assert_eq!(reply, (Some(true), None), "{WRONG_REPLY}");
+        let Ok(UiAction::OpenWorkbench { path, line: sent }) = rx.try_recv() else {
+            panic!("{NOT_FORWARDED}");
+        };
+        assert_eq!(path, PathBuf::from(WORKBENCH_FILE), "{NOT_FORWARDED}");
+        assert_eq!(sent, line, "{NOT_FORWARDED}");
+    }
+
+    #[test]
+    fn open_workbench_refuses_a_zero_line() {
+        let (reply, rx) = open_workbench_from_lua(Some(0));
+
+        assert_eq!(
+            reply,
+            (None, Some(LINE_NOT_ONE_BASED.to_owned())),
+            "{WRONG_REPLY}"
+        );
+        assert!(rx.is_empty(), "{ZERO_FORWARDED}");
+    }
 
     /// The `caudra.ui.action` doc comment is hand-written but ships to users
     /// as the authoritative name list, so it has to track the enum.

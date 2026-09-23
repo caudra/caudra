@@ -1,12 +1,16 @@
 //! The seam between Caudra's theme and overlay lifecycle and the workbench.
 //!
 //! `caudra-workbench` cannot depend on this crate without a cycle, so the
-//! translation of theme roles into the palette it paints with lives here.
+//! translation of theme roles into the palette it paints with lives here, and
+//! so does the Markdown painter its rendered view borrows.
 
+use caudra_markdown::render::TOOL_OUTPUT_MAX_LINE_BYTES;
 use caudra_workbench::{Workbench, WorkbenchStyles};
 use ratatui::style::{Modifier, Style};
+use ratatui::text::Line;
 
 use crate::components::Overlay;
+use crate::markdown::text_to_wrapped;
 use crate::repaint::Cadence;
 use crate::theme;
 
@@ -43,6 +47,19 @@ pub(crate) fn styles() -> WorkbenchStyles {
         current_match: t.item_selected,
         agent_touched: t.accent,
     }
+}
+
+/// The transcript's own Markdown renderer, lent to the workbench so a Markdown
+/// tab's rendered view reads the way an answer in the transcript does.
+pub(crate) fn paint_markdown(text: &str, width: u16) -> Vec<Line<'static>> {
+    text_to_wrapped(
+        text,
+        theme::current().assistant,
+        width,
+        TOOL_OUTPUT_MAX_LINE_BYTES,
+    )
+    .0
+    .lines
 }
 
 impl Overlay for Workbench {

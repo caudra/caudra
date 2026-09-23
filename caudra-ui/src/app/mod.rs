@@ -24,6 +24,7 @@ pub(crate) mod tasks;
 #[cfg(test)]
 pub(crate) mod tests;
 pub(crate) mod view;
+mod workbench;
 pub(crate) mod workflow;
 
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -33,10 +34,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
-use caudra_workbench::{Layout as WorkbenchLayout, MutationGate, Workbench, WorkbenchAction};
+use caudra_workbench::{
+    DocumentKey, Layout as WorkbenchLayout, MutationGate, Workbench, WorkbenchAction,
+};
 
 use crate::agent::ModelSlot;
 use crate::app::tasks::TaskOutcome;
+use crate::app::workbench::StoredDocument;
 use crate::chat::Chat;
 use crate::chat::{CANCELLED_TEXT, ChatEventResult, DONE_TEXT, ERROR_TEXT};
 use crate::clipboard::{ClipboardState, CopyResult};
@@ -91,7 +95,7 @@ use crate::components::todo_panel::TodoPanel;
 use crate::components::tools_modal::{ToolsModal, ToolsScope};
 use crate::components::usage_modal::{UsageFetchState, UsageModal, UsageScope};
 use crate::components::which_key::WhichKey;
-use crate::components::workbench::styles as workbench_styles;
+use crate::components::workbench::{paint_markdown, styles as workbench_styles};
 use crate::components::workflow_catalog_picker::WorkflowCatalogPicker;
 use crate::components::workflow_inspector::WorkflowInspector;
 use crate::components::{
@@ -175,7 +179,6 @@ const WORKFLOW_AUTH_REQUIRED: &str =
 const WORKFLOW_REQUESTER_PREFIX: &str = "workflow";
 const COPY_FAILED: &str = "Copy failed: ";
 const HISTORY_UNREADABLE: &str = "Failed to read session history: ";
-const FLASH_NO_PLAN: &str = "No plan file";
 const NO_FILE_REVERT_MSG: &str = "No file revert for this workspace";
 const NO_FILE_CHANGES_MSG: &str =
     "Nothing has written to this workspace, so there are no file changes to revert";
@@ -410,6 +413,9 @@ pub struct App {
     /// The layout last read or written, so a tick only reaches storage when
     /// something actually moved. `None` until the workbench first opens.
     pub(super) workbench_layout: Option<WorkbenchLayout>,
+    /// The plans and notes from the local document store that workbench tabs
+    /// hold, by the key of each one's tab.
+    stored_documents: HashMap<DocumentKey, StoredDocument>,
     pub(super) status_bar: StatusBar,
     pub(super) status_hits: Vec<StatusBarHit>,
     pub(super) status_mouse_down: Option<StatusBarHit>,
@@ -645,6 +651,7 @@ impl App {
             workbench: Workbench::new(workbench_styles()),
             workbench_theme_gen: crate::theme::generation(),
             workbench_layout: None,
+            stored_documents: HashMap::new(),
             status_bar,
             status_hits: Vec::new(),
             status_mouse_down: None,
@@ -739,6 +746,7 @@ impl App {
         );
         app.chats[0].context_window = app.state.model.context_window;
         app.sync_composer_cwd();
+        app.workbench.set_markdown_painter(paint_markdown);
         if let Some(workspace) = workspace_session
             && let Err(error) = app.workbench.bind_workspace_with_gate(
                 workspace,
@@ -1295,6 +1303,13 @@ impl App {
 
     fn plan_form_active(&self) -> bool {
         self.state.mode == Mode::Plan && self.plan_form.is_visible()
+    }
+
+    /// The form stays up while the plan is open in the workbench, but the
+    /// workbench is what the reader is looking at. A form that kept the keys
+    /// from behind it would implement the plan on the Enter meant for the text.
+    fn plan_form_takes_input(&self) -> bool {
+        self.plan_form_active() && !self.workbench.is_open()
     }
 
     /// Reconciles the session to a model it was handed. Every live session is
@@ -1923,7 +1938,7 @@ impl App {
         }
 
         // plan_form is non-modal: Passthrough falls through to the rest of dispatch
-        if self.plan_form_active() {
+        if self.plan_form_takes_input() {
             guard_repeat!(false);
             let action = self.plan_form.handle_key(key);
             if action != PlanFormAction::Passthrough {
@@ -2328,6 +2343,10 @@ impl App {
             WorkbenchAction::Close => self.close_permission_source(),
             WorkbenchAction::Flash(message) => self.status_bar.flash(message),
             WorkbenchAction::Copy(text) => self.copy_to_clipboard(&text),
+            WorkbenchAction::SaveDocument { key, text, close } => {
+                self.save_document(&key, text, close);
+            }
+            WorkbenchAction::RevertDocument(key) => self.revert_document(&key),
             WorkbenchAction::SendToComposer { path, lines } => {
                 self.close_permission_source();
                 let text = match path {
@@ -2693,15 +2712,7 @@ impl App {
                     self.plan_form.toggle();
                 }
             }
-            BuiltinAction::PlanEditor => {
-                return match self.state.plan.path() {
-                    Some(p) => vec![Action::OpenEditor(p.to_path_buf())],
-                    None => {
-                        self.flash(FLASH_NO_PLAN.into());
-                        vec![]
-                    }
-                };
-            }
+            BuiltinAction::PlanEditor => self.open_plan(),
             BuiltinAction::CopyMessage => {
                 let source = self.chats[self.active_chat].last_reply_source();
                 let message = match source {
@@ -2718,7 +2729,7 @@ impl App {
                 Some(source) => self.open_review(source),
                 None => self.flash(REVIEW_UNAVAILABLE_MSG.into()),
             },
-            BuiltinAction::EditInput => return vec![Action::EditInputInEditor],
+            BuiltinAction::EditInput => self.open_prompt_draft(),
             BuiltinAction::PopQueue => {
                 self.pop_active_queue();
             }
@@ -2794,6 +2805,9 @@ impl App {
     /// Opens source control on a commit the transcript named, the way a
     /// mention opens its file.
     pub(crate) fn open_workbench_commit(&mut self, commit: &CommitRef) {
+        if self.workbench_lent() {
+            return;
+        }
         self.sync_workbench_theme();
         let cwd = PathBuf::from(&self.state.session.cwd);
         self.workbench.open_at_commit(&cwd, &commit.id);
@@ -2804,6 +2818,9 @@ impl App {
     /// a session's worth of tabs around it would bury the answer.
     pub(crate) fn open_workbench_at(&mut self, mention: &Mention) {
         if let Some(path) = mention.remote_path() {
+            if self.workbench_lent() {
+                return;
+            }
             self.sync_workbench_theme();
             self.workbench
                 .open_remote_at(path.clone(), mention.lines.clone());
@@ -2819,6 +2836,9 @@ impl App {
         path: &Path,
         lines: Option<RangeInclusive<usize>>,
     ) {
+        if self.workbench_lent() {
+            return;
+        }
         self.sync_workbench_theme();
         let cwd = PathBuf::from(&self.state.session.cwd);
         self.workbench.open_at(&cwd, path, lines);
@@ -4032,6 +4052,7 @@ impl App {
 
         if let AgentEvent::ToolDone(ref e) = envelope.event {
             self.record_tool_call(e);
+            self.reload_written(e);
             // Whatever the call opened and never claimed was a prediction the
             // call disagreed with: bad arguments, or a child `batch` refused.
             if subagent_id.is_none() {
@@ -5306,7 +5327,6 @@ impl App {
             | self.tick_file_picker()
             | self.mention_popup.tick()
             | self.commit_popup.tick()
-            | self.refresh_memory_picker_if_stale()
             | self.refresh_session_picker()
             | self.poll_workflow_replies()
             | self.tick_workbench()
@@ -5730,20 +5750,21 @@ impl App {
         }
     }
 
-    /// What the external editor opens on, paired with
-    /// [`App::apply_external_input`] so a round trip cannot read one composer
-    /// and write another.
-    pub(crate) fn active_input_text(&self) -> String {
+    /// What a prompt draft opens on, with every folded paste spelled out.
+    fn active_input_text(&self) -> String {
         self.active_input_box().expanded_text()
     }
 
-    pub(crate) fn apply_external_input(&mut self, previous: &str, edited: String) {
-        let edited = edited.replace("\r\n", "\n").replace('\r', "\n");
-        if edited == previous {
+    /// Puts a saved prompt draft into the composer. A draft that still reads
+    /// the way the composer does is left alone, so saving an untouched one
+    /// keeps its pastes folded.
+    fn apply_prompt_draft(&mut self, text: String) {
+        let text = text.replace("\r\n", "\n").replace('\r', "\n");
+        if text == self.active_input_text() {
             return;
         }
         let input = self.active_input_box_mut();
-        input.set_input(edited);
+        input.set_input(text);
         input.move_to_end();
         self.resync_dropdowns();
     }
@@ -5755,19 +5776,19 @@ impl App {
                 self.plan_form.hide();
                 vec![]
             }
-            PlanFormAction::OpenEditor => match self.state.plan.path() {
-                Some(p) => vec![Action::OpenEditor(p.to_path_buf())],
-                None => {
-                    self.flash(FLASH_NO_PLAN.into());
-                    vec![]
-                }
-            },
+            PlanFormAction::OpenEditor => {
+                self.open_plan();
+                vec![]
+            }
             PlanFormAction::Implement => self.implement_plan(false),
             PlanFormAction::ClearAndImplement => self.implement_plan(true),
         }
     }
 
     fn implement_plan(&mut self, clear_context: bool) -> Vec<Action> {
+        if self.plan_unsaved() {
+            return vec![];
+        }
         let parallel = self.plan_form.parallel();
         self.plan_form.reset();
         let plan_snapshot = match std::mem::take(&mut self.state.plan) {

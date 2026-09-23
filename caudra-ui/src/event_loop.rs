@@ -2284,8 +2284,12 @@ impl<'t> EventLoop<'t> {
                 }
             }
             UiAction::OpenEditor { path, reply_tx } => {
-                let code = self.open_editor(self.focused, &path);
+                let code = self.open_editor(&path);
                 let _ = reply_tx.send(code);
+            }
+            UiAction::OpenWorkbench { path, line } => {
+                self.focused_app()
+                    .open_workbench_file(&path, line.map(|line| line..=line));
             }
             UiAction::OpenWin {
                 buf,
@@ -2339,9 +2343,10 @@ impl<'t> EventLoop<'t> {
         }
     }
 
-    /// Exits with the editor's status code; `-1` (flashed on the session's
-    /// app) when the editor could not be launched.
-    fn open_editor(&mut self, idx: usize, path: &std::path::Path) -> i32 {
+    /// `caudra.ui.open_editor`, the one caller left that wants `$EDITOR`.
+    /// Exits with the editor's status code; `-1` (flashed on the focused
+    /// session) when the editor could not be launched.
+    fn open_editor(&mut self, path: &std::path::Path) -> i32 {
         let result = {
             let _pause = self.input.pause();
             terminal::open_in_editor(path, self.terminal)
@@ -2350,7 +2355,7 @@ impl<'t> EventLoop<'t> {
         match result {
             Ok(code) => code,
             Err(e) => {
-                self.sessions[idx].app.flash(e);
+                self.focused_app().flash(e);
                 -1
             }
         }
@@ -3717,9 +3722,6 @@ impl<'t> EventLoop<'t> {
                     );
                 }
             }
-            Action::OpenEditor(path) => {
-                self.open_editor(idx, &path);
-            }
             Action::OpenUrl(target) => {
                 if terminal::local_url_opener_available() {
                     let valid = url::Url::parse(&target).is_ok_and(|url| {
@@ -3734,20 +3736,6 @@ impl<'t> EventLoop<'t> {
                             .app
                             .flash(format!("Failed to open URL: {error}"));
                     }
-                }
-            }
-            Action::EditInputInEditor => {
-                let current_text = self.sessions[idx].app.active_input_text();
-                let result = {
-                    let _pause = self.input.pause();
-                    terminal::edit_temp_content(&current_text, self.terminal)
-                };
-                self.terminal_focused = false;
-                match result {
-                    Ok(edited) => self.sessions[idx]
-                        .app
-                        .apply_external_input(&current_text, edited),
-                    Err(e) => self.sessions[idx].app.flash(e),
                 }
             }
             Action::Btw(question) => {

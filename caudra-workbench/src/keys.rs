@@ -119,6 +119,9 @@ pub const SEND_TO_COMPOSER: Bind = leader!(KeyCode::Enter, "Enter");
 /// `k` for emacs' kill-buffer, which leaves `w` to the search pane.
 pub const CLOSE_TAB: Bind = leader!(KeyCode::Char('k'), "k");
 pub const TOGGLE_WRAP: Bind = leader!(KeyCode::Char('z'), "z");
+/// The transcript spends `v` on its own compact view, which is behind the
+/// workbench while this answers, so the chord only shadows it here.
+pub const TOGGLE_RENDERED: Bind = leader!(KeyCode::Char('v'), "v");
 pub const SHRINK_SIDEBAR: Bind = leader!(KeyCode::Char('-'), "-");
 pub const GROW_SIDEBAR: Bind = leader!(KeyCode::Char('='), "=");
 pub const SHRINK_SECTION: Bind = leader!(KeyCode::Up, "↑");
@@ -182,6 +185,7 @@ pub const LEADER_BINDS: &[Bind] = &[
     SEND_TO_COMPOSER,
     CLOSE_TAB,
     TOGGLE_WRAP,
+    TOGGLE_RENDERED,
     SHRINK_SIDEBAR,
     GROW_SIDEBAR,
     SHRINK_SECTION,
