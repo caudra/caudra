@@ -2022,8 +2022,21 @@ impl Workbench {
         if cursor.section != section || cursor.row != Some(row) {
             return true;
         }
-        self.activate_scm();
+        match self.on_closed_commit() {
+            true => self.open_commit_detail(),
+            false => self.activate_scm(),
+        }
         true
+    }
+
+    /// Whether the cursor is on a commit that is closed, which a click opens
+    /// and shows at once, the way `D` does. A click on an open commit only
+    /// closes it: showing it as well would read its paths, and reading its
+    /// paths is what opens it again.
+    fn on_closed_commit(&self) -> bool {
+        self.scm
+            .selected_commit()
+            .is_some_and(|commit| self.scm.commit_files(&commit.id).is_none())
     }
 
     /// Cancels an armed discard, which every press but the one that confirms it
@@ -4072,6 +4085,7 @@ mod tests {
     const REMOTE_SETTLE_TIMEOUT: Duration = Duration::from_secs(10);
     const COMMIT_OPENED_WHOLE: &str = "a commit must open into its paths, not into one document";
     const MESSAGE_NOT_SHOWN: &str = "the commit tab does not say what the commit says";
+    const CLICK_REOPENED: &str = "a click on an open commit must close it, not show it again";
     const INITIAL_MESSAGE: &str = "initial";
     const SUBJECT: &str = "rewrite the scheduler";
     const BODY: &str = "The old one woke every tick.";
@@ -6769,6 +6783,43 @@ mod tests {
         workbench.handle_key(press(keys::OPEN_DIFF));
 
         assert!(workbench.layout().tabs.is_empty(), "{LAYOUT_LOST}");
+    }
+
+    #[test]
+    fn a_click_on_a_closed_commit_lists_its_paths_and_opens_its_message() {
+        let (_dir, mut workbench) = repository();
+        workbench.handle_key(key(keys::STAGE_TOGGLE.code));
+        commit_message(&mut workbench, &format!("{SUBJECT}\n\n{BODY}"));
+        paint(&mut workbench, TERMINAL_WIDTH, TERMINAL_HEIGHT);
+        let body = body_of(&workbench, Section::Graph);
+
+        workbench.handle_mouse(click(body.x + 1, body.y));
+
+        assert!(workbench.scm.is_expanded(0), "{COMMIT_NOT_LISTED}");
+        let tab = workbench.editor.active().expect("a commit detail tab");
+        assert!(
+            tab.buffer.lines().join("\n").contains(BODY),
+            "{MESSAGE_NOT_SHOWN}"
+        );
+    }
+
+    /// Showing a commit reads its paths, and reading its paths is what opens
+    /// it, so the second click has to close the commit rather than show it
+    /// again and undo its own fold.
+    #[test]
+    fn a_second_click_on_a_commit_closes_it() {
+        let (_dir, mut workbench) = repository();
+        workbench.handle_key(key(keys::STAGE_TOGGLE.code));
+        commit_all(&mut workbench);
+        paint(&mut workbench, TERMINAL_WIDTH, TERMINAL_HEIGHT);
+        let body = body_of(&workbench, Section::Graph);
+        workbench.handle_mouse(click(body.x + 1, body.y));
+        paint(&mut workbench, TERMINAL_WIDTH, TERMINAL_HEIGHT);
+
+        workbench.handle_mouse(click(body.x + 1, body.y));
+
+        assert!(!workbench.scm.is_expanded(0), "{CLICK_REOPENED}");
+        assert_eq!(workbench.editor.tabs().len(), 1, "{CLICK_REOPENED}");
     }
 
     #[test]

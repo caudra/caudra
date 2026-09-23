@@ -167,6 +167,8 @@ Rows in `GRAPH` carry a rail glyph: `●` for a commit on the chain of first par
 
 A row has width for a subject and no more, so a commit whose message says more than its subject carries a `¶` after it. `D` on a commit opens the whole message as a read-only tab: the hash, who wrote it and when, the parents it was built on, the message laid out as it was written, and the paths it touched. The tab is ordinary text, so `Ctrl+F` searches it and `Ctrl+C` copies from it. Long lines are left alone rather than rewrapped, because a message may hold a code fence or a table; `Ctrl+X z` wraps them if you would rather read it that way.
 
+Clicking a closed commit does both at once: it lists the paths and opens the message. Clicking an open one only closes it, and leaves whatever tab you are reading where it is.
+
 Any number of commits can stay open at once, and a folder folded under one commit stays open under another. A commit's message, a commit's diff, and the working tree's diff of the same path are all separate tabs.
 
 | Key | Action |
