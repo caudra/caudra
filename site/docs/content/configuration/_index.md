@@ -451,6 +451,21 @@ Development builds compiled with debug assertions use `caudra-debug` for every p
 
 Set `CAUDRA_NAMESPACE` to choose the directory name yourself instead of letting the build profile pick it. The value is a single directory name, so `CAUDRA_NAMESPACE=caudra-review` reads and writes `~/.config/caudra-review/`, `~/.local/state/caudra-review/`, and the rest. Use it to give a run its own config and session store, or to point a debug build at your release directories. A value that cannot be a directory name, such as one holding a path separator or `..`, stops Caudra with an error rather than falling back. An empty value counts as unset. Per-project `.caudra/` directories are unaffected.
 
+## Config file versions
+
+Each TOML config file takes a top-level `version`, and every format is at version 1. Where the key is optional, a file without it counts as version 1. A build that finds a newer version than it reads refuses the file instead of guessing what it means, and the error says to upgrade Caudra.
+
+| File | `version` | Newer than this build reads |
+|------|-----------|-----------------------------|
+| `permissions.toml` | Optional | Fails closed. Tool calls are denied until the file is fixed |
+| `mcp.toml` | Optional | Servers from that file do not start, and Caudra shows the error |
+| `providers.toml` | Optional | Caudra stops with an error |
+| `plugin.toml` | Optional | Every permission of that plugin is denied |
+| `workcell.toml` | Required | Rejected with an error |
+| `sandboxes.toml` | Required | Rejected with an error |
+
+Caudra writes `version = 1` whenever it saves `providers.toml`. `init.lua` has no version because it is a script. To share one `init.lua` across releases, branch on [`caudra.version()`](/docs/lua-api/#caudra-version).
+
 ## Personal Instructions
 
 On top of the project instruction files Caudra loads from the git root down to the cwd (`AGENTS.md`, `CLAUDE.md`, and friends; see [Context](/docs/context/#instruction-files)), you can add:

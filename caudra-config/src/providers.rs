@@ -10,7 +10,10 @@ use tracing::debug;
 use caudra_storage::paths;
 use caudra_storage::thinking::ReasoningOptions;
 
+use crate::config_version::{CONFIG_VERSION_KEY, ConfigVersion};
+
 const PROVIDERS_FILE: &str = "providers.toml";
+const PROVIDERS_VERSION: u32 = 1;
 const BAD_CONFIG_EXIT_CODE: i32 = 2;
 /// The only built-in that reads `enable_free_models`.
 const OPENCODE_SLUG: &str = "opencode";
@@ -322,6 +325,29 @@ pub fn slugify(name: &str) -> String {
         .join("-")
 }
 
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+pub enum ProviderSlugError {
+    #[error("provider name cannot be empty")]
+    Empty,
+    #[error(
+        "`{key}` is reserved in {file}; choose another provider name",
+        key = CONFIG_VERSION_KEY,
+        file = PROVIDERS_FILE
+    )]
+    Reserved,
+}
+
+/// Slug for a new custom provider. Top-level keys of `providers.toml` are
+/// slugs, so the file's own `version` key cannot be one.
+pub fn custom_provider_slug(name: &str) -> Result<String, ProviderSlugError> {
+    let slug = slugify(name);
+    match slug.as_str() {
+        "" => Err(ProviderSlugError::Empty),
+        CONFIG_VERSION_KEY => Err(ProviderSlugError::Reserved),
+        _ => Ok(slug),
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Protocol {
@@ -462,6 +488,9 @@ impl ProviderDef {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ProvidersConfig {
+    /// Named ahead of the flattened map, so the key never reads as a slug.
+    #[serde(default)]
+    version: ConfigVersion<PROVIDERS_VERSION>,
     #[serde(flatten)]
     pub providers: HashMap<String, ProviderDef>,
 }
@@ -668,6 +697,7 @@ pub fn resolve_login_url(slug: &str, plan: Option<&str>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config_version::ConfigVersionError;
     use test_case::test_case;
 
     const UNKNOWN_PURPOSE: &str = "unknown variant `compaction`";
@@ -1112,5 +1142,51 @@ best = "gpt-4.1"
     #[test_case("My.Cool@Provider!", "my-cool-provider"; "special_chars")]
     fn slugify_tests(input: &str, expected: &str) {
         assert_eq!(slugify(input), expected);
+    }
+
+    #[test_case("My Proxy", Ok("my-proxy".into()) ; "usable_name")]
+    #[test_case("", Err(ProviderSlugError::Empty) ; "empty")]
+    #[test_case(" -- ", Err(ProviderSlugError::Empty) ; "separators_only")]
+    #[test_case(" Version ", Err(ProviderSlugError::Reserved) ; "reserved_after_slugify")]
+    fn custom_provider_slug_refuses_unusable_names(
+        name: &str,
+        expected: Result<String, ProviderSlugError>,
+    ) {
+        assert_eq!(custom_provider_slug(name), expected);
+    }
+
+    /// Caudra rewrites the whole file on save, in the current shape.
+    #[test]
+    fn saving_stamps_the_version_without_turning_it_into_a_provider() {
+        let unversioned: ProvidersConfig = toml::from_str(DEFAULTS_TOML).unwrap();
+        let rewritten = toml::to_string_pretty(&unversioned).unwrap();
+        let document: toml::Table = toml::from_str(&rewritten).unwrap();
+        let reparsed: ProvidersConfig = toml::from_str(&rewritten).unwrap();
+
+        assert_eq!(
+            document[CONFIG_VERSION_KEY].as_integer(),
+            Some(i64::from(PROVIDERS_VERSION)),
+            "{rewritten}"
+        );
+        assert_eq!(reparsed.providers.keys().collect::<Vec<_>>(), ["local"]);
+    }
+
+    #[test_case(
+        format!("{CONFIG_VERSION_KEY} = {}\n", PROVIDERS_VERSION + 1),
+        ConfigVersionError::Newer {
+            found: i64::from(PROVIDERS_VERSION + 1),
+            latest: PROVIDERS_VERSION,
+        }
+        ; "newer_version"
+    )]
+    #[test_case(
+        format!("[{CONFIG_VERSION_KEY}]\nprotocol = \"openai\"\n"),
+        ConfigVersionError::Invalid
+        ; "provider_named_version"
+    )]
+    fn config_rejects_a_version_it_cannot_read(document: String, expected: ConfigVersionError) {
+        let error = toml::from_str::<ProvidersConfig>(&document).unwrap_err();
+
+        assert!(error.to_string().contains(&expected.to_string()), "{error}");
     }
 }

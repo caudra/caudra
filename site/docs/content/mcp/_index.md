@@ -62,11 +62,12 @@ oauth = { client_id = "acme-client", client_secret = "s3cret", callback_port = 3
 
 Set `command` for stdio, `url` for HTTP. Pick one.
 
-One option lives at the top level of `mcp.toml`, outside any server:
+Two options live at the top level of `mcp.toml`, outside any server:
 
 | Field | Type | Default | Notes |
 |-------|------|---------|-------|
 | `defer_tools` | usize | 10 | Defer tools only when more than this many exist |
+| `version` | integer | 1 | File format version. When it is newer than this build reads, no server in the file starts and Caudra shows the error. See [Config file versions](/docs/configuration/#config-file-versions) |
 
 ## Tool search
 

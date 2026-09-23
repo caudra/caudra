@@ -1,7 +1,10 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, LazyLock, Mutex};
 
-use caudra_config::{DefaultEffect, Effect, PermissionRule, PermissionsConfig, ToolKey};
+use caudra_config::config_version::{ConfigVersion, ConfigVersionError};
+use caudra_config::{
+    DefaultEffect, Effect, PERMISSIONS_VERSION, PermissionRule, PermissionsConfig, ToolKey,
+};
 use caudra_workflow::meta::MAX_SOURCE_BYTES;
 use caudra_workflow::{WORKFLOW_ABI_VERSION, WORKFLOW_LANGUAGE_VERSION, WorkflowMeta, parse_meta};
 use caudra_workspace::{
@@ -25,6 +28,7 @@ const MAX_INSTRUCTION_BYTES: u32 = 64 * 1024;
 const MAX_COMMAND_BYTES: u32 = 64 * 1024;
 const MAX_SKILL_BYTES: u32 = 128 * 1024;
 const MAX_PERMISSION_BYTES: u32 = 128 * 1024;
+const PERMISSIONS_ASSET: &str = ".caudra/permissions.toml";
 const SHA256_HEX_LEN: usize = 64;
 const MAX_NAMED_SKIPS: usize = 4;
 const SKIPPED_ASSETS_WARNING: &str = "Remote project assets Caudra does not recognise were skipped";
@@ -60,6 +64,12 @@ pub enum RemoteProjectContextError {
     AssetTooLarge(String),
     #[error("remote project asset is invalid: {0}")]
     InvalidContent(String),
+    #[error("remote project asset {path} has an unsupported version: {cause}")]
+    UnsupportedVersion {
+        path: String,
+        #[source]
+        cause: ConfigVersionError,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -590,7 +600,7 @@ fn validate_asset(asset: &ProjectAsset) -> Result<(), RemoteProjectContextError>
         ProjectAssetKind::Workflow if is_workflow_path(path) => {
             ProjectAssetTrust::ClientApprovalRequired
         }
-        ProjectAssetKind::Permissions if path == ".caudra/permissions.toml" => {
+        ProjectAssetKind::Permissions if path == PERMISSIONS_ASSET => {
             ProjectAssetTrust::MixedReviewRequired
         }
         _ => return Err(RemoteProjectContextError::InvalidAsset(path.to_owned())),
@@ -743,27 +753,25 @@ struct ToolDeclaration {
 pub fn parse_remote_permissions(
     bytes: &[u8],
 ) -> Result<RemotePermissionDeclarations, RemoteProjectContextError> {
-    let text = std::str::from_utf8(bytes).map_err(|_| {
-        RemoteProjectContextError::InvalidContent(".caudra/permissions.toml".into())
-    })?;
-    let table: toml::Table = toml::from_str(text).map_err(|_| {
-        RemoteProjectContextError::InvalidContent(".caudra/permissions.toml".into())
+    let text = std::str::from_utf8(bytes).map_err(|_| permission_content_error())?;
+    let mut table: toml::Table = toml::from_str(text).map_err(|_| permission_content_error())?;
+    ConfigVersion::<PERMISSIONS_VERSION>::take(&mut table).map_err(|cause| {
+        RemoteProjectContextError::UnsupportedVersion {
+            path: PERMISSIONS_ASSET.into(),
+            cause,
+        }
     })?;
     let mut declarations = RemotePermissionDeclarations::default();
     for (name, value) in table {
         if name == "default" {
-            declarations.default = Some(value.try_into().map_err(|_| {
-                RemoteProjectContextError::InvalidContent(".caudra/permissions.toml".into())
-            })?);
+            declarations.default = Some(value.try_into().map_err(|_| permission_content_error())?);
             continue;
         }
         if name == "mcp" {
             parse_remote_mcp(value, &mut declarations)?;
             continue;
         }
-        let key = ToolKey::parse(&name).map_err(|_| {
-            RemoteProjectContextError::InvalidContent(".caudra/permissions.toml".into())
-        })?;
+        let key = ToolKey::parse(&name).map_err(|_| permission_content_error())?;
         parse_tool_declaration(key, value, &mut declarations)?;
     }
     Ok(declarations)
@@ -870,7 +878,7 @@ fn insert_default(
 }
 
 fn permission_content_error() -> RemoteProjectContextError {
-    RemoteProjectContextError::InvalidContent(".caudra/permissions.toml".into())
+    RemoteProjectContextError::InvalidContent(PERMISSIONS_ASSET.into())
 }
 
 #[cfg(test)]
@@ -878,6 +886,7 @@ pub(crate) mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use async_trait::async_trait;
+    use caudra_config::config_version::CONFIG_VERSION_KEY;
     use caudra_workspace::{
         CwdHandle, OperationId, ProjectAssetContent, ProjectAssetManifest, ProjectKey,
         ResourceScope, SessionBindingId, SessionWorkspaceBinding, SourceTrustAnchor,
@@ -1593,6 +1602,47 @@ pub(crate) mod tests {
         assert_eq!(declarations.restrictive_rules[0].effect, Effect::Deny);
         assert_eq!(declarations.allow_rules.len(), 1);
         assert_eq!(declarations.allow_rules[0].effect, Effect::Allow);
+    }
+
+    #[test]
+    fn current_permission_version_is_not_read_as_a_tool_section() {
+        let rules = "[shell]\ndeny = ['rm ']\n";
+        let versioned = format!("{CONFIG_VERSION_KEY} = {PERMISSIONS_VERSION}\n{rules}");
+
+        assert_eq!(
+            parse_remote_permissions(versioned.as_bytes()),
+            parse_remote_permissions(rules.as_bytes())
+        );
+    }
+
+    #[test]
+    fn newer_permission_version_refuses_the_context() {
+        let found = PERMISSIONS_VERSION + 1;
+        let source = format!("{CONFIG_VERSION_KEY} = {found}\n[shell]\ndeny = ['rm ']\n");
+        let permission_asset = asset(
+            PERMISSIONS_ASSET,
+            "permission-1",
+            ProjectAssetKind::Permissions,
+            ProjectAssetTrust::MixedReviewRequired,
+            source.len() as u64,
+        );
+
+        let error = smol::block_on(RemoteProjectContextLoader::new().load(&session(
+            AssetService::new(vec![(permission_asset, source.as_str())]),
+            "alice",
+        )))
+        .unwrap_err();
+
+        assert_eq!(
+            error,
+            RemoteProjectContextError::UnsupportedVersion {
+                path: PERMISSIONS_ASSET.into(),
+                cause: ConfigVersionError::Newer {
+                    found: i64::from(found),
+                    latest: PERMISSIONS_VERSION,
+                },
+            }
+        );
     }
 
     #[test]

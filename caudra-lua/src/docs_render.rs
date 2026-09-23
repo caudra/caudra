@@ -49,7 +49,9 @@ The rules:
   warning at load time.
 - `plugin.toml` exists: permissions default to granted; set a key to
   `false` to revoke it. An empty file grants everything.
-- Invalid TOML: everything denied, with a warning in the log.
+- Invalid TOML, or a top-level `version` newer than this build reads:
+  everything denied, with a warning in the log. `version` is optional and
+  a file without it counts as version 1.
 "#;
     let keys = Permission::ALL.map(Permission::manifest_key);
     let anchor = if anchored {

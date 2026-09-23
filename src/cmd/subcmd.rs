@@ -15,8 +15,9 @@ use caudra_agent::tools::{
     ToolFilter, ToolRegistry, ToolState, builtin_report, is_tool_enabled,
 };
 use caudra_config::providers::{
-    Protocol, ProviderDef, ProvidersConfig, all_builtins, builtin_provider, resolve_api_key_env,
-    resolve_base_url, resolve_default_model, resolve_display_name, resolve_login_url, slugify,
+    Protocol, ProviderDef, ProvidersConfig, all_builtins, builtin_provider, custom_provider_slug,
+    resolve_api_key_env, resolve_base_url, resolve_default_model, resolve_display_name,
+    resolve_login_url, slugify,
 };
 use caudra_config::{Config, DefaultEffect, ModelPolicy, PermissionsConfig, ToolKey};
 use caudra_lua::PluginHost;
@@ -425,10 +426,7 @@ fn login_custom(storage: &StateDir) -> Result<()> {
     io::stdout().flush()?;
     let mut name = String::new();
     io::stdin().read_line(&mut name)?;
-    let slug = slugify(&name);
-    if slug.is_empty() {
-        bail!("provider name cannot be empty");
-    }
+    let slug = custom_provider_slug(&name)?;
 
     println!("  Protocol:");
     println!("    1. openai           (OpenAI Chat Completions)");

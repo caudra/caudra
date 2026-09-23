@@ -305,6 +305,8 @@ Project shell allows require trust before they become active. On startup, the TU
 
 An unreadable or malformed permissions file fails closed. Caudra disables inherited allows and denies tool calls until the file is fixed.
 
+The file can start with `version = 1`, and a file without it counts as version 1. A version newer than this build reads fails closed the same way, so an older Caudra never applies rules it would misread. See [Config file versions](/docs/configuration/#config-file-versions).
+
 A project `prompt` default cannot weaken a global `deny` default, including per-tool and MCP defaults.
 
 `/permissions` lists inactive entries as `needs review` and shows trusted config policy. Source-backed policy is separate from stored rules. Use [Edit source](#editing-policy-sources) when a verified local source is available, then reload and review any required trust separately.

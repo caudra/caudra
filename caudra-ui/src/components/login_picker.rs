@@ -4,7 +4,9 @@ use ratatui::layout::{Position, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Wrap;
 
-use caudra_config::providers::{self, Protocol, ProviderDef, ProvidersConfig, slugify};
+use caudra_config::providers::{
+    self, Protocol, ProviderDef, ProviderSlugError, ProvidersConfig, custom_provider_slug,
+};
 use caudra_grab::grab_scope;
 use caudra_providers::catalog_providers_if_available;
 use caudra_storage::StateDir;
@@ -327,14 +329,13 @@ impl LoginPicker {
             }
             Step::PickPlan { picker, slug } => Self::map_plan_action(picker.handle_key(key), slug),
             Step::CustomName { input } => match key.code {
-                KeyCode::Enter => {
-                    let name = input.value().trim().to_string();
-                    let slug = slugify(&name);
-                    if slug.is_empty() {
-                        return LoginPickerAction::Consumed;
-                    }
-                    StepAction::GoCustomProtocol { slug }
-                }
+                KeyCode::Enter => match custom_provider_slug(&input.value()) {
+                    Ok(slug) => StepAction::GoCustomProtocol { slug },
+                    Err(ProviderSlugError::Empty) => return LoginPickerAction::Consumed,
+                    Err(error) => StepAction::GoError {
+                        message: format!("Error: {error}"),
+                    },
+                },
                 KeyCode::Esc => StepAction::Back,
                 _ => {
                     input.handle_key(key);
@@ -1095,6 +1096,21 @@ mod tests {
                 ref protocol,
                 ..
             } if slug == "custom" && protocol == "openai-responses"
+        ));
+    }
+
+    #[test]
+    fn reserved_custom_name_explains_the_refusal() {
+        let mut picker = LoginPicker::new();
+        picker.step = Step::CustomName {
+            input: TextBuffer::new(" Version ".into()),
+        };
+
+        picker.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(matches!(
+            &picker.step,
+            Step::Done { message } if message.contains(&ProviderSlugError::Reserved.to_string())
         ));
     }
 

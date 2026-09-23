@@ -77,7 +77,9 @@ The rules:
   warning at load time.
 - `plugin.toml` exists: permissions default to granted; set a key to
   `false` to revoke it. An empty file grants everything.
-- Invalid TOML: everything denied, with a warning in the log.
+- Invalid TOML, or a top-level `version` newer than this build reads:
+  everything denied, with a warning in the log. `version` is optional and
+  a file without it counts as version 1.
 
 ## Overview
 
@@ -175,6 +177,30 @@ set; an empty {sep} splits into single characters.
 caudra.split("a,b,c", ",")                   -- { "a", "b", "c" }
 caudra.split("x*y*z", "*", { plain = true }) -- { "x", "y", "z" }
 caudra.split("\nhello\nworld\n", "\n", { trimempty = true }) -- { "hello", "world" }
+```
+
+---
+
+### `caudra.version()` {#caudra-version}
+
+```lua
+caudra.version()
+```
+
+Return the version of the running Caudra build. Mirrors Neovim's
+`vim.version()`, so one `init.lua` can adapt to several releases instead
+of declaring a config version.
+
+**Returns:** (`table`) `major`, `minor` and `patch` integers, plus a `prerelease`
+string on pre-release builds.
+
+**Example:**
+
+```lua
+local v = caudra.version()
+if v.major > 0 or v.minor >= 2 then
+  -- use a setting added in 0.2
+end
 ```
 
 

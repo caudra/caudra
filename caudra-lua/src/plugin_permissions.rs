@@ -2,10 +2,12 @@ use std::fmt;
 use std::io;
 use std::path::Path;
 
+use caudra_config::config_version::ConfigVersion;
 use mlua::{Error as LuaError, Function, IntoLuaMulti, Lua, Result as LuaResult};
 use tracing::warn;
 
 const MANIFEST_FILE: &str = "plugin.toml";
+const MANIFEST_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Permission {
@@ -131,7 +133,9 @@ pub(crate) fn load_plugin_permissions_with_trust(
     };
     let manifest_path = dir.join(MANIFEST_FILE);
     match std::fs::read_to_string(&manifest_path) {
-        Ok(content) => match toml::from_str::<toml::Value>(&content) {
+        Ok(content) => match ConfigVersion::<MANIFEST_VERSION>::check_document(&content)
+            .and_then(|_| toml::from_str::<toml::Value>(&content))
+        {
             Ok(val) => (PluginPermissions::from_manifest(&val), true),
             Err(e) => {
                 warn!(
@@ -164,6 +168,7 @@ pub(crate) fn load_plugin_permissions_with_trust(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use caudra_config::config_version::CONFIG_VERSION_KEY;
 
     #[test]
     fn trusted_allows_everything() {
@@ -205,6 +210,41 @@ mod tests {
         let p = PluginPermissions::from_manifest(&val);
         for perm in Permission::ALL {
             assert!(p.is_allowed(perm), "{perm} should default to allowed");
+        }
+    }
+
+    fn load_manifest(content: &str) -> (PluginPermissions, bool) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(MANIFEST_FILE), content).unwrap();
+        load_plugin_permissions_with_trust(Some(dir.path()))
+    }
+
+    #[test]
+    fn newer_manifest_version_denies_everything() {
+        let (permissions, trusted) = load_manifest(&format!(
+            "{CONFIG_VERSION_KEY} = {}\n[permissions]\nnet = true\n",
+            MANIFEST_VERSION + 1
+        ));
+
+        assert!(!trusted);
+        for perm in Permission::ALL {
+            assert!(!permissions.is_allowed(perm), "{perm} should be denied");
+        }
+    }
+
+    #[test]
+    fn current_manifest_version_keeps_its_grants() {
+        let (permissions, trusted) = load_manifest(&format!(
+            "{CONFIG_VERSION_KEY} = {MANIFEST_VERSION}\n[permissions]\nnet = false\n"
+        ));
+
+        assert!(trusted);
+        for perm in Permission::ALL {
+            assert_eq!(
+                permissions.is_allowed(perm),
+                perm != Permission::Net,
+                "{perm}"
+            );
         }
     }
 

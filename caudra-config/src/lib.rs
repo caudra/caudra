@@ -16,8 +16,11 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tracing::warn;
 
+use crate::config_version::ConfigVersion;
+
 const PROJECT_DIR: &str = ".caudra";
 const PERMISSIONS_FILE: &str = "permissions.toml";
+pub const PERMISSIONS_VERSION: u32 = 1;
 const SHELL_PERMISSION_TOOLS: &[&str] = &["bash", "shell"];
 /// Tools whose card never opens on its own. A truncated prefix of one of
 /// these bodies carries nothing: a read and a fetch are windows into a
@@ -41,6 +44,7 @@ const PROCESS_ONLY_ENV_VARS: &[&str] = &[
     "WORKCELL_MCP_CODE_WORKER",
 ];
 
+pub mod config_version;
 pub mod providers;
 pub mod sandbox;
 pub mod steering;
@@ -1144,7 +1148,8 @@ struct PermissionsFileConfig {
 
 impl<'de> Deserialize<'de> for PermissionsFileConfig {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let table = toml::Table::deserialize(deserializer)?;
+        let mut table = toml::Table::deserialize(deserializer)?;
+        ConfigVersion::<PERMISSIONS_VERSION>::take(&mut table).map_err(serde::de::Error::custom)?;
         let default = table
             .get("default")
             .map(|value| {
@@ -3140,6 +3145,7 @@ pub fn global_config_dir() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config_version::CONFIG_VERSION_KEY;
     use std::fs;
     use tempfile::TempDir;
     use test_case::test_case;
@@ -4170,6 +4176,53 @@ mod tests {
             "[shell]\ndeny = [\"git push *\"]\nask = 1\n",
         )
         .unwrap();
+
+        let permissions = load_permissions_inner(dir.path(), Some(global.as_path()));
+
+        assert_eq!(permissions.default, DefaultEffect::Deny);
+        assert_eq!(
+            permissions.rules,
+            [PermissionRule {
+                tool: ToolKey::Wildcard,
+                scope: None,
+                effect: Effect::Deny,
+            }]
+        );
+    }
+
+    #[test]
+    fn current_permissions_version_is_not_read_as_a_tool_section() {
+        const RULES: &str = "[shell]\ndeny = [\"git push *\"]\n";
+        let versioned: PermissionsFileConfig = toml::from_str(&format!(
+            "{CONFIG_VERSION_KEY} = {PERMISSIONS_VERSION}\n{RULES}"
+        ))
+        .unwrap();
+        let unversioned: PermissionsFileConfig = toml::from_str(RULES).unwrap();
+
+        assert_eq!(
+            build_permissions(versioned, PermissionsFileConfig::default()).rules,
+            build_permissions(unversioned, PermissionsFileConfig::default()).rules
+        );
+    }
+
+    #[test_case(true ; "global")]
+    #[test_case(false ; "project")]
+    fn newer_permissions_version_fails_closed(global_file: bool) {
+        const GLOBAL_ALLOW: &str = "[shell]\nallow = [\"git status *\"]\n";
+        let dir = TempDir::new().unwrap();
+        let global = global_config_dir(dir.path());
+        let newer = format!(
+            "{CONFIG_VERSION_KEY} = {}\n{GLOBAL_ALLOW}",
+            PERMISSIONS_VERSION + 1
+        );
+        if global_file {
+            write_global_permissions(dir.path(), &newer);
+        } else {
+            write_global_permissions(dir.path(), GLOBAL_ALLOW);
+            let project_dir = dir.path().join(PROJECT_DIR);
+            fs::create_dir_all(&project_dir).unwrap();
+            fs::write(project_dir.join(PERMISSIONS_FILE), &newer).unwrap();
+        }
 
         let permissions = load_permissions_inner(dir.path(), Some(global.as_path()));
 

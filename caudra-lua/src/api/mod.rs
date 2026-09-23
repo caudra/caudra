@@ -23,6 +23,7 @@ pub(crate) mod treesitter;
 pub(crate) mod ui;
 pub(crate) mod util;
 pub(crate) mod uv;
+pub(crate) mod version;
 pub(crate) mod yaml;
 
 use std::sync::Arc;
@@ -88,6 +89,7 @@ pub(crate) fn create_caudra_global(
         r#fn::create_fn_table(lua, Arc::clone(&plugin), permissions, ui_action_tx)?,
     )?;
     split::split__register(&caudra, lua)?;
+    version::version__register(&caudra, lua)?;
     caudra.set("async", r#async::create_async_table(lua)?)?;
     caudra.set(
         "interpreter",

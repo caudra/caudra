@@ -12,9 +12,11 @@ use url::{Host, Url};
 
 use super::error::McpError;
 use crate::tools::is_builtin_tool;
+use caudra_config::config_version::ConfigVersion;
 use caudra_config::{global_config_dir, is_valid_server_name};
 
 const MCP_CONFIG_FILE: &str = "mcp.toml";
+const MCP_CONFIG_VERSION: u32 = 1;
 const DEFAULT_TIMEOUT_MS: u64 = 30_000;
 const MAX_TIMEOUT_MS: u64 = 300_000;
 
@@ -727,7 +729,8 @@ fn read_config(path: &Path) -> Result<Option<McpConfig>, McpConfigError> {
             });
         }
     };
-    toml::from_str(&content)
+    ConfigVersion::<MCP_CONFIG_VERSION>::check_document(&content)
+        .and_then(|_| toml::from_str(&content))
         .inspect_err(|e| {
             tracing::warn!(
                 path = %path.display(),
@@ -744,6 +747,7 @@ fn read_config(path: &Path) -> Result<Option<McpConfig>, McpConfigError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use caudra_config::config_version::{CONFIG_VERSION_KEY, ConfigVersionError};
     use test_case::test_case;
 
     const GLOBAL_SERVER: &str = "global-server";
@@ -1209,5 +1213,43 @@ command = ["echo", "hello"]
         .unwrap();
         let cfg = read_config(&path).unwrap().unwrap();
         assert!(cfg.mcp.contains_key("valid"));
+    }
+
+    fn write_versioned_config(version: u32) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(MCP_CONFIG_FILE);
+        fs::write(
+            &path,
+            format!(
+                "{CONFIG_VERSION_KEY} = {version}\n[mcp.{GLOBAL_SERVER}]\ncommand = ['true']\n"
+            ),
+        )
+        .unwrap();
+        (dir, path)
+    }
+
+    #[test]
+    fn read_config_loads_servers_from_the_current_version() {
+        let (_dir, path) = write_versioned_config(MCP_CONFIG_VERSION);
+
+        let config = read_config(&path).unwrap().unwrap();
+
+        assert!(config.mcp.contains_key(GLOBAL_SERVER));
+    }
+
+    #[test]
+    fn read_config_refuses_a_newer_version() {
+        let found = MCP_CONFIG_VERSION + 1;
+        let (_dir, path) = write_versioned_config(found);
+        let expected = ConfigVersionError::Newer {
+            found: i64::from(found),
+            latest: MCP_CONFIG_VERSION,
+        }
+        .to_string();
+
+        assert!(matches!(
+            read_config(&path),
+            Err(McpConfigError::Parse { error, .. }) if error.contains(&expected)
+        ));
     }
 }

@@ -4,6 +4,7 @@ use caudra_config::RawConfig;
 use mlua::{Function, Lua, LuaSerdeExt, Result as LuaResult};
 
 use crate::api::split::split__doc;
+use crate::api::version::version__doc;
 use crate::docs::{DocKind, FnDoc, ModuleDoc, ParamDoc};
 
 pub(crate) type ConfigStore = Arc<Mutex<Option<RawConfig>>>;
@@ -34,6 +35,7 @@ accepts the same keys as the Configuration reference.",
 })",
         },
         split__doc,
+        version__doc,
     ],
 };
 
