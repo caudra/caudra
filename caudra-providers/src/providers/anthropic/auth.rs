@@ -37,7 +37,11 @@ pub(crate) const AUTHORIZE_URL: &str = "https://claude.com/cai/oauth/authorize";
 pub(crate) const TOKEN_URL: &str = "https://platform.claude.com/v1/oauth/token";
 pub(crate) const API_ORIGIN: &str = "https://api.anthropic.com";
 pub(crate) const SCOPES: &str = "org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload";
-pub(crate) const CLAUDE_CODE_VERSION: &str = "2.1.251";
+/// Sent as the `claude-cli/<version>` user agent and folded into the OAuth
+/// billing header. The API refuses a model released after the version it is
+/// told about, so this has to move when a new Claude ships: Opus 5.5 rejects
+/// anything below 2.1.280.
+pub(crate) const CLAUDE_CODE_VERSION: &str = "2.1.280";
 
 const CALLBACK_TIMEOUT_MESSAGE: &str = "timed out waiting for Anthropic OAuth callback";
 const STATE_MISMATCH: &str = "Anthropic authorization failed: state mismatch";
