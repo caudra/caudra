@@ -27,8 +27,8 @@ use caudra_agent::tools::{
 };
 use caudra_agent::types::{Answer, QuestionEvent, WorkflowRunCard};
 use caudra_agent::{
-    AgentEvent, BatchToolEntry, BufferSnapshot, COMPACTION_ANCHOR, CommitRef, EMPTY_RESPONSE_RULE,
-    Mention, SubagentProgress, ToolDoneEvent, ToolOutput, ToolStartEvent,
+    AgentEvent, BatchToolEntry, BufferSnapshot, COMPACTION_ANCHOR, CallStage, CommitRef,
+    EMPTY_RESPONSE_RULE, Mention, SubagentProgress, ToolDoneEvent, ToolOutput, ToolStartEvent,
 };
 use caudra_config::{ToolOutputLines, UiConfig};
 use caudra_lua::WinView;
@@ -221,11 +221,15 @@ impl Chat {
                 size,
                 body,
                 roster,
+                complete,
                 ..
             } => {
                 self.messages_panel.tool_input_roster(&id, roster);
                 self.messages_panel.tool_input_preview(&id, preview, size);
                 self.messages_panel.tool_input_body(&id, body);
+                if complete {
+                    self.messages_panel.leave_stage(&id, CallStage::Drafting);
+                }
             }
             AgentEvent::ToolStart(e) => self.messages_panel.tool_start(*e),
             AgentEvent::ToolOutput { id, content } => self.tool_output(&id, &content),
@@ -737,6 +741,17 @@ impl Chat {
         self.messages_panel.update_tool_summary(tool_id, summary);
     }
 
+    /// A permission request is raised under the id of the call it is for, so
+    /// the request's own id names the card or batch child it holds.
+    pub(crate) fn await_approval(&mut self, tool_id: &str) {
+        self.messages_panel.await_approval(tool_id);
+    }
+
+    pub(crate) fn approval_settled(&mut self, tool_id: &str) {
+        self.messages_panel
+            .leave_stage(tool_id, CallStage::AwaitingApproval);
+    }
+
     pub fn update_tool_model(&mut self, tool_id: &str, model: &str) {
         self.messages_panel.update_tool_model(tool_id, model);
     }
@@ -1077,6 +1092,7 @@ pub fn history_to_display(
                     tool_raw_input: Some(Arc::new(input.clone())),
                     tool_output,
                     tool_preview_pending: false,
+                    tool_stage: None,
                     live_output: None,
                     live_body: None,
                     annotation,

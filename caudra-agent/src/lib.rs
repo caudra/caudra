@@ -77,7 +77,7 @@ pub use editable_queue::{
 };
 pub use types::{
     ActivityChild, AgentEvent, BatchProgressEvent, BatchToolEntry, BatchToolStatus, BufferSnapshot,
-    CodeGraphRow, CodeGraphSource, Delegation, DoneReason, ENVIRONMENT_COMMANDS_LABEL,
+    CallStage, CodeGraphRow, CodeGraphSource, Delegation, DoneReason, ENVIRONMENT_COMMANDS_LABEL,
     ENVIRONMENT_MISSING_LABEL, ENVIRONMENT_NO_VERSION, Envelope, EnvironmentCommand,
     EnvironmentFact, EventSender, GrepFileEntry, GrepLine, GrepMatchGroup, INDEX_TRUNCATED,
     IndexDirectoryEntry, IndexDirectoryEntryKind, IndexLine, IndexLineSemantic, IndexOutput,

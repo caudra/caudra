@@ -76,7 +76,8 @@ use std::time::{Duration, Instant};
 use caudra_agent::AgentInput;
 use caudra_agent::tools::{SHELL_TOOL_NAME, ToolEffect};
 use caudra_agent::{
-    BufferSnapshot, ImageSource, SubagentActivity, SubagentProgress, ToolInput, ToolOutput,
+    BufferSnapshot, CallStage, ImageSource, SubagentActivity, SubagentProgress, ToolInput,
+    ToolOutput,
 };
 use caudra_providers::model_registry::Binding;
 use caudra_providers::{CaudraId, HistoryItem, ModelPurpose};
@@ -1093,6 +1094,10 @@ pub struct DisplayMessage {
     pub tool_raw_input: Option<Arc<serde_json::Value>>,
     pub tool_output: Option<Arc<ToolOutput>>,
     pub tool_preview_pending: bool,
+    /// Where the call is before it runs, which its title names in place of
+    /// its verb. Live only, like [`Self::live_body`]: a restored call has long
+    /// since run.
+    pub tool_stage: Option<CallStage>,
     pub live_output: Option<String>,
     /// The file a write is still spelling out, as far as its arguments have
     /// arrived. Transient by construction: only ever set while the call's
@@ -1133,6 +1138,7 @@ impl DisplayMessage {
             tool_raw_input: None,
             tool_output: None,
             tool_preview_pending: false,
+            tool_stage: None,
             live_output: None,
             live_body: None,
             annotation: None,
@@ -1159,6 +1165,7 @@ impl DisplayMessage {
             tool_raw_input: None,
             tool_output: None,
             tool_preview_pending: false,
+            tool_stage: None,
             live_output: None,
             live_body: None,
             annotation: None,

@@ -265,11 +265,24 @@ impl RosterStream {
             .collect();
         self.changed |= delegated.iter().any(|(_, d)| d.name.is_some());
         Rostered {
-            entries: std::mem::take(&mut self.changed)
-                .then(|| self.children.iter().map_while(Child::entry).collect()),
+            entries: std::mem::take(&mut self.changed).then(|| self.entries()),
             delegated,
             ready: std::mem::take(&mut self.ready),
         }
+    }
+
+    /// Every named child as a row. The element still open is being written,
+    /// which is the one thing about it a queued row would misstate.
+    fn entries(&self) -> Vec<BatchToolEntry> {
+        let mut entries: Vec<BatchToolEntry> =
+            self.children.iter().map_while(Child::entry).collect();
+        if self.tracked
+            && entries.len() == self.children.len()
+            && let Some(open) = entries.last_mut()
+        {
+            open.status = BatchToolStatus::Drafting;
+        }
+        entries
     }
 
     /// Re-reads the element still being written. Every earlier child has
@@ -358,6 +371,9 @@ impl RosterStream {
             && let Some((index, child)) = self.children.iter_mut().enumerate().next_back()
         {
             child.settle();
+            // A named row stops drafting at this brace, which may be all that
+            // changed about it.
+            self.changed |= child.tool.is_some();
             if let Some(raw) = child.raw.take() {
                 self.ready.push((index, raw));
             }
@@ -796,6 +812,54 @@ mod tests {
         assert_eq!(entry.status, BatchToolStatus::Pending);
         assert_eq!(entry.effect, ToolEffect::Unknown);
         assert!(entry.output.is_none() && entry.raw_input.is_none());
+    }
+
+    /// Every roster published, in order, as the status of each row.
+    fn statuses(fragments: &[&str]) -> Vec<Vec<BatchToolStatus>> {
+        let mut stream = RosterStream::new(BATCH, false).unwrap();
+        fragments
+            .iter()
+            .filter_map(|fragment| stream.absorb(fragment).entries)
+            .map(|entries| entries.into_iter().map(|entry| entry.status).collect())
+            .collect()
+    }
+
+    /// Only the element still being written drafts, and the brace that ends
+    /// it is a publication even when nothing else about the row moved.
+    #[test]
+    fn the_open_element_drafts_until_its_own_brace() {
+        use BatchToolStatus::{Drafting, Pending};
+        let published = statuses(&[
+            r#"{"tool_calls": [{"tool": "file_read", "parameters": {"filePath": "a.rs""#,
+            "}}",
+            r#", {"tool": "file_grep", "parameters": {"pattern": "fn""#,
+            "}}]}",
+        ]);
+        assert_eq!(
+            published,
+            [
+                vec![Drafting],
+                vec![Pending],
+                vec![Pending, Drafting],
+                vec![Pending, Pending],
+            ]
+        );
+    }
+
+    /// An element past the cap is never a row, so the open element it is does
+    /// not make the last tracked child, long since closed, read as drafting.
+    #[test]
+    fn an_element_past_the_cap_drafts_no_row() {
+        let mut json = String::from(r#"{"tool_calls": ["#);
+        for index in 0..MAX_BATCH_SIZE {
+            json.push_str(&format!(
+                r#"{{"tool": "shell", "parameters": {{"command": "c{index}"}}}}, "#
+            ));
+        }
+        json.push_str(r#"{"tool": "shell", "parameters": {"command": "over"#);
+        let statuses: Vec<BatchToolStatus> =
+            entries(&[&json]).iter().map(|entry| entry.status).collect();
+        assert_eq!(statuses, [BatchToolStatus::Pending; MAX_BATCH_SIZE]);
     }
 
     /// The entries `batch` itself refuses to run, which it reports in its own

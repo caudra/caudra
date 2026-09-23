@@ -28,9 +28,9 @@ use caudra_markdown::render::truncate_long_lines;
 
 use crate::markdown::{LinkMap, expand_notice, should_truncate, text_to_painted};
 use caudra_agent::{
-    ActivityChild, BatchToolStatus, BufferSnapshot, InstructionBlock, NO_FILES_FOUND, ShellOutput,
-    SnapshotSpan, SpanStyle, SubagentActivity, SubagentProgress, ToolInput, ToolOutput,
-    format_live_duration, format_settled_duration,
+    ActivityChild, BatchToolStatus, BufferSnapshot, CallStage, InstructionBlock, NO_FILES_FOUND,
+    ShellOutput, SnapshotSpan, SpanStyle, SubagentActivity, SubagentProgress, ToolInput,
+    ToolOutput, format_live_duration, format_settled_duration,
     tools::{
         FILE_READ_TOOL_NAME, FILE_WRITE_TOOL_NAME, IMAGE_GENERATE_TOOL_NAME,
         LOCAL_DOCUMENT_WRITE_TOOL_NAME, MEMORY_TOOL_NAME, PYTHON_EXECUTION_TOOL_NAME,
@@ -250,6 +250,22 @@ const LIVE_MARKDOWN_TOOLS: &[&str] = &[
     LOCAL_DOCUMENT_WRITE_TOOL_NAME,
     TASK_TOOL_NAME,
 ];
+pub(super) const WRITING_PROMPT: &str = "Writing prompt";
+pub(super) const WRITING_COMMAND: &str = "Writing command";
+pub(super) const WRITING_SCRIPT: &str = "Writing script";
+pub(super) const WRITING_BRIEF: &str = "Writing brief";
+/// What a call is doing while the model still writes its arguments, for the
+/// tools whose arguments take long enough to watch arrive. Every other tool
+/// keeps its present verb: its arguments are over before a stage could be
+/// read, and a generic "Writing" would pass for a file write.
+const DRAFTING_LABELS: &[(&str, &str)] = &[
+    (IMAGE_GENERATE_TOOL_NAME, WRITING_PROMPT),
+    (SHELL_TOOL_NAME, WRITING_COMMAND),
+    (PYTHON_EXECUTION_TOOL_NAME, WRITING_SCRIPT),
+    (TASK_TOOL_NAME, WRITING_BRIEF),
+];
+/// What any call whose permission prompt is open is doing.
+pub(super) const AWAITING_APPROVAL: &str = "Awaiting approval";
 const MILLIS_PER_SECOND: u64 = 1_000;
 const DURATION_SEPARATOR: &str = " · ";
 
@@ -321,7 +337,10 @@ impl From<BatchToolStatus> for Tense {
         match status {
             BatchToolStatus::Running => Self::Present,
             BatchToolStatus::Success => Self::Past,
-            BatchToolStatus::Pending | BatchToolStatus::Error => Self::Plain,
+            BatchToolStatus::Drafting
+            | BatchToolStatus::Pending
+            | BatchToolStatus::AwaitingApproval
+            | BatchToolStatus::Error => Self::Plain,
         }
     }
 }
@@ -349,7 +368,7 @@ const UPDATE: Inflection = ("Update", "Updating", "Updated");
 const LOAD: Inflection = ("Load", "Loading", "Loaded");
 const ASK: Inflection = ("Ask", "Asking", "Asked");
 const VIEW: Inflection = ("View", "Viewing", "Viewed");
-const DRAW: Inflection = ("Generate", "Generating", "Generated");
+const DRAW: Inflection = ("Generate image", "Generating image", "Generated image");
 /// A store reached by sub-command. The verb is the `command` argument, which
 /// the `[k=v]` suffix already shows, so the row names the store instead.
 const MAP: Inflection = ("Map", "Mapping", "Mapped");
@@ -527,8 +546,14 @@ fn query_key(name: &str) -> Option<&'static str> {
 pub(super) fn activity_label(activity: &SubagentActivity, tense: Tense) -> String {
     let past = matches!(tense, Tense::Past);
     match activity {
-        SubagentActivity::Tool { name, .. } => compact_tool(name)
-            .map_or_else(|| name.to_string(), |entry| entry.label(tense).to_owned()),
+        // A row replaced before its call ran is a call that never ran, so it
+        // takes the plain verb the way a call that did not finish well does.
+        SubagentActivity::Tool {
+            name,
+            stage: Some(_),
+            ..
+        } if past => title(name, Tense::Plain, None).1.to_owned(),
+        SubagentActivity::Tool { name, stage, .. } => title(name, tense, *stage).1.to_owned(),
         phase if past => capitalized(phase.past_label()),
         phase => capitalized(phase.label()),
     }
@@ -555,8 +580,7 @@ pub(super) fn activity_sigil(activity: &SubagentActivity, tense: Tense) -> Optio
 /// then the tense the child's status puts the verb in.
 pub(super) fn activity_child_spans(child: &ActivityChild, prefix: String) -> Vec<Span<'static>> {
     let theme = theme::current();
-    let tense = Tense::from(child.status);
-    let (sigil, label) = compact_sigil_label(&child.tool, tense);
+    let (sigil, label, tense) = title(&child.tool, child.status.into(), child.status.stage());
     let mut spans = vec![
         Span::styled(prefix, theme.tool_dim),
         Span::styled(format!("{sigil} "), batch_sigil_style(child.status, None)),
@@ -714,6 +738,35 @@ pub(super) fn compact_sigil_label(name: &str, tense: Tense) -> (char, &str) {
     compact_tool(name).map_or((COMPACT_FALLBACK_SIGIL, name), |entry| {
         (entry.sigil, entry.label(tense))
     })
+}
+
+/// The label a call's stage puts in place of its verb, `None` where the verb
+/// already says as much.
+fn stage_label(tool: &str, stage: CallStage) -> Option<&'static str> {
+    match stage {
+        CallStage::Drafting => DRAFTING_LABELS
+            .iter()
+            .find(|(known, _)| names_tool(known, tool))
+            .map(|(_, label)| *label),
+        CallStage::AwaitingApproval => Some(AWAITING_APPROVAL),
+    }
+}
+
+/// How a title opens: the tool's sigil, then the stage its call is in when
+/// that has a name, and its verb in `tense` otherwise, with the tense the rest
+/// of the title takes. A named stage is one the call has not run past, so the
+/// verb a store's header opens with reads as the request it still is.
+///
+/// Every surface that names a call opens it here, so a card, its compact row,
+/// a batch child and a subagent's activity cannot call one call two things.
+pub(super) fn title(tool: &str, tense: Tense, stage: Option<CallStage>) -> (char, &str, Tense) {
+    let staged = stage.and_then(|stage| stage_label(tool, stage));
+    let tense = match staged {
+        Some(_) => Tense::Plain,
+        None => tense,
+    };
+    let (sigil, verb) = compact_sigil_label(tool, tense);
+    (sigil, staged.unwrap_or(verb), tense)
 }
 
 /// Whether a write to `path` is drawn as the document it is rather than as its
@@ -1134,7 +1187,9 @@ fn found_nothing(output: &ToolOutput) -> bool {
 pub(super) fn batch_sigil_style(status: BatchToolStatus, output: Option<&ToolOutput>) -> Style {
     let theme = theme::current();
     match status {
-        BatchToolStatus::Pending => theme.tool_dim,
+        BatchToolStatus::Drafting
+        | BatchToolStatus::Pending
+        | BatchToolStatus::AwaitingApproval => theme.tool_dim,
         BatchToolStatus::Running => theme.spinner,
         BatchToolStatus::Success => finished_style(Indicator::resolve(ToolStatus::Success, output)),
         BatchToolStatus::Error => theme.tool_error,
@@ -1313,11 +1368,15 @@ struct ToolLineBuilder {
     /// spinner frame and a tool's sigil are ordinary text to look at and a
     /// wrapped header would otherwise restart underneath them.
     head: usize,
+    /// Where the call is before it runs, which its title names in place of
+    /// the verb its indicator would give it.
+    stage: Option<CallStage>,
 }
 
 impl ToolLineBuilder {
     fn new(width: u16, indicator: Indicator, limits: RenderLimits) -> Self {
         Self {
+            stage: None,
             sigil: COMPACT_FALLBACK_SIGIL,
             lines: Vec::new(),
             link_rows: Vec::new(),
@@ -1355,8 +1414,7 @@ impl ToolLineBuilder {
         output: Option<&ToolOutput>,
         raw_input: Option<&serde_json::Value>,
     ) {
-        let tense = Tense::from(self.indicator);
-        let (sigil, label) = compact_sigil_label(tool_name, tense);
+        let (sigil, label, tense) = title(tool_name, self.indicator.into(), self.stage);
         let header = &*inflected_header(tool_name, header, tense);
         self.sigil = sigil;
         // An omitted header leaves the label against the annotation, so the
@@ -1411,11 +1469,10 @@ impl ToolLineBuilder {
         raw_input: Option<&serde_json::Value>,
         output: Option<&ToolOutput>,
     ) {
-        let tense = Tense::from(self.indicator);
+        let (sigil, label, tense) = title(tool_name, self.indicator.into(), self.stage);
         let row = compact_row(tool_name);
-        let label = row.map_or(tool_name, |(_, entry)| entry.label(tense));
         let header = &*inflected_header(tool_name, header, tense);
-        self.sigil = row.map_or(COMPACT_FALLBACK_SIGIL, |(_, entry)| entry.sigil);
+        self.sigil = sigil;
 
         let mut copy = format!("{label} {header}");
         let mut spans = vec![Span::styled(
@@ -2213,6 +2270,7 @@ pub fn build_tool_lines(
             rctx.resting_budget(tool_name, msg.tool_output.as_deref()),
         ),
     );
+    b.stage = msg.tool_stage;
     b.apply_output_format(msg.tool_output.as_deref());
     let mut annotation = header_annotation(msg);
     if let Some(timeout) = header_timeout(tool_name, msg.tool_raw_input.as_deref()) {
@@ -2655,6 +2713,7 @@ mod tests {
             tool_raw_input: None,
             tool_output: output.map(Arc::new),
             tool_preview_pending: false,
+            tool_stage: None,
             live_output: None,
             live_body: None,
             annotation: None,
@@ -2742,6 +2801,7 @@ mod tests {
             tool_output: output.map(Arc::new),
             live_output: None,
             tool_preview_pending: false,
+            tool_stage: None,
             live_body: live_body.map(str::to_owned),
             annotation: None,
             progress: None,
@@ -3131,6 +3191,88 @@ mod tests {
         assert!(!tl.truncation, "{LIVE_PROMPT_MSG}: {text:?}");
     }
 
+    const STAGED_TITLE_MSG: &str = "a call that has not run names the stage it is in where its \
+        verb would stand, and keeps the header beside it";
+
+    /// The same card open and folded to its row: the two must not call one
+    /// call two things.
+    fn staged_titles(tool: &str, stage: Option<CallStage>) -> [String; 2] {
+        let mut msg = image_msg(None, None);
+        if let DisplayRole::Tool(role) = &mut msg.role {
+            role.name = tool.into();
+        }
+        msg.tool_stage = stage;
+        [
+            build_tool_lines(
+                &msg,
+                ToolStatus::InProgress,
+                &test_rctx(80),
+                Some(Disclosure::default()),
+            ),
+            build_tool_lines(&msg, ToolStatus::InProgress, &compact_rctx(80), None),
+        ]
+        .map(|tl| line_text(&tl.lines[0]))
+    }
+
+    #[test_case(
+        IMAGE_GENERATE_TOOL_NAME,
+        Some(CallStage::Drafting),
+        WRITING_PROMPT
+        ; "a_prompt_being_written"
+    )]
+    #[test_case(
+        IMAGE_GENERATE_TOOL_NAME,
+        Some(CallStage::AwaitingApproval),
+        AWAITING_APPROVAL
+        ; "a_generation_awaiting_approval"
+    )]
+    #[test_case(IMAGE_GENERATE_TOOL_NAME, None, DRAW.1 ; "a_generation_running")]
+    #[test_case(SHELL_TOOL_NAME, Some(CallStage::Drafting), WRITING_COMMAND ; "a_command_being_written")]
+    #[test_case(
+        PYTHON_EXECUTION_TOOL_NAME,
+        Some(CallStage::Drafting),
+        WRITING_SCRIPT
+        ; "a_script_being_written"
+    )]
+    #[test_case(TASK_TOOL_NAME, Some(CallStage::Drafting), WRITING_BRIEF ; "a_brief_being_written")]
+    #[test_case(
+        FILE_READ_TOOL_NAME,
+        Some(CallStage::Drafting),
+        READ.1
+        ; "a_call_too_short_to_watch_being_written_keeps_its_verb"
+    )]
+    #[test_case(
+        FILE_READ_TOOL_NAME,
+        Some(CallStage::AwaitingApproval),
+        AWAITING_APPROVAL
+        ; "any_call_awaiting_approval"
+    )]
+    fn a_staged_card_names_its_stage(tool: &str, stage: Option<CallStage>, label: &str) {
+        let expected = format!("{label} {GENERATED_PATH}");
+        for title in staged_titles(tool, stage) {
+            assert!(title.contains(&expected), "{STAGED_TITLE_MSG}: {title:?}");
+        }
+    }
+
+    /// A store's header opens on the verb the call asks for, and a call still
+    /// waiting to be allowed has only asked.
+    #[test]
+    fn a_staged_store_call_reads_as_the_request_it_is() {
+        let mut msg = memory_msg(
+            &format!("write {MEMORY_NOTE}"),
+            None,
+            ToolStatus::InProgress,
+        );
+        msg.tool_stage = Some(CallStage::AwaitingApproval);
+
+        let text = open_card(&msg, ToolStatus::InProgress);
+
+        assert!(
+            text.contains(&format!("{AWAITING_APPROVAL} write {MEMORY_NOTE}")),
+            "{STAGED_TITLE_MSG}: {text:?}"
+        );
+    }
+
     #[test]
     fn filtered_shell_output_defaults_to_model_view_and_can_switch_to_raw() {
         let msg = bash_msg(
@@ -3382,6 +3524,7 @@ mod tests {
             tool_raw_input: None,
             tool_output: Some(Arc::new(ToolOutput::Markdown(output.into()))),
             tool_preview_pending: false,
+            tool_stage: None,
             live_output: None,
             live_body: None,
             annotation: None,
@@ -3484,6 +3627,7 @@ mod tests {
             tool_raw_input: None,
             tool_output: Some(Arc::new(ToolOutput::Plain(body.to_owned().into()))),
             tool_preview_pending: false,
+            tool_stage: None,
             live_output: None,
             live_body: None,
             annotation: None,
@@ -3583,6 +3727,7 @@ mod tests {
             tool_raw_input: None,
             tool_output: Some(Arc::new(ToolOutput::Plain("plain fallback".into()))),
             tool_preview_pending: false,
+            tool_stage: None,
             live_output: None,
             live_body: None,
             annotation: None,
@@ -3898,6 +4043,7 @@ mod tests {
             tool_output,
             live_output,
             tool_preview_pending: false,
+            tool_stage: None,
             live_body: None,
             annotation: None,
             progress: None,
@@ -4538,6 +4684,7 @@ mod tests {
                 instructions,
             })),
             tool_preview_pending: false,
+            tool_stage: None,
             live_output: None,
             live_body: None,
             annotation: None,
@@ -5602,6 +5749,44 @@ mod tests {
         );
     }
 
+    const NEVER_RAN_MSG: &str = "a staged row a later activity replaced names a call that never \
+        ran, so it takes the plain verb";
+
+    #[test_case(SHELL_TOOL_NAME, CallStage::Drafting, WRITING_COMMAND ; "a_command_being_written")]
+    #[test_case(TASK_TOOL_NAME, CallStage::Drafting, WRITING_BRIEF ; "a_brief_being_written")]
+    #[test_case(
+        FILE_READ_TOOL_NAME,
+        CallStage::Drafting,
+        READ.1
+        ; "a_call_too_short_to_watch_being_written_keeps_its_verb"
+    )]
+    #[test_case(
+        FILE_READ_TOOL_NAME,
+        CallStage::AwaitingApproval,
+        AWAITING_APPROVAL
+        ; "any_call_awaiting_approval"
+    )]
+    fn a_staged_activity_row_names_its_stage(tool: &str, stage: CallStage, expected: &str) {
+        let activity = SubagentActivity::tool(Arc::from(tool), "").with_stage(Some(stage));
+        assert_eq!(
+            activity_label(&activity, Tense::Present),
+            expected,
+            "{STAGED_TITLE_MSG}"
+        );
+    }
+
+    #[test_case(CallStage::Drafting ; "replaced_while_being_written")]
+    #[test_case(CallStage::AwaitingApproval ; "replaced_while_awaiting_approval")]
+    fn a_replaced_staged_row_takes_the_plain_verb(stage: CallStage) {
+        let activity =
+            SubagentActivity::tool(Arc::from(SHELL_TOOL_NAME), "").with_stage(Some(stage));
+        assert_eq!(
+            activity_label(&activity, Tense::Past),
+            RUN.0,
+            "{NEVER_RAN_MSG}"
+        );
+    }
+
     #[test_case(SubagentActivity::Thinking { title: None }, "Thought" ; "thinking")]
     #[test_case(SubagentActivity::Responding, "Responded" ; "responding")]
     #[test_case(SubagentActivity::Compacting, "Compacted" ; "compacting")]
@@ -5730,6 +5915,7 @@ mod tests {
             tool_raw_input: None,
             tool_output: Some(Arc::new(ToolOutput::Plain("llm_output_here".into()))),
             tool_preview_pending: false,
+            tool_stage: None,
             live_output: None,
             live_body: None,
             annotation: None,
@@ -5772,6 +5958,7 @@ mod tests {
             })),
             text: "header\nbody_fallback".into(),
             tool_preview_pending: false,
+            tool_stage: None,
             source: None,
             tool_input: None,
             tool_raw_input: None,

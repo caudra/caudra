@@ -54,6 +54,8 @@ const CALLS_NOT_ARRAY: &str = "tool_calls must be an array";
 const TOOL_FIELD: &str = "tool";
 const PARAMETERS_FIELD: &str = "parameters";
 const FUNCTIONS_PREFIX: &str = "functions.";
+/// What joins a batch's id to a child's index to make the child's own id.
+const CHILD_ID_SEPARATOR: char = ':';
 
 static CALL_PARAM: ParamSchema = ParamSchema::Any {
     description: "Tool invocation: { tool: string, parameters: object } or flat { tool: string, ...params }",
@@ -438,9 +440,18 @@ fn child_context(ctx: &ToolContext, index: usize) -> ToolContext {
 /// dispatch would never use.
 pub(crate) fn child_tool_use_id(parent: Option<&str>, index: usize) -> String {
     match parent {
-        Some(id) => format!("{id}:{index}"),
+        Some(id) => format!("{id}{CHILD_ID_SEPARATOR}{index}"),
         None => index.to_string(),
     }
+}
+
+/// The index `id` names among `parent`'s children, the inverse of
+/// [`child_tool_use_id`]. `None` for an id that is not one of them.
+pub(crate) fn child_index(parent: &str, id: &str) -> Option<usize> {
+    id.strip_prefix(parent)?
+        .strip_prefix(CHILD_ID_SEPARATOR)?
+        .parse()
+        .ok()
 }
 
 /// The call one element describes, or `None` when it is one this tool refuses
@@ -532,7 +543,7 @@ fn publish(
 fn batch_id(ctx: &ToolContext) -> Option<String> {
     let id = ctx.tool_use_id.as_ref()?;
     Some(
-        id.rsplit_once(':')
+        id.rsplit_once(CHILD_ID_SEPARATOR)
             .map_or(id.as_str(), |(head, _)| head)
             .to_owned(),
     )
@@ -1317,6 +1328,22 @@ mod tests {
             Some(json!({ "path": HEADER_PATH })),
             "{EXPECT_PENDING_SUMMARY}"
         );
+    }
+
+    /// A child's permission prompt carries only its id, so reading the index
+    /// back is how the prompt finds its row, and must undo exactly what
+    /// minting the id did.
+    #[test_case(&child_tool_use_id(Some(BATCH_ID), 0), Some(0) ; "the_first_child")]
+    #[test_case(
+        &child_tool_use_id(Some(BATCH_ID), MAX_BATCH_SIZE - 1),
+        Some(MAX_BATCH_SIZE - 1)
+        ; "the_last_child"
+    )]
+    #[test_case(BATCH_ID, None ; "the_batch_itself")]
+    #[test_case("batch-10:0", None ; "a_batch_whose_id_extends_this_one")]
+    #[test_case("batch-1:x", None ; "a_suffix_that_is_no_index")]
+    fn a_child_id_reads_back_as_its_index(id: &str, expected: Option<usize>) {
+        assert_eq!(child_index(BATCH_ID, id), expected);
     }
 
     const MODEL_SUFFIX: &str = "<task_metadata>\ntask_id: task-1\n</task_metadata>";

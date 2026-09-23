@@ -12,8 +12,8 @@ use crate::theme;
 
 use super::tool_display::{
     ScrollTail, TREE_BRANCH, TREE_GAP, TREE_LAST, TREE_TRUNK, append_annotation, batch_sigil_style,
-    compact_args_for, compact_sigil_label, header_spans, header_timeout, inflected_header,
-    names_tool, progress_lines, scroll_footer_text,
+    compact_args_for, header_spans, header_timeout, inflected_header, names_tool, progress_lines,
+    scroll_footer_text, title,
 };
 use super::{ToolProgress, environment_card, is_collapsible, memory_card, workflow_card};
 use caudra_agent::tools::{
@@ -1042,8 +1042,7 @@ fn render_batch(entries: &[BatchToolEntry], highlight: bool, limits: &RenderLimi
             true => (TREE_LAST, TREE_GAP),
             false => (TREE_BRANCH, TREE_TRUNK),
         };
-        let tense = entry.status.into();
-        let (sigil, label) = compact_sigil_label(&entry.tool, tense);
+        let (sigil, label, tense) = title(&entry.tool, entry.status.into(), entry.status.stage());
         let inflected = inflected_header(&entry.tool, &entry.summary, tense);
         // Once the body carries the script, the row keeps only what the body
         // does not say. The same trade a card's header makes, and for the same
@@ -1240,7 +1239,10 @@ fn child_annotation(entry: &BatchToolEntry, progress: Option<&ToolProgress>) -> 
     let own = entry.annotation.clone().or_else(|| match entry.status {
         BatchToolStatus::Pending => Some(QUEUED_ANNOTATION.to_owned()),
         BatchToolStatus::Success => entry.output.as_ref().and_then(ToolOutput::annotation),
-        BatchToolStatus::Running | BatchToolStatus::Error => None,
+        BatchToolStatus::Drafting
+        | BatchToolStatus::AwaitingApproval
+        | BatchToolStatus::Running
+        | BatchToolStatus::Error => None,
     });
     let tally =
         progress.map(|progress| SubagentProgress::tally(progress.report.tools, progress.elapsed()));
@@ -3292,6 +3294,7 @@ fn merge_syntax_with_diff(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::components::tool_display::{AWAITING_APPROVAL, WRITING_COMMAND};
     use crate::markdown::{EXPAND_AFFORDANCE, TRUNCATION_PREFIX};
     use caudra_agent::tools::{
         BATCH_TOOL_NAME, FILE_GREP_TOOL_NAME, FILE_READ_TOOL_NAME, ToolEffect,
@@ -5401,6 +5404,34 @@ mod tests {
             ..batch_entry(SHELL_CHILD, 0)
         });
         assert!(row.starts_with(expected), "{SIGIL_MSG}: {row:?}");
+    }
+
+    const STAGED_CHILD_MSG: &str = "a child that has not run names the stage it is in, and only \
+        one that is written and waiting on nothing but its turn is queued";
+
+    #[test_case(BatchToolStatus::Drafting, WRITING_COMMAND, false ; "a_command_being_written")]
+    #[test_case(BatchToolStatus::Pending, "Run", true ; "a_written_command_is_queued")]
+    #[test_case(
+        BatchToolStatus::AwaitingApproval,
+        AWAITING_APPROVAL,
+        false
+        ; "a_command_awaiting_approval"
+    )]
+    fn a_staged_child_row_names_its_stage(status: BatchToolStatus, label: &str, queued: bool) {
+        let row = child_row(BatchToolEntry {
+            status,
+            output: None,
+            ..batch_entry(SHELL_CHILD, 0)
+        });
+        assert!(
+            row.starts_with(&format!("$ {label} ")),
+            "{STAGED_CHILD_MSG}: {row:?}"
+        );
+        assert_eq!(
+            row.contains(QUEUED_ANNOTATION),
+            queued,
+            "{STAGED_CHILD_MSG}: {row:?}"
+        );
     }
 
     const TREE_MSG: &str = "a card is a tree: the last child closes it and every earlier one \

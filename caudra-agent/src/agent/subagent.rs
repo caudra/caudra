@@ -27,17 +27,17 @@ use super::{ModelRoute, resolve_model_for_purpose};
 use crate::cancel::{CancelMap, CancelSlot};
 use crate::prompt::PromptId;
 use crate::prompt::profile::SystemPromptProfile;
-use crate::tools::native::batch::MAX_BATCH_SIZE;
+use crate::tools::native::batch::{self, MAX_BATCH_SIZE};
 use crate::tools::{
     BuiltinDeferral, DeferredTool, DescriptionContext, FileReadTracker, LocalTools, ToolAudience,
     ToolContext, ToolFilter, ToolLive, deferral,
 };
 use crate::{
     ActivityChild, Agent, AgentEvent, AgentInput, AgentMode, AgentParams, AgentRunParams,
-    DoneReason, Envelope, EventSender, History, InterruptSource, McpSession, SteeringQueue,
-    SteeringQueueReceiver, SubagentActivity, SubagentHistoryError, SubagentHistoryLease,
-    SubagentInfo, SubagentProgress, SubagentTaskMode, SubagentTaskSpec, SubagentTaskSpecCandidate,
-    ToolOutput, reasoning_summary, steering_queue,
+    BatchToolStatus, CallStage, DoneReason, Envelope, EventSender, History, InterruptSource,
+    McpSession, SteeringQueue, SteeringQueueReceiver, SubagentActivity, SubagentHistoryError,
+    SubagentHistoryLease, SubagentInfo, SubagentProgress, SubagentTaskMode, SubagentTaskSpec,
+    SubagentTaskSpecCandidate, ToolOutput, reasoning_summary, steering_queue,
 };
 
 pub const STRUCTURED_OUTPUT_TOOL: &str = "structured_output";
@@ -166,6 +166,39 @@ impl ProgressRelay {
         }
     }
 
+    /// The call's own row in `stage`. `None` when the last row belongs to some
+    /// other call, which leaves the activity as it was.
+    fn restaged(&self, id: &str, stage: Option<CallStage>) -> Option<SubagentActivity> {
+        match &self.last {
+            Some(
+                activity @ SubagentActivity::Tool {
+                    call_id: Some(call_id),
+                    ..
+                },
+            ) if call_id == id => Some(activity.clone().with_stage(stage)),
+            _ => None,
+        }
+    }
+
+    /// A request names the call that raised it, and that call keeps its row,
+    /// so the reader sees what is waiting on them rather than only that
+    /// something is. A batch child is marked in the roster the batch's row
+    /// goes on drawing, which is also what keeps the child's next progress
+    /// landing on a row that is still watched.
+    fn awaiting_approval(&mut self, id: &str) -> SubagentActivity {
+        if let Some(watch) = self.batch.as_mut()
+            && let Some(child) =
+                batch::child_index(&watch.id, id).and_then(|index| watch.children.get_mut(index))
+        {
+            child.status = child.status.max(BatchToolStatus::AwaitingApproval);
+            if let Some(row) = self.watched_batch() {
+                return row;
+            }
+        }
+        self.restaged(id, Some(CallStage::AwaitingApproval))
+            .unwrap_or(SubagentActivity::AwaitingPermission)
+    }
+
     /// The stateful half of [`SubagentActivity::from_event`]: a thought names
     /// itself over several deltas, and a tool can rename itself long after it
     /// started, so both need what came before.
@@ -246,6 +279,16 @@ impl ProgressRelay {
                 }
                 None
             }
+            // The arguments closed with no header left to reveal, so the row
+            // the call already has stops being written and keeps the header
+            // it earned, which the event alone does not carry.
+            AgentEvent::ToolInputDelta {
+                id,
+                preview: None,
+                complete: true,
+                ..
+            } => self.restaged(id, None),
+            AgentEvent::PermissionRequest(request) => Some(self.awaiting_approval(&request.id)),
             _ => {
                 let activity = SubagentActivity::from_event(event);
                 // A turn ends the thought even with nothing after it, and the
@@ -1158,6 +1201,8 @@ fn expand_history(messages: &[Message]) -> Vec<HistoryItem> {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use serde_json::json;
 
     use super::*;
@@ -1165,10 +1210,12 @@ mod tests {
         ContextInventory, ContextKey, ContextReadiness, ContextSnapshot, ContextStore,
         ContextUsage, ContextWindow,
     };
+    use crate::permissions::PermissionRequest;
     use crate::tools::BATCH_TOOL_NAME;
     use crate::tools::registry::Tool;
     use crate::tools::test_support::NamedMock;
-    use crate::{BatchToolStatus, ToolDoneEvent, TurnCompleteEvent};
+    use crate::{ToolDoneEvent, TurnCompleteEvent};
+    use caudra_config::ToolKey;
     use caudra_providers::{Billing, ContentBlock, Message, Role};
     use caudra_storage::id::SessionRef;
     use caudra_storage::usage_ledger::LedgerPurpose;
@@ -2032,6 +2079,101 @@ mod tests {
         );
     }
 
+    fn permission_request(id: &str) -> AgentEvent {
+        AgentEvent::PermissionRequest(Box::new(PermissionRequest::from_legacy(
+            id.to_owned(),
+            ToolKey::native(PENDING_TOOL),
+            vec![INPUT_PREVIEW.to_owned()],
+            json!({ "command": INPUT_PREVIEW }),
+            Path::new(REMOTE_CWD),
+            false,
+        )))
+    }
+
+    /// The fragment that closes the arguments, revealing nothing new.
+    fn closing_input_delta() -> AgentEvent {
+        let mut event = tool_input_delta();
+        if let AgentEvent::ToolInputDelta {
+            preview, complete, ..
+        } = &mut event
+        {
+            *preview = None;
+            *complete = true;
+        }
+        event
+    }
+
+    fn running_row() -> SubagentActivity {
+        SubagentActivity::tool(Arc::from(PENDING_TOOL), INPUT_PREVIEW).with_call_id(TOOL_ID)
+    }
+
+    /// The call that asked keeps its row, so the reader sees which command
+    /// waits on them rather than only that something does.
+    #[test]
+    fn approval_restages_the_calls_own_row() {
+        let mut relay = ProgressRelay::new();
+        relay.last = relay.activity(&tool_input_delta());
+
+        assert_eq!(
+            relay.activity(&permission_request(TOOL_ID)),
+            Some(running_row().with_stage(Some(CallStage::AwaitingApproval)))
+        );
+    }
+
+    /// The regression: a child's request used to swap the batch row for the
+    /// bare phase, and every later report for the batch then patched a row
+    /// no longer on show, so the phase outlived the wait.
+    #[test]
+    fn a_batch_child_awaiting_approval_keeps_the_batch_row() {
+        let published = rosters(vec![
+            batch_start(2),
+            permission_request(&batch::child_tool_use_id(Some(TOOL_ID), 1)),
+            batch_progress(TOOL_ID, 1, BatchToolStatus::Running),
+        ]);
+
+        let row = |status| (CHILD_TOOL.to_owned(), status);
+        assert_eq!(
+            published,
+            [
+                vec![row(BatchToolStatus::Pending), row(BatchToolStatus::Pending)],
+                vec![
+                    row(BatchToolStatus::Pending),
+                    row(BatchToolStatus::AwaitingApproval)
+                ],
+                vec![row(BatchToolStatus::Pending), row(BatchToolStatus::Running)],
+            ]
+        );
+    }
+
+    /// The closing fragment usually reveals nothing, and the row must stop
+    /// reading as written without losing the header it already earned.
+    #[test]
+    fn completion_without_a_preview_keeps_the_summary() {
+        let mut relay = ProgressRelay::new();
+        relay.last = relay.activity(&tool_input_delta());
+
+        assert_eq!(relay.activity(&closing_input_delta()), Some(running_row()));
+    }
+
+    #[test_case(Vec::new(), TOOL_ID ; "nothing_on_the_row_yet")]
+    #[test_case(vec![tool_start(CHILD_TOOL)], NEXT_TOOL_ID ; "another_calls_row")]
+    #[test_case(
+        vec![batch_start(2)],
+        &batch::child_tool_use_id(Some(TOOL_ID), 9)
+        ; "a_child_the_roster_does_not_have"
+    )]
+    fn an_unmatched_request_falls_back_to_the_phase(before: Vec<AgentEvent>, id: &str) {
+        let mut relay = ProgressRelay::new();
+        for event in &before {
+            relay.last = relay.activity(event);
+        }
+
+        assert_eq!(
+            relay.activity(&permission_request(id)),
+            Some(SubagentActivity::AwaitingPermission)
+        );
+    }
+
     /// One relay hop, stamping with `info`: every envelope it handed on.
     fn relay_hop(info: Arc<OnceLock<SubagentInfo>>, envelopes: Vec<Envelope>) -> Vec<Envelope> {
         let (sub_tx, sub_rx) = flume::unbounded();
@@ -2237,6 +2379,7 @@ mod tests {
             body: None,
             roster: None,
             delegations: Vec::new(),
+            complete: false,
         }
     }
 

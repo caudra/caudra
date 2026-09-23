@@ -370,6 +370,7 @@ async fn forward_provider_events(
                                 body: changed.body,
                                 roster: changed.roster,
                                 delegations: changed.delegations,
+                                complete: true,
                             })
                             .is_err()
                     {
@@ -436,6 +437,7 @@ async fn forward_provider_events(
                     body: changed.body,
                     roster: changed.roster,
                     delegations: changed.delegations,
+                    complete: top_ready.is_some(),
                 }
             }
             ProviderEvent::PromptProgress {
@@ -1780,6 +1782,46 @@ mod tests {
             })
             .collect();
         assert_eq!(forwarded, fragments);
+    }
+
+    /// Whether each tool-input event said its call's arguments were whole.
+    fn completions(events: Vec<AgentEvent>) -> Vec<bool> {
+        events
+            .into_iter()
+            .filter_map(|event| match event {
+                AgentEvent::ToolInputDelta { complete, .. } => Some(complete),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test_case(&[r#"{"command": "#, r#""ls -la"#, r#""}"#], &[false, false, true] ; "the_closing_brace")]
+    #[test_case(&[r#"{"command": "echo }"#, r#""}"#], &[false, true] ; "a_brace_inside_a_string_closes_nothing")]
+    fn only_the_fragment_that_closes_the_arguments_is_complete(
+        fragments: &[&str],
+        expected: &[bool],
+    ) {
+        assert_eq!(completions(deltas(SHELL, fragments)), expected);
+    }
+
+    #[test]
+    fn a_call_that_arrives_whole_arrives_complete() {
+        let (ptx, prx) = flume::unbounded();
+        ptx.send(ProviderEvent::ToolInputReady {
+            id: TOOL_ID.into(),
+            name: SHELL.into(),
+            input: serde_json::json!({ "command": "ls" }),
+            invalid_input: None,
+        })
+        .unwrap();
+        drop(ptx);
+
+        let (etx, erx) = flume::unbounded();
+        let sender = crate::EventSender::new(etx, 0);
+        smol::block_on(forward_provider_events(prx, Some(&sender), false, None));
+        drop(sender);
+        let events = erx.drain().map(|envelope| envelope.event).collect();
+        assert_eq!(completions(events), [true]);
     }
 
     #[test]

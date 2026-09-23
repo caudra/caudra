@@ -60,9 +60,10 @@ use caudra_agent::commits::{self, CommitRef};
 use caudra_agent::mentions::{self, Mention};
 use caudra_agent::tools::{BATCH_TOOL_NAME, SHELL_TOOL_NAME, ToolEffect};
 use caudra_agent::{
-    BatchToolEntry, BatchToolStatus, BufferSnapshot, EventSender, InstructionBlock, NO_FILES_FOUND,
-    ReasoningSummary, SharedBuf, SubagentProgress, ToolDoneEvent, ToolOutput, ToolStartEvent,
-    format_live_duration, format_settled_duration, reasoning_summary, streaming_reasoning_summary,
+    BatchToolEntry, BatchToolStatus, BufferSnapshot, CallStage, EventSender, InstructionBlock,
+    NO_FILES_FOUND, ReasoningSummary, SharedBuf, SubagentProgress, ToolDoneEvent, ToolOutput,
+    ToolStartEvent, format_live_duration, format_settled_duration, reasoning_summary,
+    streaming_reasoning_summary,
 };
 use caudra_lua::{EventHandle, WARM_TOOL_CAP, WinView};
 use caudra_storage::view::ViewMode;
@@ -1658,8 +1659,45 @@ impl MessagesPanel {
         }));
         let mut msg = DisplayMessage::new(role, String::new());
         msg.tool_preview_pending = true;
+        msg.tool_stage = Some(CallStage::Drafting);
         msg.timestamp = Some(format_timestamp_now(self.clock_format));
         self.messages.push(msg);
+    }
+
+    /// The call has moved past `stage`: its arguments closed, or its prompt
+    /// was answered. A card already somewhere else keeps where it is. A batch
+    /// child's row is left to the progress the move produces, which is never
+    /// far behind and can only move it forwards.
+    pub fn leave_stage(&mut self, tool_id: &str, stage: CallStage) {
+        let Some(msg) = self.find_tool_msg_mut(tool_id) else {
+            return;
+        };
+        if msg.tool_stage != Some(stage) {
+            return;
+        }
+        msg.tool_stage = None;
+        self.mark_card_dirty(tool_id);
+    }
+
+    /// The call waits on the reader's answer to a permission prompt, which is
+    /// asked under the call's own id: a card's, or a batch child's. A child
+    /// already running asked from inside its run, the way an MCP call does,
+    /// and its row says more than the wait would.
+    pub fn await_approval(&mut self, tool_id: &str) {
+        if self.tool_in_progress(tool_id) {
+            self.update_tool(tool_id, |msg| {
+                msg.tool_stage = Some(CallStage::AwaitingApproval);
+            });
+        } else if let Some((parent, index)) = batch_child_id(tool_id)
+            && self.batch_child_running(parent, index)
+            && let Some(msg) = self.find_tool_msg_mut(parent)
+            && let Some(output) = &mut msg.tool_output
+            && let ToolOutput::Batch { entries, .. } = Arc::make_mut(output)
+            && entries[index].status < BatchToolStatus::AwaitingApproval
+        {
+            entries[index].status = BatchToolStatus::AwaitingApproval;
+            self.mark_card_dirty(parent);
+        }
     }
 
     /// What a still-streaming call has revealed so far: the header it has
@@ -1755,6 +1793,7 @@ impl MessagesPanel {
                 return;
             }
             msg.tool_preview_pending = false;
+            msg.tool_stage = None;
             // Not reset: a speculative call resends its start on adoption, and
             // the clock belongs to the run rather than to the announcement.
             msg.tool_started.get_or_insert_with(Instant::now);
@@ -1818,8 +1857,7 @@ impl MessagesPanel {
         };
         if index >= entries.len()
             || entries[index].status.is_terminal()
-            || (entries[index].status == BatchToolStatus::Running
-                && entry.status == BatchToolStatus::Pending)
+            || entry.status < entries[index].status
         {
             return;
         }
@@ -2137,6 +2175,7 @@ impl MessagesPanel {
         }
         msg.live_body = None;
         msg.tool_preview_pending = false;
+        msg.tool_stage = None;
         if retain_live_output {
             msg.render_snapshot = None;
         }
@@ -2397,14 +2436,23 @@ impl MessagesPanel {
             }
             if let Some(msg) = self.find_tool_msg_mut(id) {
                 msg.tool_preview_pending = false;
+                msg.tool_stage = None;
                 msg.live_body = None;
                 if let Some(output) = &mut msg.tool_output
                     && let ToolOutput::Batch { entries, .. } = Arc::make_mut(output)
                 {
+                    // A child that was live is cut off. One still being
+                    // written joins the others that never went out.
                     for entry in entries {
-                        if entry.status == BatchToolStatus::Running {
-                            entry.status = BatchToolStatus::Error;
-                        }
+                        entry.status = match entry.status {
+                            BatchToolStatus::AwaitingApproval | BatchToolStatus::Running => {
+                                BatchToolStatus::Error
+                            }
+                            BatchToolStatus::Drafting => BatchToolStatus::Pending,
+                            BatchToolStatus::Pending
+                            | BatchToolStatus::Success
+                            | BatchToolStatus::Error => entry.status,
+                        };
                     }
                 }
                 if let Some(progress) = &mut msg.progress {
@@ -5115,6 +5163,11 @@ fn merge_batch_snapshot(msg: &mut DisplayMessage, mut incoming: Vec<BatchToolEnt
                             preserved.annotation.or_else(|| next.annotation.take());
                     }
                     *next = preserved;
+                } else if next.status < entry.status {
+                    // A row the reader has watched move on keeps its place:
+                    // a roster streamed before the move says less than the
+                    // move did.
+                    next.status = entry.status;
                 }
             } else {
                 incoming.push(entry.clone());

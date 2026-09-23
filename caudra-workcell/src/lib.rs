@@ -2107,8 +2107,15 @@ impl RemoteProgress {
         self.next_sequence.unwrap_or(1) - 1
     }
 
+    /// Never waits on the card: a full or closed sink drops the update rather
+    /// than stall the poll that produced it.
+    fn offer(&self, live: ToolLive) {
+        if let Some(sink) = &self.sink {
+            let _ = sink.try_send(live);
+        }
+    }
+
     fn publish(&mut self, status: &OperationStatus<RemoteToolResultEnvelope>) -> bool {
-        let sink = &self.sink;
         let terminal = matches!(
             status.state,
             OperationState::Completed { .. }
@@ -2123,9 +2130,7 @@ impl RemoteProgress {
                 .is_some_and(|(expected, first)| first > expected);
         let gap_sequence = first.unwrap_or(status.progress_metadata.next_sequence);
         if gap && self.reported_gap != Some(gap_sequence) {
-            let _ = sink
-                .as_ref()
-                .map(|sink| sink.try_send(ToolLive::Annotation(REMOTE_PROGRESS_GAP.into())));
+            self.offer(ToolLive::Annotation(REMOTE_PROGRESS_GAP.into()));
             self.reported_gap = Some(gap_sequence);
         }
         let mut expected = self.next_sequence.unwrap_or(1);
@@ -2138,9 +2143,7 @@ impl RemoteProgress {
                 continue;
             }
             if item.sequence > expected && self.reported_gap != Some(item.sequence) {
-                let _ = sink
-                    .as_ref()
-                    .map(|sink| sink.try_send(ToolLive::Annotation(REMOTE_PROGRESS_GAP.into())));
+                self.offer(ToolLive::Annotation(REMOTE_PROGRESS_GAP.into()));
                 self.reported_gap = Some(item.sequence);
             }
             if item.sequence > expected && !status.progress_metadata.gap_before_first && !terminal {
@@ -2152,9 +2155,7 @@ impl RemoteProgress {
                 OperationProgressKind::Stdout | OperationProgressKind::Stderr => {
                     self.buffer.append(SnapshotLine::plain(item.chunk.clone()));
                     if !self.buffer_published {
-                        let _ = sink
-                            .as_ref()
-                            .map(|sink| sink.try_send(ToolLive::Buf(Arc::clone(&self.buffer))));
+                        self.offer(ToolLive::Buf(Arc::clone(&self.buffer)));
                         self.buffer_published = true;
                     }
                 }
@@ -2162,18 +2163,14 @@ impl RemoteProgress {
                 | OperationProgressKind::Exited
                 | OperationProgressKind::Unknown(_) => {
                     if !item.chunk.is_empty() {
-                        let _ = sink
-                            .as_ref()
-                            .map(|sink| sink.try_send(ToolLive::Annotation(item.chunk.clone())));
+                        self.offer(ToolLive::Annotation(item.chunk.clone()));
                     }
                 }
             }
         }
         if terminal && expected != status.progress_metadata.next_sequence {
             self.reported_gap = Some(status.progress_metadata.next_sequence);
-            let _ = sink
-                .as_ref()
-                .map(|sink| sink.try_send(ToolLive::Annotation(REMOTE_PROGRESS_GAP.into())));
+            self.offer(ToolLive::Annotation(REMOTE_PROGRESS_GAP.into()));
         }
         if status.progress_metadata.gap_before_first || terminal {
             self.next_sequence = Some(status.progress_metadata.next_sequence);

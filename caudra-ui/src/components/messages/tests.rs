@@ -4,7 +4,9 @@ use crate::animation::test_clock::FrozenSpinner;
 use crate::chat::{DONE_TEXT, ERROR_TEXT};
 use crate::components::code_view::ScrollSpan;
 use crate::components::prompt_progress::PROMPT_PROGRESS_LABEL;
-use crate::components::tool_display::{FOLLOWING, NOTICE_PREFIX, PAUSED};
+use crate::components::tool_display::{
+    AWAITING_APPROVAL, FOLLOWING, NOTICE_PREFIX, PAUSED, WRITING_PROMPT,
+};
 use crate::repaint::expect::{OWED, QUIET};
 use crate::selection::{Selection, SelectionZone};
 use caudra_agent::tools::{
@@ -7908,6 +7910,232 @@ fn a_roster_for_an_unknown_call_is_ignored() {
     let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
     panel.tool_input_roster("t1", Some(vec![pending_child("file_read")]));
     assert!(panel.messages.is_empty());
+}
+
+const STAGE_TITLE_MSG: &str =
+    "a card's title names the stage its call is in, from its first token to its answer";
+const STAGED_ROW_MSG: &str = "a child's row keeps the furthest stage its call has reached";
+const STAGED_PATH: &str = "assets/hero.png";
+const STAGED_PROMPT: &str = "A lighthouse at dusk";
+
+/// The first row of the panel's first card, drawn afresh.
+fn title_of(panel: &mut MessagesPanel) -> String {
+    rebuild(panel);
+    first_line_text(panel, 0)
+}
+
+fn child_in(status: BatchToolStatus) -> BatchToolEntry {
+    BatchToolEntry {
+        status,
+        ..pending_child(SHELL_TOOL_NAME)
+    }
+}
+
+/// The reported jump: a generation read `Generating` from the moment it was
+/// announced, all through its prompt and the wait on the reader's answer.
+#[test]
+fn an_image_call_walks_its_pipeline() {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.tool_pending(TOOL_ID.into(), IMAGE_GENERATE_TOOL_NAME);
+    panel.tool_input_preview(TOOL_ID, Some(STAGED_PATH.into()), None);
+    panel.tool_input_body(TOOL_ID, Some(STAGED_PROMPT.into()));
+    let mut titles = vec![title_of(&mut panel)];
+
+    panel.leave_stage(TOOL_ID, CallStage::Drafting);
+    titles.push(title_of(&mut panel));
+    panel.await_approval(TOOL_ID);
+    titles.push(title_of(&mut panel));
+    panel.leave_stage(TOOL_ID, CallStage::AwaitingApproval);
+    panel.tool_start(ToolStartEvent {
+        summary: STAGED_PATH.into(),
+        ..start(TOOL_ID, IMAGE_GENERATE_TOOL_NAME)
+    });
+    titles.push(title_of(&mut panel));
+    panel.tool_done(ToolDoneEvent {
+        tool: IMAGE_GENERATE_TOOL_NAME.into(),
+        ..done(TOOL_ID)
+    });
+    titles.push(title_of(&mut panel));
+
+    let labels = [
+        WRITING_PROMPT,
+        "Generating image",
+        AWAITING_APPROVAL,
+        "Generating image",
+        "Generated image",
+    ];
+    for (title, label) in titles.iter().zip(labels) {
+        assert!(
+            title.contains(&format!("{label} {STAGED_PATH}")),
+            "{STAGE_TITLE_MSG}: {titles:#?}"
+        );
+    }
+}
+
+/// An MCP call starts before it asks, so no start follows the answer: the
+/// answer itself has to hand the title back to the call's verb.
+#[test]
+fn an_mcp_card_leaves_approval_on_answer() {
+    let _clock = FrozenSpinner::at(0);
+    let mut panel = panel_with_tools(&[(TOOL_ID, UNCLASSIFIED_TOOL)]);
+    let running = title_of(&mut panel);
+
+    panel.await_approval(TOOL_ID);
+    let waiting = title_of(&mut panel);
+    panel.leave_stage(TOOL_ID, CallStage::AwaitingApproval);
+
+    assert!(
+        waiting.contains(&format!("{AWAITING_APPROVAL} {TOOL_ID}")),
+        "{STAGE_TITLE_MSG}: {waiting:?}"
+    );
+    assert_eq!(title_of(&mut panel), running, "{STAGE_TITLE_MSG}");
+}
+
+/// A child's request is raised under the child's own id. Its row keeps the
+/// wait until the child's own progress moves it on: a roster streamed before
+/// the request says less than the request did.
+#[test]
+fn a_batch_child_awaits_approval_by_its_id() {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.tool_pending(TOOL_ID.into(), BATCH_TOOL);
+    panel.tool_input_roster(TOOL_ID, Some(vec![pending_child(SHELL_TOOL_NAME)]));
+
+    panel.await_approval(EAGER_CHILD_ID);
+    rebuild(&mut panel);
+    let text = seg_text(&panel, TOOL_ID);
+    assert!(
+        text.contains(AWAITING_APPROVAL),
+        "{STAGED_ROW_MSG}: {text:?}"
+    );
+
+    panel.tool_input_roster(
+        TOOL_ID,
+        Some(vec![
+            pending_child(SHELL_TOOL_NAME),
+            pending_child(FILE_READ_TOOL_NAME),
+        ]),
+    );
+    assert_eq!(
+        roster(&panel)[0].status,
+        BatchToolStatus::AwaitingApproval,
+        "{STAGED_ROW_MSG}"
+    );
+
+    panel.batch_progress(TOOL_ID, 0, running_child(SHELL_TOOL_NAME));
+    assert_eq!(
+        roster(&panel)[0].status,
+        BatchToolStatus::Running,
+        "{STAGED_ROW_MSG}"
+    );
+}
+
+/// A child asking from inside its run, the way an MCP call does, is still
+/// running, and its row says more than the wait would.
+#[test]
+fn a_running_child_that_asks_keeps_running() {
+    let mut panel = panel_with_running_shell();
+
+    panel.await_approval(EAGER_CHILD_ID);
+
+    assert_eq!(
+        roster(&panel)[0].status,
+        BatchToolStatus::Running,
+        "{STAGED_ROW_MSG}"
+    );
+}
+
+#[test_case(
+    BatchToolStatus::AwaitingApproval,
+    BatchToolStatus::Pending,
+    BatchToolStatus::AwaitingApproval
+    ; "a_stale_queued_report_keeps_the_wait"
+)]
+#[test_case(
+    BatchToolStatus::Running,
+    BatchToolStatus::Pending,
+    BatchToolStatus::Running
+    ; "a_stale_queued_report_keeps_the_run"
+)]
+#[test_case(
+    BatchToolStatus::AwaitingApproval,
+    BatchToolStatus::Running,
+    BatchToolStatus::Running
+    ; "an_allowed_child_runs"
+)]
+#[test_case(
+    BatchToolStatus::AwaitingApproval,
+    BatchToolStatus::Error,
+    BatchToolStatus::Error
+    ; "a_denied_child_fails"
+)]
+#[test_case(
+    BatchToolStatus::Drafting,
+    BatchToolStatus::Pending,
+    BatchToolStatus::Pending
+    ; "a_written_child_queues"
+)]
+#[test_case(
+    BatchToolStatus::Success,
+    BatchToolStatus::Running,
+    BatchToolStatus::Success
+    ; "a_settled_child_stays_settled"
+)]
+fn batch_progress_never_moves_a_row_backwards(
+    current: BatchToolStatus,
+    reported: BatchToolStatus,
+    expected: BatchToolStatus,
+) {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.tool_start(ToolStartEvent {
+        output: Some(ToolOutput::Batch {
+            entries: vec![child_in(current)],
+            text: String::new(),
+        }),
+        ..start(TOOL_ID, BATCH_TOOL)
+    });
+
+    panel.batch_progress(TOOL_ID, 0, child_in(reported));
+
+    assert_eq!(roster(&panel)[0].status, expected, "{STAGED_ROW_MSG}");
+}
+
+/// A cancel cuts off every call that was live, and a child still being
+/// written never went out, so it joins the rest of the queue.
+#[test]
+fn cancel_retires_staged_rows() {
+    const DRAFTING_CARD: &str = "t2";
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.tool_pending(TOOL_ID.into(), BATCH_TOOL);
+    panel.tool_input_roster(
+        TOOL_ID,
+        Some(vec![
+            child_in(BatchToolStatus::Pending),
+            child_in(BatchToolStatus::Pending),
+            child_in(BatchToolStatus::Pending),
+            child_in(BatchToolStatus::Drafting),
+        ]),
+    );
+    panel.await_approval(EAGER_CHILD_ID);
+    panel.batch_progress(TOOL_ID, 1, running_child(SHELL_TOOL_NAME));
+    panel.tool_pending(DRAFTING_CARD.into(), SHELL_TOOL_NAME);
+
+    panel.cancel_in_progress();
+
+    let statuses: Vec<_> = roster(&panel).iter().map(|entry| entry.status).collect();
+    assert_eq!(
+        statuses,
+        [
+            BatchToolStatus::Error,
+            BatchToolStatus::Error,
+            BatchToolStatus::Pending,
+            BatchToolStatus::Pending,
+        ],
+        "{STAGED_ROW_MSG}"
+    );
+    assert!(
+        panel.messages.iter().all(|msg| msg.tool_stage.is_none()),
+        "{STAGE_TITLE_MSG}"
+    );
 }
 
 fn eager_entry(status: BatchToolStatus) -> BatchToolEntry {

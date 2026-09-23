@@ -966,7 +966,7 @@ impl App {
             .unwrap_or(&self.permissions)
             .clone();
         if manager.pending_request(&decision.request_id).is_none() {
-            self.permission_prompt.resolve(&decision.request_id);
+            self.resolve_permission_prompt(&decision.request_id);
             return;
         }
         if self.permission_ui.pending.is_some() {
@@ -990,6 +990,18 @@ impl App {
                 accepted,
             })
         });
+    }
+
+    /// Closes the prompt the reader answered, and with it the wait the call's
+    /// title names. The prompt does not record which chat asked, and a chat
+    /// without the call has nothing to settle.
+    fn resolve_permission_prompt(&mut self, request_id: &str) {
+        if !self.permission_prompt.resolve(request_id) {
+            return;
+        }
+        for chat in &mut self.chats {
+            chat.approval_settled(request_id);
+        }
     }
 
     fn permission_failure(&mut self, message: &str) {
@@ -1106,7 +1118,7 @@ impl App {
                     && pending.guard.context == worker.permissions.pattern_candidate_context()
             });
             if *accepted || !current {
-                self.permission_prompt.resolve(request);
+                self.resolve_permission_prompt(request);
             } else {
                 self.flash("Could not save permission decision".into());
             }
@@ -1295,7 +1307,7 @@ impl App {
             }
             Ok(PermissionReply::Answered { request, accepted }) => {
                 if accepted {
-                    self.permission_prompt.resolve(&request);
+                    self.resolve_permission_prompt(&request);
                 } else {
                     self.flash("Could not save permission decision".into());
                 }

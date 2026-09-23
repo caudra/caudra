@@ -4348,8 +4348,13 @@ impl App {
                 self.permission_config_trust_deferred =
                     self.permissions.needs_project_permission_config_trust();
             }
-            self.permission_prompt
-                .enqueue(request, subagent_id.map(|id| format!("subtask {id}")));
+            let call_id = request.id.clone();
+            if self
+                .permission_prompt
+                .enqueue(request, subagent_id.map(|id| format!("subtask {id}")))
+            {
+                self.chats[chat_idx].await_approval(&call_id);
+            }
             return vec![];
         }
 
@@ -4360,6 +4365,7 @@ impl App {
 
         if let ChatEventResult::PermissionRequestResolved { request_id } = result {
             self.permission_prompt.resolve_pending(&request_id);
+            self.chats[chat_idx].approval_settled(&request_id);
             return vec![];
         }
 

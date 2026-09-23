@@ -282,9 +282,16 @@ pub struct BatchProgressEvent {
     pub entry: BatchToolEntry,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// Declared in the order a child moves through, which is what lets a reader
+/// refuse an update that would move a row backwards. The two outcomes are only
+/// ever compared once `is_terminal` has ruled them out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum BatchToolStatus {
+    /// Its element of the list is still being written.
+    Drafting,
     Pending,
+    /// Written, and waiting on the reader's answer to its permission prompt.
+    AwaitingApproval,
     Running,
     Success,
     Error,
@@ -294,6 +301,28 @@ impl BatchToolStatus {
     pub fn is_terminal(self) -> bool {
         matches!(self, Self::Success | Self::Error)
     }
+
+    /// The stage a row names in place of its verb, `None` for every status the
+    /// verb's tense already says.
+    pub fn stage(self) -> Option<CallStage> {
+        match self {
+            Self::Drafting => Some(CallStage::Drafting),
+            Self::AwaitingApproval => Some(CallStage::AwaitingApproval),
+            Self::Pending | Self::Running | Self::Success | Self::Error => None,
+        }
+    }
+}
+
+/// Where a call is before it runs, when that is worth a title of its own. A
+/// call in either stage reads as in progress by status alone, and in neither
+/// has it run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CallStage {
+    /// The model is still writing its arguments.
+    Drafting,
+    /// Its arguments are whole, and it waits on the reader's permission.
+    AwaitingApproval,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1725,6 +1754,11 @@ pub enum AgentEvent {
         /// fragment that delegates nothing, which is nearly all of them.
         #[serde(skip_serializing_if = "Vec::is_empty")]
         delegations: Vec<Delegation>,
+        /// This fragment closed the call's arguments: whatever the call waits
+        /// on next, it is no longer being written. Arguments that never parse
+        /// never close, and their call reads as written until it starts.
+        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        complete: bool,
     },
     ToolStart(Box<ToolStartEvent>),
     /// `content` is the **full accumulated output** so far, not a delta.
@@ -2278,6 +2312,9 @@ pub enum SubagentActivity {
         summary: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         call_id: Option<String>,
+        /// Where the call is before it runs, `None` once it has started.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stage: Option<CallStage>,
         /// The roster, when the tool is a `batch`. Empty for every other call.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         children: Vec<ActivityChild>,
@@ -2296,6 +2333,7 @@ impl SubagentActivity {
             name,
             summary: summary.split_whitespace().collect::<Vec<_>>().join(" "),
             call_id: None,
+            stage: None,
             children: Vec::new(),
         }
     }
@@ -2307,6 +2345,7 @@ impl SubagentActivity {
                 name,
                 summary,
                 call_id: None,
+                stage: None,
                 children,
             },
             other => other,
@@ -2316,6 +2355,14 @@ impl SubagentActivity {
     pub fn with_call_id(mut self, id: &str) -> Self {
         if let Self::Tool { call_id, .. } = &mut self {
             *call_id = Some(id.to_owned());
+        }
+        self
+    }
+
+    /// The same row, named for the stage its call is in before it runs.
+    pub fn with_stage(mut self, next: Option<CallStage>) -> Self {
+        if let Self::Tool { stage, .. } = &mut self {
+            *stage = next;
         }
         self
     }
@@ -2339,14 +2386,22 @@ impl SubagentActivity {
             // The input is still streaming, so the header is whatever the
             // arguments have revealed so far: nothing at first, then the one
             // scalar the preview pulled out of the fragments.
-            AgentEvent::ToolPending { id, name } => {
-                Some(Self::tool(Arc::from(name.as_str()), "").with_call_id(id))
-            }
+            AgentEvent::ToolPending { id, name } => Some(
+                Self::tool(Arc::from(name.as_str()), "")
+                    .with_call_id(id)
+                    .with_stage(Some(CallStage::Drafting)),
+            ),
             AgentEvent::ToolInputDelta {
-                id, name, preview, ..
-            } => preview
-                .as_deref()
-                .map(|preview| Self::tool(Arc::from(name.as_str()), preview).with_call_id(id)),
+                id,
+                name,
+                preview,
+                complete,
+                ..
+            } => preview.as_deref().map(|preview| {
+                Self::tool(Arc::from(name.as_str()), preview)
+                    .with_call_id(id)
+                    .with_stage((!complete).then_some(CallStage::Drafting))
+            }),
             AgentEvent::ToolStart(start) => {
                 Some(Self::tool(Arc::clone(&start.tool), &start.summary).with_call_id(&start.id))
             }
@@ -2358,14 +2413,22 @@ impl SubagentActivity {
     }
 
     /// The leading word, styled like a tool prefix when it names one.
+    ///
+    /// A call waiting on the reader answers with the wait rather than its
+    /// name: that is the word plugins are promised for it, and the call it
+    /// names is still in [`Self::detail`].
     pub fn label(&self) -> &str {
         match self {
             Self::Thinking { .. } => THINKING_LABEL,
             Self::Responding => RESPONDING_LABEL,
+            Self::Tool {
+                stage: Some(CallStage::AwaitingApproval),
+                ..
+            }
+            | Self::AwaitingPermission => AWAITING_PERMISSION_LABEL,
             Self::Tool { name, .. } => name,
             Self::Compacting => COMPACTING_LABEL,
             Self::Retrying => RETRYING_LABEL,
-            Self::AwaitingPermission => AWAITING_PERMISSION_LABEL,
         }
     }
 
@@ -2375,10 +2438,14 @@ impl SubagentActivity {
         match self {
             Self::Thinking { .. } => THINKING_PAST_LABEL,
             Self::Responding => RESPONDING_PAST_LABEL,
+            Self::Tool {
+                stage: Some(CallStage::AwaitingApproval),
+                ..
+            }
+            | Self::AwaitingPermission => AWAITING_PERMISSION_PAST_LABEL,
             Self::Tool { name, .. } => name,
             Self::Compacting => COMPACTING_PAST_LABEL,
             Self::Retrying => RETRYING_PAST_LABEL,
-            Self::AwaitingPermission => AWAITING_PERMISSION_PAST_LABEL,
         }
     }
 
@@ -3709,6 +3776,64 @@ mod tests {
                 .as_ref()
                 .map(|activity| (activity.label(), activity.detail())),
             expected
+        );
+    }
+
+    const STAGED_TOOL: &str = "shell";
+    const STAGED_COMMAND: &str = "cargo nextest run";
+
+    fn tool_input_delta(complete: bool) -> AgentEvent {
+        AgentEvent::ToolInputDelta {
+            id: "toolu_01".into(),
+            name: STAGED_TOOL.into(),
+            delta: String::new(),
+            preview: Some(STAGED_COMMAND.into()),
+            size: None,
+            body: None,
+            roster: None,
+            delegations: Vec::new(),
+            complete,
+        }
+    }
+
+    #[test_case(
+        AgentEvent::ToolPending { id: "toolu_01".into(), name: STAGED_TOOL.into() },
+        Some(CallStage::Drafting)
+        ; "an_announced_call_is_being_written"
+    )]
+    #[test_case(tool_input_delta(false), Some(CallStage::Drafting) ; "a_fragment_leaves_it_being_written")]
+    #[test_case(tool_input_delta(true), None ; "the_closing_fragment_ends_the_writing")]
+    #[test_case(tool_start(STAGED_TOOL, STAGED_COMMAND), None ; "a_started_call_has_no_stage")]
+    fn a_calls_row_is_in_the_stage_its_events_put_it_in(
+        event: AgentEvent,
+        expected: Option<CallStage>,
+    ) {
+        match SubagentActivity::from_event(&event) {
+            Some(SubagentActivity::Tool { stage, .. }) => assert_eq!(stage, expected),
+            other => panic!("expected a tool row, got {other:?}"),
+        }
+    }
+
+    /// Plugins are promised the wait by name, and the call it is for rides
+    /// along as the detail every tool row already carries.
+    #[test_case(None, STAGED_TOOL, STAGED_TOOL ; "a_running_call_is_its_tool")]
+    #[test_case(Some(CallStage::Drafting), STAGED_TOOL, STAGED_TOOL ; "a_call_being_written_is_its_tool")]
+    #[test_case(
+        Some(CallStage::AwaitingApproval),
+        AWAITING_PERMISSION_LABEL,
+        AWAITING_PERMISSION_PAST_LABEL
+        ; "a_call_awaiting_approval_is_the_wait"
+    )]
+    fn a_staged_call_answers_with_the_label_plugins_are_promised(
+        stage: Option<CallStage>,
+        label: &str,
+        past_label: &str,
+    ) {
+        let activity =
+            SubagentActivity::tool(Arc::from(STAGED_TOOL), STAGED_COMMAND).with_stage(stage);
+        assert_eq!(
+            (activity.label(), activity.past_label(), activity.detail()),
+            (label, past_label, Some(STAGED_COMMAND))
         );
     }
 

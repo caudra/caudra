@@ -43,7 +43,7 @@ use caudra_agent::tools::ToolEffect;
 use caudra_agent::types::{TodoItem, TodoPriority, TodoStatus};
 use caudra_agent::workspace_baseline::BaselineOutcome;
 use caudra_agent::{
-    DoneReason, GoalResult, GoalStatus, GoalVerdict, HistorySnapshot, ImageMediaType,
+    CallStage, DoneReason, GoalResult, GoalStatus, GoalVerdict, HistorySnapshot, ImageMediaType,
     McpConfigErrors, McpServerInfo, McpServerStatus, McpSnapshot, McpSnapshotReader,
     SubagentActivity, SubagentProgress, ToolAccounting, ToolDoneEvent, ToolOutput, ToolStartEvent,
     TurnCompleteEvent,
@@ -1857,6 +1857,7 @@ fn delegation_msg(delegations: Vec<caudra_agent::Delegation>) -> Msg {
         body: None,
         roster: None,
         delegations,
+        complete: false,
     })
 }
 
@@ -15869,6 +15870,80 @@ fn covered_permission_event_removes_the_matching_queued_prompt() {
 
     assert_eq!(app.permission_prompt.pending_count(), 1);
     assert_eq!(app.permission_prompt.request_id(), Some("first"));
+}
+
+const STAGED_CALL_ID: &str = "staged_call";
+const STAGED_COMMAND: &str = "cargo test";
+/// A call from an MCP server, which starts before it asks.
+const STAGED_MCP_TOOL: &str = "mcp_server_lookup";
+const APPROVAL_STAGED_MSG: &str =
+    "the card whose call raised a request names the wait, in the chat that raised it";
+const APPROVAL_SETTLED_MSG: &str = "an answered request hands the title back to the call";
+
+/// Where `chat`'s card for `tool_id` says its call is.
+fn card_stage(app: &App, chat: usize, tool_id: &str) -> Option<CallStage> {
+    let chat = &app.chats[chat];
+    (0..chat.message_count())
+        .filter_map(|index| chat.message_at(index))
+        .find(|msg| matches!(&msg.role, DisplayRole::Tool(tool) if tool.id == tool_id))
+        .and_then(|msg| msg.tool_stage)
+}
+
+#[test]
+fn a_subagent_request_stages_the_card_in_its_own_chat() {
+    let mut app = app_with_subagent();
+    for event in [
+        AgentEvent::ToolPending {
+            id: STAGED_CALL_ID.into(),
+            name: "bash".into(),
+        },
+        permission_event(STAGED_CALL_ID, STAGED_COMMAND),
+    ] {
+        app.update(subagent_msg(event, TASK_ID, Some(RESEARCH_NAME)));
+    }
+
+    assert_eq!(
+        card_stage(&app, 1, STAGED_CALL_ID),
+        Some(CallStage::AwaitingApproval),
+        "{APPROVAL_STAGED_MSG}"
+    );
+}
+
+fn answer_with_a_key(app: &mut App) {
+    rendered(app);
+    app.update(Msg::Key(key(KeyCode::Char('y'))));
+    app.finish_permission_jobs();
+}
+
+fn resolve_by_rule(app: &mut App) {
+    app.update(agent_msg(AgentEvent::PermissionRequestResolved {
+        request_id: STAGED_CALL_ID.into(),
+        source_request_id: STAGED_CALL_ID.into(),
+    }));
+}
+
+/// No start follows the answer for a call that started before it asked, so
+/// the answer itself, however it arrives, is what ends the wait.
+#[test_case(answer_with_a_key ; "the_reader_answers")]
+#[test_case(resolve_by_rule ; "a_rule_answers_for_them")]
+fn a_resolved_request_unstages_the_card(resolve: fn(&mut App)) {
+    let mut app = streaming_app();
+    app.update(agent_msg(tool_start(STAGED_CALL_ID, STAGED_MCP_TOOL)));
+    app.update(agent_msg(permission_event(STAGED_CALL_ID, STAGED_COMMAND)));
+    assert_eq!(
+        card_stage(&app, 0, STAGED_CALL_ID),
+        Some(CallStage::AwaitingApproval),
+        "{APPROVAL_STAGED_MSG}"
+    );
+
+    resolve(&mut app);
+
+    assert!(!app.permission_prompt.is_open(), "{APPROVAL_SETTLED_MSG}");
+    assert_eq!(
+        card_stage(&app, 0, STAGED_CALL_ID),
+        None,
+        "{APPROVAL_SETTLED_MSG}"
+    );
 }
 
 #[test]
