@@ -11,7 +11,7 @@ Caudra reviews a tool's action before it sends the call to the tool. Reusable de
 
 Permissions control consent. They do not sandbox shell commands or external MCP processes.
 
-In a [remote workspace](/docs/remote-workspaces/#project-context-and-trust), local file grants do not cover remote resources. Remote project permission denies apply immediately, while allows require review of the exact fetched asset. Caudra approval cannot override the Workcell server's immutable policy.
+In a [remote workspace](/docs/remote-workspaces/#project-context-and-trust), local file grants do not cover remote resources. Remote project permission denies apply immediately, while allows require review of the exact fetched asset. A remote call that can change the workspace, such as a shell command or a file write, can be allowed only as `This exact call`. Caudra approval cannot override the Workcell server's immutable policy.
 
 ## Resolution order
 

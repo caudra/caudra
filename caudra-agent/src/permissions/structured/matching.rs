@@ -6,7 +6,7 @@ use super::{
     PermissionSubject, PolicyRule, RemotePermissionIdentity, ResourceCoverage, ResourceStanding,
     StructuredPermissionDecision, StructuredPermissionEffect, StructuredPermissionRule,
     WORKCELL_OWNER, argument_constraint_matches, attribute_kind, canonical_json_sha256,
-    safe_summary,
+    remote_resource_identity, safe_summary,
 };
 use super::{
     COMMAND_OBSERVATION_ATTRIBUTE, NORMALIZED_COMMAND_ATTRIBUTE, PermissionExecutorKind,
@@ -231,12 +231,26 @@ pub(in crate::permissions) fn trusted_command_observation(
 /// user grants arbitrary command execution. Command patterns stay excluded
 /// because the reviewed text of a protected command describes more than the
 /// pattern does.
+///
+/// A remote resource is pinned by the scope its authority issued, and its
+/// attributes only describe it for display, so an exact remote selector clears
+/// the bar on its own. A remote subtree never does. Every mutating remote call
+/// is protected, so without this its own exact option could not be accepted.
 pub(super) fn protected_coverage_allowed(
     constraint: &PermissionResourceConstraint,
     resource: &PermissionResource,
 ) -> bool {
     if resource.kind == PermissionResourceKind::Command
         && matches!(constraint.selector, PermissionResourceSelector::Any)
+    {
+        return true;
+    }
+    if remote_resource_identity(&resource.kind).is_some()
+        && constraint.protected == Some(true)
+        && matches!(
+            constraint.selector,
+            PermissionResourceSelector::RemoteResource { .. }
+        )
     {
         return true;
     }
@@ -969,7 +983,8 @@ mod tests {
         default_remote_identity, exact_constraint, explicit_request, flags_in_project,
         ladder_values, mcp_subject, order_independent_command_decision, pattern_constraint,
         protected_command_resource, read_subtree_rule, remote_identity, remote_request,
-        remote_request_with, request, rule, url_ladder, webfetch_request, workcell_request,
+        remote_request_resource, remote_request_with, request, rule, url_ladder, webfetch_request,
+        workcell_request,
     };
     use crate::permissions::structured::{
         PermissionArgumentConstraint, PermissionAuthorityProfile, PermissionCapabilityFamily,
@@ -987,6 +1002,48 @@ mod tests {
     use caudra_config::ToolKey;
     use std::collections::BTreeMap;
     use std::path::{Path, PathBuf};
+
+    const REMOTE_PARENT_SCOPE: &str = "root";
+    const REMOTE_FILE_SCOPE: &str = "root\u{1f}opaque-file";
+
+    #[test_case(false; "ordinary")]
+    #[test_case(true; "mutating")]
+    fn a_remote_call_is_approvable_exactly_and_only_an_ordinary_one_by_reuse(mutating: bool) {
+        let identity = default_remote_identity();
+        let request = remote_request_resource(
+            identity.clone(),
+            PermissionResourceKind::RemoteFile {
+                identity: identity.clone(),
+            },
+            REMOTE_FILE_SCOPE,
+            mutating,
+        );
+        for lifetime in [PermissionLifetime::Once, PermissionLifetime::Conversation] {
+            let exact = request.option_rule("allow_exact", lifetime).unwrap();
+            assert!(permission_rule_covers_request(&exact, &request));
+        }
+        let mut subtree = request
+            .option_rule("allow_exact", PermissionLifetime::Once)
+            .unwrap()
+            .resources[0]
+            .clone();
+        subtree.selector = PermissionResourceSelector::RemoteSubtree {
+            identity,
+            scope: vec![REMOTE_PARENT_SCOPE.into()],
+        };
+        assert_eq!(
+            resource_constraint_matches(&subtree, &request.resources[0]),
+            !mutating
+        );
+        assert_eq!(
+            request
+                .options
+                .iter()
+                .any(|option| option.id == "allow_remote_resources"),
+            !mutating
+        );
+    }
+
     #[test]
     fn remote_grants_are_isolated_across_every_subject_identity_dimension() {
         let request = remote_request();

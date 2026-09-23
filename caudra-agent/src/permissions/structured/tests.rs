@@ -146,13 +146,17 @@ pub(super) fn remote_request_with(identity: RemotePermissionIdentity) -> Permiss
         identity.clone(),
         PermissionResourceKind::RemoteFile { identity },
         "root\u{1f}opaque-file",
+        false,
     )
 }
 
+/// A mutating remote call is protected and must prompt, the way the Workcell
+/// adapter marks every intent its authority reports as mutating.
 pub(super) fn remote_request_resource(
     identity: RemotePermissionIdentity,
     kind: PermissionResourceKind,
     value: &str,
+    mutating: bool,
 ) -> PermissionRequest {
     let intent = PermissionIntent::new(
         PermissionScopes::single("remote intent".into()),
@@ -160,8 +164,8 @@ pub(super) fn remote_request_resource(
             kind,
             value: value.into(),
             access: Some(PermissionResourceAccess::Read),
-            protected: false,
-            requires_prompt: false,
+            protected: mutating,
+            requires_prompt: mutating,
             attributes: BTreeMap::from([(
                 "display_path".into(),
                 "/path/that/must/not/be/probed".into(),

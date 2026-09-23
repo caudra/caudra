@@ -290,10 +290,13 @@ pub(super) fn rule_options(
         ),
     ];
 
+    // A mutating remote call is protected. Reusing its resources for any
+    // arguments would skip the typed confirmation a local write demands, so it
+    // earns only the exact call.
     if matches!(authority, PermissionAuthorityProfile::RemoteResource)
-        && resources
-            .iter()
-            .all(|resource| remote_resource_identity(&resource.kind).is_some())
+        && resources.iter().all(|resource| {
+            remote_resource_identity(&resource.kind).is_some() && !resource.protected
+        })
     {
         options.push(option(
             "allow_remote_resources",
@@ -1823,6 +1826,7 @@ mod tests {
                 identity: identity.clone(),
             },
             "root\u{1f}parent\u{1f}directory",
+            false,
         );
         let rule = request
             .options
