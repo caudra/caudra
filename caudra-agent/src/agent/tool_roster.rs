@@ -180,11 +180,12 @@ impl Child {
     /// it under.
     fn entry(&self) -> Option<BatchToolEntry> {
         let tool = self.tool.clone()?;
-        // The same value `input_start_input` stamps at dispatch, so the script
-        // the reader is watching does not change the moment the call starts.
+        // The same value the call itself stamps at dispatch -- Workcell's
+        // `input_start_input`, or a native tool's own `start_input` -- so the
+        // script the reader is watching does not change the moment it starts.
         let input = self.script.as_ref().and_then(|code| {
-            script_arg(&tool).map(|(language, _)| ToolInput::Code {
-                language: language.to_owned(),
+            script_arg(&tool).map(|arg| ToolInput::Code {
+                language: arg.language.to_owned(),
                 code: code.clone(),
             })
         });
@@ -288,24 +289,31 @@ impl RosterStream {
         // scanner meets first there is not a preview key for any tool.
         let (script, summary, complete) = {
             let params = object_member(&child.text, PARAMETERS_KEY).unwrap_or(&child.text);
-            let script = script_arg(&tool).and_then(|(_, key)| literal_member(params, key));
+            let arg = script_arg(&tool);
+            let carried = arg.and_then(|arg| literal_member(params, arg.key));
             let preview = preview_for(&tool, params);
-            // A script tool's row is its command's first line, which is what
-            // the settled header reports too, so neither the row nor the body
-            // under it moves when the call is dispatched. The tidied preview
-            // would cut both to a header's width and fold their newlines.
-            let summary = match &script {
+            let names_row = arg.is_some_and(|arg| arg.names_row);
+            // A command's row is its own first line, which is what the settled
+            // header reports too, so neither the row nor the body under it
+            // moves when the call is dispatched. The tidied preview would cut
+            // both to a header's width and fold their newlines. A prompt names
+            // no row, so its child is headed by the preview like any other.
+            let summary = match carried.as_ref().filter(|_| names_row) {
                 Some((code, _)) => code.lines().next().unwrap_or_default().to_owned(),
                 None => preview.as_ref().map(|p| p.text.clone()).unwrap_or_default(),
             };
+            let script_done = carried.as_ref().is_some_and(|(_, done)| *done);
+            let preview_done = preview.is_some_and(|p| p.complete);
             // A script's own closing quote settles the row for a tool that has
             // no preview key to settle it, which is every script tool whose
-            // argument reads as a blob.
-            let complete = match &script {
-                Some((_, done)) => *done,
-                None => preview.is_some_and(|p| p.complete),
+            // argument reads as a blob. One that names no row needs both: the
+            // preview naming it, and the script it is still being handed.
+            let complete = match arg {
+                None => preview_done,
+                Some(arg) if arg.names_row => script_done,
+                Some(_) => script_done && preview_done,
             };
-            (script.map(|(code, _)| code), summary, complete)
+            (carried.map(|(code, _)| code), summary, complete)
         };
         let changed = child.tool.as_deref() != Some(tool.as_str())
             || child.summary != summary
@@ -610,6 +618,52 @@ mod tests {
             script(BASH_LANG, "echo one"),
             "{SCRIPT_MSG}"
         );
+    }
+
+    const IMAGE: &str = "image_generate";
+    const IMAGE_LANG: &str = "markdown";
+    const IMAGE_PROMPT: &str = "A wide cinematic shot\nof a lighthouse";
+    const IMAGE_OUT: &str = "assets/hero.png";
+    const PROMPT_ROW_MSG: &str = "a generating child draws its prompt as a body under a row that \
+        still names the file it writes, because the prompt is the call and the path is its header";
+
+    #[test]
+    fn a_generating_childs_prompt_streams_under_a_row_naming_its_file() {
+        let json = serde_json::json!({ "tool_calls": [{
+            "tool": IMAGE,
+            "parameters": { "prompt": IMAGE_PROMPT, "out": IMAGE_OUT },
+        }] })
+        .to_string();
+
+        let entries = entries(&[&json]);
+
+        assert_eq!(
+            entries[0].input,
+            script(IMAGE_LANG, IMAGE_PROMPT),
+            "{PROMPT_ROW_MSG}"
+        );
+        assert_eq!(entries[0].summary, IMAGE_OUT, "{PROMPT_ROW_MSG}");
+    }
+
+    /// A child that names its row from something other than its script settles
+    /// on both. Stopping at the path would leave the prompt frozen wherever
+    /// the fragment carrying that path happened to end.
+    #[test]
+    fn a_generating_child_keeps_reading_its_prompt_past_the_path() {
+        let entries = entries(&[
+            concat!(
+                r#"{"tool_calls": [{"tool": "image_generate", "parameters": "#,
+                r#"{"out": "assets/hero.png", "prompt": "A wide cinematic shot"#
+            ),
+            r#"\nof a lighthouse"}}]}"#,
+        ]);
+
+        assert_eq!(
+            entries[0].input,
+            script(IMAGE_LANG, IMAGE_PROMPT),
+            "{PROMPT_ROW_MSG}"
+        );
+        assert_eq!(entries[0].summary, IMAGE_OUT, "{PROMPT_ROW_MSG}");
     }
 
     #[test_case(BATCH, true ; "the_batch_tool_itself")]

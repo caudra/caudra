@@ -6,7 +6,9 @@
 //! and the status line can say *which* file is being edited before the model
 //! has finished saying it.
 
-use crate::tools::{PYTHON_EXECUTION_TOOL_NAME, SHELL_TOOL_NAME, relative_path};
+use crate::tools::{
+    IMAGE_GENERATE_TOOL_NAME, PYTHON_EXECUTION_TOOL_NAME, SHELL_TOOL_NAME, relative_path,
+};
 
 /// Wide enough for a path or a short command, short enough that a header row
 /// never becomes the payload.
@@ -50,18 +52,46 @@ const PREVIEW_KEYS: &[(&str, &[&str])] = &[
     ("code_refs", &["symbol"]),
     ("code_impact", &["symbol"]),
     ("code_expand", &["symbol"]),
+    ("image_generate", &["out"]),
 ];
 
-/// The tools whose call *is* a script, with the language it is written in and
-/// the argument carrying it.
+/// A tool whose call *is* a script: the language it is written in, the
+/// argument carrying it, and whether that script also names the roster row.
 ///
-/// A header can only ever be the script's first line, so a batch child of one
-/// of these carries the value uncapped as well and draws it as a body. The
-/// languages are the ones stamped when the call starts, which is what lets the
-/// body a child streams be the body it keeps once it is dispatched.
-const SCRIPT_TOOLS: &[(&str, &str, &str)] = &[
-    (SHELL_TOOL_NAME, "bash", "command"),
-    (PYTHON_EXECUTION_TOOL_NAME, "python", "code"),
+/// A batch child of one of these carries the value uncapped and draws it as a
+/// body. The languages are the ones stamped when the call starts, which is
+/// what lets the body a child streams be the body it keeps once it is
+/// dispatched.
+pub(super) struct ScriptTool {
+    tool: &'static str,
+    pub(super) language: &'static str,
+    pub(super) key: &'static str,
+    /// A command is its own header, so its row is the script's first line. An
+    /// image prompt is not: the call is named by the file it writes, so the
+    /// row keeps the preview its own key produces and the prompt is only the
+    /// body drawn beneath it.
+    pub(super) names_row: bool,
+}
+
+const SCRIPT_TOOLS: &[ScriptTool] = &[
+    ScriptTool {
+        tool: SHELL_TOOL_NAME,
+        language: "bash",
+        key: "command",
+        names_row: true,
+    },
+    ScriptTool {
+        tool: PYTHON_EXECUTION_TOOL_NAME,
+        language: "python",
+        key: "code",
+        names_row: true,
+    },
+    ScriptTool {
+        tool: IMAGE_GENERATE_TOOL_NAME,
+        language: "markdown",
+        key: "prompt",
+        names_row: false,
+    },
 ];
 
 /// Tools that lead with a blob or an aggregate. There is nothing short to show
@@ -94,7 +124,7 @@ const BLOB_KEYS: &[&str] = &[
 
 /// Keys whose value is a path, shortened the way the finished header shortens
 /// it so the preview does not jump when the real header replaces it.
-const PATH_KEYS: &[&str] = &["filePath", "path"];
+const PATH_KEYS: &[&str] = &["filePath", "path", "out"];
 
 /// Below this there is no wait to narrate, and a counter that appears and
 /// vanishes is worse than none.
@@ -149,15 +179,14 @@ pub(super) fn candidates(tool: &str) -> impl Iterator<Item = &str> {
     })
 }
 
-/// The language and argument name of `tool`'s script, for the tools that are
-/// called with one. `None` for every tool whose arguments merely describe what
-/// to do rather than spell it out.
-pub(super) fn script_arg(tool: &str) -> Option<(&'static str, &'static str)> {
+/// How `tool` is called with a script, for the tools that are. `None` for
+/// every tool whose arguments merely describe what to do rather than spell it
+/// out.
+pub(super) fn script_arg(tool: &str) -> Option<&'static ScriptTool> {
     candidates(tool).find_map(|rest| {
         SCRIPT_TOOLS
             .iter()
-            .find(|(name, ..)| same_key(name, rest))
-            .map(|(_, language, key)| (*language, *key))
+            .find(|script| same_key(script.tool, rest))
     })
 }
 
@@ -630,5 +659,39 @@ mod tests {
         let Preview { text, .. } = preview_for(SHELL, &json).unwrap();
         assert!(text.ends_with('…'), "{text}");
         assert_eq!(text.chars().count(), super::PREVIEW_MAX_CHARS + 1);
+    }
+
+    const IMAGE: &str = "image_generate";
+    const SCRIPT_ROW_MSG: &str = "a command is its own header and names its row; a prompt is not, \
+        because the call is named by the file it writes";
+
+    #[test_case(SHELL, Some(("bash", "command", true)) ; "a_command_names_its_own_row")]
+    #[test_case("python_execution", Some(("python", "code", true)) ; "a_script_names_its_own_row")]
+    #[test_case(IMAGE, Some(("markdown", "prompt", false)) ; "a_prompt_names_no_row")]
+    #[test_case(EDIT, None ; "a_tool_called_with_arguments_has_no_script")]
+    fn a_tools_script_argument(tool: &str, expected: Option<(&str, &str, bool)>) {
+        let found =
+            super::script_arg(tool).map(|script| (script.language, script.key, script.names_row));
+        assert_eq!(found, expected, "{SCRIPT_ROW_MSG}");
+    }
+
+    /// The reported bug: with no table entry the call fell to the generic
+    /// rule, which skips the prompt as a blob and takes whichever other scalar
+    /// lands first. `quality` and `size` are both plausible winners, and
+    /// neither names the call.
+    #[test_case(r#"{"prompt": "a hero image", "out": "assets/hero.png""#, Some("assets/hero.png") ; "the_path_wins_over_the_prompt")]
+    #[test_case(r#"{"quality": "high", "size": "1024x1024", "out": "a.png""#, Some("a.png") ; "no_other_scalar_takes_the_row")]
+    #[test_case(r#"{"prompt": "a hero image""#, None ; "the_prompt_alone_names_nothing")]
+    fn a_generation_is_previewed_by_the_file_it_writes(json: &str, expected: Option<&str>) {
+        assert_eq!(text_of(IMAGE, json).as_deref(), expected);
+    }
+
+    /// The row must read the way `start_header` spells it, or it jumps the
+    /// moment the call is dispatched.
+    #[test]
+    fn a_generations_path_shortens_before_it_is_finished() {
+        let cwd = std::env::current_dir().unwrap();
+        let json = format!(r#"{{"out": "{}/assets/he"#, cwd.display());
+        assert_eq!(text_of(IMAGE, &json).as_deref(), Some("assets/he"));
     }
 }

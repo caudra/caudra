@@ -32,9 +32,9 @@ use caudra_agent::{
     SnapshotSpan, SpanStyle, SubagentActivity, SubagentProgress, ToolInput, ToolOutput,
     format_live_duration, format_settled_duration,
     tools::{
-        FILE_READ_TOOL_NAME, FILE_WRITE_TOOL_NAME, LOCAL_DOCUMENT_WRITE_TOOL_NAME,
-        MEMORY_TOOL_NAME, PYTHON_EXECUTION_TOOL_NAME, SHELL_TOOL_NAME, TASK_TOOL_NAME,
-        humanize_duration, timeout_annotation,
+        FILE_READ_TOOL_NAME, FILE_WRITE_TOOL_NAME, IMAGE_GENERATE_TOOL_NAME,
+        LOCAL_DOCUMENT_WRITE_TOOL_NAME, MEMORY_TOOL_NAME, PYTHON_EXECUTION_TOOL_NAME,
+        SHELL_TOOL_NAME, TASK_TOOL_NAME, humanize_duration, timeout_annotation,
     },
 };
 use caudra_workcell::effective_timeout;
@@ -216,10 +216,25 @@ const QUERY_KEYS: &[(&str, &str)] = &[
     ("code_impact", "symbol"),
     ("code_expand", "symbol"),
 ];
-/// The tools whose streaming body is a script rather than a file. Both draw
-/// it as numbered lines whole, so it is rendered here the way the settled card
-/// renders it and never through the window their output is drawn in.
-const LIVE_SCRIPT_TOOLS: &[&str] = &[SHELL_TOOL_NAME, PYTHON_EXECUTION_TOOL_NAME];
+/// The tools whose streaming body is a source the call carries entire rather
+/// than a file it names, and whether the header is a summary of that same
+/// source. All three draw the body as numbered lines whole, so it is rendered
+/// here the way the settled card renders it and never through the window
+/// their output is drawn in, and it does not move when the call stamps the
+/// same value at dispatch.
+///
+/// A command's header is its own first line with the newlines spent as
+/// spaces, so an open card defers it to the body about to spell it out. A
+/// generation's header is the file it writes, which its prompt never repeats,
+/// so the row keeps it and the prompt is drawn beneath. That is also why an
+/// image prompt belongs here at all despite being prose: what makes the group
+/// is that the argument *is* the call, so the reader watches one body from
+/// the first token to the settled card.
+const LIVE_SCRIPT_TOOLS: &[(&str, bool)] = &[
+    (SHELL_TOOL_NAME, true),
+    (PYTHON_EXECUTION_TOOL_NAME, true),
+    (IMAGE_GENERATE_TOOL_NAME, false),
+];
 /// The tools whose streaming body is a document however it is named. Both
 /// stores settle to rendered markdown, and one of them is named by an opaque
 /// reference with no extension to read, so the tool is what says so rather
@@ -2103,11 +2118,18 @@ fn header_repeats_script(header: &str, input: Option<&ToolInput>) -> bool {
 }
 
 /// Whether this tool's streaming body is a script, which an open card draws
-/// whole rather than through the window its output is given.
-pub(super) fn draws_live_script(tool_name: &str) -> bool {
+/// whole rather than through the window its output is given, and whether the
+/// header summarises that same script. `None` for every tool whose live body
+/// is neither.
+fn live_script(tool_name: &str) -> Option<bool> {
     LIVE_SCRIPT_TOOLS
         .iter()
-        .any(|known| names_tool(known, tool_name))
+        .find(|(known, _)| names_tool(known, tool_name))
+        .map(|(_, names_header)| *names_header)
+}
+
+pub(super) fn draws_live_script(tool_name: &str) -> bool {
+    live_script(tool_name).is_some()
 }
 
 /// Whether a still-arriving body is drawn as the document it is rather than as
@@ -2212,7 +2234,7 @@ pub fn build_tool_lines(
         // it as has streamed.
         let defers = expansion.is_some()
             && (header_repeats_script(header, msg.tool_input.as_deref())
-                || (live.is_some() && draws_live_script(tool_name)));
+                || (live.is_some() && live_script(tool_name) == Some(true)));
         let shown = match defers {
             true => "",
             false => header,
@@ -3010,6 +3032,103 @@ mod tests {
         let text = lines_text(&tl);
         assert!(text.contains(STREAMED_HEADER), "{text:?}");
         assert!(tl.truncation, "{LIVE_SCRIPT_MSG}: {text:?}");
+    }
+
+    /// A prompt as the model writes it: prose, several lines, and long enough
+    /// that a header could only ever hold a prefix of it.
+    const STREAMING_PROMPT: &str =
+        "A wide cinematic shot of a lighthouse\nat dusk, storm clouds behind it";
+    const GENERATED_PATH: &str = "assets/hero.png";
+    const LIVE_PROMPT_MSG: &str = "a generation draws the prompt it is being told, line by line, \
+        and keeps drawing the same body once the call stamps it";
+    const PROMPT_NAMES_NO_ROW_MSG: &str =
+        "a generation's row names the file it writes, which its prompt never repeats";
+
+    fn image_msg(live: Option<&str>, input: Option<ToolInput>) -> DisplayMessage {
+        let mut msg = bash_msg(GENERATED_PATH, ToolStatus::InProgress, input, None);
+        if let DisplayRole::Tool(tool) = &mut msg.role {
+            tool.name = IMAGE_GENERATE_TOOL_NAME.into();
+        }
+        msg.live_body = live.map(str::to_owned);
+        msg
+    }
+
+    fn prompt_input() -> Option<ToolInput> {
+        Some(ToolInput::Code {
+            language: "markdown".into(),
+            code: STREAMING_PROMPT.into(),
+        })
+    }
+
+    /// The reported bug: a generation drew nothing at all while its prompt
+    /// streamed, and the whole prompt then jumped into the header's
+    /// parentheses when the call started. The body it streams is the body it
+    /// keeps, so the two frames draw the same card.
+    #[test]
+    fn a_generation_draws_one_prompt_from_the_first_token_to_the_call() {
+        let open = |msg| {
+            lines_text(&build_tool_lines(
+                &msg,
+                ToolStatus::InProgress,
+                &test_rctx(80),
+                Some(Disclosure::default()),
+            ))
+        };
+
+        let streaming = open(image_msg(Some(STREAMING_PROMPT), None));
+
+        for line in STREAMING_PROMPT.lines() {
+            assert!(streaming.contains(line), "{LIVE_PROMPT_MSG}: {streaming:?}");
+        }
+        assert_eq!(
+            streaming,
+            open(image_msg(None, prompt_input())),
+            "{LIVE_PROMPT_MSG}"
+        );
+    }
+
+    /// A command defers its header to the body about to spell it out. A
+    /// generation must not: the path and the prompt are different things, and
+    /// dropping the path would leave the card unable to say what it writes.
+    #[test]
+    fn a_streaming_generation_keeps_the_path_on_its_row() {
+        let tl = build_tool_lines(
+            &image_msg(Some(STREAMING_PROMPT), None),
+            ToolStatus::InProgress,
+            &test_rctx(80),
+            Some(Disclosure::default()),
+        );
+
+        assert!(
+            line_text(&tl.lines[0]).contains(GENERATED_PATH),
+            "{PROMPT_NAMES_NO_ROW_MSG}: {}",
+            line_text(&tl.lines[0])
+        );
+    }
+
+    /// Routing the prompt through the live *body* would clip it to the height
+    /// the output gets and let it jump to full length once the call starts.
+    #[test]
+    fn a_streaming_prompt_is_drawn_whole_rather_than_windowed() {
+        const WINDOW: u32 = 1;
+        let window = ScrollWindow {
+            height: WINDOW as usize,
+            offset: 0,
+            follow: true,
+        };
+
+        let tl = build_tool_lines(
+            &image_msg(Some(STREAMING_PROMPT), None),
+            ToolStatus::InProgress,
+            &scroll_rctx(80, WINDOW, window),
+            Some(Disclosure::default()),
+        );
+
+        let text = lines_text(&tl);
+        for line in STREAMING_PROMPT.lines() {
+            assert!(text.contains(line), "{LIVE_PROMPT_MSG}: {text:?}");
+        }
+        assert!(!tl.truncation, "{LIVE_PROMPT_MSG}: {text:?}");
     }
 
     #[test]

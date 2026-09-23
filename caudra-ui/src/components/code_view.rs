@@ -5474,6 +5474,44 @@ mod tests {
         assert_eq!(carrying, 1, "{STREAMED_SCRIPT_MSG}");
     }
 
+    const STREAMED_PROMPT_MSG: &str = "a generating child draws the prompt that has arrived under \
+        a row still naming the file it writes: the two are different things, so both are shown";
+    const STREAMED_PROMPT: &str =
+        "A wide cinematic shot of a lighthouse\nat dusk, storm clouds behind it";
+    const GENERATED_PATH: &str = "assets/hero.png";
+    const IMAGE_CHILD: &str = "image_generate";
+
+    /// The reported bug: a generation inside a batch showed a bare path and
+    /// nothing else until the image came back, which is the longest wait of
+    /// any call the roster can hold.
+    #[test]
+    fn a_streaming_generations_prompt_hangs_under_a_row_naming_its_file() {
+        let entry = BatchToolEntry {
+            status: BatchToolStatus::Pending,
+            summary: GENERATED_PATH.into(),
+            input: Some(ToolInput::Code {
+                language: "markdown".into(),
+                code: STREAMED_PROMPT.into(),
+            }),
+            output: None,
+            ..batch_entry(IMAGE_CHILD, 0)
+        };
+
+        let card = render_batch(&[entry], false, &limits(BatchViews::default()));
+
+        let drawn: Vec<String> = card.lines.iter().map(line_text).collect();
+        assert!(
+            drawn[0].contains(GENERATED_PATH),
+            "{STREAMED_PROMPT_MSG}: {drawn:?}"
+        );
+        for line in STREAMED_PROMPT.lines() {
+            assert!(
+                drawn[1..].iter().any(|row| row.contains(line)),
+                "{STREAMED_PROMPT_MSG}: {line:?} missing from {drawn:?}"
+            );
+        }
+    }
+
     const SETTLED_MSG: &str = "a settled child owns its row and its body and nothing else: a \
         tally hung off it as a node leaves the body drawn to the left of that node";
 

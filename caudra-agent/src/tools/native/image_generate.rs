@@ -32,7 +32,7 @@ use crate::tools::schema::{ParamKind, ParamSchema, Property, to_json_schema, val
 use crate::tools::{
     BoxFuture, DescriptionContext, ToolAudience, ToolContext, relative_path, resolve_path,
 };
-use crate::types::ToolOutput;
+use crate::types::{ToolInput, ToolOutput};
 use caudra_providers::ImageSource;
 use caudra_providers::openai_images::{ImageQuality, ImageRequest, generate};
 use caudra_storage::StateDir;
@@ -52,6 +52,9 @@ const CONFLICT_CODE: &str = "conflict";
 const PNG_EXTENSION: &str = "png";
 const SAVED: &str = "Generated image saved to";
 const VIEW_HINT: &str = "Call view_image on it to see the result.";
+/// A prompt is prose, and the model writes it with the emphasis and the
+/// backticks prose is written with.
+const PROMPT_LANGUAGE: &str = "markdown";
 
 static PROMPT_PARAM: ParamSchema = ParamSchema::Primitive {
     kind: ParamKind::String,
@@ -191,8 +194,15 @@ impl ToolInvocation for ImageGenerateCall {
         HeaderFuture::Ready(HeaderResult::plain(relative_path(&self.out)))
     }
 
-    fn start_annotation(&self) -> Option<String> {
-        Some(self.prompt.clone())
+    /// The same value the stream drew, so the prompt the reader was watching
+    /// does not move when the call starts. It stays for the whole generation,
+    /// which is the long part, and the header's parentheses stay free of a
+    /// payload no row could hold.
+    fn start_input(&self) -> Option<ToolInput> {
+        Some(ToolInput::Code {
+            language: PROMPT_LANGUAGE.to_owned(),
+            code: self.prompt.clone(),
+        })
     }
 
     fn mutable_path(&self) -> Option<&Path> {
@@ -950,6 +960,29 @@ mod tests {
         let input = serde_json::json!({"prompt": PROMPT, "out": "a.png"});
         assert!(call(input).is_ok());
         assert_eq!(ImageQuality::default(), ImageQuality::Auto);
+    }
+
+    const PROMPT_IS_THE_BODY: &str = "a generation carries its prompt as the card's body, so the \
+        text the reader watched arrive is the text that stays through the wait; the header's \
+        parentheses are no place for a payload";
+
+    /// The reported bug: the whole prompt was returned as the start annotation
+    /// and `push_header` writes an annotation as ` (…)` with no cap, so a
+    /// paragraph wrapped across the header the moment the call started.
+    #[test]
+    fn a_generation_carries_its_prompt_as_a_body_and_annotates_nothing() {
+        let parsed = parse_call(&serde_json::json!({ "prompt": PROMPT, "out": "a.png" }))
+            .expect("parse should succeed");
+
+        assert_eq!(
+            parsed.start_input(),
+            Some(ToolInput::Code {
+                language: PROMPT_LANGUAGE.to_owned(),
+                code: PROMPT.to_owned(),
+            }),
+            "{PROMPT_IS_THE_BODY}"
+        );
+        assert_eq!(parsed.start_annotation(), None, "{PROMPT_IS_THE_BODY}");
     }
 
     #[test]

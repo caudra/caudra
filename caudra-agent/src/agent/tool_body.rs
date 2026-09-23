@@ -68,6 +68,11 @@ enum Body {
 /// by its settled card as the document it is. A tool whose body is only one of
 /// several commands still earns a row, because the reader that finds no such
 /// argument decodes nothing and costs nothing.
+///
+/// An image prompt belongs for the same reason, minus the claim a script
+/// makes: it does not name its own header, because the call is named by the
+/// file it writes. A generation is a long wait, and the prompt is the only
+/// thing worth reading during it.
 const BODY_ARGS: &[(&str, &[&str], Body)] = &[
     ("file_write", &["content"], Body::Drawn),
     ("file_edit", &["oldString", "newString"], Body::Counted),
@@ -77,6 +82,7 @@ const BODY_ARGS: &[(&str, &[&str], Body)] = &[
     ("memory", &["content"], Body::Drawn),
     ("local_document_write", &["content"], Body::Drawn),
     ("task", &["prompt"], Body::Drawn),
+    ("image_generate", &["prompt"], Body::Drawn),
 ];
 
 /// The arguments `tool` writes and what becomes of them, `None` for a tool
@@ -384,6 +390,7 @@ mod tests {
     const SHELL: &str = "shell";
     const MEMORY: &str = "memory";
     const TASK: &str = "task";
+    const IMAGE: &str = "image_generate";
     const CONTENT_KEYS: &[&str] = &["content"];
     const PROMPT_KEYS: &[&str] = &["prompt"];
     const EDIT_KEYS: &[&str] = &["oldString", "newString"];
@@ -394,6 +401,8 @@ mod tests {
     const COUNTED_FILES: &str = " files";
     const EXPECT_NAMED: &str = "a patch that declares files earns a header";
     const EXPECT_PROMPT: &str = "a delegation draws the brief it sends, whole";
+    const EXPECT_IMAGE_PROMPT: &str =
+        "a generation draws the prompt it sends, whole, while the model is still writing it";
 
     /// Everything the fragments published, in arrival order.
     fn published(tool: &str, fragments: &[&str]) -> String {
@@ -438,6 +447,7 @@ mod tests {
     #[test_case(MEMORY, Some((CONTENT_KEYS, Body::Drawn)) ; "a_note_is_drawn")]
     #[test_case("local_document_write", Some((CONTENT_KEYS, Body::Drawn)) ; "a_local_document_is_drawn")]
     #[test_case(TASK, Some((PROMPT_KEYS, Body::Drawn)) ; "a_delegation_draws_its_prompt")]
+    #[test_case(IMAGE, Some((PROMPT_KEYS, Body::Drawn)) ; "a_generation_draws_its_prompt")]
     #[test_case("file_read", None ; "a_tool_with_no_body")]
     fn a_tools_body_arguments(tool: &str, expected: Option<(&[&str], Body)>) {
         assert_eq!(body_arg(tool), expected);
@@ -464,6 +474,21 @@ mod tests {
     fn a_prompt_escape_split_across_fragments_still_decodes() {
         let decoded = published(TASK, &[r#"{"prompt": "first\"#, r#"nsecond"}"#]);
         assert_eq!(decoded, "first\nsecond", "{EXPECT_PROMPT}");
+    }
+
+    /// The reported bug: a generation showed nothing at all while the model
+    /// wrote the prompt, and a generation is a long wait with nothing else to
+    /// read. The output path arrives after the prompt and must not take it.
+    #[test]
+    fn a_generation_draws_the_prompt_and_not_the_path() {
+        let decoded = published(
+            IMAGE,
+            &[
+                r#"{"prompt": "A wide cinematic"#,
+                r#" shot", "out": "assets/hero.png"}"#,
+            ],
+        );
+        assert_eq!(decoded, "A wide cinematic shot", "{EXPECT_IMAGE_PROMPT}");
     }
 
     #[test]
