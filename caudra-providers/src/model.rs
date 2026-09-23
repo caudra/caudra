@@ -281,6 +281,29 @@ pub struct ModelEntry {
     pub reasoning_options: Option<&'static [StaticReasoningOption]>,
 }
 
+/// A release line, so a routing lane can answer inside the line the user is
+/// already on: moving to `gpt-6-sol` should move Fast to `gpt-6-luna` rather
+/// than leave it on the previous generation's small model.
+///
+/// `members` are id prefixes. The longest match wins, so a line can be spelled
+/// as broadly as `gpt-6-` without capturing a narrower line declared beside it.
+#[derive(Debug, Clone, Copy)]
+pub struct ModelGeneration {
+    pub label: &'static str,
+    pub members: &'static [&'static str],
+}
+
+impl ModelGeneration {
+    /// Whether a curated entry sits in this line. Read from the entry's own
+    /// prefixes rather than a separate list, so the two can never disagree.
+    pub fn contains(&self, entry: &ModelEntry) -> bool {
+        entry
+            .prefixes
+            .iter()
+            .any(|prefix| self.members.iter().any(|member| prefix.starts_with(member)))
+    }
+}
+
 impl ModelEntry {
     pub const fn facts(&self) -> ModelFacts {
         ModelFacts {
@@ -825,7 +848,7 @@ impl Model {
         custom::declared_purpose(slug, purpose)
             .into_iter()
             .chain(
-                ManifestRegistry::prefixes_for_purpose(slug, purpose)
+                ManifestRegistry::prefixes_for_purpose(slug, purpose, &anchor.id)
                     .into_iter()
                     .map(str::to_string),
             )
@@ -1109,7 +1132,7 @@ mod tests {
 
     #[test_case("zai", "glm-4.5-air", Some(ModelMarker::Small) ; "small_non_default")]
     #[test_case("anthropic", "claude-haiku-4-5", Some(ModelMarker::Fast) ; "small_default")]
-    #[test_case("anthropic", "claude-fable-5", Some(ModelMarker::Best) ; "non_small_default")]
+    #[test_case("anthropic", "claude-opus-5-5", Some(ModelMarker::Best) ; "non_small_default")]
     #[test_case("anthropic", "claude-sonnet-4-6", None ; "non_small_non_default")]
     #[test_case(UNCLASSIFIABLE, "llama3", None ; "unknown_facts")]
     fn marker_of_preserves_size_and_default_status(
@@ -1320,6 +1343,25 @@ mod tests {
         assert_eq!(non_warming.spec(), model.spec());
     }
 
+    /// A lane answers inside the anchor's own release line. Anthropic declares
+    /// none, so it keeps answering provider-wide, which is what makes Haiku the
+    /// Fast model for a Claude 5 anchor that has no small sibling.
+    #[test_case("openai/gpt-6-sol", ModelPurpose::Fast, "openai/gpt-6-luna" ; "gpt_6_keeps_fast_in_line")]
+    #[test_case("openai/gpt-6-sol", ModelPurpose::Best, "openai/gpt-6-astra" ; "gpt_6_keeps_best_in_line")]
+    #[test_case("openai/gpt-5.6-terra", ModelPurpose::Fast, "openai/gpt-5.6-luna" ; "gpt_5_6_keeps_fast_in_line")]
+    #[test_case("openai/gpt-5.6-terra", ModelPurpose::Best, "openai/gpt-5.6-sol" ; "gpt_5_6_keeps_best_in_line")]
+    #[test_case("openai/gpt-4.1", ModelPurpose::Best, "openai/gpt-6-astra" ; "an_unlined_anchor_takes_the_provider_default")]
+    #[test_case("anthropic/claude-opus-5-5", ModelPurpose::Fast, "anthropic/claude-haiku-4-5" ; "an_unlined_provider_answers_across_lines")]
+    fn a_lane_answers_inside_the_anchors_line(
+        anchor_spec: &str,
+        purpose: ModelPurpose,
+        expected: &str,
+    ) {
+        let anchor = Model::from_spec(anchor_spec).unwrap();
+        let resolved = Model::resolve(purpose, &anchor, &policy(&[], &[])).unwrap();
+        assert_eq!(resolved.spec(), expected);
+    }
+
     #[test]
     fn non_warming_resolution_leaves_an_unknown_exact_provider_cold() {
         assert!(crate::catalog_providers_if_available().is_none());
@@ -1374,10 +1416,13 @@ mod tests {
         assert_eq!(non_warming.spec(), resolved.spec());
     }
 
+    /// No anchor to read a line from, so these are the provider-wide answers:
+    /// the first default in table order, which is why the tables are ordered
+    /// newest line first.
     #[test_case("anthropic", ModelPurpose::Fast, "claude-haiku-4-5" ; "anthropic_small")]
-    #[test_case("anthropic", ModelPurpose::Best, "claude-fable-5" ; "anthropic_flagship")]
-    #[test_case("openai", ModelPurpose::Fast, "gpt-5.6-luna" ; "openai_small")]
-    #[test_case("openai", ModelPurpose::Best, "gpt-5.6-sol" ; "openai_flagship")]
+    #[test_case("anthropic", ModelPurpose::Best, "claude-opus-5-5" ; "anthropic_flagship")]
+    #[test_case("openai", ModelPurpose::Fast, "gpt-6-luna" ; "openai_small")]
+    #[test_case("openai", ModelPurpose::Best, "gpt-6-astra" ; "openai_flagship")]
     fn curated_defaults_select_by_size_lane(provider: &str, purpose: ModelPurpose, expected: &str) {
         assert_eq!(
             Model::curated_default(provider, purpose).unwrap().id,
@@ -1545,25 +1590,77 @@ mod tests {
         }
     }
 
+    /// Provider-wide, a lane still needs exactly one answer: the first default
+    /// in table order, which is what `curated_default` takes on a cold start.
     #[test]
     fn exactly_one_default_per_provider_slot() {
         for manifest in ManifestRegistry::builtins() {
             if manifest.models.is_empty() {
                 continue;
             }
-            let entries = manifest.models;
             for &purpose in &SLOTS {
                 if NO_FAST_DEFAULTS.contains(&manifest.slug) && purpose == ModelPurpose::Fast {
                     continue;
                 }
-                let count = entries
+                let count = manifest
+                    .models
                     .iter()
-                    .filter(|e| e.class() == purpose && e.default)
+                    .filter(|entry| entry.class() == purpose && entry.default)
                     .count();
+                let lines = manifest.generations.len().max(1);
                 assert_eq!(
-                    count, 1,
-                    "{}/{}: expected exactly 1 default, found {count}",
-                    manifest.slug, purpose
+                    count, lines,
+                    "{}/{purpose}: expected 1 default per line ({lines}), found {count}",
+                    manifest.slug
+                );
+            }
+        }
+    }
+
+    /// A lane is answered inside a line, so a line that sells a model for that
+    /// lane must name exactly one of them as its default. A line with no model
+    /// in the lane names none and falls through to the provider's own answer.
+    #[test]
+    fn exactly_one_default_per_line_and_slot() {
+        for manifest in ManifestRegistry::builtins() {
+            for line in manifest.generations {
+                for &purpose in &SLOTS {
+                    let members: Vec<_> = manifest
+                        .models
+                        .iter()
+                        .filter(|entry| line.contains(entry) && entry.class() == purpose)
+                        .collect();
+                    if members.is_empty() {
+                        continue;
+                    }
+                    let count = members.iter().filter(|entry| entry.default).count();
+                    assert_eq!(
+                        count, 1,
+                        "{}/{}/{purpose}: expected exactly 1 default, found {count}",
+                        manifest.slug, line.label
+                    );
+                }
+            }
+        }
+    }
+
+    /// A model may sit in at most one line, or `generation_of`'s longest-member
+    /// tie-break would be deciding something the tables meant to state.
+    #[test]
+    fn declared_lines_never_overlap() {
+        for manifest in ManifestRegistry::builtins() {
+            for entry in manifest.models {
+                let lines: Vec<_> = manifest
+                    .generations
+                    .iter()
+                    .filter(|line| line.contains(entry))
+                    .map(|line| line.label)
+                    .collect();
+                assert!(
+                    lines.len() <= 1,
+                    "{}/{}: claimed by {lines:?}",
+                    manifest.slug,
+                    entry.prefixes[0]
                 );
             }
         }

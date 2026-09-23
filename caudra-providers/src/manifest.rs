@@ -1,6 +1,8 @@
 use caudra_storage::thinking::ReasoningOptions;
 
-use crate::model::{ModelEntry, ModelFacts, ModelFamily, ModelPricing, ModelPurpose};
+use crate::model::{
+    ModelEntry, ModelFacts, ModelFamily, ModelGeneration, ModelPricing, ModelPurpose,
+};
 use crate::pricing::PricingSchedule;
 use crate::providers::catalog::CatalogMetaView;
 use crate::providers::{
@@ -18,6 +20,11 @@ pub struct ProviderManifest {
     pub fallback_max_output: Option<u32>,
     pub fallback_context_window: u32,
     pub models: &'static [ModelEntry],
+    /// Release lines, newest first. A routing lane answers inside the anchor's
+    /// line before falling back to the provider-wide default, so moving to
+    /// `gpt-6-sol` moves Fast to `gpt-6-luna`. Empty for every provider that
+    /// has never shipped two lines worth telling apart.
+    pub generations: &'static [ModelGeneration],
     /// Set by the providers whose rates move with the wall clock, so the hours
     /// sit next to the prices they scale. Everyone else bills flat.
     pub pricing_schedule: Option<&'static PricingSchedule>,
@@ -70,6 +77,7 @@ const ANTHROPIC: ProviderManifest = ProviderManifest {
     fallback_max_output: Some(128_000),
     fallback_context_window: 200_000,
     models: anthropic::models(),
+    generations: &[],
     pricing_schedule: None,
     catalog_slug: Some("anthropic"),
 };
@@ -83,6 +91,7 @@ const OPENAI: ProviderManifest = ProviderManifest {
     fallback_max_output: Some(100_000),
     fallback_context_window: 200_000,
     models: openai::models(),
+    generations: openai::generations(),
     pricing_schedule: None,
     catalog_slug: Some("openai"),
 };
@@ -96,6 +105,7 @@ const GOOGLE: ProviderManifest = ProviderManifest {
     fallback_max_output: Some(65_536),
     fallback_context_window: 1_000_000,
     models: google::models(),
+    generations: &[],
     pricing_schedule: None,
     catalog_slug: Some("google"),
 };
@@ -109,6 +119,7 @@ const COPILOT: ProviderManifest = ProviderManifest {
     fallback_max_output: Some(100_000),
     fallback_context_window: 200_000,
     models: copilot::models(),
+    generations: &[],
     pricing_schedule: None,
     catalog_slug: Some("github-copilot"),
 };
@@ -122,6 +133,7 @@ const OLLAMA: ProviderManifest = ProviderManifest {
     fallback_max_output: Some(16_384),
     fallback_context_window: 128_000,
     models: ollama::models(),
+    generations: &[],
     pricing_schedule: None,
     catalog_slug: None,
 };
@@ -135,6 +147,7 @@ const LLAMA_CPP: ProviderManifest = ProviderManifest {
     fallback_max_output: None,
     fallback_context_window: 128_000,
     models: llama_cpp::models(),
+    generations: &[],
     pricing_schedule: None,
     catalog_slug: None,
 };
@@ -148,6 +161,7 @@ const MISTRAL: ProviderManifest = ProviderManifest {
     fallback_max_output: None,
     fallback_context_window: 128_000,
     models: mistral::models(),
+    generations: &[],
     pricing_schedule: None,
     catalog_slug: Some("mistral"),
 };
@@ -161,6 +175,7 @@ const ZAI: ProviderManifest = ProviderManifest {
     fallback_max_output: Some(16_000),
     fallback_context_window: 128_000,
     models: zai::models(),
+    generations: &[],
     pricing_schedule: None,
     catalog_slug: Some("zai"),
 };
@@ -174,6 +189,7 @@ const DEEPSEEK: ProviderManifest = ProviderManifest {
     fallback_max_output: Some(384_000),
     fallback_context_window: 1_000_000,
     models: deepseek::models(),
+    generations: &[],
     pricing_schedule: Some(&deepseek::PEAK_HOURS),
     catalog_slug: Some("deepseek"),
 };
@@ -187,6 +203,7 @@ const OPENROUTER: ProviderManifest = ProviderManifest {
     fallback_max_output: Some(128_000),
     fallback_context_window: 200_000,
     models: openrouter::models(),
+    generations: &[],
     pricing_schedule: None,
     catalog_slug: Some("openrouter"),
 };
@@ -200,6 +217,7 @@ const SYNTHETIC: ProviderManifest = ProviderManifest {
     fallback_max_output: Some(32_000),
     fallback_context_window: 128_000,
     models: synthetic::models(),
+    generations: &[],
     pricing_schedule: None,
     catalog_slug: Some("synthetic"),
 };
@@ -213,6 +231,7 @@ const TENSORX: ProviderManifest = ProviderManifest {
     fallback_max_output: None,
     fallback_context_window: 200_000,
     models: tensorx::models(),
+    generations: &[],
     pricing_schedule: None,
     catalog_slug: Some("tensorx"),
 };
@@ -226,6 +245,7 @@ const OPENCODE: ProviderManifest = ProviderManifest {
     fallback_max_output: Some(128_000),
     fallback_context_window: 256_000,
     models: &[],
+    generations: &[],
     pricing_schedule: None,
     catalog_slug: Some("opencode"),
 };
@@ -239,6 +259,7 @@ const XAI: ProviderManifest = ProviderManifest {
     fallback_max_output: Some(131_072),
     fallback_context_window: 500_000,
     models: xai::models(),
+    generations: &[],
     pricing_schedule: None,
     catalog_slug: Some("xai"),
 };
@@ -252,6 +273,7 @@ const OPENCODE_GO: ProviderManifest = ProviderManifest {
     fallback_max_output: Some(64_000),
     fallback_context_window: 128_000,
     models: &[],
+    generations: &[],
     pricing_schedule: None,
     catalog_slug: Some("opencode-go"),
 };
@@ -265,6 +287,7 @@ const APERTURE: ProviderManifest = ProviderManifest {
     fallback_max_output: Some(16_384),
     fallback_context_window: 128_000,
     models: aperture::models(),
+    generations: &[],
     pricing_schedule: None,
     catalog_slug: None,
 };
@@ -332,16 +355,46 @@ impl ManifestRegistry {
             .map(|(_, entry)| entry.facts())
     }
 
+    /// The release line `model_id` belongs to, by longest matching member, or
+    /// `None` for a provider that declares no lines and for an id outside every
+    /// line it does declare.
+    fn generation_of(
+        manifest: &ProviderManifest,
+        model_id: &str,
+    ) -> Option<&'static ModelGeneration> {
+        manifest
+            .generations
+            .iter()
+            .flat_map(|generation| {
+                generation
+                    .members
+                    .iter()
+                    .map(move |member| (member, generation))
+            })
+            .filter(|(member, _)| model_id.starts_with(*member))
+            .max_by_key(|(member, _)| member.len())
+            .map(|(_, generation)| generation)
+    }
+
     fn prefixes_from_manifest(
         manifest: &ProviderManifest,
         purpose: ModelPurpose,
+        line: Option<&ModelGeneration>,
     ) -> Vec<&'static str> {
         let mut entries: Vec<_> = manifest
             .models
             .iter()
             .filter(|entry| entry.class() == purpose)
             .collect();
-        entries.sort_by_key(|entry| !entry.default);
+        // Stable, so table order still decides within each group: the anchor's
+        // own line first, its default ahead of its siblings, then everything
+        // else on the same terms.
+        entries.sort_by_key(|entry| {
+            (
+                !line.is_some_and(|line| line.contains(entry)),
+                !entry.default,
+            )
+        });
         entries
             .iter()
             .flat_map(|entry| entry.prefixes)
@@ -374,12 +427,18 @@ impl ManifestRegistry {
 
     /// Every curated candidate for a slot, the declared default first, so a
     /// caller filtering on a model policy can take the next best rather than
-    /// giving up on the provider.
-    pub fn prefixes_for_purpose(slug: &str, purpose: ModelPurpose) -> Vec<&'static str> {
+    /// giving up on the provider. `anchor_id` is the model the conversation is
+    /// already on, whose release line is preferred over the provider's.
+    pub fn prefixes_for_purpose(
+        slug: &str,
+        purpose: ModelPurpose,
+        anchor_id: &str,
+    ) -> Vec<&'static str> {
         let Some(manifest) = Self::model_supply_manifest(slug) else {
             return Vec::new();
         };
-        Self::prefixes_from_manifest(manifest, purpose)
+        let line = Self::generation_of(manifest, anchor_id);
+        Self::prefixes_from_manifest(manifest, purpose, line)
     }
 }
 
@@ -504,7 +563,8 @@ mod tests {
         )
         .unwrap();
         let facts = ManifestRegistry::facts_from_manifest(manifest, "gpt-4.1-nano");
-        let candidates = ManifestRegistry::prefixes_from_manifest(manifest, ModelPurpose::Fast);
+        let candidates =
+            ManifestRegistry::prefixes_from_manifest(manifest, ModelPurpose::Fast, None);
 
         assert_eq!(manifest.slug, "openai");
         assert_eq!(
@@ -514,11 +574,25 @@ mod tests {
                 default: false,
             })
         );
-        assert_eq!(candidates.first().copied(), Some("gpt-5.6-luna"));
+        assert_eq!(candidates.first().copied(), Some("gpt-6-luna"));
         assert_eq!(
             format!("{}/{}", "test-openai-wrapper", candidates[0]),
-            "test-openai-wrapper/gpt-5.6-luna"
+            "test-openai-wrapper/gpt-6-luna"
         );
+    }
+
+    /// The anchor's line is a preference, not a filter: a policy that excludes
+    /// everything in it must still be able to fall through to the rest.
+    #[test]
+    fn a_line_reorders_the_candidates_without_dropping_any() {
+        let manifest = ManifestRegistry::get("openai").unwrap();
+        let wide = ManifestRegistry::prefixes_from_manifest(manifest, ModelPurpose::Fast, None);
+        let lined = ManifestRegistry::prefixes_for_purpose("openai", ModelPurpose::Fast, "gpt-5.6-sol");
+
+        assert_eq!(lined.first().copied(), Some("gpt-5.6-luna"));
+        assert_eq!(wide.first().copied(), Some("gpt-6-luna"));
+        assert_eq!(lined.len(), wide.len());
+        assert!(lined.iter().all(|prefix| wide.contains(prefix)));
     }
 
     #[test]

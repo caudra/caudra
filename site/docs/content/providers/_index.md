@@ -100,13 +100,13 @@ The built-in provider still owns the slug, so `protocol`, `api_key_env`, `discov
 |  | claude-opus-4-6 | $5.00 / $25.00 | 372K ctx / 128K out |
 |  | claude-opus-4-7 | $5.00 / $25.00 | 372K ctx / 128K out |
 |  | claude-opus-4-8 | $5.00 / $25.00 | 372K ctx / 128K out |
-|  | claude-opus-5-5 | $4.00 / $20.00 | 372K ctx / 128K out |
+| Best | **claude-opus-5-5** (default) | $4.00 / $20.00 | 372K ctx / 128K out |
 |  | claude-opus-5 | $5.00 / $25.00 | 372K ctx / 128K out |
 |  | claude-fable-5-1 | $10.00 / $50.00 | 372K ctx / 128K out |
-| Best | **claude-fable-5** (default) | $10.00 / $50.00 | 372K ctx / 128K out |
+|  | claude-fable-5 | $10.00 / $50.00 | 372K ctx / 128K out |
 |  | claude-opus-4-0, claude-opus-4-1 | $15.00 / $75.00 | 200K ctx / 32K out |
 
-Routing defaults: claude-haiku-4-5 (Fast), claude-fable-5 (Best)
+Routing defaults: claude-haiku-4-5 (Fast), claude-opus-5-5 (Best)
 
 Run `caudra auth login anthropic` to sign in to a Claude subscription through browser OAuth. Caudra stores the tokens in its state directory, refreshes them automatically, and shows subscription limits through `/usage`. Subscription requests always go to `api.anthropic.com`, even when `ANTHROPIC_BASE_URL` is set.
 
@@ -136,15 +136,15 @@ You can override the model with `ANTHROPIC_MODEL` and the endpoint with `ANTHROP
 
 | Marker | Models | Pricing (in/out per 1M tokens) | Context |
 |---------|--------|-------------------------------|---------|
-| Small | gpt-6-luna | $0.10 / $0.50 | 372K ctx / 128K out |
-| Fast | **gpt-5.6-luna** (default) | $1.00 / $6.00 | 372K ctx / 128K out |
+| Fast | **gpt-6-luna** (gpt-6 default) | $0.10 / $0.50 | 372K ctx / 128K out |
+| Fast | **gpt-5.6-luna** (gpt-5.6 default) | $1.00 / $6.00 | 372K ctx / 128K out |
 | Small | gpt-5.4-nano | $0.20 / $1.25 | 400K ctx / 128K out |
 | Small | gpt-5.4-mini | $0.75 / $4.50 | 400K ctx / 128K out |
 | Small | gpt-4.1-nano | $0.10 / $0.40 | 1047K ctx / 32K out |
-|  | gpt-6-astra | $10.00 / $50.00 | 372K ctx / 128K out |
+| Best | **gpt-6-astra** (gpt-6 default) | $10.00 / $50.00 | 372K ctx / 128K out |
 |  | gpt-6-sol | $2.00 / $10.00 | 372K ctx / 128K out |
 |  | gpt-5.6-terra | $2.50 / $15.00 | 372K ctx / 128K out |
-| Best | **gpt-5.6-sol** (default) | $5.00 / $30.00 | 372K ctx / 128K out |
+| Best | **gpt-5.6-sol** (gpt-5.6 default) | $5.00 / $30.00 | 372K ctx / 128K out |
 |  | gpt-4.1-mini | $0.40 / $1.60 | 1047K ctx / 32K out |
 |  | gpt-4.1 | $2.00 / $8.00 | 1047K ctx / 32K out |
 |  | o4-mini | $1.10 / $4.40 | 200K ctx / 100K out |
@@ -158,7 +158,9 @@ You can override the model with `ANTHROPIC_MODEL` and the endpoint with `ANTHROP
 |  | gpt-5.1-codex-max | $1.25 / $10.00 | 400K ctx / 128K out |
 |  | gpt-5.1-codex | $1.25 / $10.00 | 400K ctx / 128K out |
 
-Routing defaults: gpt-5.6-luna (Fast), gpt-5.6-sol (Best)
+Routing defaults: gpt-6-luna (Fast), gpt-6-astra (Best)
+
+A lane answers inside the release line you are on. On gpt-6 that is gpt-6-luna (Fast) and gpt-6-astra (Best). On gpt-5.6 that is gpt-5.6-luna (Fast) and gpt-5.6-sol (Best).
 
 ### Google
 

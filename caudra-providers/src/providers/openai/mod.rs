@@ -5,7 +5,9 @@ pub(crate) mod responses;
 
 pub use platform::OpenAi;
 
-use crate::model::{ModelEntry, ModelFamily, ModelPricing, StaticReasoningOption};
+use crate::model::{
+    ModelEntry, ModelFamily, ModelGeneration, ModelPricing, StaticReasoningOption,
+};
 
 /// Working window for the long-context OpenAI models: gpt-5.6 luna/terra/sol
 /// and the gpt-astra family. Deliberately below what the API accepts — astra
@@ -47,6 +49,23 @@ const EFFORT_TO_MAX_NO_NONE: &[StaticReasoningOption] = &[StaticReasoningOption:
     "low", "medium", "high", "xhigh", "max",
 ])];
 
+/// The two ladders OpenAI currently sells side by side. Each carries its own
+/// Fast and Best, so a conversation on one never has a lane answered from the
+/// other while its own line still has a model for the job.
+pub(crate) const fn generations() -> &'static [ModelGeneration] {
+    const GENERATIONS: &[ModelGeneration] = &[
+        ModelGeneration {
+            label: "gpt-6",
+            members: &["gpt-6-"],
+        },
+        ModelGeneration {
+            label: "gpt-5.6",
+            members: &["gpt-5.6-"],
+        },
+    ];
+    GENERATIONS
+}
+
 pub(crate) const fn models() -> &'static [ModelEntry] {
     const MODELS: &[ModelEntry] = &[
         ModelEntry {
@@ -54,7 +73,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
             small: false,
             family: ModelFamily::Gpt,
             vision: true,
-            default: false,
+            default: true,
             // The tier above 272k that models.dev publishes cannot be spelled
             // here: this table is a const and a non-empty `tiers` is not
             // const-constructible. `from_base` reads it from the catalog.
@@ -75,7 +94,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
             small: true,
             family: ModelFamily::Gpt,
             vision: true,
-            default: false,
+            default: true,
             pricing: ModelPricing {
                 input: 0.10,
                 output: 0.50,

@@ -947,7 +947,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
             small: false,
             family: ModelFamily::Claude,
             vision: true,
-            default: false,
+            default: true,
             pricing: ModelPricing {
                 input: 4.00,
                 output: 20.00,
@@ -1011,7 +1011,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
             small: false,
             family: ModelFamily::Claude,
             vision: true,
-            default: true,
+            default: false,
             pricing: ModelPricing {
                 input: 10.00,
                 output: 50.00,

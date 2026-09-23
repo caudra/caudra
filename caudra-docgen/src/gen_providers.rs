@@ -1,4 +1,4 @@
-use caudra_providers::manifest::ManifestRegistry;
+use caudra_providers::manifest::{ManifestRegistry, ProviderManifest};
 use caudra_providers::model::ModelEntry;
 use caudra_providers::provider::ProviderKind;
 use caudra_providers::{EFFORT_LEVELS, ModelMarker};
@@ -420,7 +420,7 @@ struct ProviderSection {
     auth_line: String,
     urls: Vec<&'static str>,
     features: Option<&'static str>,
-    entries: &'static [ModelEntry],
+    manifest: &'static ProviderManifest,
 }
 
 fn format_auth(kind: ProviderKind) -> String {
@@ -452,7 +452,7 @@ fn build_sections() -> Vec<ProviderSection> {
                         "https://api.z.ai/api/coding/paas/v4",
                     ],
                     features: ProviderKind::Zai.features(),
-                    entries: ManifestRegistry::get("zai").unwrap().models,
+                    manifest: ManifestRegistry::get("zai").unwrap(),
                 });
             }
             ProviderKind::OpenAi => {
@@ -462,7 +462,7 @@ fn build_sections() -> Vec<ProviderSection> {
                     auth_line: format!("{} (also supports OAuth device flow)", format_auth(kind)),
                     urls: vec![kind.base_url()],
                     features: kind.features(),
-                    entries: ManifestRegistry::get(&kind.to_string()).unwrap().models,
+                    manifest: ManifestRegistry::get(&kind.to_string()).unwrap(),
                 });
             }
             ProviderKind::Anthropic => {
@@ -475,7 +475,7 @@ fn build_sections() -> Vec<ProviderSection> {
                     ),
                     urls: vec![kind.base_url()],
                     features: kind.features(),
-                    entries: ManifestRegistry::get(&kind.to_string()).unwrap().models,
+                    manifest: ManifestRegistry::get(&kind.to_string()).unwrap(),
                 });
             }
             ProviderKind::Xai => {
@@ -488,7 +488,7 @@ fn build_sections() -> Vec<ProviderSection> {
                     ),
                     urls: vec![kind.base_url(), "https://cli-chat-proxy.grok.com/v1"],
                     features: kind.features(),
-                    entries: ManifestRegistry::get(&kind.to_string()).unwrap().models,
+                    manifest: ManifestRegistry::get(&kind.to_string()).unwrap(),
                 });
             }
             ProviderKind::Copilot => {
@@ -501,7 +501,7 @@ fn build_sections() -> Vec<ProviderSection> {
                     ),
                     urls: vec![kind.base_url()],
                     features: kind.features(),
-                    entries: ManifestRegistry::get(&kind.to_string()).unwrap().models,
+                    manifest: ManifestRegistry::get(&kind.to_string()).unwrap(),
                 });
             }
             _ => {
@@ -511,7 +511,7 @@ fn build_sections() -> Vec<ProviderSection> {
                     auth_line: format_auth(kind),
                     urls: vec![kind.base_url()],
                     features: kind.features(),
-                    entries: ManifestRegistry::get(&kind.to_string()).unwrap().models,
+                    manifest: ManifestRegistry::get(&kind.to_string()).unwrap(),
                 });
             }
         }
@@ -520,7 +520,26 @@ fn build_sections() -> Vec<ProviderSection> {
     sections
 }
 
-fn write_model_table(out: &mut String, entries: &[ModelEntry]) {
+fn write_model_table(out: &mut String, manifest: &ProviderManifest) {
+    let entries = manifest.models;
+    let line_of = |entry: &ModelEntry| {
+        manifest
+            .generations
+            .iter()
+            .find(|line| line.contains(entry))
+            .map(|line| line.label)
+    };
+    let by_lane = || {
+        [true, false]
+            .into_iter()
+            .flat_map(move |small| entries.iter().filter(move |entry| entry.small == small))
+    };
+    let label = |entry: &ModelEntry| {
+        let prefix = entry.prefixes.first()?;
+        let marker = entry.facts().marker()?;
+        Some(format!("{prefix} ({})", marker_label(marker)))
+    };
+
     let _ = writeln!(
         out,
         "| Marker | Models | Pricing (in/out per 1M tokens) | Context |"
@@ -530,39 +549,69 @@ fn write_model_table(out: &mut String, entries: &[ModelEntry]) {
         "|---------|--------|-------------------------------|---------|"
     );
 
-    for small in [true, false] {
-        for entry in entries.iter().filter(|entry| entry.small == small) {
-            let names = entry.prefixes.join(", ");
-            let marker = entry.facts().marker().map(marker_label).unwrap_or_default();
-            let _ = writeln!(
-                out,
-                "| {} | {} | {} | {} |",
-                marker,
-                if entry.default {
-                    format!("**{names}** (default)")
-                } else {
-                    names
-                },
-                format_pricing(entry),
-                format_context(entry),
-            );
-        }
+    for entry in by_lane() {
+        let names = entry.prefixes.join(", ");
+        let _ = writeln!(
+            out,
+            "| {} | {} | {} | {} |",
+            entry.facts().marker().map(marker_label).unwrap_or_default(),
+            match (entry.default, line_of(entry)) {
+                (false, _) => names,
+                (true, None) => format!("**{names}** (default)"),
+                (true, Some(line)) => format!("**{names}** ({line} default)"),
+            },
+            format_pricing(entry),
+            format_context(entry),
+        );
     }
 
-    let defaults: Vec<String> = [true, false]
+    // The first default per lane in table order, which is the answer
+    // `find_default_for_purpose` gives a session with no model to read a line
+    // from. Tables are ordered newest line first, so that is the newest line.
+    let wide: Vec<String> = [true, false]
         .into_iter()
-        .flat_map(|small| entries.iter().filter(move |entry| entry.small == small))
-        .filter(|e| e.default)
-        .filter_map(|entry| {
-            let prefix = entry.prefixes.first()?;
-            let marker = entry.facts().marker()?;
-            Some(format!("{prefix} ({})", marker_label(marker)))
+        .filter_map(|small| {
+            entries
+                .iter()
+                .find(|entry| entry.small == small && entry.default)
+        })
+        .filter_map(label)
+        .collect();
+
+    if !wide.is_empty() {
+        let _ = writeln!(out);
+        let _ = writeln!(out, "Routing defaults: {}", wide.join(", "));
+    }
+
+    let lines: Vec<String> = manifest
+        .generations
+        .iter()
+        .filter_map(|line| {
+            let within: Vec<String> = by_lane()
+                .filter(|entry| entry.default && line_of(entry) == Some(line.label))
+                .filter_map(label)
+                .collect();
+            (!within.is_empty()).then(|| format!("On {} that is {}", line.label, join_and(&within)))
         })
         .collect();
 
-    if !defaults.is_empty() {
+    if !lines.is_empty() {
         let _ = writeln!(out);
-        let _ = writeln!(out, "Routing defaults: {}", defaults.join(", "));
+        let _ = writeln!(
+            out,
+            "A lane answers inside the release line you are on. {}.",
+            lines.join(". ")
+        );
+    }
+}
+
+/// Oxford-free list for prose, where a trailing comma before "and" would read
+/// as another item.
+fn join_and(items: &[String]) -> String {
+    match items.split_last() {
+        None => String::new(),
+        Some((last, [])) => last.clone(),
+        Some((last, rest)) => format!("{} and {last}", rest.join(", ")),
     }
 }
 
@@ -620,10 +669,10 @@ fn write_section(out: &mut String, section: &ProviderSection) {
 
     let _ = writeln!(out);
 
-    if section.entries.is_empty() {
+    if section.manifest.models.is_empty() {
         let _ = writeln!(out, "{}", no_catalog_note(section.kind));
     } else {
-        write_model_table(out, section.entries);
+        write_model_table(out, section.manifest);
     }
 
     if section.name == "Anthropic" {
