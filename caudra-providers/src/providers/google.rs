@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -9,7 +10,9 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tracing::warn;
 
-use crate::model::{Model, ModelEntry, ModelFamily, ModelPricing, StaticReasoningOption};
+use crate::model::{
+    Model, ModelEntry, ModelFamily, ModelPricing, PricingTier, StaticReasoningOption,
+};
 use crate::provider::{BoxFuture, Provider, WireRequest};
 use crate::{
     AgentError, CacheKey, ContentBlock, Message, ProviderEvent, RequestOptions, Role, StopReason,
@@ -20,6 +23,9 @@ use super::{KeyPool, ResolvedAuth, http_client, next_sse_line};
 
 const BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta";
 const ENV_VAR: &str = "GEMINI_API_KEY";
+/// Gemini 2.5 Pro bills a request whose prompt runs past this many tokens at
+/// its long-context rates, output and cache reads included.
+const LONG_CONTEXT_ABOVE: u32 = 200_000;
 
 inventory::submit!(caudra_config::providers::BuiltInProvider {
     slug: "google",
@@ -43,11 +49,18 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
             default: true,
             pricing: ModelPricing {
                 input: 1.25,
-                output: 5.00,
+                output: 10.00,
                 cache_write: 0.00,
-                cache_read: 0.31,
+                cache_read: 0.125,
                 fast: None,
-                tiers: ModelPricing::UNTIERED,
+                tiers: Cow::Borrowed(&[PricingTier {
+                    above: LONG_CONTEXT_ABOVE,
+                    input: 2.50,
+                    output: 15.00,
+                    cache_write: 0.00,
+                    cache_read: 0.25,
+                    fast: None,
+                }]),
             },
             max_output_tokens: Some(65_536),
             context_window: 1_048_576,
@@ -63,10 +76,10 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
             vision: true,
             default: false,
             pricing: ModelPricing {
-                input: 0.15,
-                output: 0.60,
+                input: 0.30,
+                output: 2.50,
                 cache_write: 0.00,
-                cache_read: 0.04,
+                cache_read: 0.03,
                 fast: None,
                 tiers: ModelPricing::UNTIERED,
             },
@@ -548,12 +561,16 @@ struct SseFunctionCall {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SseUsageMetadata {
+    /// The whole prompt, cached tokens included.
     #[serde(default)]
     prompt_token_count: u32,
+    /// The reply alone. Thinking is counted apart and bills as output too.
     #[serde(default)]
     candidates_token_count: u32,
     #[serde(default)]
-    cached_content_token_count: Option<u32>,
+    cached_content_token_count: u32,
+    #[serde(default)]
+    thoughts_token_count: u32,
 }
 
 #[derive(Deserialize)]
@@ -640,11 +657,13 @@ async fn parse_sse(
         };
 
         if let Some(meta) = chunk.usage_metadata {
-            usage.input = meta.prompt_token_count;
-            usage.output = meta.candidates_token_count;
-            if let Some(cached) = meta.cached_content_token_count {
-                usage.cache_read = cached;
-            }
+            usage.input = meta
+                .prompt_token_count
+                .saturating_sub(meta.cached_content_token_count);
+            usage.cache_read = meta.cached_content_token_count;
+            usage.output = meta
+                .candidates_token_count
+                .saturating_add(meta.thoughts_token_count);
         }
 
         let Some(candidates) = chunk.candidates else {
@@ -1324,14 +1343,49 @@ mod tests {
         ));
     }
 
+    const CACHED_ONCE: &str = "promptTokenCount already includes the cached tokens";
+    const THINKING_IS_OUTPUT: &str = "Gemini bills thinking tokens as output";
+    const LONG_CONTEXT_RULE: &str =
+        "Gemini 2.5 Pro bills a prompt past 200K at its long-context rate";
+    const GEMINI_2_5_PRO_SPEC: &str = "google/gemini-2.5-pro";
+    const PER_MILLION: f64 = 1_000_000.0;
+    const RATE_TOLERANCE: f64 = 1e-9;
+
     #[test]
     fn parse_sse_cached_tokens() {
         let data = b"data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"hi\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":100,\"candidatesTokenCount\":10,\"cachedContentTokenCount\":50}}\n\n";
         let response = mock_response(data);
         let (tx, _rx) = flume::unbounded();
         let result = smol::block_on(parse_sse(response, &tx, Duration::from_secs(30))).unwrap();
-        assert_eq!(result.usage.input, 100);
+        assert_eq!(result.usage.input, 50, "{CACHED_ONCE}");
+        assert_eq!(result.usage.cache_read, 50, "{CACHED_ONCE}");
+        assert_eq!(result.usage.total_input(), 100, "{CACHED_ONCE}");
         assert_eq!(result.usage.output, 10);
-        assert_eq!(result.usage.cache_read, 50);
+    }
+
+    #[test]
+    fn thinking_tokens_bill_as_output() {
+        let data = b"data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"hi\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":100,\"candidatesTokenCount\":10,\"thoughtsTokenCount\":30}}\n\n";
+        let response = mock_response(data);
+        let (tx, _rx) = flume::unbounded();
+        let result = smol::block_on(parse_sse(response, &tx, Duration::from_secs(30))).unwrap();
+        assert_eq!(result.usage.output, 40, "{THINKING_IS_OUTPUT}");
+        assert_eq!(result.usage.input, 100);
+    }
+
+    #[test_case(LONG_CONTEXT_ABOVE, 1.25     ; "a_prompt_at_the_threshold_bills_the_base_rate")]
+    #[test_case(LONG_CONTEXT_ABOVE + 1, 2.50 ; "a_longer_prompt_bills_the_tier")]
+    fn gemini_2_5_pro_bills_its_200k_tier(prompt_tokens: u32, input_rate: f64) {
+        let model = Model::from_spec(GEMINI_2_5_PRO_SPEC).unwrap();
+        let usage = TokenUsage {
+            input: prompt_tokens,
+            ..Default::default()
+        };
+        let cost = model.billed_cost(&usage, false).unwrap();
+        let expected = f64::from(prompt_tokens) * input_rate / PER_MILLION;
+        assert!(
+            (cost - expected).abs() < RATE_TOLERANCE,
+            "{cost} is not {expected}: {LONG_CONTEXT_RULE}"
+        );
     }
 }

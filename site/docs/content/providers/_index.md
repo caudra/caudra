@@ -171,8 +171,8 @@ A lane answers inside the release line you are on. On gpt-6 that is gpt-6-luna (
 | Marker | Models | Pricing (in/out per 1M tokens) | Context |
 |---------|--------|-------------------------------|---------|
 | Fast | **gemini-2.0-flash-lite** (default) | $0.07 / $0.30 | 1048K ctx / 65K out |
-| Best | **gemini-2.5-pro** (default) | $1.25 / $5.00 | 1048K ctx / 65K out |
-|  | gemini-2.5-flash | $0.15 / $0.60 | 1048K ctx / 65K out |
+| Best | **gemini-2.5-pro** (default) | $1.25 / $10.00 | 1048K ctx / 65K out |
+|  | gemini-2.5-flash | $0.30 / $2.50 | 1048K ctx / 65K out |
 
 Routing defaults: gemini-2.0-flash-lite (Fast), gemini-2.5-pro (Best)
 
