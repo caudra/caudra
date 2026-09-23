@@ -6,7 +6,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use caudra_providers::{
-    AgentError, Billing, ContentBlock, Message, Role, StopReason, TokenUsage, token_label,
+    AgentError, Billing, ContentBlock, Message, Role, StopReason, TokenUsage,
+    estimate_tokens_cached, token_label,
 };
 use caudra_storage::tool_ledger::ToolOutcome;
 use caudra_storage::tool_outputs::ToolOutputRef;
@@ -60,6 +61,11 @@ const MEMORY_NOTE_SEPARATOR: &str = "\n\n";
 const MEMORY_INDEX_SEPARATOR: &str = "\n";
 const MEMORY_NOTE_NOUN: &str = "note";
 const MEMORY_TAG_NOUN: &str = "tag";
+
+const STATE_KIND_FIELD: &str = "kind";
+/// Results sized by what they cost the model rather than by their lines: a
+/// page's line count only says how its extractor happened to wrap it.
+const TOKEN_SIZED_KINDS: &[&str] = &["webfetch", "websearch"];
 
 const MILLIS_PER_SECOND: u128 = 1_000;
 const SECONDS_PER_MINUTE: u64 = 60;
@@ -316,6 +322,24 @@ pub struct TextOutput {
     pub state: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lua_provenance: Option<LuaToolProvenance>,
+}
+
+impl TextOutput {
+    /// Keyed on the stored state rather than the tool name, so a reopened
+    /// session sizes the card the same way the live run did.
+    fn size_label(&self) -> String {
+        let kind = self
+            .state
+            .as_ref()
+            .and_then(|state| state.get(STATE_KIND_FIELD))
+            .and_then(serde_json::Value::as_str);
+        match kind {
+            Some(kind) if TOKEN_SIZED_KINDS.contains(&kind) => {
+                token_label(estimate_tokens_cached(&self.text))
+            }
+            _ => format!("{} lines", self.text.lines().count()),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1152,8 +1176,7 @@ impl ToolOutput {
                 "exit unknown".into()
             }),
             Self::Plain(text) | Self::Markdown(text) if !text.text.is_empty() => {
-                let n = text.text.lines().count();
-                Some(format!("{n} lines"))
+                Some(text.size_label())
             }
             Self::Image { text, .. } => Some(
                 text.strip_prefix("[image: ")
@@ -2576,6 +2599,7 @@ pub struct Envelope {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use caudra_providers::estimate_tokens;
     use caudra_storage::StateDir;
     use caudra_storage::id::SessionRef;
     use caudra_storage::tool_outputs::ToolOutputStore;
@@ -2837,6 +2861,27 @@ mod tests {
     #[test_case(ToolOutput::Diff { path: "a.rs".into(), before: String::new(), after: "new\n".into(), summary: "ok".into() }, Some("+1 -0") ; "diff_pure_insert")]
     fn annotation_cases(output: ToolOutput, expected: Option<&str>) {
         assert_eq!(output.annotation().as_deref(), expected);
+    }
+
+    const WEB_RESULT: &str = "# Title\n\nFirst paragraph.\nSecond paragraph.";
+
+    /// A web result is sized by what the model pays for it. Other Workcell
+    /// text, such as a `python_execution` result, keeps its line count.
+    #[test_case(ToolOutput::Markdown, "webfetch", token_label(estimate_tokens(WEB_RESULT)) ; "a_fetched_page_counts_tokens")]
+    #[test_case(ToolOutput::Plain, "webfetch", token_label(estimate_tokens(WEB_RESULT)) ; "a_page_fetched_as_text_counts_tokens")]
+    #[test_case(ToolOutput::Markdown, "websearch", token_label(estimate_tokens(WEB_RESULT)) ; "search_results_count_tokens")]
+    #[test_case(ToolOutput::Plain, "code", "4 lines".to_owned() ; "a_python_result_counts_lines")]
+    fn a_text_result_is_sized_by_its_kind(
+        variant: fn(TextOutput) -> ToolOutput,
+        kind: &str,
+        expected: String,
+    ) {
+        let output = variant(TextOutput {
+            state: Some(serde_json::json!({ STATE_KIND_FIELD: kind })),
+            ..TextOutput::from(WEB_RESULT)
+        });
+
+        assert_eq!(output.annotation(), Some(expected));
     }
 
     #[test]
