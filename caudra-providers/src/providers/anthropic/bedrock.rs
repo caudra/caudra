@@ -14,13 +14,17 @@ use sha2::{Digest, Sha256};
 use tracing::{debug, warn};
 
 use crate::model::Model;
-use crate::provider::{BoxFuture, Provider};
+use crate::provider::{BoxFuture, Provider, WireRequest};
 use crate::{AgentError, CacheKey, Message, ProviderEvent, RequestOptions, StreamResponse};
 
 use super::shared;
 use super::shared::hex_encode;
 
 const BEDROCK_API_VERSION: &str = "bedrock-2023-05-31";
+const BASE_URL_ENV: &str = "ANTHROPIC_BEDROCK_BASE_URL";
+const MODEL_ENV: &str = "ANTHROPIC_MODEL";
+const INVOKE_STREAM: &str = "invoke-with-response-stream";
+const INPUT_EXAMPLES: &str = "input_examples";
 const MIN_EVENTSTREAM_FRAME: usize = 16;
 const CONTAINER_METADATA_TIMEOUT: Duration = Duration::from_secs(5);
 const REFRESH_MARGIN: Duration = Duration::from_secs(5 * 60);
@@ -473,6 +477,9 @@ pub(crate) struct Bedrock {
     client: HttpClient,
     auth: Arc<Mutex<BedrockAuth>>,
     base_url: Option<String>,
+    /// `ANTHROPIC_MODEL`, which names the Bedrock model whatever the session
+    /// picked.
+    model_override: Option<String>,
 }
 
 impl Bedrock {
@@ -483,12 +490,46 @@ impl Bedrock {
         let auth = resolve_bedrock_auth().inspect_err(|e| {
             warn!(error = %e, "Bedrock auth resolution failed");
         })?;
-        let base_url = env::var("ANTHROPIC_BEDROCK_BASE_URL").ok();
         Ok(Self {
             client: super::super::http_client(timeouts),
             auth: Arc::new(Mutex::new(auth)),
-            base_url,
+            base_url: env::var(BASE_URL_ENV).ok(),
+            model_override: env::var(MODEL_ENV).ok(),
         })
+    }
+
+    /// The model a send names: the `ANTHROPIC_MODEL` override, else the session's.
+    fn sent_model_id<'a>(&'a self, model: &'a Model) -> &'a str {
+        shared::strip_long_context(self.model_override.as_deref().unwrap_or(&model.id))
+    }
+
+    /// The turn a send carries. SigV4 signs it into headers alone, so the dry
+    /// run shows this without signing anything.
+    fn request(
+        &self,
+        region: &str,
+        model: &Model,
+        messages: &[Message],
+        system: &str,
+        tools: &Value,
+        opts: &RequestOptions,
+    ) -> WireRequest {
+        let model_id = super::super::urlenc(self.sent_model_id(model));
+        let base = self
+            .base_url
+            .clone()
+            .unwrap_or_else(|| format!("https://bedrock-runtime.{region}.amazonaws.com"));
+        // Fast mode lives only on the direct API, so Bedrock skips `opts.fast`
+        // and never sends the `speed` param.
+        let mut body = shared::request_body(model, messages, None, system, tools, &opts.thinking);
+        body["anthropic_version"] = json!(BEDROCK_API_VERSION);
+        if tools
+            .as_array()
+            .is_some_and(|tools| tools.iter().any(|tool| tool.get(INPUT_EXAMPLES).is_some()))
+        {
+            body["anthropic_beta"] = json!([shared::BETA_TOOL_EXAMPLES_BEDROCK]);
+        }
+        WireRequest::post(format!("{base}/model/{model_id}/{INVOKE_STREAM}"), body)
     }
 
     fn needs_refresh(&self) -> bool {
@@ -526,46 +567,10 @@ impl Provider for Bedrock {
                 self.reload_auth().await?;
             }
             let auth = self.auth.lock().unwrap().clone();
-            let requested_id = env::var("ANTHROPIC_MODEL").unwrap_or_else(|_| model.id.clone());
-            let model_id = shared::strip_long_context(&requested_id).to_string();
+            let wire = self.request(&auth.region, model, messages, system, tools, &opts);
+            let json_body = serde_json::to_vec(&wire.body)?;
 
-            let mut body = shared::build_request_body_with_system(
-                model,
-                messages,
-                &[shared::SystemBlock {
-                    r#type: "text",
-                    text: system,
-                    cache_control: Some(shared::EPHEMERAL),
-                }],
-                tools,
-                opts.thinking,
-            );
-            // Fast mode lives only on the direct API, so Bedrock skips `opts.fast`
-            // and never sends the `speed` param.
-            body["anthropic_version"] = json!(BEDROCK_API_VERSION);
-            let has_examples = tools
-                .as_array()
-                .is_some_and(|arr| arr.iter().any(|t| t.get("input_examples").is_some()));
-            let mut betas = Vec::new();
-            if has_examples {
-                betas.push(shared::BETA_TOOL_EXAMPLES_BEDROCK);
-            }
-            if !betas.is_empty() {
-                body["anthropic_beta"] = json!(betas);
-            }
-
-            let encoded_model = super::super::urlenc(&model_id);
-            let url = match &self.base_url {
-                Some(base) => format!("{base}/model/{encoded_model}/invoke-with-response-stream"),
-                None => format!(
-                    "https://bedrock-runtime.{}.amazonaws.com/model/{encoded_model}/invoke-with-response-stream",
-                    auth.region
-                ),
-            };
-
-            let json_body = serde_json::to_vec(&body)?;
-
-            let (host, _, _) = parse_url(&url);
+            let (host, _, _) = parse_url(&wire.url);
             let host = host.to_string();
             let extra_headers = vec![("content-type", "application/json"), ("host", &host)];
 
@@ -577,8 +582,8 @@ impl Provider for Bedrock {
                     session_token,
                     expires_at: _,
                 } => Some(sign_request_sigv4(
-                    "POST",
-                    &url,
+                    wire.method,
+                    &wire.url,
                     &extra_headers,
                     &json_body,
                     access_key,
@@ -595,8 +600,8 @@ impl Provider for Bedrock {
             };
 
             let mut builder = Request::builder()
-                .method("POST")
-                .uri(&url)
+                .method(wire.method)
+                .uri(&wire.url)
                 .header("user-agent", super::super::user_agent());
             for (k, v) in &extra_headers {
                 builder = builder.header(*k, *v);
@@ -608,7 +613,12 @@ impl Provider for Bedrock {
             }
             let request = builder.body(json_body)?;
 
-            debug!(model = %model_id, region = %auth.region, "sending Bedrock request");
+            debug!(
+                model = %self.sent_model_id(model),
+                region = %auth.region,
+                url = %wire.url,
+                "sending Bedrock request"
+            );
 
             let mut response = self.client.send_async(request).await?;
             let status = response.status().as_u16();
@@ -661,6 +671,19 @@ impl Provider for Bedrock {
 
             Ok(parser.finish())
         })
+    }
+
+    fn wire_request(
+        &self,
+        model: &Model,
+        messages: &[Message],
+        system: &str,
+        tools: &Value,
+        opts: &RequestOptions,
+        _cache_key: Option<&CacheKey>,
+    ) -> Result<WireRequest, AgentError> {
+        let region = self.auth.lock().unwrap().region.clone();
+        Ok(self.request(&region, model, messages, system, tools, opts))
     }
 
     fn list_models(&self) -> BoxFuture<'_, Result<Vec<crate::model::ModelInfo>, AgentError>> {
@@ -746,8 +769,79 @@ fn days_to_ymd(days_since_epoch: u64) -> (u64, u64, u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::providers::{Timeouts, http_client};
     use crate::{ContentBlock, ProviderEvent};
     use test_case::test_case;
+
+    const REGION: &str = "eu-west-1";
+    const GATEWAY: &str = "https://gateway.example.com";
+    const PINNED_MODEL: &str = "us.anthropic.claude-opus-4-8-v1:0";
+    const LONG_CONTEXT_MODEL: &str = "anthropic/claude-opus-4-8-1m";
+    const SYSTEM_PROMPT: &str = "system";
+    const USER_TEXT: &str = "hello";
+
+    fn bedrock(base_url: Option<&str>, model_override: Option<&str>) -> Bedrock {
+        Bedrock {
+            client: http_client(Timeouts::default()),
+            auth: Arc::new(Mutex::new(BedrockAuth {
+                kind: AuthKind::None,
+                region: REGION.into(),
+            })),
+            base_url: base_url.map(Into::into),
+            model_override: model_override.map(Into::into),
+        }
+    }
+
+    fn dry_run(provider: &Bedrock, tools: &Value) -> WireRequest {
+        let model = Model::from_spec(LONG_CONTEXT_MODEL).unwrap();
+        provider
+            .wire_request(
+                &model,
+                &[Message::user(USER_TEXT.into())],
+                SYSTEM_PROMPT,
+                tools,
+                &RequestOptions::default(),
+                None,
+            )
+            .unwrap()
+    }
+
+    /// Bedrock names the model in the path rather than the body, so the URL is
+    /// where the long-context suffix is dropped and `ANTHROPIC_MODEL` shows.
+    #[test_case(
+        None,
+        None,
+        "https://bedrock-runtime.eu-west-1.amazonaws.com/model/claude-opus-4-8/invoke-with-response-stream"
+        ; "regional_endpoint_drops_the_long_context_suffix"
+    )]
+    #[test_case(
+        Some(GATEWAY),
+        Some(PINNED_MODEL),
+        "https://gateway.example.com/model/us.anthropic.claude-opus-4-8-v1%3A0/invoke-with-response-stream"
+        ; "gateway_posts_the_pinned_model"
+    )]
+    fn wire_request_names_the_model_in_the_url(
+        base_url: Option<&str>,
+        model_override: Option<&str>,
+        expected: &str,
+    ) {
+        let wire = dry_run(&bedrock(base_url, model_override), &json!([]));
+        assert_eq!(wire.url, expected);
+        assert_eq!(wire.body["anthropic_version"], BEDROCK_API_VERSION);
+        assert!(wire.body.get("model").is_none());
+        assert!(wire.body.get("stream").is_none());
+    }
+
+    #[test_case(json!([{"name": "shell"}]), Value::Null ; "plain_tools_need_no_beta")]
+    #[test_case(
+        json!([{"name": "shell", "input_examples": []}]),
+        json!([shared::BETA_TOOL_EXAMPLES_BEDROCK])
+        ; "tool_examples_ask_for_their_beta"
+    )]
+    fn tool_examples_opt_into_their_beta(tools: Value, expected: Value) {
+        let wire = dry_run(&bedrock(None, None), &tools);
+        assert_eq!(wire.body["anthropic_beta"], expected);
+    }
 
     #[test]
     fn sigv4_signing_encodes_path_segments() {

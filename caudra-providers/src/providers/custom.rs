@@ -16,7 +16,7 @@ use crate::manifest::ManifestRegistry;
 use crate::model::{
     Billing, FastPricing, Model, ModelFacts, ModelFamily, ModelPricing, ThinkingSupport,
 };
-use crate::provider::{BoxFuture, Provider, ProviderKind};
+use crate::provider::{BoxFuture, Provider, ProviderKind, WireRequest};
 use crate::providers::Timeouts;
 use crate::{
     AgentError, CacheKey, Message, ProviderEvent, RequestOptions, StreamResponse, ThinkingConfig,
@@ -357,6 +357,36 @@ struct CustomOpenAiProvider {
     protocol: Protocol,
 }
 
+impl CustomOpenAiProvider {
+    /// What one turn posts with `auth`, for the send and the dry run alike.
+    #[allow(clippy::too_many_arguments)]
+    fn request(
+        &self,
+        auth: &ResolvedAuth,
+        model: &Model,
+        messages: &[Message],
+        system: &str,
+        tools: &Value,
+        thinking: &ThinkingConfig,
+        cache_key: Option<&CacheKey>,
+    ) -> Result<WireRequest, AgentError> {
+        if self.protocol == Protocol::OpenaiResponses {
+            let body = build_responses_body(model, messages, system, tools, thinking, cache_key);
+            return Ok(WireRequest::post(responses::responses_url(auth)?, body));
+        }
+        let body = build_chat_body(
+            &self.compat,
+            model,
+            messages,
+            system,
+            tools,
+            thinking,
+            cache_key,
+        );
+        Ok(WireRequest::post(self.compat.chat_url(auth), body))
+    }
+}
+
 impl Provider for CustomOpenAiProvider {
     fn stream_message<'a>(
         &'a self,
@@ -370,14 +400,21 @@ impl Provider for CustomOpenAiProvider {
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             let auth = self.auth.lock().unwrap().clone();
+            let wire = self.request(
+                &auth,
+                model,
+                messages,
+                system,
+                tools,
+                &opts.thinking,
+                cache_key,
+            )?;
 
             if self.protocol == Protocol::OpenaiResponses {
-                let body =
-                    build_responses_body(model, messages, system, tools, &opts.thinking, cache_key);
                 return responses::do_stream(
                     self.compat.client(),
                     model,
-                    &body,
+                    &wire,
                     event_tx,
                     &auth,
                     self.compat.stream_timeout(),
@@ -385,19 +422,31 @@ impl Provider for CustomOpenAiProvider {
                 .await;
             }
 
-            let body = build_chat_body(
-                &self.compat,
-                model,
-                messages,
-                system,
-                tools,
-                &opts.thinking,
-                cache_key,
-            );
             self.compat
-                .do_stream(model, &[], &body, event_tx, &auth)
+                .do_stream(model, &[], &wire, event_tx, &auth)
                 .await
         })
+    }
+
+    fn wire_request(
+        &self,
+        model: &Model,
+        messages: &[Message],
+        system: &str,
+        tools: &Value,
+        opts: &RequestOptions,
+        cache_key: Option<&CacheKey>,
+    ) -> Result<WireRequest, AgentError> {
+        let auth = self.auth.lock().unwrap().clone();
+        self.request(
+            &auth,
+            model,
+            messages,
+            system,
+            tools,
+            &opts.thinking,
+            cache_key,
+        )
     }
 
     fn list_models(&self) -> BoxFuture<'_, Result<Vec<crate::model::ModelInfo>, AgentError>> {
@@ -418,12 +467,42 @@ impl Provider for CustomOpenAiProvider {
 mod tests {
     use super::*;
     use crate::model::{ModelInfo, ModelMarker};
+    use crate::providers::openai::responses::RESPONSES_PATH;
+    use crate::providers::openai_compat::CHAT_COMPLETIONS_PATH;
+    use crate::providers::test_support::CREDENTIAL_IN_URL;
     use crate::types::ThinkingConfig;
 
     const ANTHROPIC_KEY_LEAKED: &str =
         "an OpenAI-compatible body must never carry Anthropic's `thinking` key";
     const CACHE_KEY: &str = "session/task";
     const SYSTEM_PROMPT: &str = "You are a careful engineer.";
+    const TEST_BASE_URL: &str = "http://localhost:8000/v1";
+    const TEST_API_KEY: &str = "custom-api-key";
+
+    fn dry_run(
+        protocol: Protocol,
+        model: &Model,
+        messages: &[Message],
+        system: &str,
+        thinking: ThinkingConfig,
+        cache_key: Option<&CacheKey>,
+    ) -> WireRequest {
+        let provider = CustomOpenAiProvider {
+            compat: OpenAiCompatProvider::new(&CUSTOM_OPENAI_CONFIG, Timeouts::default()),
+            auth: Arc::new(Mutex::new(ResolvedAuth {
+                base_url: Some(TEST_BASE_URL.into()),
+                ..ResolvedAuth::bearer(TEST_API_KEY)
+            })),
+            protocol,
+        };
+        let opts = RequestOptions {
+            thinking,
+            ..RequestOptions::default()
+        };
+        provider
+            .wire_request(model, messages, system, &Value::Null, &opts, cache_key)
+            .unwrap()
+    }
 
     fn openai_def(model_id: &str) -> ProviderDef {
         serde_json::from_str(&format!(
@@ -592,10 +671,8 @@ mod tests {
         ))
         .unwrap();
         let model = model_from_def(&def, ProviderKind::OpenAi, "effort-body-test", "m");
-        let provider = OpenAiCompatProvider::new(&CUSTOM_OPENAI_CONFIG, Timeouts::default());
 
-        let mut body = provider.build_body(&model, &[], "", &Value::Null);
-        apply_declared_effort(&thinking, &mut body, &model);
+        let body = dry_run(Protocol::Openai, &model, &[], "", thinking, None).body;
 
         assert!(body.get("thinking").is_none(), "{ANTHROPIC_KEY_LEAKED}");
         body.get("reasoning_effort")
@@ -610,14 +687,16 @@ mod tests {
             "chat-body-test",
             "m",
         );
-        let provider = OpenAiCompatProvider::new(&CUSTOM_OPENAI_CONFIG, Timeouts::default());
 
-        let body = provider.build_body(
+        let body = dry_run(
+            Protocol::Openai,
             &model,
             &[Message::user("hello".into())],
             "system",
-            &Value::Null,
-        );
+            ThinkingConfig::Off,
+            None,
+        )
+        .body;
 
         assert_eq!(body["messages"][0]["role"], "system");
         assert_eq!(body["messages"][1]["content"], "hello");
@@ -632,16 +711,16 @@ mod tests {
         )
         .unwrap();
         let model = model_from_def(&def, ProviderKind::OpenAi, "responses-body-test", "m");
-        let messages = [Message::user("hello".into())];
 
-        let body = build_responses_body(
+        let body = dry_run(
+            Protocol::OpenaiResponses,
             &model,
-            &messages,
+            &[Message::user("hello".into())],
             "system",
-            &Value::Null,
-            &ThinkingConfig::Effort("xhigh".into()),
+            ThinkingConfig::Effort("xhigh".into()),
             None,
-        );
+        )
+        .body;
 
         assert_eq!(body["store"], false);
         assert_eq!(body["max_output_tokens"], 8192);
@@ -653,29 +732,34 @@ mod tests {
 
     /// A custom endpoint is OpenAI-compatible by declaration, so both wire
     /// shapes carry the conversation key an OpenAI server routes caches by.
-    #[test_case::test_case(true ; "responses")]
-    #[test_case::test_case(false ; "chat_completions")]
-    fn custom_bodies_carry_the_conversation_cache_key(responses: bool) {
+    #[test_case::test_case(Protocol::OpenaiResponses ; "responses")]
+    #[test_case::test_case(Protocol::Openai ; "chat_completions")]
+    fn custom_bodies_carry_the_conversation_cache_key(protocol: Protocol) {
         let model = model_from_def(
             &openai_def("m"),
             ProviderKind::OpenAi,
             "cache-key-test",
             "m",
         );
-        let compat = OpenAiCompatProvider::new(&CUSTOM_OPENAI_CONFIG, Timeouts::default());
         let key = CacheKey::task(None, CACHE_KEY);
-        let thinking = ThinkingConfig::Off;
 
         let [keyed, unkeyed] = [Some(&key), None].map(|cache_key| {
-            if responses {
-                build_responses_body(&model, &[], "", &Value::Null, &thinking, cache_key)
-            } else {
-                build_chat_body(&compat, &model, &[], "", &Value::Null, &thinking, cache_key)
-            }
+            dry_run(protocol, &model, &[], "", ThinkingConfig::Off, cache_key).body
         });
 
         assert_eq!(keyed[responses::PROMPT_CACHE_KEY_FIELD], CACHE_KEY);
         assert!(unkeyed.get(responses::PROMPT_CACHE_KEY_FIELD).is_none());
+    }
+
+    #[test_case::test_case(Protocol::OpenaiResponses, RESPONSES_PATH ; "responses")]
+    #[test_case::test_case(Protocol::Openai, CHAT_COMPLETIONS_PATH ; "chat_completions")]
+    fn wire_request_posts_where_the_send_does(protocol: Protocol, path: &str) {
+        let model = model_from_def(&openai_def("m"), ProviderKind::OpenAi, "wire-url-test", "m");
+
+        let wire = dry_run(protocol, &model, &[], "", ThinkingConfig::Off, None);
+
+        assert_eq!(wire.url, format!("{TEST_BASE_URL}{path}"));
+        assert!(!wire.url.contains(TEST_API_KEY), "{CREDENTIAL_IN_URL}");
     }
 
     /// The breakpoint is a Responses content-block field the protocol says
@@ -689,14 +773,15 @@ mod tests {
         let def: ProviderDef = serde_json::from_str(def).unwrap();
         let model = model_from_def(&def, ProviderKind::OpenAi, "cache-breakpoint-test", "m");
 
-        let body = build_responses_body(
+        let body = dry_run(
+            Protocol::OpenaiResponses,
             &model,
             &[],
             SYSTEM_PROMPT,
-            &Value::Null,
-            &ThinkingConfig::Off,
+            ThinkingConfig::Off,
             None,
-        );
+        )
+        .body;
 
         assert_eq!(model.supports_cache_breakpoints(), marked);
         assert_eq!(body.get(responses::INSTRUCTIONS_FIELD).is_none(), marked);

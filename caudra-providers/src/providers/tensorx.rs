@@ -4,8 +4,10 @@ use flume::Sender;
 use serde_json::{Value, json};
 
 use crate::model::{Model, ModelEntry, ModelInfo, ModelPricing};
-use crate::provider::{BoxFuture, Provider};
-use crate::{AgentError, CacheKey, Message, ProviderEvent, RequestOptions, StreamResponse};
+use crate::provider::{BoxFuture, Provider, WireRequest};
+use crate::{
+    AgentError, CacheKey, Message, ProviderEvent, RequestOptions, StreamResponse, ThinkingConfig,
+};
 
 use super::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
 use super::{KeyPool, ResolvedAuth};
@@ -72,6 +74,43 @@ impl TensorX {
         self.system_prefix = prefix;
         self
     }
+
+    /// What a turn posts, for the send and the dry run alike.
+    fn request(
+        &self,
+        auth: &ResolvedAuth,
+        model: &Model,
+        messages: &[Message],
+        system: &str,
+        tools: &Value,
+        thinking: &ThinkingConfig,
+    ) -> WireRequest {
+        let mut buf = String::new();
+        let system = super::with_prefix(&self.system_prefix, system, &mut buf);
+        let mut body = self.compat.build_body(model, messages, system, tools);
+
+        let (has_thinking, has_reasoning_effort) =
+            crate::model_registry::provider_info::<TensorXModelInfo>("tensorx", &model.id)
+                .map_or((false, false), |info| {
+                    (info.has_thinking, info.has_reasoning_effort)
+                });
+
+        if has_thinking {
+            body["thinking"] = json!(thinking.is_enabled());
+        }
+        if has_reasoning_effort {
+            thinking.apply_reasoning_effort(&mut body, model);
+        }
+        // Fallback for deepseek models that use chat_template_kwargs
+        else if !has_thinking
+            && thinking.is_enabled()
+            && model.id.starts_with("deepseek/deepseek-v4")
+        {
+            body["chat_template_kwargs"] = json!({"thinking": true});
+        }
+
+        WireRequest::post(self.compat.chat_url(auth), body)
+    }
 }
 
 impl Provider for TensorX {
@@ -87,34 +126,24 @@ impl Provider for TensorX {
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             let auth = self.auth.lock().unwrap().clone();
-            let mut buf = String::new();
-            let system = super::with_prefix(&self.system_prefix, system, &mut buf);
-            let mut body = self.compat.build_body(model, messages, system, tools);
-
-            let (has_thinking, has_reasoning_effort) =
-                crate::model_registry::provider_info::<TensorXModelInfo>("tensorx", &model.id)
-                    .map_or((false, false), |info| {
-                        (info.has_thinking, info.has_reasoning_effort)
-                    });
-
-            if has_thinking {
-                body["thinking"] = json!(opts.thinking.is_enabled());
-            }
-            if has_reasoning_effort {
-                opts.thinking.apply_reasoning_effort(&mut body, model);
-            }
-            // Fallback for deepseek models that use chat_template_kwargs
-            else if !has_thinking
-                && opts.thinking.is_enabled()
-                && model.id.starts_with("deepseek/deepseek-v4")
-            {
-                body["chat_template_kwargs"] = json!({"thinking": true});
-            }
-
+            let wire = self.request(&auth, model, messages, system, tools, &opts.thinking);
             self.compat
-                .do_stream(model, &[], &body, event_tx, &auth)
+                .do_stream(model, &[], &wire, event_tx, &auth)
                 .await
         })
+    }
+
+    fn wire_request(
+        &self,
+        model: &Model,
+        messages: &[Message],
+        system: &str,
+        tools: &Value,
+        opts: &RequestOptions,
+        _cache_key: Option<&CacheKey>,
+    ) -> Result<WireRequest, AgentError> {
+        let auth = self.auth.lock().unwrap().clone();
+        Ok(self.request(&auth, model, messages, system, tools, &opts.thinking))
     }
 
     fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {

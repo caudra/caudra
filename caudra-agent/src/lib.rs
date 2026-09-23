@@ -23,10 +23,10 @@ pub use agent::{
     Agent, AgentParams, AgentRunParams, COMPACTION_ANCHOR, DEFAULT_GOAL_CONTINUATION_LIMIT,
     EMPTY_RESPONSE_RULE, GoalError, GoalHandle, GoalResult, GoalSnapshot, GoalStatus, GoalVerdict,
     History, HistorySnapshot, InstructionBaseline, InstructionSource, Instructions,
-    LoadedInstructions, MAX_GOAL_CHARS, MAX_GOAL_CONTINUATION_LIMIT, SharedHistory,
-    UNAVAILABLE_RESULT, close_dangling_tool_calls, find_subdirectory_instructions,
-    goal_checkin_message, goal_kickoff_message, is_instruction_file, is_run_failure_marker,
-    project_for_provider, project_for_target,
+    LoadedInstructions, MAX_GOAL_CHARS, MAX_GOAL_CONTINUATION_LIMIT, ProjectedHistory,
+    SharedHistory, UNAVAILABLE_RESULT, find_subdirectory_instructions, goal_checkin_message,
+    goal_kickoff_message, is_instruction_file, is_run_failure_marker, project_for_inspection,
+    project_request,
 };
 pub use cancel::{CancelMap, CancelToken, CancelTrigger};
 pub use caudra_config::{AgentConfig, PermissionsConfig, ToolOutputLines};

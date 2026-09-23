@@ -15,7 +15,7 @@ use crate::components::prompt_progress::PromptProgress;
 use crate::components::stream_modal::{StreamDone, StreamEvent, StreamFooter, StreamUsage};
 use crate::components::{DisplayMessage, DisplayRole};
 
-use super::App;
+use super::{App, HISTORY_UNREADABLE};
 
 const TITLE: &str = " /btw ";
 /// Drawn where the thread's snapshot of the conversation ends, so the reader
@@ -74,7 +74,21 @@ pub(crate) struct BtwThread {
 }
 
 impl BtwThread {
-    fn new(prompt: Arc<BtwPrompt>, base: Vec<Message>) -> Self {
+    /// Opens over exactly what the live request sends for `history`, so the
+    /// provider can reuse the cached prefix instead of re-reading the whole
+    /// history as fresh input tokens. That includes answering a call the
+    /// mirror caught mid-turn, which a provider would otherwise reject.
+    fn new(prompt: Arc<BtwPrompt>, history: Vec<Message>) -> Self {
+        let transport = prompt.provider.reasoning_transport(&prompt.model);
+        let base = match caudra_agent::project_request(
+            &history,
+            &prompt.tools,
+            &prompt.model,
+            transport,
+        ) {
+            Cow::Borrowed(_) => history,
+            Cow::Owned(projected) => projected,
+        };
         Self {
             prompt,
             base,
@@ -145,7 +159,7 @@ impl App {
             Ok(messages) => messages,
             Err(error) => {
                 self.status_bar
-                    .flash(format!("Failed to read session history: {error}"));
+                    .flash(format!("{HISTORY_UNREADABLE}{error}"));
                 return;
             }
         };
@@ -160,24 +174,8 @@ impl App {
             return;
         };
 
-        // Mirrors what the live request puts on the wire, so the provider can reuse the cached
-        // prefix instead of re-reading the whole history as fresh input tokens.
-        let transport = prompt.provider.reasoning_transport(&prompt.model);
-        let mut base = match caudra_agent::project_for_target(
-            &messages,
-            &prompt.tools,
-            &prompt.model,
-            transport,
-        ) {
-            Cow::Borrowed(_) => messages,
-            Cow::Owned(projected) => projected,
-        };
-        // The mirror is verbatim, so mid-turn it can end on an open tool call.
-        // Providers reject that, so close them off on our own copy.
-        caudra_agent::close_dangling_tool_calls(&mut base, caudra_agent::UNAVAILABLE_RESULT);
-
         self.end_btw_thread();
-        let mut thread = BtwThread::new(prompt, base);
+        let mut thread = BtwThread::new(prompt, messages);
         thread.ask(question.clone());
         self.btw_thread = Some(thread);
         // Streaming text is not in history yet and draws below every message,
@@ -257,7 +255,6 @@ async fn run_btw(
     // btw bypasses `stream_with_retry`, the only other place options meet a model, so it has to
     // clamp for itself or it sends options the live request would have gated away.
     let opts = prompt.opts.clamped(&model);
-    let messages = caudra_providers::adapt_images_for_model(&model, &messages);
     let (event_tx, event_rx) = flume::unbounded();
 
     let forwarder = smol::spawn({
@@ -333,6 +330,7 @@ async fn run_btw(
 #[cfg(test)]
 mod tests {
     use arc_swap::ArcSwap;
+    use caudra_agent::UNAVAILABLE_RESULT;
     use caudra_providers::provider::{BoxFuture, Provider};
     use caudra_providers::{Model, RequestOptions, StreamResponse};
     use serde_json::json;
@@ -350,14 +348,19 @@ mod tests {
     const PREFILL_PROCESSED: u32 = 1_200;
     const PREFILL_TOTAL: u32 = 4_000;
     const PREFILL_CACHE: u32 = 900;
+    const TOOL: &str = "file_read";
+    const ORPHANED_CALL: &str = "orphaned";
+    const UNANSWERED_CALL: &str = "unanswered";
+    const OPEN_CALLS: [&str; 2] = ["open-first", "open-second"];
 
-    struct RecordingProvider(flume::Sender<String>);
+    /// Hands over the route and messages of every request it answers.
+    struct RecordingProvider(flume::Sender<(String, Vec<Message>)>);
 
     impl Provider for RecordingProvider {
         fn stream_message<'a>(
             &'a self,
             model: &'a Model,
-            _: &'a [Message],
+            messages: &'a [Message],
             _: &'a str,
             _: &'a serde_json::Value,
             _: &'a flume::Sender<ProviderEvent>,
@@ -365,7 +368,7 @@ mod tests {
             _: Option<&'a CacheKey>,
         ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
             Box::pin(async move {
-                self.0.send(model.spec()).unwrap();
+                self.0.send((model.spec(), messages.to_vec())).unwrap();
                 Ok(StreamResponse {
                     message: assistant_text(ANSWER),
                     stop_reason: Some(StopReason::EndTurn),
@@ -426,7 +429,7 @@ mod tests {
         }
     }
 
-    fn prompt(spec: &str, called: flume::Sender<String>) -> BtwPrompt {
+    fn prompt(spec: &str, called: flume::Sender<(String, Vec<Message>)>) -> BtwPrompt {
         prompt_with(Arc::new(RecordingProvider(called)), spec)
     }
 
@@ -589,7 +592,7 @@ mod tests {
                 CancelToken::none(),
             )
             .await;
-            assert_eq!(first_rx.try_recv().unwrap(), FIRST_MODEL);
+            assert_eq!(first_rx.try_recv().unwrap().0, FIRST_MODEL);
             assert!(matches!(
                 event_rx.try_recv(),
                 Ok(StreamEvent::Done(StreamDone { answer: Some(answer), .. })) if answer == ANSWER
@@ -605,11 +608,119 @@ mod tests {
             )
             .await;
             assert_eq!(
-                first_rx.try_recv().unwrap(),
+                first_rx.try_recv().unwrap().0,
                 FIRST_MODEL,
                 "a follow-up rides the same captured route"
             );
             assert!(second_rx.try_recv().is_err());
         });
+    }
+
+    /// A thread goes out exactly as the live request would, repairs included,
+    /// rather than through a hand-rolled copy of the projection that drifts.
+    #[test]
+    fn a_thread_sends_the_request_projection_and_the_question() {
+        smol::block_on(async {
+            let history = vec![
+                Message::user(BASE.into()),
+                Message {
+                    role: Role::User,
+                    content: vec![ContentBlock::ToolResult {
+                        tool_use_id: ORPHANED_CALL.into(),
+                        content: ANSWER.into(),
+                        is_error: false,
+                        output_ref: None,
+                    }],
+                    ..Default::default()
+                },
+                Message {
+                    role: Role::Assistant,
+                    content: vec![ContentBlock::tool_use(UNANSWERED_CALL, TOOL, json!({}))],
+                    ..Default::default()
+                },
+                Message::user(FOLLOW_UP.into()),
+                assistant_text(ANSWER),
+            ];
+            let (called, requests) = flume::unbounded();
+            let mut thread = BtwThread::new(Arc::new(prompt(FIRST_MODEL, called)), history.clone());
+            thread.ask(Q.into());
+            let (event_tx, _event_rx) = flume::unbounded();
+
+            run_btw(
+                Arc::clone(&thread.prompt),
+                thread.request_messages(),
+                event_tx,
+                None,
+                CancelToken::none(),
+            )
+            .await;
+
+            let pinned = &thread.prompt;
+            let mut expected = caudra_agent::project_request(
+                &history,
+                &pinned.tools,
+                &pinned.model,
+                pinned.provider.reasoning_transport(&pinned.model),
+            )
+            .into_owned();
+            expected.push(btw_question(Q));
+            let (_, sent) = requests.try_recv().unwrap();
+            assert_eq!(
+                serde_json::to_value(sent).unwrap(),
+                serde_json::to_value(expected).unwrap()
+            );
+        });
+    }
+
+    /// Reading the history rejects every broken tool pairing but one: a turn
+    /// caught between its calls and their results. A provider rejects a call
+    /// left unanswered, so the thread closes each one, in the order the turn
+    /// made them.
+    #[test_case(1 ; "one_open_call")]
+    #[test_case(2 ; "two_open_calls")]
+    fn a_thread_closes_the_calls_a_turn_left_open(open: usize) {
+        let calls = &OPEN_CALLS[..open];
+        let (called, _requests) = flume::unbounded();
+        let mut thread = BtwThread::new(
+            Arc::new(prompt(FIRST_MODEL, called)),
+            vec![
+                Message::user(BASE.into()),
+                Message {
+                    role: Role::Assistant,
+                    content: calls
+                        .iter()
+                        .map(|id| ContentBlock::tool_use(*id, TOOL, json!({})))
+                        .collect(),
+                    ..Default::default()
+                },
+            ],
+        );
+        thread.ask(Q.into());
+
+        let messages = thread.request_messages();
+        let (_question, base) = messages.split_last().unwrap();
+        let closing = base.last().unwrap();
+        assert!(matches!(closing.role, Role::User));
+        assert_eq!(closing.display_text.as_deref(), Some(""));
+        let results: Vec<(&str, &str, bool)> = closing
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::ToolResult {
+                    tool_use_id,
+                    content,
+                    is_error,
+                    ..
+                } => Some((tool_use_id.as_str(), content.as_str(), *is_error)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            results,
+            calls
+                .iter()
+                .map(|id| (*id, UNAVAILABLE_RESULT, true))
+                .collect::<Vec<_>>()
+        );
     }
 }

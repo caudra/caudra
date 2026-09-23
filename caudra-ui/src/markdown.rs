@@ -11,6 +11,7 @@ use caudra_markdown::Emphasis;
 use caudra_markdown::render::{
     self, Line as RLine, LineKind, Span as RSpan, SpanSource, StyleToken,
 };
+use caudra_markdown::source::source_lines;
 use ratatui::buffer::CellWidth;
 use ratatui::layout::{Position, Rect};
 use ratatui::style::{Modifier, Style};
@@ -104,19 +105,22 @@ fn style_for_token(
         StyleToken::ListMarker => t.list_marker,
         StyleToken::TableBorder => t.table_border,
         StyleToken::HorizontalRule => t.horizontal_rule,
+        StyleToken::Syntax => overlay_style(base, t.tool_dim),
     }
 }
 
 /// Heading lines preserve heading colour through emphasis. Code lines start
-/// from `Style::default()` so highlighter colours stand alone.
+/// from `code_style`, which rendered markdown leaves at `Style::default()` so
+/// highlighter colours stand alone.
 fn paint_line(
     line: &RLine,
     text_style: Style,
+    code_style: Style,
     t: &Theme,
 ) -> (Line<'static>, Vec<Option<Arc<str>>>) {
     let (base, preserve_color) = match line.kind {
         LineKind::Heading => (t.heading, true),
-        LineKind::Code => (Style::default(), false),
+        LineKind::Code => (code_style, false),
         _ => (text_style, false),
     };
     let mut spans = Vec::with_capacity(line.spans.len());
@@ -504,7 +508,7 @@ pub(crate) fn paint_semantic(
     let mut lines = Vec::with_capacity(semantic.len());
     let mut link_rows = Vec::with_capacity(semantic.len());
     for line in semantic {
-        let (painted, links) = paint_line(line, text_style, &t);
+        let (painted, links) = paint_line(line, text_style, Style::default(), &t);
         lines.push(painted);
         link_rows.push(links);
     }
@@ -616,6 +620,16 @@ pub(crate) fn text_to_painted_at(text: &str, style: Style, width: u16, base: u32
         }
     }
     painted
+}
+
+/// Colours markdown as source: one row per source line, every byte kept, the
+/// syntax dimmed rather than consumed. Code no highlighter colours stays on
+/// `style`, so a plain fence inside thinking still reads as thinking.
+pub(crate) fn source_to_lines(text: &str, style: Style, t: &Theme) -> Vec<Line<'static>> {
+    source_lines(text)
+        .iter()
+        .map(|line| paint_line(line, style, style, t).0)
+        .collect()
 }
 
 #[cfg(test)]
@@ -1089,5 +1103,24 @@ mod tests {
             interactive_link_target("https://example.com/\ntrimmed"),
             None
         );
+    }
+
+    #[test_case("**bold**", "**" ; "emphasis_delimiter")]
+    #[test_case("say `hi`", "`" ; "code_backtick")]
+    #[test_case("```rust\nfn main() {}\n```", "```rust" ; "fence_line")]
+    fn source_lines_keep_every_byte_and_dim_syntax(input: &str, syntax: &str) {
+        let t = theme::current();
+        let lines = source_to_lines(input, Style::default(), &t);
+
+        assert_eq!(lines_text(&lines), input.split('\n').collect::<Vec<_>>());
+        assert_eq!(find_span(&lines, syntax).style.fg, t.tool_dim.fg);
+    }
+
+    #[test]
+    fn source_code_without_a_language_keeps_the_callers_style() {
+        let t = theme::current();
+        let lines = source_to_lines("```\nplain body\n```", t.thinking, &t);
+
+        assert_eq!(find_span(&lines, "plain body").style, t.thinking);
     }
 }

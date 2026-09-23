@@ -11,7 +11,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, SystemTime};
 
 use caudra_config::providers::builtin_provider;
@@ -28,13 +28,18 @@ use caudra_storage::auth::load_provider_credentials;
 use caudra_storage::thinking::ReasoningOptions;
 
 use crate::model::{Model, ModelInfo, ModelPricing, PricingTier};
-use crate::provider::{BoxFuture, Provider};
-use crate::providers::anthropic::shared;
+use crate::provider::{BoxFuture, Provider, WireRequest};
+use crate::providers::anthropic::{self, shared};
 use crate::providers::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
-use crate::providers::{ResolvedAuth, Timeouts, http_client};
-use crate::{AgentError, CacheKey, Message, ProviderEvent, RequestOptions, StreamResponse};
+use crate::providers::{ResolvedAuth, Timeouts};
+use crate::{
+    AgentError, CacheKey, Message, ProviderEvent, RequestOptions, StreamResponse, ThinkingConfig,
+};
 
 const MESSAGES_PATH: &str = "/messages";
+const CATALOG_NOT_LOADED: &str = "the models.dev catalog has not loaded yet; send a message first";
+const PROVIDER_NOT_RESOLVED: &str =
+    "this provider resolves from the models.dev catalog on its first send; send a message first";
 
 const BLOCKED_PROVIDER_IN_CATALOG: &[&str] = &["zai", "zai-coding-plan", "github-copilot"];
 
@@ -516,6 +521,15 @@ pub fn catalog_provider_if_available(provider_id: &str) -> Option<ProviderData> 
     guard.providers.get(provider_id).cloned()
 }
 
+/// The catalog if it is already in memory, for callers that must never wait on
+/// its first fetch.
+pub(crate) fn warm_catalog_data() -> Result<MutexGuard<'static, CatalogData>, AgentError> {
+    SHARED_CATALOG
+        .get()
+        .and_then(|catalog| catalog.lock().ok())
+        .ok_or_else(|| config_error(CATALOG_NOT_LOADED.into()))
+}
+
 /// Non-blocking availability check for catalog-backed providers: true only when
 /// the catalog is already warm, contains the slug, and auth resolves (API key or
 /// free access). Never triggers a fetch, unlike [`try_create`].
@@ -691,6 +705,72 @@ fn init_catalog_blocking(
     }
 }
 
+/// One catalog request in the protocol its provider speaks. Zen and the
+/// per-slug catalog providers both build here, for the dry run and the send.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn catalog_request(
+    chat_compat: &OpenAiCompatProvider,
+    api_format: EndpointType,
+    auth: &ResolvedAuth,
+    model: &Model,
+    messages: &[Message],
+    system: &str,
+    tools: &Value,
+    thinking: &ThinkingConfig,
+) -> WireRequest {
+    match api_format {
+        EndpointType::ChatCompletions => {
+            let mut body = chat_compat.build_body(model, messages, system, tools);
+            thinking.apply_reasoning_effort(&mut body, model);
+            WireRequest::post(chat_compat.chat_url(auth), body)
+        }
+        EndpointType::Messages => WireRequest::post(
+            format!(
+                "{}{MESSAGES_PATH}",
+                auth.base_url.as_deref().unwrap_or_default()
+            ),
+            shared::messages_body(model, &model.id, messages, None, system, tools, thinking),
+        ),
+    }
+}
+
+/// Sends what [`catalog_request`] built for the same `api_format`.
+pub(crate) async fn send_catalog_request(
+    chat_compat: &OpenAiCompatProvider,
+    api_format: EndpointType,
+    auth: &ResolvedAuth,
+    model: &Model,
+    wire: &WireRequest,
+    event_tx: &Sender<ProviderEvent>,
+) -> Result<StreamResponse, AgentError> {
+    match api_format {
+        EndpointType::ChatCompletions => {
+            chat_compat
+                .do_stream(model, &[], wire, event_tx, auth)
+                .await
+        }
+        EndpointType::Messages => {
+            let request = auth
+                .configure_request(
+                    Request::builder()
+                        .method(wire.method)
+                        .uri(&wire.url)
+                        .header("user-agent", super::user_agent())
+                        .header("content-type", "application/json")
+                        .header("anthropic-version", anthropic::API_VERSION),
+                )
+                .body(serde_json::to_vec(&wire.body)?)?;
+            debug!(model = %model.id, "sending Anthropic-format request via catalog");
+            let response = chat_compat.client().send_async(request).await?;
+            if response.status().as_u16() == 200 {
+                anthropic::parse_sse(response, event_tx, chat_compat.stream_timeout()).await
+            } else {
+                Err(AgentError::from_response(response).await)
+            }
+        }
+    }
+}
+
 /// `Provider` for a single catalog sub-provider. Created with a resolved
 /// `ProviderData` (from `caudra_providers::catalog_provider(slug)`) plus the
 /// auth that the models.dev catalog would have used for that sub-provider.
@@ -698,8 +778,6 @@ pub struct CatalogProvider {
     data: ProviderData,
     auth: CatalogAuth,
     chat_compat: OpenAiCompatProvider,
-    client: HttpClient,
-    stream_timeout: Duration,
 }
 
 /// Which models the resolved auth unlocks: a real key unlocks all, the
@@ -739,9 +817,56 @@ impl CatalogProvider {
             data,
             auth,
             chat_compat: OpenAiCompatProvider::new(&CATALOG_PROVIDER_CONFIG, timeouts),
-            client: http_client(timeouts),
-            stream_timeout: timeouts.stream,
         })
+    }
+
+    /// The turn a send carries and the key it goes with. `Gated` holds no key,
+    /// so the dry run refuses exactly where the send would.
+    fn prepare(
+        &self,
+        model: &Model,
+        messages: &[Message],
+        system: &str,
+        tools: &Value,
+        opts: &RequestOptions,
+    ) -> Result<(&ResolvedAuth, WireRequest), AgentError> {
+        let auth = match &self.auth {
+            CatalogAuth::Keyed(auth) | CatalogAuth::FreeOnly(auth) => auth,
+            CatalogAuth::Gated => {
+                let slug = &self.data.slug;
+                return Err(AgentError::Config {
+                    message: format!(
+                        "provider '{slug}' has no API key; run `caudra auth login {slug}` or set {FREE_MODELS_OPT_IN} to use its free models"
+                    ),
+                });
+            }
+        };
+        let meta = self
+            .data
+            .models
+            .get(&model.id)
+            .ok_or_else(|| AgentError::Config {
+                message: format!(
+                    "model '{}' not found from provider '{}'",
+                    model.id, self.data.slug
+                ),
+            })?;
+        let model = Model {
+            max_output_tokens: Some(meta.output),
+            context_window: meta.context,
+            ..model.clone()
+        };
+        let wire = catalog_request(
+            &self.chat_compat,
+            self.data.api_format,
+            auth,
+            &model,
+            messages,
+            system,
+            tools,
+            &opts.thinking,
+        );
+        Ok((auth, wire))
     }
 }
 
@@ -757,91 +882,30 @@ impl Provider for CatalogProvider {
         _cache_key: Option<&'a CacheKey>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
-            let auth = match &self.auth {
-                CatalogAuth::Keyed(auth) | CatalogAuth::FreeOnly(auth) => auth,
-                CatalogAuth::Gated => {
-                    let slug = &self.data.slug;
-                    return Err(AgentError::Config {
-                        message: format!(
-                            "provider '{slug}' has no API key; run `caudra auth login {slug}` or set {FREE_MODELS_OPT_IN} to use its free models"
-                        ),
-                    });
-                }
-            };
-            let meta = self
-                .data
-                .models
-                .get(&model.id)
-                .ok_or_else(|| AgentError::Config {
-                    message: format!(
-                        "model '{}' not found from provider '{}'",
-                        model.id, self.data.slug
-                    ),
-                })?;
-            let stream_model = Model {
-                id: model.id.clone(),
-                max_output_tokens: Some(meta.output),
-                context_window: meta.context,
-                ..model.clone()
-            };
-
-            match self.data.api_format {
-                EndpointType::ChatCompletions => {
-                    let mut body =
-                        self.chat_compat
-                            .build_body(&stream_model, messages, system, tools);
-                    opts.thinking
-                        .apply_reasoning_effort(&mut body, &stream_model);
-                    self.chat_compat
-                        .do_stream(&stream_model, &[], &body, event_tx, auth)
-                        .await
-                }
-                EndpointType::Messages => {
-                    let system_blocks = vec![shared::SystemBlock {
-                        r#type: "text",
-                        text: system,
-                        cache_control: Some(shared::EPHEMERAL),
-                    }];
-                    let mut body = shared::build_request_body_with_system(
-                        &stream_model,
-                        messages,
-                        &system_blocks,
-                        tools,
-                        opts.thinking,
-                    );
-                    body["model"] = serde_json::json!(model.id);
-                    body["stream"] = serde_json::json!(true);
-                    let json_body = serde_json::to_vec(&body)?;
-                    let request = auth
-                        .configure_request(
-                            isahc::Request::builder()
-                                .method("POST")
-                                .uri(format!(
-                                    "{}{}",
-                                    auth.base_url.as_deref().unwrap_or(""),
-                                    MESSAGES_PATH
-                                ))
-                                .header("user-agent", super::user_agent())
-                                .header("content-type", "application/json")
-                                .header("anthropic-version", "2023-06-01"),
-                        )
-                        .body(json_body)?;
-                    tracing::debug!(model = %model.id, "sending Anthropic-format request via catalog");
-                    let response = self.client.send_async(request).await?;
-                    let status = response.status().as_u16();
-                    if status == 200 {
-                        crate::providers::anthropic::parse_sse(
-                            response,
-                            event_tx,
-                            self.stream_timeout,
-                        )
-                        .await
-                    } else {
-                        Err(AgentError::from_response(response).await)
-                    }
-                }
-            }
+            let (auth, wire) = self.prepare(model, messages, system, tools, &opts)?;
+            send_catalog_request(
+                &self.chat_compat,
+                self.data.api_format,
+                auth,
+                model,
+                &wire,
+                event_tx,
+            )
+            .await
         })
+    }
+
+    fn wire_request(
+        &self,
+        model: &Model,
+        messages: &[Message],
+        system: &str,
+        tools: &Value,
+        opts: &RequestOptions,
+        _cache_key: Option<&CacheKey>,
+    ) -> Result<WireRequest, AgentError> {
+        self.prepare(model, messages, system, tools, opts)
+            .map(|(_, wire)| wire)
     }
 
     fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
@@ -894,11 +958,16 @@ impl LazyCatalogProvider {
             let created = smol::unblock(move || create_resolved(&slug, timeouts)).await;
             let _ = self.inner.set(created.map_err(|e| e.to_string()));
         }
-        match self.inner.get().expect("set above") {
-            Ok(provider) => Ok(provider),
-            Err(message) => Err(AgentError::Config {
-                message: message.clone(),
-            }),
+        self.resolved()
+    }
+
+    /// What a request already resolved. Resolving is left to a send, since it
+    /// may have to fetch the catalog first.
+    fn resolved(&self) -> Result<&CatalogProvider, AgentError> {
+        match self.inner.get() {
+            Some(Ok(provider)) => Ok(provider),
+            Some(Err(message)) => Err(config_error(message.clone())),
+            None => Err(config_error(PROVIDER_NOT_RESOLVED.into())),
         }
     }
 }
@@ -920,6 +989,19 @@ impl Provider for LazyCatalogProvider {
                 .stream_message(model, messages, system, tools, event_tx, opts, cache_key)
                 .await
         })
+    }
+
+    fn wire_request(
+        &self,
+        model: &Model,
+        messages: &[Message],
+        system: &str,
+        tools: &Value,
+        opts: &RequestOptions,
+        cache_key: Option<&CacheKey>,
+    ) -> Result<WireRequest, AgentError> {
+        self.resolved()?
+            .wire_request(model, messages, system, tools, opts, cache_key)
     }
 
     fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
@@ -1066,17 +1148,30 @@ mod tests {
     use std::collections::HashMap;
 
     use super::schema::{CatalogCost, CatalogIndex, CatalogLimits, CatalogModel, CatalogProvider};
-    use std::sync::Arc;
+    use std::sync::{Arc, OnceLock};
+
+    use caudra_storage::auth::{ProviderCredentials, save_provider_credentials};
+    use serde_json::json;
 
     use super::{
-        Authentication, CatalogData, CatalogMeta, EndpointType, FREE_MODELS_OPT_IN, ProviderData,
-        StateDir, available_if_warm, determine_catalog_format,
+        Authentication, CatalogData, CatalogMeta, EndpointType, FREE_MODELS_OPT_IN,
+        LazyCatalogProvider, PROVIDER_NOT_RESOLVED, ProviderData, StateDir, available_if_warm,
+        determine_catalog_format,
     };
     use crate::model::{Model, ModelPricing};
     use crate::provider::Provider;
     use crate::providers::Timeouts;
+    use crate::providers::test_support::CREDENTIAL_IN_URL;
     use crate::{AgentError, ModelFamily, RequestOptions};
     use test_case::test_case;
+
+    const OPENCODE_GO: &str = "opencode-go";
+    const PAID_MODEL: &str = "paid-model";
+    const FREE_MODEL: &str = "free-model";
+    const MODEL_OUTPUT: u32 = 64_000;
+    const UNSET_KEY_ENV: &str = "CAUDRA_TEST_OPENCODE_GO_UNSET_KEY_30571";
+    const CATALOG_CREDENTIAL: &str = "sk-catalog-credential";
+    const SYSTEM_PROMPT: &str = "catalog system";
 
     #[test]
     fn new_rejects_no_auth() {
@@ -1096,7 +1191,7 @@ mod tests {
 
     fn opencode_go_provider_data(env_key: &str) -> ProviderData {
         ProviderData {
-            slug: "opencode-go".into(),
+            slug: OPENCODE_GO.into(),
             display_name: "Opencode Go".into(),
             env_keys: vec![env_key.into()],
             base_url: Some("https://opencode.ai/zen/go/v1".into()),
@@ -1104,11 +1199,11 @@ mod tests {
             api_format: EndpointType::ChatCompletions,
             models: HashMap::from([
                 (
-                    "paid-model".into(),
+                    PAID_MODEL.into(),
                     CatalogMeta {
                         context: 128_000,
                         context_excludes_output: false,
-                        output: 64_000,
+                        output: MODEL_OUTPUT,
                         input_price: 1.0,
                         output_price: 2.0,
                         cache_read: 0.0,
@@ -1120,11 +1215,11 @@ mod tests {
                     },
                 ),
                 (
-                    "free-model".into(),
+                    FREE_MODEL.into(),
                     CatalogMeta {
                         context: 128_000,
                         context_excludes_output: false,
-                        output: 64_000,
+                        output: MODEL_OUTPUT,
                         input_price: 0.0,
                         output_price: 0.0,
                         cache_read: 0.0,
@@ -1139,17 +1234,10 @@ mod tests {
         }
     }
 
-    #[test]
-    fn gated_free_fallback_hides_models_and_refuses_streaming() {
-        let (_tmp, state_dir) = temp_state_dir();
-        let data = opencode_go_provider_data("CAUDRA_TEST_OPENCODE_GO_UNSET_KEY_52814");
-        let provider =
-            super::CatalogProvider::new(data, &state_dir, Timeouts::default(), false).unwrap();
-        assert!(smol::block_on(provider.list_models()).unwrap().is_empty());
-
-        let model = Model {
-            id: "free-model".into(),
-            provider: Arc::from("opencode-go"),
+    fn catalog_model(id: &str) -> Model {
+        Model {
+            id: id.into(),
+            provider: Arc::from(OPENCODE_GO),
             family: ModelFamily::Generic,
             billing: crate::model::Billing::default(),
             supports_tool_examples_override: None,
@@ -1163,21 +1251,125 @@ mod tests {
             window_excludes_output: false,
             reasoning_options: ReasoningOptions::default(),
             thinking_fields: None,
-        };
+        }
+    }
+
+    /// The dry run refuses exactly where the send does.
+    #[test]
+    fn gated_free_fallback_hides_models_and_refuses_streaming() {
+        let (_tmp, state_dir) = temp_state_dir();
+        let data = opencode_go_provider_data("CAUDRA_TEST_OPENCODE_GO_UNSET_KEY_52814");
+        let provider =
+            super::CatalogProvider::new(data, &state_dir, Timeouts::default(), false).unwrap();
+        assert!(smol::block_on(provider.list_models()).unwrap().is_empty());
+
+        let model = catalog_model(FREE_MODEL);
         let (tx, _rx) = flume::unbounded();
-        let result = smol::block_on(provider.stream_message(
+        let sent = smol::block_on(provider.stream_message(
             &model,
             &[],
             "",
-            &serde_json::json!([]),
+            &json!([]),
             &tx,
             RequestOptions::default(),
             None,
         ));
+        let dry_run = provider.wire_request(
+            &model,
+            &[],
+            "",
+            &json!([]),
+            &RequestOptions::default(),
+            None,
+        );
         assert!(matches!(
-            result,
+            sent,
             Err(AgentError::Config { message }) if message.contains(FREE_MODELS_OPT_IN)
         ));
+        assert!(matches!(
+            dry_run,
+            Err(AgentError::Config { message }) if message.contains(FREE_MODELS_OPT_IN)
+        ));
+    }
+
+    /// Zen and the per-slug providers share one builder, so a single provider
+    /// pins both protocols: where each posts and where its system prompt goes.
+    #[test_case(
+        EndpointType::ChatCompletions,
+        "https://opencode.ai/zen/go/v1/chat/completions",
+        "/messages/0/content"
+        ; "chat_completions"
+    )]
+    #[test_case(
+        EndpointType::Messages,
+        "https://opencode.ai/zen/go/v1/messages",
+        "/system/0/text"
+        ; "messages"
+    )]
+    fn wire_request_speaks_the_catalog_format(
+        api_format: EndpointType,
+        url: &str,
+        system_at: &str,
+    ) {
+        let (_tmp, state_dir) = temp_state_dir();
+        save_provider_credentials(
+            &state_dir,
+            OPENCODE_GO,
+            &ProviderCredentials {
+                api_key: CATALOG_CREDENTIAL.into(),
+                host: None,
+            },
+        )
+        .unwrap();
+        let data = ProviderData {
+            api_format,
+            ..opencode_go_provider_data(UNSET_KEY_ENV)
+        };
+        let provider =
+            super::CatalogProvider::new(data, &state_dir, Timeouts::default(), false).unwrap();
+
+        let wire = provider
+            .wire_request(
+                &catalog_model(PAID_MODEL),
+                &[],
+                SYSTEM_PROMPT,
+                &json!([]),
+                &RequestOptions::default(),
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(wire.url, url);
+        assert!(
+            !wire.url.contains(CATALOG_CREDENTIAL),
+            "{CREDENTIAL_IN_URL}"
+        );
+        assert_eq!(wire.body.pointer(system_at), Some(&json!(SYSTEM_PROMPT)));
+        assert_eq!(wire.body["model"], PAID_MODEL);
+        assert_eq!(wire.body["max_tokens"], MODEL_OUTPUT);
+    }
+
+    #[test]
+    fn a_cold_lazy_provider_never_resolves_for_a_dry_run() {
+        let provider = LazyCatalogProvider {
+            slug: OPENCODE_GO.into(),
+            timeouts: Timeouts::default(),
+            inner: OnceLock::new(),
+        };
+        let error = provider
+            .wire_request(
+                &catalog_model(FREE_MODEL),
+                &[],
+                SYSTEM_PROMPT,
+                &json!([]),
+                &RequestOptions::default(),
+                None,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(error, AgentError::Config { message } if message == PROVIDER_NOT_RESOLVED)
+        );
+        assert!(provider.inner.get().is_none());
     }
 
     #[test]

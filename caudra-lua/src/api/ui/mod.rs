@@ -652,6 +652,7 @@ fn span_style_to_lua(lua: &Lua, span: &caudra_markdown::render::Span) -> LuaResu
         StyleToken::ListMarker => mlua::Value::String(lua.create_string("list_marker")?),
         StyleToken::TableBorder => mlua::Value::String(lua.create_string("table_border")?),
         StyleToken::HorizontalRule => mlua::Value::String(lua.create_string("horizontal_rule")?),
+        StyleToken::Syntax => mlua::Value::String(lua.create_string("tool_dim")?),
     };
     Ok(v)
 }

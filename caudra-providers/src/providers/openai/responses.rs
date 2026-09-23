@@ -10,13 +10,15 @@ use serde_json::{Value, json};
 use tracing::{debug, warn};
 
 use crate::model::Model;
+use crate::provider::WireRequest;
 use crate::providers::ResolvedAuth;
 use crate::{
     AgentError, CacheKey, ContentBlock, Message, ProviderEvent, ResponsesReasoning, Role,
     StopReason, StreamResponse, ThinkingConfig, TokenUsage,
 };
 
-const RESPONSES_PATH: &str = "/responses";
+pub(crate) const RESPONSES_PATH: &str = "/responses";
+const NO_BASE_URL: &str = "Responses API requires a base_url in auth";
 pub(crate) const ENCRYPTED_REASONING: &str = "reasoning.encrypted_content";
 pub(crate) const PROMPT_CACHE_KEY_FIELD: &str = "prompt_cache_key";
 pub(crate) const CACHE_BREAKPOINT_FIELD: &str = "prompt_cache_breakpoint";
@@ -241,28 +243,31 @@ pub(crate) fn convert_tools(anthropic_tools: &Value) -> Value {
     )
 }
 
+/// Where a Responses turn posts, for the send and the dry run alike.
+pub(crate) fn responses_url(auth: &ResolvedAuth) -> Result<String, AgentError> {
+    let base = auth.base_url.as_deref().ok_or_else(|| AgentError::Config {
+        message: NO_BASE_URL.into(),
+    })?;
+    Ok(format!("{base}{RESPONSES_PATH}"))
+}
+
 pub(crate) async fn do_stream(
     client: &HttpClient,
     model: &crate::model::Model,
-    body: &Value,
+    wire: &WireRequest,
     event_tx: &Sender<ProviderEvent>,
     auth: &ResolvedAuth,
     stream_timeout: Duration,
 ) -> Result<StreamResponse, AgentError> {
-    let base = auth.base_url.as_deref().ok_or_else(|| AgentError::Config {
-        message: "Responses API requires a base_url in auth".into(),
-    })?;
-    let json_body = serde_json::to_vec(body)?;
-
     let request = auth
         .configure_request(
             Request::builder()
-                .method("POST")
-                .uri(format!("{base}{RESPONSES_PATH}"))
+                .method(wire.method)
+                .uri(&wire.url)
                 .header("content-type", "application/json")
                 .header("user-agent", super::super::user_agent()),
         )
-        .body(json_body)?;
+        .body(serde_json::to_vec(&wire.body)?)?;
 
     debug!(
         model = %model.id,

@@ -7,7 +7,7 @@ use tracing::warn;
 
 use crate::model::{Model, ModelEntry, ModelFamily, ModelPricing};
 use crate::pricing::{PricingSchedule, PricingWindow};
-use crate::provider::{BoxFuture, Provider};
+use crate::provider::{BoxFuture, Provider, WireRequest};
 use crate::types::{ProviderUsage, UsageLimit};
 use crate::{
     AgentError, CacheKey, Message, ProviderEvent, RequestOptions, StreamResponse, ThinkingConfig,
@@ -166,6 +166,29 @@ impl DeepSeek {
         self.system_prefix = prefix;
         self
     }
+
+    /// What a turn posts, for the send and the dry run alike.
+    fn request(
+        &self,
+        auth: &ResolvedAuth,
+        model: &Model,
+        messages: &[Message],
+        system: &str,
+        tools: &Value,
+        thinking: &ThinkingConfig,
+    ) -> WireRequest {
+        let mut buf = String::new();
+        let system = super::with_prefix(&self.system_prefix, system, &mut buf);
+        let mut body = self.compat.build_body(model, messages, system, tools);
+        if thinking.is_enabled() {
+            body["thinking"] = serde_json::json!({"type": "enabled"});
+            thinking.apply_reasoning_effort(&mut body, model);
+            pad_reasoning_content(&model.id, &mut body);
+        } else {
+            body["thinking"] = serde_json::json!({"type": "disabled"});
+        }
+        WireRequest::post(self.compat.chat_url(auth), body)
+    }
 }
 
 impl Provider for DeepSeek {
@@ -181,25 +204,27 @@ impl Provider for DeepSeek {
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             let auth = self.auth.lock().unwrap().clone();
-            let mut buf = String::new();
-            let system = super::with_prefix(&self.system_prefix, system, &mut buf);
-            let mut body = self.compat.build_body(model, messages, system, tools);
-
-            if opts.thinking.is_enabled() {
-                body["thinking"] = serde_json::json!({"type": "enabled"});
-                opts.thinking.apply_reasoning_effort(&mut body, model);
-                if matches!(opts.thinking, ThinkingConfig::Budget(_)) {
-                    warn!("DeepSeek reasoning does not support token budgets");
-                }
-                pad_reasoning_content(&model.id, &mut body);
-            } else {
-                body["thinking"] = serde_json::json!({"type": "disabled"});
+            if matches!(opts.thinking, ThinkingConfig::Budget(_)) {
+                warn!("DeepSeek reasoning does not support token budgets");
             }
-
+            let wire = self.request(&auth, model, messages, system, tools, &opts.thinking);
             self.compat
-                .do_stream(model, &[], &body, event_tx, &auth)
+                .do_stream(model, &[], &wire, event_tx, &auth)
                 .await
         })
+    }
+
+    fn wire_request(
+        &self,
+        model: &Model,
+        messages: &[Message],
+        system: &str,
+        tools: &Value,
+        opts: &RequestOptions,
+        _cache_key: Option<&CacheKey>,
+    ) -> Result<WireRequest, AgentError> {
+        let auth = self.auth.lock().unwrap().clone();
+        Ok(self.request(&auth, model, messages, system, tools, &opts.thinking))
     }
 
     fn list_models(&self) -> BoxFuture<'_, Result<Vec<crate::model::ModelInfo>, AgentError>> {
@@ -257,12 +282,24 @@ fn pad_reasoning_content(model_id: &str, body: &mut Value) {
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+    use test_case::test_case;
+
     use super::*;
     use crate::manifest::ManifestRegistry;
-    use serde_json::json;
+    use crate::providers::Timeouts;
+    use crate::{ContentBlock, Role};
 
-    const V4: &str = "deepseek-v4-pro";
-    const R1: &str = "deepseek-reasoner";
+    const V4: &str = "deepseek/deepseek-v4-pro";
+    const R1: &str = "deepseek/deepseek-reasoner";
+    const API_KEY: &str = "sk-deepseek";
+    const SYSTEM_PROMPT: &str = "sys";
+    const USER_TEXT: &str = "hi";
+    const REPLY: &str = "ok";
+    const KEPT: &str = "kept";
+    const CALL_ID: &str = "c1";
+    const TOOL_NAME: &str = "read";
+    const TOOL_OUTPUT: &str = "out";
     /// The hours and the surcharge as the pricing page states them.
     const PUBLISHED_PEAK_HOURS: &str = "2x during 01:00-04:00, 06:00-10:00 UTC";
 
@@ -280,32 +317,71 @@ mod tests {
         assert_eq!(PEAK_HOURS.to_string(), PUBLISHED_PEAK_HOURS);
     }
 
-    #[test]
-    fn v4_pads_only_assistant_turns_without_reasoning() {
-        let mut body = json!({"messages": [
-            {"role": "system",    "content": "sys"},
-            {"role": "user",      "content": "hi"},
-            {"role": "assistant", "content": "ok", "reasoning_content": "kept"},
-            {"role": "assistant", "content": "",   "tool_calls": [{"id": "c1"}]},
-            {"role": "tool",      "tool_call_id": "c1", "content": "out"},
-        ]});
-        pad_reasoning_content(V4, &mut body);
-        let msgs = body["messages"].as_array().unwrap();
-        assert_eq!(msgs[2]["reasoning_content"], "kept");
-        assert_eq!(msgs[3]["reasoning_content"], PAD);
-        for i in [0, 1, 4] {
-            assert!(msgs[i].get("reasoning_content").is_none());
+    fn assistant(content: Vec<ContentBlock>) -> Message {
+        Message {
+            role: Role::Assistant,
+            content,
+            ..Message::default()
         }
     }
 
-    #[test]
-    fn non_v4_model_is_untouched() {
-        let input = json!({"messages": [
-            {"role": "assistant", "content": "", "tool_calls": [{"id": "c1"}]},
-            {"role": "assistant", "content": "hi"},
-        ]});
-        let mut body = input.clone();
-        pad_reasoning_content(R1, &mut body);
-        assert_eq!(body, input);
+    /// On the wire: system, user, the reasoned reply, the bare tool call, and
+    /// its result.
+    fn history() -> Vec<Message> {
+        vec![
+            Message::user(USER_TEXT.into()),
+            assistant(vec![
+                ContentBlock::thinking(KEPT.into(), None),
+                ContentBlock::Text { text: REPLY.into() },
+            ]),
+            assistant(vec![ContentBlock::tool_use(CALL_ID, TOOL_NAME, json!({}))]),
+            Message {
+                role: Role::User,
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: CALL_ID.into(),
+                    content: TOOL_OUTPUT.into(),
+                    is_error: false,
+                    output_ref: None,
+                }],
+                ..Message::default()
+            },
+        ]
+    }
+
+    #[test_case(V4, ThinkingConfig::Adaptive, Some(PAD) ; "v4_thinking_pads_the_turn_without_reasoning")]
+    #[test_case(V4, ThinkingConfig::Off, None ; "v4_without_thinking_is_not_padded")]
+    #[test_case(R1, ThinkingConfig::Adaptive, None ; "r1_is_not_padded")]
+    fn only_v4_thinking_pads_assistant_turns(
+        spec: &str,
+        thinking: ThinkingConfig,
+        padded: Option<&str>,
+    ) {
+        let provider = DeepSeek::with_auth(
+            Arc::new(Mutex::new(ResolvedAuth::bearer(API_KEY))),
+            Timeouts::default(),
+        );
+        let wire = provider
+            .wire_request(
+                &Model::from_spec(spec).unwrap(),
+                &history(),
+                SYSTEM_PROMPT,
+                &Value::Null,
+                &RequestOptions {
+                    thinking,
+                    ..RequestOptions::default()
+                },
+                None,
+            )
+            .unwrap();
+
+        let msgs = wire.body["messages"].as_array().unwrap();
+        assert_eq!(msgs[2]["reasoning_content"], KEPT);
+        assert_eq!(
+            msgs[3].get("reasoning_content").and_then(Value::as_str),
+            padded
+        );
+        for i in [0, 1, 4] {
+            assert!(msgs[i].get("reasoning_content").is_none());
+        }
     }
 }

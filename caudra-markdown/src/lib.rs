@@ -12,6 +12,7 @@
 pub mod latex;
 pub mod mermaid;
 pub mod render;
+pub mod source;
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -284,13 +285,18 @@ impl Fenced<'_> {
 
 /// Whichever of a code fence or a display-math block opens first. Order
 /// matters: `$$` inside a code block is not math, and ``` inside display
-/// math is not code.
+/// math is not code. Both kinds are tried line by line in one pass, so a
+/// text holding many blocks of one kind is not rescanned for the other.
 fn find_fenced_block(text: &str) -> Option<Fenced<'_>> {
-    match (find_code_fence(text), find_math_fence(text)) {
-        (Some(code), Some(math)) if math.before_end < code.before_end => Some(Fenced::Math(math)),
-        (Some(code), _) => Some(Fenced::Code(code)),
-        (None, Some(math)) => Some(Fenced::Math(math)),
-        (None, None) => None,
+    let mut line_start = 0;
+    loop {
+        if let Some(fence) = code_fence_at(text, line_start) {
+            return Some(Fenced::Code(fence));
+        }
+        if let Some(fence) = math_fence_at(text, line_start) {
+            return Some(Fenced::Math(fence));
+        }
+        line_start += text[line_start..].find('\n')? + 1;
     }
 }
 
@@ -300,53 +306,48 @@ struct MathFence<'a> {
     block_end: usize,
 }
 
-fn find_math_fence(text: &str) -> Option<MathFence<'_>> {
-    let mut offset = 0;
-    let mut lines = text.split('\n');
-    while let Some(line) = lines.next() {
-        let line_start = offset;
-        offset += line.len() + 1;
-        let trimmed = line.trim();
-        let Some((open, close)) = math_block_opener(trimmed) else {
-            continue;
-        };
+/// A display-math block opened by the line starting at `line_start`.
+fn math_fence_at(text: &str, line_start: usize) -> Option<MathFence<'_>> {
+    let mut lines = text[line_start..].split('\n');
+    let line = lines.next()?;
+    let trimmed = line.trim();
+    let (open, close) = math_block_opener(trimmed)?;
 
-        // `$$ E = mc^2 $$` all on one line.
-        let rest = &trimmed[open.len()..];
-        if let Some(inner) = rest.strip_suffix(close)
-            && !inner.trim().is_empty()
-        {
-            return Some(MathFence {
-                before_end: line_start,
-                latex: inner,
-                block_end: line_start + line.len(),
-            });
-        }
-        if !rest.trim().is_empty() {
-            continue;
-        }
-
-        let content_start = offset;
-        for next in lines.by_ref() {
-            let next_start = offset;
-            offset += next.len() + 1;
-            if next.trim() == close {
-                return Some(MathFence {
-                    before_end: line_start,
-                    latex: &text[content_start..next_start.saturating_sub(1).max(content_start)],
-                    block_end: next_start + next.len(),
-                });
-            }
-        }
-        // Unterminated: take the rest, which keeps a streaming equation from
-        // being re-parsed as headings and bullets on every chunk.
+    // `$$ E = mc^2 $$` all on one line.
+    let rest = &trimmed[open.len()..];
+    if let Some(inner) = rest.strip_suffix(close)
+        && !inner.trim().is_empty()
+    {
         return Some(MathFence {
             before_end: line_start,
-            latex: &text[content_start.min(text.len())..],
-            block_end: text.len(),
+            latex: inner,
+            block_end: line_start + line.len(),
         });
     }
-    None
+    if !rest.trim().is_empty() {
+        return None;
+    }
+
+    let content_start = line_start + line.len() + 1;
+    let mut offset = content_start;
+    for next in lines {
+        let next_start = offset;
+        offset += next.len() + 1;
+        if next.trim() == close {
+            return Some(MathFence {
+                before_end: line_start,
+                latex: &text[content_start..next_start.saturating_sub(1).max(content_start)],
+                block_end: next_start + next.len(),
+            });
+        }
+    }
+    // Unterminated: take the rest, which keeps a streaming equation from
+    // being re-parsed as headings and bullets on every chunk.
+    Some(MathFence {
+        before_end: line_start,
+        latex: &text[content_start.min(text.len())..],
+        block_end: text.len(),
+    })
 }
 
 fn math_block_opener(trimmed: &str) -> Option<(&'static str, &'static str)> {
@@ -376,74 +377,62 @@ fn split_normal_blocks(text: &str, base: usize) -> Vec<Block> {
     let mut i = 0;
 
     while i < lines_with_offsets.len() {
-        let (_, line) = lines_with_offsets[i];
-        if is_table_row(line) {
-            let table_start = i;
-            let header_cols = parse_table_cells(line).len();
-            let mut sep_idx = None;
-            let mut j = i;
-            while j < lines_with_offsets.len() && is_table_row(lines_with_offsets[j].1) {
-                if sep_idx.is_none()
-                    && is_separator_row(lines_with_offsets[j].1)
-                    && parse_table_cells(lines_with_offsets[j].1).len() >= header_cols
-                {
-                    sep_idx = Some(j - table_start);
-                }
-                j += 1;
-            }
-            if let Some(si) = sep_idx
-                && j - table_start >= 2
-            {
-                if let Some(ns) = normal_start.take() {
-                    let start = lines_with_offsets[ns].0;
-                    let end = lines_with_offsets[table_start].0;
-                    let raw = &text[start..end];
-                    let lead = raw.len() - raw.trim_start_matches('\n').len();
-                    let slice = raw.trim_matches('\n');
-                    if !slice.is_empty() {
-                        blocks.push(Block::Lines(lines_to_blocks(slice, base + start + lead)));
-                    }
-                }
-
-                let table_end = if j < lines_with_offsets.len()
-                    && j == lines_with_offsets.len() - 1
-                    && lines_with_offsets[j].1.trim_start().starts_with('|')
-                {
-                    j + 1
-                } else {
-                    j
-                };
-
-                let mut rows = Vec::new();
-                let mut row_sources = Vec::new();
-                let mut separator = 0..0;
-                for (k, &(off, line)) in lines_with_offsets[table_start..table_end]
-                    .iter()
-                    .enumerate()
-                {
-                    let source = range_at(base + off, base + off + line.len());
-                    if k == si {
-                        separator = source;
-                    } else {
-                        rows.push(parse_table_cells(line));
-                        row_sources.push(source);
-                    }
-                }
-                blocks.push(Block::Table {
-                    rows,
-                    header_end: si,
-                    row_sources,
-                    separator,
-                });
-                i = table_end;
-                continue;
+        let run = lines_with_offsets[i..]
+            .iter()
+            .take_while(|(_, line)| is_table_row(line))
+            .count();
+        let Some((opens_at, si)) = table_in_run(&lines_with_offsets[i..i + run]) else {
+            normal_start.get_or_insert(i);
+            i += run.max(1);
+            continue;
+        };
+        if opens_at > 0 {
+            normal_start.get_or_insert(i);
+        }
+        let table_start = i + opens_at;
+        let j = i + run;
+        if let Some(ns) = normal_start.take() {
+            let start = lines_with_offsets[ns].0;
+            let end = lines_with_offsets[table_start].0;
+            let raw = &text[start..end];
+            let lead = raw.len() - raw.trim_start_matches('\n').len();
+            let slice = raw.trim_matches('\n');
+            if !slice.is_empty() {
+                blocks.push(Block::Lines(lines_to_blocks(slice, base + start + lead)));
             }
         }
 
-        if normal_start.is_none() {
-            normal_start = Some(i);
+        let table_end = if j < lines_with_offsets.len()
+            && j == lines_with_offsets.len() - 1
+            && lines_with_offsets[j].1.trim_start().starts_with('|')
+        {
+            j + 1
+        } else {
+            j
+        };
+
+        let mut rows = Vec::new();
+        let mut row_sources = Vec::new();
+        let mut separator = 0..0;
+        for (k, &(off, line)) in lines_with_offsets[table_start..table_end]
+            .iter()
+            .enumerate()
+        {
+            let source = range_at(base + off, base + off + line.len());
+            if k == si {
+                separator = source;
+            } else {
+                rows.push(parse_table_cells(line));
+                row_sources.push(source);
+            }
         }
-        i += 1;
+        blocks.push(Block::Table {
+            rows,
+            header_end: si,
+            row_sources,
+            separator,
+        });
+        i = table_end;
     }
 
     if let Some(ns) = normal_start {
@@ -461,6 +450,30 @@ fn split_normal_blocks(text: &str, base: usize) -> Vec<Block> {
     }
 
     blocks
+}
+
+/// Where a table opens in a run of table rows, and its separator's index
+/// from there: the first row with another row after it and, at or below
+/// it, a separator at least as wide. Each row's widest separator below is
+/// found in one backward pass, so a long run that never becomes a table is
+/// not rescanned from every row.
+fn table_in_run(run: &[(usize, &str)]) -> Option<(usize, usize)> {
+    if run.len() < 2 {
+        return None;
+    }
+    let separator_cells = |line: &str| match is_separator_row(line) {
+        true => parse_table_cells(line).len(),
+        false => 0,
+    };
+    let mut widest = vec![0; run.len() + 1];
+    for (k, &(_, line)) in run.iter().enumerate().rev() {
+        widest[k] = separator_cells(line).max(widest[k + 1]);
+    }
+    let (start, header_cols) = (0..run.len() - 1)
+        .map(|k| (k, parse_table_cells(run[k].1).len()))
+        .find(|&(k, cols)| widest[k] >= cols)?;
+    let separator = (start..run.len()).find(|&k| separator_cells(run[k].1) >= header_cols)?;
+    Some((start, separator - start))
 }
 
 fn lines_to_blocks(text: &str, base: usize) -> Vec<LineBlock> {
@@ -609,13 +622,29 @@ fn is_separator_row(line: &str) -> bool {
 }
 
 fn parse_table_cells(line: &str) -> Vec<String> {
+    table_cells(line)
+        .into_iter()
+        .map(|(_, cell)| cell)
+        .collect()
+}
+
+/// A table row's cells, each as its trimmed byte range in `line` and its
+/// text with escaped pipes restored. Pipes inside code spans split nothing.
+fn table_cells(line: &str) -> Vec<(Range<usize>, String)> {
     let t = line.trim();
     let inner = t.strip_prefix('|').unwrap_or(t);
+    let base = line.len() - line.trim_start().len() + t.len() - inner.len();
     let inner = inner.strip_suffix('|').unwrap_or(inner);
+    let trimmed = |start: usize, end: usize| {
+        let cell = &inner[start..end];
+        let from = base + start + cell.len() - cell.trim_start().len();
+        from..from + cell.trim().len()
+    };
 
     let bytes = inner.as_bytes();
     let mut cells = Vec::new();
     let mut current = String::new();
+    let mut cell_start = 0;
     let mut i = 0;
 
     while i < bytes.len() {
@@ -632,9 +661,10 @@ fn parse_table_cells(line: &str) -> Vec<String> {
             current.push('|');
             i += 2;
         } else if bytes[i] == b'|' {
-            cells.push(current.trim().to_owned());
-            current = String::new();
+            cells.push((trimmed(cell_start, i), current.trim().to_owned()));
+            current.clear();
             i += 1;
+            cell_start = i;
         } else {
             let ch = inner[i..].chars().next().unwrap();
             current.push(ch);
@@ -642,7 +672,7 @@ fn parse_table_cells(line: &str) -> Vec<String> {
         }
     }
 
-    cells.push(current.trim().to_owned());
+    cells.push((trimmed(cell_start, bytes.len()), current.trim().to_owned()));
     cells
 }
 
@@ -655,75 +685,61 @@ struct CodeFence<'a> {
     closed: bool,
 }
 
-fn find_code_fence(text: &str) -> Option<CodeFence<'_>> {
+/// A code fence opened by the line starting at `line_start`.
+fn code_fence_at(text: &str, line_start: usize) -> Option<CodeFence<'_>> {
     let bytes = text.as_bytes();
-    let mut search_from = 0;
-    while search_from < bytes.len() {
-        let pos = text[search_from..].find("```")?;
-        let abs = search_from + pos;
-        if abs != 0 && bytes[abs - 1] != b'\n' {
-            search_from = abs + FENCE_MIN;
-            continue;
-        }
-        let fence_len = FENCE_MIN
-            + bytes[abs + FENCE_MIN..]
-                .iter()
-                .take_while(|&&b| b == b'`')
-                .count();
-        let after_ticks = abs + fence_len;
-        let Some(nl) = text[after_ticks..].find('\n') else {
-            search_from = abs + fence_len;
-            continue;
-        };
-        let info = &text[after_ticks..after_ticks + nl];
-        if info.contains('`') {
-            search_from = abs + fence_len;
-            continue;
-        }
-        let lang = info.trim();
-        let code_start = after_ticks + nl + 1;
-        let fence_str = "`".repeat(fence_len);
-        let mut offset = 0;
-        let mut close: Option<(usize, usize)> = None;
-        for line in text[code_start..].split('\n') {
-            let trimmed = line.trim_end();
-            if trimmed.len() >= fence_len
-                && trimmed.starts_with(&fence_str)
-                && !trimmed[fence_len..].starts_with('`')
-            {
-                close = Some((offset, line.len()));
-                break;
-            }
-            offset += line.len() + 1;
-        }
-        let (code, block_end) = if let Some((close_off, close_line_len)) = close {
-            let raw_end = code_start + close_off;
-            let code_end = if raw_end > code_start && bytes[raw_end - 1] == b'\n' {
-                raw_end - 1
-            } else {
-                raw_end
-            };
-            let trailing_start = code_start + close_off + fence_len;
-            let trailing_end = code_start + close_off + close_line_len;
-            let block_end = if text[trailing_start..trailing_end].trim().is_empty() {
-                trailing_end
-            } else {
-                trailing_start
-            };
-            (&text[code_start..code_end], block_end)
-        } else {
-            (&text[code_start..], text.len())
-        };
-        return Some(CodeFence {
-            before_end: abs,
-            lang,
-            code,
-            code_start,
-            block_end,
-            closed: close.is_some(),
-        });
+    let fence_len = count_backtick_run(bytes, line_start);
+    if fence_len < FENCE_MIN {
+        return None;
     }
-    None
+    let after_ticks = line_start + fence_len;
+    let nl = text[after_ticks..].find('\n')?;
+    let info = &text[after_ticks..after_ticks + nl];
+    if info.contains('`') {
+        return None;
+    }
+    let lang = info.trim();
+    let code_start = after_ticks + nl + 1;
+    let fence_str = "`".repeat(fence_len);
+    let mut offset = 0;
+    let mut close: Option<(usize, usize)> = None;
+    for line in text[code_start..].split('\n') {
+        let trimmed = line.trim_end();
+        if trimmed.len() >= fence_len
+            && trimmed.starts_with(&fence_str)
+            && !trimmed[fence_len..].starts_with('`')
+        {
+            close = Some((offset, line.len()));
+            break;
+        }
+        offset += line.len() + 1;
+    }
+    let (code, block_end) = if let Some((close_off, close_line_len)) = close {
+        let raw_end = code_start + close_off;
+        let code_end = if raw_end > code_start && bytes[raw_end - 1] == b'\n' {
+            raw_end - 1
+        } else {
+            raw_end
+        };
+        let trailing_start = code_start + close_off + fence_len;
+        let trailing_end = code_start + close_off + close_line_len;
+        let block_end = if text[trailing_start..trailing_end].trim().is_empty() {
+            trailing_end
+        } else {
+            trailing_start
+        };
+        (&text[code_start..code_end], block_end)
+    } else {
+        (&text[code_start..], text.len())
+    };
+    Some(CodeFence {
+        before_end: line_start,
+        lang,
+        code,
+        code_start,
+        block_end,
+        closed: close.is_some(),
+    })
 }
 
 /// Emphasis composes additively. Code spans are atomic and carry the
@@ -736,7 +752,13 @@ pub fn parse_inline(text: &str) -> Vec<InlineSpan> {
 /// reports its own slice of it, so consumers can map a rendered cell back to
 /// the markdown that produced it.
 pub fn parse_inline_at(text: &str, offset: u32) -> Vec<InlineSpan> {
-    parse_inline_impl(text, offset, Emphasis::default(), ParseMode::WithCode, true)
+    parse_inline_impl(
+        text,
+        offset,
+        Emphasis::default(),
+        ParseMode::WithCode,
+        Links::Atomic,
+    )
 }
 
 /// Rewrites a still-streaming markdown prefix so its open tail renders the
@@ -964,14 +986,28 @@ enum ParseMode {
     EmphasisOnly,
 }
 
+/// Whether links are recognised, and which source their spans report.
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum Links {
+    /// Inside a link label, where no other link can open.
+    Off,
+    /// Every span of a link points at the whole construct, so a selection
+    /// touching any of it copies the complete link back.
+    Atomic,
+    /// Every span points at exactly the text it shows, which leaves the
+    /// brackets and destination between spans. For painting the source.
+    Verbatim,
+}
+
 fn parse_inline_impl(
     text: &str,
     offset: u32,
     emphasis: Emphasis,
     mode: ParseMode,
-    allow_links: bool,
+    links: Links,
 ) -> Vec<InlineSpan> {
     let bytes = text.as_bytes();
+    let allow_links = links != Links::Off;
     let link_label_ends = (allow_links && mode == ParseMode::WithCode && bytes.contains(&b'['))
         .then(|| scan_link_label_ends(text));
     let mut spans = Vec::new();
@@ -991,7 +1027,7 @@ fn parse_inline_impl(
                 at,
                 emphasis,
                 ParseMode::EmphasisOnly,
-                allow_links,
+                links,
             )),
             ParseMode::EmphasisOnly => spans.push(InlineSpan::text(
                 plain.to_owned(),
@@ -1043,16 +1079,17 @@ fn parse_inline_impl(
         {
             flush_plain(&mut spans, &text[plain_start..pos], plain_start);
             let target = http_target(&text[link.target.clone()]);
-            let source = Source::atomic(offset + pos as u32..offset + link.end as u32);
             let mut label = parse_inline_impl(
                 &text[link.label.clone()],
                 offset + link.label.start as u32,
                 emphasis,
                 ParseMode::WithCode,
-                false,
+                Links::Off,
             );
             for span in &mut label {
-                span.source = source.clone();
+                if links == Links::Atomic {
+                    span.source = Source::atomic(offset + pos as u32..offset + link.end as u32);
+                }
                 span.link = target.clone();
             }
             spans.extend(label);
@@ -1067,13 +1104,16 @@ fn parse_inline_impl(
         {
             flush_plain(&mut spans, &text[plain_start..pos], plain_start);
             let target = Arc::<str>::from(&text[link.target.clone()]);
+            let source = match links {
+                Links::Verbatim => Source::verbatim(
+                    offset + link.target.start as u32..offset + link.target.end as u32,
+                ),
+                Links::Off | Links::Atomic => {
+                    Source::atomic(offset + pos as u32..offset + link.end as u32)
+                }
+            };
             spans.push(
-                InlineSpan::text(
-                    target.to_string(),
-                    emphasis,
-                    Source::atomic(offset + pos as u32..offset + link.end as u32),
-                )
-                .with_link(Some(target)),
+                InlineSpan::text(target.to_string(), emphasis, source).with_link(Some(target)),
             );
             pos = link.end;
             plain_start = pos;
@@ -1138,7 +1178,7 @@ fn parse_inline_impl(
                     offset + content_start as u32,
                     emphasis.merge(found),
                     mode,
-                    allow_links,
+                    links,
                 ));
                 pos = close + delim_len;
                 plain_start = pos;
@@ -2221,6 +2261,43 @@ mod tests {
             panic!("expected Table")
         };
         assert_eq!(rows[0], vec!["`x|y`", "z"]);
+    }
+
+    #[test]
+    fn table_opens_at_the_first_row_its_separator_can_head() {
+        let blocks = parse("| a | b | c |\n| x | y |\n| - | - |\n| 1 | 2 |");
+        assert_eq!(first_lines(&blocks)[0].inline, "| a | b | c |");
+        let Block::Table {
+            rows, header_end, ..
+        } = &blocks[1]
+        else {
+            panic!("expected Table")
+        };
+        assert_eq!(*header_end, 1);
+        assert_eq!(rows, &[vec!["x", "y"], vec!["1", "2"]]);
+    }
+
+    #[test]
+    fn table_rows_without_a_separator_stay_paragraphs() {
+        let blocks = parse("| a |\n| b |\n| c |");
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(first_lines(&blocks).len(), 3);
+    }
+
+    #[test]
+    fn fenced_blocks_open_in_order_of_their_first_line() {
+        let blocks = parse("$$\n```\n$$\n```\n$$\n```");
+        let [
+            Block::Math { latex, .. },
+            Block::Code {
+                code, closed: true, ..
+            },
+        ] = blocks.as_slice()
+        else {
+            panic!("expected Math then Code, got {blocks:?}")
+        };
+        assert_eq!(latex, "```");
+        assert_eq!(code, "$$");
     }
 
     #[test]

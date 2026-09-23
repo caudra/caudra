@@ -21,15 +21,15 @@ use serde_json::{Value, json};
 use tracing::{debug, info, warn};
 
 use crate::model::{Billing, Model};
-use crate::provider::{BoxFuture, Provider};
+use crate::provider::{BoxFuture, Provider, WireRequest};
 use crate::{
     AgentError, CacheKey, Message, ProviderEvent, ProviderUsage, RequestOptions, StreamResponse,
     UsageLimit,
 };
 
-use super::KeyPool;
+use super::{KeyPool, Timeouts};
 
-const API_VERSION: &str = "2023-06-01";
+pub(crate) const API_VERSION: &str = "2023-06-01";
 const API_ORIGIN: &str = auth::API_ORIGIN;
 const MESSAGES_PATH: &str = "/v1/messages";
 const OAUTH_MESSAGES_PATH: &str = "/v1/messages?beta=true";
@@ -350,6 +350,13 @@ fn origin(base_url: &str) -> &str {
     trimmed.strip_suffix(MESSAGES_PATH).unwrap_or(trimmed)
 }
 
+fn api_url(auth: &super::ResolvedAuth, path: &str) -> String {
+    format!(
+        "{}{path}",
+        origin(auth.base_url.as_deref().unwrap_or(API_ORIGIN))
+    )
+}
+
 /// True when `base_url` targets the real Anthropic API, directly or via the
 /// construction-time base-URL override (so quota stays visible behind a proxy).
 fn first_party(base_url: &str, configured_override: Option<&str>) -> bool {
@@ -433,6 +440,15 @@ struct AuthSnapshot {
     oauth_tokens: Option<OAuthTokens>,
 }
 
+/// A turn as [`Anthropic::prepare`] builds it, with what its send needs beside
+/// the request: the wire-to-canonical names that read an OAuth reply, and
+/// whether the fast-mode beta header goes along.
+struct PreparedRequest {
+    wire: WireRequest,
+    oauth_tool_names: Option<HashMap<String, String>>,
+    fast: bool,
+}
+
 struct AuthState {
     resolved: Arc<Mutex<super::ResolvedAuth>>,
     mode: AuthMode,
@@ -455,7 +471,7 @@ pub struct Anthropic {
 }
 
 impl Anthropic {
-    pub fn new(timeouts: super::Timeouts) -> Result<Self, AgentError> {
+    pub fn new(timeouts: Timeouts) -> Result<Self, AgentError> {
         let storage = StateDir::resolve()?;
         let resolved_base_url = resolve_anthropic_base_url();
         let (resolved, auth_mode, pool, oauth_tokens) =
@@ -481,10 +497,7 @@ impl Anthropic {
         })
     }
 
-    pub(crate) fn with_auth(
-        auth: Arc<Mutex<super::ResolvedAuth>>,
-        timeouts: super::Timeouts,
-    ) -> Self {
+    pub(crate) fn with_auth(auth: Arc<Mutex<super::ResolvedAuth>>, timeouts: Timeouts) -> Self {
         Self {
             client: super::http_client(timeouts),
             auth_state: Mutex::new(AuthState {
@@ -673,6 +686,43 @@ impl Anthropic {
         retry.map_err(normalize_oauth_auth_error)
     }
 
+    /// The turn a send on `auth` carries. The dry run builds it from the auth
+    /// in hand, so the preview and the send can never disagree.
+    fn prepare(
+        &self,
+        auth: &AuthSnapshot,
+        model: &Model,
+        messages: &[Message],
+        system: &str,
+        tools: &Value,
+        opts: &RequestOptions,
+    ) -> PreparedRequest {
+        let oauth = auth.mode == AuthMode::ClaudeOauth;
+        let mut body = shared::messages_body(
+            model,
+            shared::strip_long_context(&model.id),
+            messages,
+            self.system_prefix.as_deref(),
+            system,
+            tools,
+            &opts.thinking,
+        );
+        let oauth_tool_names = oauth.then(|| {
+            shared::apply_oauth_request_profile(&mut body, system, auth::CLAUDE_CODE_VERSION)
+        });
+        let fast = apply_fast_mode(&mut body, model, opts);
+        let path = if oauth {
+            OAUTH_MESSAGES_PATH
+        } else {
+            MESSAGES_PATH
+        };
+        PreparedRequest {
+            wire: WireRequest::post(api_url(&auth.resolved, path), body),
+            oauth_tool_names,
+            fast,
+        }
+    }
+
     fn build_request(
         &self,
         auth: &super::ResolvedAuth,
@@ -680,7 +730,7 @@ impl Anthropic {
         method: &str,
         path: &str,
     ) -> isahc::http::request::Builder {
-        self.build_request_with_session(auth, oauth, method, path, None)
+        self.build_request_with_session(auth, oauth, method, &api_url(auth, path), None)
     }
 
     fn build_request_with_session(
@@ -688,11 +738,9 @@ impl Anthropic {
         auth: &super::ResolvedAuth,
         oauth: bool,
         method: &str,
-        path: &str,
+        url: &str,
         session_id: Option<&str>,
     ) -> isahc::http::request::Builder {
-        let base = auth.base_url.as_deref().unwrap_or(API_ORIGIN);
-        let url = format!("{}{path}", origin(base));
         let user_agent = if oauth {
             format!("claude-cli/{} (external, cli)", auth::CLAUDE_CODE_VERSION)
         } else {
@@ -719,25 +767,18 @@ impl Anthropic {
     async fn do_stream_request(
         &self,
         auth: &AuthSnapshot,
-        body: &Value,
+        request: &PreparedRequest,
         event_tx: &Sender<ProviderEvent>,
-        fast: bool,
         cache_key: Option<&CacheKey>,
-        oauth_tool_names: Option<&HashMap<String, String>>,
     ) -> Result<StreamResponse, AgentError> {
-        let json_body = serde_json::to_vec(body)?;
+        let json_body = serde_json::to_vec(&request.wire.body)?;
         let oauth = auth.mode == AuthMode::ClaudeOauth;
-        let path = if oauth {
-            OAUTH_MESSAGES_PATH
-        } else {
-            MESSAGES_PATH
-        };
         let mut builder = self
             .build_request_with_session(
                 &auth.resolved,
                 oauth,
-                "POST",
-                path,
+                request.wire.method,
+                &request.wire.url,
                 cache_key.map(CacheKey::as_str),
             )
             .header("content-type", "application/json");
@@ -745,18 +786,23 @@ impl Anthropic {
         if oauth {
             betas.extend_from_slice(OAUTH_MESSAGE_BETAS);
         }
-        if fast {
+        if request.fast {
             betas.push(FAST_MODE_BETA);
         }
         if !betas.is_empty() {
             builder = builder.header("anthropic-beta", betas.join(","));
         }
-        let request = builder.body(json_body)?;
-        let response = self.client.send_async(request).await?;
+        let response = self.client.send_async(builder.body(json_body)?).await?;
         let status = response.status().as_u16();
 
         if status == 200 {
-            parse_sse_inner(response, event_tx, self.stream_timeout, oauth_tool_names).await
+            parse_sse_inner(
+                response,
+                event_tx,
+                self.stream_timeout,
+                request.oauth_tool_names.as_ref(),
+            )
+            .await
         } else {
             Err(AgentError::from_response(response).await)
         }
@@ -840,6 +886,15 @@ impl Anthropic {
     }
 }
 
+#[cfg(test)]
+impl Anthropic {
+    fn with_test_auth(resolved: super::ResolvedAuth, mode: AuthMode) -> Self {
+        let provider = Self::with_auth(Arc::new(Mutex::new(resolved)), Timeouts::default());
+        provider.auth_state.lock().unwrap().mode = mode;
+        provider
+    }
+}
+
 fn bearer_token(auth: &super::ResolvedAuth) -> Option<String> {
     auth.headers.iter().find_map(|(key, value)| {
         key.eq_ignore_ascii_case("authorization")
@@ -903,53 +958,13 @@ impl Provider for Anthropic {
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             let auth_snapshot = self.auth_for_request().await?;
-            let oauth = auth_snapshot.mode == AuthMode::ClaudeOauth;
-            let system_blocks = if let Some(prefix) = &self.system_prefix {
-                vec![
-                    shared::SystemBlock {
-                        r#type: "text",
-                        text: prefix,
-                        cache_control: None,
-                    },
-                    shared::SystemBlock {
-                        r#type: "text",
-                        text: system,
-                        cache_control: Some(shared::EPHEMERAL),
-                    },
-                ]
-            } else {
-                vec![shared::SystemBlock {
-                    r#type: "text",
-                    text: system,
-                    cache_control: Some(shared::EPHEMERAL),
-                }]
-            };
+            let request = self.prepare(&auth_snapshot, model, messages, system, tools, &opts);
 
-            let mut body = shared::build_request_body_with_system(
-                model,
-                messages,
-                &system_blocks,
-                tools,
-                opts.thinking.clone(),
-            );
-            body["model"] = json!(shared::strip_long_context(&model.id));
-            body["stream"] = json!(true);
-            let oauth_tool_names = if oauth {
-                Some(shared::apply_oauth_request_profile(
-                    &mut body,
-                    system,
-                    auth::CLAUDE_CODE_VERSION,
-                ))
-            } else {
-                None
-            };
-            let fast = apply_fast_mode(&mut body, model, &opts);
-
-            debug!(model = %model.id, num_messages = messages.len(), thinking = ?opts.thinking, fast, "sending API request");
-            if !oauth {
+            debug!(model = %model.id, num_messages = messages.len(), thinking = ?opts.thinking, fast = request.fast, "sending API request");
+            if auth_snapshot.mode != AuthMode::ClaudeOauth {
                 let attempted_credential = auth_credential(&auth_snapshot.resolved);
                 let result = self
-                    .do_stream_request(&auth_snapshot, &body, event_tx, fast, cache_key, None)
+                    .do_stream_request(&auth_snapshot, &request, event_tx, cache_key)
                     .await;
                 if matches!(&result, Err(error) if error.is_auth_error()) {
                     self.mark_auth_rejected(attempted_credential);
@@ -961,14 +976,7 @@ impl Provider for Anthropic {
             let (relay_tx, relay_rx) = flume::unbounded();
             let attempt = async {
                 let result = self
-                    .do_stream_request(
-                        &auth_snapshot,
-                        &body,
-                        &relay_tx,
-                        fast,
-                        cache_key,
-                        oauth_tool_names.as_ref(),
-                    )
+                    .do_stream_request(&auth_snapshot, &request, &relay_tx, cache_key)
                     .await;
                 drop(relay_tx);
                 result
@@ -993,15 +1001,10 @@ impl Provider for Anthropic {
                     return Err(AgentError::api(AUTH_CHANGED_STATUS, AUTH_CHANGED_MESSAGE));
                 }
                 let retry_access = bearer_token(&retry_auth.resolved);
+                let retry_request =
+                    self.prepare(&retry_auth, model, messages, system, tools, &opts);
                 let retry = self
-                    .do_stream_request(
-                        &retry_auth,
-                        &body,
-                        event_tx,
-                        fast,
-                        cache_key,
-                        oauth_tool_names.as_ref(),
-                    )
+                    .do_stream_request(&retry_auth, &retry_request, event_tx, cache_key)
                     .await;
                 if matches!(&retry, Err(error) if oauth_auth_error(error)) {
                     self.mark_auth_rejected(retry_access);
@@ -1010,6 +1013,20 @@ impl Provider for Anthropic {
             }
             result.map_err(normalize_oauth_auth_error)
         })
+    }
+
+    fn wire_request(
+        &self,
+        model: &Model,
+        messages: &[Message],
+        system: &str,
+        tools: &Value,
+        opts: &RequestOptions,
+        _cache_key: Option<&CacheKey>,
+    ) -> Result<WireRequest, AgentError> {
+        Ok(self
+            .prepare(&self.auth_snapshot(), model, messages, system, tools, opts)
+            .wire)
     }
 
     fn list_models(&self) -> BoxFuture<'_, Result<Vec<crate::model::ModelInfo>, AgentError>> {
@@ -1175,6 +1192,7 @@ async fn parse_sse_inner(
 mod tests {
     use super::*;
     use crate::providers::ResolvedAuth;
+    use crate::providers::test_support::CREDENTIAL_IN_URL;
     use crate::{
         CaudraId, ContentBlock, EMPTY_RESPONSE_MARKER, INVALID_TOOL_JSON_KEY, ProviderEvent, Role,
         StopReason, TokenUsage,
@@ -1189,6 +1207,20 @@ mod tests {
     const RAW_TEXT_LOST: &str = "an unparseable tool input must keep its raw text for the model";
     const THIRD_PARTY_BASE_URL: &str = "https://proxy.example.com/v1/messages";
     const STORED_OUTPUT: &str = "first\nsecond";
+    const CREDENTIAL: &str = "sk-ant-credential";
+    const REFRESH_TOKEN: &str = "refresh";
+    const LONG_CONTEXT_MODEL: &str = "anthropic/claude-opus-4-8-1m";
+    const WIRE_MODEL: &str = "claude-opus-4-8";
+    const USER_TEXT: &str = "hello";
+    const SYSTEM_PROMPT: &str = "Caudra system";
+    const SYSTEM_PREFIX: &str = "Operator prefix";
+    const CACHE_CONTROL_KEY: &str = "\"cache_control\"";
+    const BREAKPOINT_BUDGET: usize = 4;
+    const OVER_BUDGET: &str = "the Messages API rejects a request with more than four breakpoints";
+    const BREAKPOINT_MISPLACED: &str =
+        "only the last tool and the last block of the last message cache what precedes them";
+    const REPLY_TEXT: &str = "reply";
+    const FOLLOW_UP_TEXT: &str = "and then";
 
     const USAGE_BODY: &str = r#"{
         "five_hour": {"utilization": 14.0, "resets_at": "2026-02-06T22:00:00+00:00"},
@@ -1415,27 +1447,156 @@ mod tests {
         assert!(body["tools"][0].get("description").is_none());
     }
 
+    fn oauth_auth() -> ResolvedAuth {
+        auth::build_oauth_resolved(&OAuthTokens {
+            access: CREDENTIAL.into(),
+            refresh: REFRESH_TOKEN.into(),
+            expires: u64::MAX,
+            account_id: None,
+        })
+    }
+
+    fn shell_tool() -> Value {
+        json!([{"name": "shell", "input_schema": {"type": "object"}}])
+    }
+
+    /// A subscription speaks as Claude Code, which carries the system prompt
+    /// in the first user turn and prefixes every tool name.
+    #[test_case(
+        resolve_auth_from_key(CREDENTIAL, None),
+        AuthMode::ApiKey,
+        "https://api.anthropic.com/v1/messages",
+        "/system/0/text",
+        "shell"
+        ; "an_api_key_posts_the_plain_profile"
+    )]
+    #[test_case(
+        oauth_auth(),
+        AuthMode::ClaudeOauth,
+        "https://api.anthropic.com/v1/messages?beta=true",
+        "/messages/0/content/0/text",
+        "mcp_Shell"
+        ; "a_subscription_posts_the_claude_code_profile"
+    )]
+    fn wire_request_follows_the_auth_mode(
+        resolved: ResolvedAuth,
+        mode: AuthMode,
+        url: &str,
+        system_at: &str,
+        tool_name: &str,
+    ) {
+        let provider = Anthropic::with_test_auth(resolved, mode);
+        let model = Model::from_spec(LONG_CONTEXT_MODEL).unwrap();
+        let wire = provider
+            .wire_request(
+                &model,
+                &[Message::user(USER_TEXT.into())],
+                SYSTEM_PROMPT,
+                &shell_tool(),
+                &RequestOptions::default(),
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(wire.url, url);
+        assert!(!wire.url.contains(CREDENTIAL), "{CREDENTIAL_IN_URL}");
+        assert_eq!(wire.body["model"], WIRE_MODEL);
+        assert_eq!(wire.body.pointer(system_at), Some(&json!(SYSTEM_PROMPT)));
+        assert_eq!(wire.body["tools"][0]["name"], tool_name);
+    }
+
+    #[test]
+    fn a_system_prefix_spends_no_cache_breakpoint() {
+        let provider =
+            Anthropic::with_test_auth(resolve_auth_from_key(CREDENTIAL, None), AuthMode::ApiKey)
+                .with_system_prefix(Some(SYSTEM_PREFIX.into()));
+        let model = Model::from_spec(LONG_CONTEXT_MODEL).unwrap();
+        let messages = [
+            Message::user(USER_TEXT.into()),
+            message(Role::Assistant, vec![text_block("reply")]),
+            Message::user(USER_TEXT.into()),
+        ];
+        let wire = provider
+            .wire_request(
+                &model,
+                &messages,
+                SYSTEM_PROMPT,
+                &shell_tool(),
+                &RequestOptions::default(),
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(
+            wire.body["system"],
+            json!([
+                {"type": "text", "text": SYSTEM_PREFIX},
+                {"type": "text", "text": SYSTEM_PROMPT, "cache_control": {"type": "ephemeral"}},
+            ])
+        );
+        let breakpoints = wire.body.to_string().matches(CACHE_CONTROL_KEY).count();
+        assert!(breakpoints <= BREAKPOINT_BUDGET, "{OVER_BUDGET}");
+    }
+
+    /// A breakpoint caches everything ahead of it, so the tools and the
+    /// conversation are reused only when the last of each carries one. The
+    /// subscription profile rewrites both and must leave the marks in place.
+    #[test_case(resolve_auth_from_key(CREDENTIAL, None), AuthMode::ApiKey ; "an_api_key")]
+    #[test_case(oauth_auth(), AuthMode::ClaudeOauth ; "a_subscription")]
+    fn breakpoints_mark_the_last_tool_and_the_last_block(resolved: ResolvedAuth, mode: AuthMode) {
+        let provider = Anthropic::with_test_auth(resolved, mode);
+        let tools = json!([
+            {"name": "shell", "input_schema": {"type": "object"}},
+            {"name": "file_read", "input_schema": {"type": "object"}},
+        ]);
+        let messages = [
+            Message::user(USER_TEXT.into()),
+            message(Role::Assistant, vec![text_block(REPLY_TEXT)]),
+            message(
+                Role::User,
+                vec![text_block(USER_TEXT), text_block(FOLLOW_UP_TEXT)],
+            ),
+        ];
+
+        let wire = provider
+            .wire_request(
+                &Model::from_spec(LONG_CONTEXT_MODEL).unwrap(),
+                &messages,
+                SYSTEM_PROMPT,
+                &tools,
+                &RequestOptions::default(),
+                None,
+            )
+            .unwrap();
+
+        let ephemeral = json!({"type": "ephemeral"});
+        let marked = |pointer: &str| -> Vec<bool> {
+            wire.body
+                .pointer(pointer)
+                .and_then(Value::as_array)
+                .unwrap()
+                .iter()
+                .map(|item| item["cache_control"] == ephemeral)
+                .collect()
+        };
+        assert_eq!(marked("/tools"), [false, true], "{BREAKPOINT_MISPLACED}");
+        assert_eq!(
+            marked("/messages/2/content"),
+            [false, true],
+            "{BREAKPOINT_MISPLACED}"
+        );
+    }
+
     #[test]
     fn oauth_request_uses_first_party_headers_once() {
-        let provider = Anthropic::with_auth(
-            Arc::new(Mutex::new(auth::build_oauth_resolved(
-                &caudra_storage::auth::OAuthTokens {
-                    access: "token".into(),
-                    refresh: "refresh".into(),
-                    expires: u64::MAX,
-                    account_id: None,
-                },
-            ))),
-            crate::providers::Timeouts::default(),
-        );
-        provider.auth_state.lock().unwrap().mode = AuthMode::ClaudeOauth;
+        let provider = Anthropic::with_test_auth(oauth_auth(), AuthMode::ClaudeOauth);
         let request_auth = provider.current_auth();
         let request = provider
             .build_request_with_session(
                 &request_auth,
                 true,
                 "POST",
-                OAUTH_MESSAGES_PATH,
+                &api_url(&request_auth, OAUTH_MESSAGES_PATH),
                 Some("session-id"),
             )
             .body(())
@@ -1446,7 +1607,7 @@ mod tests {
         );
         assert_eq!(
             request.headers().get("authorization").unwrap(),
-            "Bearer token"
+            &format!("Bearer {CREDENTIAL}")
         );
         assert_eq!(request.headers().get("x-app").unwrap(), "cli");
         assert_eq!(

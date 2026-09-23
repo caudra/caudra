@@ -4,8 +4,10 @@ use flume::Sender;
 use serde_json::{Value, json};
 
 use crate::model::{Model, ModelEntry, ModelFamily, ModelPricing, ThinkingSupport};
-use crate::provider::{BoxFuture, Provider};
-use crate::{AgentError, CacheKey, Message, ProviderEvent, RequestOptions, StreamResponse};
+use crate::provider::{BoxFuture, Provider, WireRequest};
+use crate::{
+    AgentError, CacheKey, Message, ProviderEvent, RequestOptions, StreamResponse, ThinkingConfig,
+};
 
 use super::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
 use super::{KeyPool, ResolvedAuth};
@@ -206,6 +208,24 @@ impl Mistral {
         self.system_prefix = prefix;
         self
     }
+
+    /// What a turn posts, for the send and the dry run alike.
+    fn request(
+        &self,
+        auth: &ResolvedAuth,
+        model: &Model,
+        messages: &[Message],
+        system: &str,
+        tools: &Value,
+        thinking: &ThinkingConfig,
+    ) -> WireRequest {
+        let mut buf = String::new();
+        let system = super::with_prefix(&self.system_prefix, system, &mut buf);
+        let mut body = self.compat.build_body(model, messages, system, tools);
+        thinking.apply_reasoning_effort(&mut body, model);
+        convert_assistant_messages_in_place(&mut body["messages"]);
+        WireRequest::post(self.compat.chat_url(auth), body)
+    }
 }
 
 impl Provider for Mistral {
@@ -221,21 +241,28 @@ impl Provider for Mistral {
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             let auth = self.auth.lock().unwrap().clone();
-            let mut buf = String::new();
-            let system = super::with_prefix(&self.system_prefix, system, &mut buf);
-            let mut body = self.compat.build_body(model, messages, system, tools);
-            opts.thinking.apply_reasoning_effort(&mut body, model);
-            // Convert assistant messages to Mistral's expected format with thinking content
-            convert_assistant_messages_in_place(body.get_mut("messages").unwrap());
-
+            let wire = self.request(&auth, model, messages, system, tools, &opts.thinking);
             let mut extra_headers = vec![];
             if let Some(cache_key) = cache_key {
                 extra_headers.push(("x-affinity", cache_key.as_str()));
             }
             self.compat
-                .do_stream(model, &extra_headers, &body, event_tx, &auth)
+                .do_stream(model, &extra_headers, &wire, event_tx, &auth)
                 .await
         })
+    }
+
+    fn wire_request(
+        &self,
+        model: &Model,
+        messages: &[Message],
+        system: &str,
+        tools: &Value,
+        opts: &RequestOptions,
+        _cache_key: Option<&CacheKey>,
+    ) -> Result<WireRequest, AgentError> {
+        let auth = self.auth.lock().unwrap().clone();
+        Ok(self.request(&auth, model, messages, system, tools, &opts.thinking))
     }
 
     fn list_models(&self) -> BoxFuture<'_, Result<Vec<crate::model::ModelInfo>, AgentError>> {
@@ -308,69 +335,68 @@ fn adjust_model(model: &mut Model) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::providers::Timeouts;
+    use crate::{ContentBlock, Role};
     use serde_json::{Value, json};
     use test_case::test_case;
 
+    const API_KEY: &str = "sk-mistral";
+    const MODEL: &str = "mistral/mistral-medium-latest";
+    const SYSTEM_PROMPT: &str = "sys";
+    const REASONING: &str = "thinking";
+    const REPLY: &str = "text";
+
+    fn thinking_part() -> Value {
+        json!({"type": "thinking", "thinking": [{"type": "text", "text": REASONING}]})
+    }
+
     #[test_case(
-        json!([
-            {"role": "system", "content": "sys"},
-            {"role": "assistant", "content": "text", "reasoning_content": "thinking"}
-        ]),
-        json!([
-            {"role": "system", "content": "sys"},
-            {
-                "role": "assistant",
-                "content": [
-                    {"type": "thinking", "thinking": [{"type": "text", "text": "thinking"}]},
-                    {"type": "text", "text": "text"}
-                ]
-            }
-        ])
+        vec![ContentBlock::thinking(REASONING.into(), None), ContentBlock::Text { text: REPLY.into() }],
+        json!([thinking_part(), {"type": "text", "text": REPLY}])
         ; "assistant_text_and_thinking"
     )]
     #[test_case(
-        json!([
-            {"role": "system", "content": "sys"},
-            {"role": "assistant", "content": "", "reasoning_content": "thinking"}
-        ]),
-        json!([
-            {"role": "system", "content": "sys"},
-            {
-                "role": "assistant",
-                "content": [{"type": "thinking", "thinking": [{"type": "text", "text": "thinking"}]}]
-            }
-        ])
+        vec![ContentBlock::thinking(REASONING.into(), None)],
+        json!([thinking_part()])
         ; "assistant_empty_content_with_thinking"
     )]
     #[test_case(
-        json!([
-            {"role": "system", "content": "sys"},
-            {"role": "assistant", "reasoning_content": "thinking"}
-        ]),
-        json!([
-            {"role": "system", "content": "sys"},
-            {
-                "role": "assistant",
-                "content": [{"type": "thinking", "thinking": [{"type": "text", "text": "thinking"}]}]
-            }
-        ])
-        ; "assistant_no_content_with_thinking"
-    )]
-    #[test_case(
-        json!([
-            {"role": "system", "content": "sys"},
-            {"role": "assistant", "content": "text"}
-        ]),
-        json!([
-            {"role": "system", "content": "sys"},
-            {"role": "assistant", "content": "text"}
-        ])
+        vec![ContentBlock::Text { text: REPLY.into() }],
+        json!(REPLY)
         ; "assistant_text_only_no_thinking"
     )]
-    fn convert_assistant_messages_in_place_test(input: Value, expected: Value) {
-        let mut input_clone = input.clone();
-        convert_assistant_messages_in_place(&mut input_clone);
-        assert_eq!(input_clone, expected);
+    fn assistant_reasoning_travels_as_thinking_content(
+        content: Vec<ContentBlock>,
+        expected: Value,
+    ) {
+        let provider = Mistral::with_auth(
+            Arc::new(Mutex::new(ResolvedAuth::bearer(API_KEY))),
+            Timeouts::default(),
+        );
+        let reply = Message {
+            role: Role::Assistant,
+            content,
+            ..Message::default()
+        };
+
+        let wire = provider
+            .wire_request(
+                &Model::from_spec(MODEL).unwrap(),
+                &[reply],
+                SYSTEM_PROMPT,
+                &Value::Null,
+                &RequestOptions::default(),
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(
+            wire.body["messages"],
+            json!([
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "assistant", "content": expected},
+            ])
+        );
     }
 
     #[test_case("mistral/ministral-14b-latest", false ; "ministral_no_thinking")]

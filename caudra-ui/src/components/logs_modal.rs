@@ -25,7 +25,7 @@ use crate::components::keybindings::key;
 use crate::components::modal::Modal;
 use crate::components::scrollbar::{Scrollbar, ScrollbarMouse};
 use crate::components::{
-    Hint, HintBar, Overlay, bar_area, escape_terminal_controls, hover_style,
+    Hint, HintBar, Overlay, bar_area, escape_terminal_controls, format_bytes, hover_style,
     input_line_with_cursor, is_ctrl,
 };
 use crate::repaint::{Cadence, Dirty};
@@ -1105,23 +1105,6 @@ fn plain_text(entry: &Entry) -> String {
     }
 }
 
-const BYTE_UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
-const BYTE_STEP: u64 = 1024;
-
-fn format_bytes(bytes: u64) -> String {
-    let mut value = bytes as f64;
-    let mut unit = 0;
-    while value >= BYTE_STEP as f64 && unit + 1 < BYTE_UNITS.len() {
-        value /= BYTE_STEP as f64;
-        unit += 1;
-    }
-    if unit == 0 {
-        format!("{bytes} {}", BYTE_UNITS[0])
-    } else {
-        format!("{value:.1} {}", BYTE_UNITS[unit])
-    }
-}
-
 /// The modal opens against the configured retention, so a user who keeps twenty
 /// files can scroll into all twenty.
 pub(crate) fn max_files_or_default(configured: u32) -> u32 {
@@ -1265,14 +1248,6 @@ mod tests {
         let out = plain_text(&Entry::parse(WITH_SPAN));
         assert!(out.contains("session_id=s-1"), "{out}");
         assert!(out.contains("caudra.tool_result"), "{out}");
-    }
-
-    #[test_case(0, "0 B" ; "zero")]
-    #[test_case(512, "512 B" ; "bytes")]
-    #[test_case(2048, "2.0 KB" ; "kilobytes")]
-    #[test_case(5 * 1024 * 1024, "5.0 MB" ; "megabytes")]
-    fn sizes_read_as_units(bytes: u64, expected: &str) {
-        assert_eq!(format_bytes(bytes), expected);
     }
 
     #[test_case(0, DEFAULT_MAX_FILES ; "zero falls back")]

@@ -40,6 +40,7 @@ Commands marked Main only act on the main session's turn or history. They stay l
 | `/rename` | Rename the current session |  |
 | `/model` | Switch chat model or assign job models | Main only |
 | `/system-prompt` | Inspect the system prompt and switch profile | Main only |
+| `/projection` | Inspect the conversation as the provider receives it | Main only |
 | `/review` | Review the last reply passage by passage |  |
 | `/theme` | Switch color theme |  |
 | `/view` | Cycle transcript: auto / compact / expanded |  |
@@ -101,7 +102,7 @@ An input box appears while the focused task is running. Press Enter to queue gui
 
 That input box is a full composer. Typing `/` opens the palette, `Ctrl+S` inserts a file path, `Ctrl+X e` edits the draft in your editor, and `Ctrl+V` attaches an image to the guidance. A custom `/project:` or `/user:` command expands its template and steers the focused task rather than the main session.
 
-Commands that reach the main session's turn or history have no task equivalent, so `/compact`, `/continue`, `/model`, `/system-prompt`, `/btw`, `/extract`, the `/goal` family, the workflow commands, and MCP prompts are drawn dimmed and report their scope when run. Return to Main to use them. `/context`, `/tools`, `/skills`, `/queue`, `/review`, and the stash commands already follow the focused transcript.
+Commands that reach the main session's turn or history have no task equivalent, so `/compact`, `/continue`, `/model`, `/system-prompt`, `/projection`, `/btw`, `/extract`, the `/goal` family, the workflow commands, and MCP prompts are drawn dimmed and report their scope when run. Return to Main to use them. `/context`, `/tools`, `/skills`, `/queue`, `/review`, and the stash commands already follow the focused transcript.
 
 ## Workflows
 
@@ -152,6 +153,8 @@ Headless mode waits for tracked background agents before evaluating. An impossib
 `/context` opens a compact summary of the active context window. Main and each task have separate prompts, tools, and transcripts. The command reports Main when Main is open, or the selected task when its transcript is open. It never adds those windows together. A task restored after restart has no request snapshot until the task is continued.
 
 The summary shows the active model and window, estimated tokens by category, the compaction reserve, and remaining space. `/context all` adds item-level built-in tool, MCP tool, profile, memory, and skill inventories. Both views use the active provider's request projection, so eligible old retained tool results count as compact output-ID markers rather than their full canonical text.
+
+`/projection` shows what `/context` counts: the system prompt, the tools, and every message as the provider receives it, with `r` switching to the JSON body the active provider would send. See [Provider request projection](/docs/context/#provider-request-projection).
 
 `/tools` covers the tool array on its own. It lists every built-in and MCP tool with its state, its token cost, and the rule behind that state, and it is the only view that shows tools turned off by configuration. See [Tools](/docs/tools/) for the lists that decide those states. `g` cycles the modal through recorded activity for the session, the project, and everything ever run, with call counts, error classes, estimated result tokens, and wall clock per tool. See [Token Economy](/docs/token-economy/#what-the-tools-cost).
 

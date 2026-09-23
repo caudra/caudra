@@ -10,11 +10,13 @@ use serde_json::{Value, json};
 use tracing::{debug, warn};
 
 use super::ResolvedAuth;
+use crate::provider::WireRequest;
 use crate::{
     AgentError, ContentBlock, Message, ProviderEvent, Role, StopReason, StreamResponse, TokenUsage,
 };
 
 const STREAM_DONE: &str = "[DONE]";
+pub(crate) const CHAT_COMPLETIONS_PATH: &str = "/chat/completions";
 /// `tool_calls[].index` comes straight off the wire; a bogus huge value must
 /// not size the accumulator vec.
 const MAX_TOOL_CALLS_PER_MESSAGE: usize = 512;
@@ -151,17 +153,21 @@ impl OpenAiCompatProvider {
             .unwrap_or_else(|| self.config.base_url.to_string())
     }
 
+    /// Where a Chat Completions turn posts, for the send and the dry run alike.
+    pub(crate) fn chat_url(&self, auth: &ResolvedAuth) -> String {
+        format!("{}{CHAT_COMPLETIONS_PATH}", self.base_url(auth))
+    }
+
     fn build_request(
         &self,
         method: &str,
-        path: &str,
+        url: &str,
         auth: &ResolvedAuth,
     ) -> isahc::http::request::Builder {
-        let base = self.base_url(auth);
         auth.configure_request(
             Request::builder()
                 .method(method)
-                .uri(format!("{base}{path}"))
+                .uri(url)
                 .header("user-agent", super::user_agent()),
         )
     }
@@ -170,13 +176,13 @@ impl OpenAiCompatProvider {
         &self,
         model: &crate::model::Model,
         extra_headers: &[(&str, &str)],
-        body: &Value,
+        wire: &WireRequest,
         event_tx: &Sender<ProviderEvent>,
         auth: &ResolvedAuth,
     ) -> Result<StreamResponse, AgentError> {
-        let json_body = serde_json::to_vec(body)?;
+        let json_body = serde_json::to_vec(&wire.body)?;
         let mut request = self
-            .build_request("POST", "/chat/completions", auth)
+            .build_request(wire.method, &wire.url, auth)
             .header("content-type", "application/json");
         for &(key, value) in extra_headers {
             request = request.header(key, value);

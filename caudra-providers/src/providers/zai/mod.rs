@@ -7,11 +7,11 @@ use serde_json::Value;
 use tracing::warn;
 
 use crate::model::{Model, ModelEntry, ModelFamily, ModelPricing, ThinkingSupport};
-use crate::provider::{BoxFuture, Provider};
+use crate::provider::{BoxFuture, Provider, WireRequest};
 use crate::providers::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
 use crate::{
     AgentError, CacheKey, Message, ProviderEvent, ProviderUsage, RequestOptions, StreamResponse,
-    UsageLimit,
+    ThinkingConfig, UsageLimit,
 };
 
 use super::{KeyPool, ResolvedAuth};
@@ -297,6 +297,25 @@ impl Zai {
         self.system_prefix = prefix;
         self
     }
+
+    /// What a turn posts, for the send and the dry run alike.
+    fn request(
+        &self,
+        auth: &ResolvedAuth,
+        model: &Model,
+        messages: &[Message],
+        system: &str,
+        tools: &Value,
+        thinking: &ThinkingConfig,
+    ) -> WireRequest {
+        let mut buf = String::new();
+        let system = super::with_prefix(&self.system_prefix, system, &mut buf);
+        let mut body = self.compat.build_body(model, messages, system, tools);
+        if model.supports_thinking() {
+            thinking.apply_reasoning_effort(&mut body, model);
+        }
+        WireRequest::post(self.compat.chat_url(auth), body)
+    }
 }
 
 impl Provider for Zai {
@@ -312,15 +331,10 @@ impl Provider for Zai {
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             let auth = self.auth.lock().unwrap().clone();
-            let mut buf = String::new();
-            let system = super::with_prefix(&self.system_prefix, system, &mut buf);
-            let mut body = self.compat.build_body(model, messages, system, tools);
-            if model.supports_thinking() {
-                opts.thinking.apply_reasoning_effort(&mut body, model);
-            }
+            let wire = self.request(&auth, model, messages, system, tools, &opts.thinking);
             match self
                 .compat
-                .do_stream(model, &[], &body, event_tx, &auth)
+                .do_stream(model, &[], &wire, event_tx, &auth)
                 .await
             {
                 Err(AgentError::Api {
@@ -334,6 +348,19 @@ impl Provider for Zai {
                 result => result,
             }
         })
+    }
+
+    fn wire_request(
+        &self,
+        model: &Model,
+        messages: &[Message],
+        system: &str,
+        tools: &Value,
+        opts: &RequestOptions,
+        _cache_key: Option<&CacheKey>,
+    ) -> Result<WireRequest, AgentError> {
+        let auth = self.auth.lock().unwrap().clone();
+        Ok(self.request(&auth, model, messages, system, tools, &opts.thinking))
     }
 
     fn list_models(&self) -> BoxFuture<'_, Result<Vec<crate::model::ModelInfo>, AgentError>> {

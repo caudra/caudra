@@ -66,6 +66,7 @@ use crate::components::permissions_picker::{
     DiscoveryState, PermissionsPicker, PermissionsPickerAction,
 };
 use crate::components::plan_form::{PlanForm, PlanFormAction};
+use crate::components::projection_modal::{Projection, ProjectionAction, ProjectionModal};
 use crate::components::prompt_profile_picker::{PromptProfilePicker, PromptProfilePickerAction};
 use crate::components::question_form::{QuestionForm, QuestionFormAction};
 use crate::components::queue_actions::{QueueActionKind, QueueActions, QueueActionsAction};
@@ -117,18 +118,18 @@ use caudra_agent::workspace_baseline::WorkspaceBaseline;
 use caudra_agent::{
     AgentEvent, AgentInput, AgentMode, CommitRef, Envelope, GoalVerdict, ImageSource,
     McpConfigErrors, McpPromptInfo, McpSnapshotReader, Mention, PromptAdmission, QueueItemId,
-    SharedHistory, SteeringQueue, SubagentInfo,
+    SharedHistory, SteeringQueue, SubagentInfo, project_for_inspection,
 };
 use caudra_config::{ModelPolicy, PermissionsConfig, SnapshotsConfig, UiConfig};
 use caudra_lua::{
     BuiltinAction, EventHandle, HintReader, HintSnapshot, KeymapReader, LuaCommandReader, WinView,
 };
 use caudra_providers::{
-    Billing, ContentBlock, Message, Model, ModelPurpose, ResolvedThinking, ThinkingConfig,
-    TokenUsage, add_cost,
+    Billing, CacheKey, ContentBlock, Message, Model, ModelPurpose, RequestOptions,
+    ResolvedThinking, ThinkingConfig, TokenUsage, add_cost, project_messages,
 };
 use caudra_storage::StateDir;
-use caudra_storage::id::CaudraId;
+use caudra_storage::id::{CaudraId, SessionRef};
 use caudra_storage::input_history::InputHistory;
 use caudra_storage::model::persist_model;
 use caudra_storage::tool_ledger::{ToolCall, ToolLedger, ToolStats};
@@ -173,6 +174,7 @@ const WORKFLOW_AUTH_REQUIRED: &str =
     "A workflow agent needs authentication. Run `caudra auth login` in another terminal.";
 const WORKFLOW_REQUESTER_PREFIX: &str = "workflow";
 const COPY_FAILED: &str = "Copy failed: ";
+const HISTORY_UNREADABLE: &str = "Failed to read session history: ";
 const FLASH_NO_PLAN: &str = "No plan file";
 const NO_FILE_REVERT_MSG: &str = "No file revert for this workspace";
 const NO_FILE_CHANGES_MSG: &str =
@@ -356,6 +358,7 @@ pub struct App {
     pub(super) skills_modal: SkillsModal,
     pub(super) storage_modal: StorageModal,
     pub(super) system_prompt_modal: SystemPromptModal,
+    pub(super) projection_modal: ProjectionModal,
     context_snapshot: Watch<ContextSnapshot>,
     /// Read from the ledger when the modal asks for it, not on every frame:
     /// the table outlives sessions and only grows.
@@ -602,6 +605,7 @@ impl App {
             skills_modal: SkillsModal::new(),
             storage_modal: StorageModal::new(),
             system_prompt_modal: SystemPromptModal::default(),
+            projection_modal: ProjectionModal::default(),
             context_snapshot: Watch::default(),
             lifetime_usage: None,
             tool_stats: None,
@@ -1647,6 +1651,10 @@ impl App {
             self.system_prompt_modal.scroll(delta);
             return None;
         }
+        if self.projection_modal.is_open() {
+            self.projection_modal.scroll(delta);
+            return None;
+        }
         if self.goal_modal.is_open() {
             self.goal_modal.scroll(delta);
             return None;
@@ -1980,6 +1988,13 @@ impl App {
             guard_repeat!(false);
             let action = self.system_prompt_modal.handle_key(key);
             self.handle_system_prompt_action(action);
+            return Some(vec![]);
+        }
+
+        if self.projection_modal.is_open() {
+            guard_repeat!(false);
+            let action = self.projection_modal.handle_key(key);
+            self.handle_projection_action(action);
             return Some(vec![]);
         }
 
@@ -3307,11 +3322,17 @@ impl App {
             LogsAction::Consumed => {}
             LogsAction::Close => self.logs_modal.close(),
             LogsAction::Flash(message) => self.flash(message.into()),
-            LogsAction::Copy { text, label } => match self.clipboard.copy_text(&text) {
-                Ok(CopyResult::Noop) => {}
-                Ok(CopyResult::Copied) => self.flash(label.into()),
-                Err(e) => self.flash(format!("{COPY_FAILED}{e}")),
-            },
+            LogsAction::Copy { text, label } => self.copy_labelled(&text, label),
+        }
+    }
+
+    /// Copies `text` and says so in `label`'s words. An empty copy stays
+    /// quiet, since there was nothing to hand over.
+    fn copy_labelled(&mut self, text: &str, label: &str) {
+        match self.clipboard.copy_text(text) {
+            Ok(CopyResult::Noop) => {}
+            Ok(CopyResult::Copied) => self.flash(label.into()),
+            Err(e) => self.flash(format!("{COPY_FAILED}{e}")),
         }
     }
 
@@ -3341,16 +3362,57 @@ impl App {
     fn handle_system_prompt_action(&mut self, action: SystemPromptAction) {
         match action {
             SystemPromptAction::Consumed => {}
-            SystemPromptAction::Copy { text, label } => match self.clipboard.copy_text(&text) {
-                Ok(CopyResult::Noop) => {}
-                Ok(CopyResult::Copied) => self.flash(label.into()),
-                Err(e) => self.flash(format!("{COPY_FAILED}{e}")),
-            },
+            SystemPromptAction::Copy { text, label } => self.copy_labelled(&text, label),
             SystemPromptAction::Profile => {
                 self.system_prompt_modal.close();
                 self.prompt_profile_picker
                     .open(&self.state.system_prompt_profile_name);
             }
+        }
+    }
+
+    /// Shows the next request as the live turn would project it, taken now so
+    /// the view never shifts: reopening is how to see a newer one. Nothing is
+    /// shown before the agent has bound a prompt, since no request exists yet.
+    fn execute_projection(&mut self) {
+        let prompt = self
+            .btw_prompt
+            .as_ref()
+            .map(|prompt| prompt.load_full())
+            .filter(|prompt| !prompt.system.is_empty());
+        let snapshot = self
+            .shared_history
+            .as_ref()
+            .map(|history| history.load_full());
+        let (Some(prompt), Some(snapshot)) = (prompt, snapshot) else {
+            self.projection_modal.open(None);
+            return;
+        };
+        let history = match project_messages(&snapshot.messages) {
+            Ok(history) => history,
+            Err(error) => {
+                self.flash(format!("{HISTORY_UNREADABLE}{error}"));
+                return;
+            }
+        };
+        let transport = prompt.provider.reasoning_transport(&prompt.model);
+        let projected = project_for_inspection(&history, &prompt.tools, &prompt.model, transport);
+        self.projection_modal.open(Some(Projection {
+            prompt,
+            messages: projected.messages,
+            running_calls: projected.running_calls,
+            cache_key: CacheKey::session(&SessionRef::from(self.state.session.id)),
+            opts: RequestOptions {
+                thinking: self.state.thinking.clone(),
+                fast: self.state.fast,
+            },
+        }));
+    }
+
+    fn handle_projection_action(&mut self, action: ProjectionAction) {
+        match action {
+            ProjectionAction::Consumed => {}
+            ProjectionAction::Copy { text, label } => self.copy_labelled(&text, label),
         }
     }
 
@@ -4259,6 +4321,7 @@ impl App {
             self.skills_modal.close();
             self.storage_modal.close();
             self.system_prompt_modal.close();
+            self.projection_modal.close();
             if self.permissions_picker.is_open() {
                 self.suspend_permission_editor();
                 self.permission_config_trust_deferred =
@@ -4590,6 +4653,10 @@ impl App {
             }
             "/system-prompt" => {
                 self.execute_system_prompt();
+                vec![]
+            }
+            "/projection" => {
+                self.execute_projection();
                 vec![]
             }
             "/review" => self.run_builtin(BuiltinAction::Review),
@@ -4984,7 +5051,7 @@ impl App {
         self.subagent_input_box.set_cwd(cwd);
     }
 
-    fn overlays(&self) -> [&dyn Overlay; 37] {
+    fn overlays(&self) -> [&dyn Overlay; 38] {
         [
             &self.workbench,
             &self.logs_modal,
@@ -4995,6 +5062,7 @@ impl App {
             &self.skills_modal,
             &self.storage_modal,
             &self.system_prompt_modal,
+            &self.projection_modal,
             &self.goal_modal,
             &self.stream_modal,
             &self.float_mgr,
@@ -5026,7 +5094,7 @@ impl App {
         ]
     }
 
-    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 37] {
+    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 38] {
         [
             &mut self.workbench,
             &mut self.logs_modal,
@@ -5037,6 +5105,7 @@ impl App {
             &mut self.skills_modal,
             &mut self.storage_modal,
             &mut self.system_prompt_modal,
+            &mut self.projection_modal,
             &mut self.goal_modal,
             &mut self.stream_modal,
             &mut self.float_mgr,

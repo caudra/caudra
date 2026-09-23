@@ -5,10 +5,10 @@ use flume::Sender;
 use serde_json::{Value, json};
 
 use crate::model::{Model, ModelEntry, ModelInfo, ModelPricing};
-use crate::provider::{BoxFuture, Provider};
+use crate::provider::{BoxFuture, Provider, WireRequest};
 use crate::{
     AgentError, CacheKey, Message, ProviderEvent, ReasoningOption, ReasoningOptions,
-    RequestOptions, StreamResponse,
+    RequestOptions, StreamResponse, ThinkingConfig,
 };
 
 use super::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
@@ -73,6 +73,37 @@ impl OpenRouter {
     pub(crate) fn with_system_prefix(mut self, prefix: Option<String>) -> Self {
         self.system_prefix = prefix;
         self
+    }
+
+    /// What a turn posts, for the send and the dry run alike.
+    #[allow(clippy::too_many_arguments)]
+    fn request(
+        &self,
+        auth: &ResolvedAuth,
+        model: &Model,
+        messages: &[Message],
+        system: &str,
+        tools: &Value,
+        thinking: &ThinkingConfig,
+        cache_key: Option<&CacheKey>,
+    ) -> WireRequest {
+        let mut buf = String::new();
+        let system = super::with_prefix(&self.system_prefix, system, &mut buf);
+        let mut body = self.compat.build_body(model, messages, system, tools);
+
+        body["cache_control"] = json!({"type": "ephemeral"});
+
+        if model.supports_thinking()
+            && let Some(effort) = thinking.effort_str(model)
+        {
+            body["reasoning"] = json!({"effort": effort});
+        }
+
+        if let Some(cache_key) = cache_key {
+            body["session_id"] = json!(cache_key.as_str());
+        }
+
+        WireRequest::post(self.compat.chat_url(auth), body)
     }
 }
 
@@ -179,27 +210,41 @@ impl Provider for OpenRouter {
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             let auth = self.auth.lock().unwrap().clone();
-            let mut buf = String::new();
-            let system = super::with_prefix(&self.system_prefix, system, &mut buf);
-            let mut body = self.compat.build_body(model, messages, system, tools);
-
-            body["cache_control"] = json!({"type": "ephemeral"});
-
-            if model.supports_thinking()
-                && let Some(effort) = opts.thinking.effort_str(model)
-            {
-                body["reasoning"] = json!({"effort": effort});
-            }
-
-            if let Some(cache_key) = cache_key {
-                body["session_id"] = json!(cache_key.as_str());
-            }
-
+            let wire = self.request(
+                &auth,
+                model,
+                messages,
+                system,
+                tools,
+                &opts.thinking,
+                cache_key,
+            );
             let extra_headers = [("HTTP-Referer", REFERER), ("X-OpenRouter-Title", APP_TITLE)];
             self.compat
-                .do_stream(model, &extra_headers, &body, event_tx, &auth)
+                .do_stream(model, &extra_headers, &wire, event_tx, &auth)
                 .await
         })
+    }
+
+    fn wire_request(
+        &self,
+        model: &Model,
+        messages: &[Message],
+        system: &str,
+        tools: &Value,
+        opts: &RequestOptions,
+        cache_key: Option<&CacheKey>,
+    ) -> Result<WireRequest, AgentError> {
+        let auth = self.auth.lock().unwrap().clone();
+        Ok(self.request(
+            &auth,
+            model,
+            messages,
+            system,
+            tools,
+            &opts.thinking,
+            cache_key,
+        ))
     }
 
     fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
@@ -224,7 +269,6 @@ mod tests {
     use test_case::test_case;
 
     use super::*;
-    use crate::ThinkingConfig;
 
     const UNKNOWN_PRICE_STAYS_UNKNOWN: &str = "a price we cannot read must not become a zero price";
 

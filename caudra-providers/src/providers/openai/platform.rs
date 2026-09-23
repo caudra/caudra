@@ -10,7 +10,7 @@ use serde_json::{Value, json};
 use tracing::{debug, info, warn};
 
 use crate::model::{Billing, Model, ModelInfo};
-use crate::provider::{BoxFuture, Provider};
+use crate::provider::{BoxFuture, Provider, WireRequest};
 use crate::{
     AgentError, CacheKey, Message, ProviderEvent, ProviderUsage, RequestOptions, StreamResponse,
     UsageLimit,
@@ -383,6 +383,8 @@ impl OpenAi {
         retry
     }
 
+    /// `operation` gets each attempt's auth, whether that auth is a login, and
+    /// where to send its events.
     async fn with_oauth_stream_retry<F, Fut>(
         &self,
         coding_plan: bool,
@@ -390,7 +392,7 @@ impl OpenAi {
         operation: F,
     ) -> Result<StreamResponse, AgentError>
     where
-        F: Fn(ResolvedAuth, Sender<ProviderEvent>) -> Fut,
+        F: Fn(ResolvedAuth, bool, Sender<ProviderEvent>) -> Fut,
         Fut: std::future::Future<Output = Result<StreamResponse, AgentError>>,
     {
         let snapshot = self.auth_for_request().await?;
@@ -398,7 +400,7 @@ impl OpenAi {
         let request_auth = self.request_auth(&snapshot, coding_plan);
         let attempted_access = bearer_token(&request_auth);
         if !oauth {
-            let result = operation(request_auth, event_tx.clone()).await;
+            let result = operation(request_auth, oauth, event_tx.clone()).await;
             if matches!(&result, Err(error) if error.is_auth_error()) {
                 self.mark_auth_rejected(attempted_access);
             }
@@ -406,7 +408,7 @@ impl OpenAi {
         }
 
         let (relay_tx, relay_rx) = flume::unbounded();
-        let attempt = operation(request_auth, relay_tx);
+        let attempt = operation(request_auth, oauth, relay_tx);
         let forward = async move {
             let mut forwarded = 0usize;
             while let Ok(event) = relay_rx.recv_async().await {
@@ -432,7 +434,12 @@ impl OpenAi {
         let retry_snapshot = self.refresh_oauth(self.rejected_auth_credentials()).await?;
         let retry_auth = self.request_auth(&retry_snapshot, coding_plan);
         let retry_access = bearer_token(&retry_auth);
-        let retry = operation(retry_auth, event_tx.clone()).await;
+        let retry = operation(
+            retry_auth,
+            retry_snapshot.oauth_tokens.is_some(),
+            event_tx.clone(),
+        )
+        .await;
         if matches!(&retry, Err(error) if error.is_auth_error()) {
             self.mark_auth_rejected(retry_access);
         }
@@ -441,27 +448,57 @@ impl OpenAi {
 }
 
 impl OpenAi {
-    /// The Codex backend a login talks to answers `prompt_cache_breakpoint`
-    /// with `not supported on this model` for every 5.6 model, so only the
-    /// metered API gets the breakpoint.
-    fn responses_body(
+    /// What one attempt posts with the auth [`Self::request_auth`] resolved
+    /// for it, for the send and the dry run alike. `oauth` comes from the same
+    /// snapshot as `auth`.
+    #[allow(clippy::too_many_arguments)]
+    fn request(
         &self,
+        oauth: bool,
+        auth: &ResolvedAuth,
         model: &Model,
         messages: &[Message],
         system: &str,
         tools: &Value,
         opts: &RequestOptions,
         cache_key: Option<&CacheKey>,
-    ) -> Value {
-        let mut body = super::responses::build_body(model, messages, system, tools);
-        if supports_explicit_cache(&model.id) && !self.is_oauth() {
-            super::responses::apply_system_breakpoint(&mut body);
+    ) -> Result<WireRequest, AgentError> {
+        let mut buf = String::new();
+        let system = super::super::with_prefix(&self.system_prefix, system, &mut buf);
+        if is_codex_model(&model.id) {
+            return Ok(WireRequest::post(
+                super::responses::responses_url(auth)?,
+                responses_body(oauth, model, messages, system, tools, opts, cache_key),
+            ));
         }
-        super::responses::apply_responses_reasoning(&mut body, &opts.thinking, model);
+        let mut body = self.compat.build_body(model, messages, system, tools);
+        opts.thinking.apply_reasoning_effort(&mut body, model);
         apply_prompt_cache_key(&mut body, cache_key);
         apply_fast_mode(&mut body, model, opts);
-        body
+        Ok(WireRequest::post(self.compat.chat_url(auth), body))
     }
+}
+
+/// The Codex backend a login talks to answers `prompt_cache_breakpoint`
+/// with `not supported on this model` for every 5.6 model, so only the
+/// metered API gets the breakpoint.
+fn responses_body(
+    oauth: bool,
+    model: &Model,
+    messages: &[Message],
+    system: &str,
+    tools: &Value,
+    opts: &RequestOptions,
+    cache_key: Option<&CacheKey>,
+) -> Value {
+    let mut body = super::responses::build_body(model, messages, system, tools);
+    if supports_explicit_cache(&model.id) && !oauth {
+        super::responses::apply_system_breakpoint(&mut body);
+    }
+    super::responses::apply_responses_reasoning(&mut body, &opts.thinking, model);
+    apply_prompt_cache_key(&mut body, cache_key);
+    apply_fast_mode(&mut body, model, opts);
+    body
 }
 
 /// Only the Codex backend reads the affinity header; an API-key request to
@@ -566,45 +603,56 @@ impl Provider for OpenAi {
         cache_key: Option<&'a CacheKey>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
-            let mut buf = String::new();
-            let system = super::super::with_prefix(&self.system_prefix, system, &mut buf);
-
-            if is_codex_model(&model.id) {
-                let body = self.responses_body(model, messages, system, tools, &opts, cache_key);
-                let stream_timeout = self.compat.stream_timeout();
-                return self
-                    .with_oauth_stream_retry(true, event_tx, |codex_auth, attempt_tx| {
-                        let body = body.clone();
-                        let codex_auth = with_codex_affinity(codex_auth, cache_key);
-                        async move {
-                            super::responses::do_stream(
-                                self.compat.client(),
-                                model,
-                                &body,
-                                &attempt_tx,
-                                &codex_auth,
-                                stream_timeout,
-                            )
-                            .await
-                        }
-                    })
-                    .await;
-            }
-
-            let mut body = self.compat.build_body(model, messages, system, tools);
-            opts.thinking.apply_reasoning_effort(&mut body, model);
-            apply_prompt_cache_key(&mut body, cache_key);
-            apply_fast_mode(&mut body, model, &opts);
-            self.with_oauth_stream_retry(false, event_tx, |auth, attempt_tx| {
-                let body = body.clone();
+            let codex = is_codex_model(&model.id);
+            let stream_timeout = self.compat.stream_timeout();
+            self.with_oauth_stream_retry(codex, event_tx, |auth, oauth, attempt_tx| {
+                let wire = self.request(
+                    oauth, &auth, model, messages, system, tools, &opts, cache_key,
+                );
                 async move {
-                    self.compat
-                        .do_stream(model, &[], &body, &attempt_tx, &auth)
-                        .await
+                    let wire = wire?;
+                    if !codex {
+                        return self
+                            .compat
+                            .do_stream(model, &[], &wire, &attempt_tx, &auth)
+                            .await;
+                    }
+                    super::responses::do_stream(
+                        self.compat.client(),
+                        model,
+                        &wire,
+                        &attempt_tx,
+                        &with_codex_affinity(auth, cache_key),
+                        stream_timeout,
+                    )
+                    .await
                 }
             })
             .await
         })
+    }
+
+    fn wire_request(
+        &self,
+        model: &Model,
+        messages: &[Message],
+        system: &str,
+        tools: &Value,
+        opts: &RequestOptions,
+        cache_key: Option<&CacheKey>,
+    ) -> Result<WireRequest, AgentError> {
+        let snapshot = self.auth_snapshot();
+        let auth = self.request_auth(&snapshot, is_codex_model(&model.id));
+        self.request(
+            snapshot.oauth_tokens.is_some(),
+            &auth,
+            model,
+            messages,
+            system,
+            tools,
+            opts,
+            cache_key,
+        )
     }
 
     fn reasoning_transport(&self, model: &Model) -> crate::ReasoningTransport {
@@ -714,9 +762,12 @@ mod tests {
 
     use test_case::test_case;
 
-    use super::super::responses;
+    use super::super::responses::{self, RESPONSES_PATH};
     use super::*;
     use crate::ThinkingConfig;
+    use crate::providers::Timeouts;
+    use crate::providers::openai_compat::CHAT_COMPLETIONS_PATH;
+    use crate::providers::test_support::CREDENTIAL_IN_URL;
 
     const TEST_ACCESS: &str = "test-access";
     const TEST_REFRESH: &str = "test-refresh";
@@ -724,6 +775,9 @@ mod tests {
     const TEST_AUTH_ERROR: &str = "expired";
     const CACHE_KEY: &str = "session/task";
     const SYSTEM_PROMPT: &str = "You are a careful engineer.";
+    const TEST_BASE_URL: &str = "https://api.openai.test/v1";
+    const CODEX_MODEL: &str = "openai/gpt-5.3-codex";
+    const CHAT_MODEL: &str = "openai/gpt-4.1";
     const MISSING_PLAN_MODEL: &str =
         "a model named in PLAN_MODELS must reach the coding-plan listing";
     const UNENTITLED_PLAN_MODEL: &str =
@@ -800,29 +854,63 @@ mod tests {
         oauth: bool,
         marked: bool,
     ) {
+        let provider = provider_with_login(oauth);
+        let model = Model::from_spec(spec).unwrap();
+
+        let wire = provider
+            .wire_request(
+                &model,
+                &[],
+                SYSTEM_PROMPT,
+                &Value::Null,
+                &RequestOptions::default(),
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(
+            wire.body.get(responses::INSTRUCTIONS_FIELD).is_none(),
+            marked
+        );
+        assert_eq!(
+            wire.body["input"][0]["content"][0][responses::CACHE_BREAKPOINT_FIELD].is_object(),
+            marked
+        );
+    }
+
+    fn provider_with_login(oauth: bool) -> OpenAi {
         let provider = OpenAi::with_auth(
-            Arc::new(Mutex::new(ResolvedAuth::bearer(TEST_ACCESS))),
-            crate::providers::Timeouts::default(),
+            Arc::new(Mutex::new(ResolvedAuth {
+                base_url: Some(TEST_BASE_URL.into()),
+                ..ResolvedAuth::bearer(TEST_ACCESS)
+            })),
+            Timeouts::default(),
         );
         if oauth {
             provider.auth_state.lock().unwrap().oauth_tokens = Some(oauth_tokens());
         }
-        let model = Model::from_spec(spec).unwrap();
+        provider
+    }
 
-        let body = provider.responses_body(
-            &model,
-            &[],
-            SYSTEM_PROMPT,
-            &Value::Null,
-            &RequestOptions::default(),
-            None,
-        );
+    /// A login runs Codex models on the Codex backend, a key runs them on the
+    /// platform, and everything else speaks Chat Completions.
+    #[test_case(CODEX_MODEL, false, TEST_BASE_URL, RESPONSES_PATH ; "a_key_posts_codex_models_to_the_platform")]
+    #[test_case(CODEX_MODEL, true, auth::CODING_PLAN_BASE_URL, RESPONSES_PATH ; "a_login_posts_codex_models_to_the_codex_backend")]
+    #[test_case(CHAT_MODEL, false, TEST_BASE_URL, CHAT_COMPLETIONS_PATH ; "other_models_post_chat_completions")]
+    fn wire_request_posts_where_the_send_does(spec: &str, oauth: bool, base: &str, path: &str) {
+        let wire = provider_with_login(oauth)
+            .wire_request(
+                &Model::from_spec(spec).unwrap(),
+                &[],
+                SYSTEM_PROMPT,
+                &Value::Null,
+                &RequestOptions::default(),
+                None,
+            )
+            .unwrap();
 
-        assert_eq!(body.get(responses::INSTRUCTIONS_FIELD).is_none(), marked);
-        assert_eq!(
-            body["input"][0]["content"][0][responses::CACHE_BREAKPOINT_FIELD].is_object(),
-            marked
-        );
+        assert_eq!(wire.url, format!("{base}{path}"));
+        assert!(!wire.url.contains(TEST_ACCESS), "{CREDENTIAL_IN_URL}");
     }
 
     #[test_case("gpt-6-astra", Some(372_000))]
@@ -886,7 +974,7 @@ mod tests {
     fn coding_plan_context_window_is_restored_after_oauth() {
         let provider = OpenAi::with_auth(
             Arc::new(Mutex::new(ResolvedAuth::bearer(TEST_ACCESS))),
-            crate::providers::Timeouts::default(),
+            Timeouts::default(),
         );
         let mut model = Model::from_spec("openai/gpt-5.6-sol").unwrap();
         let baseline_context_window = model.context_window;
@@ -915,7 +1003,7 @@ mod tests {
     fn replacement_auth_remains_visible_to_all_waiters() {
         let provider = OpenAi::with_auth(
             Arc::new(Mutex::new(ResolvedAuth::bearer(TEST_ACCESS))),
-            crate::providers::Timeouts::default(),
+            Timeouts::default(),
         );
         provider.mark_auth_rejected(Some(TEST_ACCESS.into()));
         assert!(!provider.auth_replacement_available(&provider.auth_snapshot()));
@@ -975,7 +1063,7 @@ mod tests {
         smol::block_on(async {
             let provider = OpenAi::with_auth(
                 Arc::new(Mutex::new(ResolvedAuth::bearer(TEST_ACCESS))),
-                crate::providers::Timeouts::default(),
+                Timeouts::default(),
             );
             provider.auth_state.lock().unwrap().oauth_tokens = Some(OAuthTokens {
                 access: TEST_ACCESS.into(),
@@ -987,7 +1075,7 @@ mod tests {
             let (event_tx, event_rx) = flume::unbounded();
 
             let error = provider
-                .with_oauth_stream_retry(false, &event_tx, |_, attempt_tx| {
+                .with_oauth_stream_retry(false, &event_tx, |_, _, attempt_tx| {
                     calls.fetch_add(1, Ordering::SeqCst);
                     async move {
                         attempt_tx

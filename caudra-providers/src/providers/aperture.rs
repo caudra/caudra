@@ -9,7 +9,7 @@ use tracing::warn;
 
 use crate::manifest::{ManifestRegistry, ProviderManifest};
 use crate::model::{Model, ModelEntry, ModelInfo, ModelPricing, ThinkingSupport, lookup_entry};
-use crate::provider::{BoxFuture, Provider, ProviderKind};
+use crate::provider::{BoxFuture, Provider, ProviderKind, WireRequest};
 use crate::providers::anthropic::shared::declares_input_budget;
 use crate::{AgentError, CacheKey, Message, ProviderEvent, RequestOptions, StreamResponse};
 
@@ -309,6 +309,53 @@ impl Aperture {
         self.system_prefix = prefix.filter(|s| !s.is_empty());
         self
     }
+
+    fn route(&self, model: &Model) -> Route {
+        let (provider_id, model_id) = model.id.split_once('/').unwrap_or(("", &model.id));
+        let ov = merged_override(&self.overrides, provider_id, model_id);
+        let kind = routed_kind(provider_id, &ov);
+        let auth = routed_auth(&self.auth, &path_prefix(kind, &ov));
+        match kind {
+            Some(kind) => Route::Native {
+                provider: build_routed_provider(
+                    kind,
+                    auth,
+                    self.timeouts,
+                    self.system_prefix.clone(),
+                ),
+                model: native_route_model(model, kind, model_id),
+            },
+            None => Route::Gateway(auth.lock().unwrap().clone()),
+        }
+    }
+
+    /// What a turn the gateway answers itself posts, for the send and the dry
+    /// run alike.
+    fn gateway_request(
+        &self,
+        auth: &ResolvedAuth,
+        model: &Model,
+        messages: &[Message],
+        system: &str,
+        tools: &Value,
+    ) -> WireRequest {
+        let mut buf = String::new();
+        let system = super::with_prefix(&self.system_prefix, system, &mut buf);
+        WireRequest::post(
+            self.compat.chat_url(auth),
+            self.compat.build_body(model, messages, system, tools),
+        )
+    }
+}
+
+/// Where a turn goes: the native provider its vendor routes to, with the model
+/// that provider expects, or the gateway's own Chat Completions.
+enum Route {
+    Native {
+        provider: Box<dyn Provider>,
+        model: Model,
+    },
+    Gateway(ResolvedAuth),
 }
 
 fn resolve_base_url() -> Result<String, AgentError> {
@@ -425,34 +472,49 @@ impl Provider for Aperture {
         cache_key: Option<&'a CacheKey>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
-            let (provider_id, model_id) = model.id.split_once('/').unwrap_or(("", &model.id));
-            let ov = merged_override(&self.overrides, provider_id, model_id);
-            let kind = routed_kind(provider_id, &ov);
-            let auth = routed_auth(&self.auth, &path_prefix(kind, &ov));
-            if let Some(kind) = kind {
-                let provider =
-                    build_routed_provider(kind, auth, self.timeouts, self.system_prefix.clone());
-                let request_model = native_route_model(model, kind, model_id);
-                return provider
-                    .stream_message(
-                        &request_model,
-                        messages,
-                        system,
-                        tools,
-                        event_tx,
-                        opts,
-                        cache_key,
-                    )
-                    .await;
+            match self.route(model) {
+                Route::Native {
+                    provider,
+                    model: routed_model,
+                } => {
+                    provider
+                        .stream_message(
+                            &routed_model,
+                            messages,
+                            system,
+                            tools,
+                            event_tx,
+                            opts,
+                            cache_key,
+                        )
+                        .await
+                }
+                Route::Gateway(auth) => {
+                    let wire = self.gateway_request(&auth, model, messages, system, tools);
+                    self.compat
+                        .do_stream(model, &[], &wire, event_tx, &auth)
+                        .await
+                }
             }
-            let auth = auth.lock().unwrap().clone();
-            let mut buf = String::new();
-            let system = super::with_prefix(&self.system_prefix, system, &mut buf);
-            let body = self.compat.build_body(model, messages, system, tools);
-            self.compat
-                .do_stream(model, &[], &body, event_tx, &auth)
-                .await
         })
+    }
+
+    fn wire_request(
+        &self,
+        model: &Model,
+        messages: &[Message],
+        system: &str,
+        tools: &Value,
+        opts: &RequestOptions,
+        cache_key: Option<&CacheKey>,
+    ) -> Result<WireRequest, AgentError> {
+        match self.route(model) {
+            Route::Native {
+                provider,
+                model: routed_model,
+            } => provider.wire_request(&routed_model, messages, system, tools, opts, cache_key),
+            Route::Gateway(auth) => Ok(self.gateway_request(&auth, model, messages, system, tools)),
+        }
     }
 
     fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
@@ -488,26 +550,17 @@ impl Provider for Aperture {
     }
 
     fn reasoning_transport(&self, model: &Model) -> crate::ReasoningTransport {
-        let Some((provider_id, model_id)) = model.id.split_once('/') else {
-            return crate::ReasoningTransport::Other;
-        };
-        let ov = merged_override(&self.overrides, provider_id, model_id);
-        let Some(kind) = routed_kind(provider_id, &ov) else {
-            return crate::ReasoningTransport::Other;
-        };
-        let provider = build_routed_provider(
-            kind,
-            routed_auth(&self.auth, &path_prefix(Some(kind), &ov)),
-            self.timeouts,
-            self.system_prefix.clone(),
-        );
-        provider.reasoning_transport(&native_route_model(model, kind, model_id))
+        match self.route(model) {
+            Route::Native { provider, model } => provider.reasoning_transport(&model),
+            Route::Gateway(_) => crate::ReasoningTransport::Other,
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ReasoningTransport;
     use crate::model::ModelFamily;
     use serde_json::json;
     use test_case::test_case;
@@ -592,6 +645,45 @@ mod tests {
             base_url: Some("https://aperture.example.com".into()),
             headers: Vec::new(),
         }))
+    }
+
+    /// Routes the opaque `gemini` vendor onto the native Google provider.
+    fn remapping_aperture() -> Aperture {
+        let overrides = Overrides::from([(
+            "gemini".into(),
+            ProviderOverride {
+                default: base_override("google"),
+                models: HashMap::new(),
+            },
+        )]);
+        Aperture::with_auth_and_overrides(test_auth(), Timeouts::default(), overrides)
+    }
+
+    /// The dry run takes the route the send takes: the gateway's own Chat
+    /// Completions for a vendor nothing routes, the native provider otherwise.
+    #[test_case("aperture/ikora-openai/some-model", "https://aperture.example.com/v1/chat/completions" ; "unrouted_vendor_posts_to_the_gateway")]
+    #[test_case("aperture/gemini/gemini-pro-latest", "https://aperture.example.com/v1beta/models/gemini-pro-latest:streamGenerateContent?alt=sse" ; "remapped_vendor_posts_through_its_native_provider")]
+    fn wire_request_follows_the_send_route(spec: &str, expected_url: &str) {
+        let wire = remapping_aperture()
+            .wire_request(
+                &Model::from_spec(spec).unwrap(),
+                &[],
+                "",
+                &Value::Null,
+                &RequestOptions::default(),
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(wire.url, expected_url);
+    }
+
+    #[test_case("aperture/ikora-openai/some-model", ReasoningTransport::Other ; "the_gateway_reasons_generically")]
+    #[test_case("aperture/gemini/gemini-pro-latest", ReasoningTransport::GeminiGenerateContent ; "a_remapped_vendor_reasons_natively")]
+    fn reasoning_transport_follows_the_send_route(spec: &str, expected: ReasoningTransport) {
+        let model = Model::from_spec(spec).unwrap();
+
+        assert_eq!(remapping_aperture().reasoning_transport(&model), expected);
     }
 
     #[test_case(Some(ProviderKind::Ollama), Some("https://aperture.example.com/v1") ; "ollama_appends_v1")]

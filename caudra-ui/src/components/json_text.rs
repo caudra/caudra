@@ -8,6 +8,26 @@ use std::ops::Range;
 const JSON_TOKEN: &str = "json";
 const MAX_LINE_BYTES: usize = 16 * 1024;
 
+/// How a line's scalars are coloured.
+#[derive(Clone, Copy)]
+enum Scalars {
+    /// By the JSON grammar, which tells more kinds apart at a cost on every
+    /// token.
+    Highlighted,
+    /// By the theme alone, which costs no more than finding the token.
+    Themed,
+}
+
+impl Scalars {
+    /// `token` painted, in `themed` when the theme alone decides.
+    fn paint(self, token: &str, themed: Style) -> Vec<Span<'static>> {
+        match self {
+            Self::Highlighted => scalar_spans(token),
+            Self::Themed => vec![Span::styled(token.to_owned(), themed)],
+        }
+    }
+}
+
 pub(crate) fn scalar_spans(value: &str) -> Vec<Span<'static>> {
     if value.contains(['\t', '\n']) {
         return vec![Span::styled(value.to_owned(), theme::current().code_block)];
@@ -21,7 +41,15 @@ pub(crate) fn scalar_spans(value: &str) -> Vec<Span<'static>> {
 }
 
 pub(crate) fn line(value: &str) -> Line<'static> {
-    line_with_budget(value, MAX_LINE_BYTES)
+    line_with_budget(value, MAX_LINE_BYTES, Scalars::Highlighted)
+}
+
+/// A line of JSON coloured by the theme alone: keys in the accent, strings as
+/// inline code, and numbers and literals as the numeric constants math takes
+/// its colour from. No grammar runs per token and no budget cuts the line, so
+/// a document of any size paints in one linear pass.
+pub(crate) fn themed_line(value: &str) -> Line<'static> {
+    line_with_budget(value, usize::MAX, Scalars::Themed)
 }
 
 pub(crate) fn overlays(value: &str) -> Vec<(Range<usize>, Style)> {
@@ -39,7 +67,7 @@ pub(crate) fn overlays(value: &str) -> Vec<(Range<usize>, Style)> {
         .collect()
 }
 
-fn line_with_budget(value: &str, budget: usize) -> Line<'static> {
+fn line_with_budget(value: &str, budget: usize, scalars: Scalars) -> Line<'static> {
     let end = value.floor_char_boundary(budget.min(value.len()));
     let input = &value[..end];
     let bytes = input.as_bytes();
@@ -76,7 +104,7 @@ fn line_with_budget(value: &str, budget: usize) -> Line<'static> {
                 if input[index..].trim_start().starts_with(':') {
                     vec![Span::styled(token.to_owned(), theme.accent)]
                 } else {
-                    scalar_spans(token)
+                    scalars.paint(token, theme.inline_code)
                 }
             }
             b'{' | b'}' | b'[' | b']' | b':' | b',' => {
@@ -92,7 +120,7 @@ fn line_with_budget(value: &str, budget: usize) -> Line<'static> {
                 }
                 let token = &input[start..index];
                 if serde_json::from_str::<IgnoredAny>(token).is_ok() {
-                    scalar_spans(token)
+                    scalars.paint(token, theme.math)
                 } else {
                     json = false;
                     continue;
@@ -118,12 +146,16 @@ fn line_with_budget(value: &str, budget: usize) -> Line<'static> {
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_LINE_BYTES, line, overlays, scalar_spans};
-    use crate::{highlight::refresh_syntax_theme, theme};
+    use super::{MAX_LINE_BYTES, line, overlays, scalar_spans, themed_line};
+    use crate::highlight::refresh_syntax_theme;
+    use crate::theme::{self, Theme};
     use ratatui::style::Style;
     use test_case::test_case;
 
     const MIXED: &str = "Immutable roots:\n{\n  \"name\": \"value\",\n  \"count\": 7,\n  \"ready\": true\n}\nNo automatic rollback.";
+    /// A key, a string, a number and a literal on one row.
+    const THEMED_ROW: &str = "  \"name\": \"value\", \"count\": 7, \"ready\": true";
+    const NOT_THEMED: &str = "a themed line must take every colour from the theme";
 
     #[test_case(MIXED; "mixed_document")]
     #[test_case("{\"draft\": \"literal\ttab\"}"; "invalid_draft_tab_keeps_editor_coordinates")]
@@ -131,13 +163,46 @@ mod tests {
     #[test_case("{\n  \"unfinished\": \"draft"; "incomplete_draft")]
     #[test_case("\n\n"; "blank_lines")]
     fn highlighting_preserves_text(value: &str) {
+        for paint in [line, themed_line] {
+            assert_eq!(
+                value
+                    .split('\n')
+                    .map(|value| paint(value).to_string())
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                value
+            );
+        }
+    }
+
+    #[test_case("\"name\"",  |theme| theme.accent      ; "key")]
+    #[test_case("\"value\"", |theme| theme.inline_code ; "string")]
+    #[test_case("7",         |theme| theme.math        ; "number")]
+    #[test_case("true",      |theme| theme.math        ; "literal")]
+    fn themed_lines_take_their_colours_from_the_theme(token: &str, style: fn(&Theme) -> Style) {
+        let painted = themed_line(THEMED_ROW);
+        let span = painted
+            .spans
+            .iter()
+            .find(|span| span.content == token)
+            .expect(NOT_THEMED);
+
+        assert_eq!(span.style, style(&theme::current()), "{NOT_THEMED}");
+    }
+
+    /// The highlighted line leaves what runs past its budget plain; a themed
+    /// one has no budget to run past.
+    #[test]
+    fn themed_lines_colour_a_string_past_the_highlighting_budget() {
+        let value = format!("\"{}\"", "a".repeat(MAX_LINE_BYTES));
+
+        let painted = themed_line(&value);
+
+        assert_eq!(painted.spans.len(), 1, "{NOT_THEMED}");
         assert_eq!(
-            value
-                .split('\n')
-                .map(|value| line(value).to_string())
-                .collect::<Vec<_>>()
-                .join("\n"),
-            value
+            painted.spans[0].style,
+            theme::current().inline_code,
+            "{NOT_THEMED}"
         );
     }
 

@@ -11,7 +11,7 @@ use std::ops::Range;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 
-use caudra_highlight::CodeHighlighter;
+use caudra_highlight::{CodeHighlighter, StyledSegment};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::{
@@ -61,6 +61,21 @@ pub enum StyleToken {
     /// Box-drawing and connector cells of a rendered diagram. Node and edge
     /// labels inside one stay `Text` so they read as prose.
     Diagram,
+    /// Markup that rendering consumes but [`crate::source::source_lines`]
+    /// keeps in place: emphasis delimiters, backticks, code fences, and
+    /// link brackets and destinations.
+    Syntax,
+}
+
+impl From<&StyledSegment> for StyleToken {
+    fn from(segment: &StyledSegment) -> Self {
+        Self::Highlight {
+            fg: segment.fg,
+            bold: segment.bold,
+            italic: segment.italic,
+            underline: segment.underline,
+        }
+    }
 }
 
 /// How LaTeX is presented. Terminals cannot typeset maths, so the choice is
@@ -524,7 +539,7 @@ fn merge_sources(a: &SpanSource, b: &SpanSource) -> Option<SpanSource> {
     }
 }
 
-fn coalesce_adjacent_spans(spans: &mut Vec<Span>) {
+pub(crate) fn coalesce_adjacent_spans(spans: &mut Vec<Span>) {
     if spans.len() < 2 {
         return;
     }
@@ -605,17 +620,8 @@ fn render_block(
                         false => Source::atomic(at..at + src_len),
                     };
                     col += len;
-                    spans.push(Span::sourced(
-                        seg.text,
-                        StyleToken::Highlight {
-                            fg: seg.fg,
-                            bold: seg.bold,
-                            italic: seg.italic,
-                            underline: seg.underline,
-                        },
-                        Emphasis::default(),
-                        source,
-                    ));
+                    let style = StyleToken::from(&seg);
+                    spans.push(Span::sourced(seg.text, style, Emphasis::default(), source));
                 }
                 coalesce_adjacent_spans(&mut spans);
                 let from = if i == 0 { source.start } else { at };

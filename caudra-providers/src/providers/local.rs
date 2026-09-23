@@ -9,8 +9,10 @@ use tracing::warn;
 use caudra_config::providers::Protocol;
 
 use crate::model::Model;
-use crate::provider::{BoxFuture, Provider};
-use crate::{AgentError, CacheKey, Message, ProviderEvent, RequestOptions, StreamResponse};
+use crate::provider::{BoxFuture, Provider, WireRequest};
+use crate::{
+    AgentError, CacheKey, Message, ProviderEvent, RequestOptions, StreamResponse, ThinkingConfig,
+};
 
 use super::openai::responses;
 use super::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
@@ -123,6 +125,33 @@ impl LocalEndpoint {
             protocol,
         })
     }
+
+    /// What one turn posts with `auth`, for the send and the dry run alike.
+    fn request(
+        &self,
+        auth: &ResolvedAuth,
+        model: &Model,
+        messages: &[Message],
+        system: &str,
+        tools: &Value,
+        thinking: &ThinkingConfig,
+    ) -> Result<WireRequest, AgentError> {
+        let mut buf = String::new();
+        let system = super::with_prefix(&self.system_prefix, system, &mut buf);
+
+        if matches!(self.protocol, Some(Protocol::OpenaiResponses)) {
+            let mut body = responses::build_body(model, messages, system, tools);
+            body["return_progress"] = Value::Bool(true);
+            // TODO: wire thinking budget into responses API when llama.cpp supports it
+            return Ok(WireRequest::post(responses::responses_url(auth)?, body));
+        }
+
+        let mut body = self.compat.build_body(model, messages, system, tools);
+        if self.thinking_budget_field {
+            thinking.apply_local_thinking(&mut body, model);
+        }
+        Ok(WireRequest::post(self.compat.chat_url(auth), body))
+    }
 }
 
 impl Provider for LocalEndpoint {
@@ -138,17 +167,13 @@ impl Provider for LocalEndpoint {
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
             let auth = self.auth.lock().unwrap().clone();
+            let wire = self.request(&auth, model, messages, system, tools, &opts.thinking)?;
 
             if matches!(self.protocol, Some(Protocol::OpenaiResponses)) {
-                let mut buf = String::new();
-                let system = super::with_prefix(&self.system_prefix, system, &mut buf);
-                let mut body = responses::build_body(model, messages, system, tools);
-                body["return_progress"] = serde_json::Value::Bool(true);
-                // TODO: wire thinking budget into responses API when llama.cpp supports it
                 return responses::do_stream(
                     self.compat.client(),
                     model,
-                    &body,
+                    &wire,
                     event_tx,
                     &auth,
                     self.compat.stream_timeout(),
@@ -156,18 +181,23 @@ impl Provider for LocalEndpoint {
                 .await;
             }
 
-            let mut buf = String::new();
-            let system = super::with_prefix(&self.system_prefix, system, &mut buf);
-            let mut body = self.compat.build_body(model, messages, system, tools);
-
-            if self.thinking_budget_field {
-                opts.thinking.apply_local_thinking(&mut body, model);
-            }
-
             self.compat
-                .do_stream(model, &[], &body, event_tx, &auth)
+                .do_stream(model, &[], &wire, event_tx, &auth)
                 .await
         })
+    }
+
+    fn wire_request(
+        &self,
+        model: &Model,
+        messages: &[Message],
+        system: &str,
+        tools: &Value,
+        opts: &RequestOptions,
+        _cache_key: Option<&CacheKey>,
+    ) -> Result<WireRequest, AgentError> {
+        let auth = self.auth.lock().unwrap().clone();
+        self.request(&auth, model, messages, system, tools, &opts.thinking)
     }
 
     fn list_models(&self) -> BoxFuture<'_, Result<Vec<crate::model::ModelInfo>, AgentError>> {
@@ -582,12 +612,48 @@ pub(crate) const LLAMACPP: LocalEndpointConfig = LocalEndpointConfig {
 
 #[cfg(test)]
 mod tests {
+    use test_case::test_case;
+
     use super::*;
+    use crate::providers::openai::responses::RESPONSES_PATH;
+    use crate::providers::openai_compat::CHAT_COMPLETIONS_PATH;
+    use crate::providers::test_support::CREDENTIAL_IN_URL;
 
     const TEST_TIMEOUTS: super::super::Timeouts = super::super::Timeouts {
         connect: std::time::Duration::from_secs(10),
         stream: std::time::Duration::from_secs(300),
     };
+    const TEST_HOST: &str = "http://local:1234";
+    const TEST_BASE_URL: &str = "http://local:1234/v1";
+    const TEST_API_KEY: &str = "local-api-key";
+
+    #[test_case(None, CHAT_COMPLETIONS_PATH ; "chat_completions_by_default")]
+    #[test_case(Some(Protocol::OpenaiResponses), RESPONSES_PATH ; "responses_when_declared")]
+    fn wire_request_posts_where_the_send_does(protocol: Option<Protocol>, path: &str) {
+        let endpoint = LocalEndpoint::build(
+            &LLAMACPP,
+            TEST_TIMEOUTS,
+            Some(KeyPool::from_keys(vec![TEST_API_KEY.into()])),
+            Some(TEST_HOST.into()),
+            protocol,
+        )
+        .unwrap();
+        let model = Model::from_spec(LLAMACPP.default_model).unwrap();
+
+        let wire = endpoint
+            .wire_request(
+                &model,
+                &[],
+                "",
+                &Value::Null,
+                &RequestOptions::default(),
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(wire.url, format!("{TEST_BASE_URL}{path}"));
+        assert!(!wire.url.contains(TEST_API_KEY), "{CREDENTIAL_IN_URL}");
+    }
 
     #[test]
     fn from_env_without_host_or_api_key_errors() {

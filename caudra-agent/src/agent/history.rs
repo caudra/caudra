@@ -596,7 +596,7 @@ pub fn is_run_failure_marker(text: &str) -> bool {
     text.starts_with(RUN_FAILED_PREFIX) && text.ends_with(RUN_FAILED_SUFFIX)
 }
 
-pub fn close_dangling_tool_calls(messages: &mut Vec<Message>, note: &str) {
+fn close_dangling_tool_calls(messages: &mut Vec<Message>, note: &str) {
     let Some(last) = messages.last() else { return };
     if !matches!(last.role, Role::Assistant) || !last.has_tool_calls() {
         return;

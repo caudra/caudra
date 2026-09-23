@@ -1863,6 +1863,15 @@ impl WrappedRows {
         self.starts()[line.min(self.per_line.len())]
     }
 
+    /// [`Self::row_of`] for many lines, counting the rows once for them all.
+    pub(crate) fn rows_of(&self, lines: &[usize]) -> Vec<usize> {
+        let starts = self.starts();
+        lines
+            .iter()
+            .map(|&line| starts[line.min(self.per_line.len())])
+            .collect()
+    }
+
     pub(crate) fn lines(&self) -> Vec<Line<'static>> {
         self.per_line
             .iter()
@@ -6848,5 +6857,18 @@ mod tests {
             "{SOURCE_IS_PARALLEL}"
         );
         assert!(source.text.contains(LONG), "{COPY_IS_WIDTH_BLIND}");
+    }
+
+    /// One word to a row at [`ROWS_OF_WIDTH`]: the lines take three rows, one
+    /// and two.
+    const ROWS_OF_LINES: [&str; 3] = ["alpha bravo charlie", "delta", "echo foxtrot"];
+    const ROWS_OF_WIDTH: u16 = 8;
+
+    #[test]
+    fn lines_map_onto_the_rows_they_start_on_and_past_the_end_onto_the_total() {
+        let lines = ROWS_OF_LINES.into_iter().map(Line::from).collect();
+        let wrapped = WrappedRows::new(lines, 0, ROWS_OF_WIDTH);
+
+        assert_eq!(wrapped.rows_of(&[0, 1, 2, 3, 9]), [0, 3, 4, 6, 6]);
     }
 }

@@ -10,7 +10,7 @@ use serde_json::{Value, json};
 use tracing::warn;
 
 use crate::model::{Model, ModelEntry, ModelFamily, ModelPricing, StaticReasoningOption};
-use crate::provider::{BoxFuture, Provider};
+use crate::provider::{BoxFuture, Provider, WireRequest};
 use crate::{
     AgentError, CacheKey, ContentBlock, Message, ProviderEvent, RequestOptions, Role, StopReason,
     StreamResponse, ThinkingConfig, TokenUsage,
@@ -170,13 +170,8 @@ impl Google {
             .unwrap_or_default()
     }
 
-    fn stream_url(&self, model_id: &str) -> String {
-        let base = {
-            let auth = self.auth.lock().unwrap();
-            auth.base_url.as_deref().unwrap_or(BASE_URL).to_string()
-        };
-        let encoded = super::urlenc(model_id);
-        format!("{base}/models/{encoded}:streamGenerateContent?alt=sse")
+    fn current_auth(&self) -> ResolvedAuth {
+        self.auth.lock().unwrap().clone()
     }
 
     fn models_url(&self) -> String {
@@ -188,13 +183,32 @@ impl Google {
         format!("{base}/models?key={key}&pageSize=1000")
     }
 
+    /// What one turn posts with `auth`, for the send and the dry run alike.
+    /// The key rides in `x-goog-api-key`, so the URL never carries it.
+    fn request(
+        &self,
+        auth: &ResolvedAuth,
+        model: &Model,
+        messages: &[Message],
+        system: &str,
+        tools: &Value,
+        thinking: &ThinkingConfig,
+    ) -> WireRequest {
+        let base = auth.base_url.as_deref().unwrap_or(BASE_URL);
+        let encoded = super::urlenc(&model.id);
+        WireRequest::post(
+            format!("{base}/models/{encoded}:streamGenerateContent?alt=sse"),
+            self.build_body(model, messages, system, tools, thinking),
+        )
+    }
+
     fn build_body(
         &self,
         model: &Model,
         messages: &[Message],
         system: &str,
         tools: &Value,
-        thinking: ThinkingConfig,
+        thinking: &ThinkingConfig,
     ) -> Value {
         let mut body = json!({
             "contents": convert_messages(messages),
@@ -227,14 +241,18 @@ impl Google {
         event_tx: &Sender<ProviderEvent>,
         thinking: ThinkingConfig,
     ) -> Result<StreamResponse, AgentError> {
-        let body = self.build_body(model, messages, system, tools, thinking);
-        let url = self.stream_url(&model.id);
-        let json_body = serde_json::to_vec(&body)?;
-
+        let wire = self.request(
+            &self.current_auth(),
+            model,
+            messages,
+            system,
+            tools,
+            &thinking,
+        );
         let request = self
-            .build_request("POST", &url)
+            .build_request(wire.method, &wire.url)
             .header("content-type", "application/json")
-            .body(json_body)?;
+            .body(serde_json::to_vec(&wire.body)?)?;
 
         let response = self.client.send_async(request).await?;
         let status = response.status().as_u16();
@@ -259,6 +277,25 @@ impl Provider for Google {
         _cache_key: Option<&'a CacheKey>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(self.do_stream(model, messages, system, tools, event_tx, opts.thinking))
+    }
+
+    fn wire_request(
+        &self,
+        model: &Model,
+        messages: &[Message],
+        system: &str,
+        tools: &Value,
+        opts: &RequestOptions,
+        _cache_key: Option<&CacheKey>,
+    ) -> Result<WireRequest, AgentError> {
+        Ok(self.request(
+            &self.current_auth(),
+            model,
+            messages,
+            system,
+            tools,
+            &opts.thinking,
+        ))
     }
 
     fn list_models(&self) -> BoxFuture<'_, Result<Vec<crate::model::ModelInfo>, AgentError>> {
@@ -699,6 +736,7 @@ async fn parse_sse(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::providers::test_support::CREDENTIAL_IN_URL;
     use crate::{ReasoningOptions, SteeringKind};
     use std::sync::Arc;
     use test_case::test_case;
@@ -780,18 +818,30 @@ mod tests {
         }
     }
 
+    fn dry_run(messages: &[Message], system: &str, thinking: ThinkingConfig) -> WireRequest {
+        Google::with_auth(test_auth(), test_timeouts())
+            .wire_request(
+                &test_model(),
+                messages,
+                system,
+                &json!([]),
+                &RequestOptions {
+                    thinking,
+                    ..RequestOptions::default()
+                },
+                None,
+            )
+            .unwrap()
+    }
+
     #[test]
     fn google_build_body_basic() {
-        let google = Google::with_auth(test_auth(), test_timeouts());
-        let model = test_model();
-        let messages = vec![Message::user("hello".into())];
-        let body = google.build_body(
-            &model,
-            &messages,
+        let body = dry_run(
+            &[Message::user("hello".into())],
             "be helpful",
-            &json!([]),
             ThinkingConfig::Off,
-        );
+        )
+        .body;
 
         assert_eq!(body["contents"][0]["role"], "user");
         assert_eq!(body["systemInstruction"]["parts"][0]["text"], "be helpful");
@@ -801,15 +851,12 @@ mod tests {
 
     #[test]
     fn google_build_body_thinking_adaptive() {
-        let google = Google::with_auth(test_auth(), test_timeouts());
-        let messages = vec![Message::user("think".into())];
-        let body = google.build_body(
-            &test_model(),
-            &messages,
+        let body = dry_run(
+            &[Message::user("think".into())],
             "",
-            &json!([]),
             ThinkingConfig::Adaptive,
-        );
+        )
+        .body;
 
         assert_eq!(
             body["generationConfig"]["thinkingConfig"]["includeThoughts"],
@@ -819,21 +866,26 @@ mod tests {
 
     #[test]
     fn google_build_body_thinking_budget() {
-        let google = Google::with_auth(test_auth(), test_timeouts());
-        let messages = vec![Message::user("think hard".into())];
-        let body = google.build_body(
-            &test_model(),
-            &messages,
+        let body = dry_run(
+            &[Message::user("think hard".into())],
             "",
-            &json!([]),
             ThinkingConfig::Budget(8192),
-        );
+        )
+        .body;
 
         // Clamped to the model's max thinking budget (half of 8192 output tokens).
         assert_eq!(
             body["generationConfig"]["thinkingConfig"]["thinkingBudget"],
             4096
         );
+    }
+
+    #[test]
+    fn wire_request_streams_without_the_key_in_the_url() {
+        let wire = dry_run(&[], "", ThinkingConfig::Off);
+
+        assert!(wire.url.starts_with(BASE_URL));
+        assert!(!wire.url.contains(GEMINI_API_KEY), "{CREDENTIAL_IN_URL}");
     }
 
     #[test_case("STOP", StopReason::EndTurn ; "stop")]

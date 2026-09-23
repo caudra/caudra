@@ -9,14 +9,14 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tracing::{debug, warn};
 
-use super::anthropic::shared;
+use super::anthropic::{self, shared};
 use super::openai::responses;
 use super::openai_compat;
 use crate::model::{
     Billing, Model, ModelEntry, ModelFamily, ModelInfo, ModelPricing, StaticReasoningOption,
     lookup_entry,
 };
-use crate::provider::{BoxFuture, Provider};
+use crate::provider::{BoxFuture, Provider, WireRequest};
 use crate::{
     AgentError, CacheKey, Message, ProviderEvent, ReasoningOption, ReasoningOptions,
     RequestOptions, StreamResponse, ThinkingConfig,
@@ -44,6 +44,9 @@ const CHAT_COMPLETIONS_PATH: &str = "/chat/completions";
 const RESPONSES_PATH: &str = "/responses";
 const MESSAGES_PATH: &str = "/v1/messages";
 const MODELS_PATH: &str = "/models";
+const CONVERSATION_AGENT: &str = "conversation-agent";
+const ENDPOINT_NOT_RESOLVED: &str =
+    "Copilot resolves its API endpoint on the first send; send a message first";
 
 /// OpenAI families Copilot serves over the Responses API. Matched as substrings
 /// so `gpt-6-sol` and `gpt-5.3-codex` both route without naming every release.
@@ -627,12 +630,16 @@ impl Copilot {
         self
     }
 
-    async fn auth(&self) -> Result<CopilotAuth, AgentError> {
+    /// The auth a send would use, without discovering the API endpoint.
+    fn cached_auth(&self) -> Result<Option<CopilotAuth>, AgentError> {
         if let Some(auth) = &self.resolved_auth {
-            return copilot_auth_from_resolved(&auth.lock().unwrap());
+            return copilot_auth_from_resolved(&auth.lock().unwrap()).map(Some);
         }
+        Ok(self.auth.lock().unwrap().clone())
+    }
 
-        if let Some(auth) = self.auth.lock().unwrap().clone() {
+    async fn auth(&self) -> Result<CopilotAuth, AgentError> {
+        if let Some(auth) = self.cached_auth()? {
             return Ok(auth);
         }
 
@@ -661,6 +668,38 @@ impl Copilot {
             .get(model_id)
             .map(CopilotModel::endpoint)
             .unwrap_or_else(|| guess_endpoint(model_id)))
+    }
+
+    /// The endpoint a send would pick, without fetching `/models`: `None`
+    /// until a send or a listing has filled the cache.
+    fn cached_endpoint(&self, model_id: &str) -> Option<Endpoint> {
+        let models = self.models.lock().unwrap();
+        (!models.is_empty()).then(|| {
+            models
+                .get(model_id)
+                .map(CopilotModel::endpoint)
+                .unwrap_or_else(|| guess_endpoint(model_id))
+        })
+    }
+
+    /// What one turn posts to `endpoint`, for the send and the dry run alike.
+    #[allow(clippy::too_many_arguments)]
+    fn request(
+        &self,
+        endpoint: Endpoint,
+        auth: &CopilotAuth,
+        model: &Model,
+        messages: &[Message],
+        system: &str,
+        tools: &Value,
+        thinking: &ThinkingConfig,
+    ) -> WireRequest {
+        let mut prefixed_system = String::new();
+        let system = super::with_prefix(&self.system_prefix, system, &mut prefixed_system);
+        WireRequest::post(
+            format!("{}{}", auth.endpoint, endpoint.path()),
+            endpoint_body(endpoint, model, messages, system, tools, thinking),
+        )
     }
 
     async fn fetch_models(&self) -> Result<Vec<CopilotModel>, AgentError> {
@@ -705,33 +744,13 @@ impl Copilot {
 
     async fn stream_chat_completions(
         &self,
-        model: &Model,
-        messages: &[Message],
-        system: &str,
-        tools: &Value,
+        auth: &CopilotAuth,
+        wire: &WireRequest,
         event_tx: &Sender<ProviderEvent>,
     ) -> Result<StreamResponse, AgentError> {
-        let auth = self.auth().await?;
-        let wire_tools = openai_compat::convert_tools(tools);
-        let mut body = json!({
-            "model": model.id,
-            "messages": openai_compat::convert_messages(messages, system),
-            "n": 1,
-            "stream": true,
-            "temperature": 0.1,
-        });
-        if wire_tools.as_array().is_some_and(|tools| !tools.is_empty()) {
-            body["tools"] = wire_tools;
-        }
-
         let request = self
-            .build_post(
-                &auth,
-                CHAT_COMPLETIONS_PATH,
-                Some("conversation-agent"),
-                &body,
-            )?
-            .body(serde_json::to_vec(&body)?)?;
+            .build_post(auth, wire)?
+            .body(serde_json::to_vec(&wire.body)?)?;
         let response = self.client.send_async(request).await?;
         if response.status().is_success() {
             openai_compat::parse_sse(
@@ -747,24 +766,19 @@ impl Copilot {
 
     async fn stream_responses(
         &self,
+        auth: &CopilotAuth,
         model: &Model,
-        messages: &[Message],
-        system: &str,
-        tools: &Value,
+        wire: &WireRequest,
         event_tx: &Sender<ProviderEvent>,
-        thinking: ThinkingConfig,
     ) -> Result<StreamResponse, AgentError> {
-        let auth = self.auth().await?;
-        let mut body = responses::build_body(model, messages, system, tools);
-        responses::apply_responses_reasoning(&mut body, &thinking, model);
         let resolved = super::ResolvedAuth {
-            base_url: Some(auth.endpoint.clone()),
-            headers: copilot_headers(&auth, Some("conversation-agent")),
+            base_url: None,
+            headers: copilot_headers(auth, Some(CONVERSATION_AGENT)),
         };
         responses::do_stream(
             &self.client,
             model,
-            &body,
+            wire,
             event_tx,
             &resolved,
             self.stream_timeout,
@@ -774,31 +788,17 @@ impl Copilot {
 
     async fn stream_messages(
         &self,
-        model: &Model,
-        messages: &[Message],
-        system: &str,
-        tools: &Value,
+        auth: &CopilotAuth,
+        wire: &WireRequest,
         event_tx: &Sender<ProviderEvent>,
-        thinking: ThinkingConfig,
     ) -> Result<StreamResponse, AgentError> {
-        let auth = self.auth().await?;
-        let mut body = json!({
-            "model": model.id,
-            "max_tokens": model.max_output_tokens.unwrap_or(shared::FALLBACK_MAX_TOKENS),
-            "system": [{"type": "text", "text": system}],
-            "messages": anthropic_messages(messages),
-            "tools": tools,
-            "stream": true,
-        });
-        thinking.apply_to_body(&mut body, model);
-
         let request = self
-            .build_post(&auth, MESSAGES_PATH, Some("conversation-agent"), &body)?
-            .header("anthropic-version", "2023-06-01")
-            .body(serde_json::to_vec(&body)?)?;
+            .build_post(auth, wire)?
+            .header("anthropic-version", anthropic::API_VERSION)
+            .body(serde_json::to_vec(&wire.body)?)?;
         let response = self.client.send_async(request).await?;
         if response.status().is_success() {
-            super::anthropic::parse_sse(response, event_tx, self.stream_timeout).await
+            anthropic::parse_sse(response, event_tx, self.stream_timeout).await
         } else {
             Err(AgentError::from_response(response).await)
         }
@@ -807,21 +807,17 @@ impl Copilot {
     fn build_post(
         &self,
         auth: &CopilotAuth,
-        path: &str,
-        interaction_type: Option<&str>,
-        body: &Value,
+        wire: &WireRequest,
     ) -> Result<isahc::http::request::Builder, AgentError> {
         debug!(
-            path,
-            body_bytes = serde_json::to_vec(body)?.len(),
+            url = %wire.url,
+            body_bytes = serde_json::to_vec(&wire.body)?.len(),
             "sending Copilot API request"
         );
         Ok(copilot_request(
-            Request::builder()
-                .method("POST")
-                .uri(format!("{}{path}", auth.endpoint)),
+            Request::builder().method(wire.method).uri(&wire.url),
             auth,
-            interaction_type,
+            Some(CONVERSATION_AGENT),
         ))
     }
 }
@@ -837,6 +833,16 @@ enum Endpoint {
     ChatCompletions,
     Responses,
     Messages,
+}
+
+impl Endpoint {
+    fn path(self) -> &'static str {
+        match self {
+            Self::ChatCompletions => CHAT_COMPLETIONS_PATH,
+            Self::Responses => RESPONSES_PATH,
+            Self::Messages => MESSAGES_PATH,
+        }
+    }
 }
 
 #[derive(Clone, Deserialize)]
@@ -1149,6 +1155,50 @@ fn anthropic_messages(messages: &[Message]) -> Value {
     )
 }
 
+/// The body `endpoint` expects for one turn.
+fn endpoint_body(
+    endpoint: Endpoint,
+    model: &Model,
+    messages: &[Message],
+    system: &str,
+    tools: &Value,
+    thinking: &ThinkingConfig,
+) -> Value {
+    match endpoint {
+        Endpoint::ChatCompletions => {
+            let mut body = json!({
+                "model": model.id,
+                "messages": openai_compat::convert_messages(messages, system),
+                "n": 1,
+                "stream": true,
+                "temperature": 0.1,
+            });
+            let wire_tools = openai_compat::convert_tools(tools);
+            if wire_tools.as_array().is_some_and(|tools| !tools.is_empty()) {
+                body["tools"] = wire_tools;
+            }
+            body
+        }
+        Endpoint::Responses => {
+            let mut body = responses::build_body(model, messages, system, tools);
+            responses::apply_responses_reasoning(&mut body, thinking, model);
+            body
+        }
+        Endpoint::Messages => {
+            let mut body = json!({
+                "model": model.id,
+                "max_tokens": model.max_output_tokens.unwrap_or(shared::FALLBACK_MAX_TOKENS),
+                "system": [{"type": "text", "text": system}],
+                "messages": anthropic_messages(messages),
+                "tools": tools,
+                "stream": true,
+            });
+            thinking.apply_to_body(&mut body, model);
+            body
+        }
+    }
+}
+
 fn guess_endpoint(model_id: &str) -> Endpoint {
     if model_id.starts_with("claude-") {
         Endpoint::Messages
@@ -1171,25 +1221,51 @@ impl Provider for Copilot {
         _cache_key: Option<&'a CacheKey>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
-            let mut prefixed_system = String::new();
-            let system = super::with_prefix(&self.system_prefix, system, &mut prefixed_system);
             let endpoint = self.model_endpoint(&model.id).await?;
             debug!(model = %model.id, ?endpoint, "running Copilot request");
+            let auth = self.auth().await?;
+            let wire = self.request(
+                endpoint,
+                &auth,
+                model,
+                messages,
+                system,
+                tools,
+                &opts.thinking,
+            );
             match endpoint {
                 Endpoint::ChatCompletions => {
-                    self.stream_chat_completions(model, messages, system, tools, event_tx)
-                        .await
+                    self.stream_chat_completions(&auth, &wire, event_tx).await
                 }
-                Endpoint::Responses => {
-                    self.stream_responses(model, messages, system, tools, event_tx, opts.thinking)
-                        .await
-                }
-                Endpoint::Messages => {
-                    self.stream_messages(model, messages, system, tools, event_tx, opts.thinking)
-                        .await
-                }
+                Endpoint::Responses => self.stream_responses(&auth, model, &wire, event_tx).await,
+                Endpoint::Messages => self.stream_messages(&auth, &wire, event_tx).await,
             }
         })
+    }
+
+    fn wire_request(
+        &self,
+        model: &Model,
+        messages: &[Message],
+        system: &str,
+        tools: &Value,
+        opts: &RequestOptions,
+        _cache_key: Option<&CacheKey>,
+    ) -> Result<WireRequest, AgentError> {
+        let not_resolved = || AgentError::Config {
+            message: ENDPOINT_NOT_RESOLVED.into(),
+        };
+        let auth = self.cached_auth()?.ok_or_else(not_resolved)?;
+        let endpoint = self.cached_endpoint(&model.id).ok_or_else(not_resolved)?;
+        Ok(self.request(
+            endpoint,
+            &auth,
+            model,
+            messages,
+            system,
+            tools,
+            &opts.thinking,
+        ))
     }
 
     fn list_models(&self) -> BoxFuture<'_, Result<Vec<crate::model::ModelInfo>, AgentError>> {
@@ -1238,12 +1314,16 @@ impl Provider for Copilot {
 
 #[cfg(test)]
 mod tests {
-    const OPUS_CACHE_WRITE: f64 = 6.25;
-
     use super::*;
     use crate::TokenUsage;
-    use crate::providers::ResolvedAuth;
+    use crate::providers::test_support::CREDENTIAL_IN_URL;
+    use crate::providers::{ResolvedAuth, Timeouts};
     use test_case::test_case;
+
+    const OPUS_CACHE_WRITE: f64 = 6.25;
+    const TEST_TOKEN: &str = "copilot-test-token";
+    const TEST_SPEC: &str = "copilot/gpt-5.4";
+    const OTHER_MODEL_ID: &str = "grok-4.6";
 
     #[test]
     fn endpoint_prefers_messages_then_responses_then_chat() {
@@ -1276,6 +1356,77 @@ mod tests {
     #[test_case("gemini-3.1-pro-preview", Endpoint::ChatCompletions ; "everything_else_takes_chat")]
     fn guess_endpoint_covers_every_openai_family(model_id: &str, expected: Endpoint) {
         assert_eq!(guess_endpoint(model_id), expected);
+    }
+
+    fn provider_with_token() -> Copilot {
+        Copilot::with_auth(
+            Arc::new(Mutex::new(ResolvedAuth::bearer(TEST_TOKEN))),
+            Timeouts::default(),
+        )
+    }
+
+    fn dry_run(provider: &Copilot, model: &Model) -> Result<WireRequest, AgentError> {
+        provider.wire_request(
+            model,
+            &[],
+            "",
+            &Value::Null,
+            &RequestOptions::default(),
+            None,
+        )
+    }
+
+    #[test]
+    fn a_cold_model_cache_asks_for_a_send_instead_of_fetching() {
+        let model = Model::from_spec(TEST_SPEC).unwrap();
+
+        let error = dry_run(&provider_with_token(), &model).unwrap_err();
+
+        assert!(
+            matches!(error, AgentError::Config { message } if message == ENDPOINT_NOT_RESOLVED)
+        );
+    }
+
+    fn cache_model(provider: &Copilot, model_id: &str, path: &str) {
+        let cached: CopilotModel = serde_json::from_value(json!({
+            "id": model_id,
+            "supported_endpoints": [path],
+            "capabilities": {"type": "chat"}
+        }))
+        .unwrap();
+        provider
+            .models
+            .lock()
+            .unwrap()
+            .insert(model_id.into(), cached);
+    }
+
+    #[test_case(MESSAGES_PATH ; "messages")]
+    #[test_case(RESPONSES_PATH ; "responses")]
+    #[test_case(CHAT_COMPLETIONS_PATH ; "chat_completions")]
+    fn a_warm_model_cache_posts_to_the_cached_endpoint(path: &str) {
+        let provider = provider_with_token();
+        let model = Model::from_spec(TEST_SPEC).unwrap();
+        cache_model(&provider, &model.id, path);
+
+        let wire = dry_run(&provider, &model).unwrap();
+
+        assert_eq!(wire.url, format!("{DEFAULT_API_ENDPOINT}{path}"));
+        assert!(!wire.url.contains(TEST_TOKEN), "{CREDENTIAL_IN_URL}");
+    }
+
+    /// A send refetches `/models` for a model the cache lacks. The dry run
+    /// cannot fetch, so it guesses from the model's family instead.
+    #[test_case("copilot/claude-opus-5.5", MESSAGES_PATH ; "claude_guesses_messages")]
+    #[test_case("copilot/gpt-6-sol", RESPONSES_PATH ; "gpt_guesses_responses")]
+    #[test_case("copilot/gemini-3.1-pro-preview", CHAT_COMPLETIONS_PATH ; "others_guess_chat_completions")]
+    fn a_warm_cache_missing_the_model_guesses_its_endpoint(spec: &str, path: &str) {
+        let provider = provider_with_token();
+        cache_model(&provider, OTHER_MODEL_ID, CHAT_COMPLETIONS_PATH);
+
+        let wire = dry_run(&provider, &Model::from_spec(spec).unwrap()).unwrap();
+
+        assert_eq!(wire.url, format!("{DEFAULT_API_ENDPOINT}{path}"));
     }
 
     #[test]
@@ -1378,7 +1529,7 @@ mod tests {
     fn copilot_models_are_always_covered_by_the_subscription() {
         let provider = Copilot::with_auth(
             Arc::new(Mutex::new(ResolvedAuth::bearer("test-token"))),
-            crate::providers::Timeouts::default(),
+            Timeouts::default(),
         );
         let mut model = Model::from_spec("copilot/gpt-5.6-luna").unwrap();
         let baseline = model.pricing.clone();

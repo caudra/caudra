@@ -15,7 +15,8 @@ use crate::components::modal::{
 };
 use crate::components::scrollbar::{Scrollbar, ScrollbarMouse};
 use crate::components::{
-    ModalScroll, Overlay, apportion, escape_terminal_controls, format_integer, format_usize,
+    ModalScroll, Overlay, apportion, escape_terminal_controls, format_iec_bytes, format_integer,
+    format_usize,
 };
 use crate::repaint::{Dirty, Watch};
 use crate::theme::{self, Theme};
@@ -29,8 +30,6 @@ const H_PAD_STEP_WIDTH: u16 = 16;
 const GRID_CELL_COUNT: usize = 100;
 const CATEGORY_COUNT: usize = 4;
 const PERCENT_TENTHS_SCALE: u64 = 1_000;
-const BYTE_UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
-const BYTE_STEP: f64 = 1024.0;
 const COLLAPSED_STORES: usize = 6;
 const LEGEND_GAP: &str = "   ";
 const ID_WIDTH: usize = 22;
@@ -341,7 +340,7 @@ fn report_lines(
 fn summary_lines(stats: &SessionStorageStats, width: u16, theme: &Theme) -> Vec<Line<'static>> {
     let total = total_bytes(stats);
     let mut lines = vec![
-        labeled_line("On disk", format_bytes(total), theme),
+        labeled_line("On disk", format_iec_bytes(total), theme),
         Line::default(),
     ];
     lines.extend(grid_lines(stats, width, theme));
@@ -359,9 +358,9 @@ fn database_lines(stats: &SessionStorageStats, theme: &Theme) -> Vec<Line<'stati
             "Files",
             format!(
                 "{} · wal {} · shm {}",
-                format_bytes(stats.database_bytes),
-                format_bytes(stats.wal_bytes),
-                format_bytes(stats.shm_bytes)
+                format_iec_bytes(stats.database_bytes),
+                format_iec_bytes(stats.wal_bytes),
+                format_iec_bytes(stats.shm_bytes)
             ),
             theme,
         ),
@@ -370,9 +369,9 @@ fn database_lines(stats: &SessionStorageStats, theme: &Theme) -> Vec<Line<'stati
             format!(
                 "{} × {} · {} free ({} reclaimable)",
                 format_integer(stats.page_count),
-                format_bytes(stats.page_size),
+                format_iec_bytes(stats.page_size),
                 format_integer(stats.freelist_count),
-                format_bytes(reclaimable)
+                format_iec_bytes(reclaimable)
             ),
             theme,
         ),
@@ -400,7 +399,7 @@ fn database_lines(stats: &SessionStorageStats, theme: &Theme) -> Vec<Line<'stati
             "Content",
             format!(
                 "{} logical · {} cleanup jobs pending",
-                format_bytes(stats.logical_bytes),
+                format_iec_bytes(stats.logical_bytes),
                 format_integer(stats.pending_cleanup_jobs)
             ),
             theme,
@@ -431,7 +430,7 @@ fn store_lines(stores: &[StoreEntry], expanded: bool, theme: &Theme) -> Vec<Line
                 "{} more {} holding {}",
                 format_usize(hidden),
                 if hidden == 1 { "store" } else { "stores" },
-                format_bytes(hidden_bytes)
+                format_iec_bytes(hidden_bytes)
             ),
             theme.tool_dim,
         )));
@@ -458,7 +457,7 @@ fn store_row(entry: &StoreEntry, theme: &Theme) -> Line<'static> {
         Span::raw(format!(
             "{:ID_WIDTH$} {:>SIZE_WIDTH$} {:>OBJECTS_WIDTH$} {:>SNAPS_WIDTH$}  ",
             truncate(&entry.session_id, ID_WIDTH),
-            format_bytes(entry.bytes),
+            format_iec_bytes(entry.bytes),
             format_integer(entry.objects),
             format_usize(entry.manifests.len())
         )),
@@ -569,7 +568,7 @@ fn legend_entry(kind: Consumer, bytes: u64, total: u64, theme: &Theme) -> Vec<Sp
     vec![
         Span::styled(kind.glyph(), kind.style(theme)),
         Span::styled(format!(" {} ", kind.label()), theme.tool_dim),
-        Span::raw(format_bytes(bytes)),
+        Span::raw(format_iec_bytes(bytes)),
         Span::styled(
             format!(" ({})", format_percentage(bytes, total)),
             theme.tool_dim,
@@ -593,20 +592,6 @@ fn format_percentage(bytes: u64, total: u64) -> String {
     }
     let tenths = bytes.saturating_mul(PERCENT_TENTHS_SCALE) / total;
     format!("{}.{:01}%", tenths / 10, tenths % 10)
-}
-
-fn format_bytes(value: u64) -> String {
-    let mut size = value as f64;
-    let mut unit = 0;
-    while size >= BYTE_STEP && unit < BYTE_UNITS.len() - 1 {
-        size /= BYTE_STEP;
-        unit += 1;
-    }
-    if unit == 0 {
-        format!("{value} {}", BYTE_UNITS[0])
-    } else {
-        format!("{size:.1} {}", BYTE_UNITS[unit])
-    }
 }
 
 fn truncate(text: &str, width: usize) -> String {
@@ -842,14 +827,6 @@ mod tests {
         let state = StorageFetchState::Error(REASON.to_owned());
         let rendered = text(&build_lines(Some(&state), false, 80, &theme::current()));
         assert!(rendered.contains(REASON));
-    }
-
-    #[test_case(0, "0 B" ; "zero")]
-    #[test_case(512, "512 B" ; "bytes")]
-    #[test_case(1024, "1.0 KiB" ; "kibibyte")]
-    #[test_case(7 * 1024 * 1024 * 1024, "7.0 GiB" ; "gibibyte")]
-    fn bytes_are_scaled_to_the_largest_whole_unit(value: u64, expected: &str) {
-        assert_eq!(format_bytes(value), expected);
     }
 
     #[test]

@@ -7,7 +7,7 @@ use serde_json::{Value, json};
 use tracing::{debug, info, warn};
 
 use crate::model::{Billing, Model};
-use crate::provider::{BoxFuture, Provider};
+use crate::provider::{BoxFuture, Provider, WireRequest};
 use crate::providers::ResolvedAuth;
 use crate::providers::openai::responses;
 use crate::providers::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
@@ -116,6 +116,33 @@ impl Xai {
         }
         result
     }
+
+    /// What one attempt posts with `auth`, for the send and the dry run alike:
+    /// the Responses API over a login, Chat Completions over a key.
+    #[allow(clippy::too_many_arguments)]
+    fn request(
+        &self,
+        oauth: bool,
+        auth: &ResolvedAuth,
+        model: &Model,
+        messages: &[Message],
+        system: &str,
+        tools: &Value,
+        opts: &RequestOptions,
+        cache_key: Option<&CacheKey>,
+    ) -> Result<WireRequest, AgentError> {
+        let mut buf = String::new();
+        let system = super::super::with_prefix(&self.system_prefix, system, &mut buf);
+        if !oauth {
+            let mut body = self.compat.build_body(model, messages, system, tools);
+            opts.thinking.apply_reasoning_effort(&mut body, model);
+            return Ok(WireRequest::post(self.compat.chat_url(auth), body));
+        }
+        let mut body = responses::build_body(model, messages, system, tools);
+        apply_grok_reasoning(&mut body, opts, model);
+        responses::apply_prompt_cache_key(&mut body, cache_key);
+        Ok(WireRequest::post(responses::responses_url(auth)?, body))
+    }
 }
 
 fn apply_grok_reasoning(body: &mut Value, opts: &RequestOptions, model: &Model) {
@@ -170,41 +197,52 @@ impl Provider for Xai {
         cache_key: Option<&'a CacheKey>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
         Box::pin(async move {
-            let mut buf = String::new();
-            let system = super::super::with_prefix(&self.system_prefix, system, &mut buf);
-
-            if self.is_oauth() {
-                let mut body = responses::build_body(model, messages, system, tools);
-                apply_grok_reasoning(&mut body, &opts, model);
-                responses::apply_prompt_cache_key(&mut body, cache_key);
-                let stream_timeout = self.compat.stream_timeout();
-                return self
-                    .with_oauth_retry(|| async {
-                        let mut auth = self.current_auth();
-                        auth.headers.extend(proxy_request_headers(model, cache_key));
-                        responses::do_stream(
-                            self.compat.client(),
-                            model,
-                            &body,
-                            event_tx,
-                            &auth,
-                            stream_timeout,
-                        )
-                        .await
-                    })
-                    .await;
-            }
-
-            let mut body = self.compat.build_body(model, messages, system, tools);
-            opts.thinking.apply_reasoning_effort(&mut body, model);
+            let oauth = self.is_oauth();
             self.with_oauth_retry(|| async {
-                let auth = self.current_auth();
-                self.compat
-                    .do_stream(model, &[], &body, event_tx, &auth)
-                    .await
+                let mut auth = self.current_auth();
+                let wire = self.request(
+                    oauth, &auth, model, messages, system, tools, &opts, cache_key,
+                )?;
+                if !oauth {
+                    return self
+                        .compat
+                        .do_stream(model, &[], &wire, event_tx, &auth)
+                        .await;
+                }
+                auth.headers.extend(proxy_request_headers(model, cache_key));
+                responses::do_stream(
+                    self.compat.client(),
+                    model,
+                    &wire,
+                    event_tx,
+                    &auth,
+                    self.compat.stream_timeout(),
+                )
+                .await
             })
             .await
         })
+    }
+
+    fn wire_request(
+        &self,
+        model: &Model,
+        messages: &[Message],
+        system: &str,
+        tools: &Value,
+        opts: &RequestOptions,
+        cache_key: Option<&CacheKey>,
+    ) -> Result<WireRequest, AgentError> {
+        self.request(
+            self.is_oauth(),
+            &self.current_auth(),
+            model,
+            messages,
+            system,
+            tools,
+            opts,
+            cache_key,
+        )
     }
 
     fn reasoning_transport(&self, _model: &Model) -> crate::ReasoningTransport {
@@ -298,12 +336,66 @@ fn bearer_token(auth: &ResolvedAuth) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use caudra_storage::auth::{OAuthTokens, save_tokens};
+    use tempfile::TempDir;
+    use test_case::test_case;
+
     use super::*;
     use crate::ReasoningOptions;
+    use crate::providers::Timeouts;
+    use crate::providers::openai::responses::RESPONSES_PATH;
+    use crate::providers::openai_compat::CHAT_COMPLETIONS_PATH;
+    use crate::providers::test_support::CREDENTIAL_IN_URL;
     use crate::types::ThinkingConfig;
     use crate::{ModelFamily, ModelPricing};
 
     const CACHE_KEY: &str = "session/task";
+    const SYSTEM_PROMPT: &str = "You are Grok.";
+    const LOGIN_ACCESS: &str = "xai-login-access";
+    const LOGIN_REFRESH: &str = "xai-login-refresh";
+    const API_KEY: &str = "xai-api-key";
+    const TEST_BASE_URL: &str = "https://api.x.test/v1";
+
+    fn provider_with_login(state: &TempDir) -> Xai {
+        let storage = StateDir::from_path(state.path().to_path_buf());
+        let tokens = OAuthTokens {
+            access: LOGIN_ACCESS.into(),
+            refresh: LOGIN_REFRESH.into(),
+            expires: u64::MAX,
+            account_id: None,
+        };
+        save_tokens(&storage, auth::PROVIDER, &tokens).unwrap();
+        Xai {
+            storage: Some(storage),
+            ..Xai::with_auth(
+                Arc::new(Mutex::new(auth::build_oauth_resolved(&tokens))),
+                Timeouts::default(),
+            )
+        }
+    }
+
+    fn provider_with_key() -> Xai {
+        Xai::with_auth(
+            Arc::new(Mutex::new(ResolvedAuth {
+                base_url: Some(TEST_BASE_URL.into()),
+                ..ResolvedAuth::bearer(API_KEY)
+            })),
+            Timeouts::default(),
+        )
+    }
+
+    fn dry_run(provider: &Xai, opts: &RequestOptions) -> WireRequest {
+        provider
+            .wire_request(
+                &test_model(true),
+                &[],
+                SYSTEM_PROMPT,
+                &Value::Null,
+                opts,
+                None,
+            )
+            .unwrap()
+    }
 
     fn test_model(thinking: bool) -> Model {
         Model {
@@ -331,19 +423,38 @@ mod tests {
 
     #[test]
     fn grok_reasoning_sets_effort_and_include() {
-        let model = test_model(true);
-        let mut body = json!({"model": "grok-4.6"});
-        apply_grok_reasoning(
-            &mut body,
+        let state = TempDir::new().unwrap();
+        let wire = dry_run(
+            &provider_with_login(&state),
             &RequestOptions {
                 thinking: ThinkingConfig::Effort("high".into()),
                 ..RequestOptions::default()
             },
-            &model,
         );
-        assert_eq!(body["reasoning"]["effort"], "high");
-        assert_eq!(body["reasoning"]["summary"], "auto");
-        assert_eq!(body["include"][0], responses::ENCRYPTED_REASONING);
+
+        assert_eq!(wire.body["reasoning"]["effort"], "high");
+        assert_eq!(wire.body["reasoning"]["summary"], "auto");
+        assert_eq!(wire.body["include"][0], responses::ENCRYPTED_REASONING);
+    }
+
+    /// A login speaks the Responses API through the CLI proxy, a key speaks
+    /// Chat Completions to the public API.
+    #[test_case(true, auth::CLI_BASE_URL, RESPONSES_PATH ; "a_login_posts_responses_to_the_cli_proxy")]
+    #[test_case(false, TEST_BASE_URL, CHAT_COMPLETIONS_PATH ; "a_key_posts_chat_completions_to_the_api")]
+    fn wire_request_posts_where_the_send_does(login: bool, base: &str, path: &str) {
+        let state = TempDir::new().unwrap();
+        let provider = if login {
+            provider_with_login(&state)
+        } else {
+            provider_with_key()
+        };
+
+        let wire = dry_run(&provider, &RequestOptions::default());
+
+        assert_eq!(wire.url, format!("{base}{path}"));
+        for credential in [LOGIN_ACCESS, API_KEY] {
+            assert!(!wire.url.contains(credential), "{CREDENTIAL_IN_URL}");
+        }
     }
 
     #[test]

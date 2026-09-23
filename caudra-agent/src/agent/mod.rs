@@ -30,8 +30,7 @@ pub use goal::{
     goal_kickoff_message,
 };
 pub use history::{
-    History, HistorySnapshot, SharedHistory, UNAVAILABLE_RESULT, close_dangling_tool_calls,
-    is_run_failure_marker,
+    History, HistorySnapshot, SharedHistory, UNAVAILABLE_RESULT, is_run_failure_marker,
 };
 pub(crate) use instructions::{INSTRUCTION_FILES, LOCAL_INSTRUCTION_FILE};
 pub use instructions::{
@@ -40,7 +39,7 @@ pub use instructions::{
     find_remote_nested_instructions, find_subdirectory_instructions, is_instruction_file,
     load_instruction_text, load_instructions, load_remote_instructions,
 };
-pub use provider_projection::{project as project_for_provider, project_for_target};
+pub use provider_projection::{ProjectedHistory, project_for_inspection, project_request};
 pub use run::{
     Agent, AgentParams, AgentRunParams, ModelRoute, estimate_message_tokens,
     resolve_compaction_model, resolve_model_for_purpose, resolve_purpose_model,

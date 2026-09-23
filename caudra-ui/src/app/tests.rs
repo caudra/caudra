@@ -12,6 +12,7 @@ use crate::components::goal_modal::GoalTarget;
 use crate::components::input::ChordHint;
 use crate::components::keybindings::{Bind, KeybindContext, key as kb, leader as chord};
 use crate::components::messages::{ASSISTANT_LABEL, ReviewTarget};
+use crate::components::projection_modal::UNPREPARED as PROJECTION_UNPREPARED;
 use crate::components::queue_actions::QueueActionKind;
 use crate::components::queue_panel::{QueueAction, QueueHit, QueueHitTarget};
 use crate::components::rewind_picker::RewindEntry;
@@ -56,8 +57,8 @@ use caudra_lua::test_support::{HintWriterHandle, hint_writer_pair};
 use caudra_lua::{BuiltinAction, HintReader, KeymapReader, LuaCommandInfo, LuaCommandReader};
 use caudra_providers::model_registry::{self, Binding};
 use caudra_providers::{
-    Billing, ContentBlock, HistoryItemKind, Message, Role, THINKING_USAGE, TokenUsage, UserOrigin,
-    expand_message, project_messages,
+    Billing, ContentBlock, HistoryItemKind, Message, RequestOptions, Role, THINKING_USAGE,
+    TokenUsage, UserOrigin, expand_message, project_messages,
 };
 use caudra_storage::id::CaudraId;
 use caudra_storage::permission_patterns::{
@@ -123,6 +124,15 @@ const RELOCATION_OTHER_OPEN_COUNT: usize = 2;
 const RELOCATION_CONFIRM_TITLE: &str = "Confirm session relocation";
 const RELOCATION_CONFIRM: &str = "Confirm relocation";
 const RELOCATION_PROJECT_USAGE: &str = "Include historical project usage";
+const PROJECTION_QUESTION: &str = "list the files";
+const PROJECTION_CALL_ID: &str = "call-running";
+const PROJECTION_TOOL: &str = "bash";
+const PROJECTION_CALL_CLOSED: &str =
+    "a call still running must stay open, not be answered with a stand-in";
+const PROJECTION_PROMPT_REBUILT: &str = "the view must hold the prompt the run bound";
+const PROJECTION_KEY_WRONG: &str = "the wire body must name the conversation's own cache";
+const PROJECTION_OPTIONS_STALE: &str =
+    "the wire body must carry the options the next message will, not the last run's";
 /// What [`test_model`] answers as, so a turn recorded in a test lands under
 /// the session's own provider the way a real one does.
 const TEST_PROVIDER: &str = "anthropic";
@@ -4633,6 +4643,85 @@ fn the_system_prompt_viewer_hands_off_to_the_profile_picker() {
 
     assert!(!app.system_prompt_modal.is_open());
     assert!(app.prompt_profile_picker.is_open());
+}
+
+/// Before the agent binds a prompt no request exists, and the modal says so
+/// rather than refusing to open.
+#[test]
+fn projection_before_a_prompt_is_bound_opens_on_a_notice() {
+    let mut app = test_app();
+    open_projection_modal(&mut app);
+
+    assert!(app.projection_modal.is_open());
+    assert!(app.projection_modal.projection().is_none());
+    assert!(rendered(&mut app).contains(PROJECTION_UNPREPARED));
+}
+
+/// The next request carries whatever the trailing turn's calls return, so a
+/// call still running is shown open rather than repaired with a placeholder.
+#[test]
+fn projection_holds_the_bound_prompt_and_leaves_a_running_call_open() {
+    let mut app = btw_ready_app();
+    let running = Message {
+        role: Role::Assistant,
+        content: vec![ContentBlock::tool_use(
+            PROJECTION_CALL_ID,
+            PROJECTION_TOOL,
+            serde_json::json!({}),
+        )],
+        ..Default::default()
+    };
+    let history = [Message::user(PROJECTION_QUESTION.into()), running];
+    app.shared_history = Some(Arc::new(ArcSwap::from_pointee(HistorySnapshot::new(
+        crate::history_items(&history),
+    ))));
+    app.state.fast = true;
+
+    open_projection_modal(&mut app);
+
+    let projection = app.projection_modal.projection().unwrap();
+    let bound = app.btw_prompt.as_ref().unwrap().load_full();
+    assert_eq!(
+        projection.opts,
+        RequestOptions {
+            thinking: app.state.thinking.clone(),
+            fast: true,
+        },
+        "{PROJECTION_OPTIONS_STALE}"
+    );
+    assert!(!bound.opts.fast, "{PROJECTION_OPTIONS_STALE}");
+    assert!(
+        Arc::ptr_eq(&projection.prompt, &bound),
+        "{PROJECTION_PROMPT_REBUILT}"
+    );
+    assert_eq!(
+        projection.messages.len(),
+        history.len(),
+        "{PROJECTION_CALL_CLOSED}"
+    );
+    assert_eq!(projection.running_calls, 1, "{PROJECTION_CALL_CLOSED}");
+    assert_eq!(
+        projection.cache_key,
+        CacheKey::session(&SessionRef::from(app.state.session.id)),
+        "{PROJECTION_KEY_WRONG}"
+    );
+}
+
+#[test]
+fn projection_of_an_unreadable_history_flashes_and_opens_nothing() {
+    let mut app = btw_ready_app();
+    let mut items = crate::history_items(&[Message::user(PROJECTION_QUESTION.into())]);
+    items.push(items[0].clone());
+    app.shared_history = Some(Arc::new(ArcSwap::from_pointee(HistorySnapshot::new(items))));
+
+    open_projection_modal(&mut app);
+
+    assert!(!app.projection_modal.is_open());
+    assert!(
+        app.status_bar
+            .flash_text()
+            .is_some_and(|flash| flash.starts_with(HISTORY_UNREADABLE))
+    );
 }
 
 /// Tool output streams into a subagent's chat while the parent chat is the one
@@ -13131,6 +13220,10 @@ fn open_system_prompt_modal(app: &mut App) {
     app.execute_command(cmd("/system-prompt"), 0);
 }
 
+fn open_projection_modal(app: &mut App) {
+    app.execute_command(cmd("/projection"), 0);
+}
+
 fn open_goal_modal(app: &mut App) {
     app.goal_modal.open();
 }
@@ -13158,6 +13251,7 @@ fn open_argument_prompt(app: &mut App) {
 #[test_case(open_skills_modal  ; "skills_modal")]
 #[test_case(open_storage_modal ; "storage_modal")]
 #[test_case(open_system_prompt_modal ; "system_prompt_modal")]
+#[test_case(open_projection_modal ; "projection_modal")]
 #[test_case(open_goal_modal    ; "goal_modal")]
 #[test_case(open_model_picker  ; "model_picker")]
 #[test_case(open_command_modal ; "command_modal")]
@@ -13187,6 +13281,7 @@ fn a_press_outside_a_modal_dismisses_it(open: fn(&mut App)) {
 #[test_case(open_skills_modal  ; "skills_modal")]
 #[test_case(open_storage_modal ; "storage_modal")]
 #[test_case(open_system_prompt_modal ; "system_prompt_modal")]
+#[test_case(open_projection_modal ; "projection_modal")]
 #[test_case(open_goal_modal    ; "goal_modal")]
 #[test_case(open_model_picker  ; "model_picker")]
 #[test_case(open_command_modal ; "command_modal")]
@@ -15174,6 +15269,7 @@ fn open_permission_test_leader(app: &mut App) {
 #[test_case(open_skills_modal; "skills")]
 #[test_case(open_storage_modal; "storage")]
 #[test_case(open_system_prompt_modal; "system_prompt")]
+#[test_case(open_projection_modal; "projection")]
 #[test_case(open_goal_modal; "goal")]
 #[test_case(open_model_picker; "model_picker")]
 #[test_case(open_command_modal; "command_modal")]

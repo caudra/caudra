@@ -25,9 +25,7 @@ use super::goal::{
     Evaluator, GoalApply, GoalHandle, GoalStatus, ResolvedEvaluator, continuation_message,
     is_unrecoverable, resolve_evaluator,
 };
-use super::history::{
-    CANCEL_MARKER, History, repair_tool_pairs, sanitize_cancelled_history, sanitize_failed_history,
-};
+use super::history::{CANCEL_MARKER, History, sanitize_cancelled_history, sanitize_failed_history};
 use super::instructions::LoadedInstructions;
 use super::mention_preamble;
 use super::provider_projection;
@@ -981,12 +979,12 @@ impl<'h> Agent<'h> {
     }
 
     fn projected_history<'a>(&'a self, tools: &Value) -> Cow<'a, [Message]> {
-        repair_tool_pairs(provider_projection::project_for_target(
+        provider_projection::project_request(
             self.history.as_slice(),
             tools,
             &self.model,
             self.provider.reasoning_transport(&self.model),
-        ))
+        )
     }
 
     fn publish_context(
@@ -4225,6 +4223,38 @@ mod tests {
         });
     }
 
+    /// `/context`, `/btw`, and the inspector all read `project_request`, so
+    /// each is only right while the live turn sends exactly what it returns.
+    /// The model has no vision, so the history's image is described too.
+    #[test]
+    fn the_live_request_is_the_request_projection() {
+        smol::block_on(async {
+            let captured: Arc<Mutex<Vec<Message>>> = Arc::default();
+            let mut history = History::new(provider_projection::tests::rewritten_history());
+            let (mut agent, _event_rx) = make_agent(
+                RequestCapturingProvider {
+                    captured: Arc::clone(&captured),
+                },
+                &mut history,
+            );
+            agent.model = Arc::new(provider_projection::tests::text_only_model());
+            agent.tools = provider_projection::tests::tools(true);
+
+            agent.run(default_input()).await.unwrap();
+            let tools = agent.tools.clone();
+            let model = Arc::clone(&agent.model);
+            let transport = agent.provider.reasoning_transport(&model);
+            drop(agent);
+
+            let (_response, sent) = history.as_slice().split_last().unwrap();
+            let expected = provider_projection::project_request(sent, &tools, &model, transport);
+            assert_eq!(
+                serde_json::to_value(&*captured.lock().unwrap()).unwrap(),
+                serde_json::to_value(expected.as_ref()).unwrap()
+            );
+        });
+    }
+
     #[test]
     fn queued_input_drains_preamble_and_mailbox() {
         smol::block_on(async {
@@ -5556,7 +5586,7 @@ mod tests {
             // Padding holds no text of its own; the filler a provider needs is
             // written once, into the request, so this is the projection's
             // invariant rather than the transcript's.
-            let projected = provider_projection::project_for_target(
+            let projected = provider_projection::project_request(
                 history.as_slice(),
                 &serde_json::json!([]),
                 &default_model(),

@@ -43,6 +43,8 @@ const CONTEXT: &str = r#"## Context window
 
 The summary shows the active model and window, estimated tokens by category, the compaction reserve, and remaining space. `/context all` adds item-level built-in tool, MCP tool, profile, memory, and skill inventories. Both views use the active provider's request projection, so eligible old retained tool results count as compact output-ID markers rather than their full canonical text.
 
+`/projection` shows what `/context` counts: the system prompt, the tools, and every message as the provider receives it, with `r` switching to the JSON body the active provider would send. See [Provider request projection](/docs/context/#provider-request-projection).
+
 `/tools` covers the tool array on its own. It lists every built-in and MCP tool with its state, its token cost, and the rule behind that state, and it is the only view that shows tools turned off by configuration. See [Tools](/docs/tools/) for the lists that decide those states. `g` cycles the modal through recorded activity for the session, the project, and everything ever run, with call counts, error classes, estimated result tokens, and wall clock per tool. See [Token Economy](/docs/token-economy/#what-the-tools-cost).
 
 `/skills` does the same for skills. It lists each skill with its file, its scope, and whether its body is already in the window, then every candidate directory with the state directory precedence gave it. It reads the disk when it opens, so it works before the first request. See [Skills](/docs/skills/#where-skills-live).
@@ -133,7 +135,7 @@ An input box appears while the focused task is running. Press Enter to queue gui
 
 That input box is a full composer. Typing `/` opens the palette, `Ctrl+S` inserts a file path, `Ctrl+X e` edits the draft in your editor, and `Ctrl+V` attaches an image to the guidance. A custom `/project:` or `/user:` command expands its template and steers the focused task rather than the main session.
 
-Commands that reach the main session's turn or history have no task equivalent, so `/compact`, `/continue`, `/model`, `/system-prompt`, `/btw`, `/extract`, the `/goal` family, the workflow commands, and MCP prompts are drawn dimmed and report their scope when run. Return to Main to use them. `/context`, `/tools`, `/skills`, `/queue`, `/review`, and the stash commands already follow the focused transcript."#;
+Commands that reach the main session's turn or history have no task equivalent, so `/compact`, `/continue`, `/model`, `/system-prompt`, `/projection`, `/btw`, `/extract`, the `/goal` family, the workflow commands, and MCP prompts are drawn dimmed and report their scope when run. Return to Main to use them. `/context`, `/tools`, `/skills`, `/queue`, `/review`, and the stash commands already follow the focused transcript."#;
 
 const WORKFLOWS: &str = r#"## Workflows
 

@@ -34,7 +34,8 @@ pub struct Modal<'a> {
 impl Modal<'_> {
     pub fn render(&self, frame: &mut Frame, area: Rect, content_height: u16) -> (Rect, Rect) {
         let max_h = (area.height as u32 * self.max_height_percent as u32 / 100) as u16;
-        let total_h = (content_height + CHROME_LINES)
+        let total_h = content_height
+            .saturating_add(CHROME_LINES)
             .min(max_h)
             .max(CHROME_LINES + 1);
 

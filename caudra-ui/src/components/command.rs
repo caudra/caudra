@@ -18,6 +18,9 @@ use crate::components::match_spans;
 use crate::theme;
 
 const TICK_TIMEOUT_MS: u64 = 10;
+/// Abbreviations that keep opening the command they opened before a newer,
+/// shorter name tied them: nucleo breaks a score tie towards the shorter name.
+const HELD_ABBREVIATIONS: &[(&str, &str)] = &[("p", "/permissions")];
 pub(crate) const SECTION_BUILTIN: &str = "Built-in";
 const SECTION_CUSTOM: &str = "Project & User";
 const SECTION_MCP: &str = "MCP Prompts";
@@ -224,6 +227,12 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
     BuiltinCommand {
         name: "/system-prompt",
         description: "Inspect the system prompt and switch profile",
+        max_args: 0,
+        scope: ChatScope::MainOnly,
+    },
+    BuiltinCommand {
+        name: "/projection",
+        description: "Inspect the conversation as the provider receives it",
         max_args: 0,
         scope: ChatScope::MainOnly,
     },
@@ -743,6 +752,24 @@ impl CommandPalette {
         );
 
         self.tick();
+        self.hold_abbreviation(cmd_word);
+    }
+
+    fn hold_abbreviation(&mut self, typed: &str) {
+        let Some(&(_, owner)) = HELD_ABBREVIATIONS
+            .iter()
+            .find(|(abbreviation, _)| abbreviation.eq_ignore_ascii_case(typed))
+        else {
+            return;
+        };
+        let owner = CommandRowKey::Builtin(owner);
+        if let Some(position) = self
+            .filtered
+            .iter()
+            .position(|m| m.command_type.row_key() == owner)
+        {
+            self.filtered[..=position].rotate_right(1);
+        }
     }
 
     fn tick(&mut self) {
@@ -1390,7 +1417,10 @@ mod tests {
     #[test_case("/CD ~/foo", "/cd", "~/foo"   ; "case_insensitive")]
     #[test_case("/compact", "/compact", ""    ; "other_command")]
     #[test_case("/cmp", "/compact", ""    ; "fuzzy-match-1")]
-    #[test_case("/pct", "/compact", ""    ; "fuzzy-match-2")]
+    #[test_case("/cpt", "/compact", ""    ; "fuzzy-match-2")]
+    #[test_case("/p", "/permissions", ""  ; "p_keeps_opening_permissions")]
+    #[test_case("/pr", "/projection", ""  ; "pr_opens_projection")]
+    #[test_case("/proj", "/projection", "" ; "proj_opens_projection")]
     #[test_case("/btw hello world", "/btw", "hello world" ; "btw_multi_word")]
     fn confirm_parses_args(input: &str, expected_name: &str, expected_args: &str) {
         let mut p = CommandPalette::new(Arc::from([]), empty_snapshot(), LuaCommandReader::empty());

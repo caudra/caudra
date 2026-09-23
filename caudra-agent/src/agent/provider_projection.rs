@@ -1,14 +1,15 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::slice;
 
 use caudra_providers::estimate_tokens_cached;
 use caudra_providers::{
     ContentBlock, EMPTY_RESPONSE_MARKER, Message, Model, ReasoningTransport, ResponsesReasoning,
-    Role, SteeringKind,
+    Role, SteeringKind, adapt_images_for_model,
 };
 use serde_json::Value;
 
-use super::history::is_user_turn;
+use super::history::{is_user_turn, repair_tool_pairs};
 use super::steering::EMPTY_RULE;
 use crate::tools::{SKILL_TOOL_NAME, TOOL_OUTPUT_TOOL_NAME};
 
@@ -16,6 +17,7 @@ const PROTECTED_USER_TURNS: usize = 2;
 const PROTECTED_OLD_RESULT_TOKENS: usize = 40_000;
 const PRUNE_TRIGGER_TOKENS: usize = 20_000;
 const READ_LIMIT: usize = 200;
+const PRUNED_MARKER: &str = "[Old tool result pruned.";
 /// Results that must survive pruning: the retrieval tool's own output would
 /// send the model back to a notice it already read, and a skill's payload is
 /// the instructions the agent is still following.
@@ -27,7 +29,71 @@ struct Candidate {
     estimated_tokens: usize,
 }
 
-pub fn project<'a>(messages: &'a [Message], tools: &Value) -> Cow<'a, [Message]> {
+pub struct ProjectedHistory {
+    pub messages: Vec<Message>,
+    /// Calls the trailing assistant turn made that have no result yet.
+    pub running_calls: usize,
+}
+
+/// The history exactly as the next request sends it: old results pruned,
+/// reasoning lowered for the target, empty turns filled, tool pairs repaired,
+/// and images described for a model without vision. Borrows when no step
+/// changes anything.
+pub fn project_request<'a>(
+    messages: &'a [Message],
+    tools: &Value,
+    model: &Model,
+    transport: ReasoningTransport,
+) -> Cow<'a, [Message]> {
+    adapt_images(
+        model,
+        repair_tool_pairs(project_for_target(messages, tools, model, transport)),
+    )
+}
+
+/// The next request for a reader rather than a provider. Calls the trailing
+/// turn is still running stay open instead of being answered with
+/// placeholders, because their real results join the request after them.
+pub fn project_for_inspection(
+    messages: &[Message],
+    tools: &Value,
+    model: &Model,
+    transport: ReasoningTransport,
+) -> ProjectedHistory {
+    let Some((running, settled)) = messages
+        .split_last()
+        .filter(|(last, _)| matches!(last.role, Role::Assistant) && last.has_tool_calls())
+    else {
+        return ProjectedHistory {
+            messages: project_request(messages, tools, model, transport).into_owned(),
+            running_calls: 0,
+        };
+    };
+    let mut projected = project_request(settled, tools, model, transport).into_owned();
+    projected.extend(
+        adapt_images(
+            model,
+            project_for_target(slice::from_ref(running), tools, model, transport),
+        )
+        .into_owned(),
+    );
+    ProjectedHistory {
+        messages: projected,
+        running_calls: running.tool_uses().count(),
+    }
+}
+
+fn adapt_images<'a>(model: &Model, messages: Cow<'a, [Message]>) -> Cow<'a, [Message]> {
+    match messages {
+        Cow::Borrowed(messages) => adapt_images_for_model(model, messages),
+        Cow::Owned(messages) => match adapt_images_for_model(model, &messages) {
+            Cow::Borrowed(_) => Cow::Owned(messages),
+            Cow::Owned(adapted) => Cow::Owned(adapted),
+        },
+    }
+}
+
+fn project<'a>(messages: &'a [Message], tools: &Value) -> Cow<'a, [Message]> {
     if !has_tool(tools, TOOL_OUTPUT_TOOL_NAME) {
         return Cow::Borrowed(messages);
     }
@@ -109,13 +175,13 @@ pub fn project<'a>(messages: &'a [Message], tools: &Value) -> Cow<'a, [Message]>
         };
         let id = output_ref.id;
         *content = format!(
-            "[Old tool result pruned. Full output ID: {id}. Use {TOOL_OUTPUT_TOOL_NAME}(output_id=\"{id}\", offset=1, limit={READ_LIMIT}), optionally with pattern=\"...\" to search it.]"
+            "{PRUNED_MARKER} Full output ID: {id}. Use {TOOL_OUTPUT_TOOL_NAME}(output_id=\"{id}\", offset=1, limit={READ_LIMIT}), optionally with pattern=\"...\" to search it.]"
         );
     }
     Cow::Owned(projected)
 }
 
-pub fn project_for_target<'a>(
+fn project_for_target<'a>(
     messages: &'a [Message],
     tools: &Value,
     model: &Model,
@@ -293,19 +359,35 @@ fn protected_turn_start(messages: &[Message]) -> usize {
 }
 
 #[cfg(test)]
-mod tests {
-    use caudra_providers::ReasoningSource;
+pub(crate) mod tests {
+    use std::sync::Arc;
+
+    use caudra_providers::{IMAGE_OMITTED_NOTE, ImageMediaType, ImageSource, ReasoningSource};
     use caudra_storage::id::CaudraId;
     use caudra_storage::tool_outputs::ToolOutputRef;
     use test_case::test_case;
 
     use super::*;
+    use crate::UNAVAILABLE_RESULT;
+
+    const FOREIGN_MODEL: &str = "openai/gpt-5.5";
+    const FOREIGN_REASONING: &str = "reasoning another model produced";
+    const IMAGE_DATA: &str = "aGVsbG8=";
+    const PRUNED_CALL: &str = "pruned";
+    const UNANSWERED_CALL: &str = "unanswered";
+    const GAP_CALL: &str = "gap";
 
     fn anthropic_model() -> Model {
         Model::from_spec("anthropic/claude-sonnet-4-20250514").unwrap()
     }
 
-    fn tools(include_read: bool) -> Value {
+    pub(crate) fn text_only_model() -> Model {
+        let mut model = anthropic_model();
+        model.supports_vision_override = Some(false);
+        model
+    }
+
+    pub(crate) fn tools(include_read: bool) -> Value {
         if include_read {
             serde_json::json!([{"name": TOOL_OUTPUT_TOOL_NAME}, {"name": "bash"}])
         } else {
@@ -475,6 +557,132 @@ mod tests {
             .unwrap()
     }
 
+    /// Pruning, reasoning lowering, tool-pair repair, and image fallback each
+    /// have work here, the last for a model without vision: a result past the
+    /// retention reserve, reasoning another model produced, a call whose
+    /// result never arrived, and an image.
+    pub(crate) fn rewritten_history() -> Vec<Message> {
+        vec![
+            Message::user("old request".into()),
+            tool_use(PRUNED_CALL, "bash"),
+            result(PRUNED_CALL, PROTECTED_OLD_RESULT_TOKENS + 1, false, true),
+            foreign_reasoning([ContentBlock::tool_use(
+                UNANSWERED_CALL,
+                "bash",
+                serde_json::json!({}),
+            )]),
+            Message::user_with_images(
+                "recent request one".into(),
+                vec![ImageSource::new(ImageMediaType::Png, Arc::from(IMAGE_DATA))],
+            ),
+            Message::user("recent request two".into()),
+        ]
+    }
+
+    fn foreign_reasoning(calls: impl IntoIterator<Item = ContentBlock>) -> Message {
+        Message {
+            role: Role::Assistant,
+            content: [ContentBlock::thinking(
+                FOREIGN_REASONING.into(),
+                Some("signature".into()),
+            )]
+            .into_iter()
+            .chain(calls)
+            .collect(),
+            reasoning_source: Some(ReasoningSource::new(
+                &Model::from_spec(FOREIGN_MODEL).unwrap(),
+                ReasoningTransport::OpenAiResponses,
+            )),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_request_prunes_lowers_repairs_and_describes_images() {
+        let history = rewritten_history();
+
+        let request = project_request(
+            &history,
+            &tools(true),
+            &text_only_model(),
+            ReasoningTransport::AnthropicMessages,
+        );
+
+        assert!(result_content(&request, PRUNED_CALL).starts_with(PRUNED_MARKER));
+        assert_eq!(
+            result_content(&request, UNANSWERED_CALL),
+            UNAVAILABLE_RESULT
+        );
+        let blocks: Vec<&ContentBlock> = request
+            .iter()
+            .flat_map(|message| &message.content)
+            .collect();
+        for expected in [FOREIGN_REASONING, IMAGE_OMITTED_NOTE] {
+            assert!(
+                blocks
+                    .iter()
+                    .any(|block| matches!(block, ContentBlock::Text { text } if text == expected)),
+                "{expected}"
+            );
+        }
+        assert!(
+            !blocks
+                .iter()
+                .any(|block| block.is_thinking() || matches!(block, ContentBlock::Image { .. }))
+        );
+    }
+
+    /// Every request runs this, so a history no step changes is never cloned.
+    #[test]
+    fn a_history_no_step_changes_is_borrowed() {
+        let history = [
+            Message::user("go".into()),
+            tool_use("t1", "bash"),
+            result("t1", 1, false, true),
+        ];
+
+        assert!(matches!(
+            project_request(
+                &history,
+                &tools(true),
+                &text_only_model(),
+                ReasoningTransport::Other,
+            ),
+            Cow::Borrowed(_)
+        ));
+    }
+
+    fn running_turn(calls: usize) -> Message {
+        foreign_reasoning((0..calls).map(|index| {
+            ContentBlock::tool_use(format!("running-{index}"), "bash", serde_json::json!({}))
+        }))
+    }
+
+    /// A provider needs every call answered, so the request closes the calls
+    /// still running with placeholders. A reader sees them open instead: their
+    /// real results join the request after them. A trailing turn without calls
+    /// is not running and gets its filler, and a gap right before the running
+    /// turn is closed as the request closes it.
+    #[test_case(vec![Message::empty_marker()], 0; "trailing_turn_needs_filler")]
+    #[test_case(vec![running_turn(2)], 2; "running_calls")]
+    #[test_case(vec![tool_use(GAP_CALL, "bash"), running_turn(2)], 2; "running_calls_after_a_gap")]
+    fn inspection_is_the_request_with_running_calls_left_open(tail: Vec<Message>, running: usize) {
+        let mut history = rewritten_history();
+        history.extend(tail);
+        let model = text_only_model();
+        let transport = ReasoningTransport::AnthropicMessages;
+        let request = project_request(&history, &tools(true), &model, transport);
+
+        let inspected = project_for_inspection(&history, &tools(true), &model, transport);
+
+        let placeholders = usize::from(running > 0);
+        assert_eq!(
+            serde_json::to_value(&inspected.messages).unwrap(),
+            serde_json::to_value(&request[..request.len() - placeholders]).unwrap()
+        );
+        assert_eq!(inspected.running_calls, running);
+    }
+
     #[test]
     fn exact_target_preserves_native_reasoning() {
         let model = anthropic_model();
@@ -640,7 +848,7 @@ mod tests {
         let over_trigger = qualifying_history(PRUNE_TRIGGER_TOKENS + 1);
         let projected = project(&over_trigger, &tools(true));
         assert!(matches!(&projected, Cow::Owned(_)));
-        assert!(result_content(&projected, "candidate").starts_with("[Old tool result pruned."));
+        assert!(result_content(&projected, "candidate").starts_with(PRUNED_MARKER));
         assert_eq!(
             result_content(&projected, "retained"),
             content_of_tokens(PROTECTED_OLD_RESULT_TOKENS)
@@ -697,9 +905,9 @@ mod tests {
         history.extend(qualifying_history(large).into_iter().skip(1));
 
         let projected = project(&history, &tools(true));
-        assert!(result_content(&projected, "candidate").starts_with("[Old tool result pruned."));
+        assert!(result_content(&projected, "candidate").starts_with(PRUNED_MARKER));
         for id in ["error", "missing-ref", "read-result", "skill-result"] {
-            assert!(!result_content(&projected, id).starts_with("[Old tool result pruned."));
+            assert!(!result_content(&projected, id).starts_with(PRUNED_MARKER));
         }
     }
 
@@ -716,8 +924,8 @@ mod tests {
         history.push(Message::user("recent request two".into()));
 
         let projected = project(&history, &tools(true));
-        assert!(result_content(&projected, "candidate").starts_with("[Old tool result pruned."));
-        assert!(!result_content(&projected, "recent").starts_with("[Old tool result pruned."));
+        assert!(result_content(&projected, "candidate").starts_with(PRUNED_MARKER));
+        assert!(!result_content(&projected, "recent").starts_with(PRUNED_MARKER));
     }
 
     #[test]
@@ -749,7 +957,7 @@ mod tests {
 
         let projected = project(&history, &tools(true));
 
-        assert!(result_content(&projected, "huge").starts_with("[Old tool result pruned."));
+        assert!(result_content(&projected, "huge").starts_with(PRUNED_MARKER));
     }
 
     #[test]
@@ -768,9 +976,9 @@ mod tests {
 
         let projected = project(&history, &tools(true));
 
-        assert!(result_content(&projected, "older").starts_with("[Old tool result pruned."));
-        assert!(result_content(&projected, "oversized").starts_with("[Old tool result pruned."));
-        assert!(!result_content(&projected, "newer").starts_with("[Old tool result pruned."));
+        assert!(result_content(&projected, "older").starts_with(PRUNED_MARKER));
+        assert!(result_content(&projected, "oversized").starts_with(PRUNED_MARKER));
+        assert!(!result_content(&projected, "newer").starts_with(PRUNED_MARKER));
     }
 
     /// CJK costs about one token per character while occupying three bytes, so
@@ -805,6 +1013,6 @@ mod tests {
 
         let projected = project(&history, &tools(true));
 
-        assert!(result_content(&projected, "cjk").starts_with("[Old tool result pruned."));
+        assert!(result_content(&projected, "cjk").starts_with(PRUNED_MARKER));
     }
 }

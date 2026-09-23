@@ -1,7 +1,6 @@
 use std::time::{Duration, Instant};
 
 use crate::agent::AgentCommand;
-use crate::clipboard::CopyResult;
 use crate::components::Overlay;
 use crate::components::command::ChatScope;
 use crate::components::input::{ChordHint, InputHit};
@@ -25,6 +24,7 @@ use super::{App, FAST_OFF_MSG, KeyFocus, YOLO_OFF_MSG};
 pub(super) const EDGE_SCROLL_LINES: i32 = 1;
 pub(super) const EDGE_SCROLL_INTERVAL: Duration = Duration::from_millis(25);
 const MESSAGE_ACTIONS_UNAVAILABLE: &str = "Message actions unavailable here";
+const SELECTION_COPIED: &str = "Copied selection";
 /// Rows either side of the origin that scroll nothing, so parking the pointer
 /// where it started holds the view still.
 const AUTOSCROLL_DEAD_ZONE: i32 = 2;
@@ -161,6 +161,12 @@ impl App {
             self.clear_control_hovers();
             let action = self.system_prompt_modal.handle_mouse(event);
             self.handle_system_prompt_action(action);
+            return Vec::new();
+        }
+        if self.projection_modal.is_open() && !self.permission_prompt.is_open() {
+            self.clear_control_hovers();
+            let action = self.projection_modal.handle_mouse(event);
+            self.handle_projection_action(action);
             return Vec::new();
         }
         // The goal footer names session commands rather than modal state, and
@@ -775,6 +781,8 @@ impl App {
             self.help_modal.pan(delta);
         } else if self.system_prompt_modal.is_open() {
             self.system_prompt_modal.pan(delta);
+        } else if self.projection_modal.is_open() {
+            self.projection_modal.pan(delta);
         }
     }
 
@@ -991,11 +999,7 @@ impl App {
             }
         };
 
-        match self.clipboard.copy_text(&text) {
-            Ok(CopyResult::Noop) => {}
-            Ok(CopyResult::Copied) => self.status_bar.flash("Copied selection".into()),
-            Err(e) => self.status_bar.flash(format!("Copy failed: {e}")),
-        }
+        self.copy_labelled(&text, SELECTION_COPIED);
         self.selection_state = None;
     }
 
@@ -1204,6 +1208,7 @@ impl App {
         dismiss!(self.skills_modal);
         dismiss!(self.storage_modal);
         dismiss!(self.system_prompt_modal);
+        dismiss!(self.projection_modal);
         dismiss!(self.goal_modal);
 
         dismiss!(self.command_modal);

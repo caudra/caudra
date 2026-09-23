@@ -5,48 +5,35 @@
 //! turn the published prompt is assembled with empty prompt slots, so a plugin
 //! that fills one only appears once a turn has started.
 
-use std::ops::Range;
 use std::sync::Arc;
 
 use caudra_grab::grab_scope;
 use caudra_markdown::render::SpanSource;
-use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
+use crossterm::event::{KeyCode, KeyEvent, MouseEvent};
 use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::Paragraph;
-use unicode_width::UnicodeWidthChar;
 
-use crate::components::input::apply_selection;
+use crate::components::document_view::{
+    COPIED_SELECTION, COPY_HINT, COPY_LABEL, DocumentView, Painted, UNBOUND_HINT, body_width,
+};
 use crate::components::keybindings::key;
-use crate::components::modal::{CLOSE_HINT, ESC_LABEL, FooterHits, FooterLine, Modal, SEPARATOR};
-use crate::components::scrollbar::{Scrollbar, ScrollbarMouse};
-use crate::components::{ModalScroll, Overlay, bar_area, escape_terminal_controls};
+use crate::components::modal::{CLOSE_HINT, ESC_LABEL, FooterHits, FooterLine, SEPARATOR};
+use crate::components::{Overlay, escape_terminal_controls, plain_char};
 use crate::markdown::text_to_wrapped;
 use crate::provenance::LineProvenance;
 use crate::theme::{self, Theme};
 
 const TITLE_PREFIX: &str = " System Prompt - ";
-const WIDTH_PERCENT: u16 = 78;
-const MAX_HEIGHT_PERCENT: u16 = 85;
-const H_PAD: u16 = 2;
-/// The footer keeps its own row rather than trailing the content: a prompt runs
-/// to hundreds of rows, and a footer only reachable at the bottom of them is one
-/// the reader never sees.
-const FOOTER_ROWS: u16 = 1;
 const GUTTER_GAP: &str = " ";
 const SOURCE_HINT: &str = " source";
 const RENDERED_HINT: &str = " rendered";
-const COPY_HINT: &str = " copy";
 const PROFILE_HINT: &str = " profile";
 const RAW_LABEL: &str = "r";
-const COPY_LABEL: &str = "y";
 const PROFILE_LABEL: &str = "p";
 const EMPTY: &str = "No system prompt has been published yet.";
-const EMPTY_HINT: &str = "It appears once the agent has bound a model.";
 pub(crate) const COPIED: &str = "Copied the system prompt";
-pub(crate) const COPIED_SELECTION: &str = "Copied the selection";
 
 const RAW_TARGET: usize = 0;
 const COPY_TARGET: usize = 1;
@@ -65,103 +52,7 @@ pub enum SystemPromptAction {
     Profile,
 }
 
-/// A sweep over the body, in rows of the painted content and characters within
-/// a row. Held as the two ends the pointer gave rather than as an ordered pair,
-/// so a backwards drag keeps tracking the end that is moving.
-#[derive(Clone, Copy, PartialEq, Eq)]
-struct Selection {
-    anchor: (usize, usize),
-    cursor: (usize, usize),
-}
-
-impl Selection {
-    fn at(position: (usize, usize)) -> Self {
-        Self {
-            anchor: position,
-            cursor: position,
-        }
-    }
-
-    fn ordered(self) -> ((usize, usize), (usize, usize)) {
-        if self.anchor <= self.cursor {
-            (self.anchor, self.cursor)
-        } else {
-            (self.cursor, self.anchor)
-        }
-    }
-
-    /// The characters of `row` this selection covers, or `None` where it covers
-    /// none of them. `len` closes a row the selection runs past.
-    fn on_row(self, row: usize, len: usize) -> Option<Range<usize>> {
-        let (start, end) = self.ordered();
-        if row < start.0 || row > end.0 {
-            return None;
-        }
-        let from = if row == start.0 { start.1 } else { 0 };
-        let to = if row == end.0 { end.1.min(len) } else { len };
-        (from < to).then_some(from..to)
-    }
-}
-
-/// The painted body, kept until the thing it was painted for changes. Parsing
-/// and laying out a prompt of this size is the one cost here worth avoiding on
-/// a keypress that only scrolls.
-///
-/// The gutter is not part of it. Numbers are drawn beside the body rather than
-/// inside it, so they stay put while the body pans and a selection can never
-/// pick one up.
-struct Render {
-    width: u16,
-    raw: bool,
-    theme_generation: u64,
-    lines: Vec<Line<'static>>,
-    /// One per row: the source line it opens, or `None` for a row that opens
-    /// none. A row continuing the line above repeats no number, the way an
-    /// editor leaves a wrapped line numbered once.
-    numbers: Vec<Option<usize>>,
-    content_width: u16,
-}
-
-impl Render {
-    fn build(source: &str, raw: bool, width: u16, theme_generation: u64, theme: &Theme) -> Self {
-        let (lines, numbers) = if source.is_empty() {
-            (notice_lines(theme), Vec::new())
-        } else if raw || width == 0 {
-            raw_lines(source, theme)
-        } else {
-            rendered_lines(source, width, theme)
-        };
-        let content_width = lines
-            .iter()
-            .map(Line::width)
-            .max()
-            .and_then(|width| u16::try_from(width).ok())
-            .unwrap_or(u16::MAX);
-        Self {
-            width,
-            raw,
-            theme_generation,
-            lines,
-            numbers: first_of_each_line(numbers),
-            content_width,
-        }
-    }
-
-    fn matches(&self, width: u16, raw: bool, theme_generation: u64) -> bool {
-        self.width == width && self.raw == raw && self.theme_generation == theme_generation
-    }
-
-    fn row_text(&self, row: usize) -> Option<String> {
-        self.lines.get(row).map(ToString::to_string)
-    }
-
-    fn last_position(&self) -> (usize, usize) {
-        let row = self.lines.len().saturating_sub(1);
-        let len = self.row_text(row).map_or(0, |text| text.chars().count());
-        (row, len)
-    }
-}
-
+#[derive(Default)]
 pub struct SystemPromptModal {
     open: bool,
     /// What the run published, snapshotted when the modal opened. An inspector
@@ -173,37 +64,10 @@ pub struct SystemPromptModal {
     /// Columns the numbers hold beside the body, fixed while the modal is open
     /// because the source it counts cannot change under it.
     gutter: u16,
-    selection: Option<Selection>,
-    scroll: ModalScroll,
-    scrollbar: Scrollbar,
-    pan_bar: Scrollbar,
+    /// Painted per view, wrap width and theme generation.
+    document: DocumentView<(bool, u16, u64)>,
     popup: Rect,
-    /// Where the body was drawn, so a press can be read back as a position in
-    /// it. Known only after a frame, which is also the only time a press can
-    /// land on one.
-    content: Rect,
     footer: FooterHits,
-    cache: Option<Render>,
-}
-
-impl Default for SystemPromptModal {
-    fn default() -> Self {
-        Self {
-            open: false,
-            source: Arc::from(""),
-            title: String::new(),
-            raw: false,
-            gutter: 0,
-            selection: None,
-            scroll: ModalScroll::new_top(),
-            scrollbar: Scrollbar::default(),
-            pan_bar: Scrollbar::horizontal(),
-            popup: Rect::default(),
-            content: Rect::default(),
-            footer: FooterHits::default(),
-            cache: None,
-        }
-    }
 }
 
 impl SystemPromptModal {
@@ -213,18 +77,14 @@ impl SystemPromptModal {
         self.source = source;
         self.title = format!("{TITLE_PREFIX}{profile} ");
         self.raw = false;
-        self.selection = None;
-        self.cache = None;
-        self.scroll.reset();
+        self.document.reset();
         self.footer.clear();
     }
 
     pub fn close(&mut self) {
         self.open = false;
         self.source = Arc::from("");
-        self.selection = None;
-        self.cache = None;
-        self.scroll.reset();
+        self.document.reset();
         self.footer.reset();
     }
 
@@ -237,14 +97,14 @@ impl SystemPromptModal {
     }
 
     pub fn scroll(&mut self, delta: i32) {
-        self.scroll.scroll(delta);
+        self.document.scroll(delta);
     }
 
     /// A sideways wheel over the modal, which only reaches anything while a row
     /// runs past the body: rendered markdown is already broken to the columns
     /// it was given.
     pub fn pan(&mut self, delta: i32) {
-        self.scroll.pan_by(delta);
+        self.document.pan(delta);
     }
 
     pub fn handle_key(&mut self, key_event: KeyEvent) -> SystemPromptAction {
@@ -261,56 +121,23 @@ impl SystemPromptModal {
             return SystemPromptAction::Consumed;
         }
         if key::SELECT_ALL.matches(key_event) {
-            self.select_all();
+            self.document.select_all();
             return SystemPromptAction::Consumed;
         }
-        match key_event.code {
-            KeyCode::Char('r') => self.toggle_raw(),
-            KeyCode::Char('y') => return self.copy(),
-            KeyCode::Char('p') => return SystemPromptAction::Profile,
+        match plain_char(&key_event) {
+            Some('r') => self.toggle_raw(),
+            Some('y') => return self.copy(),
+            Some('p') => return SystemPromptAction::Profile,
             _ => {
-                self.scroll.handle_key(key_event);
+                self.document.handle_scroll_key(key_event);
             }
         }
         SystemPromptAction::Consumed
     }
 
     pub fn handle_mouse(&mut self, event: MouseEvent) -> SystemPromptAction {
-        match self.scrollbar.handle(&event) {
-            ScrollbarMouse::Ignored => {}
-            ScrollbarMouse::Consumed => return SystemPromptAction::Consumed,
-            ScrollbarMouse::ScrollTo(top) => {
-                self.scroll.scroll_to(top as u16);
-                return SystemPromptAction::Consumed;
-            }
-        }
-        match self.pan_bar.handle(&event) {
-            ScrollbarMouse::Ignored => {}
-            ScrollbarMouse::Consumed => return SystemPromptAction::Consumed,
-            ScrollbarMouse::ScrollTo(column) => {
-                self.scroll.pan_to(column as u16);
-                return SystemPromptAction::Consumed;
-            }
-        }
-        // A press away from the body leaves any sweep alone, so a reader can
-        // select a passage and then reach for the copy control without the
-        // press to get there throwing the selection away.
-        match event.kind {
-            MouseEventKind::Down(MouseButton::Left) => {
-                if let Some(at) = self.position_at(&event) {
-                    self.selection = Some(Selection::at(at));
-                    return SystemPromptAction::Consumed;
-                }
-            }
-            MouseEventKind::Drag(MouseButton::Left) => {
-                if let Some(at) = self.position_at(&event)
-                    && let Some(selection) = &mut self.selection
-                {
-                    selection.cursor = at;
-                    return SystemPromptAction::Consumed;
-                }
-            }
-            _ => {}
+        if self.document.handle_mouse(event) {
+            return SystemPromptAction::Consumed;
         }
         match self.footer.handle_mouse(event) {
             Some(RAW_TARGET) => self.toggle_raw(),
@@ -323,7 +150,8 @@ impl SystemPromptModal {
     }
 
     /// The sweep if there is one, the whole document otherwise. A reader who
-    /// marked a passage asked for that passage.
+    /// marked a passage asked for that passage, which in the rendered view is
+    /// the rendering; `y` with nothing marked is what reaches the source.
     fn copy(&self) -> SystemPromptAction {
         self.copy_selection()
             .unwrap_or_else(|| SystemPromptAction::Copy {
@@ -333,67 +161,19 @@ impl SystemPromptModal {
     }
 
     fn copy_selection(&self) -> Option<SystemPromptAction> {
-        self.selected_text().map(|text| SystemPromptAction::Copy {
-            text,
-            label: COPIED_SELECTION,
-        })
-    }
-
-    /// What the sweep covers, taken from the painted rows rather than from the
-    /// source: a selection copies the text the reader marked, which in the
-    /// rendered view is the rendering. `y` with nothing marked is what reaches
-    /// the source.
-    fn selected_text(&self) -> Option<String> {
-        let selection = self.selection?;
-        let render = self.cache.as_ref()?;
-        let (start, end) = selection.ordered();
-        let mut text = String::new();
-        for row in start.0..=end.0.min(render.lines.len().saturating_sub(1)) {
-            let chars: Vec<char> = render.row_text(row)?.chars().collect();
-            let range = selection
-                .on_row(row, chars.len())
-                .unwrap_or(chars.len()..chars.len());
-            if row > start.0 {
-                text.push('\n');
-            }
-            text.extend(&chars[range]);
-        }
-        (!text.is_empty()).then_some(text)
-    }
-
-    fn select_all(&mut self) {
-        let Some(render) = self.cache.as_ref() else {
-            return;
-        };
-        self.selection = Some(Selection {
-            anchor: (0, 0),
-            cursor: render.last_position(),
-        });
-    }
-
-    /// Where a press landed in the body, in the same rows and characters the
-    /// selection is held in. `None` for a press outside the body.
-    fn position_at(&self, event: &MouseEvent) -> Option<(usize, usize)> {
-        let column = event.column.checked_sub(self.content.x)?;
-        let row = event.row.checked_sub(self.content.y)?;
-        if column >= self.content.width || row >= self.content.height {
-            return None;
-        }
-        let render = self.cache.as_ref()?;
-        let row = usize::from(self.scroll.offset())
-            .saturating_add(usize::from(row))
-            .min(render.lines.len().saturating_sub(1));
-        let text = render.row_text(row)?;
-        let column = usize::from(self.scroll.pan()).saturating_add(usize::from(column));
-        Some((row, char_at_column(&text, column)))
+        self.document
+            .selected_text()
+            .map(|text| SystemPromptAction::Copy {
+                text,
+                label: COPIED_SELECTION,
+            })
     }
 
     /// Neither offset nor sweep survives the switch: the two views agree on the
     /// source behind a row, never on the row a source line landed on.
     fn toggle_raw(&mut self) {
         self.raw = !self.raw;
-        self.selection = None;
-        self.scroll.reset();
+        self.document.reset();
         self.footer.clear();
     }
 
@@ -404,108 +184,16 @@ impl SystemPromptModal {
         grab_scope!("system_prompt_modal", area);
 
         let theme = theme::current();
-        let generation = theme::generation();
-        let width = Modal::inner_width(area.width, WIDTH_PERCENT)
-            .saturating_sub(H_PAD * 2)
-            .saturating_sub(self.gutter);
-        if !self
-            .cache
-            .as_ref()
-            .is_some_and(|render| render.matches(width, self.raw, generation))
-        {
-            self.cache = Some(Render::build(
-                &self.source,
-                self.raw,
-                width,
-                generation,
-                &theme,
-            ));
-            // A rebuild rewraps, so the rows a sweep named are no longer the
-            // rows it was drawn over.
-            self.selection = None;
-        }
-        let render = self.cache.as_ref().expect("cache filled above");
-        let rows = u16::try_from(render.lines.len()).unwrap_or(u16::MAX);
-
-        let modal = Modal {
-            title: &self.title,
-            width_percent: WIDTH_PERCENT,
-            max_height_percent: MAX_HEIGHT_PERCENT,
-        };
-        let (popup, inner) = modal.render(frame, area, rows.saturating_add(FOOTER_ROWS));
-        let body = Rect {
-            x: inner.x.saturating_add(H_PAD),
-            y: inner.y,
-            width: inner.width.saturating_sub(H_PAD * 2),
-            height: inner.height.saturating_sub(FOOTER_ROWS),
-        };
-        let gutter_area = Rect {
-            width: self.gutter.min(body.width),
-            ..body
-        };
-        let content = Rect {
-            x: body.x.saturating_add(gutter_area.width),
-            width: body.width.saturating_sub(gutter_area.width),
-            ..body
-        };
-        let footer_area = Rect {
-            y: inner.y.saturating_add(body.height),
-            height: inner.height.min(FOOTER_ROWS),
-            ..body
-        };
-
-        self.scroll.update_dimensions(rows, content.height);
-        self.scroll.fit_width(render.content_width, content.width);
-        let offset = self.scroll.offset();
-        let pan = self.scroll.pan();
-
+        let width = body_width(area.width, self.gutter);
+        self.document
+            .ensure((self.raw, width, theme::generation()), self.gutter, || {
+                paint(&self.source, self.raw, width, self.gutter, &theme)
+            });
         let footer = footer(self.raw, &theme);
-        self.footer.set(footer.hits(footer_area, 0, FOOTER_ROWS));
-
-        // Only the rows on screen are cloned. The painted body is kept whole so
-        // a scroll does not repaint it, and handing the paragraph the whole of
-        // it would spend on every row what the cache saved.
-        let window = usize::from(offset)..usize::from(offset).saturating_add(content.height.into());
-        let visible: Vec<Line<'static>> = render
-            .lines
-            .iter()
-            .enumerate()
-            .skip(window.start)
-            .take(content.height.into())
-            .map(|(row, line)| match self.row_selection(row, line) {
-                Some(range) => Line::from(apply_selection(line.spans.clone(), &range)),
-                None => line.clone(),
-            })
-            .collect();
-        let numbers: Vec<Line<'static>> = render
-            .numbers
-            .get(window.start..window.end.min(render.numbers.len()))
-            .unwrap_or_default()
-            .iter()
-            .map(|number| gutter_line(*number, self.gutter, theme.diff_line_nr))
-            .collect();
-
-        frame.render_widget(Paragraph::new(numbers), gutter_area);
-        frame.render_widget(Paragraph::new(visible).scroll((0, pan)), content);
-        frame.render_widget(
-            Paragraph::new(footer.line(self.footer.hovered())),
-            footer_area,
-        );
-
-        self.scrollbar.draw(frame, inner, rows, offset);
-        self.pan_bar
-            .draw(frame, bar_area(inner), render.content_width, pan);
-
-        self.content = content;
-        self.popup = popup;
-        popup
-    }
-
-    /// The characters of a drawn row the sweep covers, measured against the
-    /// row's own text so a selection running past its end stops there.
-    fn row_selection(&self, row: usize, line: &Line<'static>) -> Option<Range<usize>> {
-        self.selection?
-            .on_row(row, line.to_string().chars().count())
+        self.popup = self
+            .document
+            .render(frame, area, &self.title, &footer, &mut self.footer);
+        self.popup
     }
 
     #[cfg(test)]
@@ -543,10 +231,37 @@ fn footer(raw: bool, theme: &Theme) -> FooterLine {
     footer
 }
 
+/// The view `raw` names, painted to `width`, with each row's source line number
+/// in the gutter beside it.
+fn paint(source: &str, raw: bool, width: u16, gutter: u16, theme: &Theme) -> Painted {
+    let (lines, numbers) = numbered_rows(source, raw, width, theme);
+    let cells = numbers
+        .into_iter()
+        .map(|number| gutter_line(number, gutter, theme.diff_line_nr))
+        .collect();
+    Painted::new(lines, cells, Vec::new())
+}
+
+fn numbered_rows(
+    source: &str,
+    raw: bool,
+    width: u16,
+    theme: &Theme,
+) -> (Vec<Line<'static>>, Vec<Option<usize>>) {
+    let (lines, numbers) = if source.is_empty() {
+        (notice_lines(theme), Vec::new())
+    } else if raw || width == 0 {
+        raw_lines(source, theme)
+    } else {
+        rendered_lines(source, width, theme)
+    };
+    (lines, first_of_each_line(numbers))
+}
+
 fn notice_lines(theme: &Theme) -> Vec<Line<'static>> {
     vec![
         Line::from(Span::styled(EMPTY, theme.status_dim)),
-        Line::from(Span::styled(EMPTY_HINT, theme.tool_dim)),
+        Line::from(Span::styled(UNBOUND_HINT, theme.tool_dim)),
     ]
 }
 
@@ -646,19 +361,6 @@ fn line_starts(text: &str) -> Vec<u32> {
         .collect()
 }
 
-/// The character a display column falls on, so a press lands where the reader
-/// sees the pointer rather than that many chars along a row of wide glyphs.
-fn char_at_column(text: &str, column: usize) -> usize {
-    let mut width = 0;
-    for (index, character) in text.chars().enumerate() {
-        if width >= column {
-            return index;
-        }
-        width += UnicodeWidthChar::width(character).unwrap_or(0);
-    }
-    text.chars().count()
-}
-
 fn line_number_at(starts: &[u32], byte: u32) -> usize {
     starts.partition_point(|&start| start <= byte).max(1)
 }
@@ -689,8 +391,13 @@ mod tests {
     const SOURCE_HIDDEN: &str = "source view must draw the document verbatim";
     const NUMBER_MISSING: &str = "every source line must be reachable by its number";
     const NUMBER_REPEATED: &str = "a folded line must be numbered once, at its head";
+    /// Appended [`FILLER_LINES`] times, so the prompt runs past the body.
+    const FILLER: &str = "filler\n";
+    const FILLER_LINES: usize = 60;
     const COPY_IS_SOURCE: &str = "copy must hand over the source, never the painted rows";
     const SELECTION_WRONG: &str = "a sweep must copy the rows it was drawn over";
+    const NOT_SCROLLED: &str = "the fixture must start a line down a prompt longer than the body";
+    const CHORD_TAKEN: &str = "Ctrl+Y must scroll a line up, never copy";
 
     fn prompt() -> String {
         format!("{HEADING}\n\n{BODY}\n\n{FENCE}\nlet x = 1;\n{FENCE}\n")
@@ -750,13 +457,11 @@ mod tests {
     /// fences in their own ranges, so numbering by the row would name line 5
     /// for the code on line 6 and line 9 for the code on line 8.
     fn numbered(source: &str, width: u16) -> Vec<(Option<usize>, String)> {
-        let theme = theme::current();
-        let render = Render::build(source, false, width, theme::generation(), &theme);
-        render
-            .numbers
-            .iter()
-            .zip(&render.lines)
-            .map(|(number, line)| (*number, line.to_string().trim_end().to_owned()))
+        let (lines, numbers) = numbered_rows(source, false, width, &theme::current());
+        numbers
+            .into_iter()
+            .zip(&lines)
+            .map(|(number, line)| (number, line.to_string().trim_end().to_owned()))
             .collect()
     }
 
@@ -847,6 +552,27 @@ mod tests {
         assert_eq!(label, COPIED);
     }
 
+    /// `y` copies, and the chord spelled with it scrolls like it does in every
+    /// other modal.
+    #[test]
+    fn ctrl_y_scrolls_a_line_up_rather_than_copying() {
+        let mut modal = SystemPromptModal::default();
+        let source = format!("{}{}", prompt(), FILLER.repeat(FILLER_LINES));
+        modal.open(Arc::from(source.as_str()), PROFILE);
+        modal.handle_key(key_ev(KeyCode::Char('r')));
+        render(&mut modal);
+        modal.scroll(-1);
+        assert!(!render(&mut modal).contains(HEADING), "{NOT_SCROLLED}");
+
+        let action = modal.handle_key(key::SCROLL_LINE_UP.to_key_event());
+
+        assert!(
+            matches!(action, SystemPromptAction::Consumed),
+            "{CHORD_TAKEN}"
+        );
+        assert!(render(&mut modal).contains(HEADING), "{CHORD_TAKEN}");
+    }
+
     #[test]
     fn the_profile_key_asks_the_host_for_the_picker() {
         let mut modal = opened();
@@ -881,7 +607,7 @@ mod tests {
     /// Drags the pointer from the first character of one body row to a column
     /// partway along a later one, the way a reader marks a passage.
     fn sweep(modal: &mut SystemPromptModal, from: (u16, u16), to: (u16, u16)) {
-        let content = modal.content;
+        let content = modal.document.content();
         let at = |(column, row): (u16, u16)| Rect {
             x: content.x.saturating_add(column),
             y: content.y.saturating_add(row),
@@ -928,23 +654,25 @@ mod tests {
         ));
         assert!(modal.is_open());
 
-        modal.selection = None;
+        // A bare click collapses the sweep to nothing.
+        sweep(&mut modal, (0, 0), (0, 0));
         modal.handle_key(key::QUIT.to_key_event());
         assert!(!modal.is_open());
     }
 
     #[test]
-    fn select_all_reaches_the_last_row() {
+    fn select_all_then_copy_hands_over_every_row() {
         let mut modal = opened();
         modal.handle_key(key_ev(KeyCode::Char('r')));
         render(&mut modal);
         modal.handle_key(key::SELECT_ALL.to_key_event());
 
-        assert_eq!(
-            modal.selected_text().as_deref(),
-            Some(prompt().trim_end()),
-            "{SELECTION_WRONG}"
-        );
+        let SystemPromptAction::Copy { text, label } = modal.handle_key(key_ev(KeyCode::Char('y')))
+        else {
+            panic!("{SELECTION_WRONG}");
+        };
+        assert_eq!(text, prompt().trim_end(), "{SELECTION_WRONG}");
+        assert_eq!(label, COPIED_SELECTION);
     }
 
     #[test]
@@ -969,7 +697,7 @@ mod tests {
         sweep(&mut modal, (0, 0), (3, 0));
         modal.handle_key(key_ev(KeyCode::Char('r')));
 
-        assert!(modal.selected_text().is_none());
+        assert!(modal.document.selected_text().is_none());
     }
 
     #[test_case(0,      1 ; "first_byte_is_line_one")]
@@ -979,13 +707,5 @@ mod tests {
     fn a_byte_reads_back_as_its_line(byte: u32, expected: usize) {
         let starts = line_starts("abc\ndef\nghi");
         assert_eq!(line_number_at(&starts, byte), expected);
-    }
-
-    #[test_case("abc",  0, 0 ; "column_zero_is_the_first_char")]
-    #[test_case("abc",  2, 2 ; "a_narrow_column_is_its_own_char")]
-    #[test_case("abc", 99, 3 ; "past_the_end_is_the_end")]
-    #[test_case("日本",  2, 1 ; "a_wide_glyph_holds_two_columns")]
-    fn a_column_reads_back_as_its_character(text: &str, column: usize, expected: usize) {
-        assert_eq!(char_at_column(text, column), expected);
     }
 }

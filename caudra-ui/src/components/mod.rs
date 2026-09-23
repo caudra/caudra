@@ -4,6 +4,7 @@ pub(crate) mod command_modal;
 pub(crate) mod commit_popup;
 pub(crate) mod completion;
 pub(crate) mod context_modal;
+pub(crate) mod document_view;
 pub(crate) mod environment_card;
 pub(crate) mod file_picker;
 pub(crate) mod file_walk;
@@ -31,6 +32,7 @@ pub(crate) mod permission_scope;
 pub(crate) mod permissions_picker;
 pub(crate) mod plan_form;
 pub(crate) mod progress_bar;
+pub(crate) mod projection_modal;
 pub(crate) mod prompt_profile_picker;
 pub(crate) mod prompt_progress;
 pub(crate) mod question_form;
@@ -96,6 +98,9 @@ const DIGIT_GROUP: usize = 3;
 /// Columns a modal pans per key press. Roughly one column of a token table, so
 /// a reader walks the table a field at a time rather than a glyph at a time.
 const PAN_STEP: i32 = 8;
+const BYTE_STEP: u64 = 1024;
+const BYTE_UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+const IEC_BYTE_UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
 
 pub(crate) fn chevron_span() -> ratatui::text::Span<'static> {
     ratatui::text::Span::styled(CHEVRON, crate::theme::current().tool_dim)
@@ -580,6 +585,30 @@ pub(crate) fn format_elapsed(seconds: u64) -> String {
     }
 }
 
+/// `512 B`, `2.0 KB`: a size in the largest unit it fills.
+pub(crate) fn format_bytes(bytes: u64) -> String {
+    scaled_bytes(bytes, &BYTE_UNITS)
+}
+
+/// [`format_bytes`] under the IEC names, `2.0 KiB`, for the storage report.
+pub(crate) fn format_iec_bytes(bytes: u64) -> String {
+    scaled_bytes(bytes, &IEC_BYTE_UNITS)
+}
+
+fn scaled_bytes(bytes: u64, units: &[&str; 5]) -> String {
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= BYTE_STEP as f64 && unit + 1 < units.len() {
+        value /= BYTE_STEP as f64;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} {}", units[0])
+    } else {
+        format!("{value:.1} {}", units[unit])
+    }
+}
+
 pub(crate) fn now_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -600,6 +629,21 @@ pub(crate) fn escape_terminal_controls(text: &str) -> String {
 
 pub fn is_ctrl(key: &KeyEvent) -> bool {
     key.modifiers.contains(KeyModifiers::CONTROL) && !key.modifiers.contains(KeyModifiers::ALT)
+}
+
+/// The character a key types with neither Ctrl nor Alt held, so a letter
+/// command never swallows a chord spelled with the same letter.
+pub(crate) fn plain_char(key: &KeyEvent) -> Option<char> {
+    match key.code {
+        KeyCode::Char(character)
+            if !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+        {
+            Some(character)
+        }
+        _ => None,
+    }
 }
 
 pub(crate) struct ModalScroll {
@@ -1739,6 +1783,16 @@ mod tests {
     #[test_case(0, 5, 0    ; "clamp_underflow")]
     fn apply_scroll_delta_cases(offset: u16, delta: i32, expected: u16) {
         assert_eq!(apply_scroll_delta(offset, delta), expected);
+    }
+
+    #[test_case(0,                      "0 B",    "0 B"     ; "zero")]
+    #[test_case(512,                    "512 B",  "512 B"   ; "bytes")]
+    #[test_case(2048,                   "2.0 KB", "2.0 KiB" ; "kilobytes")]
+    #[test_case(5 * 1024 * 1024,        "5.0 MB", "5.0 MiB" ; "megabytes")]
+    #[test_case(7 * 1024 * 1024 * 1024, "7.0 GB", "7.0 GiB" ; "gigabytes")]
+    fn sizes_read_in_the_largest_unit_they_fill(bytes: u64, short: &str, iec: &str) {
+        assert_eq!(format_bytes(bytes), short);
+        assert_eq!(format_iec_bytes(bytes), iec);
     }
 
     const MODAL_TOTAL: u16 = 100;

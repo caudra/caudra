@@ -17,7 +17,7 @@ use tracing::{debug, warn};
 
 use crate::manifest::ManifestRegistry;
 use crate::model::{Billing, Model, ModelPricing, ThinkingSupport};
-use crate::provider::{BoxFuture, Provider, ProviderKind};
+use crate::provider::{BoxFuture, Provider, ProviderKind, WireRequest};
 use crate::types::{ReasoningOptions, ThinkingFields};
 use crate::{
     AgentError, CacheKey, Message, ProviderEvent, ProviderUsage, RequestOptions, StreamResponse,
@@ -789,6 +789,19 @@ impl Provider for DynamicProvider {
                 result => result,
             }
         })
+    }
+
+    fn wire_request(
+        &self,
+        model: &Model,
+        messages: &[Message],
+        system: &str,
+        tools: &Value,
+        opts: &RequestOptions,
+        cache_key: Option<&CacheKey>,
+    ) -> Result<WireRequest, AgentError> {
+        self.inner
+            .wire_request(model, messages, system, tools, opts, cache_key)
     }
 
     fn list_models(&self) -> BoxFuture<'_, Result<Vec<crate::model::ModelInfo>, AgentError>> {

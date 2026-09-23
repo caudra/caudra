@@ -310,6 +310,12 @@ impl KeyPool {
 }
 
 #[cfg(test)]
+pub(crate) mod test_support {
+    pub(crate) const CREDENTIAL_IN_URL: &str =
+        "credentials travel in headers, never in a URL a dry run shows";
+}
+
+#[cfg(test)]
 mod tests {
     use std::cell::Cell;
     use std::rc::Rc;

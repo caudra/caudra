@@ -836,7 +836,7 @@ impl AgentLoop {
     fn publish_prepared_context(&self, slot: &ModelSlot) {
         let mcp = self.mcp.as_ref().map(McpSession::request_snapshot);
         let tools = self.request_tools(mcp.as_ref());
-        let messages = agent::project_for_target(
+        let messages = agent::project_request(
             self.history.as_slice(),
             &tools,
             &slot.model,

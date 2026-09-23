@@ -28,6 +28,8 @@ The per-source breakdown is an estimate. Caudra counts text and images locally w
 
 Repeated requests increase `/usage` even when the current `/context` total stays flat. See [Token Economy](/docs/token-economy/#lifetime-spend) for the spending ledger.
 
+`/projection` shows the request that `/context` counts: the system prompt, the tools, and the history as the provider receives them. It covers Main only. See [Inspect the projection](#inspect-the-projection).
+
 ## What loads when
 
 ```
@@ -207,9 +209,33 @@ Rule of thumb: when `AGENTS.md` grows past a screen, the new material probably w
 
 ## Provider request projection
 
-Caudra can replace old successful tool-result text with output-ID markers before sending a request to the provider. Only results retained for later retrieval are eligible. This reduces repeated context while keeping the result available through `tool_output_read` and `tool_output_grep`.
+The request for each turn carries a projection of the session history: a copy adapted to the model and provider the request goes to. Five steps build it.
 
-The `/context` report uses this provider projection rather than counting the raw transcript. Its message total can therefore be smaller than the on-disk log, and changing the active model or provider can change the projection. The replacement exists only in the provider request. Canonical session history stays intact. Compaction is separate and can rewrite the live log as described below.
+1. **Old-result pruning.** A successful tool result that Caudra [retained](/docs/token-economy/#smaller-results), from before your last two messages, becomes a marker naming its output ID, so the model can still read or search the full result with `tool_output`. The newest of those results stay whole until the next one would take them past 40,000 tokens, and pruning starts only once the rest add up to more than 20,000. Results from `tool_output` and `skill` are never pruned. The step needs `tool_output` in the request's tools, because the marker points there.
+2. **Foreign-reasoning lowering.** Reasoning goes back as reasoning only to the provider, model, and API that produced it, and only when it is complete. Otherwise it is sent as plain text, and redacted reasoning and signatures are dropped, because only the provider that issued them can use them.
+3. **Empty-turn filler.** An assistant turn with no text and no tool call, such as one that only reasoned, is sent with the text `(empty)`, since providers reject an empty turn. When a model stalls on empty replies, only the latest empty turn and the recovery prompt after it are sent, so the model does not take a run of them as the pattern to follow.
+4. **Tool-pair repair.** Providers reject a tool call without its result and a result without its call. A result whose call is missing is dropped, and a call whose result is missing is answered with the error `[Tool result not available]`.
+5. **Image fallback.** For a model without image input, each image becomes a note saying it was omitted. Switching back to a vision model sends the images again.
+
+Each change exists only in the request. The stored session history stays intact, so the next request is projected from the original again. Compaction is separate and can rewrite the live log as described below.
+
+The live request, `/context`, and `/btw` all use this projection. `/context` counts it rather than the raw transcript, so its message total can be smaller than the on-disk log, and changing the active model or provider can change the projection.
+
+### Inspect the projection
+
+`/projection` shows the conversation as the provider receives it: the system prompt, the tools, and the history after these five steps. It covers Main only. The modal takes a snapshot when it opens and holds still while you read, so reopen it to see a newer request.
+
+The Projection view lays the request out in sections. `SYSTEM` holds the system prompt and `TOOLS` names the tools offered. Each message follows as `#1 USER`, `#2 ASSISTANT`, and so on, with its text as written and its markdown syntax visible. Labels mark each `thinking`, `redacted thinking`, `tool_use`, `tool_result`, and `image` block, and an image shows its media type and size in place of the pixels. Dim tags on a message header, such as `synthetic` or `compaction summary`, record what Caudra knows about the message and never sends.
+
+`n` and `p` jump to the next and previous section. Drag to select a passage, or press `Ctrl+A` to select the whole view. With a selection standing, `y` and `Ctrl+C` copy it. With nothing selected, `y` copies the whole view as unwrapped text without the bars in the margin, and `Ctrl+C` closes the modal.
+
+Press `r` for the Wire view, the JSON body the active provider would send for the same messages, and `r` again to go back. The title shows the method and URL. Headers are left out, and credentials travel only in headers, so no key or token appears. Caudra builds the body with the same code as the real request, using only the credentials and caches it already holds. When those are not enough yet, the view says why: Copilot, for example, learns its API endpoint from the first message you send.
+
+The body is pretty-printed for reading rather than byte-identical to the one sent. Long lines run past the edge rather than wrapping, and `Shift+Left` and `Shift+Right` pan across them as in any [wide modal](/docs/keybindings/#focus). A long base64 string, such as image data or encrypted reasoning, is shortened on screen to its size, and `y` copies the body with every string whole.
+
+Opened while tool calls are still running, both views leave the last assistant turn's calls open, without the placeholder results that repair would add. The Wire body then carries those calls with no results. Each view ends with a note that their results join the next request.
+
+A view taller than 65,535 rows keeps its newest rows behind a notice that the earlier ones are left out. `Ctrl+A` then selects only the rows kept. With nothing selected, `y` still copies everything.
 
 ## When the window fills
 

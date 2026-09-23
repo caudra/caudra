@@ -50,6 +50,7 @@ pub(crate) const WIDE_CONTEXT_WINDOW: u32 = 372_000;
 
 const CLAUDE_CODE_IDENTITY: &str = "You are Claude Code, Anthropic's official CLI for Claude.";
 const BILLING_PREFIX: &str = "59cf53e54c78";
+const TEXT_BLOCK: &str = "text";
 
 pub(crate) fn strip_long_context(model_id: &str) -> &str {
     model_id
@@ -84,7 +85,7 @@ pub(crate) struct CacheControl {
     pub r#type: &'static str,
 }
 
-pub(crate) const EPHEMERAL: CacheControl = CacheControl {
+const EPHEMERAL: CacheControl = CacheControl {
     r#type: "ephemeral",
 };
 
@@ -178,11 +179,11 @@ struct MessageDeltaEvent {
 }
 
 #[derive(Serialize)]
-pub(crate) struct SystemBlock<'a> {
-    pub r#type: &'static str,
-    pub text: &'a str,
+struct SystemBlock<'a> {
+    r#type: &'static str,
+    text: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub cache_control: Option<CacheControl>,
+    cache_control: Option<CacheControl>,
 }
 
 #[derive(Serialize)]
@@ -299,24 +300,62 @@ pub(super) fn build_wire_tools(tools: &Value) -> Value {
     Value::Array(out)
 }
 
-pub(crate) fn build_request_body_with_system(
+/// The prompt's breakpoint caches a prefix ahead of it too, so the prefix
+/// spends none of the four the API allows.
+fn system_blocks<'a>(prefix: Option<&'a str>, system: &'a str) -> Vec<SystemBlock<'a>> {
+    let prompt = SystemBlock {
+        r#type: TEXT_BLOCK,
+        text: system,
+        cache_control: Some(EPHEMERAL),
+    };
+    match prefix {
+        Some(prefix) => vec![
+            SystemBlock {
+                r#type: TEXT_BLOCK,
+                text: prefix,
+                cache_control: None,
+            },
+            prompt,
+        ],
+        None => vec![prompt],
+    }
+}
+
+/// The body every Anthropic-protocol endpoint shares. Bedrock names the model
+/// in its URL, so it builds on this rather than on [`messages_body`].
+pub(crate) fn request_body(
     model: &Model,
     messages: &[Message],
-    system_blocks: &[SystemBlock<'_>],
+    system_prefix: Option<&str>,
+    system: &str,
     tools: &Value,
-    thinking: ThinkingConfig,
+    thinking: &ThinkingConfig,
 ) -> Value {
-    let wire_messages = build_wire_messages(messages);
-    let wire_tools = build_wire_tools(tools);
-
     let mut body = json!({
         "max_tokens": model.max_output_tokens.unwrap_or(FALLBACK_MAX_TOKENS),
-        "system": system_blocks,
-        "messages": wire_messages,
-        "tools": wire_tools,
+        "system": system_blocks(system_prefix, system),
+        "messages": build_wire_messages(messages),
+        "tools": build_wire_tools(tools),
     });
 
     thinking.apply_to_body(&mut body, model);
+    body
+}
+
+/// [`request_body`] as the Messages API takes it: naming its model and asking
+/// for a stream.
+pub(crate) fn messages_body(
+    model: &Model,
+    model_id: &str,
+    messages: &[Message],
+    system_prefix: Option<&str>,
+    system: &str,
+    tools: &Value,
+    thinking: &ThinkingConfig,
+) -> Value {
+    let mut body = request_body(model, messages, system_prefix, system, tools, thinking);
+    body["model"] = json!(model_id);
+    body["stream"] = json!(true);
     body
 }
 

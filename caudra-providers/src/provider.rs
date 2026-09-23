@@ -38,6 +38,8 @@ use crate::{
 
 const STATIC_FALLBACK_NOTE: &str = "using static fallback";
 const NO_FALLBACK_NOTE: &str = "no models listed";
+const NO_WIRE_BODY: &str = "this provider does not describe its wire body";
+const POST: &str = "POST";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Display, EnumString, EnumIter)]
 #[strum(serialize_all = "kebab-case")]
@@ -256,6 +258,25 @@ impl ProviderKind {
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
+/// The request a provider sends for one turn, minus its headers. Credentials
+/// only ever travel in headers, so a `WireRequest` is safe to show as-is.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WireRequest {
+    pub method: &'static str,
+    pub url: String,
+    pub body: Value,
+}
+
+impl WireRequest {
+    pub fn post(url: String, body: Value) -> Self {
+        Self {
+            method: POST,
+            url,
+            body,
+        }
+    }
+}
+
 pub trait Provider: Send + Sync {
     #[allow(clippy::too_many_arguments)]
     fn stream_message<'a>(
@@ -268,6 +289,25 @@ pub trait Provider: Send + Sync {
         opts: RequestOptions,
         cache_key: Option<&'a CacheKey>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>>;
+
+    /// What [`Self::stream_message`] would send for the same inputs, built by
+    /// the code the send runs. A dry run: it reads only in-memory auth
+    /// snapshots, warm caches, and local config and credential files. It never
+    /// refreshes credentials or touches the network, so whatever only a send
+    /// could resolve is reported as an error instead.
+    fn wire_request(
+        &self,
+        _model: &Model,
+        _messages: &[Message],
+        _system: &str,
+        _tools: &Value,
+        _opts: &RequestOptions,
+        _cache_key: Option<&CacheKey>,
+    ) -> Result<WireRequest, AgentError> {
+        Err(AgentError::Config {
+            message: NO_WIRE_BODY.into(),
+        })
+    }
 
     fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>>;
 
@@ -370,6 +410,12 @@ struct UnconfiguredProvider;
 
 const NOT_CONFIGURED: &str = "no provider configured — run /login or `caudra auth login`";
 
+fn not_configured() -> AgentError {
+    AgentError::Config {
+        message: NOT_CONFIGURED.to_string(),
+    }
+}
+
 impl Provider for UnconfiguredProvider {
     fn stream_message<'a>(
         &'a self,
@@ -381,19 +427,23 @@ impl Provider for UnconfiguredProvider {
         _opts: RequestOptions,
         _cache_key: Option<&'a CacheKey>,
     ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
-        Box::pin(async {
-            Err(AgentError::Config {
-                message: NOT_CONFIGURED.to_string(),
-            })
-        })
+        Box::pin(async { Err(not_configured()) })
+    }
+
+    fn wire_request(
+        &self,
+        _model: &Model,
+        _messages: &[Message],
+        _system: &str,
+        _tools: &Value,
+        _opts: &RequestOptions,
+        _cache_key: Option<&CacheKey>,
+    ) -> Result<WireRequest, AgentError> {
+        Err(not_configured())
     }
 
     fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
-        Box::pin(async {
-            Err(AgentError::Config {
-                message: NOT_CONFIGURED.to_string(),
-            })
-        })
+        Box::pin(async { Err(not_configured()) })
     }
 }
 
@@ -633,12 +683,57 @@ pub async fn fetch_all_models(
 
 #[cfg(test)]
 mod tests {
+    use std::future::pending;
+
+    use test_case::test_case;
+
     use super::*;
     use crate::model::ModelPricing;
 
     const LISTED_ONCE: &str =
         "a model both declared and discovered must reach the picker once, not twice";
     const DISCOVERED_SLUG: &str = "test-dynamic-model-registry";
+    const TEST_MODEL: &str = "anthropic/claude-opus-4-8";
+
+    /// A provider that can only send, as every provider is until it learns to
+    /// describe its body.
+    struct SendOnly;
+
+    impl Provider for SendOnly {
+        fn stream_message<'a>(
+            &'a self,
+            _model: &'a Model,
+            _messages: &'a [Message],
+            _system: &'a str,
+            _tools: &'a Value,
+            _event_tx: &'a Sender<ProviderEvent>,
+            _opts: RequestOptions,
+            _cache_key: Option<&'a CacheKey>,
+        ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
+            Box::pin(pending())
+        }
+
+        fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+            Box::pin(pending())
+        }
+    }
+
+    #[test_case(&SendOnly, NO_WIRE_BODY ; "a_provider_without_a_builder_says_so")]
+    #[test_case(&UnconfiguredProvider, NOT_CONFIGURED ; "no_provider_asks_for_a_login")]
+    fn wire_request_refuses_what_it_cannot_build(provider: &dyn Provider, expected: &str) {
+        let model = Model::from_spec(TEST_MODEL).unwrap();
+        let error = provider
+            .wire_request(
+                &model,
+                &[],
+                "",
+                &Value::Null,
+                &RequestOptions::default(),
+                None,
+            )
+            .unwrap_err();
+        assert!(matches!(error, AgentError::Config { message } if message == expected));
+    }
 
     /// A `providers.toml` entry and the `/models` response that also lists it
     /// arrive as separate batches, so only the merge point can tell they are
