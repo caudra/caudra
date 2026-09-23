@@ -952,8 +952,10 @@ mod tests {
 
     #[test_case("openai/gpt-6-sol", true, Some(PRIORITY_SERVICE_TIER) ; "fast_asks_for_the_priority_tier")]
     #[test_case("openai/gpt-6-luna", true, Some(PRIORITY_SERVICE_TIER) ; "luna_sells_a_fast_tier_too")]
+    #[test_case("openai/gpt-6-astra", true, Some(PRIORITY_SERVICE_TIER) ; "astra_sells_a_fast_tier")]
+    #[test_case("openai/gpt-5.6-sol", true, Some(PRIORITY_SERVICE_TIER) ; "gpt_5_6_sells_a_fast_tier")]
     #[test_case("openai/gpt-6-sol", false, None ; "standard_sends_no_tier")]
-    #[test_case("openai/gpt-5.6-sol", true, None ; "a_model_without_fast_pricing_stays_standard")]
+    #[test_case("openai/gpt-5.5", true, None ; "a_model_without_fast_pricing_stays_standard")]
     fn fast_mode_sets_the_service_tier(spec: &str, fast: bool, expected: Option<&str>) {
         let model = Model::from_spec(spec).unwrap();
         let mut body = json!({});

@@ -137,14 +137,14 @@ You can override the model with `ANTHROPIC_MODEL` and the endpoint with `ANTHROP
 | Marker | Models | Pricing (in/out per 1M tokens) | Context |
 |---------|--------|-------------------------------|---------|
 | Fast | **gpt-6-luna** (gpt-6 default) | $0.10 / $0.50 | 372K ctx / 128K out |
-| Fast | **gpt-5.6-luna** (gpt-5.6 default) | $1.00 / $6.00 | 372K ctx / 128K out |
+| Fast | **gpt-5.6-luna** (gpt-5.6 default) | $0.20 / $1.20 | 372K ctx / 128K out |
 | Small | gpt-5.4-nano | $0.20 / $1.25 | 400K ctx / 128K out |
 | Small | gpt-5.4-mini | $0.75 / $4.50 | 400K ctx / 128K out |
 | Small | gpt-4.1-nano | $0.10 / $0.40 | 1047K ctx / 32K out |
 | Best | **gpt-6-astra** (gpt-6 default) | $10.00 / $50.00 | 372K ctx / 128K out |
 |  | gpt-6-sol | $2.00 / $10.00 | 372K ctx / 128K out |
-|  | gpt-5.6-terra | $2.50 / $15.00 | 372K ctx / 128K out |
-| Best | **gpt-5.6-sol** (gpt-5.6 default) | $5.00 / $30.00 | 372K ctx / 128K out |
+|  | gpt-5.6-terra | $2.00 / $12.00 | 372K ctx / 128K out |
+| Best | **gpt-5.6-sol** (gpt-5.6 default) | $4.00 / $20.00 | 372K ctx / 128K out |
 |  | gpt-4.1-mini | $0.40 / $1.60 | 1047K ctx / 32K out |
 |  | gpt-4.1 | $2.00 / $8.00 | 1047K ctx / 32K out |
 |  | o4-mini | $1.10 / $4.40 | 200K ctx / 100K out |
@@ -202,7 +202,7 @@ Routing defaults: gemini-2.0-flash-lite (Fast), gemini-2.5-pro (Best)
 |  | gemini-3.1-pro-preview | $2.00 / $12.00 | 200K ctx / 65K out |
 |  | gpt-6-sol | $2.00 / $10.00 | 200K ctx / 100K out |
 |  | gpt-5.4 | $2.50 / $15.00 | 200K ctx / 100K out |
-|  | gpt-5.6-sol | $5.00 / $30.00 | 200K ctx / 100K out |
+|  | gpt-5.6-sol | $4.00 / $20.00 | 200K ctx / 100K out |
 |  | gpt-5.6-terra | $2.00 / $12.00 | 200K ctx / 100K out |
 |  | gpt-5.3-codex | $1.75 / $14.00 | 200K ctx / 100K out |
 |  | claude-opus-5.5 | $4.00 / $20.00 | 200K ctx / 128K out |

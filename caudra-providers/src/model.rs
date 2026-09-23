@@ -1656,6 +1656,25 @@ mod tests {
         assert_eq!(usage.cost(&FAST_RISES, false), usage.cost_at(BASE_RATES));
     }
 
+    const GPT_6_SOL_SPEC: &str = "openai/gpt-6-sol";
+    /// A 320K prompt, 300K of it cached, and an 8K reply.
+    const LONG_OPENAI_REQUEST: TokenUsage = TokenUsage {
+        input: 15_000,
+        output: 8_000,
+        cache_creation: 5_000,
+        cache_read: 300_000,
+    };
+
+    /// An `openai/` session never warms the catalog, so the table alone has to
+    /// know what a prompt past 272K costs.
+    #[test_case(false, 0.325 ; "standard")]
+    #[test_case(true, 0.650  ; "fast")]
+    fn openai_bills_past_272k_from_the_table(fast: bool, expected: f64) {
+        let model = Model::from_spec(GPT_6_SOL_SPEC).unwrap();
+        let cost = model.billed_cost(&LONG_OPENAI_REQUEST, fast).unwrap();
+        assert!((cost - expected).abs() < EPSILON, "{cost} is not {expected}");
+    }
+
     #[test]
     fn fast_pricing_is_always_a_premium() {
         for manifest in ManifestRegistry::builtins() {
