@@ -214,7 +214,7 @@ fn model_from_def(def: &ProviderDef, kind: ProviderKind, slug: &str, model_id: &
                         d.pricing_fast_output.unwrap_or(0.0),
                     )
                 }),
-            tiers: Vec::new(),
+            tiers: ModelPricing::UNTIERED,
         })
         .unwrap_or_default();
     Model {

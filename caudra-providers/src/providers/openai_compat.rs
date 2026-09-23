@@ -278,7 +278,7 @@ impl OpenAiCompatProvider {
                     .ok()
                     .unwrap_or(0.0),
                 fast: None,
-                tiers: Vec::new(),
+                tiers: crate::model::ModelPricing::UNTIERED,
             })
         });
         Some(crate::model::ModelInfo {

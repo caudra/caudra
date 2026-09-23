@@ -1281,7 +1281,7 @@ pub(crate) fn test_pricing() -> ModelPricing {
         cache_write: 3.75,
         cache_read: 0.30,
         fast: None,
-        tiers: Vec::new(),
+        tiers: ModelPricing::UNTIERED,
     }
 }
 

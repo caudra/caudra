@@ -174,7 +174,7 @@ fn parse_model(m: &Value) -> Option<ModelInfo> {
                 .unwrap_or(0.0),
             cache_read: p.get("input_cache_read").and_then(per_token).unwrap_or(0.0),
             fast: None,
-            tiers: Vec::new(),
+            tiers: ModelPricing::UNTIERED,
         })
     });
 

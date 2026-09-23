@@ -4,6 +4,7 @@
 //! + cache reads/writes because the context window limit applies to all of them combined.
 
 use std::any::Any;
+use std::borrow::Cow;
 use std::ops::AddAssign;
 use std::sync::Arc;
 
@@ -67,9 +68,12 @@ pub enum ModelError {
     PurposeCycle(ModelPurpose),
 }
 
+/// Input, output, cache write and cache read, per million tokens.
+type Rates = (f64, f64, f64, f64);
+
 /// Rates that replace the base ones once a prompt crosses `above` tokens.
-/// Anthropic's 1M window and Gemini 2.5 both bill this way, and a single flat
-/// rate cannot express either.
+/// OpenAI, Gemini 2.5 Pro and Grok all bill long prompts this way, and a
+/// single flat rate cannot express any of them.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct PricingTier {
     /// Prompt tokens above which these rates apply.
@@ -80,6 +84,11 @@ pub struct PricingTier {
     pub cache_write: f64,
     #[serde(default)]
     pub cache_read: f64,
+    /// Fast mode's rates past `above`. `None` keeps fast mode on its flat rates
+    /// across the whole window, which is how Anthropic bills it. OpenAI charges
+    /// a multiple of whichever rate applies, so its tiers state their own.
+    #[serde(default)]
+    pub fast: Option<FastPricing>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -94,8 +103,10 @@ pub struct ModelPricing {
     #[serde(default)]
     pub fast: Option<FastPricing>,
     /// Context-size tiers, ascending by `above`. Empty for the flat majority.
+    /// Borrowed when the static table states them, owned when a catalog or a
+    /// provider's listing does.
     #[serde(default)]
-    pub tiers: Vec<PricingTier>,
+    pub tiers: Cow<'static, [PricingTier]>,
 }
 
 /// Metadata discovered at runtime from a provider's `/models` endpoint.
@@ -134,7 +145,7 @@ impl ModelInfo {
 /// is the model's own: Opus 5.5 reads cache at a twentieth of its input rate
 /// where every model before it read at a tenth, so deriving would double the
 /// bill on the tokens agentic work is mostly made of.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct FastPricing {
     pub input: f64,
     pub output: f64,
@@ -154,33 +165,53 @@ impl FastPricing {
             cache_read: input * ModelPricing::CACHE_READ_MULTIPLIER,
         }
     }
+
+    fn rates(&self) -> Rates {
+        (self.input, self.output, self.cache_write, self.cache_read)
+    }
 }
 
 impl ModelPricing {
+    pub const UNTIERED: Cow<'static, [PricingTier]> = Cow::Borrowed(&[]);
+
     pub const ZERO: Self = Self {
         input: 0.0,
         output: 0.0,
         cache_write: 0.0,
         cache_read: 0.0,
         fast: None,
-        tiers: Vec::new(),
+        tiers: Self::UNTIERED,
     };
 
     pub fn is_zero(&self) -> bool {
         self.input == 0.0 && self.output == 0.0 && self.cache_write == 0.0 && self.cache_read == 0.0
     }
 
-    /// Rates for a prompt of `prompt_tokens`: the highest tier it crosses, else
-    /// the base rates. Tiers are ascending, so the last match wins.
-    fn rates_at(&self, prompt_tokens: u32) -> (f64, f64, f64, f64) {
-        self.tiers
+    /// Rates for a request whose prompt is `prompt_tokens`: the highest tier it
+    /// crosses, else the base rates. Tiers are ascending, so the last match
+    /// wins. In fast mode a crossed tier's own fast rates win, and a tier that
+    /// states none leaves fast mode on its flat rates.
+    fn rates_at(&self, prompt_tokens: u32, fast: bool) -> Rates {
+        let crossed = self
+            .tiers
             .iter()
             .take_while(|tier| prompt_tokens > tier.above)
-            .last()
-            .map_or(
-                (self.input, self.output, self.cache_write, self.cache_read),
-                |tier| (tier.input, tier.output, tier.cache_write, tier.cache_read),
-            )
+            .last();
+        let Some(tier) = crossed else {
+            return self.base_rates(fast);
+        };
+        match &self.fast {
+            Some(flat) if fast => tier.fast.as_ref().unwrap_or(flat).rates(),
+            _ => (tier.input, tier.output, tier.cache_write, tier.cache_read),
+        }
+    }
+
+    /// The rates below every tier.
+    fn base_rates(&self, fast: bool) -> Rates {
+        match &self.fast {
+            Some(flat) if fast => flat.rates(),
+            _ => (self.input, self.output, self.cache_write, self.cache_read),
+        }
     }
 
     /// Cache multipliers Anthropic applies on top of the base input rate.
@@ -471,19 +502,31 @@ impl Model {
         let catalog = manifest.catalog_meta(model_id);
         let catalog = catalog.as_ref();
         let discovered_pricing = discovered.and_then(|info| info.pricing.as_ref());
-        // A static entry's rates win, but it cannot carry tiers, so the catalog
-        // still supplies those when the two describe the same model.
-        let pricing = discovered_pricing
-            .cloned()
-            .or_else(|| {
-                static_entry.map(|entry| ModelPricing {
-                    tiers: catalog_pricing(catalog)
-                        .map(|catalog| catalog.tiers)
-                        .unwrap_or_default(),
-                    ..entry.pricing.clone()
-                })
+        let catalog_pricing = catalog_pricing(catalog);
+        // Base rates come from the first source that has any: what the provider
+        // just reported, then the static table, then the catalog. Tiers resolve
+        // on their own, from the first source that states any, because a
+        // listing that reports base rates alone (xAI's) says nothing about what
+        // a long prompt costs.
+        let sources = [
+            discovered_pricing,
+            static_entry.map(|entry| &entry.pricing),
+            catalog_pricing.as_ref(),
+        ];
+        let tiers = sources
+            .into_iter()
+            .flatten()
+            .map(|pricing| &pricing.tiers)
+            .find(|tiers| !tiers.is_empty())
+            .map_or(ModelPricing::UNTIERED, Cow::clone);
+        let pricing = sources
+            .into_iter()
+            .flatten()
+            .next()
+            .map(|pricing| ModelPricing {
+                tiers,
+                ..pricing.clone()
             })
-            .or_else(|| catalog_pricing(catalog))
             .unwrap_or_default();
         let max_output_tokens = discovered
             .and_then(|info| info.max_output_tokens)
@@ -564,7 +607,7 @@ impl Model {
                 cache_write: meta.cache_write,
                 cache_read: meta.cache_read,
                 fast: None,
-                tiers: meta.pricing_tiers,
+                tiers: Cow::Owned(meta.pricing_tiers),
             },
             discovered_free: false,
             max_output_tokens: Some(meta.output),
@@ -677,7 +720,7 @@ impl Model {
     /// `None` on an unpriced model (oauth, local), so callers can hide the cost
     /// instead of showing a misleading "$0.000".
     pub fn billed_cost(&self, usage: &TokenUsage, fast: bool) -> Option<f64> {
-        let cost = self.list_cost(usage, fast)?;
+        let cost = (!self.pricing.is_zero()).then(|| usage.cost(&self.pricing, fast))?;
         let schedule = ManifestRegistry::for_slug(&self.provider).and_then(|m| m.pricing_schedule);
         Some(schedule.map_or(cost, |s| cost * s.multiplier_at(Timestamp::now())))
     }
@@ -686,8 +729,13 @@ impl Model {
     /// what makes it right for re-pricing a session whose turns never recorded
     /// what they paid: the rate back then is unknown, and the table price is
     /// the honest guess.
+    ///
+    /// Always the rates below every context tier. What it prices is a sum of
+    /// many requests, which has no one prompt size to pick a tier with, and
+    /// summing a long session past a threshold would bill every turn in it at
+    /// the long-prompt rate.
     pub fn list_cost(&self, usage: &TokenUsage, fast: bool) -> Option<f64> {
-        (!self.pricing.is_zero()).then(|| usage.cost(&self.pricing, fast))
+        (!self.pricing.is_zero()).then(|| usage.cost_at(self.pricing.base_rates(fast)))
     }
 
     pub fn provider_display_name(&self) -> &'static str {
@@ -1028,20 +1076,19 @@ impl TokenUsage {
         }
     }
 
-    /// Crate-private on purpose: pricing outside [`Model`] skips the provider's
-    /// schedule.
+    /// Priced as one request. Crate-private on purpose: pricing outside
+    /// [`Model`] skips the provider's schedule.
     pub(crate) fn cost(&self, pricing: &ModelPricing, fast: bool) -> f64 {
-        let (input, output, cache_write, cache_read) = match &pricing.fast {
-            // Fast mode quotes one flat premium, so it never reads tiers.
-            Some(f) if fast => (f.input, f.output, f.cache_write, f.cache_read),
-            // The tier boundary is on prompt size, which is everything the
-            // model read: fresh input plus whatever came from cache.
-            _ => pricing.rates_at(self.input + self.cache_read + self.cache_creation),
-        };
-        self.input as f64 * input / PER_MILLION
-            + self.output as f64 * output / PER_MILLION
-            + self.cache_creation as f64 * cache_write / PER_MILLION
-            + self.cache_read as f64 * cache_read / PER_MILLION
+        // The tier boundary is on prompt size, which is everything the model
+        // read: fresh input plus whatever came from cache.
+        self.cost_at(pricing.rates_at(self.total_input(), fast))
+    }
+
+    fn cost_at(&self, (input, output, cache_write, cache_read): Rates) -> f64 {
+        f64::from(self.input) * input / PER_MILLION
+            + f64::from(self.output) * output / PER_MILLION
+            + f64::from(self.cache_creation) * cache_write / PER_MILLION
+            + f64::from(self.cache_read) * cache_read / PER_MILLION
     }
 }
 
@@ -1199,7 +1246,7 @@ mod tests {
         cache_write: 0.0,
         cache_read: 0.0,
         fast: None,
-        tiers: Vec::new(),
+        tiers: ModelPricing::UNTIERED,
     };
 
     #[test_case(999, "999"         ; "under_thousand")]
@@ -1459,7 +1506,7 @@ mod tests {
             cache_write: 3.75,
             cache_read: 0.30,
             fast: None,
-            tiers: Vec::new(),
+            tiers: ModelPricing::UNTIERED,
         };
         let usage = TokenUsage {
             input: 1_000_000,
@@ -1485,7 +1532,7 @@ mod tests {
                 cache_write: 37.50,
                 cache_read: 3.00,
             }),
-            tiers: Vec::new(),
+            tiers: ModelPricing::UNTIERED,
         };
         let usage = TokenUsage {
             input: 1_000_000,
@@ -1507,7 +1554,7 @@ mod tests {
             cache_write: 3.75,
             cache_read: 0.30,
             fast: None,
-            tiers: Vec::new(),
+            tiers: ModelPricing::UNTIERED,
         };
         let usage = TokenUsage {
             input: 1_000_000,
@@ -1516,6 +1563,97 @@ mod tests {
             cache_read: 0,
         };
         assert_eq!(usage.cost(&pricing, true), usage.cost(&pricing, false));
+    }
+
+    const LONG_PROMPT: u32 = 272_000;
+    const LONGER_PROMPT: u32 = 1_000_000;
+    const BASE_RATES: Rates = (1.0, 10.0, 1.25, 0.1);
+    const FLAT_FAST_RATES: Rates = (6.0, 60.0, 7.5, 0.6);
+    const LONG_RATES: Rates = (2.0, 15.0, 2.5, 0.2);
+    const LONG_FAST_RATES: Rates = (12.0, 90.0, 15.0, 1.2);
+    const LONGER_RATES: Rates = (3.0, 20.0, 3.75, 0.3);
+
+    const fn fast_at((input, output, cache_write, cache_read): Rates) -> FastPricing {
+        FastPricing {
+            input,
+            output,
+            cache_write,
+            cache_read,
+        }
+    }
+
+    const fn tier_at(
+        above: u32,
+        (input, output, cache_write, cache_read): Rates,
+        fast: Option<FastPricing>,
+    ) -> PricingTier {
+        PricingTier {
+            above,
+            input,
+            output,
+            cache_write,
+            cache_read,
+            fast,
+        }
+    }
+
+    const fn tiered(tiers: &'static [PricingTier]) -> ModelPricing {
+        let (input, output, cache_write, cache_read) = BASE_RATES;
+        ModelPricing {
+            input,
+            output,
+            cache_write,
+            cache_read,
+            fast: Some(fast_at(FLAT_FAST_RATES)),
+            tiers: Cow::Borrowed(tiers),
+        }
+    }
+
+    /// OpenAI's shape: fast mode rises past the threshold with every other rate.
+    const FAST_RISES: ModelPricing = tiered(&[tier_at(
+        LONG_PROMPT,
+        LONG_RATES,
+        Some(fast_at(LONG_FAST_RATES)),
+    )]);
+    /// Anthropic's shape: fast mode keeps one flat premium across the window.
+    const FAST_STAYS_FLAT: ModelPricing = tiered(&[tier_at(LONG_PROMPT, LONG_RATES, None)]);
+    const TWO_TIERS: ModelPricing = tiered(&[
+        tier_at(LONG_PROMPT, LONG_RATES, None),
+        tier_at(LONGER_PROMPT, LONGER_RATES, None),
+    ]);
+
+    #[test_case(&FAST_RISES, LONG_PROMPT, false, BASE_RATES           ; "a_tier_applies_only_past_its_threshold")]
+    #[test_case(&FAST_RISES, LONG_PROMPT + 1, false, LONG_RATES       ; "a_prompt_past_the_threshold_bills_the_tier")]
+    #[test_case(&TWO_TIERS, LONGER_PROMPT, false, LONG_RATES          ; "a_tier_not_yet_crossed_waits")]
+    #[test_case(&TWO_TIERS, LONGER_PROMPT + 1, false, LONGER_RATES    ; "the_highest_crossed_tier_wins")]
+    #[test_case(&FAST_RISES, LONG_PROMPT, true, FLAT_FAST_RATES       ; "fast_below_every_tier_bills_its_flat_rates")]
+    #[test_case(&FAST_RISES, LONG_PROMPT + 1, true, LONG_FAST_RATES   ; "fast_follows_a_tier_that_states_fast_rates")]
+    #[test_case(&FAST_STAYS_FLAT, LONG_PROMPT + 1, true, FLAT_FAST_RATES ; "fast_stays_flat_past_a_tier_without_fast_rates")]
+    fn a_request_pays_the_rates_its_prompt_selects(
+        pricing: &ModelPricing,
+        prompt_tokens: u32,
+        fast: bool,
+        expected: Rates,
+    ) {
+        assert_eq!(pricing.rates_at(prompt_tokens, fast), expected);
+    }
+
+    /// The threshold is on everything the model read, so a prompt served
+    /// mostly from cache crosses it as surely as a fresh one.
+    #[test_case(TokenUsage { input: 1, output: 0, cache_creation: 0, cache_read: LONG_PROMPT } ; "cache_reads")]
+    #[test_case(TokenUsage { input: 1, output: 0, cache_creation: LONG_PROMPT, cache_read: 0 } ; "cache_writes")]
+    fn cached_prompt_tokens_count_toward_the_threshold(usage: TokenUsage) {
+        assert_eq!(usage.cost(&FAST_RISES, false), usage.cost_at(LONG_RATES));
+    }
+
+    #[test]
+    fn output_never_counts_toward_the_threshold() {
+        let usage = TokenUsage {
+            input: LONG_PROMPT,
+            output: LONG_PROMPT,
+            ..Default::default()
+        };
+        assert_eq!(usage.cost(&FAST_RISES, false), usage.cost_at(BASE_RATES));
     }
 
     #[test]

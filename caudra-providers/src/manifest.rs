@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use caudra_storage::thinking::ReasoningOptions;
 
 use crate::model::{
@@ -58,9 +60,7 @@ pub(crate) fn catalog_reasoning_options(
         .filter(|options| !options.is_empty())
 }
 
-/// Rates models.dev publishes, including the tiers a static [`ModelEntry`]
-/// cannot carry: that table is a `const` and a non-empty `Vec` is not
-/// const-constructible.
+/// Rates models.dev publishes, tiers included.
 pub(crate) fn catalog_pricing(meta: Option<&CatalogMetaView>) -> Option<ModelPricing> {
     meta.map(|meta| ModelPricing {
         input: meta.input_price,
@@ -68,7 +68,7 @@ pub(crate) fn catalog_pricing(meta: Option<&CatalogMetaView>) -> Option<ModelPri
         cache_write: meta.cache_write,
         cache_read: meta.cache_read,
         fast: None,
-        tiers: meta.pricing_tiers.clone(),
+        tiers: Cow::Owned(meta.pricing_tiers.clone()),
     })
 }
 
@@ -474,7 +474,7 @@ mod tests {
 
     const NO_CATALOG_NO_RATES: &str = "a cold catalog must not invent rates";
     const TIERS_COME_FROM_CATALOG: &str =
-        "the static table cannot hold tiers, so the catalog is the only source";
+        "a model the static table does not tier must still bill the catalog's tiers";
     const EMPTY_LADDER_IS_NOT_AN_ANSWER: &str =
         "an unclassified catalog entry must not outrank the static ladder";
 
@@ -507,6 +507,7 @@ mod tests {
             output: 75.0,
             cache_write: 25.0,
             cache_read: 2.0,
+            fast: None,
         };
         let meta = meta_with(ReasoningOptions::default(), vec![tier]);
 

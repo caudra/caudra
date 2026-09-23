@@ -200,7 +200,7 @@ impl Provider for TensorX {
                                         .unwrap_or(0.0)
                                         * per_million,
                                     fast: None,
-                                    tiers: Vec::new(),
+                                    tiers: ModelPricing::UNTIERED,
                                 })
                             } else {
                                 None

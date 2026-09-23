@@ -231,7 +231,8 @@ mod tests {
     use super::*;
     use crate::ReasoningOptions;
     use crate::manifest::ManifestRegistry;
-    use crate::model::{FastPricing, ModelFamily, ModelPricing};
+    use crate::model::{FastPricing, ModelFamily, ModelPricing, PricingTier};
+    use std::borrow::Cow;
     use std::sync::Arc;
     use test_case::test_case;
 
@@ -258,6 +259,15 @@ mod tests {
     const FAST_INPUT_RATE: f64 = 12.0;
     /// [`ONE_MILLION`] input tokens at [`FAST_INPUT_RATE`].
     const FAST_LIST_PRICE: f64 = 12.0;
+    /// A tier that [`ONE_MILLION`] prompt tokens would cross in one request.
+    const LONG_PROMPT_TIER: &[PricingTier] = &[PricingTier {
+        above: ONE_MILLION - 1,
+        input: 2.0 * INPUT_RATE,
+        output: 0.0,
+        cache_write: 0.0,
+        cache_read: 0.0,
+        fast: None,
+    }];
     /// A real spec, so the bare-id fallback runs against the real tables.
     const SCHEDULED_SPEC: &str = "deepseek/deepseek-v4-pro";
     /// A provider whose model ids carry a slash of their own.
@@ -519,6 +529,19 @@ mod tests {
         assert_eq!(
             model_cost(CURRENT, &stored(Some(RECORDED)), &current, false).usd,
             Some(RECORDED)
+        );
+    }
+
+    /// A stored row sums many requests, so its total is no one prompt's size.
+    /// Tiering the sum would bill every turn of a long session at the rate
+    /// only its longest prompts paid.
+    #[test]
+    fn summed_counters_price_below_every_tier() {
+        let mut current = model(CURRENT, INPUT_RATE);
+        current.pricing.tiers = Cow::Borrowed(LONG_PROMPT_TIER);
+        assert_eq!(
+            model_cost(CURRENT, &stored(None), &current, false).usd,
+            Some(LIST_PRICE)
         );
     }
 

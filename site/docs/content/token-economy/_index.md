@@ -90,6 +90,8 @@ more context and mistakes        one bounded result
 
 Each turn is priced when it happens and that number is stored with the session. Prices move (DeepSeek, for one, doubles every rate during peak UTC hours), so a total re-priced later would be a guess. What you see is what you were billed.
 
+Some models charge more per token once a request's prompt passes a set size, and cached tokens count toward that size. Each request is priced by the size of its own prompt, so the long requests late in a session can cost more per token than the short ones at its start.
+
 ## Cache hit rate
 
 Cached prompt tokens cost a fraction of fresh ones, so the share of your prompt that the provider served from cache is the clearest signal of whether context reuse is working.

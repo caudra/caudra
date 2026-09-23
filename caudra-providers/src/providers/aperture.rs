@@ -411,7 +411,7 @@ fn parse_models(body: &Value, overrides: &Overrides) -> Vec<ModelInfo> {
                     cache_read: price_per_m(p.get("input_cache_read")),
                     cache_write: 0.0,
                     fast: None,
-                    tiers: Vec::new(),
+                    tiers: ModelPricing::UNTIERED,
                 }),
                 supports_thinking: ov
                     .supports_thinking

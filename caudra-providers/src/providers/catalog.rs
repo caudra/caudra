@@ -8,6 +8,7 @@
 //! their own [`CatalogProvider`] instance, created from the same
 //! [`ProviderData`].
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
@@ -254,15 +255,17 @@ impl CatalogMeta {
             reasoning_options: model.reasoning_options.clone().unwrap_or_default(),
             pricing_tiers: cost
                 .map(|c| {
+                    // A rate a tier leaves out is the base rate, not a free one.
                     let mut tiers: Vec<PricingTier> = c
                         .tiers
                         .iter()
                         .map(|tier| PricingTier {
                             above: tier.tier.size,
-                            input: tier.input.unwrap_or(0.0),
-                            output: tier.output.unwrap_or(0.0),
-                            cache_read: tier.cache_read.unwrap_or(0.0),
-                            cache_write: tier.cache_write.unwrap_or(0.0),
+                            input: tier.input.or(c.input).unwrap_or(0.0),
+                            output: tier.output.or(c.output).unwrap_or(0.0),
+                            cache_read: tier.cache_read.or(c.cache_read).unwrap_or(0.0),
+                            cache_write: tier.cache_write.or(c.cache_write).unwrap_or(0.0),
+                            fast: None,
                         })
                         .collect();
                     tiers.sort_by_key(|tier| tier.above);
@@ -279,7 +282,7 @@ impl CatalogMeta {
             cache_read: self.cache_read,
             cache_write: self.cache_write,
             fast: None,
-            tiers: self.pricing_tiers.clone(),
+            tiers: Cow::Owned(self.pricing_tiers.clone()),
         }
     }
 
@@ -1647,6 +1650,28 @@ mod tests {
         let tier = view.pricing_tiers.first().expect(TIERS_SURVIVE_THE_VIEW);
 
         assert_eq!(tier.above, 272_000, "{TIERS_SURVIVE_THE_VIEW}");
+        assert_eq!(tier.input, 20.0, "{TIERS_SURVIVE_THE_VIEW}");
+    }
+
+    const OMITTED_RATE_IS_NOT_FREE: &str =
+        "a rate a tier leaves out must bill at the base rate, not at zero";
+
+    #[test]
+    fn a_tier_that_omits_a_rate_keeps_the_base_rate() {
+        let model: super::schema::CatalogModel = serde_json::from_str(
+            r#"{"cost": {"input": 10.0, "output": 50.0, "cache_read": 1.0, "cache_write": 12.5,
+                 "tiers": [{"input": 20.0, "output": 75.0, "tier": {"size": 272000}}]}}"#,
+        )
+        .unwrap();
+
+        let meta = CatalogMeta::from_model(&model);
+        let tier = meta.pricing_tiers.first().expect(TIERS_SURVIVE_THE_VIEW);
+
+        assert_eq!(
+            (tier.cache_read, tier.cache_write),
+            (meta.cache_read, meta.cache_write),
+            "{OMITTED_RATE_IS_NOT_FREE}"
+        );
         assert_eq!(tier.input, 20.0, "{TIERS_SURVIVE_THE_VIEW}");
     }
 

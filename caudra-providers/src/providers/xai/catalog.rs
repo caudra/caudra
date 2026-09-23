@@ -66,7 +66,7 @@ impl From<CachedModel> for ModelInfo {
                 cache_write: model.pricing.cache_write,
                 cache_read: model.pricing.cache_read,
                 fast: None,
-                tiers: Vec::new(),
+                tiers: ModelPricing::UNTIERED,
             }),
             supports_thinking: Some(model.reasoning),
             supports_vision: Some(model.vision),
