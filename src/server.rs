@@ -2635,7 +2635,7 @@ impl FailureEffectPolicy {
             Self::None => false,
             #[cfg(unix)]
             Self::TransferPublication => matches!(error_code, Some("transferIndeterminate") | None),
-            Self::FileMutation => true,
+            Self::FileMutation => !matches!(error_code, Some("stale_resource")),
             Self::Shell => true,
             Self::WorkspaceMutation => {
                 matches!(error_code, Some("partial_failure")) || error_code.is_none()
@@ -3121,7 +3121,7 @@ where
 {
     match result {
         Ok(output) => typed_tool_result(&output, FileModelText::model_text(&output).into_owned()),
-        Err(error) => Ok(tool_error_result(error)),
+        Err(error) => operation_error_result(error.code(), error.to_string()),
     }
 }
 
@@ -3545,6 +3545,7 @@ mod tests {
         .unwrap();
         for (policy, code, expected) in [
             (FailureEffectPolicy::FileMutation, "operation_failed", true),
+            (FailureEffectPolicy::FileMutation, "stale_resource", false),
             (FailureEffectPolicy::WorkspaceMutation, "rolled_back", false),
             (
                 FailureEffectPolicy::WorkspaceMutation,
@@ -3621,6 +3622,106 @@ mod tests {
         assert_eq!(cancellation.kind, OutcomeKind::Cancelled);
         assert!(!cancellation.side_effects_possible);
         assert!(!root.path().join("published.txt").exists());
+    }
+
+    async fn writable_remote_server(root: &tempfile::TempDir) -> WorkcellServer {
+        let mut tools = test_tools();
+        tools.allow_write = true;
+        WorkcellServer::configured(
+            Some(root.path()),
+            &[ToolGroup::Files],
+            ServerBehavior::default(),
+            tools,
+        )
+        .await
+        .unwrap()
+        .with_remote_host(remote_configuration())
+        .await
+        .unwrap()
+    }
+
+    fn outcome_error_code(outcome: &StructuredOutcome) -> Option<&str> {
+        outcome.result.as_ref()?.structured_content.as_ref()?["error"]["code"].as_str()
+    }
+
+    #[tokio::test]
+    async fn a_mutation_whose_file_changed_after_preparation_publishes_nothing_and_says_so() {
+        let root = tempfile::tempdir().unwrap();
+        let server = writable_remote_server(&root).await;
+        let target = root.path().join("value.txt");
+        for (name, arguments) in [
+            (
+                "file_write",
+                serde_json::json!({"filePath": "value.txt", "content": "ours\n"}),
+            ),
+            (
+                "file_edit",
+                serde_json::json!({"filePath": "value.txt", "oldString": "original", "newString": "ours"}),
+            ),
+            (
+                "file_apply_patch",
+                serde_json::json!({"patchText": "*** Begin Patch\n*** Update File: value.txt\n@@\n-original\n+ours\n*** End Patch"}),
+            ),
+        ] {
+            tokio::fs::write(&target, "original\n").await.unwrap();
+            let operation = stored_operation(&server, name, arguments).await;
+            tokio::fs::write(&target, "theirs\n").await.unwrap();
+
+            let outcome = server
+                .run_remote_execution(operation, CancellationToken::new(), None)
+                .await;
+
+            assert_eq!(outcome.kind, OutcomeKind::Failed, "{name}");
+            assert!(!outcome.side_effects_possible, "{name}");
+            assert_eq!(
+                outcome_error_code(&outcome),
+                Some("stale_resource"),
+                "{name}"
+            );
+            assert_eq!(
+                tokio::fs::read_to_string(&target).await.unwrap(),
+                "theirs\n",
+                "{name}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_stale_patch_is_clean_only_until_its_first_change_is_published() {
+        let patch = serde_json::json!({
+            "patchText": "*** Begin Patch\n*** Update File: first.txt\n@@\n-first\n+ours\n*** Update File: second.txt\n@@\n-second\n+ours\n*** End Patch"
+        });
+        for (changed, published, code) in [
+            ("first.txt", false, "stale_resource"),
+            ("second.txt", true, "invalid_operation"),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let server = writable_remote_server(&root).await;
+            for name in ["first", "second"] {
+                tokio::fs::write(root.path().join(format!("{name}.txt")), format!("{name}\n"))
+                    .await
+                    .unwrap();
+            }
+            let operation = stored_operation(&server, "file_apply_patch", patch.clone()).await;
+            tokio::fs::write(root.path().join(changed), "theirs\n")
+                .await
+                .unwrap();
+
+            let outcome = server
+                .run_remote_execution(operation, CancellationToken::new(), None)
+                .await;
+
+            assert_eq!(outcome.kind, OutcomeKind::Failed, "{changed}");
+            assert_eq!(outcome.side_effects_possible, published, "{changed}");
+            assert_eq!(outcome_error_code(&outcome), Some(code), "{changed}");
+            assert_eq!(
+                tokio::fs::read_to_string(root.path().join("first.txt"))
+                    .await
+                    .unwrap(),
+                if published { "ours\n" } else { "theirs\n" },
+                "{changed}"
+            );
+        }
     }
 
     #[test]

@@ -64,7 +64,7 @@ fn path_string(path: &Path) -> String {
 }
 
 fn publication_stale(requested_path: &str) -> FilesystemError {
-    FilesystemError::message(format!(
+    FilesystemError::Stale(format!(
         "Prepared resource changed before publication: {requested_path}"
     ))
 }

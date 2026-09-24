@@ -12,6 +12,10 @@ pub enum FilesystemError {
     /// has to read prose to learn a file is simply absent cannot branch on it.
     #[error("{0}")]
     NotFound(String),
+    /// A prepared change found its target changed since preparation and
+    /// published nothing, so the caller can read the file again and retry.
+    #[error("{0}")]
+    Stale(String),
     #[error("Operation aborted")]
     Aborted,
     #[error("{context}: {source}")]
@@ -33,6 +37,7 @@ impl FilesystemError {
             Self::ProtectedPath(_) => "protected_path",
             Self::Operation(_) => "invalid_operation",
             Self::NotFound(_) => "not_found",
+            Self::Stale(_) => "stale_resource",
             Self::Aborted => "cancelled",
             Self::Io { source, .. } if source.kind() == io::ErrorKind::NotFound => "not_found",
             Self::Io { source, .. } if source.kind() == io::ErrorKind::PermissionDenied => {

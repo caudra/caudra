@@ -26,9 +26,14 @@ impl FilesystemCore {
         let parent = file_path
             .parent()
             .ok_or_else(|| FilesystemError::message("Cannot determine parent directory"))?;
-        fs::create_dir_all(parent)
-            .await
-            .map_err(|error| FilesystemError::io_path("Cannot create directory", parent, error))?;
+        // A file prepared from an existing version had its directory then. If
+        // that is gone the file is too, and recreating the directory would
+        // publish something on the way to refusing a stale write.
+        if expected.is_none() {
+            fs::create_dir_all(parent).await.map_err(|error| {
+                FilesystemError::io_path("Cannot create directory", parent, error)
+            })?;
+        }
         check_cancelled(token)?;
         let existing = fs::metadata(file_path).await.ok();
         let basename = file_path.file_name().unwrap_or_default().to_string_lossy();
@@ -44,7 +49,11 @@ impl FilesystemCore {
             #[cfg(unix)]
             options.mode(0o600);
             let mut file = options.open(&temporary).await.map_err(|error| {
-                FilesystemError::io_path("Cannot create temporary file", &temporary, error)
+                if expected.is_some() && error.kind() == std::io::ErrorKind::NotFound {
+                    publication_stale(requested_path)
+                } else {
+                    FilesystemError::io_path("Cannot create temporary file", &temporary, error)
+                }
             })?;
             file.write_all(content.as_bytes()).await.map_err(|error| {
                 FilesystemError::io_path("Cannot write temporary file", &temporary, error)
@@ -150,9 +159,41 @@ mod tests {
             .await
             .expect_err("stale snapshot");
         assert!(error.to_string().contains("changed before publication"));
+        assert_eq!(error.code(), "stale_resource");
         assert_eq!(
             std::fs::read_to_string(path).expect("current content"),
             "external change\n"
         );
+    }
+
+    #[tokio::test]
+    async fn a_vanished_directory_is_stale_and_is_not_recreated() {
+        let root = tempdir().expect("root");
+        let directory = root.path().join("gone");
+        let path = directory.join("value.txt");
+        std::fs::create_dir(&directory).expect("directory");
+        std::fs::write(&path, "original\n").expect("original");
+        let core = FilesystemCore::create(root.path(), true, None)
+            .await
+            .expect("core");
+        let token = CancellationToken::new();
+        let snapshot = read_text_snapshot_required(&path, core.limits.max_file_bytes, &token)
+            .await
+            .expect("snapshot");
+        std::fs::remove_dir_all(&directory).expect("racing removal");
+
+        let error = core
+            .commit_write(
+                "gone/value.txt",
+                &path,
+                "our change\n",
+                &token,
+                false,
+                Some(&snapshot.version),
+            )
+            .await
+            .expect_err("stale snapshot");
+        assert_eq!(error.code(), "stale_resource");
+        assert!(!directory.exists());
     }
 }

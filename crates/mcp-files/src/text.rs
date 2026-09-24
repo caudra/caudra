@@ -289,23 +289,14 @@ pub(crate) async fn validate_snapshot(
     maximum: usize,
     token: &CancellationToken,
 ) -> Result<(), FilesystemError> {
-    let current = match read_file_version_required(path, maximum, token).await {
-        Ok(current) => current,
-        Err(FilesystemError::Aborted) => return Err(FilesystemError::Aborted),
-        Err(_) => {
-            return Err(FilesystemError::message(format!(
-                "File changed before publication: {}",
-                path.to_string_lossy()
-            )));
-        }
-    };
-    if current != *expected {
-        return Err(FilesystemError::message(format!(
+    match read_file_version_required(path, maximum, token).await {
+        Err(FilesystemError::Aborted) => Err(FilesystemError::Aborted),
+        Ok(current) if current == *expected => Ok(()),
+        _ => Err(FilesystemError::Stale(format!(
             "File changed before publication: {}",
             path.to_string_lossy()
-        )));
+        ))),
     }
-    Ok(())
 }
 
 pub(crate) async fn exists(path: &Path) -> bool {
