@@ -257,7 +257,6 @@ delete_extraneous = false
 [sandbox.profiles.acceptance]
 provider = "fixture"
 template = "acceptance"
-template_revision = "{self.template['revision']}"
 cpus = 2
 memory_mib = 1024
 disk_gib = 8

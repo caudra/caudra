@@ -256,11 +256,20 @@ impl LifecycleClient {
         Ok(discovery)
     }
 
-    pub async fn template(&self, id: &SandboxName, revision: &Revision) -> Result<Template> {
-        let template: Template = self
-            .get(&format!("/templates/{id}?revision={}", revision.as_str()))
-            .await?;
-        if &template.manifest.id != id || &template.revision != revision {
+    /// Without a revision the daemon answers with the catalog head, the revision a create launches.
+    pub async fn template(
+        &self,
+        id: &SandboxName,
+        revision: Option<&Revision>,
+    ) -> Result<Template> {
+        let route = match revision {
+            Some(revision) => format!("/templates/{id}?revision={}", revision.as_str()),
+            None => format!("/templates/{id}"),
+        };
+        let template: Template = self.get(&route).await?;
+        if &template.manifest.id != id
+            || revision.is_some_and(|revision| &template.revision != revision)
+        {
             return Err(Error::Identity);
         }
         Ok(template)

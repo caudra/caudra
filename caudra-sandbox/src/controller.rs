@@ -233,9 +233,7 @@ impl Controller {
             .ok_or(Error::Missing)?;
         let client = self.client(provider)?;
         let discovery = client.discover().await?;
-        let template = client
-            .template(&profile.template, &profile.template_revision)
-            .await?;
+        let template = client.template(&profile.template, None).await?;
         let catalog = TemplateCatalog::without_guest_layout(vec![template_entry(&template)?])?;
         let launch =
             saved.resolve_launch(profile_name, &capabilities(provider, &discovery)?, &catalog)?;
@@ -436,7 +434,9 @@ impl Controller {
             return Err(Error::Identity);
         }
         let revision = Revision::parse(&instance.template.revision)?;
-        let template = client.template(&instance.template.id, &revision).await?;
+        let template = client
+            .template(&instance.template.id, Some(&revision))
+            .await?;
         if !template_entry(&template)?.workcell_compatible {
             return Err(Error::Protocol);
         }
@@ -1314,7 +1314,7 @@ fn create_request(launch: &ResolvedLaunch) -> Result<Create> {
     let network = configuration.network.value();
     Ok(Create {
         template_id: profile.template.clone(),
-        expected_template_revision: profile.template_revision.clone(),
+        expected_template_revision: configuration.template.revision.clone(),
         resources: Resources {
             cpu_count: profile.cpus.get(),
             memory_mb: profile.memory_mib.get(),
@@ -1528,6 +1528,9 @@ mod tests {
     const LATER: &str = "2026-09-20T13:00:00Z";
     const EARLIER: &str = "2026-09-20T11:00:00Z";
     const DIGEST: &str = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const HEAD_REVISION: &str =
+        "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+    const HEAD_ROUTE: &str = "/daemon/v1/templates/base";
     const REQUEST_DIGEST: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const NAME: &str = "saved";
     const PRIVATE_MODE: u32 = 0o700;
@@ -3381,7 +3384,7 @@ mod tests {
         )
         .unwrap();
         let draft: SandboxDraft = serde_json::from_value(json!({"providers":{"daemon":provider},"networks":{"net":{"enforcement":"off"}},"transfers":{"transfer":{}},
-            "profiles":{"dev":{"provider":"daemon","template":"base","template_revision":DIGEST,"cpus":2,"memory_mib":1024,"disk_gib":1,"cwd":".","network":"net","transfer":"transfer","persistent":true,"running_ttl_seconds":300,"on_exit":"detach"}}})).unwrap();
+            "profiles":{"dev":{"provider":"daemon","template":"base","cpus":2,"memory_mib":1024,"disk_gib":1,"cwd":".","network":"net","transfer":"transfer","persistent":true,"running_ttl_seconds":300,"on_exit":"detach"}}})).unwrap();
         let store = SandboxStore::from_config_dir(&temp.path().join("config")).unwrap();
         let loaded = store.load().unwrap();
         let saved = store.save(&loaded, &draft).unwrap();
@@ -3390,6 +3393,45 @@ mod tests {
             Controller::new(&state).unwrap(),
             saved.saved().clone(),
         )
+    }
+
+    #[test]
+    fn create_launches_the_catalog_head_it_validated() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let calls_for_server = calls.clone();
+        let server = Server::new(move |method, path, body, _| {
+            calls_for_server.lock().unwrap().push((
+                method.to_owned(),
+                path.to_owned(),
+                body.clone(),
+            ));
+            if path.ends_with("/discover") {
+                return Some((200, discovery(OWNER)));
+            }
+            if path.starts_with("/daemon/v1/templates/") {
+                let mut head = template();
+                head["revision"] = json!(HEAD_REVISION);
+                return Some((200, head));
+            }
+            None
+        });
+        let (_temp, controller, saved) = setup(&server);
+        let profile = SandboxName::parse("dev").unwrap();
+        assert!(smol::block_on(controller.create(&saved, &profile, name())).is_err());
+        let calls = calls.lock().unwrap();
+        let template_routes: Vec<&str> = calls
+            .iter()
+            .filter(|(_, path, _)| path.contains("/templates/"))
+            .map(|(_, path, _)| path.as_str())
+            .collect();
+        assert_eq!(template_routes, [HEAD_ROUTE]);
+        let (_, _, create) = calls
+            .iter()
+            .find(|(method, _, _)| method == "POST")
+            .unwrap();
+        assert_eq!(create["expectedTemplateRevision"], HEAD_REVISION);
+        let reserved = controller.store.get(&name()).unwrap();
+        assert_eq!(reserved.template.revision.as_str(), HEAD_REVISION);
     }
 
     #[test_case(false; "lost_response")]

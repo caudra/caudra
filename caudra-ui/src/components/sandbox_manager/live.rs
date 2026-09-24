@@ -489,12 +489,12 @@ impl Manager {
                     .doctor
                     .as_ref()
                     .ok_or("Live provider authority unavailable; refresh")?;
+                let pinned = &launch.configuration().template;
                 let template = doctor
                     .templates
                     .iter()
                     .find(|template| {
-                        template.manifest.id == saved.template
-                            && template.revision == saved.template_revision
+                        template.manifest.id == pinned.id && template.revision == pinned.revision
                     })
                     .ok_or("Immutable image metadata unavailable")?;
                 let review = CreateReview {

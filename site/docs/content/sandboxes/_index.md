@@ -66,7 +66,7 @@ Managed configuration lives in user-global `sandboxes.toml`, beside `init.lua` a
 
 The file uses `version = 1` and `[sandbox.providers.NAME]`, `[sandbox.networks.NAME]`, `[sandbox.transfers.NAME]`, and `[sandbox.profiles.NAME]`. Unknown fields, unsupported versions and dangling references are rejected. The file must be a user-owned regular file with no group/other access or symlink components. Saves check the previous file revision rather than overwriting concurrent edits.
 
-Replace the endpoints, resource values and template selection with your provider's values. `sha256:REPLACE_WITH_CATALOG_REVISION` below is deliberately a placeholder, not a valid pin. Use the image picker or the immutable template revision from Doctor, not the separate image-content digest.
+Replace the endpoints, resource values and template ID with your provider's values. A profile names a template ID rather than a revision. Each create launches the revision that the provider catalog currently lists for that ID.
 
 ```toml
 version = 1
@@ -91,7 +91,6 @@ delete_extraneous = false
 [sandbox.profiles.rust]
 provider = "local"
 template = "caudra-rust"
-template_revision = "sha256:REPLACE_WITH_CATALOG_REVISION"
 cpus = 4
 memory_mib = 4096
 disk_gib = 20
@@ -108,7 +107,7 @@ The implemented schema is in `caudra-config/src/sandbox.rs`: `SandboxProvider`, 
 | Record | Rules and defaults |
 |--------|--------------------|
 | Provider | `kind` is `e2b-libvirt`. Both endpoints are origins, without paths, credentials, query or fragment. HTTPS is accepted, or HTTP on a numeric loopback address. `http://localhost` is rejected. `credential_ref` is a lifecycle `sandbox-api:NAME` reference, not a Workcell `credential:NAME` reference. |
-| Profile | Provider, template pin, resources, cwd, network, transfer and positive running TTL are required. `persistent` defaults to `true`. `on_exit` defaults to `detach`, the only supported value. `cwd` is Workcell-root-relative, with `.` selecting the root. |
+| Profile | Provider, template ID, resources, cwd, network, transfer and positive running TTL are required. `persistent` defaults to `true`. `on_exit` defaults to `detach`, the only supported value. `cwd` is Workcell-root-relative, with `.` selecting the root. |
 | Network | `enforcement` is required and is `required` or `off`. TLS defaults to `sni-only`, and lists default to empty. Required enforcement with empty lists is deny-all. `off` must have empty lists and cannot select MITM. |
 | Transfer | Defaults are `respect_gitignore = true`, `initial_seed = "ask"`, and `delete_extraneous = false`. `initial_seed = "none"` disables the initial-seed offer, not later explicit transfers. `delete_extraneous = true` is rejected. |
 
@@ -120,7 +119,7 @@ CPU count, memory MiB, disk GiB and TTL must fit discovered provider limits and 
 
 The manager separates field drafts, saved configuration and live instance state. Applying a field changes the draft. Saving changes future launch defaults. It does not change the running VM, apply network rules, transfer files or rebind the conversation.
 
-Instances retain a resolved launch snapshot, including provider, profile, network and transfer revisions and the template pin. Instance details show saved-default drift separately from the live descriptor. A live lease or network change requires its own reviewed conditional action. Editing a shared policy affects future launches, and deleting a profile does not delete its instances. Existing owned instances use their launch-time transfer policy. Borrowed instances use the default transfer policy.
+Instances retain a resolved launch snapshot, including provider, profile, network and transfer revisions and the template revision they launched from. Instance details show saved-default drift separately from the live descriptor. A live lease or network change requires its own reviewed conditional action. Editing a shared policy affects future launches, and deleting a profile does not delete its instances. Existing owned instances use their launch-time transfer policy. Borrowed instances use the default transfer policy.
 
 Configuration Import replaces the draft only after validation. Export contains configuration and credential references, without secret values or live instance IDs, and saves to a new private file rather than overwriting one. Absolute client transfer roots are not reusable profile fields.
 
@@ -149,7 +148,7 @@ Closing the manager does not cancel an accepted lifecycle or image operation. Ca
 
 ## Images and template catalog
 
-Images are daemon-owned immutable catalog revisions. Details expose architecture, resource minimums/defaults, network topology, image digest, Workcell metadata, guest roots when disclosed, and visible instance references. Selecting a newer revision affects a future launch. It does not rebase existing disks. Create sends a template ID and expected revision, never a client host path.
+Images are daemon-owned immutable catalog revisions. Details expose architecture, resource minimums/defaults, network topology, image digest, Workcell metadata, guest roots when disclosed, and visible instance references. Importing a newer revision of a template ID changes what the next create launches, with no profile edit. Existing disks keep the revision they launched from. Create checks the current revision, then sends the template ID with that revision as the expected revision. If the catalog moves in between, the daemon refuses the create rather than launching an image Caudra did not check. Create never sends a client host path.
 
 Import and Build use typed forms. Import takes a host qcow2, expected digest, template metadata and an expected current catalog revision. Leave that revision empty only for a new template ID. F2 opens a host qcow2 picker, separate from the remote project picker. Selection executes nothing. F4 prepares a separately approved `qemu-img` probe using the selected source and trusted executable. The probe hashes the image and checks bounded format, backing-chain and virtual-size metadata. It is not a boot or guest-integrity test. Changing the source, digest or executable requires another probe before TUI Import.
 

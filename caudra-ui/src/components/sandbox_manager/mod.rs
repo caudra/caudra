@@ -15,7 +15,7 @@ use crate::sandbox::{
 use caudra_config::sandbox::persistence::LoadedSandboxes;
 use caudra_config::sandbox::{
     Enforcement, MAX_SANDBOX_FILE_BYTES, MAX_SANDBOX_RECORD_BYTES, MAX_SANDBOX_RECORDS, RecordKind,
-    ResourceRange, Revision, SandboxDraft, SandboxName, TlsMode,
+    ResourceRange, SandboxDraft, SandboxName, TlsMode,
 };
 use caudra_sandbox::Ownership;
 use caudra_storage::id::CaudraId;
@@ -991,11 +991,10 @@ impl Manager {
                 return Err(error("tls_mode", "TLS mode is unsupported".into()));
             }
             if let SnapshotState::Ready(catalog) = &provider.catalog {
-                let Some(template) = catalog.get(&profile.template, &profile.template_revision)
-                else {
+                let Some(template) = catalog.get(&profile.template) else {
                     return Err(error(
-                        "template_revision",
-                        "immutable template revision is missing from the catalog".into(),
+                        "template",
+                        "template is missing from the catalog".into(),
                     ));
                 };
                 if !template.workcell_compatible || template.architecture != caps.architecture {
@@ -1058,9 +1057,7 @@ impl Manager {
                 };
                 let caps = &provider.capabilities;
                 let template = match &provider.catalog {
-                    SnapshotState::Ready(catalog) => {
-                        catalog.get(&profile.template, &profile.template_revision)
-                    }
+                    SnapshotState::Ready(catalog) => catalog.get(&profile.template),
                     _ => None,
                 };
                 let enforcement = form.text("enforcement");
@@ -1104,9 +1101,8 @@ impl Manager {
             .and_then(|provider| match &provider.catalog {
                 SnapshotState::Ready(catalog) => {
                     let id = SandboxName::parse(&form.text("template")).ok()?;
-                    let revision = Revision::parse(&form.text("template_revision")).ok()?;
                     catalog
-                        .get(&id, &revision)
+                        .get(&id)
                         .map(|template| template.minimum_resources.disk_gib)
                 }
                 _ => None,
@@ -2396,7 +2392,7 @@ impl Manager {
                     .map(ToString::to_string)
                     .collect(),
             ),
-            "template" | "template_revision" => {
+            "template" => {
                 let provider = SandboxName::parse(&form.text("provider"))
                     .ok()
                     .and_then(|name| self.provider(&name, &self.draft));
@@ -2414,10 +2410,7 @@ impl Manager {
                                 entry.minimum_resources.disk_gib,
                                 entry.workcell_compatible
                             ),
-                            fields: vec![
-                                ("template", entry.id.to_string()),
-                                ("template_revision", entry.revision.as_str().into()),
-                            ],
+                            fields: vec![("template", entry.id.to_string())],
                         })
                         .collect(),
                     _ => {
@@ -2427,7 +2420,7 @@ impl Manager {
                 }
             }
             _ => {
-                self.status = "F2 chooses a provider, immutable template, network or transfer reference. Enter edits this field.".into();
+                self.status = "F2 chooses a provider, template, network or transfer reference. Enter edits this field.".into();
                 return;
             }
         };
@@ -2558,7 +2551,7 @@ pub(crate) mod tests {
     use caudra_config::sandbox::persistence::SandboxStore;
     use caudra_config::sandbox::{
         Architecture, DomainRule, Enforcement, ProviderCapabilities, RecordKind, ResourceRange,
-        SandboxDraft, SandboxName, TemplateCatalog, TemplateEntry, TlsMode,
+        Revision, SandboxDraft, SandboxName, TemplateCatalog, TemplateEntry, TlsMode,
     };
     use caudra_sandbox::{InstanceRecord, LifecycleAction, Ownership};
     use caudra_storage::id::CaudraId;
@@ -2596,7 +2589,6 @@ exclude = ["**/.env*", "**/.git/**"]
 [sandbox.profiles.dev]
 provider = "local"
 template = "rust"
-template_revision = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 cpus = 2
 memory_mib = 2048
 disk_gib = 20
@@ -2607,6 +2599,8 @@ persistent = true
 running_ttl_seconds = 3600
 on_exit = "detach"
 "#;
+    const TEMPLATE_REVISION: &str =
+        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const PROVIDER: &str = "local";
     const SAVED_TTL: &str = "3600";
     const NEW_TTL: &str = "7200";
@@ -2818,7 +2812,7 @@ on_exit = "detach"
         }
         let state = manager.state.as_mut().unwrap();
         let profile = state.draft.profiles.values().next().unwrap();
-        let digest = profile.template_revision.as_str();
+        let digest = TEMPLATE_REVISION;
         let template = serde_json::from_value(json!({"schemaVersion":1,"id":"rust","architecture":"x86_64","machine":"q35",
             "minimum":{"cpuCount":1,"memoryMB":512,"diskSizeMB":1024},"defaults":{"cpuCount":2,"memoryMB":2048,"diskSizeMB":20480},
             "networkTopology":"slirp-enforced","workcell":{"version":"test","sha256":"","protocolVersion":"2026-07-28","transferProtocol":"workcell-reviewed-v1","remoteWorkspace":true,"workspaceSnapshots":true,"reviewedTransfer":true},
@@ -3317,7 +3311,7 @@ on_exit = "detach"
         };
         let catalog = TemplateCatalog::new(vec![TemplateEntry {
             id: profile.template.clone(),
-            revision: profile.template_revision.clone(),
+            revision: Revision::parse(TEMPLATE_REVISION).unwrap(),
             architecture: Architecture::X86_64,
             minimum_resources: profile.resources(),
             workspace_root: "/workspace".into(),
@@ -3532,7 +3526,7 @@ on_exit = "detach"
     #[test_case("cpus", "0"; "zero_cpu")]
     #[test_case("memory_mib", "1.5"; "fractional_memory")]
     #[test_case("running_ttl_seconds", "forever"; "invalid_ttl")]
-    #[test_case("template_revision", "latest"; "mutable_revision")]
+    #[test_case("template", "../image.qcow2"; "host_image_path")]
     #[test_case("cwd", "../outside"; "traversal")]
     #[test_case("network", "missing"; "dangling_reference")]
     fn invalid_form_retains_text_and_focuses_error(field: &str, value: &str) {

@@ -223,7 +223,7 @@ fn saved_network_worker_commits_then_reconciles_fake_provider(
     .unwrap();
     let endpoint = format!("http://{}", server.address);
     let draft: SandboxDraft = serde_json::from_value(json!({"providers":{"daemon":{"kind":"e2b-libvirt","api_endpoint":endpoint,"proxy_endpoint":endpoint,"credential_ref":"sandbox-api:lifecycle"}},"networks":{"net":{"enforcement":"required"}},"transfers":{"transfer":{}},
-        "profiles":{"dev":{"provider":"daemon","template":"base","template_revision":DIGEST,"cpus":2,"memory_mib":1024,"disk_gib":1,"cwd":".","network":"net","transfer":"transfer","persistent":true,"running_ttl_seconds":300,"on_exit":"detach"}}})).unwrap();
+        "profiles":{"dev":{"provider":"daemon","template":"base","cpus":2,"memory_mib":1024,"disk_gib":1,"cwd":".","network":"net","transfer":"transfer","persistent":true,"running_ttl_seconds":300,"on_exit":"detach"}}})).unwrap();
     let baseline = Arc::new(store.save(&store.load().unwrap(), &draft).unwrap());
     let controller = Controller::new(&storage).unwrap();
     let profile = SandboxName::parse(PROFILE).unwrap();

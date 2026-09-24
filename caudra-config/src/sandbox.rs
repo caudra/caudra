@@ -437,7 +437,6 @@ pub enum OnExit {
 pub struct SandboxProfile {
     pub provider: SandboxName,
     pub template: SandboxName,
-    pub template_revision: Revision,
     pub cpus: NonZeroU32,
     pub memory_mib: NonZeroU32,
     pub disk_gib: NonZeroU32,
@@ -817,10 +816,8 @@ impl SavedSandboxes {
             return Err(SandboxError::Capability("provider revision"));
         }
         let template = catalog
-            .get(&profile.template, &profile.template_revision)
-            .ok_or(SandboxError::Capability(
-                "immutable template revision is absent from catalog",
-            ))?;
+            .get(&profile.template)
+            .ok_or(SandboxError::Capability("template is absent from catalog"))?;
         let network = &configuration.networks[&profile.network];
         capabilities.validate(profile, network, template)?;
         let effective = LaunchConfiguration {
@@ -856,8 +853,9 @@ pub struct TemplateEntry {
     pub guest_ca: bool,
 }
 
+/// The revision each template ID launches now, as the provider's catalog heads report it.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TemplateCatalog(BTreeMap<(SandboxName, Revision), TemplateEntry>);
+pub struct TemplateCatalog(BTreeMap<SandboxName, TemplateEntry>);
 
 impl TemplateCatalog {
     pub fn new(entries: Vec<TemplateEntry>) -> Result<Self, SandboxError> {
@@ -897,18 +895,15 @@ impl TemplateCatalog {
                     "declare supported enforced/unrestricted topology",
                 ));
             }
-            let key = (entry.id.clone(), entry.revision.clone());
-            if catalog.insert(key, entry).is_some() {
-                return Err(SandboxError::Capability(
-                    "duplicate immutable template revision",
-                ));
+            if catalog.insert(entry.id.clone(), entry).is_some() {
+                return Err(SandboxError::Capability("duplicate template ID"));
             }
         }
         Ok(Self(catalog))
     }
 
-    pub fn get(&self, id: &SandboxName, revision: &Revision) -> Option<&TemplateEntry> {
-        self.0.get(&(id.clone(), revision.clone()))
+    pub fn get(&self, id: &SandboxName) -> Option<&TemplateEntry> {
+        self.0.get(id)
     }
     pub fn entries(&self) -> impl Iterator<Item = &TemplateEntry> {
         self.0.values()
@@ -1094,7 +1089,6 @@ initial_seed = "ask"
 [sandbox.profiles.dev]
 provider = "local"
 template = "rust"
-template_revision = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 cpus = 4 # virtual CPUs
 memory_mib = 4096
 disk_gib = 20
@@ -1119,7 +1113,12 @@ running_ttl_seconds = 3600
     const ARCHITECTURE_CAPABILITY: &str = "template architecture";
     const WORKCELL_CAPABILITY: &str = "template Workcell compatibility";
     const PROVIDER_CAPABILITY: &str = "provider revision";
-    const TEMPLATE_CAPABILITY: &str = "immutable template revision is absent from catalog";
+    const TEMPLATE_CAPABILITY: &str = "template is absent from catalog";
+    const DUPLICATE_TEMPLATE: &str = "duplicate template ID";
+    const TEMPLATE_REVISION: &str =
+        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const REIMPORTED_REVISION: &str =
+        "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
     pub(super) fn name(value: &str) -> SandboxName {
         SandboxName::parse(value).unwrap()
@@ -1140,7 +1139,7 @@ running_ttl_seconds = 3600
         minimum_resources.disk_gib = positive(8);
         TemplateEntry {
             id: profile.template,
-            revision: profile.template_revision,
+            revision: Revision::parse(TEMPLATE_REVISION).unwrap(),
             architecture: Architecture::X86_64,
             minimum_resources,
             workspace_root: "/workspace".into(),
@@ -1315,6 +1314,7 @@ running_ttl_seconds = 3600
     #[test_case("[sandbox.networks.build]", "[sandbox.networks.build]\nmethods = ['GET']"; "methods")]
     #[test_case("[sandbox.transfers.source]", "[sandbox.transfers.source]\nlocal_root = '/tmp/secret'"; "transfer")]
     #[test_case("[sandbox.profiles.dev]", "[sandbox.profiles.dev]\ninstance_id = 'secret-canary-do-not-display'"; "profile")]
+    #[test_case("template = \"rust\"", "template = \"rust\"\ntemplate_revision = 'sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'"; "template_revision_pin")]
     #[test_case("credential_ref = \"sandbox-api:local\"", "credential_ref = 'env:SECRET'"; "env_ref")]
     #[test_case("credential_ref = \"sandbox-api:local\"", "credential_ref = 'credential:local'"; "workcell_ref")]
     #[test_case("cpus = 4", "cpus = 0"; "zero_cpu")]
@@ -1581,7 +1581,34 @@ running_ttl_seconds = 3600
     }
 
     #[test]
-    fn validates_template_revision_minimums_compatibility_and_mitm() {
+    fn launch_follows_the_catalog_revision_without_a_profile_pin() {
+        let saved = saved();
+        let launch = saved
+            .resolve_launch(&name(PROFILE), &capabilities(), &catalog())
+            .unwrap();
+        let mut reimported = template();
+        reimported.revision = Revision::parse(REIMPORTED_REVISION).unwrap();
+        let catalog = TemplateCatalog::new(vec![reimported]).unwrap();
+        let next = saved
+            .resolve_launch(&name(PROFILE), &capabilities(), &catalog)
+            .unwrap();
+        assert_eq!(
+            launch.configuration().template.revision.as_str(),
+            TEMPLATE_REVISION
+        );
+        assert_eq!(
+            next.configuration().template.revision.as_str(),
+            REIMPORTED_REVISION
+        );
+        assert_eq!(
+            launch.configuration().profile.revision(),
+            next.configuration().profile.revision()
+        );
+        assert_ne!(launch.revision(), next.revision());
+    }
+
+    #[test]
+    fn validates_template_minimums_compatibility_and_mitm() {
         let saved = saved();
         let mut entry = template();
         entry.minimum_resources.cpus = positive(8);
@@ -1598,7 +1625,7 @@ running_ttl_seconds = 3600
             Err(SandboxError::Capability(WORKCELL_CAPABILITY))
         );
         let mut entry = template();
-        entry.revision = Revision::parse(&format!("sha256:{}", "b".repeat(64))).unwrap();
+        entry.id = name("other");
         let catalog = TemplateCatalog::new(vec![entry]).unwrap();
         assert_eq!(
             saved.resolve_launch(&name(PROFILE), &capabilities(), &catalog),
@@ -1690,15 +1717,20 @@ running_ttl_seconds = 3600
     }
 
     #[test]
-    fn catalog_requires_unambiguous_immutable_entries() {
-        assert!(TemplateCatalog::new(vec![template(), template()]).is_err());
+    fn catalog_requires_one_revision_per_template_id() {
         for value in ["latest", "sha256:abc", "/host/image.qcow2"] {
             assert!(Revision::parse(value).is_err());
         }
-        let mut new_revision = template();
-        new_revision.revision = Revision::parse(&format!("sha256:{}", "b".repeat(64))).unwrap();
+        let mut reimported = template();
+        reimported.revision = Revision::parse(REIMPORTED_REVISION).unwrap();
         assert_eq!(
-            TemplateCatalog::new(vec![template(), new_revision])
+            TemplateCatalog::new(vec![template(), reimported]),
+            Err(SandboxError::Capability(DUPLICATE_TEMPLATE))
+        );
+        let mut other = template();
+        other.id = name("other");
+        assert_eq!(
+            TemplateCatalog::new(vec![template(), other])
                 .unwrap()
                 .entries()
                 .count(),

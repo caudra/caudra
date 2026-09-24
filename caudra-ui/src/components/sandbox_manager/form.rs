@@ -1,7 +1,7 @@
 use super::super::text_editor::TextEditor;
 use caudra_config::sandbox::{
-    CidrRule, DomainRule, MAX_NETWORK_RULES, RecordKind, Revision, SandboxDraft, SandboxError,
-    SandboxName, SandboxOrigin, SandboxRecord, TransferPolicy,
+    CidrRule, DomainRule, MAX_NETWORK_RULES, RecordKind, SandboxDraft, SandboxError, SandboxName,
+    SandboxOrigin, SandboxRecord, TransferPolicy,
 };
 use caudra_storage::sandbox_auth::SandboxCredentialRef;
 use caudra_workspace::WorkspacePath;
@@ -24,13 +24,7 @@ const PROFILE_FIELDS: &[(&str, &str, Input, &str)] = &[
         "template",
         "Template ID",
         Input::Name,
-        "Daemon catalog ID, never a host image path.",
-    ),
-    (
-        "template_revision",
-        "Immutable revision",
-        Input::Revision,
-        "sha256: followed by 64 hex digits; never a mutable alias.",
+        "Daemon catalog ID, never a host image path. Create launches its current catalog revision.",
     ),
     ("cpus", "CPU count", Input::Positive, POSITIVE),
     ("memory_mib", "Memory (MiB)", Input::Positive, POSITIVE),
@@ -154,7 +148,6 @@ const TRANSFER_FIELDS: &[(&str, &str, Input, &str)] = &[
 #[derive(Clone)]
 pub(super) enum Input {
     Name,
-    Revision,
     Origin,
     Credential,
     Cwd,
@@ -192,9 +185,6 @@ impl Field {
         let string = match &self.input {
             Input::Name => SandboxName::parse(&text)
                 .map(|value| value.to_string())
-                .map_err(sandbox_error)?,
-            Input::Revision => Revision::parse(&text)
-                .map(|value| value.as_str().to_owned())
                 .map_err(sandbox_error)?,
             Input::Origin => SandboxOrigin::parse(&text)
                 .map(|value| value.as_str().to_owned())
