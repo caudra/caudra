@@ -3964,6 +3964,12 @@ impl WorkspaceAssetService for RemoteWorkcellClient {
                 .iter()
                 .map(|asset| self.project_asset(asset))
                 .collect::<Result<Vec<_>, _>>()?,
+            unreadable: response
+                .manifest
+                .unreadable
+                .iter()
+                .map(workspace_path)
+                .collect::<Result<Vec<_>, _>>()?,
         })
     }
 

@@ -136,19 +136,19 @@ Caudra fetches remote project assets through a bounded, revision-checked manifes
 
 Supported remote assets are:
 
-| Asset        | Accepted paths and behavior                                                                                                                                                                                                                                |
-| ------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Instructions | `AGENTS.md`, `CLAUDE.md`, `COPILOT.md`, `.cursorrules`, `.windsurfrules`, `.clinerules`, `CONVENTIONS.md`, `GEMINI.md`, and `CODING_AGENT.md`, plus `.github/copilot-instructions.md` and `.caudra/instructions`. Directory scope determines applicability |
-| Skills       | One-level `<name>/SKILL.md` under `.caudra/skills`, `.claude/skills`, `.opencode/skills`, or `.agents/skills`                                                                                                                                              |
-| Commands     | Immediate Markdown files under `.caudra/commands`, `.claude/commands`, or `.opencode/commands`. They are prompt templates, not client shell scripts                                                                                                        |
-| Workflows    | `.caudra/workflows/*.rhai`. Scripts require client approval before execution                                                                                                                                                                               |
-| Permissions  | The exact `.caudra/permissions.toml` file. Restrictive rules apply immediately. Allows require review                                                                                                                                                      |
+| Asset        | Accepted paths and behavior                                                                                                                                                                                                                                                   |
+| ------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Instructions | `AGENTS.md`, `AGENTS.local.md`, `CLAUDE.md`, `COPILOT.md`, `.cursorrules`, `.windsurfrules`, `.clinerules`, `CONVENTIONS.md`, `GEMINI.md`, and `CODING_AGENT.md`, plus `.github/copilot-instructions.md` and `.caudra/instructions`. Directory scope determines applicability |
+| Skills       | One-level `<name>/SKILL.md` under `.caudra/skills`, `.claude/skills`, `.opencode/skills`, or `.agents/skills`                                                                                                                                                                 |
+| Commands     | Immediate Markdown files under `.caudra/commands`, `.claude/commands`, or `.opencode/commands`. They are prompt templates, not client shell scripts                                                                                                                           |
+| Workflows    | `.caudra/workflows/*.rhai`. Scripts require client approval before execution                                                                                                                                                                                                  |
+| Permissions  | The exact `.caudra/permissions.toml` file. Restrictive rules apply immediately. Allows require review                                                                                                                                                                         |
 
 Skill and command directories use the order shown above, selecting the highest-priority remote tier. Project entries override same-named global entries. Instructions and skill text are model context, not permission grants.
 
 Workflow approval and permission-allow trust bind to the remote authority, authenticated principal, project, resource identity, revision, and source digest. Editing the asset invalidates its prior approval. A local checkout's trust does not authorize an identically named remote file. Invalid or stale assets fail closed. Caudra approvals cannot override server policy.
 
-Development compatibility note: the sibling Workcell manifest also recognizes `AGENTS.local.md`, while this client's remote instruction allowlist does not. A manifest containing that asset is rejected. Use `AGENTS.md` for shared instructions until the implementations agree.
+An asset Caudra does not recognise and a path the host cannot read are both skipped, and the session warns you with their paths. `.caudra/permissions.toml` fails the session instead when it is unreadable or invalid. [Context](/docs/context/#in-a-sandbox) describes how workspace and client instruction files combine.
 
 Only global client MCP configuration is loaded. Local stdio extensions require explicit trust and run with an isolated launch context, rather than inheriting the client checkout's cwd and environment. Treat global Lua plugins and approved local processes as trusted client code. Remote mode is not a sandbox for extensions.
 

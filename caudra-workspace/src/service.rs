@@ -1228,6 +1228,9 @@ pub struct ProjectAssetManifest {
     pub version: OperationId,
     pub revision: CollectionRevision,
     pub assets: Vec<ProjectAsset>,
+    /// Paths the host could not read while discovering, so nothing beneath
+    /// them is in `assets`.
+    pub unreadable: Vec<WorkspacePath>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

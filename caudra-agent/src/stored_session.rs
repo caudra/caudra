@@ -397,6 +397,7 @@ pub(crate) mod tests {
                 } else {
                     vec![self.asset()]
                 },
+                unreadable: Vec::new(),
             })
         }
         async fn read(

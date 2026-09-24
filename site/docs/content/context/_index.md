@@ -174,6 +174,8 @@ Read the `host` blocks with that difference in mind. Your global file describes 
 
 A declared workspace file Caudra does not recognise is skipped, and the session warns you with its path. The rest of the project context still loads. The exception is `.caudra/permissions.toml`, which fails the session outright when it does not validate, since running without the restrictions a project asked for is worse than not running.
 
+Paths the host cannot read are skipped the same way, whether a directory it cannot list or an instruction file it cannot open. The warning names each one. Files inside an unreadable directory are missing from the context, because the host never saw them. The permission file is the exception again. The session fails when the host cannot read `.caudra` or `.caudra/permissions.toml`, and also when it cannot list the workspace root.
+
 ## What Caudra writes on your behalf
 
 Part of what the model reads was written by Caudra rather than typed by you. These messages carry your role, because that is the only role a provider accepts for them, and each one is wrapped in a `<system-reminder>` tag so the model can tell it apart from something you asked for.

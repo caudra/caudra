@@ -8864,6 +8864,7 @@ impl WorkspaceAssetService for EmptyRemoteAssets {
             version: OperationId::new("project-assets.v1").unwrap(),
             revision: CollectionRevision::new("empty").unwrap(),
             assets: Vec::new(),
+            unreadable: Vec::new(),
         })
     }
 

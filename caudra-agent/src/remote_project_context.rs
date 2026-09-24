@@ -32,6 +32,8 @@ const PERMISSIONS_ASSET: &str = ".caudra/permissions.toml";
 const SHA256_HEX_LEN: usize = 64;
 const MAX_NAMED_SKIPS: usize = 4;
 const SKIPPED_ASSETS_WARNING: &str = "Remote project assets Caudra does not recognise were skipped";
+const UNREADABLE_PATHS_WARNING: &str =
+    "Remote project paths the host could not read were skipped, with any assets beneath them";
 
 static REMOTE_CONTEXT_LOADER: LazyLock<RemoteProjectContextLoader> =
     LazyLock::new(RemoteProjectContextLoader::new);
@@ -190,6 +192,7 @@ pub struct RemoteProjectContext {
     workflows: Vec<RemoteWorkflow>,
     permissions: Option<RemotePermissionAsset>,
     skipped: Vec<WorkspacePath>,
+    unreadable: Vec<WorkspacePath>,
 }
 
 impl RemoteProjectContext {
@@ -224,21 +227,14 @@ impl RemoteProjectContext {
     }
 
     pub fn skipped_warning(&self) -> Option<String> {
-        if self.skipped.is_empty() {
-            return None;
-        }
-        let named: Vec<_> = self
-            .skipped
-            .iter()
-            .take(MAX_NAMED_SKIPS)
-            .map(WorkspacePath::as_str)
-            .collect();
-        let rest = self.skipped.len() - named.len();
-        let mut warning = format!("{SKIPPED_ASSETS_WARNING}: {}", named.join(", "));
-        if rest > 0 {
-            warning.push_str(&format!(" and {rest} more"));
-        }
-        Some(warning)
+        let warnings: Vec<_> = [
+            named_paths(SKIPPED_ASSETS_WARNING, &self.skipped),
+            named_paths(UNREADABLE_PATHS_WARNING, &self.unreadable),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        (!warnings.is_empty()).then(|| warnings.join(". "))
     }
 
     pub fn applicable_instructions(&self, path: &WorkspacePath) -> Vec<&RemoteInstruction> {
@@ -347,7 +343,7 @@ impl RemoteProjectContextLoader {
             return Ok(cached);
         }
 
-        let mut builder = ContextBuilder::new(manifest.revision);
+        let mut builder = ContextBuilder::new(manifest.revision, manifest.unreadable);
         let mut declared_bytes = 0u64;
         let mut admitted = Vec::new();
         for asset in manifest.assets {
@@ -401,7 +397,8 @@ impl RemoteProjectContextLoader {
         let context = Arc::new(builder.finish());
         if let Some(warning) = context.skipped_warning() {
             tracing::warn!(
-                skipped = context.skipped().len(),
+                skipped = context.skipped.len(),
+                unreadable = context.unreadable.len(),
                 detail = %warning,
                 "remote project assets skipped"
             );
@@ -431,10 +428,11 @@ struct ContextBuilder {
     workflows: Vec<RemoteWorkflow>,
     permissions: Option<RemotePermissionAsset>,
     skipped: Vec<WorkspacePath>,
+    unreadable: Vec<WorkspacePath>,
 }
 
 impl ContextBuilder {
-    fn new(revision: CollectionRevision) -> Self {
+    fn new(revision: CollectionRevision, unreadable: Vec<WorkspacePath>) -> Self {
         Self {
             revision,
             instructions: Vec::new(),
@@ -445,6 +443,7 @@ impl ContextBuilder {
             workflows: Vec::new(),
             permissions: None,
             skipped: Vec::new(),
+            unreadable,
         }
     }
 
@@ -569,8 +568,26 @@ impl ContextBuilder {
             workflows: self.workflows,
             permissions: self.permissions,
             skipped: self.skipped,
+            unreadable: self.unreadable,
         }
     }
+}
+
+fn named_paths(warning: &str, paths: &[WorkspacePath]) -> Option<String> {
+    if paths.is_empty() {
+        return None;
+    }
+    let named: Vec<_> = paths
+        .iter()
+        .take(MAX_NAMED_SKIPS)
+        .map(WorkspacePath::as_str)
+        .collect();
+    let rest = paths.len() - named.len();
+    let mut text = format!("{warning}: {}", named.join(", "));
+    if rest > 0 {
+        text.push_str(&format!(" and {rest} more"));
+    }
+    Some(text)
 }
 
 fn validate_manifest(
@@ -893,6 +910,7 @@ pub(crate) mod tests {
         WorkspaceAssetService, WorkspaceCapabilities, WorkspaceCapability, WorkspaceCursor,
         WorkspaceError, WorkspaceHandle, WorkspaceServices,
     };
+    use test_case::test_case;
 
     use super::*;
 
@@ -1008,6 +1026,7 @@ pub(crate) mod tests {
                         version: OperationId::new(MANIFEST_VERSION).unwrap(),
                         revision: CollectionRevision::new(MANIFEST_REVISION).unwrap(),
                         assets: assets.into_iter().map(|(asset, _)| asset).collect(),
+                        unreadable: Vec::new(),
                     },
                     content,
                 }),
@@ -1201,6 +1220,46 @@ pub(crate) mod tests {
         assert!(warning.starts_with(SKIPPED_ASSETS_WARNING), "{warning}");
         assert!(warning.contains(UNKNOWN_INSTRUCTION), "{warning}");
         assert_eq!(service.reads.load(Ordering::Relaxed), 1);
+    }
+
+    const UNREADABLE_DIRECTORY: &str = "vendor/locked";
+
+    /// A path the host could not read costs only what lies beneath it, and the
+    /// user is told which one.
+    #[test_case(1, "" ; "one_path")]
+    #[test_case(MAX_NAMED_SKIPS + 1, " and 1 more" ; "more_than_are_named")]
+    fn paths_the_host_could_not_read_are_named_while_the_rest_load(count: usize, tail: &str) {
+        let service = AssetService::new(vec![(
+            asset(
+                "AGENTS.md",
+                "asset-1",
+                ProjectAssetKind::Instructions,
+                ProjectAssetTrust::Declarative,
+                ROOT_RULE.len() as u64,
+            ),
+            ROOT_RULE,
+        )]);
+        let unreadable: Vec<_> = (0..count)
+            .map(|index| WorkspacePath::new(format!("{UNREADABLE_DIRECTORY}-{index}")).unwrap())
+            .collect();
+        service.state.lock().unwrap().manifest.unreadable = unreadable.clone();
+
+        let context = smol::block_on(
+            RemoteProjectContextLoader::new().load(&session(Arc::clone(&service), "alice")),
+        )
+        .unwrap();
+
+        assert_eq!(context.instructions()[0].content, ROOT_RULE);
+        let named = unreadable
+            .iter()
+            .take(MAX_NAMED_SKIPS)
+            .map(WorkspacePath::as_str)
+            .collect::<Vec<_>>()
+            .join(", ");
+        assert_eq!(
+            context.skipped_warning(),
+            Some(format!("{UNREADABLE_PATHS_WARNING}: {named}{tail}"))
+        );
     }
 
     /// Skipping costs context. Skipping a permission policy costs the project's
