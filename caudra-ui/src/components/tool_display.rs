@@ -1,6 +1,7 @@
 use super::{DisplayMessage, ToolProgress, ToolStatus, escape_terminal_controls};
 
 use super::code_view;
+use super::status_bar::collapse_home;
 use crate::animation::{spinner_frame, spinner_str};
 use crate::theme;
 use caudra_config::{ClockFormat, ToolOutputLines};
@@ -37,7 +38,7 @@ use caudra_agent::{
         SHELL_TOOL_NAME, TASK_TOOL_NAME, humanize_duration, timeout_annotation,
     },
 };
-use caudra_workcell::effective_timeout;
+use caudra_workcell::{CURRENT_WORKDIR, effective_timeout, requested_workdir};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
@@ -68,6 +69,10 @@ pub struct RenderCtx<'a> {
     pub batch_live: &'a BatchLiveMap,
     /// When each batch's still-running children started, by parent tool id.
     pub batch_started: &'a BatchStartedMap,
+    /// The session's working directory, which a call's `workdir` argument is
+    /// resolved against until its result says where the call ran. `None`
+    /// names no directory for a call that has no result yet.
+    pub cwd: Option<Arc<Path>>,
 }
 
 impl RenderCtx<'_> {
@@ -93,6 +98,7 @@ impl RenderCtx<'_> {
             .with_policy(self.policy.clone(), self.child_scroll.clone())
             .with_progress(progress, live, started)
             .with_width(self.width.saturating_sub(TOOL_BODY_INDENT_WIDTH))
+            .with_cwd(self.cwd.clone())
     }
 
     /// Whether this call is drawn as a fixed-height scroller rather than
@@ -172,8 +178,13 @@ pub(crate) const SPINNER_STYLE_PREFIX: &str = "spinner:";
 
 const CODE_OUTPUT_DIVIDER: &str = "  ────────────";
 /// What separates the parts of a row that reports several things at once: a
-/// header's tally from its spend, and a compact row's header from its activity.
+/// header's tally from its spend, each part of its annotation from the next,
+/// and a compact row's header from its activity.
 const ACTIVITY_SEPARATOR: &str = " · ";
+const ANNOTATION_OPEN: &str = " (";
+const ANNOTATION_CLOSE: &str = ")";
+/// Ends a workdir the header names, so the name reads as a directory.
+const DIRECTORY_SUFFIX: char = '/';
 /// One tree level, all four columns wide so a connector and the gap below it
 /// occupy the same span. Shared with `code_view` and the workflow inspector,
 /// which draw the same tree: a second copy is how two surfaces drift apart.
@@ -289,7 +300,8 @@ const QUALIFIER: [char; 3] = ['_', '.', '-'];
 /// How a tool names itself on a compact row. The `name> ` prefix is gone
 /// there, so the label is what identifies the call, and `header_keys` are the
 /// inputs the row already shows elsewhere -- in the header text, or in the
-/// annotation a timeout is named by -- so the `[k=v]` suffix can skip them.
+/// annotation a timeout or a workdir is named by -- so the `[k=v]` suffix can
+/// skip them.
 /// Tools missing from the table fall back to their registered name.
 ///
 /// The label is inflected, so the row says what the call is doing rather than
@@ -408,7 +420,7 @@ const COMPACT_TOOLS: &[(&str, CompactTool)] = &[
     tool_row("file_index", '≡', INDEX, &["path"]),
     tool_row("websearch", '◈', SEARCH, &["query"]),
     tool_row("webfetch", '↓', FETCH, &["url"]),
-    tool_row("shell", '$', RUN, &["command", "timeout"]),
+    tool_row("shell", '$', RUN, &["command", "timeout", "workdir"]),
     tool_row("python_execution", 'λ', COMPUTE, &["code", "timeout"]),
     tool_row("code_map", '◇', MAP, &["path"]),
     tool_row("code_context", '◇', LOCATE, &["task", "path"]),
@@ -1409,7 +1421,7 @@ impl ToolLineBuilder {
         &mut self,
         tool_name: &str,
         header: &str,
-        annotation: Option<&str>,
+        annotation: Vec<Span<'static>>,
         render_header: Option<&BufferSnapshot>,
         output: Option<&ToolOutput>,
         raw_input: Option<&serde_json::Value>,
@@ -1448,13 +1460,7 @@ impl ToolLineBuilder {
             spans.extend(header_spans(tool_name, header, style, raw_input));
         }
         let mut copy = format!("{label}{gap}{header}");
-        if let Some(ann) = annotation {
-            spans.push(Span::styled(
-                format!(" ({ann})"),
-                theme::current().tool_annotation,
-            ));
-            write!(copy, " ({ann})").unwrap();
-        }
+        push_annotation(&mut spans, &mut copy, annotation);
         self.lines.push(Line::from(spans));
         self.search_text = copy;
     }
@@ -1465,7 +1471,7 @@ impl ToolLineBuilder {
         &mut self,
         tool_name: &str,
         header: &str,
-        annotation: Option<&str>,
+        annotation: Vec<Span<'static>>,
         raw_input: Option<&serde_json::Value>,
         output: Option<&ToolOutput>,
     ) {
@@ -1495,13 +1501,7 @@ impl ToolLineBuilder {
             copy.push_str(&args);
             spans.push(Span::styled(args, theme::current().tool_dim));
         }
-        if let Some(ann) = annotation {
-            spans.push(Span::styled(
-                format!(" ({ann})"),
-                theme::current().tool_annotation,
-            ));
-            write!(copy, " ({ann})").unwrap();
-        }
+        push_annotation(&mut spans, &mut copy, annotation);
         self.lines.push(Line::from(spans));
         self.search_text = copy;
     }
@@ -2272,11 +2272,17 @@ pub fn build_tool_lines(
     );
     b.stage = msg.tool_stage;
     b.apply_output_format(msg.tool_output.as_deref());
-    let mut annotation = header_annotation(msg);
+    let mut report = header_annotation(msg);
     if let Some(timeout) = header_timeout(tool_name, msg.tool_raw_input.as_deref()) {
-        append_annotation(&mut annotation, &timeout_annotation(timeout));
+        append_annotation(&mut report, &timeout_annotation(timeout));
     }
-    let annotation = annotation.as_deref();
+    let workdir = header_workdir(
+        tool_name,
+        msg.tool_raw_input.as_deref(),
+        msg.tool_output.as_deref(),
+        rctx.cwd.as_deref(),
+    );
+    let annotation = annotation_spans(report.as_deref(), workdir);
     if rctx.compact {
         b.push_compact_header(
             tool_name,
@@ -2449,9 +2455,80 @@ pub(super) fn header_timeout(
     effective_timeout(tool, raw_input?)
 }
 
+/// The directory a command starts in, for the header to name when it is not
+/// the session's own.
+///
+/// The result says where the call really ran once there is one, which is also
+/// all a restored card needs. Until then the argument is resolved the way the
+/// executor will resolve it, so the words do not change when the call lands,
+/// and a call that never got to run still names where it was sent.
+pub(super) fn header_workdir(
+    tool: &str,
+    raw_input: Option<&serde_json::Value>,
+    output: Option<&ToolOutput>,
+    cwd: Option<&Path>,
+) -> Option<String> {
+    let relative = match output {
+        Some(ToolOutput::Shell(output)) => Cow::Borrowed(output.relative_workdir.as_str()),
+        _ => Cow::Owned(requested_workdir(compact_row(tool)?.0, raw_input?, cwd?)?),
+    };
+    (relative != CURRENT_WORKDIR).then(|| workdir_label(&relative))
+}
+
+/// Home folded to `~` the way the status bar folds the session's own
+/// directory, and a trailing slash that says the name is a directory.
+fn workdir_label(relative: &str) -> String {
+    let mut label = collapse_home(relative);
+    if !label.ends_with(DIRECTORY_SUFFIX) {
+        label.push(DIRECTORY_SUFFIX);
+    }
+    label
+}
+
+/// The parenthesised end of a header: what the call reports, then the
+/// directory it runs in. The directory is set in italics so it never reads as
+/// one more thing the call reported, and it goes last so it holds its place
+/// when a result puts an exit status in front of it.
+pub(super) fn annotation_spans(
+    report: Option<&str>,
+    workdir: Option<String>,
+) -> Vec<Span<'static>> {
+    let style = theme::current().tool_annotation;
+    let Some(workdir) = workdir else {
+        return report
+            .map(|report| {
+                vec![Span::styled(
+                    format!("{ANNOTATION_OPEN}{report}{ANNOTATION_CLOSE}"),
+                    style,
+                )]
+            })
+            .unwrap_or_default();
+    };
+    let lead = match report {
+        Some(report) => format!("{ANNOTATION_OPEN}{report}{ACTIVITY_SEPARATOR}"),
+        None => ANNOTATION_OPEN.to_owned(),
+    };
+    vec![
+        Span::styled(lead, style),
+        Span::styled(workdir, style.add_modifier(Modifier::ITALIC)),
+        Span::styled(ANNOTATION_CLOSE, style),
+    ]
+}
+
+/// Moves an annotation onto a header row and the row's copy together, so the
+/// row copies as the characters it shows.
+fn push_annotation(
+    spans: &mut Vec<Span<'static>>,
+    copy: &mut String,
+    annotation: Vec<Span<'static>>,
+) {
+    copy.extend(annotation.iter().map(|span| span.content.as_ref()));
+    spans.extend(annotation);
+}
+
 pub(crate) fn append_annotation(ann: &mut Option<String>, suffix: &str) {
     match ann {
-        Some(a) => write!(a, " · {suffix}").unwrap(),
+        Some(a) => write!(a, "{ACTIVITY_SEPARATOR}{suffix}").unwrap(),
         None => *ann = Some(suffix.to_owned()),
     }
 }
@@ -2484,7 +2561,14 @@ pub fn build_instructions_lines(
             ToolOutputLines::default(),
         ),
     );
-    b.push_header("load", header, annotation.as_deref(), None, None, None);
+    b.push_header(
+        "load",
+        header,
+        annotation_spans(annotation.as_deref(), None),
+        None,
+        None,
+        None,
+    );
     b.prepend_indicator(Instant::now());
 
     let start = b.lines.len();
@@ -2588,6 +2672,7 @@ mod tests {
             batch_progress: &NO_PROGRESS,
             batch_live: &NO_LIVE,
             batch_started: &NO_STARTED,
+            cwd: None,
         }
     }
 
@@ -6588,6 +6673,149 @@ mod tests {
         assert!(
             !text.contains(TIMEOUT_BRACKET),
             "{DEADLINE_ONCE_MSG}: {text:?}"
+        );
+    }
+
+    const WORKDIR_MSG: &str =
+        "a command card names where it runs, unless that is the session's own directory";
+    const WORKDIR_ITALIC_MSG: &str =
+        "only the directory leans, so it never reads as one more thing the call reported";
+    const WORKDIR_ONCE_MSG: &str = "a closed row names its directory once, in the annotation";
+    const PROJECT: &str = "/project";
+    const SUBDIR: &str = "crates/core";
+    const SUBDIR_SHOWN: &str = "crates/core/";
+    const SUBDIR_ANNOTATION: &str = " (2m timeout · crates/core/)";
+    const WORKDIR_BRACKET: &str = "[workdir=";
+
+    fn in_cwd(rctx: RenderCtx<'static>, cwd: Option<&str>) -> RenderCtx<'static> {
+        RenderCtx {
+            cwd: cwd.map(|cwd| Arc::from(Path::new(cwd))),
+            ..rctx
+        }
+    }
+
+    fn settled_in(relative_workdir: &str) -> ToolOutput {
+        let ToolOutput::Shell(output) = shell_output(false) else {
+            unreachable!()
+        };
+        ToolOutput::Shell(ShellOutput {
+            relative_workdir: relative_workdir.into(),
+            ..output
+        })
+    }
+
+    /// Running until it has a result, the way a live card is.
+    fn workdir_card(
+        tool: &str,
+        workdir: &str,
+        output: Option<ToolOutput>,
+        rctx: &RenderCtx,
+        expansion: Option<Disclosure>,
+    ) -> ToolLines {
+        let status = match output {
+            Some(_) => ToolStatus::Success,
+            None => ToolStatus::InProgress,
+        };
+        let mut msg = deadline_msg(tool, Some(serde_json::json!({ "workdir": workdir })));
+        msg.tool_output = output.map(Arc::new);
+        build_tool_lines(&msg, status, rctx, expansion)
+    }
+
+    /// A card with only its arguments spells the directory the way its result
+    /// will, so the header keeps its words when the call lands. Where the two
+    /// disagree, the result is where the call really ran.
+    #[test_case(
+        SHELL_TOOL_NAME, SUBDIR, Some(settled_in(SUBDIR)), Some(PROJECT), SUBDIR_ANNOTATION
+        ; "a settled card names its directory last"
+    )]
+    #[test_case(
+        SHELL_TOOL_NAME, "", Some(settled_in(CURRENT_WORKDIR)), Some(PROJECT), " (2m timeout)"
+        ; "the session's own directory goes unsaid"
+    )]
+    #[test_case(
+        SHELL_TOOL_NAME, PROJECT, None, Some(PROJECT), " (2m timeout)"
+        ; "the session's directory spelled absolute goes unsaid while running"
+    )]
+    #[test_case(
+        SHELL_TOOL_NAME, "/project/crates/core", None, Some(PROJECT), SUBDIR_ANNOTATION
+        ; "a running card spells its directory the way the result will"
+    )]
+    #[test_case(
+        SHELL_TOOL_NAME, "link", Some(settled_in("target")), Some(PROJECT), " (2m timeout · target/)"
+        ; "the result names where a link led"
+    )]
+    #[test_case(
+        SHELL_TOOL_NAME, "/srv/elsewhere", None, Some(PROJECT), " (2m timeout · /srv/elsewhere/)"
+        ; "a directory outside the session reads absolute"
+    )]
+    #[test_case(
+        PYTHON_EXECUTION_TOOL_NAME, SUBDIR, None, Some(PROJECT), " (5s timeout)"
+        ; "a tool that takes no directory names none"
+    )]
+    #[test_case(
+        SHELL_TOOL_NAME, SUBDIR, None, None, " (2m timeout)"
+        ; "nothing to resolve against names nothing"
+    )]
+    fn a_command_card_names_where_it_runs(
+        tool: &str,
+        workdir: &str,
+        output: Option<ToolOutput>,
+        cwd: Option<&str>,
+        expected: &str,
+    ) {
+        let tl = workdir_card(
+            tool,
+            workdir,
+            output,
+            &in_cwd(test_rctx(UNBROKEN), cwd),
+            Some(Disclosure::default()),
+        );
+        let copied = tl.search_text.lines().next().unwrap_or_default();
+        let drawn = lines_text(&tl);
+
+        assert!(copied.ends_with(expected), "{WORKDIR_MSG}: {copied:?}");
+        assert!(drawn.contains(expected), "{WORKDIR_MSG}: {drawn:?}");
+    }
+
+    #[test]
+    fn only_the_directory_is_set_in_italics() {
+        let tl = workdir_card(
+            SHELL_TOOL_NAME,
+            SUBDIR,
+            Some(settled_in(SUBDIR)),
+            &in_cwd(test_rctx(UNBROKEN), Some(PROJECT)),
+            Some(Disclosure::default()),
+        );
+        let leans = |text: &str| {
+            tl.lines
+                .iter()
+                .flat_map(|line| &line.spans)
+                .find(|span| span.content.contains(text))
+                .map(|span| span.style.add_modifier.contains(Modifier::ITALIC))
+        };
+
+        assert_eq!(leans(SUBDIR_SHOWN), Some(true), "{WORKDIR_ITALIC_MSG}");
+        assert_eq!(leans(TIMEOUT_WORD), Some(false), "{WORKDIR_ITALIC_MSG}");
+    }
+
+    /// The fold key keeps the brackets from naming what the annotation already
+    /// does, and a width that has to break the row still names it whole.
+    #[test_case(UNBROKEN ; "with room to spare")]
+    #[test_case(SETTLED_TALLY_WIDTH ; "and with none")]
+    fn a_closed_command_row_names_its_directory_once(width: u16) {
+        let tl = workdir_card(
+            SHELL_TOOL_NAME,
+            SUBDIR,
+            Some(settled_in(SUBDIR)),
+            &in_cwd(compact_rctx(width), Some(PROJECT)),
+            None,
+        );
+        let text = lines_text(&tl);
+
+        assert!(text.contains(SUBDIR_SHOWN), "{WORKDIR_ONCE_MSG}: {text:?}");
+        assert!(
+            !text.contains(WORKDIR_BRACKET),
+            "{WORKDIR_ONCE_MSG}: {text:?}"
         );
     }
 

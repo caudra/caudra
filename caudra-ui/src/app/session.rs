@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
@@ -525,6 +525,7 @@ impl App {
         self.chats.clear();
         let mut main = Chat::new(
             "Main".into(),
+            Path::new(&self.state.session.cwd),
             self.ui_config.clone(),
             self.lua_event_handle.clone(),
         );
@@ -793,6 +794,7 @@ impl App {
             let mut chat = Chat::subagent(
                 &sa.tool_use_id,
                 sa.name,
+                Path::new(&self.state.session.cwd),
                 self.ui_config.clone(),
                 self.lua_event_handle.clone(),
             );
@@ -918,7 +920,7 @@ impl App {
             match Self::snapshot_store_for(
                 &self.storage,
                 replacement.id,
-                std::path::Path::new(&replacement.cwd),
+                Path::new(&replacement.cwd),
                 self.snapshots_config.into(),
             ) {
                 Ok(store) => store,
@@ -2012,7 +2014,7 @@ impl App {
             let child_snapshots = Self::snapshot_store_for(
                 &self.storage,
                 child.id,
-                std::path::Path::new(&child.cwd),
+                Path::new(&child.cwd),
                 self.snapshots_config.into(),
             )
             .map_err(|error| format!("Failed to initialize workspace snapshots: {error}"))?;
@@ -2138,7 +2140,7 @@ impl App {
             let store = Self::snapshot_store_for(
                 &self.storage,
                 session.id,
-                std::path::Path::new(&session.cwd),
+                Path::new(&session.cwd),
                 self.snapshots_config.into(),
             )
             .map_err(|error| format!("Failed to initialize workspace snapshots: {error}"))?;

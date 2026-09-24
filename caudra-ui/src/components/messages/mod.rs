@@ -1007,6 +1007,9 @@ pub struct MessagesPanel {
     /// Resolves the hashes a sent `#` names, so the transcript agrees with the
     /// composer about which of them were ever commits.
     commit_index: CommitIndex,
+    /// The session's working directory, which a call's `workdir` argument is
+    /// resolved against until its result says where the call ran.
+    cwd: Option<Arc<Path>>,
     message_action_hits: Vec<MessageActionHit>,
     terminal_links: Vec<TerminalLink>,
     /// Cards whose message changed since the last frame and whose segment is
@@ -1112,6 +1115,7 @@ impl MessagesPanel {
             prompt_rate: PromptRate::default(),
             hover: None,
             commit_index: CommitIndex::default(),
+            cwd: None,
             message_action_hits: Vec::new(),
             terminal_links: Vec::new(),
             dirty_cards: HashSet::new(),
@@ -3006,6 +3010,12 @@ impl MessagesPanel {
         self.commit_index = index;
     }
 
+    /// Nothing is redrawn: the directory only changes while no call is
+    /// running, and a call that ran names the directory its result recorded.
+    pub(crate) fn set_cwd(&mut self, cwd: &Path) {
+        self.cwd = Some(Arc::from(cwd));
+    }
+
     /// The text of the reader's own message under the pointer, and how far into
     /// it the pointer is. Shared by everything that resolves a token in the
     /// transcript, so none of them can disagree about what is clickable.
@@ -4630,6 +4640,7 @@ impl MessagesPanel {
             batch_progress: &self.batch_child_progress,
             batch_live: &self.batch_child_output,
             batch_started: &self.batch_child_started,
+            cwd: self.cwd.clone(),
         }
     }
 

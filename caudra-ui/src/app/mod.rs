@@ -576,6 +576,7 @@ impl App {
         let mut app = Self {
             chats: vec![Chat::new(
                 "Main".into(),
+                Path::new(&state.session.cwd),
                 ui_config.clone(),
                 lua_event_handle.clone(),
             )],
@@ -4539,6 +4540,7 @@ impl App {
             let mut chat = Chat::subagent(
                 task_id,
                 subagent.name.clone(),
+                Path::new(&self.state.session.cwd),
                 self.ui_config.clone(),
                 self.lua_event_handle.clone(),
             );
@@ -4992,6 +4994,7 @@ impl App {
         self.rebind_workspace_baseline(snapshot_store, cwd.to_path_buf());
         self.status_bar.refresh_cwd(&cwd.to_string_lossy());
         self.sync_composer_cwd();
+        self.sync_transcript_cwd();
         self.pending_pattern_suggestions = None;
         self.request_pattern_suggestions();
     }
@@ -5022,6 +5025,7 @@ impl App {
         self.mention_popup.close();
         self.commit_popup.close();
         self.state.session = candidate;
+        self.sync_transcript_cwd();
         self.command_palette
             .set_custom_commands(if self.no_commands {
                 Arc::from([])
@@ -5077,6 +5081,15 @@ impl App {
         let cwd = PathBuf::from(&self.state.session.cwd);
         self.input_box.set_cwd(cwd.clone());
         self.subagent_input_box.set_cwd(cwd);
+    }
+
+    /// Points every transcript at the session's working directory, which is
+    /// what a command that has not run yet resolves its `workdir` against.
+    fn sync_transcript_cwd(&mut self) {
+        let cwd = Path::new(&self.state.session.cwd);
+        for chat in &mut self.chats {
+            chat.set_cwd(cwd);
+        }
     }
 
     fn overlays(&self) -> [&dyn Overlay; 38] {

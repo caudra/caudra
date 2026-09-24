@@ -13,6 +13,8 @@
 //! which is exact even when the reserved `task_id` turns out to differ, and
 //! everything still unadopted when the call ends is discarded.
 
+use std::path::Path;
+
 use caudra_agent::Delegation;
 
 use crate::app::App;
@@ -58,6 +60,7 @@ impl App {
         let mut chat = Chat::subagent(
             parent_tool_use_id,
             name.unwrap_or(UNNAMED_TASK).to_owned(),
+            Path::new(&self.state.session.cwd),
             self.ui_config.clone(),
             self.lua_event_handle.clone(),
         );

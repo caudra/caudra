@@ -1,5 +1,5 @@
 use std::borrow::Cow;
-use std::path::Path;
+use std::path::{MAIN_SEPARATOR, Path};
 use std::time::{Duration, Instant};
 
 use super::command::ChatScope;
@@ -22,6 +22,7 @@ use caudra_agent::GoalSnapshot;
 use caudra_workflow::{RunSnapshot, RunStatus};
 
 const TRUNCATE_PREFIX: &str = "..";
+const HOME_ABBREVIATION: &str = "~";
 const CWD_MODEL_SEPARATOR: &str = "  ";
 const BACK_TO_MAIN_LABEL: &str = "[< Main]";
 /// Replaces the countdown under the pointer: the control has to say what a
@@ -1551,17 +1552,21 @@ fn bracketed_tail(s: &str, max_width: usize) -> Cow<'_, str> {
     Cow::Owned(format!("[{}]", truncate_tail(s, max_width - 2)))
 }
 
-fn collapse_home(path: &str) -> String {
+pub(super) fn collapse_home(path: &str) -> String {
     let Some(home) = caudra_storage::paths::home() else {
         return path.to_string();
     };
     collapse_home_with(path, &home.to_string_lossy())
 }
 
+/// Matched by component, so a sibling that only shares the text of the home
+/// directory's name is left as it is.
 fn collapse_home_with(path: &str, home: &str) -> String {
-    path.strip_prefix(home)
-        .map(|rest| format!("~{rest}"))
-        .unwrap_or_else(|| path.to_string())
+    match Path::new(path).strip_prefix(home) {
+        Ok(rest) if rest.as_os_str().is_empty() => HOME_ABBREVIATION.to_owned(),
+        Ok(rest) => format!("{HOME_ABBREVIATION}{MAIN_SEPARATOR}{}", rest.display()),
+        Err(_) => path.to_owned(),
+    }
 }
 
 fn cwd_branch_label(cwd: &str) -> String {
@@ -3150,6 +3155,7 @@ mod tests {
     #[test_case("/home/user/projects/app", "/home/user", "~/projects/app" ; "inside_home")]
     #[test_case("/tmp/other", "/home/user", "/tmp/other"                  ; "outside_home")]
     #[test_case("/home/user", "/home/user", "~"                           ; "exact_home")]
+    #[test_case("/home/user2/app", "/home/user", "/home/user2/app"        ; "sibling_sharing_the_home_prefix")]
     fn collapse_home_cases(path: &str, home: &str, expected: &str) {
         assert_eq!(collapse_home_with(path, home), expected);
     }

@@ -117,12 +117,15 @@ pub struct Chat {
 }
 
 impl Chat {
+    /// `cwd` is the session's working directory, which a running command's
+    /// `workdir` argument is resolved against.
     pub fn new(
         name: String,
+        cwd: &Path,
         ui_config: UiConfig,
         lua_event_handle: caudra_lua::EventHandle,
     ) -> Self {
-        Self {
+        let mut chat = Self {
             name,
             cost: None,
             subscription_cost: None,
@@ -140,19 +143,26 @@ impl Chat {
             task_id: None,
             parent_tool_use_id: None,
             retry: None,
-        }
+        };
+        chat.set_cwd(cwd);
+        chat
     }
 
     pub(crate) fn subagent(
         task_id: &str,
         name: String,
+        cwd: &Path,
         ui_config: UiConfig,
         lua_event_handle: caudra_lua::EventHandle,
     ) -> Self {
         Self {
             task_id: Some(Arc::from(task_id)),
-            ..Self::new(name, ui_config, lua_event_handle)
+            ..Self::new(name, cwd, ui_config, lua_event_handle)
         }
+    }
+
+    pub(crate) fn set_cwd(&mut self, cwd: &Path) {
+        self.messages_panel.set_cwd(cwd);
     }
 
     pub(crate) fn task_id(&self) -> Option<&Arc<str>> {
@@ -1395,10 +1405,12 @@ mod tests {
     const MENTION_BODY: &str = "<file path=\"a.rs\">fn main() {}</file>";
     const INDEX_SKELETON: &str = "fns:\n  pub run() [2]";
     const INDEX_ANNOTATION: &str = "2 lines";
+    const SESSION_CWD: &str = "/project";
 
     fn chat() -> Chat {
         Chat::new(
             MAIN_NAME.into(),
+            Path::new(SESSION_CWD),
             UiConfig::default(),
             caudra_lua::EventHandle::disconnected_for_test(),
         )
@@ -1408,6 +1420,7 @@ mod tests {
         Chat::subagent(
             TASK_ID,
             SUBAGENT_NAME.into(),
+            Path::new(SESSION_CWD),
             UiConfig::default(),
             caudra_lua::EventHandle::disconnected_for_test(),
         )

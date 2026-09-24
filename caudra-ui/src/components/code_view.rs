@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::iter;
 use std::ops::Range;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -11,9 +12,9 @@ use crate::selection::wrap_breaks;
 use crate::theme;
 
 use super::tool_display::{
-    ScrollTail, TREE_BRANCH, TREE_GAP, TREE_LAST, TREE_TRUNK, append_annotation, batch_sigil_style,
-    compact_args_for, header_spans, header_timeout, inflected_header, names_tool, progress_lines,
-    scroll_footer_text, title,
+    ScrollTail, TREE_BRANCH, TREE_GAP, TREE_LAST, TREE_TRUNK, annotation_spans, append_annotation,
+    batch_sigil_style, compact_args_for, header_spans, header_timeout, header_workdir,
+    inflected_header, names_tool, progress_lines, scroll_footer_text, title,
 };
 use super::{ToolProgress, environment_card, is_collapsible, memory_card, workflow_card};
 use caudra_agent::tools::{
@@ -233,7 +234,7 @@ impl BodySource {
     /// Names the code block after the file it was read from, which is all a
     /// path-addressed body says about its language.
     fn named_for_path(self, path: &str) -> Self {
-        let extension = std::path::Path::new(path)
+        let extension = Path::new(path)
             .extension()
             .and_then(|extension| extension.to_str());
         match extension {
@@ -1076,9 +1077,16 @@ fn render_batch(entries: &[BatchToolEntry], highlight: bool, limits: &RenderLimi
         ) {
             spans.push(Span::styled(args, t.tool_dim));
         }
-        if let Some(annotation) = child_annotation(entry, limits.progress.get(&index)) {
-            spans.push(Span::styled(format!(" ({annotation})"), t.tool_annotation));
-        }
+        let workdir = header_workdir(
+            &entry.tool,
+            entry.raw_input.as_ref(),
+            entry.output.as_ref(),
+            limits.cwd.as_deref(),
+        );
+        spans.extend(annotation_spans(
+            child_annotation(entry, limits.progress.get(&index)).as_deref(),
+            workdir,
+        ));
         if let Some(elapsed) = child_elapsed(entry, limits.started.get(&index)) {
             let clock = match entry.status {
                 BatchToolStatus::Running => format_live_duration(elapsed),
@@ -2789,6 +2797,9 @@ pub struct RenderLimits {
     /// prefixed with. Zero means the renderer should not wrap, which is what a
     /// caller with no width to give gets.
     pub width: u16,
+    /// The session's working directory, which a child's `workdir` argument is
+    /// resolved against until its result says where the child ran.
+    pub cwd: Option<Arc<Path>>,
 }
 
 impl RenderLimits {
@@ -2805,6 +2816,7 @@ impl RenderLimits {
             started: ChildStarted::default(),
             tool_lines,
             width: UNCONSTRAINED_WIDTH,
+            cwd: None,
         }
     }
 
@@ -2840,6 +2852,10 @@ impl RenderLimits {
 
     pub fn with_width(self, width: u16) -> Self {
         Self { width, ..self }
+    }
+
+    pub fn with_cwd(self, cwd: Option<Arc<Path>>) -> Self {
+        Self { cwd, ..self }
     }
 
     /// Whether any child is still moving: a report redrawn every tick, a
@@ -2954,6 +2970,7 @@ impl RenderLimits {
             started: ChildStarted::default(),
             tool_lines: self.tool_lines,
             width: self.width.saturating_sub(batch_child_indent_width()),
+            cwd: self.cwd.clone(),
         })
     }
 }
@@ -5322,12 +5339,15 @@ mod tests {
     /// A lone child is the last node of its card, so its row opens on the
     /// closing connector.
     const ONLY_CHILD_CONNECTOR: &str = TREE_LAST;
+    const CHILD_PROJECT: &str = "/project";
 
     /// The row without the tree column, which every child carries and no
-    /// assertion here is about.
+    /// assertion here is about. Drawn in a session directory, as every live
+    /// roster is.
     fn child_row(entry: BatchToolEntry) -> String {
-        let row =
-            line_text(&render_batch(&[entry], false, &limits(BatchViews::default())).lines[0]);
+        let in_project =
+            limits(BatchViews::default()).with_cwd(Some(Arc::from(Path::new(CHILD_PROJECT))));
+        let row = line_text(&render_batch(&[entry], false, &in_project).lines[0]);
         row.strip_prefix(ONLY_CHILD_CONNECTOR)
             .expect("a child row opens on its connector")
             .to_owned()
@@ -6293,18 +6313,20 @@ mod tests {
     }
 
     const CHILD_TIMEOUT: u32 = 120_000;
-    const CHILD_TIMEOUT_SHOWN: &str = "2m timeout";
     const CHILD_WORKDIR: &str = "crates/core";
-    const CHILD_WORKDIR_SHOWN: &str = "workdir=crates/core";
+    /// The deadline, then the directory last, set off the way a standalone
+    /// card sets it off.
+    const CHILD_ANNOTATION_TAIL: &str = "2m timeout · crates/core/)";
     const COMMAND_KEY: &str = "command=";
     const TIMEOUT_KEY: &str = "timeout=";
+    const WORKDIR_KEY: &str = "workdir=";
     const CHILD_ARGS_MSG: &str = "a child's brackets carry what its own header does not show";
+    const CHILD_WORKDIR_MSG: &str = "a child names where it ran the way a standalone card does";
 
     /// The same filter a standalone row uses, reached through the same table,
-    /// so a child cannot print the command it has already drawn. The workdir
-    /// proves the brackets are still drawn at all, and the timeout that a
-    /// child names its deadline where a standalone card names it: once, in
-    /// the annotation, rather than a second time in brackets.
+    /// so a child cannot print the command it has already drawn. The deadline
+    /// and the directory are named where a standalone card names them: once,
+    /// in the annotation, rather than a second time in brackets.
     #[test]
     fn a_child_row_never_repeats_its_header_in_brackets() {
         let mut entry = batch_entry(SHELL_WIRE_CHILD, 0);
@@ -6316,15 +6338,36 @@ mod tests {
         }));
 
         let row = child_row(entry);
-        assert!(!row.contains(COMMAND_KEY), "{CHILD_ARGS_MSG}: {row:?}");
+        for key in [COMMAND_KEY, TIMEOUT_KEY, WORKDIR_KEY] {
+            assert!(!row.contains(key), "{CHILD_ARGS_MSG}: {row:?}");
+        }
         assert!(
-            row.contains(CHILD_WORKDIR_SHOWN),
+            row.contains(CHILD_ANNOTATION_TAIL),
             "{CHILD_ARGS_MSG}: {row:?}"
         );
-        assert!(!row.contains(TIMEOUT_KEY), "{CHILD_ARGS_MSG}: {row:?}");
+    }
+
+    /// Once the call lands, its result says where it really ran, so a roster
+    /// restored with no session directory to resolve against still says it.
+    #[test]
+    fn a_settled_shell_child_names_where_it_ran() {
+        let ToolOutput::Shell(output) = shell_child_output(CHILD_MEASURED_MS) else {
+            unreachable!()
+        };
+        let entry = BatchToolEntry {
+            raw_input: Some(serde_json::json!({})),
+            output: Some(ToolOutput::Shell(ShellOutput {
+                relative_workdir: CHILD_WORKDIR.into(),
+                ..output
+            })),
+            ..shell_child(BatchToolStatus::Success)
+        };
+        let card = render_batch(&[entry], false, &limits(BatchViews::default()));
+        let row = line_text(&card.lines[0]);
+
         assert!(
-            row.contains(CHILD_TIMEOUT_SHOWN),
-            "{CHILD_ARGS_MSG}: {row:?}"
+            row.contains(CHILD_ANNOTATION_TAIL),
+            "{CHILD_WORKDIR_MSG}: {row:?}"
         );
     }
 

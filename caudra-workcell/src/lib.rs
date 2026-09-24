@@ -36,7 +36,7 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Write;
 use std::future::Future;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -116,6 +116,8 @@ use workcell::{OwnedToolSpec, ToolSpec};
 pub const OWNER: &str = "workcell";
 /// Shared with the tests so a wording change cannot silently pass an assertion.
 pub const MISSING_READ_TARGET: &str = "No such file or directory";
+/// How a shell result's `relative_workdir` names the project directory itself.
+pub const CURRENT_WORKDIR: &str = ".";
 pub const NATIVE_TOOL_NAMES: &[&str] = &[
     "file_read",
     "file_glob",
@@ -1402,6 +1404,42 @@ pub fn effective_timeout(tool: &str, raw_input: &Value) -> Option<Duration> {
         },
     };
     Some(Duration::from_millis(millis))
+}
+
+/// The directory a command will start in, spelled the way its result's
+/// `relative_workdir` will spell it: [`CURRENT_WORKDIR`] for `cwd` itself,
+/// relative beneath it, absolute anywhere else. A header can then name the
+/// directory before the call runs and keep the same words once it lands.
+///
+/// Lexical where the executor canonicalizes, so a symlink reads as written
+/// until the result names where it led. `None` for a tool that takes no
+/// workdir, and for a value that is not a path at all.
+pub fn requested_workdir(tool: &str, raw_input: &Value, cwd: &Path) -> Option<String> {
+    if tool != SHELL_TOOL_NAME {
+        return None;
+    }
+    let requested = match raw_input.get("workdir") {
+        None | Some(Value::Null) => "",
+        Some(value) => value.as_str()?,
+    };
+    let mut resolved = PathBuf::new();
+    for component in cwd.join(requested).components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                resolved.pop();
+            }
+            other => resolved.push(other),
+        }
+    }
+    let spelled = match resolved.strip_prefix(cwd) {
+        Ok(relative) if relative.as_os_str().is_empty() => {
+            return Some(CURRENT_WORKDIR.to_owned());
+        }
+        Ok(relative) => relative,
+        Err(_) => &resolved,
+    };
+    Some(spelled.to_string_lossy().replace('\\', "/"))
 }
 
 fn input_start_input(input: &Input) -> Option<ToolInput> {
@@ -4729,6 +4767,29 @@ mod tests {
         raw_input: Value,
     ) -> Option<Duration> {
         effective_timeout(tool, &raw_input)
+    }
+
+    const PROJECT_CWD: &str = "/project";
+
+    /// A running card has only the arguments, a settled one has the result,
+    /// and the header must not change words between the two.
+    #[test_case(SHELL_TOOL_NAME, json!({}) => Some(CURRENT_WORKDIR.to_owned()) ; "an omitted workdir is the project")]
+    #[test_case(SHELL_TOOL_NAME, json!({ "workdir": Value::Null }) => Some(CURRENT_WORKDIR.to_owned()) ; "an explicit null arrives as omitted")]
+    #[test_case(SHELL_TOOL_NAME, json!({ "workdir": "" }) => Some(CURRENT_WORKDIR.to_owned()) ; "an empty workdir is the project")]
+    #[test_case(SHELL_TOOL_NAME, json!({ "workdir": "./" }) => Some(CURRENT_WORKDIR.to_owned()) ; "a dot is the project")]
+    #[test_case(SHELL_TOOL_NAME, json!({ "workdir": "/project/" }) => Some(CURRENT_WORKDIR.to_owned()) ; "the project spelled absolute is still the project")]
+    #[test_case(SHELL_TOOL_NAME, json!({ "workdir": "crates/core/" }) => Some("crates/core".to_owned()) ; "a subdirectory stays relative")]
+    #[test_case(SHELL_TOOL_NAME, json!({ "workdir": "/project/a/../docs" }) => Some("docs".to_owned()) ; "an absolute path inside folds to relative")]
+    #[test_case(SHELL_TOOL_NAME, json!({ "workdir": "../sibling" }) => Some("/sibling".to_owned()) ; "leaving the project reads absolute")]
+    #[test_case(SHELL_TOOL_NAME, json!({ "workdir": "/elsewhere" }) => Some("/elsewhere".to_owned()) ; "an outside path stays absolute")]
+    #[test_case(SHELL_TOOL_NAME, json!({ "workdir": "/project2" }) => Some("/project2".to_owned()) ; "a shared text prefix is not containment")]
+    #[test_case(SHELL_TOOL_NAME, json!({ "workdir": 1 }) => None ; "a workdir that is not a path names nothing")]
+    #[test_case(PYTHON_EXECUTION_TOOL_NAME, json!({ "workdir": "crates" }) => None ; "a tool without a workdir has none to report")]
+    fn a_header_workdir_is_spelled_the_way_the_result_will_spell_it(
+        tool: &str,
+        raw_input: Value,
+    ) -> Option<String> {
+        requested_workdir(tool, &raw_input, Path::new(PROJECT_CWD))
     }
 
     #[test_case(true; "cancelled_before_first_execution_poll")]

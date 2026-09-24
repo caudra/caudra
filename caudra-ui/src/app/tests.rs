@@ -39,7 +39,7 @@ use caudra_agent::permissions::{
     PermissionManager, PermissionRequest, PermissionResourceSelector, PermissionRuleRecord,
 };
 use caudra_agent::snapshots::{RestoreFailureKind, RestoreStatus};
-use caudra_agent::tools::ToolEffect;
+use caudra_agent::tools::{SHELL_TOOL_NAME, ToolEffect};
 use caudra_agent::types::{TodoItem, TodoPriority, TodoStatus};
 use caudra_agent::workspace_baseline::BaselineOutcome;
 use caudra_agent::{
@@ -16937,9 +16937,7 @@ fn turn_end_keeps_only_the_subagents_that_finished() {
     assert_eq!(ids, [FINISHED_TASK_ID]);
 }
 
-/// The popup is fed by a walker thread, so a test settles it before asserting
-/// on what it matched.
-fn mention_popup_at(app: &mut App, cwd: &std::path::Path, query: &str) {
+fn change_directory(app: &mut App, cwd: &Path) {
     let store = App::snapshot_store_for(
         &app.storage,
         app.state.session.id,
@@ -16948,6 +16946,40 @@ fn mention_popup_at(app: &mut App, cwd: &std::path::Path, query: &str) {
     )
     .expect("a snapshot store for the project");
     app.install_working_directory(cwd, store, PermissionsConfig::default());
+}
+
+const CD_SHELL_ID: &str = "cd-shell";
+/// A running shell card's annotation closing on its deadline, which it only
+/// does when there is no directory to name after it.
+const NO_WORKDIR_ANNOTATION: &str = "(2m timeout)";
+const CD_TRANSCRIPT_MSG: &str =
+    "a command sent to the directory a cd moved into is not named as running elsewhere";
+
+/// The compiler holds every new chat to being given the session's directory,
+/// but nothing holds a `cd` to handing the transcript the new one.
+#[test]
+fn a_cd_moves_the_directory_the_transcript_resolves_against() {
+    let dir = TempDir::new().expect("a temporary directory");
+    let mut app = app_without_splash();
+    change_directory(&mut app, dir.path());
+
+    let AgentEvent::ToolStart(mut start) = tool_start(CD_SHELL_ID, SHELL_TOOL_NAME) else {
+        unreachable!()
+    };
+    start.raw_input = Some(serde_json::json!({ "workdir": dir.path() }));
+    app.update(agent_msg(AgentEvent::ToolStart(start)));
+
+    let screen = rendered(&mut app);
+    assert!(
+        screen.contains(NO_WORKDIR_ANNOTATION),
+        "{CD_TRANSCRIPT_MSG}: {screen}"
+    );
+}
+
+/// The popup is fed by a walker thread, so a test settles it before asserting
+/// on what it matched.
+fn mention_popup_at(app: &mut App, cwd: &std::path::Path, query: &str) {
+    change_directory(app, cwd);
     for character in query.chars() {
         app.update(Msg::Key(key(KeyCode::Char(character))));
     }
