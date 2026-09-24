@@ -216,44 +216,10 @@ impl ShellToolGroup {
 
     /// Validate, inspect, and apply immutable policy without starting a process.
     pub async fn prepare(&self, input: ShellInput) -> Result<PreparedShell, String> {
-        if input.command.trim().is_empty() {
-            return Err("Invalid arguments: command must not be empty".into());
-        }
-        if input.command.len() > MAX_COMMAND_BYTES {
-            return Err(format!(
-                "Invalid arguments for tool shell: command is {} UTF-8 bytes; maximum is {MAX_COMMAND_BYTES}. Split the operation into smaller shell calls",
-                input.command.len()
-            ));
-        }
-        // Zero names the longest run this server allows, so a caller that means "as long as
-        // possible" never has to guess a number the schema would reject. It stays finite: no
-        // input disables the deadline.
-        let timeout_ms = match input.timeout {
-            None => DEFAULT_TIMEOUT_MS,
-            Some(0) => MAX_TIMEOUT_MS,
-            Some(requested) if requested > MAX_TIMEOUT_MS => {
-                return Err(format!(
-                    "Invalid arguments: timeout is {requested} milliseconds; the maximum is {MAX_TIMEOUT_MS}. Omit timeout for {DEFAULT_TIMEOUT_MS}, or pass 0 for the maximum"
-                ));
-            }
-            Some(requested) => requested,
-        };
-        let requested_workdir = input.workdir.as_deref().unwrap_or(".");
-        let workdir = if self.confined {
-            workdir::resolve(&self.root, requested_workdir).await?
-        } else {
-            workdir::resolve_unconfined(&self.root, requested_workdir).await?
-        };
-        let (analysis, bash_program, policy_decision) = self.policy.prepare(&input.command);
-        Ok(PreparedShell::new(
-            input.command,
-            timeout_ms,
-            (analysis, bash_program),
-            policy_decision,
-            workdir,
-            self.output_filter,
-            Arc::clone(&self.launcher),
-        ))
+        validate_command(&input.command)?;
+        let timeout_ms = input.timeout_ms()?;
+        self.bind(input.command, timeout_ms, input.workdir.as_deref())
+            .await
     }
 
     /// Prepares a non-interactive host operation through the same immutable shell policy as the
@@ -263,15 +229,38 @@ impl ShellToolGroup {
         options: DirectExecOptions,
         relative_workdir: String,
     ) -> Result<PreparedShell, String> {
+        let command = options.command.as_str().to_owned();
+        validate_command(&command)?;
+        let timeout_ms = direct_timeout_ms(options.timeout_ms)?;
         let prepared = self
-            .prepare(ShellInput {
-                command: options.command.as_str().to_owned(),
-                timeout: options.timeout_ms,
-                workdir: Some(relative_workdir),
-            })
+            .bind(command, timeout_ms, Some(&relative_workdir))
             .await?;
         self.authorize_prepared(&prepared)?;
         Ok(prepared)
+    }
+
+    async fn bind(
+        &self,
+        command: String,
+        timeout_ms: u64,
+        requested_workdir: Option<&str>,
+    ) -> Result<PreparedShell, String> {
+        let requested_workdir = requested_workdir.unwrap_or(".");
+        let workdir = if self.confined {
+            workdir::resolve(&self.root, requested_workdir).await?
+        } else {
+            workdir::resolve_unconfined(&self.root, requested_workdir).await?
+        };
+        let (analysis, bash_program, policy_decision) = self.policy.prepare(&command);
+        Ok(PreparedShell::new(
+            command,
+            timeout_ms,
+            (analysis, bash_program),
+            policy_decision,
+            workdir,
+            self.output_filter,
+            Arc::clone(&self.launcher),
+        ))
     }
 
     /// Execute after a native host has authorized the prepared scopes.
@@ -593,6 +582,32 @@ impl ShellToolGroup {
             .await
     }
 }
+
+fn validate_command(command: &str) -> Result<(), String> {
+    if command.trim().is_empty() {
+        return Err("Invalid arguments: command must not be empty".into());
+    }
+    if command.len() > MAX_COMMAND_BYTES {
+        return Err(format!(
+            "Invalid arguments for tool shell: command is {} UTF-8 bytes; maximum is {MAX_COMMAND_BYTES}. Split the operation into smaller shell calls",
+            command.len()
+        ));
+    }
+    Ok(())
+}
+
+/// The rule `ShellInput::timeout_ms` applies, zero included, read in the milliseconds the host
+/// contract counts in.
+fn direct_timeout_ms(requested: Option<u64>) -> Result<u64, String> {
+    match requested {
+        None => Ok(DEFAULT_TIMEOUT_MS),
+        Some(requested @ 1..=MAX_TIMEOUT_MS) => Ok(requested),
+        Some(requested) => Err(format!(
+            "Invalid arguments: timeout is {requested} milliseconds; it must be between 1 and {MAX_TIMEOUT_MS}. Omit it for the {DEFAULT_TIMEOUT_MS} millisecond default"
+        )),
+    }
+}
+
 async fn wait_for_pipe_deadline(deadline: Option<tokio::time::Instant>) {
     if let Some(deadline) = deadline {
         tokio::time::sleep_until(deadline).await
@@ -658,6 +673,7 @@ fn tool_error(error: impl Into<String>) -> CallToolResult {
 #[cfg(all(test, feature = "mcp"))]
 mod tests {
     use super::*;
+    use crate::types::{DEFAULT_TIMEOUT_SECS, MAX_TIMEOUT_SECS, MILLIS_PER_SECOND};
     use serde_json::json;
     use std::sync::Mutex;
 
@@ -713,8 +729,8 @@ mod tests {
         "make[1]: Entering directory '/x'\ngcc -O2 foo.c\nmake[1]: Leaving directory '/x'\n";
     const CARGO_TEST_STDOUT: &str = "running 2 tests\ntest sdk_mode::tests::wire_init ... ok\ntest sdk_mode::tests::wire_result ... ok\ntest result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s\n";
     const CARGO_TEST_STDERR: &str = "warning: future incompatibility\n";
-    const PREPARED_TIMEOUT_MS: u64 = 321;
-    const ZERO_MAXIMUM_HINT: &str = "pass 0 for the maximum";
+    const PREPARED_TIMEOUT_SECS: u64 = 321;
+    const HOURS_LONG_TIMEOUT_SECS: u64 = 10_800;
 
     async fn group_for_render(output_filter: bool) -> (tempfile::TempDir, ShellToolGroup) {
         let root = tempfile::tempdir().unwrap();
@@ -970,7 +986,7 @@ mod tests {
         let prepared = group
             .prepare(ShellInput {
                 command: format!("printf prepared > '{}'", marker.display()),
-                timeout: None,
+                timeout_sec: None,
                 workdir: None,
             })
             .await
@@ -999,12 +1015,15 @@ mod tests {
         let prepared = group
             .prepare(ShellInput {
                 command: "printf bound".into(),
-                timeout: Some(PREPARED_TIMEOUT_MS),
+                timeout_sec: Some(PREPARED_TIMEOUT_SECS),
                 workdir: Some("bound".into()),
             })
             .await
             .unwrap();
-        assert_eq!(prepared.timeout_ms(), PREPARED_TIMEOUT_MS);
+        assert_eq!(
+            prepared.timeout_ms(),
+            PREPARED_TIMEOUT_SECS * MILLIS_PER_SECOND
+        );
         assert_eq!(prepared.workdir(), workdir.canonicalize().unwrap());
         assert_eq!(prepared.relative_workdir(), "bound");
         assert!(prepared.policy_decision().is_allowed());
@@ -1016,7 +1035,10 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        assert_eq!(execution.output.timeout_ms, PREPARED_TIMEOUT_MS);
+        assert_eq!(
+            execution.output.timeout_ms,
+            PREPARED_TIMEOUT_SECS * MILLIS_PER_SECOND
+        );
         assert_eq!(execution.output.relative_workdir, "bound");
         assert_eq!(execution.output.stdout, "bound");
         let chunks = progress.chunks.lock().unwrap();
@@ -1025,21 +1047,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_omitted_timeout_defaults_and_zero_selects_the_maximum() {
+    async fn an_omitted_timeout_defaults_and_an_asked_one_is_kept() {
         let root = tempfile::tempdir().unwrap();
         let group = ShellToolGroup::with_policy(root.path(), ShellPermissionPolicy::yolo())
             .await
             .unwrap();
         for (requested, expected) in [
             (None, DEFAULT_TIMEOUT_MS),
-            (Some(0), MAX_TIMEOUT_MS),
-            (Some(1), 1),
-            (Some(MAX_TIMEOUT_MS), MAX_TIMEOUT_MS),
+            (Some(1), MILLIS_PER_SECOND),
+            (
+                Some(HOURS_LONG_TIMEOUT_SECS),
+                HOURS_LONG_TIMEOUT_SECS * MILLIS_PER_SECOND,
+            ),
+            (Some(MAX_TIMEOUT_SECS), MAX_TIMEOUT_MS),
         ] {
             let prepared = group
                 .prepare(ShellInput {
                     command: "printf bounded".into(),
-                    timeout: requested,
+                    timeout_sec: requested,
                     workdir: None,
                 })
                 .await
@@ -1048,47 +1073,84 @@ mod tests {
         }
     }
 
+    /// Zero is refused with anything above the maximum, and the refusal names the range and the
+    /// default so the caller can correct the call without guessing.
     #[tokio::test]
-    async fn a_timeout_above_the_maximum_is_refused_with_its_value_and_the_bound() {
+    async fn a_timeout_outside_the_range_is_refused_with_its_value_and_the_bounds() {
+        let root = tempfile::tempdir().unwrap();
+        let group = ShellToolGroup::with_policy(root.path(), ShellPermissionPolicy::yolo())
+            .await
+            .unwrap();
+        for requested in [0, MAX_TIMEOUT_SECS + 1] {
+            let error = group
+                .prepare(ShellInput {
+                    command: "printf refused".into(),
+                    timeout_sec: Some(requested),
+                    workdir: None,
+                })
+                .await
+                .unwrap_err();
+            assert!(
+                error.contains(&format!("timeoutSec is {requested} seconds")),
+                "{error}"
+            );
+            assert!(
+                error.contains(&format!("between 1 and {MAX_TIMEOUT_SECS}")),
+                "{error}"
+            );
+            assert!(
+                error.contains(&format!("{DEFAULT_TIMEOUT_SECS} second default")),
+                "{error}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_zero_timeout_is_refused_before_the_command_runs() {
+        let root = tempfile::tempdir().unwrap();
+        let group = ShellToolGroup::with_policy(root.path(), ShellPermissionPolicy::yolo())
+            .await
+            .unwrap();
+        let marker = root.path().join("must-not-run");
+        let command = format!("printf ran > '{}'", marker.display());
+
+        let result = call(&group, json!({"command":command,"timeoutSec":0})).await;
+
+        assert_eq!(result.is_error, Some(true));
+        assert!(!marker.exists());
+    }
+
+    /// The key names its unit, so a millisecond count sent as `timeout` is refused rather than
+    /// read as seconds. The count is in range for `timeoutSec`, so only the key can refuse it.
+    #[tokio::test]
+    async fn a_timeout_under_the_millisecond_key_is_refused_before_the_command_runs() {
+        let root = tempfile::tempdir().unwrap();
+        let group = ShellToolGroup::with_policy(root.path(), ShellPermissionPolicy::yolo())
+            .await
+            .unwrap();
+        let marker = root.path().join("must-not-run");
+        let command = format!("printf ran > '{}'", marker.display());
+
+        let result = call(
+            &group,
+            json!({"command":command,"timeout":MAX_TIMEOUT_SECS}),
+        )
+        .await;
+
+        assert_eq!(result.is_error, Some(true));
+        let error = serde_json::to_string(&result).unwrap();
+        assert!(error.contains("unknown field `timeout`"), "{error}");
+        assert!(error.contains("timeoutSec"), "{error}");
+        assert!(!marker.exists());
+    }
+
+    #[tokio::test]
+    async fn a_direct_host_operation_refuses_zero_too() {
         let root = tempfile::tempdir().unwrap();
         let group = ShellToolGroup::with_policy(root.path(), ShellPermissionPolicy::yolo())
             .await
             .unwrap();
         let error = group
-            .prepare(ShellInput {
-                command: "printf refused".into(),
-                timeout: Some(MAX_TIMEOUT_MS + 1),
-                workdir: None,
-            })
-            .await
-            .unwrap_err();
-        assert!(error.contains(&(MAX_TIMEOUT_MS + 1).to_string()), "{error}");
-        assert!(error.contains(&MAX_TIMEOUT_MS.to_string()), "{error}");
-        assert!(error.contains(ZERO_MAXIMUM_HINT), "{error}");
-    }
-
-    #[tokio::test]
-    async fn a_zero_timeout_runs_and_reports_the_maximum_deadline() {
-        let root = tempfile::tempdir().unwrap();
-        let group = ShellToolGroup::with_policy(root.path(), ShellPermissionPolicy::yolo())
-            .await
-            .unwrap();
-        let output = call(&group, json!({"command":"printf zero","timeout":0}))
-            .await
-            .structured_content
-            .unwrap();
-        assert_eq!(output["timeoutMs"], MAX_TIMEOUT_MS);
-        assert_eq!(output["timedOut"], false);
-        assert_eq!(output["stdout"], "zero");
-    }
-
-    #[tokio::test]
-    async fn a_direct_host_operation_reads_zero_the_same_way() {
-        let root = tempfile::tempdir().unwrap();
-        let group = ShellToolGroup::with_policy(root.path(), ShellPermissionPolicy::yolo())
-            .await
-            .unwrap();
-        let prepared = group
             .prepare_direct(
                 DirectExecOptions {
                     command: workcell_host_contract::CommandText::new("printf direct").unwrap(),
@@ -1097,8 +1159,8 @@ mod tests {
                 ".".to_owned(),
             )
             .await
-            .unwrap();
-        assert_eq!(prepared.timeout_ms(), MAX_TIMEOUT_MS);
+            .unwrap_err();
+        assert!(error.contains("timeout is 0 milliseconds"), "{error}");
     }
 
     #[tokio::test]
@@ -1111,7 +1173,7 @@ mod tests {
         let prepared = group
             .prepare(ShellInput {
                 command: format!("printf ran > '{}'", marker.display()),
-                timeout: None,
+                timeout_sec: None,
                 workdir: None,
             })
             .await
@@ -1148,7 +1210,7 @@ mod tests {
         let prepared = group
             .prepare(ShellInput {
                 command: format!("printf ran > '{}'", marker.display()),
-                timeout: None,
+                timeout_sec: None,
                 workdir: Some("work".into()),
             })
             .await
@@ -1179,7 +1241,7 @@ mod tests {
         let prepared = group
             .prepare(ShellInput {
                 command: format!("printf ran > '{}'", marker.display()),
-                timeout: None,
+                timeout_sec: None,
                 workdir: Some("selected".into()),
             })
             .await
@@ -1207,7 +1269,7 @@ mod tests {
         let absolute = group
             .prepare(ShellInput {
                 command: "pwd".into(),
-                timeout: None,
+                timeout_sec: None,
                 workdir: Some(outside.to_string_lossy().into_owned()),
             })
             .await
@@ -1221,7 +1283,7 @@ mod tests {
         let relative = group
             .prepare(ShellInput {
                 command: "pwd".into(),
-                timeout: None,
+                timeout_sec: None,
                 workdir: Some("../outside".into()),
             })
             .await
@@ -1269,7 +1331,7 @@ mod tests {
         let prepared = group
             .prepare(ShellInput {
                 command: "printf native".into(),
-                timeout: None,
+                timeout_sec: None,
                 workdir: None,
             })
             .await
@@ -1331,13 +1393,23 @@ mod tests {
                 .is_error,
             Some(true)
         );
-        assert_eq!(
-            call(&group, json!({"command":"sleep 2","timeout":10}))
-                .await
-                .structured_content
-                .unwrap()["timedOut"],
-            true
-        );
+        assert!(run_direct(&group, "sleep 2", 10).await.timed_out);
+    }
+
+    /// Runs under the host's millisecond deadline, the one unit fine enough to time a command
+    /// out without slowing the suite by a second per case.
+    async fn run_direct(group: &ShellToolGroup, command: &str, timeout_ms: u64) -> ShellOutput {
+        let options = DirectExecOptions {
+            command: workcell_host_contract::CommandText::new(command).unwrap(),
+            timeout_ms: Some(timeout_ms),
+        };
+        let prepared = group.prepare_direct(options, ".".to_owned()).await.unwrap();
+        group
+            .execute_prepared(prepared, CancellationToken::new(), None)
+            .await
+            .unwrap()
+            .unwrap()
+            .output
     }
     #[cfg(unix)]
     #[tokio::test]
@@ -1351,13 +1423,7 @@ mod tests {
             "(trap '' TERM; sleep 10; printf survived > '{}') & wait",
             sentinel.display()
         );
-        assert_eq!(
-            call(&group, json!({"command":command,"timeout":20}))
-                .await
-                .structured_content
-                .unwrap()["timedOut"],
-            true
-        );
+        assert!(run_direct(&group, &command, 20).await.timed_out);
         assert!(!sentinel.exists());
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert!(!sentinel.exists());
@@ -1374,13 +1440,7 @@ mod tests {
             "exec 1>&- 2>&-; sleep 1; printf late > '{}'",
             sentinel.display()
         );
-        assert_eq!(
-            call(&group, json!({"command":command,"timeout":20}))
-                .await
-                .structured_content
-                .unwrap()["timedOut"],
-            true
-        );
+        assert!(run_direct(&group, &command, 20).await.timed_out);
         tokio::time::sleep(Duration::from_millis(1100)).await;
         assert!(!sentinel.exists());
     }

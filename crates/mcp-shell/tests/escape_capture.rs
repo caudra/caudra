@@ -21,7 +21,7 @@ async fn run_with_filter(command: &str, filter: bool) -> (tempfile::TempDir, She
         .execute(
             ShellInput {
                 command: command.into(),
-                timeout: Some(60_000),
+                timeout_sec: Some(60),
                 workdir: None,
             },
             CancellationToken::new(),

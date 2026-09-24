@@ -37,7 +37,7 @@ const NOTE: &str = "hidden-cdpath-canary\n";
 const CHILD_TEST: &str = "isolated_startup_environment_child";
 const CHILD_PASSED: &str = "workcell-startup-isolation-passed";
 const CHILD_DEADLINE: Duration = Duration::from_secs(30);
-const SHELL_TIMEOUT_MS: u64 = 5000;
+const SHELL_TIMEOUT_SECS: u64 = 5;
 const PROFILE_FILES: &[&str] = &[
     ".profile",
     ".bash_profile",
@@ -152,7 +152,7 @@ async fn isolated_startup_environment_child() {
     let prepared = group
         .prepare(ShellInput {
             command: PROBE.into(),
-            timeout: Some(SHELL_TIMEOUT_MS),
+            timeout_sec: Some(SHELL_TIMEOUT_SECS),
             workdir: Some("work".into()),
         })
         .await
@@ -215,7 +215,7 @@ async fn isolated_startup_environment_child() {
 fn input(source: &str) -> ShellInput {
     ShellInput {
         command: source.to_owned(),
-        timeout: Some(SHELL_TIMEOUT_MS),
+        timeout_sec: Some(SHELL_TIMEOUT_SECS),
         workdir: None,
     }
 }

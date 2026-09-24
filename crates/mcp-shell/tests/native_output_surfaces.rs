@@ -57,7 +57,7 @@ async fn run(
         .execute(
             ShellInput {
                 command: "make all".into(),
-                timeout: Some(60_000),
+                timeout_sec: Some(60),
                 workdir: None,
             },
             CancellationToken::new(),

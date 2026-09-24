@@ -32,7 +32,7 @@
   "fixtureVersion": 1,
   "input": {
     "command": "printf 'shard 1\\nLoading:   0%%|          | 0/300 [00:00<00:30, 10.0it/s]\\nLoading:  33%%|###       | 100/300 [00:10<00:20, 10.0it/s]\\nLoading:  66%%|######    | 200/300 [00:20<00:10, 10.0it/s]\\nLoading: 100%%|##########| 300/300 [00:30<00:00, 10.0it/s]\\ndone\\n'",
-    "timeout": 60000
+    "timeoutSec": 60
   },
   "normalization": {
     "replacements": [

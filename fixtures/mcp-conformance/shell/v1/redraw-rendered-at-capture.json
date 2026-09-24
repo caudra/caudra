@@ -32,7 +32,7 @@
   "fixtureVersion": 1,
   "input": {
     "command": "printf 'Loading weights:   0%%|          | 0/851\\rLoading weights:  50%%|#####     | 425/851\\rLoading weights: 100%%|##########| 851/851\\n'",
-    "timeout": 60000
+    "timeoutSec": 60
   },
   "normalization": {
     "replacements": [

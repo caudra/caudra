@@ -867,7 +867,7 @@ mod tests {
             let prepared = group
                 .prepare(ShellInput {
                     command: source.to_owned(),
-                    timeout: None,
+                    timeout_sec: None,
                     workdir: None,
                 })
                 .await

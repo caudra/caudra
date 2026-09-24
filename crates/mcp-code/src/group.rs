@@ -27,9 +27,8 @@ use crate::{
     render::{Capture, render},
     suspend::{Answer, answer},
     types::{
-        CodeException, CodeExecution, CodeInput, CodeOutput, DEFAULT_TIMEOUT_MS, MAX_CODE_BYTES,
-        MAX_MEMORY_BYTES, MAX_SUSPENSIONS, MAX_TIMEOUT_MS, Outcome, PreparedCode,
-        STREAM_CAPTURE_BYTES,
+        CodeException, CodeExecution, CodeInput, CodeOutput, MAX_CODE_BYTES, MAX_MEMORY_BYTES,
+        MAX_SUSPENSIONS, MAX_TIMEOUT_MS, Outcome, PreparedCode, STREAM_CAPTURE_BYTES,
     },
     worker::{CodeBuildError, WorkerSource, build_pool},
 };
@@ -125,15 +124,7 @@ impl CodeToolGroup {
                 "Invalid arguments: code must not exceed {MAX_CODE_BYTES} UTF-8 bytes"
             ));
         }
-        let timeout_ms = match input.timeout {
-            Some(value) if value == 0 || value > MAX_TIMEOUT_MS => {
-                return Err(format!(
-                    "Invalid arguments: timeout must be between 1 and {MAX_TIMEOUT_MS} milliseconds"
-                ));
-            }
-            Some(value) => value,
-            None => DEFAULT_TIMEOUT_MS,
-        };
+        let timeout_ms = input.timeout_ms()?;
         Ok(PreparedCode {
             code: input.code,
             timeout_ms,
@@ -510,6 +501,7 @@ mod tests {
     use monty_pool::CrashCause;
 
     use super::*;
+    use crate::types::DEFAULT_TIMEOUT_MS;
 
     /// A pool failure never becomes an MCP fault, and never leaks worker internals. The hard-kill
     /// paths cannot be provoked from Python on purpose — Monty preflights the allocations that would

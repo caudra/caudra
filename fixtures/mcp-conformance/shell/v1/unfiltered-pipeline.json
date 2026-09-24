@@ -32,7 +32,7 @@
   "fixtureVersion": 1,
   "input": {
     "command": "make all | cat",
-    "timeout": 60000
+    "timeoutSec": 60
   },
   "normalization": {
     "replacements": [

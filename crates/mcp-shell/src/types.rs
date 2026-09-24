@@ -14,16 +14,37 @@ use crate::{
     workdir::WorkdirBinding,
 };
 
-pub const DEFAULT_TIMEOUT_MS: u64 = 120_000;
-pub const MAX_TIMEOUT_MS: u64 = 1_800_000;
+pub(crate) const MILLIS_PER_SECOND: u64 = 1_000;
+pub const DEFAULT_TIMEOUT_SECS: u64 = 120;
+pub const MAX_TIMEOUT_SECS: u64 = 21_600;
+/// Direct host execution counts in milliseconds, so it reads the same bounds in its own unit.
+pub const DEFAULT_TIMEOUT_MS: u64 = DEFAULT_TIMEOUT_SECS * MILLIS_PER_SECOND;
+pub const MAX_TIMEOUT_MS: u64 = MAX_TIMEOUT_SECS * MILLIS_PER_SECOND;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 // Strict decoding mirrors the advertised schema and prevents typoed controls from being ignored.
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct ShellInput {
     pub command: String,
-    pub timeout: Option<u64>,
+    pub timeout_sec: Option<u64>,
     pub workdir: Option<String>,
+}
+
+impl ShellInput {
+    /// The deadline this input runs under, or the refusal it gets, so a caller showing the
+    /// deadline ahead of the run reads the same rule the executor enforces.
+    ///
+    /// Zero is refused rather than read as a limit: callers disagree on whether it means none or
+    /// the default, and either guess runs a command for the wrong length of time.
+    pub fn timeout_ms(&self) -> Result<u64, String> {
+        match self.timeout_sec {
+            None => Ok(DEFAULT_TIMEOUT_MS),
+            Some(requested @ 1..=MAX_TIMEOUT_SECS) => Ok(requested * MILLIS_PER_SECOND),
+            Some(requested) => Err(format!(
+                "Invalid arguments: timeoutSec is {requested} seconds; it must be between 1 and {MAX_TIMEOUT_SECS}. Omit it for the {DEFAULT_TIMEOUT_SECS} second default"
+            )),
+        }
+    }
 }
 
 #[derive(Clone, Debug, JsonSchema, Serialize)]
@@ -370,7 +391,7 @@ mod tests {
         let prepared = group
             .prepare(ShellInput {
                 command: source.to_owned(),
-                timeout: None,
+                timeout_sec: None,
                 workdir: Some(WORKDIR.into()),
             })
             .await

@@ -1331,8 +1331,10 @@ through the same confined resolver the filesystem tools use and never opens a pa
 - `workdir` selects the initial directory and defaults to `.`. It must resolve inside the configured
   root. Only that initial directory is root-confined; the command can subsequently reach any path,
   process, or network destination visible to the server process.
-- `timeout` is measured in milliseconds and defaults to 120,000. Zero selects the 1,800,000 maximum;
-  a larger value is rejected rather than clamped, so no input removes the deadline.
+- `timeoutSec` is measured in seconds, from 1 to 21,600 (six hours), and defaults to 120. Zero and
+  larger values are rejected rather than read as a limit or clamped, so no input removes the deadline.
+  The key names its unit, so a millisecond count sent as `timeout` is refused as an unknown field
+  rather than run a thousand times longer than asked. The result still reports `timeoutMs`.
 - Shell execution is denied unless admitted by `--shell-policy` or `--yolo`. Explicit deny rules always
   win. Policy inspects command syntax but cannot infer the behavior of scripts, interpreters, wrappers,
   or allowed programs.
@@ -1367,8 +1369,8 @@ At most four shell calls execute concurrently within one process. Queued calls r
 `python_execution` evaluates one Python snippet in a separate `monty` worker process and returns the
 value of its final expression along with anything it printed.
 
-- `code` is required and limited to 65,536 UTF-8 bytes. `timeout` is optional, measured in
-  milliseconds, defaults to 5,000, and is capped at 30,000. Unknown fields are rejected.
+- `code` is required and limited to 65,536 UTF-8 bytes. `timeoutSec` is optional, measured in
+  seconds from 1 to 30, and defaults to 5. Zero, larger values, and unknown fields are rejected.
 - Each call is independent. No variables, definitions, imports, or printed output carry over, and
   there is no session to resume.
 - The worker has no filesystem access, no network access, no subprocesses, and an empty environment.

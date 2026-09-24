@@ -7,7 +7,7 @@
 //! The JSON schema is an admission contract, not a security boundary; dispatch validates again.
 
 use crate::subset::{available_modules, untyped_builtins, withheld_builtins};
-use crate::types::{CodeOutput, DEFAULT_TIMEOUT_MS, MAX_CODE_BYTES, MAX_TIMEOUT_MS};
+use crate::types::{CodeOutput, DEFAULT_TIMEOUT_SECS, MAX_CODE_BYTES, MAX_TIMEOUT_SECS};
 #[cfg(feature = "mcp")]
 use rmcp::model::{MetaObject, Tool, ToolAnnotations};
 use schemars::{JsonSchema, SchemaGenerator, generate::SchemaSettings};
@@ -56,7 +56,7 @@ Behaviour that differs from CPython even where the API exists:
 Usage notes:
 - The code parameter is required and is bounded to 65536 UTF-8 bytes.
 - The value of the final expression is returned. Use print() for intermediate output.
-- timeout is optional, measured in milliseconds, defaults to 5000, and is capped at 30000.
+- timeoutSec is optional, in seconds from 1 to 30. Omit it unless the snippet is expected to outlast the 5 second default. A value outside that range is rejected rather than clamped.
 - Each call is independent. No variables, definitions, or imports persist between calls.
 - Snippets are type checked before running unless the operator disables it, so unsupported APIs and unavailable names usually fail before any output is produced.
 - Type annotations are never required. Unannotated code is inferred permissively, so xs = [] then xs.append(1) then xs.append('a') passes. An annotation only adds a constraint that is then enforced, so when a diagnostic names one, widen or remove it rather than annotating more. Annotations themselves are never evaluated, which is why x: list[int] is fine while the same expression in a value position raises TypeError.
@@ -73,7 +73,7 @@ pub fn catalog() -> Vec<Tool> {
 #[must_use]
 pub fn specs() -> Vec<ToolSpec> {
     // Reject unknown fields to keep client mistakes from silently changing execution semantics.
-    let schema = json!({"type":"object","additionalProperties":false,"properties":{"code":{"type":"string","minLength":1,"maxLength":MAX_CODE_BYTES,"description":"Python source to execute. The value of the final expression is returned."},"timeout":{"type":"integer","minimum":1,"maximum":MAX_TIMEOUT_MS,"default":DEFAULT_TIMEOUT_MS,"description":"Optional timeout in milliseconds. Defaults to 5000 and is capped at 30000."}},"required":["code"],"$schema":"http://json-schema.org/draft-07/schema#"});
+    let schema = json!({"type":"object","additionalProperties":false,"properties":{"code":{"type":"string","minLength":1,"maxLength":MAX_CODE_BYTES,"description":"Python source to execute. The value of the final expression is returned."},"timeoutSec":{"type":"integer","minimum":1,"maximum":MAX_TIMEOUT_SECS,"default":DEFAULT_TIMEOUT_SECS,"description":"Optional timeout in seconds, from 1 to 30. Omit it for the 5 second default unless the snippet needs longer; a value outside that range is rejected."}},"required":["code"],"$schema":"http://json-schema.org/draft-07/schema#"});
     // The read-only and closed-world annotations are the inverse of the shell tool's and are
     // accurate: without mounts or host functions the interpreter reaches no file, socket, or
     // environment value. They are still presentation hints; the isolation is enforced by the worker.
@@ -141,8 +141,8 @@ mod tests {
         assert!(description.contains("Prefer this over the shell tool"));
         assert!(description.contains("eager and return lists"));
         assert_eq!(
-            tools[0].input_schema["properties"]["timeout"]["description"],
-            "Optional timeout in milliseconds. Defaults to 5000 and is capped at 30000."
+            tools[0].input_schema["properties"]["timeoutSec"]["description"],
+            "Optional timeout in seconds, from 1 to 30. Omit it for the 5 second default unless the snippet needs longer; a value outside that range is rejected."
         );
         assert_eq!(
             tools[0].meta.as_ref().unwrap().0[workcell_tool_contract::PRESENTATION_METADATA_KEY],

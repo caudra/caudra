@@ -9,7 +9,7 @@
   "tool": "shell",
   "input": {
     "command": "make broken",
-    "timeout": 60000
+    "timeoutSec": 60
   },
   "setup": {
     "files": [

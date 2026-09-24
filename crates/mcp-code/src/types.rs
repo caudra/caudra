@@ -9,10 +9,13 @@ use std::mem::size_of;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+const MILLIS_PER_SECOND: u64 = 1_000;
 /// Small scripts are the advertised use case, so the default budget is short enough that a runaway
 /// snippet fails fast instead of occupying a worker for minutes.
-pub const DEFAULT_TIMEOUT_MS: u64 = 5_000;
-pub const MAX_TIMEOUT_MS: u64 = 30_000;
+pub const DEFAULT_TIMEOUT_SECS: u64 = 5;
+pub const MAX_TIMEOUT_SECS: u64 = 30;
+pub const DEFAULT_TIMEOUT_MS: u64 = DEFAULT_TIMEOUT_SECS * MILLIS_PER_SECOND;
+pub const MAX_TIMEOUT_MS: u64 = MAX_TIMEOUT_SECS * MILLIS_PER_SECOND;
 /// Matches the shell tool's command bound so both executors reject oversized payloads alike.
 pub const MAX_CODE_BYTES: usize = 65_536;
 
@@ -29,7 +32,21 @@ pub(crate) const MAX_SUSPENSIONS: u32 = 256;
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct CodeInput {
     pub code: String,
-    pub timeout: Option<u64>,
+    pub timeout_sec: Option<u64>,
+}
+
+impl CodeInput {
+    /// The deadline this input runs under, or the refusal it gets, so a caller showing the
+    /// deadline ahead of the run reads the same rule the executor enforces.
+    pub fn timeout_ms(&self) -> Result<u64, String> {
+        match self.timeout_sec {
+            None => Ok(DEFAULT_TIMEOUT_MS),
+            Some(requested @ 1..=MAX_TIMEOUT_SECS) => Ok(requested * MILLIS_PER_SECOND),
+            Some(requested) => Err(format!(
+                "Invalid arguments: timeoutSec is {requested} seconds; it must be between 1 and {MAX_TIMEOUT_SECS}. Omit it for the {DEFAULT_TIMEOUT_SECS} second default"
+            )),
+        }
+    }
 }
 
 #[derive(Debug)]

@@ -14,8 +14,9 @@ use tokio_util::sync::CancellationToken;
 #[cfg(feature = "bundled-worker")]
 use workcell_mcp_code::bundled_worker_available;
 use workcell_mcp_code::{
-    CodeConfiguration, CodeInput, CodeToolGroup, SUBSET_MODULES, UNTYPED_BUILTINS,
-    WITHHELD_BUILTINS, WORKER_FILE_NAME, WorkerSource, catalog,
+    CodeConfiguration, CodeInput, CodeToolGroup, DEFAULT_TIMEOUT_MS, DEFAULT_TIMEOUT_SECS,
+    MAX_TIMEOUT_SECS, SUBSET_MODULES, UNTYPED_BUILTINS, WITHHELD_BUILTINS, WORKER_FILE_NAME,
+    WorkerSource, catalog,
 };
 
 /// Resolves the worker the same way the server does, plus the in-repo build location so a developer
@@ -121,11 +122,11 @@ async fn preparation_validates_and_binds_without_running_the_snippet() {
     let prepared = group
         .prepare(CodeInput {
             code: "print('prepared once')\n7".to_owned(),
-            timeout: None,
+            timeout_sec: None,
         })
         .expect("prepare");
     assert_eq!(prepared.code(), "print('prepared once')\n7");
-    assert_eq!(prepared.timeout_ms(), workcell_mcp_code::DEFAULT_TIMEOUT_MS);
+    assert_eq!(prepared.timeout_ms(), DEFAULT_TIMEOUT_MS);
     assert!(prepared.type_check());
 
     let execution = group
@@ -141,13 +142,26 @@ async fn preparation_validates_and_binds_without_running_the_snippet() {
 #[tokio::test]
 async fn preparation_rejects_invalid_limits_before_worker_execution() {
     let group = group_or_skip!();
-    let error = group
-        .prepare(CodeInput {
-            code: "1".to_owned(),
-            timeout: Some(workcell_mcp_code::MAX_TIMEOUT_MS + 1),
-        })
-        .expect_err("invalid timeout");
-    assert!(error.contains("timeout must be between"));
+    for requested in [0, MAX_TIMEOUT_SECS + 1] {
+        let error = group
+            .prepare(CodeInput {
+                code: "1".to_owned(),
+                timeout_sec: Some(requested),
+            })
+            .expect_err("invalid timeout");
+        assert!(
+            error.contains(&format!("timeoutSec is {requested} seconds")),
+            "{error}"
+        );
+        assert!(
+            error.contains(&format!("between 1 and {MAX_TIMEOUT_SECS}")),
+            "{error}"
+        );
+        assert!(
+            error.contains(&format!("{DEFAULT_TIMEOUT_SECS} second default")),
+            "{error}"
+        );
+    }
     group.shutdown().await;
 }
 
@@ -185,7 +199,7 @@ async fn native_execute_returns_typed_output_and_exact_model_summary() {
         .execute(
             CodeInput {
                 code: "21 * 2".into(),
-                timeout: None,
+                timeout_sec: None,
             },
             CancellationToken::new(),
         )
@@ -199,7 +213,7 @@ async fn native_execute_returns_typed_output_and_exact_model_summary() {
         .execute(
             CodeInput {
                 code: "   ".into(),
-                timeout: None,
+                timeout_sec: None,
             },
             CancellationToken::new(),
         )
@@ -736,7 +750,7 @@ async fn runaway_loops_hit_the_time_budget() {
     let group = group_or_skip!();
     let output = run_with(
         &group,
-        json!({ "code": "n = 0\nwhile True:\n    n += 1", "timeout": 1000 }),
+        json!({ "code": "n = 0\nwhile True:\n    n += 1", "timeoutSec": 1 }),
     )
     .await;
     assert_eq!(output["outcome"], "limited");
@@ -784,8 +798,10 @@ async fn rejects_input_outside_the_advertised_schema() {
     let group = group_or_skip!();
     for arguments in [
         json!({ "code": "   " }),
-        json!({ "code": "1", "timeout": 0 }),
-        json!({ "code": "1", "timeout": 30_001 }),
+        json!({ "code": "1", "timeoutSec": 0 }),
+        json!({ "code": "1", "timeoutSec": MAX_TIMEOUT_SECS + 1 }),
+        // In range for timeoutSec, so only the retired millisecond key can be what refuses it.
+        json!({ "code": "1", "timeout": MAX_TIMEOUT_SECS }),
         json!({ "code": "1", "unexpected": true }),
     ] {
         let result = group
@@ -847,7 +863,7 @@ async fn memory_exhaustion_is_reported_as_a_limit() {
     let group = group_or_skip!();
     let output = run_with(
         &group,
-        json!({ "code": "blob = []\nwhile True:\n    blob.append('x' * 1_000_000)", "timeout": 20_000 }),
+        json!({ "code": "blob = []\nwhile True:\n    blob.append('x' * 1_000_000)", "timeoutSec": 20 }),
     )
     .await;
     assert_eq!(output["outcome"], "limited");
@@ -868,7 +884,7 @@ async fn the_group_keeps_serving_after_a_limit_poisons_a_session() {
     let group = group_or_skip!();
     let limited = run_with(
         &group,
-        json!({ "code": "blob = []\nwhile True:\n    blob.append('x' * 1_000_000)", "timeout": 20_000 }),
+        json!({ "code": "blob = []\nwhile True:\n    blob.append('x' * 1_000_000)", "timeoutSec": 20 }),
     )
     .await;
     assert_eq!(limited["outcome"], "limited");

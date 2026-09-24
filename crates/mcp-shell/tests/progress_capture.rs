@@ -48,7 +48,7 @@ async fn run(
         .execute(
             ShellInput {
                 command: command.into(),
-                timeout: Some(120_000),
+                timeout_sec: Some(120),
                 workdir: None,
             },
             CancellationToken::new(),
@@ -226,7 +226,7 @@ async fn disabling_the_filter_leaves_the_line_collapse_off_too() {
         .execute(
             ShellInput {
                 command: "printf 'begin\\n'; for i in 1 2 3 4 5 6; do printf 'fetch %d/6 [%d%%] 4.8it/s\\n' \"$i\" \"$((i * 100 / 6))\"; done".into(),
-                timeout: Some(60_000),
+                timeout_sec: Some(60),
                 workdir: None,
             },
             CancellationToken::new(),
@@ -300,7 +300,7 @@ async fn rendering_is_not_a_filtering_choice() {
         .execute(
             ShellInput {
                 command: "printf 'step 1/3\\rstep 2/3\\rstep 3/3\\n'".into(),
-                timeout: Some(60_000),
+                timeout_sec: Some(60),
                 workdir: None,
             },
             CancellationToken::new(),

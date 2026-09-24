@@ -24,7 +24,7 @@ def session(root):
     return p, send
 
 
-def run(root, command, filtered, timeout=300000):
+def run(root, command, filtered, timeout_sec=300):
     args = [] if filtered else ["--no-shell-output-filter"]
     p = subprocess.Popen(
         [BIN, "--tool-group", "shell", "--yolo", *args, root],
@@ -38,7 +38,7 @@ def run(root, command, filtered, timeout=300000):
         sys.exit("init failed: " + p.stderr.read()[-500:])
     send({"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}})
     send({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {
-        "name": "shell", "arguments": {"command": command, "timeout": timeout}}})
+        "name": "shell", "arguments": {"command": command, "timeoutSec": timeout_sec}}})
     while True:
         line = p.stdout.readline()
         if not line:
