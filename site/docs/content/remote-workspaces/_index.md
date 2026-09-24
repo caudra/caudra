@@ -29,7 +29,7 @@ Live discovery must advertise these capabilities. Capability contracts use versi
 | `watch` | `open`, `poll`, `close`, and `recursive` |
 | `projectAssets` | `discover` and `read` |
 | `scm` | `discover`, `status`, `log`, `diff`, `readSide`, `stage`, `unstage`, `discard`, and `preparedMutations` |
-| `snapshots` | `capture`, `inspect`, `status`, `prepareRestore`, `prepareUnrevert`, `acknowledge`, `prepareCleanup`, and `durablePerFileJournal` |
+| `snapshots` | `capture`, `inspect`, `status`, `prepareRestore`, `prepareUnrevert`, `acknowledge`, and `prepareCleanup` |
 | `reviewedTransfer` | `privateStaging`, `sealedPublication`, `conditionalDownload`, `singleRange`, `durableOutcomes`, `createsDirectories`, and `safeInventory` |
 
 Reviewed transfer also requires positive file, staging, I/O, lifetime, buffer and journal limits, with `maxJournalStorageBytes >= maxJournalBytes`. Binary reads use reviewed downloads. The old raw upload/download tools cannot substitute for these capabilities.
@@ -179,6 +179,22 @@ Stored bindings include the endpoint origin, server ID, workspace ID, workspace 
 
 An ordinary server restart preserves durable identity but changes the process instance. Caudra must refresh volatile handles and reconcile pending operations. Reusing a generation after a workspace reset defeats this distinction, so generation management is the operator's responsibility.
 
+## File snapshots
+
+A remote session captures its snapshots on the Workcell host, in the store behind `--snapshot-root`. Each capture covers the session directory. A rewind works like a [local file restore](/docs/sessions/#file-snapshots): it touches only the paths that differ between the capture nearest the current head and the capture nearest the target, and a path changed since the first capture is a conflict.
+
+Captures use the `storage.snapshots` settings, lowered to the limits the host advertises. `enabled = false` turns remote capture off too. The host walk differs from a local one:
+
+- Symlinks are captured as links. A restore recreates the link and never follows it.
+- Per-directory `.gitignore` files apply. `.git/info/exclude` and the global Git ignore file do not.
+- Nested repositories, mounts, sockets, FIFOs, devices, unreadable entries, files over `max_file_bytes_mb`, and files that keep changing while they are read are left out and left alone.
+- A name that is not UTF-8 is counted and left out.
+- Protected paths such as Git metadata, `.env*` files, and private keys are never captured.
+
+Some refusals turn file revert off for the rest of the session: a tree over `max_files` or `max_bytes_mb`, a full host store with nothing of this session left to delete, or a host without snapshot support. The tool call proceeds, and Caudra reports the host's reason once. A busy host, a lost connection, or a policy denial says nothing about the workspace itself. Those block the call and name the reason, so no change runs without its revert point.
+
+The host store is shared by every session on the machine, so Caudra deletes the checkpoints of a remote session as they age. It keeps the session start, the current head, and the 32 newest captures, and deletes the older ones once 16 of them have piled up. When the host reports a full store, Caudra deletes every checkpoint of the session except the session start and tries the capture once more. Nothing is deleted while a restore awaits acknowledgement, and checkpoints of other sessions are never touched. A rewind to a head whose capture was deleted falls back to the nearest earlier capture, and finally to the session start.
+
 ## Interrupted operations
 
 Caudra journals remote mutations before dispatch. When a reply is lost, it queries operation status rather than automatically repeating the mutation. Cancellation after dispatch is also reconciled through remote status. A timeout is not proof that nothing changed.
@@ -236,4 +252,4 @@ Caudra handles it before model dispatch and emits a `system` message with subtyp
 
 ### Snapshot recovery
 
-Snapshot restore has a separate durable per-file journal. Remote rewind first prepares a preview and asks you to repeat rewind to confirm. Conflicts are not overwritten automatically. A partial or indeterminate restore requires recovery before more changes, and transcript updates and restore acknowledgement must also reconcile. Snapshots are not atomic across all files. See [Sessions](/docs/sessions/) for the conversation operations.
+Snapshot restore has its own durable journal on the host. A restore interrupted by a crash is recomputed from its two captures and the live workspace, and nothing is replayed. Remote rewind first prepares a preview that counts the files it would replace, create, and delete, and asks you to repeat rewind to confirm. Conflicts are not overwritten automatically. A restore the host refuses before it changes a file leaves the session as it was. A partial or indeterminate restore requires recovery before more changes, and transcript updates and restore acknowledgement must also reconcile. Snapshots are not atomic across all files. See [Sessions](/docs/sessions/) for the conversation operations.

@@ -705,7 +705,7 @@ mod tests {
     use std::time::Instant;
 
     use caudra_agent::AgentEvent;
-    use caudra_config::PermissionsConfig;
+    use caudra_config::{PermissionsConfig, SnapshotsConfig};
     use caudra_providers::provider::BoxFuture;
     use caudra_providers::{
         AgentError, CacheKey, ModelInfo, ProviderEvent, RequestOptions, StreamResponse,
@@ -800,7 +800,7 @@ mod tests {
                     std::env::temp_dir().join("caudra-agent-test-snapshots"),
                 )),
                 PathBuf::from("/tmp"),
-                true,
+                SnapshotsConfig::default(),
             ),
             None,
             None,

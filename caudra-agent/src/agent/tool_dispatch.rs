@@ -20,7 +20,6 @@ use crate::tools::{
     DOOM_LOOP_GUIDANCE, LocalToolEntry, LockKey, READ_ONLY_CALL_GUIDANCE,
     READ_ONLY_TOOL_RESTRICTED, TOOL_SEARCH_TOOL_NAME, ToolContext, ToolEffect, ToolSource,
 };
-use crate::workspace_baseline::BaselineOutcome;
 use crate::{
     AgentError, AgentEvent, LuaToolProvenance, ToolAccounting, ToolDoneEvent, ToolOutput,
     ToolStartEvent,
@@ -1044,14 +1043,12 @@ async fn ensure_revert_point(ctx: &ToolContext, effect: ToolEffect) -> Result<()
         }
         return Ok(());
     };
-    match gate.ensure().await {
-        // A workspace Caudra will not snapshot costs file revert, not the
-        // user's work, and it has already said so once.
-        BaselineOutcome::Ready => Ok(()),
-        BaselineOutcome::Unavailable(_) if !gate.is_remote() => Ok(()),
-        BaselineOutcome::Unavailable(reason) => Err(format!("{SNAPSHOT_FAILED}: {reason}")),
-        BaselineOutcome::Failed(error) => Err(format!("{SNAPSHOT_FAILED}: {error}")),
-    }
+    // A workspace Caudra will not snapshot costs file revert, not the user's
+    // work, and it has already said so once.
+    gate.ensure()
+        .await
+        .into_result()
+        .map_err(|error| format!("{SNAPSHOT_FAILED}: {error}"))
 }
 
 /// Enforce permission for a registry tool. MCP tools bypass this — they go
@@ -3636,8 +3633,11 @@ mod tests {
                 Arc::new(SnapshotStore::new(path))
             }
         };
-        let baseline =
-            crate::workspace_baseline::WorkspaceBaseline::new(Arc::clone(&store), root, true);
+        let baseline = crate::workspace_baseline::WorkspaceBaseline::new(
+            Arc::clone(&store),
+            root,
+            caudra_config::SnapshotsConfig::default(),
+        );
         let mut ctx = crate::tools::test_support::stub_ctx(&AgentMode::Build);
         ctx.baseline = Some(crate::workspace_baseline::BaselineGate::new(baseline, None));
         ctx.local_tools = Arc::new(HashMap::from([(

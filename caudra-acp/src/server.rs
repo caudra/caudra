@@ -580,6 +580,7 @@ async fn prepare_session(
         model: params.model.clone(),
         config: runtime.config.clone(),
         permissions_config: runtime.permissions_config.clone(),
+        snapshots: runtime.snapshots,
         timeouts: params.timeouts,
         prompt_slots: Arc::clone(&runtime.prompt_slots),
         thinking: params.thinking.clone(),

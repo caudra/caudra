@@ -324,8 +324,11 @@ fn build_app_with_lua(
     session.set_cwd(workspace.to_string_lossy().into_owned());
     let snapshot_store =
         App::snapshot_store_for(&dir, session.id, &workspace, SnapshotLimits::default()).unwrap();
-    let workspace_baseline =
-        WorkspaceBaseline::new(Arc::clone(&snapshot_store), workspace.clone(), true);
+    let workspace_baseline = WorkspaceBaseline::new(
+        Arc::clone(&snapshot_store),
+        workspace.clone(),
+        SnapshotsConfig::default(),
+    );
     App::new(
         &model,
         session,

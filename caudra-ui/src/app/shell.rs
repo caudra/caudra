@@ -9,8 +9,8 @@ use std::os::unix::process::CommandExt;
 
 use async_process::{Command, Stdio};
 use caudra_agent::{
-    AgentConfig, BaselineOutcome, CancelToken, CancelTrigger, ToolAccounting, ToolDoneEvent,
-    ToolInput, ToolOutput, ToolStartEvent, WorkspaceBaseline,
+    AgentConfig, CancelToken, CancelTrigger, ToolAccounting, ToolDoneEvent, ToolInput, ToolOutput,
+    ToolStartEvent, WorkspaceBaseline,
 };
 use caudra_providers::Message;
 use caudra_workspace::{
@@ -345,16 +345,11 @@ pub(crate) fn spawn_remote_shell(
             id: id.clone(),
             command: command.clone(),
         });
-        let baseline = match target.baseline.ensure_current().await {
-            BaselineOutcome::Ready => Ok(()),
-            BaselineOutcome::Unavailable(reason) => Err(reason.to_string()),
-            BaselineOutcome::Failed(error) => Err(error.to_string()),
-        };
-        if let Err(output) = baseline {
+        if let Err(error) = target.baseline.ensure_current().await.into_result() {
             let _ = tx.send(ShellEvent::Done {
                 id,
                 command,
-                output,
+                output: error.to_string(),
                 is_error: true,
                 visible,
                 max_output_lines: config.max_output_lines,

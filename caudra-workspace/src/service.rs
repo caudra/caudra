@@ -899,6 +899,56 @@ pub enum SnapshotState {
     Corrupt,
 }
 
+/// Why a capture left an entry out. A restore never touches an entry left out of either side.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SnapshotSkipReason {
+    NestedRepository,
+    Mount,
+    Special,
+    Oversized,
+    Unreadable,
+    Unstable,
+    Unrepresentable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotSkippedEntry {
+    /// Lossy for an unrepresentable name, so it is for display only.
+    pub path: String,
+    pub reason: SnapshotSkipReason,
+}
+
+/// Complete counts of what a capture left out, beside a bounded sample of the paths.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotSkipped {
+    pub nested_repositories: u32,
+    pub mounts: u32,
+    pub special_files: u32,
+    pub oversized_files: u32,
+    pub unreadable_entries: u32,
+    pub unstable_files: u32,
+    pub unrepresentable_names: u32,
+    pub samples: Vec<SnapshotSkippedEntry>,
+}
+
+impl SnapshotSkipped {
+    pub fn total(&self) -> u64 {
+        [
+            self.nested_repositories,
+            self.mounts,
+            self.special_files,
+            self.oversized_files,
+            self.unreadable_entries,
+            self.unstable_files,
+            self.unrepresentable_names,
+        ]
+        .into_iter()
+        .map(u64::from)
+        .sum()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SnapshotSummary {
     pub snapshot_id: SnapshotId,
@@ -906,15 +956,32 @@ pub struct SnapshotSummary {
     pub label: Option<String>,
     pub state: SnapshotState,
     pub manifest_revision: ResourceRevision,
+    /// The directory the capture covers; a restore never reaches outside it.
+    pub scope: WorkspacePath,
     pub file_count: u32,
     pub total_bytes: u64,
+    pub skipped: SnapshotSkipped,
     pub created_at_unix_ms: u64,
 }
 
+/// Ceilings for one capture. An authority clamps them to its own, so a caller
+/// states what it is willing to pay rather than what the authority allows.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotCaptureLimits {
+    /// Above it the workspace is refused rather than captured.
+    pub max_files: u64,
+    /// A larger file is left out of the capture and never restored over.
+    pub max_file_bytes: u64,
+    /// Above it the workspace is refused rather than captured.
+    pub max_total_bytes: u64,
+}
+
+/// Captures the directory the cursor names, the session's working directory.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SnapshotCaptureRequest {
     pub checkpoint_id: CheckpointId,
     pub label: Option<String>,
+    pub limits: SnapshotCaptureLimits,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -930,12 +997,19 @@ pub struct SnapshotInspectRequest {
     pub continuation: Option<ContinuationToken>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SnapshotEntryKind {
+    File,
+    /// Captured as the link itself: `digest` covers the raw target and it is never followed.
+    Symlink,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SnapshotFile {
     pub path: WorkspacePath,
     pub resource_id: ResourceId,
-    pub identity: ResourceRevision,
-    pub revision: ResourceRevision,
+    pub kind: SnapshotEntryKind,
     pub digest: ResourceRevision,
     pub mode: u32,
     pub size_bytes: u64,
@@ -969,20 +1043,47 @@ pub struct SnapshotChange {
     pub target_revision: Option<ResourceRevision>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotChangeCounts {
+    pub create: u32,
+    pub replace: u32,
+    pub delete: u32,
+    pub conflict: u32,
+    /// Paths that differ between the two captures but already match the target.
+    pub unchanged: u32,
+    pub created_directories: u32,
+}
+
+impl SnapshotChangeCounts {
+    /// Paths a restore would write or remove. Conflicts are not among them: any
+    /// conflict stops the restore before it writes anything.
+    pub fn applied(&self) -> u64 {
+        u64::from(self.create) + u64::from(self.replace) + u64::from(self.delete)
+    }
+}
+
+/// `changes` and `created_directories` are bounded samples, conflicts first;
+/// `counts` is complete.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SnapshotRestorePreview {
     pub restore_id: RestoreId,
     pub target_snapshot_id: SnapshotId,
-    pub current_revision: ResourceRevision,
-    pub target_revision: ResourceRevision,
+    /// The capture the workspace is believed to match. Only paths that differ
+    /// between it and the target are restored.
+    pub source_snapshot_id: SnapshotId,
+    pub counts: SnapshotChangeCounts,
     pub changes: Vec<SnapshotChange>,
     pub created_directories: Vec<WorkspacePath>,
 }
 
+/// Cleanup deletes checkpoints, never snapshots: one content-addressed snapshot
+/// may back checkpoints of other sessions, and the authority collects snapshots
+/// nothing references any more on its own.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SnapshotCleanupPreview {
-    pub snapshot_ids: Vec<SnapshotId>,
-    pub retained_snapshot_ids: Vec<SnapshotId>,
+    pub checkpoint_ids: Vec<CheckpointId>,
+    /// Requested checkpoints the authority no longer holds.
+    pub missing_checkpoint_ids: Vec<CheckpointId>,
     pub reclaimable_bytes: u64,
 }
 
@@ -1022,7 +1123,7 @@ pub struct SnapshotRestoreStatus {
     pub restore_id: RestoreId,
     pub state: SnapshotRestoreState,
     pub target_snapshot_id: SnapshotId,
-    pub pre_restore_snapshot_id: SnapshotId,
+    pub source_snapshot_id: SnapshotId,
     pub applied_files: u32,
     pub total_files: u32,
     pub acknowledgement_required: bool,
@@ -1032,7 +1133,8 @@ pub struct SnapshotRestoreStatus {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SnapshotCleanupResult {
-    pub deleted_snapshot_ids: Vec<SnapshotId>,
+    pub deleted_checkpoint_ids: Vec<CheckpointId>,
+    pub deleted_snapshots: u32,
     pub deleted_blobs: u32,
     pub reclaimed_bytes: u64,
 }
@@ -1070,11 +1172,18 @@ pub trait WorkspaceSnapshotReadService: Send + Sync {
 
 #[async_trait]
 pub trait WorkspaceSnapshotMutationService: Send + Sync {
+    /// Most checkpoints one cleanup may name; a caller deletes more in chunks.
+    fn max_cleanup_checkpoints(&self) -> usize;
+
+    /// Restores `target` over paths that differ between it and `source`, the
+    /// capture the workspace is believed to match. A path that matches neither
+    /// is a conflict.
     async fn prepare_restore(
         &self,
         binding: &SessionWorkspaceBinding,
         cursor: &WorkspaceCursor,
-        snapshot_id: &SnapshotId,
+        target: &SnapshotId,
+        source: &SnapshotId,
     ) -> Result<PreparedSnapshotOperation, WorkspaceError>;
 
     async fn prepare_unrevert(
@@ -1088,7 +1197,7 @@ pub trait WorkspaceSnapshotMutationService: Send + Sync {
         &self,
         binding: &SessionWorkspaceBinding,
         cursor: &WorkspaceCursor,
-        snapshot_ids: &[SnapshotId],
+        checkpoint_ids: &[CheckpointId],
     ) -> Result<PreparedSnapshotOperation, WorkspaceError>;
 
     async fn execute(

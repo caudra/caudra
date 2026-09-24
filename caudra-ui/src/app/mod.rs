@@ -969,7 +969,8 @@ impl App {
                     }
                     Ok(())
                 }
-                caudra_agent::BaselineOutcome::Unavailable(reason) => Err(reason.to_string()),
+                // Reported once by `poll_snapshot_refusal`, not after every run.
+                caudra_agent::BaselineOutcome::Unavailable(_) => Ok(()),
                 caudra_agent::BaselineOutcome::Failed(error) => Err(error.to_string()),
             };
         }
@@ -5860,11 +5861,11 @@ fn remote_workbench_gate(baseline: Arc<WorkspaceBaseline>) -> MutationGate {
     MutationGate::new(move || {
         let baseline = Arc::clone(&baseline);
         Box::pin(async move {
-            match baseline.ensure_current().await {
-                caudra_agent::BaselineOutcome::Ready => Ok(()),
-                caudra_agent::BaselineOutcome::Unavailable(reason) => Err(reason.to_string()),
-                caudra_agent::BaselineOutcome::Failed(error) => Err(error.to_string()),
-            }
+            baseline
+                .ensure_current()
+                .await
+                .into_result()
+                .map_err(|error| error.to_string())
         })
     })
 }

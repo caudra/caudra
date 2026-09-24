@@ -88,6 +88,7 @@ fn runtime_resolver(
                     ),
                     config: config.agent,
                     permissions_config: config.permissions,
+                    snapshots: config.storage.snapshots,
                     plugin_rules: plugin_host.plugin_rules(),
                     registry,
                     workspace_binding: runtime.stored_binding().cloned(),

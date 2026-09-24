@@ -19,7 +19,7 @@ use caudra_agent::agent::estimate_message_tokens;
 use caudra_agent::snapshots::{
     ConflictPolicy, RestoreReport, RestoreStatus, RestoreTarget, SnapshotError, SnapshotStore,
 };
-use caudra_agent::workspace_baseline::WorkspaceBaseline;
+use caudra_agent::workspace_baseline::{BaselineError, WorkspaceBaseline};
 use caudra_agent::{GoalHandle, GoalStatus};
 use caudra_providers::{
     HistoryItem, HistoryItemKind, ImageSource, Model, TokenUsage, active_history_items,
@@ -33,6 +33,7 @@ use caudra_storage::sessions::{
     StoredQueuedDraft, StoredQueuedPrompt, StoredSubagent, StoredSubagentOutcome,
 };
 use caudra_storage::tool_outputs::{ToolOutputId, ToolOutputRef, ToolOutputStore};
+use caudra_workspace::{PreparedSnapshotOperation, SnapshotOperationPreview};
 
 use crate::AppSession;
 use crate::storage_writer::StorageWriter;
@@ -49,6 +50,7 @@ const SOFT_SAVE_DELAY: Duration = Duration::from_millis(1000);
 const PARALLEL_RESTORE_MIN_CHATS: usize = 4;
 const RENAME_USAGE: &str = "Usage: /rename <title>";
 pub(crate) const REVERT_BUSY_MSG: &str = "Wait for the session to become idle before reverting";
+const NO_REMOTE_FILE_CHANGES: &str = "no file changes";
 
 /// Saturates rather than wraps: a goal left open for longer than `u64`
 /// milliseconds is not a number worth panicking over.
@@ -100,7 +102,7 @@ pub(super) struct RemoteRestoreConfirmation {
     target: RevertTarget,
     pending: PendingConversationRevert,
     mode: RestoreMode,
-    pub(super) prepared: caudra_workspace::PreparedSnapshotOperation,
+    pub(super) prepared: PreparedSnapshotOperation,
 }
 
 /// What `App::checkpoint` last handed to the writer: which session, how far
@@ -1271,8 +1273,20 @@ impl App {
                             .release_remote_prepared(&previous.prepared),
                     );
                 }
+                let messages = self.state.session.messages();
+                let (source_chain, target_chain) = match (
+                    checkpoint_chain(messages, pending_workspace_head(&pending)),
+                    checkpoint_chain(messages, target.head),
+                ) {
+                    (Ok(source_chain), Ok(target_chain)) => (source_chain, target_chain),
+                    (Err(error), _) | (_, Err(error)) => {
+                        self.status_bar.flash(error);
+                        return Vec::new();
+                    }
+                };
                 let prepared = match smol::block_on(
-                    self.workspace_baseline.prepare_remote_restore(target.head),
+                    self.workspace_baseline
+                        .prepare_remote_restore(&source_chain, &target_chain),
                 ) {
                     Ok(prepared) => prepared,
                     Err(error) => {
@@ -1281,15 +1295,10 @@ impl App {
                         return Vec::new();
                     }
                 };
-                let change_count = match &prepared.preview {
-                    caudra_workspace::SnapshotOperationPreview::Restore(preview) => {
-                        preview.changes.len()
-                    }
-                    _ => {
-                        self.status_bar
-                            .flash("Remote workspace restore preview was invalid".into());
-                        return Vec::new();
-                    }
+                let Some(changes) = remote_restore_changes(&prepared) else {
+                    self.status_bar
+                        .flash("Remote workspace restore preview was invalid".into());
+                    return Vec::new();
                 };
                 self.remote_restore_confirmation = Some(RemoteRestoreConfirmation {
                     conversation_source,
@@ -1299,19 +1308,15 @@ impl App {
                     prepared,
                 });
                 self.status_bar.flash(format!(
-                    "Remote restore preview: {change_count} change{}. Repeat rewind to confirm",
-                    if change_count == 1 { "" } else { "s" }
+                    "Remote restore preview: {changes}. Repeat rewind to confirm"
                 ));
                 return Vec::new();
             }
         };
-        let change_count = match &prepared.preview {
-            caudra_workspace::SnapshotOperationPreview::Restore(preview) => preview.changes.len(),
-            _ => {
-                self.status_bar
-                    .flash("Remote workspace restore preview was invalid".into());
-                return Vec::new();
-            }
+        let Some(changes) = remote_restore_changes(&prepared) else {
+            self.status_bar
+                .flash("Remote workspace restore preview was invalid".into());
+            return Vec::new();
         };
         let operation_id = CaudraId::generate();
         pending.restore_operation = Some(PendingRestoreOperation {
@@ -1334,15 +1339,16 @@ impl App {
             ));
             return Vec::new();
         }
-        self.status_bar.flash(format!(
-            "Restoring {change_count} remote workspace change{}",
-            if change_count == 1 { "" } else { "s" }
-        ));
+        self.status_bar
+            .flash(format!("Restoring remote workspace: {changes}"));
         let status = match smol::block_on(
             self.workspace_baseline
                 .execute_remote_restore(prepared, target.head),
         ) {
             Ok(status) => status,
+            Err(error) if error.left_workspace_unchanged() => {
+                return self.abandon_remote_restore(before_intent, &error);
+            }
             Err(error) => {
                 self.status_bar.flash(format!(
                     "Remote workspace restore requires recovery before more changes: {error}"
@@ -1642,6 +1648,9 @@ impl App {
             status.restore_id,
         )) {
             Ok(status) => status,
+            Err(error) if error.left_workspace_unchanged() => {
+                return self.abandon_remote_restore(before_intent, &error);
+            }
             Err(error) => {
                 self.status_bar.flash(format!(
                     "Remote workspace unrevert requires recovery before more changes: {error}"
@@ -1756,6 +1765,25 @@ impl App {
                 "Failed to save workspace restore failure: {save_error}"
             ));
         }
+    }
+
+    /// The host refused the restore before it touched a file, so the session
+    /// goes back to how it stood before the intent was saved. A failed save
+    /// heals on the next load: recovery finds no record of the restore.
+    fn abandon_remote_restore(
+        &mut self,
+        before_intent: Arc<AppSession>,
+        error: &BaselineError,
+    ) -> Vec<Action> {
+        self.state.session = before_intent;
+        let message = match self.save_session_barrier() {
+            Ok(()) => format!("Remote workspace unchanged: {error}"),
+            Err(save_error) => format!(
+                "Remote workspace unchanged: {error}; failed to clear the restore intent: {save_error}"
+            ),
+        };
+        self.status_bar.flash(message);
+        Vec::new()
     }
 
     pub fn fork_at(&self, source: DisplaySource) -> Result<ForkedSession, String> {
@@ -2090,7 +2118,7 @@ impl App {
                 session.id,
                 workspace.clone(),
                 binding.clone(),
-                self.snapshots_config.enabled,
+                self.snapshots_config,
             );
             let recovered = smol::block_on(baseline.reconcile_remote_restore())
                 .map_err(|error| format!("Remote workspace snapshot recovery failed: {error}"))?;
@@ -2778,6 +2806,30 @@ fn pending_workspace_head(pending: &PendingConversationRevert) -> Option<CaudraI
                 pending.original_head
             }
         })
+}
+
+/// What a remote rewind would do, from the host's complete counts rather than
+/// its bounded sample of paths.
+fn remote_restore_changes(prepared: &PreparedSnapshotOperation) -> Option<String> {
+    let SnapshotOperationPreview::Restore(preview) = &prepared.preview else {
+        return None;
+    };
+    let counts = &preview.counts;
+    let parts = [
+        (counts.replace, "to replace"),
+        (counts.create, "to create"),
+        (counts.delete, "to delete"),
+    ]
+    .into_iter()
+    .filter(|(count, _)| *count > 0)
+    .map(|(count, action)| format!("{count} {action}"))
+    .collect::<Vec<_>>();
+    if parts.is_empty() {
+        return Some(NO_REMOTE_FILE_CHANGES.to_owned());
+    }
+    let files = counts.applied();
+    let plural = if files == 1 { "" } else { "s" };
+    Some(format!("{files} file{plural} ({})", parts.join(", ")))
 }
 
 fn pending_original_workspace_head(pending: &PendingConversationRevert) -> Option<CaudraId> {

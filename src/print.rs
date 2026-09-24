@@ -18,7 +18,7 @@ use caudra_agent::{
     AgentConfig, AgentEvent, DoneReason, Envelope, GoalHandle, GoalVerdict, ImageSource,
     PermissionsConfig,
 };
-use caudra_config::ModelPolicy;
+use caudra_config::{ModelPolicy, SnapshotsConfig};
 use caudra_lua::EventHandle;
 use caudra_providers::model::Model;
 use caudra_providers::{Billing, TokenUsage, add_cost};
@@ -165,6 +165,7 @@ pub fn run(
     verbose: bool,
     mut config: AgentConfig,
     permissions_config: PermissionsConfig,
+    snapshots: SnapshotsConfig,
     timeouts: caudra_providers::Timeouts,
     lua_handle: EventHandle,
     fast: bool,
@@ -221,6 +222,7 @@ pub fn run(
         model: model.clone(),
         config,
         permissions_config,
+        snapshots,
         timeouts,
         prompt,
         thinking,

@@ -258,6 +258,20 @@ impl RemoteSnapshotMetadataStore {
         })
     }
 
+    /// Drops a restore the authority definitively refused. It changed nothing,
+    /// so there is nothing left to recover, acknowledge or unrevert.
+    pub fn forget_restore(
+        &self,
+        restore_id: &RestoreId,
+    ) -> Result<(), RemoteSnapshotMetadataError> {
+        self.update(|document| {
+            document
+                .restores
+                .retain(|restore| &restore.restore_id != restore_id);
+            Ok(())
+        })
+    }
+
     pub fn pending_restore(
         &self,
     ) -> Result<Option<RemoteRestoreRecord>, RemoteSnapshotMetadataError> {
@@ -282,36 +296,69 @@ impl RemoteSnapshotMetadataStore {
         }))
     }
 
-    pub fn referenced_snapshot_ids(
+    /// The capture a restore to `chain`'s first head would use: that head's,
+    /// else its nearest captured ancestor's, else the session start. `chain`
+    /// runs from a head back through its ancestors. A head without a complete
+    /// capture was either never captured or pruned, and either way the latest
+    /// capture before it is the closest state still held.
+    pub fn nearest_capture(
         &self,
-    ) -> Result<BTreeSet<SnapshotId>, RemoteSnapshotMetadataError> {
+        chain: &[CaudraId],
+    ) -> Result<Option<RemoteSnapshotMetadata>, RemoteSnapshotMetadataError> {
         let Some(document) = self.load()? else {
-            return Ok(BTreeSet::new());
+            return Ok(None);
         };
-        let mut referenced = document
-            .captures
-            .into_iter()
-            .map(|capture| capture.snapshot_id)
-            .collect::<BTreeSet<_>>();
-        for restore in document.restores {
-            if restore.blocks_mutation() || !restore.acknowledged {
-                referenced.insert(restore.target_snapshot_id);
-                if let Some(status) = restore.status {
-                    referenced.insert(status.pre_restore_snapshot_id);
-                }
-            }
-        }
-        Ok(referenced)
+        let complete = |head: Option<CaudraId>| {
+            document.captures.iter().find(|capture| {
+                capture.history_head == head && capture.state == SnapshotState::Complete
+            })
+        };
+        Ok(chain
+            .iter()
+            .find_map(|head| complete(Some(*head)))
+            .or_else(|| complete(None))
+            .cloned())
     }
 
-    pub fn remove_deleted_snapshots(
+    /// This session's checkpoints nothing needs any more: all but the session
+    /// start, the heads in `keep`, and the `keep_recent` newest captures. None
+    /// while a restore awaits acknowledgement: both of its sides are still live,
+    /// because an unrevert returns the workspace to the one it left.
+    pub fn prunable_checkpoints(
         &self,
-        deleted: &BTreeSet<SnapshotId>,
+        keep: &[Option<CaudraId>],
+        keep_recent: usize,
+    ) -> Result<Vec<CheckpointId>, RemoteSnapshotMetadataError> {
+        let Some(document) = self.load()? else {
+            return Ok(Vec::new());
+        };
+        if document
+            .restores
+            .iter()
+            .any(RemoteRestoreRecord::blocks_mutation)
+        {
+            return Ok(Vec::new());
+        }
+        let recent_start = document.captures.len().saturating_sub(keep_recent);
+        Ok(document
+            .captures
+            .into_iter()
+            .take(recent_start)
+            .filter(|capture| {
+                capture.history_head.is_some() && !keep.contains(&capture.history_head)
+            })
+            .map(|capture| capture.checkpoint_id)
+            .collect())
+    }
+
+    pub fn remove_captures(
+        &self,
+        deleted: &BTreeSet<CheckpointId>,
     ) -> Result<(), RemoteSnapshotMetadataError> {
         self.update(|document| {
             document
                 .captures
-                .retain(|capture| !deleted.contains(&capture.snapshot_id));
+                .retain(|capture| !deleted.contains(&capture.checkpoint_id));
             Ok(())
         })
     }
@@ -391,8 +438,29 @@ mod tests {
         CwdHandle, ResourceId, ResourceRevision, ResourceScope, SessionBindingId,
         SessionWorkspaceBinding, SnapshotRestoreState, WorkspaceCursor,
     };
+    use test_case::test_case;
 
     use super::*;
+
+    const SESSION_START: &str = "session-start";
+    const OPEN_RESTORE_MSG: &str = "an unacknowledged restore may still be unreverted";
+
+    fn head(sequence: u32) -> CaudraId {
+        let mut bytes = [0u8; 16];
+        bytes[12..].copy_from_slice(&sequence.to_be_bytes());
+        CaudraId::from_bytes(bytes)
+    }
+
+    fn checkpoint(snapshot: &str) -> CheckpointId {
+        CheckpointId::new(format!("checkpoint-{snapshot}")).unwrap()
+    }
+
+    fn session_start() -> RemoteSnapshotMetadata {
+        RemoteSnapshotMetadata {
+            history_head: None,
+            ..capture(head(0), SESSION_START)
+        }
+    }
 
     fn store(root: &tempfile::TempDir, generation: u64) -> RemoteSnapshotMetadataStore {
         let session_id = CaudraId::generate();
@@ -425,7 +493,7 @@ mod tests {
     fn capture(head: CaudraId, snapshot: &str) -> RemoteSnapshotMetadata {
         RemoteSnapshotMetadata {
             history_head: Some(head),
-            checkpoint_id: CheckpointId::new(format!("checkpoint-{snapshot}")).unwrap(),
+            checkpoint_id: checkpoint(snapshot),
             snapshot_id: SnapshotId::new(snapshot).unwrap(),
             manifest_revision: ResourceRevision::new("manifest").unwrap(),
             state: SnapshotState::Complete,
@@ -544,15 +612,19 @@ mod tests {
     }
 
     #[test]
-    fn pending_and_unacknowledged_restores_remain_reachable() {
+    fn an_open_restore_holds_retention_until_it_is_acknowledged() {
         let root = tempfile::tempdir().unwrap();
         let store = store(&root, 1);
+        store.record_capture(capture(head(1), "target")).unwrap();
         let record = restore("target");
         let restore_id = record.restore_id.clone();
         store.begin_restore(record).unwrap();
 
-        let referenced = store.referenced_snapshot_ids().unwrap();
-        assert!(referenced.contains(&SnapshotId::new("target").unwrap()));
+        assert_eq!(
+            store.prunable_checkpoints(&[], 0).unwrap(),
+            Vec::new(),
+            "{OPEN_RESTORE_MSG}"
+        );
 
         store
             .update_restore_status(
@@ -560,7 +632,7 @@ mod tests {
                     restore_id: restore_id.clone(),
                     state: SnapshotRestoreState::Completed,
                     target_snapshot_id: SnapshotId::new("target").unwrap(),
-                    pre_restore_snapshot_id: SnapshotId::new("pre-restore").unwrap(),
+                    source_snapshot_id: SnapshotId::new("source").unwrap(),
                     applied_files: 2,
                     total_files: 2,
                     acknowledgement_required: true,
@@ -573,6 +645,78 @@ mod tests {
         assert!(store.pending_restore().unwrap().is_some());
         store.acknowledge_restore(&restore_id, 3).unwrap();
         assert!(store.pending_restore().unwrap().is_none());
+        assert_eq!(
+            store.prunable_checkpoints(&[], 0).unwrap(),
+            vec![checkpoint("target")],
+            "{OPEN_RESTORE_MSG}"
+        );
+    }
+
+    #[test]
+    fn a_refused_restore_is_forgotten_and_holds_nothing() {
+        let root = tempfile::tempdir().unwrap();
+        let store = store(&root, 1);
+        store.record_capture(capture(head(1), "target")).unwrap();
+        let record = restore("target");
+        store.begin_restore(record.clone()).unwrap();
+
+        store.forget_restore(&record.restore_id).unwrap();
+
+        assert_eq!(store.pending_restore().unwrap(), None);
+        assert_eq!(store.restore(&record.restore_id).unwrap(), None);
+        assert_eq!(
+            store.prunable_checkpoints(&[], 0).unwrap(),
+            vec![checkpoint("target")],
+            "{OPEN_RESTORE_MSG}"
+        );
+    }
+
+    #[test]
+    fn retention_keeps_the_session_start_the_named_heads_and_the_newest_captures() {
+        let root = tempfile::tempdir().unwrap();
+        let store = store(&root, 1);
+        store.record_capture(session_start()).unwrap();
+        for sequence in 1..=5 {
+            store
+                .record_capture(capture(head(sequence), &format!("s{sequence}")))
+                .unwrap();
+        }
+
+        let prunable = store.prunable_checkpoints(&[Some(head(2))], 2).unwrap();
+        assert_eq!(prunable, vec![checkpoint("s1"), checkpoint("s3")]);
+
+        store
+            .remove_captures(&prunable.into_iter().collect())
+            .unwrap();
+        assert_eq!(store.capture(Some(head(1))).unwrap(), None);
+        assert_eq!(
+            store.capture(Some(head(2))).unwrap(),
+            Some(capture(head(2), "s2"))
+        );
+        assert_eq!(store.capture(None).unwrap(), Some(session_start()));
+    }
+
+    #[test_case(&[2, 1], "second" ; "the_head_itself")]
+    #[test_case(&[3, 2, 1], "second" ; "the_nearest_captured_ancestor")]
+    #[test_case(&[4, 1], "first" ; "past_a_corrupt_capture")]
+    #[test_case(&[5], SESSION_START ; "the_session_start_when_no_ancestor_is_captured")]
+    fn a_restore_falls_back_to_the_nearest_captured_ancestor(chain: &[u32], expected: &str) {
+        let root = tempfile::tempdir().unwrap();
+        let store = store(&root, 1);
+        store.record_capture(session_start()).unwrap();
+        store.record_capture(capture(head(1), "first")).unwrap();
+        store.record_capture(capture(head(2), "second")).unwrap();
+        store
+            .record_capture(RemoteSnapshotMetadata {
+                state: SnapshotState::Corrupt,
+                ..capture(head(4), "corrupt")
+            })
+            .unwrap();
+        let chain = chain.iter().copied().map(head).collect::<Vec<_>>();
+
+        let nearest = store.nearest_capture(&chain).unwrap().unwrap();
+
+        assert_eq!(nearest.snapshot_id.as_str(), expected);
     }
 
     #[test]

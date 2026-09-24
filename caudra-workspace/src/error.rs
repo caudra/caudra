@@ -46,6 +46,22 @@ pub enum WorkspaceError {
     PolicyDenied,
     #[error("workspace operation conflicts with current state")]
     Conflict,
+    #[error("workspace authority is busy with another operation")]
+    Busy,
+    /// A ceiling the request would pass, which no retry of the same request fixes.
+    #[error("{}", exceeded("limit", "was exceeded", .limit, .maximum))]
+    LimitExceeded {
+        limit: Option<String>,
+        maximum: Option<u64>,
+    },
+    /// Storage the authority keeps is full until something in it is released.
+    #[error("{}", exceeded("quota", "is exhausted", .limit, .maximum))]
+    QuotaExceeded {
+        limit: Option<String>,
+        maximum: Option<u64>,
+    },
+    #[error("workspace entry is not a plain file, directory or symlink the authority supports")]
+    UnsupportedEntry,
     #[error("transfer content does not match its expected digest or size")]
     TransferIntegrity,
     #[error("transfer staging or I/O quota is exhausted")]
@@ -69,4 +85,29 @@ pub enum WorkspaceError {
     Refused { code: i64, symbolic: String },
     #[error("workspace transport failed: {kind:?}")]
     Transport { kind: TransportErrorKind },
+}
+
+/// Names the limit when the authority said which, and its maximum when it has one.
+fn exceeded(kind: &str, verb: &str, limit: &Option<String>, maximum: &Option<u64>) -> String {
+    match (limit, maximum) {
+        (Some(limit), Some(maximum)) => format!("the workspace {limit} {kind} of {maximum} {verb}"),
+        (Some(limit), None) => format!("the workspace {limit} {kind} {verb}"),
+        (None, _) => format!("a workspace {kind} {verb}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use test_case::test_case;
+
+    use super::WorkspaceError;
+
+    #[test_case(WorkspaceError::LimitExceeded { limit: Some("files".into()), maximum: Some(1) }, "the workspace files limit of 1 was exceeded" ; "limit_with_maximum")]
+    #[test_case(WorkspaceError::LimitExceeded { limit: Some("ignoreRules".into()), maximum: None }, "the workspace ignoreRules limit was exceeded" ; "limit_without_maximum")]
+    #[test_case(WorkspaceError::LimitExceeded { limit: None, maximum: None }, "a workspace limit was exceeded" ; "unnamed_limit")]
+    #[test_case(WorkspaceError::QuotaExceeded { limit: Some("storageBytes".into()), maximum: Some(2) }, "the workspace storageBytes quota of 2 is exhausted" ; "quota_with_maximum")]
+    #[test_case(WorkspaceError::QuotaExceeded { limit: None, maximum: None }, "a workspace quota is exhausted" ; "unnamed_quota")]
+    fn a_refused_ceiling_names_itself_and_its_maximum(error: WorkspaceError, expected: &str) {
+        assert_eq!(error.to_string(), expected);
+    }
 }

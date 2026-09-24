@@ -28,7 +28,7 @@ use caudra_agent::{
     AgentConfig, AgentEvent, AgentInput, AgentMode, DoneReason, Envelope, History,
     PermissionsConfig, StoredSession,
 };
-use caudra_config::ModelPolicy;
+use caudra_config::{ModelPolicy, SnapshotsConfig};
 use caudra_providers::model::Model;
 use caudra_providers::{
     Billing, HistoryItem, HistoryItemKind, ImageSource, StopReason, ThinkingConfig, Timeouts,
@@ -612,6 +612,7 @@ pub struct SdkParams {
     pub model: Model,
     pub config: AgentConfig,
     pub permissions_config: PermissionsConfig,
+    pub snapshots: SnapshotsConfig,
     pub timeouts: Timeouts,
     pub prompt_slots: ResolvedSlots,
     pub prompt_profiles: Arc<PromptProfileCatalog>,
@@ -668,6 +669,7 @@ pub fn run(params: SdkParams) -> Result<()> {
         model,
         mut config,
         permissions_config,
+        snapshots,
         timeouts,
         prompt_slots,
         prompt_profiles,
@@ -821,6 +823,7 @@ pub fn run(params: SdkParams) -> Result<()> {
         model,
         config,
         permissions_config,
+        snapshots,
         timeouts,
         prompt_slots: Arc::new(prompt_slots),
         thinking: thinking.clone(),

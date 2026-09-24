@@ -31,19 +31,21 @@ use caudra_workspace::{
     ScmMutationPreview, ScmMutationResult, ScmReadSidePage, ScmReadSideRequest, ScmRepository,
     ScmRepositoryRevisions, ScmRevision, ScmSide, ScmStatusEntry, ScmStatusPage, ScmStatusRequest,
     SearchHit, SearchPage, SearchRequest, SearchScanCounts, SequenceMetadata, SessionBindingId,
-    SessionWorkspaceBinding, SnapshotCaptureRequest, SnapshotCaptureResult, SnapshotChange,
-    SnapshotChangeKind, SnapshotCleanupPreview, SnapshotCleanupResult, SnapshotFile, SnapshotId,
-    SnapshotInspectPage, SnapshotInspectRequest, SnapshotOperationPreview, SnapshotOperationResult,
-    SnapshotRestorePreview, SnapshotRestoreState, SnapshotRestoreStatus, SnapshotState,
-    SnapshotSummary, SnapshotUnrevertPreview, SourceTrustAnchor, TextContent, ToolPrepareRequest,
-    WatchCloseResult, WatchCursor, WatchEventPage, WatchOpenRequest, WatchPollRequest,
-    WatchPollState, WatchResyncReason, WatchSubscription, WatchSubscriptionId,
-    WorkspaceAssetService, WorkspaceCapabilities, WorkspaceCapability, WorkspaceControlCommand,
-    WorkspaceControlService, WorkspaceCursor, WorkspaceError, WorkspaceEvent, WorkspaceEventKind,
-    WorkspaceExecService, WorkspaceHandle, WorkspaceMutationService, WorkspacePath,
-    WorkspaceReadService, WorkspaceResource, WorkspaceScmMutationService, WorkspaceScmReadService,
-    WorkspaceSearchService, WorkspaceServices, WorkspaceSnapshotMutationService,
-    WorkspaceSnapshotReadService, WorkspaceToolService, WorkspaceWatchService, WriteContent,
+    SessionWorkspaceBinding, SnapshotCaptureLimits, SnapshotCaptureRequest, SnapshotCaptureResult,
+    SnapshotChange, SnapshotChangeCounts, SnapshotChangeKind, SnapshotCleanupPreview,
+    SnapshotCleanupResult, SnapshotEntryKind, SnapshotFile, SnapshotId, SnapshotInspectPage,
+    SnapshotInspectRequest, SnapshotOperationPreview, SnapshotOperationResult,
+    SnapshotRestorePreview, SnapshotRestoreState, SnapshotRestoreStatus, SnapshotSkipReason,
+    SnapshotSkipped, SnapshotSkippedEntry, SnapshotState, SnapshotSummary, SnapshotUnrevertPreview,
+    SourceTrustAnchor, TextContent, ToolPrepareRequest, WatchCloseResult, WatchCursor,
+    WatchEventPage, WatchOpenRequest, WatchPollRequest, WatchPollState, WatchResyncReason,
+    WatchSubscription, WatchSubscriptionId, WorkspaceAssetService, WorkspaceCapabilities,
+    WorkspaceCapability, WorkspaceControlCommand, WorkspaceControlService, WorkspaceCursor,
+    WorkspaceError, WorkspaceEvent, WorkspaceEventKind, WorkspaceExecService, WorkspaceHandle,
+    WorkspaceMutationService, WorkspacePath, WorkspaceReadService, WorkspaceResource,
+    WorkspaceScmMutationService, WorkspaceScmReadService, WorkspaceSearchService,
+    WorkspaceServices, WorkspaceSnapshotMutationService, WorkspaceSnapshotReadService,
+    WorkspaceToolService, WorkspaceWatchService, WriteContent,
 };
 use caudra_workspace::{PreparedTransferPublication, WorkspaceTransferService};
 use event_listener::{Event, EventListener};
@@ -78,6 +80,9 @@ const CONNECTION_DISCONNECTED: u8 = 1;
 const CONNECTION_RECONNECTING: u8 = 2;
 const RESOURCE_NAMESPACE_VERSION: &str = "v1";
 const NO_SYMBOLIC_REASON: &str = "<none>";
+/// A limit name travels into user-facing text, so anything longer or not a
+/// plain identifier is host prose and stays at the transport boundary.
+const MAX_LIMIT_NAME_BYTES: usize = 32;
 /// The host's token for a resource that changed after it was prepared. On a
 /// failed file mutation it also means nothing was published.
 pub(crate) const STALE_RESOURCE_CODE: &str = "stale_resource";
@@ -184,12 +189,26 @@ pub enum RemoteWorkcellError {
     StaleCursor,
     #[error("remote Workcell operation conflicts with current state")]
     Conflict,
+    #[error("remote Workcell is busy with another operation")]
+    Busy,
     #[error("remote Workcell operation was denied by policy")]
     PolicyDenied,
     #[error("remote Workcell binding does not match the requested authority")]
     BindingMismatch,
-    #[error("remote Workcell quota is exhausted")]
-    QuotaExceeded,
+    #[error("remote Workcell {} limit was exceeded", .limit.as_deref().unwrap_or("request"))]
+    LimitExceeded {
+        limit: Option<String>,
+        maximum: Option<u64>,
+    },
+    /// Snapshot refusals name their limit. The operation ledger's is the one
+    /// quota that arrives unnamed.
+    #[error("remote Workcell {} quota is exhausted", .limit.as_deref().unwrap_or("operation"))]
+    QuotaExceeded {
+        limit: Option<String>,
+        maximum: Option<u64>,
+    },
+    #[error("remote Workcell entry is not a plain file, directory or symlink")]
+    UnsupportedEntry,
     #[error("remote transfer digest or size does not match")]
     TransferIntegrity,
     #[error("remote transfer quota is exhausted")]
@@ -263,9 +282,16 @@ impl From<RemoteWorkcellError> for WorkspaceError {
             RemoteWorkcellError::StaleResource => Self::StaleCursor,
             RemoteWorkcellError::StaleCursor => Self::StaleCursor,
             RemoteWorkcellError::Conflict => Self::Conflict,
+            RemoteWorkcellError::Busy => Self::Busy,
             RemoteWorkcellError::PolicyDenied => Self::PolicyDenied,
             RemoteWorkcellError::BindingMismatch => Self::IdentityMismatch,
-            RemoteWorkcellError::QuotaExceeded => Self::Conflict,
+            RemoteWorkcellError::LimitExceeded { limit, maximum } => {
+                Self::LimitExceeded { limit, maximum }
+            }
+            RemoteWorkcellError::QuotaExceeded { limit, maximum } => {
+                Self::QuotaExceeded { limit, maximum }
+            }
+            RemoteWorkcellError::UnsupportedEntry => Self::UnsupportedEntry,
             RemoteWorkcellError::TransferIntegrity => Self::TransferIntegrity,
             RemoteWorkcellError::TransferQuota => Self::TransferQuota,
             RemoteWorkcellError::Indeterminate => Self::IndeterminateOutcome,
@@ -2345,17 +2371,14 @@ impl RemoteWorkcellClient {
         })
     }
 
-    fn bind_snapshot_request(
-        &self,
-        binding: &SessionWorkspaceBinding,
-        cursor: &WorkspaceCursor,
-    ) -> Result<contract::WorkspaceRequestBinding, WorkspaceError> {
-        self.validate_context(binding, cursor)?;
-        let host = self.host_binding();
-        Ok(contract::WorkspaceRequestBinding {
-            cwd_handle: host.cwd_handle.clone(),
-            host,
-        })
+    fn snapshot_limits(&self) -> Result<&contract::WorkspaceSnapshotLimits, WorkspaceError> {
+        self.0
+            .descriptor
+            .capabilities
+            .snapshots
+            .as_ref()
+            .map(|snapshots| &snapshots.limits)
+            .ok_or_else(invalid_response)
     }
 
     fn expected_response_path(
@@ -4650,30 +4673,22 @@ impl WorkspaceSnapshotReadService for RemoteWorkcellClient {
         if request.label.is_some() {
             self.require_capability(WorkspaceCapability::SnapshotCaptureLabels)?;
         }
+        let limits = self.snapshot_limits()?;
         let response: contract::SnapshotCaptureResponse = self
             .call(
                 contract::SNAPSHOT_CAPTURE_METHOD,
                 &contract::SnapshotCaptureRequest {
                     version: contract::ContractVersion::V1,
-                    binding: self.bind_snapshot_request(binding, cursor)?,
+                    binding: self.bind_workspace_request(binding, cursor)?,
                     checkpoint_id: contract_identifier(&request.checkpoint_id)?,
+                    limits: capture_limits(&request.limits, limits),
                 },
                 &self.0.cancellation.child_token(),
             )
             .await?;
         validate_v1(response.version)?;
         let mut snapshot = snapshot_summary(&response.snapshot)?;
-        validate_snapshot_summary(
-            &snapshot,
-            &self
-                .0
-                .descriptor
-                .capabilities
-                .snapshots
-                .as_ref()
-                .ok_or_else(invalid_response)?
-                .limits,
-        )?;
+        validate_snapshot_summary(&snapshot, limits)?;
         if snapshot.checkpoint_id.as_ref() != Some(&request.checkpoint_id) {
             return Err(invalid_response());
         }
@@ -4691,21 +4706,14 @@ impl WorkspaceSnapshotReadService for RemoteWorkcellClient {
         request: &SnapshotInspectRequest,
     ) -> Result<SnapshotInspectPage, WorkspaceError> {
         self.require_capability(WorkspaceCapability::SnapshotInspect)?;
-        let limits = &self
-            .0
-            .descriptor
-            .capabilities
-            .snapshots
-            .as_ref()
-            .ok_or_else(invalid_response)?
-            .limits;
+        let limits = self.snapshot_limits()?;
         require_nonzero_within(request.page_size, limits.max_files)?;
         let response: contract::SnapshotInspectResponse = self
             .call(
                 contract::SNAPSHOT_INSPECT_METHOD,
                 &contract::SnapshotInspectRequest {
                     version: contract::ContractVersion::V1,
-                    binding: self.bind_snapshot_request(binding, cursor)?,
+                    binding: self.bind_workspace_request(binding, cursor)?,
                     snapshot_id: contract_identifier(&request.snapshot_id)?,
                     page_size: request.page_size,
                     cursor: request
@@ -4763,7 +4771,7 @@ impl WorkspaceSnapshotReadService for RemoteWorkcellClient {
                 contract::SNAPSHOT_STATUS_METHOD,
                 &contract::SnapshotStatusRequest {
                     version: contract::ContractVersion::V1,
-                    binding: self.bind_snapshot_request(binding, cursor)?,
+                    binding: self.bind_workspace_request(binding, cursor)?,
                     restore_id: contract_identifier(restore_id)?,
                 },
                 &self.0.cancellation.child_token(),
@@ -4780,11 +4788,17 @@ impl WorkspaceSnapshotReadService for RemoteWorkcellClient {
 
 #[async_trait]
 impl WorkspaceSnapshotMutationService for RemoteWorkcellClient {
+    fn max_cleanup_checkpoints(&self) -> usize {
+        self.snapshot_limits()
+            .map_or(0, |limits| limits.max_cleanup_checkpoints as usize)
+    }
+
     async fn prepare_restore(
         &self,
         binding: &SessionWorkspaceBinding,
         cursor: &WorkspaceCursor,
-        snapshot_id: &SnapshotId,
+        target: &SnapshotId,
+        source: &SnapshotId,
     ) -> Result<PreparedSnapshotOperation, WorkspaceError> {
         self.require_capability(WorkspaceCapability::SnapshotPrepareRestore)?;
         let _permit = self.reserve_preparation().await?;
@@ -4793,15 +4807,16 @@ impl WorkspaceSnapshotMutationService for RemoteWorkcellClient {
                 contract::SNAPSHOT_PREPARE_RESTORE_METHOD,
                 &contract::SnapshotPrepareRestoreRequest {
                     version: contract::ContractVersion::V1,
-                    binding: self.bind_snapshot_request(binding, cursor)?,
-                    snapshot_id: contract_identifier(snapshot_id)?,
+                    binding: self.bind_workspace_request(binding, cursor)?,
+                    snapshot_id: contract_identifier(target)?,
+                    source_snapshot_id: contract_identifier(source)?,
                 },
                 &self.0.cancellation.child_token(),
             )
             .await?;
         validate_v1(response.version)?;
         let preview = snapshot_restore_preview(&response.preview)?;
-        if &preview.target_snapshot_id != snapshot_id {
+        if &preview.target_snapshot_id != target || &preview.source_snapshot_id != source {
             return Err(WorkspaceError::IdentityMismatch);
         }
         validate_fixed_contract(
@@ -4835,7 +4850,7 @@ impl WorkspaceSnapshotMutationService for RemoteWorkcellClient {
                 contract::SNAPSHOT_PREPARE_UNREVERT_METHOD,
                 &contract::SnapshotPrepareUnrevertRequest {
                     version: contract::ContractVersion::V1,
-                    binding: self.bind_snapshot_request(binding, cursor)?,
+                    binding: self.bind_workspace_request(binding, cursor)?,
                     restore_id: contract_identifier(restore_id)?,
                 },
                 &self.0.cancellation.child_token(),
@@ -4867,19 +4882,10 @@ impl WorkspaceSnapshotMutationService for RemoteWorkcellClient {
         &self,
         binding: &SessionWorkspaceBinding,
         cursor: &WorkspaceCursor,
-        snapshot_ids: &[SnapshotId],
+        checkpoint_ids: &[CheckpointId],
     ) -> Result<PreparedSnapshotOperation, WorkspaceError> {
         self.require_capability(WorkspaceCapability::SnapshotPrepareCleanup)?;
-        let limit = self
-            .0
-            .descriptor
-            .capabilities
-            .snapshots
-            .as_ref()
-            .ok_or_else(invalid_response)?
-            .limits
-            .max_cleanup_snapshots as usize;
-        if snapshot_ids.is_empty() || snapshot_ids.len() > limit {
+        if checkpoint_ids.is_empty() || checkpoint_ids.len() > self.max_cleanup_checkpoints() {
             return Err(invalid_response());
         }
         let _permit = self.reserve_preparation().await?;
@@ -4888,8 +4894,8 @@ impl WorkspaceSnapshotMutationService for RemoteWorkcellClient {
                 contract::SNAPSHOT_PREPARE_CLEANUP_METHOD,
                 &contract::SnapshotPrepareCleanupRequest {
                     version: contract::ContractVersion::V1,
-                    binding: self.bind_snapshot_request(binding, cursor)?,
-                    snapshot_ids: snapshot_ids
+                    binding: self.bind_workspace_request(binding, cursor)?,
+                    checkpoint_ids: checkpoint_ids
                         .iter()
                         .map(contract_identifier)
                         .collect::<Result<_, _>>()?,
@@ -4899,7 +4905,7 @@ impl WorkspaceSnapshotMutationService for RemoteWorkcellClient {
             .await?;
         validate_v1(response.version)?;
         let preview = snapshot_cleanup_preview(&response.preview)?;
-        if !cleanup_preview_partitions(snapshot_ids, &preview) {
+        if !cleanup_preview_partitions(checkpoint_ids, &preview) {
             return Err(WorkspaceError::IdentityMismatch);
         }
         validate_fixed_contract(
@@ -4967,7 +4973,7 @@ impl WorkspaceSnapshotMutationService for RemoteWorkcellClient {
                 contract::SNAPSHOT_ACKNOWLEDGE_METHOD,
                 &contract::SnapshotAcknowledgeRequest {
                     version: contract::ContractVersion::V1,
-                    binding: self.bind_snapshot_request(binding, cursor)?,
+                    binding: self.bind_workspace_request(binding, cursor)?,
                     restore_id: contract_identifier(restore_id)?,
                 },
                 &self.0.cancellation.child_token(),
@@ -5169,11 +5175,17 @@ fn map_rpc_error(error: &JsonRpcError) -> RemoteWorkcellError {
         | Some("running")
         | Some("workspace_changed")
         | Some("repository_locked")
-        | Some("busy")
         | Some("acknowledgement_required") => RemoteWorkcellError::Conflict,
-        Some("quota_exceeded") | Some("resource_limit") | Some("limit_exceeded") => {
-            RemoteWorkcellError::QuotaExceeded
+        Some("busy") => RemoteWorkcellError::Busy,
+        Some("quota_exceeded") => {
+            let (limit, maximum) = exceeded_limit(error.data.as_ref());
+            RemoteWorkcellError::QuotaExceeded { limit, maximum }
         }
+        Some("limit_exceeded") | Some("resource_limit") => {
+            let (limit, maximum) = exceeded_limit(error.data.as_ref());
+            RemoteWorkcellError::LimitExceeded { limit, maximum }
+        }
+        Some("unsupported_file") => RemoteWorkcellError::UnsupportedEntry,
         Some("policy_denied") => RemoteWorkcellError::PolicyDenied,
         Some("indeterminate") => RemoteWorkcellError::Indeterminate,
         Some("cancelled") => RemoteWorkcellError::Cancelled,
@@ -5196,6 +5208,21 @@ fn map_rpc_error(error: &JsonRpcError) -> RemoteWorkcellError {
             }
         }
     }
+}
+
+fn exceeded_limit(data: Option<&Value>) -> (Option<String>, Option<u64>) {
+    let limit = data
+        .and_then(|data| data.get("limit"))
+        .and_then(Value::as_str)
+        .filter(|limit| {
+            (1..=MAX_LIMIT_NAME_BYTES).contains(&limit.len())
+                && limit.bytes().all(|byte| byte.is_ascii_alphanumeric())
+        })
+        .map(str::to_owned);
+    let maximum = data
+        .and_then(|data| data.get("maximum"))
+        .and_then(Value::as_u64);
+    (limit, maximum)
 }
 
 fn parse_descriptor(
@@ -5442,8 +5469,8 @@ fn validate_capabilities(
             || limits.max_storage_bytes == 0
             || limits.max_storage_bytes > contract::MAX_SNAPSHOT_STORAGE_BYTES
             || limits.max_concurrent_captures == 0
-            || limits.max_cleanup_snapshots == 0
-            || limits.max_cleanup_snapshots > contract::MAX_SNAPSHOT_CLEANUP as u32
+            || limits.max_cleanup_checkpoints == 0
+            || limits.max_cleanup_checkpoints > contract::MAX_SNAPSHOT_CLEANUP as u32
         {
             return Err(RemoteWorkcellError::CapabilityMismatch);
         }
@@ -5526,8 +5553,7 @@ fn require_full_remote_parity(
         && snapshots.methods.prepare_restore
         && snapshots.methods.prepare_unrevert
         && snapshots.methods.acknowledge
-        && snapshots.methods.prepare_cleanup
-        && snapshots.durable_per_file_journal;
+        && snapshots.methods.prepare_cleanup;
     complete
         .then_some(())
         .ok_or(RemoteWorkcellError::CapabilityMismatch)
@@ -7036,18 +7062,69 @@ fn snapshot_summary(
             contract::SnapshotState::Corrupt => SnapshotState::Corrupt,
         },
         manifest_revision: resource_revision(&summary.manifest_revision)?,
+        scope: workspace_path(&summary.scope)?,
         file_count: summary.file_count,
         total_bytes: summary.total_bytes,
+        skipped: snapshot_skipped(&summary.skipped),
         created_at_unix_ms: summary.created_at_unix_ms,
     })
+}
+
+fn snapshot_skipped(skipped: &contract::SnapshotSkipped) -> SnapshotSkipped {
+    SnapshotSkipped {
+        nested_repositories: skipped.nested_repositories,
+        mounts: skipped.mounts,
+        special_files: skipped.special_files,
+        oversized_files: skipped.oversized_files,
+        unreadable_entries: skipped.unreadable_entries,
+        unstable_files: skipped.unstable_files,
+        unrepresentable_names: skipped.unrepresentable_names,
+        samples: skipped
+            .samples
+            .iter()
+            .map(|sample| SnapshotSkippedEntry {
+                path: sample.path.as_str().to_owned(),
+                reason: match sample.reason {
+                    contract::SnapshotSkipReason::NestedRepository => {
+                        SnapshotSkipReason::NestedRepository
+                    }
+                    contract::SnapshotSkipReason::Mount => SnapshotSkipReason::Mount,
+                    contract::SnapshotSkipReason::Special => SnapshotSkipReason::Special,
+                    contract::SnapshotSkipReason::Oversized => SnapshotSkipReason::Oversized,
+                    contract::SnapshotSkipReason::Unreadable => SnapshotSkipReason::Unreadable,
+                    contract::SnapshotSkipReason::Unstable => SnapshotSkipReason::Unstable,
+                    contract::SnapshotSkipReason::Unrepresentable => {
+                        SnapshotSkipReason::Unrepresentable
+                    }
+                },
+            })
+            .collect(),
+    }
+}
+
+/// A caller's ceilings, clamped to the host's. The host refuses a zero ceiling
+/// as malformed, so the smallest a caller gets is one.
+fn capture_limits(
+    requested: &SnapshotCaptureLimits,
+    host: &contract::WorkspaceSnapshotLimits,
+) -> contract::SnapshotCaptureLimits {
+    contract::SnapshotCaptureLimits {
+        max_files: u32::try_from(requested.max_files)
+            .unwrap_or(u32::MAX)
+            .clamp(1, host.max_files),
+        max_file_bytes: requested.max_file_bytes.clamp(1, host.max_file_bytes),
+        max_total_bytes: requested.max_total_bytes.clamp(1, host.max_total_bytes),
+    }
 }
 
 fn snapshot_file(file: &contract::SnapshotFile) -> Result<SnapshotFile, WorkspaceError> {
     Ok(SnapshotFile {
         path: workspace_path(&file.path)?,
         resource_id: resource_id(&file.resource_id)?,
-        identity: resource_revision(&file.identity)?,
-        revision: resource_revision(&file.revision)?,
+        kind: match file.kind {
+            contract::SnapshotEntryKind::File => SnapshotEntryKind::File,
+            contract::SnapshotEntryKind::Symlink => SnapshotEntryKind::Symlink,
+        },
         digest: resource_revision(&file.digest)?,
         mode: file.mode,
         size_bytes: file.size_bytes,
@@ -7073,8 +7150,16 @@ fn snapshot_restore_preview(
         restore_id: RestoreId::new(preview.restore_id.as_str()).map_err(|_| invalid_response())?,
         target_snapshot_id: SnapshotId::new(preview.target_snapshot_id.as_str())
             .map_err(|_| invalid_response())?,
-        current_revision: resource_revision(&preview.current_revision)?,
-        target_revision: resource_revision(&preview.target_revision)?,
+        source_snapshot_id: SnapshotId::new(preview.source_snapshot_id.as_str())
+            .map_err(|_| invalid_response())?,
+        counts: SnapshotChangeCounts {
+            create: preview.counts.create,
+            replace: preview.counts.replace,
+            delete: preview.counts.delete,
+            conflict: preview.counts.conflict,
+            unchanged: preview.counts.unchanged,
+            created_directories: preview.counts.created_directories,
+        },
         changes: preview
             .changes
             .iter()
@@ -7109,38 +7194,42 @@ fn snapshot_restore_preview(
     })
 }
 
+fn checkpoint_ids(ids: &[contract::Identifier]) -> Result<Vec<CheckpointId>, WorkspaceError> {
+    ids.iter()
+        .map(|id| CheckpointId::new(id.as_str()).map_err(|_| invalid_response()))
+        .collect()
+}
+
 fn snapshot_cleanup_preview(
     preview: &contract::SnapshotCleanupPreview,
 ) -> Result<SnapshotCleanupPreview, WorkspaceError> {
     Ok(SnapshotCleanupPreview {
-        snapshot_ids: preview
-            .snapshot_ids
-            .iter()
-            .map(|id| SnapshotId::new(id.as_str()).map_err(|_| invalid_response()))
-            .collect::<Result<_, _>>()?,
-        retained_snapshot_ids: preview
-            .retained_snapshot_ids
-            .iter()
-            .map(|id| SnapshotId::new(id.as_str()).map_err(|_| invalid_response()))
-            .collect::<Result<_, _>>()?,
+        checkpoint_ids: checkpoint_ids(&preview.checkpoint_ids)?,
+        missing_checkpoint_ids: checkpoint_ids(&preview.missing_checkpoint_ids)?,
         reclaimable_bytes: preview.reclaimable_bytes,
     })
 }
 
-fn cleanup_preview_partitions(requested: &[SnapshotId], preview: &SnapshotCleanupPreview) -> bool {
+/// Every requested checkpoint is either deleted or already gone, and nothing else is named.
+fn cleanup_preview_partitions(
+    requested: &[CheckpointId],
+    preview: &SnapshotCleanupPreview,
+) -> bool {
     let requested_len = requested.len();
     let requested = requested.iter().collect::<HashSet<_>>();
-    let deletable = preview.snapshot_ids.iter().collect::<HashSet<_>>();
-    let retained = preview.retained_snapshot_ids.iter().collect::<HashSet<_>>();
+    let deletable = preview.checkpoint_ids.iter().collect::<HashSet<_>>();
+    let missing = preview
+        .missing_checkpoint_ids
+        .iter()
+        .collect::<HashSet<_>>();
     requested.len() == requested_len
-        && requested.len() == preview.snapshot_ids.len() + preview.retained_snapshot_ids.len()
-        && deletable.len() == preview.snapshot_ids.len()
-        && retained.len() == preview.retained_snapshot_ids.len()
-        && deletable.is_disjoint(&retained)
-        && deletable.union(&retained).copied().collect::<HashSet<_>>() == requested
+        && requested.len() == preview.checkpoint_ids.len() + preview.missing_checkpoint_ids.len()
+        && deletable.len() == preview.checkpoint_ids.len()
+        && missing.len() == preview.missing_checkpoint_ids.len()
+        && deletable.union(&missing).copied().collect::<HashSet<_>>() == requested
 }
 
-fn same_unique_ids(left: &[SnapshotId], right: &[SnapshotId]) -> bool {
+fn same_unique_ids(left: &[CheckpointId], right: &[CheckpointId]) -> bool {
     let left_ids = left.iter().collect::<HashSet<_>>();
     let right_ids = right.iter().collect::<HashSet<_>>();
     left_ids.len() == left.len() && right_ids.len() == right.len() && left_ids == right_ids
@@ -7164,7 +7253,7 @@ fn snapshot_restore_status(
         },
         target_snapshot_id: SnapshotId::new(status.target_snapshot_id.as_str())
             .map_err(|_| invalid_response())?,
-        pre_restore_snapshot_id: SnapshotId::new(status.pre_restore_snapshot_id.as_str())
+        source_snapshot_id: SnapshotId::new(status.source_snapshot_id.as_str())
             .map_err(|_| invalid_response())?,
         applied_files: status.applied_files,
         total_files: status.total_files,
@@ -7188,14 +7277,16 @@ fn parse_snapshot_result(
         (SnapshotOperationPreview::Restore(preview), SnapshotOperationResult::Restore(status)) => {
             preview.restore_id == status.restore_id
                 && preview.target_snapshot_id == status.target_snapshot_id
+                && preview.source_snapshot_id == status.source_snapshot_id
         }
         (SnapshotOperationPreview::Unrevert(preview), SnapshotOperationResult::Restore(status)) => {
             preview.restore.restore_id == status.restore_id
                 && preview.restore.target_snapshot_id == status.target_snapshot_id
+                && preview.restore.source_snapshot_id == status.source_snapshot_id
                 && status.unrevert_of.as_ref() == Some(&preview.source_restore_id)
         }
         (SnapshotOperationPreview::Cleanup(preview), SnapshotOperationResult::Cleanup(result)) => {
-            same_unique_ids(&result.deleted_snapshot_ids, &preview.snapshot_ids)
+            same_unique_ids(&result.deleted_checkpoint_ids, &preview.checkpoint_ids)
         }
         _ => false,
     };
@@ -7219,11 +7310,8 @@ fn parse_snapshot_result_unbound(value: &Value) -> Result<SnapshotOperationResul
         serde_json::from_value(value.clone()).map_err(|_| invalid_response())?;
     validate_v1(response.version)?;
     Ok(SnapshotOperationResult::Cleanup(SnapshotCleanupResult {
-        deleted_snapshot_ids: response
-            .deleted_snapshot_ids
-            .iter()
-            .map(|id| SnapshotId::new(id.as_str()).map_err(|_| invalid_response()))
-            .collect::<Result<_, _>>()?,
+        deleted_checkpoint_ids: checkpoint_ids(&response.deleted_checkpoint_ids)?,
+        deleted_snapshots: response.deleted_snapshots,
         deleted_blobs: response.deleted_blobs,
         reclaimed_bytes: response.reclaimed_bytes,
     }))
@@ -7278,16 +7366,17 @@ mod tests {
     };
     use caudra_storage::workspace_binding::StoredWorkspaceBinding;
     use caudra_workspace::{
-        AuthenticatedPrincipalId, AuthorityIdentity, CwdHandle, OperationHandle, OperationId,
-        OperationState, PreparedToolCall, ProjectAssetKind, ProjectAssetTrust, ProjectIdentity,
-        ProjectKey, ResourceId, ResourceRevision, ResourceScope, ResourceSelector, RestoreId,
-        SessionBindingId, SessionWorkspaceBinding, SnapshotCleanupPreview, SnapshotId,
-        SnapshotOperationPreview, SnapshotRestorePreview, SnapshotUnrevertPreview,
-        SourceTrustAnchor, ToolPrepareRequest, WorkspaceCapability, WorkspaceCursor,
-        WorkspaceError, WorkspacePath, WorkspaceSession,
+        AuthenticatedPrincipalId, AuthorityIdentity, CheckpointId, CwdHandle, OperationHandle,
+        OperationId, OperationState, PreparedToolCall, ProjectAssetKind, ProjectAssetTrust,
+        ProjectIdentity, ProjectKey, ResourceId, ResourceScope, ResourceSelector, RestoreId,
+        SessionBindingId, SessionWorkspaceBinding, SnapshotCaptureLimits, SnapshotChangeCounts,
+        SnapshotCleanupPreview, SnapshotId, SnapshotOperationPreview, SnapshotRestorePreview,
+        SnapshotUnrevertPreview, SourceTrustAnchor, ToolPrepareRequest, WorkspaceCapability,
+        WorkspaceCursor, WorkspaceError, WorkspacePath, WorkspaceSession,
     };
     use workcell::{ToolManifest, host_contract as contract};
 
+    const HOST_SNAPSHOT_CEILING: u64 = 100;
     const PLAINTEXT_BEARER_BOUNDARY: &str =
         "a bearer may ride plaintext only to a numeric loopback literal";
     const TEST_REQUEST_DIGEST: &str =
@@ -7358,8 +7447,11 @@ mod tests {
         assert!(metadata.get("protocolVersion").is_none());
     }
 
+    /// A restore is recovered from its two captures and the live tree, so the
+    /// host needs no per-file journal. It does need to report a restore's
+    /// state, or an interrupted one could never be reconciled.
     #[test]
-    fn full_parity_accepts_bounded_transfers_and_journaled_nonatomic_snapshots() {
+    fn full_parity_accepts_bounded_transfers_and_nonatomic_snapshots_without_a_per_file_journal() {
         let mut capabilities = full_capabilities();
         capabilities
             .reviewed_transfer
@@ -7367,14 +7459,12 @@ mod tests {
             .unwrap()
             .limits
             .max_file_bytes = 64 * 1024 * 1024;
-        capabilities.snapshots.as_mut().unwrap().atomic_across_files = false;
+        let snapshots = capabilities.snapshots.as_mut().unwrap();
+        snapshots.atomic_across_files = false;
+        snapshots.durable_per_file_journal = false;
         validate_capabilities(&capabilities).unwrap();
         require_full_remote_parity(&capabilities).unwrap();
-        capabilities
-            .snapshots
-            .as_mut()
-            .unwrap()
-            .durable_per_file_journal = false;
+        capabilities.snapshots.as_mut().unwrap().methods.status = false;
         assert_eq!(
             require_full_remote_parity(&capabilities),
             Err(RemoteWorkcellError::CapabilityMismatch)
@@ -7460,7 +7550,7 @@ mod tests {
                     "prepareRestore":true,"prepareUnrevert":true,"acknowledge":true,"prepareCleanup":true},
                 "limits":{"maxFiles":1,"maxFileBytes":1,"maxTotalBytes":1,"maxCaptureEntries":1,
                     "maxCapturePathBytes":1,"maxSnapshots":1,"maxStorageBytes":1,
-                    "maxConcurrentCaptures":1,"maxCleanupSnapshots":1},
+                    "maxConcurrentCaptures":1,"maxCleanupCheckpoints":1},
                 "atomicAcrossFiles":true,"durablePerFileJournal":true
             },
             "controlPlane":true,"controlPlaneMissing":[]
@@ -7679,9 +7769,46 @@ mod tests {
                 symbolic: super::NO_SYMBOLIC_REASON.to_owned(),
             }
         );
+    }
+
+    /// A snapshot refusal says which ceiling it reached, and the caller decides
+    /// on that: a full store can be pruned, a workspace over a limit cannot.
+    #[test_case(
+        json!({"code":"limit_exceeded","limit":"files","maximum":1}),
+        WorkspaceError::LimitExceeded { limit: Some("files".into()), maximum: Some(1) }
+        ; "limit_with_maximum"
+    )]
+    #[test_case(
+        json!({"code":"limit_exceeded","limit":"ignoreRules"}),
+        WorkspaceError::LimitExceeded { limit: Some("ignoreRules".into()), maximum: None }
+        ; "limit_without_maximum"
+    )]
+    #[test_case(
+        json!({"code":"quota_exceeded","limit":"storageBytes","maximum":2}),
+        WorkspaceError::QuotaExceeded { limit: Some("storageBytes".into()), maximum: Some(2) }
+        ; "quota_with_maximum"
+    )]
+    #[test_case(
+        json!({"code":"quota_exceeded"}),
+        WorkspaceError::QuotaExceeded { limit: None, maximum: None }
+        ; "ledger_quota"
+    )]
+    #[test_case(
+        json!({"code":"resource_limit"}),
+        WorkspaceError::LimitExceeded { limit: None, maximum: None }
+        ; "operation_intent_limit"
+    )]
+    #[test_case(
+        json!({"code":"limit_exceeded","limit":"the files limit, see /etc/secret","maximum":"many"}),
+        WorkspaceError::LimitExceeded { limit: None, maximum: None }
+        ; "prose_never_travels_as_a_limit_name"
+    )]
+    #[test_case(json!({"code":"busy"}), WorkspaceError::Busy ; "busy")]
+    #[test_case(json!({"code":"unsupported_file"}), WorkspaceError::UnsupportedEntry ; "unsupported_entry")]
+    fn a_refusal_keeps_the_reason_the_host_gave(data: Value, expected: WorkspaceError) {
         assert_eq!(
-            map_rpc_error(&rpc_error(json!({"code":"quota_exceeded"}))),
-            RemoteWorkcellError::QuotaExceeded
+            WorkspaceError::from(map_rpc_error(&rpc_error(data))),
+            expected
         );
     }
 
@@ -9424,11 +9551,11 @@ mod tests {
 
     #[test]
     fn cleanup_preview_is_a_disjoint_duplicate_free_partition() {
-        let first = SnapshotId::new("first").unwrap();
-        let second = SnapshotId::new("second").unwrap();
+        let first = CheckpointId::new("first").unwrap();
+        let second = CheckpointId::new("second").unwrap();
         let preview = SnapshotCleanupPreview {
-            snapshot_ids: vec![second.clone()],
-            retained_snapshot_ids: vec![first.clone()],
+            checkpoint_ids: vec![second.clone()],
+            missing_checkpoint_ids: vec![first.clone()],
             reclaimable_bytes: 1,
         };
         assert!(cleanup_preview_partitions(
@@ -9440,22 +9567,56 @@ mod tests {
             &preview
         ));
         let overlap = SnapshotCleanupPreview {
-            snapshot_ids: vec![first.clone()],
-            retained_snapshot_ids: vec![first.clone()],
+            checkpoint_ids: vec![first.clone()],
+            missing_checkpoint_ids: vec![first.clone()],
             reclaimable_bytes: 1,
         };
         assert!(!cleanup_preview_partitions(&[first, second], &overlap));
         assert!(same_unique_ids(
-            &preview.snapshot_ids,
-            &preview.snapshot_ids
+            &preview.checkpoint_ids,
+            &preview.checkpoint_ids
         ));
         assert!(!same_unique_ids(
             &[
-                preview.snapshot_ids[0].clone(),
-                preview.snapshot_ids[0].clone()
+                preview.checkpoint_ids[0].clone(),
+                preview.checkpoint_ids[0].clone()
             ],
-            &preview.snapshot_ids
+            &preview.checkpoint_ids
         ));
+    }
+
+    #[test_case(0, 1 ; "zero_becomes_the_smallest_ceiling_the_host_accepts")]
+    #[test_case(10, 10 ; "a_lower_ceiling_is_kept")]
+    #[test_case(u64::MAX, HOST_SNAPSHOT_CEILING ; "a_higher_ceiling_is_clamped_to_the_host")]
+    fn capture_limits_are_clamped_to_what_the_host_accepts(requested: u64, expected: u64) {
+        let host = contract::WorkspaceSnapshotLimits {
+            max_files: HOST_SNAPSHOT_CEILING as u32,
+            max_file_bytes: HOST_SNAPSHOT_CEILING,
+            max_total_bytes: HOST_SNAPSHOT_CEILING,
+            max_capture_entries: 1,
+            max_capture_path_bytes: 1,
+            max_snapshots: 1,
+            max_storage_bytes: 1,
+            max_concurrent_captures: 1,
+            max_cleanup_checkpoints: 1,
+        };
+        let limits = super::capture_limits(
+            &SnapshotCaptureLimits {
+                max_files: requested,
+                max_file_bytes: requested,
+                max_total_bytes: requested,
+            },
+            &host,
+        );
+
+        assert_eq!(
+            (
+                u64::from(limits.max_files),
+                limits.max_file_bytes,
+                limits.max_total_bytes
+            ),
+            (expected, expected, expected)
+        );
     }
 
     #[test]
@@ -9465,8 +9626,8 @@ mod tests {
             restore: SnapshotRestorePreview {
                 restore_id: RestoreId::new("new-restore").unwrap(),
                 target_snapshot_id: SnapshotId::new("target").unwrap(),
-                current_revision: ResourceRevision::new("current").unwrap(),
-                target_revision: ResourceRevision::new("target-revision").unwrap(),
+                source_snapshot_id: SnapshotId::new("source").unwrap(),
+                counts: SnapshotChangeCounts::default(),
                 changes: Vec::new(),
                 created_directories: Vec::new(),
             },
@@ -9477,7 +9638,7 @@ mod tests {
                 "restoreId":"new-restore",
                 "state":"completed",
                 "targetSnapshotId":"target",
-                "preRestoreSnapshotId":"pre-restore",
+                "sourceSnapshotId":"source",
                 "appliedFiles":0,
                 "totalFiles":0,
                 "acknowledgementRequired":false,
@@ -9486,9 +9647,12 @@ mod tests {
             }
         });
         assert!(parse_snapshot_result(&response, &preview).is_ok());
-        let mut wrong_source = response;
+        let mut wrong_source = response.clone();
         wrong_source["restore"]["unrevertOf"] = json!("foreign-restore");
         assert!(parse_snapshot_result(&wrong_source, &preview).is_err());
+        let mut wrong_capture = response;
+        wrong_capture["restore"]["sourceSnapshotId"] = json!("foreign-capture");
+        assert!(parse_snapshot_result(&wrong_capture, &preview).is_err());
     }
 
     #[test]

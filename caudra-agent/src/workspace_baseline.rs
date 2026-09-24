@@ -14,6 +14,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use arc_swap::{ArcSwap, ArcSwapOption};
+use caudra_config::SnapshotsConfig;
 use caudra_storage::StateDir;
 use caudra_storage::id::CaudraId;
 use caudra_storage::remote_snapshots::{
@@ -22,36 +23,137 @@ use caudra_storage::remote_snapshots::{
 };
 use caudra_storage::workspace_binding::StoredWorkspaceBinding;
 use caudra_workspace::{
-    CheckpointId, OperationState, PreparedSnapshotOperation, RestoreId, SnapshotChangeKind,
-    SnapshotId, SnapshotOperationPreview, SnapshotOperationResult, SnapshotRestoreState,
-    SnapshotRestoreStatus, SnapshotState, WorkspaceError, WorkspaceSession,
+    CheckpointId, OperationState, PreparedSnapshotOperation, RestoreId, SnapshotCaptureLimits,
+    SnapshotCaptureRequest, SnapshotChangeKind, SnapshotOperationPreview, SnapshotOperationResult,
+    SnapshotRestorePreview, SnapshotRestoreState, SnapshotRestoreStatus, SnapshotState,
+    WorkspaceCapability, WorkspaceError, WorkspacePath, WorkspaceSession,
+    WorkspaceSnapshotMutationService, WorkspaceSnapshotReadService,
 };
 use sha2::{Digest, Sha256};
-use tracing::warn;
+use tracing::{debug, warn};
 
 use crate::snapshots::{SnapshotError, SnapshotStore};
 
 const SNAPSHOTS_DISABLED: &str = "workspace snapshots are off in your configuration";
 const CHECKPOINT_DOMAIN: &[u8] = b"caudra.remote-checkpoint.v1\0";
+/// Captures a remote session keeps besides its session start and current head.
+/// The host's store is shared by every session on the machine, and a capture
+/// stays there as a checkpoint until the session that took it deletes it.
+const REMOTE_RECENT_CHECKPOINTS: usize = 32;
+/// Retention waits for this many prunable checkpoints before it deletes any:
+/// every cleanup walks the host's whole store to collect what nothing names.
+const REMOTE_PRUNE_BATCH: usize = 16;
 
 #[derive(Debug, thiserror::Error)]
 pub enum BaselineError {
     #[error(transparent)]
     Local(#[from] SnapshotError),
-    #[error("remote workspace snapshot service is unavailable")]
+    #[error("remote workspace snapshot failed: {0}")]
     Workspace(#[from] WorkspaceError),
+    /// The host declined this workspace, and asking again gets the same answer.
+    #[error("remote workspace snapshot refused: {0}")]
+    Refused(WorkspaceError),
     #[error(transparent)]
     Metadata(#[from] RemoteSnapshotMetadataError),
     #[error("remote workspace snapshot is corrupt")]
     CorruptSnapshot,
+    #[error("no remote workspace snapshot is available to restore")]
+    NoSnapshot,
     #[error("remote workspace mutation is blocked until snapshot recovery is resolved")]
     RecoveryRequired,
-    #[error("remote workspace restore has conflicts and was not executed")]
-    RestoreConflict,
-    #[error("remote workspace restore failed")]
-    RestoreFailed,
+    #[error(
+        "remote workspace restore was not executed: {}",
+        conflict_summary(*.conflicts, .sample.as_ref())
+    )]
+    RestoreConflict {
+        conflicts: u32,
+        sample: Option<WorkspacePath>,
+    },
+    /// The host refused the restore before it changed anything.
+    #[error("remote workspace restore failed: {message} ({code})")]
+    RestoreFailed { code: String, message: String },
+    #[error("remote workspace restore was cancelled before it changed anything")]
+    RestoreCancelled,
+    #[error("remote workspace snapshot cleanup did not complete")]
+    CleanupIncomplete,
     #[error("remote workspace restore response is inconsistent")]
     InvalidRestore,
+}
+
+impl BaselineError {
+    /// Whether the restore this ended left the workspace as it was, so there is
+    /// nothing to recover or acknowledge.
+    pub fn left_workspace_unchanged(&self) -> bool {
+        matches!(self, Self::RestoreFailed { .. } | Self::RestoreCancelled)
+    }
+}
+
+fn conflict_summary(conflicts: u32, sample: Option<&WorkspacePath>) -> String {
+    let paths = if conflicts == 1 { "path" } else { "paths" };
+    match sample {
+        Some(path) => format!("{conflicts} {paths} changed since last captured, including {path}"),
+        None => format!("{conflicts} {paths} changed since last captured"),
+    }
+}
+
+/// A refusal of the workspace itself turns file revert off; anything else is a
+/// failure that must not let a change through without its revert point.
+fn capture_error(error: WorkspaceError) -> BaselineError {
+    match error {
+        WorkspaceError::LimitExceeded { .. }
+        | WorkspaceError::QuotaExceeded { .. }
+        | WorkspaceError::UnsupportedEntry
+        | WorkspaceError::UnsupportedCapability { .. } => BaselineError::Refused(error),
+        error => BaselineError::Workspace(error),
+    }
+}
+
+/// Refuses to run a restore with conflicts, naming how many and one of them.
+fn reject_conflicts(preview: &SnapshotRestorePreview) -> Result<(), BaselineError> {
+    if preview.counts.conflict == 0 {
+        return Ok(());
+    }
+    Err(BaselineError::RestoreConflict {
+        conflicts: preview.counts.conflict,
+        sample: preview
+            .changes
+            .iter()
+            .find(|change| change.kind == SnapshotChangeKind::Conflict)
+            .map(|change| change.path.clone()),
+    })
+}
+
+/// The same ceilings a local capture observes, which the host lowers to its own.
+fn capture_limits(config: &SnapshotsConfig) -> SnapshotCaptureLimits {
+    SnapshotCaptureLimits {
+        max_files: config.max_files,
+        max_file_bytes: config.max_file_bytes,
+        max_total_bytes: config.max_bytes,
+    }
+}
+
+fn snapshot_reader(
+    workspace: &WorkspaceSession,
+    capability: WorkspaceCapability,
+) -> Result<&dyn WorkspaceSnapshotReadService, WorkspaceError> {
+    workspace
+        .workspace()
+        .services()
+        .snapshot_read
+        .as_deref()
+        .ok_or(WorkspaceError::UnsupportedCapability { capability })
+}
+
+fn snapshot_mutator(
+    workspace: &WorkspaceSession,
+    capability: WorkspaceCapability,
+) -> Result<&dyn WorkspaceSnapshotMutationService, WorkspaceError> {
+    workspace
+        .workspace()
+        .services()
+        .snapshot_mutation
+        .as_deref()
+        .ok_or(WorkspaceError::UnsupportedCapability { capability })
 }
 
 /// What a mutating call learns before it runs.
@@ -62,14 +164,22 @@ pub enum BaselineOutcome {
     /// This workspace will not be snapshotted, and the call may proceed anyway.
     /// A deliberate refusal costs file revert, not the user's work.
     Unavailable(Arc<String>),
-    /// The capture was attempted and did not finish, so there is no revert
-    /// point. The call must not proceed.
+    /// The capture was attempted and did not finish, or a restore still awaits
+    /// recovery. The call must not proceed.
     Failed(BaselineError),
 }
 
 impl BaselineOutcome {
     pub fn is_unavailable(&self) -> bool {
         matches!(self, Self::Unavailable(_))
+    }
+
+    /// Whether the change may go ahead, which only a failure stops.
+    pub fn into_result(self) -> Result<(), BaselineError> {
+        match self {
+            Self::Ready | Self::Unavailable(_) => Ok(()),
+            Self::Failed(error) => Err(error),
+        }
     }
 }
 
@@ -87,21 +197,32 @@ enum BaselineTarget {
 }
 
 impl BaselineTarget {
-    /// Both halves already exist on disk, so there is nothing to capture. Two
-    /// `exists` checks, which is what makes calling this before every mutating
-    /// call affordable.
+    fn remote(
+        storage: StateDir,
+        session_id: CaudraId,
+        workspace: WorkspaceSession,
+        binding: StoredWorkspaceBinding,
+    ) -> Self {
+        Self::WorkspaceSession {
+            workspace,
+            metadata: Box::new(RemoteSnapshotMetadataStore::new(
+                storage, session_id, binding,
+            )),
+        }
+    }
+
+    /// Both halves already exist, so there is nothing to capture. Two `exists`
+    /// checks locally and one state read remotely, which is what makes calling
+    /// this before every mutating call affordable.
     fn is_captured(&self, head: Option<CaudraId>) -> bool {
         match self {
             Self::Local { store, .. } => {
                 store.has_session_start() && head.is_none_or(|head| store.has_checkpoint(head))
             }
             Self::WorkspaceSession { metadata, .. } => {
-                metadata
-                    .pending_restore()
-                    .is_ok_and(|pending| pending.is_none())
-                    && metadata.capture(head).is_ok_and(|capture| {
-                        capture.is_some_and(|capture| capture.state == SnapshotState::Complete)
-                    })
+                metadata.capture(head).is_ok_and(|capture| {
+                    capture.is_some_and(|capture| capture.state == SnapshotState::Complete)
+                })
             }
         }
     }
@@ -122,108 +243,8 @@ impl BaselineTarget {
         Ok(())
     }
 
-    async fn capture_remote(&self, head: Option<CaudraId>) -> Result<(), BaselineError> {
-        let Self::WorkspaceSession {
-            workspace,
-            metadata,
-        } = self
-        else {
-            return Err(BaselineError::InvalidRestore);
-        };
-        Self::acknowledge_completed_before_mutation(workspace, metadata).await?;
-        if head.is_some() && metadata.capture(None)?.is_none() {
-            Self::capture_remote_checkpoint(workspace, metadata, None).await?;
-        }
-        if let Some(capture) = metadata.capture(head)? {
-            return match capture.state {
-                SnapshotState::Complete => Ok(()),
-                SnapshotState::Corrupt => Err(BaselineError::CorruptSnapshot),
-            };
-        }
-        Self::capture_remote_checkpoint(workspace, metadata, head).await
-    }
-
-    async fn capture_remote_checkpoint(
-        workspace: &WorkspaceSession,
-        metadata: &RemoteSnapshotMetadataStore,
-        head: Option<CaudraId>,
-    ) -> Result<(), BaselineError> {
-        let checkpoint_id = remote_checkpoint_id(metadata, head)?;
-        let service = workspace
-            .workspace()
-            .services()
-            .snapshot_read
-            .as_ref()
-            .ok_or(WorkspaceError::Unavailable)?;
-        let result = service
-            .capture(
-                workspace.binding(),
-                workspace.cursor(),
-                &caudra_workspace::SnapshotCaptureRequest {
-                    checkpoint_id: checkpoint_id.clone(),
-                    label: None,
-                },
-            )
-            .await
-            .map_err(BaselineError::Workspace)?;
-        if result.snapshot.checkpoint_id.as_ref() != Some(&checkpoint_id) {
-            return Err(BaselineError::CorruptSnapshot);
-        }
-        let capture = RemoteSnapshotMetadata {
-            history_head: head,
-            checkpoint_id,
-            snapshot_id: result.snapshot.snapshot_id,
-            manifest_revision: result.snapshot.manifest_revision,
-            state: result.snapshot.state,
-            created_at_unix_ms: result.snapshot.created_at_unix_ms,
-        };
-        metadata.record_capture(capture.clone())?;
-        match capture.state {
-            SnapshotState::Complete => Ok(()),
-            SnapshotState::Corrupt => Err(BaselineError::CorruptSnapshot),
-        }
-    }
-
     fn is_remote(&self) -> bool {
         matches!(self, Self::WorkspaceSession { .. })
-    }
-
-    async fn acknowledge_completed_before_mutation(
-        workspace: &WorkspaceSession,
-        metadata: &RemoteSnapshotMetadataStore,
-    ) -> Result<(), BaselineError> {
-        let Some(pending) = metadata.pending_restore()? else {
-            return Ok(());
-        };
-        let status = match pending.status {
-            Some(status) => status,
-            None => {
-                workspace
-                    .workspace()
-                    .services()
-                    .snapshot_read
-                    .as_ref()
-                    .ok_or(WorkspaceError::Unavailable)?
-                    .restore_status(workspace.binding(), workspace.cursor(), &pending.restore_id)
-                    .await?
-            }
-        };
-        if !matches!(status.state, SnapshotRestoreState::Completed)
-            || status.reconciliation_required
-        {
-            return Err(BaselineError::RecoveryRequired);
-        }
-        let acknowledged = workspace
-            .workspace()
-            .services()
-            .snapshot_mutation
-            .as_ref()
-            .ok_or(WorkspaceError::Unavailable)?
-            .acknowledge(workspace.binding(), workspace.cursor(), &pending.restore_id)
-            .await?;
-        metadata.update_restore_status(acknowledged, unix_millis())?;
-        metadata.acknowledge_restore(&pending.restore_id, unix_millis())?;
-        Ok(())
     }
 }
 
@@ -231,7 +252,7 @@ impl BaselineTarget {
 pub struct WorkspaceBaseline {
     /// From configuration, so it never changes for the life of the process and
     /// `rebind` must not clear it.
-    enabled: bool,
+    config: SnapshotsConfig,
     target: ArcSwap<BaselineTarget>,
     /// Single-flights the capture: parallel tool calls and subagents all reach
     /// this, and the second one through must wait rather than start its own.
@@ -244,15 +265,8 @@ pub struct WorkspaceBaseline {
 }
 
 impl WorkspaceBaseline {
-    pub fn new(store: Arc<SnapshotStore>, cwd: PathBuf, enabled: bool) -> Arc<Self> {
-        Arc::new(Self {
-            enabled,
-            target: ArcSwap::from_pointee(BaselineTarget::Local { store, cwd }),
-            gate: async_lock::Mutex::default(),
-            unavailable: ArcSwapOption::empty(),
-            capturing: AtomicBool::new(false),
-            current_head: ArcSwapOption::empty(),
-        })
+    pub fn new(store: Arc<SnapshotStore>, cwd: PathBuf, config: SnapshotsConfig) -> Arc<Self> {
+        Self::with_target(BaselineTarget::Local { store, cwd }, config)
     }
 
     pub fn new_workspace_session(
@@ -260,16 +274,18 @@ impl WorkspaceBaseline {
         session_id: CaudraId,
         workspace: WorkspaceSession,
         binding: StoredWorkspaceBinding,
-        enabled: bool,
+        config: SnapshotsConfig,
     ) -> Arc<Self> {
+        Self::with_target(
+            BaselineTarget::remote(storage, session_id, workspace, binding),
+            config,
+        )
+    }
+
+    fn with_target(target: BaselineTarget, config: SnapshotsConfig) -> Arc<Self> {
         Arc::new(Self {
-            enabled,
-            target: ArcSwap::from_pointee(BaselineTarget::WorkspaceSession {
-                workspace,
-                metadata: Box::new(RemoteSnapshotMetadataStore::new(
-                    storage, session_id, binding,
-                )),
-            }),
+            config,
+            target: ArcSwap::from_pointee(target),
             gate: async_lock::Mutex::default(),
             unavailable: ArcSwapOption::empty(),
             capturing: AtomicBool::new(false),
@@ -292,20 +308,16 @@ impl WorkspaceBaseline {
         workspace: WorkspaceSession,
         binding: StoredWorkspaceBinding,
     ) {
-        self.target
-            .store(Arc::new(BaselineTarget::WorkspaceSession {
-                workspace,
-                metadata: Box::new(RemoteSnapshotMetadataStore::new(
-                    storage, session_id, binding,
-                )),
-            }));
+        self.target.store(Arc::new(BaselineTarget::remote(
+            storage, session_id, workspace, binding,
+        )));
         self.unavailable.store(None);
     }
 
     /// Why this workspace has no file revert, whether by configuration or by
     /// a refusal earned on the tree itself.
     pub fn unavailable_reason(&self) -> Option<Arc<String>> {
-        if !self.enabled {
+        if !self.config.enabled {
             return Some(Arc::new(SNAPSHOTS_DISABLED.to_owned()));
         }
         self.unavailable.load_full()
@@ -350,15 +362,28 @@ impl WorkspaceBaseline {
     /// Holds the gate across the capture, so the call that asked second arrives
     /// after the baseline is on disk rather than alongside it.
     pub async fn ensure(&self, head: Option<CaudraId>) -> BaselineOutcome {
-        if let Some(reason) = self.unavailable_reason() {
+        if !self.is_remote()
+            && let Some(reason) = self.unavailable_reason()
+        {
             return BaselineOutcome::Unavailable(reason);
         }
         let _gate = self.gate.lock().await;
+        let target = self.target.load_full();
+        // A restore awaiting its verdict gates every change whether or not this
+        // workspace can be captured: a change on top of a partial restore would
+        // bury what recovery has to inspect.
+        if let BaselineTarget::WorkspaceSession {
+            workspace,
+            metadata,
+        } = &*target
+            && let Err(error) = acknowledge_completed_before_mutation(workspace, metadata).await
+        {
+            return BaselineOutcome::Failed(error);
+        }
         // Re-read under the gate: whoever held it may have just answered this.
-        if let Some(reason) = self.unavailable.load_full() {
+        if let Some(reason) = self.unavailable_reason() {
             return BaselineOutcome::Unavailable(reason);
         }
-        let target = self.target.load_full();
         if target.is_captured(head) {
             return BaselineOutcome::Ready;
         }
@@ -368,24 +393,32 @@ impl WorkspaceBaseline {
                 let work = Arc::clone(&target);
                 smol::unblock(move || work.capture_local(head)).await
             }
-            BaselineTarget::WorkspaceSession { .. } => target.capture_remote(head).await,
+            BaselineTarget::WorkspaceSession {
+                workspace,
+                metadata,
+            } => capture_remote(workspace, metadata, head, &capture_limits(&self.config)).await,
         };
         self.capturing.store(false, Ordering::Release);
         match result {
             Ok(()) => BaselineOutcome::Ready,
             Err(BaselineError::Local(error)) if error.is_workspace_refusal() => {
-                let cwd = self.cwd();
-                warn!(
-                    cwd = %cwd.display(),
-                    %error,
-                    "workspace refused for snapshots, file revert is off"
-                );
-                let reason = Arc::new(error.to_string());
-                self.unavailable.store(Some(Arc::clone(&reason)));
-                BaselineOutcome::Unavailable(reason)
+                self.refuse(error.to_string())
             }
+            Err(error @ BaselineError::Refused(_)) => self.refuse(error.to_string()),
             Err(error) => BaselineOutcome::Failed(error),
         }
+    }
+
+    fn refuse(&self, reason: String) -> BaselineOutcome {
+        warn!(
+            remote = self.is_remote(),
+            cwd = %self.cwd().display(),
+            %reason,
+            "workspace refused for snapshots, file revert is off"
+        );
+        let reason = Arc::new(reason);
+        self.unavailable.store(Some(Arc::clone(&reason)));
+        BaselineOutcome::Unavailable(reason)
     }
 
     pub fn remote_capture(
@@ -399,9 +432,16 @@ impl WorkspaceBaseline {
         Ok(metadata.capture(head)?)
     }
 
+    /// Prepares a rewind from the capture nearest the head the workspace now
+    /// reflects to the one nearest the target head. Each chain runs from its
+    /// head back through the ancestors, so a head never captured, or pruned
+    /// since, resolves to the closest earlier capture and last to the session
+    /// start. Only paths the two captures disagree on are touched, and any of
+    /// them changed since the first was taken is a conflict.
     pub async fn prepare_remote_restore(
         &self,
-        target_head: Option<CaudraId>,
+        source_chain: &[CaudraId],
+        target_chain: &[CaudraId],
     ) -> Result<PreparedSnapshotOperation, BaselineError> {
         let target = self.target.load_full();
         let BaselineTarget::WorkspaceSession {
@@ -411,40 +451,35 @@ impl WorkspaceBaseline {
         else {
             return Err(BaselineError::InvalidRestore);
         };
-        BaselineTarget::acknowledge_completed_before_mutation(workspace, metadata).await?;
-        let capture = metadata
-            .capture(target_head)?
-            .filter(|capture| capture.state == SnapshotState::Complete)
-            .ok_or(BaselineError::CorruptSnapshot)?;
-        let service = workspace
-            .workspace()
-            .services()
-            .snapshot_mutation
-            .as_ref()
-            .ok_or(WorkspaceError::Unavailable)?;
+        acknowledge_completed_before_mutation(workspace, metadata).await?;
+        let (Some(restore_to), Some(restore_from)) = (
+            metadata.nearest_capture(target_chain)?,
+            metadata.nearest_capture(source_chain)?,
+        ) else {
+            return Err(BaselineError::NoSnapshot);
+        };
+        let service = snapshot_mutator(workspace, WorkspaceCapability::SnapshotPrepareRestore)?;
         let prepared = service
             .prepare_restore(
                 workspace.binding(),
                 workspace.cursor(),
-                &capture.snapshot_id,
+                &restore_to.snapshot_id,
+                &restore_from.snapshot_id,
             )
-            .await
-            .map_err(BaselineError::Workspace)?;
+            .await?;
         let SnapshotOperationPreview::Restore(preview) = &prepared.preview else {
             return Err(BaselineError::InvalidRestore);
         };
-        if preview.target_snapshot_id != capture.snapshot_id {
+        if preview.target_snapshot_id != restore_to.snapshot_id
+            || preview.source_snapshot_id != restore_from.snapshot_id
+        {
             return Err(BaselineError::InvalidRestore);
         }
-        if preview
-            .changes
-            .iter()
-            .any(|change| change.kind == SnapshotChangeKind::Conflict)
-        {
+        if let Err(conflict) = reject_conflicts(preview) {
             let _ = service
                 .release(workspace.binding(), workspace.cursor(), &prepared)
                 .await;
-            return Err(BaselineError::RestoreConflict);
+            return Err(conflict);
         }
         Ok(prepared)
     }
@@ -466,12 +501,7 @@ impl WorkspaceBaseline {
         let BaselineTarget::WorkspaceSession { workspace, .. } = &*target else {
             return Err(BaselineError::InvalidRestore);
         };
-        workspace
-            .workspace()
-            .services()
-            .snapshot_mutation
-            .as_ref()
-            .ok_or(WorkspaceError::Unavailable)?
+        snapshot_mutator(workspace, WorkspaceCapability::SnapshotRelease)?
             .release(workspace.binding(), workspace.cursor(), prepared)
             .await?;
         Ok(())
@@ -498,32 +528,21 @@ impl WorkspaceBaseline {
         {
             return Err(BaselineError::RecoveryRequired);
         }
-        let service = workspace
-            .workspace()
-            .services()
-            .snapshot_mutation
-            .as_ref()
-            .ok_or(WorkspaceError::Unavailable)?;
+        let service = snapshot_mutator(workspace, WorkspaceCapability::SnapshotPrepareUnrevert)?;
         let prepared = service
             .prepare_unrevert(workspace.binding(), workspace.cursor(), restore_id)
-            .await
-            .map_err(BaselineError::Workspace)?;
+            .await?;
         let SnapshotOperationPreview::Unrevert(preview) = &prepared.preview else {
             return Err(BaselineError::InvalidRestore);
         };
         if preview.source_restore_id != *restore_id {
             return Err(BaselineError::InvalidRestore);
         }
-        if preview
-            .restore
-            .changes
-            .iter()
-            .any(|change| change.kind == SnapshotChangeKind::Conflict)
-        {
+        if let Err(conflict) = reject_conflicts(&preview.restore) {
             let _ = service
                 .release(workspace.binding(), workspace.cursor(), &prepared)
                 .await;
-            return Err(BaselineError::RestoreConflict);
+            return Err(conflict);
         }
         Ok(prepared)
     }
@@ -543,6 +562,9 @@ impl WorkspaceBaseline {
         .await
     }
 
+    /// Records the restore before it runs, so an answer lost on the way back
+    /// still leaves something to recover from. A definitive refusal changed
+    /// nothing and is forgotten again.
     async fn execute_prepared_remote_restore(
         &self,
         prepared: PreparedSnapshotOperation,
@@ -576,29 +598,37 @@ impl WorkspaceBaseline {
             created_at_unix_ms: now,
             updated_at_unix_ms: now,
         })?;
-        let service = workspace
-            .workspace()
-            .services()
-            .snapshot_mutation
-            .as_ref()
-            .ok_or(WorkspaceError::Unavailable)?;
-        let result = service
+        let result = snapshot_mutator(workspace, WorkspaceCapability::SnapshotExecute)?
             .execute(workspace.binding(), workspace.cursor(), &prepared)
-            .await
-            .map_err(BaselineError::Workspace)?;
+            .await?;
         let status = match result.state {
             OperationState::Completed {
                 result: SnapshotOperationResult::Restore(status),
                 ..
             } => status,
-            OperationState::Failed { .. } | OperationState::Cancelled { .. } => {
-                return Err(BaselineError::RestoreFailed);
+            OperationState::Failed {
+                error,
+                side_effects_possible: false,
+            } => {
+                metadata.forget_restore(&preview.restore_id)?;
+                return Err(BaselineError::RestoreFailed {
+                    code: error.code.as_str().to_owned(),
+                    message: error.message,
+                });
+            }
+            OperationState::Cancelled {
+                side_effects_possible: false,
+            } => {
+                metadata.forget_restore(&preview.restore_id)?;
+                return Err(BaselineError::RestoreCancelled);
             }
             OperationState::NeverSeen
             | OperationState::Prepared
             | OperationState::Running
             | OperationState::Forgotten
             | OperationState::Indeterminate { .. }
+            | OperationState::Failed { .. }
+            | OperationState::Cancelled { .. }
             | OperationState::Completed {
                 result: SnapshotOperationResult::Cleanup(_),
                 ..
@@ -625,15 +655,11 @@ impl WorkspaceBaseline {
         let BaselineTarget::WorkspaceSession { workspace, .. } = &*target else {
             return Err(BaselineError::InvalidRestore);
         };
-        workspace
-            .workspace()
-            .services()
-            .snapshot_read
-            .as_ref()
-            .ok_or(WorkspaceError::Unavailable)?
-            .restore_status(workspace.binding(), workspace.cursor(), restore_id)
-            .await
-            .map_err(BaselineError::Workspace)
+        Ok(
+            snapshot_reader(workspace, WorkspaceCapability::SnapshotStatus)?
+                .restore_status(workspace.binding(), workspace.cursor(), restore_id)
+                .await?,
+        )
     }
 
     pub async fn reconcile_remote_restore(
@@ -673,15 +699,9 @@ impl WorkspaceBaseline {
         else {
             return Err(BaselineError::InvalidRestore);
         };
-        let status = workspace
-            .workspace()
-            .services()
-            .snapshot_mutation
-            .as_ref()
-            .ok_or(WorkspaceError::Unavailable)?
+        let status = snapshot_mutator(workspace, WorkspaceCapability::SnapshotAcknowledge)?
             .acknowledge(workspace.binding(), workspace.cursor(), restore_id)
-            .await
-            .map_err(BaselineError::Workspace)?;
+            .await?;
         metadata.update_restore_status(status.clone(), unix_millis())?;
         metadata.acknowledge_restore(restore_id, unix_millis())?;
         Ok(status)
@@ -706,78 +726,192 @@ impl WorkspaceBaseline {
         };
         Ok(metadata.pending_restore()?)
     }
+}
 
-    pub async fn cleanup_remote_snapshots(
-        &self,
-        candidates: impl IntoIterator<Item = SnapshotId>,
-    ) -> Result<Vec<SnapshotId>, BaselineError> {
-        let target = self.target.load_full();
-        let BaselineTarget::WorkspaceSession {
-            workspace,
-            metadata,
-        } = &*target
-        else {
-            return Ok(Vec::new());
+/// A completed restore is accepted before the next change, after which it can
+/// no longer be unreverted. Any other open restore stops the change.
+async fn acknowledge_completed_before_mutation(
+    workspace: &WorkspaceSession,
+    metadata: &RemoteSnapshotMetadataStore,
+) -> Result<(), BaselineError> {
+    let Some(pending) = metadata.pending_restore()? else {
+        return Ok(());
+    };
+    let status = match pending.status {
+        Some(status) => status,
+        None => {
+            snapshot_reader(workspace, WorkspaceCapability::SnapshotStatus)?
+                .restore_status(workspace.binding(), workspace.cursor(), &pending.restore_id)
+                .await?
+        }
+    };
+    if status.state != SnapshotRestoreState::Completed || status.reconciliation_required {
+        return Err(BaselineError::RecoveryRequired);
+    }
+    let acknowledged = snapshot_mutator(workspace, WorkspaceCapability::SnapshotAcknowledge)?
+        .acknowledge(workspace.binding(), workspace.cursor(), &pending.restore_id)
+        .await?;
+    metadata.update_restore_status(acknowledged, unix_millis())?;
+    metadata.acknowledge_restore(&pending.restore_id, unix_millis())?;
+    Ok(())
+}
+
+/// The session start comes first: it is what a rewind falls back to when no
+/// head on its way back was captured.
+async fn capture_remote(
+    workspace: &WorkspaceSession,
+    metadata: &RemoteSnapshotMetadataStore,
+    head: Option<CaudraId>,
+    limits: &SnapshotCaptureLimits,
+) -> Result<(), BaselineError> {
+    if head.is_some() && metadata.capture(None)?.is_none() {
+        capture_checkpoint(workspace, metadata, None, limits).await?;
+    }
+    if let Some(capture) = metadata.capture(head)? {
+        return match capture.state {
+            SnapshotState::Complete => Ok(()),
+            SnapshotState::Corrupt => Err(BaselineError::CorruptSnapshot),
         };
-        if metadata.pending_restore()?.is_some() {
-            return Err(BaselineError::RecoveryRequired);
+    }
+    capture_checkpoint(workspace, metadata, head, limits).await
+}
+
+/// A full store first gives up this session's older checkpoints and then gets
+/// one more try: covering the change about to happen is worth more than a
+/// rewind to old work.
+async fn capture_checkpoint(
+    workspace: &WorkspaceSession,
+    metadata: &RemoteSnapshotMetadataStore,
+    head: Option<CaudraId>,
+    limits: &SnapshotCaptureLimits,
+) -> Result<(), BaselineError> {
+    let request = SnapshotCaptureRequest {
+        checkpoint_id: remote_checkpoint_id(metadata, head)?,
+        label: None,
+        limits: limits.clone(),
+    };
+    let service =
+        snapshot_reader(workspace, WorkspaceCapability::SnapshotCapture).map_err(capture_error)?;
+    let mut captured = service
+        .capture(workspace.binding(), workspace.cursor(), &request)
+        .await;
+    if matches!(captured, Err(WorkspaceError::QuotaExceeded { .. }))
+        && make_room(workspace, metadata, head).await
+    {
+        captured = service
+            .capture(workspace.binding(), workspace.cursor(), &request)
+            .await;
+    }
+    let snapshot = captured.map_err(capture_error)?.snapshot;
+    if snapshot.checkpoint_id.as_ref() != Some(&request.checkpoint_id) {
+        return Err(BaselineError::CorruptSnapshot);
+    }
+    debug!(
+        session_start = head.is_none(),
+        files = snapshot.file_count,
+        bytes = snapshot.total_bytes,
+        skipped = snapshot.skipped.total(),
+        nested_repositories = snapshot.skipped.nested_repositories,
+        mounts = snapshot.skipped.mounts,
+        special_files = snapshot.skipped.special_files,
+        oversized_files = snapshot.skipped.oversized_files,
+        unreadable_entries = snapshot.skipped.unreadable_entries,
+        unstable_files = snapshot.skipped.unstable_files,
+        unrepresentable_names = snapshot.skipped.unrepresentable_names,
+        "remote workspace snapshot"
+    );
+    let state = snapshot.state;
+    metadata.record_capture(RemoteSnapshotMetadata {
+        history_head: head,
+        checkpoint_id: request.checkpoint_id,
+        snapshot_id: snapshot.snapshot_id,
+        manifest_revision: snapshot.manifest_revision,
+        state,
+        created_at_unix_ms: snapshot.created_at_unix_ms,
+    })?;
+    match state {
+        SnapshotState::Complete => {}
+        SnapshotState::Corrupt => return Err(BaselineError::CorruptSnapshot),
+    }
+    match prune(
+        workspace,
+        metadata,
+        head,
+        REMOTE_RECENT_CHECKPOINTS,
+        REMOTE_PRUNE_BATCH,
+    )
+    .await
+    {
+        Ok(0) => {}
+        Ok(deleted) => debug!(deleted, "pruned remote workspace checkpoints"),
+        Err(error) => warn!(%error, "remote workspace checkpoint retention failed"),
+    }
+    Ok(())
+}
+
+/// Deletes every checkpoint of this session but the session start and `head`.
+/// Answers whether that freed any, which is what makes another try worth it.
+async fn make_room(
+    workspace: &WorkspaceSession,
+    metadata: &RemoteSnapshotMetadataStore,
+    head: Option<CaudraId>,
+) -> bool {
+    match prune(workspace, metadata, head, 0, 1).await {
+        Ok(deleted) => deleted > 0,
+        Err(error) => {
+            warn!(%error, "could not free room for a remote workspace snapshot");
+            false
         }
-        let referenced = metadata.referenced_snapshot_ids()?;
-        let candidates = candidates
-            .into_iter()
-            .filter(|snapshot| !referenced.contains(snapshot))
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect::<Vec<_>>();
-        if candidates.is_empty() {
-            return Ok(Vec::new());
-        }
-        let service = workspace
-            .workspace()
-            .services()
-            .snapshot_mutation
-            .as_ref()
-            .ok_or(WorkspaceError::Unavailable)?;
+    }
+}
+
+/// Deletes this session's checkpoints nothing needs any more once `batch` of
+/// them have piled up, as many at a time as the host takes. Answers how many
+/// the host no longer holds. A host that takes none keeps everything.
+async fn prune(
+    workspace: &WorkspaceSession,
+    metadata: &RemoteSnapshotMetadataStore,
+    head: Option<CaudraId>,
+    keep_recent: usize,
+    batch: usize,
+) -> Result<usize, BaselineError> {
+    let prunable = metadata.prunable_checkpoints(&[head], keep_recent)?;
+    if prunable.len() < batch {
+        return Ok(0);
+    }
+    let service = snapshot_mutator(workspace, WorkspaceCapability::SnapshotPrepareCleanup)?;
+    let chunk = service.max_cleanup_checkpoints();
+    if chunk == 0 {
+        return Ok(0);
+    }
+    let mut deleted = 0;
+    for checkpoints in prunable.chunks(chunk) {
         let prepared = service
-            .prepare_cleanup(workspace.binding(), workspace.cursor(), &candidates)
+            .prepare_cleanup(workspace.binding(), workspace.cursor(), checkpoints)
             .await?;
         let SnapshotOperationPreview::Cleanup(preview) = &prepared.preview else {
             return Err(BaselineError::InvalidRestore);
         };
-        if preview
-            .retained_snapshot_ids
+        let mut gone = preview
+            .missing_checkpoint_ids
             .iter()
-            .any(|snapshot| referenced.contains(snapshot))
-            || preview
-                .snapshot_ids
-                .iter()
-                .any(|snapshot| referenced.contains(snapshot))
-        {
-            return Err(BaselineError::InvalidRestore);
-        }
+            .cloned()
+            .collect::<BTreeSet<_>>();
         let status = service
             .execute(workspace.binding(), workspace.cursor(), &prepared)
             .await?;
-        let result = match status.state {
-            OperationState::Completed {
-                result: SnapshotOperationResult::Cleanup(result),
-                ..
-            } => result,
-            OperationState::Failed { .. } | OperationState::Cancelled { .. } => {
-                return Err(BaselineError::RestoreFailed);
-            }
-            _ => return Err(BaselineError::RecoveryRequired),
+        let OperationState::Completed {
+            result: SnapshotOperationResult::Cleanup(result),
+            ..
+        } = status.state
+        else {
+            return Err(BaselineError::CleanupIncomplete);
         };
-        let deleted = result
-            .deleted_snapshot_ids
-            .into_iter()
-            .collect::<BTreeSet<_>>();
-        if deleted.iter().any(|snapshot| referenced.contains(snapshot)) {
-            return Err(BaselineError::InvalidRestore);
-        }
-        metadata.remove_deleted_snapshots(&deleted)?;
-        Ok(deleted.into_iter().collect())
+        gone.extend(result.deleted_checkpoint_ids);
+        metadata.remove_captures(&gone)?;
+        deleted += gone.len();
     }
+    Ok(deleted)
 }
 
 fn remote_checkpoint_id(
@@ -828,33 +962,27 @@ impl BaselineGate {
     pub async fn ensure(&self) -> BaselineOutcome {
         self.baseline.ensure(self.head).await
     }
-
-    pub fn is_remote(&self) -> bool {
-        self.baseline.is_remote()
-    }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::{HashMap, VecDeque};
     use std::fs;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use async_trait::async_trait;
     use caudra_workspace::{
-        AuthenticatedPrincipalId, AuthorityIdentity, CancellationResult, CwdHandle,
-        OperationHandle, OperationId, OperationPhase, OperationStatus, PreparedSnapshotOperation,
-        ProjectIdentity, ProjectKey, ReleaseResult, ResourceId, ResourceRevision, ResourceScope,
-        SequenceMetadata, SessionBindingId, SessionWorkspaceBinding, SnapshotCaptureRequest,
-        SnapshotCaptureResult, SnapshotCleanupPreview, SnapshotCleanupResult,
-        SnapshotOperationPreview, SnapshotOperationResult, SnapshotRestorePreview,
-        SnapshotRestoreState, SnapshotRestoreStatus, SnapshotSummary, SnapshotUnrevertPreview,
-        SourceTrustAnchor, WorkspaceCapabilities, WorkspaceCapability, WorkspaceCursor,
-        WorkspaceHandle, WorkspaceServices, WorkspaceSnapshotMutationService,
-        WorkspaceSnapshotReadService,
+        AuthenticatedPrincipalId, AuthorityIdentity, CancellationResult, CwdHandle, OperationError,
+        OperationHandle, OperationId, OperationPhase, OperationStatus, ProjectIdentity, ProjectKey,
+        ReleaseResult, ResourceId, ResourceRevision, ResourceScope, SequenceMetadata,
+        SessionBindingId, SessionWorkspaceBinding, SnapshotCaptureResult, SnapshotChange,
+        SnapshotChangeCounts, SnapshotCleanupPreview, SnapshotCleanupResult, SnapshotId,
+        SnapshotSkipped, SnapshotSummary, SnapshotUnrevertPreview, SourceTrustAnchor,
+        WorkspaceCapabilities, WorkspaceCursor, WorkspaceHandle, WorkspaceServices,
     };
     use tempfile::TempDir;
+    use test_case::test_case;
 
     use super::*;
     use crate::snapshots::SnapshotLimits;
@@ -863,18 +991,41 @@ mod tests {
     const CONTENTS: &str = "alpha";
     const READY_MSG: &str = "a mutating call gets a revert point";
     const UNAVAILABLE_MSG: &str = "a refused workspace lets the call through";
+    const BLOCKED_MSG: &str = "a capture that failed stops the call and says why";
+    const RECOVERY_MSG: &str = "an open restore stops every change until it is recovered";
+    const RETENTION_MSG: &str = "retention deletes only what the session no longer needs";
+    const REWIND_MSG: &str = "a rewind runs between the nearest captures of its two heads";
+    const REFUSED_RESTORE_MSG: &str = "a refused restore changed nothing and leaves nothing open";
+    const DISABLED_MSG: &str = "snapshots off by configuration capture nothing and report nothing";
+    const CONFLICT_PATH: &str = "file.txt";
+    const RESTORE_FAILURE_CODE: &str = "conflict";
+    const RESTORE_FAILURE_REASON: &str = "a file changed while the restore ran";
+    const FILES_LIMIT: &str = "files";
+    const STORAGE_LIMIT: &str = "storageBytes";
+    const MAX_CLEANUP: usize = 5;
 
     struct FakeSnapshots {
         capture_calls: AtomicUsize,
         execute_calls: AtomicUsize,
         release_calls: AtomicUsize,
         acknowledge_calls: AtomicUsize,
-        capture_error: Mutex<Option<WorkspaceError>>,
+        capture_errors: Mutex<VecDeque<WorkspaceError>>,
+        capture_limits: Mutex<Option<SnapshotCaptureLimits>>,
         snapshot_state: Mutex<SnapshotState>,
         restore_state: Mutex<SnapshotRestoreState>,
         conflict: AtomicBool,
+        refuse_restores: AtomicBool,
         next_restore: AtomicUsize,
-        restores: Mutex<HashMap<String, (SnapshotId, Option<RestoreId>)>>,
+        restores: Mutex<HashMap<String, FakeRestore>>,
+        checkpoints: Mutex<BTreeSet<CheckpointId>>,
+        cleanup_batches: Mutex<Vec<usize>>,
+    }
+
+    #[derive(Clone)]
+    struct FakeRestore {
+        target: SnapshotId,
+        source: SnapshotId,
+        unrevert_of: Option<RestoreId>,
     }
 
     impl Default for FakeSnapshots {
@@ -884,12 +1035,16 @@ mod tests {
                 execute_calls: AtomicUsize::new(0),
                 release_calls: AtomicUsize::new(0),
                 acknowledge_calls: AtomicUsize::new(0),
-                capture_error: Mutex::new(None),
+                capture_errors: Mutex::new(VecDeque::new()),
+                capture_limits: Mutex::new(None),
                 snapshot_state: Mutex::new(SnapshotState::Complete),
                 restore_state: Mutex::new(SnapshotRestoreState::Completed),
                 conflict: AtomicBool::new(false),
+                refuse_restores: AtomicBool::new(false),
                 next_restore: AtomicUsize::new(1),
                 restores: Mutex::new(HashMap::new()),
+                checkpoints: Mutex::new(BTreeSet::new()),
+                cleanup_batches: Mutex::new(Vec::new()),
             }
         }
     }
@@ -906,8 +1061,10 @@ mod tests {
                 label: None,
                 state: *self.snapshot_state.lock().unwrap(),
                 manifest_revision: ResourceRevision::new("manifest-r1").unwrap(),
+                scope: WorkspacePath::new(".").unwrap(),
                 file_count: 1,
                 total_bytes: 5,
+                skipped: SnapshotSkipped::default(),
                 created_at_unix_ms: 1,
             }
         }
@@ -922,46 +1079,68 @@ mod tests {
             }
         }
 
-        fn preview(&self, snapshot_id: &SnapshotId) -> SnapshotRestorePreview {
+        fn preview(
+            &self,
+            target: &SnapshotId,
+            source: &SnapshotId,
+            unrevert_of: Option<RestoreId>,
+        ) -> SnapshotRestorePreview {
             let sequence = self.next_restore.load(Ordering::SeqCst);
             let restore_id = RestoreId::new(format!("restore-{sequence}")).unwrap();
-            self.restores
-                .lock()
-                .unwrap()
-                .insert(restore_id.as_str().to_owned(), (snapshot_id.clone(), None));
+            self.restores.lock().unwrap().insert(
+                restore_id.as_str().to_owned(),
+                FakeRestore {
+                    target: target.clone(),
+                    source: source.clone(),
+                    unrevert_of,
+                },
+            );
+            let conflict = self.conflict.load(Ordering::SeqCst);
             SnapshotRestorePreview {
                 restore_id,
-                target_snapshot_id: snapshot_id.clone(),
-                current_revision: ResourceRevision::new("current-r1").unwrap(),
-                target_revision: ResourceRevision::new("target-r1").unwrap(),
-                changes: self
-                    .conflict
-                    .load(Ordering::SeqCst)
-                    .then(|| caudra_workspace::SnapshotChange {
-                        path: caudra_workspace::WorkspacePath::new("file.txt").unwrap(),
-                        resource_id: ResourceId::new("file").unwrap(),
-                        kind: SnapshotChangeKind::Conflict,
-                        current_revision: Some(ResourceRevision::new("current-file").unwrap()),
-                        target_revision: Some(ResourceRevision::new("target-file").unwrap()),
-                    })
-                    .into_iter()
-                    .collect(),
+                target_snapshot_id: target.clone(),
+                source_snapshot_id: source.clone(),
+                counts: SnapshotChangeCounts {
+                    replace: u32::from(!conflict),
+                    conflict: u32::from(conflict),
+                    ..SnapshotChangeCounts::default()
+                },
+                changes: vec![SnapshotChange {
+                    path: WorkspacePath::new(CONFLICT_PATH).unwrap(),
+                    resource_id: ResourceId::new("file").unwrap(),
+                    kind: if conflict {
+                        SnapshotChangeKind::Conflict
+                    } else {
+                        SnapshotChangeKind::Replace
+                    },
+                    current_revision: Some(ResourceRevision::new("current-file").unwrap()),
+                    target_revision: Some(ResourceRevision::new("target-file").unwrap()),
+                }],
                 created_directories: Vec::new(),
             }
         }
 
-        fn restore_status(
+        fn status_of(
             &self,
-            restore_id: RestoreId,
-            target_snapshot_id: SnapshotId,
-            unrevert_of: Option<RestoreId>,
-        ) -> SnapshotRestoreStatus {
+            restore_id: &RestoreId,
+        ) -> Result<SnapshotRestoreStatus, WorkspaceError> {
+            let FakeRestore {
+                target,
+                source,
+                unrevert_of,
+            } = self
+                .restores
+                .lock()
+                .unwrap()
+                .get(restore_id.as_str())
+                .cloned()
+                .ok_or(WorkspaceError::Conflict)?;
             let state = *self.restore_state.lock().unwrap();
-            SnapshotRestoreStatus {
-                restore_id,
+            Ok(SnapshotRestoreStatus {
+                restore_id: restore_id.clone(),
                 state,
-                target_snapshot_id,
-                pre_restore_snapshot_id: SnapshotId::new("pre-restore").unwrap(),
+                target_snapshot_id: target,
+                source_snapshot_id: source,
                 applied_files: u32::from(state != SnapshotRestoreState::Publishing),
                 total_files: 1,
                 acknowledgement_required: state == SnapshotRestoreState::Completed,
@@ -970,7 +1149,7 @@ mod tests {
                     SnapshotRestoreState::Partial | SnapshotRestoreState::Indeterminate
                 ),
                 unrevert_of,
-            }
+            })
         }
     }
 
@@ -983,9 +1162,14 @@ mod tests {
             request: &SnapshotCaptureRequest,
         ) -> Result<SnapshotCaptureResult, WorkspaceError> {
             self.capture_calls.fetch_add(1, Ordering::SeqCst);
-            if let Some(error) = self.capture_error.lock().unwrap().clone() {
+            *self.capture_limits.lock().unwrap() = Some(request.limits.clone());
+            if let Some(error) = self.capture_errors.lock().unwrap().pop_front() {
                 return Err(error);
             }
+            self.checkpoints
+                .lock()
+                .unwrap()
+                .insert(request.checkpoint_id.clone());
             Ok(SnapshotCaptureResult {
                 snapshot: self.summary(request),
                 reused_checkpoint: false,
@@ -1009,28 +1193,26 @@ mod tests {
             _cursor: &WorkspaceCursor,
             restore_id: &RestoreId,
         ) -> Result<SnapshotRestoreStatus, WorkspaceError> {
-            let (snapshot, unrevert_of) = self
-                .restores
-                .lock()
-                .unwrap()
-                .get(restore_id.as_str())
-                .cloned()
-                .ok_or(WorkspaceError::Conflict)?;
-            Ok(self.restore_status(restore_id.clone(), snapshot, unrevert_of))
+            self.status_of(restore_id)
         }
     }
 
     #[async_trait]
     impl WorkspaceSnapshotMutationService for FakeSnapshots {
+        fn max_cleanup_checkpoints(&self) -> usize {
+            MAX_CLEANUP
+        }
+
         async fn prepare_restore(
             &self,
             _binding: &SessionWorkspaceBinding,
             _cursor: &WorkspaceCursor,
-            snapshot_id: &SnapshotId,
+            target: &SnapshotId,
+            source: &SnapshotId,
         ) -> Result<PreparedSnapshotOperation, WorkspaceError> {
             let operation = self.operation();
             Ok(PreparedSnapshotOperation {
-                preview: SnapshotOperationPreview::Restore(self.preview(snapshot_id)),
+                preview: SnapshotOperationPreview::Restore(self.preview(target, source, None)),
                 operation,
             })
         }
@@ -1041,16 +1223,16 @@ mod tests {
             _cursor: &WorkspaceCursor,
             restore_id: &RestoreId,
         ) -> Result<PreparedSnapshotOperation, WorkspaceError> {
+            let original = self.status_of(restore_id)?;
             let operation = self.operation();
-            let preview = self.preview(&SnapshotId::new("pre-restore").unwrap());
-            self.restores.lock().unwrap().insert(
-                preview.restore_id.as_str().to_owned(),
-                (preview.target_snapshot_id.clone(), Some(restore_id.clone())),
-            );
             Ok(PreparedSnapshotOperation {
                 preview: SnapshotOperationPreview::Unrevert(SnapshotUnrevertPreview {
                     source_restore_id: restore_id.clone(),
-                    restore: preview,
+                    restore: self.preview(
+                        &original.source_snapshot_id,
+                        &original.target_snapshot_id,
+                        Some(restore_id.clone()),
+                    ),
                 }),
                 operation,
             })
@@ -1060,13 +1242,22 @@ mod tests {
             &self,
             _binding: &SessionWorkspaceBinding,
             _cursor: &WorkspaceCursor,
-            snapshot_ids: &[SnapshotId],
+            checkpoint_ids: &[CheckpointId],
         ) -> Result<PreparedSnapshotOperation, WorkspaceError> {
+            self.cleanup_batches
+                .lock()
+                .unwrap()
+                .push(checkpoint_ids.len());
+            let held = self.checkpoints.lock().unwrap();
+            let (present, missing) = checkpoint_ids
+                .iter()
+                .cloned()
+                .partition(|checkpoint| held.contains(checkpoint));
             Ok(PreparedSnapshotOperation {
                 operation: self.operation(),
                 preview: SnapshotOperationPreview::Cleanup(SnapshotCleanupPreview {
-                    snapshot_ids: snapshot_ids.to_vec(),
-                    retained_snapshot_ids: Vec::new(),
+                    checkpoint_ids: present,
+                    missing_checkpoint_ids: missing,
                     reclaimable_bytes: 1,
                 }),
             })
@@ -1079,36 +1270,43 @@ mod tests {
             prepared: &PreparedSnapshotOperation,
         ) -> Result<OperationStatus<SnapshotOperationResult>, WorkspaceError> {
             self.execute_calls.fetch_add(1, Ordering::SeqCst);
-            let result = match &prepared.preview {
-                SnapshotOperationPreview::Restore(preview) => {
-                    SnapshotOperationResult::Restore(self.restore_status(
-                        preview.restore_id.clone(),
-                        preview.target_snapshot_id.clone(),
-                        None,
-                    ))
-                }
-                SnapshotOperationPreview::Unrevert(preview) => {
-                    SnapshotOperationResult::Restore(self.restore_status(
-                        preview.restore.restore_id.clone(),
-                        preview.restore.target_snapshot_id.clone(),
-                        Some(preview.source_restore_id.clone()),
-                    ))
-                }
+            let restore_id = match &prepared.preview {
+                SnapshotOperationPreview::Restore(preview) => &preview.restore_id,
+                SnapshotOperationPreview::Unrevert(preview) => &preview.restore.restore_id,
                 SnapshotOperationPreview::Cleanup(preview) => {
-                    SnapshotOperationResult::Cleanup(SnapshotCleanupResult {
-                        deleted_snapshot_ids: preview.snapshot_ids.clone(),
-                        deleted_blobs: 1,
-                        reclaimed_bytes: 1,
-                    })
+                    self.checkpoints
+                        .lock()
+                        .unwrap()
+                        .retain(|checkpoint| !preview.checkpoint_ids.contains(checkpoint));
+                    return Ok(operation_status(
+                        prepared.operation.clone(),
+                        OperationState::Completed {
+                            result: SnapshotOperationResult::Cleanup(SnapshotCleanupResult {
+                                deleted_checkpoint_ids: preview.checkpoint_ids.clone(),
+                                deleted_snapshots: 1,
+                                deleted_blobs: 1,
+                                reclaimed_bytes: 1,
+                            }),
+                            side_effects_possible: true,
+                        },
+                    ));
                 }
             };
-            Ok(operation_status(
-                prepared.operation.clone(),
+            let state = if self.refuse_restores.load(Ordering::SeqCst) {
+                OperationState::Failed {
+                    error: OperationError {
+                        code: OperationId::new(RESTORE_FAILURE_CODE).unwrap(),
+                        message: RESTORE_FAILURE_REASON.to_owned(),
+                    },
+                    side_effects_possible: false,
+                }
+            } else {
                 OperationState::Completed {
-                    result,
+                    result: SnapshotOperationResult::Restore(self.status_of(restore_id)?),
                     side_effects_possible: true,
-                },
-            ))
+                }
+            };
+            Ok(operation_status(prepared.operation.clone(), state))
         }
 
         async fn operation_status(
@@ -1139,14 +1337,7 @@ mod tests {
             restore_id: &RestoreId,
         ) -> Result<SnapshotRestoreStatus, WorkspaceError> {
             self.acknowledge_calls.fetch_add(1, Ordering::SeqCst);
-            let (snapshot, unrevert_of) = self
-                .restores
-                .lock()
-                .unwrap()
-                .get(restore_id.as_str())
-                .cloned()
-                .ok_or(WorkspaceError::Conflict)?;
-            let mut status = self.restore_status(restore_id.clone(), snapshot, unrevert_of);
+            let mut status = self.status_of(restore_id)?;
             status.state = SnapshotRestoreState::Acknowledged;
             status.acknowledgement_required = false;
             Ok(status)
@@ -1185,7 +1376,7 @@ mod tests {
     fn remote_baseline(
         temp: &TempDir,
         service: Arc<FakeSnapshots>,
-        generation: u64,
+        config: SnapshotsConfig,
     ) -> Arc<WorkspaceBaseline> {
         let authority = AuthorityIdentity::new(
             SourceTrustAnchor::new("test-source").unwrap(),
@@ -1207,7 +1398,7 @@ mod tests {
         let cursor = WorkspaceCursor::new(
             &binding,
             ResourceScope::root(ResourceId::new("root").unwrap()),
-            generation,
+            1,
             CwdHandle::new("cursor").unwrap(),
         );
         let capabilities = WorkspaceCapabilities::new([
@@ -1241,15 +1432,31 @@ mod tests {
             head(99),
             WorkspaceSession::new(workspace, binding, cursor).unwrap(),
             stored,
-            true,
+            config,
         )
+    }
+
+    fn ensure(baseline: &WorkspaceBaseline, sequence: u32) -> BaselineOutcome {
+        smol::block_on(baseline.ensure(Some(head(sequence))))
+    }
+
+    /// From the first head back to the session start.
+    fn rewind(baseline: &WorkspaceBaseline) -> Result<PreparedSnapshotOperation, BaselineError> {
+        smol::block_on(baseline.prepare_remote_restore(&[head(1)], &[]))
+    }
+
+    fn quota_exceeded() -> WorkspaceError {
+        WorkspaceError::QuotaExceeded {
+            limit: Some(STORAGE_LIMIT.into()),
+            maximum: Some(1),
+        }
     }
 
     #[test]
     fn remote_capture_is_idempotent_and_concurrent_calls_are_coalesced() {
         let temp = TempDir::new().unwrap();
         let service = Arc::new(FakeSnapshots::default());
-        let baseline = remote_baseline(&temp, Arc::clone(&service), 1);
+        let baseline = remote_baseline(&temp, Arc::clone(&service), SnapshotsConfig::default());
         let first = Arc::clone(&baseline);
         let second = Arc::clone(&baseline);
 
@@ -1271,25 +1478,280 @@ mod tests {
         assert!(!temp.path().join("snapshots").exists());
     }
 
-    #[test]
-    fn remote_quota_and_corruption_fail_closed() {
-        let quota_temp = TempDir::new().unwrap();
-        let quota = Arc::new(FakeSnapshots::default());
-        *quota.capture_error.lock().unwrap() = Some(WorkspaceError::PolicyDenied);
-        let baseline = remote_baseline(&quota_temp, quota, 1);
-        assert!(matches!(
-            smol::block_on(baseline.ensure(Some(head(1)))),
-            BaselineOutcome::Failed(BaselineError::Workspace(WorkspaceError::PolicyDenied))
-        ));
+    #[test_case(WorkspaceError::LimitExceeded { limit: Some(FILES_LIMIT.into()), maximum: Some(1) } ; "a_limit")]
+    #[test_case(quota_exceeded() ; "a_full_store_with_nothing_to_delete")]
+    #[test_case(WorkspaceError::UnsupportedEntry ; "an_unsupported_entry")]
+    #[test_case(WorkspaceError::UnsupportedCapability { capability: WorkspaceCapability::SnapshotCapture } ; "a_missing_capability")]
+    fn a_refused_remote_workspace_turns_revert_off_and_lets_changes_through(error: WorkspaceError) {
+        let temp = TempDir::new().unwrap();
+        let service = Arc::new(FakeSnapshots::default());
+        service
+            .capture_errors
+            .lock()
+            .unwrap()
+            .push_back(error.clone());
+        let baseline = remote_baseline(&temp, Arc::clone(&service), SnapshotsConfig::default());
+        let expected = BaselineError::Refused(error).to_string();
 
-        let corrupt_temp = TempDir::new().unwrap();
-        let corrupt = Arc::new(FakeSnapshots::default());
-        *corrupt.snapshot_state.lock().unwrap() = SnapshotState::Corrupt;
-        let baseline = remote_baseline(&corrupt_temp, corrupt, 1);
-        assert!(matches!(
-            smol::block_on(baseline.ensure(Some(head(1)))),
-            BaselineOutcome::Failed(BaselineError::CorruptSnapshot)
-        ));
+        let outcomes = [smol::block_on(baseline.ensure(None)), ensure(&baseline, 1)];
+
+        for outcome in outcomes {
+            let BaselineOutcome::Unavailable(reason) = outcome else {
+                panic!("{UNAVAILABLE_MSG}: {outcome:?}");
+            };
+            assert_eq!(*reason, expected, "{UNAVAILABLE_MSG}");
+        }
+        assert_eq!(
+            baseline.refusal().as_deref(),
+            Some(&expected),
+            "{UNAVAILABLE_MSG}"
+        );
+        assert_eq!(
+            service.capture_calls.load(Ordering::SeqCst),
+            1,
+            "{UNAVAILABLE_MSG}"
+        );
+    }
+
+    #[test_case(WorkspaceError::Busy ; "a_busy_host")]
+    #[test_case(WorkspaceError::PolicyDenied ; "a_policy_denial")]
+    #[test_case(WorkspaceError::Unavailable ; "an_unreachable_host")]
+    fn a_failed_remote_capture_blocks_the_change_and_names_its_reason(error: WorkspaceError) {
+        let temp = TempDir::new().unwrap();
+        let service = Arc::new(FakeSnapshots::default());
+        service
+            .capture_errors
+            .lock()
+            .unwrap()
+            .push_back(error.clone());
+        let baseline = remote_baseline(&temp, service, SnapshotsConfig::default());
+
+        let outcome = smol::block_on(baseline.ensure(None));
+
+        let BaselineOutcome::Failed(failure) = outcome else {
+            panic!("{BLOCKED_MSG}: {outcome:?}");
+        };
+        assert_eq!(
+            failure.to_string(),
+            BaselineError::Workspace(error).to_string(),
+            "{BLOCKED_MSG}"
+        );
+        assert_eq!(baseline.refusal(), None, "{BLOCKED_MSG}");
+    }
+
+    #[test]
+    fn a_corrupt_remote_capture_blocks_the_change() {
+        let temp = TempDir::new().unwrap();
+        let service = Arc::new(FakeSnapshots::default());
+        *service.snapshot_state.lock().unwrap() = SnapshotState::Corrupt;
+        let baseline = remote_baseline(&temp, service, SnapshotsConfig::default());
+
+        assert!(
+            matches!(
+                ensure(&baseline, 1),
+                BaselineOutcome::Failed(BaselineError::CorruptSnapshot)
+            ),
+            "{BLOCKED_MSG}"
+        );
+    }
+
+    #[test]
+    fn a_remote_capture_asks_for_the_configured_limits() {
+        let temp = TempDir::new().unwrap();
+        let service = Arc::new(FakeSnapshots::default());
+        let config = SnapshotsConfig {
+            max_bytes: 3,
+            max_files: 1,
+            max_file_bytes: 2,
+            ..SnapshotsConfig::default()
+        };
+        let baseline = remote_baseline(&temp, Arc::clone(&service), config);
+
+        smol::block_on(baseline.ensure(None));
+
+        assert_eq!(
+            *service.capture_limits.lock().unwrap(),
+            Some(SnapshotCaptureLimits {
+                max_files: 1,
+                max_file_bytes: 2,
+                max_total_bytes: 3,
+            })
+        );
+    }
+
+    #[test]
+    fn a_remote_workspace_with_snapshots_off_is_unavailable_without_a_capture() {
+        let temp = TempDir::new().unwrap();
+        let service = Arc::new(FakeSnapshots::default());
+        let baseline = remote_baseline(
+            &temp,
+            Arc::clone(&service),
+            SnapshotsConfig {
+                enabled: false,
+                ..SnapshotsConfig::default()
+            },
+        );
+
+        let outcome = ensure(&baseline, 1);
+
+        let BaselineOutcome::Unavailable(reason) = outcome else {
+            panic!("{DISABLED_MSG}: {outcome:?}");
+        };
+        assert_eq!(reason.as_str(), SNAPSHOTS_DISABLED, "{DISABLED_MSG}");
+        assert_eq!(
+            service.capture_calls.load(Ordering::SeqCst),
+            0,
+            "{DISABLED_MSG}"
+        );
+        assert_eq!(baseline.refusal(), None, "{DISABLED_MSG}");
+    }
+
+    #[test]
+    fn a_full_store_gives_up_older_checkpoints_and_captures_again() {
+        let temp = TempDir::new().unwrap();
+        let service = Arc::new(FakeSnapshots::default());
+        let baseline = remote_baseline(&temp, Arc::clone(&service), SnapshotsConfig::default());
+        for sequence in 1..=3 {
+            assert!(
+                matches!(ensure(&baseline, sequence), BaselineOutcome::Ready),
+                "{READY_MSG}"
+            );
+        }
+        service
+            .capture_errors
+            .lock()
+            .unwrap()
+            .push_back(quota_exceeded());
+
+        let outcome = ensure(&baseline, 4);
+
+        assert!(
+            matches!(outcome, BaselineOutcome::Ready),
+            "{READY_MSG}: {outcome:?}"
+        );
+        assert_eq!(
+            *service.cleanup_batches.lock().unwrap(),
+            vec![3],
+            "{RETENTION_MSG}"
+        );
+        for sequence in 1..=3 {
+            assert_eq!(
+                baseline.remote_capture(Some(head(sequence))).unwrap(),
+                None,
+                "{RETENTION_MSG}"
+            );
+        }
+        assert!(
+            baseline.remote_capture(Some(head(4))).unwrap().is_some(),
+            "{READY_MSG}"
+        );
+        assert!(
+            baseline.remote_capture(None).unwrap().is_some(),
+            "{RETENTION_MSG}"
+        );
+    }
+
+    /// Nothing is deleted until a batch is prunable, then the batch goes in
+    /// chunks the host takes, and the session start and the newest captures
+    /// stay.
+    #[test]
+    fn retention_deletes_old_checkpoints_in_batches_the_host_accepts() {
+        let temp = TempDir::new().unwrap();
+        let service = Arc::new(FakeSnapshots::default());
+        let baseline = remote_baseline(&temp, Arc::clone(&service), SnapshotsConfig::default());
+        let newest = u32::try_from(REMOTE_RECENT_CHECKPOINTS + REMOTE_PRUNE_BATCH).unwrap();
+        let oldest_kept = u32::try_from(REMOTE_PRUNE_BATCH).unwrap() + 1;
+
+        for sequence in 1..=newest {
+            assert!(
+                matches!(ensure(&baseline, sequence), BaselineOutcome::Ready),
+                "{READY_MSG}"
+            );
+        }
+
+        let batches = service.cleanup_batches.lock().unwrap().clone();
+        assert_eq!(
+            batches.len(),
+            REMOTE_PRUNE_BATCH.div_ceil(MAX_CLEANUP),
+            "{RETENTION_MSG}: {batches:?}"
+        );
+        assert!(
+            batches.iter().all(|batch| *batch <= MAX_CLEANUP),
+            "{RETENTION_MSG}: {batches:?}"
+        );
+        assert_eq!(
+            batches.iter().sum::<usize>(),
+            REMOTE_PRUNE_BATCH,
+            "{RETENTION_MSG}"
+        );
+        assert_eq!(
+            baseline
+                .remote_capture(Some(head(oldest_kept - 1)))
+                .unwrap(),
+            None,
+            "{RETENTION_MSG}"
+        );
+        assert!(
+            baseline
+                .remote_capture(Some(head(oldest_kept)))
+                .unwrap()
+                .is_some(),
+            "{RETENTION_MSG}"
+        );
+        assert!(
+            baseline.remote_capture(None).unwrap().is_some(),
+            "{RETENTION_MSG}"
+        );
+        assert_eq!(
+            service.checkpoints.lock().unwrap().len(),
+            REMOTE_RECENT_CHECKPOINTS + 1,
+            "{RETENTION_MSG}"
+        );
+    }
+
+    #[test]
+    fn a_rewind_runs_between_the_nearest_captures_of_its_two_heads() {
+        let temp = TempDir::new().unwrap();
+        let service = Arc::new(FakeSnapshots::default());
+        let baseline = remote_baseline(&temp, service, SnapshotsConfig::default());
+        ensure(&baseline, 1);
+        ensure(&baseline, 2);
+        let snapshot = |sequence| {
+            baseline
+                .remote_capture(Some(head(sequence)))
+                .unwrap()
+                .unwrap()
+                .snapshot_id
+        };
+
+        let prepared = smol::block_on(
+            baseline.prepare_remote_restore(&[head(3), head(2), head(1)], &[head(1)]),
+        )
+        .unwrap();
+
+        let SnapshotOperationPreview::Restore(preview) = prepared.preview else {
+            panic!("{REWIND_MSG}");
+        };
+        assert_eq!(
+            (preview.target_snapshot_id, preview.source_snapshot_id),
+            (snapshot(1), snapshot(2)),
+            "{REWIND_MSG}"
+        );
+    }
+
+    #[test]
+    fn a_rewind_before_any_capture_has_no_snapshot_to_restore() {
+        let temp = TempDir::new().unwrap();
+        let baseline = remote_baseline(
+            &temp,
+            Arc::new(FakeSnapshots::default()),
+            SnapshotsConfig::default(),
+        );
+
+        assert!(
+            matches!(rewind(&baseline), Err(BaselineError::NoSnapshot)),
+            "{REWIND_MSG}"
+        );
     }
 
     #[test]
@@ -1297,23 +1759,61 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let service = Arc::new(FakeSnapshots::default());
         service.conflict.store(true, Ordering::SeqCst);
-        let baseline = remote_baseline(&temp, Arc::clone(&service), 1);
-        smol::block_on(baseline.ensure(Some(head(1))));
+        let baseline = remote_baseline(&temp, Arc::clone(&service), SnapshotsConfig::default());
+        ensure(&baseline, 1);
 
-        let result = smol::block_on(baseline.prepare_remote_restore(None));
+        let Err(BaselineError::RestoreConflict { conflicts, sample }) = rewind(&baseline) else {
+            panic!("a conflict stops the restore before it runs");
+        };
 
-        assert!(matches!(result, Err(BaselineError::RestoreConflict)));
+        assert_eq!(
+            (conflicts, sample),
+            (1, Some(WorkspacePath::new(CONFLICT_PATH).unwrap()))
+        );
         assert_eq!(service.execute_calls.load(Ordering::SeqCst), 0);
         assert_eq!(service.release_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn a_refused_restore_changes_nothing_and_leaves_nothing_to_recover() {
+        let temp = TempDir::new().unwrap();
+        let service = Arc::new(FakeSnapshots::default());
+        service.refuse_restores.store(true, Ordering::SeqCst);
+        let baseline = remote_baseline(&temp, service, SnapshotsConfig::default());
+        ensure(&baseline, 1);
+        let prepared = rewind(&baseline).unwrap();
+
+        let Err(error) = smol::block_on(baseline.execute_remote_restore(prepared, None)) else {
+            panic!("{REFUSED_RESTORE_MSG}");
+        };
+
+        assert!(error.left_workspace_unchanged(), "{REFUSED_RESTORE_MSG}");
+        let BaselineError::RestoreFailed { code, message } = error else {
+            panic!("{REFUSED_RESTORE_MSG}: {error}");
+        };
+        assert_eq!(
+            (code.as_str(), message.as_str()),
+            (RESTORE_FAILURE_CODE, RESTORE_FAILURE_REASON),
+            "{REFUSED_RESTORE_MSG}"
+        );
+        assert_eq!(
+            baseline.pending_remote_restore().unwrap(),
+            None,
+            "{REFUSED_RESTORE_MSG}"
+        );
+        assert!(
+            matches!(ensure(&baseline, 2), BaselineOutcome::Ready),
+            "{REFUSED_RESTORE_MSG}"
+        );
     }
 
     #[test]
     fn completed_rewind_can_be_unreverted_before_acknowledgement() {
         let temp = TempDir::new().unwrap();
         let service = Arc::new(FakeSnapshots::default());
-        let baseline = remote_baseline(&temp, Arc::clone(&service), 1);
-        smol::block_on(baseline.ensure(Some(head(1))));
-        let prepared = smol::block_on(baseline.prepare_remote_restore(None)).unwrap();
+        let baseline = remote_baseline(&temp, Arc::clone(&service), SnapshotsConfig::default());
+        ensure(&baseline, 1);
+        let prepared = rewind(&baseline).unwrap();
         let restored = smol::block_on(baseline.execute_remote_restore(prepared, None)).unwrap();
         assert_eq!(restored.state, SnapshotRestoreState::Completed);
         assert!(baseline.pending_remote_restore().unwrap().is_some());
@@ -1333,36 +1833,51 @@ mod tests {
         assert_eq!(service.acknowledge_calls.load(Ordering::SeqCst), 1);
     }
 
-    #[test_case::test_case(SnapshotRestoreState::Partial ; "partial")]
-    #[test_case::test_case(SnapshotRestoreState::Indeterminate ; "indeterminate")]
-    fn incomplete_restore_survives_reopen_and_blocks_mutation(state: SnapshotRestoreState) {
+    #[test_case(SnapshotRestoreState::Partial, true ; "partial")]
+    #[test_case(SnapshotRestoreState::Indeterminate, true ; "indeterminate")]
+    #[test_case(SnapshotRestoreState::Partial, false ; "partial_with_snapshots_off")]
+    #[test_case(SnapshotRestoreState::Indeterminate, false ; "indeterminate_with_snapshots_off")]
+    fn incomplete_restore_survives_reopen_and_blocks_mutation(
+        state: SnapshotRestoreState,
+        enabled: bool,
+    ) {
         let temp = TempDir::new().unwrap();
         let service = Arc::new(FakeSnapshots::default());
         *service.restore_state.lock().unwrap() = state;
-        let baseline = remote_baseline(&temp, Arc::clone(&service), 1);
-        smol::block_on(baseline.ensure(Some(head(1))));
-        let prepared = smol::block_on(baseline.prepare_remote_restore(None)).unwrap();
+        let baseline = remote_baseline(&temp, Arc::clone(&service), SnapshotsConfig::default());
+        ensure(&baseline, 1);
+        let prepared = rewind(&baseline).unwrap();
         let partial = smol::block_on(baseline.execute_remote_restore(prepared, None)).unwrap();
         assert_eq!(partial.state, state);
 
-        let reopened = remote_baseline(&temp, service, 1);
+        let reopened = remote_baseline(
+            &temp,
+            service,
+            SnapshotsConfig {
+                enabled,
+                ..SnapshotsConfig::default()
+            },
+        );
         let recovered = smol::block_on(reopened.reconcile_remote_restore())
             .unwrap()
             .unwrap();
         assert_eq!(recovered.state, state);
-        assert!(matches!(
-            smol::block_on(reopened.ensure(Some(head(2)))),
-            BaselineOutcome::Failed(BaselineError::RecoveryRequired)
-        ));
+        assert!(
+            matches!(
+                ensure(&reopened, 2),
+                BaselineOutcome::Failed(BaselineError::RecoveryRequired)
+            ),
+            "{RECOVERY_MSG}"
+        );
     }
 
     #[test]
     fn completed_restore_is_acknowledged_before_the_next_mutation() {
         let temp = TempDir::new().unwrap();
         let service = Arc::new(FakeSnapshots::default());
-        let baseline = remote_baseline(&temp, Arc::clone(&service), 1);
-        smol::block_on(baseline.ensure(Some(head(1))));
-        let prepared = smol::block_on(baseline.prepare_remote_restore(None)).unwrap();
+        let baseline = remote_baseline(&temp, Arc::clone(&service), SnapshotsConfig::default());
+        ensure(&baseline, 1);
+        let prepared = rewind(&baseline).unwrap();
         smol::block_on(baseline.execute_remote_restore(prepared, None)).unwrap();
 
         assert!(matches!(
@@ -1373,33 +1888,20 @@ mod tests {
         assert!(baseline.pending_remote_restore().unwrap().is_none());
     }
 
-    #[test]
-    fn cleanup_never_deletes_referenced_snapshots() {
-        let temp = TempDir::new().unwrap();
-        let service = Arc::new(FakeSnapshots::default());
-        let baseline = remote_baseline(&temp, service, 1);
-        smol::block_on(baseline.ensure(Some(head(1))));
-        let referenced = baseline.remote_capture(None).unwrap().unwrap().snapshot_id;
-        let orphan = SnapshotId::new("orphan").unwrap();
-
-        let deleted =
-            smol::block_on(baseline.cleanup_remote_snapshots([referenced.clone(), orphan.clone()]))
-                .unwrap();
-
-        assert_eq!(deleted, vec![orphan]);
-        assert_eq!(
-            baseline.remote_capture(None).unwrap().unwrap().snapshot_id,
-            referenced
-        );
-    }
-
     fn baseline(enabled: bool, limits: SnapshotLimits) -> (TempDir, Arc<WorkspaceBaseline>) {
         let temp = TempDir::new().unwrap();
         let root = temp.path().join("repo");
         fs::create_dir_all(&root).unwrap();
         fs::write(root.join(FILE), CONTENTS).unwrap();
         let store = Arc::new(SnapshotStore::new(temp.path().join("snapshots")).with_limits(limits));
-        let baseline = WorkspaceBaseline::new(store, root, enabled);
+        let baseline = WorkspaceBaseline::new(
+            store,
+            root,
+            SnapshotsConfig {
+                enabled,
+                ..SnapshotsConfig::default()
+            },
+        );
         (temp, baseline)
     }
 
@@ -1459,7 +1961,7 @@ mod tests {
 
         let outcome = smol::block_on(baseline.ensure(None));
         assert!(
-            matches!(outcome, BaselineOutcome::Unavailable(reason) if reason.contains("off")),
+            matches!(outcome, BaselineOutcome::Unavailable(reason) if *reason == SNAPSHOTS_DISABLED),
             "{UNAVAILABLE_MSG}"
         );
         assert!(!baseline.is_captured(), "{UNAVAILABLE_MSG}");

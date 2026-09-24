@@ -23,7 +23,7 @@ use caudra_config::sandbox::TransferPolicy;
 use caudra_config::workcell::{
     ExpectedWorkcellId, RemoteWorkcellSelection, WorkcellEndpoint, WorkcellSourceRef,
 };
-use caudra_config::{Effect, PermissionRule, PermissionsConfig, ToolKey};
+use caudra_config::{Effect, PermissionRule, PermissionsConfig, SnapshotsConfig, ToolKey};
 use caudra_storage::{
     StateDir,
     auth::{WorkcellCredential, WorkcellCredentialName, WorkcellCredentialRef},
@@ -49,11 +49,11 @@ use caudra_workspace::{
 use caudra_workspace::{
     CheckpointId, DirectoryNavigation, ListRequest, MutationResult, OperationState,
     OperationStatus, ReadBytesRequest, ResourceRevision, ResourceSelector, ScmDiscoverRequest,
-    ScmStatusRequest, SearchRequest, SessionBindingId, SnapshotCaptureRequest,
-    SnapshotInspectRequest, SnapshotOperationPreview, ToolPrepareRequest, WatchOpenRequest,
-    WatchPollRequest, WorkspaceAssetService, WorkspaceCursor, WorkspacePath, WorkspaceReadService,
-    WorkspaceScmReadService, WorkspaceSearchService, WorkspaceSnapshotMutationService,
-    WorkspaceSnapshotReadService, WorkspaceWatchService,
+    ScmStatusRequest, SearchRequest, SessionBindingId, SnapshotCaptureLimits,
+    SnapshotCaptureRequest, SnapshotInspectRequest, SnapshotOperationPreview, ToolPrepareRequest,
+    WatchOpenRequest, WatchPollRequest, WorkspaceAssetService, WorkspaceCursor, WorkspacePath,
+    WorkspaceReadService, WorkspaceScmReadService, WorkspaceSearchService,
+    WorkspaceSnapshotMutationService, WorkspaceSnapshotReadService, WorkspaceWatchService,
 };
 use caudra_workspace::{
     ScmDiffRequest, ScmDiffTarget, ScmLogRequest, ScmMutation, ScmReadSideRequest, ScmSide,
@@ -140,6 +140,16 @@ const EDITOR_NAMESPACE: &str =
     "a byte read must report the revision a conditional write is checked against";
 const EDITOR_SAVE_REFUSED: &str = "an edited remote buffer must save against the revision it read";
 const EDITOR_STALE_ACCEPTED: &str = "a concurrent remote modification must refuse the save";
+/// A full operation ledger names no limit. Only snapshot refusals do.
+const LEDGER_FULL: WorkspaceError = WorkspaceError::QuotaExceeded {
+    limit: None,
+    maximum: None,
+};
+const CAPTURE_LIMITS: SnapshotCaptureLimits = SnapshotCaptureLimits {
+    max_files: 10_000,
+    max_file_bytes: 16 * 1024 * 1024,
+    max_total_bytes: 256 * 1024 * 1024,
+};
 
 struct TransferTestHost {
     root: PathBuf,
@@ -1434,8 +1444,7 @@ async fn concurrent_registry_regressions(
                         &request,
                     )
                     .await;
-                let error = full.err();
-                assert!(matches!(error, Some(WorkspaceError::Conflict)), "{error:?}");
+                assert_eq!(full.err(), Some(LEDGER_FULL));
                 assert!(!root.join(BATCH_CANCELLED).exists());
                 cancel.cancel();
                 loop {
@@ -1746,7 +1755,7 @@ fn with_remote_baseline(
         CaudraId::generate(),
         ctx.workspace_session.clone().unwrap(),
         client.stored_binding().clone(),
-        true,
+        SnapshotsConfig::default(),
     );
     ctx.baseline = Some(BaselineGate::new(baseline.clone(), None));
     baseline
@@ -2635,6 +2644,7 @@ fn authenticated_local() {
             &SnapshotCaptureRequest {
                 checkpoint_id: CheckpointId::new("integration-checkpoint").unwrap(),
                 label: None,
+                limits: CAPTURE_LIMITS,
             },
         )
         .await
@@ -2659,8 +2669,25 @@ fn authenticated_local() {
             json!({"filePath":"written.txt","content":"changed\n"}),
         )
         .await;
+        let changed = WorkspaceSnapshotReadService::capture(
+            &client,
+            binding,
+            &resolved_root.cursor,
+            &SnapshotCaptureRequest {
+                checkpoint_id: CheckpointId::new("integration-changed").unwrap(),
+                label: None,
+                limits: CAPTURE_LIMITS,
+            },
+        )
+        .await
+        .unwrap();
         let restore = client
-            .prepare_restore(binding, cursor, &snapshot.snapshot.snapshot_id)
+            .prepare_restore(
+                binding,
+                cursor,
+                &snapshot.snapshot.snapshot_id,
+                &changed.snapshot.snapshot_id,
+            )
             .await
             .unwrap();
         let SnapshotOperationPreview::Restore(preview) = &restore.preview else {

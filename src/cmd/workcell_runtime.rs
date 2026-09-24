@@ -597,7 +597,6 @@ fn require_remote_snapshot_lifecycle(workspace: &WorkspaceSession) -> Result<(),
         WorkspaceCapability::SnapshotExecute,
         WorkspaceCapability::SnapshotOperationStatus,
         WorkspaceCapability::SnapshotRelease,
-        WorkspaceCapability::SnapshotDurablePerFileJournal,
     ] {
         workspace.workspace().capabilities().require(capability)?;
     }

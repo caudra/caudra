@@ -1074,7 +1074,7 @@ impl SpawnCtx {
                 session.id,
                 workspace,
                 stored,
-                self.snapshots.enabled,
+                self.snapshots,
             );
             let recovered =
                 smol::block_on(baseline.reconcile_remote_restore()).map_err(|error| {
@@ -1091,7 +1091,7 @@ impl SpawnCtx {
             WorkspaceBaseline::new(
                 Arc::clone(&snapshot_store),
                 PathBuf::from(&session.cwd),
-                self.snapshots.enabled,
+                self.snapshots,
             )
         };
         workspace_baseline.set_current_head(crate::session_history_head(&session));
@@ -4168,7 +4168,11 @@ mod tests {
         let session = AppSession::new(RELOCATION_MODEL, cwd.to_str().unwrap());
         let store =
             App::snapshot_store_for(&storage, session.id, cwd, SnapshotLimits::default()).unwrap();
-        let baseline = WorkspaceBaseline::new(Arc::clone(&store), cwd.to_path_buf(), true);
+        let baseline = WorkspaceBaseline::new(
+            Arc::clone(&store),
+            cwd.to_path_buf(),
+            SnapshotsConfig::default(),
+        );
         App::new(
             &test_model(),
             session,

@@ -7,9 +7,9 @@ use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use async_lock::Mutex;
-use caudra_config::ModelPolicy;
 #[cfg(test)]
 use caudra_config::ToolKey;
+use caudra_config::{ModelPolicy, SnapshotsConfig};
 use caudra_providers::Timeouts;
 use caudra_providers::model::{Model, ModelPurpose};
 use caudra_providers::provider::{self, Provider};
@@ -749,6 +749,7 @@ pub struct HeadlessParams {
     pub model: Model,
     pub config: AgentConfig,
     pub permissions_config: PermissionsConfig,
+    pub snapshots: SnapshotsConfig,
     pub timeouts: Timeouts,
     pub prompt: String,
     pub thinking: crate::ThinkingConfig,
@@ -893,14 +894,9 @@ pub async fn execute_remote_command(
     max_output_bytes: usize,
     mut progress: impl FnMut(&str),
 ) -> RemoteCommandOutput {
-    let baseline = match baseline.ensure_current().await {
-        crate::BaselineOutcome::Ready => Ok(()),
-        crate::BaselineOutcome::Unavailable(reason) => Err(reason.to_string()),
-        crate::BaselineOutcome::Failed(error) => Err(error.to_string()),
-    };
-    if let Err(output) = baseline {
+    if let Err(error) = baseline.ensure_current().await.into_result() {
         return RemoteCommandOutput {
-            output,
+            output: error.to_string(),
             is_error: true,
         };
     }
@@ -1418,7 +1414,7 @@ pub fn spawn(mut params: HeadlessParams) -> HeadlessHandle {
                         session_id,
                         workspace.clone(),
                         binding,
-                        true,
+                        params.snapshots,
                     ))
                 }
                 None => None,
@@ -1538,6 +1534,7 @@ pub struct InteractiveParams {
     pub model: Model,
     pub config: AgentConfig,
     pub permissions_config: PermissionsConfig,
+    pub snapshots: SnapshotsConfig,
     pub timeouts: Timeouts,
     pub prompt_slots: Arc<ResolvedSlots>,
     pub thinking: crate::ThinkingConfig,
@@ -1860,7 +1857,7 @@ pub async fn prepare_interactive(
             session_id,
             workspace,
             binding,
-            true,
+            params.snapshots,
         )),
         (None, None) => None,
         _ => {
@@ -3826,6 +3823,7 @@ complete(#{ report: first.output });
                     ..AgentConfig::default()
                 },
                 permissions_config: PermissionsConfig::default(),
+                snapshots: SnapshotsConfig::default(),
                 timeouts: Timeouts::default(),
                 prompt_slots: Arc::new(ResolvedSlots::default()),
                 thinking: crate::ThinkingConfig::default(),

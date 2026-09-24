@@ -177,6 +177,8 @@ A capture must finish before the call that triggered it runs, so the file it is 
 
 A file restore selects the nearest available snapshot at or before the chosen item, so several parallel tool calls share one safe run checkpoint.
 
+A remote session captures on the Workcell host instead. See [Remote workspaces](/docs/remote-workspaces/#file-snapshots) for how that walk and its retention differ.
+
 Snapshots are content-addressed with SHA-256 and stored under the Caudra state directory in `session-snapshots/<session-id>/<workspace-hash>/`. The object store contains the complete file bytes under their hashes. A checkpoint manifest maps each relative path to its object hash and Unix mode. Unchanged files reuse the same object instead of storing another copy.
 
 ### Limits
