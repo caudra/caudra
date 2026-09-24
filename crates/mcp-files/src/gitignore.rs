@@ -161,7 +161,29 @@ pub(crate) async fn extend_scope(
     let Some(contents) = read_bounded(&directory.join(".gitignore"), limits, budget).await else {
         return parent;
     };
-    compile_scope(&contents, prefix, parent, limits, budget)
+    admit_scope(&contents, prefix, parent, limits, budget)
+}
+
+/// Compiles the bytes of one ignore file, read with a bound one byte past the ceiling, onto
+/// `parent`. A file over the ceiling, beyond the file budget or not UTF-8 marks the budget
+/// incomplete and leaves `parent` unchanged.
+pub(crate) fn admit_scope(
+    contents: &[u8],
+    prefix: &str,
+    parent: Option<Arc<IgnoreScope>>,
+    limits: &FilesystemLimits,
+    budget: &mut IgnoreBudget,
+) -> Option<Arc<IgnoreScope>> {
+    if budget.files == 0 || contents.len() > limits.max_gitignore_bytes {
+        budget.complete = false;
+        return parent;
+    }
+    budget.files -= 1;
+    let Ok(contents) = std::str::from_utf8(contents) else {
+        budget.complete = false;
+        return parent;
+    };
+    compile_scope(contents, prefix, parent, limits, budget)
 }
 
 pub(crate) fn compile_scope(
@@ -204,12 +226,8 @@ async fn read_bounded(
     path: &Path,
     limits: &FilesystemLimits,
     budget: &mut IgnoreBudget,
-) -> Option<String> {
+) -> Option<Vec<u8>> {
     let file = tokio::fs::File::open(path).await.ok()?;
-    if budget.files == 0 {
-        budget.complete = false;
-        return None;
-    }
     let mut contents = Vec::new();
     let ceiling = u64::try_from(limits.max_gitignore_bytes).unwrap_or(u64::MAX);
     if file
@@ -217,19 +235,11 @@ async fn read_bounded(
         .read_to_end(&mut contents)
         .await
         .is_err()
-        || contents.len() > limits.max_gitignore_bytes
     {
         budget.complete = false;
         return None;
     }
-    budget.files -= 1;
-    match String::from_utf8(contents) {
-        Ok(contents) => Some(contents),
-        Err(_) => {
-            budget.complete = false;
-            None
-        }
-    }
+    Some(contents)
 }
 
 /// Compiles every line, reporting whether the whole file was admitted.

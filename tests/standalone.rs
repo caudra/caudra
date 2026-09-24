@@ -800,13 +800,22 @@ async fn authenticated_http_discovers_one_opt_in_remote_environment() {
     assert_eq!(http.shutdown().await, ShutdownOutcome::Completed);
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn authenticated_snapshot_restore_is_negotiated_and_uses_the_common_ledger() {
     let root = tempfile::tempdir().expect("temporary root");
     let snapshot_root = tempfile::tempdir().expect("snapshot root");
-    #[cfg(unix)]
     std::fs::set_permissions(snapshot_root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     tokio::fs::write(root.path().join("state.txt"), "before")
+        .await
+        .unwrap();
+    std::os::unix::fs::symlink("state.txt", root.path().join("link")).unwrap();
+    std::fs::create_dir(root.path().join("sub")).unwrap();
+    tokio::fs::write(root.path().join("sub/leaf.txt"), "leaf")
+        .await
+        .unwrap();
+    std::fs::create_dir_all(root.path().join("nested/.git")).unwrap();
+    tokio::fs::write(root.path().join("nested/inner.txt"), "inner")
         .await
         .unwrap();
     let server = WorkcellServer::configured(
@@ -893,12 +902,23 @@ async fn authenticated_snapshot_restore_is_negotiated_and_uses_the_common_ledger
     assert_eq!(descriptor["capabilities"]["watch"]["methods"]["poll"], true);
     assert_eq!(descriptor["capabilities"]["scm"]["methods"]["status"], true);
 
-    let capture_params = json!({
-        "version":"v1",
-        "host":remote_host_binding(descriptor),
-        "cwdHandle":descriptor["cwd"]["handle"],
-        "checkpointId":"checkpoint-http"
-    });
+    let capture_request = |checkpoint: &str, max_files: usize| {
+        json!({
+            "version":"v1",
+            "host":remote_host_binding(descriptor),
+            "cwdHandle":descriptor["cwd"]["handle"],
+            "checkpointId":checkpoint,
+            "limits":{
+                "maxFiles":max_files,
+                "maxFileBytes":workcell_host_contract::MAX_SNAPSHOT_FILE_BYTES,
+                "maxTotalBytes":workcell_host_contract::MAX_SNAPSHOT_TOTAL_BYTES
+            }
+        })
+    };
+    let capture_params = capture_request(
+        "checkpoint-http",
+        workcell_host_contract::MAX_SNAPSHOT_FILES,
+    );
     let unauthenticated = post_rpc(
         &client,
         &endpoint,
@@ -928,56 +948,114 @@ async fn authenticated_snapshot_restore_is_negotiated_and_uses_the_common_ledger
         .await,
     )
     .await;
-    let snapshot_id = capture["result"]["snapshot"]["snapshotId"].clone();
-    assert_eq!(capture["result"]["snapshot"]["state"], "complete");
-
-    tokio::fs::write(root.path().join("state.txt"), "after")
-        .await
-        .unwrap();
-    let prepare = final_sse_json(
+    let snapshot = &capture["result"]["snapshot"];
+    assert_eq!(snapshot["state"], "complete", "{capture}");
+    assert_eq!(snapshot["scope"], ".");
+    assert_eq!(snapshot["fileCount"], 3);
+    assert_eq!(snapshot["skipped"]["nestedRepositories"], 1);
+    assert_eq!(
+        snapshot["skipped"]["samples"],
+        json!([{"path":"nested","reason":"nestedRepository"}])
+    );
+    let snapshot_id = snapshot["snapshotId"].clone();
+    let refused = final_sse_json(
         post_rpc(
             &client,
             &endpoint,
             Some(TOKEN),
             remote_request(
                 5,
-                "ai.workcell/snapshot-prepare-restore",
-                json!({
-                    "version":"v1",
-                    "host":remote_host_binding(descriptor),
-                    "cwdHandle":descriptor["cwd"]["handle"],
-                    "snapshotId":snapshot_id
-                }),
+                "ai.workcell/snapshot-capture",
+                capture_request("checkpoint-refused", 1),
             ),
         )
         .await,
     )
     .await;
     assert_eq!(
-        prepare["result"]["preview"]["changes"][0]["kind"],
-        "replace"
+        refused["error"]["data"],
+        json!({"code":"limit_exceeded","limit":"files","maximum":1})
     );
+
+    tokio::fs::write(root.path().join("state.txt"), "after")
+        .await
+        .unwrap();
+    let source = final_sse_json(
+        post_rpc(
+            &client,
+            &endpoint,
+            Some(TOKEN),
+            remote_request(
+                6,
+                "ai.workcell/snapshot-capture",
+                capture_request(
+                    "checkpoint-after",
+                    workcell_host_contract::MAX_SNAPSHOT_FILES,
+                ),
+            ),
+        )
+        .await,
+    )
+    .await;
+    let prepare = final_sse_json(
+        post_rpc(
+            &client,
+            &endpoint,
+            Some(TOKEN),
+            remote_request(
+                7,
+                "ai.workcell/snapshot-prepare-restore",
+                json!({
+                    "version":"v1",
+                    "host":remote_host_binding(descriptor),
+                    "cwdHandle":descriptor["cwd"]["handle"],
+                    "snapshotId":snapshot_id,
+                    "sourceSnapshotId":source["result"]["snapshot"]["snapshotId"]
+                }),
+            ),
+        )
+        .await,
+    )
+    .await;
+    let preview = &prepare["result"]["preview"];
     assert_eq!(
-        prepare["result"]["preview"]["createdDirectories"],
-        json!([])
+        preview["counts"],
+        json!({
+            "create":0,
+            "replace":1,
+            "delete":0,
+            "conflict":0,
+            "unchanged":0,
+            "createdDirectories":0
+        }),
+        "{prepare}"
     );
-    let restore_id = prepare["result"]["preview"]["restoreId"].clone();
+    assert_eq!(preview["changes"][0]["path"], "state.txt");
+    assert_eq!(preview["changes"][0]["kind"], "replace");
+    let restore_id = preview["restoreId"].clone();
     assert!(restore_id.as_str().unwrap().starts_with("restore_"));
+    let journal = format!("snapshot-store:journal:{}", restore_id.as_str().unwrap());
+    let disclosed = prepare["result"]["operation"]["intent"]["resources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|resource| {
+            (
+                resource["display"].as_str().unwrap(),
+                resource["access"].as_str().unwrap(),
+            )
+        })
+        .collect::<Vec<_>>();
     assert_eq!(
-        prepare["result"]["operation"]["intent"]["resources"]
-            .as_array()
-            .unwrap()
-            .len(),
-        4
-    );
-    assert!(
-        prepare["result"]["operation"]["intent"]["resources"][1]["display"]
-            .as_str()
-            .unwrap()
-            .starts_with("snapshot-store:pre-restore:snap_")
+        disclosed,
+        [
+            ("file:.", "write"),
+            (journal.as_str(), "write"),
+            ("snapshot-store:settled-restore-journals", "delete"),
+        ]
     );
     let execute = remote_request(
-        6,
+        8,
         "ai.workcell/execute",
         json!({
             "version":"v1",
@@ -1005,6 +1083,40 @@ async fn authenticated_snapshot_restore_is_negotiated_and_uses_the_common_ledger
     );
     let duplicate = final_sse_json(post_rpc(&client, &endpoint, Some(TOKEN), execute).await).await;
     assert_eq!(duplicate["result"], completed["result"]);
+    let directory = final_sse_json(
+        post_rpc(
+            &client,
+            &endpoint,
+            Some(TOKEN),
+            remote_request(
+                9,
+                "ai.workcell/resolve-directory",
+                json!({
+                    "version":"v1",
+                    "host":remote_host_binding(descriptor),
+                    "cwdHandle":descriptor["cwd"]["handle"],
+                    "path":"sub"
+                }),
+            ),
+        )
+        .await,
+    )
+    .await;
+    let mut scoped_params =
+        capture_request("checkpoint-sub", workcell_host_contract::MAX_SNAPSHOT_FILES);
+    scoped_params["cwdHandle"] = directory["result"]["directory"]["handle"].clone();
+    let scoped = final_sse_json(
+        post_rpc(
+            &client,
+            &endpoint,
+            Some(TOKEN),
+            remote_request(10, "ai.workcell/snapshot-capture", scoped_params),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(scoped["result"]["snapshot"]["scope"], "sub", "{scoped}");
+    assert_eq!(scoped["result"]["snapshot"]["fileCount"], 1);
     assert_eq!(http.shutdown().await, ShutdownOutcome::Completed);
 
     let reopened = WorkcellServer::configured(

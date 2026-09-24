@@ -125,7 +125,7 @@ pub struct WorkspaceResolvedPath {
 
 #[derive(Clone, Debug)]
 pub struct WorkspaceSnapshotAccess {
-    core: Arc<FilesystemCore>,
+    pub(crate) core: Arc<FilesystemCore>,
 }
 
 impl WorkspaceSnapshotAccess {

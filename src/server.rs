@@ -47,8 +47,8 @@ use workcell_host_contract::{
     SnapshotPrepareRestoreRequest, SnapshotPrepareRestoreResponse, SnapshotPrepareUnrevertRequest,
     SnapshotRestorePreview, SnapshotStatusRequest, StructuredOutcome, ToolResultContent,
     ToolResultEnvelope, ToolResultText, WORKSPACE_MUTATION_CONTRACT_ID, WorkspaceCapability,
-    WorkspaceLimits, WorkspaceMethods, WorkspaceMutationCapability, WorkspaceRequestBinding,
-    WorkspaceWatchCapability, WorkspaceWatchLimits, WorkspaceWatchMethods,
+    WorkspaceLimits, WorkspaceMethods, WorkspaceMutationCapability, WorkspacePath,
+    WorkspaceRequestBinding, WorkspaceWatchCapability, WorkspaceWatchLimits, WorkspaceWatchMethods,
 };
 use workcell_mcp_code::{CodeBuildError, CodeConfiguration, CodeInput, CodeToolGroup};
 use workcell_mcp_code_graph::{
@@ -60,7 +60,7 @@ use workcell_mcp_files::{
     FileApplyPatchInput, FileEditInput, FileGlobInput, FileGrepInput, FileReadInput, FileResource,
     FileResourceAccess, FileToolGroup, FileWriteInput, FilesystemError, FilesystemLimits,
     IndexInput, ModelText as FileModelText, RootResourceKind, WorkspaceError,
-    root_relative_resource_id,
+    root_relative_resource_id, root_relative_resource_scope,
 };
 use workcell_mcp_shell::{
     ShellInput, ShellPermissionPolicy, ShellProgressChunk, ShellProgressSink, ShellToolGroup,
@@ -118,6 +118,8 @@ const SHELL_PREPARATION_FAILED_CODE: &str = "shell_preparation_failed";
 const SHELL_COMMAND_REFUSED_CODE: &str = "shell_command_refused";
 const PYTHON_PREPARATION_FAILED_CODE: &str = "python_preparation_failed";
 const PREPARATION_INTERNAL_CODE: &str = "preparation_internal_error";
+const SNAPSHOT_JOURNAL_RESOURCE_PREFIX: &str = "snapshot-store:journal:";
+const SNAPSHOT_SETTLED_JOURNALS_RESOURCE: &str = "snapshot-store:settled-restore-journals";
 static PROCESS_INSTANCE_ID: OnceLock<Arc<str>> = OnceLock::new();
 
 pub(crate) fn protocol_versions(modern_only: bool) -> &'static [ProtocolVersion] {
@@ -1144,6 +1146,22 @@ impl WorkcellServer {
         })
     }
 
+    /// The root-relative directory a snapshot request is bound to. A capture records it as its
+    /// scope; every other snapshot method only requires the handle to still resolve.
+    async fn snapshot_scope(
+        &self,
+        binding: &WorkspaceRequestBinding,
+    ) -> Result<WorkspacePath, ErrorData> {
+        let path = self
+            .workspace_files
+            .as_ref()
+            .ok_or_else(method_not_found)?
+            .workspace_directory_path(&binding.cwd_handle)
+            .await
+            .map_err(workspace_error)?;
+        WorkspacePath::new(path).map_err(|_| remote_invalid())
+    }
+
     async fn prepare_snapshot_restore(
         &self,
         remote: &RemoteHostState,
@@ -1153,7 +1171,7 @@ impl WorkcellServer {
         remote
             .validate_host(&request.binding.host)
             .map_err(remote_error)?;
-        validate_snapshot_cwd(remote, &request.binding)?;
+        self.snapshot_scope(&request.binding).await?;
         let encoded = serde_json::to_value(&request).map_err(|_| remote_invalid())?;
         let reservation = remote
             .reserve_preparation_wait(LARGE_PREPARATION_RESERVATION_BYTES, token)
@@ -1163,10 +1181,16 @@ impl WorkcellServer {
             .snapshots
             .as_ref()
             .ok_or_else(method_not_found)?
-            .prepare_restore_bounded(&request.snapshot_id, MAX_PREPARED_OPERATION_BYTES, token)
+            .prepare_restore(
+                &request.snapshot_id,
+                &request.source_snapshot_id,
+                MAX_PREPARED_OPERATION_BYTES,
+                token,
+            )
             .await
             .map_err(snapshot_error)?;
-        let resources = snapshot_restore_intents(&preview, prepared.pre_restore_snapshot_id())?;
+        let resources =
+            snapshot_restore_intents(prepared.scope(), &preview, prepared.unrevert_of())?;
         let operation = remote
             .prepare_reserved(
                 reservation,
@@ -1199,7 +1223,7 @@ impl WorkcellServer {
         remote
             .validate_host(&request.binding.host)
             .map_err(remote_error)?;
-        validate_snapshot_cwd(remote, &request.binding)?;
+        self.snapshot_scope(&request.binding).await?;
         let encoded = serde_json::to_value(&request).map_err(|_| remote_invalid())?;
         let reservation = remote
             .reserve_preparation_wait(LARGE_PREPARATION_RESERVATION_BYTES, token)
@@ -1209,10 +1233,11 @@ impl WorkcellServer {
             .snapshots
             .as_ref()
             .ok_or_else(method_not_found)?
-            .prepare_unrevert_bounded(&request.restore_id, MAX_PREPARED_OPERATION_BYTES, token)
+            .prepare_unrevert(&request.restore_id, MAX_PREPARED_OPERATION_BYTES, token)
             .await
             .map_err(snapshot_error)?;
-        let resources = snapshot_restore_intents(&preview, prepared.pre_restore_snapshot_id())?;
+        let resources =
+            snapshot_restore_intents(prepared.scope(), &preview, prepared.unrevert_of())?;
         let operation = remote
             .prepare_reserved(
                 reservation,
@@ -1245,7 +1270,7 @@ impl WorkcellServer {
         remote
             .validate_host(&request.binding.host)
             .map_err(remote_error)?;
-        validate_snapshot_cwd(remote, &request.binding)?;
+        self.snapshot_scope(&request.binding).await?;
         let encoded = serde_json::to_value(&request).map_err(|_| remote_invalid())?;
         let reservation = remote
             .reserve_preparation_wait(LARGE_PREPARATION_RESERVATION_BYTES, token)
@@ -1255,7 +1280,7 @@ impl WorkcellServer {
             .snapshots
             .as_ref()
             .ok_or_else(method_not_found)?
-            .prepare_cleanup_bounded(&request.snapshot_ids, MAX_PREPARED_OPERATION_BYTES)
+            .prepare_cleanup(&request.checkpoint_ids, MAX_PREPARED_OPERATION_BYTES)
             .await
             .map_err(snapshot_error)?;
         let resources = vec![resource_intent(
@@ -1984,7 +2009,7 @@ impl WorkcellServer {
                     .await
                 {
                     Ok(output) => typed_tool_result(&output, "Workspace restore completed".into()),
-                    Err(error) => operation_error_result(error.code(), error.to_string()),
+                    Err(error) => snapshot_error_result(error),
                 }
             }
             PreparedRemoteOperation::SnapshotCleanup(prepared) => {
@@ -1996,7 +2021,7 @@ impl WorkcellServer {
                     .await
                 {
                     Ok(output) => typed_tool_result(&output, "Snapshot cleanup completed".into()),
-                    Err(error) => operation_error_result(error.code(), error.to_string()),
+                    Err(error) => snapshot_error_result(error),
                 }
             }
             #[cfg(test)]
@@ -2495,12 +2520,12 @@ impl ServerHandler for WorkcellServer {
                 remote
                     .validate_workspace_host(&request.binding.host)
                     .map_err(remote_error)?;
-                validate_snapshot_cwd(remote, &request.binding)?;
+                let scope = self.snapshot_scope(&request.binding).await?;
                 serde_json::to_value(
                     self.snapshots
                         .as_ref()
                         .ok_or_else(method_not_found)?
-                        .capture(&request.checkpoint_id, &context.ct)
+                        .capture(&request.checkpoint_id, &scope, &request.limits, &context.ct)
                         .await
                         .map_err(snapshot_error)?,
                 )
@@ -2510,7 +2535,7 @@ impl ServerHandler for WorkcellServer {
                 remote
                     .validate_workspace_host(&request.binding.host)
                     .map_err(remote_error)?;
-                validate_snapshot_cwd(remote, &request.binding)?;
+                self.snapshot_scope(&request.binding).await?;
                 serde_json::to_value(
                     self.snapshots
                         .as_ref()
@@ -2529,7 +2554,7 @@ impl ServerHandler for WorkcellServer {
                 remote
                     .validate_workspace_host(&request.binding.host)
                     .map_err(remote_error)?;
-                validate_snapshot_cwd(remote, &request.binding)?;
+                self.snapshot_scope(&request.binding).await?;
                 serde_json::to_value(
                     self.snapshots
                         .as_ref()
@@ -2557,7 +2582,7 @@ impl ServerHandler for WorkcellServer {
                 remote
                     .validate_workspace_host(&request.binding.host)
                     .map_err(remote_error)?;
-                validate_snapshot_cwd(remote, &request.binding)?;
+                self.snapshot_scope(&request.binding).await?;
                 serde_json::to_value(
                     self.snapshots
                         .as_ref()
@@ -3025,66 +3050,42 @@ fn operation_file_intents(
     }
 }
 
-fn validate_snapshot_cwd(
-    remote: &RemoteHostState,
-    binding: &WorkspaceRequestBinding,
-) -> Result<(), ErrorData> {
-    if binding.cwd_handle != remote.binding.cwd_handle {
-        return Err(workspace_error(WorkspaceError::StaleCwd));
-    }
-    Ok(())
-}
-
+/// Discloses what a restore may touch: entries beneath `scope`, one intent per kind of effect its
+/// complete counts include, then its own journal, the journal an unrevert settles, and the settled
+/// journals it may reclaim to make room.
 fn snapshot_restore_intents(
+    scope: &str,
     preview: &SnapshotRestorePreview,
-    pre_restore_snapshot_id: &str,
+    unrevert_of: Option<&str>,
 ) -> Result<Vec<ResourceIntent>, ErrorData> {
-    let mut resources = preview
-        .changes
-        .iter()
-        .map(|change| {
-            Ok(ResourceIntent {
-                scope: workcell_mcp_files::root_relative_resource_scope(
-                    RootResourceKind::Path,
-                    change.path.as_str(),
-                )
-                .map_err(workspace_error)?,
-                resource_id: change.resource_id.clone(),
-                display: DisplayText::new(change.path.as_str()).map_err(|_| remote_invalid())?,
-                access: if change.target_revision.is_some() {
-                    ResourceAccess::Write
-                } else {
-                    ResourceAccess::Delete
-                },
-                revision: change.current_revision.clone(),
-            })
-        })
-        .collect::<Result<Vec<_>, ErrorData>>()?;
-    for directory in &preview.created_directories {
+    let counts = &preview.counts;
+    let writes = counts.create > 0 || counts.replace > 0 || counts.created_directories > 0;
+    let mut resources = Vec::new();
+    for access in [
+        writes.then_some(ResourceAccess::Write),
+        (counts.delete > 0).then_some(ResourceAccess::Delete),
+    ]
+    .into_iter()
+    .flatten()
+    {
         resources.push(ResourceIntent {
-            scope: workcell_mcp_files::root_relative_resource_scope(
-                RootResourceKind::Path,
-                directory.as_str(),
-            )
-            .map_err(workspace_error)?,
-            resource_id: root_relative_resource_id(RootResourceKind::Path, directory.as_str())
+            scope: root_relative_resource_scope(RootResourceKind::Path, scope)
                 .map_err(workspace_error)?,
-            display: DisplayText::new(format!("file:{}", directory.as_str()))
-                .map_err(|_| remote_invalid())?,
-            access: ResourceAccess::Write,
+            resource_id: root_relative_resource_id(RootResourceKind::Path, scope)
+                .map_err(workspace_error)?,
+            display: DisplayText::new(format!("file:{scope}")).map_err(|_| remote_invalid())?,
+            access,
             revision: None,
         });
     }
+    for restore_id in std::iter::once(preview.restore_id.as_str()).chain(unrevert_of) {
+        resources.push(resource_intent(
+            &format!("{SNAPSHOT_JOURNAL_RESOURCE_PREFIX}{restore_id}"),
+            ResourceAccess::Write,
+        )?);
+    }
     resources.push(resource_intent(
-        &format!("snapshot-store:pre-restore:{pre_restore_snapshot_id}:manifest-and-blobs"),
-        ResourceAccess::Write,
-    )?);
-    resources.push(resource_intent(
-        &format!("snapshot-store:journal:{}", preview.restore_id.as_str()),
-        ResourceAccess::Write,
-    )?);
-    resources.push(resource_intent(
-        "snapshot-store:acknowledged-restore-journals",
+        SNAPSHOT_SETTLED_JOURNALS_RESOURCE,
         ResourceAccess::Delete,
     )?);
     Ok(resources)
@@ -3351,11 +3352,25 @@ fn scm_error(error: ScmError) -> ErrorData {
     )
 }
 
+/// The refusal's code, and for a limit or quota which one was reached and its maximum, so a client
+/// can tell the operator what to change instead of only that the snapshot failed.
+fn snapshot_error_data(error: SnapshotError) -> Value {
+    let mut data = serde_json::json!({"code": error.code()});
+    if let Some((limit, maximum)) = error.limit() {
+        data["limit"] = limit.as_str().into();
+        if let Some(maximum) = maximum {
+            data["maximum"] = maximum.into();
+        }
+    }
+    data
+}
+
 fn snapshot_error(error: SnapshotError) -> ErrorData {
-    ErrorData::invalid_params(
-        error.to_string(),
-        Some(serde_json::json!({"code": error.code()})),
-    )
+    ErrorData::invalid_params(error.to_string(), Some(snapshot_error_data(error)))
+}
+
+fn snapshot_error_result(error: SnapshotError) -> Result<CallToolResult, ErrorData> {
+    error_result(snapshot_error_data(error), error.to_string())
 }
 
 fn scm_mutation_error_result(
@@ -3378,14 +3393,12 @@ fn operation_error_result(
     code: &str,
     message: impl Into<String>,
 ) -> Result<CallToolResult, ErrorData> {
-    let message = message.into();
-    let structured = serde_json::json!({
-        "error": {
-            "code": code,
-            "message": message,
-        }
-    });
-    let mut result = typed_tool_result(&structured, message)?;
+    error_result(serde_json::json!({"code": code}), message.into())
+}
+
+fn error_result(mut error: Value, message: String) -> Result<CallToolResult, ErrorData> {
+    error["message"] = message.clone().into();
+    let mut result = typed_tool_result(&serde_json::json!({"error": error}), message)?;
     result.is_error = Some(true);
     Ok(result)
 }
@@ -3476,7 +3489,7 @@ mod tests {
     use std::path::PathBuf;
 
     use tempfile::TempDir;
-    use workcell_host_contract::WorkspacePath;
+    use workcell_host_contract::{SnapshotChangeCounts, SnapshotLimit};
     use workcell_mcp_code::{WORKER_FILE_NAME, WorkerSource};
     use workcell_mcp_files::catalog as file_catalog;
     use workcell_mcp_web::{WebsearchExecutionConfiguration, catalog as web_catalog};
@@ -3785,35 +3798,138 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_restore_intents_disclose_created_directories_and_private_journal_effects() {
-        let preview = SnapshotRestorePreview {
-            restore_id: Identifier::new("restore_intent").unwrap(),
-            target_snapshot_id: Identifier::new(format!("snap_{}", "0".repeat(64))).unwrap(),
-            current_revision: Revision::new("current").unwrap(),
-            target_revision: Revision::new("target").unwrap(),
-            changes: Vec::new(),
-            created_directories: vec![WorkspacePath::new("one/two").unwrap()],
-        };
-        let pre_restore_snapshot_id = format!("snap_{}", "1".repeat(64));
-        let intents = snapshot_restore_intents(&preview, &pre_restore_snapshot_id).unwrap();
-        assert_eq!(intents.len(), 4);
-        assert_eq!(intents[0].display.as_str(), "file:one/two");
-        assert_eq!(intents[0].access, ResourceAccess::Write);
-        assert_eq!(
-            intents[1].display.as_str(),
-            format!("snapshot-store:pre-restore:{pre_restore_snapshot_id}:manifest-and-blobs")
-        );
-        assert_eq!(intents[1].access, ResourceAccess::Write);
-        assert_eq!(
-            intents[2].display.as_str(),
-            "snapshot-store:journal:restore_intent"
-        );
-        assert_eq!(intents[2].access, ResourceAccess::Write);
-        assert_eq!(
-            intents[3].display.as_str(),
-            "snapshot-store:acknowledged-restore-journals"
-        );
-        assert_eq!(intents[3].access, ResourceAccess::Delete);
+    fn restore_intents_disclose_exactly_the_effects_the_complete_counts_include() {
+        const SCOPE: &str = "one/two";
+        const SUBTREE: &str = "file:one/two";
+        const RESTORE_ID: &str = "restore_intent";
+        const ORIGINAL_ID: &str = "restore_original";
+        let journal = format!("{SNAPSHOT_JOURNAL_RESOURCE_PREFIX}{RESTORE_ID}");
+        let original = format!("{SNAPSHOT_JOURNAL_RESOURCE_PREFIX}{ORIGINAL_ID}");
+        let settled = SNAPSHOT_SETTLED_JOURNALS_RESOURCE.to_owned();
+        let bookkeeping = [
+            (journal.clone(), ResourceAccess::Write),
+            (settled.clone(), ResourceAccess::Delete),
+        ];
+        let subtree = |access| (SUBTREE.to_owned(), access);
+        let cases = [
+            (SnapshotChangeCounts::default(), None, bookkeeping.to_vec()),
+            (
+                SnapshotChangeCounts {
+                    conflict: 1,
+                    unchanged: 1,
+                    ..SnapshotChangeCounts::default()
+                },
+                None,
+                bookkeeping.to_vec(),
+            ),
+            (
+                SnapshotChangeCounts {
+                    created_directories: 1,
+                    ..SnapshotChangeCounts::default()
+                },
+                None,
+                [vec![subtree(ResourceAccess::Write)], bookkeeping.to_vec()].concat(),
+            ),
+            (
+                SnapshotChangeCounts {
+                    create: 1,
+                    ..SnapshotChangeCounts::default()
+                },
+                None,
+                [vec![subtree(ResourceAccess::Write)], bookkeeping.to_vec()].concat(),
+            ),
+            (
+                SnapshotChangeCounts {
+                    delete: 1,
+                    ..SnapshotChangeCounts::default()
+                },
+                None,
+                [vec![subtree(ResourceAccess::Delete)], bookkeeping.to_vec()].concat(),
+            ),
+            (
+                SnapshotChangeCounts {
+                    replace: 1,
+                    delete: 1,
+                    ..SnapshotChangeCounts::default()
+                },
+                Some(ORIGINAL_ID),
+                vec![
+                    subtree(ResourceAccess::Write),
+                    subtree(ResourceAccess::Delete),
+                    (journal.clone(), ResourceAccess::Write),
+                    (original, ResourceAccess::Write),
+                    (settled, ResourceAccess::Delete),
+                ],
+            ),
+        ];
+        for (counts, unrevert_of, expected) in cases {
+            let preview = SnapshotRestorePreview {
+                restore_id: Identifier::new(RESTORE_ID).unwrap(),
+                target_snapshot_id: Identifier::new(format!("snap_{}", "0".repeat(64))).unwrap(),
+                source_snapshot_id: Identifier::new(format!("snap_{}", "1".repeat(64))).unwrap(),
+                counts: counts.clone(),
+                changes: Vec::new(),
+                created_directories: Vec::new(),
+            };
+            let intents = snapshot_restore_intents(SCOPE, &preview, unrevert_of).unwrap();
+            let disclosed = intents
+                .iter()
+                .map(|intent| (intent.display.as_str().to_owned(), intent.access.clone()))
+                .collect::<Vec<_>>();
+            assert_eq!(disclosed, expected, "{counts:?}");
+            for intent in intents
+                .iter()
+                .filter(|intent| intent.display.as_str() == SUBTREE)
+            {
+                assert_eq!(
+                    intent.resource_id,
+                    root_relative_resource_id(RootResourceKind::Path, SCOPE).unwrap()
+                );
+                assert_eq!(
+                    intent.scope,
+                    root_relative_resource_scope(RootResourceKind::Path, SCOPE).unwrap()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn snapshot_refusals_name_the_limit_reached_and_its_maximum_where_it_has_one() {
+        const MAXIMUM: u64 = 7;
+        let cases = [
+            (
+                SnapshotError::LimitExceeded {
+                    limit: SnapshotLimit::Files,
+                    maximum: Some(MAXIMUM),
+                },
+                json!({"code":"limit_exceeded","limit":"files","maximum":MAXIMUM}),
+            ),
+            (
+                SnapshotError::QuotaExceeded {
+                    limit: SnapshotLimit::StorageBytes,
+                    maximum: Some(MAXIMUM),
+                },
+                json!({"code":"quota_exceeded","limit":"storageBytes","maximum":MAXIMUM}),
+            ),
+            (
+                SnapshotError::LimitExceeded {
+                    limit: SnapshotLimit::IgnoreRules,
+                    maximum: None,
+                },
+                json!({"code":"limit_exceeded","limit":"ignoreRules"}),
+            ),
+            (SnapshotError::Busy, json!({"code":"busy"})),
+        ];
+        for (error, expected) in cases {
+            assert_eq!(snapshot_error(error).data, Some(expected.clone()));
+            let result = snapshot_error_result(error).unwrap();
+            let mut structured = expected;
+            structured["message"] = error.to_string().into();
+            assert_eq!(
+                result.structured_content,
+                Some(json!({"error": structured}))
+            );
+        }
     }
 
     #[tokio::test]

@@ -545,13 +545,13 @@ impl FileToolGroup {
     }
 }
 
-struct PublicationTemporary<'a> {
-    parent: &'a File,
-    name: &'a str,
+pub(super) struct PublicationTemporary<'a> {
+    pub(super) parent: &'a File,
+    pub(super) name: &'a str,
 }
 
 impl PublicationTemporary<'_> {
-    fn remove(&self) -> Result<(), BinaryError> {
+    pub(super) fn remove(&self) -> Result<(), BinaryError> {
         match unlinkat(self.parent, self.name, AtFlags::empty()) {
             Ok(()) | Err(rustix::io::Errno::NOENT) => Ok(()),
             Err(_) => Err(BinaryError::Indeterminate),
@@ -610,31 +610,33 @@ pub(super) fn regular_file(parent: &File, name: &str) -> Result<File, BinaryErro
     #[cfg(not(target_os = "linux"))]
     return Err(BinaryError::Inaccessible);
     #[cfg(target_os = "linux")]
-    {
-        let before = descriptor
-            .metadata()
-            .map_err(|_| BinaryError::Inaccessible)?;
-        if !before.is_file() {
-            return Err(BinaryError::Inaccessible);
-        }
-        // Reopen the already validated regular inode, not its replaceable directory entry.
-        let file = File::from(
-            open(
-                format!("/proc/self/fd/{}", descriptor.as_raw_fd()),
-                OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NONBLOCK,
-                Mode::empty(),
-            )
-            .map_err(|_| BinaryError::Inaccessible)?,
-        );
-        if !file
-            .metadata()
-            .map_err(|_| BinaryError::Inaccessible)?
-            .is_file()
-        {
-            return Err(BinaryError::Inaccessible);
-        }
-        Ok(file)
+    reopen_regular(&descriptor)
+}
+
+/// Reopens the regular inode an `O_PATH` descriptor names, never its replaceable directory entry.
+pub(super) fn reopen_regular(descriptor: &File) -> Result<File, BinaryError> {
+    let before = descriptor
+        .metadata()
+        .map_err(|_| BinaryError::Inaccessible)?;
+    if !before.is_file() {
+        return Err(BinaryError::Inaccessible);
     }
+    let file = File::from(
+        open(
+            format!("/proc/self/fd/{}", descriptor.as_raw_fd()),
+            OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NONBLOCK,
+            Mode::empty(),
+        )
+        .map_err(|_| BinaryError::Inaccessible)?,
+    );
+    if !file
+        .metadata()
+        .map_err(|_| BinaryError::Inaccessible)?
+        .is_file()
+    {
+        return Err(BinaryError::Inaccessible);
+    }
+    Ok(file)
 }
 
 fn validate_destination(

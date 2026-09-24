@@ -221,6 +221,11 @@ impl RootPathPolicy {
     fn is_protected_path(&self, path: &Path) -> bool {
         protected_relative(path.strip_prefix(&self.root).unwrap_or(path))
     }
+
+    /// Protected-path decision for a `/`-separated root-relative path, the same one `resolve` makes.
+    pub(crate) fn protects_relative(&self, relative: &str) -> bool {
+        self.confined && protected_relative(Path::new(relative))
+    }
 }
 
 fn protected_relative(path: &Path) -> bool {

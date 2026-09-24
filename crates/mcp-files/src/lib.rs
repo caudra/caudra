@@ -21,6 +21,7 @@ mod patch;
 mod path_policy;
 mod prepared;
 mod read_operations;
+mod snapshot_tree;
 mod text;
 #[cfg(unix)]
 mod transfer_inventory;
@@ -49,6 +50,11 @@ pub use prepared::PreparedFileIndex;
 pub use prepared::{
     PreparedFileEdit, PreparedFileGlob, PreparedFileGrep, PreparedFilePatch, PreparedFileRead,
     PreparedFileWrite,
+};
+pub use snapshot_tree::{
+    SnapshotTreeContent, SnapshotTreeEntry, SnapshotTreeError, SnapshotTreeExpected,
+    SnapshotTreeFile, SnapshotTreeLimit, SnapshotTreeLimits, SnapshotTreeLink, SnapshotTreeNode,
+    SnapshotTreeObserved, SnapshotTreeStamp, SnapshotTreeWalk,
 };
 pub use types::*;
 pub use workcell_tool_contract::{ToolAnnotations, ToolSpec};

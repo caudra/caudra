@@ -529,45 +529,67 @@ restore journals remain beneath a directory keyed by the complete durable worksp
 that private root. They never cross workspace generations and are never returned as byte payloads or
 exposed by an HTTP route.
 
-`ai.workcell/snapshot-capture` uses a client checkpoint ID for durable idempotency. It captures at most
-128 confined regular files, 64 MiB per file, and 256 MiB total while holding the filesystem mutation
-lock. Each scan admits at most 50,000 directory entries and 16 MiB of aggregate retained path bytes,
-including directories that contain no files, before repeating the scan and publishing the manifest. A
-concurrent change fails capture instead of publishing a mixed manifest. Symlinks and special files are
-rejected rather than followed. The
-filesystem policy's protected paths, including Git metadata, credentials, and `.workcell`, are excluded;
-an in-workspace code-worker cache is also recorded as an exclusion even when its final path does not
-exist yet. Immutable blobs are SHA-256 addressed and deduplicated. Every blob, manifest, checkpoint,
-and journal publication checks the prospective replacement-aware total while holding the publication
-lock. A failed capture runs bounded orphan collection. Manifests record root-relative path, resource
-identity, revision, digest, mode, and size. `snapshot-inspect` pages that bounded manifest and verifies
-both manifest identity and every referenced blob before returning metadata.
+`ai.workcell/snapshot-capture` captures the directory its `cwdHandle` names, recorded as the snapshot's
+`scope`, under a client checkpoint ID that makes the call idempotent: an existing checkpoint is
+returned as it was first captured. One descriptor-relative walk that never follows a link or crosses a
+mount visits the scope, holding the filesystem mutation lock so Workcell's own writes cannot interleave.
+Regular files are stored by content. A symlink is stored as the link itself, its raw target as the blob,
+because following it would capture something outside the scope or capture the same file twice. The
+walk honours per-directory `.gitignore` files, and a directory that holds its own repository is a
+different worktree: it is reported and never entered. Mounts, sockets, FIFOs, devices, files over the
+per-file limit, entries that cannot be opened, and files whose content changed during three consecutive
+reads are left out and reported, never refusing the capture; a single entry a snapshot cannot hold is
+not a reason to lose revert for the rest of the tree. A name that is not UTF-8 is counted but cannot be
+named on the wire. The summary carries a count per reason and up to 32 sampled paths. Protected paths
+(Git metadata, `.ssh`, `.workcell`, `.env*`, `.npmrc`, `.pypirc`, `.netrc`, and private-key names) and
+root-relative exclusions, such as an in-workspace code-worker cache that may not exist yet, are left
+out silently.
 
-`snapshot-prepare-restore` allocates the stable restore ID and deterministic pre-restore snapshot ID,
-and returns the complete create, replace, delete, conflict, and missing-ancestor preview before storing
-the prepared value in the common operation ledger. Authorization includes one aggregate private-store
-manifest-and-blob write intent in addition to workspace and journal effects. Execution revalidates the
-captured workspace revision before any effect and again
-compares each file immediately before publication. Later edits are never overwritten, and execution
-creates only ancestor directories disclosed by preparation. Each replacement is atomic for one file,
-but a portable atomic transaction across files does not exist: discovery reports
-`atomicAcrossFiles: false`. Before publication, Workcell captures the exact current file state as a
-private snapshot and durably writes a restore journal under the prepared restore ID. Directory and file
-progress are journaled separately. A cancellation or ordinary failure reports partial or indeterminate
-state; after restart, bounded journal recovery compares the workspace with pre- and post-state, resolves
-an already completed restore, and otherwise requires reconciliation without replaying writes.
+The client lowers `maxFiles`, `maxFileBytes`, and `maxTotalBytes` per capture below the advertised
+50,000 files, 100 MiB, and 512 MiB. The per-file limit skips a file; the file-count and total-byte
+limits refuse the capture, because silently dropping files past a count would restore an arbitrary
+subset. The walk also stops at 250,000 directory entries, 64 MiB of retained path bytes, or a depth of
+128, and a manifest is at most 32 MiB. Every limit and quota refusal carries `data.limit`, naming the
+limit, and `data.maximum` where it has one, so a client can say which setting to change. Immutable
+blobs are SHA-256 addressed and deduplicated, and every blob, manifest, checkpoint, and journal
+publication is charged against the store quota while holding the publication lock. A failed capture
+removes what it stored. Manifests record, per entry, the root-relative path, kind, digest, mode, and
+size, then every pruned path with its reason. `snapshot-inspect` pages that manifest and verifies its
+identity before returning metadata. Manifests written by the previous release remain readable.
 
-`snapshot-status` reads the durable restore journal. `snapshot-prepare-unrevert` restores the private
-pre-restore snapshot through the same preview, common-ledger execution, compare-before-write, and status
-path. A completed, partial, or indeterminate restore protects its paths and referenced snapshots until
-the completed state is acknowledged with `snapshot-acknowledge`; another overlapping restore is refused.
-Journal count and byte quotas are checked before restore and unrevert, and pressure may reclaim only
-acknowledged terminal journals. `snapshot-prepare-cleanup` is likewise a common-ledger mutation.
-Preparation retains one exact plan covering checkpoint mappings, acknowledged journals, manifests, and
-unreachable blobs and binds authorization to its digest. Execution revalidates that plan, removes
-references before referents, and deletes no resource discovered after preparation. An empty snapshot ID
-list is a GC-only request. Startup completes bounded orphan collection, including an over-quota orphan
-store with no manifests, without replaying workspace writes.
+`snapshot-prepare-restore` names a target snapshot and a source snapshot the workspace is believed to
+match. The restore touches only paths whose entries differ between the two and that both captures
+covered, beneath the deeper of their scopes: a path either side pruned, excluded, or never saw is left
+alone. Each such path is observed now. One that already matches the target counts as unchanged, one
+that matches the source is planned as a create, replace, or delete, and anything else is a conflict. A
+missing ancestor directory is planned for creation; one that is not a plain directory is a conflict.
+Conflicts refuse execution, since restoring over an edit nobody captured would destroy it. The preview
+carries complete counts and bounded samples, conflicts first. Authorization discloses write and delete
+intents on the scope for the effects those counts include, the restore's own journal, and the settled
+journals it may reclaim for room. Execution journals the restore, then publishes each path only while
+its live entry still matches what preparation observed, by device, inode, size, mode, and timestamps.
+Each publication is atomic for one entry, but a portable transaction across files does not exist:
+discovery reports `atomicAcrossFiles: false`. The first refusal stops the restore; if nothing was
+published yet the journal is removed and the refusal returned, otherwise the restore is `partial`. An
+I/O outcome that cannot be known makes it `indeterminate` with `reconciliation_required`. The journal
+records state transitions and counts, not paths, and a restore that a crash left publishing is recomputed
+from its two captures and the live workspace at startup. Nothing is replayed.
+
+`snapshot-status` reads the durable restore journal. A completed, partial, or indeterminate restore
+awaits a decision: `snapshot-acknowledge` accepts it, and `snapshot-prepare-unrevert` restores the same
+two captures the other way round through the same preview, ledger execution, and per-path check. An
+unrevert that completes marks the original restore reverted and itself awaits acknowledgement. While one
+restore awaits a decision, every other restore is refused. Journal count and byte quotas are checked
+before execution, and pressure reclaims only settled journals.
+
+`snapshot-prepare-cleanup` deletes checkpoints, never snapshots directly, because one
+content-addressed snapshot may back the checkpoints of several sessions. It names up to 128 checkpoint
+IDs; the preview separates the ones that exist from the missing ones and counts reclaimable manifest,
+checkpoint, and journal bytes. Blobs are collected on execution, not counted in advance. Preparation
+retains one exact plan: the checkpoints, the settled journals, and every snapshot that no other
+checkpoint, awaiting restore, or pending preparation still names. Authorization is one server-state
+delete intent bound to that plan's digest. Execution refuses unless the store would still plan exactly
+that, removes references before referents, then deletes blobs no remaining manifest names.
 
 Preparations, terminal outcomes, and ordered shell progress are held in a bounded in-process ledger.
 Status therefore reports an instance mismatch as `indeterminate`, and a released, expired, or evicted

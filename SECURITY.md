@@ -229,46 +229,50 @@ that contains the workspace or is contained by it, an unsupported private entry,
 or more journals than the recovery bound. Workcell never falls back to a shared temporary path. The
 private root is operator state: do not mount it into the exposed workspace or serve it independently.
 
-Capture traverses only canonical entries admitted by filesystem confinement and the protected-path
-policy. Git metadata, `.workcell`, credential-bearing paths, the private snapshot root, and a configured
-in-workspace code-worker cache are excluded. Each scan bounds aggregate directory-entry count and
-retained path bytes before collecting entries, including wide directories and empty directory trees. A
-configured exclusion is resolved through its nearest
-existing ancestor, so a later-created suffix remains excluded; escaping and malformed suffixes fail
-startup. Every included entry must remain a regular file; symlinks, sockets, devices, and pipes fail
-capture. Per-file, file-count, total-byte, concurrent-capture, retained snapshot, journal, metadata, and
-total-storage limits are fixed and advertised. Blob, manifest, checkpoint, and journal bytes are
-serialized and charged prospectively, including replacement size, under one publication lock. Failed
-or inconsistent captures run bounded reachability collection. A complete second scan must match the
-first before an immutable manifest is published. Blob names are content digests and both blobs and
-manifests are verified when read. Private files use owner-only modes and same-directory
-create/sync/rename or create/link/sync publication.
+Capture walks the directory named by the request's cwd handle, which must still resolve to the
+directory the host issued it for. Every name is opened beneath an already open directory with
+`RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_XDEV`, so however the tree changes during a walk,
+capture never follows a link or crosses a mount. A symlink is data: the link's raw target is stored and
+never resolved. Protected paths (Git metadata, `.ssh`, `.workcell`, credential-bearing names),
+gitignored paths, and configured exclusions are left out. A configured exclusion
+is resolved through its nearest existing ancestor, so a later-created suffix remains excluded; escaping
+and malformed suffixes fail startup. A directory that holds its own repository is never entered. Mounts,
+special files, oversized files, unreadable entries, files that never read the same twice, and names
+that are not UTF-8 are left out and counted rather than failing the capture, and a restore never
+touches a path either capture left out. Entry-count, path-byte, depth, ignore-rule, file-count,
+total-byte, manifest, retained snapshot and checkpoint, journal, and total-storage limits are fixed and
+advertised; a client can only lower the per-capture ones. Blob, manifest, checkpoint, and journal
+bytes are charged prospectively under one publication lock, and a failed capture removes what it
+stored. Blob names are content digests and blobs are verified when read; manifest identity is verified
+on every load. Private files use owner-only modes and same-directory create/sync/rename or
+create/link/sync publication.
 
-Restore authorization happens against stable restore and deterministic pre-restore snapshot IDs and
-the complete prepared create/replace/delete/conflict and missing-ancestor list in the existing operation
-ledger. The workspace
-revision is compared again before the first effect and each file is compared immediately before its
-effect. An aggregate private-store write intent covers the prepared pre-restore manifest and blobs. A
-mismatch refuses publication; it never chooses the snapshot over a later edit. The
-pre-restore state is captured before a durable journal under that same restore ID enters `publishing`.
-Execution creates only prepared ancestors and journals directory progress before file progress. Each
-file replacement is atomic, but the complete restore is not. Termination can happen after a directory
-creation or file rename and before its journal update. Startup therefore compares bounded journal
-entries with pre-state and target digest/mode, marks safely completed work complete, and otherwise
-reports `partial` or `indeterminate` with reconciliation required. It does not replay an incomplete
-restore.
+A restore is authorized against its prepared plan in the existing operation ledger: write and delete
+intents on the scope for the effects its complete counts include, its own journal, the journal an
+unrevert settles, and the settled journals it may reclaim. It changes only paths that differ between
+its source and target captures, both of which covered them, and only where the live entry matched the
+source when prepared. A conflict anywhere refuses execution. Each path is published through a staged
+entry beside it and only while the live entry still carries the device, inode, size, mode, and
+timestamps preparation observed; a mismatch stops the restore rather than choosing the snapshot over a
+later edit. No write, link, or unlink goes through a symlinked or non-directory ancestor. Each
+publication is atomic for one entry, but the complete restore is not. The journal is durable before
+the first effect and records transitions, never paths. Termination can happen after a publication and
+before its journal update, so startup recomputes a restore left `publishing` from its two captures and
+the live workspace: fully applied becomes `completed`, one whose remaining paths all still match the
+source `partial`, and anything else `indeterminate` with reconciliation required. It never replays an
+incomplete restore.
 
-Unrevert targets the exact private pre-restore snapshot and uses the same prepared execution and status
-path. Until a completed restore is acknowledged, overlapping restores are rejected. Partial and
-indeterminate journals cannot be acknowledged and continue to gate overlap until an operator
-reconciles private state. Journal count and byte limits are enforced before restore and unrevert; only
-acknowledged terminal journals are reclaimable under pressure. Prepared cleanup also uses the common
-ledger. It retains the exact checkpoint, acknowledged-journal, manifest, and unreachable-blob deletion
-set and binds one server-state resource intent to that plan. Execution revalidates equality, removes
-references before referents, and never widens the prepared set. Startup bounded GC makes every cleanup
-crash boundary openable and permits GC-only recovery when no manifest ID remains. Pending preparations
-and every non-reclaimable journal remain reachability roots, so cleanup cannot remove state needed for
-restore, recovery, or unrevert.
+Unrevert restores the same two captures the other way round through the same prepared execution and
+status path, and settles the original restore as reverted once it completes. While one restore awaits
+acknowledgement or unrevert, every other restore is refused, so two restores cannot interleave over the
+same paths. Journal count and byte limits are enforced before execution; only settled journals are
+reclaimable under pressure. Prepared cleanup also uses the common ledger. It names checkpoints, never
+snapshots, retains the exact checkpoint, settled-journal, and snapshot deletion set, and binds one
+server-state resource intent to that plan's digest. Execution refuses unless the store would still plan
+the same set, removes references before referents, and then deletes only blobs no remaining manifest
+names; an unreadable manifest might name any blob, so then none is deleted. Pending preparations,
+retained checkpoints, and every unsettled journal remain reachability roots, so cleanup cannot remove
+state needed for restore, recovery, or unrevert.
 
 Discovery reports snapshots only after private-store validation and startup recovery succeed. It sets
 `controlPlane: true` only when operations, workspace reads, watch, project assets, writable prepared

@@ -42,9 +42,9 @@ pub const SNAPSHOT_PREPARE_CLEANUP_METHOD: &str = "ai.workcell/snapshot-prepare-
 pub const WORKSPACE_MUTATION_CONTRACT_ID: &str = "workspace.mutation.v1";
 pub const DIRECT_EXEC_CONTRACT_ID: &str = "workspace.exec.v1";
 pub const SCM_MUTATION_CONTRACT_ID: &str = "workspace.scm.mutation.v1";
-pub const SNAPSHOT_RESTORE_CONTRACT_ID: &str = "workspace.snapshot.restore.v1";
-pub const SNAPSHOT_UNREVERT_CONTRACT_ID: &str = "workspace.snapshot.unrevert.v1";
-pub const SNAPSHOT_CLEANUP_CONTRACT_ID: &str = "workspace.snapshot.cleanup.v1";
+pub const SNAPSHOT_RESTORE_CONTRACT_ID: &str = "workspace.snapshot.restore.v2";
+pub const SNAPSHOT_UNREVERT_CONTRACT_ID: &str = "workspace.snapshot.unrevert.v2";
+pub const SNAPSHOT_CLEANUP_CONTRACT_ID: &str = "workspace.snapshot.cleanup.v2";
 pub const MAX_ARGUMENT_BYTES: usize = 1_048_576;
 pub const MAX_ID_BYTES: usize = 128;
 pub const MAX_DISPLAY_TEXT_BYTES: usize = 65_536;
@@ -98,15 +98,18 @@ pub const MAX_SCM_DIFF_PARSED_LINES: u32 = 20_000;
 pub const MAX_SCM_SIDE_LINES: u32 = 4_000;
 pub const MAX_SCM_SIDE_BYTES: u32 = 512 * 1_024;
 pub const MAX_SCM_TEXT_BYTES: usize = MAX_SCM_SIDE_BYTES as usize;
-pub const MAX_SNAPSHOT_FILES: usize = 128;
-pub const MAX_SNAPSHOT_FILE_BYTES: u64 = 64 * 1_024 * 1_024;
-pub const MAX_SNAPSHOT_TOTAL_BYTES: u64 = 256 * 1_024 * 1_024;
-pub const MAX_SNAPSHOT_CAPTURE_ENTRIES: usize = 50_000;
-pub const MAX_SNAPSHOT_CAPTURE_PATH_BYTES: u64 = 16 * 1_024 * 1_024;
-pub const MAX_SNAPSHOT_COUNT: usize = 128;
-pub const MAX_SNAPSHOT_STORAGE_BYTES: u64 = 1_024 * 1_024 * 1_024;
+pub const MAX_SNAPSHOT_FILES: usize = 50_000;
+pub const MAX_SNAPSHOT_FILE_BYTES: u64 = 100 * 1_024 * 1_024;
+pub const MAX_SNAPSHOT_TOTAL_BYTES: u64 = 512 * 1_024 * 1_024;
+pub const MAX_SNAPSHOT_CAPTURE_ENTRIES: usize = 250_000;
+pub const MAX_SNAPSHOT_CAPTURE_PATH_BYTES: u64 = 64 * 1_024 * 1_024;
+pub const MAX_SNAPSHOT_COUNT: usize = 256;
+pub const MAX_SNAPSHOT_STORAGE_BYTES: u64 = 2 * 1_024 * 1_024 * 1_024;
 pub const MAX_SNAPSHOT_CLEANUP: usize = 128;
 pub const MAX_SNAPSHOT_JOURNALS: usize = 256;
+pub const MAX_SNAPSHOT_PREVIEW_CHANGES: usize = MAX_PAGE_SIZE as usize;
+pub const MAX_SNAPSHOT_SKIPPED_SAMPLES: usize = 32;
+pub const MAX_SNAPSHOT_DEPTH: usize = 128;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -467,7 +470,7 @@ pub struct WorkspaceSnapshotLimits {
     pub max_snapshots: u32,
     pub max_storage_bytes: u64,
     pub max_concurrent_captures: u32,
-    pub max_cleanup_snapshots: u32,
+    pub max_cleanup_checkpoints: u32,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -919,6 +922,16 @@ pub struct ScmMutationResponse {
     pub revisions: ScmRepositoryRevisions,
 }
 
+/// Per-capture ceilings a client may lower below the host's advertised limits.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct SnapshotCaptureLimits {
+    pub max_files: u32,
+    pub max_file_bytes: u64,
+    pub max_total_bytes: u64,
+}
+
+/// Captures the directory named by `binding.cwd_handle`, the session's working directory.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct SnapshotCaptureRequest {
@@ -926,6 +939,7 @@ pub struct SnapshotCaptureRequest {
     #[serde(flatten)]
     pub binding: WorkspaceRequestBinding,
     pub checkpoint_id: Identifier,
+    pub limits: SnapshotCaptureLimits,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -935,6 +949,86 @@ pub enum SnapshotState {
     Corrupt,
 }
 
+/// The limit or quota a snapshot operation reached, carried in `limit_exceeded` and
+/// `quota_exceeded` error data beside its `maximum` where the limit has one.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SnapshotLimit {
+    Files,
+    TotalBytes,
+    CaptureEntries,
+    CapturePathBytes,
+    Depth,
+    IgnoreRules,
+    ManifestBytes,
+    PreparedBytes,
+    Snapshots,
+    Checkpoints,
+    StorageBytes,
+    Journals,
+}
+
+impl SnapshotLimit {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Files => "files",
+            Self::TotalBytes => "totalBytes",
+            Self::CaptureEntries => "captureEntries",
+            Self::CapturePathBytes => "capturePathBytes",
+            Self::Depth => "depth",
+            Self::IgnoreRules => "ignoreRules",
+            Self::ManifestBytes => "manifestBytes",
+            Self::PreparedBytes => "preparedBytes",
+            Self::Snapshots => "snapshots",
+            Self::Checkpoints => "checkpoints",
+            Self::StorageBytes => "storageBytes",
+            Self::Journals => "journals",
+        }
+    }
+}
+
+impl fmt::Display for SnapshotLimit {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// Why a capture left an entry out. A restore never touches an entry left out of either side.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SnapshotSkipReason {
+    NestedRepository,
+    Mount,
+    Special,
+    Oversized,
+    Unreadable,
+    Unstable,
+    Unrepresentable,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct SnapshotSkippedEntry {
+    /// Lossy for an unrepresentable name, so it is for display only.
+    pub path: DisplayText,
+    pub reason: SnapshotSkipReason,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct SnapshotSkipped {
+    pub nested_repositories: u32,
+    pub mounts: u32,
+    pub special_files: u32,
+    pub oversized_files: u32,
+    pub unreadable_entries: u32,
+    pub unstable_files: u32,
+    pub unrepresentable_names: u32,
+    #[serde(deserialize_with = "deserialize_snapshot_skipped_samples")]
+    pub samples: Vec<SnapshotSkippedEntry>,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct SnapshotSummary {
@@ -942,8 +1036,10 @@ pub struct SnapshotSummary {
     pub checkpoint_id: Option<Identifier>,
     pub state: SnapshotState,
     pub manifest_revision: Revision,
+    pub scope: WorkspacePath,
     pub file_count: u32,
     pub total_bytes: u64,
+    pub skipped: SnapshotSkipped,
     pub created_at_unix_ms: u64,
 }
 
@@ -966,13 +1062,20 @@ pub struct SnapshotInspectRequest {
     pub cursor: Option<Cursor>,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SnapshotEntryKind {
+    File,
+    /// Captured as the link itself: `digest` covers the raw target and it is never followed.
+    Symlink,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct SnapshotFile {
     pub path: WorkspacePath,
     pub resource_id: ResourceId,
-    pub identity: Revision,
-    pub revision: Revision,
+    pub kind: SnapshotEntryKind,
     pub digest: Revision,
     pub mode: u32,
     pub size_bytes: u64,
@@ -997,6 +1100,9 @@ pub struct SnapshotPrepareRestoreRequest {
     #[serde(flatten)]
     pub binding: WorkspaceRequestBinding,
     pub snapshot_id: Identifier,
+    /// The capture the workspace is believed to match. Only paths that differ between it and the
+    /// target are restored, and each must still match this side when it is replaced.
+    pub source_snapshot_id: Identifier,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1027,13 +1133,26 @@ pub struct SnapshotChange {
     pub target_revision: Option<Revision>,
 }
 
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct SnapshotChangeCounts {
+    pub create: u32,
+    pub replace: u32,
+    pub delete: u32,
+    pub conflict: u32,
+    /// Paths that differ between the two captures but already match the target.
+    pub unchanged: u32,
+    pub created_directories: u32,
+}
+
+/// `changes` and `created_directories` are bounded samples, conflicts first; `counts` is complete.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct SnapshotRestorePreview {
     pub restore_id: Identifier,
     pub target_snapshot_id: Identifier,
-    pub current_revision: Revision,
-    pub target_revision: Revision,
+    pub source_snapshot_id: Identifier,
+    pub counts: SnapshotChangeCounts,
     #[serde(deserialize_with = "deserialize_snapshot_changes")]
     pub changes: Vec<SnapshotChange>,
     #[serde(deserialize_with = "deserialize_snapshot_restore_directories")]
@@ -1065,7 +1184,7 @@ pub struct SnapshotRestoreStatus {
     pub restore_id: Identifier,
     pub state: SnapshotRestoreState,
     pub target_snapshot_id: Identifier,
-    pub pre_restore_snapshot_id: Identifier,
+    pub source_snapshot_id: Identifier,
     pub applied_files: u32,
     pub total_files: u32,
     pub acknowledgement_required: bool,
@@ -1105,23 +1224,25 @@ pub struct SnapshotAcknowledgeResponse {
     pub restore: SnapshotRestoreStatus,
 }
 
+/// Deletes checkpoints, never snapshots: a content-addressed snapshot may back checkpoints of other
+/// sessions. Snapshots and blobs nothing references any more are collected afterwards.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct SnapshotPrepareCleanupRequest {
     pub version: ContractVersion,
     #[serde(flatten)]
     pub binding: WorkspaceRequestBinding,
-    #[serde(deserialize_with = "deserialize_snapshot_ids")]
-    pub snapshot_ids: Vec<Identifier>,
+    #[serde(deserialize_with = "deserialize_checkpoint_ids")]
+    pub checkpoint_ids: Vec<Identifier>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct SnapshotCleanupPreview {
-    #[serde(deserialize_with = "deserialize_snapshot_ids")]
-    pub snapshot_ids: Vec<Identifier>,
-    #[serde(deserialize_with = "deserialize_snapshot_ids")]
-    pub retained_snapshot_ids: Vec<Identifier>,
+    #[serde(deserialize_with = "deserialize_checkpoint_ids")]
+    pub checkpoint_ids: Vec<Identifier>,
+    #[serde(deserialize_with = "deserialize_checkpoint_ids")]
+    pub missing_checkpoint_ids: Vec<Identifier>,
     pub reclaimable_bytes: u64,
 }
 
@@ -1137,8 +1258,9 @@ pub struct SnapshotPrepareCleanupResponse {
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct SnapshotCleanupResponse {
     pub version: ContractVersion,
-    #[serde(deserialize_with = "deserialize_snapshot_ids")]
-    pub deleted_snapshot_ids: Vec<Identifier>,
+    #[serde(deserialize_with = "deserialize_checkpoint_ids")]
+    pub deleted_checkpoint_ids: Vec<Identifier>,
+    pub deleted_snapshots: u32,
     pub deleted_blobs: u32,
     pub reclaimed_bytes: u64,
 }
@@ -2299,14 +2421,23 @@ fn deserialize_snapshot_files<'de, D>(deserializer: D) -> Result<Vec<SnapshotFil
 where
     D: Deserializer<'de>,
 {
-    deserialize_bounded_vec(deserializer, MAX_SNAPSHOT_FILES, "files")
+    deserialize_bounded_vec(deserializer, MAX_PAGE_SIZE as usize, "files")
+}
+
+fn deserialize_snapshot_skipped_samples<'de, D>(
+    deserializer: D,
+) -> Result<Vec<SnapshotSkippedEntry>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_bounded_vec(deserializer, MAX_SNAPSHOT_SKIPPED_SAMPLES, "samples")
 }
 
 fn deserialize_snapshot_changes<'de, D>(deserializer: D) -> Result<Vec<SnapshotChange>, D::Error>
 where
     D: Deserializer<'de>,
 {
-    deserialize_bounded_vec(deserializer, MAX_SNAPSHOT_FILES, "changes")
+    deserialize_bounded_vec(deserializer, MAX_SNAPSHOT_PREVIEW_CHANGES, "changes")
 }
 
 fn deserialize_snapshot_restore_directories<'de, D>(
@@ -2315,14 +2446,18 @@ fn deserialize_snapshot_restore_directories<'de, D>(
 where
     D: Deserializer<'de>,
 {
-    deserialize_bounded_vec(deserializer, MAX_RESOURCE_INTENTS, "createdDirectories")
+    deserialize_bounded_vec(
+        deserializer,
+        MAX_SNAPSHOT_PREVIEW_CHANGES,
+        "createdDirectories",
+    )
 }
 
-fn deserialize_snapshot_ids<'de, D>(deserializer: D) -> Result<Vec<Identifier>, D::Error>
+fn deserialize_checkpoint_ids<'de, D>(deserializer: D) -> Result<Vec<Identifier>, D::Error>
 where
     D: Deserializer<'de>,
 {
-    deserialize_bounded_vec(deserializer, MAX_SNAPSHOT_CLEANUP, "snapshotIds")
+    deserialize_bounded_vec(deserializer, MAX_SNAPSHOT_CLEANUP, "checkpointIds")
 }
 
 fn deserialize_snapshot_paths<'de, D>(deserializer: D) -> Result<Vec<WorkspacePath>, D::Error>
