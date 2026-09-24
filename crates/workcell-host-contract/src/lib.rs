@@ -1560,6 +1560,10 @@ pub struct ProjectAssetManifest {
     pub revision: Revision,
     #[serde(deserialize_with = "deserialize_project_assets")]
     pub assets: Vec<ProjectAsset>,
+    /// Paths discovery could not read, so nothing beneath them was
+    /// discovered. At most [`MAX_PROJECT_ASSETS`] are named.
+    #[serde(deserialize_with = "deserialize_unreadable_project_paths")]
+    pub unreadable: Vec<WorkspacePath>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -2361,6 +2365,15 @@ where
     D: Deserializer<'de>,
 {
     deserialize_bounded_vec(deserializer, MAX_PROJECT_ASSETS, "assets")
+}
+
+fn deserialize_unreadable_project_paths<'de, D>(
+    deserializer: D,
+) -> Result<Vec<WorkspacePath>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_bounded_vec(deserializer, MAX_PROJECT_ASSETS, "unreadable")
 }
 
 fn deserialize_mutation_results<'de, D>(

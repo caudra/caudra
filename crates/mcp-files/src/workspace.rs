@@ -1389,32 +1389,10 @@ impl FileToolGroup {
         token: &CancellationToken,
     ) -> Result<DiscoverProjectAssetsResponse, WorkspaceError> {
         let directory = self.validate_directory(&request.binding.cwd_handle).await?;
-        let entries = self.list_entries(&directory.path, true, token).await?;
-        if entries.truncated {
-            return Err(WorkspaceError::InvalidRequest);
-        }
-        let mut assets = Vec::new();
-        for entry in entries.entries {
-            if entry.kind != WorkspaceEntryKind::File {
-                continue;
-            }
-            let Some((kind, trust)) = project_asset_kind(entry.path.as_str()) else {
-                continue;
-            };
-            assets.push(ProjectAsset {
-                path: entry.path,
-                resource_id: entry.resource_id,
-                revision: entry.revision,
-                kind,
-                trust,
-                size_bytes: entry.size_bytes.unwrap_or(0),
-            });
-            if assets.len() > MAX_PROJECT_ASSETS {
-                return Err(WorkspaceError::InvalidRequest);
-            }
-        }
+        let (mut assets, mut unreadable) = self.walk_project_assets(&directory.path, token).await?;
         assets.sort_by(|left, right| left.path.as_str().cmp(right.path.as_str()));
-        let revision = digest_serializable(&assets)?;
+        unreadable.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+        let revision = digest_serializable(&(&assets, &unreadable))?;
         Ok(DiscoverProjectAssetsResponse {
             version: ContractVersion::V1,
             manifest: ProjectAssetManifest {
@@ -1422,8 +1400,114 @@ impl FileToolGroup {
                     .map_err(|_| WorkspaceError::InvalidRequest)?,
                 revision,
                 assets,
+                unreadable,
             },
         })
+    }
+
+    /// Assets are named by path, so the walk only reads the files that match
+    /// one. A directory, entry or asset it cannot read is reported instead of
+    /// failing discovery: one bad mount must not keep a session from starting.
+    async fn walk_project_assets(
+        &self,
+        root: &Path,
+        token: &CancellationToken,
+    ) -> Result<(Vec<ProjectAsset>, Vec<WorkspacePath>), WorkspaceError> {
+        let allows_protected = self.core.policy.traversal_allows_protected(root);
+        let mut assets = Vec::new();
+        let mut unreadable = Vec::new();
+        let mut stack = vec![root.to_path_buf()];
+        let mut visited = 0usize;
+        while let Some(directory) = stack.pop() {
+            check_cancelled(token)?;
+            let listing_failed = |error| {
+                FilesystemError::io_path("Cannot list workspace directory", &directory, error)
+            };
+            let mut children = Vec::new();
+            let listed = match fs::read_dir(&directory).await {
+                Ok(mut reader) => loop {
+                    match reader.next_entry().await {
+                        Ok(Some(entry)) => {
+                            visited = visited.saturating_add(1);
+                            if visited > self.core.limits.max_traversal_entries
+                                || visited > MAX_WORKSPACE_LIST_ENTRIES as usize
+                            {
+                                return Err(WorkspaceError::InvalidRequest);
+                            }
+                            children.push(entry);
+                        }
+                        Ok(None) => break Ok(()),
+                        Err(error) => break Err(listing_failed(error)),
+                    }
+                },
+                Err(error) => Err(listing_failed(error)),
+            };
+            if let Err(error) = listed {
+                if directory == root {
+                    return Err(error.into());
+                }
+                skip_unreadable(
+                    &mut unreadable,
+                    self.core.policy.relative(&directory)?,
+                    error,
+                )?;
+                continue;
+            }
+            children.sort_by_cached_key(fs::DirEntry::path);
+            let mut directories = Vec::new();
+            for entry in children {
+                let path = entry.path();
+                let file_type = match entry.file_type().await {
+                    Ok(file_type) => file_type,
+                    Err(error) => {
+                        let error = FilesystemError::io_path(
+                            "Cannot inspect workspace entry",
+                            &path,
+                            error,
+                        );
+                        skip_unreadable(&mut unreadable, self.core.policy.relative(&path)?, error)?;
+                        continue;
+                    }
+                };
+                if file_type.is_symlink()
+                    || !self
+                        .core
+                        .policy
+                        .traversal_entry_allowed(allows_protected, &path)
+                    || !self.core.policy.authorize_canonical_entry(&path)
+                {
+                    continue;
+                }
+                if file_type.is_dir() {
+                    directories.push(path);
+                    continue;
+                }
+                let relative = self.core.policy.relative(&path)?;
+                let Some((kind, trust)) = project_asset_kind(&relative) else {
+                    continue;
+                };
+                let entry = match self.workspace_entry(&path, relative.clone()).await {
+                    Ok(entry) => entry,
+                    Err(error) => {
+                        skip_unreadable(&mut unreadable, relative, error)?;
+                        continue;
+                    }
+                };
+                assets.push(ProjectAsset {
+                    path: entry.path,
+                    resource_id: entry.resource_id,
+                    revision: entry.revision,
+                    kind,
+                    trust,
+                    size_bytes: entry.size_bytes.unwrap_or(0),
+                });
+                if assets.len() > MAX_PROJECT_ASSETS {
+                    return Err(WorkspaceError::InvalidRequest);
+                }
+            }
+            stack.extend(directories.into_iter().rev());
+        }
+        Ok((assets, unreadable))
     }
 
     pub async fn workspace_read_project_asset(
@@ -2045,6 +2129,23 @@ fn project_asset_kind(path: &str) -> Option<(ProjectAssetKind, ProjectAssetTrust
         ));
     }
     None
+}
+
+/// Names a path discovery could not read, unless it could hide the project's
+/// permission policy: a session running without the project's restrictions is
+/// weaker than one that does not start.
+fn skip_unreadable(
+    unreadable: &mut Vec<WorkspacePath>,
+    relative: String,
+    error: impl Into<WorkspaceError>,
+) -> Result<(), WorkspaceError> {
+    if matches!(relative.as_str(), ".caudra" | ".caudra/permissions.toml") {
+        return Err(error.into());
+    }
+    if unreadable.len() < MAX_PROJECT_ASSETS {
+        unreadable.push(WorkspacePath::new(relative).map_err(|_| WorkspaceError::InvalidRequest)?);
+    }
+    Ok(())
 }
 
 async fn validate_repository_storage(
@@ -3308,6 +3409,77 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn discovery_names_what_it_cannot_read_and_fails_closed_on_the_permission_policy() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let parent = tempdir().unwrap();
+        let root = parent.path().join("root");
+        for directory in ["locked", "notes", ".caudra"] {
+            fs::create_dir_all(root.join(directory)).await.unwrap();
+        }
+        for file in [
+            "AGENTS.md",
+            "locked/AGENTS.md",
+            "notes/AGENTS.md",
+            ".caudra/permissions.toml",
+            "private.bin",
+        ] {
+            fs::write(root.join(file), "[shell]\n").await.unwrap();
+        }
+        let set_mode = |path: &str, mode: u32| {
+            std::fs::set_permissions(root.join(path), std::fs::Permissions::from_mode(mode))
+                .unwrap();
+        };
+        for path in ["locked", "notes/AGENTS.md", "private.bin"] {
+            set_mode(path, 0o000);
+        }
+        if std::fs::read_dir(root.join("locked")).is_ok() {
+            // Permission bits do not bind this process, so nothing is unreadable.
+            set_mode("locked", 0o755);
+            return;
+        }
+        let group = FileToolGroup::new(&root, false, None).await.unwrap();
+        let request = DiscoverProjectAssetsRequest {
+            version: ContractVersion::V1,
+            binding: request_binding(group.workspace_root().await.unwrap().handle),
+        };
+
+        let discovered = group
+            .workspace_discover_project_assets(&request, &CancellationToken::new())
+            .await
+            .unwrap();
+        let assets = discovered
+            .manifest
+            .assets
+            .iter()
+            .map(|asset| asset.path.as_str())
+            .collect::<Vec<_>>();
+        let unreadable = discovered
+            .manifest
+            .unreadable
+            .iter()
+            .map(WorkspacePath::as_str)
+            .collect::<Vec<_>>();
+        assert_eq!(assets, [".caudra/permissions.toml", "AGENTS.md"]);
+        assert_eq!(unreadable, ["locked", "notes/AGENTS.md"]);
+
+        for (path, locked, restored) in [
+            (".caudra/permissions.toml", 0o000, 0o644),
+            (".caudra", 0o000, 0o755),
+        ] {
+            set_mode(path, locked);
+            let refused = group
+                .workspace_discover_project_assets(&request, &CancellationToken::new())
+                .await
+                .unwrap_err();
+            set_mode(path, restored);
+            assert_eq!(refused.code(), "filesystem_permission_denied", "{path}");
+        }
+        set_mode("locked", 0o755);
     }
 
     fn workspace_path(value: &str) -> Result<WorkspacePath, WorkspaceError> {
