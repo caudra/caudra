@@ -93,15 +93,33 @@ def table_run_summary(rows):
         inp = total_input(r)
         out = int(r["run_output_tokens"] or 0)
         prompt = r["prompt"][:50] + ("..." if len(r["prompt"]) > 50 else "")
-        table_rows.append((
-            r["agent"], r["model"], r["tag"] or "-", prompt,
-            fmt_num(cost, 4), fmt_num(dur, 1), str(turns),
-            fmt_num(inp), fmt_num(out),
-        ))
+        table_rows.append(
+            (
+                r["agent"],
+                r["model"],
+                r["tag"] or "-",
+                prompt,
+                fmt_num(cost, 4),
+                fmt_num(dur, 1),
+                str(turns),
+                fmt_num(inp),
+                fmt_num(out),
+            )
+        )
 
     fmt_table(
         "Run Summary",
-        ["Agent", "Model", "Tag", "Prompt", "Cost ($)", "Duration (s)", "Turns", "Total In Tok", "Output Tok"],
+        [
+            "Agent",
+            "Model",
+            "Tag",
+            "Prompt",
+            "Cost ($)",
+            "Duration (s)",
+            "Turns",
+            "Total In Tok",
+            "Output Tok",
+        ],
         table_rows,
         ["<", "<", "<", "<", ">", ">", ">", ">", ">"],
     )
@@ -117,7 +135,9 @@ def turn_total_input(r):
 
 
 def table_tool_usage(rows):
-    agent_tools = defaultdict(lambda: defaultdict(lambda: {"count": 0, "inp": 0, "out": 0}))
+    agent_tools = defaultdict(
+        lambda: defaultdict(lambda: {"count": 0, "inp": 0, "out": 0})
+    )
     for r in rows:
         tool = r["tool_name"]
         if not tool:
@@ -132,20 +152,28 @@ def table_tool_usage(rows):
         tools = agent_tools[agent]
         for tool in sorted(tools, key=lambda t: -tools[t]["count"]):
             b = tools[tool]
-            table_rows.append((
-                agent, tool, str(b["count"]),
-                fmt_num(safe_div(b["inp"], b["count"])),
-                fmt_num(safe_div(b["out"], b["count"])),
-            ))
+            table_rows.append(
+                (
+                    agent,
+                    tool,
+                    str(b["count"]),
+                    fmt_num(safe_div(b["inp"], b["count"])),
+                    fmt_num(safe_div(b["out"], b["count"])),
+                )
+            )
         total = {"count": 0, "inp": 0, "out": 0}
         for b in tools.values():
             for k in total:
                 total[k] += b[k]
-        table_rows.append((
-            agent, "TOTAL", str(total["count"]),
-            fmt_num(safe_div(total["inp"], total["count"])),
-            fmt_num(safe_div(total["out"], total["count"])),
-        ))
+        table_rows.append(
+            (
+                agent,
+                "TOTAL",
+                str(total["count"]),
+                fmt_num(safe_div(total["inp"], total["count"])),
+                fmt_num(safe_div(total["out"], total["count"])),
+            )
+        )
         table_rows.append(("", "", "", "", ""))
 
     fmt_table(
@@ -157,10 +185,17 @@ def table_tool_usage(rows):
 
 
 def table_token_efficiency(rows):
-    agents = defaultdict(lambda: {
-        "inp": 0, "out": 0, "cache_r": 0, "cache_w": 0,
-        "cost": 0.0, "turns": 0, "runs": 0,
-    })
+    agents = defaultdict(
+        lambda: {
+            "inp": 0,
+            "out": 0,
+            "cache_r": 0,
+            "cache_w": 0,
+            "cost": 0.0,
+            "turns": 0,
+            "runs": 0,
+        }
+    )
     for r in unique_runs(rows):
         a = agents[r["agent"]]
         a["inp"] += int(r["run_input_tokens"] or 0)
@@ -179,18 +214,35 @@ def table_token_efficiency(rows):
         out_in_ratio = safe_div(a["out"], total_in)
         cost_per_1k_out = safe_div(a["cost"], a["out"]) * 1000
         tok_per_turn = safe_div(a["out"], a["turns"])
-        table_rows.append((
-            agent, str(a["runs"]),
-            fmt_num(total_in), fmt_num(a["out"]),
-            fmt_num(a["cache_r"]), fmt_num(a["cache_w"]),
-            fmt_pct(cache_hit), fmt_num(out_in_ratio, 3),
-            fmt_num(cost_per_1k_out, 4), fmt_num(tok_per_turn),
-        ))
+        table_rows.append(
+            (
+                agent,
+                str(a["runs"]),
+                fmt_num(total_in),
+                fmt_num(a["out"]),
+                fmt_num(a["cache_r"]),
+                fmt_num(a["cache_w"]),
+                fmt_pct(cache_hit),
+                fmt_num(out_in_ratio, 3),
+                fmt_num(cost_per_1k_out, 4),
+                fmt_num(tok_per_turn),
+            )
+        )
 
     fmt_table(
         "Token Efficiency by Agent",
-        ["Agent", "Runs", "Total In Tok", "Output Tok", "Cache Read", "Cache Write",
-         "Cache Hit %", "Out/In Ratio", "$/1k Out Tok", "Out Tok/Turn"],
+        [
+            "Agent",
+            "Runs",
+            "Total In Tok",
+            "Output Tok",
+            "Cache Read",
+            "Cache Write",
+            "Cache Hit %",
+            "Out/In Ratio",
+            "$/1k Out Tok",
+            "Out Tok/Turn",
+        ],
         table_rows,
         ["<", ">", ">", ">", ">", ">", ">", ">", ">", ">"],
     )

@@ -99,11 +99,13 @@ def parse_stream_json(log_text: str) -> tuple[dict, dict[int, dict], list[dict]]
             turn_usage[idx] = usage
             for block in content:
                 if block.get("type") == "tool_use":
-                    tool_calls.append({
-                        "turn": idx,
-                        "name": block.get("name"),
-                        "input": block.get("input", {}),
-                    })
+                    tool_calls.append(
+                        {
+                            "turn": idx,
+                            "name": block.get("name"),
+                            "input": block.get("input", {}),
+                        }
+                    )
 
         elif msg_type == "result":
             session_id = msg.get("session_id", session_id)

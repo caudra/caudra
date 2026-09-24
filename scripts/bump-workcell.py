@@ -102,7 +102,9 @@ def write_hashes(hashes):
     lines = FLAKE.read_text().splitlines(keepends=True)
     start = lines.index(BLOCK_OPEN + "\n")
     end = lines.index(BLOCK_CLOSE + "\n", start)
-    body = [f'        "{key}" =\n          "{value}";\n' for key, value in hashes.items()]
+    body = [
+        f'        "{key}" =\n          "{value}";\n' for key, value in hashes.items()
+    ]
     FLAKE.write_text("".join(lines[: start + 1] + body + lines[end:]))
 
 
@@ -138,14 +140,20 @@ def main():
         print(f"{DEPENDENCY} is already at {current[:8]} and the flake agrees")
         return
 
-    dirty = [path for path in TRACKED if run(["git", "-C", ROOT, "status", "--porcelain", path])]
+    dirty = [
+        path
+        for path in TRACKED
+        if run(["git", "-C", ROOT, "status", "--porcelain", path])
+    ]
     if dirty:
         fail(f"uncommitted changes in {', '.join(dirty)}; commit or stash them first")
 
     if target != current:
         print(f"{DEPENDENCY} {current[:8]} -> {target[:8]}")
         manifest = CARGO_TOML.read_text()
-        line = next(l for l in manifest.splitlines() if l.startswith(f"{DEPENDENCY} = "))
+        line = next(
+            l for l in manifest.splitlines() if l.startswith(f"{DEPENDENCY} = ")
+        )
         CARGO_TOML.write_text(manifest.replace(line, line.replace(current, target), 1))
         # Plain cargo: the dev wrapper patches the dependency to a local path,
         # which would leave the lockfile describing something other than the pin.

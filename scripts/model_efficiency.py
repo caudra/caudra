@@ -102,9 +102,7 @@ P95 = 95
 # a model id containing % or _ as a pattern.
 MAIN_MODEL = "substr(s.model, instr(s.model, '/') + 1)"
 
-SESSION_HAS_SELF_SUBAGENT = (
-    "EXISTS (SELECT 1 FROM subagents sa WHERE sa.session_id = s.id AND sa.model = s.model)"
-)
+SESSION_HAS_SELF_SUBAGENT = "EXISTS (SELECT 1 FROM subagents sa WHERE sa.session_id = s.id AND sa.model = s.model)"
 
 # Recovers the main/subagent split the ledger lacks, from `model_usage` instead.
 #   subagent  the row's model is not the session's main model, so only subagents ran it
@@ -261,7 +259,9 @@ def by_provider(ledger):
             {
                 "provider": row["provider"],
                 "model": ", ".join(
-                    sorted(r["model"] for r in ledger if r["provider"] == row["provider"])
+                    sorted(
+                        r["model"] for r in ledger if r["provider"] == row["provider"]
+                    )
                 ),
                 "cost": 0.0,
                 "priced_turns": 0,
@@ -272,7 +272,13 @@ def by_provider(ledger):
             },
         )
         add_usage(bucket, row)
-        for key in ("cost", "priced_turns", "unpriced_turns", "turns", "subscription_turns"):
+        for key in (
+            "cost",
+            "priced_turns",
+            "unpriced_turns",
+            "turns",
+            "subscription_turns",
+        ):
             bucket[key] += row[key]
     return [with_derived(row) for row in grouped.values()]
 
@@ -358,7 +364,9 @@ def wall_time(events, models):
             responses[key][(event["session_id"], event["group"])] += event["ms"]
             # Role is part of the turn key because a main-agent turn number and a subagent
             # id can collide within one session, which would fuse two unrelated units.
-            turns[key][(event["session_id"], event["role"], event["turn"])] += event["ms"]
+            turns[key][(event["session_id"], event["role"], event["turn"])] += event[
+                "ms"
+            ]
     out = []
     for model in models:
         for role in ROLE_VIEWS:
@@ -653,7 +661,9 @@ def session_workload(conn, models, cwd):
                 "main_ms_per_turn": ratio(sum(s["main_ms"] for s in sessions), turns),
                 "sub_ms_per_turn": ratio(sum(s["sub_ms"] for s in sessions), turns),
                 "mean_sub_share": mean(shares),
-                "responses_per_turn": ratio(sum(s["responses"] for s in sessions), turns),
+                "responses_per_turn": ratio(
+                    sum(s["responses"] for s in sessions), turns
+                ),
                 "tools_per_turn": ratio(sum(s["calls"] for s in sessions), turns),
                 "runs_per_turn": ratio(sum(s["runs"] for s in sessions), turns),
             }
@@ -817,8 +827,20 @@ def table(headers, aligns, rows):
 
 def combined_table(ledger):
     return table(
-        ["Model", "Turns", "Total tokens", "Tok/turn", "Out/turn", "Cache rd/turn",
-         "Hit", "Miss", "Write", "$/turn", "Unpriced", "Sub"],
+        [
+            "Model",
+            "Turns",
+            "Total tokens",
+            "Tok/turn",
+            "Out/turn",
+            "Cache rd/turn",
+            "Hit",
+            "Miss",
+            "Write",
+            "$/turn",
+            "Unpriced",
+            "Sub",
+        ],
         ["<", ">", ">", ">", ">", ">", ">", ">", ">", ">", ">", ">"],
         [
             [
@@ -862,8 +884,18 @@ def wall_table(rows):
 
 def role_table(rows):
     return table(
-        ["Model", "Role", "Sessions", "Total tokens", "Share", "Input", "Output",
-         "Cache write", "Cache read", "Hit"],
+        [
+            "Model",
+            "Role",
+            "Sessions",
+            "Total tokens",
+            "Share",
+            "Input",
+            "Output",
+            "Cache write",
+            "Cache read",
+            "Hit",
+        ],
         ["<", "<", ">", ">", ">", ">", ">", ">", ">", ">"],
         [
             [
@@ -902,8 +934,17 @@ def session_table(rows):
 
 def bucket_table(rows):
     return table(
-        ["Model", "Buckets", "Turns/bucket", "Tok/turn p50", "Tok/turn p95", "Tok/turn mean",
-         "Hit p50", "Hit p95", "Hit mean"],
+        [
+            "Model",
+            "Buckets",
+            "Turns/bucket",
+            "Tok/turn p50",
+            "Tok/turn p95",
+            "Tok/turn mean",
+            "Hit p50",
+            "Hit p95",
+            "Hit mean",
+        ],
         ["<", ">", ">", ">", ">", ">", ">", ">", ">"],
         [
             [
@@ -924,8 +965,16 @@ def bucket_table(rows):
 
 def thinking_table(rows):
     return table(
-        ["Model", "Thinking", "Sessions", "User turns", "Total tokens",
-         "Blocks", "Block p50", "Block p95"],
+        [
+            "Model",
+            "Thinking",
+            "Sessions",
+            "User turns",
+            "Total tokens",
+            "Blocks",
+            "Block p50",
+            "Block p95",
+        ],
         ["<", "<", ">", ">", ">", ">", ">", ">"],
         [
             [
@@ -945,9 +994,21 @@ def thinking_table(rows):
 
 def workload_table(rows):
     return table(
-        ["Model", "Sessions", "User turns", "Median s/turn", "Mean s/turn", "p90 s/turn",
-         "Skew", "Main s/turn", "Sub s/turn", "Sub share", "Resp/turn", "Tools/turn",
-         "Subruns/turn"],
+        [
+            "Model",
+            "Sessions",
+            "User turns",
+            "Median s/turn",
+            "Mean s/turn",
+            "p90 s/turn",
+            "Skew",
+            "Main s/turn",
+            "Sub s/turn",
+            "Sub share",
+            "Resp/turn",
+            "Tools/turn",
+            "Subruns/turn",
+        ],
         ["<", ">", ">", ">", ">", ">", ">", ">", ">", ">", ">", ">", ">"],
         [
             [
@@ -972,8 +1033,16 @@ def workload_table(rows):
 
 def attribution_table(rows):
     return table(
-        ["Leader", "Incurred by", "Kind", "Sessions", "User turns", "Notional",
-         "$/user turn", "Share"],
+        [
+            "Leader",
+            "Incurred by",
+            "Kind",
+            "Sessions",
+            "User turns",
+            "Notional",
+            "$/user turn",
+            "Share",
+        ],
         ["<", "<", "<", ">", ">", ">", ">", ">"],
         [
             [
@@ -995,7 +1064,10 @@ def check_table(rows):
     return table(
         ["Check", "Result", "Detail"],
         ["<", "<", "<"],
-        [[row["check"], "pass" if row["ok"] else "FAIL", row["detail"]] for row in rows],
+        [
+            [row["check"], "pass" if row["ok"] else "FAIL", row["detail"]]
+            for row in rows
+        ],
     )
 
 
@@ -1200,14 +1272,19 @@ def render_text(report):
             out.extend(["(no rows)", ""])
             continue
         widths = [
-            max(len(headers[i]), max(len(row[i]) for row in rows)) for i in range(len(headers))
+            max(len(headers[i]), max(len(row[i]) for row in rows))
+            for i in range(len(headers))
         ]
         out.append(
-            "  ".join(f"{h:{a}{w}}" for h, a, w in zip(headers, aligns, widths)).rstrip()
+            "  ".join(
+                f"{h:{a}{w}}" for h, a, w in zip(headers, aligns, widths)
+            ).rstrip()
         )
         for row in rows:
             out.append(
-                "  ".join(f"{c:{a}{w}}" for c, a, w in zip(row, aligns, widths)).rstrip()
+                "  ".join(
+                    f"{c:{a}{w}}" for c, a, w in zip(row, aligns, widths)
+                ).rstrip()
             )
         out.append("")
     out.append("Caveats")
@@ -1247,7 +1324,9 @@ def render_markdown(report):
             out.append("_No rows._")
             continue
         out.append("| " + " | ".join(spec["headers"]) + " |")
-        out.append("|" + "|".join("---:" if a == ">" else "---" for a in spec["aligns"]) + "|")
+        out.append(
+            "|" + "|".join("---:" if a == ">" else "---" for a in spec["aligns"]) + "|"
+        )
         out.extend("| " + " | ".join(row) + " |" for row in spec["rows"])
     return "\n".join(out) + "\n"
 
@@ -1269,13 +1348,20 @@ def render_json(report):
 
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    p.add_argument("--db", type=Path, default=DEFAULT_DB, help=f"session database (default: {DEFAULT_DB})")
+    p.add_argument(
+        "--db",
+        type=Path,
+        default=DEFAULT_DB,
+        help=f"session database (default: {DEFAULT_DB})",
+    )
     p.add_argument(
         "--models",
         default=",".join(DEFAULT_MODELS),
         help=f"comma-separated model ids (default: {','.join(DEFAULT_MODELS)})",
     )
-    p.add_argument("--purpose", default=DEFAULT_PURPOSE, help="ledger purpose, empty for all")
+    p.add_argument(
+        "--purpose", default=DEFAULT_PURPOSE, help="ledger purpose, empty for all"
+    )
     p.add_argument("--cwd", default="", help="restrict to one project directory")
     p.add_argument("--format", choices=["text", "markdown", "json"], default="text")
     return p.parse_args()

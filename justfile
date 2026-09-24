@@ -40,10 +40,12 @@ lint-fix:
 fmt-check:
     cargo fmt --all -- --check
     stylua --check plugins/
+    ruff format --check scripts/
 
 fmt:
     cargo fmt --all
     stylua plugins/
+    ruff format scripts/
 
 pylint:
     ruff check scripts/
