@@ -994,9 +994,7 @@ mod tests {
             mutation: &ScmMutation,
         ) -> Result<PreparedScmMutation, WorkspaceError> {
             if matches!(*self.mode.lock().expect("mode"), MutationMode::Locked) {
-                return Err(WorkspaceError::PendingOperation {
-                    operation_id: "index-lock".to_owned(),
-                });
+                return Err(WorkspaceError::Conflict);
             }
             let paths = mutation_paths(mutation);
             let mut revisions = self.revisions();
@@ -1247,7 +1245,7 @@ mod tests {
             .await;
             assert!(matches!(
                 locked,
-                Err(Error::Workspace(WorkspaceError::PendingOperation { .. }))
+                Err(Error::Workspace(WorkspaceError::Conflict))
             ));
 
             *fake.mode.lock().expect("mode") = MutationMode::Indeterminate;

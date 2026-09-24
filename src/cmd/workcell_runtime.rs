@@ -40,6 +40,8 @@ use tokio_util::sync::CancellationToken;
 use crate::cli::WorkcellSelectorArgs;
 
 const WORKCELL_CODE_WORKER_ENV: &str = "WORKCELL_MCP_CODE_WORKER";
+const PENDING_REACHABLE_REMEDY: &str = "reconcile it, or inspect its effects and acknowledge it";
+const PENDING_UNREACHABLE_REMEDY: &str = "it ran on an earlier workspace generation and cannot be reconciled; inspect its effects and acknowledge it";
 
 enum WorkcellBackend {
     Embedded { _host: WorkcellHost },
@@ -253,9 +255,15 @@ impl WorkcellRuntime {
         // never the session, so the outcome is adopted rather than propagated.
         let _ = smol::block_on(caudra_agent::scratch::prepare_remote(&workspace_session));
         for pending in client.pending_remote_operations() {
+            let remedy = if pending.reachable {
+                PENDING_REACHABLE_REMEDY
+            } else {
+                PENDING_UNREACHABLE_REMEDY
+            };
             eprintln!(
-                "warning: remote mutations overlapping pending operation {} are blocked until it is reconciled or explicitly acknowledged",
-                pending.operation_id.as_str()
+                "warning: remote operation {} ({}) has no confirmed outcome; {remedy}",
+                pending.operation_id.as_str(),
+                pending.operation_kind
             );
         }
         let label = match &selection.source {

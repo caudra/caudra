@@ -61,9 +61,10 @@ pub(super) fn connector(storage: StateDir, cwd: PathBuf) -> SandboxConnector {
             let binding = runtime.stored_binding().cloned().ok_or_else(|| {
                 color_eyre::eyre::eyre!("Sandbox did not supply a workspace binding")
             })?;
-            if !RemoteOperationJournal::open(&storage)?
+            if RemoteOperationJournal::open(&storage)?
                 .list_pending(&binding)?
-                .is_empty()
+                .iter()
+                .any(|record| record.reachable_from(&binding))
             {
                 bail!("Reconcile pending Workcell mutations before attaching this sandbox");
             }

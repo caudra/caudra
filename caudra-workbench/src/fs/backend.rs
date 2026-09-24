@@ -268,9 +268,7 @@ impl From<WorkspaceError> for BackendError {
     fn from(error: WorkspaceError) -> Self {
         match error {
             WorkspaceError::Conflict | WorkspaceError::StaleResource { .. } => Self::Conflict,
-            WorkspaceError::IndeterminateOutcome | WorkspaceError::PendingOperation { .. } => {
-                Self::Indeterminate
-            }
+            WorkspaceError::IndeterminateOutcome => Self::Indeterminate,
             error => Self::Workspace(error),
         }
     }

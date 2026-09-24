@@ -183,7 +183,15 @@ An ordinary server restart preserves durable identity but changes the process in
 
 Caudra journals remote mutations before dispatch. When a reply is lost, it queries operation status rather than automatically repeating the mutation. Cancellation after dispatch is also reconciled through remote status. A timeout is not proof that nothing changed.
 
-On connection and recovery, confirmed terminal outcomes can clear pending records. Forgotten server state, unavailable status, or an unconfirmed dispatched operation remains **indeterminate**. Overlapping mutations are blocked. Shell operations can block a broad workspace scope because their effects cannot be reduced to one file.
+On connection and recovery, confirmed terminal outcomes can clear pending records. Forgotten server state, unavailable status, or an unconfirmed dispatched operation remains **indeterminate**.
+
+The journal only records operations. A pending or indeterminate operation does not hold back later tool calls or workbench saves, in this Caudra process or in another one. Sandbox lifecycle actions, reviewed transfers, and attaching a session to a sandbox still refuse to start until the pending operations of the current workspace generation are reconciled or acknowledged.
+
+Within one session, remote tool calls follow the local concurrency rules. Two writes to one file wait for each other and both apply, because the second is prepared only after the first has published. A write waiting at its permission prompt holds back later writes to the same file. Writes to different files run in parallel. Shell and Python calls take no file locks, so they never wait for a write and no write waits for them. Any remote call can still wait for a free operation slot when the host is at capacity.
+
+File locks are shared within one session only, and a relative and an absolute path to one file take different locks. In those cases two writes can prepare against the same version of the file. The host refuses the second publication because the file changed after it was prepared, so the first change is kept. The refused write is reported as indeterminate and stays in the pending report until you acknowledge it.
+
+An operation recorded against an earlier generation of the workspace is listed under its own heading. The host that ran it is gone, so it cannot be reconciled. Acknowledge it once you have checked its effects.
 
 Use the recovery controller without asking the model to repeat the command:
 
@@ -200,9 +208,9 @@ Use the recovery controller without asking the model to repeat the command:
 | `/remote pending` | Show the same status and pending-operation report |
 | `/remote reconnect` | Rediscover the server, validate identity and catalog, then reconcile pending operations |
 | `/remote reconcile` | Query operation status and clear confirmed outcomes without resending mutations |
-| `/remote acknowledge <operation-id> --accept-possible-effects` | Explicitly release that operation's local safety block |
+| `/remote acknowledge <operation-id> --accept-possible-effects` | Clear that operation from the pending report after you have inspected it |
 
-Acknowledgement is not cancellation, rollback, or proof of completion. The remote operation may already have changed files or may still be running. The exact `--accept-possible-effects` flag is required. Use the operation ID from the pending report, only after inspecting its possible effects. Do not delete the journal to bypass the block. None of these commands retries a mutation.
+Acknowledgement is not cancellation, rollback, or proof of completion. The remote operation may already have changed files or may still be running. The exact `--accept-possible-effects` flag is required. Use the operation ID from the pending report, only after inspecting its possible effects. None of these commands retries a mutation.
 
 The CLI uses the same controller without starting a model or loading project assets:
 

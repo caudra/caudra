@@ -735,7 +735,7 @@ impl RemoteWorkcellClient {
         if !self
             .pending_remote_operations()
             .iter()
-            .any(|operation| operation.operation_kind == TRANSFER_KIND)
+            .any(|operation| operation.reachable && operation.operation_kind == TRANSFER_KIND)
         {
             let _ = self.release_stage(&stage).await;
         }
@@ -1022,7 +1022,7 @@ impl WorkspaceTransferService for RemoteWorkcellClient {
         let operation = self.prepared_handle(
             &response.operation,
             "transfer",
-            Some((TRANSFER_KIND.to_owned(), false)),
+            Some(TRANSFER_KIND.to_owned()),
             Some(PreparedWorkspaceContext {
                 binding: stage.binding.clone(),
                 cursor: stage.cursor.clone(),

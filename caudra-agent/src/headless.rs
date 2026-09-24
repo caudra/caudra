@@ -1110,9 +1110,6 @@ fn remote_command_error(error: WorkspaceError) -> String {
         }
         WorkspaceError::Cancelled => REMOTE_COMMAND_CANCELLED.into(),
         WorkspaceError::IndeterminateOutcome => REMOTE_COMMAND_INDETERMINATE.into(),
-        WorkspaceError::PendingOperation { .. } => {
-            "Remote command is blocked by a pending remote operation".into()
-        }
         _ => "Remote command execution failed".into(),
     }
 }

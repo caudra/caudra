@@ -292,7 +292,7 @@ caudra --workcell-profile dev remote reconcile
 caudra --workcell-profile dev remote acknowledge OPERATION_ID --accept-possible-effects
 ```
 
-A remote selector is required. With no action, `remote` shows status. Acknowledgement releases a local safety block and accepts that the operation may have had effects or may still be running. It does not cancel, undo, or resend the operation. See [recovery commands](/docs/remote-workspaces/#recovery-commands) for the TUI and SDK forms and the inspection steps to take first.
+A remote selector is required. With no action, `remote` shows status. Pending operations never block tool calls. Acknowledgement clears an operation from the pending report and accepts that it may have had effects or may still be running. It does not cancel, undo, or resend the operation. See [recovery commands](/docs/remote-workspaces/#recovery-commands) for the TUI and SDK forms and the inspection steps to take first.
 
 ### `caudra auth`
 

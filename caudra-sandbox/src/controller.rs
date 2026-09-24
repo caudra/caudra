@@ -927,10 +927,11 @@ impl Controller {
             return Ok(());
         };
         let journal = RemoteOperationJournal::open(self.store.state()).map_err(|_| Error::Store)?;
-        if !journal
+        if journal
             .list_pending(binding)
             .map_err(|_| Error::Store)?
-            .is_empty()
+            .iter()
+            .any(|record| record.reachable_from(binding))
         {
             return Err(Error::Busy);
         }
@@ -1491,12 +1492,15 @@ mod tests {
     use caudra_storage::{
         StateDir,
         private_file::PrivateFileError,
+        remote_operation_journal::{
+            RemoteOperationJournal, RemoteOperationReservation, RequestDigest,
+        },
         sandbox_auth::{SandboxCredentialRef, save_sandbox_api_key},
         workspace_binding::StoredWorkspaceBinding,
     };
     use caudra_workspace::{
-        AuthenticatedPrincipalId, AuthorityIdentity, CwdHandle, ProjectIdentity, ProjectKey,
-        SessionBindingId, SessionWorkspaceBinding, SourceTrustAnchor, WorkspacePath,
+        AuthenticatedPrincipalId, AuthorityIdentity, CwdHandle, OperationId, ProjectIdentity,
+        ProjectKey, SessionBindingId, SessionWorkspaceBinding, SourceTrustAnchor, WorkspacePath,
     };
     use futures_lite::future;
     use serde_json::{Value, json};
@@ -3827,12 +3831,23 @@ mod tests {
         ));
     }
 
+    fn pending_reservation(binding: StoredWorkspaceBinding) -> RemoteOperationReservation {
+        RemoteOperationReservation {
+            operation_id: OperationId::new("pending-operation").unwrap(),
+            invocation_id: OperationId::new("pending-invocation").unwrap(),
+            preparation_id: OperationId::new("pending-preparation").unwrap(),
+            binding,
+            operation_kind: "test".into(),
+            request_digest: RequestDigest::sha256(DIGEST).unwrap(),
+            created_at: 1,
+            publication_cwd: None,
+            publication_id: None,
+            host_instance_id: "test-instance".to_owned(),
+        }
+    }
+
     #[test]
     fn unresolved_remote_mutations_block_disk_controls_but_allow_recovery_resume() {
-        use caudra_storage::remote_operation_journal::{
-            RemoteOperationJournal, RemoteOperationReservation, RequestDigest,
-        };
-        use caudra_workspace::OperationId;
         let server = Server::new(|method, path, _, headers| {
             if path.ends_with("/resume") {
                 let mut resumed = instance();
@@ -3853,22 +3868,9 @@ mod tests {
         let mut bound = record.clone();
         bound.workcell_binding = Some(binding.clone());
         controller.store.replace(&record, &bound).unwrap();
-        let mut journal = RemoteOperationJournal::open(controller.store.state()).unwrap();
-        journal
-            .reserve_before_send(&RemoteOperationReservation {
-                operation_id: OperationId::new("pending-operation").unwrap(),
-                invocation_id: OperationId::new("pending-invocation").unwrap(),
-                preparation_id: OperationId::new("pending-preparation").unwrap(),
-                binding,
-                operation_kind: "test".into(),
-                request_digest: RequestDigest::sha256(DIGEST).unwrap(),
-                lock_keys: Vec::new(),
-                created_at: 1,
-                publication_cwd: None,
-                broad_lock: true,
-                publication_id: None,
-                host_instance_id: "test-instance".to_owned(),
-            })
+        RemoteOperationJournal::open(controller.store.state())
+            .unwrap()
+            .reserve_before_send(&pending_reservation(binding))
             .unwrap();
         assert!(matches!(
             smol::block_on(controller.action(
@@ -3884,6 +3886,28 @@ mod tests {
         )
         .unwrap();
         assert_eq!(resumed.instance.unwrap().state, InstanceState::Running);
+    }
+
+    /// An operation recorded against an earlier workspace generation can never
+    /// be reconciled, so it must not hold back the disk controls for good.
+    #[test_case("", true; "current_generation_blocks")]
+    #[test_case("generation", false; "earlier_generation_does_not_block")]
+    fn only_a_reconcilable_remote_mutation_blocks_disk_controls(recorded: &str, blocks: bool) {
+        let server = Server::new(|method, path, _, headers| regular(method, path, headers));
+        let (_temp, controller, saved) = setup(&server);
+        let record = create_ready(&controller, &saved);
+        let mut bound = record.clone();
+        bound.workcell_binding = Some(binding(&record, ""));
+        controller.store.replace(&record, &bound).unwrap();
+        RemoteOperationJournal::open(controller.store.state())
+            .unwrap()
+            .reserve_before_send(&pending_reservation(binding(&record, recorded)))
+            .unwrap();
+        match controller.require_resolved_mutations(&bound) {
+            Err(Error::Busy) => assert!(blocks),
+            Ok(()) => assert!(!blocks),
+            Err(other) => panic!("{other:?}"),
+        }
     }
 
     #[test]

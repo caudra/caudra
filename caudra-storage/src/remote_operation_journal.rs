@@ -21,7 +21,7 @@ use admission::JournalAdmission;
 pub const REMOTE_OPERATION_JOURNAL_FILE: &str = "remote-operations.sqlite3";
 const JOURNAL_DIR: &str = "recovery";
 const APPLICATION_ID: i64 = i32::from_be_bytes(*b"CAUR") as i64;
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 const OWNER_FILE_MODE: u32 = 0o600;
 const OWNER_DIR_MODE: u32 = 0o700;
 const PAGE_SIZE: i64 = 4096;
@@ -31,9 +31,8 @@ const MAX_ROWS: usize = 4096;
 const MAX_GC_ROWS: usize = 256;
 const MAX_SQLITE_VALUE_BYTES: i32 = 64 * 1024;
 const MAX_OPERATION_KIND_BYTES: usize = 64;
+const OPERATION_KIND_FIELD: &str = "operation kind";
 const SHA256_DIGEST_BYTES: usize = 71;
-const MAX_LOCK_KEYS: usize = 64;
-const MAX_LOCK_KEY_BYTES: usize = 512;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_SCHEMA_OBJECTS: i64 = 16;
 
@@ -44,7 +43,6 @@ CREATE TABLE remote_operations (
     preparation_id       TEXT NOT NULL UNIQUE,
     publication_id       TEXT,
     publication_cwd      TEXT,
-    broad_lock           INTEGER NOT NULL DEFAULT 0 CHECK(broad_lock IN (0, 1)),
     binding              TEXT NOT NULL CHECK(json_valid(binding)),
     source                TEXT NOT NULL,
     server                TEXT NOT NULL,
@@ -58,7 +56,6 @@ CREATE TABLE remote_operations (
     cursor_label          TEXT,
     operation_kind        TEXT NOT NULL,
     request_digest        TEXT NOT NULL,
-    lock_keys             TEXT NOT NULL CHECK(json_valid(lock_keys)),
     state                 TEXT NOT NULL CHECK(state IN (
                               'reserved', 'dispatched', 'succeeded', 'failed',
                               'cancelled', 'indeterminate'
@@ -90,8 +87,6 @@ pub enum RemoteOperationJournalError {
     Json(#[from] serde_json::Error),
     #[error("duplicate remote operation idempotency identity")]
     DuplicateId,
-    #[error("remote mutation is blocked by pending operation {0}")]
-    PendingOperation(String),
     #[error("remote operation {0} was not found")]
     NotFound(String),
     #[error("remote operation cannot transition from {from:?} to {to:?}")]
@@ -118,52 +113,11 @@ pub enum RemoteOperationJournalError {
     AdmissionChanged,
     #[error("remote operation journal contains invalid data in {0}")]
     CorruptData(&'static str),
-    #[error("pending remote operation {0} belongs to a different workspace generation")]
-    PendingBindingMismatch(String),
 }
 
 impl From<io::Error> for RemoteOperationJournalError {
     fn from(error: io::Error) -> Self {
         Self::PersistentStateUnavailable(error)
-    }
-}
-
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(try_from = "String", into = "String")]
-pub struct OpaqueLockKey(String);
-
-impl OpaqueLockKey {
-    pub fn new(value: impl Into<String>) -> Result<Self, RemoteOperationJournalError> {
-        let value = value.into();
-        validate_text("lock key", &value, MAX_LOCK_KEY_BYTES)?;
-        Ok(Self(value))
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl fmt::Debug for OpaqueLockKey {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_tuple("OpaqueLockKey")
-            .field(&"<opaque>")
-            .finish()
-    }
-}
-
-impl TryFrom<String> for OpaqueLockKey {
-    type Error = RemoteOperationJournalError;
-
-    fn try_from(value: String) -> Result<Self, Self::Error> {
-        Self::new(value)
-    }
-}
-
-impl From<OpaqueLockKey> for String {
-    fn from(value: OpaqueLockKey) -> Self {
-        value.0
     }
 }
 
@@ -262,7 +216,6 @@ impl RemoteOperationState {
 #[derive(Debug, Clone)]
 pub struct RemoteOperationReservation {
     pub publication_cwd: Option<WorkspacePath>,
-    pub broad_lock: bool,
     pub host_instance_id: String,
     pub publication_id: Option<OperationId>,
     pub operation_id: OperationId,
@@ -271,7 +224,6 @@ pub struct RemoteOperationReservation {
     pub binding: StoredWorkspaceBinding,
     pub operation_kind: String,
     pub request_digest: RequestDigest,
-    pub lock_keys: Vec<OpaqueLockKey>,
     pub created_at: u64,
 }
 
@@ -286,7 +238,6 @@ pub struct RemoteOperationRecord {
     pub binding: StoredWorkspaceBinding,
     pub operation_kind: String,
     pub request_digest: RequestDigest,
-    pub lock_keys: Vec<OpaqueLockKey>,
     pub state: RemoteOperationState,
     pub created_at: u64,
     pub updated_at: u64,
@@ -294,6 +245,15 @@ pub struct RemoteOperationRecord {
     pub terminal_at: Option<u64>,
     pub acknowledged_at: Option<u64>,
     pub side_effects_possible: bool,
+}
+
+impl RemoteOperationRecord {
+    /// False for an operation an earlier generation of the workspace recorded:
+    /// the host that ran it is gone, so it can be acknowledged but never
+    /// reconciled, and nothing done to the current workspace can affect it.
+    pub fn reachable_from(&self, current: &StoredWorkspaceBinding) -> bool {
+        self.binding.workspace_generation() == current.workspace_generation()
+    }
 }
 
 pub struct RemoteOperationJournal {
@@ -349,7 +309,6 @@ impl RemoteOperationJournal {
             return Err(RemoteOperationJournalError::JournalFull);
         }
         let binding = serde_json::to_string(&reservation.binding)?;
-        let lock_keys = serde_json::to_string(&reservation.lock_keys)?;
         let created_at = to_i64(reservation.created_at, "created_at")?;
         let transaction = self
             .connection
@@ -374,43 +333,14 @@ impl RemoteOperationJournal {
         if duplicate {
             return Err(RemoteOperationJournalError::DuplicateId);
         }
-        let conflict: Option<String> = transaction
-            .query_row(
-                "SELECT operation_id FROM remote_operations
-             WHERE source = ?1 AND server = ?2 AND workspace = ?3
-               AND resource_namespace = ?4 AND principal = ?5 AND project = ?6
-               AND state IN ('reserved', 'dispatched', 'indeterminate') AND acknowledged_at IS NULL
-               AND (workspace_generation != ?7
-                    OR (broad_lock = 1 AND state != 'indeterminate')
-                    OR ?8 OR EXISTS (
-                   SELECT 1 FROM json_each(remote_operations.lock_keys) pending
-                   JOIN json_each(?9) requested ON pending.value = requested.value))
-             ORDER BY created_at, operation_id LIMIT 1",
-                params![
-                    reservation.binding.trust_anchor().as_str(),
-                    reservation.binding.server_id(),
-                    reservation.binding.workspace_id(),
-                    reservation.binding.resource_namespace_version(),
-                    reservation.binding.principal_id(),
-                    reservation.binding.project_key().as_str(),
-                    reservation.binding.workspace_generation(),
-                    reservation.broad_lock,
-                    lock_keys
-                ],
-                |row| row.get(0),
-            )
-            .optional()?;
-        if let Some(operation_id) = conflict {
-            return Err(RemoteOperationJournalError::PendingOperation(operation_id));
-        }
         transaction.execute(
             "INSERT INTO remote_operations (
                  operation_id, invocation_id, preparation_id, binding, source, server,
                  host_instance_id, workspace, workspace_generation, resource_namespace, principal, project,
-                 cwd_handle, cursor_label, operation_kind, request_digest, lock_keys, state,
-                 created_at, updated_at, side_effects_possible, publication_id, broad_lock, publication_cwd
+                 cwd_handle, cursor_label, operation_kind, request_digest, state,
+                 created_at, updated_at, side_effects_possible, publication_id, publication_cwd
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
-                       ?15, ?16, ?17, 'reserved', ?18, ?18, 0, ?19, ?20, ?21)",
+                       ?15, ?16, 'reserved', ?17, ?17, 0, ?18, ?19)",
             params![
                 reservation.operation_id.as_str(),
                 reservation.invocation_id.as_str(),
@@ -428,10 +358,8 @@ impl RemoteOperationJournal {
                 reservation.binding.cursor_label(),
                 reservation.operation_kind,
                 reservation.request_digest.as_str(),
-                lock_keys,
                 created_at,
                 reservation.publication_id.as_ref().map(OperationId::as_str),
-                reservation.broad_lock,
                 reservation.publication_cwd.as_ref().map(WorkspacePath::as_str),
             ],
         )?;
@@ -496,47 +424,24 @@ impl RemoteOperationJournal {
         )
     }
 
+    /// Every unresolved operation of this workspace, including those recorded
+    /// against an earlier generation of it. Those can no longer be reconciled
+    /// with the host that ran them, but they stay listed until acknowledged;
+    /// callers tell them apart with [`RemoteOperationRecord::reachable_from`].
     pub fn list_pending(
         &self,
         binding: &StoredWorkspaceBinding,
     ) -> Result<Vec<RemoteOperationRecord>, RemoteOperationJournalError> {
-        let mismatched_generation = self
-            .connection
-            .query_row(
-                "SELECT operation_id FROM remote_operations
-             WHERE source = ?1 AND server = ?2 AND workspace = ?3 AND principal = ?4
-                   AND project = ?5 AND resource_namespace = ?6 AND workspace_generation != ?7
-                   AND state IN ('reserved', 'dispatched', 'indeterminate')
-                   AND acknowledged_at IS NULL
-             ORDER BY created_at, operation_id LIMIT 1",
-                params![
-                    binding.trust_anchor().as_str(),
-                    binding.server_id(),
-                    binding.workspace_id(),
-                    binding.principal_id(),
-                    binding.project_key().as_str(),
-                    binding.resource_namespace_version(),
-                    binding.workspace_generation(),
-                ],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()?;
-        if let Some(operation_id) = mismatched_generation {
-            return Err(RemoteOperationJournalError::PendingBindingMismatch(
-                operation_id,
-            ));
-        }
         let mut statement = self.connection.prepare(
             "SELECT operation_id, invocation_id, preparation_id, binding, operation_kind,
-                    request_digest, lock_keys, state, created_at, updated_at, dispatched_at,
+                    request_digest, state, created_at, updated_at, dispatched_at,
                     terminal_at, acknowledged_at, side_effects_possible, publication_id, publication_cwd,
                     host_instance_id
              FROM remote_operations WHERE source = ?1 AND server = ?2 AND workspace = ?3
-                   AND workspace_generation = ?4 AND resource_namespace = ?5
-                   AND principal = ?6 AND project = ?7
+                   AND resource_namespace = ?4 AND principal = ?5 AND project = ?6
                    AND state IN ('reserved', 'dispatched', 'indeterminate')
                    AND acknowledged_at IS NULL
-             ORDER BY created_at, operation_id LIMIT ?8",
+             ORDER BY created_at, operation_id LIMIT ?7",
         )?;
         let records = statement
             .query_map(
@@ -544,7 +449,6 @@ impl RemoteOperationJournal {
                     binding.trust_anchor().as_str(),
                     binding.server_id(),
                     binding.workspace_id(),
-                    binding.workspace_generation(),
                     binding.resource_namespace_version(),
                     binding.principal_id(),
                     binding.project_key().as_str(),
@@ -554,13 +458,11 @@ impl RemoteOperationJournal {
             )?
             .collect::<Result<Vec<_>, _>>()
             .map_err(RemoteOperationJournalError::from)?;
-        if let Some(record) = records
+        if records
             .iter()
-            .find(|record| !record.binding.same_workspace_identity(binding))
+            .any(|record| !same_workspace_in_any_generation(&record.binding, binding))
         {
-            return Err(RemoteOperationJournalError::PendingBindingMismatch(
-                record.operation_id.as_str().to_owned(),
-            ));
+            return Err(RemoteOperationJournalError::CorruptData("binding"));
         }
         Ok(records)
     }
@@ -844,14 +746,24 @@ fn validate_reservation(
         return Err(RemoteOperationJournalError::DuplicateId);
     }
     validate_text(
-        "operation kind",
+        OPERATION_KIND_FIELD,
         &reservation.operation_kind,
         MAX_OPERATION_KIND_BYTES,
-    )?;
-    if reservation.lock_keys.len() > MAX_LOCK_KEYS {
-        return Err(RemoteOperationJournalError::LimitExceeded { field: "lock keys" });
-    }
-    Ok(())
+    )
+}
+
+/// The row's own binding has to name the workspace its indexed columns
+/// matched, or the record is not what the query selected.
+fn same_workspace_in_any_generation(
+    recorded: &StoredWorkspaceBinding,
+    current: &StoredWorkspaceBinding,
+) -> bool {
+    recorded.trust_anchor() == current.trust_anchor()
+        && recorded.server_id() == current.server_id()
+        && recorded.workspace_id() == current.workspace_id()
+        && recorded.resource_namespace_version() == current.resource_namespace_version()
+        && recorded.principal_id() == current.principal_id()
+        && recorded.project_key() == current.project_key()
 }
 
 fn validate_text(
@@ -872,13 +784,10 @@ fn record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RemoteOperationR
     let binding = serde_json::from_str(&row.get::<_, String>(3)?).map_err(|error| {
         rusqlite::Error::FromSqlConversionFailure(3, rusqlite::types::Type::Text, Box::new(error))
     })?;
-    let lock_keys = serde_json::from_str(&row.get::<_, String>(6)?).map_err(|error| {
-        rusqlite::Error::FromSqlConversionFailure(6, rusqlite::types::Type::Text, Box::new(error))
-    })?;
-    let state_name: String = row.get(7)?;
+    let state_name: String = row.get(6)?;
     let state = RemoteOperationState::from_storage_name(&state_name).ok_or_else(|| {
         rusqlite::Error::FromSqlConversionFailure(
-            7,
+            6,
             rusqlite::types::Type::Text,
             Box::new(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -888,26 +797,26 @@ fn record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RemoteOperationR
     })?;
     Ok(RemoteOperationRecord {
         publication_cwd: row
-            .get::<_, Option<String>>(15)?
+            .get::<_, Option<String>>(14)?
             .map(WorkspacePath::new)
             .transpose()
             .map_err(|error| {
                 rusqlite::Error::FromSqlConversionFailure(
-                    15,
+                    14,
                     rusqlite::types::Type::Text,
                     Box::new(error),
                 )
             })?,
         publication_id: row
-            .get::<_, Option<String>>(14)?
-            .map(|id| parse_operation_id(id, 14))
+            .get::<_, Option<String>>(13)?
+            .map(|id| parse_operation_id(id, 13))
             .transpose()?,
-        host_instance_id: row.get(16)?,
+        host_instance_id: row.get(15)?,
         operation_id,
         invocation_id,
         preparation_id,
         binding,
-        operation_kind: row.get(4)?,
+        operation_kind: parse_operation_kind(row.get(4)?, 4)?,
         request_digest: RequestDigest::sha256(row.get::<_, String>(5)?).map_err(|error| {
             rusqlite::Error::FromSqlConversionFailure(
                 5,
@@ -915,14 +824,13 @@ fn record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RemoteOperationR
                 Box::new(error),
             )
         })?,
-        lock_keys,
         state,
-        created_at: from_i64(row.get(8)?, 8)?,
-        updated_at: from_i64(row.get(9)?, 9)?,
-        dispatched_at: optional_u64(row.get(10)?, 10)?,
-        terminal_at: optional_u64(row.get(11)?, 11)?,
-        acknowledged_at: optional_u64(row.get(12)?, 12)?,
-        side_effects_possible: row.get(13)?,
+        created_at: from_i64(row.get(7)?, 7)?,
+        updated_at: from_i64(row.get(8)?, 8)?,
+        dispatched_at: optional_u64(row.get(9)?, 9)?,
+        terminal_at: optional_u64(row.get(10)?, 10)?,
+        acknowledged_at: optional_u64(row.get(11)?, 11)?,
+        side_effects_possible: row.get(12)?,
     })
 }
 
@@ -934,6 +842,18 @@ fn parse_operation_id(value: String, index: usize) -> rusqlite::Result<Operation
             Box::new(error),
         )
     })
+}
+
+/// Held to the bounds it was written with, since reports print it verbatim.
+fn parse_operation_kind(value: String, index: usize) -> rusqlite::Result<String> {
+    validate_text(OPERATION_KIND_FIELD, &value, MAX_OPERATION_KIND_BYTES).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            index,
+            rusqlite::types::Type::Text,
+            Box::new(error),
+        )
+    })?;
+    Ok(value)
 }
 
 fn from_i64(value: i64, index: usize) -> rusqlite::Result<u64> {
@@ -1007,10 +927,12 @@ mod tests {
     const LABEL: &str = "workspace";
     const REQUEST_DIGEST: &str =
         "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-    const RAW_LOCK_KEY: &str = "opaque-lock-value";
     const UNSUPPORTED_VERSION_EXPECTED: &str =
         "an unreadable journal must be refused with its path and the supported version";
     const FUTURE_SCHEMA_VERSION: i64 = SCHEMA_VERSION + 1;
+    const SHELL_KIND: &str = "canonical:shell";
+    const WRITE_KIND: &str = "canonical:file_write";
+    const PREVIOUS_GENERATION: &str = "previous-generation";
     const CRASH_PATH_ENV: &str = "CAUDRA_TEST_JOURNAL_CRASH_PATH";
     const CRASH_SQL_ENV: &str = "CAUDRA_TEST_JOURNAL_CRASH_SQL";
     const HOT_JOURNAL_MAGIC: &[u8] = b"\xd9\xd5\x05\xf9\x20\xa1\x63\xd7";
@@ -1099,7 +1021,6 @@ mod tests {
                 "PRAGMA journal_mode=DELETE;
                  ALTER TABLE remote_operations DROP COLUMN publication_id;
                  ALTER TABLE remote_operations DROP COLUMN publication_cwd;
-                 ALTER TABLE remote_operations DROP COLUMN broad_lock;
                  PRAGMA user_version=2; {SPILL_TRANSACTION}"
             ),
             _ => unreachable!(),
@@ -1249,16 +1170,18 @@ mod tests {
         assert_eq!(journal_snapshot(&path), before);
     }
 
-    #[test_case(false; "same_resource_across_cursors")]
-    #[test_case(true; "broad_lock_across_cursors")]
-    fn reservations_are_atomic_across_independent_journal_connections(broad: bool) {
+    /// The journal records operations and never arbitrates between them: two
+    /// processes reserving at the same instant, one of them a shell, both get
+    /// their row.
+    #[test]
+    fn reservations_from_independent_connections_never_block_each_other() {
         let temp = TempDir::new().unwrap();
         let path = temp.path().join("state");
         RemoteOperationJournal::open(&StateDir::from_path(path.clone())).unwrap();
         let barrier = Arc::new(Barrier::new(2));
-        let tasks = ["root", "nested"]
+        let tasks = [("root", SHELL_KIND), ("nested", WRITE_KIND)]
             .into_iter()
-            .map(|cursor| {
+            .map(|(cursor, kind)| {
                 let path = path.clone();
                 let barrier = barrier.clone();
                 thread::spawn(move || {
@@ -1268,57 +1191,42 @@ mod tests {
                         cursor,
                         binding("source", "authority", "principal", "project", cursor),
                     );
-                    if broad {
-                        reservation.broad_lock = cursor == "root";
-                        reservation.lock_keys = vec![OpaqueLockKey::new(cursor).unwrap()];
-                    }
+                    reservation.operation_kind = kind.into();
                     barrier.wait();
-                    match journal.reserve_before_send(&reservation) {
-                        Ok(()) => true,
-                        Err(RemoteOperationJournalError::PendingOperation(_)) => false,
-                        Err(error) => panic!("unexpected reservation error: {error}"),
-                    }
+                    journal.reserve_before_send(&reservation).unwrap();
                 })
             })
             .collect::<Vec<_>>();
-        assert_eq!(
-            tasks
-                .into_iter()
-                .map(|task| usize::from(task.join().unwrap()))
-                .sum::<usize>(),
-            1
-        );
+        for task in tasks {
+            task.join().unwrap();
+        }
+        let journal = RemoteOperationJournal::open(&StateDir::from_path(path)).unwrap();
+        assert_eq!(journal.list_pending(&default_binding()).unwrap().len(), 2);
     }
 
     #[test]
-    fn transfer_recovery_metadata_and_broad_locks_survive_reopen() {
+    fn transfer_recovery_metadata_survives_reopen() {
         let temp = TempDir::new().unwrap();
         let state = StateDir::from_path(temp.path().join("state"));
         let mut journal = RemoteOperationJournal::open(&state).unwrap();
         let mut reserved = reservation("publication", default_binding());
-        reserved.operation_kind = "canonical:shell".into();
-        reserved.broad_lock = true;
         reserved.publication_id = Some(OperationId::new("publication").unwrap());
         reserved.publication_cwd = Some(WorkspacePath::new("nested").unwrap());
         journal.reserve_before_send(&reserved).unwrap();
         journal.mark_dispatched(&reserved.operation_id, 11).unwrap();
         drop(journal);
-        let mut journal = RemoteOperationJournal::open(&state).unwrap();
+        let journal = RemoteOperationJournal::open(&state).unwrap();
         let pending = journal.list_pending(&default_binding()).unwrap();
         assert_eq!(pending[0].publication_id, reserved.publication_id);
         assert_eq!(pending[0].publication_cwd, reserved.publication_cwd);
         assert_eq!(pending[0].state, RemoteOperationState::Dispatched);
-        let mut other = reservation("another", default_binding());
-        other.lock_keys = vec![OpaqueLockKey::new("unrelated-resource").unwrap()];
-        assert!(matches!(
-            journal.reserve_before_send(&other),
-            Err(RemoteOperationJournalError::PendingOperation(_))
-        ));
+        assert_eq!(pending[0].dispatched_at, Some(11));
     }
 
     #[test_case(1; "v1")]
     #[test_case(2; "v2")]
     #[test_case(3; "v3")]
+    #[test_case(4; "v4")]
     #[test_case(FUTURE_SCHEMA_VERSION; "future")]
     fn unsupported_journal_versions_are_rejected_without_rewriting(version: i64) {
         let temp = TempDir::new().unwrap();
@@ -1333,7 +1241,6 @@ mod tests {
             .execute_batch(
                 "ALTER TABLE remote_operations DROP COLUMN publication_id;
              ALTER TABLE remote_operations DROP COLUMN publication_cwd;
-             ALTER TABLE remote_operations DROP COLUMN broad_lock;
              ALTER TABLE remote_operations DROP COLUMN host_instance_id;
              PRAGMA journal_mode = DELETE;",
             )
@@ -1413,7 +1320,6 @@ mod tests {
     fn reservation(id: &str, binding: StoredWorkspaceBinding) -> RemoteOperationReservation {
         RemoteOperationReservation {
             publication_cwd: None,
-            broad_lock: false,
             host_instance_id: "test-instance".to_owned(),
             publication_id: None,
             operation_id: OperationId::new(format!("operation-{id}")).unwrap(),
@@ -1422,7 +1328,6 @@ mod tests {
             binding,
             operation_kind: "tool_mutation".into(),
             request_digest: RequestDigest::sha256(REQUEST_DIGEST).unwrap(),
-            lock_keys: vec![OpaqueLockKey::new(RAW_LOCK_KEY).unwrap()],
             created_at: 10,
         }
     }
@@ -1532,28 +1437,53 @@ mod tests {
         assert_eq!(journal.list_pending(&exact).unwrap().len(), 1);
     }
 
+    /// A recreated sandbox keeps its workspace identity under a new
+    /// generation. What the old one left unresolved is still reported, with
+    /// the generation that recorded it, and never stands in the new one's way.
     #[test]
-    fn workspace_generation_mismatch_surfaces_pending_operation_without_querying_it() {
+    fn pending_operations_of_an_earlier_generation_are_listed_and_block_nothing() {
         let temp = TempDir::new().unwrap();
         let state_dir = StateDir::from_path(temp.path().join("state"));
-        let exact = default_binding();
-        let reservation = reservation("old-generation", exact.clone());
-        let mut journal = RemoteOperationJournal::open(&state_dir).unwrap();
-        journal.reserve_before_send(&reservation).unwrap();
-        let restarted = binding_with_generation(
+        let previous = binding_with_generation(
             "source",
             "authority",
             "principal",
             "project",
             "cursor",
-            "different-generation",
+            PREVIOUS_GENERATION,
         );
+        let mut journal = RemoteOperationJournal::open(&state_dir).unwrap();
+        let earlier = reservation("earlier", previous);
+        journal.reserve_before_send(&earlier).unwrap();
+        journal.mark_dispatched(&earlier.operation_id, 11).unwrap();
+        let current = default_binding();
+        let mut later = reservation("current", current.clone());
+        later.created_at = earlier.created_at + 1;
 
-        assert!(matches!(
-            journal.list_pending(&restarted),
-            Err(RemoteOperationJournalError::PendingBindingMismatch(operation_id))
-                if operation_id == reservation.operation_id.as_str()
-        ));
+        journal.reserve_before_send(&later).unwrap();
+
+        let pending = journal.list_pending(&current).unwrap();
+        let generations = pending
+            .iter()
+            .map(|record| {
+                (
+                    record.operation_id.as_str(),
+                    record.binding.workspace_generation(),
+                    record.reachable_from(&current),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            generations,
+            [
+                (earlier.operation_id.as_str(), PREVIOUS_GENERATION, false),
+                (
+                    later.operation_id.as_str(),
+                    current.workspace_generation(),
+                    true
+                ),
+            ]
+        );
     }
 
     #[test]
@@ -1562,8 +1492,7 @@ mod tests {
         let state_dir = StateDir::from_path(temp.path().join("state"));
         let binding = default_binding();
         let first = reservation("first", binding.clone());
-        let mut second = reservation("second", binding.clone());
-        second.lock_keys = vec![OpaqueLockKey::new("other-resource").unwrap()];
+        let second = reservation("second", binding.clone());
         let mut journal = RemoteOperationJournal::open(&state_dir).unwrap();
         journal.reserve_before_send(&first).unwrap();
         journal.reserve_before_send(&second).unwrap();
@@ -1595,15 +1524,9 @@ mod tests {
     fn records_are_bounded_and_debug_redacts_opaque_values() {
         const RAW_WORKSPACE_PATH: &str = "/private/workspace/path";
 
-        let lock_key = OpaqueLockKey::new(RAW_LOCK_KEY).unwrap();
-        assert!(!format!("{lock_key:?}").contains(RAW_LOCK_KEY));
         let digest = RequestDigest::sha256(REQUEST_DIGEST).unwrap();
         assert!(!format!("{digest:?}").contains(REQUEST_DIGEST));
         assert!(RequestDigest::sha256("raw request content").is_err());
-        assert!(matches!(
-            OpaqueLockKey::new("x".repeat(MAX_LOCK_KEY_BYTES + 1)),
-            Err(RemoteOperationJournalError::LimitExceeded { field: "lock key" })
-        ));
 
         let temp = TempDir::new().unwrap();
         let state_dir = StateDir::from_path(temp.path().join("state"));
@@ -1628,12 +1551,12 @@ mod tests {
             }
         }
         let mut oversized = reservation("large", default_binding());
-        oversized.lock_keys = (0..=MAX_LOCK_KEYS)
-            .map(|index| OpaqueLockKey::new(format!("lock-{index}")).unwrap())
-            .collect();
+        oversized.operation_kind = "x".repeat(MAX_OPERATION_KIND_BYTES + 1);
         assert!(matches!(
             journal.reserve_before_send(&oversized),
-            Err(RemoteOperationJournalError::LimitExceeded { field: "lock keys" })
+            Err(RemoteOperationJournalError::LimitExceeded {
+                field: "operation kind"
+            })
         ));
 
         let columns = journal
@@ -1656,6 +1579,33 @@ mod tests {
         ));
     }
 
+    /// Reports print a stored kind as it is, so one edited outside Caudra to
+    /// carry a terminal escape fails the read instead.
+    #[test]
+    fn a_stored_kind_is_held_to_its_bounds_on_read() {
+        const ESCAPING_KIND: &str = "canonical:\u{1b}[2Jshell";
+        const KIND_COLUMN: usize = 4;
+        let temp = TempDir::new().unwrap();
+        let state_dir = StateDir::from_path(temp.path().join("state"));
+        let mut journal = RemoteOperationJournal::open(&state_dir).unwrap();
+        journal
+            .reserve_before_send(&reservation("escaping", default_binding()))
+            .unwrap();
+        journal
+            .connection
+            .execute(
+                "UPDATE remote_operations SET operation_kind = ?1",
+                [ESCAPING_KIND],
+            )
+            .unwrap();
+        assert!(matches!(
+            journal.list_pending(&default_binding()),
+            Err(RemoteOperationJournalError::Sqlite(
+                rusqlite::Error::FromSqlConversionFailure(KIND_COLUMN, _, _)
+            ))
+        ));
+    }
+
     #[test]
     fn journal_enforces_row_and_database_size_bounds() {
         let temp = TempDir::new().unwrap();
@@ -1670,12 +1620,12 @@ mod tests {
                  INSERT INTO remote_operations (
                      operation_id, invocation_id, preparation_id, binding, source, server,
                      host_instance_id, workspace, workspace_generation, resource_namespace,
-                     principal, project, cwd_handle, operation_kind, request_digest, lock_keys,
+                     principal, project, cwd_handle, operation_kind, request_digest,
                      state, created_at, updated_at, side_effects_possible
                   ) SELECT 'operation-' || value, 'invocation-' || value,
                            'preparation-' || value, '{}', 'source', 'authority', 'instance',
                            'workspace', 'generation', 'namespace', 'principal', 'project',
-                           'cursor', 'tool_mutation', ?2, '[]', 'failed', 1, 1, 0
+                           'cursor', 'tool_mutation', ?2, 'failed', 1, 1, 0
                    FROM seq",
                 params![MAX_ROWS as i64, REQUEST_DIGEST],
             )

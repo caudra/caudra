@@ -12,7 +12,7 @@ use caudra_config::workcell::{RemoteWorkcellSelection, WorkcellEndpoint};
 use caudra_storage::auth::{WorkcellCredential, WorkcellCredentialName};
 use caudra_storage::id::CaudraId;
 use caudra_storage::remote_operation_journal::{
-    OpaqueLockKey, RemoteOperationJournal, RemoteOperationJournalError, RemoteOperationReservation,
+    RemoteOperationJournal, RemoteOperationRecord, RemoteOperationReservation,
     RemoteOperationState, RequestDigest,
 };
 use caudra_storage::workspace_binding::StoredWorkspaceBinding;
@@ -57,7 +57,6 @@ use isahc::{AsyncBody, HttpClient, ResponseExt};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
-use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 use url::{Host, Url};
@@ -95,6 +94,8 @@ const SNAPSHOT_RESTORE_KIND: &str = "snapshot_restore";
 const SNAPSHOT_UNREVERT_KIND: &str = "snapshot_unrevert";
 const SNAPSHOT_CLEANUP_KIND: &str = "snapshot_cleanup";
 const MAX_CONTROL_OPERATIONS: usize = 32;
+const UNREACHABLE_OPERATIONS_HEADING: &str = "Operations from an earlier workspace generation";
+const UNREACHABLE_OPERATIONS_REMEDY: &str = "The host that ran them is gone, so they cannot be reconciled; acknowledge each once you have checked its effects.";
 const SHELL_CONTRACT_ID: &str = "shell.execution.v1";
 
 mod transfer;
@@ -193,7 +194,7 @@ pub enum RemoteWorkcellError {
     Indeterminate,
     #[error("remote Workcell durable operation journal is unavailable")]
     JournalUnavailable,
-    #[error("pending remote operation {operation_id} belongs to a different workspace generation")]
+    #[error("pending remote operation {operation_id} is recorded against a different project")]
     RecoveryBindingMismatch { operation_id: String },
     /// A refusal that arrived well formed and carried a reason this client has
     /// no mapping for. The host's prose stays at the transport boundary; the
@@ -240,6 +241,9 @@ pub struct PendingRemoteOperation {
     pub operation_id: OperationId,
     pub operation_kind: String,
     pub state: RemoteOperationState,
+    /// False when an earlier generation of the workspace recorded it: its host
+    /// is gone, so only acknowledging it after inspecting the files remains.
+    pub reachable: bool,
 }
 
 impl From<RemoteWorkcellError> for WorkspaceError {
@@ -982,8 +986,6 @@ struct JournalOperation {
     preparation_id: OperationId,
     operation_kind: String,
     request_digest: RequestDigest,
-    lock_keys: Vec<OpaqueLockKey>,
-    broad: bool,
 }
 
 struct PendingJournalOperation {
@@ -994,11 +996,36 @@ struct PendingJournalOperation {
     preparation_id: OperationId,
     operation_kind: String,
     request_digest: RequestDigest,
-    lock_keys: Vec<OpaqueLockKey>,
     state: RemoteOperationState,
-    broad: bool,
     dispatched_at: Option<u64>,
     cursor: WorkspaceCursor,
+    reachable: bool,
+}
+
+impl PendingJournalOperation {
+    fn from_record(
+        record: RemoteOperationRecord,
+        current: &StoredWorkspaceBinding,
+    ) -> Option<(OperationId, Self)> {
+        let reachable = record.reachable_from(current);
+        let cursor = record.binding.cursor().cloned()?;
+        Some((
+            record.operation_id,
+            Self {
+                publication_cwd: record.publication_cwd,
+                publication_id: record.publication_id,
+                host_instance_id: record.host_instance_id,
+                invocation_id: record.invocation_id,
+                preparation_id: record.preparation_id,
+                operation_kind: record.operation_kind,
+                request_digest: record.request_digest,
+                state: record.state,
+                dispatched_at: record.dispatched_at,
+                cursor,
+                reachable,
+            },
+        ))
+    }
 }
 
 struct RemoteJournalState {
@@ -1029,35 +1056,13 @@ impl RemoteMutationJournal {
         journal: RemoteOperationJournal,
         binding: StoredWorkspaceBinding,
     ) -> Result<Self, RemoteWorkcellError> {
-        let records = journal
+        let pending = journal
             .list_pending(&binding)
-            .map_err(journal_startup_error)?;
-        let pending = records
+            .map_err(|_| RemoteWorkcellError::JournalUnavailable)?
             .into_iter()
             .map(|record| {
-                let cursor = record
-                    .binding
-                    .cursor()
-                    .cloned()
-                    .ok_or(RemoteWorkcellError::JournalUnavailable)?;
-                let broad = broad_operation_kind(&record.operation_kind);
-                Ok((
-                    record.operation_id,
-                    PendingJournalOperation {
-                        publication_cwd: record.publication_cwd,
-                        publication_id: record.publication_id,
-                        host_instance_id: record.host_instance_id,
-                        invocation_id: record.invocation_id,
-                        preparation_id: record.preparation_id,
-                        operation_kind: record.operation_kind,
-                        request_digest: record.request_digest,
-                        lock_keys: record.lock_keys,
-                        state: record.state,
-                        broad,
-                        dispatched_at: record.dispatched_at,
-                        cursor,
-                    },
-                ))
+                PendingJournalOperation::from_record(record, &binding)
+                    .ok_or(RemoteWorkcellError::JournalUnavailable)
             })
             .collect::<Result<HashMap<_, _>, _>>()?;
         Ok(Self {
@@ -1088,42 +1093,9 @@ impl RemoteMutationJournal {
         stored_binding: StoredWorkspaceBinding,
     ) -> Result<(), WorkspaceError> {
         let mut state = self.state.lock().map_err(|_| WorkspaceError::Unavailable)?;
-        let persisted = state
-            .journal
-            .list_pending(&stored_binding)
-            .map_err(|_| WorkspaceError::Unavailable)?;
-        for record in persisted {
-            let cursor = record
-                .binding
-                .cursor()
-                .cloned()
-                .ok_or(WorkspaceError::Unavailable)?;
-            let broad = broad_operation_kind(&record.operation_kind);
-            state
-                .pending
-                .entry(record.operation_id)
-                .or_insert(PendingJournalOperation {
-                    publication_cwd: record.publication_cwd,
-                    publication_id: record.publication_id,
-                    host_instance_id: record.host_instance_id,
-                    invocation_id: record.invocation_id,
-                    preparation_id: record.preparation_id,
-                    operation_kind: record.operation_kind,
-                    request_digest: record.request_digest,
-                    lock_keys: record.lock_keys,
-                    state: record.state,
-                    broad,
-                    dispatched_at: record.dispatched_at,
-                    cursor,
-                });
-        }
-        if let Some((operation_id, _)) = state
-            .pending
-            .iter()
-            .find(|(_, pending)| mutation_locks_overlap(operation, pending))
-        {
+        if state.pending.contains_key(&operation.operation_id) {
             return Err(WorkspaceError::PendingOperation {
-                operation_id: operation_id.as_str().to_owned(),
+                operation_id: operation.operation_id.as_str().to_owned(),
             });
         }
         let cursor = stored_binding
@@ -1134,7 +1106,6 @@ impl RemoteMutationJournal {
             .journal
             .reserve_before_send(&RemoteOperationReservation {
                 publication_cwd: operation.publication_cwd.clone(),
-                broad_lock: operation.broad,
                 host_instance_id: operation.host_instance_id.clone(),
                 publication_id: operation.publication_id.clone(),
                 operation_id: operation.operation_id.clone(),
@@ -1143,15 +1114,9 @@ impl RemoteMutationJournal {
                 binding: stored_binding,
                 operation_kind: operation.operation_kind.clone(),
                 request_digest: operation.request_digest.clone(),
-                lock_keys: operation.lock_keys.clone(),
                 created_at: unix_millis(),
             })
-            .map_err(|error| match error {
-                RemoteOperationJournalError::PendingOperation(operation_id) => {
-                    WorkspaceError::PendingOperation { operation_id }
-                }
-                _ => WorkspaceError::Unavailable,
-            })?;
+            .map_err(|_| WorkspaceError::Unavailable)?;
         state.pending.insert(
             operation.operation_id.clone(),
             PendingJournalOperation {
@@ -1162,11 +1127,10 @@ impl RemoteMutationJournal {
                 preparation_id: operation.preparation_id.clone(),
                 operation_kind: operation.operation_kind.clone(),
                 request_digest: operation.request_digest.clone(),
-                lock_keys: operation.lock_keys.clone(),
                 state: RemoteOperationState::Reserved,
-                broad: operation.broad,
                 dispatched_at: None,
                 cursor,
+                reachable: true,
             },
         );
         Ok(())
@@ -1316,6 +1280,7 @@ impl RemoteMutationJournal {
                 operation_id: operation_id.clone(),
                 operation_kind: pending.operation_kind.clone(),
                 state: pending.state,
+                reachable: pending.reachable,
             })
             .collect::<Vec<_>>();
         pending.sort_unstable_by(|left, right| {
@@ -1332,6 +1297,7 @@ impl RemoteMutationJournal {
         Ok(state
             .pending
             .iter()
+            .filter(|(_, pending)| pending.reachable)
             .map(|(operation_id, pending)| RecoveryOperation {
                 publication_cwd: pending.publication_cwd.clone(),
                 publication_id: pending.publication_id.clone(),
@@ -1551,7 +1517,6 @@ struct RemoteInner {
     watches: Mutex<BoundedMap<WatchSubscriptionId, WatchRecord>>,
     operations: Mutex<OperationRegistry>,
     operation_slots: Event,
-    canonical_mutation_admission: Arc<AsyncMutex<()>>,
     mutation_journal: RemoteMutationJournal,
 }
 
@@ -1739,7 +1704,6 @@ impl RemoteWorkcellClient {
             watches: Mutex::new(BoundedMap::new(watch_limit, watch_ttl)),
             operations: Mutex::new(OperationRegistry::new(operation_limit)),
             operation_slots: Event::new(),
-            canonical_mutation_admission: Arc::new(AsyncMutex::new(())),
             mutation_journal,
         }));
         client.recover_pending_operations().await?;
@@ -1789,21 +1753,6 @@ impl RemoteWorkcellClient {
             binding: binding.clone(),
             cursor: cursor.clone(),
         })
-    }
-
-    pub(crate) async fn admit_canonical_tool(
-        &self,
-        name: &str,
-        intent: &contract::OperationIntent,
-    ) -> Option<OwnedMutexGuard<()>> {
-        canonical_journal_policy(name, intent)?;
-        Some(
-            self.0
-                .canonical_mutation_admission
-                .clone()
-                .lock_owned()
-                .await,
-        )
     }
 
     pub async fn execute_canonical_tool(
@@ -1939,6 +1888,17 @@ impl RemoteWorkcellClient {
 
     pub fn root_cursor(&self) -> &WorkspaceCursor {
         &self.0.root_cursor
+    }
+
+    /// The workspace path of `cursor`'s directory: the base the host resolves
+    /// a relative path against.
+    pub fn cursor_path(
+        &self,
+        binding: &SessionWorkspaceBinding,
+        cursor: &WorkspaceCursor,
+    ) -> Result<WorkspacePath, WorkspaceError> {
+        self.validate_context(binding, cursor)
+            .map(|record| record.path)
     }
 
     pub fn workspace_handle(&self) -> Result<WorkspaceHandle, WorkspaceError> {
@@ -2688,14 +2648,14 @@ impl RemoteWorkcellClient {
         &self,
         response: &contract::PrepareResponse,
         prefix: &str,
-        journal_policy: Option<(String, bool)>,
+        journal_policy: Option<String>,
         context: Option<PreparedWorkspaceContext>,
     ) -> Result<OperationHandle, WorkspaceError> {
         validate_prepare(response, &self.host_binding())?;
         let preparation_id = operation_id(&response.preparation_id)?;
         let invocation_id = operation_id(&self.next_identifier(prefix)?)?;
-        let mut journal = journal_policy
-            .map(|(operation_kind, broad)| {
+        let journal = journal_policy
+            .map(|operation_kind| {
                 Ok::<JournalOperation, WorkspaceError>(JournalOperation {
                     publication_cwd: None,
                     publication_id: None,
@@ -2712,32 +2672,9 @@ impl RemoteWorkcellClient {
                         response.binding.argument_digest.as_str().to_owned(),
                     )
                     .map_err(|_| invalid_response())?,
-                    lock_keys: response
-                        .intent
-                        .resources
-                        .iter()
-                        .map(|resource| OpaqueLockKey::new(resource.resource_id.as_str()))
-                        .collect::<Result<Vec<_>, _>>()
-                        .map_err(|_| invalid_response())?,
-                    broad,
                 })
             })
             .transpose()?;
-        if let Some(journal) = &mut journal
-            && journal.broad
-            && journal.lock_keys.is_empty()
-        {
-            journal.lock_keys.push(
-                OpaqueLockKey::new(self.0.root_cursor.scope().resource_id().as_str())
-                    .map_err(|_| invalid_response())?,
-            );
-        }
-        if journal
-            .as_ref()
-            .is_some_and(|operation| operation.lock_keys.is_empty())
-        {
-            return Err(invalid_response());
-        }
         let handle = OperationHandle {
             preparation_id: preparation_id.clone(),
             invocation_id: Some(invocation_id.clone()),
@@ -3188,23 +3125,45 @@ impl WorkspaceControlService for RemoteWorkcellClient {
             }
             WorkspaceControlCommand::Status | WorkspaceControlCommand::Pending => {}
         }
-        let mut pending = self.pending_remote_operations();
-        pending.sort_by(|left, right| left.operation_id.as_str().cmp(right.operation_id.as_str()));
+        let (reachable, unreachable): (Vec<_>, Vec<_>) = self
+            .pending_remote_operations()
+            .into_iter()
+            .partition(|operation| operation.reachable);
         let mut output = format!(
             "Remote: {:?}; pending operations: {}. No mutation resent.",
             self.connection_status(),
-            pending.len()
+            reachable.len()
         );
-        for operation in pending.iter().take(MAX_CONTROL_OPERATIONS) {
-            let id = serde_json::to_string(operation.operation_id.as_str())
-                .map_err(|_| invalid_response())?;
-            output.push_str(&format!("\n{id}: {:?}", operation.state));
-        }
-        if pending.len() > MAX_CONTROL_OPERATIONS {
-            output.push_str("\nPending operation display truncated; reconcile before acknowledging further operations.");
+        push_control_operations(&mut output, &reachable)?;
+        if !unreachable.is_empty() {
+            output.push_str(&format!(
+                "\n{UNREACHABLE_OPERATIONS_HEADING}: {}. {UNREACHABLE_OPERATIONS_REMEDY}",
+                unreachable.len()
+            ));
+            push_control_operations(&mut output, &unreachable)?;
         }
         Ok(output)
     }
+}
+
+fn push_control_operations(
+    output: &mut String,
+    operations: &[PendingRemoteOperation],
+) -> Result<(), WorkspaceError> {
+    for operation in operations.iter().take(MAX_CONTROL_OPERATIONS) {
+        let id = serde_json::to_string(operation.operation_id.as_str())
+            .map_err(|_| invalid_response())?;
+        output.push_str(&format!(
+            "\n{id}: {:?} {}",
+            operation.state, operation.operation_kind
+        ));
+    }
+    if operations.len() > MAX_CONTROL_OPERATIONS {
+        output.push_str(&format!(
+            "\nShowing the first {MAX_CONTROL_OPERATIONS}; resolve these to see the rest."
+        ));
+    }
+    Ok(())
 }
 
 #[async_trait]
@@ -3827,7 +3786,7 @@ impl WorkspaceMutationService for RemoteWorkcellClient {
         let operation = self.prepared_handle(
             &response,
             "mutation",
-            Some((WORKSPACE_MUTATION_KIND.to_owned(), false)),
+            Some(WORKSPACE_MUTATION_KIND.to_owned()),
             Some(PreparedWorkspaceContext {
                 binding: binding.clone(),
                 cursor: cursor.clone(),
@@ -3932,7 +3891,7 @@ impl WorkspaceExecService for RemoteWorkcellClient {
         let operation = self.prepared_handle(
             &response,
             "exec",
-            Some((DIRECT_EXEC_KIND.to_owned(), true)),
+            Some(DIRECT_EXEC_KIND.to_owned()),
             Some(PreparedWorkspaceContext {
                 binding: binding.clone(),
                 cursor: cursor.clone(),
@@ -4593,7 +4552,7 @@ impl WorkspaceScmMutationService for RemoteWorkcellClient {
             operation: self.prepared_handle(
                 &response.operation,
                 "scm",
-                Some((SCM_MUTATION_KIND.to_owned(), false)),
+                Some(SCM_MUTATION_KIND.to_owned()),
                 Some(PreparedWorkspaceContext {
                     binding: binding.clone(),
                     cursor: cursor.clone(),
@@ -4843,7 +4802,7 @@ impl WorkspaceSnapshotMutationService for RemoteWorkcellClient {
             operation: self.prepared_handle(
                 &response.operation,
                 "snapshot",
-                Some((SNAPSHOT_RESTORE_KIND.to_owned(), false)),
+                Some(SNAPSHOT_RESTORE_KIND.to_owned()),
                 Some(PreparedWorkspaceContext {
                     binding: binding.clone(),
                     cursor: cursor.clone(),
@@ -4881,7 +4840,7 @@ impl WorkspaceSnapshotMutationService for RemoteWorkcellClient {
             operation: self.prepared_handle(
                 &response.operation,
                 "unrevert",
-                Some((SNAPSHOT_UNREVERT_KIND.to_owned(), false)),
+                Some(SNAPSHOT_UNREVERT_KIND.to_owned()),
                 Some(PreparedWorkspaceContext {
                     binding: binding.clone(),
                     cursor: cursor.clone(),
@@ -4941,7 +4900,7 @@ impl WorkspaceSnapshotMutationService for RemoteWorkcellClient {
             operation: self.prepared_handle(
                 &response.operation,
                 "cleanup",
-                Some((SNAPSHOT_CLEANUP_KIND.to_owned(), false)),
+                Some(SNAPSHOT_CLEANUP_KIND.to_owned()),
                 Some(PreparedWorkspaceContext {
                     binding: binding.clone(),
                     cursor: cursor.clone(),
@@ -6361,48 +6320,13 @@ fn validate_fixed_contract(
     }
 }
 
-fn journal_startup_error(error: RemoteOperationJournalError) -> RemoteWorkcellError {
-    match error {
-        RemoteOperationJournalError::PendingBindingMismatch(operation_id) => {
-            RemoteWorkcellError::RecoveryBindingMismatch { operation_id }
-        }
-        _ => RemoteWorkcellError::JournalUnavailable,
-    }
-}
-
-fn canonical_journal_policy(
-    tool_name: &str,
-    intent: &contract::OperationIntent,
-) -> Option<(String, bool)> {
+fn canonical_journal_policy(tool_name: &str, intent: &contract::OperationIntent) -> Option<String> {
     let known_mutation = matches!(tool_name, "file_write" | "file_edit" | "file_apply_patch");
     let isolated = tool_name == "python_execution" && !intent.mutating;
     (known_mutation
         || intent.mutating
         || (intent.kind == contract::OperationKind::Execute && !isolated))
-        .then(|| {
-            (
-                format!("{CANONICAL_OPERATION_PREFIX}{tool_name}"),
-                intent.kind == contract::OperationKind::Execute,
-            )
-        })
-}
-
-fn broad_operation_kind(operation_kind: &str) -> bool {
-    operation_kind == DIRECT_EXEC_KIND
-        || matches!(
-            operation_kind,
-            "canonical:shell" | "canonical:python_execution"
-        )
-}
-
-fn mutation_locks_overlap(operation: &JournalOperation, pending: &PendingJournalOperation) -> bool {
-    let pending_broad = pending.broad && pending.state != RemoteOperationState::Indeterminate;
-    operation.broad
-        || pending_broad
-        || operation
-            .lock_keys
-            .iter()
-            .any(|key| pending.lock_keys.contains(key))
+        .then(|| format!("{CANONICAL_OPERATION_PREFIX}{tool_name}"))
 }
 
 /// Whether a host's "no record" answer proves the operation never ran.
@@ -7293,7 +7217,6 @@ mod tests {
     use std::collections::HashMap;
     use std::io::{BufRead, BufReader, Read, Write};
     use std::net::TcpListener;
-    use std::pin::pin;
     use std::str::FromStr;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc;
@@ -7301,7 +7224,6 @@ mod tests {
     use std::thread;
     use std::time::Duration;
 
-    use futures_lite::future;
     use serde_json::{Value, json};
     use test_case::test_case;
     use tokio::sync::Mutex as AsyncMutex;
@@ -7310,8 +7232,8 @@ mod tests {
     use super::{
         BoundedMap, CursorRecord, CursorRegistry, DIRECT_EXEC_KIND, JSON_SCHEMA_VERSION,
         JournalOperation, JsonRpcError, MAX_SSE_EVENT_BYTES, OperationRegistry,
-        PreparedWorkspaceContext, RecoveryOperation, RemoteEvent, RemoteInner,
-        RemoteMutationJournal, RemotePreparedToolCall, RemoteToolExecutionError, RemoteTransport,
+        PendingRemoteOperation, PreparedWorkspaceContext, RecoveryOperation, RemoteEvent,
+        RemoteInner, RemoteMutationJournal, RemotePreparedToolCall, RemoteTransport,
         RemoteWorkcellClient, RemoteWorkcellError, ResourceCache, SHELL_CONTRACT_ID,
         SHELL_EXECUTION_TIMEOUT, StoredOperation, ToolListWire, WORKSPACE_MUTATION_KIND,
         canonical_journal_policy, cleanup_preview_partitions, convert_status, execution_timeout,
@@ -7324,7 +7246,7 @@ mod tests {
     };
     use crate::transfer::PrivateStaging;
     use crate::{
-        Input, REMOTE_ADMISSION_EXPIRED, REMOTE_PREPARATION_RENEWAL, RemoteExecutionCleanup,
+        Input, REMOTE_DEADLINE_BEFORE_DISPATCH, REMOTE_PREPARATION_RENEWAL, RemoteExecutionCleanup,
         RemotePreparedState, RemoteWorkcellInvocation, ToolKind,
     };
     use caudra_agent::cancel::CancelToken;
@@ -7335,16 +7257,17 @@ mod tests {
     use caudra_storage::StateDir;
     use caudra_storage::auth::WorkcellCredentialRef;
     use caudra_storage::remote_operation_journal::{
-        OpaqueLockKey, RemoteOperationJournal, RemoteOperationState, RequestDigest,
+        RemoteOperationJournal, RemoteOperationState, RequestDigest,
     };
     use caudra_storage::workspace_binding::StoredWorkspaceBinding;
     use caudra_workspace::{
-        CwdHandle, OperationHandle, OperationId, OperationState, PreparedToolCall,
-        ProjectAssetKind, ProjectAssetTrust, ResourceId, ResourceRevision, ResourceScope,
-        ResourceSelector, RestoreId, SessionBindingId, SnapshotCleanupPreview, SnapshotId,
+        AuthenticatedPrincipalId, AuthorityIdentity, CwdHandle, OperationHandle, OperationId,
+        OperationState, PreparedToolCall, ProjectAssetKind, ProjectAssetTrust, ProjectIdentity,
+        ProjectKey, ResourceId, ResourceRevision, ResourceScope, ResourceSelector, RestoreId,
+        SessionBindingId, SessionWorkspaceBinding, SnapshotCleanupPreview, SnapshotId,
         SnapshotOperationPreview, SnapshotRestorePreview, SnapshotUnrevertPreview,
-        ToolPrepareRequest, WorkspaceCapability, WorkspaceCursor, WorkspaceError, WorkspacePath,
-        WorkspaceSession,
+        SourceTrustAnchor, ToolPrepareRequest, WorkspaceCapability, WorkspaceCursor,
+        WorkspaceError, WorkspacePath, WorkspaceSession,
     };
     use workcell::{ToolManifest, host_contract as contract};
 
@@ -7354,6 +7277,11 @@ mod tests {
         "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
     const UNMAPPED_RPC_CODE: i64 = -32602;
     const UNMAPPED_RPC_MESSAGE: &str = "path escapes the workspace root";
+    const SHELL_KIND: &str = "canonical:shell";
+    const WRITE_KIND: &str = "canonical:file_write";
+    const CANCELLED: &str = "cancelled";
+    /// Long past, so dispatch would renew the preparation on the host first.
+    const LAPSED_EXPIRY_UNIX_MS: u64 = 0;
 
     #[test]
     fn authoritative_cursors_survive_capacity_pressure_and_reject_rebinding() {
@@ -8308,12 +8236,7 @@ mod tests {
         super::Instant::now() + super::RESERVATION_WAIT
     }
 
-    fn journal_operation(
-        id: &str,
-        lock_key: &str,
-        operation_kind: &str,
-        broad: bool,
-    ) -> JournalOperation {
+    fn journal_operation(id: &str, operation_kind: &str) -> JournalOperation {
         JournalOperation {
             publication_cwd: None,
             publication_id: None,
@@ -8323,8 +8246,6 @@ mod tests {
             preparation_id: OperationId::new(format!("preparation-{id}")).unwrap(),
             operation_kind: operation_kind.to_owned(),
             request_digest: RequestDigest::sha256(TEST_REQUEST_DIGEST).unwrap(),
-            lock_keys: vec![OpaqueLockKey::new(lock_key).unwrap()],
-            broad,
         }
     }
 
@@ -8358,11 +8279,11 @@ mod tests {
         assert!(canonical_journal_policy("python_execution", &execute).is_none());
         assert_eq!(
             canonical_journal_policy("file_write", &read),
-            Some(("canonical:file_write".to_owned(), false))
+            Some(WRITE_KIND.to_owned())
         );
         assert_eq!(
             canonical_journal_policy("shell", &execute),
-            Some(("canonical:shell".to_owned(), true))
+            Some(SHELL_KIND.to_owned())
         );
     }
 
@@ -8371,7 +8292,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let state_dir = StateDir::from_path(temp.path().join("state"));
         let binding = StoredWorkspaceBinding::local_from_cwd("opaque-workspace");
-        let operation = journal_operation("crash", "resource-a", "workspace_mutation", false);
+        let operation = journal_operation("crash", "workspace_mutation");
         {
             let journal = RemoteOperationJournal::open(&state_dir).unwrap();
             let coordinator = RemoteMutationJournal::new(journal, binding.clone()).unwrap();
@@ -8419,7 +8340,7 @@ mod tests {
         let binding = StoredWorkspaceBinding::local_from_cwd("opaque-workspace");
         let journal = RemoteOperationJournal::open(&state_dir).unwrap();
         let coordinator = RemoteMutationJournal::new(journal, binding.clone()).unwrap();
-        let operation = journal_operation("cancelled", "resource-a", "workspace_mutation", false);
+        let operation = journal_operation("cancelled", "workspace_mutation");
         coordinator.reserve(&operation).unwrap();
 
         coordinator.abandon(&operation.operation_id).unwrap();
@@ -8430,66 +8351,189 @@ mod tests {
         assert!(journal.list_pending(&binding).unwrap().is_empty());
     }
 
-    #[test]
-    fn overlapping_mutations_and_shell_broad_scope_are_blocked_until_acknowledged() {
+    /// The journal records operations so recovery can find them; it never
+    /// decides what may run. An operation whose outcome is still open, in any
+    /// state, holds back neither a command nor a write.
+    #[test_case(SHELL_KIND, WRITE_KIND, RemoteOperationState::Reserved; "reserved_shell_then_write")]
+    #[test_case(SHELL_KIND, WRITE_KIND, RemoteOperationState::Dispatched; "dispatched_shell_then_write")]
+    #[test_case(SHELL_KIND, WRITE_KIND, RemoteOperationState::Indeterminate; "indeterminate_shell_then_write")]
+    #[test_case(WRITE_KIND, SHELL_KIND, RemoteOperationState::Dispatched; "dispatched_write_then_shell")]
+    #[test_case(WRITE_KIND, WRITE_KIND, RemoteOperationState::Dispatched; "dispatched_write_then_write")]
+    #[test_case(DIRECT_EXEC_KIND, DIRECT_EXEC_KIND, RemoteOperationState::Dispatched; "dispatched_exec_then_exec")]
+    fn open_operations_never_block_new_reservations(
+        first_kind: &str,
+        second_kind: &str,
+        first_state: RemoteOperationState,
+    ) {
         let temp = tempfile::tempdir().unwrap();
         let state_dir = StateDir::from_path(temp.path().join("state"));
         let binding = StoredWorkspaceBinding::local_from_cwd("opaque-workspace");
         let journal = RemoteOperationJournal::open(&state_dir).unwrap();
         let coordinator = RemoteMutationJournal::new(journal, binding).unwrap();
-        let first = journal_operation("first", "resource-a", "workspace_mutation", false);
-        let overlap = journal_operation("overlap", "resource-a", "scm_mutation", false);
-        let disjoint = journal_operation("disjoint", "resource-b", "workspace_mutation", false);
-        let shell = journal_operation("shell", "workspace", "canonical:shell", true);
-        coordinator.reserve(&first).unwrap();
-        assert!(matches!(
-            coordinator.reserve(&overlap),
-            Err(WorkspaceError::PendingOperation { operation_id })
-                if operation_id == first.operation_id.as_str()
-        ));
-        coordinator.reserve(&disjoint).unwrap();
-        assert!(matches!(
-            coordinator.reserve(&shell),
-            Err(WorkspaceError::PendingOperation { .. })
-        ));
-        coordinator.acknowledge(&first.operation_id).unwrap();
-        coordinator.acknowledge(&disjoint.operation_id).unwrap();
-        coordinator.reserve(&shell).unwrap();
-        let other = journal_operation("other", "resource-c", DIRECT_EXEC_KIND, true);
-        assert!(matches!(
-            coordinator.reserve(&other),
-            Err(WorkspaceError::PendingOperation { operation_id })
-                if operation_id == shell.operation_id.as_str()
-        ));
-        coordinator.acknowledge(&shell.operation_id).unwrap();
-        assert!(coordinator.pending().is_empty());
+        let first = journal_operation("first", first_kind);
+        let second = journal_operation("second", second_kind);
+        reserve_in_state(&coordinator, &first, first_state);
+
+        coordinator.reserve(&second).unwrap();
+
+        let states = coordinator
+            .pending()
+            .into_iter()
+            .map(|pending| (pending.operation_id, pending.state))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            states,
+            vec![
+                (first.operation_id, first_state),
+                (second.operation_id, RemoteOperationState::Reserved),
+            ]
+        );
     }
 
-    /// An indeterminate shell command used to block every mutation because its
-    /// broad_lock stayed active. A cancelled-then-reconnected session would
-    /// report "blocked by pending operation" for every write until the user
-    /// manually acknowledged it. Now: reserved/dispatched broad_lock blocks;
-    /// indeterminate broad_lock does not.
-    #[test]
-    fn an_indeterminate_broad_lock_does_not_block_new_reservations() {
+    fn reserve_in_state(
+        coordinator: &RemoteMutationJournal,
+        operation: &JournalOperation,
+        state: RemoteOperationState,
+    ) {
+        coordinator.reserve(operation).unwrap();
+        if state != RemoteOperationState::Reserved {
+            coordinator
+                .mark_dispatched(&operation.operation_id)
+                .unwrap();
+        }
+        if state == RemoteOperationState::Indeterminate {
+            coordinator
+                .mark_indeterminate(&operation.operation_id)
+                .unwrap();
+        }
+    }
+
+    /// No-replay rests on identity, not on blocking: an operation whose outcome
+    /// is still open is refused if it is sent again, and its record is kept.
+    #[test_case(RemoteOperationState::Reserved; "reserved")]
+    #[test_case(RemoteOperationState::Dispatched; "dispatched")]
+    #[test_case(RemoteOperationState::Indeterminate; "indeterminate")]
+    fn an_open_operation_is_never_reserved_twice(state: RemoteOperationState) {
         let temp = tempfile::tempdir().unwrap();
         let state_dir = StateDir::from_path(temp.path().join("state"));
         let binding = StoredWorkspaceBinding::local_from_cwd("opaque-workspace");
         let journal = RemoteOperationJournal::open(&state_dir).unwrap();
         let coordinator = RemoteMutationJournal::new(journal, binding).unwrap();
-        let shell = journal_operation("shell", "workspace", "canonical:shell", true);
-        coordinator.reserve(&shell).unwrap();
-        coordinator.mark_dispatched(&shell.operation_id).unwrap();
-        coordinator.mark_indeterminate(&shell.operation_id).unwrap();
-        let write = journal_operation("write", "resource-a", WORKSPACE_MUTATION_KIND, false);
-        coordinator.reserve(&write).unwrap();
-        coordinator.acknowledge(&shell.operation_id).unwrap();
-        coordinator.acknowledge(&write.operation_id).unwrap();
+        let operation = journal_operation("replayed", WRITE_KIND);
+        reserve_in_state(&coordinator, &operation, state);
+
+        assert_eq!(
+            coordinator.reserve(&operation),
+            Err(WorkspaceError::PendingOperation {
+                operation_id: operation.operation_id.as_str().to_owned(),
+            })
+        );
+        let states = coordinator
+            .pending()
+            .into_iter()
+            .map(|pending| (pending.operation_id, pending.state))
+            .collect::<Vec<_>>();
+        assert_eq!(states, vec![(operation.operation_id, state)]);
     }
 
-    #[test_case("shell", RemoteOperationState::Reserved; "active_shell_blocks_shell")]
-    #[test_case("file_write", RemoteOperationState::Dispatched; "dispatched_shell_blocks_write")]
-    fn canonical_journal_rejection_is_definitive(tool: &str, pending_state: RemoteOperationState) {
+    fn binding_in_generation(generation: &str) -> StoredWorkspaceBinding {
+        let authority = AuthorityIdentity::new(
+            SourceTrustAnchor::new("source").unwrap(),
+            "server",
+            "workspace",
+            generation,
+            "namespace",
+        )
+        .unwrap();
+        let principal = AuthenticatedPrincipalId::new(authority.clone(), "principal").unwrap();
+        let project = ProjectIdentity::new(authority.clone(), ProjectKey::new("project").unwrap());
+        let session = SessionWorkspaceBinding::new(
+            SessionBindingId::new("session").unwrap(),
+            authority,
+            principal,
+            project,
+        )
+        .unwrap();
+        StoredWorkspaceBinding::new(session, CwdHandle::new("cwd").unwrap(), None).unwrap()
+    }
+
+    /// The host that ran an operation of an earlier workspace generation is
+    /// gone, so that operation can never be reconciled. It must not stop the
+    /// client from starting or hold anything back; recovery leaves it alone,
+    /// and only an explicit acknowledgement clears it.
+    #[test_case(RemoteOperationState::Reserved; "reserved")]
+    #[test_case(RemoteOperationState::Dispatched; "dispatched")]
+    #[test_case(RemoteOperationState::Indeterminate; "indeterminate")]
+    fn an_earlier_generation_operation_is_listed_skipped_by_recovery_and_acknowledgeable(
+        state: RemoteOperationState,
+    ) {
+        const PREVIOUS_GENERATION: &str = "previous-generation";
+        const CURRENT_GENERATION: &str = "current-generation";
+        let temp = tempfile::tempdir().unwrap();
+        let state_dir = StateDir::from_path(temp.path().join("state"));
+        let earlier = journal_operation("earlier", WRITE_KIND);
+        {
+            let previous = RemoteMutationJournal::new(
+                RemoteOperationJournal::open(&state_dir).unwrap(),
+                binding_in_generation(PREVIOUS_GENERATION),
+            )
+            .unwrap();
+            reserve_in_state(&previous, &earlier, state);
+        }
+        let current = RemoteMutationJournal::new(
+            RemoteOperationJournal::open(&state_dir).unwrap(),
+            binding_in_generation(CURRENT_GENERATION),
+        )
+        .unwrap();
+        let later = journal_operation("later", SHELL_KIND);
+
+        current.reserve(&later).unwrap();
+
+        assert_eq!(
+            current.pending(),
+            vec![
+                PendingRemoteOperation {
+                    operation_id: earlier.operation_id.clone(),
+                    operation_kind: WRITE_KIND.to_owned(),
+                    state,
+                    reachable: false,
+                },
+                PendingRemoteOperation {
+                    operation_id: later.operation_id.clone(),
+                    operation_kind: SHELL_KIND.to_owned(),
+                    state: RemoteOperationState::Reserved,
+                    reachable: true,
+                },
+            ]
+        );
+        let recoverable = current
+            .recovery_operations()
+            .unwrap()
+            .into_iter()
+            .map(|operation| operation.operation_id)
+            .collect::<Vec<_>>();
+        assert_eq!(recoverable, vec![later.operation_id.clone()]);
+        current.acknowledge(&earlier.operation_id).unwrap();
+        let remaining = current
+            .pending()
+            .into_iter()
+            .map(|pending| pending.operation_id)
+            .collect::<Vec<_>>();
+        assert_eq!(remaining, vec![later.operation_id]);
+    }
+
+    /// Cancellation or an expired deadline before dispatch ends the call
+    /// without contacting the host or leaving anything to reconcile, not even
+    /// to renew a preparation that has lapsed.
+    #[test_case(true, u64::MAX, CANCELLED; "cancelled")]
+    #[test_case(false, u64::MAX, REMOTE_DEADLINE_BEFORE_DISPATCH; "deadline_expired")]
+    #[test_case(true, LAPSED_EXPIRY_UNIX_MS, CANCELLED; "cancelled_after_lapse")]
+    #[test_case(false, LAPSED_EXPIRY_UNIX_MS, REMOTE_DEADLINE_BEFORE_DISPATCH; "deadline_expired_after_lapse")]
+    fn a_call_stopped_before_dispatch_never_reaches_the_host(
+        cancelled: bool,
+        expires_at_unix_ms: u64,
+        expected: &str,
+    ) {
         const CAPACITY: usize = 8;
         let temp = tempfile::tempdir().unwrap();
         let state_dir = StateDir::from_path(temp.path().join("state"));
@@ -8504,27 +8548,12 @@ mod tests {
         let binding = stored_binding.binding().clone();
         let journal = RemoteOperationJournal::open(&state_dir).unwrap();
         let coordinator = RemoteMutationJournal::new(journal, stored_binding.clone()).unwrap();
-        let active = journal_operation("active", "workspace", "canonical:shell", true);
-        coordinator.reserve(&active).unwrap();
-        if pending_state != RemoteOperationState::Reserved {
-            coordinator.mark_dispatched(&active.operation_id).unwrap();
-        }
-        if pending_state == RemoteOperationState::Indeterminate {
-            coordinator
-                .mark_indeterminate(&active.operation_id)
-                .unwrap();
-        }
-        let rejected = journal_operation(
-            "rejected",
-            "resource-a",
-            &format!("canonical:{tool}"),
-            tool == "shell",
-        );
+        let stopped = journal_operation("stopped", WRITE_KIND);
         let operation = OperationHandle {
-            preparation_id: rejected.preparation_id.clone(),
-            invocation_id: Some(rejected.invocation_id.clone()),
+            preparation_id: stopped.preparation_id.clone(),
+            invocation_id: Some(stopped.invocation_id.clone()),
             execution_id: None,
-            expires_at_unix_ms: Some(u64::MAX),
+            expires_at_unix_ms: Some(expires_at_unix_ms),
         };
         let mut operations = OperationRegistry::new(CAPACITY);
         operations
@@ -8534,9 +8563,9 @@ mod tests {
                     transfer: None,
                     binding: binding_for("test.v1"),
                     context: None,
-                    invocation_id: rejected.invocation_id.clone(),
-                    expires_at_unix_ms: u64::MAX,
-                    journal: Some(rejected.clone()),
+                    invocation_id: stopped.invocation_id.clone(),
+                    expires_at_unix_ms,
+                    journal: Some(stopped.clone()),
                     persisted: false,
                 },
             )
@@ -8579,14 +8608,9 @@ mod tests {
             watches: Mutex::new(BoundedMap::new(CAPACITY, Duration::MAX)),
             operations: Mutex::new(operations),
             operation_slots: super::Event::new(),
-            canonical_mutation_admission: Arc::new(AsyncMutex::new(())),
             mutation_journal: coordinator,
         }));
-        let raw_input = if tool == "shell" {
-            json!({"command":"true"})
-        } else {
-            json!({"filePath":"test", "content":"test"})
-        };
+        let raw_input = json!({"filePath":"test", "content":"test"});
         let call = RemotePreparedToolCall {
             prepared: PreparedToolCall {
                 operation,
@@ -8600,43 +8624,20 @@ mod tests {
             binding: binding.clone(),
             cursor: cursor.clone(),
         };
-        smol::block_on(async {
-            let first = client
-                .admit_canonical_tool(tool, &call.intent)
-                .await
-                .unwrap();
-            for (bypass, kind) in [("file_read", "read"), ("python_execution", "execute")] {
-                let intent =
-                    serde_json::from_value(json!({"kind":kind, "mutating":false, "resources":[]}))
-                        .unwrap();
-                let mut admission = pin!(client.admit_canonical_tool(bypass, &intent));
-                assert!(future::poll_once(&mut admission).await.unwrap().is_none());
-            }
-            let cloned = client.clone();
-            let mut queued = pin!(cloned.admit_canonical_tool(tool, &call.intent));
-            assert!(future::poll_once(&mut queued).await.is_none());
-            drop(first);
-            assert!(queued.await.is_some());
-        });
-        let failure = smol::block_on(client.execute_canonical_tool_tracked(
-            &binding,
-            &cursor,
-            &call.prepared,
-        ))
-        .unwrap_err();
-        assert!(
-            matches!(failure, RemoteToolExecutionError::BeforeDispatch(WorkspaceError::PendingOperation { ref operation_id }) if operation_id == active.operation_id.as_str())
-        );
         let (trigger, cancel) = CancelToken::new();
         let mut ctx = crate::tests::context(temp.path(), Arc::new(ToolRegistry::new()), cancel);
         ctx.workspace_session = Some(
             WorkspaceSession::new(client.workspace_handle().unwrap(), binding, cursor).unwrap(),
         );
-        let kind = ToolKind::from_name(tool).unwrap();
+        if cancelled {
+            trigger.cancel();
+        } else {
+            ctx.deadline = Deadline::after(Duration::ZERO);
+        }
         let invocation = RemoteWorkcellInvocation {
             client: client.clone(),
-            kind,
-            input: Input::parse(kind, raw_input.clone()).unwrap(),
+            kind: ToolKind::FileWrite,
+            input: Input::parse(ToolKind::FileWrite, raw_input.clone()).unwrap(),
             raw_input,
             prepared: AsyncMutex::new(RemotePreparedState::default()),
         };
@@ -8645,42 +8646,14 @@ mod tests {
             call: None,
             execution_started: false,
         };
-        smol::block_on(async {
-            const CANCELLED: &str = "cancelled";
-            let first = client
-                .admit_canonical_tool(tool, &call.intent)
-                .await
-                .unwrap();
-            let mut queued = pin!(invocation.execute_remote(&ctx, call.clone(), &mut cleanup));
-            assert!(future::poll_once(&mut queued).await.is_none());
-            trigger.cancel();
-            assert_eq!(queued.await.output.unwrap_err(), CANCELLED);
-            drop(first);
-        });
-        assert!(!cleanup.execution_started);
-        ctx.cancel = CancelToken::none();
-        ctx.deadline = Deadline::after(Duration::ZERO);
-        let expired = smol::block_on(invocation.execute_remote(&ctx, call.clone(), &mut cleanup));
-        assert_eq!(expired.output.unwrap_err(), REMOTE_ADMISSION_EXPIRED);
-        assert!(!cleanup.execution_started);
-        ctx.deadline = Deadline::None;
+
         let result = smol::block_on(invocation.execute_remote(&ctx, call, &mut cleanup));
-        assert_eq!(result.output.unwrap_err(), failure.to_string());
-        let pending = client.pending_remote_operations();
-        assert_eq!(pending.len(), 1);
-        assert_eq!(pending[0].operation_id, active.operation_id);
-        assert_eq!(pending[0].state, pending_state);
+
+        assert_eq!(result.output.unwrap_err(), expected);
+        assert!(!cleanup.execution_started);
+        assert!(client.pending_remote_operations().is_empty());
         let journal = RemoteOperationJournal::open(&state_dir).unwrap();
-        let persisted = journal.list_pending(&stored_binding).unwrap();
-        assert_eq!(persisted.len(), 1);
-        assert_eq!(persisted[0].operation_id, active.operation_id);
-        assert!(
-            !client
-                .0
-                .mutation_journal
-                .contains(&rejected.operation_id)
-                .unwrap()
-        );
+        assert!(journal.list_pending(&stored_binding).unwrap().is_empty());
         listener.set_nonblocking(true).unwrap();
         assert!(listener.accept().is_err());
     }
@@ -8850,11 +8823,11 @@ mod tests {
         })
     }
 
-    /// A queued command waits behind whatever holds admission, and the server
-    /// expires preparations on its own timer. The wait is legitimate, so the
-    /// call has to be renewed and run, never reported as a conflict.
+    /// A command can wait on review past the moment the server expires its
+    /// preparation on its own timer. The wait is legitimate, so the call has
+    /// to be renewed and run, never reported as a conflict.
     #[test]
-    fn a_command_queued_past_its_preparation_renews_instead_of_conflicting() {
+    fn a_command_reviewed_past_its_preparation_renews_instead_of_conflicting() {
         const LAPSING_MS: u64 = 200;
         const LAPSE_POLL: Duration = Duration::from_millis(5);
         const HEALTHY_MS: u64 = 600_000;
@@ -9010,7 +8983,6 @@ mod tests {
             watches: Mutex::new(BoundedMap::new(8, Duration::MAX)),
             operations: Mutex::new(OperationRegistry::new(8)),
             operation_slots: super::Event::new(),
-            canonical_mutation_admission: Arc::new(AsyncMutex::new(())),
             mutation_journal: coordinator,
         }));
         let raw_input = json!({"command":"true"});
@@ -9048,18 +9020,13 @@ mod tests {
         };
         let expiry = call.prepared.operation.expires_at_unix_ms.unwrap();
         let result = smol::block_on(async {
-            let held = client.admit_canonical_tool("shell", &call.intent).await;
-            assert!(held.is_some());
-            let mut queued = pin!(invocation.execute_remote(&ctx, call, &mut cleanup));
-            assert!(future::poll_once(&mut queued).await.is_none());
             while unix_millis() <= expiry {
                 smol::Timer::after(LAPSE_POLL).await;
             }
-            drop(held);
-            queued.await
+            invocation.execute_remote(&ctx, call, &mut cleanup).await
         });
 
-        let output = result.output.expect("queued command reported an error");
+        let output = result.output.expect("reviewed command reported an error");
         assert!(!result.is_error);
         assert!(output.as_text().contains(COMMAND_OUTPUT), "{output:?}");
         let executed = host.params_for(contract::EXECUTE_METHOD);
@@ -9079,7 +9046,7 @@ mod tests {
     /// A pending operation from a nested cursor is recovered at the root
     /// scope. When the host says NeverSeen or Prepared (same instance), the
     /// local dispatch fence is weaker than the host's assertion, so the
-    /// operation resolves to cancelled and stops blocking.
+    /// operation resolves to cancelled and leaves the pending list.
     #[test_case(RemoteOperationState::Dispatched, OperationState::NeverSeen; "dispatched_never_seen")]
     #[test_case(RemoteOperationState::Indeterminate, OperationState::NeverSeen; "indeterminate_never_seen")]
     #[test_case(RemoteOperationState::Dispatched, OperationState::Prepared; "dispatched_prepared")]
@@ -9105,7 +9072,7 @@ mod tests {
             1,
             CwdHandle::new("nested-cwd").unwrap(),
         );
-        let pending = journal_operation("pending", "workspace", DIRECT_EXEC_KIND, true);
+        let pending = journal_operation("pending", DIRECT_EXEC_KIND);
         {
             let journal = RemoteOperationJournal::open(&state_dir).unwrap();
             let coordinator = RemoteMutationJournal::new(journal, root.clone()).unwrap();
@@ -9138,7 +9105,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let state_dir = StateDir::from_path(temp.path().join("state"));
         let binding = StoredWorkspaceBinding::local_from_cwd("opaque-workspace");
-        let operation = journal_operation("reserved", "resource-a", WORKSPACE_MUTATION_KIND, false);
+        let operation = journal_operation("reserved", WORKSPACE_MUTATION_KIND);
         let journal = RemoteOperationJournal::open(&state_dir).unwrap();
         let coordinator = RemoteMutationJournal::new(journal, binding.clone()).unwrap();
         coordinator.reserve(&operation).unwrap();
@@ -9174,8 +9141,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let state_dir = StateDir::from_path(temp.path().join("state"));
         let binding = StoredWorkspaceBinding::local_from_cwd("opaque-workspace");
-        let operation =
-            journal_operation("dispatched", "resource-a", WORKSPACE_MUTATION_KIND, false);
+        let operation = journal_operation("dispatched", WORKSPACE_MUTATION_KIND);
         let journal = RemoteOperationJournal::open(&state_dir).unwrap();
         let coordinator = RemoteMutationJournal::new(journal, binding.clone()).unwrap();
         coordinator.reserve(&operation).unwrap();
@@ -9201,7 +9167,7 @@ mod tests {
         let binding = StoredWorkspaceBinding::local_from_cwd("opaque-workspace");
         let journal = RemoteOperationJournal::open(&state_dir).unwrap();
         let coordinator = RemoteMutationJournal::new(journal, binding.clone()).unwrap();
-        let operation = journal_operation("live", "resource-a", WORKSPACE_MUTATION_KIND, false);
+        let operation = journal_operation("live", WORKSPACE_MUTATION_KIND);
         coordinator.reserve(&operation).unwrap();
         coordinator
             .mark_dispatched(&operation.operation_id)
@@ -9266,8 +9232,14 @@ mod tests {
             mutating: true,
             resources: read.resources.clone(),
         };
-        assert!(canonical_journal_policy("file_write", &read).is_some());
-        assert!(canonical_journal_policy("shell", &shell).unwrap().1);
+        assert_eq!(
+            canonical_journal_policy("file_write", &read),
+            Some(WRITE_KIND.to_owned())
+        );
+        assert_eq!(
+            canonical_journal_policy("shell", &shell),
+            Some(SHELL_KIND.to_owned())
+        );
     }
 
     #[test]
@@ -9277,8 +9249,7 @@ mod tests {
         let binding = StoredWorkspaceBinding::local_from_cwd("opaque-workspace");
         let journal = RemoteOperationJournal::open(&state_dir).unwrap();
         let coordinator = RemoteMutationJournal::new(journal, binding).unwrap();
-        let mut operation =
-            journal_operation("recovery", "resource-a", "workspace_mutation", false);
+        let mut operation = journal_operation("recovery", "workspace_mutation");
         operation.invocation_id = OperationId::new("invocation").unwrap();
         operation.preparation_id = OperationId::new("prepared").unwrap();
         coordinator.reserve(&operation).unwrap();
@@ -9317,8 +9288,7 @@ mod tests {
         let binding = StoredWorkspaceBinding::local_from_cwd("opaque-workspace");
         let journal = RemoteOperationJournal::open(&state_dir).unwrap();
         let coordinator = RemoteMutationJournal::new(journal, binding).unwrap();
-        let mut operation =
-            journal_operation("forgotten", "resource-a", "workspace_mutation", false);
+        let mut operation = journal_operation("forgotten", "workspace_mutation");
         operation.invocation_id = OperationId::new("invocation").unwrap();
         operation.preparation_id = OperationId::new("prepared").unwrap();
         coordinator.reserve(&operation).unwrap();

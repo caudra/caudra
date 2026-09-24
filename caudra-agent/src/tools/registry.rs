@@ -24,7 +24,7 @@ use crate::template::Vars;
 use crate::{BufferSnapshot, ToolInput, ToolOutput, ToolOutputLimits};
 
 use super::deferral::DeferredTool;
-use super::{DescriptionContext, ToolContext};
+use super::{DescriptionContext, LockKey, ToolContext};
 
 const EXAMPLES_HEADER: &str = "Examples:";
 const EXAMPLE_CODE_KEY: &str = "code";
@@ -450,6 +450,15 @@ pub trait ToolInvocation: Send + Sync {
     /// running, like `file_grep` matches, cannot be declared here. Never
     /// overlaps `mutation_targets`, which already covers read-modify-write.
     fn read_targets(&self, _ctx: &ToolContext) -> Vec<PathBuf> {
+        Vec::new()
+    }
+    /// Files whose version `preflight` fixes: a remote write is prepared
+    /// against the file as it is now and refused if the file changes before it
+    /// publishes. Dispatch takes an exclusive guard on each before `preflight`
+    /// and holds it through `execute`, so a second write to the file prepares
+    /// only after the first has published. An implementor declares no
+    /// `mutation_targets` or `read_targets`, so no call acquires twice.
+    fn preflight_write_keys(&self, _ctx: &ToolContext) -> Vec<LockKey> {
         Vec::new()
     }
     /// Whether this invocation's effects are confined to the remote workspace

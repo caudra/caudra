@@ -2,7 +2,9 @@ use std::{env, fs, path::PathBuf, str::FromStr, time::Duration};
 
 use async_trait::async_trait;
 use caudra_agent::agent::tool_dispatch::{self, Emit};
-use caudra_agent::tools::{FileReadTracker, ToolEffect, ToolRegistry, interpreter_ctx};
+use caudra_agent::tools::{
+    FileReadTracker, ToolContext, ToolEffect, ToolRegistry, interpreter_ctx,
+};
 use caudra_agent::workspace_baseline::{BaselineGate, WorkspaceBaseline};
 use caudra_agent::{
     AgentEvent, AgentMode, CancelToken, EventSender, ToolOutput,
@@ -101,8 +103,29 @@ const BATCH_CONTENT: &str = "batch completed";
 const BATCH_CANCELLED: &str = "batch-cancelled.txt";
 const LAPSED_FILE: &str = "lapsed-preparation.txt";
 const LAPSED_TTL_MS: u64 = 1_500;
+/// The lapsed preparation and the renewal that replaced it.
+const LAPSED_PREPARATIONS: usize = 2;
+const LAPSED_EXECUTIONS: usize = 1;
 const REMOTE_PREPARATION_CAPACITY: usize = 64;
-const HELD_PREPARATIONS: usize = 4;
+/// The shell held before dispatch and the write held at its prompt.
+const HELD_PREPARATIONS: usize = 2;
+const PUBLICATION_OVERWRITE: &str = "written while the publication awaited reconciliation";
+const SHARED_EDIT_FILE: &str = "shared-edit.txt";
+const SHARED_EDIT_ORIGINAL: &str = "first line\nsecond line\n";
+const SHARED_EDITS: [(&str, &str); 2] =
+    [("first line", "FIRST LINE"), ("second line", "SECOND LINE")];
+const SHARED_EDIT_APPLIED: &str = "FIRST LINE\nSECOND LINE\n";
+const RUNNING_SHELL_STARTED: &str = "running-shell.started";
+const RUNNING_SHELL_MARKER: &str = "running-shell.marker";
+const RUNNING_SHELL_PEER: &str = "running-shell.peer";
+const RUNNING_SHELL_OUTPUT: &str = "the marker arrived while this shell ran";
+/// The main agent's `{cwd}` is a local path and a workflow agent's is the
+/// workspace path, so one remote file must not be keyed by either.
+const TASK_CWD_VAR: &str = "{cwd}";
+const WORKFLOW_TASK_CWD: &str = ".";
+const BESIDE_UNCERTAIN_SHELL: &str = "beside-uncertain-shell.txt";
+const BESIDE_UNCERTAIN_WRITE: &str = "beside-uncertain-write.txt";
+const BESIDE_UNCERTAIN_CONTENT: &str = "ran beside an uncertain operation";
 const EDITOR_FILE: &str = "editor.txt";
 const EDITOR_IMAGE: &str = "editor.png";
 const EDITOR_IMAGE_EDGE: u32 = 3;
@@ -919,32 +942,34 @@ fn reviewed_transfer() {
             fs::write(&fault, b"lose execute response").unwrap();
             let result = client.execute_publication(&prepared).await.unwrap();
             assert!(matches!(result.state, OperationState::Indeterminate { .. }));
-            assert_eq!(client.pending_remote_operations().len(), 1);
-            assert!(matches!(
-                client.execute_publication(&prepared).await,
-                Err(WorkspaceError::PendingOperation { .. })
-            ));
-            let overlap = client.prepare_canonical_tool(client.session_binding(), client.root_cursor(), &ToolPrepareRequest { name: "file_write".into(), input: json!({"filePath":format!("nested/{name}"),"content":"forbidden overlapping write"}) }).await.unwrap();
-            assert!(matches!(
-                client
-                    .execute_canonical_tool(
-                        client.session_binding(),
-                        client.root_cursor(),
-                        &overlap.prepared
-                    )
-                    .await,
-                Err(WorkspaceError::PendingOperation { .. })
-            ));
-            client
-                .release_canonical_tool(
-                    client.session_binding(),
-                    client.root_cursor(),
-                    &overlap.prepared,
-                )
-                .await
-                .unwrap();
+            let pending = client.pending_remote_operations();
+            assert_eq!(pending.len(), 1);
+            assert_eq!(
+                client.execute_publication(&prepared).await.err(),
+                Some(WorkspaceError::PendingOperation {
+                    operation_id: pending[0].operation_id.as_str().to_owned(),
+                })
+            );
             let count = fs::read_to_string(fault.with_extension("count")).unwrap();
             fs::remove_file(&fault).unwrap();
+            let published = root.join("nested").join(name);
+            assert_binary(
+                LocalTransferSource::new(smol::fs::File::open(&published).await.unwrap()),
+                1024,
+            )
+            .await;
+            tool(
+                &client,
+                client.root_cursor(),
+                "file_write",
+                json!({"filePath":format!("nested/{name}"), "content":PUBLICATION_OVERWRITE}),
+            )
+            .await;
+            assert_eq!(
+                fs::read_to_string(&published).unwrap(),
+                PUBLICATION_OVERWRITE
+            );
+            assert_eq!(client.pending_remote_operations(), pending);
             if restart {
                 fs::write(fault.with_extension("restart"), b"restart").unwrap();
             }
@@ -966,31 +991,18 @@ fn reviewed_transfer() {
             assert!(recovered.pending_remote_operations().is_empty());
             let status = recovered.publication_status(&restored).await.unwrap();
             assert_eq!(status.state, TransferPublicationState::Completed);
-            assert_binary(
-                recovered
-                    .download(&status.file.unwrap(), None)
-                    .await
-                    .unwrap()
-                    .source,
-                1024,
-            )
-            .await;
+            assert!(status.file.is_some());
             assert_eq!(
                 fs::read_to_string(fault.with_extension("count")).unwrap(),
                 count
             );
-            assert_binary(
-                LocalTransferSource::new(
-                    smol::fs::File::open(root.join("nested").join(name))
-                        .await
-                        .unwrap(),
-                ),
-                1024,
-            )
-            .await;
+            assert_eq!(
+                fs::read_to_string(&published).unwrap(),
+                PUBLICATION_OVERWRITE
+            );
         }
         eprintln!(
-            "PASS lost execute, durable restart recovery, cross-cursor locks, Unknown retains lock, no replay"
+            "PASS lost execute, durable restart recovery, replay refused by identity, same-file write never held back, Unknown keeps the record, no replay"
         );
     });
 }
@@ -1313,17 +1325,21 @@ async fn concurrent_registry_regressions(
     let gate = fault.with_file_name("batch-execute-gate");
     let trace = fault.with_file_name("batch-rpc-trace");
     let baseline_state = tempfile::tempdir().unwrap();
-    let baseline = WorkspaceBaseline::new_workspace_session(
-        StateDir::from_path(baseline_state.path().into()),
-        CaudraId::generate(),
-        ctx.workspace_session.clone().unwrap(),
-        client.stored_binding().clone(),
-        true,
-    );
-    ctx.baseline = Some(BaselineGate::new(baseline.clone(), None));
+    let baseline = with_remote_baseline(&mut ctx, client, baseline_state.path());
     let first = json!({"command":format!("printf '{BATCH_CONTENT}' > {BATCH_FIRST}; printf '{BATCH_CONTENT}'")});
     let second = json!({"command":format!("printf '{BATCH_CONTENT}' > {BATCH_SECOND}; printf '{BATCH_CONTENT}'")});
     let write = json!({"filePath":BATCH_WRITE,"content":BATCH_CONTENT});
+    let [first_edit, second_edit] = SHARED_EDITS
+        .map(|(old, new)| json!({"filePath":SHARED_EDIT_FILE, "oldString":old, "newString":new}));
+    let waiting = json!({
+        "command":format!(
+            ": > {RUNNING_SHELL_STARTED}; while [ ! -e {RUNNING_SHELL_MARKER} ] || [ ! -e {RUNNING_SHELL_PEER} ]; do sleep {}; done; cat {RUNNING_SHELL_MARKER}",
+            BATCH_POLL.as_secs_f64()
+        ),
+        "timeout":BATCH_TIMEOUT.as_millis() as u64,
+    });
+    let marker = json!({"filePath":RUNNING_SHELL_MARKER, "content":RUNNING_SHELL_OUTPUT});
+    let peer = json!({"command":format!(": > {RUNNING_SHELL_PEER}; printf '{BATCH_CONTENT}'")});
     let run = |id: &'static str, name, input| {
         tool_dispatch::run(&registry, None, id.into(), name, input, &ctx, Emit::Notify)
     };
@@ -1331,157 +1347,141 @@ async fn concurrent_registry_regressions(
         assert!(client.pending_remote_operations().is_empty());
         fs::write(&trace, "").unwrap();
         fs::write(&gate, "hold first execute before forwarding").unwrap();
-        let overlap = async {
+        let alongside = async {
             while !gate.with_extension("entered").exists() {
                 smol::Timer::after(BATCH_POLL).await;
             }
-            let pending = client.pending_remote_operations();
-            assert_eq!(pending.len(), 1);
+            let held = client.pending_remote_operations();
+            assert_eq!(held.len(), 1);
+            let (shell, file) = futures_lite::future::zip(
+                run("batch-second", "shell", &second),
+                run("batch-write", "file_write", &write),
+            )
+            .await;
+            assert!(!shell.is_error, "{}", shell.output.as_text());
+            assert!(shell.output.as_text().contains(BATCH_CONTENT));
+            assert!(!file.is_error, "{}", file.output.as_text());
+            for path in [BATCH_SECOND, BATCH_WRITE] {
+                assert_eq!(fs::read_to_string(root.join(path)).unwrap(), BATCH_CONTENT);
+            }
             assert!(!root.join(BATCH_FIRST).exists());
-            let queued = async {
-                let (shell, file) = futures_lite::future::zip(
-                    run("batch-second", "shell", &second),
-                    run("batch-write", "file_write", &write),
-                )
-                .await;
-                assert!(!shell.is_error, "{}", shell.output.as_text());
-                assert!(shell.output.as_text().contains(BATCH_CONTENT));
-                assert!(!file.is_error, "{}", file.output.as_text());
-            };
-            let release = async {
-                let mut started = BTreeSet::new();
-                while started.len() < 2 {
-                    if let AgentEvent::ToolStart(start) = rx.recv_async().await.unwrap().event
-                        && matches!(start.id.as_str(), "batch-second" | "batch-write")
-                    {
-                        started.insert(start.id);
+            assert_eq!(client.pending_remote_operations(), held);
+            eprintln!(
+                "PASS a shell and a write complete while another shell is held in flight, whose record is kept"
+            );
+            let diagnostics = fault.with_file_name("rpc-diagnostics");
+            fs::write(&diagnostics, "").unwrap();
+            let (cancel, token) = CancelToken::new();
+            let (_response_tx, response_rx) = flume::unbounded();
+            let mut prompting_ctx = ctx.clone();
+            prompting_ctx.cancel = token;
+            prompting_ctx.permissions = Arc::new(PermissionManager::new_nonpersistent(
+                PermissionsConfig::default(),
+                root.to_path_buf(),
+                Arc::default(),
+            ));
+            prompting_ctx.user_response_rx = Some(Arc::new(smol::lock::Mutex::new(response_rx)));
+            let cancelled_input = json!({"filePath":BATCH_CANCELLED, "content":BATCH_CONTENT});
+            let cancelled = tool_dispatch::run(
+                &registry,
+                None,
+                "batch-cancelled".into(),
+                "file_write",
+                &cancelled_input,
+                &prompting_ctx,
+                Emit::Notify,
+            );
+            let cancel_when_full = async {
+                loop {
+                    if let AgentEvent::PermissionRequest(_) = rx.recv_async().await.unwrap().event {
+                        break;
                     }
                 }
-                let diagnostics = fault.with_file_name("rpc-diagnostics");
-                fs::write(&diagnostics, "").unwrap();
-                let (cancel, token) = CancelToken::new();
-                let mut cancelled_ctx = ctx.clone();
-                cancelled_ctx.cancel = token;
-                let cancelled_input = json!({"filePath":BATCH_CANCELLED, "content":BATCH_CONTENT});
-                let cancelled = tool_dispatch::run(
-                    &registry,
-                    None,
-                    "batch-cancelled".into(),
-                    "file_write",
-                    &cancelled_input,
-                    &cancelled_ctx,
-                    Emit::Notify,
-                );
-                let cancel_when_full = async {
-                    loop {
-                        if let AgentEvent::ToolStart(start) = rx.recv_async().await.unwrap().event
-                            && start.id == "batch-cancelled"
-                        {
-                            break;
-                        }
-                    }
-                    let records = fs::read_to_string(&diagnostics).unwrap();
-                    let prepared: Value = records
+                let records = fs::read_to_string(&diagnostics).unwrap();
+                let prepared: Value = records
+                    .lines()
+                    .map(|line| serde_json::from_str::<Value>(line).unwrap())
+                    .find(|record| {
+                        record["method"] == "ai.workcell/prepare" && record["tool"] == "file_write"
+                    })
+                    .unwrap();
+                let preparation_id = prepared["preparationId"].as_str().unwrap();
+                let request = ToolPrepareRequest {
+                    name: "file_read".into(),
+                    input: json!({"filePath":"fixture.txt"}),
+                };
+                let mut fillers = Vec::new();
+                for _ in HELD_PREPARATIONS..REMOTE_PREPARATION_CAPACITY {
+                    fillers.push(
+                        capacity_client
+                            .prepare_canonical_tool(
+                                capacity_client.session_binding(),
+                                capacity_client.root_cursor(),
+                                &request,
+                            )
+                            .await
+                            .unwrap(),
+                    );
+                }
+                let full = capacity_client
+                    .prepare_canonical_tool(
+                        capacity_client.session_binding(),
+                        capacity_client.root_cursor(),
+                        &request,
+                    )
+                    .await;
+                let error = full.err();
+                assert!(matches!(error, Some(WorkspaceError::Conflict)), "{error:?}");
+                assert!(!root.join(BATCH_CANCELLED).exists());
+                cancel.cancel();
+                loop {
+                    let released = fs::read_to_string(&diagnostics)
+                        .unwrap()
                         .lines()
-                        .map(|line| serde_json::from_str::<Value>(line).unwrap())
-                        .find(|record| {
-                            record["method"] == "ai.workcell/prepare"
-                                && record["tool"] == "file_write"
-                        })
-                        .unwrap();
-                    let preparation_id = prepared["preparationId"].as_str().unwrap();
-                    let request = ToolPrepareRequest {
-                        name: "file_read".into(),
-                        input: json!({"filePath":"fixture.txt"}),
-                    };
-                    let mut fillers = Vec::new();
-                    for _ in HELD_PREPARATIONS..REMOTE_PREPARATION_CAPACITY {
-                        fillers.push(
-                            capacity_client
-                                .prepare_canonical_tool(
-                                    capacity_client.session_binding(),
-                                    capacity_client.root_cursor(),
-                                    &request,
-                                )
-                                .await
-                                .unwrap(),
-                        );
+                        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                        .any(|record| {
+                            record["method"] == "ai.workcell/release"
+                                && record["preparationId"] == preparation_id
+                                && record["result"]["released"] == true
+                        });
+                    if released {
+                        break;
                     }
-                    let full = capacity_client
-                        .prepare_canonical_tool(
+                    smol::Timer::after(BATCH_POLL).await;
+                }
+                let replacement = capacity_client
+                    .prepare_canonical_tool(
+                        capacity_client.session_binding(),
+                        capacity_client.root_cursor(),
+                        &request,
+                    )
+                    .await
+                    .unwrap();
+                fillers.push(replacement);
+                for prepared in fillers {
+                    capacity_client
+                        .release_canonical_tool(
                             capacity_client.session_binding(),
                             capacity_client.root_cursor(),
-                            &request,
-                        )
-                        .await;
-                    let error = full.err();
-                    assert!(matches!(error, Some(WorkspaceError::Conflict)), "{error:?}");
-                    assert!(!root.join(BATCH_CANCELLED).exists());
-                    cancel.cancel();
-                    loop {
-                        let released = fs::read_to_string(&diagnostics)
-                            .unwrap()
-                            .lines()
-                            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-                            .any(|record| {
-                                record["method"] == "ai.workcell/release"
-                                    && record["preparationId"] == preparation_id
-                                    && record["result"]["released"] == true
-                            });
-                        if released {
-                            break;
-                        }
-                        smol::Timer::after(BATCH_POLL).await;
-                    }
-                    let replacement = capacity_client
-                        .prepare_canonical_tool(
-                            capacity_client.session_binding(),
-                            capacity_client.root_cursor(),
-                            &request,
+                            &prepared.prepared,
                         )
                         .await
                         .unwrap();
-                    fillers.push(replacement);
-                    for prepared in fillers {
-                        capacity_client
-                            .release_canonical_tool(
-                                capacity_client.session_binding(),
-                                capacity_client.root_cursor(),
-                                &prepared.prepared,
-                            )
-                            .await
-                            .unwrap();
-                    }
-                };
-                let (cancelled, ()) = futures_lite::future::zip(cancelled, cancel_when_full).await;
-                assert!(cancelled.is_error);
-                assert!(
-                    cancelled.output.as_text().to_lowercase().contains("cancel"),
-                    "{}",
-                    cancelled.output.as_text()
-                );
-                assert!(!root.join(BATCH_CANCELLED).exists());
-                assert_eq!(client.pending_remote_operations().len(), 1);
-                eprintln!(
-                    "PASS queued cancellation releases unsent preparation, full 64-slot ledger admits replacement, no cancelled file or new journal row"
-                );
-                assert!(!root.join(BATCH_SECOND).exists());
-                assert!(!root.join(BATCH_WRITE).exists());
-                let retained = client.pending_remote_operations();
-                assert_eq!(retained.len(), 1);
-                assert_eq!(retained[0].operation_id, pending[0].operation_id);
-                let records = fs::read_to_string(&trace).unwrap();
-                let records = records.lines().collect::<Vec<_>>();
-                assert_eq!(
-                    records.len(),
-                    1,
-                    "queued calls dispatched or reconciled before release: {records:?}"
-                );
-                let record: Value = serde_json::from_str(records[0]).unwrap();
-                assert_eq!(record["method"], "ai.workcell/execute");
-                fs::write(gate.with_extension("release"), "release").unwrap();
+                }
             };
-            futures_lite::future::zip(queued, release).await;
+            let (cancelled, ()) = futures_lite::future::zip(cancelled, cancel_when_full).await;
+            assert!(cancelled.is_error);
+            assert!(
+                cancelled.output.as_text().contains(PERMISSION_DENIED),
+                "{}",
+                cancelled.output.as_text()
+            );
+            assert!(!root.join(BATCH_CANCELLED).exists());
+            assert_eq!(client.pending_remote_operations(), held);
+            eprintln!(
+                "PASS cancelling a pending prompt releases its unsent preparation, full 64-slot ledger admits replacement, no cancelled file or new journal row"
+            );
+            fs::write(gate.with_extension("release"), "release").unwrap();
         };
         futures_lite::future::zip(
             async {
@@ -1489,7 +1489,7 @@ async fn concurrent_registry_regressions(
                 assert!(!first.is_error, "{}", first.output.as_text());
                 assert!(first.output.as_text().contains(BATCH_CONTENT));
             },
-            overlap,
+            alongside,
         )
         .await;
         assert_eq!(
@@ -1498,9 +1498,6 @@ async fn concurrent_registry_regressions(
         );
         assert!(client.pending_remote_operations().is_empty());
         assert!(baseline.is_captured());
-        for path in [BATCH_SECOND, BATCH_WRITE] {
-            assert_eq!(fs::read_to_string(root.join(path)).unwrap(), BATCH_CONTENT);
-        }
         let mut next_ctx = ctx.clone();
         let next_head = Some(CaudraId::generate());
         next_ctx.baseline = Some(BaselineGate::new(baseline.clone(), next_head));
@@ -1552,34 +1549,93 @@ async fn concurrent_registry_regressions(
     })
     .await;
     eprintln!(
-        "PASS concurrent two-shell/file_write batch: same-client queue, no execute before release, all artifacts and shell output, no unresolved rows, unsynchronized fresh automatic snapshot"
+        "PASS concurrent two-shell/file_write batch: nothing queues behind an in-flight shell, all artifacts and shell output, no unresolved rows, unsynchronized fresh automatic snapshot"
+    );
+    let beside_running = async {
+        fs::write(root.join(SHARED_EDIT_FILE), SHARED_EDIT_ORIGINAL).unwrap();
+        let mut workflow_ctx = ctx.clone();
+        workflow_ctx.task_environment = workflow_ctx
+            .task_environment
+            .set(TASK_CWD_VAR, WORKFLOW_TASK_CWD);
+        let (first_done, second_done) = futures_lite::future::zip(
+            run("edit-first-line", "file_edit", &first_edit),
+            tool_dispatch::run(
+                &registry,
+                None,
+                "edit-second-line".into(),
+                "file_edit",
+                &second_edit,
+                &workflow_ctx,
+                Emit::Notify,
+            ),
+        )
+        .await;
+        for done in [first_done, second_done] {
+            assert!(!done.is_error, "{}", done.output.as_text());
+        }
+        assert_eq!(
+            fs::read_to_string(root.join(SHARED_EDIT_FILE)).unwrap(),
+            SHARED_EDIT_APPLIED
+        );
+        eprintln!(
+            "PASS two edits of one file started together by agents with different {{cwd}} both apply"
+        );
+        let beside = async {
+            while !root.join(RUNNING_SHELL_STARTED).exists() {
+                smol::Timer::after(BATCH_POLL).await;
+            }
+            let (shell, file) = futures_lite::future::zip(
+                run("shell-beside-running", "shell", &peer),
+                run("marker-beside-running", "file_write", &marker),
+            )
+            .await;
+            assert!(!shell.is_error, "{}", shell.output.as_text());
+            assert!(shell.output.as_text().contains(BATCH_CONTENT));
+            assert!(!file.is_error, "{}", file.output.as_text());
+        };
+        let (running, ()) =
+            futures_lite::future::zip(run("running-shell", "shell", &waiting), beside).await;
+        assert!(!running.is_error, "{}", running.output.as_text());
+        assert!(running.output.as_text().contains(RUNNING_SHELL_OUTPUT));
+        assert!(client.pending_remote_operations().is_empty());
+    };
+    futures_lite::future::race(beside_running, async {
+        smol::Timer::after(BATCH_TIMEOUT).await;
+        panic!(
+            "calls beside a running shell did not finish: started={}, marker={}, peer={}",
+            root.join(RUNNING_SHELL_STARTED).exists(),
+            root.join(RUNNING_SHELL_MARKER).exists(),
+            root.join(RUNNING_SHELL_PEER).exists()
+        );
+    })
+    .await;
+    eprintln!(
+        "PASS a running shell holds back neither a second shell nor the write it waits for, and the journal ends empty"
     );
 }
 
-/// A command queued behind another one waits on a client admission lock while
-/// the server expires its preparation on an independent timer. The wait is
-/// legitimate work, so the call has to be renewed and run.
+/// A command held at its permission prompt outlives the preparation the
+/// server made for it on an independent timer. The wait is legitimate work,
+/// so the approved call has to be renewed and run, exactly once.
 async fn lapsed_preparation_regression(client: &RemoteWorkcellClient, root: &Path) {
     let registry = Arc::new(ToolRegistry::new());
     RemoteWorkcellHost::new(client.clone())
         .register(&registry)
         .unwrap();
     let permissions = Arc::new(PermissionManager::new_nonpersistent(
-        PermissionsConfig {
-            yolo: true,
-            ..Default::default()
-        },
+        PermissionsConfig::default(),
         root.to_path_buf(),
         Arc::default(),
     ));
-    let (tx, _rx) = flume::unbounded();
+    let (tx, rx) = flume::unbounded();
+    let (_response_tx, response_rx) = flume::unbounded();
     let mut ctx = interpreter_ctx(
         &AgentMode::Build,
         &EventSender::new(tx, 0),
         CancelToken::none(),
-        permissions,
+        permissions.clone(),
         Arc::new(FileReadTracker::new()),
-        None,
+        Some(Arc::new(smol::lock::Mutex::new(response_rx))),
         registry.clone(),
     );
     ctx.workspace_session = Some(
@@ -1591,85 +1647,52 @@ async fn lapsed_preparation_regression(client: &RemoteWorkcellClient, root: &Pat
         .unwrap(),
     );
     let baseline_state = tempfile::tempdir().unwrap();
-    ctx.baseline = Some(BaselineGate::new(
-        WorkspaceBaseline::new_workspace_session(
-            StateDir::from_path(baseline_state.path().into()),
-            CaudraId::generate(),
-            ctx.workspace_session.clone().unwrap(),
-            client.stored_binding().clone(),
-            true,
-        ),
-        None,
-    ));
+    with_remote_baseline(&mut ctx, client, baseline_state.path());
     let fault = PathBuf::from(env::var_os("WORKCELL_TEST_FAULT").unwrap());
-    let gate = fault.with_file_name("batch-execute-gate");
     let shorten = fault.with_file_name("short-preparation-ttl");
     let expiry = fault.with_file_name("short-preparation-expiry");
     let diagnostics = fault.with_file_name("rpc-diagnostics");
     let trace = fault.with_file_name("batch-rpc-trace");
     fs::write(&diagnostics, "").unwrap();
     fs::write(&trace, "").unwrap();
-    for stale in [
-        &expiry,
-        &gate.with_extension("entered"),
-        &gate.with_extension("release"),
-    ] {
-        let _ = fs::remove_file(stale);
-    }
-    fs::write(&gate, "hold the first command before forwarding").unwrap();
-    let holder = json!({"command":format!("printf '{BATCH_CONTENT}'")});
-    let queued = json!({"command":format!("printf '{BATCH_CONTENT}' > {LAPSED_FILE}; printf '{BATCH_CONTENT}'")});
+    let _ = fs::remove_file(&expiry);
+    fs::write(&shorten, LAPSED_TTL_MS.to_string()).unwrap();
+    let reviewed = json!({"command":format!("printf '{BATCH_CONTENT}' > {LAPSED_FILE}; printf '{BATCH_CONTENT}'")});
     let exercise = async {
-        let held = tool_dispatch::run(
+        let dispatch = tool_dispatch::run(
             &registry,
             None,
-            "lapsed-holder".into(),
+            "lapsed-reviewed".into(),
             "shell",
-            &holder,
+            &reviewed,
             &ctx,
             Emit::Silent,
         );
-        let overlap = async {
-            while !gate.with_extension("entered").exists() {
+        let approve_after_lapse = async {
+            let request = loop {
+                if let AgentEvent::PermissionRequest(request) = rx.recv_async().await.unwrap().event
+                {
+                    break request;
+                }
+            };
+            let lapses_at = fs::read_to_string(&expiry)
+                .unwrap()
+                .trim()
+                .parse::<u128>()
+                .unwrap();
+            while unix_millis() <= lapses_at {
                 smol::Timer::after(BATCH_POLL).await;
             }
-            fs::write(&shorten, LAPSED_TTL_MS.to_string()).unwrap();
-            let queued = tool_dispatch::run(
-                &registry,
-                None,
-                "lapsed-queued".into(),
-                "shell",
-                &queued,
-                &ctx,
-                Emit::Silent,
-            );
-            let release = async {
-                loop {
-                    if let Ok(deadline) = fs::read_to_string(&expiry)
-                        && let Ok(deadline) = deadline.trim().parse::<u128>()
-                    {
-                        while unix_millis() <= deadline {
-                            smol::Timer::after(BATCH_POLL).await;
-                        }
-                        break;
-                    }
-                    smol::Timer::after(BATCH_POLL).await;
-                }
-                assert!(!root.join(LAPSED_FILE).exists());
-                fs::write(gate.with_extension("release"), "release").unwrap();
-            };
-            let (queued, ()) = futures_lite::future::zip(queued, release).await;
-            assert!(!queued.is_error, "{}", queued.output.as_text());
-            assert!(queued.output.as_text().contains(BATCH_CONTENT));
+            assert!(permissions.answer(&request.id, PermissionAnswer::AllowOnce));
         };
-        let (held, ()) = futures_lite::future::zip(held, overlap).await;
-        assert!(!held.is_error, "{}", held.output.as_text());
+        let (done, ()) = futures_lite::future::zip(dispatch, approve_after_lapse).await;
+        assert!(!done.is_error, "{}", done.output.as_text());
+        assert!(done.output.as_text().contains(BATCH_CONTENT));
     };
     futures_lite::future::race(exercise, async {
         smol::Timer::after(BATCH_TIMEOUT).await;
         panic!(
-            "queued command behind a lapsed preparation did not finish: entered={}, trace={:?}",
-            gate.with_extension("entered").exists(),
+            "a command approved after its preparation lapsed did not finish: trace={:?}",
             fs::read_to_string(&trace)
         );
     })
@@ -1687,18 +1710,42 @@ async fn lapsed_preparation_regression(client: &RemoteWorkcellClient, root: &Pat
         .iter()
         .filter(|record| record["method"] == "ai.workcell/prepare" && record["tool"] == "shell")
         .count();
-    assert_eq!(prepared, 3, "the queued command did not renew: {records:?}");
+    assert_eq!(
+        prepared, LAPSED_PREPARATIONS,
+        "the approved command did not renew: {records:?}"
+    );
     let executed = fs::read_to_string(&trace)
         .unwrap()
         .lines()
         .filter_map(|line| serde_json::from_str::<Value>(line).ok())
         .filter(|record| record["method"] == "ai.workcell/execute")
         .count();
-    assert_eq!(executed, 2, "a lapsed preparation was dispatched twice");
+    assert_eq!(
+        executed, LAPSED_EXECUTIONS,
+        "a lapsed preparation was dispatched as well"
+    );
     assert!(client.pending_remote_operations().is_empty());
     eprintln!(
-        "PASS a command queued behind another renews the preparation the server expired, runs exactly once, and leaves no unresolved row"
+        "PASS a command approved after its preparation lapsed renews it, runs exactly once, and leaves no unresolved row"
     );
+}
+
+/// Gives `ctx` the revert point a mutating remote call captures first, kept in
+/// `state`.
+fn with_remote_baseline(
+    ctx: &mut ToolContext,
+    client: &RemoteWorkcellClient,
+    state: &Path,
+) -> Arc<WorkspaceBaseline> {
+    let baseline = WorkspaceBaseline::new_workspace_session(
+        StateDir::from_path(state.into()),
+        CaudraId::generate(),
+        ctx.workspace_session.clone().unwrap(),
+        client.stored_binding().clone(),
+        true,
+    );
+    ctx.baseline = Some(BaselineGate::new(baseline.clone(), None));
+    baseline
 }
 
 fn unix_millis() -> u128 {
@@ -1883,66 +1930,45 @@ async fn canonical_registry_regressions(client: &RemoteWorkcellClient, root: &Pa
         },
     )
     .await;
-    assert_eq!(client.pending_remote_operations().len(), 1);
-    let read = tool_dispatch::run(
-        &registry,
-        None,
-        "read-while-locked".into(),
-        "file_index",
-        &json!({"path":"."}),
-        &ctx,
-        Emit::Silent,
-    )
-    .await;
-    assert!(!read.is_error, "{}", read.output.as_text());
-    let isolated = tool_dispatch::run(
-        &registry,
-        None,
-        "python-while-locked".into(),
-        "python_execution",
-        &json!({"code":"2 + 2"}),
-        &ctx,
-        Emit::Silent,
-    )
-    .await;
-    assert!(!isolated.is_error, "{}", isolated.output.as_text());
     let pending = client.pending_remote_operations();
     assert_eq!(pending.len(), 1);
-    let unblocked = client
-        .prepare_canonical_tool(
-            client.session_binding(),
-            client.root_cursor(),
-            &ToolPrepareRequest {
-                name: "file_write".into(),
-                input: json!({"filePath":"unblocked.txt", "content":"unblocked"}),
-            },
-        )
-        .await
-        .unwrap();
-    let result = client
-        .execute_canonical_tool(
-            client.session_binding(),
-            client.root_cursor(),
-            &unblocked.prepared,
-        )
-        .await
-        .unwrap();
-    assert!(
-        matches!(result.state, OperationState::Completed { .. }),
-        "an indeterminate broad_lock must not block an unrelated write"
-    );
-    assert_eq!(
-        fs::read_to_string(root.join("unblocked.txt")).unwrap(),
-        "unblocked"
-    );
-    let retained = client.pending_remote_operations();
-    assert_eq!(retained.len(), 1);
-    assert_eq!(retained[0].operation_id, pending[0].operation_id);
+    let baseline_state = tempfile::tempdir().unwrap();
+    with_remote_baseline(&mut ctx, client, baseline_state.path());
+    for (id, name, input) in [
+        ("index-beside-uncertain", "file_index", json!({"path":"."})),
+        (
+            "python-beside-uncertain",
+            "python_execution",
+            json!({"code":"2 + 2"}),
+        ),
+        (
+            "shell-beside-uncertain",
+            "shell",
+            json!({"command":format!("printf '{BESIDE_UNCERTAIN_CONTENT}' > {BESIDE_UNCERTAIN_SHELL}")}),
+        ),
+        (
+            "write-beside-uncertain",
+            "file_write",
+            json!({"filePath":BESIDE_UNCERTAIN_WRITE, "content":BESIDE_UNCERTAIN_CONTENT}),
+        ),
+    ] {
+        let done =
+            tool_dispatch::run(&registry, None, id.into(), name, &input, &ctx, Emit::Silent).await;
+        assert!(!done.is_error, "{name}: {}", done.output.as_text());
+    }
+    for path in [BESIDE_UNCERTAIN_SHELL, BESIDE_UNCERTAIN_WRITE] {
+        assert_eq!(
+            fs::read_to_string(root.join(path)).unwrap(),
+            BESIDE_UNCERTAIN_CONTENT
+        );
+    }
+    assert_eq!(client.pending_remote_operations(), pending);
     client
         .acknowledge_pending_operation(&pending[0].operation_id)
         .unwrap();
+    assert!(client.pending_remote_operations().is_empty());
     eprintln!(
-        "PASS dropped future sends cancel/status, retains uncertain effects lock, permits index and isolated Python, unblocked writes proceed"
+        "PASS dropped future sends cancel/status, keeps the uncertain record, and index, Python, shell and write all run beside it"
     );
 }
 
@@ -2966,25 +2992,33 @@ fn authenticated_local() {
             assert_eq!(records.len(), 1);
             assert!(records[0].side_effects_possible);
             assert!(records[0].acknowledged_at.is_none());
-            let overlap = recovered
-                .prepare_canonical_tool(
-                    recovered.session_binding(),
-                    recovered.root_cursor(),
-                    &ToolPrepareRequest {
-                        name: "file_write".into(),
-                        input: json!({"filePath":"after-ack.txt", "content":"acknowledged"}),
-                    },
-                )
-                .await
-                .unwrap();
-            recovered
-                .execute_canonical_tool(
-                    recovered.session_binding(),
-                    recovered.root_cursor(),
-                    &overlap.prepared,
-                )
-                .await
-                .expect("an indeterminate broad_lock must not block unrelated writes");
+            for path in [BESIDE_UNCERTAIN_SHELL, BESIDE_UNCERTAIN_WRITE] {
+                let beside = root.join("nested").join(path);
+                if beside.exists() {
+                    fs::remove_file(beside).unwrap();
+                }
+            }
+            tool(
+                &recovered,
+                recovered.root_cursor(),
+                "shell",
+                json!({"command":format!("printf '{BESIDE_UNCERTAIN_CONTENT}' > nested/{BESIDE_UNCERTAIN_SHELL}")}),
+            )
+            .await;
+            tool(
+                &recovered,
+                recovered.root_cursor(),
+                "file_write",
+                json!({"filePath":format!("nested/{BESIDE_UNCERTAIN_WRITE}"), "content":BESIDE_UNCERTAIN_CONTENT}),
+            )
+            .await;
+            for path in [BESIDE_UNCERTAIN_SHELL, BESIDE_UNCERTAIN_WRITE] {
+                assert_eq!(
+                    fs::read_to_string(root.join("nested").join(path)).unwrap(),
+                    BESIDE_UNCERTAIN_CONTENT
+                );
+            }
+            assert_eq!(recovered.pending_remote_operations(), pending);
             let session = caudra_workspace::WorkspaceSession::new(
                 recovered.workspace_handle().unwrap(),
                 recovered.session_binding().clone(),
@@ -3005,13 +3039,6 @@ fn authenticated_local() {
             .await
             .unwrap();
             assert!(recovered.pending_remote_operations().is_empty());
-            tool(
-                &recovered,
-                recovered.root_cursor(),
-                "file_write",
-                json!({"filePath":"after-ack.txt", "content":"acknowledged"}),
-            )
-            .await;
             assert_eq!(
                 fs::read_to_string(fault.with_extension("count")).unwrap(),
                 count
@@ -3021,7 +3048,7 @@ fn authenticated_local() {
                 EXECUTION_MARKER
             );
             eprintln!(
-                "PASS lost response then {}: NeverSeen retains cross-cursor locks until explicit acknowledgement",
+                "PASS lost response then {}: NeverSeen keeps the record until explicit acknowledgement while shells and writes run beside it",
                 if restart {
                     "same-generation restart"
                 } else {

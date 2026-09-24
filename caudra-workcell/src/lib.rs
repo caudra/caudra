@@ -49,7 +49,7 @@ use caudra_agent::permissions::{
     filesystem_permission_resource, prepared_command_binding, shell_permission_scope,
 };
 use caudra_agent::tools::{
-    BoxFuture, DescriptionContext, ExecFuture, HeaderFuture, HeaderResult,
+    BoxFuture, DescriptionContext, ExecFuture, HeaderFuture, HeaderResult, LockKey,
     PYTHON_EXECUTION_TOOL_NAME, ParseError, PermissionIntent, PermissionScopes, PlanModeAccess,
     RegistryError, SHELL_TOOL_NAME, Tool, ToolAudience, ToolContext, ToolEffect, ToolExecResult,
     ToolInvocation, ToolLive, ToolRegistry, ToolSource, expand_tilde,
@@ -158,11 +158,11 @@ const SHELL_EXECUTION_TIMEOUT: Duration =
     Duration::from_millis(workcell::shell::MAX_TIMEOUT_MS + SHELL_COMPLETION_ALLOWANCE_MS);
 const REMOTE_RECONCILE_TIMEOUT: Duration = Duration::from_secs(10);
 const REMOTE_RECONCILE_MAX_POLLS: usize = 4;
-const REMOTE_ADMISSION_EXPIRED: &str = "Remote Workcell execution deadline expired before dispatch";
+const REMOTE_DEADLINE_BEFORE_DISPATCH: &str =
+    "Remote Workcell execution deadline expired before dispatch";
 /// A preparation lives on the server's own timer, so a call that waits behind
-/// review or behind another command's admission can outlive it. Renewing before
-/// dispatch keeps a legitimate call alive; the renewed intent still has to be
-/// the one that was reviewed.
+/// review can outlive it. Renewing before dispatch keeps a legitimate call
+/// alive; the renewed intent still has to be the one that was reviewed.
 const REMOTE_PREPARATION_RENEWAL: Duration = Duration::from_secs(15);
 const REMOTE_PREPARATION_LAPSED: &str =
     "Remote Workcell preparation expired before dispatch and could not be renewed";
@@ -1608,28 +1608,13 @@ impl RemoteWorkcellInvocation {
             Err(_) => Duration::ZERO,
         };
         let deadline = Instant::now() + timeout;
-        let admission = ctx
-            .cancel
-            .race(future::race(
-                async {
-                    Ok(self
-                        .client
-                        .admit_canonical_tool(self.kind.name(), &call.intent)
-                        .await)
-                },
-                async {
-                    smol::Timer::at(deadline).await;
-                    Err(REMOTE_ADMISSION_EXPIRED.into())
-                },
-            ))
-            .await;
-        let _admission = match admission {
-            Ok(Ok(admission)) if Instant::now() < deadline && !ctx.cancel.is_cancelled() => {
-                admission
-            }
-            Ok(Err(error)) | Err(error) => return Err(error).into(),
-            _ => return Err(REMOTE_ADMISSION_EXPIRED.into()).into(),
-        };
+        // A stopped call must not prepare on the host again to renew itself.
+        if timeout.is_zero() {
+            return Err(REMOTE_DEADLINE_BEFORE_DISPATCH.into()).into();
+        }
+        if let Err(cancelled) = ctx.cancel.race(future::ready(())).await {
+            return Err(cancelled).into();
+        }
         if let Err(error) = self.renew_lapsing_preparation(&mut call, cleanup).await {
             return Err(error).into();
         }
@@ -1652,7 +1637,7 @@ impl RemoteWorkcellInvocation {
             }
             Err(error) if !cleanup.execution_started => return Err(error).into(),
             Ok(None) if !cleanup.execution_started => {
-                return Err(REMOTE_ADMISSION_EXPIRED.into()).into();
+                return Err(REMOTE_DEADLINE_BEFORE_DISPATCH.into()).into();
             }
             _ => match self.reconcile(&call, &mut progress).await {
                 Some(status) => status,
@@ -1849,6 +1834,25 @@ fn bounded_remote_display(value: &str) -> String {
     value.chars().take(REMOTE_DISPLAY_MAX_CHARS).collect()
 }
 
+/// The host files a remote write prepares against: the ones it names, joined to
+/// the workspace path `cwd`. Shell and python are left out, as they are
+/// locally: what they touch is unknown until they run. An absolute spelling
+/// keeps its own key, because the host never reveals where its root is. Two
+/// writes spelling one file both ways can still both prepare, and the host's
+/// publication check refuses the second instead of losing it.
+fn remote_write_keys(input: &Input, cwd: &str) -> Vec<LockKey> {
+    let paths = match input {
+        Input::FileWrite(input) => vec![input.file_path.as_str()],
+        Input::FileEdit(input) => vec![input.file_path.as_str()],
+        Input::FileApplyPatch(input) => patch::paths(&input.patch_text),
+        _ => return Vec::new(),
+    };
+    paths
+        .into_iter()
+        .map(|path| LockKey::remote(cwd, path))
+        .collect()
+}
+
 fn remote_shell_plan_access(call: &RemotePreparedToolCall) -> PlanModeAccess {
     let resources = &call.intent.resources;
     let [cwd, command, startup] = resources.as_slice() else {
@@ -2032,6 +2036,21 @@ impl ToolInvocation for RemoteWorkcellInvocation {
                     ToolEffect::ReadOnly
                 }
             })
+    }
+
+    /// Resolved against the session's cursor, never `{cwd}`: that names another
+    /// directory for the main agent, a workflow agent and a headless run, and
+    /// one file has to take one key in all of them. A stale cursor takes none,
+    /// as its preparation is refused anyway.
+    fn preflight_write_keys(&self, ctx: &ToolContext) -> Vec<LockKey> {
+        ctx.workspace_session
+            .as_ref()
+            .and_then(|session| {
+                self.client
+                    .cursor_path(session.binding(), session.cursor())
+                    .ok()
+            })
+            .map_or_else(Vec::new, |cwd| remote_write_keys(&self.input, cwd.as_str()))
     }
 
     fn preflight<'a>(
@@ -8178,6 +8197,37 @@ mod tests {
             invocation.mutation_targets(&ctx).is_empty(),
             "{EXPECT_NO_DOUBLE_GUARD}"
         );
+    }
+
+    const REMOTE_CWD: &str = "project";
+    const REMOTE_TARGET: &str = "/project/src/lib.rs";
+    const REMOTE_MOVED: &str = "/project/src/moved.rs";
+    const REMOTE_ABSOLUTE: &str = "/workspace/project/src/lib.rs";
+    const REMOTE_MOVE_PATCH: &str =
+        "*** Begin Patch\n*** Update File: src/lib.rs\n*** Move to: src/moved.rs\n*** End Patch";
+
+    /// A remote write is prepared against the file as the host sees it, so its
+    /// keys name that file from the workspace root however a relative call
+    /// spells it. Shell, python and reads name nothing, exactly as they do
+    /// locally.
+    #[test_case(ToolKind::FileWrite, json!({"filePath": "src/lib.rs", "content": ""}), &[REMOTE_TARGET] ; "relative_write")]
+    #[test_case(ToolKind::FileEdit, json!({"filePath": "./src/../src/lib.rs", "oldString": "a", "newString": "b"}), &[REMOTE_TARGET] ; "folded_edit")]
+    #[test_case(ToolKind::FileEdit, json!({"filePath": REMOTE_ABSOLUTE, "oldString": "a", "newString": "b"}), &[REMOTE_ABSOLUTE] ; "absolute_edit_keeps_its_spelling")]
+    #[test_case(ToolKind::FileApplyPatch, json!({"patchText": REMOTE_MOVE_PATCH}), &[REMOTE_TARGET, REMOTE_MOVED] ; "patch_names_every_file")]
+    #[test_case(ToolKind::Shell, json!({"command": "echo > src/lib.rs"}), &[] ; "shell_names_nothing")]
+    #[test_case(ToolKind::Code, json!({"code": "1"}), &[] ; "python_names_nothing")]
+    #[test_case(ToolKind::FileRead, json!({"filePath": "src/lib.rs"}), &[] ; "read_names_nothing")]
+    fn remote_writes_lock_the_host_files_they_prepare(
+        kind: ToolKind,
+        input: Value,
+        expected: &[&str],
+    ) {
+        let input = Input::parse(kind, input).expect("valid input");
+        let expected = expected
+            .iter()
+            .map(|path| LockKey::Remote((*path).to_owned()))
+            .collect::<Vec<_>>();
+        assert_eq!(remote_write_keys(&input, REMOTE_CWD), expected);
     }
 
     /// Workcell records every successful `file_read` against the tracker it is

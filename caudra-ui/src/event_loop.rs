@@ -1971,11 +1971,12 @@ impl<'t> EventLoop<'t> {
                 return Err(reason.into());
             }
             if let Some(binding) = runtime.app.state.session.workspace_binding()
-                && !RemoteOperationJournal::open(&self.ctx.storage)
+                && RemoteOperationJournal::open(&self.ctx.storage)
                     .map_err(|error| error.to_string())?
                     .list_pending(binding)
                     .map_err(|error| error.to_string())?
-                    .is_empty()
+                    .iter()
+                    .any(|record| record.reachable_from(binding))
             {
                 return Err("Reconcile pending Workcell mutations before a sandbox action".into());
             }

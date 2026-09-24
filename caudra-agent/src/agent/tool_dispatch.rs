@@ -2,6 +2,7 @@ use std::borrow::Cow;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, VecDeque};
 use std::hash::{Hash, Hasher};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -16,8 +17,8 @@ use crate::tools::registry::{
     PlanModeAccess, RegisteredTool, ToolInvocation, ToolRegistry, TrustedToolSource,
 };
 use crate::tools::{
-    DOOM_LOOP_GUIDANCE, LocalToolEntry, READ_ONLY_CALL_GUIDANCE, READ_ONLY_TOOL_RESTRICTED,
-    TOOL_SEARCH_TOOL_NAME, ToolContext, ToolEffect, ToolSource,
+    DOOM_LOOP_GUIDANCE, LocalToolEntry, LockKey, READ_ONLY_CALL_GUIDANCE,
+    READ_ONLY_TOOL_RESTRICTED, TOOL_SEARCH_TOOL_NAME, ToolContext, ToolEffect, ToolSource,
 };
 use crate::workspace_baseline::BaselineOutcome;
 use crate::{
@@ -601,6 +602,15 @@ async fn run_inner(
             }
         };
 
+        // A remote write is prepared against the file as the host sees it now,
+        // and the host refuses to publish it once the file has changed. Taken
+        // after the verdict like the guards below, two writes to one file
+        // would prepare against the same version and the second would always
+        // be refused, so these are taken before preparation instead.
+        let _preparation_guards = ctx
+            .path_locks
+            .acquire(&invocation.preflight_write_keys(ctx), &[])
+            .await;
         let mut prepared_intent = match invocation.preflight(ctx).await {
             Ok(intent) => intent,
             Err(error) => return done_error(error),
@@ -736,9 +746,14 @@ async fn run_inner(
         // a tool's own stale check, write, and mtime record must not interleave
         // with a concurrent call naming the same file. Not gated on
         // `stale_read_check`; turning that off must not re-enable clobbering.
+        // Remote writes are the exception above: their prompt holds back later
+        // writes to the same file, and they wait before their start event.
         let _guards = ctx
             .path_locks
-            .acquire(&mutation_targets, &invocation.read_targets(ctx))
+            .acquire(
+                &local_keys(&mutation_targets),
+                &local_keys(&invocation.read_targets(ctx)),
+            )
             .await;
 
         let result = invocation.execute(ctx).await;
@@ -818,6 +833,10 @@ async fn run_inner(
 fn canonical_tool_name<'a>(name: &'a str, ctx: &'a ToolContext) -> &'a str {
     let name = super::streaming::canonical_tool_name(name);
     ctx.resolve_tool_name_alias(name)
+}
+
+fn local_keys(paths: &[PathBuf]) -> Vec<LockKey> {
+    paths.iter().cloned().map(LockKey::Local).collect()
 }
 
 fn set_lua_provenance(

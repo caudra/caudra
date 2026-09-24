@@ -623,9 +623,9 @@ mod tests {
     use crate::AgentMode;
     use crate::agent::speculative::{REVISED_INPUT, SpeculativeRuns};
     use crate::agent::tool_dispatch::{ResponseObservations, ToolOutcome};
-    use crate::tools::STALE_READ_MSG;
-    use crate::tools::registry::{ToolRegistry, ToolSource};
+    use crate::tools::registry::{BoxFuture, PermissionIntent, ToolRegistry, ToolSource};
     use crate::tools::test_support::{stub_ctx, stub_ctx_with};
+    use crate::tools::{LockKey, STALE_READ_MSG};
     use futures_lite::future;
     use serde_json::json;
     use std::collections::HashMap;
@@ -1683,5 +1683,116 @@ mod tests {
             format!("{SEED}{FIRST_MARK}{SECOND_MARK}"),
             "{EXPECT_BOTH_APPLIED}"
         );
+    }
+
+    const PREPARING: &str = "preparing";
+    const KEY_FIELD: &str = "key";
+    const REMOTE_FILE: &str = "/workspace/contended.rs";
+    const OTHER_REMOTE_FILE: &str = "/workspace/other.rs";
+
+    /// Stands in for a remote write, whose preparation fixes the version of
+    /// the file it will replace. The gauge counts calls between the start of
+    /// preparation and the end of execution, the span its key has to cover.
+    struct PreparingTool {
+        gauge: Arc<Gauge>,
+    }
+
+    struct PreparingCall {
+        gauge: Arc<Gauge>,
+        key: Option<String>,
+    }
+
+    impl ToolInvocation for PreparingCall {
+        fn start_header(&self) -> HeaderFuture {
+            HeaderFuture::Ready(HeaderResult::plain(PREPARING.to_owned()))
+        }
+        fn preflight_write_keys(&self, _ctx: &ToolContext) -> Vec<LockKey> {
+            self.key.iter().cloned().map(LockKey::Remote).collect()
+        }
+        fn preflight<'a>(
+            &'a self,
+            _ctx: &'a ToolContext,
+        ) -> BoxFuture<'a, Result<Option<PermissionIntent>, String>> {
+            Box::pin(async move {
+                let depth = self.gauge.inside.fetch_add(1, Ordering::SeqCst) + 1;
+                self.gauge.peak.fetch_max(depth, Ordering::SeqCst);
+                future::yield_now().await;
+                Ok(None)
+            })
+        }
+        fn execute<'a>(self: Box<Self>, _ctx: &'a ToolContext) -> ExecFuture<'a> {
+            Box::pin(async move {
+                future::yield_now().await;
+                self.gauge.inside.fetch_sub(1, Ordering::SeqCst);
+                ToolExecResult::from(Ok::<_, String>(ToolOutput::Plain(BODY.into())))
+            })
+        }
+    }
+
+    impl Tool for PreparingTool {
+        fn name(&self) -> &str {
+            PREPARING
+        }
+        fn description(&self, _ctx: &DescriptionContext) -> Cow<'_, str> {
+            Cow::Borrowed("")
+        }
+        fn schema(&self) -> Value {
+            json!({ "type": "object", "properties": {} })
+        }
+        fn parse(&self, input: &Value) -> Result<Box<dyn ToolInvocation>, ParseError> {
+            Ok(Box::new(PreparingCall {
+                gauge: Arc::clone(&self.gauge),
+                key: input[KEY_FIELD].as_str().map(str::to_owned),
+            }))
+        }
+    }
+
+    /// A remote write's key is held from before its preparation to the end of
+    /// its execution, so a second write to that file prepares only once the
+    /// first has published. Other files, and calls naming none, such as a
+    /// shell command, run alongside it.
+    #[test_case(Some(REMOTE_FILE), Some(REMOTE_FILE), 1 ; "one_remote_file_is_serialized")]
+    #[test_case(Some(REMOTE_FILE), Some(OTHER_REMOTE_FILE), 2 ; "different_remote_files_overlap")]
+    #[test_case(Some(REMOTE_FILE), None, 2 ; "a_call_naming_no_file_overlaps_a_writer")]
+    fn remote_write_keys_cover_preparation_through_execution(
+        first: Option<&str>,
+        second: Option<&str>,
+        expected_peak: usize,
+    ) {
+        let gauge = Arc::new(Gauge::default());
+        let registry = Arc::new(ToolRegistry::new());
+        registry
+            .register(
+                Arc::new(PreparingTool {
+                    gauge: Arc::clone(&gauge),
+                }),
+                ToolSource::Native {
+                    owner: super::super::OWNER.into(),
+                    contract: PREPARING.into(),
+                    trusted: true,
+                },
+            )
+            .expect("registering a stub child");
+        let mut ctx = stub_ctx(&AgentMode::Build);
+        ctx.registry = Arc::clone(&registry);
+
+        let result = smol::block_on(async {
+            parsed(calls(json!([
+                { "tool": PREPARING, KEY_FIELD: first },
+                { "tool": PREPARING, KEY_FIELD: second },
+            ])))
+            .unwrap()
+            .execute(&ctx)
+            .await
+        });
+
+        let Ok(ToolOutput::Batch { entries, .. }) = result.output else {
+            panic!("expected a batch result");
+        };
+        assert!(
+            entries.iter().all(|e| e.status == BatchToolStatus::Success),
+            "{entries:?}"
+        );
+        assert_eq!(gauge.peak.load(Ordering::SeqCst), expected_peak);
     }
 }

@@ -50,7 +50,7 @@ pub enum WorkspaceError {
     TransferIntegrity,
     #[error("transfer staging or I/O quota is exhausted")]
     TransferQuota,
-    #[error("workspace mutation is blocked by pending operation {operation_id}")]
+    #[error("remote operation {operation_id} is still awaiting reconciliation")]
     PendingOperation { operation_id: String },
     #[error("workspace operation was cancelled")]
     Cancelled,

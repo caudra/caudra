@@ -1364,7 +1364,7 @@ impl WorkspaceControlCommand {
                 .map(Self::Acknowledge)
                 .map_err(|_| "Invalid operation identifier"),
             ["acknowledge", ..] => Err(
-                "Acknowledgement releases the local safety block; the remote operation may already have had effects or may still be running. It does not cancel, undo, or resend it. Confirm with: /remote acknowledge <operation-id> --accept-possible-effects",
+                "Acknowledgement clears the operation from the pending report. The remote operation may already have had effects or may still be running. It does not cancel, undo, or resend it. Confirm with: /remote acknowledge <operation-id> --accept-possible-effects",
             ),
             _ => Err(
                 "Usage: /remote status|pending|reconnect|reconcile|acknowledge <operation-id> --accept-possible-effects",

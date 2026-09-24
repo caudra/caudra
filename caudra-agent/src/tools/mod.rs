@@ -27,7 +27,7 @@ pub use deferral::{
     TOOL_SEARCH_TOOL_NAME,
 };
 pub use file_tracker::{FileReadTracker, STALE_READ_MSG};
-pub use path_locks::{PathGuards, PathLocks};
+pub use path_locks::{LockKey, PathGuards, PathLocks};
 pub use registry::{
     BoxFuture, ExecFuture, HeaderFuture, HeaderResult, ParseError, PermissionIntent,
     PermissionScopes, PlanModeAccess, RegisteredTool, RegistryError, Tool, ToolAudience,
