@@ -3,7 +3,7 @@ use std::{env, fs, path::PathBuf, str::FromStr, time::Duration};
 use async_trait::async_trait;
 use caudra_agent::agent::tool_dispatch::{self, Emit};
 use caudra_agent::tools::{
-    FileReadTracker, ToolContext, ToolEffect, ToolRegistry, interpreter_ctx,
+    FileReadTracker, ToolContext, ToolEffect, ToolRegistry, interpreter_ctx, stale_read_message,
 };
 use caudra_agent::workspace_baseline::{BaselineGate, WorkspaceBaseline};
 use caudra_agent::{
@@ -110,6 +110,10 @@ const REMOTE_PREPARATION_CAPACITY: usize = 64;
 /// The shell held before dispatch and the write held at its prompt.
 const HELD_PREPARATIONS: usize = 2;
 const PUBLICATION_OVERWRITE: &str = "written while the publication awaited reconciliation";
+const STALE_EDIT_FILE: &str = "stale-edit.txt";
+const STALE_EDIT_ORIGINAL: &str = "prepared against this\n";
+const STALE_EDIT_OURS: &str = "the agent's change\n";
+const STALE_EDIT_THEIRS: &str = "changed before publication\n";
 const SHARED_EDIT_FILE: &str = "shared-edit.txt";
 const SHARED_EDIT_ORIGINAL: &str = "first line\nsecond line\n";
 const SHARED_EDITS: [(&str, &str); 2] =
@@ -1860,6 +1864,27 @@ async fn canonical_registry_regressions(client: &RemoteWorkcellClient, root: &Pa
             fs::remove_file(&progress_fault).unwrap();
         }
     }
+    let stale_target = root.join(STALE_EDIT_FILE);
+    fs::write(&stale_target, STALE_EDIT_ORIGINAL).unwrap();
+    let invocation = registry
+        .get("file_edit")
+        .unwrap()
+        .tool
+        .parse(&json!({
+            "filePath": STALE_EDIT_FILE,
+            "oldString": STALE_EDIT_ORIGINAL,
+            "newString": STALE_EDIT_OURS,
+        }))
+        .unwrap();
+    invocation.preflight(&ctx).await.unwrap();
+    fs::write(&stale_target, STALE_EDIT_THEIRS).unwrap();
+    let done = invocation.execute(&ctx).await;
+    assert_eq!(done.output.err(), Some(stale_read_message(STALE_EDIT_FILE)));
+    assert_eq!(
+        fs::read_to_string(&stale_target).unwrap(),
+        STALE_EDIT_THEIRS
+    );
+    assert!(client.pending_remote_operations().is_empty());
     let done = tool_dispatch::run(
         &registry,
         None,
@@ -1877,7 +1902,7 @@ async fn canonical_registry_regressions(client: &RemoteWorkcellClient, root: &Pa
         done.output.as_text()
     );
     eprintln!(
-        "PASS actual registry Python, read/write/unknown plan shell, large progress, definitive network denial"
+        "PASS actual registry Python, read/write/unknown plan shell, large progress, stale edit asks for a re-read and leaves no record, definitive network denial"
     );
     let trace = PathBuf::from(env::var_os("WORKCELL_TEST_RPC_TRACE").unwrap());
     fs::write(&trace, "").unwrap();

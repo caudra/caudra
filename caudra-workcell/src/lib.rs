@@ -17,11 +17,11 @@ pub use pattern_analysis::{
     PatternOmissionReason, PatternSourceObligation, PatternSourceObligations,
     analyze_pattern_calls,
 };
-use remote::RemoteToolExecutionError;
 pub use remote::{
     NamedBearerCredential, PendingRemoteOperation, RemoteConnectionStatus, RemoteEvent,
     RemotePreparedToolCall, RemoteToolResultEnvelope, RemoteWorkcellClient, RemoteWorkcellError,
 };
+use remote::{RemoteToolExecutionError, STALE_RESOURCE_CODE};
 pub use transfer::LocalTransferPublisher;
 pub use transfer_authorization::NativeTransferAuthorization;
 pub use transfer_inventory::{
@@ -52,7 +52,7 @@ use caudra_agent::tools::{
     BoxFuture, DescriptionContext, ExecFuture, HeaderFuture, HeaderResult, LockKey,
     PYTHON_EXECUTION_TOOL_NAME, ParseError, PermissionIntent, PermissionScopes, PlanModeAccess,
     RegistryError, SHELL_TOOL_NAME, Tool, ToolAudience, ToolContext, ToolEffect, ToolExecResult,
-    ToolInvocation, ToolLive, ToolRegistry, ToolSource, expand_tilde,
+    ToolInvocation, ToolLive, ToolRegistry, ToolSource, expand_tilde, stale_read_message,
 };
 use caudra_agent::{
     AgentEvent, CodeGraphRow, CodeGraphSource, EnvironmentCommand, EnvironmentFact, GrepFileEntry,
@@ -68,7 +68,8 @@ use caudra_storage::permission_state::{
     BROWSE_DIRECT, BROWSE_RECURSION_ATTRIBUTE, BROWSE_RECURSIVE,
 };
 use caudra_workspace::{
-    OperationProgressKind, OperationState, OperationStatus, PreparedToolCall, ToolPrepareRequest,
+    OperationError, OperationProgressKind, OperationState, OperationStatus, PreparedToolCall,
+    ToolPrepareRequest,
 };
 use futures_lite::future;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -1702,7 +1703,7 @@ impl RemoteWorkcellInvocation {
                     };
                 }
                 OperationState::Failed { error, .. } => {
-                    return ToolExecResult::from(Err(error.message))
+                    return ToolExecResult::from(Err(remote_failure_message(&self.input, error)))
                         .with_annotation(Some("remote Workcell failure".into()));
                 }
                 OperationState::Cancelled {
@@ -1834,23 +1835,40 @@ fn bounded_remote_display(value: &str) -> String {
     value.chars().take(REMOTE_DISPLAY_MAX_CHARS).collect()
 }
 
-/// The host files a remote write prepares against: the ones it names, joined to
-/// the workspace path `cwd`. Shell and python are left out, as they are
-/// locally: what they touch is unknown until they run. An absolute spelling
-/// keeps its own key, because the host never reveals where its root is. Two
-/// writes spelling one file both ways can still both prepare, and the host's
-/// publication check refuses the second instead of losing it.
-fn remote_write_keys(input: &Input, cwd: &str) -> Vec<LockKey> {
-    let paths = match input {
+/// The host files a remote write names, spelled as the agent spelled them.
+/// Shell and python name none, as locally: what they touch is unknown until
+/// they run.
+fn remote_write_paths(input: &Input) -> Vec<&str> {
+    match input {
         Input::FileWrite(input) => vec![input.file_path.as_str()],
         Input::FileEdit(input) => vec![input.file_path.as_str()],
         Input::FileApplyPatch(input) => patch::paths(&input.patch_text),
-        _ => return Vec::new(),
-    };
-    paths
+        _ => Vec::new(),
+    }
+}
+
+/// The host files a remote write prepares against, joined to the workspace
+/// path `cwd`. An absolute spelling keeps its own key, because the host never
+/// reveals where its root is. Two writes spelling one file both ways can still
+/// both prepare, and the host's publication check refuses the second instead
+/// of losing it.
+fn remote_write_keys(input: &Input, cwd: &str) -> Vec<LockKey> {
+    remote_write_paths(input)
         .into_iter()
         .map(|path| LockKey::remote(cwd, path))
         .collect()
+}
+
+/// A write whose file changed after the host prepared it is refused before
+/// anything is published, so the agent gets what a local write to a file that
+/// changed since it was read gets.
+fn remote_failure_message(input: &Input, error: OperationError) -> String {
+    let paths = remote_write_paths(input);
+    if error.code.as_str() == STALE_RESOURCE_CODE && !paths.is_empty() {
+        stale_read_message(paths.join(", "))
+    } else {
+        error.message
+    }
 }
 
 fn remote_shell_plan_access(call: &RemotePreparedToolCall) -> PlanModeAccess {
@@ -8228,6 +8246,34 @@ mod tests {
             .map(|path| LockKey::Remote((*path).to_owned()))
             .collect::<Vec<_>>();
         assert_eq!(remote_write_keys(&input, REMOTE_CWD), expected);
+    }
+
+    const REMOTE_RELATIVE_TARGET: &str = "src/lib.rs";
+    const REMOTE_MOVE_PATCH_FILES: &str = "src/lib.rs, src/moved.rs";
+    const HOST_REFUSAL: &str = "Prepared resource changed before publication: src/lib.rs";
+    const OTHER_FAILURE_CODE: &str = "filesystem_io";
+
+    /// The host refuses a write whose file changed after it was prepared, and
+    /// publishes nothing, so the agent is told to read the file again as it is
+    /// locally. Any other failure keeps the host's words.
+    #[test_case(ToolKind::FileWrite, json!({"filePath": REMOTE_RELATIVE_TARGET, "content": ""}), STALE_RESOURCE_CODE, Some(REMOTE_RELATIVE_TARGET) ; "stale_write")]
+    #[test_case(ToolKind::FileEdit, json!({"filePath": REMOTE_ABSOLUTE, "oldString": "a", "newString": "b"}), STALE_RESOURCE_CODE, Some(REMOTE_ABSOLUTE) ; "stale_edit_keeps_its_spelling")]
+    #[test_case(ToolKind::FileApplyPatch, json!({"patchText": REMOTE_MOVE_PATCH}), STALE_RESOURCE_CODE, Some(REMOTE_MOVE_PATCH_FILES) ; "stale_patch_names_every_file")]
+    #[test_case(ToolKind::FileWrite, json!({"filePath": REMOTE_RELATIVE_TARGET, "content": ""}), OTHER_FAILURE_CODE, None ; "other_write_failure")]
+    #[test_case(ToolKind::Shell, json!({"command": "true"}), STALE_RESOURCE_CODE, None ; "shell_keeps_the_host_message")]
+    fn a_stale_remote_write_asks_for_a_re_read(
+        kind: ToolKind,
+        input: Value,
+        code: &str,
+        reread: Option<&str>,
+    ) {
+        let input = Input::parse(kind, input).expect("valid input");
+        let error = OperationError {
+            code: OperationId::new(code).unwrap(),
+            message: HOST_REFUSAL.to_owned(),
+        };
+        let expected = reread.map_or_else(|| HOST_REFUSAL.to_owned(), stale_read_message);
+        assert_eq!(remote_failure_message(&input, error), expected);
     }
 
     /// Workcell records every successful `file_read` against the tracker it is

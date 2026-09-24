@@ -26,7 +26,7 @@ pub use deferral::{
     BuiltinDeferral, DeferralSession, DeferralSnapshot, DeferredTool, SearchOutcome,
     TOOL_SEARCH_TOOL_NAME,
 };
-pub use file_tracker::{FileReadTracker, STALE_READ_MSG};
+pub use file_tracker::{FileReadTracker, STALE_READ_MSG, stale_read_message};
 pub use path_locks::{LockKey, PathGuards, PathLocks};
 pub use registry::{
     BoxFuture, ExecFuture, HeaderFuture, HeaderResult, ParseError, PermissionIntent,

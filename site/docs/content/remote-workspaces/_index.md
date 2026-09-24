@@ -189,7 +189,9 @@ The journal only records operations. A pending or indeterminate operation does n
 
 Within one session, remote tool calls follow the local concurrency rules. Two writes to one file wait for each other and both apply, because the second is prepared only after the first has published. A write waiting at its permission prompt holds back later writes to the same file. Writes to different files run in parallel. Shell and Python calls take no file locks, so they never wait for a write and no write waits for them. Any remote call can still wait for a free operation slot when the host is at capacity.
 
-File locks are shared within one session only, and a relative and an absolute path to one file take different locks. In those cases two writes can prepare against the same version of the file. The host refuses the second publication because the file changed after it was prepared, so the first change is kept. The refused write is reported as indeterminate and stays in the pending report until you acknowledge it.
+File locks are shared within one session only, and a relative and an absolute path to one file take different locks. In those cases two writes can prepare against the same version of the file. Another session or a shell command can also change a file between preparation and publication, for example while the write waits at its permission prompt. The host then refuses to publish and leaves the file as it is. The model gets the answer a stale local edit gets: the file changed since it was last read and must be read again. Nothing was written, so the refusal leaves no pending record.
+
+A patch that spans several files is the exception once one of its files is published. A refusal after that point leaves the patch partly applied, so it is reported as indeterminate and stays in the pending report until you acknowledge it.
 
 An operation recorded against an earlier generation of the workspace is listed under its own heading. The host that ran it is gone, so it cannot be reconciled. Acknowledge it once you have checked its effects.
 

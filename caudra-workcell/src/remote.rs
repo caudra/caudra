@@ -78,6 +78,10 @@ const CONNECTION_DISCONNECTED: u8 = 1;
 const CONNECTION_RECONNECTING: u8 = 2;
 const RESOURCE_NAMESPACE_VERSION: &str = "v1";
 const NO_SYMBOLIC_REASON: &str = "<none>";
+/// The host's token for a resource that changed after it was prepared. On a
+/// failed file mutation it also means nothing was published.
+pub(crate) const STALE_RESOURCE_CODE: &str = "stale_resource";
+const TOOL_ERROR_CODE: &str = "tool_error";
 const RESERVATION_WAIT: Duration = Duration::from_secs(10);
 /// Caps a single park so a slot freed by the clock rather than by a release is
 /// still noticed: expiry notifies nobody.
@@ -5151,7 +5155,7 @@ fn map_rpc_error(error: &JsonRpcError) -> RemoteWorkcellError {
         Some("transferIndeterminate") => RemoteWorkcellError::Indeterminate,
         Some("transferStorageUnavailable") => RemoteWorkcellError::Transport,
         Some("authentication") | Some("permission_denied") => RemoteWorkcellError::Authentication,
-        Some("stale_resource") | Some("stale_repository") | Some("stale_prepared_operation") => {
+        Some(STALE_RESOURCE_CODE) | Some("stale_repository") | Some("stale_prepared_operation") => {
             RemoteWorkcellError::StaleResource
         }
         Some("stale_cwd") | Some("invalid_cursor") | Some("stale_cursor") => {
@@ -6614,7 +6618,14 @@ fn failed_operation_error(
 ) -> Result<OperationError, WorkspaceError> {
     match (&outcome.result, &outcome.error) {
         (Some(result), None) if result.is_error => Ok(OperationError {
-            code: OperationId::new("tool_error").map_err(|_| invalid_response())?,
+            code: OperationId::new(
+                result
+                    .structured_content
+                    .as_ref()
+                    .and_then(|content| content["error"]["code"].as_str())
+                    .unwrap_or(TOOL_ERROR_CODE),
+            )
+            .map_err(|_| invalid_response())?,
             message: result
                 .content
                 .iter()
@@ -8154,6 +8165,37 @@ mod tests {
             .state,
             OperationState::Cancelled { .. }
         ));
+    }
+
+    #[test_case(
+        Some(serde_json::json!({"error": {"code": crate::remote::STALE_RESOURCE_CODE}})),
+        crate::remote::STALE_RESOURCE_CODE;
+        "a_failed_file_mutation_names_its_cause"
+    )]
+    #[test_case(None, crate::remote::TOOL_ERROR_CODE; "a_text_only_failure_stays_generic")]
+    fn a_failed_tool_result_keeps_the_code_the_host_gave_it(structured: Option<Value>, code: &str) {
+        let mut failed = completed_status();
+        failed.state = contract::OperationState::Failed;
+        let outcome = failed.outcome.as_mut().unwrap();
+        outcome.kind = contract::OutcomeKind::Failed;
+        let result = outcome.result.as_mut().unwrap();
+        result.is_error = true;
+        result.structured_content = structured;
+
+        let state = convert_status(
+            &failed,
+            &operation_handle(),
+            &host_binding(),
+            None,
+            |value| Ok(value.clone()),
+        )
+        .unwrap()
+        .state;
+
+        let OperationState::Failed { error, .. } = state else {
+            panic!("a failed status must convert to a failed state: {state:?}");
+        };
+        assert_eq!(error.code.as_str(), code);
     }
 
     #[test]

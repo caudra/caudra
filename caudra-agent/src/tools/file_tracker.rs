@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::fmt::Display;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -9,6 +10,12 @@ use tracing::warn;
 pub const STALE_READ_MSG: &str = "file changed since last read";
 
 pub struct FileReadTracker(Mutex<HashMap<PathBuf, SystemTime>>);
+
+/// What the agent is told when a write lands on a file that changed after it
+/// was read, whether the check ran here or on a remote host.
+pub fn stale_read_message(paths: impl Display) -> String {
+    format!("{STALE_READ_MSG}: {paths} - re-read using read tool before editing")
+}
 
 fn get_mtime(path: &Path) -> Option<SystemTime> {
     fs::metadata(path).and_then(|m| m.modified()).ok()
@@ -60,10 +67,7 @@ impl FileReadTracker {
             return Ok(());
         };
         if recorded != current {
-            return Err(format!(
-                "{STALE_READ_MSG}: {} - re-read using read tool before editing",
-                path.display(),
-            ));
+            return Err(stale_read_message(path.display()));
         }
         Ok(())
     }
