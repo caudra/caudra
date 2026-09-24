@@ -1257,7 +1257,7 @@ mod tests {
                 requires_prompt: false,
                 attributes: BTreeMap::from([("workdir".into(), "/project".into())]),
             }],
-            json!({"command": "cargo test", "timeout": 30}),
+            json!({"command": "cargo test", "timeoutSec": 30}),
         );
         let exact = explicit_request(
             PermissionAuthorityProfile::ExactOnly,

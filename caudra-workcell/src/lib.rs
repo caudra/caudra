@@ -78,10 +78,7 @@ use tokio::runtime::{Builder, Runtime};
 use tokio_util::sync::CancellationToken;
 #[cfg(test)]
 use workcell::code::bundled_worker_available;
-use workcell::code::{
-    CodeConfiguration, CodeExecution, CodeInput, DEFAULT_TIMEOUT_MS as CODE_DEFAULT_TIMEOUT_MS,
-    MAX_TIMEOUT_MS as CODE_MAX_TIMEOUT_MS, Outcome, WorkerSource,
-};
+use workcell::code::{CodeConfiguration, CodeExecution, CodeInput, Outcome, WorkerSource};
 use workcell::code_graph::{
     CodeContextInput, CodeExpandInput, CodeGraphLimits, CodeGraphToolGroup, CodeImpactInput,
     CodeMapInput, CodeRefsInput, GraphProgress, GraphProgressSink, ModelText as CodeGraphModelText,
@@ -100,10 +97,9 @@ use workcell::files::{
 };
 use workcell::output_filter::RowRenderer;
 use workcell::shell::{
-    DEFAULT_TIMEOUT_MS as SHELL_DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS as SHELL_MAX_TIMEOUT_MS,
-    PreparedShell, ShellExecution, ShellFilterInfo as WorkcellShellFilterInfo, ShellInput,
-    ShellOutput as WorkcellShellOutput, ShellProgressChunk, ShellProgressSink, ShellStream,
-    ShellToolGroup,
+    MAX_TIMEOUT_MS as SHELL_MAX_TIMEOUT_MS, PreparedShell, ShellExecution,
+    ShellFilterInfo as WorkcellShellFilterInfo, ShellInput, ShellOutput as WorkcellShellOutput,
+    ShellProgressChunk, ShellProgressSink, ShellStream, ShellToolGroup,
 };
 use workcell::web::{
     PreparedWebfetch, PreparedWebsearch, ProxyConfiguration, WebExecution, WebToolGroup,
@@ -158,7 +154,7 @@ const REMOTE_EXECUTION_TIMEOUT: Duration = Duration::from_secs(600);
 /// what turns a completed run into a result instead of a cancellation.
 const SHELL_COMPLETION_ALLOWANCE_MS: u64 = 30_000;
 const SHELL_EXECUTION_TIMEOUT: Duration =
-    Duration::from_millis(workcell::shell::MAX_TIMEOUT_MS + SHELL_COMPLETION_ALLOWANCE_MS);
+    Duration::from_millis(SHELL_MAX_TIMEOUT_MS + SHELL_COMPLETION_ALLOWANCE_MS);
 const REMOTE_RECONCILE_TIMEOUT: Duration = Duration::from_secs(10);
 const REMOTE_RECONCILE_MAX_POLLS: usize = 4;
 const REMOTE_DEADLINE_BEFORE_DISPATCH: &str =
@@ -1383,27 +1379,16 @@ fn input_header(input: &Input) -> String {
 /// before it fires rather than after. `tool` is the canonical name; the caller
 /// resolves whatever qualifier the call arrived with.
 ///
-/// `None` when the executor would refuse the value, because naming a deadline
-/// that never applies is worse than naming none. The rules belong to the two
-/// executors and differ: only the shell reads zero as its maximum.
+/// `None` when the executor would refuse the input, because naming a deadline
+/// that never applies is worse than naming none. The input is decoded as the
+/// executor's own type and asked for its deadline, so the rule has one home.
 pub fn effective_timeout(tool: &str, raw_input: &Value) -> Option<Duration> {
-    let (default, max) = match tool {
-        SHELL_TOOL_NAME => (SHELL_DEFAULT_TIMEOUT_MS, SHELL_MAX_TIMEOUT_MS),
-        PYTHON_EXECUTION_TOOL_NAME => (CODE_DEFAULT_TIMEOUT_MS, CODE_MAX_TIMEOUT_MS),
+    let millis = match tool {
+        SHELL_TOOL_NAME => ShellInput::deserialize(raw_input).ok()?.timeout_ms(),
+        PYTHON_EXECUTION_TOOL_NAME => CodeInput::deserialize(raw_input).ok()?.timeout_ms(),
         _ => return None,
     };
-    // An explicit null is how an omitted optional field arrives from some
-    // models, and it deserializes to the same absent value.
-    let millis = match raw_input.get("timeout") {
-        None | Some(Value::Null) => default,
-        Some(value) => match value.as_u64()? {
-            0 if tool == SHELL_TOOL_NAME => max,
-            0 => return None,
-            requested if requested > max => return None,
-            requested => requested,
-        },
-    };
-    Some(Duration::from_millis(millis))
+    millis.ok().map(Duration::from_millis)
 }
 
 /// The directory a command will start in, spelled the way its result's
@@ -4639,11 +4624,18 @@ mod tests {
     use std::sync::Arc;
     use tempfile::TempDir;
     use test_case::test_case;
+    use workcell::code::{
+        DEFAULT_TIMEOUT_MS as CODE_DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS as CODE_MAX_TIMEOUT_MS,
+        MAX_TIMEOUT_SECS as CODE_MAX_TIMEOUT_SECS,
+    };
     use workcell::environment::{
         CommandDescriptor, ContainerDescriptor, DeclaredPackageManager,
         ExecutionEnvironmentExecution, ExecutionEnvironmentOutput, GitDescriptor, OsDescriptor,
         PackageManagerDescriptor, PrivilegeDescriptor, RuntimeDescriptor,
         SystemPackageManagerDescriptor, WorkspaceDescriptor,
+    };
+    use workcell::shell::{
+        DEFAULT_TIMEOUT_MS as SHELL_DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_SECS as SHELL_MAX_TIMEOUT_SECS,
     };
 
     const PATCH: &str = "*** Begin Patch\n*** Add File: created.txt\n+hello\n*** End Patch";
@@ -4665,7 +4657,9 @@ mod tests {
     const BROWSE_CONTENT_SENTINEL: &str = "content_not_authorized_by_a_names_only_grant";
     const PATTERN_PACKAGES: [&str; 3] = ["alpha", "beta", "gamma"];
     const PATTERN_COMMAND: &str = "cargo check -p alpha --tests";
-    const PATTERN_TIMEOUT_MS: u64 = 1_000;
+    const PATTERN_TIMEOUT_SECS: u64 = 1;
+    const DEADLINE_COMMAND: &str = "cargo test";
+    const DEADLINE_CODE: &str = "21 * 2";
     const GENERIC_NAME_REGEX: &str = "(?:alpha|beta|gamma|delta-[0-9]+)";
     const POSSIBLE_WORKDIRS_ATTRIBUTE: &str = "possible_workdirs";
     const POSSIBLE_WORKDIRS_LABEL: &str = "Possible working directories:";
@@ -4747,21 +4741,24 @@ mod tests {
     }
 
     /// What a header may promise is exactly what the executor will enforce, so
-    /// the two rules are read from the same place. They are not the same rule:
-    /// the shell reads zero as its maximum, the code worker refuses it.
-    #[test_case(SHELL_TOOL_NAME, json!({}) => Some(Duration::from_millis(SHELL_DEFAULT_TIMEOUT_MS)) ; "an omitted shell deadline is the default one")]
-    #[test_case(SHELL_TOOL_NAME, json!({ "timeout": Value::Null }) => Some(Duration::from_millis(SHELL_DEFAULT_TIMEOUT_MS)) ; "an explicit null arrives as omitted")]
-    #[test_case(SHELL_TOOL_NAME, json!({ "timeout": 0 }) => Some(Duration::from_millis(SHELL_MAX_TIMEOUT_MS)) ; "zero selects the shell maximum")]
-    #[test_case(SHELL_TOOL_NAME, json!({ "timeout": 1 }) => Some(Duration::from_millis(1)) ; "the smallest shell deadline is kept as asked")]
-    #[test_case(SHELL_TOOL_NAME, json!({ "timeout": SHELL_MAX_TIMEOUT_MS }) => Some(Duration::from_millis(SHELL_MAX_TIMEOUT_MS)) ; "the shell maximum is itself allowed")]
-    #[test_case(SHELL_TOOL_NAME, json!({ "timeout": SHELL_MAX_TIMEOUT_MS + 1 }) => None ; "a shell deadline past the maximum is refused rather than clamped")]
-    #[test_case(SHELL_TOOL_NAME, json!({ "timeout": -1 }) => None ; "a negative deadline names nothing")]
-    #[test_case(SHELL_TOOL_NAME, json!({ "timeout": "30m" }) => None ; "a deadline that is not a number names nothing")]
-    #[test_case(PYTHON_EXECUTION_TOOL_NAME, json!({}) => Some(Duration::from_millis(CODE_DEFAULT_TIMEOUT_MS)) ; "an omitted code deadline is its own default")]
-    #[test_case(PYTHON_EXECUTION_TOOL_NAME, json!({ "timeout": 0 }) => None ; "zero is refused by the code worker")]
-    #[test_case(PYTHON_EXECUTION_TOOL_NAME, json!({ "timeout": CODE_MAX_TIMEOUT_MS }) => Some(Duration::from_millis(CODE_MAX_TIMEOUT_MS)) ; "the code maximum is allowed")]
-    #[test_case(PYTHON_EXECUTION_TOOL_NAME, json!({ "timeout": CODE_MAX_TIMEOUT_MS + 1 }) => None ; "a code deadline past the maximum is refused")]
-    #[test_case("file_read", json!({ "timeout": 1 }) => None ; "a tool without a deadline has none to report")]
+    /// the input is put to the executor's own type rather than read by a copy of
+    /// its rule. Anything that type refuses runs under no deadline at all.
+    #[test_case(SHELL_TOOL_NAME, json!({ "command": DEADLINE_COMMAND }) => Some(Duration::from_millis(SHELL_DEFAULT_TIMEOUT_MS)) ; "an omitted shell deadline is the default one")]
+    #[test_case(SHELL_TOOL_NAME, json!({ "command": DEADLINE_COMMAND, "timeoutSec": Value::Null }) => Some(Duration::from_millis(SHELL_DEFAULT_TIMEOUT_MS)) ; "an explicit null arrives as omitted")]
+    #[test_case(SHELL_TOOL_NAME, json!({ "command": DEADLINE_COMMAND, "timeoutSec": 0 }) => None ; "zero is refused rather than read as a limit")]
+    #[test_case(SHELL_TOOL_NAME, json!({ "command": DEADLINE_COMMAND, "timeoutSec": 1 }) => Some(Duration::from_secs(1)) ; "the smallest shell deadline is one second")]
+    #[test_case(SHELL_TOOL_NAME, json!({ "command": DEADLINE_COMMAND, "timeoutSec": SHELL_MAX_TIMEOUT_SECS }) => Some(Duration::from_millis(SHELL_MAX_TIMEOUT_MS)) ; "the shell maximum is itself allowed")]
+    #[test_case(SHELL_TOOL_NAME, json!({ "command": DEADLINE_COMMAND, "timeoutSec": SHELL_MAX_TIMEOUT_SECS + 1 }) => None ; "a shell deadline past the maximum is refused rather than clamped")]
+    #[test_case(SHELL_TOOL_NAME, json!({ "command": DEADLINE_COMMAND, "timeout": SHELL_MAX_TIMEOUT_SECS }) => None ; "a count under the millisecond key is refused")]
+    #[test_case(SHELL_TOOL_NAME, json!({ "command": DEADLINE_COMMAND, "timeoutSec": -1 }) => None ; "a negative deadline names nothing")]
+    #[test_case(SHELL_TOOL_NAME, json!({ "command": DEADLINE_COMMAND, "timeoutSec": "30m" }) => None ; "a deadline that is not a number names nothing")]
+    #[test_case(SHELL_TOOL_NAME, json!({ "timeoutSec": 1 }) => None ; "a call with no command never runs")]
+    #[test_case(PYTHON_EXECUTION_TOOL_NAME, json!({ "code": DEADLINE_CODE }) => Some(Duration::from_millis(CODE_DEFAULT_TIMEOUT_MS)) ; "an omitted code deadline is its own default")]
+    #[test_case(PYTHON_EXECUTION_TOOL_NAME, json!({ "code": DEADLINE_CODE, "timeoutSec": 0 }) => None ; "zero is refused by the code worker")]
+    #[test_case(PYTHON_EXECUTION_TOOL_NAME, json!({ "code": DEADLINE_CODE, "timeoutSec": CODE_MAX_TIMEOUT_SECS }) => Some(Duration::from_millis(CODE_MAX_TIMEOUT_MS)) ; "the code maximum is allowed")]
+    #[test_case(PYTHON_EXECUTION_TOOL_NAME, json!({ "code": DEADLINE_CODE, "timeoutSec": CODE_MAX_TIMEOUT_SECS + 1 }) => None ; "a code deadline past the maximum is refused")]
+    #[test_case(PYTHON_EXECUTION_TOOL_NAME, json!({ "code": DEADLINE_CODE, "timeout": CODE_MAX_TIMEOUT_SECS }) => None ; "the code worker refuses the millisecond key too")]
+    #[test_case("file_read", json!({ "timeoutSec": 1 }) => None ; "a tool without a deadline has none to report")]
     fn a_header_deadline_is_the_one_the_executor_will_enforce(
         tool: &str,
         raw_input: Value,
@@ -5338,7 +5335,7 @@ mod tests {
                     "additionalProperties": false,
                     "properties": {
                         "command": { "type": "string", "minLength": 1 },
-                        "timeout": { "type": "integer", "minimum": 0, "maximum": 1_800_000, "default": 120_000 },
+                        "timeoutSec": { "type": "integer", "minimum": 1, "maximum": 21_600, "default": 120 },
                         "workdir": { "type": "string", "minLength": 1 }
                     },
                     "required": ["command"]
@@ -5352,7 +5349,7 @@ mod tests {
                     "additionalProperties": false,
                     "properties": {
                         "code": { "type": "string", "minLength": 1, "maxLength": 65_536 },
-                        "timeout": { "type": "integer", "minimum": 1, "maximum": 30_000, "default": 5_000 }
+                        "timeoutSec": { "type": "integer", "minimum": 1, "maximum": 30, "default": 5 }
                     },
                     "required": ["code"]
                 }),
@@ -6229,8 +6226,8 @@ mod tests {
 
     #[test_case(json!({"command": PATTERN_COMMAND}); "omitted_defaults")]
     #[test_case(json!({"command": PATTERN_COMMAND, "workdir": "."}); "explicit_workdir")]
-    #[test_case(json!({"command": PATTERN_COMMAND, "timeout": PATTERN_TIMEOUT_MS}); "explicit_timeout")]
-    #[test_case(json!({"command": PATTERN_COMMAND, "workdir": null, "timeout": null}); "explicit_nulls")]
+    #[test_case(json!({"command": PATTERN_COMMAND, "timeoutSec": PATTERN_TIMEOUT_SECS}); "explicit_timeout")]
+    #[test_case(json!({"command": PATTERN_COMMAND, "workdir": null, "timeoutSec": null}); "explicit_nulls")]
     #[test_case(json!({"command": "cd crate && cargo check -p alpha --tests", "workdir": "."}); "primitive_in_compound_source")]
     fn shell_preflight_binds_original_json_not_typed_defaults(input: Value) {
         smol::block_on(async {
@@ -6454,7 +6451,7 @@ mod tests {
                 saved
             );
             let mut input = input_for(PATTERN_PACKAGES[1]);
-            input["timeout"] = json!(PATTERN_TIMEOUT_MS);
+            input["timeoutSec"] = json!(PATTERN_TIMEOUT_SECS);
             input["workdir"] = json!(".");
             let approved = prepared_shell_request(root.path(), &registry, input, "reload").await;
             let rule = &saved[0].rule;
@@ -6513,7 +6510,7 @@ mod tests {
                     "source" => changed.resources[cargo_index].value.push_str(" --fix"),
                     "input" => changed.input["command"] = json!("cargo clean"),
                     "input_workdir" => changed.input["workdir"] = json!("crate"),
-                    "timeout" => changed.input["timeout"] = Value::Null,
+                    "timeout" => changed.input["timeoutSec"] = Value::Null,
                     "missing_binding" => {
                         changed.resources[cargo_index]
                             .attributes

@@ -16949,6 +16949,7 @@ fn change_directory(app: &mut App, cwd: &Path) {
 }
 
 const CD_SHELL_ID: &str = "cd-shell";
+const CD_SHELL_COMMAND: &str = "pwd";
 /// A running shell card's annotation closing on its deadline, which it only
 /// does when there is no directory to name after it.
 const NO_WORKDIR_ANNOTATION: &str = "(2m timeout)";
@@ -16966,7 +16967,10 @@ fn a_cd_moves_the_directory_the_transcript_resolves_against() {
     let AgentEvent::ToolStart(mut start) = tool_start(CD_SHELL_ID, SHELL_TOOL_NAME) else {
         unreachable!()
     };
-    start.raw_input = Some(serde_json::json!({ "workdir": dir.path() }));
+    start.raw_input = Some(serde_json::json!({
+        "command": CD_SHELL_COMMAND,
+        "workdir": dir.path(),
+    }));
     app.update(agent_msg(AgentEvent::ToolStart(start)));
 
     let screen = rendered(&mut app);

@@ -2047,7 +2047,7 @@ mod tests {
         let request = explicit_request(
             PermissionAuthorityProfile::Shell,
             resources,
-            json!({"command": "multiple", "timeout": 30}),
+            json!({"command": "multiple", "timeoutSec": 30}),
         );
         let option = request
             .options

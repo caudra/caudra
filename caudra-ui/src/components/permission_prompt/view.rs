@@ -1962,7 +1962,7 @@ pub(super) mod tests {
                     arguments: Vec::new(),
                 }
             }
-            "input" => request.input["timeout"] = json!(1000),
+            "input" => request.input["timeoutSec"] = json!(1),
             "digest" => {
                 rule.arguments = PermissionArgumentConstraint::Exact {
                     digest: "different".into(),

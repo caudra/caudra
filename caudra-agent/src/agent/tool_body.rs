@@ -529,7 +529,7 @@ mod tests {
             SHELL,
             &[
                 r#"{"command": "python3 - <<'PY'\nimp"#,
-                r#"ort re\nprint(re)\nPY", "timeout": 1000}"#,
+                r#"ort re\nprint(re)\nPY", "timeoutSec": 1}"#,
             ],
         );
         assert_eq!(decoded, "python3 - <<'PY'\nimport re\nprint(re)\nPY");

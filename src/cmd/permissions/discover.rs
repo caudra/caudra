@@ -653,13 +653,13 @@ fn analyze_call(
         return;
     }
     stats.shell_calls += 1;
-    if input
-        .keys()
-        .any(|key| !matches!(key.as_str(), "command" | "workdir" | "timeout"))
-        || input
-            .get("timeout")
-            .is_some_and(|value| value.as_u64().is_none())
-    {
+    // Sessions recorded before the deadline moved to seconds name it in
+    // milliseconds as `timeout`, and discovery reads history as written.
+    if input.iter().any(|(key, value)| match key.as_str() {
+        "command" | "workdir" => false,
+        "timeoutSec" | "timeout" => value.as_u64().is_none(),
+        _ => true,
+    }) {
         stats.exclude(DiscoveryExclusion::MalformedCall);
         return;
     }
@@ -995,6 +995,9 @@ mod tests {
     const OTHER_SECOND: &str = "cargo test -p beta --target right";
     const LARGE_SESSION_ROWS: usize = MAX_ROWS_PER_SESSION * 4;
     const NOT_FULL_CALL_AUTHORIZATION: &str = "not full-call authorization";
+    const HISTORY_TIMEOUT_SECS: u64 = 600;
+    const HISTORY_TIMEOUT_MS: u64 = 600_000;
+    const WORDED_DEADLINE: &str = "10m";
 
     #[derive(Clone, Serialize, Deserialize)]
     #[serde(transparent)]
@@ -1612,6 +1615,7 @@ mod tests {
     #[test_case("extra_input"; "unrecognized_input_fields_are_not_exported")]
     #[test_case("nested_batch"; "nested_batches_are_not_recursed")]
     #[test_case("parent_workdir"; "parent_components_are_not_fs_resolved")]
+    #[test_case("worded_deadline"; "a_deadline_that_is_not_a_count_is_not_guessed")]
     #[test_case("large_command"; "oversized_command_not_analyzed")]
     fn malformed_or_out_of_scope_inputs_are_omitted(case: &str) {
         let (_temp, state, mut database) = fixture();
@@ -1633,12 +1637,34 @@ mod tests {
                 "shell",
                 json!({"command": FIRST, "workdir": "../elsewhere"}),
             ),
+            "worded_deadline" => call(
+                11,
+                "shell",
+                json!({"command": FIRST, "timeoutSec": WORDED_DEADLINE}),
+            ),
             _ => shell(11, &"x".repeat(MAX_COMMAND_BYTES + 1)),
         };
         save(&mut database, 1, PROJECT, vec![record], vec![]);
         let report = discover_for_project(&state, Path::new(PROJECT), limits()).unwrap();
         assert_eq!(report.recognition.retained_observations, 0);
         assert!(!serde_json::to_string(&report).unwrap().contains(SECRET));
+    }
+
+    /// A deadline is not what makes a command worth a rule, and older sessions
+    /// still spell it in milliseconds under the key it had then.
+    #[test_case(json!({"command": FIRST, "timeoutSec": HISTORY_TIMEOUT_SECS}); "in_seconds")]
+    #[test_case(json!({"command": FIRST, "timeout": HISTORY_TIMEOUT_MS}); "in_milliseconds_from_older_sessions")]
+    fn a_recorded_deadline_does_not_hide_the_call(input: Value) {
+        let (_temp, state, mut database) = fixture();
+        save(
+            &mut database,
+            1,
+            PROJECT,
+            vec![call(11, "shell", input)],
+            vec![],
+        );
+        let report = discover_for_project(&state, Path::new(PROJECT), limits()).unwrap();
+        assert_eq!(report.processing.analyzed_shell_calls, 1);
     }
 
     #[test_case(DATE, TIME_MS; "inclusive_millisecond")]

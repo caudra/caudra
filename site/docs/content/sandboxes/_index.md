@@ -283,6 +283,8 @@ e2b-libvirt distinguishes the running lease from paused-disk retention. Persiste
 
 Expiry stops a persistent VM even if the guest cannot flush, records an unclean pause and retains the disk subject to retention. Unflushed data can be lost. Explicit pause can refuse a failed flush. Workcell proxy access ends with the running lease, independently of a client conversation remaining open.
 
+A running command does not extend the lease. A shell call can run for up to six hours, so extend the lease before a long job starts. Expiry stops the VM and the command with it.
+
 The daemon retains create-operation history while the instance record exists and for 24 hours after removal or a failure before insertion. Its 4096-entry operation journal refuses new work rather than evicting history early. Unknown/pruned history returns `history_unavailable` with an unknown outcome. Database loss, rollback or clock problems require operator recovery, not blind retries.
 
 ## Operator constraints

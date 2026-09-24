@@ -1350,7 +1350,7 @@ async fn concurrent_registry_regressions(
             ": > {RUNNING_SHELL_STARTED}; while [ ! -e {RUNNING_SHELL_MARKER} ] || [ ! -e {RUNNING_SHELL_PEER} ]; do sleep {}; done; cat {RUNNING_SHELL_MARKER}",
             BATCH_POLL.as_secs_f64()
         ),
-        "timeout":BATCH_TIMEOUT.as_millis() as u64,
+        "timeoutSec":BATCH_TIMEOUT.as_secs(),
     });
     let marker = json!({"filePath":RUNNING_SHELL_MARKER, "content":RUNNING_SHELL_OUTPUT});
     let peer = json!({"command":format!(": > {RUNNING_SHELL_PEER}; printf '{BATCH_CONTENT}'")});
@@ -2435,7 +2435,7 @@ fn authenticated_local() {
                 &client,
                 current,
                 "shell",
-                json!({"command":"pwd","timeout":1000}),
+                json!({"command":"pwd","timeoutSec":1}),
             )
             .await;
             let directory = if nested {
@@ -2764,7 +2764,7 @@ fn authenticated_local() {
                     name: "shell".into(),
                     input: json!({
                         "command": format!("printf '{EXECUTION_MARKER}' >> execution-count.txt; printf '{RECOVERED_CONTENT}' > recovered.txt"),
-                        "timeout": 1000,
+                        "timeoutSec": 1,
                     }),
                 },
             )
@@ -2839,7 +2839,7 @@ fn authenticated_local() {
         );
         let prepared = recovered.prepare_canonical_tool(recovered.session_binding(), recovered.root_cursor(), &ToolPrepareRequest {
             name: "shell".into(),
-            input: json!({"command":"printf acknowledged > acknowledged.txt", "timeout":1000}),
+            input: json!({"command":"printf acknowledged > acknowledged.txt", "timeoutSec":1}),
         }).await.unwrap();
         fs::write(
             fault.with_extension("preparation"),
@@ -2919,7 +2919,7 @@ fn authenticated_local() {
             };
             let prepared = client.prepare_canonical_tool(client.session_binding(), &nested.cursor, &ToolPrepareRequest {
                 name: "shell".into(),
-                input: json!({"command":format!("printf '{EXECUTION_MARKER}' >> {marker}"), "timeout":1000}),
+                input: json!({"command":format!("printf '{EXECUTION_MARKER}' >> {marker}"), "timeoutSec":1}),
             }).await.unwrap();
             fs::write(
                 fault.with_extension("preparation"),

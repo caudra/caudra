@@ -982,7 +982,7 @@ mod tests {
             .shell;
         let input = ShellInput {
             command: COMMAND.into(),
-            timeout: None,
+            timeout_sec: None,
             workdir: Some(fixture.project().to_str().unwrap().into()),
         };
         let prepared = host.runtime.block_on(group.prepare(input.clone())).unwrap();

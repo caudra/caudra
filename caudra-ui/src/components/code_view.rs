@@ -6312,13 +6312,14 @@ mod tests {
         assert_ne!(found_nothing.style, found_something.style, "{SIGIL_MSG}");
     }
 
-    const CHILD_TIMEOUT: u32 = 120_000;
+    const CHILD_TIMEOUT_SECS: u64 = 120;
+    const CHILD_COMMAND: &str = "cargo test";
     const CHILD_WORKDIR: &str = "crates/core";
     /// The deadline, then the directory last, set off the way a standalone
     /// card sets it off.
     const CHILD_ANNOTATION_TAIL: &str = "2m timeout · crates/core/)";
     const COMMAND_KEY: &str = "command=";
-    const TIMEOUT_KEY: &str = "timeout=";
+    const TIMEOUT_KEY: &str = "timeoutSec=";
     const WORKDIR_KEY: &str = "workdir=";
     const CHILD_ARGS_MSG: &str = "a child's brackets carry what its own header does not show";
     const CHILD_WORKDIR_MSG: &str = "a child names where it ran the way a standalone card does";
@@ -6334,7 +6335,7 @@ mod tests {
         entry.raw_input = Some(serde_json::json!({
             "command": summary,
             "workdir": CHILD_WORKDIR,
-            "timeout": CHILD_TIMEOUT,
+            "timeoutSec": CHILD_TIMEOUT_SECS,
         }));
 
         let row = child_row(entry);
@@ -6355,7 +6356,7 @@ mod tests {
             unreachable!()
         };
         let entry = BatchToolEntry {
-            raw_input: Some(serde_json::json!({})),
+            raw_input: Some(serde_json::json!({ "command": CHILD_COMMAND })),
             output: Some(ToolOutput::Shell(ShellOutput {
                 relative_workdir: CHILD_WORKDIR.into(),
                 ..output

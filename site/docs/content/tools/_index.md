@@ -249,7 +249,7 @@ A progress bar redraws a row instead of printing lines. Caudra renders both the 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `command` | string | yes | Bash command to execute on the MCP server host. |
-| `timeout` | integer | no | Optional timeout in milliseconds. Defaults to 120000, 0 selects the 1800000 maximum, and a larger value is rejected. |
+| `timeoutSec` | integer | no | Optional timeout in seconds, from 1 to 21600. Omit it for the 120 second default unless the command needs longer; a value outside that range is rejected. |
 | `workdir` | string | no | Optional configured-root-relative or absolute initial working directory inside the configured root. |
 
 ### `python_execution` <span class="badge">on demand</span> {#python_execution}
@@ -261,7 +261,7 @@ Release builds include the isolated Monty worker. `WORKCELL_MCP_CODE_WORKER` can
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `code` | string | yes | Python source to execute. The value of the final expression is returned. |
-| `timeout` | integer | no | Optional timeout in milliseconds. Defaults to 5000 and is capped at 30000. |
+| `timeoutSec` | integer | no | Optional timeout in seconds, from 1 to 30. Omit it for the 5 second default unless the snippet needs longer; a value outside that range is rejected. |
 
 ### `execution_environment` <span class="badge">on demand</span> {#execution_environment}
 

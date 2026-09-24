@@ -282,10 +282,10 @@ const DURATION_SEPARATOR: &str = " · ";
 
 /// Duration inputs and the millis one of their units is worth, so a bracket
 /// reads `1m` instead of `60`. The unit belongs to the tool rather than to the
-/// key, and reading it off the name alone would be wrong by a factor of a
-/// thousand: `timeout` is seconds to a fetch and milliseconds to the two tools
-/// that run something. A key that names its own unit still gets a row, because
-/// the tool it belongs to is what says the name is a duration at all.
+/// key, and reading it off the name alone could be wrong by a factor of a
+/// thousand: `timeout` is seconds to a fetch, while a server's own tool may
+/// count it in milliseconds. A key that names its own unit still gets a row,
+/// because the tool it belongs to is what says the name is a duration at all.
 ///
 /// The two command runners are absent on purpose. Their deadline is always on
 /// the row, default and all, so it is annotated rather than bracketed and
@@ -420,8 +420,8 @@ const COMPACT_TOOLS: &[(&str, CompactTool)] = &[
     tool_row("file_index", '≡', INDEX, &["path"]),
     tool_row("websearch", '◈', SEARCH, &["query"]),
     tool_row("webfetch", '↓', FETCH, &["url"]),
-    tool_row("shell", '$', RUN, &["command", "timeout", "workdir"]),
-    tool_row("python_execution", 'λ', COMPUTE, &["code", "timeout"]),
+    tool_row("shell", '$', RUN, &["command", "timeoutSec", "workdir"]),
+    tool_row("python_execution", 'λ', COMPUTE, &["code", "timeoutSec"]),
     tool_row("code_map", '◇', MAP, &["path"]),
     tool_row("code_context", '◇', LOCATE, &["task", "path"]),
     tool_row("code_refs", '◇', TRACE, &["symbol", "path"]),
@@ -6540,19 +6540,19 @@ mod tests {
 
     const DURATION_MSG: &str = "a duration input reads as one, in the unit its tool quotes";
 
-    /// `timeout` is seconds to a fetch, so the same key and the same number
-    /// have to come out a thousand-fold apart from a tool quoting millis. A
-    /// count is left alone: only the table says a number is a span of time,
-    /// which is why an untabled tool cannot turn one into `2m`.
+    /// `timeout` is seconds to a fetch, while a server's own tool may count
+    /// the same key in millis. A count is left alone: only the table says a
+    /// number is a span of time, which is why an untabled tool cannot turn
+    /// one into `2m`.
     ///
     /// The two command runners name their deadline in the annotation instead,
     /// default and all, so a bracket repeating it would say it twice.
     #[test_case(
-        "shell", serde_json::json!({ "timeout": 600_000 }), None
+        "shell", serde_json::json!({ "timeoutSec": 600 }), None
         ; "a command runner leaves its timeout to the annotation"
     )]
     #[test_case(
-        "python_execution", serde_json::json!({ "timeout": 5_000 }), None
+        "python_execution", serde_json::json!({ "timeoutSec": 5 }), None
         ; "so does the code worker"
     )]
     #[test_case(
@@ -6564,7 +6564,7 @@ mod tests {
         ; "a key naming its unit still answers to its tool"
     )]
     #[test_case(
-        "mcp_Shell", serde_json::json!({ "timeout": 120_000 }), None
+        "mcp_Shell", serde_json::json!({ "timeoutSec": 120 }), None
         ; "a qualified command runner folds it the same way"
     )]
     #[test_case(
@@ -6590,9 +6590,13 @@ mod tests {
     const DEADLINE_MSG: &str = "a command card names the deadline it will run under, typed or not";
     const DEADLINE_ONCE_MSG: &str = "a closed row says the deadline once, in the annotation";
     const DEADLINE_COMMAND: &str = "cargo test";
+    const DEADLINE_CODE: &str = "21 * 2";
     const TIMEOUT_WORD: &str = "timeout";
-    const TIMEOUT_BRACKET: &str = "[timeout=";
-    const SHELL_MAX_SHOWN: &str = "(30m timeout)";
+    const TIMEOUT_BRACKET: &str = "[timeoutSec=";
+    const SHELL_MAX_SHOWN: &str = "(6h timeout)";
+    const HOURS_LONG_TIMEOUT_SECS: u64 = 10_800;
+    const SHELL_LONGEST_SECS: u64 = 21_600;
+    const PAST_SHELL_LONGEST_SECS: u64 = 86_400;
 
     fn deadline_msg(tool: &str, raw_input: Option<serde_json::Value>) -> DisplayMessage {
         let mut msg = bash_msg(DEADLINE_COMMAND, ToolStatus::Success, None, None);
@@ -6608,7 +6612,7 @@ mod tests {
     /// watching a command sit there, so it is named too. The value is read from
     /// the stored input, which is what a reloaded session still has.
     #[test_case(
-        SHELL_TOOL_NAME, Some(serde_json::json!({})), Some("(2m timeout)")
+        SHELL_TOOL_NAME, Some(serde_json::json!({ "command": DEADLINE_COMMAND })), Some("(2m timeout)")
         ; "an unasked deadline is still the one in force"
     )]
     #[test_case(
@@ -6616,23 +6620,31 @@ mod tests {
         ; "a card with no stored input promises nothing"
     )]
     #[test_case(
-        SHELL_TOOL_NAME, Some(serde_json::json!({ "timeout": 0 })), Some(SHELL_MAX_SHOWN)
-        ; "zero reads as the longest wait the shell allows"
-    )]
-    #[test_case(
-        SHELL_TOOL_NAME, Some(serde_json::json!({ "timeout": 90_000 })), Some("(1m30s timeout)")
+        SHELL_TOOL_NAME, Some(serde_json::json!({ "command": DEADLINE_COMMAND, "timeoutSec": 90 })), Some("(1m30s timeout)")
         ; "an asked deadline is quoted as asked"
     )]
     #[test_case(
-        SHELL_TOOL_NAME, Some(serde_json::json!({ "timeout": 3_600_000 })), None
+        SHELL_TOOL_NAME, Some(serde_json::json!({ "command": DEADLINE_COMMAND, "timeoutSec": HOURS_LONG_TIMEOUT_SECS })), Some("(3h timeout)")
+        ; "a deadline hours long is quoted in hours"
+    )]
+    #[test_case(
+        SHELL_TOOL_NAME, Some(serde_json::json!({ "command": DEADLINE_COMMAND, "timeoutSec": SHELL_LONGEST_SECS })), Some(SHELL_MAX_SHOWN)
+        ; "the longest wait the shell allows is quoted too"
+    )]
+    #[test_case(
+        SHELL_TOOL_NAME, Some(serde_json::json!({ "command": DEADLINE_COMMAND, "timeoutSec": PAST_SHELL_LONGEST_SECS })), None
         ; "a deadline the executor will refuse is not promised"
     )]
     #[test_case(
-        PYTHON_EXECUTION_TOOL_NAME, Some(serde_json::json!({})), Some("(5s timeout)")
+        SHELL_TOOL_NAME, Some(serde_json::json!({ "command": DEADLINE_COMMAND, "timeoutSec": 0 })), None
+        ; "zero is refused, so it promises nothing"
+    )]
+    #[test_case(
+        PYTHON_EXECUTION_TOOL_NAME, Some(serde_json::json!({ "code": DEADLINE_CODE })), Some("(5s timeout)")
         ; "the code worker names its own default"
     )]
     #[test_case(
-        PYTHON_EXECUTION_TOOL_NAME, Some(serde_json::json!({ "timeout": 0 })), None
+        PYTHON_EXECUTION_TOOL_NAME, Some(serde_json::json!({ "code": DEADLINE_CODE, "timeoutSec": 0 })), None
         ; "zero is not a deadline the code worker would take"
     )]
     fn a_command_card_names_the_deadline_it_will_run_under(
@@ -6660,7 +6672,13 @@ mod tests {
     #[test_case(SETTLED_TALLY_WIDTH ; "and with none")]
     fn a_closed_command_row_does_not_quote_its_deadline_twice(width: u16) {
         let tl = build_tool_lines(
-            &deadline_msg(SHELL_TOOL_NAME, Some(serde_json::json!({ "timeout": 0 }))),
+            &deadline_msg(
+                SHELL_TOOL_NAME,
+                Some(serde_json::json!({
+                    "command": DEADLINE_COMMAND,
+                    "timeoutSec": SHELL_LONGEST_SECS,
+                })),
+            ),
             ToolStatus::Success,
             &compact_rctx(width),
             None,
@@ -6706,7 +6724,6 @@ mod tests {
 
     /// Running until it has a result, the way a live card is.
     fn workdir_card(
-        tool: &str,
         workdir: &str,
         output: Option<ToolOutput>,
         rctx: &RenderCtx,
@@ -6716,7 +6733,10 @@ mod tests {
             Some(_) => ToolStatus::Success,
             None => ToolStatus::InProgress,
         };
-        let mut msg = deadline_msg(tool, Some(serde_json::json!({ "workdir": workdir })));
+        let mut msg = deadline_msg(
+            SHELL_TOOL_NAME,
+            Some(serde_json::json!({ "command": DEADLINE_COMMAND, "workdir": workdir })),
+        );
         msg.tool_output = output.map(Arc::new);
         build_tool_lines(&msg, status, rctx, expansion)
     }
@@ -6725,46 +6745,40 @@ mod tests {
     /// will, so the header keeps its words when the call lands. Where the two
     /// disagree, the result is where the call really ran.
     #[test_case(
-        SHELL_TOOL_NAME, SUBDIR, Some(settled_in(SUBDIR)), Some(PROJECT), SUBDIR_ANNOTATION
+        SUBDIR, Some(settled_in(SUBDIR)), Some(PROJECT), SUBDIR_ANNOTATION
         ; "a settled card names its directory last"
     )]
     #[test_case(
-        SHELL_TOOL_NAME, "", Some(settled_in(CURRENT_WORKDIR)), Some(PROJECT), " (2m timeout)"
+        "", Some(settled_in(CURRENT_WORKDIR)), Some(PROJECT), " (2m timeout)"
         ; "the session's own directory goes unsaid"
     )]
     #[test_case(
-        SHELL_TOOL_NAME, PROJECT, None, Some(PROJECT), " (2m timeout)"
+        PROJECT, None, Some(PROJECT), " (2m timeout)"
         ; "the session's directory spelled absolute goes unsaid while running"
     )]
     #[test_case(
-        SHELL_TOOL_NAME, "/project/crates/core", None, Some(PROJECT), SUBDIR_ANNOTATION
+        "/project/crates/core", None, Some(PROJECT), SUBDIR_ANNOTATION
         ; "a running card spells its directory the way the result will"
     )]
     #[test_case(
-        SHELL_TOOL_NAME, "link", Some(settled_in("target")), Some(PROJECT), " (2m timeout · target/)"
+        "link", Some(settled_in("target")), Some(PROJECT), " (2m timeout · target/)"
         ; "the result names where a link led"
     )]
     #[test_case(
-        SHELL_TOOL_NAME, "/srv/elsewhere", None, Some(PROJECT), " (2m timeout · /srv/elsewhere/)"
+        "/srv/elsewhere", None, Some(PROJECT), " (2m timeout · /srv/elsewhere/)"
         ; "a directory outside the session reads absolute"
     )]
     #[test_case(
-        PYTHON_EXECUTION_TOOL_NAME, SUBDIR, None, Some(PROJECT), " (5s timeout)"
-        ; "a tool that takes no directory names none"
-    )]
-    #[test_case(
-        SHELL_TOOL_NAME, SUBDIR, None, None, " (2m timeout)"
+        SUBDIR, None, None, " (2m timeout)"
         ; "nothing to resolve against names nothing"
     )]
     fn a_command_card_names_where_it_runs(
-        tool: &str,
         workdir: &str,
         output: Option<ToolOutput>,
         cwd: Option<&str>,
         expected: &str,
     ) {
         let tl = workdir_card(
-            tool,
             workdir,
             output,
             &in_cwd(test_rctx(UNBROKEN), cwd),
@@ -6777,10 +6791,27 @@ mod tests {
         assert!(drawn.contains(expected), "{WORKDIR_MSG}: {drawn:?}");
     }
 
+    /// Only the shell starts somewhere, so a directory on any other call is
+    /// not one it runs in, however well it would resolve.
+    #[test]
+    fn a_tool_that_takes_no_directory_names_none() {
+        let msg = deadline_msg(
+            PYTHON_EXECUTION_TOOL_NAME,
+            Some(serde_json::json!({ "code": DEADLINE_CODE, "workdir": SUBDIR })),
+        );
+        let drawn = lines_text(&build_tool_lines(
+            &msg,
+            ToolStatus::InProgress,
+            &in_cwd(test_rctx(UNBROKEN), Some(PROJECT)),
+            Some(Disclosure::default()),
+        ));
+
+        assert!(!drawn.contains(SUBDIR_SHOWN), "{WORKDIR_MSG}: {drawn:?}");
+    }
+
     #[test]
     fn only_the_directory_is_set_in_italics() {
         let tl = workdir_card(
-            SHELL_TOOL_NAME,
             SUBDIR,
             Some(settled_in(SUBDIR)),
             &in_cwd(test_rctx(UNBROKEN), Some(PROJECT)),
@@ -6804,7 +6835,6 @@ mod tests {
     #[test_case(SETTLED_TALLY_WIDTH ; "and with none")]
     fn a_closed_command_row_names_its_directory_once(width: u16) {
         let tl = workdir_card(
-            SHELL_TOOL_NAME,
             SUBDIR,
             Some(settled_in(SUBDIR)),
             &in_cwd(compact_rctx(width), Some(PROJECT)),
