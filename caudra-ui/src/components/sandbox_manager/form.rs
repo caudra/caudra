@@ -1,7 +1,7 @@
 use super::super::text_editor::TextEditor;
 use caudra_config::sandbox::{
-    CidrRule, DomainRule, MAX_NETWORK_RULES, RecordKind, SandboxDraft, SandboxError, SandboxName,
-    SandboxOrigin, SandboxRecord, TransferPolicy,
+    CidrRule, DomainRule, LeaseSeconds, MAX_NETWORK_RULES, RecordKind, SandboxDraft, SandboxError,
+    SandboxName, SandboxOrigin, SandboxRecord, TransferPolicy,
 };
 use caudra_storage::sandbox_auth::SandboxCredentialRef;
 use caudra_workspace::WorkspacePath;
@@ -10,6 +10,8 @@ use serde_json::{Map, Value};
 use std::num::NonZeroU32;
 
 const POSITIVE: &str = "Use a positive whole number (no units or rounding).";
+pub(super) const LEASE_HELP: &str =
+    "Use whole seconds. 0 runs until paused or deleted, which the provider must allow.";
 const BOOLEAN: &str = "Use true or false; this changes saved defaults only.";
 pub(super) const DOMAIN_HELP: &str = "One hostname per line, e.g. api.example.com or *.example.com (subdomains only). No URLs, paths, ports or methods. Enter adds a line; Alt+Insert appends; Alt+Delete clears the current line. Blank lines are ignored. Empty domains AND CIDRs deny all under required enforcement. Operator blocks still win.";
 pub(super) const CIDR_HELP: &str = "One IPv4/IPv6 network per line; normalized at review. Enter adds a line; Alt+Insert appends; Alt+Delete clears the current line. Blank lines are ignored. Operator metadata/private-destination blocks still win.";
@@ -44,8 +46,8 @@ const PROFILE_FIELDS: &[(&str, &str, Input, &str)] = &[
     (
         "running_ttl_seconds",
         "Running TTL (seconds)",
-        Input::Positive,
-        POSITIVE,
+        Input::Lease,
+        LEASE_HELP,
     ),
     (
         "on_exit",
@@ -152,6 +154,7 @@ pub(super) enum Input {
     Credential,
     Cwd,
     Positive,
+    Lease,
     Boolean,
     Choice(&'static [&'static str]),
     Domains,
@@ -201,6 +204,12 @@ impl Field {
                     .parse::<NonZeroU32>()
                     .map(|value| Value::from(value.get()))
                     .map_err(|_| POSITIVE.into());
+            }
+            Input::Lease => {
+                return text
+                    .parse::<LeaseSeconds>()
+                    .map(|lease| Value::from(lease.get()))
+                    .map_err(|_| LEASE_HELP.into());
             }
             Input::Boolean => {
                 return text

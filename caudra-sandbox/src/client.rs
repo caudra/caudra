@@ -1,4 +1,4 @@
-use caudra_config::sandbox::{Revision, SandboxName, SandboxOrigin};
+use caudra_config::sandbox::{LeaseSeconds, Revision, SandboxName, SandboxOrigin};
 use caudra_storage::sandbox_auth::SandboxApiKey;
 use futures_lite::io::AsyncReadExt;
 use isahc::{
@@ -248,7 +248,6 @@ impl LifecycleClient {
                 .enumerate()
                 .any(|(index, mode)| discovery.tls_modes[..index].contains(mode))
             || (!c.egress_policy && (!discovery.tls_modes.is_empty() || c.live_tls_mode_change))
-            || discovery.limits.max_lease_seconds == 0
             || discovery.limits.list_page_size as usize > MAX_PAGE_SIZE
         {
             return Err(Error::Protocol);
@@ -352,7 +351,7 @@ impl LifecycleClient {
         id: &str,
         action: &str,
         expected: &Expected,
-        lease: Option<u32>,
+        lease: Option<LeaseSeconds>,
     ) -> Result<Instance> {
         identifier(id)?;
         #[derive(Serialize)]
@@ -361,7 +360,7 @@ impl LifecycleClient {
             #[serde(flatten)]
             expected: &'a Expected,
             #[serde(skip_serializing_if = "Option::is_none")]
-            lease_seconds: Option<u32>,
+            lease_seconds: Option<LeaseSeconds>,
         }
         let (method, path) = if action == "delete" {
             (Method::DELETE, format!("/instances/{id}"))

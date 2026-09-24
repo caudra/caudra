@@ -1,8 +1,8 @@
 use caudra_config::{
     sandbox::{
-        Architecture, Enforcement, ProviderCapabilities, ResolvedLaunch, ResourceRange,
-        Resources as ProfileResources, Revision, SandboxName, SandboxProvider, SavedSandboxes,
-        TemplateCatalog, TemplateEntry, TlsMode, persistence::SandboxStore,
+        Architecture, Enforcement, LeaseSeconds, ProviderCapabilities, ResolvedLaunch,
+        ResourceRange, Resources as ProfileResources, Revision, SandboxName, SandboxProvider,
+        SavedSandboxes, TemplateCatalog, TemplateEntry, TlsMode, persistence::SandboxStore,
     },
     workcell::{ExpectedWorkcellId, RemoteWorkcellSelection, WorkcellEndpoint, WorkcellSourceRef},
 };
@@ -63,8 +63,8 @@ pub struct RestartFailure {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LifecycleAction {
     Pause,
-    Resume { lease_seconds: u32 },
-    Extend { lease_seconds: u32 },
+    Resume { lease_seconds: LeaseSeconds },
+    Extend { lease_seconds: LeaseSeconds },
     Delete { destroy_borrowed: bool },
     Detach,
     ApplyPolicy { policy: Policy },
@@ -503,7 +503,7 @@ impl Controller {
         &self,
         name: &SandboxName,
         revision: &Revision,
-        lease_seconds: u32,
+        lease_seconds: LeaseSeconds,
     ) -> StdResult<InstanceRecord, RestartFailure> {
         let mut phase = RestartPhase::Pause;
         let result = async {
@@ -532,9 +532,7 @@ impl Controller {
             let lease = self.store.lease(&record, true)?;
             self.require_quiescent(&record)?;
             let (_, discovery) = self.owned_client(&record).await?;
-            if lease_seconds == 0 || lease_seconds > discovery.limits.max_lease_seconds {
-                return Err(Error::Lease);
-            }
+            check_lease(lease_seconds, &discovery)?;
             let paused = self
                 .action_locked(
                     name,
@@ -564,13 +562,6 @@ impl Controller {
         revision: Option<&Revision>,
         action: LifecycleAction,
     ) -> Result<InstanceRecord> {
-        if matches!(
-            action,
-            LifecycleAction::Resume { lease_seconds: 0 }
-                | LifecycleAction::Extend { lease_seconds: 0 }
-        ) {
-            return Err(Error::Lease);
-        }
         let record = self.store.get(name)?;
         let _control = self.store.control_lease(&record)?;
         self.action_locked(name, revision, action, None, None).await
@@ -663,15 +654,22 @@ impl Controller {
             }
             LifecycleAction::Detach => return Err(Error::Protocol),
         };
-        if lease_seconds
-            .is_some_and(|lease| lease == 0 || lease > discovery.limits.max_lease_seconds)
-        {
-            return Err(Error::Lease);
+        if let Some(lease) = lease_seconds {
+            check_lease(lease, &discovery)?;
+        }
+        if route == "renew" && instance.lease_deadline.is_none() {
+            if instance.state != InstanceState::Running {
+                return Err(Error::Lease);
+            }
+            if lease_seconds.and_then(LeaseSeconds::finite).is_some() {
+                return Err(Error::LeaseNoExpiry);
+            }
         }
         let minimum_lease_deadline = lease_seconds
+            .and_then(LeaseSeconds::finite)
             .map(|seconds| -> Result<String> {
                 let requested = timestamp(&discovery.server_time)?
-                    .checked_add(Duration::from_secs(u64::from(seconds)))
+                    .checked_add(Duration::from_secs(u64::from(seconds.get())))
                     .map_err(|_| Error::Lease)?;
                 let deadline = if route == "renew" {
                     requested.max(timestamp(
@@ -1138,8 +1136,7 @@ impl Controller {
                 .configuration()
                 .profile
                 .value()
-                .running_ttl_seconds
-                .get();
+                .running_ttl_seconds;
             record = self
                 .action(name, LifecycleAction::Resume { lease_seconds })
                 .await?;
@@ -1260,10 +1257,22 @@ fn capabilities(provider: &SandboxProvider, discovery: &Discovery) -> Result<Pro
         disk_gib: range(discovery.limits.resources.disk_size_mb / MIB_PER_GIB)?,
         disk_growth: true,
         persistent: discovery.capabilities.persistent_disk,
-        max_ttl_seconds: nonzero(discovery.limits.max_lease_seconds)?,
+        max_ttl_seconds: discovery.limits.max_lease_seconds,
         network_modes: vec![network_mode(&discovery.network_topology)?],
         tls_modes: discovery.tls_modes.clone(),
     })
+}
+
+fn check_lease(lease: LeaseSeconds, discovery: &Discovery) -> Result<()> {
+    let max = discovery.limits.max_lease_seconds;
+    if lease.within(max) {
+        Ok(())
+    } else {
+        Err(Error::LeaseOverCap {
+            requested: lease,
+            max,
+        })
+    }
 }
 
 fn validate_template(template: &Template) -> Result<()> {
@@ -1324,7 +1333,7 @@ fn create_request(launch: &ResolvedLaunch) -> Result<Create> {
                 .checked_mul(MIB_PER_GIB)
                 .ok_or(Error::Protocol)?,
         },
-        lease_seconds: profile.running_ttl_seconds.get(),
+        lease_seconds: profile.running_ttl_seconds,
         persistent: profile.persistent,
         egress: (network.enforcement == Enforcement::Required).then(|| Policy {
             mode: match network.tls_mode {
@@ -1391,13 +1400,19 @@ fn validate_lifecycle_result(intent: &LifecycleIntent, instance: &Instance) -> R
         "pause" => instance.state == InstanceState::Paused && instance.lease_deadline.is_none(),
         "delete" => instance.state == InstanceState::Deleted && instance.lease_deadline.is_none(),
         "resume" | "renew" => {
-            let deadline = instance.lease_deadline.as_deref().ok_or(Error::Lease)?;
-            let minimum = intent
-                .minimum_lease_deadline
-                .as_deref()
-                .ok_or(Error::Unresolved)?;
-            if timestamp(deadline)? < timestamp(minimum)? {
-                return Err(Error::Lease);
+            let lease = intent.lease_seconds.ok_or(Error::Unresolved)?;
+            match (lease.finite(), instance.lease_deadline.as_deref()) {
+                (None, None) => {}
+                (Some(_), Some(deadline)) => {
+                    let minimum = intent
+                        .minimum_lease_deadline
+                        .as_deref()
+                        .ok_or(Error::Unresolved)?;
+                    if timestamp(deadline)? < timestamp(minimum)? {
+                        return Err(Error::Lease);
+                    }
+                }
+                _ => return Err(Error::Lease),
             }
             instance.state == InstanceState::Running
         }
@@ -1486,7 +1501,7 @@ mod tests {
         generate_api_key,
     };
     use caudra_config::sandbox::{
-        ProviderKind, SandboxDraft, SandboxName, SandboxOrigin, SandboxProvider,
+        LeaseSeconds, ProviderKind, SandboxDraft, SandboxName, SandboxOrigin, SandboxProvider,
         persistence::SandboxStore,
     };
     use caudra_storage::{
@@ -1542,6 +1557,8 @@ mod tests {
     const DENY_REVISION: &str = "fb44c0f5ba3bfc047e139e764fc03a852d08600a8777ea16ef62c2892c9503d9";
     const ALLOW_REVISION: &str = "9702568256299b79c8a8a32db948ac6bba9a0e476cdadbbc7168f6c84394a017";
     const INSTANCE_STORE: &str = "sandboxes/instances.json";
+    const LEASE: LeaseSeconds = LeaseSeconds::new(300);
+    const LEASE_CAP: LeaseSeconds = LeaseSeconds::new(3600);
 
     #[test]
     fn interrupted_restart_after_pause_requires_explicit_resume() {
@@ -1575,7 +1592,7 @@ mod tests {
             async {
                 Some(
                     controller
-                        .restart_at(&name(), &before.revision().unwrap(), 300)
+                        .restart_at(&name(), &before.revision().unwrap(), LEASE)
                         .await,
                 )
             },
@@ -1593,7 +1610,7 @@ mod tests {
         assert_eq!(intent.observed_revision, Some(2));
         assert!(!intent.failure_acknowledged);
         assert!(matches!(
-            smol::block_on(recovered.restart_at(&name(), &after.revision().unwrap(), 300)),
+            smol::block_on(recovered.restart_at(&name(), &after.revision().unwrap(), LEASE)),
             Err(super::RestartFailure {
                 source: Error::NotReady,
                 ..
@@ -1689,7 +1706,7 @@ mod tests {
         *state.lock().unwrap() = Some(controller.store.state().clone());
         let before = create_ready(&controller, &saved);
         let result =
-            smol::block_on(controller.restart_at(&name(), &before.revision().unwrap(), 300));
+            smol::block_on(controller.restart_at(&name(), &before.revision().unwrap(), LEASE));
         let pause_failed =
             scenario.starts_with("pause_") || scenario.starts_with("refusal_concurrent_");
         assert_eq!(
@@ -1781,7 +1798,9 @@ mod tests {
                 smol::block_on(recovered.action_at(
                     &name(),
                     &after.revision().unwrap(),
-                    LifecycleAction::Resume { lease_seconds: 300 }
+                    LifecycleAction::Resume {
+                        lease_seconds: LEASE,
+                    }
                 ))
                 .is_err()
             );
@@ -1796,7 +1815,9 @@ mod tests {
                 smol::block_on(recovered.action_at(
                     &name(),
                     &after.revision().unwrap(),
-                    LifecycleAction::Resume { lease_seconds: 300 }
+                    LifecycleAction::Resume {
+                        lease_seconds: LEASE,
+                    }
                 )),
                 Err(Error::Unresolved)
             ));
@@ -1812,7 +1833,8 @@ mod tests {
     #[test_case("borrowed")]
     #[test_case("paused")]
     #[test_case("runtime")]
-    #[test_case("lease")]
+    #[test_case("no_expiry_over_cap")]
+    #[test_case("finite_over_cap")]
     fn restart_preflight_never_dispatches(scenario: &str) {
         let server = Server::new(|method, path, _, headers| {
             assert!(!path.ends_with("/pause") && !path.ends_with("/resume"));
@@ -1837,12 +1859,12 @@ mod tests {
             record.revision()
         }
         .unwrap();
-        let error = smol::block_on(controller.restart_at(
-            &name(),
-            &revision,
-            if scenario == "lease" { 0 } else { 300 },
-        ))
-        .unwrap_err();
+        let lease = match scenario {
+            "no_expiry_over_cap" => LeaseSeconds::NO_EXPIRY,
+            "finite_over_cap" => LeaseSeconds::new(LEASE_CAP.get() + 1),
+            _ => LEASE,
+        };
+        let error = smol::block_on(controller.restart_at(&name(), &revision, lease)).unwrap_err();
         assert_eq!(error.phase, RestartPhase::Pause);
         assert!(match scenario {
             "stale" => matches!(error.source, Error::ReviewChanged),
@@ -1850,7 +1872,10 @@ mod tests {
             "borrowed" => matches!(error.source, Error::Borrowed),
             "paused" => matches!(error.source, Error::NotReady),
             "runtime" => matches!(error.source, Error::Busy),
-            "lease" => matches!(error.source, Error::Lease),
+            "no_expiry_over_cap" | "finite_over_cap" => matches!(
+                error.source,
+                Error::LeaseOverCap { requested, max } if requested == lease && max == LEASE_CAP
+            ),
             _ => false,
         });
         assert_eq!(
@@ -2413,7 +2438,9 @@ mod tests {
         let (_temp, controller, saved) = setup(&server);
         let record = create_ready(&controller, &saved);
         let action = if renew {
-            LifecycleAction::Extend { lease_seconds: 300 }
+            LifecycleAction::Extend {
+                lease_seconds: LEASE,
+            }
         } else {
             LifecycleAction::Pause
         };
@@ -2461,8 +2488,12 @@ mod tests {
         let route = route.to_owned();
         let action = match route.as_str() {
             "pause" => LifecycleAction::Pause,
-            "resume" => LifecycleAction::Resume { lease_seconds: 300 },
-            "renew" => LifecycleAction::Extend { lease_seconds: 300 },
+            "resume" => LifecycleAction::Resume {
+                lease_seconds: LEASE,
+            },
+            "renew" => LifecycleAction::Extend {
+                lease_seconds: LEASE,
+            },
             _ => LifecycleAction::Delete {
                 destroy_borrowed: false,
             },
@@ -2908,8 +2939,12 @@ mod tests {
         let record = create_ready(&controller, &saved);
         let action = match route.as_str() {
             "pause" => LifecycleAction::Pause,
-            "resume" => LifecycleAction::Resume { lease_seconds: 300 },
-            "renew" => LifecycleAction::Extend { lease_seconds: 300 },
+            "resume" => LifecycleAction::Resume {
+                lease_seconds: LEASE,
+            },
+            "renew" => LifecycleAction::Extend {
+                lease_seconds: LEASE,
+            },
             _ => LifecycleAction::Delete {
                 destroy_borrowed: false,
             },
@@ -3350,7 +3385,7 @@ mod tests {
     fn discovery(owner: &str) -> Value {
         json!({"apiVersion":"1","ownerID":owner,"serverTime":NOW,"authentication":"api_key_namespace","templateID":"base","networkTopology":"slirp-unrestricted",
             "capabilities":{"idempotentCreate":true,"operationLookup":true,"conditionalMutations":true,"explicitCredentials":true,"persistentDisk":true,"memoryPause":false,"egressPolicy":false,"cancelCreate":true,"templateCatalog":true,"conditionalTemplateCreate":true,"warmStart":false,"localTemplateAdmin":true,"httpTemplateAdmin":false},
-            "limits":{"maxLeaseSeconds":3600,"runtimeAdmission":4,"operationJournalEntries":4096,"listPageSize":100,"resources":{"cpuCount":4,"memoryMB":4096,"diskSizeMB":8192},"newKeyMaxAgeSeconds":300,"newKeyFutureSkewSeconds":30},
+            "limits":{"maxLeaseSeconds":LEASE_CAP,"runtimeAdmission":4,"operationJournalEntries":4096,"listPageSize":100,"resources":{"cpuCount":4,"memoryMB":4096,"diskSizeMB":8192},"newKeyMaxAgeSeconds":300,"newKeyFutureSkewSeconds":30},
             "retention":{"pausedDiskMaxAgeSeconds":0,"operationHistorySeconds":86400,"historyStartsAfter":"instance_removed"},"idempotencyKey":"uuidv7","recovery":"query_operation_never_replay_unknown","credentialScope":"sandbox_lifetime","proxyOrigin":"client_configured"})
     }
     fn instance() -> Value {
@@ -3533,6 +3568,185 @@ mod tests {
             Some((200, operation(path.rsplit('/').next().unwrap(), instance())))
         } else {
             Some((200, instance()))
+        }
+    }
+
+    fn uncapped(method: &str, path: &str, headers: &str) -> Option<(u16, Value)> {
+        if path.ends_with("/discover") {
+            let mut discovered = discovery(OWNER);
+            discovered["limits"]["maxLeaseSeconds"] = json!(LeaseSeconds::NO_EXPIRY);
+            return Some((200, discovered));
+        }
+        regular(method, path, headers)
+    }
+
+    #[test]
+    fn create_sends_a_lease_with_no_expiry_to_an_uncapped_daemon() {
+        let sent = Arc::new(Mutex::new(None));
+        let sent_for_server = sent.clone();
+        let server = Server::new(move |method, path, body, headers| {
+            if method == "POST" && path == "/daemon/v1/instances" {
+                *sent_for_server.lock().unwrap() = Some(body["leaseSeconds"].clone());
+            }
+            uncapped(method, path, headers)
+        });
+        let (temp, controller, _) = setup(&server);
+        let config = SandboxStore::from_config_dir(&temp.path().join("config")).unwrap();
+        let loaded = config.load().unwrap();
+        let mut draft = loaded.draft();
+        draft
+            .profiles
+            .get_mut(&SandboxName::parse("dev").unwrap())
+            .unwrap()
+            .running_ttl_seconds = LeaseSeconds::NO_EXPIRY;
+        let saved = config.save(&loaded, &draft).unwrap();
+        create_ready(&controller, saved.saved());
+        assert_eq!(*sent.lock().unwrap(), Some(json!(LeaseSeconds::NO_EXPIRY)));
+    }
+
+    #[test_case("renew", LeaseSeconds::NO_EXPIRY, None, true; "renew_to_no_expiry")]
+    #[test_case("resume", LeaseSeconds::NO_EXPIRY, None, true; "resume_with_no_expiry")]
+    #[test_case("renew", LeaseSeconds::NO_EXPIRY, Some(LATER), false; "no_expiry_answered_with_a_deadline")]
+    #[test_case("resume", LEASE, None, false; "finite_answered_without_a_deadline")]
+    fn no_expiry_lease_is_sent_and_verified(
+        route: &'static str,
+        lease: LeaseSeconds,
+        deadline: Option<&'static str>,
+        accepted: bool,
+    ) {
+        let server = Server::new(move |method, path, body, headers| {
+            if path.ends_with(&format!("/{route}")) {
+                assert_eq!(body["leaseSeconds"], json!(lease));
+                let mut current = instance();
+                current["revision"] = json!(SETTLED_REVISION);
+                current["leaseDeadline"] = json!(deadline);
+                if route == "resume" {
+                    current["executionID"] = json!(CHANGED_EXECUTION);
+                }
+                return Some((200, current));
+            }
+            uncapped(method, path, headers)
+        });
+        let (_temp, controller, saved) = setup(&server);
+        let created = create_ready(&controller, &saved);
+        let action = if route == "resume" {
+            let mut paused = created.clone();
+            let instance = paused.instance.as_mut().unwrap();
+            instance.state = InstanceState::Paused;
+            instance.lease_deadline = None;
+            controller.store.replace(&created, &paused).unwrap();
+            LifecycleAction::Resume {
+                lease_seconds: lease,
+            }
+        } else {
+            LifecycleAction::Extend {
+                lease_seconds: lease,
+            }
+        };
+        let result = smol::block_on(controller.action(&name(), action));
+        if !accepted {
+            assert!(matches!(result, Err(Error::Lease)));
+            return;
+        }
+        let record = result.unwrap();
+        let instance = record.instance.unwrap();
+        assert_eq!(instance.state, InstanceState::Running);
+        assert_eq!(instance.lease_deadline, None);
+        let intent = record.lifecycle.unwrap();
+        assert_eq!(intent.lease_seconds, Some(LeaseSeconds::NO_EXPIRY));
+        assert_eq!(intent.minimum_lease_deadline, None);
+        assert_eq!(intent.observed_revision, Some(SETTLED_REVISION));
+    }
+
+    #[test]
+    fn no_expiry_lease_needs_an_uncapped_daemon() {
+        let server = Server::new(|method, path, _, headers| {
+            assert!(!path.ends_with("/renew"));
+            regular(method, path, headers)
+        });
+        let (_temp, controller, saved) = setup(&server);
+        let created = create_ready(&controller, &saved);
+        assert!(matches!(
+            smol::block_on(controller.action(
+                &name(),
+                LifecycleAction::Extend {
+                    lease_seconds: LeaseSeconds::NO_EXPIRY
+                }
+            )),
+            Err(Error::LeaseOverCap { requested, max })
+                if requested == LeaseSeconds::NO_EXPIRY && max == LEASE_CAP
+        ));
+        assert_eq!(
+            controller.store.get(&name()).unwrap().revision().unwrap(),
+            created.revision().unwrap()
+        );
+    }
+
+    #[test_case(InstanceState::Running, LEASE, Error::LeaseNoExpiry; "finite_never_shortens_no_expiry")]
+    #[test_case(InstanceState::Paused, LeaseSeconds::NO_EXPIRY, Error::Lease; "paused_no_expiry")]
+    #[test_case(InstanceState::Paused, LEASE, Error::Lease; "paused_finite")]
+    fn extend_without_a_deadline_never_dispatches(
+        state: InstanceState,
+        lease: LeaseSeconds,
+        expected: Error,
+    ) {
+        let server = Server::new(|method, path, _, headers| {
+            assert!(!path.ends_with("/renew"));
+            uncapped(method, path, headers)
+        });
+        let (_temp, controller, saved) = setup(&server);
+        let created = create_ready(&controller, &saved);
+        let mut current = created.clone();
+        let instance = current.instance.as_mut().unwrap();
+        instance.state = state;
+        instance.lease_deadline = None;
+        controller.store.replace(&created, &current).unwrap();
+        assert_eq!(
+            smol::block_on(controller.action(
+                &name(),
+                LifecycleAction::Extend {
+                    lease_seconds: lease
+                }
+            ))
+            .unwrap_err()
+            .to_string(),
+            expected.to_string()
+        );
+        assert_eq!(
+            controller.store.get(&name()).unwrap().revision().unwrap(),
+            current.revision().unwrap()
+        );
+    }
+
+    #[test_case(LeaseSeconds::NO_EXPIRY, None, true; "no_expiry_without_minimum")]
+    #[test_case(LeaseSeconds::NO_EXPIRY, Some(LATER), false; "no_expiry_with_minimum")]
+    #[test_case(LEASE, None, false; "finite_without_minimum")]
+    fn lease_intents_carry_a_minimum_deadline_exactly_when_finite(
+        lease: LeaseSeconds,
+        minimum: Option<&str>,
+        valid: bool,
+    ) {
+        let server = Server::new(|method, path, _, headers| regular(method, path, headers));
+        let (_temp, controller, saved) = setup(&server);
+        let record = create_ready(&controller, &saved);
+        let path = controller
+            .store
+            .state()
+            .persistent_path()
+            .join(INSTANCE_STORE);
+        let mut document: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        document["records"][NAME]["lifecycle"] = json!({
+            "action":"renew","expected":record.instance.as_ref().unwrap().expected(),
+            "lease_seconds":lease,"observed_revision":null,"policy":null,"policy_revision":null,
+            "minimum_lease_deadline":minimum,"allow_equal_revision":false,"failure_acknowledged":false
+        });
+        fs::write(&path, serde_json::to_vec(&document).unwrap()).unwrap();
+        let reopened = Controller::new(controller.store.state()).unwrap();
+        let listed = reopened.store.list();
+        if valid {
+            assert!(listed.is_ok());
+        } else {
+            assert!(matches!(listed, Err(Error::Store)));
         }
     }
 
@@ -3765,7 +3979,9 @@ mod tests {
         let record = create_ready(&controller, &saved);
         let _active = shorten.then(|| controller.store.lease(&record, false).unwrap());
         let action = if shorten {
-            LifecycleAction::Extend { lease_seconds: 300 }
+            LifecycleAction::Extend {
+                lease_seconds: LEASE,
+            }
         } else {
             LifecycleAction::Pause
         };
@@ -3804,7 +4020,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_selection_and_zero_renewal_never_allocate() {
+    fn missing_selection_never_allocates() {
         let temp = tempdir();
         let controller = Controller::new(&StateDir::from_path(temp.path().to_path_buf())).unwrap();
         assert!(matches!(
@@ -3812,10 +4028,13 @@ mod tests {
             Err(Error::Missing)
         ));
         assert!(matches!(
-            smol::block_on(
-                controller.action(&name(), LifecycleAction::Extend { lease_seconds: 0 })
-            ),
-            Err(Error::Lease)
+            smol::block_on(controller.action(
+                &name(),
+                LifecycleAction::Extend {
+                    lease_seconds: LeaseSeconds::NO_EXPIRY
+                }
+            )),
+            Err(Error::Missing)
         ));
         assert!(controller.snapshots().unwrap().is_empty());
     }
@@ -3923,9 +4142,12 @@ mod tests {
             )),
             Err(Error::Busy)
         ));
-        let resumed = smol::block_on(
-            controller.action(&name(), LifecycleAction::Resume { lease_seconds: 300 }),
-        )
+        let resumed = smol::block_on(controller.action(
+            &name(),
+            LifecycleAction::Resume {
+                lease_seconds: LEASE,
+            },
+        ))
         .unwrap();
         assert_eq!(resumed.instance.unwrap().state, InstanceState::Running);
     }

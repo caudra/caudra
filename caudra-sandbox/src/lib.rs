@@ -11,7 +11,7 @@ pub use controller::{
 };
 pub use store::{CreateIntent, InstanceRecord, LifecycleIntent, Ownership, RuntimeLease, Store};
 
-use caudra_config::sandbox::{SandboxError, persistence::SandboxStoreError};
+use caudra_config::sandbox::{LeaseSeconds, SandboxError, persistence::SandboxStoreError};
 use caudra_storage::{private_file::PrivateFileError, sandbox_auth::SandboxCredentialError};
 use thiserror::Error;
 
@@ -77,8 +77,19 @@ pub enum Error {
         "sandbox API key is missing or too short; use auth sandbox generate or set (at least 32 bytes)"
     )]
     Credential,
-    #[error("lease must be positive, within daemon limits, and renewal must not shorten it")]
+    #[error("lease must be within daemon limits, and renewal must not shorten it")]
     Lease,
+    #[error(
+        "requested lease ({requested}) exceeds the daemon's cap ({max}); raise E2B_LOCAL_MAX_TIMEOUT, or set it to 0 to allow leases with no expiry (nothing was sent)"
+    )]
+    LeaseOverCap {
+        requested: LeaseSeconds,
+        max: LeaseSeconds,
+    },
+    #[error(
+        "this lease has no expiry, and Extend never shortens a lease; Pause and Resume, or Restart, with the finite lease you want (nothing was sent)"
+    )]
+    LeaseNoExpiry,
     #[error(
         "approved explicit local provider action required; no daemon is installed or started automatically"
     )]

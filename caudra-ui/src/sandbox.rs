@@ -2,8 +2,8 @@
 
 use caudra_config::sandbox::persistence::{LoadedSandboxes, SandboxStore, SandboxStoreError};
 use caudra_config::sandbox::{
-    MAX_SANDBOX_FILE_BYTES, ProviderCapabilities, ResolvedLaunch, Revision, SandboxDraft,
-    SandboxName, TemplateCatalog,
+    LeaseSeconds, MAX_SANDBOX_FILE_BYTES, ProviderCapabilities, ResolvedLaunch, Revision,
+    SandboxDraft, SandboxName, TemplateCatalog,
 };
 use caudra_sandbox::{
     Controller, CreateReview, Doctor, Error as SandboxError, InstanceRecord, LifecycleAction,
@@ -601,7 +601,7 @@ pub(crate) enum LiveOperation {
     Restart {
         name: SandboxName,
         revision: Revision,
-        lease_seconds: u32,
+        lease_seconds: LeaseSeconds,
     },
     Reconcile {
         name: SandboxName,
@@ -643,7 +643,7 @@ pub struct SandboxControl {
 
 enum ControlAction {
     Lifecycle(LifecycleAction),
-    Restart { lease_seconds: u32 },
+    Restart { lease_seconds: LeaseSeconds },
     AcknowledgeFailure,
 }
 
@@ -1023,7 +1023,9 @@ mod tests {
         SandboxSnapshotRequest, SnapshotState, StoreTicket, start_snapshot,
     };
     use caudra_config::sandbox::persistence::SandboxStore;
-    use caudra_config::sandbox::{DomainRule, Enforcement, NetworkPolicy, SandboxName};
+    use caudra_config::sandbox::{
+        DomainRule, Enforcement, LeaseSeconds, NetworkPolicy, SandboxName,
+    };
     use caudra_sandbox::LifecycleAction;
     use caudra_storage::{
         StateDir,
@@ -1040,7 +1042,7 @@ mod tests {
     const DOMAIN: &str = "registry.example";
     const DETAIL: &str = "instance-specific result";
     const PRIVATE_MODE: u32 = 0o700;
-    const LEASE_SECONDS: u32 = 3600;
+    const LEASE_SECONDS: LeaseSeconds = LeaseSeconds::new(3600);
 
     #[test_case(ControlAction::Lifecycle(LifecycleAction::Pause), false; "pause_releases_without_reconnect")]
     #[test_case(ControlAction::Restart { lease_seconds: LEASE_SECONDS }, true; "restart_rebuilds_runtime")]

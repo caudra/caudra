@@ -1,4 +1,6 @@
-use caudra_config::sandbox::{ResolvedLaunch, Revision, SandboxName, SandboxProvider};
+use caudra_config::sandbox::{
+    LeaseSeconds, ResolvedLaunch, Revision, SandboxName, SandboxProvider,
+};
 use caudra_storage::{
     StateDir,
     id::CaudraId,
@@ -40,13 +42,14 @@ pub struct LifecycleIntent {
     pub action: String,
     pub expected: Expected,
     #[serde(deserialize_with = "Option::deserialize")]
-    pub lease_seconds: Option<u32>,
+    pub lease_seconds: Option<LeaseSeconds>,
     #[serde(deserialize_with = "Option::deserialize")]
     pub observed_revision: Option<u64>,
     #[serde(deserialize_with = "Option::deserialize")]
     pub policy: Option<Policy>,
     #[serde(deserialize_with = "Option::deserialize")]
     pub policy_revision: Option<String>,
+    /// Present exactly when a resume or renew asks for a finite lease.
     #[serde(deserialize_with = "Option::deserialize")]
     pub minimum_lease_deadline: Option<String>,
     pub allow_equal_revision: bool,
@@ -63,8 +66,8 @@ impl LifecycleIntent {
         ) || self.policy.is_some() != policy
             || self.policy_revision.is_some() != policy
             || self.lease_seconds.is_some() != lease
-            || self.minimum_lease_deadline.is_some() != lease
-            || self.lease_seconds == Some(0)
+            || self.minimum_lease_deadline.is_some()
+                != self.lease_seconds.and_then(LeaseSeconds::finite).is_some()
         {
             return Err(Error::Store);
         }

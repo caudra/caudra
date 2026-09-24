@@ -6,6 +6,7 @@ use color_eyre::eyre::bail;
 
 use caudra_agent::tools::all_builtin_tool_names;
 use caudra_config::is_disableable_tool;
+use caudra_config::sandbox::LeaseSeconds;
 use caudra_storage::auth::WorkcellCredentialName;
 use caudra_storage::retention::{Duration as RetentionDuration, GroupBy, KeepPolicy};
 
@@ -896,18 +897,21 @@ pub enum SandboxAction {
     },
     Resume {
         name: String,
+        /// Running lease; 0 runs until paused or deleted (the daemon must allow it)
         #[arg(long)]
-        lease_seconds: u32,
+        lease_seconds: LeaseSeconds,
         #[arg(long)]
         yes: bool,
     },
     Pause {
         name: String,
     },
+    /// Lengthen the running lease; 0 runs until paused or deleted. Never shortens a lease
     Extend {
         name: String,
+        /// Running lease from now; 0 runs until paused or deleted (the daemon must allow it)
         #[arg(long)]
-        lease_seconds: u32,
+        lease_seconds: LeaseSeconds,
     },
     /// Delete owned disks only with --yes; borrowed records detach unless --destroy-borrowed
     Delete {

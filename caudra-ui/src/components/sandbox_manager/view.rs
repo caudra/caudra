@@ -24,6 +24,8 @@ const FORM_HELP_ROWS: u16 = 4;
 const FORM_SUMMARY_ROWS: u16 = 3;
 const PAUSED_DISK: &str = "Paused / stopped execution: persistent disk retained, subject to disk retention. Memory/process state is not saved; Resume is a cold boot.\n";
 const DELETED_DISK: &str = "Deleted: no paused disk to Resume.\n";
+const NO_EXPIRY_DEADLINE: &str = "none (runs until paused or deleted)";
+const UNAVAILABLE_DEADLINE: &str = "unavailable";
 
 impl SandboxManager {
     pub(crate) fn view(&mut self, frame: &mut Frame, area: Rect) -> Rect {
@@ -1027,11 +1029,15 @@ impl Manager {
                         _ => "",
                     },
                     instance.workcell,
-                    instance.lease_deadline.as_deref().unwrap_or("unavailable"),
+                    match (&instance.lease_deadline, &instance.state) {
+                        (Some(deadline), _) => deadline.as_str(),
+                        (None, SandboxInstanceState::Running) => NO_EXPIRY_DEADLINE,
+                        (None, _) => UNAVAILABLE_DEADLINE,
+                    },
                     instance
                         .retention_deadline
                         .as_deref()
-                        .unwrap_or("unavailable"),
+                        .unwrap_or(UNAVAILABLE_DEADLINE),
                     instance.blockers.join(", "),
                     instance.record.as_ref().map(|record| serde_json::to_string_pretty(&serde_json::json!({"ownership":record.ownership,"detached":record.detached,"create":record.create,"lifecycle":record.lifecycle})).unwrap_or_default()).unwrap_or_else(|| "untracked; Attach borrows by default".into()),
                     serde_json::to_string_pretty(&instance.live).unwrap_or_default(),
@@ -1148,7 +1154,8 @@ fn safe(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        Confirmation, Control, DELETED_DISK, Focus, PAUSED_DISK, ReadSurface, SandboxView,
+        Confirmation, Control, DELETED_DISK, Focus, NO_EXPIRY_DEADLINE, PAUSED_DISK, ReadSurface,
+        SandboxView, UNAVAILABLE_DEADLINE,
     };
     use crate::components::{
         Overlay, buffer_text,
@@ -1173,6 +1180,30 @@ mod tests {
     const DETAIL_TAIL: &str = "unchanged.";
     const CONFIRMATION_TAIL: &str = "text.";
     const RETENTION_DEADLINE: &str = "2026-09-22T12:00:00Z";
+    const LEASE_DEADLINE: &str = "2026-09-20T13:00:00Z";
+
+    #[test_case(SandboxInstanceState::Running, None, NO_EXPIRY_DEADLINE; "running_without_deadline_never_expires")]
+    #[test_case(SandboxInstanceState::Running, Some(LEASE_DEADLINE), LEASE_DEADLINE; "running_with_deadline")]
+    #[test_case(SandboxInstanceState::Paused, None, UNAVAILABLE_DEADLINE; "paused_has_no_lease")]
+    fn instance_details_show_the_running_lease(
+        instance_state: SandboxInstanceState,
+        deadline: Option<&str>,
+        shown: &str,
+    ) {
+        let (_directory, _store, mut manager) = fixture();
+        live_instance(&mut manager, false);
+        let state = manager.state.as_mut().unwrap();
+        let SnapshotState::Ready(rows) = &mut state.snapshot.as_mut().unwrap().instances else {
+            panic!("missing instance")
+        };
+        rows[0].state = instance_state;
+        rows[0].lease_deadline = deadline.map(Into::into);
+        assert!(
+            state
+                .read_only_detail()
+                .contains(&format!("\nLease: {shown}\n"))
+        );
+    }
 
     #[test_case(InstanceState::Paused, SandboxInstanceState::Paused, PAUSED_DISK, DELETED_DISK; "paused_disk_retained")]
     #[test_case(InstanceState::Deleted, SandboxInstanceState::Deleted, DELETED_DISK, PAUSED_DISK; "deleted_is_not_stopped")]

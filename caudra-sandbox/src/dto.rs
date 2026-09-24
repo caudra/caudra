@@ -1,5 +1,5 @@
 use caudra_config::sandbox::{
-    CidrRule, DomainRule, MAX_NETWORK_RULES, Revision, SandboxName, TlsMode,
+    CidrRule, DomainRule, LeaseSeconds, MAX_NETWORK_RULES, Revision, SandboxName, TlsMode,
 };
 use caudra_storage::workspace_binding::StoredWorkspaceBinding;
 use serde::{Deserialize, Serialize};
@@ -106,7 +106,8 @@ pub struct Capabilities {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Limits {
-    pub max_lease_seconds: u32,
+    /// Zero is an uncapped daemon, which also admits a lease with no expiry.
+    pub max_lease_seconds: LeaseSeconds,
     pub runtime_admission: u32,
     pub operation_journal_entries: u32,
     pub list_page_size: u32,
@@ -264,7 +265,7 @@ pub struct Create {
     pub template_id: SandboxName,
     pub expected_template_revision: Revision,
     pub resources: Resources,
-    pub lease_seconds: u32,
+    pub lease_seconds: LeaseSeconds,
     pub persistent: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub egress: Option<Policy>,
@@ -358,6 +359,7 @@ pub struct Instance {
     pub network_topology: String,
     pub persistent: bool,
     pub pause_unclean: bool,
+    /// Absent while running is a lease with no expiry.
     pub lease_deadline: Option<String>,
     pub retention: Retention,
     pub egress: Egress,

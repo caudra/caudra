@@ -1,7 +1,7 @@
 use super::{
     Confirmation, Control, Focus, Manager, ReadSurface, SandboxAction, SandboxView, SnapshotState,
     StoreTicket, TextEditor, editor_action,
-    form::{CIDR_HELP, DOMAIN_HELP, network_list_key, parse_cidrs, parse_domains},
+    form::{CIDR_HELP, DOMAIN_HELP, LEASE_HELP, network_list_key, parse_cidrs, parse_domains},
     image,
     view::hover_style,
 };
@@ -12,7 +12,7 @@ use crate::{
     },
     theme,
 };
-use caudra_config::sandbox::SandboxName;
+use caudra_config::sandbox::{LeaseSeconds, SandboxName};
 use caudra_sandbox::{
     CreateReview, LifecycleAction, Ownership,
     dto::{OperationStatus, Policy},
@@ -30,6 +30,9 @@ use ratatui::{
 use std::path::{Path, PathBuf};
 
 const DEFAULT_LEASE: &str = "3600";
+pub(super) const LEASE_FIELD: &str = "Lease seconds";
+const NO_EXPIRY_REVIEW: &str = "New running lease: no expiry. The VM keeps running, and using host resources, until it is paused or deleted, including after Caudra exits.";
+const EXTEND_REVIEW: &str = "EXTEND: lengthen the running lease, counted from now. Extend never shortens a lease, so one with no expiry keeps it. Conditional on the reviewed execution and revision. Saved profiles remain unchanged.";
 const DESTROY_BORROWED: &str = "Destroy borrowed VM/disk (type DELETE; empty detaches)";
 const DELETE_APPROVAL: &str = "DELETE";
 const TRANSITION: &str = "Attach opens a NEW sandbox session after Workcell verification and session gates. The local session is saved unchanged. No conversation, grants, pending prompts, files or secrets are copied. Closing/exiting detaches; it never deletes or pauses the VM.";
@@ -330,7 +333,7 @@ impl Manager {
                 field(DESTROY_BORROWED, String::new(), false)
             }
             Kind::Resume | Kind::Restart | Kind::Extend => field(
-                "Lease seconds",
+                LEASE_FIELD,
                 target
                     .as_ref()
                     .and_then(|row| row.effective.as_ref())
@@ -340,6 +343,7 @@ impl Manager {
                             .profile
                             .value()
                             .running_ttl_seconds
+                            .get()
                             .to_string()
                     })
                     .unwrap_or_else(|| DEFAULT_LEASE.into()),
@@ -641,6 +645,11 @@ impl Manager {
                     {
                         return Err("Live instance changed/unavailable. Reconcile, then review a fresh action.".into());
                     }
+                    let lease = || {
+                        form.field(LEASE_FIELD)
+                            .parse::<LeaseSeconds>()
+                            .map_err(|_| LEASE_HELP.to_owned())
+                    };
                     let operation = match form.kind {
                         Kind::Attach => LiveOperation::Attach { name, revision },
                         Kind::Reconcile => LiveOperation::Reconcile { name },
@@ -648,26 +657,12 @@ impl Manager {
                         Kind::Restart => LiveOperation::Restart {
                             name,
                             revision,
-                            lease_seconds: form
-                                .field("Lease seconds")
-                                .parse::<u32>()
-                                .ok()
-                                .filter(|lease| *lease > 0)
-                                .ok_or("Lease must be a positive number of seconds")?,
+                            lease_seconds: lease()?,
                         },
                         Kind::AcknowledgeFailure => {
                             LiveOperation::AcknowledgeFailure { name, revision }
                         }
                         _ => {
-                            let lease = || {
-                                form.field("Lease seconds")
-                                    .parse::<u32>()
-                                    .ok()
-                                    .filter(|lease| *lease > 0)
-                                    .ok_or_else(|| {
-                                        "Lease must be a positive number of seconds".to_owned()
-                                    })
-                            };
                             let action = match form.kind {
                                 Kind::Pause => LifecycleAction::Pause,
                                 Kind::Resume => LifecycleAction::Resume {
@@ -702,9 +697,10 @@ impl Manager {
                     let effect = match &operation {
                         LiveOperation::Attach { .. } => TRANSITION.into(),
                         LiveOperation::AcknowledgeFailure { .. } => format!("{ACK_REVIEW}\n{}", record.lifecycle_failure_review().map_err(|error| error.to_string())?),
-                        LiveOperation::Restart { lease_seconds, .. } => format!("{RESTART_REVIEW}\nNew running lease: {lease_seconds} seconds."),
+                        LiveOperation::Restart { lease_seconds, .. } => format!("{RESTART_REVIEW}\n{}", lease_review(*lease_seconds)),
                         LiveOperation::Control { action: LifecycleAction::Pause, .. } => PAUSE_REVIEW.into(),
-                        LiveOperation::Control { action: LifecycleAction::Resume { lease_seconds }, .. } => format!("RESUME: cold boot the preserved disk; no memory/process restoration or disk deletion. New running lease: {lease_seconds} seconds. Reconnect only after verified success."),
+                        LiveOperation::Control { action: LifecycleAction::Resume { lease_seconds }, .. } => format!("RESUME: cold boot the preserved disk; no memory/process restoration or disk deletion. {} Reconnect only after verified success.", lease_review(*lease_seconds)),
+                        LiveOperation::Control { action: LifecycleAction::Extend { lease_seconds }, .. } => format!("{EXTEND_REVIEW}\n{}", lease_review(*lease_seconds)),
                         LiveOperation::Control { action: LifecycleAction::Delete { destroy_borrowed: false }, .. } if record.ownership == Ownership::Borrowed => "DETACH borrowed instance only. VM and disk are NOT deleted.".into(),
                         LiveOperation::Control { action: LifecycleAction::Detach, .. } => "DETACH local record only. VM and disk are NOT deleted.".into(),
                         LiveOperation::Control { action: LifecycleAction::Delete { .. }, .. } => "PERMANENTLY DELETE this VM AND DISK. Cannot be undone.".into(),
@@ -712,7 +708,6 @@ impl Manager {
                             let doctor = self.snapshot.as_ref().and_then(|snapshot| snapshot.providers.get(&target.provider)).and_then(|provider| provider.doctor.as_ref()).ok_or("Provider TLS metadata unavailable")?;
                             format!("Apply host-only rules (no port/method policy). Empty domains AND CIDRs deny all. Saved profiles remain unchanged. MITM terminates TLS and can break pinning.\n{}\nDiscovered TLS modes: {:?}; live mode change: {}; reviewed image guest CA: {}; instance guest CA ready: {}", pretty(policy)?, doctor.discovery.tls_modes, doctor.discovery.capabilities.live_tls_mode_change, record.template.manifest.guest_ca, target.live.as_ref().is_some_and(|instance| instance.egress.guest_ca_ready))
                         }
-                        LiveOperation::Control { action, .. } => format!("{action:?}\nConditional on the reviewed execution and revision. Saved profiles remain unchanged."),
                         LiveOperation::CancelCreate { .. } => "CANCEL CREATE: explicit remote cancellation; may race completion. Reconcile if outcome is unknown. Escape/close alone never requests this.".into(),
                         _ => "RECONCILE by lookup only; never replay Create or implicitly resume.".into(),
                     };
@@ -1103,6 +1098,13 @@ fn instance_action_error(
     }
 }
 
+fn lease_review(lease: LeaseSeconds) -> String {
+    match lease.finite() {
+        Some(_) => format!("New running lease: {lease}."),
+        None => NO_EXPIRY_REVIEW.into(),
+    }
+}
+
 fn pretty(value: &impl serde::Serialize) -> Result<String, String> {
     serde_json::to_string_pretty(value).map_err(|error| error.to_string())
 }
@@ -1110,15 +1112,18 @@ fn pretty(value: &impl serde::Serialize) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ACK_REVIEW, INSTANCE_ACTIONS, Kind, LiveField, LiveForm, PAUSE_REVIEW, PERSISTENT_REQUIRED,
-        RECOVERY_REQUIRED, RESTART_REVIEW, TextEditor, image, instance_action_error,
+        ACK_REVIEW, EXTEND_REVIEW, INSTANCE_ACTIONS, Kind, LEASE_FIELD, LEASE_HELP, LiveField,
+        LiveForm, NO_EXPIRY_REVIEW, PAUSE_REVIEW, PERSISTENT_REQUIRED, RECOVERY_REQUIRED,
+        RESTART_REVIEW, TextEditor, image, instance_action_error,
     };
     use crate::components::sandbox_manager::{
         Confirmation, SandboxAction, SnapshotState,
         tests::{fixture, live_instance},
     };
     use crate::sandbox::{LiveOperation, SandboxInstanceState};
+    use caudra_config::sandbox::LeaseSeconds;
     use caudra_sandbox::{
+        LifecycleAction,
         dto::{InstanceState, PROTOCOL_VERSION, TRANSFER_PROTOCOL},
         local_admin::AdminOperation,
     };
@@ -1128,6 +1133,7 @@ mod tests {
 
     const DIGEST: &str = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const RAW: &str = "Raw operation JSON override (optional)";
+    const PROFILE_LEASE: LeaseSeconds = LeaseSeconds::new(3600);
 
     #[test_case(Kind::Pause, InstanceState::Running, true; "running_pause")]
     #[test_case(Kind::Restart, InstanceState::Running, true; "running_restart")]
@@ -1182,17 +1188,14 @@ mod tests {
         if kind == Kind::Restart {
             assert!(matches!(
                 **operation,
-                LiveOperation::Restart {
-                    lease_seconds: 3600,
-                    ..
-                }
+                LiveOperation::Restart { lease_seconds, .. } if lease_seconds == PROFILE_LEASE
             ));
             assert!(preview.contains(RESTART_REVIEW));
         } else {
             assert!(matches!(
                 **operation,
                 LiveOperation::Control {
-                    action: caudra_sandbox::LifecycleAction::Pause,
+                    action: LifecycleAction::Pause,
                     ..
                 }
             ));
@@ -1200,6 +1203,37 @@ mod tests {
         }
         assert!(matches!(state.confirm(0), SandboxAction::None));
         assert!(state.live_pending.is_none());
+    }
+
+    #[test_case("0", Some(LeaseSeconds::NO_EXPIRY); "no_expiry")]
+    #[test_case("forever", None; "not_whole_seconds")]
+    fn extend_reviews_a_lease_with_no_expiry(text: &str, expected: Option<LeaseSeconds>) {
+        let (_directory, _store, mut manager) = fixture();
+        live_instance(&mut manager, false);
+        let state = manager.state.as_mut().unwrap();
+        assert!(matches!(state.open_live(Kind::Extend), SandboxAction::None));
+        set(state.live_form.as_mut().unwrap(), LEASE_FIELD, text);
+        state.live_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL));
+        let Some(expected) = expected else {
+            assert!(state.confirmation.is_none());
+            assert_eq!(state.status, LEASE_HELP);
+            return;
+        };
+        let Some(Confirmation::Live {
+            operation, preview, ..
+        }) = &state.confirmation
+        else {
+            panic!("missing review")
+        };
+        assert!(matches!(
+            **operation,
+            LiveOperation::Control {
+                action: LifecycleAction::Extend { lease_seconds },
+                ..
+            } if lease_seconds == expected
+        ));
+        assert!(preview.contains(EXTEND_REVIEW));
+        assert!(preview.contains(NO_EXPIRY_REVIEW));
     }
 
     #[test_case(false; "ephemeral_disk")]

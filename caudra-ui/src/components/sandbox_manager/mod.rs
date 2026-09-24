@@ -14,8 +14,8 @@ use crate::sandbox::{
 };
 use caudra_config::sandbox::persistence::LoadedSandboxes;
 use caudra_config::sandbox::{
-    Enforcement, MAX_SANDBOX_FILE_BYTES, MAX_SANDBOX_RECORD_BYTES, MAX_SANDBOX_RECORDS, RecordKind,
-    ResourceRange, SandboxDraft, SandboxName, TlsMode,
+    Enforcement, LeaseSeconds, MAX_SANDBOX_FILE_BYTES, MAX_SANDBOX_RECORD_BYTES,
+    MAX_SANDBOX_RECORDS, RecordKind, ResourceRange, SandboxDraft, SandboxName, TlsMode,
 };
 use caudra_sandbox::Ownership;
 use caudra_storage::id::CaudraId;
@@ -42,6 +42,8 @@ const TOO_LARGE: &str = "Input exceeds the sandbox editor size limit.";
 const IMPORT_HELP: &str = "Paste strict versioned sandboxes.toml (credential references only). Ctrl+Enter validates and replaces the document draft, not the file.";
 const EXPORT_HELP: &str = "Strict configuration preview: references only, no credentials or live instance IDs. Ctrl+S saves to a NEW private file; Ctrl+C copies a selection.";
 const LOCKED_UNKNOWN: &str = "Provider capabilities/catalog unavailable: defaults can be saved offline, but launch compatibility is unverified.";
+const UNCAPPED_LEASE_HINT: &str =
+    "; 0 (no expiry) needs the provider started with E2B_LOCAL_MAX_TIMEOUT=0";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum SandboxView {
@@ -970,10 +972,15 @@ impl Manager {
                     "provider does not support persistent disks".into(),
                 ));
             }
-            if profile.running_ttl_seconds > caps.max_ttl_seconds {
+            if !profile.running_ttl_seconds.within(caps.max_ttl_seconds) {
+                let hint = if profile.running_ttl_seconds == LeaseSeconds::NO_EXPIRY {
+                    UNCAPPED_LEASE_HINT
+                } else {
+                    ""
+                };
                 return Err(error(
                     "running_ttl_seconds",
-                    format!("provider TTL maximum is {} seconds", caps.max_ttl_seconds),
+                    format!("provider TTL maximum is {}{hint}", caps.max_ttl_seconds),
                 ));
             }
             let Some(network) = draft.networks.get(&profile.network) else {
@@ -2534,11 +2541,11 @@ fn read_only_key(event: KeyEvent) -> bool {
 
 #[cfg(all(test, unix))]
 pub(crate) mod tests {
-    use super::live::{INSTANCE_ACTIONS, Kind};
+    use super::live::{INSTANCE_ACTIONS, Kind, LEASE_FIELD};
     use super::{
         CONFLICT, Confirmation, Control, DocumentMode, Focus, Form, Navigation, SAVED,
         SandboxAction, SandboxManager, SandboxView, StoreEffect, StoreReply, StoreResult,
-        StoreTicket, UNAVAILABLE,
+        StoreTicket, UNAVAILABLE, UNCAPPED_LEASE_HINT,
     };
     use crate::components::{Overlay, keybindings::key};
     use crate::sandbox::{
@@ -2550,8 +2557,9 @@ pub(crate) mod tests {
     };
     use caudra_config::sandbox::persistence::SandboxStore;
     use caudra_config::sandbox::{
-        Architecture, DomainRule, Enforcement, ProviderCapabilities, RecordKind, ResourceRange,
-        Revision, SandboxDraft, SandboxName, TemplateCatalog, TemplateEntry, TlsMode,
+        Architecture, DomainRule, Enforcement, LeaseSeconds, ProviderCapabilities, RecordKind,
+        ResourceRange, Revision, SandboxDraft, SandboxName, TemplateCatalog, TemplateEntry,
+        TlsMode,
     };
     use caudra_sandbox::{InstanceRecord, LifecycleAction, Ownership};
     use caudra_storage::id::CaudraId;
@@ -2604,7 +2612,8 @@ on_exit = "detach"
     const PROVIDER: &str = "local";
     const SAVED_TTL: &str = "3600";
     const NEW_TTL: &str = "7200";
-    const LEASE: &str = "Lease seconds";
+    const NO_EXPIRY_TTL: &str = "0";
+    const PROVIDER_TTL_CAP: LeaseSeconds = LeaseSeconds::new(3600);
     const NEWER_TTL: &str = "8100";
     const SECRET: &str = "never-export-this-api-token";
     const DIRECTORY_MODE: u32 = 0o700;
@@ -3096,7 +3105,10 @@ on_exit = "detach"
         press(&mut manager, KeyCode::Esc);
         let state = manager.state.as_ref().unwrap();
         assert!(state.confirmation.is_none());
-        assert_eq!(state.live_form.as_ref().unwrap().field(LEASE), NEW_TTL);
+        assert_eq!(
+            state.live_form.as_ref().unwrap().field(LEASE_FIELD),
+            NEW_TTL
+        );
         press(&mut manager, KeyCode::Esc);
         let state = manager.state.as_ref().unwrap();
         assert!(state.live_form.is_none());
@@ -3111,7 +3123,7 @@ on_exit = "detach"
         manager.open(conversation, SandboxView::Instances);
         press(&mut manager, KeyCode::Char('e'));
         let form = manager.state.as_ref().unwrap().live_form.as_ref().unwrap();
-        assert_eq!(form.field(LEASE), NEW_TTL);
+        assert_eq!(form.field(LEASE_FIELD), NEW_TTL);
         assert_eq!(form.origin, None);
         press(&mut manager, KeyCode::Esc);
         assert_eq!(manager.state.as_ref().unwrap().instance_action, None);
@@ -3124,7 +3136,7 @@ on_exit = "detach"
                 .live_form
                 .as_ref()
                 .unwrap()
-                .field(LEASE),
+                .field(LEASE_FIELD),
             NEW_TTL
         );
         press(&mut manager, KeyCode::F(6));
@@ -3141,7 +3153,7 @@ on_exit = "detach"
                 .live_form
                 .as_ref()
                 .unwrap()
-                .field(LEASE),
+                .field(LEASE_FIELD),
             SAVED_TTL
         );
         assert!(!manager.pending());
@@ -4238,6 +4250,35 @@ on_exit = "detach"
                 );
             }
         }
+    }
+
+    #[test_case(PROVIDER_TTL_CAP, Some(UNCAPPED_LEASE_HINT); "capped_provider")]
+    #[test_case(LeaseSeconds::NO_EXPIRY, None; "uncapped_provider")]
+    fn profile_with_no_expiry_needs_an_uncapped_provider(cap: LeaseSeconds, hint: Option<&str>) {
+        let (_directory, _store, mut manager) = fixture();
+        edit(&mut manager, "running_ttl_seconds", NO_EXPIRY_TTL);
+        install_catalog(&mut manager);
+        let state = manager.state.as_mut().unwrap();
+        let snapshot = state.snapshot.as_mut().unwrap();
+        snapshot
+            .providers
+            .values_mut()
+            .next()
+            .unwrap()
+            .capabilities
+            .max_ttl_seconds = cap;
+        let action = manager.handle_key(key::SAVE.to_key_event());
+        let Some(hint) = hint else {
+            effect(action);
+            return;
+        };
+        let refusal = format!("Profile dev: provider TTL maximum is {cap}{hint}");
+        assert!(matches!(action, SandboxAction::None));
+        let state = manager.state.as_ref().unwrap();
+        assert_eq!(state.status, refusal);
+        let form = state.form.as_ref().unwrap();
+        assert_eq!(form.fields[form.focus].key, "running_ttl_seconds");
+        assert_eq!(form.fields[form.focus].error, Some(refusal));
     }
 
     #[test_case("provider"; "provider_reference")]

@@ -17,7 +17,7 @@ Caudra pins the published Workcell commit `3194bbb3c974b99cfbe147554a60f4ba3805f
 
 Use compatible Caudra, e2b-libvirt and in-guest Workcell builds. Image manifests require `protocolVersion = "2026-07-28"`, `transferProtocol = "workcell-reviewed-v1"`, `remoteWorkspace = true` and `reviewedTransfer = true`. Caudra also validates workspace identity and the [required live capabilities](/docs/remote-workspaces/#prepare-the-server), including durable snapshots, reviewed publication and the complete operation lifecycle, before attachment. Doctor reads provider metadata but does not boot-test an image.
 
-Current persisted shapes are sandbox configuration and instance-store version `1`, remote workspace binding version `2`, remote operation journal version `5`, and transfer journal/archive version `2`. Lifecycle intents require explicit postcondition fields, including the requested policy and revision or minimum lease deadline for the relevant action. Directory recovery metadata is required. Incompatible configuration, remote bindings, journal versions and incomplete intents fail without migration or rewriting their state. Inspect unresolved effects with the originating build before adopting a current workspace. Existing local embedded sessions still load, including sessions without a stored workspace binding.
+Current persisted shapes are sandbox configuration and instance-store version `1`, remote workspace binding version `2`, remote operation journal version `5`, and transfer journal/archive version `2`. Lifecycle intents require explicit postcondition fields for their action: the requested policy and revision, or the requested lease with a minimum deadline when that lease is finite. Directory recovery metadata is required. Incompatible configuration, remote bindings, journal versions and incomplete intents fail without migration or rewriting their state. Inspect unresolved effects with the originating build before adopting a current workspace. Existing local embedded sessions still load, including sessions without a stored workspace binding.
 
 ## Configure and connect
 
@@ -107,13 +107,13 @@ The implemented schema is in `caudra-config/src/sandbox.rs`: `SandboxProvider`, 
 | Record | Rules and defaults |
 |--------|--------------------|
 | Provider | `kind` is `e2b-libvirt`. Both endpoints are origins, without paths, credentials, query or fragment. HTTPS is accepted, or HTTP on a numeric loopback address. `http://localhost` is rejected. `credential_ref` is a lifecycle `sandbox-api:NAME` reference, not a Workcell `credential:NAME` reference. |
-| Profile | Provider, template ID, resources, cwd, network, transfer and positive running TTL are required. `persistent` defaults to `true`. `on_exit` defaults to `detach`, the only supported value. `cwd` is Workcell-root-relative, with `.` selecting the root. |
+| Profile | Provider, template ID, resources, cwd, network, transfer and running TTL are required. A running TTL of `0` has [no expiry](#leases-with-no-expiry). `persistent` defaults to `true`. `on_exit` defaults to `detach`, the only supported value. `cwd` is Workcell-root-relative, with `.` selecting the root. |
 | Network | `enforcement` is required and is `required` or `off`. TLS defaults to `sni-only`, and lists default to empty. Required enforcement with empty lists is deny-all. `off` must have empty lists and cannot select MITM. |
 | Transfer | Defaults are `respect_gitignore = true`, `initial_seed = "ask"`, and `delete_extraneous = false`. `initial_seed = "none"` disables the initial-seed offer, not later explicit transfers. `delete_extraneous = true` is rejected. |
 
 Omitting `exclude` keeps the built-in profile defaults: `**/.git/**`, `**/.env*`, `**/target/**`, `**/node_modules/**`, `**/.venv/**`, `**/.ssh/**`, `**/.aws/**`, `**/.caudra/**`, `**/*.pem`, and `**/*.key`. Supplying an array replaces those defaults. Exclusions are relative globs without traversal, negation or absolute paths. Independent protected-path checks remain in force even with `exclude = []` or gitignore handling disabled.
 
-CPU count, memory MiB, disk GiB and TTL must fit discovered provider limits and template minimums. Unsupported architecture, topology, TLS or persistence is refused before creation. Disk size is virtual capacity, not a reservation of host space or a promise to resize the guest filesystem. Save can validate configuration offline, but launch compatibility remains unverified until discovery succeeds.
+CPU count, memory MiB, disk GiB and TTL must fit discovered provider limits and template minimums. A TTL of `0` fits only a provider without a lease cap. Unsupported architecture, topology, TLS or persistence is refused before creation. Disk size is virtual capacity, not a reservation of host space or a promise to resize the guest filesystem. Save can validate configuration offline, but launch compatibility remains unverified until discovery succeeds.
 
 ### Saved defaults versus effective state
 
@@ -258,7 +258,7 @@ caudra sandbox resume dev --lease-seconds 3600
 caudra sandbox detach dev
 ```
 
-`list` shows saved records. `list --provider local` reads owner-scoped live instances. `inspect` has the alias `reconcile` and queries recorded operations rather than replaying them. Extend cannot shorten a lease. Pause requires an owned persistent instance. Pause and Resume preserve its filesystem, but Resume cold-boots and does not restore processes or RAM. Exiting Caudra detaches without pausing or deleting the VM. The explicit `detach` command marks the local record detached and leaves the VM and disk alone.
+`list` shows saved records. `list --provider local` reads owner-scoped live instances. `inspect` has the alias `reconcile` and queries recorded operations rather than replaying them. `--lease-seconds 0` asks for a lease with no expiry. Extend cannot shorten a lease. Pause requires an owned persistent instance. Pause and Resume preserve its filesystem, but Resume cold-boots and does not restore processes or RAM. Exiting Caudra detaches without pausing or deleting the VM. The explicit `detach` command marks the local record detached and leaves the VM and disk alone.
 
 Destructive and recovery actions have separate commands:
 
@@ -286,6 +286,16 @@ Expiry stops a persistent VM even if the guest cannot flush, records an unclean 
 A running command does not extend the lease. A shell call can run for up to six hours, so extend the lease before a long job starts. Expiry stops the VM and the command with it.
 
 The daemon retains create-operation history while the instance record exists and for 24 hours after removal or a failure before insertion. Its 4096-entry operation journal refuses new work rather than evicting history early. Unknown/pruned history returns `history_unavailable` with an unknown outcome. Database loss, rollback or clock problems require operator recovery, not blind retries.
+
+### Leases with no expiry
+
+A lease of `0` has no expiry. The VM keeps running, and keeps using host CPU, memory and disk, until it is paused or deleted. That includes the time after Caudra exits. Instance details show its lease deadline as `none (runs until paused or deleted)`.
+
+The operator opts in by starting the daemon with `E2B_LOCAL_MAX_TIMEOUT=0`, which removes the lease cap. Discovery then reports `maxLeaseSeconds` as `0`. A daemon with a cap refuses a lease of `0`, and Caudra checks the cap before it sends anything. Persistent and non-persistent instances follow the same rule.
+
+Extend never shortens a lease. Extending to `0` removes the expiry of a running instance. Caudra refuses a finite Extend on an instance that has no expiry, before any request. To give a persistent instance a finite lease again, Pause and then Resume with the lease you want, or use Restart from the manager. A non-persistent instance cannot pause, so it runs until you delete it.
+
+The E2B-compatible API stays finite. Its timeouts must be positive, and it lists an instance with no expiry with `endAt` set to `9999-12-31T23:59:59Z`. An E2B set-timeout call replaces that lease with the finite timeout it gives.
 
 ## Operator constraints
 

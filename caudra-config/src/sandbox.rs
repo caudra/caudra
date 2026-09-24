@@ -6,7 +6,8 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::num::NonZeroU32;
+use std::num::{NonZeroU32, ParseIntError};
+use std::str::FromStr;
 use thiserror::Error;
 use url::Url;
 
@@ -27,6 +28,10 @@ const MAX_FILTER_BYTES: usize = 512;
 const MAX_ROOT_BYTES: usize = 4096;
 const SHA256_PREFIX: &str = "sha256:";
 const SHA256_HEX_BYTES: usize = 64;
+const NO_EXPIRY: &str = "no expiry";
+const TTL_CAPABILITY: &str = "running TTL";
+const NO_EXPIRY_CAPABILITY: &str =
+    "running TTL of 0 (no expiry) needs a provider started with E2B_LOCAL_MAX_TIMEOUT=0";
 const DEFAULT_EXCLUDES: &[&str] = &[
     "**/.git/**",
     "**/.env*",
@@ -432,6 +437,54 @@ pub enum OnExit {
     Detach,
 }
 
+/// A running lease in seconds. Zero never expires: the instance runs until it is paused or
+/// deleted, which a provider admits only once its operator has removed the lease cap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct LeaseSeconds(u32);
+
+impl LeaseSeconds {
+    pub const NO_EXPIRY: Self = Self(0);
+
+    pub const fn new(seconds: u32) -> Self {
+        Self(seconds)
+    }
+
+    pub const fn get(self) -> u32 {
+        self.0
+    }
+
+    pub fn finite(self) -> Option<NonZeroU32> {
+        NonZeroU32::new(self.0)
+    }
+
+    /// Whether a provider capping leases at `cap` admits this one. A zero cap is no cap.
+    pub fn within(self, cap: Self) -> bool {
+        match (self.finite(), cap.finite()) {
+            (_, None) => true,
+            (Some(lease), Some(cap)) => lease <= cap,
+            (None, Some(_)) => false,
+        }
+    }
+}
+
+impl fmt::Display for LeaseSeconds {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.finite() {
+            Some(seconds) => write!(formatter, "{seconds} seconds"),
+            None => formatter.write_str(NO_EXPIRY),
+        }
+    }
+}
+
+impl FromStr for LeaseSeconds {
+    type Err = ParseIntError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        value.parse().map(Self)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SandboxProfile {
@@ -445,7 +498,7 @@ pub struct SandboxProfile {
     pub transfer: SandboxName,
     #[serde(default = "persistent_default")]
     pub persistent: bool,
-    pub running_ttl_seconds: NonZeroU32,
+    pub running_ttl_seconds: LeaseSeconds,
     #[serde(default)]
     pub on_exit: OnExit,
 }
@@ -965,7 +1018,8 @@ pub struct ProviderCapabilities {
     pub disk_gib: ResourceRange,
     pub disk_growth: bool,
     pub persistent: bool,
-    pub max_ttl_seconds: NonZeroU32,
+    /// Zero is no cap: the provider admits any lease, including one with no expiry.
+    pub max_ttl_seconds: LeaseSeconds,
     pub network_modes: Vec<Enforcement>,
     pub tls_modes: Vec<TlsMode>,
 }
@@ -1013,8 +1067,14 @@ impl ProviderCapabilities {
         if profile.persistent && !self.persistent {
             return Err(SandboxError::Capability("persistent disks"));
         }
-        if profile.running_ttl_seconds > self.max_ttl_seconds {
-            return Err(SandboxError::Capability("running TTL"));
+        if !profile.running_ttl_seconds.within(self.max_ttl_seconds) {
+            return Err(SandboxError::Capability(
+                if profile.running_ttl_seconds == LeaseSeconds::NO_EXPIRY {
+                    NO_EXPIRY_CAPABILITY
+                } else {
+                    TTL_CAPABILITY
+                },
+            ));
         }
         if self.network_modes.len() > 2
             || self.tls_modes.len() > 2
@@ -1058,11 +1118,12 @@ impl ResolvedLaunch {
 #[cfg(test)]
 mod tests {
     use super::{
-        Architecture, CidrRule, DomainRule, Enforcement, InitialSeed, MAX_NETWORK_RULES,
-        MAX_SANDBOX_FILE_BYTES, MAX_SANDBOX_NAME_BYTES, MAX_SANDBOX_RECORDS, MAX_TRANSFER_EXCLUDES,
-        NetworkPolicy, OnExit, ProviderCapabilities, RecordKind, ResourceRange, Revision,
-        SandboxDraft, SandboxError, SandboxName, SandboxOrigin, SandboxRecord, SavedSandboxes,
-        TemplateCatalog, TemplateEntry, TlsMode, TransferPolicy,
+        Architecture, CidrRule, DomainRule, Enforcement, InitialSeed, LeaseSeconds,
+        MAX_NETWORK_RULES, MAX_SANDBOX_FILE_BYTES, MAX_SANDBOX_NAME_BYTES, MAX_SANDBOX_RECORDS,
+        MAX_TRANSFER_EXCLUDES, NO_EXPIRY_CAPABILITY, NetworkPolicy, OnExit, ProviderCapabilities,
+        RecordKind, ResourceRange, Revision, SandboxDraft, SandboxError, SandboxName,
+        SandboxOrigin, SandboxRecord, SavedSandboxes, TTL_CAPABILITY, TemplateCatalog,
+        TemplateEntry, TlsMode, TransferPolicy,
     };
     use std::num::NonZeroU32;
     use test_case::test_case;
@@ -1108,7 +1169,6 @@ running_ttl_seconds = 3600
     const NETWORK_CAPABILITY: &str = "network enforcement/topology";
     const TLS_CAPABILITY: &str = "TLS mode or guest CA";
     const DISK_GROWTH_CAPABILITY: &str = "disk growth";
-    const TTL_CAPABILITY: &str = "running TTL";
     const PERSISTENT_CAPABILITY: &str = "persistent disks";
     const ARCHITECTURE_CAPABILITY: &str = "template architecture";
     const WORKCELL_CAPABILITY: &str = "template Workcell compatibility";
@@ -1119,6 +1179,9 @@ running_ttl_seconds = 3600
         "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const REIMPORTED_REVISION: &str =
         "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const TTL_LINE: &str = "running_ttl_seconds = 3600";
+    const NO_EXPIRY_TTL_LINE: &str = "running_ttl_seconds = 0";
+    const PROVIDER_TTL_CAP: u32 = 7200;
 
     pub(super) fn name(value: &str) -> SandboxName {
         SandboxName::parse(value).unwrap()
@@ -1194,7 +1257,7 @@ running_ttl_seconds = 3600
             },
             disk_growth: true,
             persistent: true,
-            max_ttl_seconds: positive(7200),
+            max_ttl_seconds: LeaseSeconds::new(PROVIDER_TTL_CAP),
             network_modes: vec![Enforcement::Required],
             tls_modes: vec![TlsMode::SniOnly, TlsMode::Mitm],
         }
@@ -1320,7 +1383,7 @@ running_ttl_seconds = 3600
     #[test_case("cpus = 4", "cpus = 0"; "zero_cpu")]
     #[test_case("memory_mib = 4096", "memory_mib = -1"; "negative_memory")]
     #[test_case("disk_gib = 20", "disk_gib = 0"; "zero_disk")]
-    #[test_case("running_ttl_seconds = 3600", "running_ttl_seconds = 0"; "zero_ttl")]
+    #[test_case("running_ttl_seconds = 3600", "running_ttl_seconds = -1"; "negative_ttl")]
     #[test_case("running_ttl_seconds = 3600", ""; "missing_ttl")]
     #[test_case("enforcement = \"required\"", ""; "explicit_enforcement")]
     #[test_case("cwd = \".\"", "cwd = '../escape'"; "cwd_escape")]
@@ -1567,7 +1630,7 @@ running_ttl_seconds = 3600
     #[test_case(|caps| caps.disk_gib.max = positive(8), DISK_CAPABILITY; "disk")]
     #[test_case(|caps| caps.disk_growth = false, DISK_GROWTH_CAPABILITY; "unsupported_growth")]
     #[test_case(|caps| caps.persistent = false, PERSISTENT_CAPABILITY; "persistent")]
-    #[test_case(|caps| caps.max_ttl_seconds = positive(60), TTL_CAPABILITY; "ttl")]
+    #[test_case(|caps| caps.max_ttl_seconds = LeaseSeconds::new(60), TTL_CAPABILITY; "ttl")]
     #[test_case(|caps| caps.network_modes = vec![Enforcement::Off], NETWORK_CAPABILITY; "no_enforcement")]
     #[test_case(|caps| caps.tls_modes.clear(), TLS_CAPABILITY; "no_tls")]
     #[test_case(|caps| caps.architecture = Architecture::Aarch64, ARCHITECTURE_CAPABILITY; "architecture")]
@@ -1577,6 +1640,38 @@ running_ttl_seconds = 3600
         assert_eq!(
             saved().resolve_launch(&name(PROFILE), &capabilities, &catalog()),
             Err(SandboxError::Capability(reason))
+        );
+    }
+
+    #[test_case(3600, 0, true; "finite_uncapped")]
+    #[test_case(0, 0, true; "no_expiry_uncapped")]
+    #[test_case(3600, 3600, true; "finite_at_cap")]
+    #[test_case(3601, 3600, false; "finite_over_cap")]
+    #[test_case(0, 3600, false; "no_expiry_capped")]
+    fn lease_fits_the_provider_cap(lease: u32, cap: u32, admitted: bool) {
+        assert_eq!(
+            LeaseSeconds::new(lease).within(LeaseSeconds::new(cap)),
+            admitted
+        );
+    }
+
+    #[test_case(PROVIDER_TTL_CAP, Err(SandboxError::Capability(NO_EXPIRY_CAPABILITY)); "capped_provider")]
+    #[test_case(0, Ok(LeaseSeconds::NO_EXPIRY); "uncapped_provider")]
+    fn no_expiry_profile_needs_an_uncapped_provider(
+        cap: u32,
+        expected: Result<LeaseSeconds, SandboxError>,
+    ) {
+        let saved = SavedSandboxes::new(
+            SandboxDraft::import(&SAMPLE.replace(TTL_LINE, NO_EXPIRY_TTL_LINE)).unwrap(),
+        )
+        .unwrap();
+        let mut capabilities = capabilities();
+        capabilities.max_ttl_seconds = LeaseSeconds::new(cap);
+        assert_eq!(
+            saved
+                .resolve_launch(&name(PROFILE), &capabilities, &catalog())
+                .map(|launch| launch.configuration().profile.value().running_ttl_seconds),
+            expected
         );
     }
 
