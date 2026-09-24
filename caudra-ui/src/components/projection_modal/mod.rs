@@ -21,7 +21,7 @@ use self::projection::GUTTER;
 use self::wire::Wire;
 use crate::agent::BtwPrompt;
 use crate::components::document_view::{
-    COPIED_SELECTION, COPY_HINT, COPY_LABEL, DocumentView, Jump, body_width,
+    COPIED_SELECTION, COPY_HINT, COPY_LABEL, DocumentMouse, DocumentView, Jump, body_width,
 };
 use crate::components::keybindings::key;
 use crate::components::modal::{CLOSE_HINT, ESC_LABEL, FooterHits, FooterLine, SEPARATOR};
@@ -247,8 +247,10 @@ impl ProjectionModal {
     }
 
     pub fn handle_mouse(&mut self, event: MouseEvent) -> ProjectionAction {
-        if self.document.handle_mouse(event) {
-            return ProjectionAction::Consumed;
+        match self.document.handle_mouse(event) {
+            DocumentMouse::Consumed => return ProjectionAction::Consumed,
+            DocumentMouse::Copy(text) => return copy_swept(text),
+            DocumentMouse::Passthrough => {}
         }
         let control = self
             .footer
@@ -297,12 +299,7 @@ impl ProjectionModal {
     }
 
     fn copy_selection(&self) -> Option<ProjectionAction> {
-        self.document
-            .selected_text()
-            .map(|text| ProjectionAction::Copy {
-                text,
-                label: COPIED_SELECTION,
-            })
+        self.document.selected_text().map(copy_swept)
     }
 
     pub fn view(&mut self, frame: &mut Frame, area: Rect) -> Rect {
@@ -348,6 +345,15 @@ impl Overlay for ProjectionModal {
 
     fn close(&mut self) {
         self.close();
+    }
+}
+
+/// Hands over the text a sweep covers, under the label every sweep copies
+/// with, whether a key asked or the pointer let go.
+fn copy_swept(text: String) -> ProjectionAction {
+    ProjectionAction::Copy {
+        text,
+        label: COPIED_SELECTION,
     }
 }
 
@@ -453,6 +459,10 @@ mod tests {
     const COPY_IS_SOURCE: &str = "y with nothing swept must hand over the source of the view";
     const BARS_MISSING: &str = "the sections must wear their bars";
     const GUTTER_COPIED: &str = "the gutter must never be copied";
+    const SWEEP_NOT_COPIED: &str = "letting go of a sweep must copy it";
+    /// Where a sweep from the body's first cell ends: a few characters into
+    /// its third row, so it runs across the system prompt's header.
+    const SWEEP_END: (u16, u16) = (3, 2);
     const TITLE_WRONG: &str = "the title must name the model and count the messages";
     const WIRE_TITLE_WRONG: &str = "the Wire view must be titled by the request line";
     const CREDENTIALS_SHOWN: &str = "the title must never show a URL's credentials";
@@ -663,6 +673,22 @@ mod tests {
         modal.handle_mouse(press(MouseEventKind::Up(MouseButton::Left)))
     }
 
+    /// Drags the pointer across the body between two positions counted from
+    /// its first cell and lets go. Answers with what the release asked of the
+    /// host.
+    fn sweep(modal: &mut ProjectionModal, from: (u16, u16), to: (u16, u16)) -> ProjectionAction {
+        let content = modal.document.content();
+        let at = |kind, (column, row): (u16, u16)| MouseEvent {
+            kind,
+            column: content.x + column,
+            row: content.y + row,
+            modifiers: KeyModifiers::NONE,
+        };
+        modal.handle_mouse(at(MouseEventKind::Down(MouseButton::Left), from));
+        modal.handle_mouse(at(MouseEventKind::Drag(MouseButton::Left), to));
+        modal.handle_mouse(at(MouseEventKind::Up(MouseButton::Left), to))
+    }
+
     /// What a provider that never describes its body answers a dry run with.
     fn refusal() -> String {
         let model = Model::from_spec(MODEL).unwrap();
@@ -742,6 +768,20 @@ mod tests {
         modal.handle_key(key::SELECT_ALL.to_key_event());
 
         let (text, label) = copied(&mut modal);
+
+        assert_eq!(label, COPIED_SELECTION);
+        assert!(text.starts_with(SYSTEM_HEADER), "{GUTTER_COPIED}: {text:?}");
+        assert!(!text.contains(BAR), "{GUTTER_COPIED}");
+    }
+
+    #[test]
+    fn a_released_sweep_copies_its_rows_and_none_of_the_gutter() {
+        let mut modal = opened();
+        render(&mut modal, TALL_HEIGHT);
+
+        let ProjectionAction::Copy { text, label } = sweep(&mut modal, (0, 0), SWEEP_END) else {
+            panic!("{SWEEP_NOT_COPIED}");
+        };
 
         assert_eq!(label, COPIED_SELECTION);
         assert!(text.starts_with(SYSTEM_HEADER), "{GUTTER_COPIED}: {text:?}");

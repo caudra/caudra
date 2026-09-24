@@ -229,7 +229,7 @@ The live request, `/context`, and `/btw` all use this projection. `/context` cou
 
 The Projection view lays the request out in sections. `SYSTEM` holds the system prompt and `TOOLS` names the tools offered. Each message follows as `#1 USER`, `#2 ASSISTANT`, and so on, with its text as written and its markdown syntax visible. Labels mark each `thinking`, `redacted thinking`, `tool_use`, `tool_result`, and `image` block, and an image shows its media type and size in place of the pixels. Dim tags on a message header, such as `synthetic` or `compaction summary`, record what Caudra knows about the message and never sends.
 
-`n` and `p` jump to the next and previous section. Drag to select a passage, or press `Ctrl+A` to select the whole view. With a selection standing, `y` and `Ctrl+C` copy it. With nothing selected, `y` copies the whole view as unwrapped text without the bars in the margin, and `Ctrl+C` closes the modal.
+`n` and `p` jump to the next and previous section. Drag to select a passage, and releasing the mouse button copies it. Press `Ctrl+A` to select the whole view. With a selection standing, `y` and `Ctrl+C` copy it. With nothing selected, `y` copies the whole view as unwrapped text without the bars in the margin, and `Ctrl+C` closes the modal.
 
 Press `r` for the Wire view, the JSON body the active provider would send for the same messages, and `r` again to go back. The title shows the method and URL. Headers are left out, and credentials travel only in headers, so no key or token appears. Caudra builds the body with the same code as the real request, using only the credentials and caches it already holds. When those are not enough yet, the view says why: Copilot, for example, learns its API endpoint from the first message you send.
 

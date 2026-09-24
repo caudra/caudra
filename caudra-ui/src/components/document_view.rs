@@ -164,6 +164,16 @@ pub(crate) enum Jump {
     Previous,
 }
 
+/// What the pointer did to the document. `Passthrough` leaves the event to
+/// the owner, such as its footer.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum DocumentMouse {
+    Consumed,
+    /// A sweep was let go over this text.
+    Copy(String),
+    Passthrough,
+}
+
 /// One painted document and everything that moves through it. `K` is what the
 /// paint depends on, such as the view, the wrap width and the theme generation:
 /// the rows are repainted only when it changes.
@@ -172,6 +182,9 @@ pub(crate) struct DocumentView<K> {
     painted: Painted,
     gutter: u16,
     selection: Option<Selection>,
+    /// Between a press on the body and its release, which is the sweep's to
+    /// copy rather than the owner's to read as a click.
+    dragging: bool,
     scroll: ModalScroll,
     scrollbar: Scrollbar,
     pan_bar: Scrollbar,
@@ -188,6 +201,7 @@ impl<K> Default for DocumentView<K> {
             painted: Painted::default(),
             gutter: 0,
             selection: None,
+            dragging: false,
             scroll: ModalScroll::new_top(),
             scrollbar: Scrollbar::default(),
             pan_bar: Scrollbar::horizontal(),
@@ -222,6 +236,7 @@ impl<K: PartialEq> DocumentView<K> {
         self.key = None;
         self.painted = Painted::default();
         self.selection = None;
+        self.dragging = false;
         self.scroll.reset();
     }
 
@@ -255,44 +270,60 @@ impl<K: PartialEq> DocumentView<K> {
         }
     }
 
-    /// Claims a press on a bar or a sweep over the body. Anything else goes
-    /// back to the owner unclaimed and leaves a sweep standing, so a reader can
-    /// mark a passage and then reach for a copy control without losing it.
-    pub(crate) fn handle_mouse(&mut self, event: MouseEvent) -> bool {
+    /// Claims a press on a bar, and a sweep over the body from its press to its
+    /// release. Letting go hands over what the sweep covered, since the modal
+    /// holds the pointer and the terminal can no longer copy it for the reader.
+    /// Anything else goes back to the owner unclaimed and leaves a sweep
+    /// standing, so a reader can mark a passage and then reach for a control
+    /// without losing it.
+    pub(crate) fn handle_mouse(&mut self, event: MouseEvent) -> DocumentMouse {
+        // Wherever it lands, a press ends the sweep before it, whose release
+        // may have gone to another overlay. A step arrow's release falls
+        // through the bar and must not read as that sweep's.
+        if event.kind == MouseEventKind::Down(MouseButton::Left) {
+            self.dragging = false;
+        }
         match self.scrollbar.handle(&event) {
             ScrollbarMouse::Ignored => {}
-            ScrollbarMouse::Consumed => return true,
+            ScrollbarMouse::Consumed => return DocumentMouse::Consumed,
             ScrollbarMouse::ScrollTo(top) => {
                 self.scroll.scroll_to(top as u16);
-                return true;
+                return DocumentMouse::Consumed;
             }
         }
         match self.pan_bar.handle(&event) {
             ScrollbarMouse::Ignored => {}
-            ScrollbarMouse::Consumed => return true,
+            ScrollbarMouse::Consumed => return DocumentMouse::Consumed,
             ScrollbarMouse::ScrollTo(column) => {
                 self.scroll.pan_to(column as u16);
-                return true;
+                return DocumentMouse::Consumed;
             }
         }
         match event.kind {
             MouseEventKind::Down(MouseButton::Left) => {
                 if let Some(at) = self.position_at(&event) {
                     self.selection = Some(Selection::at(at));
-                    return true;
+                    self.dragging = true;
+                    return DocumentMouse::Consumed;
                 }
             }
-            MouseEventKind::Drag(MouseButton::Left) => {
+            MouseEventKind::Drag(MouseButton::Left) if self.dragging => {
                 if let Some(at) = self.position_at(&event)
                     && let Some(selection) = &mut self.selection
                 {
                     selection.cursor = at;
-                    return true;
                 }
+                return DocumentMouse::Consumed;
+            }
+            MouseEventKind::Up(MouseButton::Left) if self.dragging => {
+                self.dragging = false;
+                return self
+                    .selected_text()
+                    .map_or(DocumentMouse::Consumed, DocumentMouse::Copy);
             }
             _ => {}
         }
-        false
+        DocumentMouse::Passthrough
     }
 
     /// What the sweep covers, taken from the painted rows rather than from
@@ -493,8 +524,17 @@ mod tests {
     const SECTIONS: [usize; 3] = [3, 10, 20];
     const CAP: usize = 5;
     const CAPPED_FROM: usize = 10;
+    const PRESS: MouseEventKind = MouseEventKind::Down(MouseButton::Left);
+    const DRAG: MouseEventKind = MouseEventKind::Drag(MouseButton::Left);
+    const RELEASE: MouseEventKind = MouseEventKind::Up(MouseButton::Left);
+    /// What a sweep over [`ROWS`] from `(0, 0)` to `(4, 2)` covers.
+    const SWEPT: &str = "alpha\n\nbrav";
+    /// Past the body's last column and row, counted from its first cell.
+    const OFF_THE_BODY: (u16, u16) = (WIDTH, HEIGHT);
     const SELECTION_WRONG: &str = "a sweep must copy the rows it was drawn over";
-    const GUTTER_SELECTED: &str = "a press on the gutter must never start a sweep";
+    const SWEEP_DROPPED: &str = "letting go must leave the sweep standing";
+    const CLICK_COPIED: &str = "a click that swept nothing must copy nothing";
+    const GUTTER_TAKEN: &str = "a click on the gutter must be left to the owner";
     const GUTTER_MOVED: &str = "the gutter must stay put while the body pans";
     const REPAINT_WRONG: &str = "rows must be repainted only for a new key";
     const JUMP_WRONG: &str = "a jump must bring the section's first row to the top";
@@ -543,29 +583,52 @@ mod tests {
         }
     }
 
-    /// Presses at one body position and drags to another, both counted from
-    /// the body's first cell.
-    fn sweep(view: &mut DocumentView<u8>, from: (u16, u16), to: (u16, u16)) {
+    /// Sends `kind` at a position counted from the body's first cell.
+    fn pointer(
+        view: &mut DocumentView<u8>,
+        kind: MouseEventKind,
+        (column, row): (u16, u16),
+    ) -> DocumentMouse {
         let content = view.content;
-        for (kind, (column, row)) in [
-            (MouseEventKind::Down(MouseButton::Left), from),
-            (MouseEventKind::Drag(MouseButton::Left), to),
-        ] {
-            view.handle_mouse(mouse(kind, content.x + column, content.y + row));
-        }
+        view.handle_mouse(mouse(kind, content.x + column, content.y + row))
     }
 
-    #[test_case((0, 0), (4, 2) ; "forwards")]
-    #[test_case((4, 2), (0, 0) ; "backwards")]
-    fn a_sweep_copies_the_rows_it_covers(from: (u16, u16), to: (u16, u16)) {
+    /// Presses at one body position and drags to another, still holding on.
+    fn sweep(view: &mut DocumentView<u8>, from: (u16, u16), to: (u16, u16)) {
+        pointer(view, PRESS, from);
+        pointer(view, DRAG, to);
+    }
+
+    #[test_case((0, 0), (4, 2), (4, 2)       ; "forwards")]
+    #[test_case((4, 2), (0, 0), (0, 0)       ; "backwards")]
+    #[test_case((0, 0), (4, 2), OFF_THE_BODY ; "let_go_off_the_body")]
+    fn a_sweep_copies_the_rows_it_covers(from: (u16, u16), to: (u16, u16), released: (u16, u16)) {
         let mut view = opened(sample());
         draw(&mut view);
         sweep(&mut view, from, to);
 
         assert_eq!(
-            view.selected_text().as_deref(),
-            Some("alpha\n\nbrav"),
+            pointer(&mut view, RELEASE, released),
+            DocumentMouse::Copy(SWEPT.to_owned()),
             "{SELECTION_WRONG}"
+        );
+        assert_eq!(
+            view.selected_text().as_deref(),
+            Some(SWEPT),
+            "{SWEEP_DROPPED}"
+        );
+    }
+
+    #[test]
+    fn a_bare_click_copies_nothing() {
+        let mut view = opened(sample());
+        draw(&mut view);
+        pointer(&mut view, PRESS, (1, 0));
+
+        assert_eq!(
+            pointer(&mut view, RELEASE, (1, 0)),
+            DocumentMouse::Consumed,
+            "{CLICK_COPIED}"
         );
     }
 
@@ -581,20 +644,28 @@ mod tests {
         );
     }
 
+    /// The sweep's own release never arrived, as when another overlay took the
+    /// pointer mid-drag. The click after it is still the owner's, and neither
+    /// half of it touches the sweep.
     #[test]
-    fn a_press_on_the_gutter_is_left_to_the_owner() {
+    fn a_click_on_the_gutter_is_left_to_the_owner() {
         let mut view = opened(sample());
         draw(&mut view);
+        sweep(&mut view, (0, 0), (4, 2));
         let content = view.content;
 
-        let claimed = view.handle_mouse(mouse(
-            MouseEventKind::Down(MouseButton::Left),
-            content.x - 1,
-            content.y,
-        ));
-
-        assert!(!claimed, "{GUTTER_SELECTED}");
-        assert!(view.selection.is_none(), "{GUTTER_SELECTED}");
+        for kind in [PRESS, RELEASE] {
+            assert_eq!(
+                view.handle_mouse(mouse(kind, content.x - 1, content.y)),
+                DocumentMouse::Passthrough,
+                "{GUTTER_TAKEN}"
+            );
+        }
+        assert_eq!(
+            view.selected_text().as_deref(),
+            Some(SWEPT),
+            "{SWEEP_DROPPED}"
+        );
     }
 
     #[test]

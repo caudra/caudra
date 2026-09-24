@@ -16,7 +16,8 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 
 use crate::components::document_view::{
-    COPIED_SELECTION, COPY_HINT, COPY_LABEL, DocumentView, Painted, UNBOUND_HINT, body_width,
+    COPIED_SELECTION, COPY_HINT, COPY_LABEL, DocumentMouse, DocumentView, Painted, UNBOUND_HINT,
+    body_width,
 };
 use crate::components::keybindings::key;
 use crate::components::modal::{CLOSE_HINT, ESC_LABEL, FooterHits, FooterLine, SEPARATOR};
@@ -136,8 +137,10 @@ impl SystemPromptModal {
     }
 
     pub fn handle_mouse(&mut self, event: MouseEvent) -> SystemPromptAction {
-        if self.document.handle_mouse(event) {
-            return SystemPromptAction::Consumed;
+        match self.document.handle_mouse(event) {
+            DocumentMouse::Consumed => return SystemPromptAction::Consumed,
+            DocumentMouse::Copy(text) => return copy_swept(text),
+            DocumentMouse::Passthrough => {}
         }
         match self.footer.handle_mouse(event) {
             Some(RAW_TARGET) => self.toggle_raw(),
@@ -161,12 +164,7 @@ impl SystemPromptModal {
     }
 
     fn copy_selection(&self) -> Option<SystemPromptAction> {
-        self.document
-            .selected_text()
-            .map(|text| SystemPromptAction::Copy {
-                text,
-                label: COPIED_SELECTION,
-            })
+        self.document.selected_text().map(copy_swept)
     }
 
     /// Neither offset nor sweep survives the switch: the two views agree on the
@@ -209,6 +207,15 @@ impl Overlay for SystemPromptModal {
 
     fn close(&mut self) {
         self.close();
+    }
+}
+
+/// Hands over the text a sweep covers, under the label every sweep copies
+/// with, whether a key asked or the pointer let go.
+fn copy_swept(text: String) -> SystemPromptAction {
+    SystemPromptAction::Copy {
+        text,
+        label: COPIED_SELECTION,
     }
 }
 
@@ -396,6 +403,7 @@ mod tests {
     const FILLER_LINES: usize = 60;
     const COPY_IS_SOURCE: &str = "copy must hand over the source, never the painted rows";
     const SELECTION_WRONG: &str = "a sweep must copy the rows it was drawn over";
+    const FOOTER_UNHEARD: &str = "a click on the footer must reach it while a sweep stands";
     const NOT_SCROLLED: &str = "the fixture must start a line down a prompt longer than the body";
     const CHORD_TAKEN: &str = "Ctrl+Y must scroll a line up, never copy";
 
@@ -605,8 +613,13 @@ mod tests {
     }
 
     /// Drags the pointer from the first character of one body row to a column
-    /// partway along a later one, the way a reader marks a passage.
-    fn sweep(modal: &mut SystemPromptModal, from: (u16, u16), to: (u16, u16)) {
+    /// partway along a later one and lets go, the way a reader marks a
+    /// passage. Answers with what the release asked of the host.
+    fn sweep(
+        modal: &mut SystemPromptModal,
+        from: (u16, u16),
+        to: (u16, u16),
+    ) -> SystemPromptAction {
         let content = modal.document.content();
         let at = |(column, row): (u16, u16)| Rect {
             x: content.x.saturating_add(column),
@@ -616,7 +629,7 @@ mod tests {
         };
         modal.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), at(from)));
         modal.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), at(to)));
-        modal.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), at(to)));
+        modal.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), at(to)))
     }
 
     #[test]
@@ -626,10 +639,7 @@ mod tests {
         render(&mut modal);
 
         // The fixture's rows 0 to 2 are the heading, a blank, and the body.
-        sweep(&mut modal, (0, 0), (4, 2));
-
-        let SystemPromptAction::Copy { text, label } = modal.handle_key(key_ev(KeyCode::Char('y')))
-        else {
+        let SystemPromptAction::Copy { text, label } = sweep(&mut modal, (0, 0), (4, 2)) else {
             panic!("{SELECTION_WRONG}");
         };
         assert_eq!(
@@ -688,6 +698,19 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// Only a release that ends a press on the body hands the sweep over. A
+    /// click's release is the footer's, or closing would copy instead.
+    #[test]
+    fn a_footer_click_with_a_sweep_standing_reaches_the_footer() {
+        let mut modal = opened();
+        render(&mut modal);
+        sweep(&mut modal, (0, 0), (3, 0));
+
+        click(&mut modal, CLOSE_TARGET);
+
+        assert!(!modal.is_open(), "{FOOTER_UNHEARD}");
     }
 
     #[test]

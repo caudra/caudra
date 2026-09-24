@@ -134,7 +134,7 @@ caudra --system-prompt-profile review prompt system
 
 Inside the TUI, run `/system-prompt` to read the prompt the current session is sending. The modal shows the text the agent bound, so it matches what the provider received rather than a fresh assembly of it. Press `r` to swap between rendered markdown and the source, `y` to copy, and `p` to open the profile picker.
 
-Drag the pointer to select a passage, or press `Ctrl+A` to select everything. With a selection standing, `y` and `Ctrl+C` copy it and the line numbers stay out of the clipboard. With nothing selected, `y` copies the whole prompt source and `Ctrl+C` closes the modal.
+Drag the pointer to select a passage, and releasing the mouse button copies it without the line numbers. Press `Ctrl+A` to select everything. With a selection standing, `y` and `Ctrl+C` copy it the same way. With nothing selected, `y` copies the whole prompt source and `Ctrl+C` closes the modal.
 
 Line numbers count source lines in both views. A rendered row is numbered by the line it draws from, so a heading row and the code inside a fence point at the text you would find at that line in the profile file. A line too long for the modal is folded across several rows and numbered once, at its head.
 
