@@ -29,7 +29,7 @@ pub(super) const TOOLS_HEADER: &str = "TOOLS";
 pub(super) const USER_HEADER: &str = "USER";
 const ASSISTANT_HEADER: &str = "ASSISTANT";
 pub(super) const TOOL_NAME_KEY: &str = "name";
-const TOOL_NAME_GAP: &str = ", ";
+pub(super) const TOOL_DESCRIPTION_KEY: &str = "description";
 const OBSERVATION_TAG: &str = "observation";
 const MENTION_TAG: &str = "mention";
 const SYNTHETIC_TAG: &str = "synthetic";
@@ -114,14 +114,14 @@ impl<'a> Document<'a> {
         );
         self.markdown(&prompt.system, theme.assistant);
 
-        let names = tool_names(&prompt.tools);
+        let tools = prompt.tools.as_array().map_or(&[][..], Vec::as_slice);
         let header = Span::styled(TOOLS_HEADER, heading(theme.tool));
-        self.section(tagged(header, [names.len()], theme.tool_dim), theme.tool);
-        if !names.is_empty() {
-            self.push(Line::from(Span::styled(
-                names.join(TOOL_NAME_GAP),
-                theme.assistant,
-            )));
+        self.section(tagged(header, [tools.len()], theme.tool_dim), theme.tool);
+        for (index, tool) in tools.iter().enumerate() {
+            if index > 0 {
+                self.push(Line::default());
+            }
+            self.tool(tool);
         }
 
         for (index, message) in projection.messages.iter().enumerate() {
@@ -129,6 +129,29 @@ impl<'a> Document<'a> {
         }
         if projection.running_calls > 0 {
             self.notice(running_notice(projection.running_calls));
+        }
+    }
+
+    /// A tool as the request declares it: its name, its description as the
+    /// markdown it is written in, and every other field, such as its input
+    /// schema, as JSON under the field's name.
+    fn tool(&mut self, tool: &Value) {
+        let theme = self.theme;
+        let text = |key: &str| tool.get(key).and_then(Value::as_str);
+        if let Some(name) = text(TOOL_NAME_KEY) {
+            self.push(Line::from(Span::styled(name.to_owned(), theme.tool)));
+        }
+        if let Some(description) = text(TOOL_DESCRIPTION_KEY).filter(|text| !text.is_empty()) {
+            self.markdown(description, theme.assistant);
+        }
+        let fields = tool
+            .as_object()
+            .into_iter()
+            .flatten()
+            .filter(|(key, _)| !matches!(key.as_str(), TOOL_NAME_KEY | TOOL_DESCRIPTION_KEY));
+        for (key, value) in fields {
+            self.push(Line::from(Span::styled(key.clone(), theme.tool_dim)));
+            self.json(value);
         }
     }
 
@@ -338,15 +361,6 @@ fn is_present(value: Option<&str>) -> bool {
     value.is_some_and(|value| !value.is_empty())
 }
 
-fn tool_names(tools: &Value) -> Vec<&str> {
-    tools
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|tool| tool.get(TOOL_NAME_KEY)?.as_str())
-        .collect()
-}
-
 /// The bytes a base64 payload decodes to, counted from its digits alone.
 fn decoded_len(base64: &str) -> u64 {
     let digits = base64.trim_end_matches(BASE64_PAD).len() as u64;
@@ -387,7 +401,9 @@ pub(super) fn displayable(mut line: Line<'static>) -> Line<'static> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::components::projection_modal::tests::{SYSTEM, TOOLS, projection};
+    use crate::components::projection_modal::tests::{
+        PARAMETER, SCHEMA_KEY, SYSTEM, TOOL_DESCRIPTION, TOOLS, projection, tool_schema,
+    };
     use crate::theme;
     use caudra_providers::{ImageMediaType, ImageSource, ResponsesReasoning};
     use serde_json::json;
@@ -424,6 +440,8 @@ mod tests {
     const NOT_VERBATIM: &str = "thinking must be shown as written, coloured as markdown source";
     const NOT_PLAIN: &str = "a tool result is data and must not be read as markdown";
     const NOT_COLOURED: &str = "a tool input must be coloured as JSON";
+    const TOOL_INCOMPLETE: &str =
+        "a tool must be declared whole: its name, its description and each other field";
     const NOT_ESCAPED: &str = "a control character must never reach the terminal";
     const COPY_ALTERED: &str = "a copy must hand over the text as it was written";
     const NOTICE_WRONG: &str = "running calls are announced once, after the last message";
@@ -634,6 +652,76 @@ mod tests {
                 .all(|span| span.style == theme.assistant),
             "{NOT_PLAIN}"
         );
+    }
+
+    /// Each tool opens on its name, then its description as the markdown
+    /// source it was written in, then every other field as JSON under the
+    /// field's name. A blank row keeps one tool off the next.
+    #[test]
+    fn every_tool_is_declared_whole_under_its_name() {
+        let theme = theme::current();
+        let (painted, source) = paint_request(Vec::new(), 0, WIDE);
+        let rows = texts(painted.lines());
+        let schema = serde_json::to_string_pretty(&tool_schema()).unwrap();
+        let tools: Vec<Vec<&str>> = TOOLS
+            .iter()
+            .map(|&name| {
+                [name]
+                    .into_iter()
+                    .chain(TOOL_DESCRIPTION.split('\n'))
+                    .chain([SCHEMA_KEY])
+                    .chain(schema.split('\n'))
+                    .collect()
+            })
+            .collect();
+        let declared = tools.join(&"");
+        let header = format!("{TOOLS_HEADER}{SEPARATOR}{}", TOOLS.len());
+        let first = rows
+            .iter()
+            .position(|row| *row == header)
+            .expect(ROW_MISSING)
+            + 1;
+
+        assert_eq!(
+            rows[first..first + declared.len()],
+            declared,
+            "{TOOL_INCOMPLETE}"
+        );
+        assert!(source.contains(&declared.join("\n")), "{COPY_ALTERED}");
+        assert_eq!(
+            row(&painted, TOOLS[0]).spans[0].style,
+            theme.tool,
+            "{TOOL_INCOMPLETE}"
+        );
+        assert_eq!(
+            span(&painted.lines()[first + 1], DELIMITER).style.fg,
+            theme.tool_dim.fg,
+            "{NOT_VERBATIM}"
+        );
+        let quoted_key = format!("\"{PARAMETER}\"");
+        let key = painted
+            .lines()
+            .iter()
+            .flat_map(|line| &line.spans)
+            .find(|span| span.content == quoted_key)
+            .expect(NOT_COLOURED);
+        assert_eq!(key.style, theme.accent, "{NOT_COLOURED}");
+    }
+
+    /// An MCP tool may declare no description, or an empty one. Neither draws
+    /// a row, and the fields beside it are still shown.
+    #[test_case(json!({ TOOL_NAME_KEY: TOOL, TOOL_DESCRIPTION_KEY: "" }), &[TOOL] ; "empty")]
+    #[test_case(
+        json!({ TOOL_NAME_KEY: TOOL, TOOL_DESCRIPTION_KEY: null, SCHEMA_KEY: {} }),
+        &[TOOL, SCHEMA_KEY, "{}"] ; "null"
+    )]
+    fn a_tool_without_a_description_draws_no_row_for_it(tool: Value, expected: &[&str]) {
+        let theme = theme::current();
+        let mut document = Document::new(&theme);
+
+        document.tool(&tool);
+
+        assert_eq!(texts(&document.lines), expected, "{TOOL_INCOMPLETE}");
     }
 
     #[test]

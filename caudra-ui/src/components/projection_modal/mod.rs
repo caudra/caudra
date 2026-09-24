@@ -410,13 +410,19 @@ mod tests {
     use serde_json::{Value, json};
     use test_case::test_case;
 
-    use super::projection::{BAR, SYSTEM_HEADER, TOOL_NAME_KEY, TOOLS_HEADER, USER_HEADER};
+    use super::projection::{
+        BAR, SYSTEM_HEADER, TOOL_DESCRIPTION_KEY, TOOL_NAME_KEY, TOOLS_HEADER, USER_HEADER,
+    };
     use super::wire::{ELIDED_OPEN, UNBUILT, UNBUILT_TITLE, WIRE_TITLE_PREFIX};
     use super::*;
     use crate::components::key as key_ev;
 
     pub(super) const SYSTEM: &str = "# Rules\n\nBe **brief**.";
     pub(super) const TOOLS: [&str; 2] = ["bash", "file_read"];
+    /// Every tool's, markdown across more than one line.
+    pub(super) const TOOL_DESCRIPTION: &str = "Runs **one** command.\n\n- `cwd` is the project";
+    pub(super) const SCHEMA_KEY: &str = "input_schema";
+    pub(super) const PARAMETER: &str = "command";
     const MODEL: &str = "anthropic/claude-sonnet-4-20250514";
     const TEXT: &str = "hello";
     const WIRE_METHOD: &str = "POST";
@@ -568,6 +574,11 @@ mod tests {
         routed(Arc::new(Unused), messages, running_calls)
     }
 
+    /// The input schema every fixture tool declares.
+    pub(super) fn tool_schema() -> Value {
+        json!({ "type": "object", "properties": { PARAMETER: { "type": "string" } } })
+    }
+
     fn routed(
         provider: Arc<dyn Provider>,
         messages: Vec<Message>,
@@ -575,7 +586,13 @@ mod tests {
     ) -> Projection {
         let tools = TOOLS
             .iter()
-            .map(|name| json!({ TOOL_NAME_KEY: name }))
+            .map(|name| {
+                json!({
+                    TOOL_NAME_KEY: name,
+                    TOOL_DESCRIPTION_KEY: TOOL_DESCRIPTION,
+                    SCHEMA_KEY: tool_schema(),
+                })
+            })
             .collect();
         Projection {
             prompt: Arc::new(BtwPrompt {
