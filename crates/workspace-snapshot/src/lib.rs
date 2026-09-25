@@ -9,6 +9,8 @@ mod manifest;
 mod restore;
 mod store;
 
+pub use capture::{SnapshotCapturePhase, SnapshotCaptureProgress, SnapshotCaptureProgressSink};
+
 use std::{
     collections::{BTreeSet, HashMap},
     fmt::Write as _,
@@ -35,18 +37,20 @@ use workcell_host_contract::{
 };
 use workcell_mcp_files::{
     RootResourceKind, SnapshotTreeError, SnapshotTreeLimit, WorkspaceSnapshotAccess,
-    root_relative_resource_id,
+    WorkspaceSnapshotScope, root_relative_resource_id,
 };
 
 use crate::{
+    capture::{CaptureProgress, capture_response, validate_limits},
     cleanup::CleanupPlan,
     manifest::{MAX_MANIFEST_BYTES, Manifest, SNAPSHOT_ID_PREFIX, StoredEntry},
     restore::{RestorePlan, StoredJournal},
-    store::{DIGEST_PREFIX, Store},
+    store::{CHECKPOINTS, DIGEST_PREFIX, Store},
 };
 
 const CHECKPOINT_VERSION: &str = "workspace-snapshot-checkpoint.v1";
 const CAPTURE_ADMISSION_TIMEOUT: Duration = Duration::from_secs(30);
+const CAPTURE_EXECUTION_BUDGET: Duration = Duration::from_secs(15 * 60);
 const MAX_PRIVATE_METADATA_BYTES: u64 = 2 * 1_024 * 1_024;
 const MAX_EXCLUSIONS: usize = 32;
 /// Room for abandoned temporaries beside every entry the quotas allow.
@@ -95,6 +99,13 @@ pub struct PreparedSnapshotRestore {
     plan: Arc<RestorePlan>,
 }
 
+pub struct PreparedSnapshotCapture {
+    manager: SnapshotManager,
+    checkpoint_id: Identifier,
+    scope: WorkspaceSnapshotScope,
+    limits: SnapshotCaptureLimits,
+}
+
 pub struct PreparedSnapshotCleanup {
     manager: SnapshotManager,
     plan: Arc<CleanupPlan>,
@@ -136,8 +147,10 @@ pub enum SnapshotError {
         limit: SnapshotLimit,
         maximum: Option<u64>,
     },
-    #[error("snapshot capture admission timed out")]
+    #[error("snapshot storage is busy")]
     Busy,
+    #[error("snapshot capture execution budget was exhausted")]
+    TimedOut,
     #[error("the workspace no longer matches what the snapshot operation expects")]
     Conflict,
     #[error("another restore awaits acknowledgement")]
@@ -146,6 +159,8 @@ pub enum SnapshotError {
     Cancelled,
     #[error("snapshot operation failed")]
     OperationFailed,
+    #[error("snapshot capture rollback could not be confirmed")]
+    RollbackFailed,
 }
 
 impl SnapshotError {
@@ -162,10 +177,12 @@ impl SnapshotError {
             Self::LimitExceeded { .. } => "limit_exceeded",
             Self::QuotaExceeded { .. } => "quota_exceeded",
             Self::Busy => "busy",
+            Self::TimedOut => "timed_out",
             Self::Conflict => "conflict",
             Self::AcknowledgementRequired => "acknowledgement_required",
             Self::Cancelled => "cancelled",
             Self::OperationFailed => "operation_failed",
+            Self::RollbackFailed => "rollback_failed",
         }
     }
 
@@ -246,6 +263,8 @@ impl SnapshotManager {
             version: ContractVersion::V1,
             methods: WorkspaceSnapshotMethods {
                 capture: true,
+                prepare_capture: true,
+                checkpoint: true,
                 inspect: true,
                 status: true,
                 prepare_restore: true,
@@ -279,13 +298,92 @@ impl SnapshotManager {
         limits: &SnapshotCaptureLimits,
         token: &CancellationToken,
     ) -> Result<SnapshotCaptureResponse, SnapshotError> {
-        let guards = self.capture_guards(token).await?;
+        validate_limits(limits)?;
+        let scope = self
+            .inner
+            .workspace
+            .snapshot_scope(scope)
+            .await
+            .map_err(|_| SnapshotError::UnsupportedFile)?;
+        let prepared = self.prepare_capture(checkpoint_id, &scope, limits)?;
+        self.execute_capture(&prepared, token, None).await
+    }
+
+    pub fn prepare_capture(
+        &self,
+        checkpoint_id: &Identifier,
+        scope: &WorkspaceSnapshotScope,
+        limits: &SnapshotCaptureLimits,
+    ) -> Result<PreparedSnapshotCapture, SnapshotError> {
+        validate_limits(limits)?;
+        Ok(PreparedSnapshotCapture {
+            manager: self.clone(),
+            checkpoint_id: checkpoint_id.clone(),
+            scope: scope.clone(),
+            limits: limits.clone(),
+        })
+    }
+
+    pub async fn execute_capture(
+        &self,
+        prepared: &PreparedSnapshotCapture,
+        token: &CancellationToken,
+        progress: Option<Arc<dyn SnapshotCaptureProgressSink>>,
+    ) -> Result<SnapshotCaptureResponse, SnapshotError> {
+        if !Arc::ptr_eq(&self.inner, &prepared.manager.inner) {
+            return Err(SnapshotError::InvalidRequest);
+        }
+        let mut progress = CaptureProgress::new(progress);
+        let cancellation = token.child_token();
+        let _cancel_on_drop = cancellation.clone().drop_guard();
+        let execution = async {
+            let guards = match self.acquire_capture_guards(&cancellation).await {
+                Ok(guards) => guards,
+                Err(error) => {
+                    progress.phase(SnapshotCapturePhase::Finished);
+                    return Err(error);
+                }
+            };
+            let checkpoint_id = prepared.checkpoint_id.as_str().to_owned();
+            let scope = prepared.scope.clone();
+            let limits = prepared.limits.clone();
+            let token = cancellation.clone();
+            self.blocking(guards, move |inner| {
+                let result = inner.capture(&checkpoint_id, &scope, &limits, &token, &mut progress);
+                progress.phase(SnapshotCapturePhase::Finished);
+                result
+            })
+            .await
+        };
+        tokio::pin!(execution);
+        tokio::select! {
+            biased;
+            result = &mut execution => result,
+            () = tokio::time::sleep(CAPTURE_EXECUTION_BUDGET) => {
+                cancellation.cancel();
+                match execution.await {
+                    Err(SnapshotError::Cancelled) => Err(SnapshotError::TimedOut),
+                    result => result,
+                }
+            }
+        }
+    }
+
+    pub async fn checkpoint(
+        &self,
+        checkpoint_id: &Identifier,
+        scope: &WorkspacePath,
+    ) -> Result<SnapshotCaptureResponse, SnapshotError> {
         let checkpoint_id = checkpoint_id.as_str().to_owned();
         let scope = scope.as_str().to_owned();
-        let limits = limits.clone();
-        let token = token.clone();
-        self.blocking(guards, move |inner| {
-            inner.capture(&checkpoint_id, &scope, &limits, &token)
+        let publication = Arc::clone(&self.inner.publication)
+            .try_lock_owned()
+            .map_err(|_| SnapshotError::Busy)?;
+        self.blocking(publication, move |inner| {
+            let manifest = inner
+                .load_checkpoint(&checkpoint_id)?
+                .ok_or(SnapshotError::NotFound)?;
+            capture_response(&manifest, &checkpoint_id, &scope, true)
         })
         .await
     }
@@ -460,6 +558,18 @@ impl SnapshotManager {
         &self,
         token: &CancellationToken,
     ) -> Result<[OwnedMutexGuard<()>; 3], SnapshotError> {
+        tokio::time::timeout(
+            CAPTURE_ADMISSION_TIMEOUT,
+            self.acquire_capture_guards(token),
+        )
+        .await
+        .map_err(|_| SnapshotError::Busy)?
+    }
+
+    async fn acquire_capture_guards(
+        &self,
+        token: &CancellationToken,
+    ) -> Result<[OwnedMutexGuard<()>; 3], SnapshotError> {
         let acquire = async {
             let capture = Arc::clone(&self.inner.capture).lock_owned().await;
             let publication = Arc::clone(&self.inner.publication).lock_owned().await;
@@ -469,9 +579,7 @@ impl SnapshotManager {
         tokio::select! {
             biased;
             () = token.cancelled() => Err(SnapshotError::Cancelled),
-            result = tokio::time::timeout(CAPTURE_ADMISSION_TIMEOUT, acquire) => {
-                result.map_err(|_| SnapshotError::Busy)
-            }
+            guards = acquire => Ok(guards),
         }
     }
 
@@ -528,7 +636,11 @@ impl SnapshotInner {
 
     fn load_checkpoint(&self, checkpoint_id: &str) -> Result<Option<Manifest>, SnapshotError> {
         match self.read_checkpoint(&self.store.checkpoint_path(checkpoint_id)) {
-            Ok(checkpoint) => self.load_manifest(&checkpoint.snapshot_id).map(Some),
+            Ok(checkpoint) => {
+                let manifest = self.load_manifest(&checkpoint.snapshot_id)?;
+                self.store.sync(CHECKPOINTS)?;
+                Ok(Some(manifest))
+            }
             Err(SnapshotError::NotFound) => Ok(None),
             Err(error) => Err(error),
         }
@@ -593,6 +705,20 @@ impl PreparedSnapshotRestore {
     #[must_use]
     pub fn unrevert_of(&self) -> Option<&str> {
         self.plan.unrevert_of.as_deref()
+    }
+}
+
+impl PreparedSnapshotCapture {
+    #[must_use]
+    pub fn retained_bytes(&self) -> usize {
+        size_of::<Self>()
+            .saturating_add(self.checkpoint_id.as_str().len())
+            .saturating_add(self.scope.retained_bytes())
+    }
+
+    #[must_use]
+    pub fn scope(&self) -> &str {
+        self.scope.path()
     }
 }
 
@@ -852,11 +978,14 @@ mod tests {
             fs::{OpenOptionsExt, PermissionsExt, symlink},
             net::UnixListener,
         },
+        sync::{atomic::Ordering, mpsc},
         task::Poll,
+        time::Instant,
     };
 
     use rustix::fs::{CWD, FileType, Mode, mknodat};
     use tempfile::TempDir;
+    use tokio::sync::Notify;
     use workcell_host_contract::{
         SnapshotChangeCounts, SnapshotChangeKind, SnapshotEntryKind, SnapshotRestoreState,
         SnapshotSkipReason, SnapshotSkipped, SnapshotSummary,
@@ -864,11 +993,33 @@ mod tests {
     use workcell_mcp_files::FileToolGroup;
 
     use super::*;
-    use crate::store::{BLOBS, CHECKPOINTS, JOURNALS, MANIFESTS};
+    use crate::{
+        capture::MAX_BLOB_BATCH_FILES,
+        store::{BLOBS, CHECKPOINTS, JOURNALS, MANIFESTS},
+    };
 
     const ROOT: &str = ".";
     const PRIVATE_DIRECTORY_MODE: u32 = 0o700;
     const PRIVATE_FILE_MODE: u32 = 0o600;
+    const BARRIER_TIMEOUT: Duration = Duration::from_secs(10);
+    const BENCHMARK_FILES: usize = 20_000;
+    const BENCHMARK_DIRECTORIES: usize = 100;
+    const BENCHMARK_FILE_BYTES: usize = 128;
+
+    struct CaptureBarrier {
+        entered: Notify,
+        release: Mutex<mpsc::Receiver<()>>,
+        phase: SnapshotCapturePhase,
+    }
+
+    impl SnapshotCaptureProgressSink for CaptureBarrier {
+        fn publish(&self, progress: SnapshotCaptureProgress) {
+            if progress.phase == self.phase {
+                self.entered.notify_one();
+                lock(&self.release).recv_timeout(BARRIER_TIMEOUT).unwrap();
+            }
+        }
+    }
 
     struct Fixture {
         workspace: TempDir,
@@ -1166,6 +1317,513 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "local 20,000-file snapshot persistence benchmark"]
+    async fn capture_persistence_benchmark() {
+        let fixture = Fixture::new().await;
+        for index in 0..BENCHMARK_FILES {
+            fixture.write(
+                &format!("dir-{}/file-{index}", index % BENCHMARK_DIRECTORIES),
+                &format!("{index:0width$}", width = BENCHMARK_FILE_BYTES),
+            );
+        }
+        let started = Instant::now();
+        let first = fixture.capture("first").await;
+        let first_elapsed = started.elapsed();
+        let started = Instant::now();
+        let unchanged = fixture.capture("unchanged").await;
+        eprintln!(
+            "files={} bytes_per_file={} first_seconds={:.3} unchanged_seconds={:.3}",
+            BENCHMARK_FILES,
+            BENCHMARK_FILE_BYTES,
+            first_elapsed.as_secs_f64(),
+            started.elapsed().as_secs_f64()
+        );
+        assert_eq!(first.snapshot_id, unchanged.snapshot_id);
+        assert_eq!(first.file_count as usize, BENCHMARK_FILES);
+        assert_eq!(
+            first.total_bytes,
+            (BENCHMARK_FILES * BENCHMARK_FILE_BYTES) as u64
+        );
+        assert_eq!(fixture.stored(BLOBS), BENCHMARK_FILES);
+    }
+
+    #[tokio::test]
+    async fn a_checkpoint_references_only_complete_durable_batches_including_the_final_partial_batch()
+     {
+        let mut fixture = Fixture::new().await;
+        for index in 0..=MAX_BLOB_BATCH_FILES {
+            fixture.write(
+                &format!("unique-{index}"),
+                &format!("{index:0width$}", width = BENCHMARK_FILE_BYTES),
+            );
+        }
+        let summary = fixture.capture("batches").await;
+        assert_eq!(summary.file_count as usize, MAX_BLOB_BATCH_FILES + 1);
+        fixture.reopen().await;
+        let manifest = fixture
+            .manager
+            .inner
+            .load_manifest(summary.snapshot_id.as_str())
+            .unwrap();
+        for entry in manifest.content.entries {
+            assert_eq!(
+                fixture
+                    .manager
+                    .inner
+                    .store
+                    .read_blob(&entry.digest, entry.size_bytes)
+                    .unwrap()
+                    .len(),
+                BENCHMARK_FILE_BYTES
+            );
+        }
+        assert_eq!(
+            fs::read_dir(fixture.manager.inner.store.directory(BLOBS))
+                .unwrap()
+                .count(),
+            MAX_BLOB_BATCH_FILES + 1
+        );
+    }
+
+    #[tokio::test]
+    async fn batch_sync_link_and_cancellation_failures_clean_new_content_without_touching_receipts()
+    {
+        for cancel in [false, true] {
+            for sync in [false, true] {
+                let fixture = Fixture::new().await;
+                fixture.write("original.txt", "original");
+                let original = fixture.capture("original").await;
+                for index in 0..MAX_BLOB_BATCH_FILES + 3 {
+                    fixture.write(&format!("new-{index}"), &index.to_string());
+                }
+                let store = &fixture.manager.inner.store;
+                let faults = &store.faults;
+                let calls = if sync {
+                    &faults.blob_sync_calls
+                } else {
+                    &faults.blob_link_calls
+                };
+                let trigger = match (cancel, sync) {
+                    (false, false) => &faults.blob_link_failure,
+                    (false, true) => &faults.blob_sync_failure,
+                    (true, false) => &faults.cancel_after_blob_link,
+                    (true, true) => &faults.cancel_after_blob_sync,
+                };
+                trigger.store(
+                    calls.load(Ordering::SeqCst) + MAX_BLOB_BATCH_FILES + 2,
+                    Ordering::SeqCst,
+                );
+                let failed = fixture
+                    .try_capture("failed-batch", ROOT, &limits())
+                    .await
+                    .unwrap_err();
+                assert_eq!(
+                    failed,
+                    if cancel {
+                        SnapshotError::Cancelled
+                    } else {
+                        SnapshotError::OperationFailed
+                    }
+                );
+                for directory in [BLOBS, MANIFESTS, CHECKPOINTS] {
+                    assert_eq!(fs::read_dir(store.directory(directory)).unwrap().count(), 1);
+                }
+                let scope = WorkspacePath::new(ROOT).unwrap();
+                assert_eq!(
+                    fixture
+                        .manager
+                        .checkpoint(&id("failed-batch"), &scope)
+                        .await
+                        .unwrap_err(),
+                    SnapshotError::NotFound
+                );
+                assert_eq!(
+                    fixture
+                        .manager
+                        .checkpoint(&id("original"), &scope)
+                        .await
+                        .unwrap()
+                        .snapshot,
+                    original
+                );
+                trigger.store(0, Ordering::SeqCst);
+                let recovered = fixture.capture("failed-batch").await;
+                assert_eq!(recovered.file_count as usize, MAX_BLOB_BATCH_FILES + 4);
+                let manifest = fixture
+                    .manager
+                    .inner
+                    .load_manifest(recovered.snapshot_id.as_str())
+                    .unwrap();
+                for entry in manifest.content.entries {
+                    store.read_blob(&entry.digest, entry.size_bytes).unwrap();
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn checkpoint_lookup_recovers_only_the_original_published_scope_after_restart() {
+        let mut fixture = Fixture::new().await;
+        fixture.write("file.txt", "original");
+        let checkpoint = id("receipt");
+        let scope = WorkspacePath::new(ROOT).unwrap();
+        assert_eq!(
+            fixture
+                .manager
+                .checkpoint(&checkpoint, &scope)
+                .await
+                .unwrap_err(),
+            SnapshotError::NotFound
+        );
+        assert_eq!(fixture.stored(CHECKPOINTS), 0);
+        let original = fixture.capture(checkpoint.as_str()).await;
+        fixture.write("file.txt", "changed after lost reply");
+        fixture.reopen().await;
+        let receipt = fixture
+            .manager
+            .checkpoint(&checkpoint, &scope)
+            .await
+            .unwrap();
+        assert_eq!(receipt.snapshot, original);
+        assert!(receipt.reused_checkpoint);
+        fixture.write("other/file.txt", "different scope");
+        let other = WorkspacePath::new("other").unwrap();
+        assert_eq!(
+            fixture
+                .manager
+                .checkpoint(&checkpoint, &other)
+                .await
+                .unwrap_err(),
+            SnapshotError::InvalidRequest
+        );
+        assert_eq!(
+            fixture
+                .try_capture(checkpoint.as_str(), "other", &limits())
+                .await
+                .unwrap_err(),
+            SnapshotError::InvalidRequest
+        );
+        assert_eq!(
+            fixture
+                .manager
+                .checkpoint(&checkpoint, &scope)
+                .await
+                .unwrap()
+                .snapshot,
+            original
+        );
+    }
+
+    #[tokio::test]
+    async fn uncertain_publication_and_failed_rollback_preserve_sources_until_receipt_sync_succeeds()
+     {
+        let mut fixture = Fixture::new().await;
+        fixture.write("file.txt", "original");
+        let original = fixture.capture("original").await;
+        fixture.write("file.txt", "interrupted");
+        let store = &fixture.manager.inner.store;
+        store.faults.checkpoint_sync.store(true, Ordering::SeqCst);
+        store.faults.checkpoint_remove.store(true, Ordering::SeqCst);
+        let failed = fixture.try_capture("interrupted", ROOT, &limits()).await;
+        for directory in [BLOBS, MANIFESTS, CHECKPOINTS] {
+            assert_eq!(fixture.stored(directory), 2);
+        }
+        assert_eq!(failed.unwrap_err(), SnapshotError::RollbackFailed);
+        let checkpoint = id("interrupted");
+        let scope = WorkspacePath::new(ROOT).unwrap();
+        let stored = fixture
+            .manager
+            .inner
+            .read_checkpoint(&store.checkpoint_path(checkpoint.as_str()))
+            .unwrap();
+        let expected = fixture
+            .manager
+            .inner
+            .load_manifest(&stored.snapshot_id)
+            .unwrap()
+            .summary(Some(checkpoint.as_str()))
+            .unwrap();
+        assert_eq!(
+            fixture
+                .manager
+                .checkpoint(&checkpoint, &scope)
+                .await
+                .unwrap_err(),
+            SnapshotError::OperationFailed
+        );
+        assert_eq!(
+            store.remove_temporaries().unwrap_err(),
+            SnapshotError::OperationFailed
+        );
+        store.faults.checkpoint_sync.store(false, Ordering::SeqCst);
+        let receipt = fixture
+            .manager
+            .checkpoint(&checkpoint, &scope)
+            .await
+            .unwrap();
+        assert_eq!(receipt.snapshot, expected);
+        fixture.reopen().await;
+        assert_eq!(
+            fixture
+                .manager
+                .checkpoint(&checkpoint, &scope)
+                .await
+                .unwrap()
+                .snapshot,
+            expected
+        );
+        assert_eq!(
+            fixture
+                .manager
+                .checkpoint(&id("original"), &scope)
+                .await
+                .unwrap()
+                .snapshot,
+            original
+        );
+    }
+
+    #[tokio::test]
+    async fn prepared_capture_refuses_replaced_directory_after_admission_but_accepts_content_changes()
+     {
+        for replace in [false, true] {
+            let fixture = Fixture::new().await;
+            fixture.write("sub/original.txt", "original");
+            let path = WorkspacePath::new("sub").unwrap();
+            let scope = fixture
+                .manager
+                .inner
+                .workspace
+                .snapshot_scope(&path)
+                .await
+                .unwrap();
+            let prepared = fixture
+                .manager
+                .prepare_capture(&id("bound"), &scope, &limits())
+                .unwrap();
+            let admission = fixture.manager.inner.publication.lock().await;
+            let token = CancellationToken::new();
+            let execution = fixture.manager.execute_capture(&prepared, &token, None);
+            tokio::pin!(execution);
+            std::future::poll_fn(|cx| {
+                assert!(execution.as_mut().poll(cx).is_pending());
+                Poll::Ready(())
+            })
+            .await;
+            if replace {
+                fs::rename(fixture.path("sub"), fixture.path("moved")).unwrap();
+            }
+            fixture.write("sub/new.txt", "new");
+            drop(admission);
+            let result = execution.await;
+            if replace {
+                assert_eq!(result.unwrap_err(), SnapshotError::Conflict);
+                assert_eq!(fixture.stored(CHECKPOINTS), 0);
+                assert_eq!(fixture.stored(BLOBS), 0);
+            } else {
+                assert_eq!(result.unwrap().snapshot.file_count, 2);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn checkpoint_reuse_refuses_lowered_limits_without_replacing_the_receipt() {
+        let fixture = Fixture::new().await;
+        fixture.write("first.txt", "original");
+        fixture.write("second.txt", "original");
+        let original = fixture.capture("limits").await;
+        for lowered in [
+            SnapshotCaptureLimits {
+                max_files: 1,
+                ..limits()
+            },
+            SnapshotCaptureLimits {
+                max_total_bytes: 1,
+                ..limits()
+            },
+            SnapshotCaptureLimits {
+                max_file_bytes: 1,
+                ..limits()
+            },
+        ] {
+            assert!(fixture.try_capture("limits", ROOT, &lowered).await.is_err());
+        }
+        assert_eq!(fixture.capture("limits").await, original);
+    }
+
+    #[tokio::test]
+    async fn dropping_the_capture_task_cancels_the_blocking_worker_even_without_its_timer() {
+        let fixture = Fixture::new().await;
+        fixture.write("file.txt", "must roll back");
+        let (release, receiver) = mpsc::channel();
+        let barrier = Arc::new(CaptureBarrier {
+            entered: Notify::new(),
+            release: Mutex::new(receiver),
+            phase: SnapshotCapturePhase::Publishing,
+        });
+        let manager = fixture.manager.clone();
+        let scope = manager
+            .inner
+            .workspace
+            .snapshot_scope(&WorkspacePath::new(ROOT).unwrap())
+            .await
+            .unwrap();
+        let prepared = manager
+            .prepare_capture(&id("dropped"), &scope, &limits())
+            .unwrap();
+        let progress = barrier.clone();
+        let task = tokio::spawn(async move {
+            manager
+                .execute_capture(&prepared, &CancellationToken::new(), Some(progress))
+                .await
+        });
+        barrier.entered.notified().await;
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert!(fixture.manager.inner.capture.try_lock().is_err());
+        release.send(()).unwrap();
+        let _settled = fixture.manager.inner.capture.lock().await;
+        for directory in [BLOBS, MANIFESTS, CHECKPOINTS] {
+            assert_eq!(fixture.stored(directory), 0);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn capture_cancellation_and_budget_wait_for_worker_rollback_before_releasing_locks() {
+        for expire in [false, true] {
+            let fixture = Fixture::new().await;
+            fixture.write("file.txt", "captured before cancellation");
+            let checkpoint = id("barrier");
+            let scope = WorkspacePath::new(ROOT).unwrap();
+            let admission = fixture.manager.inner.capture.lock().await;
+            let bound = fixture
+                .manager
+                .inner
+                .workspace
+                .snapshot_scope(&scope)
+                .await
+                .unwrap();
+            let prepared = fixture
+                .manager
+                .prepare_capture(&checkpoint, &bound, &limits())
+                .unwrap();
+            assert_eq!(fixture.stored(BLOBS), 0);
+            assert_eq!(fixture.stored(CHECKPOINTS), 0);
+            drop(admission);
+            let (release, receiver) = mpsc::channel();
+            let barrier = Arc::new(CaptureBarrier {
+                entered: Notify::new(),
+                release: Mutex::new(receiver),
+                phase: SnapshotCapturePhase::Publishing,
+            });
+            let manager = fixture.manager.clone();
+            let token = CancellationToken::new();
+            let execution_token = token.clone();
+            let progress = barrier.clone();
+            let task = tokio::spawn(async move {
+                manager
+                    .execute_capture(&prepared, &execution_token, Some(progress))
+                    .await
+            });
+            barrier.entered.notified().await;
+            assert_eq!(fixture.stored(BLOBS), 1);
+            assert_eq!(
+                fixture
+                    .manager
+                    .checkpoint(&checkpoint, &scope)
+                    .await
+                    .unwrap_err(),
+                SnapshotError::Busy
+            );
+            if expire {
+                tokio::time::advance(CAPTURE_EXECUTION_BUDGET).await;
+            } else {
+                token.cancel();
+            }
+            assert!(!task.is_finished());
+            assert!(fixture.manager.inner.capture.try_lock().is_err());
+            assert!(fixture.manager.inner.publication.try_lock().is_err());
+            let workspace = fixture.manager.inner.workspace.capture_guard();
+            tokio::pin!(workspace);
+            std::future::poll_fn(|cx| {
+                assert!(workspace.as_mut().poll(cx).is_pending());
+                Poll::Ready(())
+            })
+            .await;
+            release.send(()).unwrap();
+            assert_eq!(
+                task.await.unwrap().unwrap_err(),
+                if expire {
+                    SnapshotError::TimedOut
+                } else {
+                    SnapshotError::Cancelled
+                }
+            );
+            for directory in [BLOBS, MANIFESTS, CHECKPOINTS] {
+                assert_eq!(fixture.stored(directory), 0);
+            }
+            assert!(fixture.manager.inner.capture.try_lock().is_ok());
+            assert!(fixture.manager.inner.publication.try_lock().is_ok());
+            drop(workspace.await);
+            assert_eq!(
+                fixture
+                    .manager
+                    .checkpoint(&checkpoint, &scope)
+                    .await
+                    .unwrap_err(),
+                SnapshotError::NotFound
+            );
+            fixture.capture(checkpoint.as_str()).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn cancellation_after_durable_capture_keeps_the_successful_receipt() {
+        let fixture = Fixture::new().await;
+        fixture.write("file.txt", "published");
+        let (release, receiver) = mpsc::channel();
+        let barrier = Arc::new(CaptureBarrier {
+            entered: Notify::new(),
+            release: Mutex::new(receiver),
+            phase: SnapshotCapturePhase::Finished,
+        });
+        let manager = fixture.manager.clone();
+        let checkpoint = id("published");
+        let scope = WorkspacePath::new(ROOT).unwrap();
+        let bound = manager
+            .inner
+            .workspace
+            .snapshot_scope(&scope)
+            .await
+            .unwrap();
+        let prepared = manager
+            .prepare_capture(&checkpoint, &bound, &limits())
+            .unwrap();
+        let token = CancellationToken::new();
+        let execution_token = token.clone();
+        let progress = barrier.clone();
+        let task = tokio::spawn(async move {
+            manager
+                .execute_capture(&prepared, &execution_token, Some(progress))
+                .await
+        });
+        barrier.entered.notified().await;
+        assert_eq!(fixture.stored(CHECKPOINTS), 1);
+        token.cancel();
+        release.send(()).unwrap();
+        let result = task.await.unwrap().unwrap();
+        assert_eq!(
+            fixture
+                .manager
+                .checkpoint(&checkpoint, &scope)
+                .await
+                .unwrap()
+                .snapshot,
+            result.snapshot
+        );
+    }
+
+    #[tokio::test]
     async fn concurrent_captures_of_one_checkpoint_wait_and_reuse() {
         let fixture = Fixture::new().await;
         let checkpoint = id("concurrent");
@@ -1190,8 +1848,7 @@ mod tests {
         let (first, second) = tokio::join!(first, second);
         let (first, second) = (first.unwrap(), second.unwrap());
 
-        assert!(!first.reused_checkpoint);
-        assert!(second.reused_checkpoint);
+        assert_ne!(first.reused_checkpoint, second.reused_checkpoint);
         assert_eq!(first.snapshot.snapshot_id, second.snapshot.snapshot_id);
     }
 
@@ -1231,8 +1888,8 @@ mod tests {
                     token.cancel();
                     SnapshotError::Cancelled
                 } else {
-                    tokio::time::advance(CAPTURE_ADMISSION_TIMEOUT).await;
-                    SnapshotError::Busy
+                    tokio::time::advance(CAPTURE_EXECUTION_BUDGET).await;
+                    SnapshotError::TimedOut
                 };
 
                 assert_eq!(pending.await.unwrap_err(), expected);
@@ -1412,6 +2069,40 @@ mod tests {
         fixture.execute(&prepared).await.unwrap();
         assert_eq!(fixture.read("small"), "abc");
         assert_eq!(fixture.read("grown"), "0123456789");
+    }
+
+    #[tokio::test]
+    async fn oversized_link_targets_are_skipped_and_identical_checkpoint_retries_succeed() {
+        let fixture = Fixture::new().await;
+        symlink("abc", fixture.path("oversized-link")).unwrap();
+        symlink("a", fixture.path("bounded-link")).unwrap();
+        let limits = SnapshotCaptureLimits {
+            max_file_bytes: 1,
+            ..limits()
+        };
+        let first = fixture
+            .try_capture("link-limits", ROOT, &limits)
+            .await
+            .unwrap();
+        let retry = fixture
+            .try_capture("link-limits", ROOT, &limits)
+            .await
+            .unwrap();
+        assert!(!first.reused_checkpoint);
+        assert!(retry.reused_checkpoint);
+        assert_eq!(first.snapshot, retry.snapshot);
+        assert_eq!(first.snapshot.skipped.oversized_files, 1);
+        assert_eq!(first.snapshot.file_count, 1);
+        let entries = fixture
+            .manager
+            .inspect(&first.snapshot.snapshot_id, MAX_PAGE_SIZE, None)
+            .await
+            .unwrap()
+            .files;
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].path.as_str(), "bounded-link");
+        assert_eq!(entries[0].kind, SnapshotEntryKind::Symlink);
+        assert_eq!(entries[0].size_bytes, limits.max_file_bytes);
     }
 
     #[tokio::test]

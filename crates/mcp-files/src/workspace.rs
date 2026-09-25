@@ -1,5 +1,6 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
+    fs::Metadata,
     mem::size_of,
     path::{Path, PathBuf},
     sync::{
@@ -128,7 +129,36 @@ pub struct WorkspaceSnapshotAccess {
     pub(crate) core: Arc<FilesystemCore>,
 }
 
+#[derive(Clone, Debug)]
+pub struct WorkspaceSnapshotScope {
+    pub(crate) path: String,
+    pub(crate) revision: Revision,
+}
+
+impl WorkspaceSnapshotScope {
+    #[must_use]
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+
+    #[must_use]
+    pub fn retained_bytes(&self) -> usize {
+        size_of::<Self>() + self.path.capacity() + self.revision.as_str().len()
+    }
+}
+
 impl WorkspaceSnapshotAccess {
+    pub async fn snapshot_scope(
+        &self,
+        path: &WorkspacePath,
+    ) -> Result<WorkspaceSnapshotScope, WorkspaceError> {
+        let resolved = self.resolve(path).await?;
+        Ok(WorkspaceSnapshotScope {
+            path: path.as_str().to_owned(),
+            revision: directory_revision(&resolved).await?,
+        })
+    }
+
     #[must_use]
     pub fn root(&self) -> &Path {
         self.core.root()
@@ -1037,6 +1067,17 @@ impl FileToolGroup {
         cwd: &ResourceId,
     ) -> Result<String, WorkspaceError> {
         Ok(self.validate_directory(cwd).await?.relative_path)
+    }
+
+    pub async fn workspace_snapshot_scope(
+        &self,
+        cwd: &ResourceId,
+    ) -> Result<WorkspaceSnapshotScope, WorkspaceError> {
+        let binding = self.validate_directory(cwd).await?;
+        Ok(WorkspaceSnapshotScope {
+            path: binding.relative_path,
+            revision: binding.revision,
+        })
     }
 
     pub async fn workspace_discover_repository(
@@ -2241,10 +2282,17 @@ async fn directory_revision(path: &Path) -> Result<Revision, WorkspaceError> {
     let metadata = fs::metadata(path).await.map_err(|error| {
         FilesystemError::io_path("Cannot inspect workspace directory", path, error)
     })?;
+    directory_revision_from_metadata(path, &metadata)
+}
+
+pub(crate) fn directory_revision_from_metadata(
+    path: &Path,
+    metadata: &Metadata,
+) -> Result<Revision, WorkspaceError> {
     if !metadata.is_dir() {
         return Err(WorkspaceError::InvalidRequest);
     }
-    let identity = directory_identity(&metadata);
+    let identity = directory_identity(metadata);
     digest_parts(&[&path.to_string_lossy(), &identity])
 }
 

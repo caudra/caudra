@@ -60,7 +60,7 @@ pub use types::*;
 pub use workcell_tool_contract::{ToolAnnotations, ToolSpec};
 pub use workspace::{
     PreparedWorkspaceMutation, RootResourceKind, WorkspaceError, WorkspaceRepositoryResource,
-    WorkspaceResolvedPath, WorkspaceSnapshotAccess, WorkspaceWatchBatch, WorkspaceWatchEvent,
-    WorkspaceWatchFailure, WorkspaceWatcher, root_relative_resource_id,
+    WorkspaceResolvedPath, WorkspaceSnapshotAccess, WorkspaceSnapshotScope, WorkspaceWatchBatch,
+    WorkspaceWatchEvent, WorkspaceWatchFailure, WorkspaceWatcher, root_relative_resource_id,
     root_relative_resource_scope,
 };

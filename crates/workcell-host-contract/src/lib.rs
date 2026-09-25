@@ -33,6 +33,8 @@ pub const SCM_DIFF_METHOD: &str = "ai.workcell/scm-diff";
 pub const SCM_READ_SIDE_METHOD: &str = "ai.workcell/scm-read-side";
 pub const SCM_PREPARE_MUTATION_METHOD: &str = "ai.workcell/scm-prepare-mutation";
 pub const SNAPSHOT_CAPTURE_METHOD: &str = "ai.workcell/snapshot-capture";
+pub const SNAPSHOT_PREPARE_CAPTURE_METHOD: &str = "ai.workcell/snapshot-prepare-capture";
+pub const SNAPSHOT_CHECKPOINT_METHOD: &str = "ai.workcell/snapshot-checkpoint";
 pub const SNAPSHOT_INSPECT_METHOD: &str = "ai.workcell/snapshot-inspect";
 pub const SNAPSHOT_STATUS_METHOD: &str = "ai.workcell/snapshot-status";
 pub const SNAPSHOT_PREPARE_RESTORE_METHOD: &str = "ai.workcell/snapshot-prepare-restore";
@@ -43,6 +45,7 @@ pub const WORKSPACE_MUTATION_CONTRACT_ID: &str = "workspace.mutation.v1";
 pub const DIRECT_EXEC_CONTRACT_ID: &str = "workspace.exec.v1";
 pub const SCM_MUTATION_CONTRACT_ID: &str = "workspace.scm.mutation.v1";
 pub const SNAPSHOT_RESTORE_CONTRACT_ID: &str = "workspace.snapshot.restore.v2";
+pub const SNAPSHOT_CAPTURE_CONTRACT_ID: &str = "workcell.snapshot.capture.v1";
 pub const SNAPSHOT_UNREVERT_CONTRACT_ID: &str = "workspace.snapshot.unrevert.v2";
 pub const SNAPSHOT_CLEANUP_CONTRACT_ID: &str = "workspace.snapshot.cleanup.v2";
 pub const MAX_ARGUMENT_BYTES: usize = 1_048_576;
@@ -451,6 +454,10 @@ pub struct WorkspaceSnapshotCapability {
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct WorkspaceSnapshotMethods {
     pub capture: bool,
+    #[serde(default)]
+    pub prepare_capture: bool,
+    #[serde(default)]
+    pub checkpoint: bool,
     pub inspect: bool,
     pub status: bool,
     pub prepare_restore: bool,
@@ -940,6 +947,17 @@ pub struct SnapshotCaptureRequest {
     pub binding: WorkspaceRequestBinding,
     pub checkpoint_id: Identifier,
     pub limits: SnapshotCaptureLimits,
+}
+
+pub type SnapshotPrepareCaptureRequest = SnapshotCaptureRequest;
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct SnapshotCheckpointRequest {
+    pub version: ContractVersion,
+    #[serde(flatten)]
+    pub binding: WorkspaceRequestBinding,
+    pub checkpoint_id: Identifier,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -2663,6 +2681,38 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn capture_wire_contracts_use_the_common_preparation_and_lookup_has_no_work_inputs() {
+        assert_eq!(
+            SNAPSHOT_PREPARE_CAPTURE_METHOD,
+            "ai.workcell/snapshot-prepare-capture"
+        );
+        assert_eq!(
+            SNAPSHOT_CHECKPOINT_METHOD,
+            "ai.workcell/snapshot-checkpoint"
+        );
+        assert_eq!(SNAPSHOT_CAPTURE_CONTRACT_ID, "workcell.snapshot.capture.v1");
+        let lookup = json!({
+            "version":"v1", "host":binding(), "cwdHandle":"cwd", "checkpointId":"checkpoint"
+        });
+        let checkpoint: SnapshotCheckpointRequest = serde_json::from_value(lookup.clone()).unwrap();
+        assert_eq!(serde_json::to_value(checkpoint).unwrap(), lookup);
+        let mut capture = lookup.clone();
+        capture["limits"] = json!({"maxFiles":100,"maxFileBytes":1024,"maxTotalBytes":4096});
+        let prepared: SnapshotPrepareCaptureRequest =
+            serde_json::from_value(capture.clone()).unwrap();
+        assert_eq!(serde_json::to_value(prepared).unwrap(), capture);
+        assert!(serde_json::from_value::<SnapshotCheckpointRequest>(capture).is_err());
+        assert!(serde_json::from_value::<SnapshotPrepareCaptureRequest>(lookup).is_err());
+        let methods = json!({
+            "capture":true,"prepareCapture":true,"checkpoint":true,"inspect":true,"status":true,
+            "prepareRestore":true,"prepareUnrevert":true,"acknowledge":true,"prepareCleanup":true
+        });
+        let advertised: WorkspaceSnapshotMethods = serde_json::from_value(methods.clone()).unwrap();
+        assert!(advertised.prepare_capture && advertised.checkpoint);
+        assert_eq!(serde_json::to_value(advertised).unwrap(), methods);
+    }
 
     #[test]
     fn external_strings_and_unknown_fields_are_rejected() {

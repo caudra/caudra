@@ -229,6 +229,29 @@ that contains the workspace or is contained by it, an unsupported private entry,
 or more journals than the recovery bound. Workcell never falls back to a shared temporary path. The
 private root is operator state: do not mount it into the exposed workspace or serve it independently.
 
+Prepared capture uses the existing authenticated operation ledger and its count/byte ceilings, not a
+separate job registry. Preparation discloses scope reads and private capture-store read/write/rollback
+effects without scanning. Execute returns `running` before admission. Its cancellation token is owned
+by the operation, so a disconnected or cancelled request cannot abandon accepted capture work.
+Explicit operation cancellation and the fixed 15-minute overall host budget signal cooperative
+cancellation; neither releases locks or reports a terminal outcome while blocking work still runs.
+Rollback failure is indeterminate. Successful durable publication wins cancellation. Checkpoint lookup
+is read-only, validates the stored scope, and returns `busy` rather than reading across publication;
+`not_found` cannot prove that a missing operation did not run. Receipts remain within the existing
+durable workspace binding and storage quotas. Phase telemetry contains counters and timing only.
+
+The prepared cwd revision is checked against the scope descriptor used by traversal, not a separate
+path existence check. The host closes capture admission and cancels and drains the ledger's accepted
+captures during shutdown. HTTP cannot report graceful completion while a capture worker holds its
+execution lease. If an execution task is forcibly dropped, its worker token is cancelled even though
+its async budget timer no longer exists; blocked OS I/O remains non-preemptible.
+
+Recovery syncs blob and manifest directories before checkpoint references, including when rename left
+no temporary file. Lookup re-syncs checkpoint references before exposing completion. Rollback stops on
+an uncertain reference unlink or sync rather than deleting referents. An intact receipt whose earlier
+publication and rollback both failed can therefore be made durable by a later successful lookup sync;
+a failed sync refuses the receipt. Store layout directories are synced at open as well.
+
 Capture walks the directory named by the request's cwd handle, which must still resolve to the
 directory the host issued it for. Every name is opened beneath an already open directory with
 `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_XDEV`, so however the tree changes during a walk,
@@ -246,6 +269,18 @@ bytes are charged prospectively under one publication lock, and a failed capture
 stored. Blob names are content digests and blobs are verified when read; manifest identity is verified
 on every load. Private files use owner-only modes and same-directory create/sync/rename or
 create/link/sync publication.
+
+Capture staging is bounded to 64 temporary blob files and 4 MiB, with up to eight scoped fsync workers
+and no input-controlled concurrency. Larger files remain streamed one at a time. The batch is fully
+synced before any immutable blob name becomes visible; deferring those file syncs until after linking
+would let recovery reuse non-durable bytes and is not permitted. Temporary names are excluded from
+blob inventories and are discarded during recovery, never adopted. Staged bytes are charged before
+writing, including deduplication within the pending batch. Worker joins finish before failure cleanup
+or cancellation settlement, and the existing reference-before-referent rollback barriers still apply.
+Staging mismatch, read-error, and cancellation paths explicitly confirm temporary-file removal.
+Failed cleanup returns `rollback_failed` and stops capture without refunding its reservation; it never
+continues past an uncharged orphan or reports clean cancellation. Subsequent capture inventories
+charge surviving temporary bytes; startup recovery removes them.
 
 A restore is authorized against its prepared plan in the existing operation ledger: write and delete
 intents on the scope for the effects its complete counts include, its own journal, the journal an

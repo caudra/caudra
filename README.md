@@ -529,9 +529,40 @@ restore journals remain beneath a directory keyed by the complete durable worksp
 that private root. They never cross workspace generations and are never returned as byte payloads or
 exposed by an HTTP route.
 
-`ai.workcell/snapshot-capture` captures the directory its `cwdHandle` names, recorded as the snapshot's
-`scope`, under a client checkpoint ID that makes the call idempotent: an existing checkpoint is
-returned as it was first captured. One descriptor-relative walk that never follows a link or crosses a
+`ai.workcell/snapshot-prepare-capture` accepts `version`, the workspace binding, `checkpointId`, and
+`limits`, returning the common `PrepareResponse` with contract `workcell.snapshot.capture.v1`.
+Preparation validates bounded input and retains the cwd handle's directory identity without scanning
+or waiting for capture admission. Execution checks that identity against the opened scope descriptor
+after admission, before traversing it; replacing the directory refuses the capture, while changing its
+contents does not. Capture alone returns `running` promptly from `execute`; poll the existing operation
+`status` for its `SnapshotCaptureResponse` in `outcome.result.structuredContent`. The accepted capture
+is operation-owned: dropping or cancelling the execute request does not cancel it. Explicit operation
+`cancel` and a fixed 15-minute host budget covering queueing and work request cooperative cancellation.
+Locks and the ledger execution lease remain held until the blocking worker finishes publication or
+rollback, even past that budget if a filesystem call has not returned. A durable publication wins a
+cancellation race. Host shutdown closes capture admission, cancels accepted captures through the ledger,
+and drains their execution leases. HTTP shutdown reports completion only after workers have settled;
+forced or timed-out shutdown does not claim completion. Restore and cleanup executions still wait for
+their outcome.
+
+`snapshot-checkpoint` accepts the binding and `checkpointId` and returns the original
+`SnapshotCaptureResponse` with `reusedCheckpoint: true`, without capturing anything. It checks the
+stored scope against the requested cwd. `not_found` means no published receipt was found, not that a
+running or lost operation has settled; `busy` means publication is locked and lookup should be retried.
+A lookup syncs the checkpoint directory before returning a recovered receipt. Startup syncs store
+directories even when a crash after rename left no temporary file. Failed publication rollback keeps
+referents until reference removal is durable, so lookup may finish committing an intact receipt after
+an earlier sync/unlink failure; a continuing sync failure returns an error, not completion.
+A published checkpoint survives lost execute replies and host restarts; reconnect with a fresh cwd
+handle. Clients gate the new flow on snapshot `capture`, `prepareCapture`, and `checkpoint` methods.
+The synchronous `snapshot-capture` method remains available to existing callers.
+
+Capture records the directory its `cwdHandle` names as the snapshot's `scope`, under a client
+checkpoint ID. Reusing that ID in the same scope returns its first capture; a different scope is refused.
+Reuse also refuses a receipt exceeding the new request's file-count, total-byte, or per-file ceiling;
+it never replaces the original checkpoint. Lookup has no limits input, so clients check its summary
+against their current policy.
+One descriptor-relative walk that never follows a link or crosses a
 mount visits the scope, holding the filesystem mutation lock so Workcell's own writes cannot interleave.
 Regular files are stored by content. A symlink is stored as the link itself, its raw target as the blob,
 because following it would capture something outside the scope or capture the same file twice. The
@@ -546,8 +577,9 @@ root-relative exclusions, such as an in-workspace code-worker cache that may not
 out silently.
 
 The client lowers `maxFiles`, `maxFileBytes`, and `maxTotalBytes` per capture below the advertised
-50,000 files, 100 MiB, and 512 MiB. The per-file limit skips a file; the file-count and total-byte
-limits refuse the capture, because silently dropping files past a count would restore an arbitrary
+50,000 files, 100 MiB, and 512 MiB. The per-file limit skips oversized files and symlink targets;
+symlinks are measured by their raw target bytes, not the destination's contents. The file-count and
+total-byte limits refuse the capture, because silently dropping files past a count would restore an arbitrary
 subset. The walk also stops at 250,000 directory entries, 64 MiB of retained path bytes, or a depth of
 128, and a manifest is at most 32 MiB. Every limit and quota refusal carries `data.limit`, naming the
 limit, and `data.maximum` where it has one, so a client can say which setting to change. Immutable
@@ -556,6 +588,19 @@ publication is charged against the store quota while holding the publication loc
 removes what it stored. Manifests record, per entry, the root-relative path, kind, digest, mode, and
 size, then every pruned path with its reason. `snapshot-inspect` pages that manifest and verifies its
 identity before returning metadata. Manifests written by the previous release remain readable.
+
+New small blobs are staged in private temporary files, in batches of at most 64 files and 4 MiB.
+Staged bytes count against the storage quota and repeated digests share a single pending file. Up to
+eight scoped workers fsync the batch files; every worker finishes successfully before any immutable
+blob name in that batch is linked. Files larger than the byte cap use the existing single-file
+streaming path after draining the batch. No file contents are retained in a whole-workspace buffer.
+Blob-directory, manifest, and checkpoint durability barriers remain in place. Failure or cancellation
+joins all sync workers and removes this capture's staging and new publications, not prior receipts.
+Mismatch and read-error paths confirm temporary-file removal before returning or refunding a staging
+reservation. An unconfirmed removal stops capture with `rollback_failed`, retains its reservation, and
+cannot be reported as clean cancellation. Drop cleanup is only a fallback.
+The opt-in `capture_persistence_benchmark` test measures first and unchanged captures of 20,000 unique
+128-byte files across 100 directories.
 
 `snapshot-prepare-restore` names a target snapshot and a source snapshot the workspace is believed to
 match. The restore touches only paths whose entries differ between the two and that both captures
@@ -591,10 +636,12 @@ checkpoint, awaiting restore, or pending preparation still names. Authorization 
 delete intent bound to that plan's digest. Execution refuses unless the store would still plan exactly
 that, removes references before referents, then deletes blobs no remaining manifest names.
 
-Preparations, terminal outcomes, and ordered shell progress are held in a bounded in-process ledger.
+Preparations, terminal outcomes, shell progress, and capture phase/counter progress are held in a
+bounded in-process ledger. Capture progress is emitted at phase transitions and at most once per second
+within a phase, with elapsed time, entry/file counts, and bytes, never paths or contents.
 Status therefore reports an instance mismatch as `indeterminate`, and a released, expired, or evicted
 record as `forgotten` while its bounded tombstone remains. Restarting the process intentionally loses
-the generic ledger; snapshot restore journals retain only reconciliation status and publication
+the generic ledger; published checkpoints retain capture receipts, and snapshot restore journals retain only reconciliation status and publication
 progress. Every retained outcome carries `sideEffectsPossible`; an uncertain post-start cancellation
 is retained as `indeterminate`, not as a clean cancellation. There are no user, tenant, ticket, signing,
 lease-broker, controller, or administrative APIs.

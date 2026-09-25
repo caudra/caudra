@@ -1,6 +1,6 @@
 use std::{
     net::{Ipv4Addr, SocketAddr, SocketAddrV4},
-    sync::Arc,
+    sync::{Arc, Mutex as SyncMutex},
     time::Duration,
 };
 
@@ -102,10 +102,26 @@ pub enum ShutdownOutcome {
 }
 
 struct HttpServerInner {
+    lifecycle: Arc<SyncMutex<Option<WorkcellServer>>>,
     shutdown: CancellationToken,
     task: Mutex<Option<JoinHandle<Result<(), std::io::Error>>>>,
     abort: AbortHandle,
     state_tx: watch::Sender<ServeState>,
+}
+
+impl HttpServerInner {
+    fn server(&self) -> Option<WorkcellServer> {
+        self.lifecycle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    fn cancel_captures(&self) {
+        if let Some(server) = self.server() {
+            server.cancel_captures();
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -113,6 +129,13 @@ pub struct HttpServer {
     address: SocketAddr,
     bind_mode: HttpBindMode,
     inner: Arc<HttpServerInner>,
+}
+
+impl Drop for HttpServerInner {
+    fn drop(&mut self) {
+        self.cancel_captures();
+        self.shutdown.cancel();
+    }
 }
 
 impl HttpServer {
@@ -155,6 +178,8 @@ impl HttpServer {
             .with_sse_retry(Some(SSE_RETRY))
             .with_cancellation_token(shutdown.child_token())
             .with_allowed_hosts(configuration.allowed_hosts.clone());
+        let lifecycle = Arc::new(SyncMutex::new(Some(server.clone())));
+        let task_server = server.clone();
         let service: StreamableHttpService<WorkcellServer, NeverSessionManager> =
             StreamableHttpService::new(
                 move || Ok(server.clone()),
@@ -183,10 +208,17 @@ impl HttpServer {
         let (state_tx, _state_rx) = watch::channel(ServeState::Running);
         let task_shutdown = shutdown.clone();
         let task_state = state_tx.clone();
+        let task_lifecycle = lifecycle.clone();
         let task = tokio::spawn(async move {
             let result = axum::serve(listener, router)
                 .with_graceful_shutdown(task_shutdown.cancelled_owned())
                 .await;
+            task_server.shutdown().await;
+            drop(task_server);
+            task_lifecycle
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
             task_state.send_replace(if result.is_ok() {
                 ServeState::Completed
             } else {
@@ -199,6 +231,7 @@ impl HttpServer {
             address,
             bind_mode: configuration.bind_mode,
             inner: Arc::new(HttpServerInner {
+                lifecycle,
                 shutdown,
                 task: Mutex::new(Some(task)),
                 abort,
@@ -236,6 +269,7 @@ impl HttpServer {
     }
 
     pub async fn shutdown(&self) -> ShutdownOutcome {
+        self.inner.cancel_captures();
         self.inner.shutdown.cancel();
         let task = self.inner.task.lock().await.take();
         let Some(mut task) = task else {
@@ -248,9 +282,18 @@ impl HttpServer {
                             state.changed().await.map_err(|_| ShutdownOutcome::Failed)?
                         }
                         ServeState::Failed => return Err(ShutdownOutcome::Failed),
-                        ServeState::Completed | ServeState::Forced => return Ok(()),
+                        ServeState::Completed | ServeState::Forced => break,
                     }
                 }
+                if let Some(server) = self.inner.server() {
+                    server.shutdown().await;
+                }
+                self.inner
+                    .lifecycle
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take();
+                Ok(())
             })
             .await
             {
@@ -272,6 +315,7 @@ impl HttpServer {
     }
 
     pub async fn force(&self) {
+        self.inner.cancel_captures();
         self.inner.shutdown.cancel();
         self.inner.abort.abort();
         self.inner.state_tx.send_replace(ServeState::Forced);
@@ -357,6 +401,9 @@ async fn wait_for_shutdown(service: HttpServer) -> Result<TransportOutcome, Tran
             result?;
             if shutdown == ShutdownOutcome::Failed {
                 return Err(TransportError::HttpService);
+            }
+            if shutdown == ShutdownOutcome::TimedOut {
+                return Ok(TransportOutcome::ShutdownTimedOut);
             }
             Ok(TransportOutcome::PeerClosed)
         }

@@ -3,10 +3,16 @@
 
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+#[cfg(test)]
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, AtomicUsize, Ordering},
+};
 use std::{
     fs::{self, File, Metadata, OpenOptions},
     io::{self, Read, Write},
     path::{Component, Path, PathBuf},
+    thread::{self, Builder},
 };
 
 use sha2::{Digest, Sha256};
@@ -31,6 +37,7 @@ const TEMPORARY_SUFFIX: &str = ".tmp";
 const RESTORE_ID_PREFIX: &str = "restore_";
 const MAX_RESTORE_ID_BYTES: usize = 64;
 const STREAM_BUFFER_BYTES: usize = 64 * 1_024;
+const BLOB_SYNC_WORKERS: usize = 8;
 #[cfg(unix)]
 const PRIVATE_FILE_MODE: u32 = 0o600;
 #[cfg(unix)]
@@ -40,6 +47,38 @@ const SHARED_PERMISSION_BITS: u32 = 0o077;
 
 pub(crate) struct Store {
     root: PathBuf,
+    #[cfg(test)]
+    pub(crate) faults: StoreFaults,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct StoreFaults {
+    pub checkpoint_sync: AtomicBool,
+    pub checkpoint_remove: AtomicBool,
+    pub temporary_remove: Arc<AtomicBool>,
+    pub blob_sync_failure: AtomicUsize,
+    pub blob_link_failure: AtomicUsize,
+    pub cancel_after_blob_sync: AtomicUsize,
+    pub cancel_after_blob_link: AtomicUsize,
+    pub blob_sync_calls: AtomicUsize,
+    pub blob_link_calls: AtomicUsize,
+    pub blob_io: Mutex<Vec<BlobIo>>,
+}
+
+#[cfg(test)]
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum BlobIo {
+    Staged(u64),
+    Synced,
+    Linked,
+}
+
+#[derive(Default)]
+pub(crate) struct CaptureInventory {
+    pub bytes: u64,
+    pub checkpoints: usize,
+    pub manifests: usize,
 }
 
 impl Store {
@@ -59,7 +98,13 @@ impl Store {
         for directory in DIRECTORIES {
             create_private_directory(&root.join(directory))?;
         }
-        Ok(Self { root })
+        sync_directory(&root)?;
+        sync_directory(root.parent().ok_or(SnapshotError::InvalidConfiguration)?)?;
+        Ok(Self {
+            root,
+            #[cfg(test)]
+            faults: StoreFaults::default(),
+        })
     }
 
     pub(crate) fn manifest_path(&self, snapshot_id: &str) -> Result<PathBuf, SnapshotError> {
@@ -118,40 +163,45 @@ impl Store {
         Ok(names)
     }
 
-    pub(crate) fn count(&self, directory: &str) -> Result<usize, SnapshotError> {
-        Ok(self.names(directory)?.len())
-    }
-
     /// Bytes held by every store file, temporaries included: they occupy the same disk.
     pub(crate) fn usage(&self) -> Result<u64, SnapshotError> {
-        let mut total = 0_u64;
+        Ok(self.capture_inventory(&CancellationToken::new())?.bytes)
+    }
+
+    pub(crate) fn capture_inventory(
+        &self,
+        token: &CancellationToken,
+    ) -> Result<CaptureInventory, SnapshotError> {
+        let mut inventory = CaptureInventory::default();
         for directory in DIRECTORIES {
             for entry in private_entries(&self.root.join(directory))? {
-                let (_, metadata) = entry?;
-                total = total
+                check_cancelled(token)?;
+                let (name, metadata) = entry?;
+                inventory.bytes = inventory
+                    .bytes
                     .checked_add(metadata.len())
                     .ok_or(SnapshotError::UnhealthyStorage)?;
+                if !is_temporary(&name) {
+                    inventory.checkpoints += usize::from(directory == CHECKPOINTS);
+                    inventory.manifests += usize::from(directory == MANIFESTS);
+                }
             }
         }
-        Ok(total)
+        Ok(inventory)
     }
 
     /// Removes temporaries a crash left behind. Nothing reads them, so none is ever resumed.
     pub(crate) fn remove_temporaries(&self) -> Result<(), SnapshotError> {
         for directory in DIRECTORIES {
             let path = self.root.join(directory);
-            let mut removed = false;
             for entry in private_entries(&path)? {
                 let (name, _) = entry?;
                 if is_temporary(&name) {
                     fs::remove_file(path.join(&name))
                         .map_err(|_| SnapshotError::UnhealthyStorage)?;
-                    removed = true;
                 }
             }
-            if removed {
-                sync_directory(&path)?;
-            }
+            self.sync(directory)?;
         }
         Ok(())
     }
@@ -223,11 +273,17 @@ impl Store {
         let mut temporary = Temporary::create(parent)?;
         temporary.write_all(bytes)?;
         fs::rename(&temporary.path, path).map_err(|_| SnapshotError::OperationFailed)?;
-        sync_directory(parent)
+        self.sync_path(parent)
     }
 
     /// Removes one store file; an already missing one is success. The caller syncs the directory.
     pub(crate) fn remove(&self, path: &Path) -> Result<(), SnapshotError> {
+        #[cfg(test)]
+        if path.parent() == Some(self.directory(CHECKPOINTS).as_path())
+            && self.faults.checkpoint_remove.load(Ordering::SeqCst)
+        {
+            return Err(SnapshotError::OperationFailed);
+        }
         match fs::remove_file(path) {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
@@ -236,7 +292,16 @@ impl Store {
     }
 
     pub(crate) fn sync(&self, directory: &str) -> Result<(), SnapshotError> {
-        sync_directory(&self.root.join(directory))
+        self.sync_path(&self.root.join(directory))
+    }
+
+    fn sync_path(&self, path: &Path) -> Result<(), SnapshotError> {
+        #[cfg(test)]
+        if path == self.directory(CHECKPOINTS) && self.faults.checkpoint_sync.load(Ordering::SeqCst)
+        {
+            return Err(SnapshotError::OperationFailed);
+        }
+        sync_directory(path)
     }
 
     /// Stores `size` bytes from `source` as the blob `digest`, verifying both on the way. The
@@ -248,22 +313,167 @@ impl Store {
         size: u64,
         token: &CancellationToken,
     ) -> Result<BlobWrite, SnapshotError> {
+        let Some(staged) = self.stage_blob(source, digest, size, token)? else {
+            return Ok(BlobWrite::Mismatch);
+        };
+        let published = self
+            .sync_blob(&staged, token)
+            .and_then(|synced| self.publish_blob(synced, token));
+        self.discard_staged_blob(&staged)?;
+        if published? {
+            Ok(BlobWrite::Stored)
+        } else {
+            Ok(BlobWrite::Present)
+        }
+    }
+
+    pub(crate) fn stage_blob(
+        &self,
+        source: &mut dyn Read,
+        digest: &str,
+        size: u64,
+        token: &CancellationToken,
+    ) -> Result<Option<StagedBlob>, SnapshotError> {
         let path = self.blob_path(digest)?;
         let mut temporary = Temporary::create(&self.root.join(BLOBS))?;
-        let (written_digest, written) =
-            digest_stream(source, Some(&mut temporary.file), size, token)?;
-        if written != size || written_digest != digest {
-            return Ok(BlobWrite::Mismatch);
+        #[cfg(test)]
+        {
+            temporary.remove_failure = Some(self.faults.temporary_remove.clone());
         }
-        temporary
+        match digest_stream(source, Some(&mut temporary.file), size, token) {
+            Ok((written_digest, written)) if written == size && written_digest == digest => {}
+            result => {
+                temporary.remove()?;
+                return result.map(|_| None);
+            }
+        }
+        #[cfg(test)]
+        self.faults
+            .blob_io
+            .lock()
+            .unwrap()
+            .push(BlobIo::Staged(size));
+        Ok(Some(StagedBlob {
+            path,
+            size,
+            temporary,
+        }))
+    }
+
+    pub(crate) fn sync_blob<'a>(
+        &self,
+        staged: &'a StagedBlob,
+        token: &CancellationToken,
+    ) -> Result<SyncedBlob<'a>, SnapshotError> {
+        self.sync_blob_file(staged, token)?;
+        Ok(SyncedBlob { staged })
+    }
+
+    pub(crate) fn sync_blob_batch<'a>(
+        &self,
+        staged: &'a [StagedBlob],
+        token: &CancellationToken,
+    ) -> Result<Vec<SyncedBlob<'a>>, SnapshotError> {
+        if staged.len() <= 1 {
+            return staged
+                .iter()
+                .map(|blob| self.sync_blob(blob, token))
+                .collect();
+        }
+        thread::scope(|scope| {
+            let mut workers = Vec::new();
+            let mut failure = None;
+            for chunk in staged.chunks(staged.len().div_ceil(BLOB_SYNC_WORKERS)) {
+                match Builder::new().spawn_scoped(scope, || {
+                    chunk
+                        .iter()
+                        .map(|blob| self.sync_blob(blob, token))
+                        .collect::<Result<Vec<_>, _>>()
+                }) {
+                    Ok(worker) => workers.push(worker),
+                    Err(_) => {
+                        failure = Some(SnapshotError::OperationFailed);
+                        break;
+                    }
+                }
+            }
+            let mut synced = Vec::with_capacity(staged.len());
+            for worker in workers {
+                match worker
+                    .join()
+                    .map_err(|_| SnapshotError::OperationFailed)
+                    .and_then(|result| result)
+                {
+                    Ok(mut blobs) => synced.append(&mut blobs),
+                    Err(error) => {
+                        failure.get_or_insert(error);
+                    }
+                }
+            }
+            match failure {
+                Some(error) => Err(error),
+                None => Ok(synced),
+            }
+        })
+    }
+
+    fn sync_blob_file(
+        &self,
+        staged: &StagedBlob,
+        token: &CancellationToken,
+    ) -> Result<(), SnapshotError> {
+        check_cancelled(token)?;
+        #[cfg(test)]
+        let call = self.faults.blob_sync_calls.fetch_add(1, Ordering::SeqCst) + 1;
+        #[cfg(test)]
+        if self.faults.blob_sync_failure.load(Ordering::SeqCst) == call {
+            return Err(SnapshotError::OperationFailed);
+        }
+        staged
+            .temporary
             .file
             .sync_all()
             .map_err(|_| SnapshotError::OperationFailed)?;
-        match fs::hard_link(&temporary.path, &path) {
-            Ok(()) => Ok(BlobWrite::Stored),
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(BlobWrite::Present),
+        #[cfg(test)]
+        {
+            self.faults.blob_io.lock().unwrap().push(BlobIo::Synced);
+            if self.faults.cancel_after_blob_sync.load(Ordering::SeqCst) == call {
+                token.cancel();
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn publish_blob(
+        &self,
+        synced: SyncedBlob<'_>,
+        token: &CancellationToken,
+    ) -> Result<bool, SnapshotError> {
+        check_cancelled(token)?;
+        #[cfg(test)]
+        let call = self.faults.blob_link_calls.fetch_add(1, Ordering::SeqCst) + 1;
+        #[cfg(test)]
+        if self.faults.blob_link_failure.load(Ordering::SeqCst) == call {
+            return Err(SnapshotError::OperationFailed);
+        }
+        match fs::hard_link(&synced.staged.temporary.path, &synced.staged.path) {
+            Ok(()) => {
+                #[cfg(test)]
+                {
+                    self.faults.blob_io.lock().unwrap().push(BlobIo::Linked);
+                    if self.faults.cancel_after_blob_link.load(Ordering::SeqCst) == call {
+                        token.cancel();
+                    }
+                }
+                Ok(true)
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(false),
             Err(_) => Err(SnapshotError::OperationFailed),
         }
+    }
+
+    pub(crate) fn discard_staged_blob(&self, staged: &StagedBlob) -> Result<(), SnapshotError> {
+        staged.temporary.remove()
     }
 
     /// Opens a blob for streaming. The reader fails at end of input unless it read exactly `size`
@@ -297,6 +507,16 @@ pub(crate) struct BlobReader {
     read: u64,
     size: u64,
     digest: String,
+}
+
+pub(crate) struct StagedBlob {
+    pub path: PathBuf,
+    pub size: u64,
+    temporary: Temporary,
+}
+
+pub(crate) struct SyncedBlob<'a> {
+    staged: &'a StagedBlob,
 }
 
 impl Read for BlobReader {
@@ -351,7 +571,10 @@ pub(crate) fn digest_stream(
         };
         hasher.update(&buffer[..count]);
         if let Some(sink) = sink.as_mut() {
-            sink.write_all(&buffer[..count])
+            let writable = usize::try_from(maximum.saturating_sub(total))
+                .unwrap_or(usize::MAX)
+                .min(count);
+            sink.write_all(&buffer[..writable])
                 .map_err(|_| SnapshotError::OperationFailed)?;
         }
         total = total.saturating_add(u64::try_from(count).unwrap_or(u64::MAX));
@@ -371,6 +594,8 @@ pub(crate) enum BlobWrite {
 struct Temporary {
     path: PathBuf,
     file: File,
+    #[cfg(test)]
+    remove_failure: Option<Arc<AtomicBool>>,
 }
 
 impl Temporary {
@@ -386,7 +611,12 @@ impl Temporary {
         let file = options
             .open(&path)
             .map_err(|_| SnapshotError::OperationFailed)?;
-        Ok(Self { path, file })
+        Ok(Self {
+            path,
+            file,
+            #[cfg(test)]
+            remove_failure: None,
+        })
     }
 
     fn write_all(&mut self, bytes: &[u8]) -> Result<(), SnapshotError> {
@@ -395,11 +625,27 @@ impl Temporary {
             .and_then(|()| self.file.sync_all())
             .map_err(|_| SnapshotError::OperationFailed)
     }
+
+    fn remove(&self) -> Result<(), SnapshotError> {
+        #[cfg(test)]
+        if self
+            .remove_failure
+            .as_ref()
+            .is_some_and(|failure| failure.load(Ordering::SeqCst))
+        {
+            return Err(SnapshotError::RollbackFailed);
+        }
+        match fs::remove_file(&self.path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(_) => Err(SnapshotError::RollbackFailed),
+        }
+    }
 }
 
 impl Drop for Temporary {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
+        let _ = self.remove();
     }
 }
 

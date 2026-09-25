@@ -36,7 +36,7 @@ use uuid::Uuid;
 use workcell_host_contract::MAX_SNAPSHOT_DEPTH;
 use workcell_host_contract::{SnapshotSkipReason, WorkspacePath};
 
-use crate::WorkspaceSnapshotAccess;
+use crate::{WorkspaceSnapshotAccess, WorkspaceSnapshotScope};
 #[cfg(unix)]
 use crate::{
     binary::{
@@ -45,6 +45,7 @@ use crate::{
     },
     gitignore::{IgnoreBudget, IgnoreScope, IgnoreScratch, admit_scope},
     operations::FilesystemCore,
+    workspace::directory_revision_from_metadata,
 };
 
 #[cfg(unix)]
@@ -238,8 +239,38 @@ impl WorkspaceSnapshotAccess {
         limits: SnapshotTreeLimits,
         token: CancellationToken,
     ) -> Result<SnapshotTreeWalk, SnapshotTreeError> {
-        WalkState::open(self.core.clone(), scope, exclusions, limits, token)
+        WalkState::open(self.core.clone(), scope, exclusions, limits, token, None)
             .map(|state| SnapshotTreeWalk { state })
+    }
+
+    #[cfg(unix)]
+    pub fn walk_tree_bound(
+        &self,
+        scope: &WorkspaceSnapshotScope,
+        exclusions: Vec<String>,
+        limits: SnapshotTreeLimits,
+        token: CancellationToken,
+    ) -> Result<SnapshotTreeWalk, SnapshotTreeError> {
+        WalkState::open(
+            self.core.clone(),
+            scope.path(),
+            exclusions,
+            limits,
+            token,
+            Some(scope),
+        )
+        .map(|state| SnapshotTreeWalk { state })
+    }
+
+    #[cfg(not(unix))]
+    pub fn walk_tree_bound(
+        &self,
+        _scope: &WorkspaceSnapshotScope,
+        _exclusions: Vec<String>,
+        _limits: SnapshotTreeLimits,
+        _token: CancellationToken,
+    ) -> Result<SnapshotTreeWalk, SnapshotTreeError> {
+        Err(SnapshotTreeError::Unsupported)
     }
 
     /// The entry at `path` without following it, or where an ancestor blocks reaching it.
@@ -387,6 +418,7 @@ impl WalkState {
         exclusions: Vec<String>,
         limits: SnapshotTreeLimits,
         token: CancellationToken,
+        expected: Option<&WorkspaceSnapshotScope>,
     ) -> Result<Self, SnapshotTreeError> {
         let mut directory =
             open_root(core.root()).map_err(|_| SnapshotTreeError::ScopeUnavailable)?;
@@ -432,6 +464,19 @@ impl WalkState {
             // An inner repository answers to its own rules only, as it does to git.
             if reject_repository(&directory).is_err() {
                 rules = None;
+            }
+        }
+        if let Some(expected) = expected {
+            let path = if scope == "." {
+                state.core.root().to_path_buf()
+            } else {
+                state.core.root().join(scope)
+            };
+            let metadata = directory.metadata()?;
+            let revision = directory_revision_from_metadata(&path, &metadata)
+                .map_err(|_| SnapshotTreeError::Changed)?;
+            if revision != expected.revision {
+                return Err(SnapshotTreeError::Changed);
             }
         }
         state.enter(directory, prefix, rules)?;
