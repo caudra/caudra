@@ -330,6 +330,8 @@ pub enum ScmError {
     StalePreparedOperation,
     #[error("SCM repository is unavailable")]
     RepositoryUnavailable,
+    #[error("Not a Git repository")]
+    NotRepository,
     #[error("SCM repository layout is unsupported")]
     UnsupportedRepository,
     #[error("SCM data exceeds a configured limit")]
@@ -356,6 +358,7 @@ impl ScmError {
             Self::StaleCursor => "stale_cursor",
             Self::StalePreparedOperation => "stale_prepared_operation",
             Self::RepositoryUnavailable => "repository_unavailable",
+            Self::NotRepository => "not_repository",
             Self::UnsupportedRepository => "unsupported_repository",
             Self::LimitExceeded => "limit_exceeded",
             Self::UnsupportedEncoding => "unsupported_encoding",
@@ -2311,11 +2314,13 @@ fn map_workspace_error(error: WorkspaceError) -> ScmError {
     match error {
         WorkspaceError::StaleCwd | WorkspaceError::StaleResource => ScmError::StaleRepository,
         WorkspaceError::RepositoryUnavailable => ScmError::RepositoryUnavailable,
+        WorkspaceError::NotRepository => ScmError::NotRepository,
+        WorkspaceError::FileTooLarge { .. } => ScmError::LimitExceeded,
         WorkspaceError::UnsupportedRepository => ScmError::UnsupportedRepository,
         WorkspaceError::InvalidRequest
         | WorkspaceError::InvalidCursor
         | WorkspaceError::StaleCursor
-        | WorkspaceError::WatchUnavailable
+        | WorkspaceError::WatchUnavailable { .. }
         | WorkspaceError::RolledBack(_)
         | WorkspaceError::PartialFailure(_)
         | WorkspaceError::Filesystem(_) => ScmError::InvalidRequest,
@@ -2368,6 +2373,77 @@ mod tests {
     };
 
     use super::*;
+
+    const NOT_REPOSITORY_CODE: &str = "not_repository";
+
+    #[tokio::test]
+    async fn discovery_distinguishes_absent_repositories_from_corrupt_or_missing_roots() {
+        let parent = tempfile::tempdir().unwrap();
+        init_repository(parent.path());
+        let root = parent.path().join("workspace");
+        std_fs::create_dir(&root).unwrap();
+        std_fs::create_dir(root.join("nested")).unwrap();
+        let files = FileToolGroup::new(&root, false, None).await.unwrap();
+        let cwd = files.workspace_root().await.unwrap();
+        let group = ScmGroup::new(files);
+        let request = ScmDiscoverRequest {
+            version: ContractVersion::V1,
+            binding: WorkspaceRequestBinding {
+                host: host_binding(cwd.handle.clone()),
+                cwd_handle: cwd.handle,
+            },
+            path: path("nested"),
+        };
+        let error = group
+            .discover(&request, &CancellationToken::new())
+            .await
+            .unwrap_err();
+        assert_eq!(error, ScmError::NotRepository);
+        assert_eq!(error.code(), NOT_REPOSITORY_CODE);
+        std_fs::create_dir(root.join(".git")).unwrap();
+        assert_eq!(
+            group
+                .discover(&request, &CancellationToken::new())
+                .await
+                .unwrap_err(),
+            ScmError::RepositoryUnavailable
+        );
+        std_fs::remove_dir(root.join("nested")).unwrap();
+        assert_eq!(
+            group
+                .discover(&request, &CancellationToken::new())
+                .await
+                .unwrap_err(),
+            ScmError::RepositoryUnavailable
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn inaccessible_repository_discovery_remains_a_failure_not_confirmed_absence() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let denied = root.path().join("denied");
+        std_fs::create_dir(&denied).unwrap();
+        let files = FileToolGroup::new(root.path(), false, None).await.unwrap();
+        let cwd = files.workspace_root().await.unwrap();
+        let group = ScmGroup::new(files);
+        let request = ScmDiscoverRequest {
+            version: ContractVersion::V1,
+            binding: WorkspaceRequestBinding {
+                host: host_binding(cwd.handle.clone()),
+                cwd_handle: cwd.handle,
+            },
+            path: path("denied"),
+        };
+        std_fs::set_permissions(&denied, std_fs::Permissions::from_mode(0o0)).unwrap();
+        let result = group.discover(&request, &CancellationToken::new()).await;
+        std_fs::set_permissions(&denied, std_fs::Permissions::from_mode(0o700)).unwrap();
+        if !rustix::process::geteuid().is_root() {
+            assert_eq!(result.unwrap_err(), ScmError::RepositoryUnavailable);
+        }
+    }
 
     struct Fixture {
         _root: TempDir,

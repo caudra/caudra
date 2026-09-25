@@ -70,7 +70,7 @@ pub const MAX_PAGE_SIZE: u32 = 500;
 pub const MAX_TEXT_READ_BYTES: u32 = 64 * 1_024;
 pub const MAX_WORKSPACE_LIST_ENTRIES: u32 = 50_000;
 pub const MAX_WORKSPACE_LIST_RETAINED_BYTES: u64 = 16 * 1_024 * 1_024;
-pub const MAX_WORKSPACE_LIST_HASH_BYTES: u64 = 64 * 1_024 * 1_024;
+pub const MAX_PROJECT_ASSET_DISCOVERY_HASH_BYTES: u64 = 64 * 1_024 * 1_024;
 pub const MAX_SEARCH_MATCH_TEXT_BYTES: usize = 16 * 1_024;
 pub const MAX_WATCH_SUBSCRIPTIONS: usize = 8;
 pub const MAX_WATCH_RETAINED_EVENTS: usize = 256;
@@ -566,7 +566,6 @@ pub struct WorkspaceLimits {
     pub max_cursor_bytes: u32,
     pub max_list_entries: u32,
     pub max_list_retained_bytes: u64,
-    pub max_list_hash_bytes: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1381,7 +1380,7 @@ pub enum WorkspaceEntryKind {
 pub struct WorkspaceEntry {
     pub path: WorkspacePath,
     pub resource_id: ResourceId,
-    pub revision: Revision,
+    pub revision: Option<Revision>,
     pub kind: WorkspaceEntryKind,
     pub size_bytes: Option<u64>,
 }
@@ -1413,6 +1412,7 @@ pub struct ListResponse {
     #[serde(deserialize_with = "deserialize_workspace_entries")]
     pub entries: Vec<WorkspaceEntry>,
     pub truncated: bool,
+    pub incomplete: bool,
     pub next_cursor: Option<Cursor>,
 }
 
@@ -2681,6 +2681,30 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn workspace_inventory_requires_completeness_and_carries_no_content_revision() {
+        let wire = json!({
+            "version": "v1", "revision": "inventory", "truncated": false, "incomplete": true,
+            "nextCursor": null, "entries": [{
+                "path": "large.bin", "resourceId": "resource", "revision": null,
+                "kind": "file", "sizeBytes": 7508089
+            }]
+        });
+        let response: ListResponse = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(serde_json::to_value(response).unwrap(), wire);
+        let mut missing = wire.clone();
+        missing.as_object_mut().unwrap().remove("incomplete");
+        assert!(serde_json::from_value::<ListResponse>(missing).is_err());
+        let mut stat_entry = wire["entries"][0].clone();
+        stat_entry["revision"] = json!("sha256:verified");
+        assert!(
+            serde_json::from_value::<WorkspaceEntry>(stat_entry)
+                .unwrap()
+                .revision
+                .is_some()
+        );
+    }
 
     #[test]
     fn capture_wire_contracts_use_the_common_preparation_and_lookup_has_no_work_inputs() {

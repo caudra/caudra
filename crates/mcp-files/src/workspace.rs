@@ -1,27 +1,38 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     fs::Metadata,
+    io,
     mem::size_of,
     path::{Path, PathBuf},
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, Weak,
         atomic::{AtomicU8, Ordering},
         mpsc::{Receiver, SyncSender, sync_channel},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher, event::ModifyKind};
+#[cfg(target_os = "linux")]
+use rustix::fs::{ResolveFlags, openat2};
+#[cfg(unix)]
+use rustix::{
+    fs::{Dir, Mode, OFlags, open},
+    io::Errno,
+};
 use sha2::{Digest, Sha256};
-use tokio::fs;
-use tokio::sync::{Notify, OwnedMutexGuard};
+#[cfg(unix)]
+use std::{ffi::OsStr, fs::File, os::unix::ffi::OsStrExt};
+use tokio::sync::{Notify, OwnedMutexGuard, OwnedSemaphorePermit, Semaphore};
+use tokio::task::JoinHandle;
+use tokio::{fs, io::AsyncReadExt};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use workcell_host_contract::{
     ContractVersion, Cursor, DirectoryNavigation, DiscoverProjectAssetsRequest,
     DiscoverProjectAssetsResponse, Identifier, ListRequest, ListResponse, MAX_PAGE_SIZE,
-    MAX_PROJECT_ASSET_READ_BYTES, MAX_PROJECT_ASSETS, MAX_TEXT_READ_BYTES,
-    MAX_WORKSPACE_LIST_ENTRIES, MAX_WORKSPACE_LIST_HASH_BYTES, MAX_WORKSPACE_LIST_RETAINED_BYTES,
+    MAX_PROJECT_ASSET_DISCOVERY_HASH_BYTES, MAX_PROJECT_ASSET_READ_BYTES, MAX_PROJECT_ASSETS,
+    MAX_TEXT_READ_BYTES, MAX_WORKSPACE_LIST_ENTRIES, MAX_WORKSPACE_LIST_RETAINED_BYTES,
     PROJECT_ASSET_MANIFEST_VERSION, ProjectAsset, ProjectAssetContent, ProjectAssetEncoding,
     ProjectAssetKind, ProjectAssetManifest, ProjectAssetTrust, ReadProjectAssetRequest,
     ReadProjectAssetResponse, ReadTextRequest, ReadTextResponse, ResourceId, Revision,
@@ -31,17 +42,40 @@ use workcell_host_contract::{
     WorkspacePath,
 };
 
+#[cfg(unix)]
+use crate::binary::DIRECTORY_FLAGS;
 use crate::{
     FileGrepInput, FileResource, FileResourceAccess, FileToolGroup, FilesystemError,
+    SnapshotTreeStamp,
     operations::FilesystemCore,
     text::{
-        FileVersion, check_cancelled, read_bounded, read_file_version_required,
-        read_text_snapshot_required, split_text_lines, validate_snapshot,
+        FileVersion, check_cancelled, read_file_version_required, read_text_snapshot_required,
+        split_text_lines, validate_snapshot,
     },
 };
 
 const MAX_CWD_HANDLES: usize = 256;
 const MAX_CURSORS: usize = 256;
+const LIST_REVISION_NAMESPACE: &str = "inventory:";
+const LIST_CURSOR_PREFIX: &str = "list";
+const MAX_LIST_WORKERS: usize = 4;
+const MAX_LIST_INVENTORIES: usize = 16;
+const MAX_LIST_INVENTORY_ENTRIES: usize = 200_000;
+const MAX_LIST_INVENTORY_BYTES: usize = 128 * 1_024 * 1_024;
+const LIST_INVENTORY_RESERVATION_BYTES: usize = 2 * MAX_WORKSPACE_LIST_RETAINED_BYTES as usize;
+const LIST_INVENTORY_TTL: Duration = Duration::from_secs(30);
+const LIST_CAPACITY_MESSAGE: &str =
+    "Workspace listing inventory capacity is exhausted; retry after expiry";
+const PROJECT_ASSET_HASH_BUFFER_BYTES: usize = 64 * 1_024;
+#[cfg(unix)]
+const WORKSPACE_METADATA_FLAGS: OFlags =
+    OFlags::PATH.union(OFlags::NOFOLLOW).union(OFlags::CLOEXEC);
+#[cfg(unix)]
+const LIST_SEARCH_FLAGS: OFlags = WORKSPACE_METADATA_FLAGS.union(OFlags::DIRECTORY);
+#[cfg(target_os = "linux")]
+const LIST_RESOLVE_FLAGS: ResolveFlags = ResolveFlags::BENEATH
+    .union(ResolveFlags::NO_SYMLINKS)
+    .union(ResolveFlags::NO_MAGICLINKS);
 const MAX_GIT_METADATA_ENTRIES: usize = 200_000;
 const WATCH_BACKEND_QUEUE: usize = 256;
 const MAX_WATCH_BACKEND_PATHS: usize = 16;
@@ -96,9 +130,18 @@ pub enum WorkspaceError {
     #[error("workspace resource revision is stale")]
     StaleResource,
     #[error("workspace watch backend is unavailable")]
-    WatchUnavailable,
+    WatchUnavailable {
+        phase: WorkspaceWatchPhase,
+        kind: WorkspaceWatchErrorKind,
+        io_kind: Option<io::ErrorKind>,
+        raw_os_error: Option<i32>,
+    },
+    #[error("workspace path is not in a Git repository")]
+    NotRepository,
     #[error("no supported repository is available in the workspace")]
     RepositoryUnavailable,
+    #[error("workspace file exceeds the configured content size limit of {maximum} bytes")]
+    FileTooLarge { maximum: usize },
     #[error("linked worktrees, submodules, and external git directories are unsupported")]
     UnsupportedRepository,
     #[error("workspace mutation was rolled back: {0}")]
@@ -622,14 +665,34 @@ impl WorkspaceError {
             Self::InvalidCursor => "invalid_cursor",
             Self::StaleCursor => "stale_cursor",
             Self::StaleResource => "stale_resource",
-            Self::WatchUnavailable => "watch_unavailable",
+            Self::WatchUnavailable { .. } => "watch_unavailable",
+            Self::NotRepository => "not_repository",
             Self::RepositoryUnavailable => "repository_unavailable",
+            Self::FileTooLarge { .. } => "file_too_large",
             Self::UnsupportedRepository => "unsupported_repository",
             Self::RolledBack(_) => "rolled_back",
             Self::PartialFailure(_) => "partial_failure",
             Self::Filesystem(error) => error.code(),
         }
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceWatchPhase {
+    Initialize,
+    Register,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceWatchErrorKind {
+    Generic,
+    Io,
+    PathNotFound,
+    WatchNotFound,
+    InvalidConfig,
+    MaxFilesWatch,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -650,9 +713,11 @@ pub struct WorkspaceWatchBatch {
     pub failure: Option<WorkspaceWatchFailure>,
 }
 
+#[derive(Debug)]
 struct WorkspaceListEntries {
     entries: Vec<WorkspaceEntry>,
     truncated: bool,
+    incomplete: bool,
 }
 
 enum WorkspaceWatchSignal {
@@ -809,9 +874,119 @@ impl WorkspaceWatcher {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct WorkspaceState {
     inner: Mutex<WorkspaceStateInner>,
+    list_workers: Arc<Semaphore>,
+    list_slots: Arc<Semaphore>,
+    list_entries: Arc<Semaphore>,
+    list_bytes: Arc<Semaphore>,
+}
+
+impl Default for WorkspaceState {
+    fn default() -> Self {
+        Self {
+            inner: Mutex::default(),
+            list_workers: Arc::new(Semaphore::new(MAX_LIST_WORKERS)),
+            list_slots: Arc::new(Semaphore::new(MAX_LIST_INVENTORIES)),
+            list_entries: Arc::new(Semaphore::new(MAX_LIST_INVENTORY_ENTRIES)),
+            list_bytes: Arc::new(Semaphore::new(MAX_LIST_INVENTORY_BYTES)),
+        }
+    }
+}
+
+impl WorkspaceState {
+    fn reserve_listing(&self) -> Result<ListingReservation, WorkspaceError> {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .expire_listings(Instant::now());
+        Ok(ListingReservation {
+            _slot: self
+                .list_slots
+                .clone()
+                .try_acquire_owned()
+                .map_err(|_| listing_capacity())?,
+            entries: self
+                .list_entries
+                .clone()
+                .try_acquire_many_owned(MAX_WORKSPACE_LIST_ENTRIES)
+                .map_err(|_| listing_capacity())?,
+            bytes: self
+                .list_bytes
+                .clone()
+                .try_acquire_many_owned(LIST_INVENTORY_RESERVATION_BYTES as u32)
+                .map_err(|_| listing_capacity())?,
+        })
+    }
+
+    fn listing_page(
+        &self,
+        cursor: &Cursor,
+        request_digest: &Revision,
+        scope_revision: &Revision,
+    ) -> Result<ListResponse, WorkspaceError> {
+        let mut parts = cursor.as_str().splitn(4, '_');
+        if parts.next() != Some(LIST_CURSOR_PREFIX) {
+            return Err(WorkspaceError::StaleCursor);
+        }
+        let id = parts
+            .next()
+            .and_then(|id| Uuid::parse_str(id).ok())
+            .ok_or(WorkspaceError::StaleCursor)?;
+        let offset = parts
+            .next()
+            .and_then(|offset| offset.parse::<usize>().ok())
+            .ok_or(WorkspaceError::StaleCursor)?;
+        let inventory = {
+            let mut state = self
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.expire_listings(Instant::now());
+            state
+                .listings
+                .get(&id)
+                .ok_or(WorkspaceError::StaleCursor)?
+                .inventory
+                .clone()
+        };
+        if inventory.request_digest != *request_digest
+            || offset == 0
+            || offset >= inventory.listed.entries.len()
+            || !offset.is_multiple_of(inventory.page_size)
+            || inventory.cursor(offset)? != *cursor
+        {
+            return Err(WorkspaceError::InvalidCursor);
+        }
+        if inventory.scope_revision != *scope_revision {
+            return Err(WorkspaceError::StaleCursor);
+        }
+        inventory.page(offset)
+    }
+
+    fn retain_listing(
+        self: &Arc<Self>,
+        inventory: Arc<ListingInventory>,
+    ) -> Result<(), WorkspaceError> {
+        let mut state = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.expire_listings(Instant::now());
+        if state.listings.contains_key(&inventory.id) {
+            return Err(WorkspaceError::InvalidRequest);
+        }
+        let expiry = tokio::spawn(expire_listing(
+            Arc::downgrade(self),
+            inventory.id,
+            inventory.expires_at,
+        ));
+        state
+            .listings
+            .insert(inventory.id, ListingRecord { inventory, expiry });
+        Ok(())
+    }
 }
 
 #[derive(Debug, Default)]
@@ -819,6 +994,85 @@ struct WorkspaceStateInner {
     directories: HashMap<ResourceId, DirectoryBinding>,
     cursors: HashMap<Cursor, CursorBinding>,
     cursor_order: VecDeque<Cursor>,
+    listings: HashMap<Uuid, ListingRecord>,
+}
+
+impl WorkspaceStateInner {
+    fn expire_listings(&mut self, now: Instant) {
+        self.listings
+            .retain(|_, record| record.inventory.expires_at > now);
+    }
+}
+
+#[derive(Debug)]
+struct ListingReservation {
+    _slot: OwnedSemaphorePermit,
+    entries: OwnedSemaphorePermit,
+    bytes: OwnedSemaphorePermit,
+}
+
+#[derive(Debug)]
+struct ListingInventory {
+    listed: WorkspaceListEntries,
+    id: Uuid,
+    nonce: Uuid,
+    request_digest: Revision,
+    scope_revision: Revision,
+    revision: Revision,
+    page_size: usize,
+    expires_at: Instant,
+    _reservation: ListingReservation,
+}
+
+impl ListingInventory {
+    fn cursor(&self, offset: usize) -> Result<Cursor, WorkspaceError> {
+        let proof = digest_parts(&[
+            self.nonce.as_simple().to_string().as_str(),
+            &offset.to_string(),
+        ])?;
+        Cursor::new(format!(
+            "{LIST_CURSOR_PREFIX}_{}_{offset}_{}",
+            self.id.as_simple(),
+            proof.as_str()
+        ))
+        .map_err(|_| WorkspaceError::InvalidRequest)
+    }
+
+    fn page(&self, offset: usize) -> Result<ListResponse, WorkspaceError> {
+        if self.expires_at <= Instant::now() {
+            return Err(WorkspaceError::StaleCursor);
+        }
+        let end = offset
+            .saturating_add(self.page_size)
+            .min(self.listed.entries.len());
+        Ok(ListResponse {
+            version: ContractVersion::V1,
+            revision: self.revision.clone(),
+            entries: self
+                .listed
+                .entries
+                .get(offset..end)
+                .ok_or(WorkspaceError::InvalidCursor)?
+                .to_vec(),
+            truncated: self.listed.truncated,
+            incomplete: self.listed.incomplete,
+            next_cursor: (end < self.listed.entries.len())
+                .then(|| self.cursor(end))
+                .transpose()?,
+        })
+    }
+}
+
+#[derive(Debug)]
+struct ListingRecord {
+    inventory: Arc<ListingInventory>,
+    expiry: JoinHandle<()>,
+}
+
+impl Drop for ListingRecord {
+    fn drop(&mut self) {
+        self.expiry.abort();
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -830,7 +1084,6 @@ struct DirectoryBinding {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CursorKind {
-    List,
     Search,
 }
 
@@ -1127,7 +1380,15 @@ impl FileToolGroup {
                         relative_path,
                     });
                 }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    if !fs::metadata(&current)
+                        .await
+                        .map_err(|_| WorkspaceError::RepositoryUnavailable)?
+                        .is_dir()
+                    {
+                        return Err(WorkspaceError::RepositoryUnavailable);
+                    }
+                }
                 Err(_) => return Err(WorkspaceError::RepositoryUnavailable),
             }
             if current == self.core.root() {
@@ -1139,7 +1400,7 @@ impl FileToolGroup {
                 .ok_or(WorkspaceError::RepositoryUnavailable)?
                 .to_path_buf();
         }
-        Err(WorkspaceError::RepositoryUnavailable)
+        Err(WorkspaceError::NotRepository)
     }
 
     pub async fn workspace_stat(
@@ -1161,49 +1422,28 @@ impl FileToolGroup {
         token: &CancellationToken,
     ) -> Result<ListResponse, WorkspaceError> {
         validate_page_size(request.page_size)?;
-        let (_, root, _) = self
+        check_cancelled(token)?;
+        let permit = self
+            .workspace
+            .list_workers
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| listing_capacity())?;
+        let (binding, root, _) = self
             .resolve_workspace_path(&request.binding.cwd_handle, &request.path)
             .await?;
-        if !fs::metadata(&root)
-            .await
-            .map_err(|error| {
-                FilesystemError::io_path("Cannot inspect workspace list root", &root, error)
-            })?
-            .is_dir()
-        {
-            return Err(WorkspaceError::InvalidRequest);
-        }
-        let listed = self.list_entries(&root, request.recursive, token).await?;
-        let mut entries = listed.entries;
-        entries.sort_by(|left, right| left.path.as_str().cmp(right.path.as_str()));
-        let revision = digest_serializable(&(&entries, listed.truncated))?;
-        let request_digest = digest_parts(&[
-            request.binding.cwd_handle.as_str(),
-            request.path.as_str(),
-            if request.recursive {
-                "recursive"
-            } else {
-                "direct"
-            },
-        ])?;
-        let offset = self.cursor_offset(
-            request.cursor.as_ref(),
-            CursorKind::List,
-            &request_digest,
-            &revision,
-        )?;
-        let page_size = request.page_size as usize;
-        let end = offset.saturating_add(page_size).min(entries.len());
-        let next_cursor = (end < entries.len())
-            .then(|| self.insert_cursor(CursorKind::List, request_digest, revision.clone(), end))
-            .transpose()?;
-        Ok(ListResponse {
-            version: ContractVersion::V1,
-            revision,
-            entries: entries.into_iter().skip(offset).take(page_size).collect(),
-            truncated: listed.truncated,
-            next_cursor,
+        #[cfg(test)]
+        tests::run_workspace_hook(tests::WorkspaceHookPhase::CwdResolved, &binding.path, token);
+        let group = self.clone();
+        let request = request.clone();
+        let token = token.child_token();
+        let _cancel_on_drop = token.clone().drop_guard();
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            group.workspace_list_blocking(&binding, &root, &request, &token)
         })
+        .await
+        .map_err(|_| WorkspaceError::InvalidRequest)?
     }
 
     pub async fn workspace_read_text(
@@ -1401,7 +1641,7 @@ impl FileToolGroup {
             notification.clone(),
             failure.clone(),
         ))
-        .map_err(|_| WorkspaceError::WatchUnavailable)?;
+        .map_err(|error| watch_unavailable(WorkspaceWatchPhase::Initialize, error))?;
         watcher
             .watch(
                 &scope,
@@ -1411,7 +1651,7 @@ impl FileToolGroup {
                     RecursiveMode::NonRecursive
                 },
             )
-            .map_err(|_| WorkspaceError::WatchUnavailable)?;
+            .map_err(|error| watch_unavailable(WorkspaceWatchPhase::Register, error))?;
         Ok(WorkspaceWatcher {
             _watcher: watcher,
             receiver: Mutex::new(receiver),
@@ -1430,7 +1670,13 @@ impl FileToolGroup {
         token: &CancellationToken,
     ) -> Result<DiscoverProjectAssetsResponse, WorkspaceError> {
         let directory = self.validate_directory(&request.binding.cwd_handle).await?;
-        let (mut assets, mut unreadable) = self.walk_project_assets(&directory.path, token).await?;
+        let (mut assets, mut unreadable) = self
+            .walk_project_assets(
+                &directory.path,
+                MAX_PROJECT_ASSET_DISCOVERY_HASH_BYTES,
+                token,
+            )
+            .await?;
         assets.sort_by(|left, right| left.path.as_str().cmp(right.path.as_str()));
         unreadable.sort_by(|left, right| left.as_str().cmp(right.as_str()));
         let revision = digest_serializable(&(&assets, &unreadable))?;
@@ -1452,6 +1698,7 @@ impl FileToolGroup {
     async fn walk_project_assets(
         &self,
         root: &Path,
+        maximum_hash_bytes: u64,
         token: &CancellationToken,
     ) -> Result<(Vec<ProjectAsset>, Vec<WorkspacePath>), WorkspaceError> {
         let allows_protected = self.core.policy.traversal_allows_protected(root);
@@ -1459,6 +1706,7 @@ impl FileToolGroup {
         let mut unreadable = Vec::new();
         let mut stack = vec![root.to_path_buf()];
         let mut visited = 0usize;
+        let mut remaining_hash_bytes = maximum_hash_bytes;
         while let Some(directory) = stack.pop() {
             check_cancelled(token)?;
             let listing_failed = |error| {
@@ -1527,20 +1775,27 @@ impl FileToolGroup {
                 let Some((kind, trust)) = project_asset_kind(&relative) else {
                     continue;
                 };
-                let entry = match self.workspace_entry(&path, relative.clone()).await {
-                    Ok(entry) => entry,
+                let (revision, size_bytes) = match self
+                    .read_project_asset_revision(&path, &mut remaining_hash_bytes, token)
+                    .await
+                {
+                    Ok(snapshot) => snapshot,
+                    Err(
+                        error @ (WorkspaceError::InvalidRequest
+                        | WorkspaceError::Filesystem(FilesystemError::Aborted)),
+                    ) => return Err(error),
                     Err(error) => {
                         skip_unreadable(&mut unreadable, relative, error)?;
                         continue;
                     }
                 };
                 assets.push(ProjectAsset {
-                    path: entry.path,
-                    resource_id: entry.resource_id,
-                    revision: entry.revision,
+                    path: workspace_path(relative.clone())?,
+                    resource_id: root_relative_resource_id(RootResourceKind::Path, &relative)?,
+                    revision,
                     kind,
                     trust,
-                    size_bytes: entry.size_bytes.unwrap_or(0),
+                    size_bytes,
                 });
                 if assets.len() > MAX_PROJECT_ASSETS {
                     return Err(WorkspaceError::InvalidRequest);
@@ -1549,6 +1804,62 @@ impl FileToolGroup {
             stack.extend(directories.into_iter().rev());
         }
         Ok((assets, unreadable))
+    }
+
+    async fn read_project_asset_revision(
+        &self,
+        path: &Path,
+        remaining_hash_bytes: &mut u64,
+        token: &CancellationToken,
+    ) -> Result<(Revision, u64), WorkspaceError> {
+        check_cancelled(token)?;
+        let failed = |error| FilesystemError::io("Cannot read project asset", error);
+        let before = fs::metadata(path).await.map_err(failed)?;
+        if !before.is_file() {
+            return Err(WorkspaceError::StaleResource);
+        }
+        if before.len() > self.core.limits.max_file_bytes as u64 {
+            return Err(WorkspaceError::FileTooLarge {
+                maximum: self.core.limits.max_file_bytes,
+            });
+        }
+        *remaining_hash_bytes = remaining_hash_bytes
+            .checked_sub(before.len())
+            .ok_or(WorkspaceError::InvalidRequest)?;
+        let mut options = fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        options.custom_flags((OFlags::NONBLOCK | OFlags::NOFOLLOW).bits() as i32);
+        let mut file = options.open(path).await.map_err(failed)?;
+        if SnapshotTreeStamp::of(&before)
+            != SnapshotTreeStamp::of(&file.metadata().await.map_err(failed)?)
+        {
+            return Err(WorkspaceError::StaleResource);
+        }
+        #[cfg(test)]
+        tests::run_workspace_hook(tests::WorkspaceHookPhase::BeforeRead, path, token);
+        let mut remaining = before.len();
+        let mut buffer = [0u8; PROJECT_ASSET_HASH_BUFFER_BYTES];
+        let mut digest = Sha256::new();
+        while remaining > 0 {
+            check_cancelled(token)?;
+            let capacity = remaining.min(buffer.len() as u64) as usize;
+            let count = file.read(&mut buffer[..capacity]).await.map_err(failed)?;
+            if count == 0 {
+                return Err(WorkspaceError::StaleResource);
+            }
+            remaining -= count as u64;
+            digest.update(&buffer[..count]);
+        }
+        check_cancelled(token)?;
+        if SnapshotTreeStamp::of(&before)
+            != SnapshotTreeStamp::of(&file.metadata().await.map_err(failed)?)
+        {
+            return Err(WorkspaceError::StaleResource);
+        }
+        let revision = Revision::new(encode_digest(digest.finalize()))
+            .map_err(|_| WorkspaceError::InvalidRequest)?;
+        Ok((revision, before.len()))
     }
 
     pub async fn workspace_read_project_asset(
@@ -1571,7 +1882,7 @@ impl FileToolGroup {
             .await?;
         if stat.entry.kind != WorkspaceEntryKind::File
             || stat.entry.path != request.path
-            || stat.entry.revision != request.expected_revision
+            || stat.entry.revision.as_ref() != Some(&request.expected_revision)
         {
             return Err(WorkspaceError::StaleResource);
         }
@@ -1588,7 +1899,7 @@ impl FileToolGroup {
                 token,
             )
             .await?;
-        if read.path != request.path || read.revision != stat.entry.revision {
+        if read.path != request.path || Some(&read.revision) != stat.entry.revision.as_ref() {
             return Err(WorkspaceError::StaleResource);
         }
         Ok(ReadProjectAssetResponse {
@@ -1705,6 +2016,11 @@ impl FileToolGroup {
             FilesystemError::io_path("Cannot inspect workspace path", path, error)
         })?;
         let (kind, size_bytes, revision) = if metadata.is_file() {
+            if metadata.len() > self.core.limits.max_file_bytes as u64 {
+                return Err(WorkspaceError::FileTooLarge {
+                    maximum: self.core.limits.max_file_bytes,
+                });
+            }
             (
                 WorkspaceEntryKind::File,
                 Some(metadata.len()),
@@ -1728,14 +2044,135 @@ impl FileToolGroup {
             path: WorkspacePath::new(relative.clone())
                 .map_err(|_| WorkspaceError::InvalidRequest)?,
             resource_id: root_relative_resource_id(RootResourceKind::Path, &relative)?,
-            revision,
+            revision: Some(revision),
             kind,
             size_bytes,
         })
     }
 
-    async fn list_entries(
+    #[cfg(not(unix))]
+    fn workspace_list_blocking(
         &self,
+        _binding: &DirectoryBinding,
+        _root: &Path,
+        _request: &ListRequest,
+        _token: &CancellationToken,
+    ) -> Result<ListResponse, WorkspaceError> {
+        Err(FilesystemError::message("Descriptor-relative workspace listing is unsupported").into())
+    }
+
+    #[cfg(unix)]
+    fn workspace_list_blocking(
+        &self,
+        binding: &DirectoryBinding,
+        root: &Path,
+        request: &ListRequest,
+        token: &CancellationToken,
+    ) -> Result<ListResponse, WorkspaceError> {
+        let scope = self.open_workspace_listing_scope(binding, root, token)?;
+        let metadata = scope
+            .metadata()
+            .map_err(|error| FilesystemError::io("Cannot inspect workspace list root", error))?;
+        let scope_revision = directory_revision_from_metadata(root, &metadata)?;
+        let request_digest = digest_serializable(&(
+            &request.binding.cwd_handle,
+            &binding.revision,
+            self.core.policy.relative(root)?,
+            request.recursive,
+            request.page_size,
+        ))?;
+        check_cancelled(token)?;
+        if let Some(cursor) = &request.cursor {
+            return self
+                .workspace
+                .listing_page(cursor, &request_digest, &scope_revision);
+        }
+        let mut reservation = self.workspace.reserve_listing()?;
+        let mut listed = self.list_entries_blocking(&scope, root, request.recursive, token)?;
+        listed
+            .entries
+            .sort_by(|left, right| left.path.as_str().cmp(right.path.as_str()));
+        check_cancelled(token)?;
+        let id = Uuid::new_v4();
+        let revision = Revision::new(format!("{LIST_REVISION_NAMESPACE}{id}"))
+            .map_err(|_| WorkspaceError::InvalidRequest)?;
+        let bytes = size_of::<ListingInventory>() * 2
+            + size_of::<ListingRecord>() * 2
+            + request_digest.retained_bytes()
+            + scope_revision.retained_bytes()
+            + revision.retained_bytes()
+            + listed.entries.capacity() * size_of::<WorkspaceEntry>()
+            + listed
+                .entries
+                .iter()
+                .map(workspace_entry_retained_bytes)
+                .sum::<usize>();
+        if bytes > reservation.bytes.num_permits() {
+            return Err(listing_capacity());
+        }
+        drop(
+            reservation
+                .bytes
+                .split(reservation.bytes.num_permits() - bytes),
+        );
+        drop(
+            reservation
+                .entries
+                .split(reservation.entries.num_permits() - listed.entries.len()),
+        );
+        let inventory = Arc::new(ListingInventory {
+            listed,
+            id,
+            nonce: Uuid::new_v4(),
+            request_digest,
+            scope_revision,
+            revision,
+            page_size: request.page_size as usize,
+            expires_at: Instant::now() + LIST_INVENTORY_TTL,
+            _reservation: reservation,
+        });
+        let page = inventory.page(0)?;
+        check_cancelled(token)?;
+        if page.next_cursor.is_some() {
+            self.workspace.retain_listing(inventory)?;
+        }
+        Ok(page)
+    }
+
+    #[cfg(unix)]
+    fn open_workspace_listing_scope(
+        &self,
+        binding: &DirectoryBinding,
+        root: &Path,
+        token: &CancellationToken,
+    ) -> Result<File, WorkspaceError> {
+        check_cancelled(token)?;
+        let anchor = open_listing_root(self.core.root())
+            .map_err(|error| FilesystemError::io("Cannot open workspace root", error.into()))?;
+        let cwd = open_listing_child(&anchor, &binding.relative_path, LIST_SEARCH_FLAGS)
+            .map_err(|_| WorkspaceError::StaleCwd)?;
+        let metadata = cwd.metadata().map_err(|_| WorkspaceError::StaleCwd)?;
+        if directory_revision_from_metadata(&binding.path, &metadata)? != binding.revision {
+            return Err(WorkspaceError::StaleCwd);
+        }
+        drop(anchor);
+        #[cfg(test)]
+        tests::run_workspace_hook(tests::WorkspaceHookPhase::CwdOpened, &binding.path, token);
+        check_cancelled(token)?;
+        let scope = open_listing_child(&cwd, scope_relative(&binding.path, root)?, DIRECTORY_FLAGS)
+            .map_err(|error| match error {
+                Errno::NOTDIR => WorkspaceError::InvalidRequest,
+                error => {
+                    FilesystemError::io("Cannot open workspace list root", error.into()).into()
+                }
+            })?;
+        Ok(scope)
+    }
+
+    #[cfg(unix)]
+    fn list_entries_blocking(
+        &self,
+        scope: &File,
         root: &Path,
         recursive: bool,
         token: &CancellationToken,
@@ -1745,18 +2182,51 @@ impl FileToolGroup {
         let allows_protected = self.core.policy.traversal_allows_protected(root);
         let mut visited = 0usize;
         let mut retained_bytes = root.as_os_str().len();
-        let mut hashed_bytes = 0u64;
         let mut truncated = false;
+        let mut incomplete = false;
         'traversal: while let Some(directory) = stack.pop() {
             check_cancelled(token)?;
-            let mut reader = fs::read_dir(&directory).await.map_err(|error| {
-                FilesystemError::io_path("Cannot list workspace directory", &directory, error)
-            })?;
+            let opened =
+                open_listing_child(scope, scope_relative(root, &directory)?, DIRECTORY_FLAGS)
+                    .and_then(|directory| Dir::read_from(&directory));
+            let mut reader = match opened {
+                Ok(reader) => reader,
+                Err(error) if directory == root => {
+                    return Err(FilesystemError::io(
+                        "Cannot list workspace directory",
+                        error.into(),
+                    )
+                    .into());
+                }
+                Err(_) => {
+                    incomplete = true;
+                    continue;
+                }
+            };
             let mut children = Vec::new();
             let mut stop_after_directory = false;
-            while let Some(entry) = reader.next_entry().await.map_err(|error| {
-                FilesystemError::io_path("Cannot list workspace directory", &directory, error)
-            })? {
+            loop {
+                check_cancelled(token)?;
+                let entry = match reader.next() {
+                    Some(Ok(entry)) => entry,
+                    None => break,
+                    Some(Err(error)) if directory == root => {
+                        return Err(FilesystemError::io_path(
+                            "Cannot list workspace directory",
+                            &directory,
+                            error.into(),
+                        )
+                        .into());
+                    }
+                    Some(Err(_)) => {
+                        incomplete = true;
+                        break;
+                    }
+                };
+                let name = entry.file_name().to_bytes();
+                if matches!(name, b"." | b"..") {
+                    continue;
+                }
                 visited = visited.saturating_add(1);
                 if visited > self.core.limits.max_traversal_entries
                     || visited > MAX_WORKSPACE_LIST_ENTRIES as usize
@@ -1765,44 +2235,46 @@ impl FileToolGroup {
                     stop_after_directory = true;
                     break;
                 }
-                let path = entry.path();
-                let file_type = entry.file_type().await.map_err(|error| {
-                    FilesystemError::io_path("Cannot inspect workspace entry", &path, error)
-                })?;
-                if file_type.is_symlink()
-                    || !self
-                        .core
-                        .policy
-                        .traversal_entry_allowed(allows_protected, &path)
+                let path = directory.join(OsStr::from_bytes(name));
+                if !self
+                    .core
+                    .policy
+                    .traversal_entry_allowed(allows_protected, &path)
                     || !self.core.policy.authorize_canonical_entry(&path)
                 {
                     continue;
                 }
-                let prospective = retained_bytes.saturating_add(path.as_os_str().len());
+                let prospective = retained_bytes
+                    .saturating_add(path.as_os_str().len())
+                    .saturating_add(size_of::<PathBuf>());
                 if prospective > MAX_WORKSPACE_LIST_RETAINED_BYTES as usize {
                     truncated = true;
                     stop_after_directory = true;
                     break;
                 }
                 retained_bytes = prospective;
-                children.push((path, file_type.is_dir()));
+                children.push(path);
             }
-            children.sort_by(|left, right| left.0.cmp(&right.0));
-            for (path, directory) in &children {
-                if !directory {
-                    let size = fs::metadata(path)
-                        .await
-                        .map_err(|error| FilesystemError::io_path("Cannot inspect", path, error))?
-                        .len();
-                    if hashed_bytes.saturating_add(size) > MAX_WORKSPACE_LIST_HASH_BYTES {
-                        truncated = true;
-                        break 'traversal;
+            children.sort();
+            #[cfg(test)]
+            tests::run_workspace_hook(tests::WorkspaceHookPhase::BeforeRead, &directory, token);
+            for path in &children {
+                check_cancelled(token)?;
+                let entry = match self.workspace_metadata_entry(scope, root, path) {
+                    Ok(Some(entry)) => entry,
+                    Ok(None) | Err(_) => {
+                        incomplete = true;
+                        continue;
                     }
-                    hashed_bytes = hashed_bytes.saturating_add(size);
-                }
-                let relative = self.core.policy.relative(path)?;
-                let entry = self.workspace_entry(path, relative).await?;
-                let entry_bytes = workspace_entry_retained_bytes(&entry);
+                };
+                let directory = entry.kind == WorkspaceEntryKind::Directory;
+                let entry_bytes = workspace_entry_retained_bytes(&entry).saturating_add(
+                    if recursive && directory {
+                        path.as_os_str().len() + size_of::<PathBuf>()
+                    } else {
+                        0
+                    },
+                );
                 if retained_bytes.saturating_add(entry_bytes)
                     > MAX_WORKSPACE_LIST_RETAINED_BYTES as usize
                 {
@@ -1811,7 +2283,7 @@ impl FileToolGroup {
                 }
                 retained_bytes = retained_bytes.saturating_add(entry_bytes);
                 entries.push(entry);
-                if recursive && *directory {
+                if recursive && directory {
                     stack.push(path.clone());
                 }
             }
@@ -1819,7 +2291,46 @@ impl FileToolGroup {
                 break 'traversal;
             }
         }
-        Ok(WorkspaceListEntries { entries, truncated })
+        check_cancelled(token)?;
+        Ok(WorkspaceListEntries {
+            entries,
+            truncated,
+            incomplete,
+        })
+    }
+
+    #[cfg(unix)]
+    fn workspace_metadata_entry(
+        &self,
+        scope: &File,
+        root: &Path,
+        path: &Path,
+    ) -> Result<Option<WorkspaceEntry>, WorkspaceError> {
+        if path.to_str().is_none() {
+            return Ok(None);
+        }
+        let node = open_listing_child(scope, scope_relative(root, path)?, WORKSPACE_METADATA_FLAGS)
+            .map_err(|error| {
+                FilesystemError::io("Cannot open workspace entry metadata", error.into())
+            })?;
+        let metadata = node
+            .metadata()
+            .map_err(|error| FilesystemError::io("Cannot inspect workspace entry", error))?;
+        let kind = if metadata.is_file() {
+            WorkspaceEntryKind::File
+        } else if metadata.is_dir() {
+            WorkspaceEntryKind::Directory
+        } else {
+            return Ok(None);
+        };
+        let relative = self.core.policy.relative(path)?;
+        Ok(Some(WorkspaceEntry {
+            path: workspace_path(relative.clone())?,
+            resource_id: root_relative_resource_id(RootResourceKind::Path, &relative)?,
+            revision: None,
+            kind,
+            size_bytes: metadata.is_file().then_some(metadata.len()),
+        }))
     }
 
     fn cursor_offset(
@@ -2088,6 +2599,90 @@ impl FileToolGroup {
     }
 }
 
+fn listing_capacity() -> WorkspaceError {
+    FilesystemError::message(LIST_CAPACITY_MESSAGE).into()
+}
+
+async fn expire_listing(workspace: Weak<WorkspaceState>, id: Uuid, deadline: Instant) {
+    tokio::time::sleep_until(deadline.into()).await;
+    if let Some(workspace) = workspace.upgrade() {
+        workspace
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .listings
+            .remove(&id);
+    }
+}
+
+#[cfg(unix)]
+fn open_listing_root(root: &Path) -> Result<File, Errno> {
+    let relative = root.strip_prefix("/").map_err(|_| Errno::INVAL)?;
+    let anchor = File::from(open("/", LIST_SEARCH_FLAGS, Mode::empty())?);
+    open_listing_child(
+        &anchor,
+        if relative.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            relative
+        },
+        LIST_SEARCH_FLAGS,
+    )
+}
+
+#[cfg(unix)]
+fn open_listing_child(parent: &File, path: impl AsRef<Path>, flags: OFlags) -> Result<File, Errno> {
+    #[cfg(target_os = "linux")]
+    {
+        openat2(
+            parent,
+            path.as_ref(),
+            flags,
+            Mode::empty(),
+            LIST_RESOLVE_FLAGS,
+        )
+        .map(File::from)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (parent, path, flags);
+        Err(Errno::NOSYS)
+    }
+}
+
+#[cfg(unix)]
+fn scope_relative<'a>(scope: &Path, path: &'a Path) -> Result<&'a str, WorkspaceError> {
+    let relative = path
+        .strip_prefix(scope)
+        .map_err(|_| WorkspaceError::InvalidRequest)?;
+    if relative.as_os_str().is_empty() {
+        Ok(".")
+    } else {
+        relative.to_str().ok_or(WorkspaceError::InvalidRequest)
+    }
+}
+
+fn watch_unavailable(phase: WorkspaceWatchPhase, error: notify::Error) -> WorkspaceError {
+    let (kind, io_kind, raw_os_error) = match error.kind {
+        notify::ErrorKind::Generic(_) => (WorkspaceWatchErrorKind::Generic, None, None),
+        notify::ErrorKind::Io(error) => (
+            WorkspaceWatchErrorKind::Io,
+            Some(error.kind()),
+            error.raw_os_error(),
+        ),
+        notify::ErrorKind::PathNotFound => (WorkspaceWatchErrorKind::PathNotFound, None, None),
+        notify::ErrorKind::WatchNotFound => (WorkspaceWatchErrorKind::WatchNotFound, None, None),
+        notify::ErrorKind::InvalidConfig(_) => (WorkspaceWatchErrorKind::InvalidConfig, None, None),
+        notify::ErrorKind::MaxFilesWatch => (WorkspaceWatchErrorKind::MaxFilesWatch, None, None),
+    };
+    WorkspaceError::WatchUnavailable {
+        phase,
+        kind,
+        io_kind,
+        raw_os_error,
+    }
+}
+
 fn watch_handler(
     sender: SyncSender<WorkspaceWatchSignal>,
     notification: Arc<Notify>,
@@ -2274,8 +2869,8 @@ async fn file_revision(
     maximum: usize,
     token: &CancellationToken,
 ) -> Result<Revision, WorkspaceError> {
-    let bytes = read_bounded(path, maximum, token).await?;
-    Revision::new(hex_digest(&bytes)).map_err(|_| WorkspaceError::InvalidRequest)
+    let version = read_file_version_required(path, maximum, token).await?;
+    Revision::new(version.revision()).map_err(|_| WorkspaceError::InvalidRequest)
 }
 
 async fn directory_revision(path: &Path) -> Result<Revision, WorkspaceError> {
@@ -2367,7 +2962,7 @@ fn workspace_entry_retained_bytes(entry: &WorkspaceEntry) -> usize {
     size_of::<WorkspaceEntry>()
         .saturating_add(entry.path.retained_bytes())
         .saturating_add(entry.resource_id.retained_bytes())
-        .saturating_add(entry.revision.retained_bytes())
+        .saturating_add(entry.revision.as_ref().map_or(0, Revision::retained_bytes))
 }
 
 fn digest_parts(parts: &[&str]) -> Result<Revision, WorkspaceError> {
@@ -2385,7 +2980,10 @@ fn digest_serializable(value: &impl serde::Serialize) -> Result<Revision, Worksp
 }
 
 fn hex_digest(bytes: &[u8]) -> String {
-    let digest = Sha256::digest(bytes);
+    encode_digest(Sha256::digest(bytes))
+}
+
+fn encode_digest(digest: impl IntoIterator<Item = u8>) -> String {
     let mut value = String::from("sha256:");
     for byte in digest {
         use std::fmt::Write as _;
@@ -2415,7 +3013,7 @@ mod tests {
         assert!(super::root_relative_resource_scope(super::RootResourceKind::Path, &deep).is_err());
     }
 
-    use std::fs as std_fs;
+    use std::{fs as std_fs, sync::OnceLock};
 
     use tempfile::tempdir;
     use workcell_host_contract::{
@@ -2428,8 +3026,1106 @@ mod tests {
     use crate::FileReadInput;
     use crate::text::install_snapshot_read_hook;
 
+    const PERMISSION_DENIED_CODE: &str = "filesystem_permission_denied";
+    const STALE_RESOURCE_CODE: &str = "stale_resource";
+    const WATCH_UNAVAILABLE_CODE: &str = "watch_unavailable";
+    const PRIVATE_DIAGNOSTIC: &str = "/private/root/token-secret";
+    #[derive(Eq, Hash, PartialEq)]
+    pub(super) enum WorkspaceHookPhase {
+        CwdResolved,
+        CwdOpened,
+        BeforeRead,
+    }
+    type ListHook = Box<dyn FnOnce(&CancellationToken) + Send>;
+    static LIST_HOOKS: OnceLock<Mutex<HashMap<(WorkspaceHookPhase, PathBuf), ListHook>>> =
+        OnceLock::new();
+
+    fn install_workspace_hook(
+        phase: WorkspaceHookPhase,
+        path: &Path,
+        hook: impl FnOnce(&CancellationToken) + Send + 'static,
+    ) {
+        LIST_HOOKS
+            .get_or_init(Mutex::default)
+            .lock()
+            .unwrap()
+            .insert((phase, path.to_path_buf()), Box::new(hook));
+    }
+
+    pub(super) fn run_workspace_hook(
+        phase: WorkspaceHookPhase,
+        path: &Path,
+        token: &CancellationToken,
+    ) {
+        let hook = LIST_HOOKS
+            .get_or_init(Mutex::default)
+            .lock()
+            .unwrap()
+            .remove(&(phase, path.to_path_buf()));
+        if let Some(hook) = hook {
+            hook(token);
+        }
+    }
+
+    async fn list_request(group: &FileToolGroup) -> ListRequest {
+        ListRequest {
+            version: ContractVersion::V1,
+            binding: request_binding(group.workspace_root().await.unwrap().handle),
+            path: workspace_path(".").unwrap(),
+            recursive: true,
+            page_size: MAX_PAGE_SIZE,
+            cursor: None,
+        }
+    }
+
     #[tokio::test]
-    async fn workspace_reads_searches_and_pages_with_revision_bound_cursors() {
+    async fn inventory_pages_and_retries_never_rewalk_or_observe_post_capture_changes() {
+        use std::sync::atomic::AtomicUsize;
+
+        const ORIGINAL: &str = "old";
+        let root = tempdir().unwrap();
+        for name in ["a.txt", "b.txt", "c.txt"] {
+            std_fs::write(root.path().join(name), ORIGINAL).unwrap();
+        }
+        let group = FileToolGroup::new(root.path(), false, None).await.unwrap();
+        let mut request = list_request(&group).await;
+        request.page_size = 1;
+        let first = group
+            .workspace_list(&request, &CancellationToken::new())
+            .await
+            .unwrap();
+        let rewalks = Arc::new(AtomicUsize::new(0));
+        let observed = rewalks.clone();
+        install_workspace_hook(WorkspaceHookPhase::BeforeRead, root.path(), move |_| {
+            observed.fetch_add(1, Ordering::SeqCst);
+        });
+        std_fs::write(root.path().join("b.txt"), "changed after capture").unwrap();
+        std_fs::remove_file(root.path().join("c.txt")).unwrap();
+        std_fs::write(root.path().join("d.txt"), "added").unwrap();
+        request.cursor = first.next_cursor;
+        let second = group
+            .workspace_list(&request, &CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(second.entries[0].path.as_str(), "b.txt");
+        assert_eq!(second.entries[0].size_bytes, Some(ORIGINAL.len() as u64));
+        request.cursor = second.next_cursor.clone();
+        let last = group
+            .workspace_list(&request, &CancellationToken::new())
+            .await
+            .unwrap();
+        let retry = group
+            .workspace_list(&request, &CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(last.entries[0].path.as_str(), "c.txt");
+        assert!(last.next_cursor.is_none());
+        assert_eq!(
+            serde_json::to_value(&last).unwrap(),
+            serde_json::to_value(retry).unwrap()
+        );
+        assert_eq!(last.revision, second.revision);
+        assert_eq!(rewalks.load(Ordering::SeqCst), 0);
+        request.cursor = None;
+        let fresh = group
+            .workspace_list(&request, &CancellationToken::new())
+            .await
+            .unwrap();
+        assert_ne!(fresh.revision, last.revision);
+        assert_eq!(rewalks.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn empty_scopes_have_distinct_inventory_generations_without_retained_receipts() {
+        let root = tempdir().unwrap();
+        for scope in ["first", "second"] {
+            std_fs::create_dir(root.path().join(scope)).unwrap();
+        }
+        let group = FileToolGroup::new(root.path(), false, None).await.unwrap();
+        let mut request = list_request(&group).await;
+        let mut revisions = HashSet::new();
+        for scope in ["first", "second", "first"] {
+            request.path = workspace_path(scope).unwrap();
+            let page = group
+                .workspace_list(&request, &CancellationToken::new())
+                .await
+                .unwrap();
+            assert!(page.entries.is_empty());
+            assert!(page.next_cursor.is_none());
+            assert!(revisions.insert(page.revision));
+        }
+        assert!(group.workspace.inner.lock().unwrap().listings.is_empty());
+        assert_eq!(
+            group.workspace.list_slots.available_permits(),
+            MAX_LIST_INVENTORIES
+        );
+        assert_eq!(
+            group.workspace.list_entries.available_permits(),
+            MAX_LIST_INVENTORY_ENTRIES
+        );
+        assert_eq!(
+            group.workspace.list_bytes.available_permits(),
+            MAX_LIST_INVENTORY_BYTES
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cached_pages_do_not_bypass_revoked_scope_read_permission() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if rustix::process::geteuid().is_root() {
+            return;
+        }
+        let root = tempdir().unwrap();
+        let scope = root.path().join("scope");
+        std_fs::create_dir(&scope).unwrap();
+        for name in ["a", "b"] {
+            std_fs::write(scope.join(name), name).unwrap();
+        }
+        let group = FileToolGroup::new(root.path(), false, None).await.unwrap();
+        let mut request = list_request(&group).await;
+        request.path = workspace_path("scope").unwrap();
+        request.page_size = 1;
+        request.cursor = group
+            .workspace_list(&request, &CancellationToken::new())
+            .await
+            .unwrap()
+            .next_cursor;
+        std_fs::set_permissions(&scope, std_fs::Permissions::from_mode(0o0)).unwrap();
+        let refused = group
+            .workspace_list(&request, &CancellationToken::new())
+            .await;
+        std_fs::set_permissions(&scope, std_fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(refused.unwrap_err().code(), PERMISSION_DENIED_CODE);
+    }
+
+    #[tokio::test]
+    async fn inventory_expiry_tasks_do_not_keep_the_workspace_alive_after_owner_drop() {
+        let root = tempdir().unwrap();
+        for name in ["a", "b"] {
+            std_fs::write(root.path().join(name), name).unwrap();
+        }
+        let group = FileToolGroup::new(root.path(), false, None).await.unwrap();
+        let mut request = list_request(&group).await;
+        request.page_size = 1;
+        group
+            .workspace_list(&request, &CancellationToken::new())
+            .await
+            .unwrap();
+        let weak = Arc::downgrade(&group.workspace);
+        assert_eq!(group.workspace.inner.lock().unwrap().listings.len(), 1);
+        drop(group);
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[tokio::test]
+    async fn inventory_cursors_reject_wrong_scope_cwd_page_bounds_and_forged_offsets() {
+        let root = tempdir().unwrap();
+        std_fs::create_dir(root.path().join("scope")).unwrap();
+        for name in ["a", "b", "c"] {
+            std_fs::write(root.path().join("scope").join(name), name).unwrap();
+        }
+        let group = FileToolGroup::new(root.path(), false, None).await.unwrap();
+        let mut request = list_request(&group).await;
+        request.path = workspace_path("scope").unwrap();
+        request.page_size = 1;
+        request.cursor = group
+            .workspace_list(&request, &CancellationToken::new())
+            .await
+            .unwrap()
+            .next_cursor;
+        let mut wrong_scope = request.clone();
+        wrong_scope.path = workspace_path(".").unwrap();
+        let mut wrong_page = request.clone();
+        wrong_page.page_size += 1;
+        let mut wrong_recursion = request.clone();
+        wrong_recursion.recursive = !request.recursive;
+        let mut wrong_cwd = request.clone();
+        let cwd = group
+            .workspace_resolve_directory(
+                &request.binding.cwd_handle,
+                &DirectoryNavigation::new("scope").unwrap(),
+            )
+            .await
+            .unwrap();
+        wrong_cwd.binding = request_binding(cwd.handle);
+        wrong_cwd.path = workspace_path(".").unwrap();
+        let mut forged = request.clone();
+        forged.cursor = Some(
+            Cursor::new(
+                request
+                    .cursor
+                    .as_ref()
+                    .unwrap()
+                    .as_str()
+                    .replacen("_1_", "_2_", 1),
+            )
+            .unwrap(),
+        );
+        for wrong in [wrong_scope, wrong_page, wrong_recursion, wrong_cwd, forged] {
+            assert!(matches!(
+                group
+                    .workspace_list(&wrong, &CancellationToken::new())
+                    .await
+                    .unwrap_err(),
+                WorkspaceError::InvalidCursor
+            ));
+        }
+        request.cursor = Some(Cursor::new("unknown-inventory").unwrap());
+        assert!(matches!(
+            group
+                .workspace_list(&request, &CancellationToken::new())
+                .await
+                .unwrap_err(),
+            WorkspaceError::StaleCursor
+        ));
+    }
+
+    #[tokio::test]
+    async fn cached_pages_still_refuse_replaced_scope_and_cwd_descriptors() {
+        for replace_cwd in [false, true] {
+            let root = tempdir().unwrap();
+            let public = root.path().join("public");
+            let scope = public.join("scope");
+            std_fs::create_dir_all(&scope).unwrap();
+            for name in ["a", "b"] {
+                std_fs::write(scope.join(name), name).unwrap();
+            }
+            let group = FileToolGroup::new(root.path(), false, None).await.unwrap();
+            let mut request = list_request(&group).await;
+            if replace_cwd {
+                let cwd = group
+                    .workspace_resolve_directory(
+                        &request.binding.cwd_handle,
+                        &DirectoryNavigation::new("public").unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                request.binding = request_binding(cwd.handle);
+            }
+            request.path =
+                workspace_path(if replace_cwd { "scope" } else { "public/scope" }).unwrap();
+            request.page_size = 1;
+            request.cursor = group
+                .workspace_list(&request, &CancellationToken::new())
+                .await
+                .unwrap()
+                .next_cursor;
+            std_fs::rename(
+                if replace_cwd { &public } else { &scope },
+                root.path().join("old"),
+            )
+            .unwrap();
+            std_fs::create_dir_all(&scope).unwrap();
+            let error = group
+                .workspace_list(&request, &CancellationToken::new())
+                .await
+                .unwrap_err();
+            if replace_cwd {
+                assert!(matches!(error, WorkspaceError::StaleCwd));
+            } else {
+                assert!(matches!(error, WorkspaceError::StaleCursor));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn inventories_expire_without_requests_and_never_restart_unknown_cursors() {
+        let root = tempdir().unwrap();
+        for name in ["a", "b"] {
+            std_fs::write(root.path().join(name), name).unwrap();
+        }
+        let group = FileToolGroup::new(root.path(), false, None).await.unwrap();
+        let mut request = list_request(&group).await;
+        request.page_size = 1;
+        request.cursor = group
+            .workspace_list(&request, &CancellationToken::new())
+            .await
+            .unwrap()
+            .next_cursor;
+        let id = *group
+            .workspace
+            .inner
+            .lock()
+            .unwrap()
+            .listings
+            .keys()
+            .next()
+            .unwrap();
+        expire_listing(Arc::downgrade(&group.workspace), id, Instant::now()).await;
+        assert!(group.workspace.inner.lock().unwrap().listings.is_empty());
+        assert_eq!(
+            group.workspace.list_slots.available_permits(),
+            MAX_LIST_INVENTORIES
+        );
+        assert!(matches!(
+            group
+                .workspace_list(&request, &CancellationToken::new())
+                .await
+                .unwrap_err(),
+            WorkspaceError::StaleCursor
+        ));
+    }
+
+    #[tokio::test]
+    async fn inventory_capacity_never_evicts_live_receipts_and_arc_leases_remain_charged() {
+        let root = tempdir().unwrap();
+        for name in ["a", "b"] {
+            std_fs::write(root.path().join(name), name).unwrap();
+        }
+        let group = FileToolGroup::new(root.path(), false, None).await.unwrap();
+        let mut request = list_request(&group).await;
+        request.page_size = 1;
+        let mut first = None;
+        for _ in 0..MAX_LIST_INVENTORIES {
+            let page = group
+                .workspace_list(&request, &CancellationToken::new())
+                .await
+                .unwrap();
+            first = first.or(page.next_cursor);
+        }
+        assert_eq!(
+            group
+                .workspace_list(&request, &CancellationToken::new())
+                .await
+                .unwrap_err()
+                .code(),
+            listing_capacity().code()
+        );
+        request.cursor = first;
+        assert!(
+            group
+                .workspace_list(&request, &CancellationToken::new())
+                .await
+                .unwrap()
+                .next_cursor
+                .is_none()
+        );
+        let held = {
+            let mut state = group.workspace.inner.lock().unwrap();
+            let held = state.listings.values().next().unwrap().inventory.clone();
+            state.expire_listings(Instant::now() + LIST_INVENTORY_TTL);
+            held
+        };
+        assert_eq!(
+            held._reservation.entries.num_permits(),
+            held.listed.entries.len()
+        );
+        assert!(
+            held._reservation.bytes.num_permits()
+                >= held.listed.entries.capacity() * size_of::<WorkspaceEntry>()
+                    + held
+                        .listed
+                        .entries
+                        .iter()
+                        .map(workspace_entry_retained_bytes)
+                        .sum::<usize>()
+        );
+        assert_eq!(
+            group.workspace.list_slots.available_permits(),
+            MAX_LIST_INVENTORIES - 1
+        );
+        assert_eq!(
+            group.workspace.list_entries.available_permits(),
+            MAX_LIST_INVENTORY_ENTRIES - held._reservation.entries.num_permits()
+        );
+        assert_eq!(
+            group.workspace.list_bytes.available_permits(),
+            MAX_LIST_INVENTORY_BYTES - held._reservation.bytes.num_permits()
+        );
+        assert!(matches!(
+            group
+                .workspace_list(&request, &CancellationToken::new())
+                .await
+                .unwrap_err(),
+            WorkspaceError::StaleCursor
+        ));
+        drop(held);
+        assert_eq!(
+            group.workspace.list_slots.available_permits(),
+            MAX_LIST_INVENTORIES
+        );
+        assert_eq!(
+            group.workspace.list_entries.available_permits(),
+            MAX_LIST_INVENTORY_ENTRIES
+        );
+        assert_eq!(
+            group.workspace.list_bytes.available_permits(),
+            MAX_LIST_INVENTORY_BYTES
+        );
+    }
+
+    #[test]
+    fn inventory_admission_reserves_entries_and_bytes_and_rolls_back_partial_reservations() {
+        let state = WorkspaceState::default();
+        for gate in [&state.list_entries, &state.list_bytes] {
+            let held = gate
+                .clone()
+                .try_acquire_many_owned(gate.available_permits() as u32)
+                .unwrap();
+            assert!(state.reserve_listing().is_err());
+            assert_eq!(state.list_slots.available_permits(), MAX_LIST_INVENTORIES);
+            drop(held);
+            assert_eq!(
+                state.list_entries.available_permits(),
+                MAX_LIST_INVENTORY_ENTRIES
+            );
+            assert_eq!(
+                state.list_bytes.available_permits(),
+                MAX_LIST_INVENTORY_BYTES
+            );
+        }
+        drop(state.reserve_listing().unwrap());
+        assert_eq!(state.list_slots.available_permits(), MAX_LIST_INVENTORIES);
+        assert_eq!(
+            state.list_entries.available_permits(),
+            MAX_LIST_INVENTORY_ENTRIES
+        );
+        assert_eq!(
+            state.list_bytes.available_permits(),
+            MAX_LIST_INVENTORY_BYTES
+        );
+    }
+
+    #[tokio::test]
+    async fn worker_admission_is_bounded_and_cancelled_requests_never_queue_or_capture() {
+        let root = tempdir().unwrap();
+        let group = FileToolGroup::new(root.path(), false, None).await.unwrap();
+        let request = list_request(&group).await;
+        let _workers = group
+            .workspace
+            .list_workers
+            .clone()
+            .try_acquire_many_owned(MAX_LIST_WORKERS as u32)
+            .unwrap();
+        assert_eq!(
+            group
+                .workspace_list(&request, &CancellationToken::new())
+                .await
+                .unwrap_err()
+                .code(),
+            listing_capacity().code()
+        );
+        let token = CancellationToken::new();
+        token.cancel();
+        assert!(matches!(
+            group.workspace_list(&request, &token).await.unwrap_err(),
+            WorkspaceError::Filesystem(FilesystemError::Aborted)
+        ));
+        assert!(group.workspace.inner.lock().unwrap().listings.is_empty());
+    }
+
+    #[tokio::test]
+    async fn listing_refuses_a_real_cwd_replacement_between_resolution_and_descriptor_open() {
+        for scope in [".", "child"] {
+            let root = tempdir().unwrap();
+            let public = root.path().join("public");
+            std_fs::create_dir_all(public.join("child")).unwrap();
+            let group = FileToolGroup::new(root.path(), false, None).await.unwrap();
+            let mut request = list_request(&group).await;
+            let directory = group
+                .workspace_resolve_directory(
+                    &request.binding.cwd_handle,
+                    &DirectoryNavigation::new("public").unwrap(),
+                )
+                .await
+                .unwrap();
+            request.binding = request_binding(directory.handle);
+            request.path = workspace_path(scope).unwrap();
+            let original = public.clone();
+            let moved = root.path().join("public-old");
+            install_workspace_hook(WorkspaceHookPhase::CwdResolved, &public, move |_| {
+                std_fs::rename(&original, moved).unwrap();
+                std_fs::create_dir_all(original.join("child")).unwrap();
+                std_fs::write(
+                    original.join("child/replacement.txt"),
+                    "replacement metadata",
+                )
+                .unwrap();
+            });
+            let error = group
+                .workspace_list(&request, &CancellationToken::new())
+                .await
+                .unwrap_err();
+            assert!(matches!(error, WorkspaceError::StaleCwd));
+        }
+    }
+
+    #[tokio::test]
+    async fn adding_children_does_not_invalidate_the_opened_cwd_identity() {
+        use std::time::SystemTime;
+
+        let root = tempdir().unwrap();
+        let group = FileToolGroup::new(root.path(), false, None).await.unwrap();
+        let request = list_request(&group).await;
+        let directory = root.path().to_path_buf();
+        install_workspace_hook(WorkspaceHookPhase::CwdResolved, root.path(), move |_| {
+            std_fs::write(directory.join("new.txt"), "new").unwrap();
+            std_fs::File::open(directory)
+                .unwrap()
+                .set_times(std_fs::FileTimes::new().set_modified(SystemTime::UNIX_EPOCH))
+                .unwrap();
+        });
+        let response = group
+            .workspace_list(&request, &CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(!response.incomplete);
+        assert_eq!(response.entries.len(), 1);
+        assert_eq!(response.entries[0].path.as_str(), "new.txt");
+    }
+
+    #[tokio::test]
+    async fn child_scope_resolution_stays_on_the_verified_cwd_descriptor_after_rename() {
+        let root = tempdir().unwrap();
+        let public = root.path().join("public");
+        std_fs::create_dir_all(public.join("child")).unwrap();
+        std_fs::write(public.join("child/original.txt"), "original").unwrap();
+        let group = FileToolGroup::new(root.path(), false, None).await.unwrap();
+        let mut request = list_request(&group).await;
+        let directory = group
+            .workspace_resolve_directory(
+                &request.binding.cwd_handle,
+                &DirectoryNavigation::new("public").unwrap(),
+            )
+            .await
+            .unwrap();
+        request.binding = request_binding(directory.handle);
+        request.path = workspace_path("child").unwrap();
+        let original = public.clone();
+        let moved = root.path().join("public-old");
+        install_workspace_hook(WorkspaceHookPhase::CwdOpened, &public, move |_| {
+            std_fs::rename(&original, moved).unwrap();
+            std_fs::create_dir_all(original.join("child")).unwrap();
+            std_fs::write(
+                original.join("child/replacement.txt"),
+                "replacement metadata",
+            )
+            .unwrap();
+        });
+        let response = group
+            .workspace_list(&request, &CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(!response.incomplete);
+        assert_eq!(response.entries.len(), 1);
+        assert_eq!(
+            response.entries[0].path.as_str(),
+            "public/child/original.txt"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn ordinary_listings_cross_existing_mounts_without_weakening_snapshot_or_transfer_policy()
+    {
+        use crate::binary::open_child;
+
+        let root = Path::new("/dev");
+        let anchor = open_listing_root(root).unwrap();
+        assert_eq!(
+            open_child(&anchor, "pts", DIRECTORY_FLAGS).unwrap_err(),
+            Errno::XDEV
+        );
+        let group = FileToolGroup::new(root, false, None).await.unwrap();
+        let mut request = list_request(&group).await;
+        request.recursive = false;
+        let response = group
+            .workspace_list(&request, &CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(response.entries.iter().any(
+            |entry| entry.path.as_str() == "pts" && entry.kind == WorkspaceEntryKind::Directory
+        ));
+        request.path = workspace_path("pts").unwrap();
+        group
+            .workspace_list(&request, &CancellationToken::new())
+            .await
+            .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn listing_requires_read_permission_only_on_directories_it_enumerates() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if rustix::process::geteuid().is_root() {
+            return;
+        }
+        for search_only_cwd in [false, true] {
+            let fixture = tempdir().unwrap();
+            let parent = fixture.path().join("search-only-parent");
+            let project = parent.join("project");
+            let public = project.join("public");
+            std_fs::create_dir_all(public.join("child")).unwrap();
+            std_fs::write(public.join("child/file.txt"), "metadata").unwrap();
+            std_fs::set_permissions(&parent, std_fs::Permissions::from_mode(0o111)).unwrap();
+            assert_eq!(
+                std_fs::read_dir(&parent).unwrap_err().kind(),
+                io::ErrorKind::PermissionDenied
+            );
+            if search_only_cwd {
+                for path in [&project, &public] {
+                    std_fs::set_permissions(path, std_fs::Permissions::from_mode(0o111)).unwrap();
+                }
+            }
+            let result = async {
+                let group = FileToolGroup::new(&project, false, None).await?;
+                let directory = group.workspace_root().await?;
+                let cwd = if search_only_cwd {
+                    group
+                        .workspace_resolve_directory(
+                            &directory.handle,
+                            &DirectoryNavigation::new("public").unwrap(),
+                        )
+                        .await?
+                        .handle
+                } else {
+                    directory.handle
+                };
+                group
+                    .workspace_list(
+                        &ListRequest {
+                            version: ContractVersion::V1,
+                            binding: request_binding(cwd),
+                            path: workspace_path(if search_only_cwd { "child" } else { "." })
+                                .unwrap(),
+                            recursive: false,
+                            page_size: MAX_PAGE_SIZE,
+                            cursor: None,
+                        },
+                        &CancellationToken::new(),
+                    )
+                    .await
+            }
+            .await;
+            for path in [&parent, &project, &public] {
+                std_fs::set_permissions(path, std_fs::Permissions::from_mode(0o700)).unwrap();
+            }
+            let response = result.unwrap();
+            assert!(!response.incomplete);
+            assert_eq!(response.entries.len(), 1);
+            assert_eq!(
+                response.entries[0].path.as_str(),
+                if search_only_cwd {
+                    "public/child/file.txt"
+                } else {
+                    "public"
+                }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn vanished_descendants_leave_readable_siblings_and_an_incomplete_inventory() {
+        let root = tempdir().unwrap();
+        let missing = root.path().join("missing.txt");
+        std_fs::write(&missing, "missing").unwrap();
+        std_fs::write(root.path().join("sibling.txt"), "sibling").unwrap();
+        let group = FileToolGroup::new(root.path(), false, None).await.unwrap();
+        install_workspace_hook(WorkspaceHookPhase::BeforeRead, root.path(), move |_| {
+            std_fs::remove_file(missing).unwrap()
+        });
+        let response = group
+            .workspace_list(&list_request(&group).await, &CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(response.incomplete);
+        assert!(!response.truncated);
+        assert_eq!(response.entries.len(), 1);
+        assert_eq!(response.entries[0].path.as_str(), "sibling.txt");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn listing_never_resolves_replaced_ancestors_into_protected_or_outside_metadata() {
+        use std::os::unix::fs::symlink;
+
+        const PUBLIC: &str = "public";
+        const FORBIDDEN: &str = "forbidden metadata and content";
+        for protected in [false, true] {
+            let parent = tempdir().unwrap();
+            let root = parent.path().join("root");
+            let public = root.join("public");
+            let target = if protected {
+                root.join(".git")
+            } else {
+                parent.path().join("outside")
+            };
+            std_fs::create_dir_all(&public).unwrap();
+            std_fs::create_dir_all(&target).unwrap();
+            std_fs::write(public.join("config"), PUBLIC).unwrap();
+            std_fs::write(target.join("config"), FORBIDDEN).unwrap();
+            std_fs::write(root.join("sibling.txt"), PUBLIC).unwrap();
+            let group = FileToolGroup::new(&root, false, None).await.unwrap();
+            let moved = root.join("public-old");
+            let raced = public.clone();
+            install_workspace_hook(WorkspaceHookPhase::BeforeRead, &public, move |_| {
+                std_fs::rename(&raced, moved).unwrap();
+                symlink(target, raced).unwrap();
+            });
+            let response = group
+                .workspace_list(&list_request(&group).await, &CancellationToken::new())
+                .await
+                .unwrap();
+            assert!(response.incomplete);
+            assert!(!response.truncated);
+            assert_eq!(
+                response
+                    .entries
+                    .iter()
+                    .map(|entry| entry.path.as_str())
+                    .collect::<Vec<_>>(),
+                ["public", "sibling.txt"]
+            );
+            assert!(
+                response
+                    .entries
+                    .iter()
+                    .all(|entry| entry.size_bytes != Some(FORBIDDEN.len() as u64))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn cancellation_during_descriptor_enumeration_stops_before_child_metadata() {
+        let root = tempdir().unwrap();
+        std_fs::write(root.path().join("sibling.txt"), "sibling").unwrap();
+        let group = FileToolGroup::new(root.path(), false, None).await.unwrap();
+        let token = CancellationToken::new();
+        let cancelled = token.clone();
+        install_workspace_hook(WorkspaceHookPhase::BeforeRead, root.path(), move |_| {
+            cancelled.cancel()
+        });
+        let error = group
+            .workspace_list(&list_request(&group).await, &token)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            WorkspaceError::Filesystem(FilesystemError::Aborted)
+        ));
+    }
+
+    #[tokio::test]
+    async fn dropping_a_listing_cancels_its_blocking_descriptor_worker() {
+        use tokio::sync::oneshot;
+
+        let root = tempdir().unwrap();
+        std_fs::write(root.path().join("sibling.txt"), "sibling").unwrap();
+        let group = FileToolGroup::new(root.path(), false, None).await.unwrap();
+        let request = list_request(&group).await;
+        let workspace = group.workspace.clone();
+        let (entered, observed) = oneshot::channel();
+        let (resume, paused) = sync_channel(0);
+        install_workspace_hook(WorkspaceHookPhase::BeforeRead, root.path(), move |token| {
+            entered.send(token.clone()).unwrap();
+            paused.recv().unwrap();
+        });
+        let listing = tokio::spawn(async move {
+            group
+                .workspace_list(&request, &CancellationToken::new())
+                .await
+        });
+        let token = observed.await.unwrap();
+        assert_eq!(
+            workspace.list_workers.available_permits(),
+            MAX_LIST_WORKERS - 1
+        );
+        assert_eq!(
+            workspace.list_entries.available_permits(),
+            MAX_LIST_INVENTORY_ENTRIES - MAX_WORKSPACE_LIST_ENTRIES as usize
+        );
+        assert_eq!(
+            workspace.list_bytes.available_permits(),
+            MAX_LIST_INVENTORY_BYTES - LIST_INVENTORY_RESERVATION_BYTES
+        );
+        listing.abort();
+        assert!(listing.await.unwrap_err().is_cancelled());
+        assert_eq!(
+            workspace.list_workers.available_permits(),
+            MAX_LIST_WORKERS - 1
+        );
+        let cancelled = token.is_cancelled();
+        resume.send(()).unwrap();
+        assert!(cancelled);
+        let _workers = workspace
+            .list_workers
+            .clone()
+            .acquire_many_owned(MAX_LIST_WORKERS as u32)
+            .await
+            .unwrap();
+        assert_eq!(
+            workspace.list_slots.available_permits(),
+            MAX_LIST_INVENTORIES
+        );
+        assert_eq!(
+            workspace.list_entries.available_permits(),
+            MAX_LIST_INVENTORY_ENTRIES
+        );
+        assert_eq!(
+            workspace.list_bytes.available_permits(),
+            MAX_LIST_INVENTORY_BYTES
+        );
+        assert!(workspace.inner.lock().unwrap().listings.is_empty());
+    }
+
+    #[tokio::test]
+    async fn asset_discovery_charges_its_own_budget_before_reading_each_candidate() {
+        use std::sync::atomic::AtomicUsize;
+
+        const FILE_BYTES: usize = 5;
+        const HASH_BUDGET: u64 = 64;
+        const FILE_COUNT: usize = 13;
+        let root = tempdir().unwrap();
+        let reads = Arc::new(AtomicUsize::new(0));
+        for index in 0..FILE_COUNT {
+            let directory = root.path().join(format!("asset-{index:02}"));
+            std_fs::create_dir(&directory).unwrap();
+            let path = directory.join("AGENTS.md");
+            std_fs::write(&path, vec![b'x'; FILE_BYTES]).unwrap();
+            let reads = reads.clone();
+            install_workspace_hook(WorkspaceHookPhase::BeforeRead, &path, move |_| {
+                reads.fetch_add(1, Ordering::SeqCst);
+            });
+        }
+        let group = FileToolGroup::new(root.path(), false, None).await.unwrap();
+        let error = group
+            .walk_project_assets(root.path(), HASH_BUDGET, &CancellationToken::new())
+            .await
+            .unwrap_err();
+        LIST_HOOKS
+            .get()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .retain(|(_, path), _| !path.starts_with(root.path()));
+        assert!(matches!(error, WorkspaceError::InvalidRequest));
+        assert_eq!(
+            reads.load(Ordering::SeqCst),
+            HASH_BUDGET as usize / FILE_BYTES
+        );
+    }
+
+    #[tokio::test]
+    async fn asset_growth_or_read_failure_cannot_refund_or_overrun_reserved_hash_bytes() {
+        const ORIGINAL: &str = "small";
+        const GROWN: &str = "larger than the entire discovery allowance";
+        for replacement in ["", GROWN] {
+            let root = tempdir().unwrap();
+            let path = root.path().join("AGENTS.md");
+            std_fs::write(&path, ORIGINAL).unwrap();
+            let group = FileToolGroup::new(root.path(), false, None).await.unwrap();
+            let raced = path.clone();
+            install_workspace_hook(WorkspaceHookPhase::BeforeRead, &path, move |_| {
+                std_fs::write(raced, replacement).unwrap()
+            });
+            let mut budget = ORIGINAL.len() as u64;
+            let error = group
+                .read_project_asset_revision(&path, &mut budget, &CancellationToken::new())
+                .await
+                .unwrap_err();
+            assert!(matches!(error, WorkspaceError::StaleResource));
+            assert_eq!(budget, 0);
+            std_fs::write(&path, ORIGINAL).unwrap();
+            let error = group
+                .read_project_asset_revision(&path, &mut budget, &CancellationToken::new())
+                .await
+                .unwrap_err();
+            assert!(matches!(error, WorkspaceError::InvalidRequest));
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_asset_hashing_does_not_return_a_partial_manifest() {
+        const HASH_BUDGET: u64 = 64;
+        let root = tempdir().unwrap();
+        let path = root.path().join("AGENTS.md");
+        std_fs::write(&path, "asset").unwrap();
+        let group = FileToolGroup::new(root.path(), false, None).await.unwrap();
+        let token = CancellationToken::new();
+        let cancelled = token.clone();
+        install_workspace_hook(WorkspaceHookPhase::BeforeRead, &path, move |_| {
+            cancelled.cancel()
+        });
+        let error = group
+            .walk_project_assets(root.path(), HASH_BUDGET, &token)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            WorkspaceError::Filesystem(FilesystemError::Aborted)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn special_files_are_skipped_without_opening_or_blocking() {
+        use rustix::fs::{CWD, FileType, Mode, mknodat};
+        use std::os::unix::{fs::symlink, net::UnixListener};
+
+        let root = tempdir().unwrap();
+        mknodat(
+            CWD,
+            root.path().join("fifo"),
+            FileType::Fifo,
+            Mode::RUSR | Mode::WUSR,
+            0,
+        )
+        .unwrap();
+        let _socket = UnixListener::bind(root.path().join("socket")).unwrap();
+        symlink("absent", root.path().join("dangling")).unwrap();
+        std_fs::write(root.path().join("sibling.txt"), "sibling").unwrap();
+        let group = FileToolGroup::new(root.path(), false, None).await.unwrap();
+        let request = list_request(&group).await;
+        let response = group
+            .workspace_list(&request, &CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(response.incomplete);
+        assert!(!response.truncated);
+        assert_eq!(response.entries.len(), 1);
+        assert_eq!(response.entries[0].path.as_str(), "sibling.txt");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unreadable_descendants_do_not_hide_siblings_but_a_denied_root_is_an_error() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempdir().unwrap();
+        let denied = root.path().join("denied");
+        let unreadable = root.path().join("unreadable.txt");
+        std_fs::create_dir(&denied).unwrap();
+        std_fs::write(&unreadable, "unreadable").unwrap();
+        let group = FileToolGroup::new(root.path(), false, None).await.unwrap();
+        let request = list_request(&group).await;
+        std_fs::set_permissions(&denied, std_fs::Permissions::from_mode(0o0)).unwrap();
+        std_fs::set_permissions(&unreadable, std_fs::Permissions::from_mode(0o0)).unwrap();
+        let response = group
+            .workspace_list(&request, &CancellationToken::new())
+            .await
+            .unwrap();
+        let refused = group
+            .workspace_list(
+                &ListRequest {
+                    path: workspace_path("denied").unwrap(),
+                    ..request.clone()
+                },
+                &CancellationToken::new(),
+            )
+            .await;
+        let stat = group
+            .workspace_stat(&StatRequest {
+                version: ContractVersion::V1,
+                binding: request.binding,
+                path: workspace_path("unreadable.txt").unwrap(),
+            })
+            .await;
+        std_fs::set_permissions(&denied, std_fs::Permissions::from_mode(0o700)).unwrap();
+        std_fs::set_permissions(&unreadable, std_fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(response.entries.len(), 2);
+        assert!(!response.truncated);
+        if !rustix::process::geteuid().is_root() {
+            assert!(response.incomplete);
+            assert_eq!(refused.unwrap_err().code(), PERMISSION_DENIED_CODE);
+            assert_eq!(stat.unwrap_err().code(), PERMISSION_DENIED_CODE);
+        }
+    }
+
+    #[tokio::test]
+    async fn metadata_inventory_revisions_cannot_authorize_mutations_or_hide_same_size_changes() {
+        const ORIGINAL: &str = "before";
+        const REPLACEMENT: &str = "edited";
+        let root = tempdir().unwrap();
+        let path = root.path().join("file.txt");
+        std_fs::write(&path, ORIGINAL).unwrap();
+        let times = std_fs::FileTimes::new()
+            .set_modified(std_fs::metadata(&path).unwrap().modified().unwrap());
+        let group = FileToolGroup::new(root.path(), true, None).await.unwrap();
+        let request = list_request(&group).await;
+        let listed = group
+            .workspace_list(&request, &CancellationToken::new())
+            .await
+            .unwrap();
+        let stat_request = StatRequest {
+            version: ContractVersion::V1,
+            binding: request.binding.clone(),
+            path: workspace_path("file.txt").unwrap(),
+        };
+        let revision = group
+            .workspace_stat(&stat_request)
+            .await
+            .unwrap()
+            .entry
+            .revision
+            .unwrap();
+        for expected_revision in [listed.revision, revision] {
+            std_fs::write(&path, REPLACEMENT).unwrap();
+            std_fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_times(times)
+                .unwrap();
+            let result = group
+                .prepare_workspace_mutation(
+                    &request.binding.cwd_handle,
+                    vec![WorkspaceMutation::Delete {
+                        path: stat_request.path.clone(),
+                        expected_revision,
+                    }],
+                    &CancellationToken::new(),
+                )
+                .await;
+            assert_eq!(result.err().unwrap().code(), STALE_RESOURCE_CODE);
+        }
+        assert_eq!(std_fs::read_to_string(path).unwrap(), REPLACEMENT);
+    }
+
+    #[test]
+    fn native_watch_diagnostics_keep_only_phase_kind_and_os_classification() {
+        for phase in [
+            WorkspaceWatchPhase::Initialize,
+            WorkspaceWatchPhase::Register,
+        ] {
+            let native = notify::Error::io(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                PRIVATE_DIAGNOSTIC,
+            ))
+            .add_path(PathBuf::from(PRIVATE_DIAGNOSTIC));
+            let error = watch_unavailable(phase.clone(), native);
+            assert_eq!(error.code(), WATCH_UNAVAILABLE_CODE);
+            assert!(!format!("{error:?} {error}").contains(PRIVATE_DIAGNOSTIC));
+            assert!(
+                matches!(error, WorkspaceError::WatchUnavailable { phase: actual, kind: WorkspaceWatchErrorKind::Io, io_kind: Some(io::ErrorKind::PermissionDenied), raw_os_error: None } if actual == phase)
+            );
+        }
+        let errno = rustix::io::Errno::NOSPC.raw_os_error();
+        let error = watch_unavailable(
+            WorkspaceWatchPhase::Register,
+            notify::Error::io(io::Error::from_raw_os_error(errno)),
+        );
+        assert!(
+            matches!(error, WorkspaceError::WatchUnavailable { raw_os_error: Some(actual), .. } if actual == errno)
+        );
+        let error = watch_unavailable(
+            WorkspaceWatchPhase::Initialize,
+            notify::Error::generic(PRIVATE_DIAGNOSTIC),
+        );
+        assert!(!format!("{error:?} {error}").contains(PRIVATE_DIAGNOSTIC));
+        assert!(matches!(
+            error,
+            WorkspaceError::WatchUnavailable {
+                kind: WorkspaceWatchErrorKind::Generic,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn workspace_reads_searches_and_pages_with_inventory_bound_list_cursors() {
         let root = tempdir().unwrap();
         fs::write(root.path().join("b.txt"), "needle b\n")
             .await
@@ -2465,6 +4161,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(second.entries[0].path.as_str(), "b.txt");
+        assert_eq!(first.revision, second.revision);
+        assert!(first.revision.as_str().starts_with(LIST_REVISION_NAMESPACE));
+        assert!(!first.incomplete);
 
         let tampered = group
             .workspace_list(
@@ -2480,7 +4179,7 @@ mod tests {
         fs::write(root.path().join("b.txt"), "changed\n")
             .await
             .unwrap();
-        let stale = group
+        let replayed = group
             .workspace_list(
                 &ListRequest {
                     cursor: Some(cursor),
@@ -2489,8 +4188,11 @@ mod tests {
                 &CancellationToken::new(),
             )
             .await
-            .unwrap_err();
-        assert_eq!(stale.code(), "stale_cursor");
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(replayed).unwrap(),
+            serde_json::to_value(second).unwrap()
+        );
 
         let read = group
             .workspace_read_text(
@@ -2649,31 +4351,34 @@ mod tests {
             .unwrap();
 
         assert!(listed.truncated);
+        assert!(!listed.incomplete);
         assert_eq!(listed.entries.len(), 8);
         assert!(listed.next_cursor.is_none());
     }
 
     #[tokio::test]
-    async fn workspace_list_stops_before_hashing_past_its_aggregate_byte_budget() {
+    async fn workspace_list_never_reads_content_or_applies_content_size_limits() {
         let root = tempdir().unwrap();
-        let file = std_fs::File::create(root.path().join("oversized.txt")).unwrap();
-        file.set_len(MAX_WORKSPACE_LIST_HASH_BYTES + 1).unwrap();
-        let limits = crate::FilesystemLimits {
-            max_file_bytes: (MAX_WORKSPACE_LIST_HASH_BYTES + 1) as usize,
-            ..crate::FilesystemLimits::default()
-        };
-        let group = FileToolGroup::new(root.path(), false, Some(limits))
+        const LARGE_BYTES: u64 = 65 * 1_024 * 1_024;
+        const CONTENT: &str = "small text\n";
+        for name in ["oversized.txt", "ckeditor.js.map", "binary.bin"] {
+            let file = std_fs::File::create(root.path().join(name)).unwrap();
+            file.set_len(LARGE_BYTES).unwrap();
+        }
+        fs::write(root.path().join("small.txt"), CONTENT)
             .await
             .unwrap();
+        let group = FileToolGroup::new(root.path(), false, None).await.unwrap();
         let directory = group.workspace_root().await.unwrap();
+        let binding = request_binding(directory.handle);
         let listed = group
             .workspace_list(
                 &ListRequest {
                     version: ContractVersion::V1,
-                    binding: request_binding(directory.handle),
+                    binding: binding.clone(),
                     path: workspace_path(".").unwrap(),
                     recursive: true,
-                    page_size: 1,
+                    page_size: MAX_PAGE_SIZE,
                     cursor: None,
                 },
                 &CancellationToken::new(),
@@ -2681,9 +4386,35 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(listed.truncated);
-        assert!(listed.entries.is_empty());
+        assert!(!listed.truncated);
+        assert!(!listed.incomplete);
+        assert_eq!(listed.entries.len(), 4);
+        assert!(listed.entries.iter().all(|entry| entry.revision.is_none()));
         assert!(listed.next_cursor.is_none());
+        let error = group
+            .workspace_stat(&StatRequest {
+                version: ContractVersion::V1,
+                binding: binding.clone(),
+                path: workspace_path("ckeditor.js.map").unwrap(),
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(error, WorkspaceError::FileTooLarge { .. }));
+        let read = group
+            .workspace_read_text(
+                &ReadTextRequest {
+                    version: ContractVersion::V1,
+                    binding,
+                    path: workspace_path("small.txt").unwrap(),
+                    range: None,
+                    byte_offset: 0,
+                    max_bytes: MAX_TEXT_READ_BYTES,
+                },
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(read.text, CONTENT);
     }
 
     #[tokio::test]
@@ -3010,7 +4741,7 @@ mod tests {
             mutations.push(WorkspaceMutation::Write {
                 path: workspace_path(&name).unwrap(),
                 content: MutationContent::new("x").unwrap(),
-                expected_revision: stat.entry.revision,
+                expected_revision: stat.entry.revision.unwrap(),
             });
         }
 
@@ -3060,7 +4791,7 @@ mod tests {
                 vec![WorkspaceMutation::Rename {
                     from: workspace_path("binary.dat").unwrap(),
                     to: workspace_path("renamed.dat").unwrap(),
-                    expected_revision: initial.entry.revision,
+                    expected_revision: initial.entry.revision.unwrap(),
                 }],
                 &CancellationToken::new(),
             )
@@ -3088,7 +4819,7 @@ mod tests {
                 &directory.handle,
                 vec![WorkspaceMutation::Delete {
                     path: workspace_path("renamed.dat").unwrap(),
-                    expected_revision: renamed.entry.revision,
+                    expected_revision: renamed.entry.revision.unwrap(),
                 }],
                 &CancellationToken::new(),
             )

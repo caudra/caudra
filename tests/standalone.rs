@@ -775,7 +775,7 @@ async fn authenticated_http_discovers_one_opt_in_remote_environment() {
             "maxPathBytes": workcell_host_contract::MAX_WORKSPACE_PATH_BYTES,
             "maxDiscoveryEntries": workcell_host_contract::MAX_WORKSPACE_LIST_ENTRIES,
             "maxDiscoveryRetainedBytes": workcell_host_contract::MAX_WORKSPACE_LIST_RETAINED_BYTES,
-            "maxDiscoveryHashBytes": workcell_host_contract::MAX_WORKSPACE_LIST_HASH_BYTES,
+            "maxDiscoveryHashBytes": workcell_host_contract::MAX_PROJECT_ASSET_DISCOVERY_HASH_BYTES,
         })
     );
     assert_eq!(descriptor["capabilities"]["directExec"]["prepared"], true);
@@ -1761,6 +1761,9 @@ async fn authenticated_scm_is_negotiated_structured_and_uses_the_common_ledger()
 #[tokio::test]
 async fn authenticated_workspace_operations_bind_cursors_mutations_and_direct_exec() {
     let root = tempfile::tempdir().expect("temporary root");
+    const LARGE_BYTES: u64 = 7_508_089;
+    const NOT_REPOSITORY_CODE: &str = "not_repository";
+    const FILE_TOO_LARGE_CODE: &str = "file_too_large";
     tokio::fs::write(root.path().join("a.txt"), "needle before\n")
         .await
         .unwrap();
@@ -1770,6 +1773,12 @@ async fn authenticated_workspace_operations_bind_cursors_mutations_and_direct_ex
     tokio::fs::create_dir(root.path().join("sub"))
         .await
         .unwrap();
+    for name in ["sub/ckeditor.js.map", "sub/binary.bin"] {
+        std::fs::File::create(root.path().join(name))
+            .unwrap()
+            .set_len(LARGE_BYTES)
+            .unwrap();
+    }
     let policy = ShellPermissionPolicy::from_toml(
         "version = 1\ndefault = \"deny\"\nallow = [\"printf *\", \"sleep *\"]\n",
         false,
@@ -1856,7 +1865,7 @@ async fn authenticated_workspace_operations_bind_cursors_mutations_and_direct_ex
         "host":host,
         "cwdHandle":cwd,
         "path":".",
-        "recursive":false,
+        "recursive":true,
         "pageSize":1,
         "cursor":null
     });
@@ -1884,13 +1893,81 @@ async fn authenticated_workspace_operations_bind_cursors_mutations_and_direct_ex
             &client,
             &endpoint,
             Some(TOKEN),
-            remote_request(4, "ai.workcell/list", list_params),
+            remote_request(4, "ai.workcell/list", list_params.clone()),
         )
         .await,
     )
     .await;
     assert_eq!(listed["result"]["entries"][0]["path"], "a.txt");
+    assert_eq!(listed["result"]["entries"][0]["revision"], Value::Null);
+    assert_eq!(listed["result"]["incomplete"], false);
+    assert_eq!(listed["result"]["truncated"], false);
     assert!(listed["result"]["nextCursor"].is_string());
+    tokio::fs::write(root.path().join("sub/after-capture.bin"), "new entry")
+        .await
+        .unwrap();
+    let mut page = listed;
+    let mut paths = vec!["a.txt".to_owned()];
+    while page["result"]["nextCursor"].is_string() {
+        let mut params = list_params.clone();
+        params["cursor"] = page["result"]["nextCursor"].clone();
+        let next = final_sse_json(
+            post_rpc(
+                &client,
+                &endpoint,
+                Some(TOKEN),
+                remote_request(40, "ai.workcell/list", params),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(next["result"]["revision"], page["result"]["revision"]);
+        assert_eq!(next["result"]["incomplete"], false);
+        for entry in next["result"]["entries"].as_array().unwrap() {
+            assert_eq!(entry["revision"], Value::Null);
+            paths.push(entry["path"].as_str().unwrap().to_owned());
+        }
+        page = next;
+    }
+    assert_eq!(
+        paths,
+        [
+            "a.txt",
+            "b.txt",
+            "sub",
+            "sub/binary.bin",
+            "sub/ckeditor.js.map"
+        ]
+    );
+    tokio::fs::remove_file(root.path().join("sub/after-capture.bin"))
+        .await
+        .unwrap();
+    for (method, path, expected) in [
+        (
+            "ai.workcell/stat",
+            "sub/ckeditor.js.map",
+            FILE_TOO_LARGE_CODE,
+        ),
+        ("ai.workcell/scm-discover", ".", NOT_REPOSITORY_CODE),
+    ] {
+        let response = final_sse_json(
+            post_rpc(
+                &client,
+                &endpoint,
+                Some(TOKEN),
+                remote_request(
+                    41,
+                    method,
+                    json!({
+                        "version":"v1", "host":host, "cwdHandle":cwd, "path":path
+                    }),
+                ),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(response["error"]["data"]["code"], expected);
+    }
 
     let read = final_sse_json(
         post_rpc(

@@ -407,11 +407,34 @@ deterministically ordered list and traversal, bounded text ranges, and determini
 `ai.workcell/read-text`, and `ai.workcell/search-text`. Every relative request carries both the exact
 host binding and an immutable cwd handle. Directory resolution returns a fresh handle plus a
 root-relative POSIX display path; traversal or symlinks cannot leave the one configured root-project.
-List and search pagination use bounded opaque server-side cursors bound to the request digest and
-observed resource revision. Unknown or modified cursors are rejected, and a resource change returns
-an explicit stale-cursor error. List traversal retains at most 50,000 entries and 16 MiB of entry and
-path state and hashes at most 64 MiB of file content, independently of the requested page size;
-`truncated` is explicit when one of those aggregate limits stops the traversal. Search responses
+Listing captures metadata once and serves subsequent pages from that immutable inventory, without
+walking or hashing the tree again. Opaque cursors bind its generation, verified cwd, normalized scope,
+recursion mode, and page size. Changes after capture may leave display metadata stale: watches
+reconcile the view, while explicit stat/read and conditional mutations remain live and revision-bound.
+Listing is a captured view, not an atomic filesystem snapshot or ongoing live traversal. Entries carry
+`revision: null`, regardless of file size or encoding. Its page revision binds the metadata inventory,
+not file contents, and cannot authorize mutations. Explicit stat returns a verified revision; a file
+over the configured content limit returns `file_too_large` with `maximum` bytes instead of hiding its
+siblings. List traversal retains at most 50,000 entries and 16 MiB of entry and path state,
+independently of page size. `truncated` reports a traversal bound; the separate required `incomplete`
+flag reports skipped vanished, unreadable, symlink, or special entries. Protected paths remain
+excluded. Listing verifies the opened cwd descriptor against the handle's directory identity, then
+opens the requested scope relative to that descriptor. Directory enumeration and metadata inspection
+stay beneath the pinned scope without following symlinks or magic links. Ordinary mounts remain
+visible; snapshot and transfer mount restrictions do not apply to browsing. Non-enumerated ancestors
+need search permission, not read permission; unsupported kernels fail closed. A refused listing root
+is an error, not an empty inventory. Each page revalidates cwd and scope descriptors, so replacing a
+scope or rebinding a cwd still refuses the request.
+
+Paginated inventories expire 30 seconds after capture, including completed inventories retained for
+identical page retries. Unknown or expired cursors return `stale_cursor`; modified or mismatched
+cursors are refused, never restarted at page zero. A request without a cursor captures a fresh view.
+Each filesystem group allows at most 16 retained or capturing inventories, 200,000 aggregate entries,
+128 MiB of conservatively accounted inventory state, and four concurrent listing workers. Captures
+reserve 50,000 entries and 32 MiB before walking, then reduce the reservation to the retained state.
+Capacity exhaustion refuses admission with `invalid_operation`; it never evicts unexpired receipts.
+Expiry removes cached receipts, but active page references keep their memory reservation until released.
+Search pagination still checks current result revisions and returns stale-cursor errors on changes. Search responses
 preserve the underlying scan's `filesScanned`,
 `filesListed`, and `truncated` values, so a null cursor does not claim completeness when the bounded
 scan stopped early. Match text and its resource revision come from one metadata-verified file
@@ -433,6 +456,9 @@ continuation cursor. It never claims a complete incremental history across one o
 Subscriptions, raw backend queues, retained events and bytes, poll batches, waits, total event count,
 and lifetime are all bounded; close, overflow, backend failure, expiry, replacement, and server drop
 release the native watcher and abort its expiry task.
+Watch setup failures return `watch_unavailable` with `phase` (`initialize` or `register`), a sanitized
+backend `kind`, and nullable `ioKind` and `rawOsError`. Native error text and host paths are discarded;
+the server does not change kernel watch limits.
 
 Native filesystems do not provide one portable exact rename contract. Workcell therefore advertises
 `exactRenamePairing: false` and normalizes what the backend can establish into remove/create events.
@@ -455,9 +481,11 @@ a client may apply denies immediately, but must review allows and bind that deci
 revision. Workcell does not parse or apply any of these sources.
 
 Discovery retains at most 256 assets, visits at most 50,000 entries, retains at most 16 MiB of path
-state, and hashes at most 64 MiB of content; it rejects a partial traversal. Asset paths are at most
-4,096 bytes and each UTF-8 read is at most 64 KiB. Reads reuse confined stat, require the discovered
-content revision, and return source bytes without parsing or executing them.
+state, and hashes at most 64 MiB of content; it rejects a partial traversal. Discovery reserves each
+candidate's observed length against its own hash budget before reading and never reads beyond that
+reservation, even if the file grows. Failed or changed reads do not refund their reservation.
+Asset paths are at most 4,096 bytes and each UTF-8 read is at most 64 KiB. Reads reuse confined stat,
+require the discovered content revision, and return source bytes without parsing or executing them.
 
 The manifest does not include `.env`, `init.lua`, MCP configuration, plugin configuration or source,
 general `.caudra` configuration, arbitrary scripts, or arbitrary remote configuration. It follows no
@@ -493,6 +521,8 @@ worktree and `.git` directory that both remain inside the configured root. Linke
 submodules, symlinked or external git directories, bare repositories, and configured external filter
 or diff/textconv programs are rejected. Git availability and its bounded version response are probed
 when the remote host is constructed; failed probes omit SCM and add `scm` to `controlPlaneMissing`.
+Discovery returns `not_repository` only when no `.git` is found up to the configured root. Inaccessible,
+corrupt, unsupported, or stale repositories remain failures rather than normal absence.
 At most four SCM operations run concurrently across all groups in one process; queued requests remain
 cancellable. The effective bound is advertised as `maxConcurrentOperations`.
 The regular, non-symlink `.git/config` is limited to the advertised 1 MiB `maxConfigBytes`; bounded

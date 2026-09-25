@@ -666,7 +666,6 @@ impl WorkcellServer {
                         max_list_entries: workcell_host_contract::MAX_WORKSPACE_LIST_ENTRIES,
                         max_list_retained_bytes:
                             workcell_host_contract::MAX_WORKSPACE_LIST_RETAINED_BYTES,
-                        max_list_hash_bytes: workcell_host_contract::MAX_WORKSPACE_LIST_HASH_BYTES,
                     },
                 }),
                 watch: Some(WorkspaceWatchCapability {
@@ -721,7 +720,7 @@ impl WorkcellServer {
                         max_discovery_retained_bytes:
                             workcell_host_contract::MAX_WORKSPACE_LIST_RETAINED_BYTES,
                         max_discovery_hash_bytes:
-                            workcell_host_contract::MAX_WORKSPACE_LIST_HASH_BYTES,
+                            workcell_host_contract::MAX_PROJECT_ASSET_DISCOVERY_HASH_BYTES,
                     },
                 }),
                 workspace_mutation: workspace_files.allow_write().then_some(
@@ -3513,20 +3512,37 @@ fn symbolic_invalid_params(message: String, code: &str) -> ErrorData {
 
 fn workspace_error(error: WorkspaceError) -> ErrorData {
     let code = error.code();
+    let mut data = serde_json::json!({"code": code});
     let message = match error {
         WorkspaceError::InvalidRequest => "workspace request is invalid",
         WorkspaceError::StaleCwd => "workspace cwd handle is unknown or stale",
         WorkspaceError::InvalidCursor => "workspace cursor is invalid",
         WorkspaceError::StaleCursor => "workspace cursor is stale",
         WorkspaceError::StaleResource => "workspace resource revision is stale",
-        WorkspaceError::WatchUnavailable => "workspace watch backend is unavailable",
+        WorkspaceError::WatchUnavailable {
+            phase,
+            kind,
+            io_kind,
+            raw_os_error,
+        } => {
+            data["phase"] = serde_json::json!(phase);
+            data["kind"] = serde_json::json!(kind);
+            data["ioKind"] = serde_json::json!(io_kind.map(|kind| format!("{kind:?}")));
+            data["rawOsError"] = serde_json::json!(raw_os_error);
+            "workspace watch backend is unavailable"
+        }
+        WorkspaceError::NotRepository => "Not a Git repository",
         WorkspaceError::RepositoryUnavailable => "workspace repository is unavailable",
+        WorkspaceError::FileTooLarge { maximum } => {
+            data["maximum"] = serde_json::json!(maximum);
+            "workspace file exceeds the configured content size limit"
+        }
         WorkspaceError::UnsupportedRepository => "workspace repository layout is unsupported",
         WorkspaceError::RolledBack(_) => "workspace mutation was rolled back",
         WorkspaceError::PartialFailure(_) => "workspace mutation rollback was incomplete",
         WorkspaceError::Filesystem(_) => "workspace filesystem operation failed",
     };
-    ErrorData::invalid_params(message, Some(serde_json::json!({"code": code})))
+    ErrorData::invalid_params(message, Some(data))
 }
 
 fn scm_error(error: ScmError) -> ErrorData {
@@ -3678,7 +3694,9 @@ mod tests {
         SnapshotChangeCounts, SnapshotLimit,
     };
     use workcell_mcp_code::{WORKER_FILE_NAME, WorkerSource};
-    use workcell_mcp_files::catalog as file_catalog;
+    use workcell_mcp_files::{
+        WorkspaceWatchErrorKind, WorkspaceWatchPhase, catalog as file_catalog,
+    };
     use workcell_mcp_web::{WebsearchExecutionConfiguration, catalog as web_catalog};
 
     use super::*;
@@ -3687,6 +3705,27 @@ mod tests {
     const PATH_OUTSIDE_ROOT_CODE: &str = "path_outside_root";
     const NOT_FOUND_CODE: &str = "not_found";
     const CAPTURE_TEST_TIMEOUT: Duration = Duration::from_secs(10);
+
+    #[test]
+    fn watch_refusals_serialize_safe_diagnostics_and_keep_the_stable_error_code() {
+        let error = workspace_error(WorkspaceError::WatchUnavailable {
+            phase: WorkspaceWatchPhase::Register,
+            kind: WorkspaceWatchErrorKind::Io,
+            io_kind: Some(std::io::ErrorKind::PermissionDenied),
+            raw_os_error: None,
+        });
+        assert_eq!(
+            error.data.unwrap(),
+            json!({
+                "code": "watch_unavailable", "phase": "register", "kind": "io",
+                "ioKind": "PermissionDenied", "rawOsError": null
+            })
+        );
+        assert_eq!(
+            scm_error(ScmError::NotRepository).data.unwrap(),
+            json!({"code":"not_repository"})
+        );
+    }
 
     #[test]
     fn canonical_cwd_rebases_paths_and_patch_directives_not_content() {

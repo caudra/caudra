@@ -133,12 +133,38 @@ revision-bearing text reads, and deterministic paginated text search through tha
 MCP route. Every relative request repeats the immutable host and root-project binding and names an
 opaque cwd handle. Handles are server-held directory bindings rather than path-bearing tickets;
 resolving a directory creates a fresh one, and rebinding, removal, root escape, or an escaping symlink
-is rejected. Pagination cursors are bounded server-held records bound to both request digest and
-observed revision, so tampering is invalid and changed results are explicitly stale. Search preserves
+is rejected. Pagination cursors bind the request and its captured generation or result revision.
+Tampering is refused; search result changes are explicitly stale. Search preserves
 bounded traversal coverage and truncation metadata even when no page cursor remains. Text reads expose
 byte continuation within a selected line range, the line containing the first byte, and the last line
 completed by the chunk, so oversized lines and beyond-EOF ranges cannot silently skip or fabricate
 content.
+
+Workspace listing opens no file contents and applies no content byte limit. Its nullable entry
+revisions cannot substitute for stat/read revisions in mutation preconditions. Opaque inventory
+generations serve pagination only. Unreadable or vanished descendants and unsupported file kinds mark
+the bounded response incomplete; a refused root remains an error. Before opening a requested scope,
+listing compares the opened cwd descriptor's directory identity with the original immutable binding.
+Child creation and directory timestamp changes do not invalidate that identity. Scope resolution stays
+relative to the verified cwd descriptor, even if the pathname is subsequently replaced. Listing uses
+its own `BENEATH | NO_SYMLINKS | NO_MAGICLINKS` resolver for enumeration and metadata: ordinary mounts
+and bind mounts remain visible, while snapshot and transfer resolvers retain their `NO_XDEV` policy.
+Non-enumerated ancestors use search-only descriptors; only directories being listed require read
+permission. Replacing an ancestor with a symlink cannot redirect metadata reads into a protected or
+external tree; unsupported kernels have no pathname fallback. Blocking enumeration checks a child
+cancellation token between entries, including when its caller is dropped.
+
+Listing pages reuse immutable captured metadata and may be stale relative to later filesystem changes.
+Every page verifies cwd and scope identity plus scope read permission; cached metadata is never
+authority for content reads or writes. Cursors bind a generation, normalized scope, cwd, recursion,
+page bounds, and a private per-inventory receipt nonce. Expiry or unknown generations refuse rather
+than restarting traversal. Records survive the last page for stable retries until their fixed 30-second
+expiry. At most 16 inventories, 200,000 entries, 128 MiB of accounted inventory state, and four workers
+are admitted per filesystem group. Admission reserves each capture's maximum entries and conservative
+memory envelope before allocating the traversal, then releases unused quota. Live receipts are not
+evicted to make room. Shared inventory references own their quota leases, so removing an expired
+record cannot undercount a page still using it. Bounded expiry tasks hold only weak workspace references
+and are aborted with their records; cancelled or dropped captures retain admission until their worker exits.
 
 Workspace watch state is volatile, bounded, and owned by the authenticated remote-host instance. A
 subscription is bound to the same host, workspace generation, principal, root project, and immutable
@@ -153,6 +179,8 @@ Every subscription owns one abortable expiry task; close, terminal resync, repla
 host drop abort it instead of retaining a detached sleeper.
 The backend's order is retained, but rename pairing is not portable: known ends become remove/create,
 and ambiguity becomes `rescan`.
+Watch setup diagnostics retain only the initialization/registration phase, backend error category,
+I/O kind, and numeric OS error. Native error messages and path lists are never serialized or logged.
 
 Project-asset discovery is a fixed, versioned server allowlist. It covers recognized project
 instruction files, one-level skill `SKILL.md` sources in the documented compatibility directories,
@@ -161,7 +189,10 @@ instruction files, one-level skill `SKILL.md` sources in the documented compatib
 project-controlled extension mechanism. Discovery and reads reuse confined traversal, stat, symlink
 rejection, protected-path policy, text bounds, and content revisions. Discovery admits at most 256
 assets while scanning at most 50,000 entries, 16 MiB of retained path state, and 64 MiB of hashed
-content; paths are at most 4,096 bytes and reads at most 64 KiB. A bounded partial scan is rejected.
+content; paths are at most 4,096 bytes and reads at most 64 KiB. Discovery charges the observed file
+length before reading, caps actual reads at the reservation, and rejects changed metadata. Failed
+reads retain their charge. Exhausting this independent hash budget rejects the discovery rather than
+returning a partial manifest. A bounded partial scan is rejected.
 `.env`, `init.lua`, MCP configuration, plugin configuration or source, general or remote configuration,
 and arbitrary scripts are excluded. The server does not parse, load, execute, or grant trust to any
 discovered source. Instructions, skills, and commands are labeled `declarative`; workflow bytes are
