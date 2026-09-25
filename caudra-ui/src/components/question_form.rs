@@ -912,8 +912,11 @@ const NEWLINE_MODIFIERS: KeyModifiers = KeyModifiers::SHIFT.union(KeyModifiers::
 /// A trailing backslash is the plain-terminal way to ask for a newline where
 /// the modifier combination never reaches the process.
 fn ends_with_backslash(buffer: &TextBuffer) -> bool {
-    let value = buffer.value();
-    buffer.cursor_offset() > 0 && value[..buffer.cursor_offset()].ends_with('\\')
+    buffer
+        .x()
+        .checked_sub(1)
+        .and_then(|index| buffer.lines()[buffer.y()].chars().nth(index))
+        == Some('\\')
 }
 
 /// A line with the character under the caret reversed. Nothing places a
@@ -1493,18 +1496,60 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_typed_answer_is_kept_verbatim() {
+    #[test_case(TYPED ; "ascii")]
+    #[test_case("Wait…" ; "ellipsis")]
+    #[test_case("café" ; "accented")]
+    #[test_case("\u{10400}" ; "supplementary_plane")]
+    fn a_typed_answer_is_kept_verbatim(answer: &str) {
         let mut form = opened(vec![question(HEADER, false)]);
         press(&mut form, KeyCode::Down);
         press(&mut form, KeyCode::Down);
         press(&mut form, KeyCode::Enter);
         assert_eq!(form.mode, Mode::EditingCustom);
-        type_text(&mut form, TYPED);
+        type_text(&mut form, answer);
         let action = press(&mut form, KeyCode::Enter);
         assert!(
-            matches!(&action, QuestionFormAction::Submit(picks) if picks == &[vec![TYPED.to_owned()]]),
+            matches!(&action, QuestionFormAction::Submit(picks) if picks == &[vec![answer.to_owned()]]),
         );
+    }
+
+    #[test_case("", 0, false ; "empty")]
+    #[test_case("\\", 0, false ; "start_of_buffer")]
+    #[test_case("\\", 1, true ; "ascii_backslash")]
+    #[test_case("…", 1, false ; "unicode_without_backslash")]
+    #[test_case("…\\", 2, true ; "unicode_backslash")]
+    #[test_case("éa\\", 3, true ; "byte_boundary_still_wrong_character")]
+    #[test_case("…\\tail", 2, true ; "middle_of_line")]
+    #[test_case("…a\\", 2, false ; "backslash_after_caret")]
+    #[test_case("…\n\\", 3, true ; "later_line")]
+    #[test_case("…\\\ntail", 3, false ; "start_of_later_line")]
+    fn backslash_detection_uses_character_positions(text: &str, cursor: usize, expected: bool) {
+        let mut buffer = TextBuffer::new(text.to_owned());
+        buffer.set_cursor_offset(cursor);
+        assert_eq!(ends_with_backslash(&buffer), expected);
+    }
+
+    #[test_case("plain\\", 6, "plain\n" ; "ascii")]
+    #[test_case("…\\", 2, "…\n" ; "ellipsis")]
+    #[test_case("éa\\", 3, "éa\n" ; "accented")]
+    #[test_case("\u{10400}\\", 2, "\u{10400}\n" ; "supplementary_plane")]
+    #[test_case("…\\tail", 2, "…\ntail" ; "middle_of_line")]
+    #[test_case("…\né\\tail", 4, "…\né\ntail" ; "later_line")]
+    fn enter_replaces_backslash_before_caret_with_newline(
+        text: &str,
+        cursor: usize,
+        expected: &str,
+    ) {
+        let mut form = typing(false);
+        form.custom = TextBuffer::new(text.to_owned());
+        form.custom.set_cursor_offset(cursor);
+
+        let action = press(&mut form, KeyCode::Enter);
+
+        assert!(matches!(action, QuestionFormAction::Consumed));
+        assert_eq!(form.mode, Mode::EditingCustom);
+        assert_eq!(form.custom.value(), expected);
+        assert_eq!(form.custom.cursor_offset(), cursor);
     }
 
     #[test]
