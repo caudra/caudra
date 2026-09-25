@@ -107,6 +107,7 @@ const UNREACHABLE_OPERATIONS_HEADING: &str = "Operations from an earlier workspa
 const UNREACHABLE_OPERATIONS_REMEDY: &str = "The host that ran them is gone, so they cannot be reconciled; acknowledge each once you have checked its effects.";
 const SHELL_CONTRACT_ID: &str = "shell.execution.v1";
 
+mod snapshot;
 mod transfer;
 
 #[derive(Clone)]
@@ -1546,6 +1547,7 @@ struct RemoteInner {
     cursors: Mutex<CursorRegistry>,
     watches: Mutex<BoundedMap<WatchSubscriptionId, WatchRecord>>,
     operations: Mutex<OperationRegistry>,
+    captures: snapshot::CaptureRegistry,
     operation_slots: Event,
     mutation_journal: RemoteMutationJournal,
 }
@@ -1733,6 +1735,7 @@ impl RemoteWorkcellClient {
             }),
             watches: Mutex::new(BoundedMap::new(watch_limit, watch_ttl)),
             operations: Mutex::new(OperationRegistry::new(operation_limit)),
+            captures: snapshot::CaptureRegistry::default(),
             operation_slots: Event::new(),
             mutation_journal,
         }));
@@ -1995,7 +1998,7 @@ impl RemoteWorkcellClient {
                 .snapshots
                 .as_ref()
                 .is_some_and(|snapshots| {
-                    snapshots.methods.capture
+                    snapshots.methods.prepare_capture && snapshots.methods.checkpoint
                         || snapshots.methods.inspect
                         || snapshots.methods.status
                 })
@@ -2495,6 +2498,7 @@ impl RemoteWorkcellClient {
                 | contract::PREPARE_MUTATION_METHOD
                 | contract::PREPARE_EXEC_METHOD
                 | contract::SCM_PREPARE_MUTATION_METHOD
+                | contract::SNAPSHOT_PREPARE_CAPTURE_METHOD
                 | contract::SNAPSHOT_PREPARE_RESTORE_METHOD
                 | contract::SNAPSHOT_PREPARE_UNREVERT_METHOD
                 | contract::SNAPSHOT_PREPARE_CLEANUP_METHOD
@@ -4673,30 +4677,10 @@ impl WorkspaceSnapshotReadService for RemoteWorkcellClient {
         if request.label.is_some() {
             self.require_capability(WorkspaceCapability::SnapshotCaptureLabels)?;
         }
-        let limits = self.snapshot_limits()?;
-        let response: contract::SnapshotCaptureResponse = self
-            .call(
-                contract::SNAPSHOT_CAPTURE_METHOD,
-                &contract::SnapshotCaptureRequest {
-                    version: contract::ContractVersion::V1,
-                    binding: self.bind_workspace_request(binding, cursor)?,
-                    checkpoint_id: contract_identifier(&request.checkpoint_id)?,
-                    limits: capture_limits(&request.limits, limits),
-                },
-                &self.0.cancellation.child_token(),
-            )
-            .await?;
-        validate_v1(response.version)?;
-        let mut snapshot = snapshot_summary(&response.snapshot)?;
-        validate_snapshot_summary(&snapshot, limits)?;
-        if snapshot.checkpoint_id.as_ref() != Some(&request.checkpoint_id) {
-            return Err(invalid_response());
-        }
-        snapshot.label.clone_from(&request.label);
-        Ok(SnapshotCaptureResult {
-            snapshot,
-            reused_checkpoint: response.reused_checkpoint,
+        self.capture_snapshot(binding, cursor, request, |delay| async move {
+            smol::Timer::after(delay).await;
         })
+        .await
     }
 
     async fn inspect(
@@ -5190,6 +5174,10 @@ fn map_rpc_error(error: &JsonRpcError) -> RemoteWorkcellError {
         Some("indeterminate") => RemoteWorkcellError::Indeterminate,
         Some("cancelled") => RemoteWorkcellError::Cancelled,
         Some("timed_out") => RemoteWorkcellError::Timeout,
+        Some(snapshot::NOT_FOUND) => RemoteWorkcellError::UnmappedRefusal {
+            code: error.code,
+            symbolic: snapshot::NOT_FOUND.to_owned(),
+        },
         _ if matches!(error.code, 401 | 403) => RemoteWorkcellError::Authentication,
         // A refusal we have no symbolic mapping for still arrived well formed,
         // so calling it invalid blames the wire for a decision the host made.
@@ -5547,7 +5535,8 @@ fn require_full_remote_parity(
         && scm.methods.unstage
         && scm.methods.discard
         && scm.prepared_mutations
-        && snapshots.methods.capture
+        && snapshots.methods.prepare_capture
+        && snapshots.methods.checkpoint
         && snapshots.methods.inspect
         && snapshots.methods.status
         && snapshots.methods.prepare_restore
@@ -5890,7 +5879,7 @@ fn workspace_capabilities(
             || snapshots.methods.prepare_cleanup;
         push_if(
             &mut result,
-            snapshots.methods.capture,
+            snapshot::compatible(capabilities),
             WorkspaceCapability::SnapshotCapture,
         );
         push_if(
@@ -7369,10 +7358,11 @@ mod tests {
         AuthenticatedPrincipalId, AuthorityIdentity, CheckpointId, CwdHandle, OperationHandle,
         OperationId, OperationState, PreparedToolCall, ProjectAssetKind, ProjectAssetTrust,
         ProjectIdentity, ProjectKey, ResourceId, ResourceScope, ResourceSelector, RestoreId,
-        SessionBindingId, SessionWorkspaceBinding, SnapshotCaptureLimits, SnapshotChangeCounts,
-        SnapshotCleanupPreview, SnapshotId, SnapshotOperationPreview, SnapshotRestorePreview,
-        SnapshotUnrevertPreview, SourceTrustAnchor, ToolPrepareRequest, WorkspaceCapability,
-        WorkspaceCursor, WorkspaceError, WorkspacePath, WorkspaceSession,
+        SessionBindingId, SessionWorkspaceBinding, SnapshotCaptureLimits, SnapshotCaptureRequest,
+        SnapshotCaptureResult, SnapshotChangeCounts, SnapshotCleanupPreview, SnapshotId,
+        SnapshotOperationPreview, SnapshotRestorePreview, SnapshotUnrevertPreview,
+        SourceTrustAnchor, ToolPrepareRequest, WorkspaceCapability, WorkspaceCursor,
+        WorkspaceError, WorkspacePath, WorkspaceSession,
     };
     use workcell::{ToolManifest, host_contract as contract};
 
@@ -7388,6 +7378,11 @@ mod tests {
     const CANCELLED: &str = "cancelled";
     /// Long past, so dispatch would renew the preparation on the host first.
     const LAPSED_EXPIRY_UNIX_MS: u64 = 0;
+    const SNAPSHOT_CHECKPOINT: &str = "baseline-checkpoint";
+    const SNAPSHOT_RPC_MESSAGE: &str = "snapshot request refused";
+    const SNAPSHOT_PREPARATION: &str = "capture-prepared";
+    const SNAPSHOT_POLLS: usize = 24;
+    const SNAPSHOT_REFUSAL: i64 = -32602;
 
     #[test]
     fn authoritative_cursors_survive_capacity_pressure_and_reject_rebinding() {
@@ -7546,7 +7541,7 @@ mod tests {
                 "preparedMutations":true,"discardUntracked":false
             },
             "snapshots":{
-                "version":"v1","methods":{"capture":true,"inspect":true,"status":true,
+                "version":"v1","methods":{"capture":true,"prepareCapture":true,"checkpoint":true,"inspect":true,"status":true,
                     "prepareRestore":true,"prepareUnrevert":true,"acknowledge":true,"prepareCleanup":true},
                 "limits":{"maxFiles":1,"maxFileBytes":1,"maxTotalBytes":1,"maxCaptureEntries":1,
                     "maxCapturePathBytes":1,"maxSnapshots":1,"maxStorageBytes":1,
@@ -8782,6 +8777,7 @@ mod tests {
             }),
             watches: Mutex::new(BoundedMap::new(CAPACITY, Duration::MAX)),
             operations: Mutex::new(operations),
+            captures: super::snapshot::CaptureRegistry::default(),
             operation_slots: super::Event::new(),
             mutation_journal: coordinator,
         }));
@@ -8833,8 +8829,8 @@ mod tests {
         assert!(listener.accept().is_err());
     }
 
-    struct ScriptedHost {
-        endpoint: WorkcellEndpoint,
+    pub(super) struct ScriptedHost {
+        pub(super) endpoint: WorkcellEndpoint,
         calls: Arc<Mutex<Vec<(String, Value)>>>,
         stop: Arc<AtomicBool>,
         server: Option<thread::JoinHandle<()>>,
@@ -8851,6 +8847,10 @@ mod tests {
 
     impl ScriptedHost {
         fn new(respond: impl Fn(&str, &Value) -> Value + Send + 'static) -> Self {
+            Self::rpc(move |method, params| Ok(respond(method, params)))
+        }
+
+        fn rpc(respond: impl Fn(&str, &Value) -> Result<Value, Value> + Send + 'static) -> Self {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let endpoint =
                 WorkcellEndpoint::parse(&format!("http://{}/mcp", listener.local_addr().unwrap()))
@@ -8888,14 +8888,16 @@ mod tests {
                     let params = request["params"].clone();
                     let result = respond(&method, &params);
                     recorded.lock().unwrap().push((method, params));
-                    let body =
-                        json!({"jsonrpc":"2.0","id":request["id"],"result":result}).to_string();
-                    write!(
+                    let body = match result {
+                        Ok(result) => json!({"jsonrpc":"2.0","id":request["id"],"result":result}),
+                        Err(error) => json!({"jsonrpc":"2.0","id":request["id"],"error":error}),
+                    }
+                    .to_string();
+                    let _ = write!(
                         stream,
                         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                         body.len()
-                    )
-                    .unwrap();
+                    );
                 }
             });
             Self {
@@ -8915,7 +8917,7 @@ mod tests {
                 .collect()
         }
 
-        fn params_for(&self, method: &str) -> Vec<Value> {
+        pub(super) fn params_for(&self, method: &str) -> Vec<Value> {
             self.calls
                 .lock()
                 .unwrap()
@@ -8949,6 +8951,653 @@ mod tests {
         operations.limits.max_progress_events = COUNT;
         operations.limits.max_progress_bytes = BYTES;
         descriptor
+    }
+
+    pub(super) fn snapshot_client(
+        endpoint: &WorkcellEndpoint,
+        state: &StateDir,
+    ) -> RemoteWorkcellClient {
+        const CAPACITY: usize = 8;
+        let seed = StoredWorkspaceBinding::local_from_cwd("snapshot-workspace");
+        let cursor = WorkspaceCursor::new(
+            seed.binding(),
+            ResourceScope::root(ResourceId::new("root").unwrap()),
+            0,
+            CwdHandle::new("cwd").unwrap(),
+        );
+        let stored = seed.with_cursor(cursor.clone()).unwrap();
+        let binding = stored.binding().clone();
+        let (transport, events) = RemoteTransport::new(endpoint, None).unwrap();
+        let descriptor = scripted_descriptor();
+        RemoteWorkcellClient(Arc::new(RemoteInner {
+            staging: PrivateStaging::new(super::transfer::negotiated_limits(
+                descriptor.capabilities.reviewed_transfer.as_ref(),
+            )),
+            transport,
+            capabilities: workspace_capabilities(&descriptor.capabilities),
+            descriptor,
+            host_binding: Mutex::new(host_binding()),
+            authority: binding.authority().clone(),
+            project: binding.project().clone(),
+            session_binding: binding,
+            stored_binding: stored.clone(),
+            root_cursor: cursor.clone(),
+            manifest: shell_manifest(),
+            catalog: HashMap::new(),
+            events,
+            cancellation: CancellationToken::new(),
+            paths: Mutex::new(ResourceCache::new(CAPACITY, Duration::MAX)),
+            repositories: Mutex::new(BoundedMap::new(CAPACITY, Duration::MAX)),
+            cursors: Mutex::new(CursorRegistry {
+                records: HashMap::from([(
+                    cursor.cwd_handle().clone(),
+                    CursorRecord {
+                        cursor,
+                        path: WorkspacePath::root(),
+                    },
+                )]),
+                limit: CAPACITY,
+            }),
+            watches: Mutex::new(BoundedMap::new(CAPACITY, Duration::MAX)),
+            operations: Mutex::new(OperationRegistry::new(CAPACITY)),
+            captures: super::snapshot::CaptureRegistry::default(),
+            operation_slots: super::Event::new(),
+            mutation_journal: RemoteMutationJournal::new(
+                RemoteOperationJournal::open(state).unwrap(),
+                stored,
+            )
+            .unwrap(),
+        }))
+    }
+
+    pub(super) fn snapshot_request() -> SnapshotCaptureRequest {
+        SnapshotCaptureRequest {
+            checkpoint_id: CheckpointId::new(SNAPSHOT_CHECKPOINT).unwrap(),
+            label: None,
+            limits: SnapshotCaptureLimits {
+                max_files: 1,
+                max_file_bytes: 1,
+                max_total_bytes: 1,
+            },
+        }
+    }
+
+    pub(super) fn snapshot_checkpoint() -> Value {
+        json!({"version":"v1", "reusedCheckpoint":true, "snapshot": {
+            "snapshotId":"snapshot", "checkpointId":SNAPSHOT_CHECKPOINT,
+            "state":"complete", "manifestRevision":"manifest", "scope":".",
+            "fileCount":1, "totalBytes":1, "createdAtUnixMs":1,
+            "skipped":{"nestedRepositories":0,"mounts":0,"specialFiles":0,
+                "oversizedFiles":0,"unreadableEntries":0,"unstableFiles":0,
+                "unrepresentableNames":0,"samples":[]}
+        }})
+    }
+
+    pub(super) fn snapshot_refusal(code: &str) -> Value {
+        json!({"code":SNAPSHOT_REFUSAL, "message":SNAPSHOT_RPC_MESSAGE, "data":{"code":code}})
+    }
+
+    pub(super) fn snapshot_host(
+        respond: impl Fn(&str, &Value, Result<Value, Value>) -> Result<Value, Value> + Send + 'static,
+    ) -> ScriptedHost {
+        let prepared = Mutex::new(HashMap::<String, (Value, Value)>::new());
+        ScriptedHost::rpc(move |method, params| {
+            let reply = match method {
+                contract::SNAPSHOT_CHECKPOINT_METHOD => {
+                    Err(snapshot_refusal(super::snapshot::NOT_FOUND))
+                }
+                contract::SNAPSHOT_PREPARE_CAPTURE_METHOD => {
+                    let mut request = params.clone();
+                    request.as_object_mut().unwrap().remove("_meta");
+                    let digest = super::CatalogRevision::for_serializable(&request).unwrap();
+                    let resources = [
+                        ("file:.", "read"),
+                        ("snapshot-store:captures", "read"),
+                        ("snapshot-store:captures", "write"),
+                        ("snapshot-store:captures", "delete"),
+                    ]
+                    .into_iter()
+                    .map(|(display, access)| {
+                        json!({
+                            "display":display, "access":access, "resourceId":"resource",
+                            "scope":["resource"], "revision":null
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                    let mut prepared = prepared.lock().unwrap();
+                    let preparation_id = format!("{SNAPSHOT_PREPARATION}-{}", prepared.len());
+                    let response = json!({
+                        "version":"v1", "preparationId":preparation_id,
+                        "expiresAtUnixMs":u64::MAX,
+                        "binding":{"host":params["host"], "argumentDigest":digest.as_str(),
+                            "contract":{"id":contract::SNAPSHOT_CAPTURE_CONTRACT_ID,"version":"v1","resultVersion":"v1"}},
+                        "intent":{"kind":"mutate","mutating":true,"resources":resources}
+                    });
+                    prepared.insert(
+                        preparation_id,
+                        (response.clone(), params["checkpointId"].clone()),
+                    );
+                    Ok(response)
+                }
+                contract::EXECUTE_METHOD | contract::STATUS_METHOD => {
+                    let prepared = prepared.lock().unwrap();
+                    let (prepared, checkpoint) =
+                        &prepared[params["preparationId"].as_str().unwrap()];
+                    let mut status = serde_json::to_value(completed_status()).unwrap();
+                    status["preparationId"] = params["preparationId"].clone();
+                    status["invocationId"] = params["invocationId"].clone();
+                    status["binding"] = prepared["binding"].clone();
+                    status["expiresAtUnixMs"] = prepared["expiresAtUnixMs"].clone();
+                    status["outcome"]["result"]["structuredContent"] = snapshot_checkpoint();
+                    status["outcome"]["result"]["structuredContent"]["snapshot"]["checkpointId"] =
+                        checkpoint.clone();
+                    Ok(status)
+                }
+                contract::CANCEL_METHOD => {
+                    Ok(json!({"version":"v1","state":"running","cancellationRequested":true}))
+                }
+                contract::RELEASE_METHOD => {
+                    Ok(json!({"version":"v1","state":"forgotten","released":true}))
+                }
+                other => panic!("unexpected snapshot method {other}"),
+            };
+            respond(method, params, reply)
+        })
+    }
+
+    fn capture_without_waiting(
+        client: &RemoteWorkcellClient,
+    ) -> Result<SnapshotCaptureResult, WorkspaceError> {
+        smol::block_on(client.capture_snapshot(
+            client.session_binding(),
+            client.root_cursor(),
+            &snapshot_request(),
+            |_| async {},
+        ))
+    }
+
+    #[test]
+    fn snapshot_running_outlasts_rpc_budget_without_reexecuting() {
+        let remaining = Mutex::new(SNAPSHOT_POLLS);
+        let host = snapshot_host(move |method, _, reply| {
+            let mut remaining = remaining.lock().unwrap();
+            if matches!(method, contract::EXECUTE_METHOD | contract::STATUS_METHOD)
+                && *remaining > 0
+            {
+                *remaining -= 1;
+                let mut status = reply.unwrap();
+                status["state"] = json!("running");
+                status["outcome"] = Value::Null;
+                Ok(status)
+            } else {
+                reply
+            }
+        });
+        let temp = tempfile::tempdir().unwrap();
+        let state = StateDir::from_path(temp.path().join("state"));
+        let client = snapshot_client(&host.endpoint, &state);
+        let waited = Mutex::new(Duration::ZERO);
+        let result = smol::block_on(client.capture_snapshot(
+            client.session_binding(),
+            client.root_cursor(),
+            &snapshot_request(),
+            |delay| {
+                *waited.lock().unwrap() += delay;
+                async {}
+            },
+        ))
+        .unwrap();
+        assert_eq!(
+            result.snapshot.checkpoint_id,
+            Some(snapshot_request().checkpoint_id)
+        );
+        assert!(*waited.lock().unwrap() > super::DEFAULT_TIMEOUT);
+        assert_eq!(host.params_for(contract::EXECUTE_METHOD).len(), 1);
+        assert_eq!(
+            host.params_for(contract::STATUS_METHOD).len(),
+            SNAPSHOT_POLLS
+        );
+        assert_eq!(host.params_for(contract::RELEASE_METHOD).len(), 1);
+        assert!(
+            host.params_for(contract::SNAPSHOT_CAPTURE_METHOD)
+                .is_empty()
+        );
+        assert_eq!(client.0.captures.len().unwrap(), 0);
+        assert!(client.pending_remote_operations().is_empty());
+        assert!(
+            RemoteOperationJournal::open(&state)
+                .unwrap()
+                .list_pending(client.stored_binding())
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test_case(false; "lost_execute_reply")]
+    #[test_case(true; "client_restart")]
+    fn snapshot_commit_is_recovered_by_checkpoint(restarted: bool) {
+        let published = AtomicBool::new(restarted);
+        let host = snapshot_host(move |method, _, reply| match method {
+            contract::EXECUTE_METHOD => {
+                published.store(true, Ordering::Release);
+                Err(snapshot_refusal("timed_out"))
+            }
+            contract::SNAPSHOT_CHECKPOINT_METHOD if published.load(Ordering::Acquire) => {
+                Ok(snapshot_checkpoint())
+            }
+            _ => reply,
+        });
+        let temp = tempfile::tempdir().unwrap();
+        let client = snapshot_client(
+            &host.endpoint,
+            &StateDir::from_path(temp.path().join("state")),
+        );
+        assert!(capture_without_waiting(&client).unwrap().reused_checkpoint);
+        assert_eq!(
+            host.params_for(contract::EXECUTE_METHOD).len(),
+            usize::from(!restarted)
+        );
+        assert!(
+            host.params_for(contract::SNAPSHOT_CAPTURE_METHOD)
+                .is_empty()
+        );
+    }
+
+    #[test_case("checkpointId", json!("foreign"), true; "lookup_checkpoint_id")]
+    #[test_case("scope", json!("foreign"), true; "lookup_scope")]
+    #[test_case("checkpointId", json!("foreign"), false; "completed_checkpoint_id")]
+    #[test_case("scope", json!("foreign"), false; "completed_scope")]
+    #[test_case("state", json!("corrupt"), false; "corrupt_result")]
+    #[test_case("fileCount", json!(2), false; "summary_limit")]
+    fn snapshot_result_identity_and_summary_are_validated(
+        field: &'static str,
+        value: Value,
+        lookup: bool,
+    ) {
+        let host = snapshot_host(move |method, _, reply| {
+            if lookup && method == contract::SNAPSHOT_CHECKPOINT_METHOD {
+                let mut checkpoint = snapshot_checkpoint();
+                checkpoint["snapshot"][field] = value.clone();
+                Ok(checkpoint)
+            } else if !lookup
+                && matches!(method, contract::EXECUTE_METHOD | contract::STATUS_METHOD)
+            {
+                let mut status = reply.unwrap();
+                status["outcome"]["result"]["structuredContent"]["snapshot"][field] = value.clone();
+                Ok(status)
+            } else {
+                reply
+            }
+        });
+        let temp = tempfile::tempdir().unwrap();
+        let client = snapshot_client(
+            &host.endpoint,
+            &StateDir::from_path(temp.path().join("state")),
+        );
+        assert!(matches!(
+            capture_without_waiting(&client),
+            Err(WorkspaceError::IdentityMismatch | WorkspaceError::InvalidResponse { .. })
+        ));
+        assert_eq!(
+            host.params_for(contract::EXECUTE_METHOD).len(),
+            usize::from(!lookup)
+        );
+        assert!(host.params_for(contract::RELEASE_METHOD).is_empty());
+    }
+
+    #[test_case("contract"; "wrong_contract")]
+    #[test_case("binding"; "wrong_binding")]
+    #[test_case("digest"; "wrong_arguments")]
+    #[test_case("intent"; "workspace_write_not_capture")]
+    #[test_case("scope"; "wrong_read_scope")]
+    fn snapshot_preparation_is_checked_before_execute(mismatch: &'static str) {
+        let host = snapshot_host(move |method, _, reply| {
+            if method != contract::SNAPSHOT_PREPARE_CAPTURE_METHOD {
+                return reply;
+            }
+            let mut prepared = reply.unwrap();
+            match mismatch {
+                "contract" => {
+                    prepared["binding"]["contract"]["id"] =
+                        json!(contract::SNAPSHOT_RESTORE_CONTRACT_ID)
+                }
+                "binding" => prepared["binding"]["host"]["workspaceId"] = json!("foreign"),
+                "digest" => prepared["binding"]["argumentDigest"] = json!(TEST_REQUEST_DIGEST),
+                "intent" => prepared["intent"]["resources"][0]["access"] = json!("write"),
+                "scope" => prepared["intent"]["resources"][0]["display"] = json!("file:foreign"),
+                _ => unreachable!(),
+            }
+            Ok(prepared)
+        });
+        let temp = tempfile::tempdir().unwrap();
+        let client = snapshot_client(
+            &host.endpoint,
+            &StateDir::from_path(temp.path().join("state")),
+        );
+        assert!(capture_without_waiting(&client).is_err());
+        assert!(host.params_for(contract::EXECUTE_METHOD).is_empty());
+        assert!(client.pending_remote_operations().is_empty());
+    }
+
+    #[test_case("indeterminate", "not_found"; "unknown_absent")]
+    #[test_case("forgotten", "not_found"; "forgotten_absent")]
+    #[test_case("neverSeen", "not_found"; "never_seen_absent")]
+    #[test_case("indeterminate", "busy"; "unknown_busy")]
+    fn snapshot_unresolved_capture_is_never_replayed(terminal: &'static str, lookup: &'static str) {
+        let executed = AtomicBool::new(false);
+        let host = snapshot_host(move |method, _, reply| {
+            if method == contract::SNAPSHOT_CHECKPOINT_METHOD && executed.load(Ordering::Acquire) {
+                return Err(snapshot_refusal(lookup));
+            }
+            if matches!(method, contract::EXECUTE_METHOD | contract::STATUS_METHOD) {
+                executed.store(true, Ordering::Release);
+                let mut status = reply.unwrap();
+                status["state"] = json!(terminal);
+                if terminal == "cancelled" {
+                    status["outcome"] = json!({"kind":"cancelled","sideEffectsPossible":false,"result":null,"error":null});
+                } else {
+                    for field in ["binding", "executionId", "expiresAtUnixMs", "outcome"] {
+                        status[field] = Value::Null;
+                    }
+                }
+                return Ok(status);
+            }
+            reply
+        });
+        let temp = tempfile::tempdir().unwrap();
+        let client = snapshot_client(
+            &host.endpoint,
+            &StateDir::from_path(temp.path().join("state")),
+        );
+        for _ in 0..2 {
+            assert_eq!(
+                capture_without_waiting(&client).unwrap_err(),
+                if terminal == "cancelled" {
+                    WorkspaceError::Cancelled
+                } else {
+                    WorkspaceError::IndeterminateOutcome
+                }
+            );
+        }
+        assert_eq!(host.params_for(contract::EXECUTE_METHOD).len(), 1);
+        assert_eq!(
+            host.params_for(contract::SNAPSHOT_PREPARE_CAPTURE_METHOD)
+                .len(),
+            1
+        );
+        assert_eq!(client.0.captures.len().unwrap(), 1);
+        assert!(client.pending_remote_operations().is_empty());
+    }
+
+    #[test_case(false; "cancel_remains_running")]
+    #[test_case(true; "cancel_rpc_failed")]
+    fn snapshot_client_cancellation_uses_independent_control(fail_cancel: bool) {
+        let host = snapshot_host(move |method, _, reply| {
+            if method == contract::CANCEL_METHOD && fail_cancel {
+                return Err(snapshot_refusal("timed_out"));
+            }
+            if matches!(method, contract::EXECUTE_METHOD | contract::STATUS_METHOD) {
+                let mut status = reply.unwrap();
+                status["state"] = json!("running");
+                status["outcome"] = Value::Null;
+                Ok(status)
+            } else {
+                reply
+            }
+        });
+        let temp = tempfile::tempdir().unwrap();
+        let client = snapshot_client(
+            &host.endpoint,
+            &StateDir::from_path(temp.path().join("state")),
+        );
+        let result = smol::block_on(client.capture_snapshot(
+            client.session_binding(),
+            client.root_cursor(),
+            &snapshot_request(),
+            |_| {
+                client.0.cancellation.cancel();
+                async { futures_lite::future::pending::<()>().await }
+            },
+        ));
+        assert_eq!(result.unwrap_err(), WorkspaceError::Cancelled);
+        assert_eq!(host.params_for(contract::CANCEL_METHOD).len(), 1);
+        assert_eq!(client.0.captures.len().unwrap(), 1);
+        assert!(host.params_for(contract::RELEASE_METHOD).is_empty());
+    }
+
+    #[test]
+    fn snapshot_named_refusal_is_preserved_from_failed_outcome() {
+        let host = snapshot_host(move |method, _, reply| {
+            if method == contract::EXECUTE_METHOD {
+                let mut status = reply.unwrap();
+                status["state"] = json!("failed");
+                status["outcome"]["kind"] = json!("failed");
+                status["outcome"]["result"]["isError"] = json!(true);
+                status["outcome"]["result"]["structuredContent"] = json!({"error":{
+                    "code":"limit_exceeded", "limit":"captureEntries", "maximum":HOST_SNAPSHOT_CEILING,
+                    "message":SNAPSHOT_RPC_MESSAGE
+                }});
+                Ok(status)
+            } else {
+                reply
+            }
+        });
+        let temp = tempfile::tempdir().unwrap();
+        let client = snapshot_client(
+            &host.endpoint,
+            &StateDir::from_path(temp.path().join("state")),
+        );
+        assert_eq!(
+            capture_without_waiting(&client).unwrap_err(),
+            WorkspaceError::LimitExceeded {
+                limit: Some("captureEntries".into()),
+                maximum: Some(HOST_SNAPSHOT_CEILING),
+            }
+        );
+        assert_eq!(host.params_for(contract::RELEASE_METHOD).len(), 1);
+    }
+
+    #[test_case("not_found"; "absent")]
+    #[test_case("busy"; "publication_contention")]
+    fn snapshot_timeout_stays_failed_and_same_host_retry_only_polls(lookup: &'static str) {
+        let executed = AtomicBool::new(false);
+        let host = snapshot_host(move |method, _, reply| match method {
+            contract::EXECUTE_METHOD => {
+                executed.store(true, Ordering::Release);
+                Err(snapshot_refusal("timed_out"))
+            }
+            contract::SNAPSHOT_CHECKPOINT_METHOD if executed.load(Ordering::Acquire) => {
+                Err(snapshot_refusal(lookup))
+            }
+            contract::CANCEL_METHOD => Err(snapshot_refusal("timed_out")),
+            _ => reply,
+        });
+        let temp = tempfile::tempdir().unwrap();
+        let client = snapshot_client(
+            &host.endpoint,
+            &StateDir::from_path(temp.path().join("state")),
+        );
+        assert_eq!(
+            capture_without_waiting(&client).unwrap_err(),
+            RemoteWorkcellError::Timeout.into()
+        );
+        assert_eq!(client.0.captures.len().unwrap(), 1);
+        assert!(capture_without_waiting(&client).is_ok());
+        assert_eq!(host.params_for(contract::EXECUTE_METHOD).len(), 1);
+        assert_eq!(host.params_for(contract::STATUS_METHOD).len(), 1);
+        assert_eq!(
+            host.params_for(contract::SNAPSHOT_PREPARE_CAPTURE_METHOD)
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn snapshot_absent_after_verified_host_restart_can_be_recaptured() {
+        let host = snapshot_host(move |method, params, reply| match method {
+            contract::EXECUTE_METHOD if params["host"]["instanceId"] == "instance" => {
+                Err(snapshot_refusal("timed_out"))
+            }
+            contract::CANCEL_METHOD => Err(snapshot_refusal("timed_out")),
+            _ => reply,
+        });
+        let temp = tempfile::tempdir().unwrap();
+        let client = snapshot_client(
+            &host.endpoint,
+            &StateDir::from_path(temp.path().join("state")),
+        );
+        assert_eq!(
+            capture_without_waiting(&client).unwrap_err(),
+            RemoteWorkcellError::Timeout.into()
+        );
+        client.0.host_binding.lock().unwrap().instance_id =
+            contract::Identifier::new("restarted").unwrap();
+        assert!(capture_without_waiting(&client).is_ok());
+        assert_eq!(host.params_for(contract::EXECUTE_METHOD).len(), 2);
+        assert_eq!(client.0.captures.len().unwrap(), 0);
+    }
+
+    #[test]
+    fn snapshot_dropped_waiter_explicitly_cancels_without_forgetting() {
+        let settled = CancellationToken::new();
+        let signal = settled.clone();
+        let host = snapshot_host(move |method, _, reply| {
+            if method == contract::STATUS_METHOD {
+                signal.cancel();
+            }
+            if matches!(method, contract::EXECUTE_METHOD | contract::STATUS_METHOD) {
+                let mut status = reply.unwrap();
+                status["state"] = json!("running");
+                status["outcome"] = Value::Null;
+                Ok(status)
+            } else {
+                reply
+            }
+        });
+        let temp = tempfile::tempdir().unwrap();
+        let client = snapshot_client(
+            &host.endpoint,
+            &StateDir::from_path(temp.path().join("state")),
+        );
+        smol::block_on(async {
+            let waiting = CancellationToken::new();
+            let request = snapshot_request();
+            futures_lite::future::race(
+                async {
+                    let _ = client
+                        .capture_snapshot(
+                            client.session_binding(),
+                            client.root_cursor(),
+                            &request,
+                            |_| {
+                                waiting.cancel();
+                                futures_lite::future::pending::<()>()
+                            },
+                        )
+                        .await;
+                    panic!("capture unexpectedly settled before waiter drop");
+                },
+                waiting.cancelled(),
+            )
+            .await;
+            settled.cancelled().await;
+            assert_eq!(client.0.captures.len().unwrap(), 1);
+            assert_eq!(host.params_for(contract::CANCEL_METHOD).len(), 1);
+            assert!(host.params_for(contract::RELEASE_METHOD).is_empty());
+        });
+    }
+
+    #[test]
+    fn snapshot_publication_winning_cancellation_is_recovered_on_next_call() {
+        let published = AtomicBool::new(false);
+        let host = snapshot_host(move |method, _, reply| match method {
+            contract::EXECUTE_METHOD => {
+                let mut status = reply.unwrap();
+                status["state"] = json!("running");
+                status["outcome"] = Value::Null;
+                Ok(status)
+            }
+            contract::CANCEL_METHOD => {
+                published.store(true, Ordering::Release);
+                Ok(json!({"version":"v1","state":"completed","cancellationRequested":false}))
+            }
+            contract::SNAPSHOT_CHECKPOINT_METHOD if published.load(Ordering::Acquire) => {
+                Ok(snapshot_checkpoint())
+            }
+            _ => reply,
+        });
+        let temp = tempfile::tempdir().unwrap();
+        let state = StateDir::from_path(temp.path().join("state"));
+        let client = snapshot_client(&host.endpoint, &state);
+        let result = smol::block_on(client.capture_snapshot(
+            client.session_binding(),
+            client.root_cursor(),
+            &snapshot_request(),
+            |_| {
+                client.0.cancellation.cancel();
+                futures_lite::future::pending::<()>()
+            },
+        ));
+        assert_eq!(result.unwrap_err(), WorkspaceError::Cancelled);
+        assert_eq!(client.0.captures.len().unwrap(), 0);
+        let reconnected = snapshot_client(&host.endpoint, &state);
+        assert!(
+            capture_without_waiting(&reconnected)
+                .unwrap()
+                .reused_checkpoint
+        );
+        assert_eq!(host.params_for(contract::EXECUTE_METHOD).len(), 1);
+    }
+
+    #[test]
+    fn snapshot_busy_without_a_handle_does_not_start_work() {
+        let host = snapshot_host(move |_, _, _| Err(snapshot_refusal("busy")));
+        let temp = tempfile::tempdir().unwrap();
+        let client = snapshot_client(
+            &host.endpoint,
+            &StateDir::from_path(temp.path().join("state")),
+        );
+        assert_eq!(
+            capture_without_waiting(&client).unwrap_err(),
+            WorkspaceError::Busy
+        );
+        assert_eq!(host.methods(), [contract::SNAPSHOT_CHECKPOINT_METHOD]);
+    }
+
+    #[test_case("prepareCapture")]
+    #[test_case("checkpoint")]
+    fn snapshot_old_only_host_fails_discovery(method: &'static str) {
+        let mut descriptor = serde_json::to_value(scripted_descriptor()).unwrap();
+        descriptor["capabilities"]["snapshots"]["methods"]
+            .as_object_mut()
+            .unwrap()
+            .remove(method);
+        let capabilities = serde_json::from_value(descriptor["capabilities"].clone()).unwrap();
+        assert!(
+            !workspace_capabilities(&capabilities).supports(WorkspaceCapability::SnapshotCapture)
+        );
+        let host = ScriptedHost::new(move |method, _| {
+            assert_eq!(method, "server/discover");
+            json!({"resultType":"complete","ttlMs":0,"cacheScope":"private",
+                "supportedVersions":[super::PROTOCOL_VERSION],
+                "capabilities":{"extensions":{contract::EXTENSION_ID:descriptor}}})
+        });
+        let selection = selection(
+            host.endpoint.as_url().as_str(),
+            WorkcellSourceRef::Direct,
+            None,
+        );
+        let temp = tempfile::tempdir().unwrap();
+        let state = StateDir::from_path(temp.path().join("state"));
+        let result = smol::block_on(RemoteWorkcellClient::connect(
+            &selection,
+            None,
+            SessionBindingId::new("test").unwrap(),
+            RemoteOperationJournal::open(&state).unwrap(),
+            CancellationToken::new(),
+        ));
+        assert_eq!(result.unwrap_err(), RemoteWorkcellError::CapabilityMismatch);
+        assert_eq!(host.methods(), ["server/discover"]);
     }
 
     fn shell_manifest() -> ToolManifest {
@@ -9157,6 +9806,7 @@ mod tests {
             }),
             watches: Mutex::new(BoundedMap::new(8, Duration::MAX)),
             operations: Mutex::new(OperationRegistry::new(8)),
+            captures: super::snapshot::CaptureRegistry::default(),
             operation_slots: super::Event::new(),
             mutation_journal: coordinator,
         }));

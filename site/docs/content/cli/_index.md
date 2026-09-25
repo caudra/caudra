@@ -31,6 +31,7 @@ When interactive Caudra starts in a Herdr pane, it automatically reports native 
 | `--allowed-tools` / `--disallowed-tools` | yes | yes | yes |
 | `--system-prompt-profile` | yes | yes | yes |
 | `--ephemeral` | yes | yes | yes |
+| `--no-snapshots` | yes | yes | yes |
 | `-c` / `--continue`, `-s` / `--session` | yes | no (always new session) | yes |
 | `--exit-on-done` | yes | n/a (always exits) | n/a |
 | `--image` | no (use Ctrl+V paste) | yes | via wire protocol |
@@ -49,6 +50,7 @@ When interactive Caudra starts in a Herdr pane, it automatically reports native 
 | `-p`, `--print` | Non-interactive run. See [Headless Mode](/docs/headless/) |
 | `--prompt <TEXT>` | First message of the session. Piped stdin is appended after it when both are present. Distinct from `-p`, which selects non-interactive output |
 | `--ephemeral` | Store the session, outputs, snapshots, input history, and stash in a temporary root removed at exit. Credentials, trust, and preferences remain persistent |
+| `--no-snapshots` | Disable automatic local and remote workspace snapshots and file revert for this process, including startup and exit captures. Also applies to ACP. Existing snapshots and restore recovery remain available. See [Disabling snapshots](/docs/sessions/#disable-automatic-snapshots) |
 | `--image <PATH>` | Attach an image in `--print` mode (repeatable). Paths must be png, jpeg, gif, or webp |
 | `-m`, `--model <SPEC>` | Model as `provider/model-id`. Fallback: last used → `provider.default_model` in config → auto-detect from available providers |
 | `--verbose` | Full turn-by-turn messages in `--print` output |

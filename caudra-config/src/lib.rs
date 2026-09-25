@@ -2227,7 +2227,7 @@ impl SnapshotsConfig {
             default: ConfigValue::Bool(DEFAULT_SNAPSHOTS_ENABLED),
             min: None,
             env: None,
-            description: "Capture workspace snapshots. `false` keeps existing snapshots restorable but takes no new ones, so file revert stops covering new work",
+            description: "Capture automatic workspace snapshots locally and remotely, including session-start and final captures. `false` disables capture and file revert without deleting existing snapshots or bypassing restore recovery. `--no-snapshots` overrides this for one run",
         },
         ConfigField {
             name: "max_bytes_mb",
@@ -4577,6 +4577,20 @@ mod tests {
 
         assert!(!defaults.storage.ephemeral);
         assert!(configured.into_config(false).unwrap().storage.ephemeral);
+    }
+
+    #[test_case(None, true; "default_enabled")]
+    #[test_case(Some(true), true; "explicit_enabled")]
+    #[test_case(Some(false), false; "explicit_disabled")]
+    fn snapshots_enabled_survives_limit_overlay(enabled: Option<bool>, expected: bool) {
+        let source = enabled.map_or_else(String::new, |enabled| {
+            format!("[storage.snapshots]\nenabled = {enabled}\n")
+        });
+        let mut base: RawConfig = toml::from_str(&source).unwrap();
+        base.merge(toml::from_str("[storage.snapshots]\nmax_files = 1\n").unwrap());
+        let snapshots = base.into_config(false).unwrap().storage.snapshots;
+        assert_eq!(snapshots.enabled, expected);
+        assert_eq!(snapshots.max_files, 1);
     }
 
     #[test]

@@ -99,9 +99,6 @@ const FAST_SCROLL_FACTOR: u32 = 4;
 /// One row of finger travel moves the content one row.
 const TOUCH_SCROLL_LINES: u32 = 1;
 const AGENT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
-/// How long the final snapshot of one session may wait for the artifact lock.
-/// Budgeted per session so a workspace of tabs cannot multiply into a stall,
-/// and matched to the agent timeout so no one phase of exit dominates.
 const SHUTDOWN_SNAPSHOT_BUDGET: Duration = Duration::from_secs(3);
 const DELETE_FOCUSED_ERR: &str = "cannot delete the focused session";
 const DELETE_BUSY_ERR: &str = "wait for the session to become idle before deleting it";
@@ -3976,6 +3973,7 @@ impl<'t> EventLoop<'t> {
         // Split across the three operations so a slow exit points at one of
         // them instead of at the whole phase.
         let (mut snapshot_ms, mut checkpoint_ms, mut session_clone_ms) = (0, 0, 0);
+        let snapshot_deadline = Instant::now() + SHUTDOWN_SNAPSHOT_BUDGET;
         for (mut app, lease) in apps {
             let mut step = Instant::now();
             let mut step_ms = || {
@@ -3986,15 +3984,16 @@ impl<'t> EventLoop<'t> {
             // Only a session that captured a baseline has a bracket to close.
             // Exiting one that never wrote must not walk the tree on the way
             // out for a revert point nothing can reach.
-            match app
-                .has_revert_point()
-                .then(|| app.snapshot_history_head_within(SHUTDOWN_SNAPSHOT_BUDGET))
-            {
+            match app.has_revert_point().then(|| {
+                app.snapshot_history_head_within(
+                    snapshot_deadline.saturating_duration_since(Instant::now()),
+                )
+            }) {
                 None | Some(Ok(true)) => {}
                 Some(Ok(false)) => warn!(
                     session_id = %app.state.session.id,
                     budget = ?SHUTDOWN_SNAPSHOT_BUDGET,
-                    "artifact lock busy, skipping final workspace snapshot"
+                    "snapshot budget expired or capture unavailable, skipping final workspace snapshot"
                 ),
                 Some(Err(error)) => {
                     warn!(session_id = %app.state.session.id, %error, "final workspace snapshot failed")

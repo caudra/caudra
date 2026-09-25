@@ -1,4 +1,9 @@
-use std::{env, fs, path::PathBuf, str::FromStr, time::Duration};
+use std::{
+    env, fs,
+    path::PathBuf,
+    str::FromStr,
+    time::{Duration, Instant},
+};
 
 use async_trait::async_trait;
 use caudra_agent::agent::tool_dispatch::{self, Emit};
@@ -150,6 +155,10 @@ const CAPTURE_LIMITS: SnapshotCaptureLimits = SnapshotCaptureLimits {
     max_file_bytes: 16 * 1024 * 1024,
     max_total_bytes: 256 * 1024 * 1024,
 };
+const CAPTURE_WORKLOAD_FILES: u32 = 20_000;
+const CAPTURE_WORKLOAD_DIRECTORIES: u32 = 100;
+const CAPTURE_WORKLOAD_FILE_BYTES: usize = 128;
+const CAPTURE_WORKLOAD_CHECKPOINTS: [&str; 2] = ["workload-first", "workload-unchanged"];
 
 struct TransferTestHost {
     root: PathBuf,
@@ -1722,21 +1731,29 @@ async fn lapsed_preparation_regression(client: &RemoteWorkcellClient, root: &Pat
     let prepared = records
         .iter()
         .filter(|record| record["method"] == "ai.workcell/prepare" && record["tool"] == "shell")
-        .count();
+        .map(|record| record["preparationId"].clone())
+        .collect::<Vec<_>>();
     assert_eq!(
-        prepared, LAPSED_PREPARATIONS,
+        prepared.len(),
+        LAPSED_PREPARATIONS,
         "the approved command did not renew: {records:?}"
     );
     let executed = fs::read_to_string(&trace)
         .unwrap()
         .lines()
         .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-        .filter(|record| record["method"] == "ai.workcell/execute")
-        .count();
+        .filter(|record| {
+            record["method"] == "ai.workcell/execute"
+                && prepared.contains(&record["params"]["preparationId"])
+        })
+        .map(|record| record["params"]["preparationId"].clone())
+        .collect::<Vec<_>>();
     assert_eq!(
-        executed, LAPSED_EXECUTIONS,
+        executed.len(),
+        LAPSED_EXECUTIONS,
         "a lapsed preparation was dispatched as well"
     );
+    assert_eq!(executed.last(), prepared.last());
     assert!(client.pending_remote_operations().is_empty());
     eprintln!(
         "PASS a command approved after its preparation lapsed renews it, runs exactly once, and leaves no unresolved row"
@@ -2237,6 +2254,70 @@ fn unsupported_server() {
     eprintln!("PASS unsupported server refused before catalog or transfer downgrade");
 }
 
+async fn capture_workload(client: &RemoteWorkcellClient, root: &Path) {
+    if env::var("WORKCELL_TEST_CAPTURE_WORKLOAD").as_deref() != Ok("1") {
+        return;
+    }
+    let workspace = tempfile::Builder::new()
+        .prefix("capture-workload-")
+        .tempdir_in(root)
+        .unwrap();
+    for directory in 0..CAPTURE_WORKLOAD_DIRECTORIES {
+        fs::create_dir(workspace.path().join(directory.to_string())).unwrap();
+    }
+    for index in 0..CAPTURE_WORKLOAD_FILES {
+        let mut content = [b'x'; CAPTURE_WORKLOAD_FILE_BYTES];
+        let prefix = format!("fixture {index}\n");
+        content[..prefix.len()].copy_from_slice(prefix.as_bytes());
+        fs::write(
+            workspace.path().join(format!(
+                "{}/{index}.txt",
+                index % CAPTURE_WORKLOAD_DIRECTORIES
+            )),
+            content,
+        )
+        .unwrap();
+    }
+    let scope =
+        WorkspacePath::new(workspace.path().file_name().unwrap().to_str().unwrap()).unwrap();
+    let resolved = client
+        .resolve_directory_cursor(client.session_binding(), client.root_cursor(), &scope)
+        .await
+        .unwrap();
+    for checkpoint in CAPTURE_WORKLOAD_CHECKPOINTS {
+        let started = Instant::now();
+        let result = WorkspaceSnapshotReadService::capture(
+            client,
+            client.session_binding(),
+            &resolved.cursor,
+            &SnapshotCaptureRequest {
+                checkpoint_id: CheckpointId::new(checkpoint).unwrap(),
+                label: None,
+                limits: SnapshotCaptureLimits {
+                    max_files: u64::from(CAPTURE_WORKLOAD_FILES),
+                    ..CAPTURE_LIMITS
+                },
+            },
+        )
+        .await
+        .unwrap();
+        assert!(!result.reused_checkpoint);
+        assert_eq!(result.snapshot.scope, scope);
+        assert_eq!(result.snapshot.file_count, CAPTURE_WORKLOAD_FILES);
+        assert_eq!(
+            result.snapshot.total_bytes,
+            u64::from(CAPTURE_WORKLOAD_FILES) * CAPTURE_WORKLOAD_FILE_BYTES as u64
+        );
+        assert!(client.pending_remote_operations().is_empty());
+        eprintln!(
+            "PASS capture workload {checkpoint}: {} files, {} bytes, {:.3}s",
+            result.snapshot.file_count,
+            result.snapshot.total_bytes,
+            started.elapsed().as_secs_f64()
+        );
+    }
+}
+
 #[test]
 fn authenticated_local() {
     let Ok(endpoint) = env::var("WORKCELL_TEST_ENDPOINT") else {
@@ -2637,15 +2718,17 @@ fn authenticated_local() {
         eprintln!(
             "PASS recursive list/search, ranged authenticated bytes, watch open/poll/close, SCM discover/status/log/read-side/stage/diff/unstage"
         );
+        capture_workload(&client, &root).await;
+        let capture_request = SnapshotCaptureRequest {
+            checkpoint_id: CheckpointId::new("integration-checkpoint").unwrap(),
+            label: None,
+            limits: CAPTURE_LIMITS,
+        };
         let snapshot = WorkspaceSnapshotReadService::capture(
             &client,
             binding,
             &resolved_root.cursor,
-            &SnapshotCaptureRequest {
-                checkpoint_id: CheckpointId::new("integration-checkpoint").unwrap(),
-                label: None,
-                limits: CAPTURE_LIMITS,
-            },
+            &capture_request,
         )
         .await
         .unwrap();
@@ -2722,6 +2805,17 @@ fn authenticated_local() {
             "changed\n"
         );
         client.reconnect(&CancellationToken::new()).await.unwrap();
+        let recovered = WorkspaceSnapshotReadService::capture(
+            &client,
+            client.session_binding(),
+            client.root_cursor(),
+            &capture_request,
+        )
+        .await
+        .unwrap();
+        assert!(recovered.reused_checkpoint);
+        assert_eq!(recovered.snapshot, snapshot.snapshot);
+        assert!(client.pending_remote_operations().is_empty());
         tool(
             &client,
             cursor,
@@ -2729,7 +2823,9 @@ fn authenticated_local() {
             json!({"filePath":"written.txt"}),
         )
         .await;
-        eprintln!("PASS snapshot capture/inspect/restore/unrevert and reconnect");
+        eprintln!(
+            "PASS snapshot capture/inspect/restore/unrevert and checkpoint recovery after reconnect"
+        );
         fs::create_dir(root.join("stale-dir")).unwrap();
         let stale = client
             .resolve_directory_cursor(binding, cursor, &WorkspacePath::new("stale-dir").unwrap())

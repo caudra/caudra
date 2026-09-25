@@ -183,6 +183,7 @@ def main():
             mcp_methods: ClassVar[list[str]] = []
             rpc_active: ClassVar[dict] = {}
             operation_states: ClassVar[dict] = {}
+            preparation_tools: ClassVar[dict[str, str]] = {}
             operation_limits: ClassVar[dict] = {}
             prepare_barrier: ClassVar[threading.Barrier | None] = None
 
@@ -343,7 +344,14 @@ def main():
                     hold_execute = False
                     if method == "ai.workcell/execute":
                         with self.fault_lock:
-                            if batch_gate.exists():
+                            preparation_id = json.loads(request_body)["params"][
+                                "preparationId"
+                            ]
+                            if (
+                                batch_gate.exists()
+                                and self.preparation_tools.get(preparation_id)
+                                == "shell"
+                            ):
                                 batch_gate.unlink()
                                 hold_execute = True
                     if hold_execute:
@@ -438,12 +446,14 @@ def main():
                                 and "error" not in payload
                             ):
                                 self.operation_states[preparation_id] = "prepared"
+                                self.preparation_tools[preparation_id] = params["tool"]
                             if (
                                 method == "ai.workcell/release"
                                 and preparation_id
                                 and result.get("released")
                             ):
                                 self.operation_states.pop(preparation_id, None)
+                                self.preparation_tools.pop(preparation_id, None)
                             if method == "server/discover":
                                 pending = [result]
                                 while pending:
@@ -705,6 +715,7 @@ def main():
                     server.wait(timeout=5)
                     Proxy.rpc_active.clear()
                     Proxy.operation_states.clear()
+                    Proxy.preparation_tools.clear()
                     server = start_server()
 
                 env = os.environ.copy()

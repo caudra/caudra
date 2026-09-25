@@ -53,6 +53,7 @@ fn load_config(
         .unwrap_or_default()
         .into_config(cli.no_rtk)
         .context("invalid config")?;
+    config.storage.snapshots.enabled &= !cli.no_snapshots;
     config.permissions = if remote {
         caudra_config::load_global_permissions()
     } else {
@@ -230,15 +231,7 @@ pub fn dispatch(mut cli: Cli) -> Result<ExitCode> {
             update::rollback().map_err(|e| color_eyre::eyre::eyre!("{e}"))?;
         }
         Some(Command::Acp { model, yolo }) => {
-            acp::run(
-                model.as_deref(),
-                yolo,
-                cli.ephemeral,
-                cli.no_plugins,
-                cli.no_jit,
-                cli.system_prompt_profile.as_deref(),
-                &cli.workcell,
-            )?;
+            acp::run(model.as_deref(), yolo, &cli)?;
         }
         Some(Command::Tools {
             enabled_only,

@@ -9,11 +9,13 @@
 //! it is about to overwrite has been recorded.
 
 use std::collections::BTreeSet;
+use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use arc_swap::{ArcSwap, ArcSwapOption};
+use async_lock::Mutex;
 use caudra_config::SnapshotsConfig;
 use caudra_storage::StateDir;
 use caudra_storage::id::CaudraId;
@@ -29,6 +31,8 @@ use caudra_workspace::{
     WorkspaceCapability, WorkspaceError, WorkspacePath, WorkspaceSession,
     WorkspaceSnapshotMutationService, WorkspaceSnapshotReadService,
 };
+use event_listener::Event;
+use futures_lite::future;
 use sha2::{Digest, Sha256};
 use tracing::{debug, warn};
 
@@ -78,6 +82,10 @@ pub enum BaselineError {
     CleanupIncomplete,
     #[error("remote workspace restore response is inconsistent")]
     InvalidRestore,
+    #[error("workspace snapshot capture is busy; final snapshot skipped")]
+    CaptureBusy,
+    #[error("workspace snapshot target changed; final snapshot skipped")]
+    TargetChanged,
 }
 
 impl BaselineError {
@@ -254,14 +262,23 @@ pub struct WorkspaceBaseline {
     /// `rebind` must not clear it.
     config: SnapshotsConfig,
     target: ArcSwap<BaselineTarget>,
+    target_changed: Event,
     /// Single-flights the capture: parallel tool calls and subagents all reach
     /// this, and the second one through must wait rather than start its own.
-    gate: async_lock::Mutex<()>,
+    gate: Arc<Mutex<()>>,
     /// Sticky, so a workspace the store refused is judged once rather than on
     /// every call.
     unavailable: ArcSwapOption<String>,
     capturing: AtomicBool,
     current_head: ArcSwapOption<CaudraId>,
+}
+
+struct Capturing<'a>(&'a AtomicBool);
+
+impl Drop for Capturing<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
 }
 
 impl WorkspaceBaseline {
@@ -286,7 +303,8 @@ impl WorkspaceBaseline {
         Arc::new(Self {
             config,
             target: ArcSwap::from_pointee(target),
-            gate: async_lock::Mutex::default(),
+            target_changed: Event::new(),
+            gate: Arc::new(Mutex::default()),
             unavailable: ArcSwapOption::empty(),
             capturing: AtomicBool::new(false),
             current_head: ArcSwapOption::empty(),
@@ -299,6 +317,7 @@ impl WorkspaceBaseline {
         self.target
             .store(Arc::new(BaselineTarget::Local { store, cwd }));
         self.unavailable.store(None);
+        self.target_changed.notify(usize::MAX);
     }
 
     pub fn rebind_workspace_session(
@@ -312,6 +331,7 @@ impl WorkspaceBaseline {
             storage, session_id, workspace, binding,
         )));
         self.unavailable.store(None);
+        self.target_changed.notify(usize::MAX);
     }
 
     /// Why this workspace has no file revert, whether by configuration or by
@@ -321,6 +341,10 @@ impl WorkspaceBaseline {
             return Some(Arc::new(SNAPSHOTS_DISABLED.to_owned()));
         }
         self.unavailable.load_full()
+    }
+
+    pub fn is_enabled(&self) -> bool {
+        self.config.enabled
     }
 
     /// The refusal alone, for the UI to report once. Configuration is not news
@@ -359,9 +383,46 @@ impl WorkspaceBaseline {
             .await
     }
 
+    pub fn reserve_remote_capture(
+        self: &Arc<Self>,
+        head: CaudraId,
+    ) -> Result<Option<impl Future<Output = BaselineOutcome> + Send + 'static>, BaselineError> {
+        let target = self.target.load_full();
+        if self.unavailable_reason().is_some()
+            || !target.is_remote()
+            || !target.is_captured(None)
+            || target.is_captured(Some(head))
+        {
+            return Ok(None);
+        }
+        let gate = self.gate.try_lock_arc().ok_or(BaselineError::CaptureBusy)?;
+        let changed = self.target_changed.listen();
+        let baseline = Arc::clone(self);
+        Ok(Some(async move {
+            let _gate = gate;
+            future::or(
+                async move {
+                    changed.await;
+                    BaselineOutcome::Failed(BaselineError::TargetChanged)
+                },
+                baseline.ensure_target(target, Some(head)),
+            )
+            .await
+        }))
+    }
+
     /// Holds the gate across the capture, so the call that asked second arrives
     /// after the baseline is on disk rather than alongside it.
     pub async fn ensure(&self, head: Option<CaudraId>) -> BaselineOutcome {
+        if !self.config.enabled {
+            match self.pending_remote_restore() {
+                Ok(None) => {
+                    return BaselineOutcome::Unavailable(Arc::new(SNAPSHOTS_DISABLED.to_owned()));
+                }
+                Ok(Some(_)) => {}
+                Err(error) => return BaselineOutcome::Failed(error),
+            }
+        }
         if !self.is_remote()
             && let Some(reason) = self.unavailable_reason()
         {
@@ -369,6 +430,17 @@ impl WorkspaceBaseline {
         }
         let _gate = self.gate.lock().await;
         let target = self.target.load_full();
+        self.ensure_target(target, head).await
+    }
+
+    async fn ensure_target(
+        &self,
+        target: Arc<BaselineTarget>,
+        head: Option<CaudraId>,
+    ) -> BaselineOutcome {
+        if !Arc::ptr_eq(&target, &self.target.load_full()) {
+            return BaselineOutcome::Failed(BaselineError::TargetChanged);
+        }
         // A restore awaiting its verdict gates every change whether or not this
         // workspace can be captured: a change on top of a partial restore would
         // bury what recovery has to inspect.
@@ -388,6 +460,7 @@ impl WorkspaceBaseline {
             return BaselineOutcome::Ready;
         }
         self.capturing.store(true, Ordering::Release);
+        let _capturing = Capturing(&self.capturing);
         let result = match &*target {
             BaselineTarget::Local { .. } => {
                 let work = Arc::clone(&target);
@@ -398,7 +471,9 @@ impl WorkspaceBaseline {
                 metadata,
             } => capture_remote(workspace, metadata, head, &capture_limits(&self.config)).await,
         };
-        self.capturing.store(false, Ordering::Release);
+        if !Arc::ptr_eq(&target, &self.target.load_full()) {
+            return BaselineOutcome::Failed(BaselineError::TargetChanged);
+        }
         match result {
             Ok(()) => BaselineOutcome::Ready,
             Err(BaselineError::Local(error)) if error.is_workspace_refusal() => {
@@ -981,6 +1056,7 @@ mod tests {
         SnapshotSkipped, SnapshotSummary, SnapshotUnrevertPreview, SourceTrustAnchor,
         WorkspaceCapabilities, WorkspaceCursor, WorkspaceHandle, WorkspaceServices,
     };
+    use futures_lite::future::poll_once;
     use tempfile::TempDir;
     use test_case::test_case;
 
@@ -1006,10 +1082,12 @@ mod tests {
 
     struct FakeSnapshots {
         capture_calls: AtomicUsize,
+        status_calls: AtomicUsize,
         execute_calls: AtomicUsize,
         release_calls: AtomicUsize,
         acknowledge_calls: AtomicUsize,
         capture_errors: Mutex<VecDeque<WorkspaceError>>,
+        capture_pause: Mutex<Option<flume::Receiver<()>>>,
         capture_limits: Mutex<Option<SnapshotCaptureLimits>>,
         snapshot_state: Mutex<SnapshotState>,
         restore_state: Mutex<SnapshotRestoreState>,
@@ -1032,10 +1110,12 @@ mod tests {
         fn default() -> Self {
             Self {
                 capture_calls: AtomicUsize::new(0),
+                status_calls: AtomicUsize::new(0),
                 execute_calls: AtomicUsize::new(0),
                 release_calls: AtomicUsize::new(0),
                 acknowledge_calls: AtomicUsize::new(0),
                 capture_errors: Mutex::new(VecDeque::new()),
+                capture_pause: Mutex::new(None),
                 capture_limits: Mutex::new(None),
                 snapshot_state: Mutex::new(SnapshotState::Complete),
                 restore_state: Mutex::new(SnapshotRestoreState::Completed),
@@ -1162,6 +1242,10 @@ mod tests {
             request: &SnapshotCaptureRequest,
         ) -> Result<SnapshotCaptureResult, WorkspaceError> {
             self.capture_calls.fetch_add(1, Ordering::SeqCst);
+            let pause = self.capture_pause.lock().unwrap().clone();
+            if let Some(pause) = pause {
+                pause.recv_async().await.unwrap();
+            }
             *self.capture_limits.lock().unwrap() = Some(request.limits.clone());
             if let Some(error) = self.capture_errors.lock().unwrap().pop_front() {
                 return Err(error);
@@ -1193,6 +1277,7 @@ mod tests {
             _cursor: &WorkspaceCursor,
             restore_id: &RestoreId,
         ) -> Result<SnapshotRestoreStatus, WorkspaceError> {
+            self.status_calls.fetch_add(1, Ordering::SeqCst);
             self.status_of(restore_id)
         }
     }
@@ -1452,6 +1537,117 @@ mod tests {
         }
     }
 
+    #[test_case(false; "complete")]
+    #[test_case(true; "cancel")]
+    fn reserved_remote_capture_gates_mutation_before_it_is_polled(cancel: bool) {
+        let temp = TempDir::new().unwrap();
+        let service = Arc::new(FakeSnapshots::default());
+        let baseline = remote_baseline(&temp, Arc::clone(&service), SnapshotsConfig::default());
+        smol::block_on(baseline.ensure(None)).into_result().unwrap();
+        let (resume, pause) = flume::bounded(1);
+        *service.capture_pause.lock().unwrap() = Some(pause);
+        baseline.set_current_head(Some(head(1)));
+        let mut capture = Box::pin(baseline.reserve_remote_capture(head(1)).unwrap().unwrap());
+        baseline.set_current_head(Some(head(2)));
+        let mut mutation = Box::pin(baseline.ensure_current());
+
+        assert!(smol::block_on(poll_once(&mut mutation)).is_none());
+        assert_eq!(service.capture_calls.load(Ordering::SeqCst), 1);
+        assert!(matches!(
+            baseline.reserve_remote_capture(head(2)),
+            Err(BaselineError::CaptureBusy)
+        ));
+        assert!(smol::block_on(poll_once(&mut capture)).is_none());
+        assert!(baseline.is_capturing());
+        assert!(smol::block_on(poll_once(&mut mutation)).is_none());
+        assert!(baseline.remote_capture(Some(head(1))).unwrap().is_none());
+        if !cancel {
+            resume.send(()).unwrap();
+            assert!(matches!(
+                smol::block_on(&mut capture),
+                BaselineOutcome::Ready
+            ));
+        }
+        drop(capture);
+        assert!(!baseline.is_capturing());
+        assert_eq!(
+            baseline.remote_capture(Some(head(1))).unwrap().is_some(),
+            !cancel
+        );
+        *service.capture_pause.lock().unwrap() = None;
+        assert!(matches!(smol::block_on(mutation), BaselineOutcome::Ready));
+        assert!(baseline.remote_capture(Some(head(2))).unwrap().is_some());
+    }
+
+    #[test_case(false; "reserved")]
+    #[test_case(true; "running")]
+    fn reserved_remote_capture_cannot_cross_a_rebind(running: bool) {
+        let temp = TempDir::new().unwrap();
+        let service = Arc::new(FakeSnapshots::default());
+        let baseline = remote_baseline(&temp, Arc::clone(&service), SnapshotsConfig::default());
+        smol::block_on(baseline.ensure(None)).into_result().unwrap();
+        let (_resume, pause) = flume::bounded(1);
+        *service.capture_pause.lock().unwrap() = Some(pause);
+        let mut capture = Box::pin(baseline.reserve_remote_capture(head(1)).unwrap().unwrap());
+        if running {
+            assert!(smol::block_on(poll_once(&mut capture)).is_none());
+            assert!(baseline.is_capturing());
+        }
+        let other_temp = TempDir::new().unwrap();
+        let other_service = Arc::new(FakeSnapshots::default());
+        let other = remote_baseline(
+            &other_temp,
+            Arc::clone(&other_service),
+            SnapshotsConfig::default(),
+        );
+        let target = other.target.load_full();
+        let BaselineTarget::WorkspaceSession { workspace, .. } = &*target else {
+            unreachable!();
+        };
+        baseline.rebind_workspace_session(
+            StateDir::from_path(other_temp.path().join("state")),
+            head(99),
+            workspace.clone(),
+            StoredWorkspaceBinding::new_with_cursor(
+                workspace.binding().clone(),
+                workspace.cursor().clone(),
+                None,
+            )
+            .unwrap(),
+        );
+        assert!(matches!(
+            smol::block_on(capture),
+            BaselineOutcome::Failed(BaselineError::TargetChanged)
+        ));
+        assert!(!baseline.is_capturing());
+        assert_eq!(
+            service.capture_calls.load(Ordering::SeqCst),
+            1 + usize::from(running)
+        );
+        assert_eq!(other_service.capture_calls.load(Ordering::SeqCst), 0);
+        assert!(baseline.remote_capture(Some(head(1))).unwrap().is_none());
+        assert!(baseline.gate.try_lock().is_some());
+    }
+
+    #[test_case(false; "before_poll")]
+    #[test_case(true; "during_capture")]
+    fn cancelling_remote_ensure_clears_the_capture_flag(running: bool) {
+        let temp = TempDir::new().unwrap();
+        let service = Arc::new(FakeSnapshots::default());
+        let baseline = remote_baseline(&temp, Arc::clone(&service), SnapshotsConfig::default());
+        let (_resume, pause) = flume::bounded(1);
+        *service.capture_pause.lock().unwrap() = Some(pause);
+        let mut capture = Box::pin(baseline.ensure(None));
+        if running {
+            assert!(smol::block_on(poll_once(&mut capture)).is_none());
+            assert!(baseline.is_capturing());
+        }
+        drop(capture);
+        assert!(!baseline.is_capturing());
+        assert!(baseline.gate.try_lock().is_some());
+        assert!(baseline.remote_capture(None).unwrap().is_none());
+    }
+
     #[test]
     fn remote_capture_is_idempotent_and_concurrent_calls_are_coalesced() {
         let temp = TempDir::new().unwrap();
@@ -1579,10 +1775,16 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_remote_workspace_with_snapshots_off_is_unavailable_without_a_capture() {
+    #[test_case(false; "fresh")]
+    #[test_case(true; "existing_captures")]
+    fn a_remote_workspace_with_snapshots_off_skips_capture_and_gate(existing: bool) {
         let temp = TempDir::new().unwrap();
         let service = Arc::new(FakeSnapshots::default());
+        if existing {
+            let baseline = remote_baseline(&temp, Arc::clone(&service), SnapshotsConfig::default());
+            assert!(matches!(ensure(&baseline, 1), BaselineOutcome::Ready));
+        }
+        let capture_calls = service.capture_calls.load(Ordering::SeqCst);
         let baseline = remote_baseline(
             &temp,
             Arc::clone(&service),
@@ -1592,17 +1794,31 @@ mod tests {
             },
         );
 
-        let outcome = ensure(&baseline, 1);
-
-        let BaselineOutcome::Unavailable(reason) = outcome else {
-            panic!("{DISABLED_MSG}: {outcome:?}");
-        };
-        assert_eq!(reason.as_str(), SNAPSHOTS_DISABLED, "{DISABLED_MSG}");
+        let old_capture = baseline.remote_capture(None).unwrap();
+        let _gate = baseline.gate.try_lock().unwrap();
+        assert!(baseline.reserve_remote_capture(head(2)).unwrap().is_none());
+        for head in [None, Some(head(1)), Some(head(2))] {
+            let gate = BaselineGate::new(Arc::clone(&baseline), head);
+            let outcome = smol::block_on(poll_once(gate.ensure())).unwrap();
+            let BaselineOutcome::Unavailable(reason) = &outcome else {
+                panic!("{DISABLED_MSG}: {outcome:?}");
+            };
+            assert_eq!(reason.as_str(), SNAPSHOTS_DISABLED, "{DISABLED_MSG}");
+            outcome.into_result().unwrap();
+        }
         assert_eq!(
             service.capture_calls.load(Ordering::SeqCst),
-            0,
+            capture_calls,
             "{DISABLED_MSG}"
         );
+        assert_eq!(service.status_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(service.acknowledge_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(service.execute_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(service.release_calls.load(Ordering::SeqCst), 0);
+        assert!(service.cleanup_batches.lock().unwrap().is_empty());
+        assert_eq!(baseline.remote_capture(None).unwrap(), old_capture);
+        assert_eq!(old_capture.is_some(), existing);
+        assert_eq!(baseline.remote_capture(Some(head(2))).unwrap(), None);
         assert_eq!(baseline.refusal(), None, "{DISABLED_MSG}");
     }
 
@@ -1807,8 +2023,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn completed_rewind_can_be_unreverted_before_acknowledgement() {
+    #[test_case(true; "enabled")]
+    #[test_case(false; "disabled")]
+    fn completed_rewind_can_be_unreverted_before_acknowledgement(enabled: bool) {
         let temp = TempDir::new().unwrap();
         let service = Arc::new(FakeSnapshots::default());
         let baseline = remote_baseline(&temp, Arc::clone(&service), SnapshotsConfig::default());
@@ -1818,6 +2035,14 @@ mod tests {
         assert_eq!(restored.state, SnapshotRestoreState::Completed);
         assert!(baseline.pending_remote_restore().unwrap().is_some());
 
+        let baseline = remote_baseline(
+            &temp,
+            Arc::clone(&service),
+            SnapshotsConfig {
+                enabled,
+                ..SnapshotsConfig::default()
+            },
+        );
         let prepared =
             smol::block_on(baseline.prepare_remote_unrevert(&restored.restore_id)).unwrap();
         let unreverted = smol::block_on(baseline.execute_remote_unrevert(
@@ -1852,7 +2077,7 @@ mod tests {
 
         let reopened = remote_baseline(
             &temp,
-            service,
+            Arc::clone(&service),
             SnapshotsConfig {
                 enabled,
                 ..SnapshotsConfig::default()
@@ -1862,6 +2087,8 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(recovered.state, state);
+        let pending = reopened.pending_remote_restore().unwrap();
+        let capture_calls = service.capture_calls.load(Ordering::SeqCst);
         assert!(
             matches!(
                 ensure(&reopened, 2),
@@ -1869,10 +2096,14 @@ mod tests {
             ),
             "{RECOVERY_MSG}"
         );
+        assert_eq!(reopened.pending_remote_restore().unwrap(), pending);
+        assert_eq!(service.acknowledge_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(service.capture_calls.load(Ordering::SeqCst), capture_calls);
     }
 
-    #[test]
-    fn completed_restore_is_acknowledged_before_the_next_mutation() {
+    #[test_case(true; "enabled")]
+    #[test_case(false; "disabled")]
+    fn completed_restore_is_acknowledged_before_the_next_mutation(enabled: bool) {
         let temp = TempDir::new().unwrap();
         let service = Arc::new(FakeSnapshots::default());
         let baseline = remote_baseline(&temp, Arc::clone(&service), SnapshotsConfig::default());
@@ -1880,10 +2111,19 @@ mod tests {
         let prepared = rewind(&baseline).unwrap();
         smol::block_on(baseline.execute_remote_restore(prepared, None)).unwrap();
 
-        assert!(matches!(
-            smol::block_on(baseline.ensure(None)),
-            BaselineOutcome::Ready
-        ));
+        let baseline = remote_baseline(
+            &temp,
+            Arc::clone(&service),
+            SnapshotsConfig {
+                enabled,
+                ..SnapshotsConfig::default()
+            },
+        );
+        let capture_calls = service.capture_calls.load(Ordering::SeqCst);
+        let outcome = smol::block_on(baseline.ensure(None));
+        assert_eq!(outcome.is_unavailable(), !enabled);
+        outcome.into_result().unwrap();
+        assert_eq!(service.capture_calls.load(Ordering::SeqCst), capture_calls);
         assert_eq!(service.acknowledge_calls.load(Ordering::SeqCst), 1);
         assert!(baseline.pending_remote_restore().unwrap().is_none());
     }
@@ -1955,11 +2195,19 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_disabled_baseline_is_unavailable_without_touching_the_store() {
-        let (_temp, baseline) = baseline(false, SnapshotLimits::default());
+    #[test_case(false; "original_workspace")]
+    #[test_case(true; "rebound_workspace")]
+    fn a_disabled_baseline_is_unavailable_without_touching_the_store(rebind: bool) {
+        let (temp, baseline) = baseline(false, SnapshotLimits::default());
+        if rebind {
+            baseline.rebind(
+                Arc::new(SnapshotStore::new(temp.path().join("other-snapshots"))),
+                baseline.cwd(),
+            );
+        }
+        let _gate = baseline.gate.try_lock().unwrap();
 
-        let outcome = smol::block_on(baseline.ensure(None));
+        let outcome = smol::block_on(poll_once(baseline.ensure(None))).unwrap();
         assert!(
             matches!(outcome, BaselineOutcome::Unavailable(reason) if *reason == SNAPSHOTS_DISABLED),
             "{UNAVAILABLE_MSG}"

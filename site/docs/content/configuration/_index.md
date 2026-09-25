@@ -333,7 +333,7 @@ Disabling the master switch or setting `rules.truncation.enabled = false` stops 
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `enabled` | bool | `true` | Capture workspace snapshots. `false` keeps existing snapshots restorable but takes no new ones, so file revert stops covering new work |
+| `enabled` | bool | `true` | Capture automatic workspace snapshots locally and remotely, including session-start and final captures. `false` disables capture and file revert without deleting existing snapshots or bypassing restore recovery. `--no-snapshots` overrides this for one run |
 | `max_bytes_mb` | u64 | `512` | Largest working tree a capture will take, and the cap on one session's object store. A workspace above it loses file revert rather than paying for a snapshot the store cannot keep |
 | `max_files` | u64 | `50000` | Most files a capture will take, counted after ignore rules |
 | `max_file_bytes_mb` | u64 | `100` | Largest single file a capture will take. A bigger one is left out of the snapshot and left alone on disk, so it cannot be reverted |

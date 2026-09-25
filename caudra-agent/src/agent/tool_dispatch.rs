@@ -1512,7 +1512,9 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-    use caudra_config::{DefaultEffect, Effect, PermissionRule, PermissionsConfig, ToolKey};
+    use caudra_config::{
+        DefaultEffect, Effect, PermissionRule, PermissionsConfig, SnapshotsConfig, ToolKey,
+    };
     use caudra_providers::{INVALID_TOOL_JSON_KEY, InvalidToolInput};
     use caudra_storage::StateDir;
     use caudra_storage::id::SessionRef;
@@ -1531,6 +1533,7 @@ mod tests {
     use crate::tools::native::batch::BatchTool;
     use crate::tools::registry::{PermissionIntent, ToolSource};
     use crate::tools::test_support::{GUARDED_TOOL_NAME, GuardedMock};
+    use crate::workspace_baseline::{BaselineGate, WorkspaceBaseline};
     use crate::{AgentMode, EventSender};
 
     const OBSERVED_TOOL: &str = "observed";
@@ -3696,6 +3699,33 @@ mod tests {
                     NO_CAPTURE_MSG
                 }
             );
+        });
+    }
+
+    #[test_case(ToolEffect::Mutating; "mutating")]
+    #[test_case(ToolEffect::Unknown; "unknown")]
+    fn disabled_snapshots_run_mutations_even_with_an_unusable_store(effect: ToolEffect) {
+        smol::block_on(async {
+            let executed = Arc::new(AtomicBool::new(false));
+            let (temp, mut ctx, store) =
+                baseline_ctx(effect, BaselineStore::Broken, Arc::clone(&executed));
+            ctx.baseline = Some(BaselineGate::new(
+                WorkspaceBaseline::new(
+                    Arc::clone(&store),
+                    temp.path().join("repo"),
+                    SnapshotsConfig {
+                        enabled: false,
+                        ..SnapshotsConfig::default()
+                    },
+                ),
+                None,
+            ));
+
+            let done = run_baseline_probe(&ctx).await;
+
+            assert!(!done.is_error, "{}", done.output.as_text());
+            assert!(executed.load(Ordering::SeqCst));
+            assert!(!store.has_session_start());
         });
     }
 

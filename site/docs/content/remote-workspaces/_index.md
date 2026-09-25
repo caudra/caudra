@@ -29,7 +29,7 @@ Live discovery must advertise these capabilities. Capability contracts use versi
 | `watch` | `open`, `poll`, `close`, and `recursive` |
 | `projectAssets` | `discover` and `read` |
 | `scm` | `discover`, `status`, `log`, `diff`, `readSide`, `stage`, `unstage`, `discard`, and `preparedMutations` |
-| `snapshots` | `capture`, `inspect`, `status`, `prepareRestore`, `prepareUnrevert`, `acknowledge`, and `prepareCleanup` |
+| `snapshots` | `capture`, `prepareCapture`, `checkpoint`, `inspect`, `status`, `prepareRestore`, `prepareUnrevert`, `acknowledge`, and `prepareCleanup` |
 | `reviewedTransfer` | `privateStaging`, `sealedPublication`, `conditionalDownload`, `singleRange`, `durableOutcomes`, `createsDirectories`, and `safeInventory` |
 
 Reviewed transfer also requires positive file, staging, I/O, lifetime, buffer and journal limits, with `maxJournalStorageBytes >= maxJournalBytes`. Binary reads use reviewed downloads. The old raw upload/download tools cannot substitute for these capabilities.
@@ -183,7 +183,11 @@ An ordinary server restart preserves durable identity but changes the process in
 
 A remote session captures its snapshots on the Workcell host, in the store behind `--snapshot-root`. Each capture covers the session directory. A rewind works like a [local file restore](/docs/sessions/#file-snapshots): it touches only the paths that differ between the capture nearest the current head and the capture nearest the target, and a path changed since the first capture is a conflict.
 
-Captures use the `storage.snapshots` settings, lowered to the limits the host advertises. `enabled = false` turns remote capture off too. The host walk differs from a local one:
+Capture is a prepared operation. Caudra starts it and polls status through short requests, so a large capture can outlast an ordinary RPC deadline. The host reports capture phases and applies a 15-minute cooperative budget. Cancellation waits for active filesystem work to publish or roll back. A timeout does not prove that the worker stopped. After a lost reply, Caudra looks up the original checkpoint instead of assuming success or creating a different checkpoint.
+
+Run-completion captures run in the background without blocking the terminal UI. File rewind and unrevert wait until a pending final capture settles, so their preview cannot use an unfinished source snapshot. Shutdown gives final captures a shared, bounded wait and requests cancellation when it expires.
+
+Captures use the `storage.snapshots` settings, lowered to the limits the host advertises. `enabled = false` or `--no-snapshots` [disables automatic capture](/docs/sessions/#disable-automatic-snapshots), including session-start and final snapshots, without bypassing restore recovery. The host walk differs from a local one:
 
 - Symlinks are captured as links. A restore recreates the link and never follows it.
 - Per-directory `.gitignore` files apply. `.git/info/exclude` and the global Git ignore file do not.

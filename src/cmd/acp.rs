@@ -16,7 +16,7 @@ use caudra_storage::sessions::StoredMode;
 use caudra_storage::workspace_binding::StoredWorkspaceBinding;
 
 use super::workcell_runtime::WorkcellRuntime;
-use crate::cli::WorkcellSelectorArgs;
+use crate::cli::{Cli, WorkcellSelectorArgs};
 use crate::setup;
 
 struct SessionResources {
@@ -46,6 +46,7 @@ fn runtime_resolver(
     selection: WorkcellSelectorArgs,
     no_plugins: bool,
     no_jit: bool,
+    no_snapshots: bool,
 ) -> AcpRuntimeResolver {
     Arc::new(
         move |cwd: PathBuf, stored: Option<StoredWorkspaceBinding>| {
@@ -70,6 +71,7 @@ fn runtime_resolver(
                     plugin_host.load_init_files_or_skip(no_plugins, &cwd)
                 }?;
                 let mut config = raw.unwrap_or_default().into_config(false)?;
+                config.storage.snapshots.enabled &= !no_snapshots;
                 config.permissions = if runtime.is_remote() {
                     caudra_config::load_global_permissions()
                 } else {
@@ -114,15 +116,7 @@ fn runtime_resolver(
     )
 }
 
-pub fn run(
-    model_arg: Option<&str>,
-    yolo: bool,
-    ephemeral: bool,
-    no_plugins: bool,
-    no_jit: bool,
-    profile_arg: Option<&str>,
-    workcell: &crate::cli::WorkcellSelectorArgs,
-) -> Result<()> {
+pub fn run(model_arg: Option<&str>, yolo: bool, cli: &Cli) -> Result<()> {
     // Every phase up to `init_logging` runs without a subscriber, so its cost is
     // invisible unless it is measured here and reported once the sink exists.
     let started = Instant::now();
@@ -141,11 +135,11 @@ pub fn run(
     let cwd = env::current_dir().unwrap_or_else(|_| ".".into());
     caudra_config::load_global_env_file();
 
-    let mut plugin_host = PluginHost::with_jit(Arc::new(ToolRegistry::default()), !no_jit)
+    let mut plugin_host = PluginHost::with_jit(Arc::new(ToolRegistry::default()), !cli.no_jit)
         .context("initialize lua plugin host")?;
 
     let raw_config = plugin_host
-        .load_global_init_file_or_skip(no_plugins)
+        .load_global_init_file_or_skip(cli.no_plugins)
         .context("load init.lua files")?;
 
     let mut config = raw_config
@@ -159,7 +153,7 @@ pub fn run(
     }
     config.validate()?;
     let (storage, _ephemeral_root) =
-        super::run_storage(storage, ephemeral || config.storage.ephemeral)?;
+        super::run_storage(storage, cli.ephemeral || config.storage.ephemeral)?;
     super::configure_native_tools(&config.agent);
     super::install_native_permission_rules(&plugin_host.plugin_rules(), &cwd);
 
@@ -205,9 +199,15 @@ pub fn run(
         initial_wd: cwd,
         thinking,
         prompt_profiles,
-        system_prompt_profile_override: profile_arg.map(str::to_owned),
+        system_prompt_profile_override: cli.system_prompt_profile.clone(),
         yolo,
         model_policy: Arc::new(config.provider.model_policy.clone()),
-        runtime_resolver: runtime_resolver(storage, workcell.clone(), no_plugins, no_jit),
+        runtime_resolver: runtime_resolver(
+            storage,
+            cli.workcell.clone(),
+            cli.no_plugins,
+            cli.no_jit,
+            cli.no_snapshots,
+        ),
     })
 }

@@ -77,6 +77,13 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub ephemeral: bool,
 
+    #[arg(
+        long,
+        global = true,
+        help = "Disable automatic workspace snapshots and file revert for this run (local and remote)"
+    )]
+    pub no_snapshots: bool,
+
     /// Attach an image to the prompt in --print mode as vision content (repeatable)
     #[arg(long = "image", value_name = "PATH")]
     pub images: Vec<PathBuf>,
@@ -1031,6 +1038,18 @@ mod tests {
     const MODEL_SPEC: &str = "openai/gpt-5";
     const PERMISSIONS_NOT_PARSED: &str = "expected permission rebind subcommand";
     const PERMISSION_DATABASE: &str = "/explicit-copy/caudra.sqlite";
+
+    #[test_case(&[], false; "default")]
+    #[test_case(&["--no-snapshots"], true; "tui")]
+    #[test_case(&["--print", "--no-snapshots"], true; "print")]
+    #[test_case(&["--print", "--input-format", "stream-json", "--no-snapshots"], true; "sdk")]
+    #[test_case(&["--no-snapshots", "acp"], true; "before_acp")]
+    #[test_case(&["acp", "--no-snapshots"], true; "after_acp")]
+    #[test_case(&["--workcell-profile", "dev", "--no-snapshots"], true; "remote")]
+    fn no_snapshots_is_global(args: &[&str], expected: bool) {
+        let cli = Cli::try_parse_from(["caudra"].into_iter().chain(args.iter().copied())).unwrap();
+        assert_eq!(cli.no_snapshots, expected);
+    }
 
     #[test_case(false; "human_proposals")]
     #[test_case(true; "json_proposals")]

@@ -118,7 +118,7 @@ use caudra_agent::snapshots::{
     SESSION_SNAPSHOTS_DIR, SnapshotError, SnapshotLimits, SnapshotStore, workspace_key,
 };
 use caudra_agent::types::WorkflowProvenance;
-use caudra_agent::workspace_baseline::WorkspaceBaseline;
+use caudra_agent::workspace_baseline::{BaselineOutcome, WorkspaceBaseline};
 use caudra_agent::{
     AgentEvent, AgentInput, AgentMode, CommitRef, Envelope, GoalVerdict, ImageSource,
     McpConfigErrors, McpPromptInfo, McpSnapshotReader, Mention, PromptAdmission, QueueItemId,
@@ -139,8 +139,12 @@ use caudra_storage::model::persist_model;
 use caudra_storage::tool_ledger::{ToolCall, ToolLedger, ToolStats};
 use caudra_storage::usage_ledger::{LedgerPurpose, LifetimeUsage, TurnUsage, UsageLedger};
 use caudra_storage::view::ViewMode;
+use caudra_storage::workspace_binding::StoredWorkspaceBinding;
+use caudra_workspace::SnapshotState;
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent};
 use flume::{Receiver, TryRecvError};
+use futures_lite::future;
+use smol::{Task, Timer};
 
 use crate::storage_writer::StorageWriter;
 use ratatui::layout::Position;
@@ -180,6 +184,8 @@ const WORKFLOW_REQUESTER_PREFIX: &str = "workflow";
 const COPY_FAILED: &str = "Copy failed: ";
 const HISTORY_UNREADABLE: &str = "Failed to read session history: ";
 const NO_FILE_REVERT_MSG: &str = "No file revert for this workspace";
+const REMOTE_SNAPSHOT_READY: &str = "Remote workspace snapshot is available";
+const REMOTE_SNAPSHOT_BUSY: &str = "Workspace snapshot capture is busy; final snapshot skipped";
 const NO_FILE_CHANGES_MSG: &str =
     "Nothing has written to this workspace, so there are no file changes to revert";
 const FAST_UNSUPPORTED_MSG: &str = "Fast mode needs a model that sells a fast tier (API only)";
@@ -331,6 +337,13 @@ pub enum KeyFocus {
     Transcript,
 }
 
+struct PendingSnapshot {
+    session_id: CaudraId,
+    binding: Option<StoredWorkspaceBinding>,
+    head: CaudraId,
+    task: Task<BaselineOutcome>,
+}
+
 pub struct App {
     pub(super) chats: Vec<Chat>,
     pub(super) active_chat: usize,
@@ -475,6 +488,7 @@ pub struct App {
     /// Shared with this session's agents, which is what lets the first mutating
     /// tool call capture the revert point the UI later restores from.
     pub(crate) workspace_baseline: Arc<WorkspaceBaseline>,
+    pending_snapshot: Option<PendingSnapshot>,
     /// Mirrors the baseline's refusal, so the poller can tell a new verdict
     /// from the one it already reported.
     pub(crate) snapshots_unavailable: Option<String>,
@@ -702,6 +716,7 @@ impl App {
             local_documents: None,
             snapshot_store,
             workspace_baseline,
+            pending_snapshot: None,
             snapshots_unavailable: None,
             snapshots_config: SnapshotsConfig::default(),
             usage_slot: Arc::new(ArcSwapOption::empty()),
@@ -932,6 +947,7 @@ impl App {
     /// The store and the baseline move together: an agent mid-session must never
     /// capture one workspace's revert point into another workspace's store.
     fn rebind_workspace_baseline(&mut self, store: Arc<SnapshotStore>, cwd: PathBuf) {
+        self.pending_snapshot = None;
         self.workspace_baseline.rebind(Arc::clone(&store), cwd);
         self.snapshot_store = store;
     }
@@ -947,33 +963,51 @@ impl App {
             .or_else(|| crate::session_history_head(&self.state.session))
     }
 
-    /// Closes the bracket a revert needs: the baseline is one end, `head` the
-    /// other. Inline, and it walks and hashes the whole working tree under a
-    /// machine-global lock.
-    ///
-    /// A session with no baseline has nothing to revert to, so it is not made
-    /// to pay for a walk it will never spend.
     pub(super) fn snapshot_history_head(&mut self) -> Result<(), String> {
+        let _ = self.poll_snapshot_capture();
         let Some(head) = self.history_head().filter(|_| self.has_revert_point()) else {
             return Ok(());
         };
         if self.workspace_baseline.is_remote() {
-            let already_captured = self
-                .workspace_baseline
-                .remote_capture(Some(head))
-                .is_ok_and(|capture| capture.is_some());
-            return match smol::block_on(self.workspace_baseline.ensure(Some(head))) {
-                caudra_agent::BaselineOutcome::Ready => {
-                    if !already_captured {
-                        self.status_bar
-                            .flash("Remote workspace snapshot is available".into());
-                    }
+            if let Some(pending) = &self.pending_snapshot {
+                return if pending.head == head {
                     Ok(())
-                }
-                // Reported once by `poll_snapshot_refusal`, not after every run.
-                caudra_agent::BaselineOutcome::Unavailable(_) => Ok(()),
-                caudra_agent::BaselineOutcome::Failed(error) => Err(error.to_string()),
-            };
+                } else {
+                    Err(REMOTE_SNAPSHOT_BUSY.into())
+                };
+            }
+            if let Some(capture) = self
+                .workspace_baseline
+                .reserve_remote_capture(head)
+                .map_err(|error| error.to_string())?
+            {
+                let preview = self
+                    .remote_restore_confirmation
+                    .take()
+                    .and_then(|confirmation| {
+                        self.workspace_session
+                            .clone()
+                            .map(|workspace| (workspace, confirmation.prepared))
+                    });
+                self.pending_snapshot = Some(PendingSnapshot {
+                    session_id: self.state.session.id,
+                    binding: self.state.session.workspace_binding().cloned(),
+                    head,
+                    task: smol::spawn(async move {
+                        if let Some((workspace, prepared)) = preview
+                            && let Some(service) =
+                                &workspace.workspace().services().snapshot_mutation
+                            && let Err(error) = service
+                                .release(workspace.binding(), workspace.cursor(), &prepared)
+                                .await
+                        {
+                            tracing::warn!(%error, "failed to release superseded remote restore preview");
+                        }
+                        capture.await
+                    }),
+                });
+            }
+            return Ok(());
         }
         self.snapshot_store
             .snapshot(std::path::Path::new(&self.state.session.cwd), head)
@@ -981,9 +1015,46 @@ impl App {
             .map_err(|error| error.to_string())
     }
 
+    fn discard_stale_snapshot_capture(&mut self) {
+        if self.pending_snapshot.as_ref().is_some_and(|pending| {
+            pending.session_id != self.state.session.id
+                || pending.binding.as_ref() != self.state.session.workspace_binding()
+        }) {
+            self.pending_snapshot = None;
+        }
+    }
+
+    fn poll_snapshot_capture(&mut self) -> Dirty {
+        self.discard_stale_snapshot_capture();
+        let Some(pending) = self.pending_snapshot.as_mut() else {
+            return Dirty::NO;
+        };
+        let Some(outcome) = smol::block_on(future::poll_once(&mut pending.task)) else {
+            return Dirty::NO;
+        };
+        let head = pending.head;
+        self.pending_snapshot = None;
+        if self.history_head() != Some(head) {
+            return Dirty::NO;
+        }
+        match outcome {
+            BaselineOutcome::Ready => self.status_bar.flash(REMOTE_SNAPSHOT_READY.into()),
+            BaselineOutcome::Unavailable(_) => return Dirty::NO,
+            BaselineOutcome::Failed(error) => {
+                tracing::warn!(%error, "final workspace snapshot failed");
+                self.status_bar
+                    .flash(format!("Final workspace snapshot failed: {error}"));
+            }
+        }
+        Dirty::YES
+    }
+
     /// Whether a run has captured a baseline for this workspace yet. Until one
     /// exists there is nothing for a later capture to bracket.
     pub(super) fn has_revert_point(&self) -> bool {
+        if !self.workspace_baseline.is_enabled() {
+            return false;
+        }
         if self.workspace_baseline.is_remote() {
             self.workspace_baseline
                 .remote_capture(self.history_head())
@@ -1009,21 +1080,52 @@ impl App {
         })
     }
 
-    /// [`Self::snapshot_history_head`] with a ceiling on how long it may wait
-    /// for the machine-global artifact lock. Answers whether it ran.
-    ///
-    /// Exit is the one caller that cannot afford the unbounded form: the lock
-    /// is one file for every caudra on the machine, so a capture running in an
-    /// unrelated workspace is enough to hold exit open, and `flock` will
-    /// happily starve the waiter. Losing the final snapshot costs rewind
-    /// fidelity for one head; waiting costs the user their terminal, and
-    /// blocks every other session queued behind the same lock.
     pub(super) fn snapshot_history_head_within(
         &mut self,
         budget: Duration,
     ) -> Result<bool, String> {
+        if !self.workspace_baseline.is_enabled() {
+            return Ok(true);
+        }
         if self.workspace_baseline.is_remote() {
-            return self.snapshot_history_head().map(|()| true);
+            let deadline = Instant::now() + budget;
+            self.discard_stale_snapshot_capture();
+            let Some(head) = self.history_head().filter(|_| self.has_revert_point()) else {
+                self.pending_snapshot = None;
+                return Ok(true);
+            };
+            if self
+                .pending_snapshot
+                .as_ref()
+                .is_some_and(|pending| pending.head != head)
+            {
+                self.pending_snapshot = None;
+                return Ok(false);
+            }
+            if budget.is_zero() {
+                self.pending_snapshot = None;
+            } else if self.pending_snapshot.is_none() {
+                self.snapshot_history_head()?;
+            }
+            let Some(pending) = self.pending_snapshot.take() else {
+                return Ok(self
+                    .workspace_baseline
+                    .remote_capture(Some(head))
+                    .is_ok_and(|capture| {
+                        capture.is_some_and(|capture| capture.state == SnapshotState::Complete)
+                    }));
+            };
+            return match smol::block_on(future::or(
+                async move { Some(pending.task.await) },
+                async move {
+                    Timer::at(deadline).await;
+                    None
+                },
+            )) {
+                Some(BaselineOutcome::Ready) => Ok(true),
+                Some(BaselineOutcome::Unavailable(_)) | None => Ok(false),
+                Some(BaselineOutcome::Failed(error)) => Err(error.to_string()),
+            };
         }
         self.snapshot_store
             .capture_head_within(
@@ -5034,6 +5136,7 @@ impl App {
                     &change.context,
                 ))
             });
+        self.pending_snapshot = None;
         self.workspace_baseline.rebind_workspace_session(
             self.storage.clone(),
             self.state.session.id,
@@ -5335,6 +5438,7 @@ impl App {
             | self.mcp_picker.refresh()
             | self.tick_permission_config_trust()
             | self.poll_snapshot_refusal()
+            | self.poll_snapshot_capture()
             | self.poll_pattern_suggestions()
             | self.poll_permission_editor()
             | self.poll_sandbox()

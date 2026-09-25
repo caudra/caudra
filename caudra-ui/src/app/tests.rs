@@ -1,6 +1,7 @@
 use super::*;
 use crate::agent::shared_queue;
 use crate::app::sandbox::attached_sandbox_instance;
+use crate::app::session::REVERT_SNAPSHOT_PENDING_MSG;
 use crate::app::tasks::{MAIN_TASK_ID, TaskStatus};
 use crate::chat::{CANCELLED_TEXT, DONE_TEXT, ERROR_TEXT};
 use crate::components::command::{BUILTIN_COMMANDS, CommandPalette, ParsedCommand};
@@ -27,6 +28,7 @@ use crate::repaint::expect::{OWED, QUIET};
 use crate::selection::{SelectableZone, SelectionState, SelectionZone};
 use crate::test_pattern_discovery_report;
 use arc_swap::ArcSwap;
+use async_trait::async_trait;
 use caudra_agent::command::CustomCommand;
 use caudra_agent::context::{
     ContextInventory, ContextModel, ContextReadiness, ContextReserve, ContextUsage, ContextWindow,
@@ -79,9 +81,16 @@ use caudra_storage::view::ViewMode;
 use caudra_storage::workspace_binding::StoredWorkspaceBinding;
 use caudra_workbench::keys as workbench_keys;
 use caudra_workspace::{
-    CollectionRevision, OperationId, ProjectAsset, ProjectAssetContent, ProjectAssetManifest,
-    SessionWorkspaceBinding, WorkspaceAssetService, WorkspaceCapabilities, WorkspaceCursor,
-    WorkspaceError, WorkspaceHandle, WorkspaceServices, WorkspaceSession,
+    CancellationResult, CheckpointId, CollectionRevision, CwdHandle, OperationHandle, OperationId,
+    OperationPhase, OperationStatus, PreparedSnapshotOperation, ProjectAsset, ProjectAssetContent,
+    ProjectAssetManifest, ReleaseResult, ResourceId, ResourceRevision, ResourceScope, RestoreId,
+    SessionWorkspaceBinding, SnapshotCaptureRequest, SnapshotCaptureResult, SnapshotChangeCounts,
+    SnapshotId, SnapshotInspectPage, SnapshotInspectRequest, SnapshotOperationPreview,
+    SnapshotOperationResult, SnapshotRestorePreview, SnapshotRestoreState, SnapshotRestoreStatus,
+    SnapshotSkipped, SnapshotState, SnapshotSummary, WorkspaceAssetService, WorkspaceCapabilities,
+    WorkspaceCapability, WorkspaceCursor, WorkspaceError, WorkspaceHandle, WorkspacePath,
+    WorkspaceServices, WorkspaceSession, WorkspaceSnapshotMutationService,
+    WorkspaceSnapshotReadService,
 };
 use crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
@@ -98,6 +107,14 @@ use tempfile::TempDir;
 use test_case::test_case;
 
 const WRITER_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
+const SNAPSHOT_TEST_TIMEOUT: Duration = Duration::from_secs(10);
+const SNAPSHOT_TEST_BUDGET: Duration = Duration::from_millis(10);
+const SNAPSHOT_TEST_TIMEOUT_MSG: &str = "remote snapshot task did not finish";
+const SNAPSHOT_TEST_ID: &str = "snapshot";
+const SNAPSHOT_TEST_REVISION: &str = "snapshot-revision";
+const SNAPSHOT_TEST_RESTORE: &str = "snapshot-restore";
+const SNAPSHOT_TEST_REBOUND_ROOT: &str = "rebound-root";
+const SNAPSHOT_TEST_REBOUND_CURSOR: &str = "rebound-cursor";
 const PERMISSION_TEST_TIMEOUT: Duration = Duration::from_secs(10);
 const PATTERN_TEST_ANALYSIS: &str = "test-analysis/v1";
 const PATTERN_TEST_SOURCE: &str = "history-test";
@@ -9733,6 +9750,630 @@ impl caudra_providers::provider::Provider for PendingProvider {
     }
 }
 
+struct BlockedSnapshots {
+    started: flume::Sender<()>,
+    resume: flume::Receiver<()>,
+}
+
+#[async_trait]
+impl WorkspaceSnapshotReadService for BlockedSnapshots {
+    async fn capture(
+        &self,
+        _binding: &SessionWorkspaceBinding,
+        _cursor: &WorkspaceCursor,
+        request: &SnapshotCaptureRequest,
+    ) -> Result<SnapshotCaptureResult, WorkspaceError> {
+        self.started.send_async(()).await.unwrap();
+        self.resume.recv_async().await.unwrap();
+        Ok(SnapshotCaptureResult {
+            snapshot: SnapshotSummary {
+                snapshot_id: SnapshotId::new(format!(
+                    "{SNAPSHOT_TEST_ID}-{}",
+                    request.checkpoint_id.as_str()
+                ))
+                .unwrap(),
+                checkpoint_id: Some(request.checkpoint_id.clone()),
+                label: None,
+                state: SnapshotState::Complete,
+                manifest_revision: ResourceRevision::new(SNAPSHOT_TEST_REVISION).unwrap(),
+                scope: WorkspacePath::new(".").unwrap(),
+                file_count: 0,
+                total_bytes: 0,
+                skipped: SnapshotSkipped::default(),
+                created_at_unix_ms: 1,
+            },
+            reused_checkpoint: false,
+        })
+    }
+
+    async fn inspect(
+        &self,
+        _binding: &SessionWorkspaceBinding,
+        _cursor: &WorkspaceCursor,
+        _request: &SnapshotInspectRequest,
+    ) -> Result<SnapshotInspectPage, WorkspaceError> {
+        Err(WorkspaceError::UnsupportedCapability {
+            capability: WorkspaceCapability::SnapshotInspect,
+        })
+    }
+
+    async fn restore_status(
+        &self,
+        _binding: &SessionWorkspaceBinding,
+        _cursor: &WorkspaceCursor,
+        _restore_id: &RestoreId,
+    ) -> Result<SnapshotRestoreStatus, WorkspaceError> {
+        Err(WorkspaceError::UnsupportedCapability {
+            capability: WorkspaceCapability::SnapshotStatus,
+        })
+    }
+}
+
+struct SnapshotRestoreProbe(flume::Sender<WorkspaceCapability>);
+
+impl SnapshotRestoreProbe {
+    fn unsupported<T>(&self, capability: WorkspaceCapability) -> Result<T, WorkspaceError> {
+        self.0.send(capability).unwrap();
+        Err(WorkspaceError::UnsupportedCapability { capability })
+    }
+}
+
+#[async_trait]
+impl WorkspaceSnapshotMutationService for SnapshotRestoreProbe {
+    fn max_cleanup_checkpoints(&self) -> usize {
+        0
+    }
+
+    async fn prepare_restore(
+        &self,
+        _binding: &SessionWorkspaceBinding,
+        _cursor: &WorkspaceCursor,
+        target: &SnapshotId,
+        source: &SnapshotId,
+    ) -> Result<PreparedSnapshotOperation, WorkspaceError> {
+        self.0
+            .send(WorkspaceCapability::SnapshotPrepareRestore)
+            .unwrap();
+        Ok(PreparedSnapshotOperation {
+            operation: OperationHandle {
+                preparation_id: OperationId::new(SNAPSHOT_TEST_RESTORE).unwrap(),
+                invocation_id: None,
+                execution_id: None,
+                expires_at_unix_ms: None,
+            },
+            preview: SnapshotOperationPreview::Restore(SnapshotRestorePreview {
+                restore_id: RestoreId::new(SNAPSHOT_TEST_RESTORE).unwrap(),
+                target_snapshot_id: target.clone(),
+                source_snapshot_id: source.clone(),
+                counts: SnapshotChangeCounts {
+                    replace: u32::from(target != source),
+                    ..SnapshotChangeCounts::default()
+                },
+                changes: Vec::new(),
+                created_directories: Vec::new(),
+            }),
+        })
+    }
+
+    async fn prepare_unrevert(
+        &self,
+        _binding: &SessionWorkspaceBinding,
+        _cursor: &WorkspaceCursor,
+        _restore_id: &RestoreId,
+    ) -> Result<PreparedSnapshotOperation, WorkspaceError> {
+        self.unsupported(WorkspaceCapability::SnapshotPrepareUnrevert)
+    }
+
+    async fn prepare_cleanup(
+        &self,
+        _binding: &SessionWorkspaceBinding,
+        _cursor: &WorkspaceCursor,
+        _checkpoint_ids: &[CheckpointId],
+    ) -> Result<PreparedSnapshotOperation, WorkspaceError> {
+        self.unsupported(WorkspaceCapability::SnapshotPrepareCleanup)
+    }
+
+    async fn execute(
+        &self,
+        _binding: &SessionWorkspaceBinding,
+        _cursor: &WorkspaceCursor,
+        _prepared: &PreparedSnapshotOperation,
+    ) -> Result<OperationStatus<SnapshotOperationResult>, WorkspaceError> {
+        self.unsupported(WorkspaceCapability::SnapshotExecute)
+    }
+
+    async fn operation_status(
+        &self,
+        _binding: &SessionWorkspaceBinding,
+        _cursor: &WorkspaceCursor,
+        _operation: &OperationHandle,
+    ) -> Result<OperationStatus<SnapshotOperationResult>, WorkspaceError> {
+        self.unsupported(WorkspaceCapability::SnapshotOperationStatus)
+    }
+
+    async fn cancel(
+        &self,
+        _binding: &SessionWorkspaceBinding,
+        _cursor: &WorkspaceCursor,
+        _operation: &OperationHandle,
+    ) -> Result<CancellationResult, WorkspaceError> {
+        self.unsupported(WorkspaceCapability::SnapshotCancel)
+    }
+
+    async fn acknowledge(
+        &self,
+        _binding: &SessionWorkspaceBinding,
+        _cursor: &WorkspaceCursor,
+        _restore_id: &RestoreId,
+    ) -> Result<SnapshotRestoreStatus, WorkspaceError> {
+        self.unsupported(WorkspaceCapability::SnapshotAcknowledge)
+    }
+
+    async fn release(
+        &self,
+        _binding: &SessionWorkspaceBinding,
+        _cursor: &WorkspaceCursor,
+        _prepared: &PreparedSnapshotOperation,
+    ) -> Result<ReleaseResult, WorkspaceError> {
+        self.0.send(WorkspaceCapability::SnapshotRelease).unwrap();
+        Ok(ReleaseResult {
+            state: OperationPhase::Cancelled,
+            released: true,
+        })
+    }
+}
+
+fn install_snapshot_restore_probe(app: &mut App) -> flume::Receiver<WorkspaceCapability> {
+    let (requests_tx, requests) = flume::unbounded();
+    let workspace = app.workspace_session.as_ref().unwrap();
+    let handle = WorkspaceHandle::new(
+        workspace.workspace().authority().clone(),
+        WorkspaceCapabilities::new([
+            WorkspaceCapability::SnapshotCapture,
+            WorkspaceCapability::SnapshotPrepareRestore,
+            WorkspaceCapability::SnapshotPrepareUnrevert,
+            WorkspaceCapability::SnapshotRelease,
+        ]),
+        WorkspaceServices {
+            snapshot_read: workspace.workspace().services().snapshot_read.clone(),
+            snapshot_mutation: Some(Arc::new(SnapshotRestoreProbe(requests_tx))),
+            ..WorkspaceServices::default()
+        },
+    )
+    .unwrap();
+    let workspace = WorkspaceSession::new(
+        handle,
+        workspace.binding().clone(),
+        workspace.cursor().clone(),
+    )
+    .unwrap();
+    app.workspace_baseline.rebind_workspace_session(
+        app.storage.clone(),
+        app.state.session.id,
+        workspace.clone(),
+        app.state.session.workspace_binding().unwrap().clone(),
+    );
+    app.workspace_session = Some(workspace);
+    requests
+}
+
+fn remote_snapshot_app(
+    enabled: bool,
+    existing: bool,
+) -> (TempDir, App, flume::Receiver<()>, flume::Sender<()>) {
+    let (temp, _, _, mut app) = tempdir_app();
+    let target = remote_workspace_session();
+    let (started_tx, started) = flume::bounded(1);
+    let (resume, resume_rx) = flume::bounded(1);
+    let service = Arc::new(BlockedSnapshots {
+        started: started_tx,
+        resume: resume_rx,
+    });
+    let handle = WorkspaceHandle::new(
+        target.workspace().authority().clone(),
+        WorkspaceCapabilities::new([WorkspaceCapability::SnapshotCapture]),
+        WorkspaceServices {
+            snapshot_read: Some(service),
+            ..WorkspaceServices::default()
+        },
+    )
+    .unwrap();
+    let workspace =
+        WorkspaceSession::new(handle, target.binding().clone(), target.cursor().clone()).unwrap();
+    let binding = StoredWorkspaceBinding::new_with_cursor(
+        workspace.binding().clone(),
+        workspace.cursor().clone(),
+        None,
+    )
+    .unwrap();
+    app.state.session = Arc::new(AppSession::new_with_workspace("test", ".", binding.clone()));
+    app.state
+        .session_mut()
+        .replace_messages(crate::history_items(&[Message::user(FIRST_CONTENT.into())]));
+    if existing {
+        let baseline = WorkspaceBaseline::new_workspace_session(
+            app.storage.clone(),
+            app.state.session.id,
+            workspace.clone(),
+            binding.clone(),
+            SnapshotsConfig::default(),
+        );
+        resume.send(()).unwrap();
+        smol::block_on(baseline.ensure(None)).into_result().unwrap();
+        started.recv_timeout(SNAPSHOT_TEST_TIMEOUT).unwrap();
+    }
+    app.snapshots_config.enabled = enabled;
+    app.workspace_baseline = WorkspaceBaseline::new_workspace_session(
+        app.storage.clone(),
+        app.state.session.id,
+        workspace.clone(),
+        binding,
+        app.snapshots_config,
+    );
+    app.workspace_session = Some(workspace);
+    (temp, app, started, resume)
+}
+
+fn wait_for_snapshot_task(app: &App) {
+    smol::block_on(future::or(
+        async {
+            while !app.pending_snapshot.as_ref().unwrap().task.is_finished() {
+                future::yield_now().await;
+            }
+        },
+        async {
+            Timer::after(SNAPSHOT_TEST_TIMEOUT).await;
+            panic!("{SNAPSHOT_TEST_TIMEOUT_MSG}");
+        },
+    ));
+}
+
+fn wait_for_snapshot_gate(baseline: &WorkspaceBaseline) {
+    smol::block_on(future::or(
+        async {
+            baseline.ensure(None).await.into_result().unwrap();
+        },
+        async {
+            Timer::after(SNAPSHOT_TEST_TIMEOUT).await;
+            panic!("{SNAPSHOT_TEST_TIMEOUT_MSG}");
+        },
+    ));
+}
+
+#[test_case(RestoreMode::Files, false; "files")]
+#[test_case(RestoreMode::Both, false; "files_and_conversation")]
+#[test_case(RestoreMode::Files, true; "files_with_cached_preview")]
+#[test_case(RestoreMode::Both, true; "both_with_cached_preview")]
+fn remote_final_snapshot_defers_file_rewind_until_source_is_captured(
+    mode: RestoreMode,
+    cached: bool,
+) {
+    let (_temp, mut app, started, resume) = remote_snapshot_app(true, true);
+    let requests = install_snapshot_restore_probe(&mut app);
+    let head = app.history_head().unwrap();
+    let root = app
+        .workspace_baseline
+        .remote_capture(None)
+        .unwrap()
+        .unwrap();
+    if cached {
+        assert!(app.revert_to(head, mode).is_empty());
+        assert!(app.remote_restore_confirmation.is_some());
+        assert_eq!(
+            requests.try_recv().unwrap(),
+            WorkspaceCapability::SnapshotPrepareRestore
+        );
+    }
+    app.snapshot_history_head().unwrap();
+    started.recv_timeout(SNAPSHOT_TEST_TIMEOUT).unwrap();
+    if cached {
+        assert_eq!(
+            requests.try_recv().unwrap(),
+            WorkspaceCapability::SnapshotRelease
+        );
+    }
+    assert!(app.remote_restore_confirmation.is_none());
+    assert!(app.revert_to(head, mode).is_empty());
+    assert_eq!(
+        app.status_bar.flash_text(),
+        Some(REVERT_SNAPSHOT_PENDING_MSG)
+    );
+    assert!(requests.is_empty());
+    assert!(app.remote_restore_confirmation.is_none());
+    assert!(app.state.session.meta.pending_revert.is_none());
+    assert_eq!(app.history_head(), Some(head));
+    resume.send(()).unwrap();
+    wait_for_snapshot_task(&app);
+    assert!(app.revert_to(head, mode).is_empty());
+    assert_eq!(
+        requests.try_recv().unwrap(),
+        WorkspaceCapability::SnapshotPrepareRestore
+    );
+    assert!(requests.is_empty());
+    assert!(app.pending_snapshot.is_none());
+    let captured = app
+        .workspace_baseline
+        .remote_capture(Some(head))
+        .unwrap()
+        .unwrap();
+    let confirmation = app.remote_restore_confirmation.as_ref().unwrap();
+    let SnapshotOperationPreview::Restore(preview) = &confirmation.prepared.preview else {
+        unreachable!()
+    };
+    assert_eq!(preview.source_snapshot_id, captured.snapshot_id);
+    assert_eq!(preview.target_snapshot_id, root.snapshot_id);
+    assert_ne!(preview.source_snapshot_id, preview.target_snapshot_id);
+    assert_eq!(preview.counts.replace, 1);
+    assert_eq!(app.history_head(), Some(head));
+}
+
+#[test_case(false; "conversation_only")]
+#[test_case(true; "files")]
+fn remote_final_snapshot_only_blocks_unrevert_that_changes_files(files: bool) {
+    let (_temp, mut app, started, resume) = remote_snapshot_app(true, true);
+    let requests = install_snapshot_restore_probe(&mut app);
+    let head = app.history_head().unwrap();
+    app.snapshot_history_head().unwrap();
+    started.recv_timeout(SNAPSHOT_TEST_TIMEOUT).unwrap();
+    assert!(matches!(
+        app.revert_to(head, RestoreMode::Conversation).as_slice(),
+        [Action::LoadSession(_)]
+    ));
+    assert_eq!(app.history_head(), None);
+    if files {
+        let root = app
+            .workspace_baseline
+            .remote_capture(None)
+            .unwrap()
+            .unwrap();
+        let status = SnapshotRestoreStatus {
+            restore_id: RestoreId::new(SNAPSHOT_TEST_RESTORE).unwrap(),
+            state: SnapshotRestoreState::Completed,
+            source_snapshot_id: root.snapshot_id.clone(),
+            target_snapshot_id: root.snapshot_id,
+            applied_files: 0,
+            total_files: 0,
+            acknowledgement_required: true,
+            reconciliation_required: false,
+            unrevert_of: None,
+        };
+        app.state
+            .session_mut()
+            .meta
+            .pending_revert
+            .as_mut()
+            .unwrap()
+            .file_status = Some(serde_json::to_value(status).unwrap());
+        let pending = app.state.session.meta.pending_revert.clone();
+        assert!(app.unrevert().is_empty());
+        assert_eq!(
+            app.status_bar.flash_text(),
+            Some(REVERT_SNAPSHOT_PENDING_MSG)
+        );
+        assert_eq!(app.state.session.meta.pending_revert, pending);
+        assert_eq!(app.history_head(), None);
+    } else {
+        assert!(matches!(
+            app.unrevert().as_slice(),
+            [Action::LoadSession(_)]
+        ));
+        assert_eq!(app.history_head(), Some(head));
+        assert!(app.state.session.meta.pending_revert.is_none());
+    }
+    assert!(requests.is_empty());
+    assert!(app.remote_restore_confirmation.is_none());
+    resume.send(()).unwrap();
+    wait_for_snapshot_task(&app);
+    if files {
+        assert!(app.unrevert().is_empty());
+        assert_eq!(
+            requests.try_recv().unwrap(),
+            WorkspaceCapability::SnapshotPrepareUnrevert
+        );
+    } else {
+        let _ = app.tick();
+    }
+    assert!(app.pending_snapshot.is_none());
+    assert!(requests.is_empty());
+}
+
+#[test_case(false; "current_head")]
+#[test_case(true; "head_advanced")]
+fn remote_final_snapshot_returns_before_capture_and_announces_only_current_head(advance: bool) {
+    let (_temp, mut app, started, resume) = remote_snapshot_app(true, true);
+    let head = app.history_head();
+    app.snapshot_history_head().unwrap();
+    started.recv_timeout(SNAPSHOT_TEST_TIMEOUT).unwrap();
+    assert!(app.pending_snapshot.is_some());
+    assert!(app.workspace_baseline.is_capturing());
+    assert!(
+        app.workspace_baseline
+            .remote_capture(head)
+            .unwrap()
+            .is_none()
+    );
+    assert_ne!(app.status_bar.flash_text(), Some(REMOTE_SNAPSHOT_READY));
+    app.snapshot_history_head().unwrap();
+    assert!(started.is_empty());
+    if advance {
+        app.state
+            .session_mut()
+            .replace_messages(crate::history_items(&[Message::user(
+                CURRENT_CONTENT.into(),
+            )]));
+    }
+    resume.send(()).unwrap();
+    wait_for_snapshot_task(&app);
+    let _ = app.tick();
+    assert!(app.pending_snapshot.is_none());
+    assert_eq!(
+        app.status_bar.flash_text() == Some(REMOTE_SNAPSHOT_READY),
+        !advance
+    );
+    assert!(
+        app.workspace_baseline
+            .remote_capture(head)
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(app.poll_snapshot_capture(), Dirty::NO);
+}
+
+#[test_case(false; "rebind")]
+#[test_case(true; "drop_app")]
+fn remote_final_snapshot_is_cancelled_with_its_owner(drop_app: bool) {
+    let (_temp, mut app, started, _resume) = remote_snapshot_app(true, true);
+    let baseline = Arc::clone(&app.workspace_baseline);
+    app.snapshot_history_head().unwrap();
+    started.recv_timeout(SNAPSHOT_TEST_TIMEOUT).unwrap();
+    if drop_app {
+        drop(app);
+        wait_for_snapshot_gate(&baseline);
+    } else {
+        let workspace = app.workspace_session.clone().unwrap();
+        app.state.session = Arc::new(AppSession::new_with_workspace(
+            "test",
+            ".",
+            app.state.session.workspace_binding().unwrap().clone(),
+        ));
+        baseline.rebind_workspace_session(
+            app.storage.clone(),
+            app.state.session.id,
+            workspace,
+            app.state.session.workspace_binding().unwrap().clone(),
+        );
+        wait_for_snapshot_task(&app);
+        let _ = app.tick();
+        assert!(app.pending_snapshot.is_none());
+        assert_ne!(app.status_bar.flash_text(), Some(REMOTE_SNAPSHOT_READY));
+    }
+    assert!(!baseline.is_capturing());
+}
+
+#[test_case(Duration::ZERO, false; "expired_before_schedule")]
+#[test_case(Duration::ZERO, true; "expired_while_running")]
+#[test_case(SNAPSHOT_TEST_BUDGET, false; "bounded_new_capture")]
+#[test_case(SNAPSHOT_TEST_BUDGET, true; "bounded_running_capture")]
+fn remote_final_snapshot_shutdown_honors_budget(budget: Duration, running: bool) {
+    let (_temp, mut app, started, _resume) = remote_snapshot_app(true, true);
+    let head = app.history_head();
+    if running {
+        app.snapshot_history_head().unwrap();
+        started.recv_timeout(SNAPSHOT_TEST_TIMEOUT).unwrap();
+    }
+    let start = Instant::now();
+    assert!(!app.snapshot_history_head_within(budget).unwrap());
+    assert!(start.elapsed() < SNAPSHOT_TEST_TIMEOUT);
+    assert!(app.pending_snapshot.is_none());
+    wait_for_snapshot_gate(&app.workspace_baseline);
+    assert!(!app.workspace_baseline.is_capturing());
+    assert!(
+        app.workspace_baseline
+            .remote_capture(head)
+            .unwrap()
+            .is_none()
+    );
+    if budget.is_zero() && !running {
+        assert!(started.is_empty());
+    }
+}
+
+#[test_case(false; "running")]
+#[test_case(true; "completed")]
+fn remote_final_snapshot_cannot_announce_for_another_binding(completed: bool) {
+    let (_temp, mut app, started, resume) = remote_snapshot_app(true, true);
+    app.snapshot_history_head().unwrap();
+    started.recv_timeout(SNAPSHOT_TEST_TIMEOUT).unwrap();
+    if completed {
+        resume.send(()).unwrap();
+        wait_for_snapshot_task(&app);
+    }
+    let workspace = app.workspace_session.as_ref().unwrap();
+    let cursor = WorkspaceCursor::new(
+        workspace.binding(),
+        ResourceScope::root(ResourceId::new(SNAPSHOT_TEST_REBOUND_ROOT).unwrap()),
+        2,
+        CwdHandle::new(SNAPSHOT_TEST_REBOUND_CURSOR).unwrap(),
+    );
+    let binding =
+        StoredWorkspaceBinding::new_with_cursor(workspace.binding().clone(), cursor, None).unwrap();
+    app.state
+        .session_mut()
+        .replace_workspace_cursor(binding)
+        .unwrap();
+    let _ = app.tick();
+    assert!(app.pending_snapshot.is_none());
+    assert_ne!(app.status_bar.flash_text(), Some(REMOTE_SNAPSHOT_READY));
+    wait_for_snapshot_gate(&app.workspace_baseline);
+    assert!(!app.workspace_baseline.is_capturing());
+}
+
+#[test_case(false; "success")]
+#[test_case(true; "new_head_is_busy")]
+fn remote_final_snapshot_shutdown_observes_the_scheduled_head(advance: bool) {
+    let (_temp, mut app, started, resume) = remote_snapshot_app(true, true);
+    let head = app.history_head();
+    app.snapshot_history_head().unwrap();
+    started.recv_timeout(SNAPSHOT_TEST_TIMEOUT).unwrap();
+    if advance {
+        app.state
+            .session_mut()
+            .replace_messages(crate::history_items(&[Message::user(
+                CURRENT_CONTENT.into(),
+            )]));
+        assert_eq!(
+            app.snapshot_history_head(),
+            Err(REMOTE_SNAPSHOT_BUSY.to_owned())
+        );
+        assert!(
+            !app.snapshot_history_head_within(SNAPSHOT_TEST_TIMEOUT)
+                .unwrap()
+        );
+        wait_for_snapshot_gate(&app.workspace_baseline);
+        assert!(
+            app.workspace_baseline
+                .remote_capture(head)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            app.workspace_baseline
+                .remote_capture(app.history_head())
+                .unwrap()
+                .is_none()
+        );
+    } else {
+        resume.send(()).unwrap();
+        assert!(
+            app.snapshot_history_head_within(SNAPSHOT_TEST_TIMEOUT)
+                .unwrap()
+        );
+        assert!(
+            app.workspace_baseline
+                .remote_capture(head)
+                .unwrap()
+                .is_some()
+        );
+    }
+    assert!(app.pending_snapshot.is_none());
+    assert!(started.is_empty());
+}
+
+#[test_case(false, false; "disabled_fresh")]
+#[test_case(false, true; "disabled_existing")]
+#[test_case(true, false; "no_revert_point")]
+fn remote_final_snapshot_requires_enabled_revert_point(enabled: bool, existing: bool) {
+    let (_temp, mut app, started, _resume) = remote_snapshot_app(enabled, existing);
+    app.snapshot_history_head().unwrap();
+    assert!(app.pending_snapshot.is_none());
+    assert!(started.is_empty());
+    assert!(app.snapshot_history_head_within(Duration::ZERO).unwrap());
+    assert!(
+        app.snapshot_history_head_within(SNAPSHOT_TEST_BUDGET)
+            .unwrap()
+    );
+}
+
 fn snapshot_revert_app() -> (TempDir, App, PathBuf, CaudraId, CaudraId, CaudraId) {
     let (temp, _, _, mut app) = tempdir_app();
     let workspace = PathBuf::from(&app.state.session.cwd);
@@ -9814,6 +10455,61 @@ fn a_run_that_writes_nothing_leaves_no_revert_point() {
 
     assert!(matches!(actions.as_slice(), [Action::SendMessage(_)]));
     assert!(!app.snapshot_store.has_session_start(), "{UNTOUCHED_MSG}");
+}
+
+#[test_case(false; "fresh_session")]
+#[test_case(true; "resumed_session")]
+fn disabled_snapshots_skip_baseline_run_and_final_captures(existing: bool) {
+    let (_temp, _, _, mut app) = tempdir_app();
+    let workspace = PathBuf::from(&app.state.session.cwd);
+    let path = workspace.join(SNAPSHOT_FILE);
+    std::fs::write(&path, FIRST_CONTENT).unwrap();
+    if existing {
+        app.snapshot_store
+            .snapshot_session_start(&workspace)
+            .unwrap();
+    }
+    app.snapshots_config.enabled = false;
+    app.workspace_baseline = WorkspaceBaseline::new(
+        Arc::clone(&app.snapshot_store),
+        workspace,
+        app.snapshots_config,
+    );
+    let blocker = format!(
+        "{NO_FILE_REVERT_MSG}: {}",
+        app.workspace_baseline.unavailable_reason().unwrap()
+    );
+    app.state
+        .session_mut()
+        .replace_messages(crate::history_items(&[
+            Message::user(FIRST_CONTENT.into()),
+            assistant_message(CURRENT_CONTENT),
+        ]));
+    let head = app.history_head().unwrap();
+    smol::block_on(app.workspace_baseline.ensure(Some(head)))
+        .into_result()
+        .unwrap();
+    std::fs::write(&path, CURRENT_CONTENT).unwrap();
+    app.update(done_event());
+    app.snapshot_history_head().unwrap();
+    assert!(app.snapshot_history_head_within(Duration::ZERO).unwrap());
+
+    assert!(!app.has_revert_point());
+    assert_eq!(app.file_revert_blocker(), Some(blocker.clone()));
+    assert!(app.revert_to(head, RestoreMode::Files).is_empty());
+    assert_eq!(app.status_bar.flash_text(), Some(blocker.as_str()));
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), CURRENT_CONTENT);
+    assert!(!app.snapshot_store.has_checkpoint(head));
+    assert_eq!(app.snapshot_store.has_session_start(), existing);
+    if existing {
+        assert_eq!(
+            app.snapshot_store
+                .load_session_start_manifest()
+                .unwrap()
+                .len(),
+            1
+        );
+    }
 }
 
 #[test]
@@ -10264,12 +10960,19 @@ fn fork_and_revert_through_parallel_result_include_the_whole_result_group() {
     );
 }
 
-#[test]
-fn unrevert_restores_worktree_before_original_conversation() {
+#[test_case(true; "enabled")]
+#[test_case(false; "disabled")]
+fn unrevert_restores_worktree_before_original_conversation(enabled: bool) {
     let (_temp, mut app, path, _, second_user, _) = snapshot_revert_app();
     let original_head = crate::session_history_head(&app.state.session);
     app.revert_to(second_user, RestoreMode::Both);
 
+    app.snapshots_config.enabled = enabled;
+    app.workspace_baseline = WorkspaceBaseline::new(
+        Arc::clone(&app.snapshot_store),
+        PathBuf::from(&app.state.session.cwd),
+        app.snapshots_config,
+    );
     let actions = app.unrevert();
 
     assert!(matches!(actions.as_slice(), [Action::LoadSession(_)]));

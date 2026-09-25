@@ -181,6 +181,22 @@ A remote session captures on the Workcell host instead. See [Remote workspaces](
 
 Snapshots are content-addressed with SHA-256 and stored under the Caudra state directory in `session-snapshots/<session-id>/<workspace-hash>/`. The object store contains the complete file bytes under their hashes. A checkpoint manifest maps each relative path to its object hash and Unix mode. Unchanged files reuse the same object instead of storing another copy.
 
+### Disable automatic snapshots
+
+Run `caudra --no-snapshots` to disable automatic snapshots for one process. The flag applies to local and remote workspaces, including TUI, `--print`, SDK, and ACP sessions. It skips session-start, pre-mutation, run-completion, cancellation, and final captures, including when resuming a session with old snapshots.
+
+For a persistent setting, merge this into `caudra.setup()` in your `init.lua`:
+
+```lua
+caudra.setup({ storage = { snapshots = { enabled = false } } })
+```
+
+`--no-snapshots` overrides the configured value without saving it. Remote sessions read this setting from the client user configuration, not from the remote project.
+
+File revert is unavailable while snapshots are disabled. Conversation revert still works. Existing snapshots remain stored and become available for file revert when snapshots are enabled again. An existing file revert can still be unreverted.
+
+Disabling capture does not bypass restore recovery. An unresolved remote restore still blocks mutations, and recovery may query its status. Unknown or partial mutations are not silently acknowledged or cleared.
+
 ### Limits
 
 Snapshot walks follow `.gitignore`, `.ignore`, the global Git ignore file, and `.git/info/exclude`, whether or not the workspace is a Git repository. Nested repositories, `.git`, symlinks, special files, and paths outside the session directory are not captured, and the walk does not cross a filesystem boundary. Changing a path between captured and ignored or symlink state is outside the restore guarantee because manifests cannot distinguish that state from absence.

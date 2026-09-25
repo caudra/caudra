@@ -50,6 +50,8 @@ const SOFT_SAVE_DELAY: Duration = Duration::from_millis(1000);
 const PARALLEL_RESTORE_MIN_CHATS: usize = 4;
 const RENAME_USAGE: &str = "Usage: /rename <title>";
 pub(crate) const REVERT_BUSY_MSG: &str = "Wait for the session to become idle before reverting";
+pub(super) const REVERT_SNAPSHOT_PENDING_MSG: &str =
+    "Wait for the remote workspace snapshot to finish, then retry the file restore";
 const NO_REMOTE_FILE_CHANGES: &str = "no file changes";
 
 /// Saturates rather than wraps: a goal left open for longer than `u64`
@@ -1058,6 +1060,9 @@ impl App {
                 RestoreMode::Conversation
             }
         };
+        if mode.restores_files() && self.snapshot_blocks_file_restore() {
+            return Vec::new();
+        }
         self.checkpoint_now();
         let conversation_source = crate::session_history_head(&self.state.session);
         let target = match resolve_revert_target(
@@ -1244,6 +1249,15 @@ impl App {
             return Vec::new();
         }
         self.finish_conversation_restore(conversation_source, target)
+    }
+
+    fn snapshot_blocks_file_restore(&mut self) -> bool {
+        let _ = self.poll_snapshot_capture();
+        if self.pending_snapshot.is_none() {
+            return false;
+        }
+        self.status_bar.flash(REVERT_SNAPSHOT_PENDING_MSG.into());
+        true
     }
 
     fn revert_remote_workspace(
@@ -1593,6 +1607,9 @@ impl App {
             self.update_context_for_head(current_head);
             return self.finish_remote_unrevert_display();
         };
+        if self.snapshot_blocks_file_restore() {
+            return Vec::new();
+        }
         let status = match serde_json::from_value::<caudra_workspace::SnapshotRestoreStatus>(
             file_status.clone(),
         ) {

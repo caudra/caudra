@@ -3657,6 +3657,22 @@ mod tests {
         plugin_host.begin_shutdown();
     }
 
+    #[test_case(false, false; "local_default")]
+    #[test_case(false, true; "local_disabled")]
+    #[test_case(true, false; "remote_default")]
+    #[test_case(true, true; "remote_disabled")]
+    fn shared_config_applies_no_snapshots(remote: bool, disabled: bool) {
+        use clap::Parser;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut cli = Cli::parse_from(["caudra", "--no-plugins"]);
+        cli.no_snapshots = disabled;
+        let mut host = PluginHost::with_jit(Arc::new(ToolRegistry::new()), true).unwrap();
+        let config = load_config(&host, &cli, dir.path(), remote).unwrap();
+        assert_eq!(config.storage.snapshots.enabled, !disabled);
+        host.begin_shutdown();
+    }
+
     #[test_case(0; "zero_turns")]
     #[test_case(2; "bounded_turns")]
     fn shared_config_applies_cli_turn_limit_and_tool_policy(max: u32) {
