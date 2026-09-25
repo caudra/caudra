@@ -3,11 +3,14 @@
 //! Shared by the file-picker modal and the `@` mention popup so a project is
 //! never listed by two different sets of ignore rules.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 
+use caudra_workbench::{ResourceEntry, WorkbenchPath};
+use caudra_workspace::ResourceKind;
 use ignore::WalkBuilder;
 use ignore::overrides::OverrideBuilder;
 use nucleo::{Injector, Utf32String};
@@ -18,6 +21,7 @@ pub(crate) const NOTHING_TO_PICK_MSG: &str = "Nothing to pick in the current dir
 const WALKER_CRASHED_MSG: &str = "file walker crashed";
 const THREAD_NAME: &str = "file-walker";
 const GIT_OVERRIDE: &str = "!.git";
+const REMOTE_SEPARATOR: char = '/';
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Walk {
@@ -36,6 +40,36 @@ impl Walk {
             Self::Unreadable => Some(UNREADABLE_DIR_MSG),
         }
     }
+}
+
+pub(crate) fn apply_remote_entries(
+    resources: &mut HashMap<String, ResourceEntry>,
+    entries: Vec<ResourceEntry>,
+    removed: Vec<WorkbenchPath>,
+) -> (Vec<String>, bool) {
+    let mut reset = false;
+    for path in removed {
+        let path = path.display();
+        reset |= resources.remove(&path).is_some();
+        reset |= resources
+            .remove(&format!("{path}{REMOTE_SEPARATOR}"))
+            .is_some();
+    }
+    let mut added = Vec::new();
+    for entry in entries {
+        let path = entry.path.display();
+        let directory = format!("{path}{REMOTE_SEPARATOR}");
+        let (path, previous) = if entry.kind == ResourceKind::Directory {
+            (directory, path)
+        } else {
+            (path, directory)
+        };
+        reset |= resources.remove(&previous).is_some();
+        if resources.insert(path.clone(), entry).is_none() {
+            added.push(path);
+        }
+    }
+    (added, reset)
 }
 
 /// Walks `root` into `injector`, honouring ignore files and skipping `.git`.

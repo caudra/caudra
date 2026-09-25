@@ -13,7 +13,7 @@
 use caudra_workbench::{
     BackendDriver, BackendEvent, ResourceEntry, WorkbenchBackend, WorkbenchPath,
 };
-use caudra_workspace::{ResourceKind, WorkspacePath, WorkspaceSession};
+use caudra_workspace::{WorkspacePath, WorkspaceSession};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent};
 use nucleo::{Config, Utf32String};
 use ratatui::Frame;
@@ -58,6 +58,23 @@ impl Drop for Session {
     fn drop(&mut self) {
         self.cancel
             .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+impl Session {
+    fn apply_remote(&mut self, entries: Vec<ResourceEntry>, removed: Vec<WorkbenchPath>) {
+        let (mut added, reset) =
+            file_walk::apply_remote_entries(&mut self.remote_resources, entries, removed);
+        if reset {
+            self.completion.clear_items();
+            added = self.remote_resources.keys().cloned().collect();
+        }
+        let injector = self.completion.injector();
+        for path in added {
+            injector.push((), |_, columns| {
+                columns[0] = Utf32String::from(path.as_str())
+            });
+        }
     }
 }
 
@@ -175,27 +192,21 @@ impl MentionPopup {
         if let Some(done_rx) = &session.done_rx {
             let _ = done_rx.try_recv();
         }
-        if let Some(backend) = &mut session.backend {
-            for event in backend.drain() {
+        let mut changed = Dirty::NO;
+        if let Some(events) = session.backend.as_mut().map(BackendDriver::drain) {
+            for event in events {
                 if let BackendEvent::Listed {
-                    result: Ok(result), ..
+                    result: Ok(result),
+                    removed,
+                    ..
                 } = event
                 {
-                    let injector = session.completion.injector();
-                    for entry in result.entries {
-                        let mut path = entry.path.display();
-                        if entry.kind == ResourceKind::Directory {
-                            path.push('/');
-                        }
-                        injector.push((), |_, columns| {
-                            columns[0] = Utf32String::from(path.as_str());
-                        });
-                        session.remote_resources.insert(path, entry);
-                    }
+                    session.apply_remote(result.entries, removed);
+                    changed = Dirty::YES;
                 }
             }
         }
-        session.completion.tick()
+        session.completion.tick() | changed
     }
 
     /// Waits for the walk to finish and the matcher to drain, so a test can
@@ -298,6 +309,7 @@ impl MentionPopup {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use caudra_workspace::ResourceKind;
     use crossterm::event::{MouseButton, MouseEventKind};
     use test_case::test_case;
 
@@ -314,6 +326,8 @@ mod tests {
     const NOT_INSERTED: &str = "the click did not complete the row it landed on";
     const INSERTED: &str = "the pointer completed a row it should have left alone";
     const WRONG_ROW: &str = "the pointer marked a row other than the one under it";
+    const REMOTE_RECONCILED: &str =
+        "withdrawn or retyped paths must disappear from mention matches";
 
     /// A popup with rows already matched, so a test can drive the pointer
     /// without waiting on a walker thread.
@@ -329,6 +343,61 @@ mod tests {
             }),
             trigger: Some(0..1),
         }
+    }
+
+    #[test_case(ResourceKind::File, None; "withdrawn_file")]
+    #[test_case(ResourceKind::File, Some(ResourceKind::Directory); "file_becomes_directory")]
+    #[test_case(ResourceKind::Directory, Some(ResourceKind::File); "directory_becomes_file")]
+    fn remote_mentions_reconcile_matcher_rows(
+        first: ResourceKind,
+        replacement: Option<ResourceKind>,
+    ) {
+        let mut popup = popup(&[], AREA);
+        let session = popup.session.as_mut().unwrap();
+        let entry = ResourceEntry {
+            path: WorkbenchPath::Remote(WorkspacePath::new(ROWS[0]).unwrap()),
+            resource_id: None,
+            revision: None,
+            kind: first,
+            size_bytes: None,
+        };
+        session.apply_remote(vec![entry.clone()], Vec::new());
+        session.completion.settle();
+        assert!(!session.completion.is_empty());
+        let (entries, removed) = match replacement {
+            Some(kind) => (
+                vec![ResourceEntry {
+                    kind,
+                    ..entry.clone()
+                }],
+                Vec::new(),
+            ),
+            None => (Vec::new(), vec![entry.path]),
+        };
+        session.apply_remote(entries, removed);
+        session.completion.settle();
+        let expected = replacement.map(|kind| {
+            if kind == ResourceKind::Directory {
+                format!("{}/", ROWS[0])
+            } else {
+                ROWS[0].to_owned()
+            }
+        });
+        assert_eq!(
+            session.completion.selected(),
+            expected.as_deref(),
+            "{REMOTE_RECONCILED}"
+        );
+        assert_eq!(
+            session.remote_resources.len(),
+            usize::from(expected.is_some()),
+            "{REMOTE_RECONCILED}"
+        );
+        assert_eq!(
+            session.completion.injector().injected_items() as usize,
+            session.remote_resources.len(),
+            "{REMOTE_RECONCILED}"
+        );
     }
 
     fn event(kind: MouseEventKind, row: u16) -> MouseEvent {

@@ -1,33 +1,43 @@
 //! Backend-neutral filesystem operations used by the workbench.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::time::SystemTime;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant, SystemTime};
 
 use async_trait::async_trait;
 use caudra_workspace::{
     ContinuationToken, ListRequest, Mutation, MutationCondition, MutationRequest, OperationState,
     ReadBytesRequest, ResourceId, ResourceKind, ResourceRevision, ResourceSelector, SearchRequest,
-    WatchCursor, WatchEventPage, WatchOpenRequest, WatchPollRequest, WatchPollState,
-    WatchSubscriptionId, WorkspaceError, WorkspaceEvent, WorkspacePath, WorkspaceResource,
-    WorkspaceSession, WriteContent,
+    TransportErrorKind, WatchCursor, WatchEventPage, WatchOpenRequest, WatchPollRequest,
+    WatchPollState, WatchSubscriptionId, WorkspaceError, WorkspaceEvent, WorkspacePath,
+    WorkspaceResource, WorkspaceSession, WriteContent,
 };
 use ignore::WalkBuilder;
+use smol::lock::Mutex;
 
 use super::read::{self, LineEnding, ReadOnly};
 
 const PAGE_SIZE: u32 = 256;
+const MAX_LIST_PAGES: usize = 1024;
+const MAX_RETAINED_ENTRIES: usize = 50_000;
+const MAX_LIST_DEPTH: usize = 256;
+const MAX_LIST_DELTA_ENTRIES: usize = PAGE_SIZE as usize * 2;
+const MAX_PINNED_PATHS: usize = 1024;
 const WATCH_EVENTS: u32 = 256;
 const WATCH_BYTES: u32 = 256 * 1024;
 const WATCH_WAIT_MS: u64 = 250;
+const WATCH_RETRY_DELAY: Duration = Duration::from_secs(1);
+const WATCH_RETRY_MAX_DELAY: Duration = Duration::from_secs(30);
+const MAX_WATCH_RETRIES: u32 = 5;
 const MAX_MUTATION_STATUS_POLLS: usize = 8;
 const MAX_EDITABLE_BYTES: u64 = 2 * 1024 * 1024;
 const BINARY_SNIFF_BYTES: usize = 8 * 1024;
+const NOT_FOUND_CODE: &str = "not_found";
 static LOCAL_BACKEND_CALLS: AtomicUsize = AtomicUsize::new(0);
 
 pub type RequestId = u64;
@@ -236,10 +246,16 @@ pub struct WatchResult {
 
 #[derive(Debug, thiserror::Error)]
 pub enum BackendError {
+    #[error("remote file does not exist")]
+    NotFound,
     #[error("filesystem operation is for the wrong workspace backend")]
     WrongBackend,
     #[error("resource is not a file")]
     NotFile,
+    #[error("directories cannot be opened in the editor")]
+    Directory,
+    #[error("pipes, devices and other special files cannot be edited")]
+    SpecialFile,
     #[error("binary files cannot be edited")]
     Binary,
     #[error("file exceeds the editable size limit")]
@@ -267,6 +283,9 @@ pub enum BackendError {
 impl From<WorkspaceError> for BackendError {
     fn from(error: WorkspaceError) -> Self {
         match error {
+            WorkspaceError::Refused { symbolic, .. } if symbolic == NOT_FOUND_CODE => {
+                Self::NotFound
+            }
             WorkspaceError::Conflict | WorkspaceError::StaleResource { .. } => Self::Conflict,
             WorkspaceError::IndeterminateOutcome => Self::Indeterminate,
             error => Self::Workspace(error),
@@ -278,6 +297,10 @@ impl From<WorkspaceError> for BackendError {
 pub trait WorkbenchFilesystem: Send + Sync {
     fn is_remote(&self) -> bool;
 
+    async fn list_root(&self, path: &WorkbenchPath) -> Result<WorkbenchPath, BackendError> {
+        Ok(path.clone())
+    }
+
     async fn list(
         &self,
         parent: &WorkbenchPath,
@@ -286,6 +309,17 @@ pub trait WorkbenchFilesystem: Send + Sync {
     ) -> Result<ListResult, BackendError>;
 
     async fn read(&self, entry: &ResourceEntry) -> Result<LoadedFile, BackendError>;
+
+    async fn read_path(&self, path: &WorkbenchPath) -> Result<LoadedFile, BackendError> {
+        self.read(&ResourceEntry {
+            path: path.clone(),
+            resource_id: None,
+            revision: None,
+            kind: ResourceKind::File,
+            size_bytes: None,
+        })
+        .await
+    }
 
     async fn write(
         &self,
@@ -357,6 +391,9 @@ pub enum BackendEvent {
     Listed {
         request: RequestId,
         parent: WorkbenchPath,
+        complete: bool,
+        authoritative: bool,
+        removed: Vec<WorkbenchPath>,
         result: Result<ListResult, BackendError>,
     },
     Opened {
@@ -389,13 +426,44 @@ pub enum BackendEvent {
         request: RequestId,
         result: Result<SearchResult, BackendError>,
     },
-    WatchOpened(Result<Option<WatchHandle>, BackendError>),
-    WatchPolled(Result<WatchResult, BackendError>),
+    WatchOpened {
+        request: RequestId,
+        result: Result<Option<WatchHandle>, BackendError>,
+    },
+    WatchPolled {
+        request: RequestId,
+        result: Result<WatchResult, BackendError>,
+    },
 }
 
 struct Envelope {
     generation: u64,
     event: BackendEvent,
+}
+
+struct PendingListPage {
+    entries: VecDeque<ResourceEntry>,
+    continuation: Option<ContinuationToken>,
+    limited: bool,
+}
+
+enum Admission {
+    Added,
+    ChunkFull,
+    Capacity,
+}
+
+struct Listing {
+    request: RequestId,
+    parent: WorkbenchPath,
+    recursive: bool,
+    indexing: bool,
+    cursors: HashSet<ContinuationToken>,
+    paths: HashSet<WorkbenchPath>,
+    pages: usize,
+    incomplete: bool,
+    refresh: bool,
+    pending_page: Option<PendingListPage>,
 }
 
 /// Runs backend futures away from rendering and admits only responses from the
@@ -407,12 +475,24 @@ pub struct BackendDriver {
     next_request: RequestId,
     active_search: RequestId,
     search_task: Option<smol::Task<()>>,
+    open_tasks: HashMap<RequestId, smol::Task<()>>,
+    listing: Option<Listing>,
+    list_task: Option<smol::Task<()>>,
     cancelled: HashSet<RequestId>,
     resources: HashMap<WorkbenchPath, ResourceEntry>,
+    resource_order: VecDeque<WorkbenchPath>,
+    child_counts: HashMap<WorkbenchPath, usize>,
+    pinned: HashSet<WorkbenchPath>,
+    pin_overflow: bool,
+    #[cfg(test)]
+    retained_limit: usize,
     sender: flume::Sender<Envelope>,
     events: flume::Receiver<Envelope>,
-    watch: Option<WatchHandle>,
-    watch_cancel: Arc<AtomicBool>,
+    watch: Option<(RequestId, flume::Sender<()>)>,
+    watch_enabled: bool,
+    watch_retry: Option<Instant>,
+    watch_attempts: u32,
+    watch_warned: bool,
     stale: bool,
 }
 
@@ -426,12 +506,24 @@ impl BackendDriver {
             next_request: 1,
             active_search: 0,
             search_task: None,
+            open_tasks: HashMap::new(),
+            listing: None,
+            list_task: None,
             cancelled: HashSet::new(),
             resources: HashMap::new(),
+            resource_order: VecDeque::new(),
+            child_counts: HashMap::new(),
+            pinned: HashSet::new(),
+            pin_overflow: false,
+            #[cfg(test)]
+            retained_limit: MAX_RETAINED_ENTRIES,
             sender,
             events,
             watch: None,
-            watch_cancel: Arc::new(AtomicBool::new(false)),
+            watch_enabled: false,
+            watch_retry: None,
+            watch_attempts: 0,
+            watch_warned: false,
             stale: false,
         }
     }
@@ -448,6 +540,10 @@ impl BackendDriver {
         self.stale
     }
 
+    pub fn is_listing(&self) -> bool {
+        self.listing.is_some()
+    }
+
     pub fn resource(&self, path: &WorkbenchPath) -> Option<&ResourceEntry> {
         self.resources.get(path)
     }
@@ -456,80 +552,426 @@ impl BackendDriver {
         self.stale = false;
     }
 
+    pub fn set_pinned_paths(&mut self, mut paths: impl Iterator<Item = WorkbenchPath>) {
+        self.pinned.clear();
+        self.pinned.extend(paths.by_ref().take(MAX_PINNED_PATHS));
+        self.pin_overflow = paths.next().is_some();
+    }
+
+    fn retained_limit(&self) -> usize {
+        #[cfg(test)]
+        {
+            self.retained_limit
+        }
+        #[cfg(not(test))]
+        {
+            MAX_RETAINED_ENTRIES
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_retained_limit(&mut self, limit: usize) {
+        self.retained_limit = limit.min(MAX_RETAINED_ENTRIES);
+    }
+
     pub fn rebind(&mut self, backend: WorkbenchBackend, root: WorkbenchPath) {
+        self.open_tasks.clear();
+        self.cancel_listing();
         self.search_task = None;
         self.close_watch();
-        self.watch_cancel = Arc::new(AtomicBool::new(false));
         self.generation = self.generation.wrapping_add(1);
         self.backend = backend.filesystem();
         self.root = root;
         self.cancelled.clear();
         self.resources.clear();
+        self.resource_order.clear();
+        self.child_counts.clear();
+        self.pinned.clear();
+        self.pin_overflow = false;
         self.active_search = 0;
         self.stale = true;
     }
 
     pub fn suspend(&mut self) {
+        self.open_tasks.clear();
+        self.cancel_listing();
         self.search_task = None;
         self.close_watch();
         self.generation = self.generation.wrapping_add(1);
         self.cancelled.clear();
-        self.resources.clear();
         self.active_search = 0;
         self.stale = true;
     }
 
     pub fn list(&mut self, parent: WorkbenchPath, recursive: bool) -> RequestId {
+        if let Some(listing) = &mut self.listing
+            && listing.parent == parent
+            && listing.recursive == recursive
+        {
+            listing.refresh = true;
+            return listing.request;
+        }
+        self.cancel_listing();
         let request = self.request_id();
+        let listing = Listing {
+            request,
+            parent,
+            recursive,
+            indexing: recursive && !self.is_remote(),
+            cursors: HashSet::new(),
+            paths: HashSet::new(),
+            pages: 0,
+            incomplete: false,
+            refresh: false,
+            pending_page: None,
+        };
+        self.list_page(&listing, None);
+        self.listing = Some(listing);
+        request
+    }
+
+    pub fn cancel_listing(&mut self) -> Option<RequestId> {
+        self.list_task = None;
+        self.listing.take().map(|listing| listing.request)
+    }
+
+    fn list_page(&mut self, listing: &Listing, continuation: Option<ContinuationToken>) {
+        let request = listing.request;
+        let parent = listing.parent.clone();
+        let recursive = listing.indexing;
         let backend = Arc::clone(&self.backend);
         let sender = self.sender.clone();
         let generation = self.generation;
-        smol::spawn(async move {
-            let mut continuation = None;
-            let mut seen = HashSet::new();
-            let mut combined = ListResult {
-                entries: Vec::new(),
-                continuation: None,
-                incomplete: false,
-            };
-            let result = loop {
-                match backend.list(&parent, recursive, continuation).await {
-                    Ok(page) => {
-                        combined.entries.extend(page.entries);
-                        combined.incomplete |= page.incomplete;
-                        let Some(next) = page.continuation else {
-                            break Ok(combined);
-                        };
-                        if !seen.insert(next.clone()) {
-                            break Err(BackendError::InvalidResponse);
-                        }
-                        continuation = Some(next);
-                    }
-                    Err(error) => break Err(error),
+        self.list_task = Some(smol::spawn(async move {
+            let (parent, result) = match backend.list_root(&parent).await {
+                Ok(parent) => {
+                    let result = backend.list(&parent, recursive, continuation).await;
+                    (parent, result)
                 }
+                Err(error) => (parent, Err(error)),
             };
             let _ = sender.send(Envelope {
                 generation,
                 event: BackendEvent::Listed {
                     request,
                     parent,
+                    complete: false,
+                    authoritative: false,
+                    removed: Vec::new(),
                     result,
                 },
             });
-        })
-        .detach();
-        request
+        }));
+    }
+
+    fn install_listing(
+        &mut self,
+        result: &mut Result<ListResult, BackendError>,
+        removed: &mut Vec<WorkbenchPath>,
+        authoritative: &mut bool,
+    ) -> bool {
+        let Some(mut listing) = self.listing.take() else {
+            return true;
+        };
+        self.list_task = None;
+        let mut page = if let Some(page) = listing.pending_page.take() {
+            page
+        } else {
+            let Ok(page) = result else {
+                self.stale = true;
+                if listing.refresh {
+                    listing.refresh = false;
+                    listing.cursors.clear();
+                    listing.paths.clear();
+                    listing.pages = 0;
+                    listing.incomplete = false;
+                    self.list_page(&listing, None);
+                    self.listing = Some(listing);
+                    return false;
+                }
+                return true;
+            };
+            listing.pages += 1;
+            listing.incomplete |= page.incomplete;
+            let limited = page.entries.len() > PAGE_SIZE as usize;
+            page.entries.truncate(PAGE_SIZE as usize);
+            PendingListPage {
+                entries: std::mem::take(&mut page.entries).into(),
+                continuation: page.continuation.take(),
+                limited,
+            }
+        };
+        let mut delta = HashMap::new();
+        while let Some(entry) = page.entries.pop_front() {
+            let Some(ancestors) = self.ancestors(&entry.path) else {
+                page.limited = true;
+                break;
+            };
+            let paths = ancestors.iter().chain(std::iter::once(&entry.path));
+            let additional = paths
+                .clone()
+                .filter(|path| !listing.paths.contains(*path))
+                .count();
+            if listing.paths.len() + additional > self.retained_limit() {
+                page.limited = true;
+                break;
+            }
+            let before = removed.len();
+            match self.admit_entry(&entry, &ancestors, &mut delta, removed) {
+                Admission::Added => {}
+                Admission::Capacity => {
+                    page.limited = true;
+                    break;
+                }
+                Admission::ChunkFull => {
+                    page.entries.push_front(entry);
+                    listing.pending_page = Some(page);
+                    let _ = self.sender.send(Envelope {
+                        generation: self.generation,
+                        event: BackendEvent::Listed {
+                            request: listing.request,
+                            parent: listing.parent.clone(),
+                            complete: false,
+                            authoritative: false,
+                            removed: Vec::new(),
+                            result: Ok(ListResult {
+                                entries: Vec::new(),
+                                continuation: None,
+                                incomplete: false,
+                            }),
+                        },
+                    });
+                    *result = Ok(ListResult {
+                        entries: delta.into_values().collect(),
+                        continuation: None,
+                        incomplete: listing.incomplete,
+                    });
+                    self.listing = Some(listing);
+                    return false;
+                }
+            }
+            listing.paths.extend(ancestors.iter().cloned());
+            listing.paths.insert(entry.path.clone());
+            listing.incomplete |= removed[before..]
+                .iter()
+                .any(|path| listing.paths.contains(path));
+        }
+        let mut continuation = page.continuation.take();
+        let more_pages = continuation.is_some() || (listing.recursive && !listing.indexing);
+        let bad_cursor = continuation
+            .as_ref()
+            .is_some_and(|next| !listing.cursors.insert(next.clone()));
+        let invalid = page.limited || (more_pages && listing.pages >= MAX_LIST_PAGES) || bad_cursor;
+        let mut complete = continuation.is_none() || invalid;
+        *authoritative =
+            complete && !invalid && !listing.incomplete && (listing.indexing || !listing.recursive);
+        if *authoritative {
+            self.resources.retain(|path, _| {
+                let covered = path != &listing.parent && path.starts_with(&listing.parent);
+                let mut direct_child = path.clone();
+                if covered && !listing.recursive {
+                    while let Some(parent) = direct_child.parent() {
+                        if parent == listing.parent {
+                            break;
+                        }
+                        direct_child = parent;
+                    }
+                }
+                let keep = !covered || listing.paths.contains(&direct_child);
+                if !keep {
+                    removed.push(path.clone());
+                }
+                keep
+            });
+            self.resource_order
+                .retain(|path| self.resources.contains_key(path));
+            self.rebuild_child_counts();
+            self.stale = false;
+        }
+        let incomplete = invalid || listing.incomplete;
+        if complete && !invalid && listing.recursive && !listing.indexing {
+            listing.indexing = true;
+            listing.cursors.clear();
+            listing.paths.clear();
+            listing.incomplete = false;
+            complete = false;
+        } else if complete && !bad_cursor && listing.refresh {
+            listing.refresh = false;
+            listing.indexing = listing.recursive;
+            listing.cursors.clear();
+            listing.paths.clear();
+            listing.pages = 0;
+            listing.incomplete = false;
+            continuation = None;
+            complete = false;
+        }
+        *result = Ok(ListResult {
+            entries: delta.into_values().collect(),
+            continuation: None,
+            incomplete,
+        });
+        if complete && incomplete {
+            self.stale = true;
+        }
+        if !complete {
+            self.list_page(&listing, continuation);
+            self.listing = Some(listing);
+        }
+        complete
+    }
+
+    fn cache_entry(&mut self, entry: &ResourceEntry) {
+        if !self.resources.contains_key(&entry.path) {
+            if let Some(parent) = entry.path.parent() {
+                *self.child_counts.entry(parent).or_default() += 1;
+            }
+            self.resource_order.push_back(entry.path.clone());
+        }
+        self.resources.insert(entry.path.clone(), entry.clone());
+    }
+
+    fn rebuild_child_counts(&mut self) {
+        self.child_counts.clear();
+        for path in self.resources.keys() {
+            if let Some(parent) = path.parent() {
+                *self.child_counts.entry(parent).or_default() += 1;
+            }
+        }
+    }
+
+    fn ancestors(&self, path: &WorkbenchPath) -> Option<Vec<WorkbenchPath>> {
+        if path == &self.root || !path.starts_with(&self.root) {
+            return None;
+        }
+        let mut ancestors = Vec::new();
+        let mut parent = path.parent()?;
+        while parent != self.root {
+            if ancestors.len() == MAX_LIST_DEPTH {
+                return None;
+            }
+            ancestors.push(parent.clone());
+            parent = parent.parent()?;
+        }
+        ancestors.reverse();
+        Some(ancestors)
+    }
+
+    fn admit_entry(
+        &mut self,
+        entry: &ResourceEntry,
+        ancestors: &[WorkbenchPath],
+        delta: &mut HashMap<WorkbenchPath, ResourceEntry>,
+        removed: &mut Vec<WorkbenchPath>,
+    ) -> Admission {
+        let mut updates = ancestors
+            .iter()
+            .filter(|path| {
+                self.resources
+                    .get(*path)
+                    .is_none_or(|entry| entry.kind != ResourceKind::Directory)
+            })
+            .map(|path| ResourceEntry {
+                path: path.clone(),
+                resource_id: None,
+                revision: None,
+                kind: ResourceKind::Directory,
+                size_bytes: None,
+            })
+            .collect::<Vec<_>>();
+        if self.resources.get(&entry.path) != Some(entry) {
+            updates.push(entry.clone());
+        }
+        if delta.len() + updates.len() > MAX_LIST_DELTA_ENTRIES {
+            return Admission::ChunkFull;
+        }
+        if entry.kind != ResourceKind::Directory && self.child_counts.contains_key(&entry.path) {
+            self.resources.retain(|path, _| {
+                let keep = path == &entry.path || !path.starts_with(&entry.path);
+                if !keep {
+                    removed.push(path.clone());
+                    delta.remove(path);
+                }
+                keep
+            });
+            self.resource_order
+                .retain(|path| self.resources.contains_key(path));
+            self.rebuild_child_counts();
+        }
+        let required = updates
+            .iter()
+            .filter(|entry| !self.resources.contains_key(&entry.path))
+            .count();
+        if required > self.retained_limit() {
+            return Admission::Capacity;
+        }
+        while self.resources.len() + required > self.retained_limit() {
+            if self.pin_overflow {
+                return Admission::Capacity;
+            }
+            let mut candidate = None;
+            for _ in 0..self.resource_order.len() {
+                let Some(path) = self.resource_order.pop_front() else {
+                    break;
+                };
+                if !self.child_counts.contains_key(&path)
+                    && !self.pinned.contains(&path)
+                    && path != entry.path
+                    && !ancestors.contains(&path)
+                {
+                    candidate = Some(path);
+                    break;
+                }
+                self.resource_order.push_back(path);
+            }
+            let Some(path) = candidate else {
+                return Admission::Capacity;
+            };
+            self.resources.remove(&path);
+            delta.remove(&path);
+            if let Some(parent) = path.parent()
+                && let Some(count) = self.child_counts.get_mut(&parent)
+            {
+                *count -= 1;
+                if *count == 0 {
+                    self.child_counts.remove(&parent);
+                }
+            }
+            removed.push(path);
+        }
+        for update in updates {
+            self.cache_entry(&update);
+            delta.insert(update.path.clone(), update);
+        }
+        Admission::Added
     }
 
     pub fn open(&mut self, entry: ResourceEntry) -> RequestId {
-        let request = self.request_id();
         let backend = Arc::clone(&self.backend);
-        self.spawn(request, async move {
-            BackendEvent::Opened {
-                request,
-                result: backend.read(&entry).await,
-            }
-        });
+        self.spawn_open(async move { backend.read(&entry).await })
+    }
+
+    pub fn open_path(&mut self, path: WorkbenchPath) -> RequestId {
+        let backend = Arc::clone(&self.backend);
+        self.spawn_open(async move { backend.read_path(&path).await })
+    }
+
+    fn spawn_open(
+        &mut self,
+        future: impl Future<Output = Result<LoadedFile, BackendError>> + Send + 'static,
+    ) -> RequestId {
+        let request = self.request_id();
+        let sender = self.sender.clone();
+        let generation = self.generation;
+        self.open_tasks.insert(
+            request,
+            smol::spawn(async move {
+                let result = future.await;
+                let _ = sender.send(Envelope {
+                    generation,
+                    event: BackendEvent::Opened { request, result },
+                });
+            }),
+        );
         request
     }
 
@@ -660,6 +1102,17 @@ impl BackendDriver {
     }
 
     pub fn cancel(&mut self, request: RequestId) {
+        if self.open_tasks.remove(&request).is_some() {
+            return;
+        }
+        if self
+            .listing
+            .as_ref()
+            .is_some_and(|listing| listing.request == request)
+        {
+            self.cancel_listing();
+            return;
+        }
         if self.active_search == request {
             self.search_task = None;
             self.active_search = 0;
@@ -668,48 +1121,69 @@ impl BackendDriver {
         self.cancelled.insert(request);
     }
 
+    pub fn cancel_open(&mut self, request: RequestId) {
+        self.open_tasks.remove(&request);
+    }
+
     pub fn open_watch(&mut self) {
-        if self.watch_cancel.load(Ordering::Acquire) {
-            self.watch_cancel = Arc::new(AtomicBool::new(false));
+        if self.watch_enabled {
+            return;
         }
+        self.watch_enabled = true;
+        self.start_watch();
+    }
+
+    fn start_watch(&mut self) {
+        let request = self.request_id();
+        let (acknowledge, acknowledged) = flume::bounded(1);
+        self.watch = Some((request, acknowledge));
         let backend = Arc::clone(&self.backend);
         let sender = self.sender.clone();
         let generation = self.generation;
-        let cancel = Arc::clone(&self.watch_cancel);
-        smol::spawn(async move {
-            let result = backend.watch_open().await;
-            if cancel.load(Ordering::Acquire) {
-                if let Ok(Some(handle)) = result {
-                    let _ = backend.watch_close(handle).await;
-                }
-                return;
-            }
-            let _ = sender.send(Envelope {
-                generation,
-                event: BackendEvent::WatchOpened(result),
-            });
-        })
+        smol::spawn(watch_session(
+            backend,
+            sender,
+            generation,
+            request,
+            acknowledged,
+        ))
         .detach();
     }
 
     pub fn close_watch(&mut self) {
-        self.watch_cancel.store(true, Ordering::Release);
-        let Some(handle) = self.watch.take() else {
-            return;
-        };
-        let backend = Arc::clone(&self.backend);
-        smol::spawn(async move {
-            let _ = backend.watch_close(handle).await;
-        })
-        .detach();
+        self.watch = None;
+        self.watch_enabled = false;
+        self.watch_retry = None;
+        self.watch_attempts = 0;
+        self.watch_warned = false;
     }
 
     pub fn drain(&mut self) -> Vec<BackendEvent> {
+        self.drain_at(Instant::now())
+    }
+
+    fn drain_at(&mut self, now: Instant) -> Vec<BackendEvent> {
         let mut admitted = Vec::new();
         let mut refresh = false;
-        let mut reopen_watch = false;
-        for envelope in self.events.try_iter() {
+        for _ in 0..self.events.len() {
+            let Ok(mut envelope) = self.events.try_recv() else {
+                break;
+            };
             if envelope.generation != self.generation {
+                continue;
+            }
+            if let BackendEvent::Opened { request, .. } = &envelope.event
+                && self.open_tasks.remove(request).is_none()
+            {
+                continue;
+            }
+            if let BackendEvent::WatchOpened { request, .. }
+            | BackendEvent::WatchPolled { request, .. } = &envelope.event
+                && self
+                    .watch
+                    .as_ref()
+                    .is_none_or(|(active, _)| active != request)
+            {
                 continue;
             }
             if matches!(&envelope.event, BackendEvent::SearchPage { request, .. } if *request != self.active_search)
@@ -720,71 +1194,74 @@ impl BackendDriver {
             if request.is_some_and(|request| self.cancelled.remove(&request)) {
                 continue;
             }
+            if let BackendEvent::Listed {
+                request,
+                parent,
+                result,
+                complete,
+                removed,
+                authoritative,
+                ..
+            } = &mut envelope.event
+            {
+                if self
+                    .listing
+                    .as_ref()
+                    .is_none_or(|listing| listing.request != *request)
+                {
+                    continue;
+                }
+                if let Some(listing) = &mut self.listing
+                    && listing.parent == self.root
+                    && listing.pages == 0
+                {
+                    self.root = parent.clone();
+                    listing.parent = parent.clone();
+                }
+                *complete = self.install_listing(result, removed, authoritative);
+            }
             match &envelope.event {
-                BackendEvent::Listed {
-                    result: Ok(page), ..
-                } => {
-                    for entry in &page.entries {
-                        self.resources.insert(entry.path.clone(), entry.clone());
-                    }
-                    self.stale = false;
-                }
-                BackendEvent::Opened {
-                    result: Ok(LoadedFile { entry: file, .. }),
-                    ..
-                }
-                | BackendEvent::Saved {
-                    result: Ok(file), ..
-                }
-                | BackendEvent::Created {
-                    result: Ok(file), ..
-                } => {
-                    self.resources.insert(file.path.clone(), file.clone());
-                }
-                BackendEvent::Renamed {
-                    source,
-                    result: Ok(entry),
+                BackendEvent::WatchOpened {
+                    result: Ok(Some(_)),
                     ..
                 } => {
-                    self.resources.remove(source);
-                    self.resources.insert(entry.path.clone(), entry.clone());
+                    refresh = true;
+                    self.acknowledge_watch();
                 }
-                BackendEvent::Deleted {
-                    path,
-                    result: Ok(()),
-                    ..
+                BackendEvent::WatchOpened {
+                    result: Ok(None), ..
+                } => self.watch = None,
+                BackendEvent::WatchPolled {
+                    result: Ok(result), ..
                 } => {
-                    self.resources
-                        .retain(|candidate, _| !path_contains(path, candidate));
-                }
-                BackendEvent::WatchOpened(Ok(Some(handle))) => {
-                    self.watch = Some(handle.clone());
-                    self.poll_watch(handle.clone());
-                }
-                BackendEvent::WatchPolled(Ok(result)) => {
                     if matches!(result.update, WatchUpdate::Resync) {
-                        self.watch = None;
-                        self.resources.clear();
                         self.stale = true;
                         refresh = true;
-                        reopen_watch = true;
+                        self.retry_watch(now);
                     } else {
-                        self.watch = Some(result.handle.clone());
+                        self.watch_attempts = 0;
                         if matches!(&result.update, WatchUpdate::Events(events) if !events.is_empty())
                         {
-                            self.resources.clear();
                             self.stale = true;
                             refresh = true;
                         }
-                        self.poll_watch(result.handle.clone());
+                        self.acknowledge_watch();
                     }
                 }
-                BackendEvent::WatchPolled(Err(_)) => {
+                BackendEvent::WatchOpened {
+                    result: Err(error), ..
+                }
+                | BackendEvent::WatchPolled {
+                    result: Err(error), ..
+                } => {
                     self.watch = None;
-                    self.resources.clear();
-                    self.stale = true;
-                    refresh = true;
-                    reopen_watch = true;
+                    if retryable_watch_error(error) {
+                        self.retry_watch(now);
+                    }
+                    if self.watch_warned {
+                        continue;
+                    }
+                    self.watch_warned = true;
                 }
                 _ => {}
             }
@@ -793,31 +1270,26 @@ impl BackendDriver {
         if refresh {
             self.list(self.root.clone(), true);
         }
-        if reopen_watch {
-            self.watch_cancel = Arc::new(AtomicBool::new(false));
-            self.open_watch();
+        if self.watch_retry.is_some_and(|deadline| now >= deadline) {
+            self.watch_retry = None;
+            self.start_watch();
         }
         admitted
     }
 
-    fn poll_watch(&self, handle: WatchHandle) {
-        if self.watch_cancel.load(Ordering::Acquire) {
-            return;
+    fn acknowledge_watch(&self) {
+        if let Some((_, acknowledge)) = &self.watch {
+            let _ = acknowledge.try_send(());
         }
-        let backend = Arc::clone(&self.backend);
-        let sender = self.sender.clone();
-        let generation = self.generation;
-        let cancel = Arc::clone(&self.watch_cancel);
-        smol::spawn(async move {
-            let result = backend.watch_poll(handle).await;
-            if !cancel.load(Ordering::Acquire) {
-                let _ = sender.send(Envelope {
-                    generation,
-                    event: BackendEvent::WatchPolled(result),
-                });
-            }
-        })
-        .detach();
+    }
+
+    fn retry_watch(&mut self, now: Instant) {
+        self.watch = None;
+        if self.watch_enabled && self.watch_attempts < MAX_WATCH_RETRIES {
+            let delay = (WATCH_RETRY_DELAY * (1 << self.watch_attempts)).min(WATCH_RETRY_MAX_DELAY);
+            self.watch_attempts += 1;
+            self.watch_retry = Some(now + delay);
+        }
     }
 
     fn request_id(&mut self) -> RequestId {
@@ -844,6 +1316,83 @@ impl Drop for BackendDriver {
     fn drop(&mut self) {
         self.close_watch();
     }
+}
+
+fn retryable_watch_error(error: &BackendError) -> bool {
+    matches!(
+        error,
+        BackendError::Workspace(
+            WorkspaceError::WatchUnavailable
+                | WorkspaceError::Unavailable
+                | WorkspaceError::Busy
+                | WorkspaceError::Transport {
+                    kind: TransportErrorKind::Disconnected | TransportErrorKind::Timeout
+                }
+        )
+    )
+}
+
+async fn watch_session(
+    backend: Arc<dyn WorkbenchFilesystem>,
+    sender: flume::Sender<Envelope>,
+    generation: u64,
+    request: RequestId,
+    acknowledged: flume::Receiver<()>,
+) {
+    let result = backend.watch_open().await;
+    let handle = result.as_ref().ok().and_then(Clone::clone);
+    let sent = sender
+        .send(Envelope {
+            generation,
+            event: BackendEvent::WatchOpened { request, result },
+        })
+        .is_ok();
+    let Some(mut handle) = handle else {
+        return;
+    };
+    if sent {
+        while acknowledged.recv_async().await.is_ok() {
+            let result = smol::future::race(
+                async { Some(backend.watch_poll(handle.clone()).await) },
+                async {
+                    let _ = acknowledged.recv_async().await;
+                    None
+                },
+            )
+            .await;
+            let Some(result) = result else {
+                break;
+            };
+            let terminal = !matches!(
+                &result,
+                Ok(WatchResult {
+                    update: WatchUpdate::Events(_),
+                    ..
+                })
+            );
+            if let Ok(result) = &result {
+                handle = result.handle.clone();
+            }
+            if terminal {
+                let _ = backend.watch_close(handle).await;
+                let _ = sender.send(Envelope {
+                    generation,
+                    event: BackendEvent::WatchPolled { request, result },
+                });
+                return;
+            }
+            if sender
+                .send(Envelope {
+                    generation,
+                    event: BackendEvent::WatchPolled { request, result },
+                })
+                .is_err()
+            {
+                break;
+            }
+        }
+    }
+    let _ = backend.watch_close(handle).await;
 }
 
 #[derive(Debug, Clone)]
@@ -1092,6 +1641,7 @@ impl ResourceEntry {
 pub struct WorkspaceFilesystem {
     session: WorkspaceSession,
     gate: MutationGate,
+    cursor_path: Arc<Mutex<Option<WorkspacePath>>>,
 }
 
 impl WorkspaceFilesystem {
@@ -1107,7 +1657,11 @@ impl WorkspaceFilesystem {
         if services.read.is_none() || services.mutation.is_none() || services.search.is_none() {
             return Err(BackendError::Workspace(WorkspaceError::Unavailable));
         }
-        Ok(Self { session, gate })
+        Ok(Self {
+            session,
+            gate,
+            cursor_path: Arc::new(Mutex::new(None)),
+        })
     }
 
     fn read_service(
@@ -1136,15 +1690,131 @@ impl WorkspaceFilesystem {
         path.remote().ok_or(BackendError::WrongBackend)
     }
 
-    async fn resolve_entry(&self, path: &WorkspacePath) -> Result<ResourceEntry, BackendError> {
+    async fn cursor_path(&self) -> Result<WorkspacePath, BackendError> {
+        let mut cached = self.cursor_path.lock().await;
+        if let Some(path) = cached.as_ref() {
+            return Ok(path.clone());
+        }
         let resource = self
             .read_service()?
-            .resolve(self.session.binding(), self.session.cursor(), path)
+            .stat(
+                self.session.binding(),
+                self.session.cursor(),
+                &ResourceSelector::Current,
+            )
             .await?;
+        if resource.project != *self.session.binding().project()
+            || resource.scope.resource_id() != self.session.cursor().scope().resource_id()
+            || !matches!(
+                resource.kind,
+                ResourceKind::Directory | ResourceKind::ProjectRoot
+            )
+        {
+            return Err(BackendError::InvalidResponse);
+        }
+        let path = resource.path.ok_or(BackendError::InvalidResponse)?;
+        *cached = Some(path.clone());
+        Ok(path)
+    }
+
+    async fn relative(&self, path: &WorkspacePath) -> Result<WorkspacePath, BackendError> {
+        let root = self.cursor_path().await?;
+        if path == &root {
+            return Ok(WorkspacePath::root());
+        }
+        if root.is_root() {
+            return Ok(path.clone());
+        }
+        let relative = path
+            .as_str()
+            .strip_prefix(root.as_str())
+            .and_then(|path| path.strip_prefix('/'))
+            .ok_or(BackendError::WrongBackend)?;
+        WorkspacePath::new(relative).map_err(|_| BackendError::InvalidResponse)
+    }
+
+    async fn resolve_entry(&self, path: &WorkspacePath) -> Result<ResourceEntry, BackendError> {
+        let relative = self.relative(path).await?;
+        let resource = self
+            .read_service()?
+            .resolve(self.session.binding(), self.session.cursor(), &relative)
+            .await?;
+        if resource.path.as_ref() != Some(path) {
+            return Err(BackendError::InvalidResponse);
+        }
         ResourceEntry::remote(resource)
     }
 
+    async fn mutation_revision(
+        &self,
+        entry: &ResourceEntry,
+    ) -> Result<ResourceRevision, BackendError> {
+        if entry.revision.is_some() {
+            return remote_revision(entry);
+        }
+        let selector = match &entry.resource_id {
+            Some(id) => ResourceSelector::Id(id.clone()),
+            None => ResourceSelector::Path(self.relative(self.remote(&entry.path)?).await?),
+        };
+        let resource = self
+            .read_service()?
+            .stat(self.session.binding(), self.session.cursor(), &selector)
+            .await?;
+        let verified = ResourceEntry::remote(resource)?;
+        if (entry.resource_id.is_some() && verified.resource_id != entry.resource_id)
+            || verified.path != entry.path
+            || verified.kind != entry.kind
+        {
+            return Err(BackendError::Conflict);
+        }
+        remote_revision(&verified)
+    }
+
+    async fn identify(&self, entry: &ResourceEntry) -> Result<ResourceEntry, BackendError> {
+        if entry.resource_id.is_some() {
+            return Ok(entry.clone());
+        }
+        let resolved = self.resolve_entry(self.remote(&entry.path)?).await?;
+        if resolved.path != entry.path || resolved.kind != entry.kind {
+            return Err(BackendError::Conflict);
+        }
+        Ok(ResourceEntry {
+            resource_id: resolved.resource_id,
+            ..entry.clone()
+        })
+    }
+
     async fn mutate(&self, mutation: Mutation) -> Result<Option<ResourceRevision>, BackendError> {
+        let mutation = match mutation {
+            Mutation::Write {
+                path,
+                content,
+                condition,
+            } => Mutation::Write {
+                path: self.relative(&path).await?,
+                content,
+                condition,
+            },
+            Mutation::CreateDirectory { path } => Mutation::CreateDirectory {
+                path: self.relative(&path).await?,
+            },
+            Mutation::Move {
+                source,
+                destination,
+                expected_revision,
+            } => Mutation::Move {
+                source: self.relative(&source).await?,
+                destination: self.relative(&destination).await?,
+                expected_revision,
+            },
+            Mutation::Remove {
+                path,
+                expected_revision,
+            } => Mutation::Remove {
+                path: self.relative(&path).await?,
+                expected_revision,
+            },
+        };
         self.gate
             .ensure()
             .await
@@ -1198,19 +1868,34 @@ impl WorkbenchFilesystem for WorkspaceFilesystem {
         true
     }
 
+    async fn list_root(&self, path: &WorkbenchPath) -> Result<WorkbenchPath, BackendError> {
+        if self.remote(path)?.is_root() {
+            Ok(WorkbenchPath::Remote(self.cursor_path().await?))
+        } else {
+            Ok(path.clone())
+        }
+    }
+
+    async fn read_path(&self, path: &WorkbenchPath) -> Result<LoadedFile, BackendError> {
+        let entry = self.resolve_entry(self.remote(path)?).await?;
+        self.read(&entry).await
+    }
+
     async fn list(
         &self,
         parent: &WorkbenchPath,
         recursive: bool,
         continuation: Option<ContinuationToken>,
     ) -> Result<ListResult, BackendError> {
+        let parent = self.list_root(parent).await?;
+        let relative = self.relative(self.remote(&parent)?).await?;
         let page = self
             .read_service()?
             .list(
                 self.session.binding(),
                 self.session.cursor(),
                 &ListRequest {
-                    parent: ResourceSelector::Path(self.remote(parent)?.clone()),
+                    parent: ResourceSelector::Path(relative),
                     recursive,
                     continuation,
                     limit: PAGE_SIZE,
@@ -1225,8 +1910,8 @@ impl WorkbenchFilesystem for WorkspaceFilesystem {
         sort_entries(&mut entries);
         Ok(ListResult {
             entries,
+            incomplete: page.incomplete || (page.truncated && page.continuation.is_none()),
             continuation: page.continuation,
-            incomplete: page.incomplete,
         })
     }
 
@@ -1237,8 +1922,13 @@ impl WorkbenchFilesystem for WorkspaceFilesystem {
     /// recover with. Identity stays pinned to the resource id, and the revision
     /// the read reports is what a later save is conditional on.
     async fn read(&self, entry: &ResourceEntry) -> Result<LoadedFile, BackendError> {
-        if entry.kind != ResourceKind::File {
-            return Err(BackendError::NotFile);
+        match entry.kind {
+            ResourceKind::File => {}
+            ResourceKind::Directory | ResourceKind::ProjectRoot => {
+                return Err(BackendError::Directory);
+            }
+            ResourceKind::Other => return Err(BackendError::SpecialFile),
+            ResourceKind::Symlink => return Err(BackendError::NotFile),
         }
         if entry
             .size_bytes
@@ -1246,6 +1936,7 @@ impl WorkbenchFilesystem for WorkspaceFilesystem {
         {
             return Err(BackendError::TooLarge);
         }
+        let entry = self.identify(entry).await?;
         let resource_id = entry
             .resource_id
             .clone()
@@ -1266,6 +1957,13 @@ impl WorkbenchFilesystem for WorkspaceFilesystem {
         if content.resource_id != resource_id {
             return Err(BackendError::InvalidResponse);
         }
+        if content
+            .total_bytes
+            .is_some_and(|total| total > MAX_EDITABLE_BYTES)
+            || content.bytes.len() as u64 > MAX_EDITABLE_BYTES
+        {
+            return Err(BackendError::TooLarge);
+        }
         if content.range.start != 0
             || content.range.end_exclusive != content.bytes.len() as u64
             || content
@@ -1276,9 +1974,6 @@ impl WorkbenchFilesystem for WorkspaceFilesystem {
         }
         if content.truncated || content.next_byte_offset.is_some() {
             return Err(BackendError::Truncated);
-        }
-        if content.bytes.len() as u64 > MAX_EDITABLE_BYTES {
-            return Err(BackendError::TooLarge);
         }
         if content.bytes[..content.bytes.len().min(BINARY_SNIFF_BYTES)].contains(&0) {
             return Err(BackendError::Binary);
@@ -1309,6 +2004,7 @@ impl WorkbenchFilesystem for WorkspaceFilesystem {
             _ => return Err(BackendError::MissingRevision),
         };
         let path = self.remote(&entry.path)?.clone();
+        let entry = self.identify(entry).await?;
         let next = self
             .mutate(Mutation::Write {
                 path: path.clone(),
@@ -1346,7 +2042,7 @@ impl WorkbenchFilesystem for WorkspaceFilesystem {
         entry: &ResourceEntry,
         destination: &WorkbenchPath,
     ) -> Result<ResourceEntry, BackendError> {
-        let expected_revision = remote_revision(entry)?;
+        let expected_revision = self.mutation_revision(entry).await?;
         let source = self.remote(&entry.path)?.clone();
         let destination = self.remote(destination)?.clone();
         self.mutate(Mutation::Move {
@@ -1361,7 +2057,7 @@ impl WorkbenchFilesystem for WorkspaceFilesystem {
     async fn delete(&self, entry: &ResourceEntry) -> Result<(), BackendError> {
         self.mutate(Mutation::Remove {
             path: self.remote(&entry.path)?.clone(),
-            expected_revision: remote_revision(entry)?,
+            expected_revision: self.mutation_revision(entry).await?,
         })
         .await?;
         Ok(())
@@ -1529,7 +2225,7 @@ fn event_request(event: &BackendEvent) -> Option<RequestId> {
         | BackendEvent::Deleted { request, .. }
         | BackendEvent::Counted { request, .. }
         | BackendEvent::SearchPage { request, .. } => Some(*request),
-        BackendEvent::WatchOpened(_) | BackendEvent::WatchPolled(_) => None,
+        BackendEvent::WatchOpened { .. } | BackendEvent::WatchPolled { .. } => None,
     }
 }
 
@@ -1627,6 +2323,7 @@ fn local_error(error: std::io::Error) -> BackendError {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    use crate::fs::tree::Tree;
     use std::collections::HashMap;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1648,6 +2345,7 @@ pub(crate) mod tests {
         WorkspaceSearchService, WorkspaceServices, WorkspaceWatchService,
     };
     use tempfile::TempDir;
+    use test_case::test_case;
 
     use super::*;
 
@@ -1658,6 +2356,42 @@ pub(crate) mod tests {
     const ORIGINAL: &str = "one\ntwo\n";
     const CHANGED: &str = "changed\n";
     const WATCH_WAIT: &str = "an idle watch must await an event, not trigger a reconnect";
+    const LIST_RETAINED: &str = "partial or failed listings must retain valid rows";
+    const LIST_BOUNDED: &str = "listing must coalesce refreshes and bound pagination";
+    const WATCH_BOUNDED: &str = "watch retries must be bounded and stop on suspension";
+    const MUTATION_CONDITIONAL: &str =
+        "mutations must use a verified revision, never overwrite a conflict";
+    const DELTA_BOUNDED: &str = "pages must carry only bounded changes, not accumulated snapshots";
+    const ROTATING_GENERATIONS: usize = 3;
+    const NOT_FOUND_ERROR_CODE: i64 = -32000;
+    const LARGE_TREE_DIRECTORIES: usize = 5_000;
+    const LEGACY_RETAINED_LIMIT: usize = 16_384;
+    const TARGETED_RETAINED_LIMIT: usize = 2;
+    const TREE_REACHABLE: &str = "every retained file must keep its complete directory ancestry";
+    pub(crate) const SCOPED_ROOT: &str = "sub";
+    pub(crate) const SCOPED_FILE: &str = "sub/a.rs";
+    pub(crate) const SHADOW_FILE: &str = "sub/sub/a.rs";
+    pub(crate) const SCOPED_CONTENTS: &str = "selected contents";
+    pub(crate) const SHADOW_CONTENTS: &str = "wrong nested contents";
+    const SCOPED_CREATED: &str = "sub/new.rs";
+    const SCOPED_DIRECTORY: &str = "sub/new-directory";
+    const SCOPED_RENAMED: &str = "sub/renamed.rs";
+    const OUTSIDE_FILE: &str = "outside.rs";
+    const CURSOR_EXACT: &str =
+        "project-relative paths must address the same resource under a non-root cursor";
+    const DEEP_ENTRY_PARTS: usize = 4;
+
+    pub(crate) struct ListCall {
+        pub(crate) request: ListRequest,
+        pub(crate) reply: flume::Sender<Result<(), WorkspaceError>>,
+    }
+
+    pub(crate) struct ReadCall {
+        pub(crate) path: WorkspacePath,
+        pub(crate) reply: flume::Sender<()>,
+    }
+
+    type WatchReply = flume::Sender<Result<(), WorkspaceError>>;
 
     #[derive(Clone)]
     struct FakeFile {
@@ -1669,12 +2403,21 @@ pub(crate) mod tests {
 
     struct FakeWorkspace {
         binding: SessionWorkspaceBinding,
+        cwd: WorkspacePath,
         files: Mutex<HashMap<WorkspacePath, FakeFile>>,
         watch: (
             flume::Sender<WatchEventPage>,
             flume::Receiver<WatchEventPage>,
         ),
         scm_calls: AtomicUsize,
+        scm_error: Mutex<Option<WorkspaceError>>,
+        stat_calls: AtomicUsize,
+        list_page_size: AtomicUsize,
+        list_probe: Mutex<Option<flume::Sender<ListCall>>>,
+        read_probe: Mutex<Option<flume::Sender<ReadCall>>>,
+        watch_probe: Mutex<Option<flume::Sender<WatchReply>>>,
+        watch_poll_error: Mutex<Option<WorkspaceError>>,
+        watch_closed: (flume::Sender<()>, flume::Receiver<()>),
         search_probe: Mutex<Option<(flume::Sender<()>, flume::Sender<()>)>>,
     }
 
@@ -1689,6 +2432,44 @@ pub(crate) mod tests {
     pub(crate) struct RemoteControl(Arc<FakeWorkspace>);
 
     impl RemoteControl {
+        pub(crate) fn read_calls(&self) -> flume::Receiver<ReadCall> {
+            let (sender, receiver) = flume::unbounded();
+            *self.0.read_probe.lock().unwrap() = Some(sender);
+            receiver
+        }
+        pub(crate) fn remove(&self, path: &str) {
+            self.0
+                .files
+                .lock()
+                .unwrap()
+                .remove(&WorkspacePath::new(path).unwrap());
+        }
+        pub(crate) fn watch_calls(&self) -> flume::Receiver<WatchReply> {
+            let (sender, receiver) = flume::unbounded();
+            *self.0.watch_probe.lock().unwrap() = Some(sender);
+            receiver
+        }
+
+        pub(crate) fn set_kind(&self, path: &str, kind: ResourceKind) {
+            self.0
+                .files
+                .lock()
+                .unwrap()
+                .get_mut(&WorkspacePath::new(path).unwrap())
+                .unwrap()
+                .kind = kind;
+        }
+
+        pub(crate) fn list_calls(&self) -> flume::Receiver<ListCall> {
+            let (sender, receiver) = flume::unbounded();
+            *self.0.list_probe.lock().unwrap() = Some(sender);
+            receiver
+        }
+
+        pub(crate) fn scm_error(&self, error: WorkspaceError) {
+            *self.0.scm_error.lock().unwrap() = Some(error);
+        }
+
         pub(crate) fn replace(&self, path: &str, contents: &str) {
             let path = WorkspacePath::new(path).unwrap();
             let mut files = self.0.files.lock().unwrap();
@@ -1771,6 +2552,49 @@ pub(crate) mod tests {
     }
 
     impl FakeWorkspace {
+        fn absolute(&self, path: &WorkspacePath) -> WorkspacePath {
+            if path.is_root() {
+                self.cwd.clone()
+            } else if self.cwd.is_root() {
+                path.clone()
+            } else {
+                WorkspacePath::new(format!("{}/{path}", self.cwd)).unwrap()
+            }
+        }
+
+        fn mutation_path(&self, mutation: &Mutation) -> Mutation {
+            match mutation {
+                Mutation::Write {
+                    path,
+                    content,
+                    condition,
+                } => Mutation::Write {
+                    path: self.absolute(path),
+                    content: content.clone(),
+                    condition: condition.clone(),
+                },
+                Mutation::CreateDirectory { path } => Mutation::CreateDirectory {
+                    path: self.absolute(path),
+                },
+                Mutation::Move {
+                    source,
+                    destination,
+                    expected_revision,
+                } => Mutation::Move {
+                    source: self.absolute(source),
+                    destination: self.absolute(destination),
+                    expected_revision: expected_revision.clone(),
+                },
+                Mutation::Remove {
+                    path,
+                    expected_revision,
+                } => Mutation::Remove {
+                    path: self.absolute(path),
+                    expected_revision: expected_revision.clone(),
+                },
+            }
+        }
+
         fn resource(&self, path: &WorkspacePath, file: &FakeFile) -> WorkspaceResource {
             WorkspaceResource {
                 project: self.binding.project().clone(),
@@ -1800,9 +2624,27 @@ pub(crate) mod tests {
             _cursor: &WorkspaceCursor,
             path: &WorkspacePath,
         ) -> Result<WorkspaceResource, WorkspaceError> {
+            let path = self.absolute(path);
+            let probe = self.read_probe.lock().unwrap().clone();
+            if let Some(probe) = probe {
+                let (reply, response) = flume::bounded(1);
+                probe
+                    .send(ReadCall {
+                        path: path.clone(),
+                        reply,
+                    })
+                    .map_err(|_| WorkspaceError::Cancelled)?;
+                response
+                    .recv_async()
+                    .await
+                    .map_err(|_| WorkspaceError::Cancelled)?;
+            }
             let files = self.files.lock().unwrap();
-            let file = files.get(path).ok_or(WorkspaceError::Unavailable)?;
-            Ok(self.resource(path, file))
+            let file = files.get(&path).ok_or_else(|| WorkspaceError::Refused {
+                code: NOT_FOUND_ERROR_CODE,
+                symbolic: NOT_FOUND_CODE.to_owned(),
+            })?;
+            Ok(self.resource(&path, file))
         }
 
         async fn resolve_directory(
@@ -1817,14 +2659,25 @@ pub(crate) mod tests {
         async fn stat(
             &self,
             _binding: &SessionWorkspaceBinding,
-            _cursor: &WorkspaceCursor,
+            cursor: &WorkspaceCursor,
             resource: &ResourceSelector,
         ) -> Result<WorkspaceResource, WorkspaceError> {
+            if matches!(resource, ResourceSelector::Current) {
+                return Ok(WorkspaceResource {
+                    project: self.binding.project().clone(),
+                    scope: cursor.scope().clone(),
+                    path: Some(self.cwd.clone()),
+                    kind: ResourceKind::Directory,
+                    revision: None,
+                    size_bytes: None,
+                });
+            }
+            self.stat_calls.fetch_add(1, Ordering::Relaxed);
             let files = self.files.lock().unwrap();
             let (path, file) = files
                 .iter()
                 .find(|(path, file)| match resource {
-                    ResourceSelector::Path(expected) => *path == expected,
+                    ResourceSelector::Path(expected) => **path == self.absolute(expected),
                     ResourceSelector::Id(expected) => file.id == *expected,
                     ResourceSelector::Current => false,
                 })
@@ -1838,8 +2691,23 @@ pub(crate) mod tests {
             _cursor: &WorkspaceCursor,
             request: &ListRequest,
         ) -> Result<ListPage, WorkspaceError> {
+            let probe = self.list_probe.lock().unwrap().clone();
+            if let Some(probe) = probe {
+                let (reply, response) = flume::bounded(1);
+                probe
+                    .send(ListCall {
+                        request: request.clone(),
+                        reply,
+                    })
+                    .unwrap();
+                response
+                    .recv_async()
+                    .await
+                    .map_err(|_| WorkspaceError::Cancelled)??;
+            }
             let parent = match &request.parent {
-                ResourceSelector::Path(path) => path,
+                ResourceSelector::Path(path) => self.absolute(path),
+                ResourceSelector::Current => self.cwd.clone(),
                 _ => return Err(WorkspaceError::Unavailable),
             };
             let mut resources = self
@@ -1858,7 +2726,10 @@ pub(crate) mod tests {
                         suffix.is_some_and(|suffix| request.recursive || !suffix.contains('/'))
                     }
                 })
-                .map(|(path, file)| self.resource(path, file))
+                .map(|(path, file)| WorkspaceResource {
+                    revision: None,
+                    ..self.resource(path, file)
+                })
                 .collect::<Vec<_>>();
             resources.sort_by_key(|resource| resource.path.clone());
             let offset = request
@@ -1866,14 +2737,22 @@ pub(crate) mod tests {
                 .as_ref()
                 .and_then(|token| token.as_str().parse::<usize>().ok())
                 .unwrap_or(0);
-            let end = (offset + 1).min(resources.len());
+            let end = (offset
+                + self
+                    .list_page_size
+                    .load(Ordering::Relaxed)
+                    .min(request.limit as usize))
+            .min(resources.len());
             let next =
                 (end < resources.len()).then(|| ContinuationToken::new(end.to_string()).unwrap());
             Ok(ListPage {
                 revision: CollectionRevision::new("list-revision").unwrap(),
-                resources: resources[offset..end].to_vec(),
+                resources: resources
+                    .get(offset..end)
+                    .ok_or(WorkspaceError::Unavailable)?
+                    .to_vec(),
                 truncated: next.is_some(),
-                incomplete: next.is_some(),
+                incomplete: false,
                 continuation: next,
             })
         }
@@ -1933,8 +2812,9 @@ pub(crate) mod tests {
             request: &MutationRequest,
         ) -> Result<OperationStatus<MutationResult>, WorkspaceError> {
             let mut files = self.files.lock().unwrap();
-            let mutation = request.mutations.first().ok_or(WorkspaceError::Conflict)?;
-            let (kind, path, destination, revision) = match mutation {
+            let mutation =
+                self.mutation_path(request.mutations.first().ok_or(WorkspaceError::Conflict)?);
+            let (kind, path, destination, revision) = match &mutation {
                 Mutation::Write {
                     path,
                     content,
@@ -2005,14 +2885,29 @@ pub(crate) mod tests {
                     if files.contains_key(destination) {
                         return Err(WorkspaceError::Conflict);
                     }
-                    let mut file = files.remove(source).ok_or(WorkspaceError::Conflict)?;
+                    let file = files.get(source).ok_or(WorkspaceError::Conflict)?;
                     if file.revision != *expected_revision {
-                        files.insert(source.clone(), file);
                         return Err(WorkspaceError::Conflict);
                     }
-                    file.revision = Self::next_revision(&files);
                     let revision = file.revision.clone();
-                    files.insert(destination.clone(), file);
+                    let moved = files
+                        .keys()
+                        .filter(|path| {
+                            WorkbenchPath::Remote((*path).clone())
+                                .starts_with(&WorkbenchPath::Remote(source.clone()))
+                        })
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    for path in moved {
+                        let mut file = files.remove(&path).unwrap();
+                        let suffix = path.as_str().strip_prefix(source.as_str()).unwrap();
+                        let moved_path =
+                            WorkspacePath::new(format!("{}{suffix}", destination.as_str()))
+                                .unwrap();
+                        file.id =
+                            ResourceId::new(format!("moved-{}", moved_path.as_str())).unwrap();
+                        files.insert(moved_path, file);
+                    }
                     (
                         MutationKind::Move,
                         source.clone(),
@@ -2089,9 +2984,18 @@ pub(crate) mod tests {
                 return std::future::pending().await;
             }
             let files = self.files.lock().unwrap();
+            let root = match &request.root {
+                ResourceSelector::Current => self.cwd.clone(),
+                ResourceSelector::Path(path) => self.absolute(path),
+                ResourceSelector::Id(_) => return Err(WorkspaceError::Unavailable),
+            };
             let hits = files
                 .iter()
-                .filter(|(_, file)| file.kind == ResourceKind::File)
+                .filter(|(path, file)| {
+                    file.kind == ResourceKind::File
+                        && WorkbenchPath::Remote((*path).clone())
+                            .starts_with(&WorkbenchPath::Remote(root.clone()))
+                })
                 .flat_map(|(path, file)| {
                     String::from_utf8_lossy(&file.bytes)
                         .lines()
@@ -2127,6 +3031,15 @@ pub(crate) mod tests {
             _cursor: &WorkspaceCursor,
             _request: &WatchOpenRequest,
         ) -> Result<WatchSubscription, WorkspaceError> {
+            let probe = self.watch_probe.lock().unwrap().clone();
+            if let Some(probe) = probe {
+                let (reply, response) = flume::bounded(1);
+                probe.send(reply).unwrap();
+                response
+                    .recv_async()
+                    .await
+                    .map_err(|_| WorkspaceError::Cancelled)??;
+            }
             Ok(WatchSubscription {
                 subscription_id: WatchSubscriptionId::new("watch").unwrap(),
                 cursor: WatchCursor::new("cursor-0").unwrap(),
@@ -2140,6 +3053,9 @@ pub(crate) mod tests {
             _cursor: &WorkspaceCursor,
             _request: &WatchPollRequest,
         ) -> Result<WatchEventPage, WorkspaceError> {
+            if let Some(error) = self.watch_poll_error.lock().unwrap().take() {
+                return Err(error);
+            }
             self.watch
                 .1
                 .recv_async()
@@ -2153,6 +3069,7 @@ pub(crate) mod tests {
             _cursor: &WorkspaceCursor,
             subscription_id: &WatchSubscriptionId,
         ) -> Result<WatchCloseResult, WorkspaceError> {
+            let _ = self.watch_closed.0.send(());
             Ok(WatchCloseResult {
                 subscription_id: subscription_id.clone(),
                 closed: true,
@@ -2169,6 +3086,9 @@ pub(crate) mod tests {
             _request: &ScmDiscoverRequest,
         ) -> Result<ScmDiscoverResult, WorkspaceError> {
             self.scm_calls.fetch_add(1, Ordering::Relaxed);
+            if let Some(error) = self.scm_error.lock().unwrap().clone() {
+                return Err(error);
+            }
             Ok(ScmDiscoverResult {
                 repository: scm_repository(),
             })
@@ -2423,6 +3343,10 @@ pub(crate) mod tests {
     }
 
     fn session_fixture() -> (WorkspaceSession, Arc<FakeWorkspace>) {
+        session_fixture_at(WorkspacePath::root())
+    }
+
+    fn session_fixture_at(cwd: WorkspacePath) -> (WorkspaceSession, Arc<FakeWorkspace>) {
         let authority = AuthorityIdentity::new(
             SourceTrustAnchor::new("test-anchor").unwrap(),
             "test-authority",
@@ -2462,9 +3386,18 @@ pub(crate) mod tests {
         ]);
         let fake = Arc::new(FakeWorkspace {
             binding: binding.clone(),
+            cwd,
             files: Mutex::new(files),
             watch: flume::unbounded(),
             scm_calls: AtomicUsize::new(0),
+            scm_error: Mutex::new(None),
+            stat_calls: AtomicUsize::new(0),
+            list_page_size: AtomicUsize::new(1),
+            list_probe: Mutex::new(None),
+            read_probe: Mutex::new(None),
+            watch_probe: Mutex::new(None),
+            watch_poll_error: Mutex::new(None),
+            watch_closed: flume::unbounded(),
             search_probe: Mutex::new(None),
         });
         let capabilities = WorkspaceCapabilities::from([
@@ -2507,7 +3440,15 @@ pub(crate) mod tests {
         .unwrap();
         let cursor = WorkspaceCursor::new(
             &binding,
-            ResourceScope::root(ResourceId::new("root").unwrap()),
+            if fake.cwd.is_root() {
+                ResourceScope::root(ResourceId::new("root").unwrap())
+            } else {
+                ResourceScope::new(
+                    vec![ResourceId::new("root").unwrap()],
+                    ResourceId::new("cursor-directory").unwrap(),
+                )
+                .unwrap()
+            },
             1,
             CwdHandle::new("cwd").unwrap(),
         );
@@ -2523,6 +3464,953 @@ pub(crate) mod tests {
     pub(crate) fn widget_fixture() -> (WorkspaceSession, RemoteControl) {
         let (session, fake) = session_fixture();
         (session, RemoteControl(fake))
+    }
+
+    pub(crate) fn scoped_widget_fixture() -> (WorkspaceSession, RemoteControl) {
+        let (session, fake) = session_fixture_at(WorkspacePath::new(SCOPED_ROOT).unwrap());
+        let control = RemoteControl(fake);
+        control.insert(SCOPED_FILE, SCOPED_CONTENTS);
+        control.insert(SHADOW_FILE, SHADOW_CONTENTS);
+        (session, control)
+    }
+
+    #[test]
+    fn non_root_cursor_normalizes_all_service_paths_without_touching_shadow_resources() {
+        smol::block_on(async {
+            let (session, control) = scoped_widget_fixture();
+            control.insert(OUTSIDE_FILE, SCOPED_CONTENTS);
+            let backend = WorkspaceFilesystem::new(session).unwrap();
+            let root = WorkbenchPath::Remote(WorkspacePath::root());
+            assert_eq!(
+                backend.list_root(&root).await.unwrap().display(),
+                SCOPED_ROOT
+            );
+            let page = backend.list(&root, false, None).await.unwrap();
+            let selected = &page.entries[0];
+            assert_eq!(selected.path.display(), SCOPED_FILE, "{CURSOR_EXACT}");
+            assert_eq!(
+                backend.read(selected).await.unwrap().lines,
+                [SCOPED_CONTENTS],
+                "{CURSOR_EXACT}"
+            );
+            let loaded = backend.read_path(&selected.path).await.unwrap();
+            assert_eq!(loaded.lines, [SCOPED_CONTENTS], "{CURSOR_EXACT}");
+            let hits = backend
+                .search(SCOPED_CONTENTS.to_owned(), None, None)
+                .await
+                .unwrap()
+                .hits;
+            assert_eq!(hits.len(), 1, "{CURSOR_EXACT}");
+            assert_eq!(hits[0].entry.path.display(), SCOPED_FILE, "{CURSOR_EXACT}");
+            let saved = backend
+                .write(&loaded.entry, CHANGED.to_owned())
+                .await
+                .unwrap();
+            assert_eq!(control.contents(SCOPED_FILE), CHANGED, "{CURSOR_EXACT}");
+            let created = backend
+                .create_file(&WorkbenchPath::Remote(
+                    WorkspacePath::new(SCOPED_CREATED).unwrap(),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(created.path.display(), SCOPED_CREATED, "{CURSOR_EXACT}");
+            let directory = backend
+                .create_dir(&WorkbenchPath::Remote(
+                    WorkspacePath::new(SCOPED_DIRECTORY).unwrap(),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(directory.path.display(), SCOPED_DIRECTORY, "{CURSOR_EXACT}");
+            let renamed = backend
+                .rename(
+                    &saved,
+                    &WorkbenchPath::Remote(WorkspacePath::new(SCOPED_RENAMED).unwrap()),
+                )
+                .await
+                .unwrap();
+            assert_eq!(renamed.path.display(), SCOPED_RENAMED, "{CURSOR_EXACT}");
+            backend.delete(&renamed).await.unwrap();
+            assert!(matches!(
+                backend.read_path(&renamed.path).await,
+                Err(BackendError::NotFound)
+            ));
+            assert_eq!(
+                control.contents(SHADOW_FILE),
+                SHADOW_CONTENTS,
+                "{CURSOR_EXACT}"
+            );
+            assert_eq!(
+                control.contents(OUTSIDE_FILE),
+                SCOPED_CONTENTS,
+                "{CURSOR_EXACT}"
+            );
+            assert!(matches!(
+                backend
+                    .create_file(&WorkbenchPath::Remote(
+                        WorkspacePath::new(OUTSIDE_FILE).unwrap()
+                    ))
+                    .await,
+                Err(BackendError::WrongBackend)
+            ));
+        });
+    }
+
+    async fn drain_next(driver: &mut BackendDriver, now: Instant) -> Vec<BackendEvent> {
+        let envelope = driver.events.recv_async().await.unwrap();
+        driver.sender.send(envelope).unwrap();
+        driver.drain_at(now)
+    }
+
+    fn remote_driver(backend: WorkspaceFilesystem) -> BackendDriver {
+        BackendDriver::new(
+            WorkbenchBackend::custom(Arc::new(backend)),
+            WorkbenchPath::Remote(WorkspacePath::root()),
+        )
+    }
+
+    fn indexed_entry(index: usize) -> ResourceEntry {
+        ResourceEntry {
+            path: WorkbenchPath::Remote(WorkspacePath::new(format!("file-{index}")).unwrap()),
+            resource_id: None,
+            revision: None,
+            kind: ResourceKind::File,
+            size_bytes: None,
+        }
+    }
+
+    fn deep_page_fixture() -> (BackendDriver, flume::Receiver<ListCall>) {
+        let (backend, fake) = fixture();
+        fake.list_page_size
+            .store(PAGE_SIZE as usize, Ordering::Relaxed);
+        let control = RemoteControl(fake);
+        for index in 0..PAGE_SIZE {
+            control.insert(&format!("a-{index}/b/c/file"), ORIGINAL);
+        }
+        let calls = control.list_calls();
+        (remote_driver(backend), calls)
+    }
+
+    async fn install_first_deep_chunk(
+        driver: &mut BackendDriver,
+        calls: &flume::Receiver<ListCall>,
+    ) -> Vec<BackendEvent> {
+        driver.list(driver.root.clone(), true);
+        let shallow = calls.recv_async().await.unwrap();
+        assert!(!shallow.request.recursive);
+        shallow.reply.send(Ok(())).unwrap();
+        drain_next(driver, Instant::now()).await;
+        let recursive = calls.recv_async().await.unwrap();
+        assert!(recursive.request.recursive && recursive.request.continuation.is_none());
+        recursive.reply.send(Ok(())).unwrap();
+        drain_next(driver, Instant::now()).await
+    }
+
+    #[test]
+    fn children_first_page_streams_every_entry_in_bounded_chunks_before_advancing_cursor() {
+        smol::block_on(async {
+            let (mut driver, calls) = deep_page_fixture();
+            let first = install_first_deep_chunk(&mut driver, &calls).await;
+            assert!(
+                matches!(&first[..], [BackendEvent::Listed { complete: false, authoritative: false, result: Ok(page), .. }] if !page.incomplete && page.entries.len() == MAX_LIST_DELTA_ENTRIES),
+                "{DELTA_BOUNDED}"
+            );
+            assert!(calls.is_empty(), "{DELTA_BOUNDED}");
+            let listing = driver.listing.as_ref().unwrap();
+            assert!(
+                listing
+                    .pending_page
+                    .as_ref()
+                    .is_some_and(|page| page.entries.len() <= PAGE_SIZE as usize)
+            );
+            let pages = listing.pages;
+            let second = driver.drain();
+            assert!(
+                matches!(&second[..], [BackendEvent::Listed { complete: false, authoritative: false, result: Ok(page), .. }] if !page.incomplete && page.entries.len() == MAX_LIST_DELTA_ENTRIES),
+                "{DELTA_BOUNDED}"
+            );
+            assert_eq!(
+                driver.listing.as_ref().unwrap().pages,
+                pages,
+                "{DELTA_BOUNDED}"
+            );
+            assert!(driver.listing.as_ref().unwrap().pending_page.is_none());
+            let next = calls.recv_async().await.unwrap();
+            assert_eq!(
+                next.request.continuation.as_ref().unwrap().as_str(),
+                PAGE_SIZE.to_string()
+            );
+            next.reply.send(Ok(())).unwrap();
+            let final_page = drain_next(&mut driver, Instant::now()).await;
+            assert!(
+                matches!(&final_page[..], [BackendEvent::Listed { complete: true, authoritative: true, result: Ok(page), .. }] if !page.incomplete && page.entries.len() <= MAX_LIST_DELTA_ENTRIES)
+            );
+            for index in 0..PAGE_SIZE {
+                let path = WorkbenchPath::Remote(
+                    WorkspacePath::new(format!("a-{index}/b/c/file")).unwrap(),
+                );
+                assert!(driver.resource(&path).is_some(), "{DELTA_BOUNDED}");
+                for parent in driver.ancestors(&path).unwrap() {
+                    assert!(driver.resource(&parent).is_some(), "{TREE_REACHABLE}");
+                }
+            }
+            assert_eq!(
+                driver.resources.len(),
+                PAGE_SIZE as usize * DEEP_ENTRY_PARTS + [FILE, DIRECTORY].len()
+            );
+            assert!(driver.listing.is_none() && calls.is_empty());
+        });
+    }
+
+    enum ListingStop {
+        Cancel,
+        Suspend,
+        Rebind,
+    }
+
+    #[test_case(ListingStop::Cancel; "cancelled_chunk")]
+    #[test_case(ListingStop::Suspend; "suspended_chunk")]
+    #[test_case(ListingStop::Rebind; "rebound_chunk")]
+    fn stale_pending_page_chunks_cannot_install_after_the_listing_stops(stop: ListingStop) {
+        smol::block_on(async {
+            let (mut driver, calls) = deep_page_fixture();
+            install_first_deep_chunk(&mut driver, &calls).await;
+            assert!(driver.listing.as_ref().unwrap().pending_page.is_some());
+            match stop {
+                ListingStop::Cancel => {
+                    driver.cancel_listing();
+                }
+                ListingStop::Suspend => driver.suspend(),
+                ListingStop::Rebind => {
+                    let (backend, _) = fixture();
+                    driver.rebind(
+                        WorkbenchBackend::custom(Arc::new(backend)),
+                        driver.root.clone(),
+                    );
+                    driver.cache_entry(&indexed_entry(0));
+                }
+            }
+            let retained = driver.resources.clone();
+            assert!(driver.drain().is_empty(), "{LIST_RETAINED}");
+            assert_eq!(driver.resources, retained, "{LIST_RETAINED}");
+            assert!(driver.listing.is_none() && calls.is_empty());
+        });
+    }
+
+    fn seed_listing(driver: &mut BackendDriver, refresh: bool) {
+        driver.cancel_listing();
+        driver.listing = Some(Listing {
+            request: driver.request_id(),
+            parent: driver.root.clone(),
+            recursive: true,
+            indexing: true,
+            cursors: HashSet::new(),
+            paths: HashSet::new(),
+            pages: 0,
+            incomplete: false,
+            refresh,
+            pending_page: None,
+        });
+    }
+
+    #[test]
+    fn pages_emit_linear_deltas_and_enforce_a_generation_entry_bound() {
+        let (backend, _) = fixture();
+        let mut driver = remote_driver(backend);
+        seed_listing(&mut driver, false);
+        let mut emitted = 0;
+        for offset in (0..MAX_RETAINED_ENTRIES + PAGE_SIZE as usize).step_by(PAGE_SIZE as usize) {
+            let mut page = Ok(ListResult {
+                entries: (offset..offset + PAGE_SIZE as usize)
+                    .map(indexed_entry)
+                    .collect(),
+                continuation: Some(ContinuationToken::new(offset.to_string()).unwrap()),
+                incomplete: false,
+            });
+            let mut removed = Vec::new();
+            let mut authoritative = false;
+            let complete = driver.install_listing(&mut page, &mut removed, &mut authoritative);
+            let page = page.unwrap();
+            assert!(page.entries.len() <= PAGE_SIZE as usize, "{DELTA_BOUNDED}");
+            emitted += page.entries.len();
+            assert!(!authoritative && removed.is_empty());
+            assert_eq!(
+                complete,
+                offset + PAGE_SIZE as usize > MAX_RETAINED_ENTRIES,
+                "{LIST_BOUNDED}"
+            );
+            assert_eq!(page.incomplete, complete, "{LIST_BOUNDED}");
+            if complete {
+                break;
+            }
+        }
+        assert_eq!(emitted, MAX_RETAINED_ENTRIES, "{DELTA_BOUNDED}");
+        assert_eq!(
+            driver.resources.len(),
+            MAX_RETAINED_ENTRIES,
+            "{LIST_BOUNDED}"
+        );
+        assert!(driver.listing.is_none());
+    }
+
+    #[test]
+    fn rotating_partial_scans_bound_retained_rows_and_emit_evictions() {
+        let (backend, _) = fixture();
+        let mut driver = remote_driver(backend);
+        let mut presented = HashMap::new();
+        let total = MAX_RETAINED_ENTRIES * ROTATING_GENERATIONS;
+        for offset in (0..total).step_by(PAGE_SIZE as usize) {
+            seed_listing(&mut driver, false);
+            let mut result = Ok(ListResult {
+                entries: (offset..offset + PAGE_SIZE as usize)
+                    .map(indexed_entry)
+                    .collect(),
+                continuation: None,
+                incomplete: true,
+            });
+            let mut removed = Vec::new();
+            let mut authoritative = false;
+            assert!(driver.install_listing(&mut result, &mut removed, &mut authoritative));
+            for path in removed {
+                presented.remove(&path);
+            }
+            for entry in result.unwrap().entries {
+                presented.insert(entry.path.clone(), entry);
+            }
+            assert!(presented.len() <= MAX_RETAINED_ENTRIES, "{LIST_BOUNDED}");
+            assert_eq!(
+                driver.resource_order.len(),
+                driver.resources.len(),
+                "{LIST_BOUNDED}"
+            );
+            assert_eq!(presented.len(), driver.resources.len(), "{LIST_BOUNDED}");
+            assert!(!authoritative);
+        }
+        assert_eq!(presented, driver.resources);
+        assert!(presented.contains_key(&indexed_entry(total - 1).path));
+        assert!(!presented.contains_key(&indexed_entry(0).path));
+    }
+
+    fn large_tree_entry(directory: usize, file: Option<usize>) -> ResourceEntry {
+        let path = match file {
+            Some(file) => format!("dir-{directory}/file-{file}"),
+            None => format!("dir-{directory}"),
+        };
+        ResourceEntry {
+            path: WorkbenchPath::Remote(WorkspacePath::new(path).unwrap()),
+            resource_id: None,
+            revision: None,
+            kind: if file.is_some() {
+                ResourceKind::File
+            } else {
+                ResourceKind::Directory
+            },
+            size_bytes: None,
+        }
+    }
+
+    #[test_case(MAX_RETAINED_ENTRIES, 4, false; "twenty_five_thousand_entries")]
+    #[test_case(MAX_RETAINED_ENTRIES, 9, false; "exactly_at_capacity")]
+    #[test_case(MAX_RETAINED_ENTRIES, 10, false; "above_capacity")]
+    #[test_case(LEGACY_RETAINED_LIMIT, 4, false; "legacy_capacity_directories_first")]
+    #[test_case(LEGACY_RETAINED_LIMIT, 4, true; "legacy_capacity_children_first")]
+    fn shallow_then_recursive_capacity_preserves_structural_closure(
+        limit: usize,
+        files: usize,
+        children_first: bool,
+    ) {
+        let (backend, _) = fixture();
+        let mut driver = remote_driver(backend);
+        driver.set_retained_limit(limit);
+        seed_listing(&mut driver, false);
+        driver.listing.as_mut().unwrap().indexing = false;
+        let pinned_directory = large_tree_entry(LARGE_TREE_DIRECTORIES - 1, None).path;
+        let pinned_file = large_tree_entry(0, Some(0)).path;
+        driver.set_pinned_paths([pinned_directory.clone(), pinned_file.clone()].into_iter());
+        let directories = (0..LARGE_TREE_DIRECTORIES)
+            .map(|dir| large_tree_entry(dir, None))
+            .collect::<Vec<_>>();
+        let children = (0..LARGE_TREE_DIRECTORIES)
+            .flat_map(|dir| (0..files).map(move |file| large_tree_entry(dir, Some(file))))
+            .collect::<Vec<_>>();
+        let recursive = if children_first {
+            children.iter().chain(&directories)
+        } else {
+            directories.iter().chain(&children)
+        }
+        .cloned()
+        .collect::<Vec<_>>();
+        let mut presented = HashMap::new();
+        let mut incomplete = false;
+        for phase in [&directories, &recursive] {
+            for (index, page) in phase.chunks(PAGE_SIZE as usize).enumerate() {
+                let last = (index + 1) * PAGE_SIZE as usize >= phase.len();
+                let mut result = Ok(ListResult {
+                    entries: page.to_vec(),
+                    continuation: (!last)
+                        .then(|| ContinuationToken::new(index.to_string()).unwrap()),
+                    incomplete: false,
+                });
+                let mut removed = Vec::new();
+                let mut authoritative = false;
+                let complete =
+                    driver.install_listing(&mut result, &mut removed, &mut authoritative);
+                let result = result.unwrap();
+                assert!(
+                    result.entries.len() <= MAX_LIST_DELTA_ENTRIES,
+                    "{DELTA_BOUNDED}"
+                );
+                incomplete |= result.incomplete;
+                for path in removed {
+                    presented.remove(&path);
+                }
+                for entry in result.entries {
+                    presented.insert(entry.path.clone(), entry);
+                }
+                assert!(presented.len() <= limit, "{LIST_BOUNDED}");
+                assert_eq!(
+                    driver.resource_order.len(),
+                    driver.resources.len(),
+                    "{LIST_BOUNDED}"
+                );
+                assert!(
+                    driver.child_counts.len() <= driver.resources.len(),
+                    "{LIST_BOUNDED}"
+                );
+                if complete {
+                    break;
+                }
+            }
+        }
+        assert_eq!(incomplete, directories.len() + children.len() > limit);
+        assert_eq!(presented, driver.resources);
+        assert!(
+            presented.contains_key(&pinned_directory),
+            "{TREE_REACHABLE}"
+        );
+        assert!(presented.contains_key(&pinned_file), "{TREE_REACHABLE}");
+        for entry in presented.values() {
+            for parent in driver.ancestors(&entry.path).unwrap() {
+                assert!(
+                    presented
+                        .get(&parent)
+                        .is_some_and(|entry| entry.kind == ResourceKind::Directory),
+                    "{TREE_REACHABLE}"
+                );
+            }
+        }
+        let mut tree = Tree::remote(driver.root.clone(), false);
+        tree.update_remote(&presented.into_values().collect::<Vec<_>>(), &[]);
+        tree.reveal_workbench_path(&pinned_file);
+        assert_eq!(
+            tree.selected().unwrap().path,
+            pinned_file,
+            "{TREE_REACHABLE}"
+        );
+    }
+
+    #[test]
+    fn capped_scan_runs_one_coalesced_followup_after_an_already_processed_file_changes() {
+        smol::block_on(async {
+            let (backend, fake) = fixture();
+            let control = RemoteControl(fake);
+            control.insert(NESTED, ORIGINAL);
+            let calls = control.list_calls();
+            let mut driver = remote_driver(backend);
+            driver.set_retained_limit(TARGETED_RETAINED_LIMIT);
+            let request = driver.list(driver.root.clone(), true);
+            for _ in [FILE, DIRECTORY] {
+                let call = calls.recv_async().await.unwrap();
+                assert!(!call.request.recursive);
+                call.reply.send(Ok(())).unwrap();
+                drain_next(&mut driver, Instant::now()).await;
+            }
+            let first = calls.recv_async().await.unwrap();
+            assert!(first.request.recursive && first.request.continuation.is_none());
+            first.reply.send(Ok(())).unwrap();
+            drain_next(&mut driver, Instant::now()).await;
+            control.replace(FILE, CHANGED);
+            assert_eq!(driver.list(driver.root.clone(), true), request);
+            for _ in [DIRECTORY, NESTED] {
+                calls
+                    .recv_async()
+                    .await
+                    .unwrap()
+                    .reply
+                    .send(Ok(()))
+                    .unwrap();
+                drain_next(&mut driver, Instant::now()).await;
+            }
+            let followup = calls.recv_async().await.unwrap();
+            assert!(
+                followup.request.recursive && followup.request.continuation.is_none(),
+                "{LIST_BOUNDED}"
+            );
+            followup.reply.send(Ok(())).unwrap();
+            drain_next(&mut driver, Instant::now()).await;
+            let path = WorkbenchPath::Remote(WorkspacePath::new(FILE).unwrap());
+            assert_eq!(
+                driver.resource(&path).unwrap().size_bytes,
+                Some(CHANGED.len() as u64)
+            );
+            for _ in [DIRECTORY, NESTED] {
+                calls
+                    .recv_async()
+                    .await
+                    .unwrap()
+                    .reply
+                    .send(Ok(()))
+                    .unwrap();
+                drain_next(&mut driver, Instant::now()).await;
+            }
+            assert!(driver.listing.is_none(), "{LIST_BOUNDED}");
+            assert!(calls.is_empty(), "{LIST_BOUNDED}");
+        });
+    }
+
+    #[test]
+    fn pinned_path_overflow_preserves_retained_targets_without_an_unbounded_pin_set() {
+        let (backend, _) = fixture();
+        let mut driver = remote_driver(backend);
+        driver.set_retained_limit(TARGETED_RETAINED_LIMIT);
+        driver.cache_entry(&indexed_entry(0));
+        driver.cache_entry(&indexed_entry(1));
+        driver.set_pinned_paths(
+            (TARGETED_RETAINED_LIMIT..MAX_PINNED_PATHS + TARGETED_RETAINED_LIMIT + 1)
+                .map(|index| indexed_entry(index).path),
+        );
+        assert_eq!(driver.pinned.len(), MAX_PINNED_PATHS, "{LIST_BOUNDED}");
+        seed_listing(&mut driver, false);
+        let mut result = Ok(ListResult {
+            entries: vec![indexed_entry(TARGETED_RETAINED_LIMIT)],
+            continuation: None,
+            incomplete: false,
+        });
+        let mut removed = Vec::new();
+        let mut authoritative = false;
+        assert!(driver.install_listing(&mut result, &mut removed, &mut authoritative));
+        assert!(result.unwrap().incomplete);
+        assert!(removed.is_empty());
+        assert!(!authoritative);
+        assert!(
+            driver.resources.contains_key(&indexed_entry(0).path),
+            "{TREE_REACHABLE}"
+        );
+        assert!(
+            driver.resources.contains_key(&indexed_entry(1).path),
+            "{TREE_REACHABLE}"
+        );
+    }
+
+    #[test]
+    fn completed_scan_reconciles_with_a_refresh_already_queued() {
+        let (backend, _) = fixture();
+        let mut driver = remote_driver(backend);
+        let old = indexed_entry(0);
+        let fresh = indexed_entry(1);
+        driver.cache_entry(&old);
+        seed_listing(&mut driver, true);
+        let mut result = Ok(ListResult {
+            entries: vec![fresh.clone()],
+            continuation: None,
+            incomplete: false,
+        });
+        let mut removed = Vec::new();
+        let mut authoritative = false;
+        assert!(!driver.install_listing(&mut result, &mut removed, &mut authoritative));
+        assert!(authoritative, "{LIST_RETAINED}");
+        assert_eq!(removed, [old.path], "{LIST_RETAINED}");
+        assert_eq!(driver.resources.len(), 1);
+        assert_eq!(driver.resource(&fresh.path), Some(&fresh));
+        assert!(driver.listing.is_some());
+    }
+
+    #[test_case(false; "late_failure")]
+    #[test_case(true; "queued_refresh_after_failure")]
+    fn shallow_pages_are_installed_before_later_pages_and_keep_previous_rows(refresh: bool) {
+        smol::block_on(async {
+            let (backend, fake) = fixture();
+            let control = RemoteControl(fake.clone());
+            control.insert(NESTED, ORIGINAL);
+            let old = backend
+                .resolve_entry(&WorkspacePath::new(NESTED).unwrap())
+                .await
+                .unwrap();
+            let calls = control.list_calls();
+            let mut driver = remote_driver(backend);
+            driver.cache_entry(&old);
+            let request = driver.list(driver.root.clone(), true);
+            let first = calls.recv_async().await.unwrap();
+            assert!(!first.request.recursive, "{LIST_BOUNDED}");
+            first.reply.send(Ok(())).unwrap();
+            let events = drain_next(&mut driver, Instant::now()).await;
+            assert!(
+                matches!(&events[..], [BackendEvent::Listed { complete: false, result: Ok(page), .. }] if page.entries.len() == 1),
+                "{LIST_RETAINED}"
+            );
+            let later = calls.recv_async().await.unwrap();
+            assert!(later.request.continuation.is_some(), "{LIST_BOUNDED}");
+            assert!(driver.resource(&old.path).is_some(), "{LIST_RETAINED}");
+            if refresh {
+                assert_eq!(
+                    driver.list(driver.root.clone(), true),
+                    request,
+                    "{LIST_BOUNDED}"
+                );
+                assert_eq!(
+                    driver.list(driver.root.clone(), true),
+                    request,
+                    "{LIST_BOUNDED}"
+                );
+            }
+            later.reply.send(Err(WorkspaceError::Unavailable)).unwrap();
+            let events = drain_next(&mut driver, Instant::now()).await;
+            assert!(
+                matches!(&events[..], [BackendEvent::Listed { complete, result: Err(_), .. }] if *complete != refresh)
+            );
+            assert!(driver.resource(&old.path).is_some(), "{LIST_RETAINED}");
+            assert_eq!(driver.resources.len(), 2, "{LIST_RETAINED}");
+            if !refresh {
+                assert_ne!(driver.list(driver.root.clone(), true), request);
+            }
+            let retry = calls.recv_async().await.unwrap();
+            assert!(retry.request.continuation.is_none(), "{LIST_BOUNDED}");
+            driver.suspend();
+        });
+    }
+
+    #[test_case(false, false; "incomplete")]
+    #[test_case(true, false; "repeated_cursor")]
+    #[test_case(false, true; "page_ceiling")]
+    fn incomplete_listings_deduplicate_without_removing_old_entries(repeated: bool, ceiling: bool) {
+        smol::block_on(async {
+            let (backend, fake) = fixture();
+            let old = backend
+                .resolve_entry(&WorkspacePath::new(DIRECTORY).unwrap())
+                .await
+                .unwrap();
+            let entry = backend
+                .resolve_entry(&WorkspacePath::new(FILE).unwrap())
+                .await
+                .unwrap();
+            let calls = RemoteControl(fake).list_calls();
+            let mut driver = remote_driver(backend);
+            driver.cache_entry(&old);
+            let request = driver.list(driver.root.clone(), false);
+            let _blocked = calls.recv_async().await.unwrap();
+            let token = ContinuationToken::new("next").unwrap();
+            if repeated {
+                driver
+                    .listing
+                    .as_mut()
+                    .unwrap()
+                    .cursors
+                    .insert(token.clone());
+            }
+            if ceiling {
+                driver.listing.as_mut().unwrap().pages = MAX_LIST_PAGES - 1;
+            }
+            driver
+                .sender
+                .send(Envelope {
+                    generation: driver.generation,
+                    event: BackendEvent::Listed {
+                        request,
+                        parent: driver.root.clone(),
+                        complete: false,
+                        authoritative: false,
+                        removed: Vec::new(),
+                        result: Ok(ListResult {
+                            entries: vec![entry.clone(), entry],
+                            continuation: (repeated || ceiling).then_some(token),
+                            incomplete: !repeated && !ceiling,
+                        }),
+                    },
+                })
+                .unwrap();
+            let events = driver.drain();
+            assert!(
+                matches!(&events[..], [BackendEvent::Listed { complete: true, result: Ok(page), .. }] if page.incomplete && page.entries.len() == 1),
+                "{LIST_RETAINED}"
+            );
+            assert!(driver.resource(&old.path).is_some(), "{LIST_RETAINED}");
+            assert!(driver.listing.is_none(), "{LIST_BOUNDED}");
+        });
+    }
+
+    #[test_case(false; "cancelled_request")]
+    #[test_case(true; "suspended_generation")]
+    fn stale_listing_responses_cannot_replace_new_rows(suspend: bool) {
+        smol::block_on(async {
+            let (backend, fake) = fixture();
+            let calls = RemoteControl(fake).list_calls();
+            let mut driver = remote_driver(backend);
+            let request = driver.list(driver.root.clone(), false);
+            let _old_call = calls.recv_async().await.unwrap();
+            let generation = driver.generation;
+            if suspend {
+                driver.suspend();
+            } else {
+                driver.cancel(request);
+            }
+            let fresh = driver.list(driver.root.clone(), false);
+            let first = calls.recv_async().await.unwrap();
+            first.reply.send(Ok(())).unwrap();
+            drain_next(&mut driver, Instant::now()).await;
+            let second = calls.recv_async().await.unwrap();
+            second.reply.send(Ok(())).unwrap();
+            drain_next(&mut driver, Instant::now()).await;
+            driver
+                .sender
+                .send(Envelope {
+                    generation,
+                    event: BackendEvent::Listed {
+                        request,
+                        parent: driver.root.clone(),
+                        complete: true,
+                        authoritative: true,
+                        removed: Vec::new(),
+                        result: Ok(ListResult {
+                            entries: Vec::new(),
+                            continuation: None,
+                            incomplete: false,
+                        }),
+                    },
+                })
+                .unwrap();
+            assert_ne!(request, fresh);
+            assert!(driver.drain().is_empty(), "{LIST_RETAINED}");
+            assert_eq!(driver.resources.len(), 2, "{LIST_RETAINED}");
+        });
+    }
+
+    #[test_case(false, false, false; "unrevisioned_delete")]
+    #[test_case(true, false, false; "unrevisioned_rename")]
+    #[test_case(false, true, false; "revisioned_delete")]
+    #[test_case(true, true, false; "revisioned_rename")]
+    #[test_case(false, false, true; "delete_stat_race")]
+    #[test_case(true, false, true; "rename_stat_race")]
+    fn directory_mutations_stat_only_when_needed_and_remain_conditional(
+        rename: bool,
+        revisioned: bool,
+        conflict: bool,
+    ) {
+        smol::block_on(async {
+            let (mut backend, fake) = fixture();
+            let path = WorkspacePath::new(DIRECTORY).unwrap();
+            let mut entry = backend.resolve_entry(&path).await.unwrap();
+            if !revisioned {
+                entry.revision = None;
+            }
+            if conflict {
+                let fake = fake.clone();
+                backend.gate = MutationGate::new(move || {
+                    let fake = fake.clone();
+                    Box::pin(async move {
+                        RemoteControl(fake).replace(DIRECTORY, CHANGED);
+                        Ok(())
+                    })
+                });
+            }
+            let destination = WorkbenchPath::Remote(WorkspacePath::new(RENAMED).unwrap());
+            let result = if rename {
+                backend.rename(&entry, &destination).await.map(|_| ())
+            } else {
+                backend.delete(&entry).await
+            };
+            assert_eq!(
+                fake.stat_calls.load(Ordering::Relaxed),
+                usize::from(!revisioned),
+                "{MUTATION_CONDITIONAL}"
+            );
+            if conflict {
+                assert!(
+                    matches!(result, Err(BackendError::Conflict)),
+                    "{MUTATION_CONDITIONAL}"
+                );
+                assert!(
+                    fake.files.lock().unwrap().contains_key(&path),
+                    "{MUTATION_CONDITIONAL}"
+                );
+            } else {
+                result.unwrap();
+                assert!(
+                    !fake.files.lock().unwrap().contains_key(&path),
+                    "{MUTATION_CONDITIONAL}"
+                );
+            }
+        });
+    }
+
+    #[test_case(WorkspaceError::WatchUnavailable, true; "watch_unavailable")]
+    #[test_case(WorkspaceError::Transport { kind: TransportErrorKind::Timeout }, true; "timeout")]
+    #[test_case(WorkspaceError::IdentityMismatch, false; "identity")]
+    #[test_case(WorkspaceError::PermissionDenied, false; "permission")]
+    #[test_case(WorkspaceError::PolicyDenied, false; "policy")]
+    fn watch_failures_retry_with_injected_time_and_warn_once(error: WorkspaceError, retry: bool) {
+        smol::block_on(async {
+            let (backend, fake) = fixture();
+            let (sender, calls) = flume::unbounded();
+            *fake.watch_probe.lock().unwrap() = Some(sender);
+            let mut driver = remote_driver(backend);
+            let now = Instant::now();
+            driver.open_watch();
+            let first = calls.recv_async().await.unwrap();
+            let next_request = driver.next_request;
+            driver.open_watch();
+            assert_eq!(driver.next_request, next_request, "{WATCH_BOUNDED}");
+            first.send(Err(error.clone())).unwrap();
+            assert_eq!(
+                drain_next(&mut driver, now).await.len(),
+                1,
+                "{WATCH_BOUNDED}"
+            );
+            assert_eq!(driver.watch_retry.is_some(), retry, "{WATCH_BOUNDED}");
+            assert!(driver.listing.is_none(), "{WATCH_BOUNDED}");
+            if retry {
+                driver.drain_at(now);
+                assert_eq!(driver.next_request, next_request, "{WATCH_BOUNDED}");
+                for _ in 0..MAX_WATCH_RETRIES {
+                    let deadline = driver.watch_retry.unwrap();
+                    driver.drain_at(deadline);
+                    calls
+                        .recv_async()
+                        .await
+                        .unwrap()
+                        .send(Err(error.clone()))
+                        .unwrap();
+                    assert!(
+                        drain_next(&mut driver, deadline).await.is_empty(),
+                        "{WATCH_BOUNDED}"
+                    );
+                }
+                assert!(driver.watch_retry.is_none(), "{WATCH_BOUNDED}");
+            }
+            driver.suspend();
+            let next_request = driver.next_request;
+            driver.drain_at(now + WATCH_RETRY_MAX_DELAY * MAX_WATCH_RETRIES);
+            assert_eq!(driver.next_request, next_request, "{WATCH_BOUNDED}");
+        });
+    }
+
+    #[test_case(false, false; "pending_open_suspend")]
+    #[test_case(true, false; "queued_open_suspend")]
+    #[test_case(false, true; "pending_open_rebind")]
+    #[test_case(true, true; "queued_open_rebind")]
+    fn stopped_watches_close_even_when_open_response_is_pending(queued: bool, rebind: bool) {
+        smol::block_on(async {
+            let (backend, fake) = fixture();
+            let (sender, calls) = flume::unbounded();
+            *fake.watch_probe.lock().unwrap() = Some(sender);
+            let mut driver = remote_driver(backend);
+            driver.open_watch();
+            let pending = calls.recv_async().await.unwrap();
+            if queued {
+                pending.send(Ok(())).unwrap();
+                let envelope = driver.events.recv_async().await.unwrap();
+                driver.sender.send(envelope).unwrap();
+            }
+            if rebind {
+                let (replacement, _) = fixture();
+                driver.rebind(
+                    WorkbenchBackend::custom(Arc::new(replacement)),
+                    driver.root.clone(),
+                );
+            } else {
+                driver.suspend();
+            }
+            if !queued {
+                pending.send(Ok(())).unwrap();
+            }
+            fake.watch_closed.1.recv_async().await.unwrap();
+            assert!(driver.drain().is_empty(), "{WATCH_BOUNDED}");
+            assert!(fake.watch_closed.1.is_empty(), "{WATCH_BOUNDED}");
+        });
+    }
+
+    #[test_case(false; "open_failure")]
+    #[test_case(true; "poll_failure")]
+    fn watch_recovery_rescans_once_then_suspension_closes_the_subscription(poll: bool) {
+        smol::block_on(async {
+            let (backend, fake) = fixture();
+            let control = RemoteControl(fake.clone());
+            let calls = control.watch_calls();
+            let listings = control.list_calls();
+            if poll {
+                *fake.watch_poll_error.lock().unwrap() = Some(WorkspaceError::WatchUnavailable);
+            }
+            let mut driver = remote_driver(backend);
+            let now = Instant::now();
+            driver.open_watch();
+            let first = calls.recv_async().await.unwrap();
+            first
+                .send(if poll {
+                    Ok(())
+                } else {
+                    Err(WorkspaceError::WatchUnavailable)
+                })
+                .unwrap();
+            drain_next(&mut driver, now).await;
+            if poll {
+                drain_next(&mut driver, now).await;
+                fake.watch_closed.1.recv_async().await.unwrap();
+            }
+            assert_eq!(driver.listing.is_some(), poll, "{WATCH_BOUNDED}");
+            let deadline = driver.watch_retry.unwrap();
+            driver.drain_at(deadline);
+            calls.recv_async().await.unwrap().send(Ok(())).unwrap();
+            let events = drain_next(&mut driver, deadline).await;
+            assert!(
+                matches!(
+                    &events[..],
+                    [BackendEvent::WatchOpened {
+                        result: Ok(Some(_)),
+                        ..
+                    }]
+                ),
+                "{WATCH_BOUNDED}"
+            );
+            let _listing = listings.recv_async().await.unwrap();
+            assert!(driver.watch_retry.is_none(), "{WATCH_BOUNDED}");
+            driver.suspend();
+            fake.watch_closed.1.recv_async().await.unwrap();
+            let request = driver.next_request;
+            driver.drain_at(deadline + WATCH_RETRY_MAX_DELAY);
+            assert_eq!(driver.next_request, request, "{WATCH_BOUNDED}");
+            assert!(listings.is_empty(), "{WATCH_BOUNDED}");
+        });
+    }
+
+    #[test_case(false; "suspend")]
+    #[test_case(true; "rebind")]
+    fn suspension_cancels_scheduled_watch_retry(rebind: bool) {
+        smol::block_on(async {
+            let (backend, fake) = fixture();
+            let calls = RemoteControl(fake).watch_calls();
+            let mut driver = remote_driver(backend);
+            let now = Instant::now();
+            driver.open_watch();
+            calls
+                .recv_async()
+                .await
+                .unwrap()
+                .send(Err(WorkspaceError::WatchUnavailable))
+                .unwrap();
+            drain_next(&mut driver, now).await;
+            assert!(driver.watch_retry.is_some(), "{WATCH_BOUNDED}");
+            if rebind {
+                let (backend, _) = fixture();
+                driver.rebind(
+                    WorkbenchBackend::custom(Arc::new(backend)),
+                    driver.root.clone(),
+                );
+            } else {
+                driver.suspend();
+            }
+            let request = driver.next_request;
+            driver.drain_at(now + WATCH_RETRY_MAX_DELAY);
+            assert_eq!(driver.next_request, request, "{WATCH_BOUNDED}");
+            assert!(driver.watch_retry.is_none(), "{WATCH_BOUNDED}");
+        });
     }
 
     #[test]
@@ -2578,8 +4466,11 @@ pub(crate) mod tests {
         });
     }
 
-    #[test]
-    fn remote_watch_validates_order_and_requests_resync_without_sleeping() {
+    #[test_case(WatchResyncReason::RetentionLost; "overflow")]
+    #[test_case(WatchResyncReason::SubscriptionExpired; "expired_subscription")]
+    fn remote_watch_validates_order_and_requests_resync_without_sleeping(
+        reason: WatchResyncReason,
+    ) {
         smol::block_on(async {
             let (backend, fake) = fixture();
             let handle = backend.watch_open().await.unwrap().unwrap();
@@ -2634,9 +4525,7 @@ pub(crate) mod tests {
                 .0
                 .send(WatchEventPage {
                     subscription_id: current.handle.subscription_id.clone(),
-                    state: WatchPollState::FullResync {
-                        reason: WatchResyncReason::RetentionLost,
-                    },
+                    state: WatchPollState::FullResync { reason },
                     sequence: SequenceMetadata {
                         first_retained_sequence: Some(9),
                         next_sequence: 9,
@@ -2702,6 +4591,9 @@ pub(crate) mod tests {
                 event: BackendEvent::Listed {
                     request: 41,
                     parent: first_root,
+                    complete: true,
+                    authoritative: true,
+                    removed: Vec::new(),
                     result: Ok(ListResult {
                         entries: vec![stale_entry.clone()],
                         continuation: None,

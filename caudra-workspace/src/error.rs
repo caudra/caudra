@@ -48,6 +48,10 @@ pub enum WorkspaceError {
     Conflict,
     #[error("workspace authority is busy with another operation")]
     Busy,
+    #[error("workspace directory is not a repository")]
+    NotRepository,
+    #[error("workspace watch backend is unavailable")]
+    WatchUnavailable,
     /// A ceiling the request would pass, which no retry of the same request fixes.
     #[error("{}", exceeded("limit", "was exceeded", .limit, .maximum))]
     LimitExceeded {
@@ -109,5 +113,16 @@ mod tests {
     #[test_case(WorkspaceError::QuotaExceeded { limit: None, maximum: None }, "a workspace quota is exhausted" ; "unnamed_quota")]
     fn a_refused_ceiling_names_itself_and_its_maximum(error: WorkspaceError, expected: &str) {
         assert_eq!(error.to_string(), expected);
+    }
+
+    #[test_case(WorkspaceError::NotRepository, "not_repository"; "not_repository")]
+    #[test_case(WorkspaceError::WatchUnavailable, "watch_unavailable"; "watch_unavailable")]
+    fn availability_errors_round_trip_without_private_details(error: WorkspaceError, code: &str) {
+        let value = serde_json::json!({"error": code});
+        assert_eq!(serde_json::to_value(&error).unwrap(), value);
+        assert_eq!(
+            serde_json::from_value::<WorkspaceError>(value).unwrap(),
+            error
+        );
     }
 }

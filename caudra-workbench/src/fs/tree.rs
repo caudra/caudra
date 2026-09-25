@@ -4,10 +4,12 @@
 //! opening the explorer in a monorepo costs one `readdir` rather than a walk of
 //! the whole checkout.
 
-use std::collections::HashSet;
+#[cfg(test)]
+use std::cell::Cell;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use caudra_workspace::WorkspacePath;
+use caudra_workspace::{ResourceKind, WorkspacePath};
 use ignore::{DirEntry, WalkBuilder};
 
 use super::backend::{ResourceEntry, WorkbenchPath};
@@ -93,6 +95,7 @@ struct Node {
 pub struct Tree {
     root: WorkbenchPath,
     nodes: Vec<Node>,
+    remote: Option<RemoteTree>,
     expanded: HashSet<WorkbenchPath>,
     show_hidden: bool,
     rows: Vec<Row>,
@@ -105,6 +108,7 @@ impl Default for Tree {
         Self {
             root: WorkbenchPath::Local(PathBuf::new()),
             nodes: Vec::new(),
+            remote: None,
             expanded: HashSet::new(),
             show_hidden: false,
             rows: Vec::new(),
@@ -119,6 +123,7 @@ impl Tree {
         let mut tree = Self {
             root: WorkbenchPath::Local(root.to_path_buf()),
             nodes: Vec::new(),
+            remote: None,
             expanded: HashSet::new(),
             show_hidden,
             rows: Vec::new(),
@@ -133,21 +138,47 @@ impl Tree {
         Self {
             root,
             show_hidden,
+            remote: Some(RemoteTree::default()),
             ..Self::default()
         }
     }
 
-    pub fn replace_remote(&mut self, entries: Vec<ResourceEntry>) {
+    pub fn update_remote(&mut self, entries: &[ResourceEntry], removed: &[WorkbenchPath]) {
         let selected = self.selected().map(|row| row.path.clone());
-        self.nodes = remote_children(&self.root, &entries);
-        self.expanded.retain(|path| {
-            entries.iter().any(|entry| {
-                entry.path == *path && entry.kind == caudra_workspace::ResourceKind::Directory
-            })
-        });
+        let visible_change = entries
+            .iter()
+            .map(|entry| &entry.path)
+            .chain(removed)
+            .any(|path| {
+                path.parent()
+                    .is_some_and(|parent| parent == self.root || self.expanded.contains(&parent))
+            });
+        let Some(remote) = &mut self.remote else {
+            return;
+        };
+        for path in removed {
+            remote.remove(path);
+            self.expanded.remove(path);
+        }
+        for entry in entries {
+            remote.insert(entry.clone());
+            if entry.kind != ResourceKind::Directory {
+                self.expanded.remove(&entry.path);
+            }
+        }
+        if !visible_change {
+            return;
+        }
         self.rebuild_rows();
         if let Some(path) = selected {
             self.select_workbench_path(&path);
+        }
+    }
+
+    pub fn set_remote_root(&mut self, root: &WorkbenchPath) {
+        if self.remote.is_some() && &self.root != root {
+            self.root = root.clone();
+            self.rebuild_rows();
         }
     }
 
@@ -266,6 +297,9 @@ impl Tree {
     }
 
     pub fn resource(&self, path: &WorkbenchPath) -> Option<&ResourceEntry> {
+        if let Some(remote) = &self.remote {
+            return remote.entries.get(path);
+        }
         find_node(&self.nodes, path)?.resource.as_ref()
     }
 
@@ -424,7 +458,11 @@ impl Tree {
 
     fn rebuild_rows(&mut self) {
         let mut rows = Vec::with_capacity(self.rows.len().max(16));
-        flatten(&self.nodes, 0, false, &self.expanded, &mut rows);
+        if let Some(remote) = &self.remote {
+            remote.flatten(&self.root, 0, &self.expanded, &mut rows);
+        } else {
+            flatten(&self.nodes, 0, false, &self.expanded, &mut rows);
+        }
         self.rows = rows;
         self.selected = self.selected.min(self.rows.len().saturating_sub(1));
     }
@@ -585,39 +623,100 @@ fn read_dir(dir: &Path, show_hidden: bool) -> Vec<Node> {
     nodes
 }
 
-fn remote_children(parent: &WorkbenchPath, entries: &[ResourceEntry]) -> Vec<Node> {
-    let mut nodes = entries
-        .iter()
-        .filter(|entry| entry.path.parent().as_ref() == Some(parent))
-        .map(|entry| {
-            let kind = match entry.kind {
-                caudra_workspace::ResourceKind::Directory => EntryKind::Directory,
-                _ => EntryKind::File,
-            };
-            Node {
-                path: entry.path.clone(),
-                resource: Some(entry.clone()),
-                name: entry.path.file_name(),
-                kind,
-                ignored: false,
-                children: (kind == EntryKind::Directory)
-                    .then(|| remote_children(&entry.path, entries)),
+type RemoteKey = (bool, String, String);
+
+#[derive(Default)]
+struct RemoteTree {
+    entries: HashMap<WorkbenchPath, ResourceEntry>,
+    children: HashMap<WorkbenchPath, BTreeMap<RemoteKey, WorkbenchPath>>,
+    #[cfg(test)]
+    updates: usize,
+    #[cfg(test)]
+    visits: Cell<usize>,
+}
+
+impl RemoteTree {
+    fn key(entry: &ResourceEntry) -> RemoteKey {
+        let name = entry.path.file_name();
+        (
+            entry.kind != ResourceKind::Directory,
+            name.to_lowercase(),
+            name,
+        )
+    }
+
+    fn remove(&mut self, path: &WorkbenchPath) {
+        let Some(entry) = self.entries.remove(path) else {
+            return;
+        };
+        if let Some(parent) = path.parent()
+            && let Some(children) = self.children.get_mut(&parent)
+        {
+            children.remove(&Self::key(&entry));
+            if children.is_empty() {
+                self.children.remove(&parent);
             }
-        })
-        .collect::<Vec<_>>();
-    nodes.sort_by(|a, b| {
-        b.kind
-            .eq(&EntryKind::Directory)
-            .cmp(&a.kind.eq(&EntryKind::Directory))
-            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
-            .then_with(|| a.name.cmp(&b.name))
-    });
-    nodes
+        }
+    }
+
+    fn insert(&mut self, entry: ResourceEntry) {
+        #[cfg(test)]
+        {
+            self.updates += 1;
+        }
+        self.remove(&entry.path);
+        if let Some(parent) = entry.path.parent() {
+            self.children
+                .entry(parent)
+                .or_default()
+                .insert(Self::key(&entry), entry.path.clone());
+        }
+        self.entries.insert(entry.path.clone(), entry);
+    }
+
+    fn flatten(
+        &self,
+        parent: &WorkbenchPath,
+        depth: usize,
+        expanded: &HashSet<WorkbenchPath>,
+        rows: &mut Vec<Row>,
+    ) {
+        let Some(children) = self.children.get(parent) else {
+            return;
+        };
+        for ((file, _, name), path) in children {
+            #[cfg(test)]
+            self.visits.set(self.visits.get() + 1);
+            let Some(entry) = self.entries.get(path) else {
+                continue;
+            };
+            let is_expanded = !file && expanded.contains(path);
+            rows.push(Row {
+                path: path.clone(),
+                resource: Some(entry.clone()),
+                name: name.clone(),
+                depth,
+                kind: if *file {
+                    EntryKind::File
+                } else {
+                    EntryKind::Directory
+                },
+                expanded: is_expanded,
+                git: None,
+                agent_touched: false,
+                ignored: false,
+            });
+            if is_expanded {
+                self.flatten(path, depth + 1, expanded, rows);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{EntryKind, GitMark, Row, Tree};
+    use super::{ResourceEntry, ResourceKind, WorkbenchPath, WorkspacePath};
     use std::collections::HashSet;
     use std::fs;
     use std::path::Path;
@@ -640,6 +739,10 @@ mod tests {
     const CHAIN_GREEDY: &str = "a folder with more than one way on must keep its own row";
     const CURSOR_ADRIFT: &str = "the cursor must ride up to the folder that held its row";
     const LETTER_TIED: &str = "two marks would be indistinguishable";
+    const REMOTE_DIRECTORIES: usize = 128;
+    const REMOTE_CHILDREN: usize = 16;
+    const REMOTE_PAGE: usize = 32;
+    const REMOTE_LINEAR: &str = "remote indexing must touch only changed entries and visible rows";
     const MARKS: [GitMark; 5] = [
         GitMark::Modified,
         GitMark::Added,
@@ -660,6 +763,59 @@ mod tests {
         fs::write(root.join("src/main.rs"), "fn main() {}\n").unwrap();
         fs::write(root.join("src/nested/deep.rs"), "// deep\n").unwrap();
         tmp
+    }
+
+    #[test_case(false; "directories_first")]
+    #[test_case(true; "children_first")]
+    fn remote_parent_index_installs_many_pages_without_recursive_rebuilds(children_first: bool) {
+        let root = WorkbenchPath::Remote(WorkspacePath::root());
+        let mut tree = Tree::remote(root, false);
+        let entry = |path: String, kind| ResourceEntry {
+            path: WorkbenchPath::Remote(WorkspacePath::new(path).unwrap()),
+            resource_id: None,
+            revision: None,
+            kind,
+            size_bytes: None,
+        };
+        let directories = (0..REMOTE_DIRECTORIES)
+            .map(|index| entry(format!("dir-{index}"), ResourceKind::Directory))
+            .collect::<Vec<_>>();
+        let children = (0..REMOTE_DIRECTORIES)
+            .flat_map(|dir| {
+                (0..REMOTE_CHILDREN)
+                    .map(move |child| entry(format!("dir-{dir}/file-{child}"), ResourceKind::File))
+            })
+            .collect::<Vec<_>>();
+        if !children_first {
+            tree.update_remote(&directories, &[]);
+        }
+        for page in children.chunks(REMOTE_PAGE) {
+            tree.update_remote(page, &[]);
+        }
+        if children_first {
+            tree.update_remote(&directories, &[]);
+        }
+        let remote = tree.remote.as_ref().unwrap();
+        assert_eq!(
+            remote.updates,
+            directories.len() + children.len(),
+            "{REMOTE_LINEAR}"
+        );
+        assert_eq!(remote.visits.get(), directories.len(), "{REMOTE_LINEAR}");
+        assert_eq!(remote.children.len(), REMOTE_DIRECTORIES + 1);
+        assert_eq!(tree.rows().len(), REMOTE_DIRECTORIES);
+        let selected = children.last().unwrap();
+        tree.reveal_workbench_path(&selected.path);
+        assert_eq!(tree.selected().unwrap().path, selected.path);
+        assert_eq!(tree.rows().len(), REMOTE_DIRECTORIES + REMOTE_CHILDREN);
+        let before = tree.remote.as_ref().unwrap().updates;
+        tree.update_remote(&[], std::slice::from_ref(&selected.path));
+        assert!(tree.resource(&selected.path).is_none());
+        assert_eq!(
+            tree.remote.as_ref().unwrap().updates,
+            before,
+            "{REMOTE_LINEAR}"
+        );
     }
 
     fn names(tree: &Tree) -> Vec<String> {

@@ -13,7 +13,7 @@ use ignore::WalkBuilder;
 use nucleo::pattern::{CaseMatching, Normalization, Pattern};
 use nucleo::{Config, Matcher, Utf32Str};
 
-use crate::fs::backend::ResourceEntry;
+use crate::fs::backend::{ResourceEntry, WorkbenchPath};
 
 const MAX_FILES: usize = 20_000;
 const MAX_MATCHES: usize = 200;
@@ -142,15 +142,23 @@ impl QuickOpen {
         self.remote.get(&self.files[index]).cloned()
     }
 
-    pub fn replace_remote_entries(&mut self, entries: &[ResourceEntry]) {
-        if self.remote.is_empty() && !self.open {
+    pub fn update_remote_entries(&mut self, entries: &[ResourceEntry], removed: &[WorkbenchPath]) {
+        if !self.open {
             return;
         }
-        let query = self.query.clone();
-        let open = self.open;
-        self.open_remote(entries.to_vec());
-        self.open = open;
-        self.query = query;
+        for path in removed {
+            self.remote.remove(&path.display());
+        }
+        for entry in entries {
+            let path = entry.path.display();
+            if entry.kind == caudra_workspace::ResourceKind::File {
+                self.remote.insert(path, entry.clone());
+            } else {
+                self.remote.remove(&path);
+            }
+        }
+        self.files = self.remote.keys().cloned().collect();
+        self.files.sort();
         self.rescan();
     }
 

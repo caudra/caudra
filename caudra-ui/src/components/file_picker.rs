@@ -18,7 +18,7 @@ use caudra_grab::grab_scope;
 use caudra_workbench::{
     BackendDriver, BackendError, BackendEvent, ResourceEntry, WorkbenchBackend, WorkbenchPath,
 };
-use caudra_workspace::{ResourceKind, WorkspacePath, WorkspaceSession};
+use caudra_workspace::{WorkspacePath, WorkspaceSession};
 
 use crate::animation::spinner_frame;
 use crate::components::Overlay;
@@ -93,6 +93,29 @@ struct Session {
 impl Drop for Session {
     fn drop(&mut self) {
         self.cancel.store(true, Ordering::Relaxed);
+    }
+}
+
+impl Session {
+    fn apply_remote(&mut self, entries: Vec<ResourceEntry>, removed: Vec<WorkbenchPath>) {
+        let (mut added, reset) =
+            file_walk::apply_remote_entries(&mut self.remote_resources, entries, removed);
+        if reset {
+            self.nucleo.restart(true);
+            self.matches.clear();
+            self.total_matches = 0;
+            self.selected = 0;
+            self.scroll_offset = 0;
+            self.row_hits.clear();
+            self.mouse_down = None;
+            added = self.remote_resources.keys().cloned().collect();
+        }
+        let injector = self.nucleo.injector();
+        for path in added {
+            injector.push((), |_, columns| {
+                columns[0] = Utf32String::from(path.as_str())
+            });
+        }
     }
 }
 
@@ -337,38 +360,45 @@ impl FilePickerModal {
         };
 
         let mut remote_error = None;
-        if let Some(backend) = &mut s.backend {
-            for event in backend.drain() {
-                if let BackendEvent::Listed { result, .. } = event {
+        let mut remote_changed = false;
+        if let Some(events) = s.backend.as_mut().map(BackendDriver::drain) {
+            for event in events {
+                if let BackendEvent::Listed {
+                    result,
+                    complete,
+                    removed,
+                    ..
+                } = event
+                {
+                    remote_changed = true;
                     match result {
                         Ok(result) => {
-                            let injector = s.nucleo.injector();
-                            for entry in result.entries {
-                                let mut path = entry.path.display();
-                                if entry.kind == ResourceKind::Directory {
-                                    path.push('/');
-                                }
-                                injector.push((), |_, columns| {
-                                    columns[0] = Utf32String::from(path.as_str());
-                                });
-                                s.remote_resources.insert(path, entry);
+                            s.apply_remote(result.entries, removed);
+                            if complete {
+                                s.walk = Walk::Listed;
                             }
-                            s.walk = Walk::Listed;
                         }
-                        Err(error) => remote_error = Some(error.to_string()),
+                        Err(error) => {
+                            if complete {
+                                s.walk = Walk::Listed;
+                            }
+                            remote_error = Some(error.to_string());
+                        }
                     }
                 }
             }
         }
         if let Some(error) = remote_error {
-            self.session = None;
+            if s.remote_resources.is_empty() {
+                self.session = None;
+            }
             return (Dirty::YES, Some(error));
         }
 
         let status = s.nucleo.tick(0);
         s.matching = status.running;
         // The title says "scanning…" while walking, so finishing redraws too.
-        let mut dirty = Dirty::from(status.changed);
+        let mut dirty = Dirty::from(status.changed || remote_changed);
 
         if s.walk == Walk::Running
             && let Some(done_rx) = &s.done_rx
@@ -663,6 +693,7 @@ mod tests {
     use crate::components::file_walk::NOTHING_TO_PICK_MSG;
     use crate::components::keybindings::key as kb;
     use crate::repaint::expect::{OWED, QUIET};
+    use caudra_workspace::ResourceKind;
     use crossterm::event::{KeyEventKind, KeyEventState, KeyModifiers};
     use std::time::Duration;
     use tempfile::TempDir;
@@ -685,9 +716,13 @@ mod tests {
     const OVERFLOWING_MATCHES: usize = 50;
 
     const MAIN_PATH: &str = "src/main.rs";
+    const MAIN_PARENT: &str = "src/";
+    const MAIN_WITH_PARENT_ROWS: usize = 2;
     const README_PATH: &str = "docs/readme.md";
     const README_QUERY: &str = "readme";
     const MAIN_FILE: &str = "main.rs";
+    const REMOTE_RECONCILED: &str =
+        "the matcher and resource map must agree after a removal or type change";
 
     /// Ticks until `ready` holds, collecting the frames owed on the way, or
     /// `None` if the picker never got there.
@@ -1289,7 +1324,89 @@ mod tests {
         assert!(session.mouse_down.is_none());
     }
 
-    struct RemotePickerFilesystem;
+    struct RemotePickerFilesystem {
+        fail_recursive: bool,
+    }
+
+    #[test_case(ResourceKind::File, None; "withdrawn_file")]
+    #[test_case(ResourceKind::File, Some(ResourceKind::Directory); "file_becomes_directory")]
+    #[test_case(ResourceKind::Directory, Some(ResourceKind::File); "directory_becomes_file")]
+    fn remote_picker_reconciles_matcher_rows(
+        first: ResourceKind,
+        replacement: Option<ResourceKind>,
+    ) {
+        let (mut picker, _done) = pending_picker();
+        let entry = ResourceEntry {
+            path: WorkbenchPath::Remote(WorkspacePath::new(MAIN_PATH).unwrap()),
+            resource_id: None,
+            revision: None,
+            kind: first,
+            size_bytes: None,
+        };
+        let other = ResourceEntry {
+            path: WorkbenchPath::Remote(WorkspacePath::new(README_PATH).unwrap()),
+            kind: ResourceKind::File,
+            ..entry.clone()
+        };
+        picker
+            .session
+            .as_mut()
+            .unwrap()
+            .apply_remote(vec![entry.clone(), other], Vec::new());
+        assert!(
+            tick_until(&mut picker, |session| session.matches.len() == 2).is_some(),
+            "{NEVER_CONVERGED}"
+        );
+        let (entries, removed) = match replacement {
+            Some(kind) => (
+                vec![ResourceEntry {
+                    kind,
+                    ..entry.clone()
+                }],
+                Vec::new(),
+            ),
+            None => (Vec::new(), vec![entry.path]),
+        };
+        picker
+            .session
+            .as_mut()
+            .unwrap()
+            .apply_remote(entries, removed);
+        let expected = 1 + usize::from(replacement.is_some());
+        assert!(
+            tick_until(&mut picker, |session| session.matches.len() == expected
+                && !session.matching)
+            .is_some(),
+            "{NEVER_CONVERGED}"
+        );
+        let session = picker.session.as_ref().unwrap();
+        assert_eq!(
+            session.remote_resources.len(),
+            expected,
+            "{REMOTE_RECONCILED}"
+        );
+        assert_eq!(
+            session.nucleo.injector().injected_items() as usize,
+            expected,
+            "{REMOTE_RECONCILED}"
+        );
+        assert!(
+            session
+                .matches
+                .iter()
+                .all(|row| session.remote_resources.contains_key(&row.path)),
+            "{REMOTE_RECONCILED}"
+        );
+        let old = if first == ResourceKind::Directory {
+            format!("{MAIN_PATH}/")
+        } else {
+            MAIN_PATH.to_owned()
+        };
+        assert!(
+            !session.matches.iter().any(|row| row.path == old),
+            "{REMOTE_RECONCILED}"
+        );
+    }
 
     #[async_trait::async_trait]
     impl caudra_workbench::WorkbenchFilesystem for RemotePickerFilesystem {
@@ -1300,9 +1417,14 @@ mod tests {
         async fn list(
             &self,
             _parent: &WorkbenchPath,
-            _recursive: bool,
+            recursive: bool,
             _continuation: Option<caudra_workspace::ContinuationToken>,
         ) -> Result<caudra_workbench::ListResult, BackendError> {
+            if recursive && self.fail_recursive {
+                return Err(BackendError::Workspace(
+                    caudra_workspace::WorkspaceError::Unavailable,
+                ));
+            }
             Ok(caudra_workbench::ListResult {
                 entries: vec![ResourceEntry {
                     path: WorkbenchPath::Remote(WorkspacePath::new(MAIN_PATH).unwrap()),
@@ -1385,12 +1507,15 @@ mod tests {
         }
     }
 
-    #[test]
-    fn remote_picker_materializes_backend_resources_without_local_filesystem_calls() {
+    #[test_case(false; "streamed_pages_are_deduplicated")]
+    #[test_case(true; "late_failure_retains_results")]
+    fn remote_picker_materializes_backend_resources_without_local_filesystem_calls(
+        fail_recursive: bool,
+    ) {
         caudra_workbench::LocalFilesystem::reset_call_count();
         let (mut picker, _done) = pending_picker();
         let root = WorkbenchPath::Remote(WorkspacePath::root());
-        let backend = WorkbenchBackend::custom(Arc::new(RemotePickerFilesystem));
+        let backend = WorkbenchBackend::custom(Arc::new(RemotePickerFilesystem { fail_recursive }));
         let mut driver = BackendDriver::new(backend, root.clone());
         driver.list(root, true);
         let session = picker.session.as_mut().unwrap();
@@ -1398,11 +1523,26 @@ mod tests {
         session.backend = Some(driver);
 
         assert!(
-            tick_until(&mut picker, |session| !session.matches.is_empty()).is_some(),
+            tick_until(&mut picker, |session| session.walk == Walk::Listed
+                && session.matches.len() == MAIN_WITH_PARENT_ROWS)
+            .is_some(),
             "{NEVER_CONVERGED}"
         );
-        let session = picker.session.as_ref().unwrap();
+        let session = picker.session.as_mut().unwrap();
+        assert_eq!(
+            session.nucleo.injector().injected_items() as usize,
+            MAIN_WITH_PARENT_ROWS
+        );
+        assert_eq!(
+            session.remote_resources[MAIN_PARENT].kind,
+            ResourceKind::Directory
+        );
         assert!(session.remote_resources[MAIN_PATH].resource_id.is_some());
+        session.selected = session
+            .matches
+            .iter()
+            .position(|row| row.path == MAIN_PATH)
+            .unwrap();
         assert!(matches!(
             picker.handle_key(key(KeyCode::Enter)),
             FilePickerModalAction::Select(path) if path == MAIN_PATH

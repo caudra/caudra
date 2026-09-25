@@ -39,7 +39,9 @@ use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use caudra_workspace::{ScmDiffTarget, ScmMutation, ScmRevision, ScmSide, WorkspacePath};
+use caudra_workspace::{
+    ScmDiffTarget, ScmMutation, ScmRevision, ScmSide, WorkspaceError, WorkspacePath,
+};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
 use serde::{Deserialize, Serialize};
@@ -53,7 +55,8 @@ use fs::watch::Watch;
 use menu::{Action as MenuAction, Menu, Target};
 use quick_open::QuickOpen;
 use scm::backend::{
-    CommitFilesResult, DiffResult as RemoteDiffResult, Driver as ScmDriver, Event as ScmEvent,
+    CommitFilesResult, DiffResult as RemoteDiffResult, Driver as ScmDriver,
+    Error as ScmBackendError, Event as ScmEvent,
 };
 use scm::repo::Commit;
 use scm::{MIN_SECTION_ROWS, Scm, Section};
@@ -90,6 +93,10 @@ const RENAME_PROMPT: &str = "Rename: ";
 const NEW_FILE_PROMPT: &str = "New file: ";
 const NEW_FOLDER_PROMPT: &str = "New folder: ";
 const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
+const WATCH_WARNING: &str = "Remote live updates are unavailable; manual refresh still works";
+const LISTING_INCOMPLETE: &str =
+    "Remote file listing is incomplete; keeping previously loaded entries";
+const MAX_REMOTE_READS: usize = 8;
 /// Where a workspace session files the tabs it synthesises from the repository,
 /// which name no path the workspace itself would serve.
 const SCM_SYNTHETIC_ROOT: &str = ".caudra-scm";
@@ -372,6 +379,13 @@ enum OpenPurpose {
     Discard,
 }
 
+#[derive(Debug)]
+struct PendingOpen {
+    path: WorkbenchPath,
+    purpose: OpenPurpose,
+    invalidated: bool,
+}
+
 impl InputKind {
     fn label(self) -> &'static str {
         match self {
@@ -469,20 +483,18 @@ pub struct Workbench {
     search: Search,
     remote_backend: Option<BackendDriver>,
     remote_scm: Option<ScmDriver>,
-    remote_entries: Vec<ResourceEntry>,
+    remote_entries: HashMap<WorkbenchPath, ResourceEntry>,
     remote_pending: HashSet<RequestId>,
-    pending_open: HashMap<RequestId, OpenPurpose>,
+    pending_open: HashMap<RequestId, PendingOpen>,
     pending_save: HashMap<RequestId, WorkbenchPath>,
     pending_create: HashMap<RequestId, InputKind>,
     pending_count: HashMap<RequestId, WorkbenchPath>,
     pending_lines: HashMap<WorkbenchPath, RangeInclusive<usize>>,
-    deferred_open: HashMap<WorkbenchPath, OpenPurpose>,
     /// The commit whose detail tab is waiting on the asynchronous walk that
     /// lists what it changed. Only a workspace session ever sets it; a local
     /// repository answers the same question in the same breath.
     pending_commit_detail: Option<String>,
     delete_target: Option<ResourceEntry>,
-    remote_invalidated: HashSet<WorkbenchPath>,
     /// Started when the workbench opens and dropped when it closes, so a tree
     /// nobody is looking at costs no kernel handles.
     watch: Option<Watch>,
@@ -549,17 +561,15 @@ impl Workbench {
             search: Search::default(),
             remote_backend: None,
             remote_scm: None,
-            remote_entries: Vec::new(),
+            remote_entries: HashMap::new(),
             remote_pending: HashSet::new(),
             pending_open: HashMap::new(),
             pending_save: HashMap::new(),
             pending_create: HashMap::new(),
             pending_count: HashMap::new(),
             pending_lines: HashMap::new(),
-            deferred_open: HashMap::new(),
             pending_commit_detail: None,
             delete_target: None,
-            remote_invalidated: HashSet::new(),
             watch: None,
             touched: HashSet::new(),
             drag: Drag::None,
@@ -606,6 +616,10 @@ impl Workbench {
 
     pub fn close(&mut self) {
         self.open = false;
+        self.cancel_pending_opens();
+        for tab in self.editor.tabs_mut() {
+            tab.remote_reload = false;
+        }
         self.watch = None;
         // A clean document says nothing the host does not already hold, and
         // left open it would go stale behind the next change to the host's copy.
@@ -613,6 +627,9 @@ impl Workbench {
             .close_where(&|tab| tab.document.is_some() && !tab.is_dirty());
         if let Some(backend) = &mut self.remote_backend {
             backend.close_watch();
+            if let Some(request) = backend.cancel_listing() {
+                self.remote_pending.remove(&request);
+            }
         }
         if !self.remote_pending.is_empty()
             || self.remote_scm.as_ref().is_some_and(ScmDriver::is_busy)
@@ -631,9 +648,7 @@ impl Workbench {
         self.pending_create.clear();
         self.pending_count.clear();
         self.pending_lines.clear();
-        self.deferred_open.clear();
         self.delete_target = None;
-        self.remote_invalidated.clear();
     }
 
     pub fn bind_workspace(
@@ -680,9 +695,7 @@ impl Workbench {
         self.pending_create.clear();
         self.pending_count.clear();
         self.pending_lines.clear();
-        self.deferred_open.clear();
         self.delete_target = None;
-        self.remote_invalidated.clear();
         self.tree = Tree::remote(root.clone(), self.show_hidden);
         if reload && let Some(driver) = &mut self.remote_backend {
             driver.open_watch();
@@ -726,9 +739,7 @@ impl Workbench {
         self.pending_create.clear();
         self.pending_count.clear();
         self.pending_lines.clear();
-        self.deferred_open.clear();
         self.delete_target = None;
-        self.remote_invalidated.clear();
     }
 
     pub fn open(&mut self, root: &Path) {
@@ -831,10 +842,10 @@ impl Workbench {
         }
         self.open = true;
         let path = WorkbenchPath::Remote(path);
+        self.open_workbench_path(&path, OpenPurpose::Open);
         if let Some(lines) = lines {
             self.pending_lines.insert(path.clone(), lines);
         }
-        self.open_workbench_path(&path, OpenPurpose::Open);
         self.show_explorer();
     }
 
@@ -976,6 +987,11 @@ impl Workbench {
     /// again rather than sleeping until the next key.
     pub fn is_busy(&self) -> bool {
         !self.remote_pending.is_empty()
+            || (self.open && self.editor.tabs().iter().any(|tab| tab.remote_reload))
+            || self
+                .remote_backend
+                .as_ref()
+                .is_some_and(BackendDriver::is_listing)
             || self.remote_scm.as_ref().is_some_and(ScmDriver::is_busy)
             || self.search.is_running()
             || self.edge_scroll_delta() != 0
@@ -1012,6 +1028,10 @@ impl Workbench {
                         self.scm.apply_workspace_snapshot(snapshot);
                         self.apply_marks();
                     }
+                    Err(ScmBackendError::Workspace(WorkspaceError::NotRepository)) => {
+                        self.scm.clear_workspace_repository();
+                        self.apply_marks();
+                    }
                     Err(error) => self.scm.fail_workspace_refresh(error),
                 },
                 ScmEvent::Diffed { result, .. } => match result {
@@ -1026,8 +1046,9 @@ impl Workbench {
                     mutation, result, ..
                 } => {
                     if let ScmMutation::Discard { paths } = &mutation {
-                        self.remote_invalidated
-                            .extend(paths.iter().cloned().map(WorkbenchPath::Remote));
+                        for path in paths {
+                            self.invalidate_remote(Some(&WorkbenchPath::Remote(path.clone())));
+                        }
                         self.refresh_remote_tree();
                     }
                     if let Err(error) = result {
@@ -1041,10 +1062,39 @@ impl Workbench {
     }
 
     fn drain_remote_backend(&mut self) -> bool {
+        let visible = self.sidebar_rows().max(1);
         let Some(backend) = &mut self.remote_backend else {
             return false;
         };
+        backend.set_pinned_paths(
+            self.editor
+                .active()
+                .map(|tab| tab.path.clone())
+                .into_iter()
+                .chain(self.tree.selected().map(|row| row.path.clone()))
+                .chain(
+                    self.editor
+                        .tabs()
+                        .iter()
+                        .filter(|tab| tab.resource.is_some())
+                        .map(|tab| tab.path.clone()),
+                )
+                .chain(
+                    self.pending_open
+                        .values()
+                        .map(|pending| pending.path.clone()),
+                )
+                .chain(
+                    self.tree
+                        .rows()
+                        .iter()
+                        .skip(self.tree.scroll())
+                        .take(visible)
+                        .map(|row| row.path.clone()),
+                ),
+        );
         let events = backend.drain();
+        self.tree.set_remote_root(backend.root());
         let changed = !events.is_empty();
         for event in events {
             let scm_invalidate = matches!(
@@ -1056,22 +1106,46 @@ impl Workbench {
             );
             match event {
                 BackendEvent::Listed {
-                    request, result, ..
+                    request,
+                    result,
+                    complete,
+                    removed,
+                    ..
                 } => {
-                    self.remote_pending.remove(&request);
+                    if complete {
+                        self.remote_pending.remove(&request);
+                    }
                     match result {
-                        Ok(result) => self.apply_remote_listing(result),
+                        Ok(result) => self.apply_remote_listing(result, complete, removed),
                         Err(error) => self.flash = Some(error.to_string()),
                     }
                 }
                 BackendEvent::Opened { request, result } => {
                     self.remote_pending.remove(&request);
-                    let purpose = self.pending_open.remove(&request);
-                    match (purpose, result) {
-                        (Some(purpose), Ok(loaded)) => self.apply_remote_open(purpose, loaded),
-                        (Some(_), Err(error)) => {
-                            if matches!(error, BackendError::Indeterminate) {
-                                self.refresh_remote_tree();
+                    let pending = self.pending_open.remove(&request);
+                    match (pending, result) {
+                        (Some(pending), Ok(loaded)) => {
+                            self.apply_remote_open(pending.purpose, loaded);
+                            if pending.invalidated {
+                                self.invalidate_remote(Some(&pending.path));
+                            }
+                        }
+                        (Some(pending), Err(error)) => {
+                            self.pending_lines.remove(&pending.path);
+                            if let Some(tab) = self
+                                .editor
+                                .tabs_mut()
+                                .iter_mut()
+                                .find(|tab| tab.path == pending.path)
+                            {
+                                tab.remote_reload = false;
+                            }
+                            if pending.invalidated {
+                                self.invalidate_remote(Some(&pending.path));
+                            } else if pending.purpose == OpenPurpose::Reload
+                                && matches!(error, BackendError::NotFound)
+                            {
+                                self.close_tabs_under(&pending.path);
                             }
                             self.flash = Some(error.to_string());
                         }
@@ -1104,7 +1178,7 @@ impl Workbench {
                                 tab.conflict = true;
                             }
                             self.flash = Some(error.to_string());
-                            self.remote_invalidated.insert(path);
+                            self.invalidate_remote(Some(&path));
                             self.refresh_remote_tree();
                         }
                         (None, _) => {}
@@ -1119,7 +1193,7 @@ impl Workbench {
                             self.refresh_remote_tree();
                         }
                         (Some(InputKind::NewFolder), Ok(entry)) => {
-                            self.remote_invalidated.insert(entry.path);
+                            self.invalidate_remote(Some(&entry.path));
                             self.refresh_remote_tree();
                         }
                         (Some(_), Err(error)) => {
@@ -1139,16 +1213,13 @@ impl Workbench {
                     self.remote_pending.remove(&request);
                     match result {
                         Ok(entry) => {
-                            self.editor.rename_resource(
-                                &source,
-                                &entry.path,
-                                Some(entry.clone()),
-                                self.theme_generation,
-                            );
-                            self.remote_invalidated.insert(entry.path);
+                            self.apply_remote_rename(&source, &entry);
                             self.refresh_remote_tree();
                         }
                         Err(error) => {
+                            if matches!(error, BackendError::Conflict) {
+                                self.mark_remote_conflict(&source);
+                            }
                             if matches!(error, BackendError::Indeterminate) {
                                 self.refresh_remote_tree();
                             }
@@ -1168,6 +1239,9 @@ impl Workbench {
                             self.refresh_remote_tree();
                         }
                         Err(error) => {
+                            if matches!(error, BackendError::Conflict) {
+                                self.mark_remote_conflict(&path);
+                            }
                             if matches!(error, BackendError::Indeterminate) {
                                 self.refresh_remote_tree();
                             }
@@ -1180,11 +1254,7 @@ impl Workbench {
                     let path = self.pending_count.remove(&request);
                     match (path, result) {
                         (Some(path), Ok(count)) => {
-                            self.delete_target = self
-                                .remote_entries
-                                .iter()
-                                .find(|entry| entry.path == path)
-                                .cloned();
+                            self.delete_target = self.mutation_resource(&path);
                             self.confirm = Some(Confirm {
                                 ask: Ask::Delete(count),
                                 choice: Choice::Cancel,
@@ -1201,80 +1271,49 @@ impl Workbench {
                         Err(error) => self.search.fail_remote(request, error.to_string()),
                     }
                 }
-                BackendEvent::WatchPolled(Ok(result)) => self.apply_remote_watch(result),
-                BackendEvent::WatchOpened(Err(error)) | BackendEvent::WatchPolled(Err(error)) => {
-                    self.flash = Some(error.to_string())
+                BackendEvent::WatchPolled {
+                    result: Ok(result), ..
+                } => self.apply_remote_watch(result),
+                BackendEvent::WatchOpened { result: Err(_), .. }
+                | BackendEvent::WatchPolled { result: Err(_), .. } => {
+                    self.flash = Some(WATCH_WARNING.to_owned())
                 }
-                BackendEvent::WatchOpened(Ok(_)) => {}
+                BackendEvent::WatchOpened {
+                    result: Ok(Some(_)),
+                    ..
+                } => self.invalidate_remote(None),
+                BackendEvent::WatchOpened {
+                    result: Ok(None), ..
+                } => {}
             }
             if scm_invalidate {
                 self.refresh_remote_scm();
             }
         }
+        self.reload_remote_targets();
         changed
     }
 
-    fn apply_remote_listing(&mut self, result: ListResult) {
-        self.remote_entries = result.entries;
-        for tab in self.editor.tabs_mut() {
-            if !tab.is_dirty()
-                && let Some(entry) = self
-                    .remote_entries
-                    .iter()
-                    .find(|entry| entry.path == tab.path)
-            {
-                tab.resource = Some(entry.clone());
-            }
+    fn apply_remote_listing(
+        &mut self,
+        result: ListResult,
+        complete: bool,
+        removed: Vec<WorkbenchPath>,
+    ) {
+        if complete && result.incomplete {
+            self.flash = Some(LISTING_INCOMPLETE.to_owned());
         }
-        self.tree.replace_remote(self.remote_entries.clone());
-        self.palette.replace_remote_entries(&self.remote_entries);
-        let deferred = std::mem::take(&mut self.deferred_open);
-        for (path, purpose) in deferred {
-            if let Some(entry) = self
-                .remote_entries
-                .iter()
-                .find(|entry| entry.path == path)
-                .cloned()
-            {
-                self.request_remote_open(entry, purpose);
-            } else {
-                self.pending_lines.remove(&path);
-                self.flash = Some(format!("remote file does not exist: {}", path.display()));
+        if !result.entries.is_empty() || !removed.is_empty() {
+            self.tree.update_remote(&result.entries, &removed);
+            self.palette
+                .update_remote_entries(&result.entries, &removed);
+            for path in &removed {
+                self.remote_entries.remove(path);
             }
-        }
-        let invalidated = std::mem::take(&mut self.remote_invalidated);
-        for path in invalidated {
-            let Some(entry) = self
-                .remote_entries
-                .iter()
-                .find(|entry| entry.path == path)
-                .cloned()
-            else {
-                self.editor.close_where(&|tab| tab.path == path);
-                continue;
-            };
-            let purpose = match self
-                .editor
-                .tabs()
-                .iter()
-                .find(|tab| tab.path == path)
-                .map(Tab::is_dirty)
-            {
-                Some(true) => {
-                    if let Some(tab) = self
-                        .editor
-                        .tabs_mut()
-                        .iter_mut()
-                        .find(|tab| tab.path == path)
-                    {
-                        tab.conflict = true;
-                    }
-                    continue;
-                }
-                Some(false) => OpenPurpose::Reload,
-                None => continue,
-            };
-            self.request_remote_open(entry, purpose);
+            for entry in result.entries {
+                self.remote_entries.insert(entry.path.clone(), entry);
+            }
+            self.apply_marks();
         }
     }
 
@@ -1319,23 +1358,15 @@ impl Workbench {
             WatchUpdate::Events(events) => {
                 let refresh = !events.is_empty();
                 for event in events {
-                    self.remote_invalidated
-                        .insert(WorkbenchPath::Remote(event.path));
+                    self.invalidate_remote(Some(&WorkbenchPath::Remote(event.path)));
                     if let Some(previous) = event.previous_path {
-                        self.remote_invalidated
-                            .insert(WorkbenchPath::Remote(previous));
+                        self.invalidate_remote(Some(&WorkbenchPath::Remote(previous)));
                     }
                 }
                 refresh
             }
             WatchUpdate::Resync => {
-                self.remote_invalidated.extend(
-                    self.editor
-                        .tabs()
-                        .iter()
-                        .filter(|tab| tab.path.remote().is_some())
-                        .map(|tab| tab.path.clone()),
-                );
+                self.invalidate_remote(None);
                 true
             }
         };
@@ -1345,12 +1376,168 @@ impl Workbench {
     }
 
     fn request_remote_open(&mut self, entry: ResourceEntry, purpose: OpenPurpose) {
+        self.start_remote_read(entry.path.clone(), purpose, Some(entry));
+    }
+
+    fn apply_remote_rename(&mut self, source: &WorkbenchPath, destination: &ResourceEntry) {
+        let requests = self
+            .pending_open
+            .iter()
+            .filter(|(_, pending)| pending.path.starts_with(source))
+            .map(|(request, _)| *request)
+            .collect::<Vec<_>>();
+        let mut retry = Vec::new();
+        for request in requests {
+            let Some(pending) = self.pending_open.remove(&request) else {
+                continue;
+            };
+            if let Some(backend) = &mut self.remote_backend {
+                backend.cancel_open(request);
+            }
+            self.remote_pending.remove(&request);
+            let lines = self.pending_lines.remove(&pending.path);
+            if pending.purpose == OpenPurpose::Reload {
+                if let Some(tab) = self
+                    .editor
+                    .tabs_mut()
+                    .iter_mut()
+                    .find(|tab| tab.path == pending.path)
+                {
+                    tab.remote_reload = !tab.is_dirty();
+                    tab.conflict |= tab.is_dirty();
+                }
+                continue;
+            }
+            let moved = if &pending.path == source {
+                Ok(destination.path.clone())
+            } else {
+                destination
+                    .path
+                    .join(&pending.path.display_relative(source))
+            };
+            match moved {
+                Ok(path) => retry.push((path, pending.purpose, lines)),
+                Err(error) => self.flash = Some(error.to_string()),
+            }
+        }
+        self.editor.rename_resource(
+            source,
+            &destination.path,
+            Some(destination.clone()),
+            self.theme_generation,
+        );
+        for tab in self.editor.tabs_mut() {
+            if tab.path.starts_with(&destination.path) && tab.resource.is_some() && !tab.is_dirty()
+            {
+                tab.remote_reload = true;
+            }
+        }
+        for (path, purpose, lines) in retry {
+            self.request_remote_path(path.clone(), purpose);
+            if let Some(lines) = lines {
+                self.pending_lines.insert(path, lines);
+            }
+        }
+    }
+
+    fn request_remote_path(&mut self, path: WorkbenchPath, purpose: OpenPurpose) {
+        let entry = matches!(purpose, OpenPurpose::Open | OpenPurpose::Preview)
+            .then(|| self.remote_entries.get(&path).cloned())
+            .flatten();
+        self.start_remote_read(path, purpose, entry);
+    }
+
+    fn start_remote_read(
+        &mut self,
+        path: WorkbenchPath,
+        purpose: OpenPurpose,
+        entry: Option<ResourceEntry>,
+    ) {
+        if self
+            .pending_open
+            .values()
+            .any(|pending| pending.path == path)
+        {
+            if purpose == OpenPurpose::Reload {
+                return;
+            }
+            self.cancel_pending_opens();
+        }
+        if self.pending_open.len() >= MAX_REMOTE_READS {
+            if purpose == OpenPurpose::Reload {
+                return;
+            }
+            self.cancel_pending_opens();
+        }
         let Some(backend) = &mut self.remote_backend else {
             return;
         };
-        let request = backend.open(entry);
+        let request = match entry {
+            Some(entry) => backend.open(entry),
+            None => backend.open_path(path.clone()),
+        };
         self.remote_pending.insert(request);
-        self.pending_open.insert(request, purpose);
+        self.pending_open.insert(
+            request,
+            PendingOpen {
+                path: path.clone(),
+                purpose,
+                invalidated: false,
+            },
+        );
+        if let Some(tab) = self
+            .editor
+            .tabs_mut()
+            .iter_mut()
+            .find(|tab| tab.path == path)
+        {
+            tab.remote_reload = false;
+        }
+    }
+
+    fn invalidate_remote(&mut self, path: Option<&WorkbenchPath>) {
+        for tab in self.editor.tabs_mut() {
+            if tab.resource.is_some()
+                && tab.path.remote().is_some()
+                && path.is_none_or(|path| tab.path.starts_with(path))
+            {
+                if tab.is_dirty() {
+                    tab.conflict = true;
+                    tab.remote_reload = false;
+                } else {
+                    tab.remote_reload = true;
+                }
+            }
+        }
+        for pending in self.pending_open.values_mut() {
+            if path.is_none_or(|path| pending.path.starts_with(path)) {
+                pending.invalidated = true;
+            }
+        }
+    }
+
+    fn reload_remote_targets(&mut self) {
+        if !self.open {
+            return;
+        }
+        let available = MAX_REMOTE_READS.saturating_sub(self.pending_open.len());
+        let paths = self
+            .editor
+            .tabs()
+            .iter()
+            .filter(|tab| {
+                tab.remote_reload
+                    && !self
+                        .pending_open
+                        .values()
+                        .any(|pending| pending.path == tab.path)
+            })
+            .take(available)
+            .map(|tab| tab.path.clone())
+            .collect::<Vec<_>>();
+        for path in paths {
+            self.request_remote_path(path, OpenPurpose::Reload);
+        }
     }
 
     fn cancel_pending_opens(&mut self) {
@@ -1358,8 +1545,20 @@ impl Workbench {
             return;
         };
         for request in self.pending_open.keys().copied().collect::<Vec<_>>() {
-            backend.cancel(request);
+            backend.cancel_open(request);
             self.remote_pending.remove(&request);
+        }
+        for pending in self.pending_open.values() {
+            self.pending_lines.remove(&pending.path);
+            if pending.purpose == OpenPurpose::Reload
+                && let Some(tab) = self
+                    .editor
+                    .tabs_mut()
+                    .iter_mut()
+                    .find(|tab| tab.path == pending.path)
+            {
+                tab.remote_reload = true;
+            }
         }
         self.pending_open.clear();
     }
@@ -2041,17 +2240,13 @@ impl Workbench {
                 return;
             }
         };
+        let entry = self.mutation_resource(&input.at);
         let Some(backend) = &mut self.remote_backend else {
             return;
         };
         let request = match input.kind {
             InputKind::Rename => {
-                let Some(entry) = self
-                    .remote_entries
-                    .iter()
-                    .find(|entry| entry.path == input.at)
-                    .cloned()
-                else {
+                let Some(entry) = entry else {
                     self.flash = Some(BackendError::MissingRevision.to_string());
                     return;
                 };
@@ -2632,7 +2827,8 @@ impl Workbench {
         if keys::QUICK_OPEN.matches(key) {
             self.palette.set_priority(self.other_tabs());
             if self.remote_backend.is_some() {
-                self.palette.open_remote(self.remote_entries.clone());
+                self.palette
+                    .open_remote(self.remote_entries.values().cloned().collect());
             } else {
                 self.palette.open(&self.root, self.show_hidden);
             }
@@ -2643,13 +2839,7 @@ impl Workbench {
                 // Only what the workspace serves can be asked for again. Anything
                 // else, such as a host's document, would read as a path it no
                 // longer lists and be closed.
-                self.remote_invalidated.extend(
-                    self.editor
-                        .tabs()
-                        .iter()
-                        .filter(|tab| tab.path.remote().is_some())
-                        .map(|tab| tab.path.clone()),
-                );
+                self.invalidate_remote(None);
                 self.refresh_remote_tree();
             } else {
                 self.tree.reload();
@@ -2846,16 +3036,7 @@ impl Workbench {
             }
             if self.remote_backend.is_some() {
                 let path = self.editor.active()?.path.clone();
-                let Some(entry) = self
-                    .remote_entries
-                    .iter()
-                    .find(|entry| entry.path == path)
-                    .cloned()
-                else {
-                    self.flash = Some("remote file revision is still refreshing".into());
-                    return Some(WorkbenchAction::Consumed);
-                };
-                self.request_remote_open(entry, OpenPurpose::Discard);
+                self.request_remote_path(path, OpenPurpose::Discard);
                 return Some(WorkbenchAction::Consumed);
             }
             let outcome = self.editor.active_mut()?.discard_and_reload();
@@ -3767,21 +3948,7 @@ impl Workbench {
             if matches!(purpose, OpenPurpose::Open | OpenPurpose::Preview) {
                 self.cancel_pending_opens();
             }
-            let entry = self
-                .remote_entries
-                .iter()
-                .find(|entry| entry.path == *path)
-                .cloned();
-            match entry {
-                Some(entry) if entry.kind == caudra_workspace::ResourceKind::File => {
-                    self.request_remote_open(entry, purpose);
-                }
-                Some(_) => self.flash = Some(BackendError::NotFile.to_string()),
-                None => {
-                    self.deferred_open.insert(path.clone(), purpose);
-                    self.refresh_remote_tree();
-                }
-            }
+            self.request_remote_path(path.clone(), purpose);
             return;
         }
         let Some(path) = path.local() else {
@@ -3837,6 +4004,7 @@ impl Workbench {
             return;
         }
         if let Some(entry) = self.delete_target.take() {
+            let entry = self.mutation_resource(&entry.path).unwrap_or(entry);
             if let Some(backend) = &mut self.remote_backend {
                 let request = backend.delete(entry);
                 self.remote_pending.insert(request);
@@ -3871,6 +4039,23 @@ impl Workbench {
         self.editor
             .close_where(&|tab| tab.path.starts_with(path) && !tab.is_dirty());
         self.reveal_active();
+    }
+
+    fn mutation_resource(&self, path: &WorkbenchPath) -> Option<ResourceEntry> {
+        self.editor
+            .tabs()
+            .iter()
+            .find(|tab| &tab.path == path)
+            .and_then(|tab| tab.resource.clone())
+            .or_else(|| self.remote_entries.get(path).cloned())
+    }
+
+    fn mark_remote_conflict(&mut self, path: &WorkbenchPath) {
+        for tab in self.editor.tabs_mut() {
+            if tab.path.starts_with(path) {
+                tab.conflict = true;
+            }
+        }
     }
 
     /// A save that fails keeps the tab open with the reason in the status row,
@@ -4277,6 +4462,10 @@ mod tests {
     };
     use crate::chrome::ELLIPSIS;
     use crate::editor::{VisualRow, render};
+    use crate::fs::backend::tests::{
+        RemoteControl, SCOPED_CONTENTS, SCOPED_FILE, SCOPED_ROOT, SHADOW_CONTENTS, SHADOW_FILE,
+        scoped_widget_fixture,
+    };
     use crate::fs::tree::GitMark;
     use crate::menu::Item as MenuItem;
     use crate::scroll::SCROLLBAR_THUMB;
@@ -4286,8 +4475,7 @@ mod tests {
         OPEN_MARK, RENDERED_STATUS, REVERT_MARK, STAGE_MARK, TabHit, TabPart, UNSTAGE_MARK,
         button_at, confirm_at, header_at, on_menu_mark, tab_at, toggle_at, visible_range,
     };
-    #[cfg(unix)]
-    use caudra_workspace::WorkspacePath;
+    use caudra_workspace::{ResourceKind, WorkspaceError, WorkspacePath};
     use crossterm::event::{
         KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
     };
@@ -4298,6 +4486,7 @@ mod tests {
     use ratatui::layout::Rect;
     use ratatui::style::Style;
     use ratatui::text::Line;
+    use std::cell::Cell as Counter;
     use std::collections::BTreeMap;
     use std::fs;
     use std::ops::RangeInclusive;
@@ -4340,6 +4529,31 @@ mod tests {
     const MARK_MISSING: &str = "the explorer row is missing its source control mark";
     const DIFF_EDITABLE: &str = "a diff tab must be read-only";
     const REMOTE_SETTLE_TIMEOUT: Duration = Duration::from_secs(10);
+    const REMOTE_TEST_FILE: &str = "same-name.txt";
+    const REMOTE_TEST_NESTED: &str = "src/lib.rs";
+    const REMOTE_REPLACEMENT: &str = "theirs";
+    const REMOTE_TEST_DIRECTORY: &str = "src";
+    const REMOTE_MOVED_DIRECTORY: &str = "moved";
+    const REMOTE_MOVED_NESTED: &str = "moved/lib.rs";
+    const REMOTE_MUTATION_CONFLICT: &str =
+        "an opened buffer must retain its original conditional revision";
+    const CAPPED_TREE_ENTRIES: usize = 2;
+    const TARGETED_READ_TABS: usize = super::MAX_REMOTE_READS * 2 + 1;
+    const INVALIDATION_BURST: usize = 512;
+    const TARGETED_REPLACEMENT: &str = "new remote contents";
+    const TARGETED_READ_INDEPENDENT: &str =
+        "targeted reads must not depend on global listing completion";
+    const TARGETED_READ_BOUNDED: &str =
+        "invalidations must coalesce into bounded reads of open targets";
+    const DIRECTORY_ERROR: &str = "directories cannot be opened in the editor";
+    const SPECIAL_FILE_ERROR: &str = "pipes, devices and other special files cannot be edited";
+    const BINARY_ERROR: &str = "binary files cannot be edited";
+    const HUGE_FILE_ERROR: &str = "file exceeds the editable size limit";
+    const OVERSIZED_BYTES: usize = 3 * 1024 * 1024;
+    const REPOSITORY_UNAVAILABLE: &str = "repository_unavailable";
+    const REPOSITORY_ERROR_CODE: i64 = -32000;
+    const REPOSITORY_ERROR: &str =
+        "workspace authority refused the request with code -32000, reason repository_unavailable";
     const COMMIT_OPENED_WHOLE: &str = "a commit must open into its paths, not into one document";
     const MESSAGE_NOT_SHOWN: &str = "the commit tab does not say what the commit says";
     const CLICK_REOPENED: &str = "a click on an open commit must close it, not show it again";
@@ -9278,7 +9492,7 @@ mod tests {
             std::thread::yield_now();
         }
         panic!(
-            "remote workbench did not settle: tabs={:?}, pending={:?}, opens={:?}, invalidated={:?}, entries={:?}, flash={:?}",
+            "remote workbench did not settle: tabs={:?}, pending={:?}, opens={:?}, entries={:?}, flash={:?}",
             workbench
                 .editor
                 .tabs()
@@ -9287,14 +9501,625 @@ mod tests {
                 .collect::<Vec<_>>(),
             workbench.remote_pending,
             workbench.pending_open,
-            workbench.remote_invalidated,
             workbench
                 .remote_entries
-                .iter()
+                .values()
                 .map(|entry| &entry.path)
                 .collect::<Vec<_>>(),
             workbench.flash,
         );
+    }
+
+    fn remote_notice(workbench: &mut Workbench) -> String {
+        let deadline = Instant::now() + REMOTE_SETTLE_TIMEOUT;
+        while Instant::now() < deadline {
+            if let (_, Some(message)) = workbench.tick() {
+                return message;
+            }
+            std::thread::yield_now();
+        }
+        panic!("remote workbench did not report the expected notice");
+    }
+
+    fn capped_remote_workbench() -> (Workbench, RemoteControl) {
+        let (session, control) = crate::fs::backend::tests::widget_fixture();
+        control.insert(REMOTE_TEST_NESTED, REMOTE_REPLACEMENT);
+        let mut workbench = Workbench::new(WorkbenchStyles::default());
+        workbench.bind_workspace(session.clone()).unwrap();
+        workbench
+            .remote_backend
+            .as_mut()
+            .unwrap()
+            .set_retained_limit(CAPPED_TREE_ENTRIES);
+        workbench.toggle_workspace(session).unwrap();
+        settle_remote(&mut workbench, |workbench| !workbench.is_busy());
+        assert_eq!(workbench.remote_entries.len(), CAPPED_TREE_ENTRIES);
+        assert!(workbench.remote_backend.as_ref().unwrap().is_stale());
+        (workbench, control)
+    }
+
+    #[test]
+    fn scoped_workbench_preserves_listed_id_and_reloads_the_same_canonical_path() {
+        let (session, control) = scoped_widget_fixture();
+        let mut workbench = Workbench::new(WorkbenchStyles::default());
+        workbench.toggle_workspace(session).unwrap();
+        settle_remote(&mut workbench, |workbench| !workbench.is_busy());
+        assert_eq!(workbench.backend_root().display(), SCOPED_ROOT);
+        let path = WorkbenchPath::Remote(WorkspacePath::new(SCOPED_FILE).unwrap());
+        let resolves = control.read_calls();
+        workbench.open_workbench_path(&path, super::OpenPurpose::Open);
+        settle_remote(&mut workbench, |workbench| !workbench.is_busy());
+        assert!(resolves.is_empty(), "{TARGETED_READ_INDEPENDENT}");
+        assert_eq!(
+            workbench.editor.active().unwrap().contents(),
+            SCOPED_CONTENTS
+        );
+        control.replace(SCOPED_FILE, TARGETED_REPLACEMENT);
+        workbench.invalidate_remote(Some(&path));
+        workbench.reload_remote_targets();
+        let reload = resolves.recv().unwrap();
+        assert_eq!(reload.path.as_str(), SCOPED_FILE);
+        reload.reply.send(()).unwrap();
+        settle_remote(&mut workbench, |workbench| !workbench.is_busy());
+        assert_eq!(
+            workbench.editor.active().unwrap().contents(),
+            TARGETED_REPLACEMENT
+        );
+        assert_eq!(control.contents(SHADOW_FILE), SHADOW_CONTENTS);
+    }
+
+    #[test_case(false; "clean_uncached_tab_reloads")]
+    #[test_case(true; "dirty_uncached_tab_keeps_its_baseline")]
+    fn capped_tree_watch_changes_refresh_open_targets_without_completing_the_index(dirty: bool) {
+        let (mut workbench, control) = capped_remote_workbench();
+        let path = WorkbenchPath::Remote(WorkspacePath::new(REMOTE_TEST_NESTED).unwrap());
+        assert!(!workbench.remote_entries.contains_key(&path));
+        workbench.open_workbench_path(&path, super::OpenPurpose::Open);
+        settle_remote(&mut workbench, |workbench| !workbench.is_busy());
+        if dirty {
+            workbench.editor_key(key(KeyCode::Char('X')));
+        }
+        let original = workbench.editor.active().unwrap().contents();
+        let revision = workbench
+            .editor
+            .active()
+            .unwrap()
+            .resource
+            .as_ref()
+            .unwrap()
+            .revision
+            .clone();
+        let blocked_listing = control.list_calls();
+        control.replace(REMOTE_TEST_NESTED, TARGETED_REPLACEMENT);
+        control.watch_change(REMOTE_TEST_NESTED);
+        settle_remote(&mut workbench, |workbench| {
+            let tab = workbench.editor.active().unwrap();
+            if dirty {
+                tab.conflict
+            } else {
+                tab.contents() == TARGETED_REPLACEMENT
+            }
+        });
+        let _listing = blocked_listing.recv().unwrap();
+        assert!(workbench.remote_backend.as_ref().unwrap().is_listing());
+        let tab = workbench.editor.active().unwrap();
+        if dirty {
+            assert_eq!(tab.contents(), original, "{LOST_EDIT}");
+            assert_eq!(
+                tab.resource.as_ref().unwrap().revision,
+                revision,
+                "{REMOTE_MUTATION_CONFLICT}"
+            );
+            assert!(tab.is_dirty());
+        } else {
+            assert!(!tab.is_dirty() && !tab.conflict);
+        }
+        assert!(!tab.remote_reload, "{TARGETED_READ_INDEPENDENT}");
+        assert!(
+            workbench.pending_open.is_empty(),
+            "{TARGETED_READ_INDEPENDENT}"
+        );
+        workbench.close();
+    }
+
+    #[test]
+    fn uncached_renamed_descendant_revert_reads_its_new_path_without_root_rescans() {
+        let (mut workbench, control) = capped_remote_workbench();
+        let path = WorkbenchPath::Remote(WorkspacePath::new(REMOTE_TEST_NESTED).unwrap());
+        workbench.open_workbench_path(&path, super::OpenPurpose::Open);
+        settle_remote(&mut workbench, |workbench| !workbench.is_busy());
+        workbench.editor_key(key(KeyCode::Char('X')));
+        let revision = workbench
+            .editor
+            .active()
+            .unwrap()
+            .resource
+            .as_ref()
+            .unwrap()
+            .revision
+            .clone();
+        workbench.commit_remote_input(Input {
+            kind: InputKind::Rename,
+            at: WorkbenchPath::Remote(WorkspacePath::new(REMOTE_TEST_DIRECTORY).unwrap()),
+            value: REMOTE_MOVED_DIRECTORY.into(),
+        });
+        settle_remote(&mut workbench, |workbench| !workbench.is_busy());
+        let moved = WorkbenchPath::Remote(WorkspacePath::new(REMOTE_MOVED_NESTED).unwrap());
+        assert_eq!(workbench.editor.active().unwrap().path, moved);
+        assert!(!workbench.remote_entries.contains_key(&moved));
+        control.replace(REMOTE_MOVED_NESTED, TARGETED_REPLACEMENT);
+        let listings = control.list_calls();
+        let reads = control.read_calls();
+        workbench.buffer_key(press(keys::REVERT));
+        let read = reads.recv().unwrap();
+        assert_eq!(
+            read.path.as_str(),
+            REMOTE_MOVED_NESTED,
+            "{TARGETED_READ_INDEPENDENT}"
+        );
+        assert_eq!(
+            workbench
+                .editor
+                .active()
+                .unwrap()
+                .resource
+                .as_ref()
+                .unwrap()
+                .revision,
+            revision,
+            "{REMOTE_MUTATION_CONFLICT}"
+        );
+        read.reply.send(()).unwrap();
+        settle_remote(&mut workbench, |workbench| {
+            workbench.pending_open.is_empty()
+        });
+        let tab = workbench.editor.active().unwrap();
+        assert_eq!(tab.contents(), TARGETED_REPLACEMENT);
+        assert!(!tab.is_dirty() && !tab.conflict);
+        assert!(listings.is_empty(), "{TARGETED_READ_INDEPENDENT}");
+    }
+
+    #[test_case(false; "clean_reconciliation_moves_to_destination")]
+    #[test_case(true; "dirty_baseline_survives_cancelled_old_read")]
+    fn directory_rename_cancels_old_subtree_reads_and_reconciles_the_new_paths(dirty: bool) {
+        let (mut workbench, control) = capped_remote_workbench();
+        let source = WorkbenchPath::Remote(WorkspacePath::new(REMOTE_TEST_NESTED).unwrap());
+        workbench.open_workbench_path(&source, super::OpenPurpose::Open);
+        settle_remote(&mut workbench, |workbench| !workbench.is_busy());
+        let baseline = workbench
+            .editor
+            .active()
+            .unwrap()
+            .resource
+            .as_ref()
+            .unwrap()
+            .revision
+            .clone();
+        let reads = control.read_calls();
+        control.replace(REMOTE_TEST_NESTED, TARGETED_REPLACEMENT);
+        workbench.invalidate_remote(Some(&source));
+        workbench.reload_remote_targets();
+        let old = reads.recv().unwrap();
+        assert_eq!(old.path.as_str(), REMOTE_TEST_NESTED);
+        if dirty {
+            workbench.editor_key(key(KeyCode::Char('X')));
+        }
+        let buffer = workbench.editor.active().unwrap().contents();
+        workbench.commit_remote_input(Input {
+            kind: InputKind::Rename,
+            at: WorkbenchPath::Remote(WorkspacePath::new(REMOTE_TEST_DIRECTORY).unwrap()),
+            value: REMOTE_MOVED_DIRECTORY.to_owned(),
+        });
+        let renamed_directory = reads.recv().unwrap();
+        assert_eq!(renamed_directory.path.as_str(), REMOTE_MOVED_DIRECTORY);
+        renamed_directory.reply.send(()).unwrap();
+        settle_remote(&mut workbench, |workbench| {
+            workbench.editor.active().unwrap().path.display() == REMOTE_MOVED_NESTED
+        });
+        let _ = old.reply.send(());
+        if !dirty {
+            let current = reads.recv().unwrap();
+            assert_eq!(current.path.as_str(), REMOTE_MOVED_NESTED);
+            current.reply.send(()).unwrap();
+        }
+        settle_remote(&mut workbench, |workbench| !workbench.is_busy());
+        assert!(reads.is_empty(), "{TARGETED_READ_BOUNDED}");
+        let tab = workbench.editor.active().unwrap();
+        if dirty {
+            assert_eq!(tab.contents(), buffer, "{LOST_EDIT}");
+            assert_eq!(
+                tab.resource.as_ref().unwrap().revision,
+                baseline,
+                "{REMOTE_MUTATION_CONFLICT}"
+            );
+            assert!(tab.is_dirty() && tab.conflict);
+        } else {
+            assert_eq!(tab.contents(), TARGETED_REPLACEMENT);
+            assert!(!tab.is_dirty() && !tab.remote_reload);
+        }
+    }
+
+    #[test]
+    fn invalidation_bursts_coalesce_and_bound_targeted_read_concurrency() {
+        let (mut workbench, control) = capped_remote_workbench();
+        for index in 0..TARGETED_READ_TABS {
+            let name = format!("target-{index}");
+            control.insert(&name, REMOTE_REPLACEMENT);
+            workbench.open_workbench_path(
+                &WorkbenchPath::Remote(WorkspacePath::new(name).unwrap()),
+                super::OpenPurpose::Open,
+            );
+            settle_remote(&mut workbench, |workbench| !workbench.is_busy());
+        }
+        let reads = control.read_calls();
+        workbench.invalidate_remote(None);
+        workbench.reload_remote_targets();
+        let held = (0..super::MAX_REMOTE_READS)
+            .map(|_| reads.recv().unwrap())
+            .collect::<Vec<_>>();
+        for index in 0..INVALIDATION_BURST {
+            let unrelated =
+                WorkbenchPath::Remote(WorkspacePath::new(format!("unrelated-{index}")).unwrap());
+            workbench.invalidate_remote(Some(&unrelated));
+            workbench.invalidate_remote(None);
+            workbench.reload_remote_targets();
+        }
+        assert_eq!(
+            workbench.pending_open.len(),
+            super::MAX_REMOTE_READS,
+            "{TARGETED_READ_BOUNDED}"
+        );
+        assert!(reads.is_empty(), "{TARGETED_READ_BOUNDED}");
+        for index in 0..TARGETED_READ_TABS {
+            control.replace(&format!("target-{index}"), TARGETED_REPLACEMENT);
+        }
+        let read_count = Counter::new(held.len());
+        for read in held {
+            read.reply.send(()).unwrap();
+        }
+        settle_remote(&mut workbench, |workbench| {
+            assert!(
+                workbench.pending_open.len() <= super::MAX_REMOTE_READS,
+                "{TARGETED_READ_BOUNDED}"
+            );
+            for read in reads.try_iter() {
+                read.reply.send(()).unwrap();
+                read_count.set(read_count.get() + 1);
+            }
+            workbench.pending_open.is_empty()
+                && workbench.editor.tabs().iter().all(|tab| !tab.remote_reload)
+        });
+        assert_eq!(
+            read_count.get(),
+            TARGETED_READ_TABS + super::MAX_REMOTE_READS,
+            "{TARGETED_READ_BOUNDED}"
+        );
+        assert!(
+            workbench
+                .editor
+                .tabs()
+                .iter()
+                .all(|tab| tab.contents() == TARGETED_REPLACEMENT && !tab.conflict)
+        );
+    }
+
+    #[test]
+    fn remote_first_page_is_visible_while_later_page_and_watch_are_blocked() {
+        let (session, control) = crate::fs::backend::tests::widget_fixture();
+        control.insert(REMOTE_TEST_NESTED, REMOTE_REPLACEMENT);
+        let calls = control.list_calls();
+        let watches = control.watch_calls();
+        let mut workbench = Workbench::new(WorkbenchStyles::default());
+        workbench.toggle_workspace(session).unwrap();
+        let watch = watches.recv().unwrap();
+        let first = calls.recv().unwrap();
+        assert!(!first.request.recursive);
+        first.reply.send(Ok(())).unwrap();
+        settle_remote(&mut workbench, |workbench| {
+            !workbench.tree.rows().is_empty()
+        });
+        let later = calls.recv().unwrap();
+        assert!(later.request.continuation.is_some());
+        assert_eq!(workbench.tree.rows()[0].name, REMOTE_TEST_FILE);
+        assert!(draw(&mut workbench, TERMINAL_WIDTH, TERMINAL_HEIGHT).contains(REMOTE_TEST_FILE));
+        watch.send(Err(WorkspaceError::WatchUnavailable)).unwrap();
+        assert_eq!(remote_notice(&mut workbench), super::WATCH_WARNING);
+        later.reply.send(Err(WorkspaceError::Unavailable)).unwrap();
+        settle_remote(&mut workbench, |workbench| !workbench.is_busy());
+        assert_eq!(workbench.tree.rows()[0].name, REMOTE_TEST_FILE);
+        workbench.refresh_remote_tree();
+        let retry = calls.recv().unwrap();
+        assert!(retry.request.continuation.is_none());
+        workbench.close();
+        assert!(workbench.remote_pending.is_empty());
+    }
+
+    #[test]
+    fn first_watch_install_reconciles_changes_missed_after_initial_scan() {
+        let (session, control) = crate::fs::backend::tests::widget_fixture();
+        let watches = control.watch_calls();
+        let mut workbench = Workbench::new(WorkbenchStyles::default());
+        workbench.toggle_workspace(session).unwrap();
+        let watch = watches.recv().unwrap();
+        settle_remote(&mut workbench, |workbench| !workbench.is_busy());
+        let path = WorkbenchPath::Remote(WorkspacePath::new(REMOTE_TEST_NESTED).unwrap());
+        assert!(!workbench.remote_entries.contains_key(&path));
+        control.insert(REMOTE_TEST_NESTED, REMOTE_REPLACEMENT);
+        watch.send(Ok(())).unwrap();
+        settle_remote(&mut workbench, |workbench| {
+            workbench.remote_entries.contains_key(&path) && !workbench.is_busy()
+        });
+        workbench.close();
+    }
+
+    #[test]
+    fn nested_opens_resolve_independently_of_shallow_listing() {
+        let (session, control) = crate::fs::backend::tests::widget_fixture();
+        control.insert(REMOTE_TEST_NESTED, REMOTE_REPLACEMENT);
+        let mut workbench = Workbench::new(WorkbenchStyles::default());
+        workbench.toggle_workspace(session).unwrap();
+        let path = WorkbenchPath::Remote(WorkspacePath::new(REMOTE_TEST_NESTED).unwrap());
+        workbench.request_remote_path(path.clone(), super::OpenPurpose::Open);
+        settle_remote(&mut workbench, |workbench| !workbench.is_busy());
+        assert_eq!(workbench.editor.active().expect(NO_TAB).path, path);
+        assert!(workbench.tree.rows().iter().any(|row| row.path == path));
+        assert!(workbench.pending_open.is_empty());
+    }
+
+    #[test]
+    fn listing_refresh_does_not_replace_the_revision_of_an_opened_file() {
+        let (session, control) = crate::fs::backend::tests::widget_fixture();
+        let mut workbench = Workbench::new(WorkbenchStyles::default());
+        workbench.toggle_workspace(session).unwrap();
+        settle_remote(&mut workbench, |workbench| !workbench.is_busy());
+        let path = WorkbenchPath::Remote(WorkspacePath::new(REMOTE_TEST_FILE).unwrap());
+        workbench.open_workbench_path(&path, super::OpenPurpose::Open);
+        settle_remote(&mut workbench, |workbench| !workbench.is_busy());
+        let revision = workbench
+            .editor
+            .active()
+            .unwrap()
+            .resource
+            .as_ref()
+            .unwrap()
+            .revision
+            .clone();
+        control.replace(REMOTE_TEST_FILE, REMOTE_REPLACEMENT);
+        workbench.refresh_remote_tree();
+        settle_remote(&mut workbench, |workbench| !workbench.is_busy());
+        assert_eq!(
+            workbench
+                .editor
+                .active()
+                .unwrap()
+                .resource
+                .as_ref()
+                .unwrap()
+                .revision,
+            revision
+        );
+        workbench.editor_key(key(KeyCode::Char('X')));
+        workbench.save_active();
+        settle_remote(&mut workbench, |workbench| !workbench.is_busy());
+        let tab = workbench.editor.active().unwrap();
+        assert!(tab.conflict && tab.is_dirty(), "{NO_CONFLICT}");
+        assert_eq!(
+            control.contents(REMOTE_TEST_FILE),
+            REMOTE_REPLACEMENT,
+            "{LOST_EDIT}"
+        );
+    }
+
+    #[test_case(false; "rename")]
+    #[test_case(true; "delete")]
+    fn opened_file_mutations_refuse_external_changes(delete: bool) {
+        let (session, control) = crate::fs::backend::tests::widget_fixture();
+        let mut workbench = Workbench::new(WorkbenchStyles::default());
+        workbench.toggle_workspace(session).unwrap();
+        settle_remote(&mut workbench, |workbench| !workbench.is_busy());
+        let path = WorkbenchPath::Remote(WorkspacePath::new(REMOTE_TEST_FILE).unwrap());
+        workbench.open_workbench_path(&path, super::OpenPurpose::Open);
+        settle_remote(&mut workbench, |workbench| !workbench.is_busy());
+        workbench.editor_key(key(KeyCode::Char('X')));
+        let contents = workbench.editor.active().unwrap().contents();
+        let revision = workbench
+            .editor
+            .active()
+            .unwrap()
+            .resource
+            .as_ref()
+            .unwrap()
+            .revision
+            .clone();
+        control.replace(REMOTE_TEST_FILE, REMOTE_REPLACEMENT);
+        if delete {
+            workbench.run_on_row(MenuAction::Delete, path.clone());
+            settle_remote(&mut workbench, |workbench| workbench.confirm.is_some());
+            workbench.resolve_delete(Choice::Discard);
+        } else {
+            workbench.commit_remote_input(Input {
+                kind: InputKind::Rename,
+                at: path.clone(),
+                value: REMOTE_MOVED_DIRECTORY.into(),
+            });
+        }
+        settle_remote(&mut workbench, |workbench| !workbench.is_busy());
+        let tab = workbench.editor.active().expect(NO_TAB);
+        assert!(tab.conflict && tab.is_dirty(), "{REMOTE_MUTATION_CONFLICT}");
+        assert_eq!(tab.path, path);
+        assert_eq!(tab.contents(), contents, "{LOST_EDIT}");
+        assert_eq!(
+            tab.resource.as_ref().unwrap().revision,
+            revision,
+            "{REMOTE_MUTATION_CONFLICT}"
+        );
+        workbench.save_active();
+        settle_remote(&mut workbench, |workbench| !workbench.is_busy());
+        assert_eq!(
+            control.contents(REMOTE_TEST_FILE),
+            REMOTE_REPLACEMENT,
+            "{REMOTE_MUTATION_CONFLICT}"
+        );
+    }
+
+    #[test_case(false; "unchanged_descendant")]
+    #[test_case(true; "externally_changed_descendant")]
+    fn directory_rename_remaps_dirty_descendants_without_rebasing_their_contents(changed: bool) {
+        let (session, control) = crate::fs::backend::tests::widget_fixture();
+        control.insert(REMOTE_TEST_NESTED, REMOTE_REPLACEMENT);
+        let mut workbench = Workbench::new(WorkbenchStyles::default());
+        workbench.toggle_workspace(session).unwrap();
+        settle_remote(&mut workbench, |workbench| !workbench.is_busy());
+        workbench.open_workbench_path(
+            &WorkbenchPath::Remote(WorkspacePath::new(REMOTE_TEST_NESTED).unwrap()),
+            super::OpenPurpose::Open,
+        );
+        settle_remote(&mut workbench, |workbench| !workbench.is_busy());
+        workbench.editor_key(key(KeyCode::Char('X')));
+        let contents = workbench.editor.active().unwrap().contents();
+        let revision = workbench
+            .editor
+            .active()
+            .unwrap()
+            .resource
+            .as_ref()
+            .unwrap()
+            .revision
+            .clone();
+        if changed {
+            control.replace(REMOTE_TEST_NESTED, REMOTE_TEST_FILE);
+        }
+        workbench.commit_remote_input(Input {
+            kind: InputKind::Rename,
+            at: WorkbenchPath::Remote(WorkspacePath::new(REMOTE_TEST_DIRECTORY).unwrap()),
+            value: REMOTE_MOVED_DIRECTORY.into(),
+        });
+        settle_remote(&mut workbench, |workbench| !workbench.is_busy());
+        let tab = workbench.editor.active().expect(NO_TAB);
+        let resource = tab.resource.as_ref().unwrap();
+        assert_eq!(resource.path, tab.path);
+        assert_eq!(resource.path.display(), REMOTE_MOVED_NESTED);
+        assert_eq!(resource.revision, revision, "{REMOTE_MUTATION_CONFLICT}");
+        assert!(resource.resource_id.is_none());
+        workbench.save_active();
+        settle_remote(&mut workbench, |workbench| !workbench.is_busy());
+        let tab = workbench.editor.active().expect(NO_TAB);
+        assert_eq!(tab.conflict, changed, "{REMOTE_MUTATION_CONFLICT}");
+        assert_eq!(
+            control.contents(REMOTE_MOVED_NESTED),
+            if changed { REMOTE_TEST_FILE } else { &contents }
+        );
+        if !changed {
+            assert!(tab.resource.as_ref().unwrap().resource_id.is_some());
+        }
+    }
+
+    #[test_case(false; "clean_tab_closes")]
+    #[test_case(true; "dirty_tab_survives")]
+    fn authoritative_missing_files_preserve_dirty_buffers(dirty: bool) {
+        let (session, control) = crate::fs::backend::tests::widget_fixture();
+        let mut workbench = Workbench::new(WorkbenchStyles::default());
+        workbench.toggle_workspace(session).unwrap();
+        settle_remote(&mut workbench, |workbench| !workbench.is_busy());
+        let path = WorkbenchPath::Remote(WorkspacePath::new(REMOTE_TEST_FILE).unwrap());
+        workbench.open_workbench_path(&path, super::OpenPurpose::Open);
+        settle_remote(&mut workbench, |workbench| !workbench.is_busy());
+        if dirty {
+            workbench.editor_key(key(KeyCode::Char('X')));
+        }
+        let contents = workbench.editor.active().unwrap().contents();
+        control.remove(REMOTE_TEST_FILE);
+        workbench.invalidate_remote(Some(&path));
+        workbench.refresh_remote_tree();
+        settle_remote(&mut workbench, |workbench| !workbench.is_busy());
+        if dirty {
+            let tab = workbench.editor.active().expect(NO_TAB);
+            assert!(tab.conflict && tab.is_dirty());
+            assert_eq!(tab.contents(), contents, "{LOST_EDIT}");
+        } else {
+            assert!(workbench.editor.tabs().is_empty());
+        }
+    }
+
+    #[test_case(ResourceKind::Directory, "", DIRECTORY_ERROR; "directory")]
+    #[test_case(ResourceKind::Other, "", SPECIAL_FILE_ERROR; "fifo")]
+    #[test_case(ResourceKind::File, "\0", BINARY_ERROR; "binary")]
+    #[test_case(ResourceKind::File, "large", HUGE_FILE_ERROR; "huge")]
+    fn remote_file_errors_leave_the_tree_usable(
+        kind: ResourceKind,
+        contents: &str,
+        expected: &str,
+    ) {
+        let (session, control) = crate::fs::backend::tests::widget_fixture();
+        let contents = if expected == HUGE_FILE_ERROR {
+            "x".repeat(OVERSIZED_BYTES)
+        } else {
+            contents.to_owned()
+        };
+        control.replace(REMOTE_TEST_FILE, &contents);
+        control.set_kind(REMOTE_TEST_FILE, kind);
+        let mut workbench = Workbench::new(WorkbenchStyles::default());
+        workbench.toggle_workspace(session).unwrap();
+        settle_remote(&mut workbench, |workbench| !workbench.is_busy());
+        let entries = workbench.remote_entries.clone();
+        let path = WorkbenchPath::Remote(WorkspacePath::new(REMOTE_TEST_FILE).unwrap());
+        workbench.open_workbench_path(&path, super::OpenPurpose::Open);
+        assert_eq!(remote_notice(&mut workbench), expected);
+        assert_eq!(workbench.remote_entries, entries);
+        assert!(workbench.editor.tabs().is_empty());
+        workbench.refresh_remote_tree();
+        settle_remote(&mut workbench, |workbench| !workbench.is_busy());
+        assert_eq!(workbench.remote_entries, entries);
+    }
+
+    #[test_case(true, false; "absent_on_open")]
+    #[test_case(false, false; "broken_on_open")]
+    #[test_case(true, true; "repository_removed")]
+    #[test_case(false, true; "repository_broken_after_refresh")]
+    fn remote_scm_distinguishes_absence_from_repository_errors(
+        absent: bool,
+        previously_open: bool,
+    ) {
+        let (session, control) = crate::fs::backend::tests::widget_fixture();
+        let mut workbench = Workbench::new(WorkbenchStyles::default());
+        if previously_open {
+            workbench.bind_workspace(session.clone()).unwrap();
+            settle_remote(&mut workbench, |workbench| !workbench.scm_refreshing());
+            assert!(workbench.scm.is_repository());
+        }
+        control.scm_error(if absent {
+            WorkspaceError::NotRepository
+        } else {
+            WorkspaceError::Refused {
+                code: REPOSITORY_ERROR_CODE,
+                symbolic: REPOSITORY_UNAVAILABLE.to_owned(),
+            }
+        });
+        if previously_open {
+            workbench.refresh_remote_scm();
+        } else {
+            workbench.bind_workspace(session).unwrap();
+        }
+        settle_remote(&mut workbench, |workbench| !workbench.scm_refreshing());
+        if absent {
+            assert!(!workbench.scm.is_repository());
+            assert!(workbench.scm.error().is_none());
+            assert!(workbench.scm.log().is_empty());
+            assert!(
+                Section::ALL
+                    .iter()
+                    .all(|section| workbench.scm.count(*section) == 0)
+            );
+            workbench.open = true;
+            workbench.sidebar = SidebarView::SourceControl;
+            assert!(
+                draw(&mut workbench, TERMINAL_WIDTH, TERMINAL_HEIGHT).contains(NOT_A_REPOSITORY)
+            );
+        } else if previously_open {
+            assert!(workbench.scm.is_repository());
+        } else {
+            assert_eq!(workbench.scm.error(), Some(REPOSITORY_ERROR));
+        }
     }
 
     #[test]

@@ -270,6 +270,14 @@ impl Scm {
         }
     }
 
+    pub fn clear_workspace_repository(&mut self) {
+        self.open_workspace();
+        self.error = None;
+        for section in &mut self.sections {
+            section.count = 0;
+        }
+    }
+
     /// Rereads the repository. The log costs a walk, so it is only reread when
     /// the graph is open to show it.
     pub fn refresh(&mut self) {

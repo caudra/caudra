@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::hash::Hash;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
@@ -80,6 +80,7 @@ const CONNECTION_DISCONNECTED: u8 = 1;
 const CONNECTION_RECONNECTING: u8 = 2;
 const RESOURCE_NAMESPACE_VERSION: &str = "v1";
 const NO_SYMBOLIC_REASON: &str = "<none>";
+const MAX_RPC_DIAGNOSTIC_BYTES: usize = 128;
 /// A limit name travels into user-facing text, so anything longer or not a
 /// plain identifier is host prose and stays at the transport boundary.
 const MAX_LIMIT_NAME_BYTES: usize = 32;
@@ -95,6 +96,7 @@ const PATH_STYLE: &str = "root-relative-posix";
 const TOOL_MANIFEST_VERSION: &str = "v2";
 const JSON_SCHEMA_VERSION: &str = "http://json-schema.org/draft-07/schema#";
 const DEFAULT_CACHE_TTL: Duration = Duration::from_secs(600);
+const WATCH_INITIAL_SEQUENCE: u64 = 1;
 const CANONICAL_OPERATION_PREFIX: &str = "canonical:";
 const WORKSPACE_MUTATION_KIND: &str = "workspace_mutation";
 const DIRECT_EXEC_KIND: &str = "direct_exec";
@@ -192,6 +194,10 @@ pub enum RemoteWorkcellError {
     Conflict,
     #[error("remote Workcell is busy with another operation")]
     Busy,
+    #[error("remote Workcell directory is not a repository")]
+    NotRepository,
+    #[error("remote Workcell watch backend is unavailable")]
+    WatchUnavailable,
     #[error("remote Workcell operation was denied by policy")]
     PolicyDenied,
     #[error("remote Workcell binding does not match the requested authority")]
@@ -284,6 +290,8 @@ impl From<RemoteWorkcellError> for WorkspaceError {
             RemoteWorkcellError::StaleCursor => Self::StaleCursor,
             RemoteWorkcellError::Conflict => Self::Conflict,
             RemoteWorkcellError::Busy => Self::Busy,
+            RemoteWorkcellError::NotRepository => Self::NotRepository,
+            RemoteWorkcellError::WatchUnavailable => Self::WatchUnavailable,
             RemoteWorkcellError::PolicyDenied => Self::PolicyDenied,
             RemoteWorkcellError::BindingMismatch => Self::IdentityMismatch,
             RemoteWorkcellError::LimitExceeded { limit, maximum } => {
@@ -331,6 +339,12 @@ struct JsonRpcError {
     message: String,
     #[serde(default)]
     data: Option<Value>,
+}
+
+struct RpcCallContext<'a> {
+    id: u64,
+    method: &'a str,
+    started: Instant,
 }
 
 #[derive(Deserialize)]
@@ -545,6 +559,11 @@ impl RemoteTransport {
     where
         F: FnOnce() -> Result<(), RemoteWorkcellError>,
     {
+        let context = RpcCallContext {
+            id,
+            method,
+            started: Instant::now(),
+        };
         let mut builder = Request::builder()
             .method(Method::POST)
             .uri(self.endpoint.as_str())
@@ -598,8 +617,8 @@ impl RemoteTransport {
             .and_then(|value| value.to_str().ok())
             .and_then(|value| value.split(';').next());
         let result = match content_type {
-            Some(SSE_CONTENT_TYPE) => self.read_sse(&mut response, id).await,
-            Some(JSON_CONTENT_TYPE) => self.read_json(&mut response, id).await,
+            Some(SSE_CONTENT_TYPE) => self.read_sse(&mut response, &context).await,
+            Some(JSON_CONTENT_TYPE) => self.read_json(&mut response, &context).await,
             _ => Err(RemoteWorkcellError::InvalidProtocol),
         };
         match result {
@@ -623,18 +642,18 @@ impl RemoteTransport {
     async fn read_json(
         &self,
         response: &mut isahc::Response<isahc::AsyncBody>,
-        id: u64,
+        context: &RpcCallContext<'_>,
     ) -> Result<Value, RemoteWorkcellError> {
         let bytes = read_bounded(response.body_mut(), MAX_HTTP_RESPONSE_BYTES).await?;
         let value: Value =
             serde_json::from_slice(&bytes).map_err(|_| RemoteWorkcellError::InvalidProtocol)?;
-        self.find_response(value, id)
+        self.find_response(value, context)
     }
 
     async fn read_sse(
         &self,
         response: &mut isahc::Response<isahc::AsyncBody>,
-        id: u64,
+        context: &RpcCallContext<'_>,
     ) -> Result<Value, RemoteWorkcellError> {
         let mut buffer = Vec::new();
         let mut chunk = [0_u8; 8192];
@@ -657,7 +676,7 @@ impl RemoteTransport {
                 if end > MAX_SSE_EVENT_BYTES {
                     return Err(RemoteWorkcellError::InvalidProtocol);
                 }
-                let result = self.parse_sse_event(&buffer[..end], id)?;
+                let result = self.parse_sse_event(&buffer[..end], context)?;
                 buffer.drain(..end);
                 if let Some(result) = result {
                     return Ok(result);
@@ -671,14 +690,18 @@ impl RemoteTransport {
             return Err(RemoteWorkcellError::InvalidProtocol);
         }
         if !buffer.is_empty()
-            && let Some(result) = self.parse_sse_event(&buffer, id)?
+            && let Some(result) = self.parse_sse_event(&buffer, context)?
         {
             return Ok(result);
         }
         Err(RemoteWorkcellError::InvalidProtocol)
     }
 
-    fn parse_sse_event(&self, event: &[u8], id: u64) -> Result<Option<Value>, RemoteWorkcellError> {
+    fn parse_sse_event(
+        &self,
+        event: &[u8],
+        context: &RpcCallContext<'_>,
+    ) -> Result<Option<Value>, RemoteWorkcellError> {
         let text = std::str::from_utf8(event).map_err(|_| RemoteWorkcellError::InvalidProtocol)?;
         let data = text
             .lines()
@@ -693,10 +716,14 @@ impl RemoteTransport {
         }
         let value =
             serde_json::from_str(&data).map_err(|_| RemoteWorkcellError::InvalidProtocol)?;
-        self.handle_message(value, id)
+        self.handle_message(value, context)
     }
 
-    fn find_response(&self, value: Value, id: u64) -> Result<Value, RemoteWorkcellError> {
+    fn find_response(
+        &self,
+        value: Value,
+        context: &RpcCallContext<'_>,
+    ) -> Result<Value, RemoteWorkcellError> {
         let messages = match value {
             Value::Array(messages) if !messages.is_empty() => messages,
             Value::Array(_) => return Err(RemoteWorkcellError::InvalidProtocol),
@@ -704,7 +731,7 @@ impl RemoteTransport {
         };
         let mut response = None;
         for message in messages {
-            if let Some(value) = self.handle_message(message, id)?
+            if let Some(value) = self.handle_message(message, context)?
                 && response.replace(value).is_some()
             {
                 return Err(RemoteWorkcellError::InvalidProtocol);
@@ -716,7 +743,7 @@ impl RemoteTransport {
     fn handle_message(
         &self,
         message: Value,
-        id: u64,
+        context: &RpcCallContext<'_>,
     ) -> Result<Option<Value>, RemoteWorkcellError> {
         let object = message
             .as_object()
@@ -764,7 +791,7 @@ impl RemoteTransport {
         {
             return Err(RemoteWorkcellError::InvalidProtocol);
         }
-        if object.get("id").and_then(Value::as_u64) != Some(id) {
+        if object.get("id").and_then(Value::as_u64) != Some(context.id) {
             return Err(RemoteWorkcellError::InvalidProtocol);
         }
         if has_error {
@@ -778,7 +805,36 @@ impl RemoteTransport {
             if error.message.is_empty() {
                 return Err(RemoteWorkcellError::InvalidProtocol);
             }
-            return Err(map_rpc_error(&error));
+            let mapped = map_rpc_error(&error);
+            let symbolic =
+                rpc_diagnostic_token(error.data.as_ref().and_then(|data| data.get("code")));
+            if matches!(
+                mapped,
+                RemoteWorkcellError::UnmappedRefusal { .. } | RemoteWorkcellError::WatchUnavailable
+            ) && symbolic != Some(snapshot::NOT_FOUND)
+            {
+                let phase = error
+                    .data
+                    .as_ref()
+                    .and_then(|data| data.get("phase"))
+                    .and_then(Value::as_str)
+                    .filter(|phase| matches!(*phase, "initialize" | "register"));
+                let errno = error
+                    .data
+                    .as_ref()
+                    .and_then(|data| data.get("rawOsError"))
+                    .and_then(Value::as_i64);
+                warn!(
+                    method = context.method,
+                    elapsed_ms = context.started.elapsed().as_millis() as u64,
+                    code = error.code,
+                    symbolic = symbolic.unwrap_or(NO_SYMBOLIC_REASON),
+                    phase,
+                    errno,
+                    "remote Workcell request refused"
+                );
+            }
+            return Err(mapped);
         }
         Ok(object.get("result").cloned())
     }
@@ -798,8 +854,11 @@ struct BoundedMap<K, V> {
 struct ResourceCache {
     by_id: HashMap<ResourceId, CacheEntry<WorkspacePath>>,
     by_path: HashMap<WorkspacePath, ResourceId>,
+    by_touch: BTreeSet<(Instant, ResourceId)>,
     limit: usize,
     ttl: Duration,
+    #[cfg(test)]
+    maintenance_probes: usize,
 }
 
 impl ResourceCache {
@@ -807,80 +866,89 @@ impl ResourceCache {
         Self {
             by_id: HashMap::new(),
             by_path: HashMap::new(),
+            by_touch: BTreeSet::new(),
             limit: limit.max(1),
             ttl,
+            #[cfg(test)]
+            maintenance_probes: 0,
         }
     }
 
-    fn expire(&mut self) {
-        let now = Instant::now();
-        let expired = self
-            .by_id
-            .iter()
-            .filter_map(|(id, entry)| {
-                (now.duration_since(entry.touched) > self.ttl).then_some(id.clone())
-            })
-            .collect::<Vec<_>>();
-        for id in expired {
+    fn oldest(&mut self) -> Option<&(Instant, ResourceId)> {
+        #[cfg(test)]
+        {
+            self.maintenance_probes += 1;
+        }
+        self.by_touch.first()
+    }
+
+    fn expire(&mut self, now: Instant) {
+        let ttl = self.ttl;
+        while let Some((touched, id)) = self.oldest() {
+            if now.duration_since(*touched) <= ttl {
+                break;
+            }
+            let id = id.clone();
             self.remove_id(&id);
         }
     }
 
     fn insert(&mut self, id: ResourceId, path: WorkspacePath) {
-        self.expire();
-        if let Some(previous) = self.by_path.get(&path).cloned()
-            && previous != id
-        {
+        self.insert_at(id, path, Instant::now());
+    }
+
+    fn insert_at(&mut self, id: ResourceId, path: WorkspacePath, now: Instant) {
+        self.expire(now);
+        self.remove_id(&id);
+        if let Some(previous) = self.by_path.get(&path).cloned() {
             self.remove_id(&previous);
         }
-        if let Some(previous) = self.by_id.get(&id).map(|entry| entry.value.clone())
-            && previous != path
-        {
-            self.by_path.remove(&previous);
-        }
-        while !self.by_id.contains_key(&id) && self.by_id.len() >= self.limit {
-            let Some(oldest) = self
-                .by_id
-                .iter()
-                .min_by_key(|(_, entry)| entry.touched)
-                .map(|(id, _)| id.clone())
-            else {
+        while self.by_id.len() >= self.limit {
+            let Some((_, oldest)) = self.oldest().cloned() else {
                 break;
             };
             self.remove_id(&oldest);
         }
+        self.by_touch.insert((now, id.clone()));
         self.by_path.insert(path.clone(), id.clone());
         self.by_id.insert(
             id,
             CacheEntry {
                 value: path,
-                touched: Instant::now(),
+                touched: now,
             },
         );
     }
 
     fn get_path(&mut self, id: &ResourceId) -> Option<&WorkspacePath> {
-        self.expire();
+        self.get_path_at(id, Instant::now())
+    }
+
+    fn get_path_at(&mut self, id: &ResourceId, now: Instant) -> Option<&WorkspacePath> {
+        self.expire(now);
         let entry = self.by_id.get_mut(id)?;
-        entry.touched = Instant::now();
+        self.by_touch.remove(&(entry.touched, id.clone()));
+        entry.touched = now;
+        self.by_touch.insert((now, id.clone()));
         Some(&entry.value)
     }
 
     fn remove_id(&mut self, id: &ResourceId) {
         if let Some(entry) = self.by_id.remove(id) {
             self.by_path.remove(&entry.value);
+            self.by_touch.remove(&(entry.touched, id.clone()));
         }
     }
 
     fn remove_path(&mut self, path: &WorkspacePath) {
-        if let Some(id) = self.by_path.remove(path) {
-            self.by_id.remove(&id);
+        if let Some(id) = self.by_path.get(path).cloned() {
+            self.remove_id(&id);
         }
     }
 
     #[cfg(test)]
     fn id_for_path(&mut self, path: &WorkspacePath) -> Option<&ResourceId> {
-        self.expire();
+        self.expire(Instant::now());
         self.by_path.get(path)
     }
 }
@@ -938,10 +1006,6 @@ where
         Some(&entry.value)
     }
 
-    fn remove(&mut self, key: &K) -> Option<V> {
-        self.entries.remove(key).map(|entry| entry.value)
-    }
-
     #[cfg(test)]
     fn len(&mut self) -> usize {
         self.expire();
@@ -979,9 +1043,46 @@ impl CursorRegistry {
 
 #[derive(Clone)]
 struct WatchRecord {
+    workspace_cursor: WorkspaceCursor,
     cursor: WatchCursor,
     root: WorkspacePath,
     recursive: bool,
+}
+
+struct WatchRegistry {
+    records: HashMap<WatchSubscriptionId, CacheEntry<WatchRecord>>,
+    limit: usize,
+    ttl: Duration,
+}
+
+impl WatchRegistry {
+    fn new(limit: usize, ttl: Duration) -> Self {
+        Self {
+            records: HashMap::new(),
+            limit: limit.max(1),
+            ttl,
+        }
+    }
+
+    fn insert(&mut self, id: WatchSubscriptionId, record: WatchRecord) {
+        if !self.records.contains_key(&id)
+            && self.records.len() >= self.limit
+            && let Some(oldest) = self
+                .records
+                .iter()
+                .min_by_key(|(_, entry)| entry.touched)
+                .map(|(id, _)| id.clone())
+        {
+            self.records.remove(&oldest);
+        }
+        self.records.insert(
+            id,
+            CacheEntry {
+                value: record,
+                touched: Instant::now(),
+            },
+        );
+    }
 }
 
 #[derive(Clone)]
@@ -1545,7 +1646,7 @@ struct RemoteInner {
     paths: Mutex<ResourceCache>,
     repositories: Mutex<BoundedMap<ResourceId, WorkspacePath>>,
     cursors: Mutex<CursorRegistry>,
-    watches: Mutex<BoundedMap<WatchSubscriptionId, WatchRecord>>,
+    watches: Mutex<WatchRegistry>,
     operations: Mutex<OperationRegistry>,
     captures: snapshot::CaptureRegistry,
     operation_slots: Event,
@@ -1733,7 +1834,7 @@ impl RemoteWorkcellClient {
                 records: cursors,
                 limit: cursor_limit,
             }),
-            watches: Mutex::new(BoundedMap::new(watch_limit, watch_ttl)),
+            watches: Mutex::new(WatchRegistry::new(watch_limit, watch_ttl)),
             operations: Mutex::new(OperationRegistry::new(operation_limit)),
             captures: snapshot::CaptureRegistry::default(),
             operation_slots: Event::new(),
@@ -2637,7 +2738,7 @@ impl RemoteWorkcellClient {
                 contract::WorkspaceEntryKind::File => ResourceKind::File,
                 contract::WorkspaceEntryKind::Directory => ResourceKind::Directory,
             },
-            revision: Some(resource_revision(&entry.revision)?),
+            revision: entry.revision.as_ref().map(resource_revision).transpose()?,
             size_bytes: entry.size_bytes,
         })
     }
@@ -3330,8 +3431,10 @@ impl WorkspaceReadService for RemoteWorkcellClient {
                 self.remember_entry(entry)
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let (truncated, incomplete) =
-            pagination_flags(response.truncated, response.next_cursor.is_some());
+        let (truncated, incomplete) = pagination_flags(
+            response.truncated || response.incomplete,
+            response.next_cursor.is_some(),
+        );
         Ok(ListPage {
             revision: collection_revision(&response.revision)?,
             resources,
@@ -3576,6 +3679,7 @@ impl WorkspaceWatchService for RemoteWorkcellClient {
             .insert(
                 subscription_id.clone(),
                 WatchRecord {
+                    workspace_cursor: cursor.clone(),
                     cursor: watch_cursor.clone(),
                     root,
                     recursive: request.recursive,
@@ -3605,34 +3709,56 @@ impl WorkspaceWatchService for RemoteWorkcellClient {
                 capability: WorkspaceCapability::WatchPoll,
             })?
             .limits;
-        require_nonzero_within(request.max_events, limits.max_poll_events)?;
-        require_nonzero_within(request.max_bytes, limits.max_poll_bytes)?;
-        if request.wait_ms > limits.max_wait_ms {
-            return Err(invalid_response());
-        }
-        let known = self
-            .0
-            .watches
-            .lock()
-            .map_err(|_| WorkspaceError::Unavailable)?
-            .get(&request.subscription_id)
-            .cloned()
-            .ok_or(WorkspaceError::StaleCursor)?;
-        if known.cursor != request.cursor {
-            return Err(WorkspaceError::StaleCursor);
-        }
+        require_nonzero_within(request.max_events, u32::MAX)?;
+        require_nonzero_within(request.max_bytes, u32::MAX)?;
+        let max_events = request.max_events.min(limits.max_poll_events);
+        let max_bytes = request.max_bytes.min(limits.max_poll_bytes);
+        let wait_ms = request.wait_ms.min(limits.max_wait_ms);
+        let wire_binding = self.bind_workspace_request(binding, cursor)?;
+        let known = {
+            let mut watches = self
+                .0
+                .watches
+                .lock()
+                .map_err(|_| WorkspaceError::Unavailable)?;
+            let ttl = watches.ttl;
+            let entry = watches
+                .records
+                .get_mut(&request.subscription_id)
+                .ok_or(WorkspaceError::StaleCursor)?;
+            if entry.value.workspace_cursor != *cursor || entry.value.cursor != request.cursor {
+                return Err(WorkspaceError::StaleCursor);
+            }
+            if entry.touched.elapsed() > ttl {
+                watches.records.remove(&request.subscription_id);
+                return Ok(WatchEventPage {
+                    subscription_id: request.subscription_id.clone(),
+                    state: WatchPollState::FullResync {
+                        reason: WatchResyncReason::SubscriptionExpired,
+                    },
+                    sequence: SequenceMetadata {
+                        first_retained_sequence: None,
+                        next_sequence: WATCH_INITIAL_SEQUENCE,
+                        gap_before_first: true,
+                    },
+                    events: Vec::new(),
+                });
+            }
+            entry.touched = Instant::now();
+            entry.value.clone()
+        };
         let response: contract::WatchPollResponse = self
             .call(
                 contract::WATCH_POLL_METHOD,
                 &contract::WatchPollRequest {
                     version: contract::ContractVersion::V1,
-                    binding: self.bind_workspace_request(binding, cursor)?,
+                    binding: wire_binding,
                     subscription_id: contract_identifier(&request.subscription_id)?,
                     cursor: contract::Cursor::new(request.cursor.as_str())
                         .map_err(|_| WorkspaceError::StaleCursor)?,
-                    max_events: request.max_events,
-                    max_bytes: request.max_bytes,
-                    wait_ms: request.wait_ms,
+                    max_events,
+                    max_bytes,
+                    wait_ms,
                 },
                 &self.0.cancellation.child_token(),
             )
@@ -3642,8 +3768,8 @@ impl WorkspaceWatchService for RemoteWorkcellClient {
         if response.subscription_id.as_str() != request.subscription_id.as_str() {
             return Err(WorkspaceError::IdentityMismatch);
         }
-        if response.events.len() > request.max_events as usize
-            || serialized_items_bytes(&response.events)? > request.max_bytes as usize
+        if response.events.len() > max_events as usize
+            || serialized_items_bytes(&response.events)? > max_bytes as usize
         {
             return Err(invalid_response());
         }
@@ -3693,6 +3819,7 @@ impl WorkspaceWatchService for RemoteWorkcellClient {
                 .watches
                 .lock()
                 .map_err(|_| WorkspaceError::Unavailable)?
+                .records
                 .remove(&request.subscription_id);
         }
         Ok(WatchEventPage {
@@ -3714,13 +3841,15 @@ impl WorkspaceWatchService for RemoteWorkcellClient {
         subscription_id: &WatchSubscriptionId,
     ) -> Result<WatchCloseResult, WorkspaceError> {
         self.require_capability(WorkspaceCapability::WatchClose)?;
+        let wire_binding = self.bind_workspace_request(binding, cursor)?;
         if self
             .0
             .watches
             .lock()
             .map_err(|_| WorkspaceError::Unavailable)?
+            .records
             .get(subscription_id)
-            .is_none()
+            .is_none_or(|entry| entry.value.workspace_cursor != *cursor)
         {
             return Err(WorkspaceError::StaleCursor);
         }
@@ -3729,7 +3858,7 @@ impl WorkspaceWatchService for RemoteWorkcellClient {
                 contract::WATCH_CLOSE_METHOD,
                 &contract::WatchCloseRequest {
                     version: contract::ContractVersion::V1,
-                    binding: self.bind_workspace_request(binding, cursor)?,
+                    binding: wire_binding,
                     subscription_id: contract_identifier(subscription_id)?,
                 },
                 &self.0.cancellation.child_token(),
@@ -3743,6 +3872,7 @@ impl WorkspaceWatchService for RemoteWorkcellClient {
             .watches
             .lock()
             .map_err(|_| WorkspaceError::Unavailable)?
+            .records
             .remove(subscription_id);
         Ok(WatchCloseResult {
             subscription_id: subscription_id.clone(),
@@ -3790,6 +3920,13 @@ impl WorkspaceMutationService for RemoteWorkcellClient {
             .iter()
             .map(workspace_mutation)
             .collect::<Result<Vec<_>, _>>()?;
+        let expected_results = request
+            .mutations
+            .iter()
+            .map(|mutation| {
+                expected_mutation_result(mutation, |path| self.expected_response_path(cursor, path))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let content_bytes = request
             .mutations
             .iter()
@@ -3826,17 +3963,16 @@ impl WorkspaceMutationService for RemoteWorkcellClient {
         drop(preparation_permit);
         let status = self
             .execute_operation(binding, cursor, &operation, |value| {
-                parse_mutation_result(value, request)
+                parse_mutation_result(value, &expected_results)
             })
             .await?;
         if let OperationState::Completed { result, .. } = &status.state {
-            let base = self.validate_context(binding, cursor)?.path;
             let mut paths = self
                 .0
                 .paths
                 .lock()
                 .map_err(|_| WorkspaceError::Unavailable)?;
-            invalidate_mutation_aliases(&mut paths, &base, result)?;
+            invalidate_mutation_aliases(&mut paths, result);
         }
         Ok(status)
     }
@@ -5126,11 +5262,7 @@ fn parse_content_range(value: &str) -> Result<(u64, u64, Option<u64>), RemoteWor
 }
 
 fn map_rpc_error(error: &JsonRpcError) -> RemoteWorkcellError {
-    let symbolic = error
-        .data
-        .as_ref()
-        .and_then(|data| data.get("code"))
-        .and_then(Value::as_str);
+    let symbolic = rpc_diagnostic_token(error.data.as_ref().and_then(|data| data.get("code")));
     match symbolic {
         Some("transferIntegrityFailure") => RemoteWorkcellError::TransferIntegrity,
         Some("transferLimitExceeded") => RemoteWorkcellError::TransferQuota,
@@ -5161,6 +5293,8 @@ fn map_rpc_error(error: &JsonRpcError) -> RemoteWorkcellError {
         | Some("repository_locked")
         | Some("acknowledgement_required") => RemoteWorkcellError::Conflict,
         Some("busy") => RemoteWorkcellError::Busy,
+        Some("not_repository") => RemoteWorkcellError::NotRepository,
+        Some("watch_unavailable") => RemoteWorkcellError::WatchUnavailable,
         Some("quota_exceeded") => {
             let (limit, maximum) = exceeded_limit(error.data.as_ref());
             RemoteWorkcellError::QuotaExceeded { limit, maximum }
@@ -5179,23 +5313,20 @@ fn map_rpc_error(error: &JsonRpcError) -> RemoteWorkcellError {
             symbolic: snapshot::NOT_FOUND.to_owned(),
         },
         _ if matches!(error.code, 401 | 403) => RemoteWorkcellError::Authentication,
-        // A refusal we have no symbolic mapping for still arrived well formed,
-        // so calling it invalid blames the wire for a decision the host made.
-        // The host's own explanation is private diagnostic material and stays
-        // in this log; the codes travel so the caller learns what was refused.
-        _ => {
-            warn!(
-                code = error.code,
-                symbolic = symbolic.unwrap_or_default(),
-                message = %error.message,
-                "remote Workcell refusal has no symbolic mapping"
-            );
-            RemoteWorkcellError::UnmappedRefusal {
-                code: error.code,
-                symbolic: symbolic.unwrap_or(NO_SYMBOLIC_REASON).to_owned(),
-            }
-        }
+        _ => RemoteWorkcellError::UnmappedRefusal {
+            code: error.code,
+            symbolic: symbolic.unwrap_or(NO_SYMBOLIC_REASON).to_owned(),
+        },
     }
+}
+
+fn rpc_diagnostic_token(value: Option<&Value>) -> Option<&str> {
+    value.and_then(Value::as_str).filter(|token| {
+        (1..=MAX_RPC_DIAGNOSTIC_BYTES).contains(&token.len())
+            && token
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+    })
 }
 
 fn exceeded_limit(data: Option<&Value>) -> (Option<String>, Option<u64>) {
@@ -5334,8 +5465,6 @@ fn validate_capabilities(
             || limits.max_list_entries > contract::MAX_WORKSPACE_LIST_ENTRIES
             || limits.max_list_retained_bytes == 0
             || limits.max_list_retained_bytes > contract::MAX_WORKSPACE_LIST_RETAINED_BYTES
-            || limits.max_list_hash_bytes == 0
-            || limits.max_list_hash_bytes > contract::MAX_WORKSPACE_LIST_HASH_BYTES
         {
             return Err(RemoteWorkcellError::CapabilityMismatch);
         }
@@ -6193,26 +6322,13 @@ fn validate_selector_id(
     Ok(())
 }
 
-fn invalidate_mutation_aliases(
-    paths: &mut ResourceCache,
-    base: &WorkspacePath,
-    result: &MutationResult,
-) -> Result<(), WorkspaceError> {
+fn invalidate_mutation_aliases(paths: &mut ResourceCache, result: &MutationResult) {
     for entry in &result.results {
-        if matches!(
-            entry.kind,
-            MutationKind::Create
-                | MutationKind::CreateDirectory
-                | MutationKind::Move
-                | MutationKind::Remove
-        ) {
-            paths.remove_path(&join_workspace_path(base, &entry.path)?);
-        }
+        paths.remove_path(&entry.path);
         if let Some(destination) = &entry.destination {
-            paths.remove_path(&join_workspace_path(base, destination)?);
+            paths.remove_path(destination);
         }
     }
-    Ok(())
 }
 
 fn path_within(parent: &WorkspacePath, path: &WorkspacePath, recursive: bool) -> bool {
@@ -6787,17 +6903,21 @@ fn mutation_content_bytes(mutation: &Mutation) -> usize {
 
 fn parse_mutation_result(
     value: &Value,
-    request: &MutationRequest,
+    expected: &[MutationEntryResult],
 ) -> Result<MutationResult, WorkspaceError> {
     let result = parse_mutation_result_unbound(value)?;
     if !result.committed
         || result.rolled_back
-        || result.results.len() != request.mutations.len()
+        || result.results.len() != expected.len()
         || !result
             .results
             .iter()
-            .zip(&request.mutations)
-            .all(|(result, requested)| mutation_corresponds(result, requested))
+            .zip(expected)
+            .all(|(result, expected)| {
+                result.kind == expected.kind
+                    && result.path == expected.path
+                    && result.destination == expected.destination
+            })
     {
         return Err(invalid_response());
     }
@@ -6844,39 +6964,35 @@ fn parse_mutation_result_unbound(value: &Value) -> Result<MutationResult, Worksp
     })
 }
 
-fn mutation_corresponds(result: &MutationEntryResult, mutation: &Mutation) -> bool {
-    match mutation {
+fn expected_mutation_result(
+    mutation: &Mutation,
+    resolve_path: impl Fn(&WorkspacePath) -> Result<WorkspacePath, WorkspaceError>,
+) -> Result<MutationEntryResult, WorkspaceError> {
+    let (kind, path, destination) = match mutation {
         Mutation::Write {
             path, condition, ..
-        } => {
-            result.path == *path
-                && result.destination.is_none()
-                && result.kind
-                    == match condition {
-                        MutationCondition::MustNotExist => MutationKind::Create,
-                        MutationCondition::Matches(_) => MutationKind::Write,
-                    }
-        }
-        Mutation::CreateDirectory { path } => {
-            result.kind == MutationKind::CreateDirectory
-                && result.path == *path
-                && result.destination.is_none()
-        }
-        Mutation::Remove { path, .. } => {
-            result.kind == MutationKind::Remove
-                && result.path == *path
-                && result.destination.is_none()
-        }
+        } => (
+            match condition {
+                MutationCondition::MustNotExist => MutationKind::Create,
+                MutationCondition::Matches(_) => MutationKind::Write,
+            },
+            path,
+            None,
+        ),
+        Mutation::CreateDirectory { path } => (MutationKind::CreateDirectory, path, None),
+        Mutation::Remove { path, .. } => (MutationKind::Remove, path, None),
         Mutation::Move {
             source,
             destination,
             ..
-        } => {
-            result.kind == MutationKind::Move
-                && result.path == *source
-                && result.destination.as_ref() == Some(destination)
-        }
-    }
+        } => (MutationKind::Move, source, Some(destination)),
+    };
+    Ok(MutationEntryResult {
+        kind,
+        path: resolve_path(path)?,
+        destination: destination.map(resolve_path).transpose()?,
+        revision: None,
+    })
 }
 
 fn watch_resync_reason(reason: contract::WatchResyncReason) -> WatchResyncReason {
@@ -7308,32 +7424,36 @@ fn parse_snapshot_result_unbound(value: &Value) -> Result<SnapshotOperationResul
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
+    use std::fmt::Debug;
     use std::io::{BufRead, BufReader, Read, Write};
     use std::net::TcpListener;
     use std::str::FromStr;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::mpsc;
     use std::sync::{Arc, Mutex};
     use std::thread;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use serde_json::{Value, json};
     use test_case::test_case;
     use tokio::sync::Mutex as AsyncMutex;
     use tokio_util::sync::CancellationToken;
+    use tracing::field::{Field, Visit};
+    use tracing::span::{Attributes, Id, Record};
+    use tracing::{Event as TracingEvent, Metadata, Subscriber};
 
     use super::{
-        BoundedMap, CursorRecord, CursorRegistry, DIRECT_EXEC_KIND, JSON_SCHEMA_VERSION,
-        JournalOperation, JsonRpcError, MAX_SSE_EVENT_BYTES, OperationRegistry,
-        PendingRemoteOperation, PreparedWorkspaceContext, RecoveryOperation, RemoteEvent,
-        RemoteInner, RemoteMutationJournal, RemotePreparedToolCall, RemoteTransport,
+        BoundedMap, CatalogRevision, CursorRecord, CursorRegistry, DIRECT_EXEC_KIND,
+        JSON_SCHEMA_VERSION, JournalOperation, JsonRpcError, MAX_SSE_EVENT_BYTES,
+        OperationRegistry, PendingRemoteOperation, PreparedWorkspaceContext, RecoveryOperation,
+        RemoteEvent, RemoteInner, RemoteMutationJournal, RemotePreparedToolCall, RemoteTransport,
         RemoteWorkcellClient, RemoteWorkcellError, ResourceCache, SHELL_CONTRACT_ID,
         SHELL_EXECUTION_TIMEOUT, StoredOperation, ToolListWire, WORKSPACE_MUTATION_KIND,
-        canonical_journal_policy, cleanup_preview_partitions, convert_status, execution_timeout,
-        freeze_catalog, join_workspace_path, map_rpc_error, numeric_loopback, pagination_flags,
-        parse_content_range, parse_snapshot_result, project_asset_kind, project_asset_trust,
-        recovery_status, require_full_remote_parity, require_nonzero_within,
+        WatchRegistry, canonical_journal_policy, cleanup_preview_partitions, convert_status,
+        execution_timeout, freeze_catalog, join_workspace_path, map_rpc_error, numeric_loopback,
+        pagination_flags, parse_content_range, parse_snapshot_result, project_asset_kind,
+        project_asset_trust, recovery_status, require_full_remote_parity, require_nonzero_within,
         same_descriptor_except_instance, same_unique_ids, serialized_items_bytes,
         source_trust_anchor, unix_millis, validate_capabilities, validate_selector_id,
         watch_path_within, workspace_capabilities,
@@ -7355,14 +7475,17 @@ mod tests {
     };
     use caudra_storage::workspace_binding::StoredWorkspaceBinding;
     use caudra_workspace::{
-        AuthenticatedPrincipalId, AuthorityIdentity, CheckpointId, CwdHandle, OperationHandle,
-        OperationId, OperationState, PreparedToolCall, ProjectAssetKind, ProjectAssetTrust,
-        ProjectIdentity, ProjectKey, ResourceId, ResourceScope, ResourceSelector, RestoreId,
+        AuthenticatedPrincipalId, AuthorityIdentity, CheckpointId, CwdHandle, ListRequest,
+        Mutation, MutationCondition, MutationKind, MutationRequest, OperationHandle, OperationId,
+        OperationState, PreparedToolCall, ProjectAssetKind, ProjectAssetTrust, ProjectIdentity,
+        ProjectKey, ResourceId, ResourceRevision, ResourceScope, ResourceSelector, RestoreId,
         SessionBindingId, SessionWorkspaceBinding, SnapshotCaptureLimits, SnapshotCaptureRequest,
         SnapshotCaptureResult, SnapshotChangeCounts, SnapshotCleanupPreview, SnapshotId,
         SnapshotOperationPreview, SnapshotRestorePreview, SnapshotUnrevertPreview,
-        SourceTrustAnchor, ToolPrepareRequest, WorkspaceCapability, WorkspaceCursor,
-        WorkspaceError, WorkspacePath, WorkspaceSession,
+        SourceTrustAnchor, ToolPrepareRequest, WatchCursor, WatchOpenRequest, WatchPollRequest,
+        WatchPollState, WatchResyncReason, WatchSubscription, WatchSubscriptionId,
+        WorkspaceCapability, WorkspaceCursor, WorkspaceError, WorkspaceMutationService,
+        WorkspacePath, WorkspaceReadService, WorkspaceSession, WorkspaceWatchService, WriteContent,
     };
     use workcell::{ToolManifest, host_contract as contract};
 
@@ -7383,6 +7506,21 @@ mod tests {
     const SNAPSHOT_PREPARATION: &str = "capture-prepared";
     const SNAPSHOT_POLLS: usize = 24;
     const SNAPSHOT_REFUSAL: i64 = -32602;
+    const RPC_REFUSAL_LOG: &str = "remote Workcell request refused";
+    const WATCH_ERRNO: i64 = 28;
+    const WATCH_PHASE: &str = "register";
+    const MUTATION_CWD: &str = "sub";
+    const MUTATION_TARGET: &str = "sub/a.rs";
+    const MUTATION_DESTINATION: &str = "sub/b.rs";
+    const MUTATION_SHADOW: &str = "sub/sub/a.rs";
+    const MUTATION_SHADOW_DESTINATION: &str = "sub/sub/b.rs";
+    const MUTATION_ORIGINAL: &str = "original";
+    const MUTATION_UPDATED: &str = "updated";
+    const MUTATION_SHADOW_CONTENT: &str = "untouched";
+    const MUTATION_PREPARATION: &str = "mutation-prepared";
+    const CACHE_REGRESSION_ENTRIES: usize = 25_000;
+    const CACHE_PRESSURE_LIMIT: usize = 1024;
+    const CACHE_CLOCK_STEP: Duration = Duration::from_secs(1);
 
     #[test]
     fn authoritative_cursors_survive_capacity_pressure_and_reject_rebinding() {
@@ -7512,7 +7650,7 @@ mod tests {
                 "methods":{"resolveDirectory":true,"stat":true,"list":true,"readText":true,"searchText":true},
                 "limits":{"maxPathBytes":1,"maxPageSize":1,"maxTextReadBytes":1,
                     "maxSearchPatternBytes":1,"maxCursorBytes":1,"maxListEntries":1,
-                    "maxListRetainedBytes":1,"maxListHashBytes":1}
+                    "maxListRetainedBytes":1}
             },
             "watch":{
                 "version":"v1","methods":{"open":true,"poll":true,"close":true},
@@ -7800,6 +7938,10 @@ mod tests {
     )]
     #[test_case(json!({"code":"busy"}), WorkspaceError::Busy ; "busy")]
     #[test_case(json!({"code":"unsupported_file"}), WorkspaceError::UnsupportedEntry ; "unsupported_entry")]
+    #[test_case(json!({"code":"not_repository"}), WorkspaceError::NotRepository ; "not_repository")]
+    #[test_case(json!({"code":"watch_unavailable"}), WorkspaceError::WatchUnavailable ; "watch_unavailable")]
+    #[test_case(json!({"code":"repository_locked"}), WorkspaceError::Conflict ; "repository_conflict")]
+    #[test_case(json!({"code":"transferConflict"}), WorkspaceError::Conflict ; "transfer_conflict")]
     fn a_refusal_keeps_the_reason_the_host_gave(data: Value, expected: WorkspaceError) {
         assert_eq!(
             WorkspaceError::from(map_rpc_error(&rpc_error(data))),
@@ -7812,6 +7954,16 @@ mod tests {
     /// how a correct `file_read` surfaced as "invalid response".
     #[test_case(json!({"code":"capability_unavailable"}), "capability_unavailable" ; "absent_group")]
     #[test_case(json!({"code":"not_found"}), "not_found" ; "missing_path")]
+    #[test_case(json!({"code":"repository_unavailable"}), "repository_unavailable" ; "repository_failure")]
+    #[test_case(json!({"code":"unsupported_repository"}), "unsupported_repository" ; "unsupported_repository")]
+    #[test_case(json!({"code":"unknown"}), "unknown" ; "unknown_code")]
+    #[test_case(json!({"code":"not_repository_extra"}), "not_repository_extra" ; "not_repository_prefix")]
+    #[test_case(json!({"code":"watch_unavailable_extra"}), "watch_unavailable_extra" ; "watch_unavailable_prefix")]
+    #[test_case(json!({"kind":"not_repository"}), crate::remote::NO_SYMBOLIC_REASON ; "not_repository_kind_alias")]
+    #[test_case(json!({"kind":"watch_unavailable"}), crate::remote::NO_SYMBOLIC_REASON ; "watch_unavailable_kind_alias")]
+    #[test_case(json!({"code":"/private/workspace"}), crate::remote::NO_SYMBOLIC_REASON ; "path_is_not_a_symbolic_code")]
+    #[test_case(json!({"code":"Bearer secret"}), crate::remote::NO_SYMBOLIC_REASON ; "prose_is_not_a_symbolic_code")]
+    #[test_case(json!({"code":"x".repeat(crate::remote::MAX_RPC_DIAGNOSTIC_BYTES + 1)}), crate::remote::NO_SYMBOLIC_REASON ; "oversized_symbolic_code")]
     #[test_case(json!({}), crate::remote::NO_SYMBOLIC_REASON ; "no_symbolic_code")]
     fn an_unmapped_refusal_carries_its_reason_instead_of_claiming_malformed(
         data: Value,
@@ -7841,6 +7993,103 @@ mod tests {
             message: UNMAPPED_RPC_MESSAGE.to_owned(),
             data: Some(data),
         }
+    }
+
+    #[derive(Clone, Default)]
+    struct RpcDiagnostics(Arc<Mutex<Vec<(String, String)>>>);
+
+    impl Visit for RpcDiagnostics {
+        fn record_debug(&mut self, field: &Field, value: &dyn Debug) {
+            self.0
+                .lock()
+                .unwrap()
+                .push((field.name().to_owned(), format!("{value:?}")));
+        }
+
+        fn record_str(&mut self, field: &Field, value: &str) {
+            self.0
+                .lock()
+                .unwrap()
+                .push((field.name().to_owned(), value.to_owned()));
+        }
+    }
+
+    impl Subscriber for RpcDiagnostics {
+        fn enabled(&self, metadata: &Metadata<'_>) -> bool {
+            metadata.target() == "caudra_workcell::remote"
+        }
+
+        fn new_span(&self, _: &Attributes<'_>) -> Id {
+            Id::from_u64(1)
+        }
+
+        fn record(&self, _: &Id, _: &Record<'_>) {}
+
+        fn record_follows_from(&self, _: &Id, _: &Id) {}
+
+        fn event(&self, event: &TracingEvent<'_>) {
+            event.record(&mut self.clone());
+        }
+
+        fn enter(&self, _: &Id) {}
+
+        fn exit(&self, _: &Id) {}
+    }
+
+    #[test_case(crate::remote::JSON_CONTENT_TYPE, contract::SCM_DISCOVER_METHOD, "repository_unavailable"; "json_unmapped")]
+    #[test_case(crate::remote::SSE_CONTENT_TYPE, contract::SCM_DISCOVER_METHOD, "repository_unavailable"; "sse_unmapped")]
+    #[test_case(crate::remote::JSON_CONTENT_TYPE, contract::WATCH_OPEN_METHOD, "watch_unavailable"; "json_watch")]
+    #[test_case(crate::remote::SSE_CONTENT_TYPE, contract::WATCH_OPEN_METHOD, "watch_unavailable"; "sse_watch")]
+    fn rpc_refusal_diagnostics_keep_call_context_without_payloads(
+        content_type: &str,
+        method: &str,
+        symbolic: &str,
+    ) {
+        let body = json!({"jsonrpc":"2.0", "id":"$ID", "error": {
+            "code":UNMAPPED_RPC_CODE, "message":"private host path /private/workspace",
+            "data":{"code":symbolic, "phase":WATCH_PHASE, "rawOsError":WATCH_ERRNO,
+                "token":"private-response-token", "path":"/private/workspace"}
+        }})
+        .to_string()
+        .replace("\"$ID\"", "$ID");
+        let body = if content_type == super::SSE_CONTENT_TYPE {
+            format!("data: {body}\n\n")
+        } else {
+            body
+        };
+        let (endpoint, server) = serve_once(body, content_type);
+        let (transport, _) = RemoteTransport::new(&endpoint, None).unwrap();
+        let diagnostics = RpcDiagnostics::default();
+        let error = tracing::subscriber::with_default(diagnostics.clone(), || {
+            smol::block_on(transport.request(
+                method,
+                json!({"path":"/private/workspace", "token":"private-request-token"}),
+                super::MAX_HTTP_RESPONSE_BYTES as u64,
+                &CancellationToken::new(),
+            ))
+            .unwrap_err()
+        });
+        server.join().unwrap();
+        assert_eq!(error, map_rpc_error(&rpc_error(json!({"code":symbolic}))));
+        let fields = diagnostics.0.lock().unwrap();
+        let mut recorded = fields.iter().cloned().collect::<HashMap<_, _>>();
+        assert_eq!(recorded.len(), fields.len());
+        recorded
+            .remove("elapsed_ms")
+            .unwrap()
+            .parse::<u64>()
+            .unwrap();
+        assert_eq!(
+            recorded,
+            HashMap::from([
+                ("message".to_owned(), RPC_REFUSAL_LOG.to_owned()),
+                ("method".to_owned(), method.to_owned()),
+                ("code".to_owned(), UNMAPPED_RPC_CODE.to_string()),
+                ("symbolic".to_owned(), symbolic.to_owned()),
+                ("phase".to_owned(), WATCH_PHASE.to_owned()),
+                ("errno".to_owned(), WATCH_ERRNO.to_string()),
+            ])
+        );
     }
 
     fn serve_once(body: String, content_type: &str) -> (WorkcellEndpoint, thread::JoinHandle<()>) {
@@ -8775,7 +9024,7 @@ mod tests {
                 )]),
                 limit: CAPACITY,
             }),
-            watches: Mutex::new(BoundedMap::new(CAPACITY, Duration::MAX)),
+            watches: Mutex::new(WatchRegistry::new(CAPACITY, Duration::MAX)),
             operations: Mutex::new(operations),
             captures: super::snapshot::CaptureRegistry::default(),
             operation_slots: super::Event::new(),
@@ -8953,6 +9202,810 @@ mod tests {
         descriptor
     }
 
+    fn watch_host() -> ScriptedHost {
+        watch_host_with_response(|_, response| response)
+    }
+
+    struct MutationHost {
+        host: ScriptedHost,
+        files: Arc<Mutex<HashMap<String, String>>>,
+    }
+
+    fn mutation_revision(content: &str) -> ResourceRevision {
+        ResourceRevision::new(
+            CatalogRevision::for_serializable(&content)
+                .unwrap()
+                .as_str(),
+        )
+        .unwrap()
+    }
+
+    fn mutation_host(result_patch: Value) -> MutationHost {
+        let files = Arc::new(Mutex::new(HashMap::from([
+            (MUTATION_TARGET.to_owned(), MUTATION_ORIGINAL.to_owned()),
+            (
+                MUTATION_SHADOW.to_owned(),
+                MUTATION_SHADOW_CONTENT.to_owned(),
+            ),
+            (
+                MUTATION_SHADOW_DESTINATION.to_owned(),
+                MUTATION_SHADOW_CONTENT.to_owned(),
+            ),
+        ])));
+        let host_files = files.clone();
+        let prepared = Mutex::new(None::<(Value, Value)>);
+        let host = ScriptedHost::rpc(move |method, params| match method {
+            contract::PREPARE_MUTATION_METHOD => {
+                assert_eq!(params["cwdHandle"], MUTATION_CWD);
+                let mutation = params["mutations"][0].clone();
+                let kind = mutation["kind"].as_str().unwrap();
+                assert_eq!(
+                    mutation
+                        .get("path")
+                        .or_else(|| mutation.get("from"))
+                        .unwrap(),
+                    "a.rs"
+                );
+                if kind == "rename" {
+                    assert_eq!(mutation["to"], "b.rs");
+                }
+                let files = host_files.lock().unwrap();
+                let current = files.get(MUTATION_TARGET);
+                if (matches!(kind, "create" | "mkdir") && current.is_some())
+                    || mutation.get("expectedRevision").is_some_and(|expected| {
+                        current
+                            .is_none_or(|content| expected != mutation_revision(content).as_str())
+                    })
+                {
+                    return Err(snapshot_refusal(super::STALE_RESOURCE_CODE));
+                }
+                let response = json!({
+                    "version":"v1", "preparationId":MUTATION_PREPARATION,
+                    "expiresAtUnixMs":u64::MAX,
+                    "binding":{"host":params["host"], "argumentDigest":TEST_REQUEST_DIGEST,
+                        "contract":{"id":contract::WORKSPACE_MUTATION_CONTRACT_ID,"version":"v1","resultVersion":"v1"}},
+                    "intent":{"kind":"mutate","mutating":true,"resources":[{
+                        "display":MUTATION_TARGET,"access":"write","resourceId":"resource",
+                        "scope":["resource"],"revision":null
+                    }]}
+                });
+                *prepared.lock().unwrap() = Some((response.clone(), mutation));
+                Ok(response)
+            }
+            contract::EXECUTE_METHOD => {
+                let prepared = prepared.lock().unwrap();
+                let (prepared, mutation) = prepared.as_ref().unwrap();
+                let kind = mutation["kind"].as_str().unwrap();
+                let mut files = host_files.lock().unwrap();
+                let destination = match kind {
+                    "create" | "write" => {
+                        files.insert(
+                            MUTATION_TARGET.into(),
+                            mutation["content"].as_str().unwrap().into(),
+                        );
+                        None
+                    }
+                    "mkdir" => {
+                        files.insert(MUTATION_TARGET.into(), String::new());
+                        None
+                    }
+                    "delete" => {
+                        files.remove(MUTATION_TARGET).unwrap();
+                        None
+                    }
+                    "rename" => {
+                        let content = files.remove(MUTATION_TARGET).unwrap();
+                        files.insert(MUTATION_DESTINATION.into(), content);
+                        Some(MUTATION_DESTINATION)
+                    }
+                    _ => panic!("unexpected mutation kind {kind}"),
+                };
+                let revision = files
+                    .get(destination.unwrap_or(MUTATION_TARGET))
+                    .map(|content| mutation_revision(content));
+                let mut entry = json!({"kind":kind,"path":MUTATION_TARGET,"destination":destination,"revision":revision});
+                entry
+                    .as_object_mut()
+                    .unwrap()
+                    .extend(result_patch.as_object().unwrap().clone());
+                let mut status = serde_json::to_value(completed_status()).unwrap();
+                status["preparationId"] = params["preparationId"].clone();
+                status["invocationId"] = params["invocationId"].clone();
+                status["binding"] = prepared["binding"].clone();
+                status["expiresAtUnixMs"] = prepared["expiresAtUnixMs"].clone();
+                status["outcome"]["result"]["structuredContent"] = json!({
+                    "version":"v1","committed":true,"rolledBack":false,"atomicAcrossFiles":false,"results":[entry]
+                });
+                Ok(status)
+            }
+            contract::RELEASE_METHOD => {
+                Ok(json!({"version":"v1","state":"forgotten","released":true}))
+            }
+            _ => panic!("unexpected mutation method {method}"),
+        });
+        MutationHost { host, files }
+    }
+
+    fn nonroot_mutation_client(host: &MutationHost, state: &StateDir) -> RemoteWorkcellClient {
+        let mut client = snapshot_client(&host.host.endpoint, state);
+        let inner = Arc::get_mut(&mut client.0).unwrap();
+        inner
+            .descriptor
+            .capabilities
+            .workspace
+            .as_mut()
+            .unwrap()
+            .limits
+            .max_path_bytes = contract::MAX_WORKSPACE_PATH_BYTES as u32;
+        inner
+            .descriptor
+            .capabilities
+            .workspace_mutation
+            .as_mut()
+            .unwrap()
+            .max_content_bytes = contract::MAX_ARGUMENT_BYTES as u64;
+        let cursor = WorkspaceCursor::new(
+            &inner.session_binding,
+            inner.root_cursor.scope().clone(),
+            inner.root_cursor.generation(),
+            CwdHandle::new(MUTATION_CWD).unwrap(),
+        );
+        inner
+            .cursors
+            .lock()
+            .unwrap()
+            .insert(
+                cursor.cwd_handle().clone(),
+                CursorRecord {
+                    cursor: cursor.clone(),
+                    path: WorkspacePath::new(MUTATION_CWD).unwrap(),
+                },
+            )
+            .unwrap();
+        inner.root_cursor = cursor;
+        for (index, path) in [
+            MUTATION_TARGET,
+            MUTATION_DESTINATION,
+            MUTATION_SHADOW,
+            MUTATION_SHADOW_DESTINATION,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            inner.paths.lock().unwrap().insert(
+                ResourceId::new(format!("resource-{index}")).unwrap(),
+                WorkspacePath::new(path).unwrap(),
+            );
+        }
+        client
+    }
+
+    fn mutation_request(kind: MutationKind, revision: ResourceRevision) -> MutationRequest {
+        let path = WorkspacePath::new("a.rs").unwrap();
+        MutationRequest {
+            mutations: vec![match kind {
+                MutationKind::Create | MutationKind::Write => Mutation::Write {
+                    path,
+                    content: WriteContent::Text(MUTATION_UPDATED.into()),
+                    condition: if kind == MutationKind::Create {
+                        MutationCondition::MustNotExist
+                    } else {
+                        MutationCondition::Matches(revision)
+                    },
+                },
+                MutationKind::CreateDirectory => Mutation::CreateDirectory { path },
+                MutationKind::Move => Mutation::Move {
+                    source: path,
+                    destination: WorkspacePath::new("b.rs").unwrap(),
+                    expected_revision: revision,
+                },
+                MutationKind::Remove => Mutation::Remove {
+                    path,
+                    expected_revision: revision,
+                },
+            }],
+        }
+    }
+
+    #[test_case(MutationKind::Write; "write")]
+    #[test_case(MutationKind::Create; "create")]
+    #[test_case(MutationKind::CreateDirectory; "mkdir")]
+    #[test_case(MutationKind::Move; "rename")]
+    #[test_case(MutationKind::Remove; "delete")]
+    fn nonroot_mutations_validate_project_paths_without_redispatch(kind: MutationKind) {
+        let host = mutation_host(json!({}));
+        let temp = tempfile::tempdir().unwrap();
+        let client =
+            nonroot_mutation_client(&host, &StateDir::from_path(temp.path().join("state")));
+        if matches!(kind, MutationKind::Create | MutationKind::CreateDirectory) {
+            host.files.lock().unwrap().remove(MUTATION_TARGET);
+        } else {
+            let stale = mutation_request(kind, mutation_revision(MUTATION_UPDATED));
+            assert_eq!(
+                smol::block_on(client.execute(
+                    client.session_binding(),
+                    client.root_cursor(),
+                    &stale
+                )),
+                Err(WorkspaceError::StaleResource {
+                    resource_id: ResourceId::new(client.host_binding().cwd_handle.as_str())
+                        .unwrap(),
+                })
+            );
+            assert_eq!(
+                host.files.lock().unwrap().get(MUTATION_TARGET).unwrap(),
+                MUTATION_ORIGINAL
+            );
+            assert!(host.host.params_for(contract::EXECUTE_METHOD).is_empty());
+        }
+        let request = mutation_request(kind, mutation_revision(MUTATION_ORIGINAL));
+        let status = smol::block_on(client.execute(
+            client.session_binding(),
+            client.root_cursor(),
+            &request,
+        ))
+        .unwrap();
+        let OperationState::Completed { result, .. } = status.state else {
+            panic!("mutation did not complete")
+        };
+        assert!(result.committed);
+        assert_eq!(result.results.len(), 1);
+        assert_eq!(result.results[0].kind, kind);
+        assert_eq!(result.results[0].path.as_str(), MUTATION_TARGET);
+        assert_eq!(
+            result.results[0]
+                .destination
+                .as_ref()
+                .map(|path| path.as_str()),
+            (kind == MutationKind::Move).then_some(MUTATION_DESTINATION)
+        );
+        let files = host.files.lock().unwrap();
+        match kind {
+            MutationKind::Create | MutationKind::Write => {
+                assert_eq!(files.get(MUTATION_TARGET).unwrap(), MUTATION_UPDATED)
+            }
+            MutationKind::CreateDirectory => {
+                assert!(files.get(MUTATION_TARGET).unwrap().is_empty())
+            }
+            MutationKind::Move => {
+                assert!(!files.contains_key(MUTATION_TARGET));
+                assert_eq!(files.get(MUTATION_DESTINATION).unwrap(), MUTATION_ORIGINAL);
+            }
+            MutationKind::Remove => assert!(!files.contains_key(MUTATION_TARGET)),
+        }
+        for shadow in [MUTATION_SHADOW, MUTATION_SHADOW_DESTINATION] {
+            assert_eq!(files.get(shadow).unwrap(), MUTATION_SHADOW_CONTENT);
+            assert!(
+                client
+                    .0
+                    .paths
+                    .lock()
+                    .unwrap()
+                    .id_for_path(&WorkspacePath::new(shadow).unwrap())
+                    .is_some()
+            );
+        }
+        assert!(
+            client
+                .0
+                .paths
+                .lock()
+                .unwrap()
+                .id_for_path(&WorkspacePath::new(MUTATION_TARGET).unwrap())
+                .is_none()
+        );
+        assert_eq!(
+            client
+                .0
+                .paths
+                .lock()
+                .unwrap()
+                .id_for_path(&WorkspacePath::new(MUTATION_DESTINATION).unwrap())
+                .is_none(),
+            kind == MutationKind::Move
+        );
+        assert_eq!(host.host.params_for(contract::EXECUTE_METHOD).len(), 1);
+        assert_eq!(host.host.params_for(contract::RELEASE_METHOD).len(), 1);
+    }
+
+    #[test_case(MutationKind::Write, json!({"path":"a.rs"}); "cursor_relative_response_is_invalid")]
+    #[test_case(MutationKind::Write, json!({"path":"sub/sub/a.rs"}); "double_prefixed_response_is_invalid")]
+    #[test_case(MutationKind::Move, json!({"destination":"sub/sub/b.rs"}); "wrong_rename_destination")]
+    #[test_case(MutationKind::Write, json!({"kind":"delete"}); "wrong_mutation_kind")]
+    fn nonroot_mutations_reject_bad_outcomes_without_reexecution(kind: MutationKind, patch: Value) {
+        let host = mutation_host(patch);
+        let temp = tempfile::tempdir().unwrap();
+        let client =
+            nonroot_mutation_client(&host, &StateDir::from_path(temp.path().join("state")));
+        let request = mutation_request(kind, mutation_revision(MUTATION_ORIGINAL));
+        assert_eq!(
+            smol::block_on(client.execute(
+                client.session_binding(),
+                client.root_cursor(),
+                &request
+            )),
+            Err(super::invalid_response())
+        );
+        assert_eq!(host.host.params_for(contract::EXECUTE_METHOD).len(), 1);
+        assert!(host.host.params_for(contract::STATUS_METHOD).is_empty());
+        assert!(host.host.params_for(contract::RELEASE_METHOD).is_empty());
+        assert_eq!(
+            host.files.lock().unwrap().get(MUTATION_SHADOW).unwrap(),
+            MUTATION_SHADOW_CONTENT
+        );
+    }
+
+    fn watch_host_with_response(
+        respond: impl Fn(&str, Value) -> Value + Send + 'static,
+    ) -> ScriptedHost {
+        let next_id = AtomicU64::new(0);
+        ScriptedHost::new(move |method, params| {
+            let response = match method {
+                contract::WATCH_OPEN_METHOD => json!({
+                    "version":"v1", "subscriptionId":format!("watch-{}", next_id.fetch_add(1, Ordering::Relaxed)),
+                    "state":"current", "cursor":"a", "expiresAtUnixMs":u64::MAX
+                }),
+                contract::WATCH_POLL_METHOD => json!({
+                    "version":"v1", "subscriptionId":params["subscriptionId"],
+                    "state":"current", "resyncReason":null, "firstRetainedSequence":null,
+                    "nextSequence":crate::remote::WATCH_INITIAL_SEQUENCE, "events":[],
+                    "nextCursor":"b", "expiresAtUnixMs":u64::MAX
+                }),
+                contract::WATCH_CLOSE_METHOD => json!({
+                    "version":"v1", "subscriptionId":params["subscriptionId"], "closed":true
+                }),
+                _ => panic!("unexpected watch method {method}"),
+            };
+            respond(method, response)
+        })
+    }
+
+    fn open_watch(client: &RemoteWorkcellClient) -> WatchSubscription {
+        smol::block_on(client.open(
+            client.session_binding(),
+            client.root_cursor(),
+            &WatchOpenRequest {
+                root: ResourceSelector::Current,
+                recursive: false,
+            },
+        ))
+        .unwrap()
+    }
+
+    fn watch_poll_request(subscription: &WatchSubscription) -> WatchPollRequest {
+        WatchPollRequest {
+            subscription_id: subscription.subscription_id.clone(),
+            cursor: subscription.cursor.clone(),
+            max_events: 1,
+            max_bytes: 1,
+            wait_ms: 0,
+        }
+    }
+
+    fn expire_watch(client: &RemoteWorkcellClient, id: &WatchSubscriptionId) {
+        let mut watches = client.0.watches.lock().unwrap();
+        watches.ttl = super::DEFAULT_CACHE_TTL;
+        watches.records.get_mut(id).unwrap().touched = Instant::now() - watches.ttl * 2;
+    }
+
+    #[test_case((256, 65_536, 30_000), (128, 4096, 1000), (128, 4096, 1000); "negotiated_host_ceiling")]
+    #[test_case((1, 1, 0), (128, 4096, 1000), (1, 1, 0); "smaller_nonblocking_request")]
+    #[test_case((u32::MAX, u32::MAX, u64::MAX), (1, 1, 1), (1, 1, 1); "maximum_request")]
+    fn watch_poll_clamps_to_negotiated_limits(
+        requested: (u32, u32, u64),
+        limits: (u32, u32, u64),
+        expected: (u32, u32, u64),
+    ) {
+        let host = watch_host();
+        let temp = tempfile::tempdir().unwrap();
+        let mut client = snapshot_client(
+            &host.endpoint,
+            &StateDir::from_path(temp.path().join("state")),
+        );
+        let advertised = &mut Arc::get_mut(&mut client.0)
+            .unwrap()
+            .descriptor
+            .capabilities
+            .watch
+            .as_mut()
+            .unwrap()
+            .limits;
+        advertised.max_poll_events = limits.0;
+        advertised.max_poll_bytes = limits.1;
+        advertised.max_wait_ms = limits.2;
+        let subscription = open_watch(&client);
+        let mut request = watch_poll_request(&subscription);
+        request.max_events = requested.0;
+        request.max_bytes = requested.1;
+        request.wait_ms = requested.2;
+        let page =
+            smol::block_on(client.poll(client.session_binding(), client.root_cursor(), &request))
+                .unwrap();
+        assert!(matches!(page.state, WatchPollState::Current { .. }));
+        let calls = host.params_for(contract::WATCH_POLL_METHOD);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["maxEvents"], expected.0);
+        assert_eq!(calls[0]["maxBytes"], expected.1);
+        assert_eq!(calls[0]["waitMs"], expected.2);
+    }
+
+    #[test_case(0, 1; "zero_events")]
+    #[test_case(1, 0; "zero_bytes")]
+    fn watch_poll_rejects_zero_before_dispatch(max_events: u32, max_bytes: u32) {
+        let host = watch_host();
+        let temp = tempfile::tempdir().unwrap();
+        let client = snapshot_client(
+            &host.endpoint,
+            &StateDir::from_path(temp.path().join("state")),
+        );
+        let subscription = open_watch(&client);
+        let mut request = watch_poll_request(&subscription);
+        request.max_events = max_events;
+        request.max_bytes = max_bytes;
+        request.wait_ms = u64::MAX;
+        assert_eq!(
+            smol::block_on(client.poll(client.session_binding(), client.root_cursor(), &request)),
+            Err(super::invalid_response())
+        );
+        assert!(host.params_for(contract::WATCH_POLL_METHOD).is_empty());
+    }
+
+    #[test_case(json!({"events":[{"sequence":1,"kind":"modify","path":"f"},{"sequence":2,"kind":"modify","path":"f"}],"nextSequence":3}), 1024, crate::remote::invalid_response(); "too_many_events_for_clamped_limit")]
+    #[test_case(json!({"events":[{"sequence":1,"kind":"modify","path":"f"}],"nextSequence":2}), 1, crate::remote::invalid_response(); "too_many_bytes_for_clamped_limit")]
+    #[test_case(json!({"subscriptionId":"wrong"}), 1024, WorkspaceError::IdentityMismatch; "wrong_subscription")]
+    #[test_case(json!({"nextCursor":null}), 1024, crate::remote::invalid_response(); "malformed_current_state")]
+    fn clamped_watch_poll_still_rejects_bad_responses(
+        patch: Value,
+        max_bytes: u32,
+        expected: WorkspaceError,
+    ) {
+        let host = watch_host_with_response(move |method, mut response| {
+            if method == contract::WATCH_POLL_METHOD {
+                response
+                    .as_object_mut()
+                    .unwrap()
+                    .extend(patch.as_object().unwrap().clone());
+            }
+            response
+        });
+        let temp = tempfile::tempdir().unwrap();
+        let mut client = snapshot_client(
+            &host.endpoint,
+            &StateDir::from_path(temp.path().join("state")),
+        );
+        Arc::get_mut(&mut client.0)
+            .unwrap()
+            .descriptor
+            .capabilities
+            .watch
+            .as_mut()
+            .unwrap()
+            .limits
+            .max_poll_bytes = max_bytes;
+        let subscription = open_watch(&client);
+        let mut request = watch_poll_request(&subscription);
+        request.max_events = u32::MAX;
+        request.max_bytes = u32::MAX;
+        request.wait_ms = u64::MAX;
+        assert_eq!(
+            smol::block_on(client.poll(client.session_binding(), client.root_cursor(), &request)),
+            Err(expected)
+        );
+        assert_eq!(
+            client
+                .0
+                .watches
+                .lock()
+                .unwrap()
+                .records
+                .get(&subscription.subscription_id)
+                .unwrap()
+                .value
+                .cursor,
+            subscription.cursor
+        );
+        assert_eq!(host.params_for(contract::WATCH_POLL_METHOD).len(), 1);
+    }
+
+    #[test_case(false; "other_watch_is_current")]
+    #[test_case(true; "other_watch_is_also_expired")]
+    fn local_watch_expiry_resyncs_only_the_matching_subscription(other_expired: bool) {
+        let host = watch_host();
+        let temp = tempfile::tempdir().unwrap();
+        let client = snapshot_client(
+            &host.endpoint,
+            &StateDir::from_path(temp.path().join("state")),
+        );
+        let expired = open_watch(&client);
+        let other = open_watch(&client);
+        expire_watch(&client, &expired.subscription_id);
+        if other_expired {
+            expire_watch(&client, &other.subscription_id);
+        }
+        let transient = open_watch(&client);
+        smol::block_on(client.close(
+            client.session_binding(),
+            client.root_cursor(),
+            &transient.subscription_id,
+        ))
+        .unwrap();
+        let request = watch_poll_request(&expired);
+        let page =
+            smol::block_on(client.poll(client.session_binding(), client.root_cursor(), &request))
+                .unwrap();
+        assert_eq!(page.subscription_id, expired.subscription_id);
+        assert_eq!(
+            page.state,
+            WatchPollState::FullResync {
+                reason: WatchResyncReason::SubscriptionExpired
+            }
+        );
+        assert!(page.events.is_empty());
+        assert_eq!(page.sequence.first_retained_sequence, None);
+        assert_eq!(page.sequence.next_sequence, super::WATCH_INITIAL_SEQUENCE);
+        assert!(page.sequence.gap_before_first);
+        assert!(
+            client
+                .0
+                .watches
+                .lock()
+                .unwrap()
+                .records
+                .contains_key(&other.subscription_id)
+        );
+        assert_eq!(
+            smol::block_on(client.poll(client.session_binding(), client.root_cursor(), &request)),
+            Err(WorkspaceError::StaleCursor)
+        );
+        let reopened = open_watch(&client);
+        let page = smol::block_on(client.poll(
+            client.session_binding(),
+            client.root_cursor(),
+            &watch_poll_request(&reopened),
+        ))
+        .unwrap();
+        assert!(matches!(page.state, WatchPollState::Current { .. }));
+        let page = smol::block_on(client.poll(
+            client.session_binding(),
+            client.root_cursor(),
+            &watch_poll_request(&other),
+        ))
+        .unwrap();
+        assert_eq!(
+            matches!(
+                page.state,
+                WatchPollState::FullResync {
+                    reason: WatchResyncReason::SubscriptionExpired
+                }
+            ),
+            other_expired
+        );
+        let calls = host.params_for(contract::WATCH_POLL_METHOD);
+        assert!(
+            calls
+                .iter()
+                .all(|params| params["subscriptionId"] != expired.subscription_id.as_str())
+        );
+        assert_eq!(calls.len(), if other_expired { 1 } else { 2 });
+    }
+
+    enum WatchMismatch {
+        UnknownSubscription,
+        WatchCursor,
+        StaleWorkspaceCursor,
+        OtherWorkspaceCursor,
+        Binding,
+    }
+
+    #[test_case(WatchMismatch::UnknownSubscription, WorkspaceError::StaleCursor; "unknown_subscription")]
+    #[test_case(WatchMismatch::WatchCursor, WorkspaceError::StaleCursor; "wrong_watch_cursor")]
+    #[test_case(WatchMismatch::StaleWorkspaceCursor, WorkspaceError::StaleCursor; "stale_workspace_cursor")]
+    #[test_case(WatchMismatch::OtherWorkspaceCursor, WorkspaceError::StaleCursor; "other_valid_workspace_cursor")]
+    #[test_case(WatchMismatch::Binding, WorkspaceError::IdentityMismatch; "wrong_session_binding")]
+    fn local_watch_expiry_never_masks_invalid_context(
+        mismatch: WatchMismatch,
+        expected: WorkspaceError,
+    ) {
+        let host = watch_host();
+        let temp = tempfile::tempdir().unwrap();
+        let client = snapshot_client(
+            &host.endpoint,
+            &StateDir::from_path(temp.path().join("state")),
+        );
+        let subscription = open_watch(&client);
+        expire_watch(&client, &subscription.subscription_id);
+        let mut request = watch_poll_request(&subscription);
+        let mut binding = client.session_binding().clone();
+        request.max_events = u32::MAX;
+        request.max_bytes = u32::MAX;
+        request.wait_ms = u64::MAX;
+        let mut cursor = client.root_cursor().clone();
+        match mismatch {
+            WatchMismatch::UnknownSubscription => {
+                request.subscription_id = WatchSubscriptionId::new("unknown").unwrap()
+            }
+            WatchMismatch::WatchCursor => request.cursor = WatchCursor::new("wrong").unwrap(),
+            WatchMismatch::StaleWorkspaceCursor | WatchMismatch::OtherWorkspaceCursor => {
+                cursor = WorkspaceCursor::new(
+                    &binding,
+                    cursor.scope().clone(),
+                    cursor.generation(),
+                    CwdHandle::new("other").unwrap(),
+                );
+                if matches!(mismatch, WatchMismatch::OtherWorkspaceCursor) {
+                    client
+                        .0
+                        .cursors
+                        .lock()
+                        .unwrap()
+                        .insert(
+                            cursor.cwd_handle().clone(),
+                            CursorRecord {
+                                cursor: cursor.clone(),
+                                path: WorkspacePath::root(),
+                            },
+                        )
+                        .unwrap();
+                }
+            }
+            WatchMismatch::Binding => {
+                binding = StoredWorkspaceBinding::local_from_cwd("another-workspace")
+                    .binding()
+                    .clone()
+            }
+        }
+        assert_eq!(
+            smol::block_on(client.poll(&binding, &cursor, &request)),
+            Err(expected)
+        );
+        assert!(
+            client
+                .0
+                .watches
+                .lock()
+                .unwrap()
+                .records
+                .contains_key(&subscription.subscription_id)
+        );
+        let page = smol::block_on(client.poll(
+            client.session_binding(),
+            client.root_cursor(),
+            &watch_poll_request(&subscription),
+        ))
+        .unwrap();
+        assert_eq!(
+            page.state,
+            WatchPollState::FullResync {
+                reason: WatchResyncReason::SubscriptionExpired
+            }
+        );
+        assert!(host.params_for(contract::WATCH_POLL_METHOD).is_empty());
+    }
+
+    #[test_case(1; "single_slot")]
+    #[test_case(2; "multiple_slots")]
+    fn watch_registry_capacity_remains_bounded(limit: usize) {
+        let host = watch_host();
+        let temp = tempfile::tempdir().unwrap();
+        let client = snapshot_client(
+            &host.endpoint,
+            &StateDir::from_path(temp.path().join("state")),
+        );
+        client.0.watches.lock().unwrap().limit = limit;
+        let oldest = open_watch(&client);
+        expire_watch(&client, &oldest.subscription_id);
+        for _ in 0..limit {
+            open_watch(&client);
+        }
+        assert_eq!(client.0.watches.lock().unwrap().records.len(), limit);
+        assert_eq!(
+            smol::block_on(client.poll(
+                client.session_binding(),
+                client.root_cursor(),
+                &watch_poll_request(&oldest)
+            )),
+            Err(WorkspaceError::StaleCursor)
+        );
+        assert!(host.params_for(contract::WATCH_POLL_METHOD).is_empty());
+    }
+
+    #[test_case(None, "file"; "metadata_only_file")]
+    #[test_case(None, "directory"; "metadata_only_directory")]
+    #[test_case(Some(crate::remote::tests::TEST_REQUEST_DIGEST), "file"; "verified_file")]
+    fn remembered_entries_preserve_optional_revisions(revision: Option<&str>, kind: &str) {
+        let endpoint = WorkcellEndpoint::parse("http://127.0.0.1:1/mcp").unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let client = snapshot_client(&endpoint, &StateDir::from_path(temp.path().join("state")));
+        let entry: contract::WorkspaceEntry = serde_json::from_value(json!({
+            "path":"f", "resourceId":"resource", "revision":revision,
+            "kind":kind, "sizeBytes":1
+        }))
+        .unwrap();
+        let resource = client.remember_entry(&entry).unwrap();
+        assert_eq!(
+            resource.revision.as_ref().map(|revision| revision.as_str()),
+            revision
+        );
+        assert_eq!(
+            resource.path.as_ref().unwrap().as_str(),
+            entry.path.as_str()
+        );
+        assert_eq!(
+            resource.scope.resource_id().as_str(),
+            entry.resource_id.as_str()
+        );
+        assert_eq!(resource.project, *client.session_binding().project());
+        assert_eq!(resource.size_bytes, entry.size_bytes);
+        assert_eq!(
+            client
+                .selector_path(
+                    client.root_cursor(),
+                    &ResourceSelector::Id(resource.scope.resource_id().clone())
+                )
+                .unwrap(),
+            resource.path.unwrap()
+        );
+    }
+
+    #[test_case(false, false, false, (false, false); "complete")]
+    #[test_case(false, false, true, (true, false); "continuation")]
+    #[test_case(false, true, false, (false, true); "incomplete")]
+    #[test_case(false, true, true, (true, true); "incomplete_with_continuation")]
+    #[test_case(true, false, false, (false, true); "bounded_scan")]
+    #[test_case(true, false, true, (true, true); "bounded_scan_with_continuation")]
+    #[test_case(true, true, false, (false, true); "bounded_incomplete_scan")]
+    #[test_case(true, true, true, (true, true); "bounded_incomplete_scan_with_continuation")]
+    fn metadata_list_pages_propagate_incompleteness(
+        truncated: bool,
+        incomplete: bool,
+        has_cursor: bool,
+        expected: (bool, bool),
+    ) {
+        let host = ScriptedHost::new(move |method, _| {
+            assert_eq!(method, contract::LIST_METHOD);
+            json!({
+                "version":"v1", "revision":"collection",
+                "entries":[{"path":"f", "resourceId":"resource", "revision":null,
+                    "kind":"file", "sizeBytes":1}],
+                "truncated":truncated, "incomplete":incomplete,
+                "nextCursor":has_cursor.then_some("n")
+            })
+        });
+        let temp = tempfile::tempdir().unwrap();
+        let client = snapshot_client(
+            &host.endpoint,
+            &StateDir::from_path(temp.path().join("state")),
+        );
+        let page = smol::block_on(client.list(
+            client.session_binding(),
+            client.root_cursor(),
+            &ListRequest {
+                parent: ResourceSelector::Current,
+                recursive: false,
+                continuation: None,
+                limit: 1,
+            },
+        ))
+        .unwrap();
+        assert_eq!((page.truncated, page.incomplete), expected);
+        assert_eq!(page.continuation.is_some(), has_cursor);
+        assert_eq!(page.revision.as_str(), "collection");
+        assert_eq!(page.resources.len(), 1);
+        let resource = &page.resources[0];
+        assert_eq!(resource.revision, None);
+        assert_eq!(resource.path.as_ref().unwrap().as_str(), "f");
+        assert_eq!(resource.scope.resource_id().as_str(), "resource");
+        assert_eq!(
+            client
+                .selector_path(
+                    client.root_cursor(),
+                    &ResourceSelector::Id(resource.scope.resource_id().clone())
+                )
+                .unwrap(),
+            *resource.path.as_ref().unwrap()
+        );
+    }
+
     pub(super) fn snapshot_client(
         endpoint: &WorkcellEndpoint,
         state: &StateDir,
@@ -8998,7 +10051,7 @@ mod tests {
                 )]),
                 limit: CAPACITY,
             }),
-            watches: Mutex::new(BoundedMap::new(CAPACITY, Duration::MAX)),
+            watches: Mutex::new(WatchRegistry::new(CAPACITY, Duration::MAX)),
             operations: Mutex::new(OperationRegistry::new(CAPACITY)),
             captures: super::snapshot::CaptureRegistry::default(),
             operation_slots: super::Event::new(),
@@ -9804,7 +10857,7 @@ mod tests {
                 )]),
                 limit: 8,
             }),
-            watches: Mutex::new(BoundedMap::new(8, Duration::MAX)),
+            watches: Mutex::new(WatchRegistry::new(8, Duration::MAX)),
             operations: Mutex::new(OperationRegistry::new(8)),
             captures: super::snapshot::CaptureRegistry::default(),
             operation_slots: super::Event::new(),
@@ -10343,6 +11396,248 @@ mod tests {
         paths.insert(new_id.clone(), second.clone());
         assert!(paths.id_for_path(&first).is_none());
         assert_eq!(paths.get_path(&new_id), Some(&second));
+        assert_resource_cache_consistent(&paths);
+    }
+
+    fn assert_resource_cache_consistent(cache: &ResourceCache) {
+        assert!(cache.by_id.len() <= cache.limit);
+        assert_eq!(cache.by_id.len(), cache.by_path.len());
+        assert_eq!(cache.by_id.len(), cache.by_touch.len());
+        for (id, entry) in &cache.by_id {
+            assert_eq!(cache.by_path.get(&entry.value), Some(id));
+            assert!(cache.by_touch.contains(&(entry.touched, id.clone())));
+        }
+    }
+
+    #[test_case(Duration::ZERO; "zero_ttl")]
+    #[test_case(Duration::from_secs(10); "sliding_ttl")]
+    fn resource_cache_preserves_exact_expiry_and_refresh(ttl: Duration) {
+        let mut cache = ResourceCache::new(1, ttl);
+        let id = ResourceId::new("resource").unwrap();
+        let path = WorkspacePath::new("file").unwrap();
+        let start = Instant::now();
+        cache.insert_at(id.clone(), path.clone(), start);
+        let refreshed = start + ttl;
+        assert_eq!(cache.get_path_at(&id, refreshed), Some(&path));
+        assert_resource_cache_consistent(&cache);
+        let expiry = refreshed + ttl;
+        cache.expire(expiry);
+        assert_eq!(cache.by_path.get(&path), Some(&id));
+        assert_eq!(
+            cache.get_path_at(&id, expiry + Duration::from_nanos(1)),
+            None
+        );
+        assert!(cache.by_id.is_empty());
+        assert_resource_cache_consistent(&cache);
+    }
+
+    #[test_case(false; "oldest_expires")]
+    #[test_case(true; "lookup_refresh_reorders_expiry")]
+    fn resource_cache_expires_only_due_entries(refresh: bool) {
+        let mut cache = ResourceCache::new(2, CACHE_CLOCK_STEP * 3);
+        let first_id = ResourceId::new("first").unwrap();
+        let second_id = ResourceId::new("second").unwrap();
+        let first_path = WorkspacePath::new("first").unwrap();
+        let second_path = WorkspacePath::new("second").unwrap();
+        let start = Instant::now();
+        cache.insert_at(first_id.clone(), first_path.clone(), start);
+        cache.insert_at(
+            second_id.clone(),
+            second_path.clone(),
+            start + CACHE_CLOCK_STEP,
+        );
+        if refresh {
+            assert_eq!(
+                cache.get_path_at(&first_id, start + CACHE_CLOCK_STEP * 2),
+                Some(&first_path)
+            );
+        }
+        let now = start + CACHE_CLOCK_STEP * 4 + Duration::from_nanos(1);
+        cache.expire(now);
+        assert_eq!(cache.get_path_at(&second_id, now), None);
+        assert!(!cache.by_path.contains_key(&second_path));
+        assert_eq!(
+            cache.get_path_at(&first_id, now),
+            refresh.then_some(&first_path)
+        );
+        assert_resource_cache_consistent(&cache);
+    }
+
+    #[test_case(false; "evicts_oldest_insert")]
+    #[test_case(true; "lookup_protects_recent_resource")]
+    fn resource_cache_eviction_uses_last_touch_without_alias_leaks(refresh: bool) {
+        let mut cache = ResourceCache::new(2, Duration::MAX);
+        let first_id = ResourceId::new("first").unwrap();
+        let second_id = ResourceId::new("second").unwrap();
+        let third_id = ResourceId::new("third").unwrap();
+        let first_path = WorkspacePath::new("first").unwrap();
+        let second_path = WorkspacePath::new("second").unwrap();
+        let third_path = WorkspacePath::new("third").unwrap();
+        let start = Instant::now();
+        cache.insert_at(first_id.clone(), first_path.clone(), start);
+        cache.insert_at(
+            second_id.clone(),
+            second_path.clone(),
+            start + CACHE_CLOCK_STEP,
+        );
+        if refresh {
+            assert_eq!(
+                cache.get_path_at(&first_id, start + CACHE_CLOCK_STEP * 2),
+                Some(&first_path)
+            );
+        }
+        let now = start + CACHE_CLOCK_STEP * 3;
+        assert_eq!(cache.get_path_at(&third_id, now), None);
+        cache.insert_at(third_id.clone(), third_path.clone(), now);
+        assert_eq!(
+            cache.get_path_at(&first_id, now),
+            refresh.then_some(&first_path)
+        );
+        assert_eq!(
+            cache.get_path_at(&second_id, now),
+            (!refresh).then_some(&second_path)
+        );
+        assert_eq!(cache.get_path_at(&third_id, now), Some(&third_path));
+        assert_resource_cache_consistent(&cache);
+    }
+
+    #[test_case(0; "zero_capacity_clamps_to_one")]
+    #[test_case(2; "replacement_removes_both_previous_aliases")]
+    fn resource_cache_replacement_and_invalidation_retire_touch_records(limit: usize) {
+        let mut cache = ResourceCache::new(limit, Duration::MAX);
+        let old_id = ResourceId::new("old").unwrap();
+        let id = ResourceId::new("resource").unwrap();
+        let old_path = WorkspacePath::new("old").unwrap();
+        let path = WorkspacePath::new("new").unwrap();
+        cache.insert(old_id.clone(), path.clone());
+        cache.insert(id.clone(), old_path.clone());
+        cache.insert(id.clone(), path.clone());
+        assert_eq!(cache.by_id.len(), 1);
+        assert_eq!(cache.get_path(&old_id), None);
+        assert_eq!(cache.id_for_path(&old_path), None);
+        cache.remove_path(&old_path);
+        cache.remove_id(&old_id);
+        assert_eq!(cache.get_path(&id), Some(&path));
+        assert_resource_cache_consistent(&cache);
+        cache.remove_path(&path);
+        assert_eq!(cache.get_path(&id), None);
+        assert!(cache.by_id.is_empty());
+        assert_resource_cache_consistent(&cache);
+    }
+
+    #[test_case(false; "repeated_insert")]
+    #[test_case(true; "repeated_lookup")]
+    fn resource_cache_refresh_index_stays_bounded(lookup: bool) {
+        let mut cache = ResourceCache::new(1, Duration::MAX);
+        let id = ResourceId::new("resource").unwrap();
+        let path = WorkspacePath::new("file").unwrap();
+        let start = Instant::now();
+        cache.insert_at(id.clone(), path.clone(), start);
+        for offset in 1..=CACHE_REGRESSION_ENTRIES {
+            let now = start + Duration::from_nanos(offset as u64);
+            if lookup {
+                assert_eq!(cache.get_path_at(&id, now), Some(&path));
+            } else {
+                cache.insert_at(id.clone(), path.clone(), now);
+            }
+        }
+        assert_eq!(cache.maintenance_probes, CACHE_REGRESSION_ENTRIES + 1);
+        assert_eq!(cache.by_id.len(), 1);
+        assert_resource_cache_consistent(&cache);
+    }
+
+    #[test_case(1; "single_expiry")]
+    #[test_case(crate::remote::tests::CACHE_REGRESSION_ENTRIES; "bulk_expiry")]
+    fn resource_cache_expiry_visits_each_retired_entry_once(count: usize) {
+        let mut cache = ResourceCache::new(count, CACHE_CLOCK_STEP);
+        let start = Instant::now();
+        for index in 0..count {
+            cache.insert_at(
+                ResourceId::new(format!("resource-{index}")).unwrap(),
+                WorkspacePath::new(format!("file-{index}")).unwrap(),
+                start,
+            );
+        }
+        assert_eq!(cache.maintenance_probes, count);
+        cache.expire(start + CACHE_CLOCK_STEP);
+        assert_eq!(cache.by_id.len(), count);
+        assert_eq!(cache.maintenance_probes, count + 1);
+        let now = start + CACHE_CLOCK_STEP + Duration::from_nanos(1);
+        cache.expire(now);
+        assert_eq!(cache.maintenance_probes, count * 2 + 2);
+        assert!(cache.by_id.is_empty());
+        assert_resource_cache_consistent(&cache);
+        cache.expire(now);
+        assert_eq!(cache.maintenance_probes, count * 2 + 3);
+    }
+
+    #[test_case(crate::remote::tests::CACHE_REGRESSION_ENTRIES; "all_entries_retained")]
+    #[test_case(crate::remote::tests::CACHE_PRESSURE_LIMIT; "bounded_capacity_pressure")]
+    fn metadata_cache_registration_and_lookup_have_linear_maintenance(limit: usize) {
+        let endpoint = WorkcellEndpoint::parse("http://127.0.0.1:1/mcp").unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let client = snapshot_client(&endpoint, &StateDir::from_path(temp.path().join("state")));
+        *client.0.paths.lock().unwrap() = ResourceCache::new(limit, Duration::MAX);
+        let entries = (0..CACHE_REGRESSION_ENTRIES)
+            .map(|index| contract::WorkspaceEntry {
+                path: contract::WorkspacePath::new(format!("file-{index}")).unwrap(),
+                resource_id: contract::ResourceId::new(format!("resource-{index}")).unwrap(),
+                revision: None,
+                kind: contract::WorkspaceEntryKind::File,
+                size_bytes: Some(1),
+            })
+            .collect::<Vec<_>>();
+        let started = Instant::now();
+        for entry in &entries {
+            assert!(client.remember_entry(entry).unwrap().revision.is_none());
+        }
+        let registration_time = started.elapsed();
+        let retained = limit.min(CACHE_REGRESSION_ENTRIES);
+        let evicted = CACHE_REGRESSION_ENTRIES - retained;
+        let registration_probes = CACHE_REGRESSION_ENTRIES + evicted;
+        let retained_ids = {
+            let cache = client.0.paths.lock().unwrap();
+            assert_eq!(cache.by_id.len(), retained);
+            assert_eq!(cache.maintenance_probes, registration_probes);
+            assert_resource_cache_consistent(&cache);
+            cache.by_id.keys().cloned().collect::<HashSet<_>>()
+        };
+        let started = Instant::now();
+        for entry in &entries {
+            let id = ResourceId::new(entry.resource_id.as_str()).unwrap();
+            let selected =
+                client.selector_path(client.root_cursor(), &ResourceSelector::Id(id.clone()));
+            if !retained_ids.contains(&id) {
+                assert_eq!(
+                    selected,
+                    Err(WorkspaceError::StaleResource { resource_id: id })
+                );
+            } else {
+                assert_eq!(selected.unwrap().as_str(), entry.path.as_str());
+            }
+        }
+        let lookup_time = started.elapsed();
+        let mut cache = client.0.paths.lock().unwrap();
+        assert_eq!(
+            cache.maintenance_probes,
+            registration_probes + CACHE_REGRESSION_ENTRIES
+        );
+        assert_resource_cache_consistent(&cache);
+        let started = Instant::now();
+        for entry in &entries {
+            cache.remove_path(&WorkspacePath::new(entry.path.as_str()).unwrap());
+        }
+        let invalidation_time = started.elapsed();
+        assert!(cache.by_id.is_empty());
+        assert_eq!(
+            cache.maintenance_probes,
+            registration_probes + CACHE_REGRESSION_ENTRIES
+        );
+        assert_resource_cache_consistent(&cache);
+        eprintln!(
+            "resource_cache entries={CACHE_REGRESSION_ENTRIES} limit={limit} registration={registration_time:?} lookup={lookup_time:?} invalidation={invalidation_time:?} maintenance_probes={}",
+            cache.maintenance_probes
+        );
     }
 
     #[test]

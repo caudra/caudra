@@ -1457,7 +1457,7 @@ pub(super) mod tests {
                 return Ok(WorkspaceResource {
                     project: binding.project().clone(),
                     scope: cursor.scope().clone(),
-                    path: None,
+                    path: Some(WorkspacePath::root()),
                     kind: ResourceKind::ProjectRoot,
                     revision: None,
                     size_bytes: None,
@@ -1690,6 +1690,7 @@ pub(super) mod tests {
             base.binding().authority().clone(),
             WorkspaceCapabilities::new([
                 WorkspaceCapability::Resolve,
+                WorkspaceCapability::Stat,
                 WorkspaceCapability::List,
                 WorkspaceCapability::ReadBytes,
                 WorkspaceCapability::MutationExecute,
@@ -1739,15 +1740,49 @@ pub(super) mod tests {
     #[test]
     fn hidden_remote_workbench_drains_before_sandbox_control() {
         let mut app = test_app();
-        let (workspace, _, _) = source_remote_workspace();
-        app.workbench.toggle_workspace(workspace).unwrap();
+        let (workspace, remote, write_started) = source_remote_workspace();
+        app.workbench.toggle_workspace(workspace.clone()).unwrap();
+        settle_source_workbenches(&mut app);
+        app.workbench
+            .open_remote_at(WorkspacePath::new(SOURCE_FILE).unwrap(), None);
+        settle_source_workbenches(&mut app);
+        app.update(Msg::Paste(REMOTE_EDIT.into()));
+        assert!(source_screen(&mut app).contains(REMOTE_EDIT));
+        let (release, held) = flume::bounded(1);
+        *remote.write_gate.lock().unwrap() = Some(held);
+        source_key(&mut app, workbench_keys::SAVE);
+        write_started
+            .recv_timeout(super::PERMISSION_WRITE_TIMEOUT)
+            .unwrap();
         app.workbench.close();
         assert!(!app.workbench.is_open());
         assert!(app.workbench.is_busy());
         assert!(app.sandbox_action_blocker(true).is_some());
+        assert!(remote.writes.lock().unwrap().is_empty());
+        release.send(()).unwrap();
         settle_source_workbenches(&mut app);
         assert!(app.sandbox_action_blocker(true).is_none());
         assert!(!app.workbench.is_open());
+        let writes = remote.writes.lock().unwrap();
+        assert_eq!(writes.len(), 1);
+        let (binding, cursor, request) = &writes[0];
+        assert_eq!(binding, workspace.binding());
+        assert_eq!(cursor, workspace.cursor());
+        let [
+            Mutation::Write {
+                condition,
+                content: WriteContent::Text(content),
+                ..
+            },
+        ] = request.mutations.as_slice()
+        else {
+            panic!("{NEVER_EXECUTE}");
+        };
+        assert_eq!(
+            condition,
+            &MutationCondition::Matches(ResourceRevision::new(REMOTE_REVISION).unwrap())
+        );
+        assert_eq!(content, &format!("{REMOTE_EDIT}{REMOTE_CONTENT}"));
     }
 
     fn source_key(app: &mut App, binding: workbench_keys::Bind) {

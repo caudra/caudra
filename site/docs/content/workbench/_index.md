@@ -107,6 +107,10 @@ Rows carry three marks. On the left, a `⋮` that opens the [context menu](#cont
 
 Paths the repository ignores are listed and drawn back, so a build directory is somewhere you can still look without it competing with your source.
 
+In a remote workspace, the top-level entries arrive first and the rest of the tree fills in as listing pages arrive. Listing reads file metadata rather than file contents, so a large binary or source map cannot prevent other files from appearing. A partial listing keeps the entries already received and reports that the result is incomplete. Opening or changing a file performs its own checks.
+
+Remote pages use a bounded, short-lived metadata inventory rather than walking the tree again for every page. They describe the tree when that inventory was captured. Watches and manual refresh reconcile later changes, while saves and other mutations still check the selected file's current revision.
+
 `Ctrl+P` opens a fuzzy file picker over the whole project. Type part of a path, `Enter` opens it. Before you type anything it lists your other open tabs first, most recent before the rest, so `Ctrl+P` then `Enter` goes back to the file you came from. The project is walked once and reused, and walked again after `F5`, after `Ctrl+X h`, or when a file appears or disappears on disk.
 
 ## Editor
@@ -127,11 +131,13 @@ Files the editor cannot take still open. Binaries, files over 8 MiB, and files t
 
 The workbench watches the project while it is open. A file that changes on disk reloads in place when its tab has no unsaved edits, keeping the cursor where it was.
 
-A tab with unsaved edits keeps them and raises a conflict instead. The status row says so, and `Ctrl+R` resolves it by throwing the buffer away and taking what is on disk. Saving over the other writer is the other way out, and `Ctrl+S` does that.
+A tab with unsaved edits keeps them and raises a conflict instead. The status row says so, and `Ctrl+R` resolves it by throwing the buffer away and taking what is on disk. `Ctrl+S` refuses a stale save instead of overwriting the other writer's changes. Copy any edits you want to keep before reloading.
 
 Bursts of writes settle before the panes react, so a build or a `git checkout` costs one refresh rather than one per file.
 
 The watch covers the project and stops while the workbench is closed. A file outside the project, such as the [plan](#plans-memory-notes-and-prompt-drafts), reloads when the agent's own tool call writes it, under the same rules. Reopening the workbench rereads every tab whose file changed while it was closed, and so does opening a file that already has a tab.
+
+If a remote watch cannot start, browsing and manual refresh remain available. The status row reports that live updates are unavailable while bounded retries attempt to reconnect. Closing the workbench stops those retries. A successful watch installation refreshes the listing to cover changes that happened before the watch was ready.
 
 ## Rendered Markdown
 
@@ -144,6 +150,8 @@ The rendered view is for reading. The arrow keys, `PageUp`, `PageDown`, `Home`, 
 ## Source control
 
 `Ctrl+X 2` shows three stacked sections, with the current branch in the sidebar header.
+
+If the selected remote directory is not inside a Git repository, this pane shows `Not a Git repository`. File browsing and editing remain available. Inaccessible or damaged repositories still report an error.
 
 ```
 ┌─────────────────┐

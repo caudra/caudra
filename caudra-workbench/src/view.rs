@@ -40,7 +40,7 @@ const EMPTY_EDITOR_HINT: &str = "No file open";
 /// neither.
 pub(crate) const RENDERED_STATUS: &str = "Rendered";
 const NO_CHANGES: &str = "No changes";
-pub(crate) const NOT_A_REPOSITORY: &str = "Not a git repository";
+pub(crate) const NOT_A_REPOSITORY: &str = "Not a Git repository";
 const SEARCH_PROMPT: &str = "Search  ";
 const INCLUDE_PROMPT: &str = "Files   ";
 const SEARCHING: &str = "Searching\u{2026}";

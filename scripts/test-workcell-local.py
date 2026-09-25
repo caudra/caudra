@@ -310,6 +310,36 @@ def main():
                                 "method": method,
                                 "tool": request.get("params", {}).get("tool"),
                             }
+                    if (
+                        method == "ai.workcell/watch-open"
+                        and (
+                            temp / "drop-operation-response.watch-unavailable"
+                        ).exists()
+                    ):
+                        assert (
+                            self.headers.get("Authorization")
+                            == "Bearer " + token.read_text()
+                        )
+                        body = json.dumps(
+                            {
+                                "jsonrpc": "2.0",
+                                "id": request["id"],
+                                "error": {
+                                    "code": -32000,
+                                    "message": "injected watch setup refusal",
+                                    "data": {
+                                        "code": "watch_unavailable",
+                                        "phase": "setup",
+                                    },
+                                },
+                            }
+                        ).encode()
+                        self.send_response(400)
+                        self.send_header("Content-Type", "application/json")
+                        self.send_header("Content-Length", str(len(body)))
+                        self.end_headers()
+                        self.wfile.write(body)
+                        return
                     batch_gate = temp / "batch-execute-gate"
                     if method == "ai.workcell/prepare":
                         with self.fault_lock:
@@ -756,6 +786,26 @@ def main():
                 ]
                 restart_server()
                 if not sandbox_only:
+                    metadata_root = temp / "metadata-root"
+                    metadata_root.mkdir(mode=0o700)
+                    args[1] = str(metadata_root)
+                    restart_server()
+                    with child(
+                        [
+                            *command,
+                            os.environ.get(
+                                "WORKCELL_TEST_METADATA_FILTER", "metadata_"
+                            ),
+                            "--",
+                            "--nocapture",
+                            "--test-threads=1",
+                        ],
+                        cwd=repo,
+                        env={**env, "WORKCELL_TEST_METADATA_ROOT": str(metadata_root)},
+                    ) as tests:
+                        metadata_status = tests.wait(timeout=600)
+                    args[1] = str(root)
+                    restart_server()
                     test_filter = os.environ.get("WORKCELL_TEST_FILTER")
                     selected = [test_filter] if test_filter else []
                     with child(
@@ -767,6 +817,8 @@ def main():
                             "--test-threads=1",
                             "--skip",
                             "unsupported_server",
+                            "--skip",
+                            "metadata_",
                         ],
                         cwd=repo,
                         env=env,
@@ -778,6 +830,7 @@ def main():
                                 flush=True,
                             )
                             raise RuntimeError("authenticated local integration failed")
+                    assert metadata_status == 0, "metadata/Workbench integration failed"
                 if os.environ.get("CAUDRA_TEST_BINARY"):
                     root = temp / "entrypoint-root"
                     root.mkdir(mode=0o700)

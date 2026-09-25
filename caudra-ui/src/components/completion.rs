@@ -74,6 +74,14 @@ impl Completion {
         self.nucleo.injector()
     }
 
+    pub fn clear_items(&mut self) {
+        self.nucleo.restart(true);
+        self.matches.clear();
+        self.selected = 0;
+        self.scroll_offset = 0;
+        self.pressed = None;
+    }
+
     pub fn query(&self) -> &str {
         &self.query
     }

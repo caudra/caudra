@@ -81,6 +81,7 @@ pub struct Tab {
     /// The file changed underneath an edited buffer. Neither copy can be thrown
     /// away without being asked, so the tab says so and waits.
     pub conflict: bool,
+    pub(crate) remote_reload: bool,
     /// A tab one click put up, which the next one takes over. Asking for the
     /// file again or typing in it pins the tab for good.
     pub preview: bool,
@@ -124,6 +125,7 @@ impl Tab {
             modified: loaded.modified,
             source: None,
             conflict: false,
+            remote_reload: false,
             preview: false,
             rendered: None,
             revision: 0,
@@ -178,6 +180,7 @@ impl Tab {
             modified: None,
             source: None,
             conflict: false,
+            remote_reload: false,
             preview: false,
             rendered: None,
             revision: 0,
@@ -227,6 +230,7 @@ impl Tab {
             modified: None,
             source: None,
             conflict: false,
+            remote_reload: false,
             preview: false,
             rendered: None,
             revision: 0,
@@ -264,10 +268,11 @@ impl Tab {
     ) {
         self.title = path.file_name();
         self.highlighter = ViewportHighlighter::new(&path.display(), theme_generation);
-        self.path = path;
-        if resource.is_some() {
-            self.resource = resource;
+        if let Some(opened) = &mut self.resource {
+            opened.path = path.clone();
+            opened.resource_id = resource.and_then(|resource| resource.resource_id);
         }
+        self.path = path;
         if !self.is_markdown() {
             self.rendered = None;
         }

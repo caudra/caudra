@@ -1,5 +1,6 @@
 use std::{
     env, fs,
+    fs::{File, FileTimes},
     path::PathBuf,
     str::FromStr,
     time::{Duration, Instant},
@@ -35,6 +36,11 @@ use caudra_storage::{
     id::CaudraId,
     remote_operation_journal::{RemoteOperationJournal, RemoteOperationState},
 };
+use caudra_workbench::{
+    BackendDriver, BackendError, BackendEvent, BackendRevision, Layout, MutationGate, SidebarView,
+    Workbench, WorkbenchBackend, WorkbenchFilesystem, WorkbenchPath, WorkbenchStyles,
+    WorkspaceFilesystem,
+};
 use caudra_workcell::{
     LocalTransferPublisher, RemoteWorkcellHost, ReviewedTransferHost, reviewed_workspace_transfer,
 };
@@ -53,13 +59,14 @@ use caudra_workspace::{
 };
 use caudra_workspace::{
     CheckpointId, DirectoryNavigation, ListRequest, MutationResult, OperationState,
-    OperationStatus, ReadBytesRequest, ResourceRevision, ResourceSelector, ScmDiscoverRequest,
-    ScmStatusRequest, SearchRequest, SessionBindingId, SnapshotCaptureLimits,
+    OperationStatus, ReadBytesRequest, ReadTextRequest, ResourceRevision, ResourceSelector,
+    ScmDiscoverRequest, ScmStatusRequest, SearchRequest, SessionBindingId, SnapshotCaptureLimits,
     SnapshotCaptureRequest, SnapshotInspectRequest, SnapshotOperationPreview, ToolPrepareRequest,
-    WatchOpenRequest, WatchPollRequest, WorkspaceAssetService, WorkspaceCursor, WorkspacePath,
-    WorkspaceReadService, WorkspaceScmReadService, WorkspaceSearchService,
+    WatchOpenRequest, WatchPollRequest, WatchPollState, WorkspaceAssetService, WorkspaceCursor,
+    WorkspacePath, WorkspaceReadService, WorkspaceScmReadService, WorkspaceSearchService,
     WorkspaceSnapshotMutationService, WorkspaceSnapshotReadService, WorkspaceWatchService,
 };
+use caudra_workspace::{ResourceKind, WorkspaceSession};
 use caudra_workspace::{
     ScmDiffRequest, ScmDiffTarget, ScmLogRequest, ScmMutation, ScmReadSideRequest, ScmSide,
     WorkspaceScmMutationService,
@@ -67,6 +74,7 @@ use caudra_workspace::{
 use futures_lite::io::{AsyncReadExt, repeat};
 use image::{DynamicImage, ImageFormat};
 use isahc::AsyncReadResponseExt;
+use ratatui::{Terminal, backend::TestBackend};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
@@ -75,7 +83,10 @@ use std::{
     path::Path,
     sync::atomic::{AtomicBool, Ordering},
 };
-use std::{fmt::Write as _, sync::Arc};
+use std::{
+    fmt::{Debug, Write as _},
+    sync::Arc,
+};
 use tokio_util::sync::CancellationToken;
 
 const LIMIT: u32 = 100;
@@ -140,7 +151,7 @@ const EDITOR_IMAGE: &str = "editor.png";
 const EDITOR_IMAGE_EDGE: u32 = 3;
 const EDITOR_ORIGINAL: &str = "original editor line\n";
 const EDITOR_SAVED: &str = "saved editor line\n";
-const EDITOR_EXTERNAL: &str = "external editor line\n";
+const EDITOR_EXTERNAL: &str = "other editor line\n";
 const EDITOR_NAMESPACE: &str =
     "a byte read must report the revision a conditional write is checked against";
 const EDITOR_SAVE_REFUSED: &str = "an edited remote buffer must save against the revision it read";
@@ -159,6 +170,32 @@ const CAPTURE_WORKLOAD_FILES: u32 = 20_000;
 const CAPTURE_WORKLOAD_DIRECTORIES: u32 = 100;
 const CAPTURE_WORKLOAD_FILE_BYTES: usize = 128;
 const CAPTURE_WORKLOAD_CHECKPOINTS: [&str; 2] = ["workload-first", "workload-unchanged"];
+const METADATA_SMALL: &str = "small.txt";
+const METADATA_NESTED: &str = "nested/other.txt";
+const METADATA_BINARY: &str = "huge.bin";
+const METADATA_SOURCEMAP: &str = "nested/bundle.js.map";
+const METADATA_CONTENT: &str = "small readable text\n";
+const METADATA_REPLACEMENT: &str = "other readable text\n";
+const METADATA_MOVED: &str = "moved.txt";
+const FILE_TOO_LARGE: &str = "file_too_large";
+const REPOSITORY_UNAVAILABLE: &str = "repository_unavailable";
+const WATCH_FAULT_EXTENSION: &str = "watch-unavailable";
+const WATCH_MAX_BYTES: u32 = 65_536;
+const WATCH_WAIT_MS: u64 = 1_000;
+const WORKBENCH_FILE: &str = "sub/a.rs";
+const WORKBENCH_SHADOW: &str = "sub/sub/a.rs";
+const WORKBENCH_CONTENT: &str = "const VALUE: &str = \"bytes-A\";\n";
+const WORKBENCH_OTHER: &str = "const VALUE: &str = \"bytes-B\";\n";
+const WORKBENCH_CHANGED: &str = "const VALUE: &str = \"bytes-C\";\n";
+const WORKBENCH_SAVED: &str = "const VALUE: &str = \"saved-A\";\n";
+const WORKBENCH_MOVED: &str = "sub/moved.rs";
+const WORKBENCH_HIDDEN: &str = ".arbitrary-hidden";
+const WORKBENCH_NO_GIT: &str = "Not a Git repository";
+const WORKBENCH_FRAME_WIDTH: u16 = 120;
+const WORKBENCH_FRAME_HEIGHT: u16 = 30;
+const WORKBENCH_WORKLOAD_DIRECTORIES: usize = 5_000;
+const WORKBENCH_FILES_PER_DIRECTORY: usize = 4;
+const WORKBENCH_WORKLOAD_TIMEOUT: Duration = Duration::from_secs(420);
 
 struct TransferTestHost {
     root: PathBuf,
@@ -2125,16 +2162,15 @@ async fn remote_editor_revision_namespace(client: &RemoteWorkcellClient, root: &
     .await
     .unwrap();
     assert_eq!(reopened.bytes, EDITOR_SAVED.as_bytes());
-    fs::write(root.join(EDITOR_FILE), EDITOR_EXTERNAL).unwrap();
+    overwrite_preserving_metadata(&root.join(EDITOR_FILE), EDITOR_EXTERNAL);
     let refused =
         conditional_write(client, &path, EDITOR_ORIGINAL, reopened.revision.clone()).await;
     assert!(
-        !matches!(
+        matches!(
             refused,
-            Ok(OperationStatus {
-                state: OperationState::Completed { .. },
-                ..
-            })
+            Err(WorkspaceError::StaleCursor
+                | WorkspaceError::StaleResource { .. }
+                | WorkspaceError::Conflict)
         ),
         "{EDITOR_STALE_ACCEPTED}: {refused:?}"
     );
@@ -2158,7 +2194,7 @@ async fn remote_editor_revision_namespace(client: &RemoteWorkcellClient, root: &
         Err(WorkspaceError::StaleResource { .. })
     ));
     eprintln!(
-        "PASS remote byte reads report workspace revisions, conditional saves commit, concurrent modification refused"
+        "PASS remote byte reads report workspace revisions, conditional saves commit, same-size/mtime content overwrite refuses stale save"
     );
     remote_image_bytes(client, root).await;
 }
@@ -2220,6 +2256,758 @@ async fn remote_image_bytes(client: &RemoteWorkcellClient, root: &Path) {
         other => panic!("remote view_image must return pixels: {other:?}"),
     }
     eprintln!("PASS remote view_image resolves, stats, and reads image bytes");
+}
+
+fn overwrite_preserving_metadata(path: &Path, content: &str) {
+    let before = fs::metadata(path).unwrap();
+    assert_eq!(before.len(), content.len() as u64);
+    fs::write(path, content).unwrap();
+    File::options()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_times(FileTimes::new().set_modified(before.modified().unwrap()))
+        .unwrap();
+    let after = fs::metadata(path).unwrap();
+    assert_eq!(after.len(), before.len());
+    assert_eq!(after.modified().unwrap(), before.modified().unwrap());
+}
+
+fn workbench_path(path: &str) -> WorkbenchPath {
+    WorkbenchPath::Remote(WorkspacePath::new(path).unwrap())
+}
+
+async fn workbench_session(client: &RemoteWorkcellClient, path: &str) -> WorkspaceSession {
+    let directory = client
+        .resolve_directory_cursor(
+            client.session_binding(),
+            client.root_cursor(),
+            &WorkspacePath::new(path).unwrap(),
+        )
+        .await
+        .unwrap();
+    WorkspaceSession::new(
+        client.workspace_handle().unwrap(),
+        client.session_binding().clone(),
+        directory.cursor,
+    )
+    .unwrap()
+}
+
+fn assert_workbench_conflict<T: Debug>(result: Result<T, BackendError>) {
+    assert!(
+        matches!(
+            result,
+            Err(BackendError::Conflict | BackendError::Workspace(WorkspaceError::StaleCursor))
+        ),
+        "{result:?}"
+    );
+}
+
+async fn settle_workbench(workbench: &mut Workbench) -> Vec<String> {
+    let deadline = Instant::now() + BATCH_TIMEOUT;
+    let mut warnings = Vec::new();
+    loop {
+        let (_, warning) = workbench.tick();
+        warnings.extend(warning);
+        if !workbench.is_busy() && !workbench.scm_refreshing() {
+            break;
+        }
+        assert!(Instant::now() < deadline, "Workbench did not settle");
+        smol::Timer::after(BATCH_POLL).await;
+    }
+    warnings
+}
+
+fn workbench_frame(workbench: &mut Workbench) -> String {
+    let mut terminal = Terminal::new(TestBackend::new(
+        WORKBENCH_FRAME_WIDTH,
+        WORKBENCH_FRAME_HEIGHT,
+    ))
+    .unwrap();
+    terminal
+        .draw(|frame| workbench.view(frame, frame.area()))
+        .unwrap();
+    terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect()
+}
+
+fn workbench_fixture(root: &Path) {
+    fs::create_dir_all(root.join("sub/sub")).unwrap();
+    fs::create_dir_all(root.join("sub").join(WORKBENCH_HIDDEN)).unwrap();
+    fs::write(root.join(WORKBENCH_FILE), WORKBENCH_CONTENT).unwrap();
+    fs::write(root.join(WORKBENCH_SHADOW), WORKBENCH_OTHER).unwrap();
+}
+
+async fn authenticated_workbench_nonroot(client: &RemoteWorkcellClient, root: &Path) {
+    workbench_fixture(root);
+    let session = workbench_session(client, "sub").await;
+    let filesystem = WorkspaceFilesystem::new(session.clone()).unwrap();
+    let page = filesystem
+        .list(&workbench_path("sub"), true, None)
+        .await
+        .unwrap();
+    assert!(!page.incomplete);
+    assert!(page.continuation.is_none());
+    let entry = page
+        .entries
+        .iter()
+        .find(|entry| entry.path == workbench_path(WORKBENCH_FILE))
+        .unwrap();
+    assert_eq!(entry.revision, None);
+    assert!(entry.resource_id.is_some());
+    let loaded = filesystem.read(entry).await.unwrap();
+    assert_eq!(loaded.lines, [WORKBENCH_CONTENT.trim_end()]);
+    assert_eq!(loaded.entry.path, entry.path);
+    assert!(matches!(
+        loaded.entry.revision,
+        Some(BackendRevision::Remote(_))
+    ));
+    let direct = filesystem.read_path(&entry.path).await.unwrap();
+    assert_eq!(direct.lines, loaded.lines);
+    assert_eq!(direct.entry.resource_id, entry.resource_id);
+    eprintln!(
+        "PASS real Workbench non-root metadata selection and direct path read bytes-A, not sub/sub bytes-B"
+    );
+    assert!(matches!(
+        filesystem.write(entry, WORKBENCH_SAVED.to_owned()).await,
+        Err(BackendError::MissingRevision)
+    ));
+    overwrite_preserving_metadata(&root.join(WORKBENCH_FILE), WORKBENCH_CHANGED);
+    assert_workbench_conflict(
+        filesystem
+            .write(&loaded.entry, WORKBENCH_CONTENT.to_owned())
+            .await,
+    );
+    assert_workbench_conflict(
+        filesystem
+            .rename(&loaded.entry, &workbench_path(WORKBENCH_MOVED))
+            .await,
+    );
+    assert_workbench_conflict(filesystem.delete(&loaded.entry).await);
+    for rename in [true, false] {
+        fs::write(root.join(WORKBENCH_FILE), WORKBENCH_CONTENT).unwrap();
+        let file = root.join(WORKBENCH_FILE);
+        let gate = MutationGate::new(move || {
+            let file = file.clone();
+            Box::pin(async move {
+                overwrite_preserving_metadata(&file, WORKBENCH_CHANGED);
+                Ok(())
+            })
+        });
+        let raced = WorkspaceFilesystem::new_with_gate(session.clone(), gate).unwrap();
+        let result = if rename {
+            raced
+                .rename(entry, &workbench_path(WORKBENCH_MOVED))
+                .await
+                .map(|_| ())
+        } else {
+            raced.delete(entry).await
+        };
+        assert_workbench_conflict(result);
+        assert_eq!(
+            fs::read_to_string(root.join(WORKBENCH_FILE)).unwrap(),
+            WORKBENCH_CHANGED
+        );
+        assert!(!root.join(WORKBENCH_MOVED).exists());
+    }
+    assert_eq!(
+        fs::read_to_string(root.join(WORKBENCH_SHADOW)).unwrap(),
+        WORKBENCH_OTHER
+    );
+    eprintln!(
+        "PASS real Workbench same-size/mtime stale save/rename/delete and unrevisioned stat-to-prepare races refused; shadow bytes-B untouched"
+    );
+    let fresh = filesystem.read(entry).await.unwrap();
+    let saved = filesystem
+        .write(&fresh.entry, WORKBENCH_SAVED.to_owned())
+        .await;
+    assert_eq!(
+        fs::read_to_string(root.join(WORKBENCH_FILE)).unwrap(),
+        WORKBENCH_SAVED
+    );
+    saved.unwrap();
+    assert_workbench_conflict(
+        filesystem
+            .rename(entry, &workbench_path(WORKBENCH_MOVED))
+            .await,
+    );
+    let refreshed = filesystem
+        .list(&workbench_path("sub"), true, None)
+        .await
+        .unwrap();
+    assert!(!refreshed.incomplete);
+    assert!(refreshed.continuation.is_none());
+    let entry = refreshed
+        .entries
+        .iter()
+        .find(|entry| entry.path == workbench_path(WORKBENCH_FILE))
+        .unwrap();
+    assert_eq!(entry.revision, None);
+    let mut renamed = filesystem
+        .rename(entry, &workbench_path(WORKBENCH_MOVED))
+        .await
+        .unwrap();
+    assert_eq!(renamed.path, workbench_path(WORKBENCH_MOVED));
+    assert!(renamed.revision.is_some());
+    assert_eq!(
+        fs::read_to_string(root.join(WORKBENCH_MOVED)).unwrap(),
+        WORKBENCH_SAVED
+    );
+    renamed.revision = None;
+    filesystem.delete(&renamed).await.unwrap();
+    assert!(!root.join(WORKBENCH_FILE).exists());
+    assert!(!root.join(WORKBENCH_MOVED).exists());
+    assert_eq!(
+        fs::read_to_string(root.join(WORKBENCH_SHADOW)).unwrap(),
+        WORKBENCH_OTHER
+    );
+    eprintln!(
+        "PASS real Workbench non-root conditional save/rename/delete, same-size/mtime stale revisions and stat-to-prepare races, fresh unrevisioned mutations, shadow bytes-B untouched"
+    );
+}
+
+async fn authenticated_workbench_view(session: WorkspaceSession) {
+    let filesystem = WorkspaceFilesystem::new(session.clone()).unwrap();
+    let watch = filesystem
+        .watch_open()
+        .await
+        .unwrap()
+        .expect("real Workbench watch");
+    let polled = filesystem.watch_poll(watch.clone()).await;
+    let watch = polled
+        .as_ref()
+        .map_or(watch, |result| result.handle.clone());
+    filesystem.watch_close(watch).await.unwrap();
+    let mut workbench = Workbench::new(WorkbenchStyles::default());
+    workbench.restore(Layout {
+        sidebar: SidebarView::SourceControl,
+        show_hidden: true,
+        ..Layout::default()
+    });
+    workbench.toggle_workspace(session).unwrap();
+    let mut warnings = settle_workbench(&mut workbench).await;
+    let source_control = workbench_frame(&mut workbench);
+    assert!(
+        source_control.contains(WORKBENCH_NO_GIT),
+        "{source_control}"
+    );
+    workbench.open_remote_at(WorkspacePath::new(WORKBENCH_FILE).unwrap(), None);
+    warnings.extend(settle_workbench(&mut workbench).await);
+    let frame = workbench_frame(&mut workbench);
+    assert!(frame.contains(WORKBENCH_CONTENT.trim_end()), "{frame}");
+    assert!(!frame.contains(WORKBENCH_OTHER.trim_end()), "{frame}");
+    assert!(frame.contains(WORKBENCH_HIDDEN), "{frame}");
+    workbench.close();
+    eprintln!("PASS real Workbench rendered bytes-A, NoGit UI, show_hidden folder");
+    polled.unwrap();
+    assert!(warnings.is_empty(), "{warnings:?}");
+    eprintln!("PASS real Workbench initial watch setup/poll/close without degraded live updates");
+}
+
+async fn authenticated_workbench_workload(client: &RemoteWorkcellClient, root: &Path) {
+    let fixture = tempfile::Builder::new()
+        .prefix("workbench-workload-")
+        .tempdir_in(root)
+        .unwrap();
+    let relative = fixture.path().strip_prefix(root).unwrap().to_str().unwrap();
+    let mut expected = Vec::new();
+    for directory in 0..WORKBENCH_WORKLOAD_DIRECTORIES {
+        let name = format!("directory-{directory:04}");
+        fs::create_dir(fixture.path().join(&name)).unwrap();
+        expected.push((
+            workbench_path(&format!("{relative}/{name}")),
+            ResourceKind::Directory,
+        ));
+        for file in 0..WORKBENCH_FILES_PER_DIRECTORY {
+            let name = format!("{name}/file-{file}.rs");
+            fs::write(fixture.path().join(&name), WORKBENCH_CONTENT).unwrap();
+            expected.push((
+                workbench_path(&format!("{relative}/{name}")),
+                ResourceKind::File,
+            ));
+        }
+    }
+    fs::create_dir(fixture.path().join(WORKBENCH_HIDDEN)).unwrap();
+    fs::write(
+        fixture.path().join(WORKBENCH_HIDDEN).join("a.rs"),
+        WORKBENCH_CONTENT,
+    )
+    .unwrap();
+    expected.push((
+        workbench_path(&format!("{relative}/{WORKBENCH_HIDDEN}")),
+        ResourceKind::Directory,
+    ));
+    expected.push((
+        workbench_path(&format!("{relative}/{WORKBENCH_HIDDEN}/a.rs")),
+        ResourceKind::File,
+    ));
+    let session = workbench_session(client, relative).await;
+    let mut driver = BackendDriver::new(
+        WorkbenchBackend::workspace(session).unwrap(),
+        workbench_path(relative),
+    );
+    let started = Instant::now();
+    let request = driver.list(driver.root().clone(), true);
+    let mut first_visible = None;
+    let mut seen = BTreeSet::new();
+    let mut pages = 0;
+    let mut drain_time = Duration::ZERO;
+    loop {
+        let mut done = false;
+        let drain_started = Instant::now();
+        let events = driver.drain();
+        drain_time += drain_started.elapsed();
+        for event in events {
+            let BackendEvent::Listed {
+                request: returned,
+                complete,
+                authoritative,
+                removed,
+                result,
+                ..
+            } = event
+            else {
+                panic!("unexpected event: {event:?}")
+            };
+            assert_eq!(returned, request);
+            assert!(removed.is_empty());
+            let page = result.unwrap_or_else(|error| {
+                panic!(
+                    "Workbench list failed: {error:?}; batches={pages} retained={} elapsed_ms={} drain_ms={}",
+                    seen.len(), started.elapsed().as_millis(), drain_time.as_millis()
+                )
+            });
+            assert!(!page.incomplete);
+            pages += 1;
+            if !page.entries.is_empty() && first_visible.is_none() {
+                first_visible = Some(started.elapsed());
+                eprintln!(
+                    "Workbench first_visible_ms={}",
+                    started.elapsed().as_millis()
+                );
+                assert!(
+                    !complete,
+                    "first visible batch waited for complete indexing"
+                );
+            }
+            for entry in page.entries {
+                assert_eq!(entry.revision, None);
+                seen.insert(entry.path.display());
+            }
+            if complete {
+                assert!(authoritative);
+                done = true;
+            }
+        }
+        if done {
+            break;
+        }
+        assert!(
+            started.elapsed() < WORKBENCH_WORKLOAD_TIMEOUT,
+            "Workbench workload exceeded bounded wait: pages={pages}, retained={}",
+            seen.len()
+        );
+        smol::Timer::after(BATCH_POLL).await;
+    }
+    let complete = started.elapsed();
+    assert_eq!(seen.len(), expected.len());
+    assert!(!driver.is_listing());
+    assert!(!driver.is_stale());
+    for (path, kind) in &expected {
+        let entry = driver
+            .resource(path)
+            .unwrap_or_else(|| panic!("not retained: {path:?}"));
+        assert_eq!(&entry.kind, kind);
+        assert_eq!(entry.revision, None);
+        assert_eq!(
+            entry.size_bytes,
+            (*kind == ResourceKind::File).then_some(WORKBENCH_CONTENT.len() as u64)
+        );
+    }
+    let entry = driver.resource(&expected[1].0).unwrap().clone();
+    let open = driver.open(entry);
+    let deadline = Instant::now() + BATCH_TIMEOUT;
+    loop {
+        let events = driver.drain();
+        if !events.is_empty() {
+            assert_eq!(events.len(), 1);
+            let BackendEvent::Opened { request, result } = events.into_iter().next().unwrap()
+            else {
+                panic!("expected driver open")
+            };
+            assert_eq!(request, open);
+            assert_eq!(result.unwrap().lines, [WORKBENCH_CONTENT.trim_end()]);
+            break;
+        }
+        assert!(Instant::now() < deadline, "retained file did not open");
+        smol::Timer::after(BATCH_POLL).await;
+    }
+    eprintln!(
+        "PASS real Workbench driver normal_files={} normal_directories={} hidden_entries=2 retained={} pages={pages} first_visible_ms={} complete_ms={} drain_ms={} retained metadata selection opens",
+        WORKBENCH_WORKLOAD_DIRECTORIES * WORKBENCH_FILES_PER_DIRECTORY,
+        WORKBENCH_WORKLOAD_DIRECTORIES,
+        expected.len(),
+        first_visible.unwrap().as_millis(),
+        complete.as_millis(),
+        drain_time.as_millis()
+    );
+}
+
+async fn metadata_client(state: &Path, session: &str) -> RemoteWorkcellClient {
+    let credential = NamedBearerCredential::new(
+        WorkcellCredentialName::new("integration").unwrap(),
+        WorkcellCredential::new(
+            fs::read_to_string(env::var_os("WORKCELL_TEST_TOKEN_FILE").unwrap()).unwrap(),
+        )
+        .unwrap(),
+    );
+    let selection = RemoteWorkcellSelection {
+        source: WorkcellSourceRef::Direct,
+        endpoint: WorkcellEndpoint::parse(&env::var("WORKCELL_TEST_ENDPOINT").unwrap()).unwrap(),
+        cwd: WorkspacePath::root(),
+        credential_ref: Some(WorkcellCredentialRef::from_str("credential:integration").unwrap()),
+        expected_server_id: Some(ExpectedWorkcellId::new("integration-server-id").unwrap()),
+        expected_workspace_id: Some(ExpectedWorkcellId::new("integration-workspace-id").unwrap()),
+    };
+    RemoteWorkcellClient::connect(
+        &selection,
+        Some(credential),
+        SessionBindingId::new(session).unwrap(),
+        RemoteOperationJournal::open(&StateDir::from_path(state.to_owned())).unwrap(),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap()
+}
+
+#[test]
+fn metadata_workbench_nonroot() {
+    let Some(root) = env::var_os("WORKCELL_TEST_METADATA_ROOT") else {
+        return;
+    };
+    smol::block_on(async {
+        let state = tempfile::tempdir().unwrap();
+        let client = metadata_client(state.path(), "workbench-nonroot").await;
+        authenticated_workbench_nonroot(&client, &PathBuf::from(root)).await;
+    });
+}
+
+#[test]
+fn metadata_workbench_workload() {
+    let Some(root) = env::var_os("WORKCELL_TEST_METADATA_ROOT") else {
+        return;
+    };
+    smol::block_on(async {
+        let state = tempfile::tempdir().unwrap();
+        let client = metadata_client(state.path(), "workbench-workload").await;
+        authenticated_workbench_workload(&client, &PathBuf::from(root)).await;
+    });
+}
+
+#[test]
+fn metadata_workbench_view() {
+    let Some(root) = env::var_os("WORKCELL_TEST_METADATA_ROOT") else {
+        return;
+    };
+    smol::block_on(async {
+        let root = PathBuf::from(root);
+        workbench_fixture(&root);
+        let state = tempfile::tempdir().unwrap();
+        let client = metadata_client(state.path(), "workbench-view").await;
+        authenticated_workbench_view(workbench_session(&client, "sub").await).await;
+    });
+}
+
+#[test]
+fn metadata_only_workspace() {
+    let Some(root) = env::var_os("WORKCELL_TEST_METADATA_ROOT") else {
+        return;
+    };
+    smol::block_on(async {
+        let root = PathBuf::from(root);
+        let state = tempfile::tempdir().unwrap();
+        let client = metadata_client(state.path(), "metadata-session").await;
+        let binding = client.session_binding();
+        let cursor = client.root_cursor();
+        assert!(!root.join(".git").exists());
+        assert_eq!(
+            WorkspaceScmReadService::discover(
+                &client,
+                binding,
+                cursor,
+                &ScmDiscoverRequest {
+                    path: WorkspacePath::root()
+                },
+            )
+            .await
+            .unwrap_err(),
+            WorkspaceError::NotRepository,
+        );
+        let fixture = tempfile::Builder::new()
+            .prefix("metadata-")
+            .tempdir_in(&root)
+            .unwrap();
+        let relative = fixture
+            .path()
+            .strip_prefix(&root)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        let path = |name: &str| WorkspacePath::new(format!("{relative}/{name}")).unwrap();
+        fs::create_dir(fixture.path().join("nested")).unwrap();
+        for name in [METADATA_SMALL, METADATA_NESTED] {
+            fs::write(fixture.path().join(name), METADATA_CONTENT).unwrap();
+        }
+        fs::write(
+            fixture.path().join(METADATA_BINARY),
+            vec![BINARY_BYTE; BINARY_BYTES as usize],
+        )
+        .unwrap();
+        fs::write(
+            fixture.path().join(METADATA_SOURCEMAP),
+            vec![b'A'; BINARY_BYTES as usize],
+        )
+        .unwrap();
+        let expected = [
+            (METADATA_SMALL, Some(METADATA_CONTENT.len() as u64)),
+            (METADATA_NESTED, Some(METADATA_CONTENT.len() as u64)),
+            (METADATA_BINARY, Some(BINARY_BYTES)),
+            (METADATA_SOURCEMAP, Some(BINARY_BYTES)),
+            ("nested", None),
+        ]
+        .map(|(name, size)| (path(name), size))
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+        for limit in [2, LIMIT] {
+            let mut continuation = None;
+            let mut entries = BTreeSet::new();
+            loop {
+                let page = client
+                    .list(
+                        binding,
+                        cursor,
+                        &ListRequest {
+                            parent: ResourceSelector::Path(WorkspacePath::new(relative).unwrap()),
+                            recursive: true,
+                            continuation,
+                            limit,
+                        },
+                    )
+                    .await
+                    .unwrap();
+                assert!(!page.incomplete, "{page:?}");
+                assert_eq!(page.truncated, page.continuation.is_some());
+                assert!(!page.resources.is_empty());
+                for resource in page.resources {
+                    assert_eq!(resource.revision, None, "{resource:?}");
+                    assert!(entries.insert((resource.path.unwrap(), resource.size_bytes)));
+                }
+                continuation = page.continuation;
+                if continuation.is_none() {
+                    break;
+                }
+            }
+            assert_eq!(entries, expected);
+        }
+        let small = ResourceSelector::Path(path(METADATA_SMALL));
+        let read = client
+            .read_text(
+                binding,
+                cursor,
+                &ReadTextRequest {
+                    resource: small.clone(),
+                    range: None,
+                    byte_offset: 0,
+                    max_bytes: LIMIT,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(read.text, METADATA_CONTENT);
+        let stat = WorkspaceReadService::stat(&client, binding, cursor, &small)
+            .await
+            .unwrap();
+        assert_eq!(stat.revision.as_ref(), Some(&read.revision));
+        for name in [METADATA_BINARY, METADATA_SOURCEMAP] {
+            let error = WorkspaceReadService::stat(
+                &client,
+                binding,
+                cursor,
+                &ResourceSelector::Path(path(name)),
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                matches!(&error, WorkspaceError::Refused { symbolic, .. } if symbolic == FILE_TOO_LARGE),
+                "{error:?}"
+            );
+        }
+        eprintln!(
+            "PASS complete recursive metadata-only listing, pagination, names/sizes, absent revisions, small read/stat, explicit 6MiB binary/sourcemap stat refuses file_too_large"
+        );
+        overwrite_preserving_metadata(&fixture.path().join(METADATA_SMALL), METADATA_REPLACEMENT);
+        for mutation in [
+            Mutation::Move {
+                source: path(METADATA_SMALL),
+                destination: path(METADATA_MOVED),
+                expected_revision: read.revision.clone(),
+            },
+            Mutation::Remove {
+                path: path(METADATA_SMALL),
+                expected_revision: read.revision,
+            },
+        ] {
+            let refused = WorkspaceMutationService::execute(
+                &client,
+                binding,
+                cursor,
+                &MutationRequest {
+                    mutations: vec![mutation],
+                },
+            )
+            .await;
+            assert!(
+                matches!(
+                    refused,
+                    Err(WorkspaceError::StaleCursor
+                        | WorkspaceError::StaleResource { .. }
+                        | WorkspaceError::Conflict)
+                ),
+                "{refused:?}"
+            );
+            assert_eq!(
+                fs::read_to_string(fixture.path().join(METADATA_SMALL)).unwrap(),
+                METADATA_REPLACEMENT
+            );
+            assert!(!fixture.path().join(METADATA_MOVED).exists());
+        }
+        let fresh = WorkspaceReadService::stat(&client, binding, cursor, &small)
+            .await
+            .unwrap();
+        for mutation in [
+            Mutation::Move {
+                source: path(METADATA_SMALL),
+                destination: path(METADATA_MOVED),
+                expected_revision: fresh.revision.clone().unwrap(),
+            },
+            Mutation::Remove {
+                path: path(METADATA_MOVED),
+                expected_revision: fresh.revision.unwrap(),
+            },
+        ] {
+            let result = WorkspaceMutationService::execute(
+                &client,
+                binding,
+                cursor,
+                &MutationRequest {
+                    mutations: vec![mutation],
+                },
+            )
+            .await
+            .unwrap();
+            assert!(
+                matches!(result.state, OperationState::Completed { .. }),
+                "{result:?}"
+            );
+        }
+        assert!(!fixture.path().join(METADATA_SMALL).exists());
+        assert!(!fixture.path().join(METADATA_MOVED).exists());
+        eprintln!(
+            "PASS metadata-only entries require verified mutation revisions; stale same-size/mtime rename/delete refused, fresh revisions succeed"
+        );
+        fs::create_dir(fixture.path().join(".git")).unwrap();
+        let error = WorkspaceScmReadService::discover(
+            &client,
+            binding,
+            cursor,
+            &ScmDiscoverRequest {
+                path: WorkspacePath::new(relative).unwrap(),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(&error, WorkspaceError::Refused { symbolic, .. } if symbolic == REPOSITORY_UNAVAILABLE),
+            "{error:?}"
+        );
+        eprintln!(
+            "PASS no .git root is typed NotRepository; corrupt .git remains repository_unavailable"
+        );
+        let watch_request = WatchOpenRequest {
+            root: ResourceSelector::Path(path("nested")),
+            recursive: true,
+        };
+        let watch = WorkspaceWatchService::open(&client, binding, cursor, &watch_request)
+            .await
+            .unwrap();
+        fs::write(fixture.path().join(METADATA_BINARY), METADATA_CONTENT).unwrap();
+        fs::write(fixture.path().join(METADATA_NESTED), METADATA_REPLACEMENT).unwrap();
+        let deadline = Instant::now() + BATCH_TIMEOUT;
+        let mut watch_cursor = watch.cursor;
+        loop {
+            let page = WorkspaceWatchService::poll(
+                &client,
+                binding,
+                cursor,
+                &WatchPollRequest {
+                    subscription_id: watch.subscription_id.clone(),
+                    cursor: watch_cursor,
+                    max_events: LIMIT,
+                    max_bytes: WATCH_MAX_BYTES,
+                    wait_ms: WATCH_WAIT_MS,
+                },
+            )
+            .await
+            .unwrap();
+            assert!(
+                page.events.iter().all(|event| event
+                    .path
+                    .as_str()
+                    .starts_with(&format!("{relative}/nested/"))),
+                "{page:?}"
+            );
+            if page
+                .events
+                .iter()
+                .any(|event| event.path == path(METADATA_NESTED))
+            {
+                break;
+            }
+            let WatchPollState::Current { next_cursor, .. } = page.state else {
+                panic!("watch requires resync: {page:?}")
+            };
+            watch_cursor = next_cursor;
+            assert!(
+                Instant::now() < deadline,
+                "scoped watch event never arrived"
+            );
+        }
+        assert!(
+            WorkspaceWatchService::close(&client, binding, cursor, &watch.subscription_id)
+                .await
+                .unwrap()
+                .closed
+        );
+        let fault = PathBuf::from(env::var_os("WORKCELL_TEST_FAULT").unwrap())
+            .with_extension(WATCH_FAULT_EXTENSION);
+        fs::write(&fault, b"inject watch setup refusal").unwrap();
+        assert_eq!(
+            WorkspaceWatchService::open(&client, binding, cursor, &watch_request)
+                .await
+                .unwrap_err(),
+            WorkspaceError::WatchUnavailable
+        );
+        fs::remove_file(fault).unwrap();
+        eprintln!(
+            "PASS real scoped recursive watch setup/poll/close, injected typed watch_unavailable"
+        );
+    });
 }
 
 #[test]
