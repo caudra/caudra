@@ -855,8 +855,9 @@ impl App {
                 SidebarView::Explorer => KeybindContext::WorkbenchExplorer,
                 SidebarView::SourceControl => KeybindContext::WorkbenchSourceControl,
                 SidebarView::Search => KeybindContext::WorkbenchSearch,
+                SidebarView::Transfer => KeybindContext::Workbench,
             });
-            if self.workbench.focus() == Focus::Editor {
+            if self.workbench.focus() == Focus::Editor && !self.workbench.transfer_input_active() {
                 contexts.push(KeybindContext::WorkbenchEditor);
             }
         } else if self.paste_editor.is_open() {

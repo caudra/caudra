@@ -9,7 +9,7 @@
 use std::borrow::Cow;
 use std::ops::Range;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use caudra_agent::{
     AgentInput, AgentMode, CommitRef, EditableQueue, EditableQueueReceiver, ExtractedCommand,
@@ -245,6 +245,11 @@ pub(crate) fn queue() -> (QueueSender, QueueReceiver) {
 }
 
 impl QueueSender {
+    pub(crate) fn lock_dispatch(&self) -> MutexGuard<'_, ()> {
+        self.claim_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
     pub(crate) fn wake_dispatch(&self) {
         self.queue.wake();
     }
@@ -486,9 +491,11 @@ impl QueueSender {
 
 impl QueueReceiver {
     fn dispatch_allowed(&self) -> bool {
-        self.dispatch_guard
-            .lock()
-            .is_ok_and(|guard| guard.as_ref().is_none_or(|guard| guard()))
+        !crate::sandbox::transfer::active()
+            && self
+                .dispatch_guard
+                .lock()
+                .is_ok_and(|guard| guard.as_ref().is_none_or(|guard| guard()))
     }
 
     pub(crate) fn claim_idle(&self, min_run_id: u64) -> Vec<(QueueItemId, QueueItem)> {

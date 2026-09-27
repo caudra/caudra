@@ -974,6 +974,13 @@ impl App {
             .filter(|manager| manager.pending_request(&decision.request_id).is_some())
             .unwrap_or(&self.permissions)
             .clone();
+        if self.sandbox_live.transfer.as_ref().is_some_and(|worker| {
+            Arc::ptr_eq(&manager, &worker.permissions)
+                && !self.transfer_scope_current(&worker.scope)
+        }) {
+            self.resolve_permission_prompt(&decision.request_id);
+            return;
+        }
         if manager.pending_request(&decision.request_id).is_none() {
             self.resolve_permission_prompt(&decision.request_id);
             return;
@@ -1135,6 +1142,7 @@ impl App {
         {
             let current = self.sandbox_live.transfer.as_ref().is_some_and(|worker| {
                 pending.guard.session == self.state.session.id
+                    && self.transfer_scope_current(&worker.scope)
                     && pending
                         .guard
                         .owner

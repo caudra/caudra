@@ -3,7 +3,6 @@ use crate::AppSession;
 use crate::components::sandbox_manager::{SandboxAction, SandboxView};
 use crate::components::{DisplayMessage, DisplayRole, Overlay};
 use crate::repaint::Dirty;
-use crate::sandbox::transfer::{TransferCommand, TransferReply, TransferWorker};
 use crate::sandbox::{LiveRequest, start_live, start_snapshot};
 use crate::sandbox::{
     NETWORK_PENDING, NETWORK_RECOVERY, NETWORK_SAVE_NOTICE, NETWORK_SAVE_UNKNOWN,
@@ -11,7 +10,6 @@ use crate::sandbox::{
     start_network_reconcile,
 };
 use crate::sandbox::{SandboxSnapshot, SandboxSnapshotRequest, SandboxWorkers, start_store_effect};
-use caudra_agent::AgentEvent;
 use caudra_config::sandbox::SandboxName;
 use flume::TryRecvError;
 use std::sync::Arc;
@@ -132,7 +130,6 @@ impl App {
                 self.sandbox_reply = Some(start_store_effect(ticket, effect));
             }
             SandboxAction::Live(request) => self.sandbox_live.queued = Some(request),
-            SandboxAction::Transfer(command) => self.sandbox_live.transfer_queued = Some(command),
         }
     }
 
@@ -148,91 +145,15 @@ impl App {
         self.sandbox_manager.live_failed(message);
     }
 
-    pub(crate) fn transfer_failed(&mut self, message: String) {
-        if let Some(scope) = self.sandbox_snapshot_request() {
-            self.sandbox_manager
-                .receive_transfer(&scope, TransferReply::Failed(message));
-        }
-    }
-
-    pub(crate) fn start_transfer(&mut self, command: TransferCommand) {
-        let result = match command {
-            TransferCommand::Open { scope, link } => {
-                if self.sandbox_snapshot_request().as_ref() != Some(&scope)
-                    || !self.sandbox_manager.is_open()
-                {
-                    return;
-                }
-                self.sandbox_live.transfer = None;
-                match self.sandbox_live.transfer_connector.clone() {
-                    Some(connector) => TransferWorker::start(scope, link, connector, &self.storage)
-                        .map(|worker| self.sandbox_live.transfer = Some(worker)),
-                    _ => Err("Transfer connector unavailable; no fallback".into()),
-                }
-            }
-            TransferCommand::Close => {
-                if let Some(worker) = self.sandbox_live.transfer.as_mut() {
-                    worker.cancel();
-                }
-                Ok(())
-            }
-            command => self
-                .sandbox_live
-                .transfer
-                .as_ref()
-                .ok_or_else(|| "Reconnect Compare before requesting another operation".into())
-                .and_then(|worker| worker.send(command)),
-        };
-        if let Err(error) = result {
-            self.transfer_failed(error);
-        }
-    }
-
-    fn poll_transfer(&mut self) -> Dirty {
-        let current = self.sandbox_snapshot_request();
-        let Some(worker) = self.sandbox_live.transfer.as_mut() else {
-            return Dirty::NO;
-        };
-        if current.as_ref() != Some(&worker.scope) || !self.sandbox_manager.is_open() {
-            worker.cancel();
-        }
-        let mut dirty = Dirty::NO;
-        let mut closed = false;
-        for reply in worker.replies.try_iter() {
-            closed |= matches!(reply, TransferReply::Closed);
-            self.sandbox_manager.receive_transfer(&worker.scope, reply);
-            dirty = Dirty::YES;
-        }
-        closed |= worker.replies.is_disconnected();
-        for envelope in worker.permission_events.try_iter() {
-            match envelope.event {
-                AgentEvent::PermissionRequest(request) => {
-                    if worker.permissions.pending_request(&request.id).is_some() {
-                        self.permission_prompt
-                            .enqueue(request, Some("workspace transfer".into()));
-                    }
-                }
-                AgentEvent::PermissionRequestUpdated(request) => {
-                    self.permission_prompt.update(request);
-                }
-                AgentEvent::PermissionRequestResolved { request_id, .. } => {
-                    self.permission_prompt.resolve_pending(&request_id);
-                }
-                _ => continue,
-            }
-            dirty = Dirty::YES;
-        }
-        for event in worker.progress.try_iter() {
-            self.sandbox_manager.transfer_progress(&worker.scope, event);
-            dirty = Dirty::YES;
-        }
-        if closed {
-            self.sandbox_live.transfer = None;
-        }
-        dirty
-    }
-
     pub(crate) fn sandbox_action_blocker(&self, transition: bool) -> Option<&'static str> {
+        self.sandbox_admission_blocker(transition, false)
+    }
+
+    pub(crate) fn transfer_start_blocker(&self) -> Option<&'static str> {
+        self.sandbox_admission_blocker(false, true)
+    }
+
+    fn sandbox_admission_blocker(&self, transition: bool, transfer: bool) -> Option<&'static str> {
         if let Some(reason) = self.sandbox_detached_action_blocker() {
             return Some(reason);
         }
@@ -242,16 +163,23 @@ impl App {
                 "Wait for the active agent, permission or restore operation before a sandbox mutation",
             );
         }
-        if self.workbench.is_busy() {
+        if !transfer && self.workbench.is_busy() {
             return Some(
                 "Wait for pending Workbench reads or writes before changing sandbox authority",
             );
         }
-        if self.workbench_blocks_workspace_change()
-            || (transition
-                && (!self.input_box.is_empty()
-                    || !self.subagent_input_box.is_empty()
-                    || !self.subagent_drafts.is_empty()))
+        if (if transfer {
+            self.workbench.blocks_transfer_start()
+                || self
+                    .parked_workbench
+                    .as_ref()
+                    .is_some_and(|workbench| workbench.blocks_workspace_change())
+        } else {
+            self.workbench_blocks_workspace_change()
+        }) || (transition
+            && (!self.input_box.is_empty()
+                || !self.subagent_input_box.is_empty()
+                || !self.subagent_drafts.is_empty()))
         {
             return Some(UNSAVED_DRAFT_ERR);
         }
@@ -521,6 +449,7 @@ impl App {
 mod tests {
     use super::super::tests::{remote_workspace_session, test_app};
     use super::UNSAVED_DRAFT_ERR;
+    use crate::AppSession;
     use crate::app::Msg;
     use crate::components::Overlay;
     use crate::components::Status;
@@ -529,7 +458,9 @@ mod tests {
     use crate::components::sandbox_manager::tests::{fixture, live_instance};
     use crate::components::sandbox_manager::{SandboxAction, SandboxView};
     use crate::repaint::Dirty;
-    use crate::sandbox::transfer::{TransferCommand, TransferLink, transfer_permissions};
+    use crate::sandbox::transfer::{
+        TransferCommand, TransferLink, TransferScope, transfer_permissions,
+    };
     use crate::sandbox::{
         LiveOperation, LiveOutcome, LiveReply, NETWORK_RECOVERY, NETWORK_SAVE_UNKNOWN,
         NetworkReconcileReport, NetworkReconcileRequest, SandboxSnapshot, SnapshotReply,
@@ -548,7 +479,9 @@ mod tests {
         },
     };
     use caudra_providers::{ImageMediaType, ImageSource};
-    use caudra_storage::{id::CaudraId, private_file::PrivateFileError};
+    use caudra_storage::{
+        id::CaudraId, private_file::PrivateFileError, workspace_binding::StoredWorkspaceBinding,
+    };
     use caudra_workbench::{Workbench, WorkbenchStyles};
     use caudra_workcell::NativeTransferAuthorization;
     use caudra_workspace::WorkspacePath;
@@ -1301,6 +1234,19 @@ mod tests {
         ));
         let active = app.permissions.clone();
         let remote = remote_workspace_session();
+        let binding = StoredWorkspaceBinding::new_with_cursor(
+            remote.binding().clone(),
+            remote.cursor().clone(),
+            None,
+        )
+        .unwrap()
+        .with_sandbox_record(CaudraId::generate())
+        .unwrap();
+        app.state.session = Arc::new(AppSession::new_with_workspace("test", ".", binding.clone()));
+        app.sandbox_live.name = Some(SandboxName::parse("test").unwrap());
+        app.sandbox_live.readiness = Some(Arc::new(|| true));
+        app.sync_transfer_availability();
+        assert!(app.workbench.open_transfer());
         if remote_active {
             app.workspace_session = Some(remote.clone());
         }
@@ -1355,7 +1301,19 @@ mod tests {
                 effect,
             ),
         });
-        let scope = app.sandbox_snapshot_request().unwrap();
+        let configuration_revision = app
+            .sandbox_snapshot_request()
+            .unwrap()
+            .configuration_revision;
+        app.sandbox_manager.close();
+        let scope = TransferScope {
+            conversation: app.state.session.id,
+            binding,
+            name: SandboxName::parse("test").unwrap(),
+            instance_revision: configuration_revision.clone(),
+            configuration_revision,
+            generation: app.workbench.transfer_generation(),
+        };
         let (ready, waiting) = flume::bounded(1);
         let (finished, result) = flume::bounded(1);
         app.sandbox_live.transfer_connector = Some(Arc::new(move |link, host| {
@@ -1383,14 +1341,15 @@ mod tests {
             Err(TRANSFER_TEST_DONE.into())
         }));
         app.start_transfer(TransferCommand::Open {
-            link: TransferLink {
+            link: Box::new(TransferLink {
                 name: SandboxName::parse("test").unwrap(),
                 instance_revision: scope.configuration_revision.clone(),
                 configuration_revision: scope.configuration_revision.clone(),
                 local_root: root_b.path().into(),
                 remote_root: WorkspacePath::root(),
-            },
-            scope,
+                attached_binding: Some(scope.binding.clone()),
+            }),
+            scope: Box::new(scope),
         });
         let denied = configured_deny.is_some() || persisted_deny;
         assert_eq!(waiting.recv_timeout(PERMISSION_TIMEOUT).unwrap(), !denied);
@@ -1416,7 +1375,7 @@ mod tests {
             usize::from(configured_deny.is_none())
         );
         assert!(std::env::var_os(DOTENV_KEY).is_none());
-        app.sandbox_live.transfer = None;
+        app.sandbox_live.transfer.take().unwrap().finish();
     }
 
     #[test]

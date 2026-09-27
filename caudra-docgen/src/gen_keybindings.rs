@@ -60,9 +60,9 @@ fn write_section(out: &mut String, ctx: KeybindContext) {
         out.push_str(
             "\nSee [Managed Sandboxes](/docs/sandboxes/#tui-manager) for instance actions and \
              [image forms](/docs/sandboxes/#images-and-template-catalog) for the host picker and \
-             approved probe. The [Transfer panel](/docs/sandboxes/#tui-transfer-review) has \
-             separate controls. Escape there requests cancellation and waits for cleanup, \
-             unlike closing a lifecycle action.\n",
+             approved probe. File uploads and downloads live in the \
+             [workbench Transfer view](/docs/workbench/#transfer), available after attaching \
+             to a sandbox. Leaving Transfer requests cancellation and waits for cleanup.\n",
         );
     }
 }

@@ -14,15 +14,16 @@ use caudra_agent::{
     },
     tools::{PermissionIntent, PermissionScopes},
     workspace_transfer::{
-        LocalAccess, PlanReview, PlannedFile, TransferAction, TransferAuthorization, TransferError,
-        TransferPlan, TransferRoots,
+        LocalAccess, PlanReview, PlannedDirectory, PlannedFile, TransferAction,
+        TransferAuthorization, TransferError, TransferPlan, TransferRoots,
     },
 };
 use caudra_config::ToolKey;
 use caudra_storage::id::CaudraId;
 use caudra_workspace::{
-    LocalTransferAuthorization, LocalTransferCondition, LocalTransferReview,
-    PreparedTransferPublication, TransferDigest, WorkspaceError, WorkspacePath,
+    DirectoryPublicationRequest, LocalTransferAuthorization, LocalTransferCondition,
+    LocalTransferReview, PreparedDirectoryPublication, PreparedTransferPublication, TransferDigest,
+    WorkspaceError, WorkspacePath,
 };
 use serde_json::{Value, json};
 use smol::lock::Mutex as AsyncMutex;
@@ -166,6 +167,33 @@ impl NativeTransferAuthorization {
 
 #[async_trait]
 impl TransferAuthorization for NativeTransferAuthorization {
+    async fn review_remote_directory(
+        &self,
+        plan: &TransferPlan,
+        directory: &PlannedDirectory,
+        prepared: &PreparedDirectoryPublication,
+    ) -> Result<(), TransferError> {
+        let intent: OperationIntent =
+            serde_json::from_value(prepared.review.clone()).map_err(|_| TransferError::Stale)?;
+        if intent.kind != OperationKind::Transfer
+            || !intent.mutating
+            || intent.resources.is_empty()
+            || prepared.request.path != directory.path
+            || prepared.request.publication_id != directory.operation_id
+        {
+            return Err(TransferError::Stale);
+        }
+        let roots = &plan.review().context.roots;
+        let resources = remote_resources(roots, intent, &prepared.request_digest)?;
+        self.enforce(
+            roots,
+            resources,
+            json!({"plan_id":plan.digest(), "prepared_directory":prepared}),
+            true,
+        )
+        .await
+    }
+
     async fn roots(&self, roots: &TransferRoots) -> Result<(), TransferError> {
         self.enforce(
             roots,
@@ -225,7 +253,7 @@ impl TransferAuthorization for NativeTransferAuthorization {
         } else {
             PermissionResourceAccess::Read
         };
-        let resources = review
+        let mut resources: Vec<_> = review
             .files
             .iter()
             .flat_map(|file| {
@@ -238,6 +266,14 @@ impl TransferAuthorization for NativeTransferAuthorization {
                 resources
             })
             .collect();
+        for directory in &review.directories {
+            resources.push(Self::local_resource(roots, &directory.path, access.clone()));
+            if review.action == TransferAction::Pull {
+                resources.extend(directory.create_directories.iter().map(|path| {
+                    Self::local_resource(roots, path, PermissionResourceAccess::Write)
+                }));
+            }
+        }
         self.enforce(
             roots,
             resources,
@@ -277,54 +313,7 @@ impl TransferAuthorization for NativeTransferAuthorization {
             return Err(TransferError::Stale);
         }
         let roots = &plan.review().context.roots;
-        let identity = RemotePermissionIdentity::from_binding(&roots.remote.binding);
-        let resources = intent
-            .resources
-            .into_iter()
-            .map(|resource| {
-                if resource.scope.is_empty()
-                    || !matches!(
-                        resource.access,
-                        ResourceAccess::Write
-                            | ResourceAccess::ReadWrite
-                            | ResourceAccess::Traverse
-                            | ResourceAccess::Inspect
-                    )
-                {
-                    return Err(TransferError::Stale);
-                }
-                Ok(PermissionResource {
-                    kind: PermissionResourceKind::RemoteFile {
-                        identity: identity.clone(),
-                    },
-                    value: resource
-                        .scope
-                        .iter()
-                        .map(|id| id.as_str())
-                        .collect::<Vec<_>>()
-                        .join("\u{1f}"),
-                    access: Some(
-                        if matches!(
-                            resource.access,
-                            ResourceAccess::Write | ResourceAccess::ReadWrite
-                        ) {
-                            PermissionResourceAccess::Write
-                        } else {
-                            PermissionResourceAccess::Read
-                        },
-                    ),
-                    protected: false,
-                    requires_prompt: true,
-                    attributes: BTreeMap::from([
-                        ("display_path".into(), resource.display.as_str().into()),
-                        (
-                            "request_digest".into(),
-                            prepared.request_digest.as_str().into(),
-                        ),
-                    ]),
-                })
-            })
-            .collect::<Result<Vec<_>, TransferError>>()?;
+        let resources = remote_resources(roots, intent, &prepared.request_digest)?;
         self.enforce(
             roots,
             resources,
@@ -337,6 +326,47 @@ impl TransferAuthorization for NativeTransferAuthorization {
 
 #[async_trait]
 impl LocalTransferAuthorization for NativeTransferAuthorization {
+    async fn authorize_directory(
+        &self,
+        request: &DirectoryPublicationRequest,
+    ) -> Result<(), WorkspaceError> {
+        let plan = self
+            .consent
+            .lock()
+            .map_err(|_| WorkspaceError::PermissionDenied)?
+            .as_ref()
+            .map(|(_, review)| review.clone())
+            .ok_or(WorkspaceError::PermissionDenied)?;
+        if plan.action != TransferAction::Pull
+            || !plan.directories.iter().any(|directory| {
+                directory.operation_id == request.publication_id
+                    && directory.path == request.path
+                    && request
+                        .create_directories
+                        .iter()
+                        .all(|path| directory.create_directories.contains(path))
+            })
+        {
+            return Err(WorkspaceError::PermissionDenied);
+        }
+        let resources = request
+            .create_directories
+            .iter()
+            .chain([&request.path])
+            .map(|path| {
+                Self::local_resource(&plan.context.roots, path, PermissionResourceAccess::Write)
+            })
+            .collect();
+        self.enforce(
+            &plan.context.roots,
+            resources,
+            json!({"local_directory_publication":request}),
+            false,
+        )
+        .await
+        .map_err(|_| WorkspaceError::PermissionDenied)
+    }
+
     async fn authorize(&self, review: &LocalTransferReview) -> Result<(), WorkspaceError> {
         let plan = self
             .consent
@@ -383,6 +413,58 @@ impl LocalTransferAuthorization for NativeTransferAuthorization {
         .await
         .map_err(|_| WorkspaceError::PermissionDenied)
     }
+}
+
+fn remote_resources(
+    roots: &TransferRoots,
+    intent: OperationIntent,
+    request_digest: &TransferDigest,
+) -> Result<Vec<PermissionResource>, TransferError> {
+    let identity = RemotePermissionIdentity::from_binding(&roots.remote.binding);
+    intent
+        .resources
+        .into_iter()
+        .map(|resource| {
+            if resource.scope.is_empty()
+                || !matches!(
+                    resource.access,
+                    ResourceAccess::Write
+                        | ResourceAccess::ReadWrite
+                        | ResourceAccess::Traverse
+                        | ResourceAccess::Inspect
+                )
+            {
+                return Err(TransferError::Stale);
+            }
+            Ok(PermissionResource {
+                kind: PermissionResourceKind::RemoteFile {
+                    identity: identity.clone(),
+                },
+                value: resource
+                    .scope
+                    .iter()
+                    .map(|id| id.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\u{1f}"),
+                access: Some(
+                    if matches!(
+                        resource.access,
+                        ResourceAccess::Write | ResourceAccess::ReadWrite
+                    ) {
+                        PermissionResourceAccess::Write
+                    } else {
+                        PermissionResourceAccess::Read
+                    },
+                ),
+                protected: false,
+                requires_prompt: true,
+                attributes: BTreeMap::from([
+                    ("display_path".into(), resource.display.as_str().into()),
+                    ("request_digest".into(), request_digest.as_str().into()),
+                ]),
+            })
+        })
+        .collect::<Result<Vec<_>, TransferError>>()
 }
 
 #[cfg(test)]

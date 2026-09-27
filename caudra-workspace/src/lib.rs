@@ -30,10 +30,12 @@ pub use resource::{
 };
 pub use service::*;
 pub use transfer::{
-    DownloadedTransfer, LocalPublicationState, LocalTransferAuthorization, LocalTransferCondition,
+    DirectoryPublicationRequest, DirectoryPublicationStatus, DownloadedTransfer,
+    LocalPublicationState, LocalTransferAuthorization, LocalTransferCondition,
     LocalTransferDestination, LocalTransferPath, LocalTransferReview, LocalTransferRevision,
-    LocalTransferService, LocalTransferSource, PreparedLocalTransfer, PreparedTransferPublication,
-    RemoteTransferFile, RemoteTransferStage, SealedTransfer, TransferContent, TransferDigest,
-    TransferLimits, TransferMode, TransferPublicationRequest, TransferPublicationState,
-    TransferPublicationStatus, WorkspaceTransferService,
+    LocalTransferService, LocalTransferSource, PreparedDirectoryPublication,
+    PreparedLocalDirectory, PreparedLocalTransfer, PreparedTransferPublication,
+    PublishedTransferDirectory, RemoteTransferFile, RemoteTransferStage, SealedTransfer,
+    TransferContent, TransferDigest, TransferLimits, TransferMode, TransferPublicationRequest,
+    TransferPublicationState, TransferPublicationStatus, WorkspaceTransferService,
 };

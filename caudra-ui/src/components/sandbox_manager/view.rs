@@ -119,9 +119,7 @@ impl Manager {
             );
             self.hits.push((tab_areas[index], Control::View(view)));
         }
-        if let Some(panel) = self.transfer.as_mut() {
-            panel.view(frame, body);
-        } else if self.confirmation.is_some() {
+        if self.confirmation.is_some() {
             self.view_confirmation(frame, body);
         } else if self.live_pending.is_some() {
             self.readers[ReadSurface::Body as usize].view(frame, body, safe(&self.status));
@@ -212,22 +210,6 @@ impl Manager {
                 Hint::key("Enter", KeyCode::Enter, "Draft / inspect"),
                 Hint::key("Esc", KeyCode::Esc, "Back"),
             ]];
-        }
-        if self.transfer.is_some() {
-            return vec![
-                vec![
-                    Hint::char("s", "Seed"),
-                    Hint::char("p", "Push"),
-                    Hint::char("l", "Pull"),
-                    Hint::char("r", "Review"),
-                    Hint::char("x", "Execute"),
-                ],
-                vec![
-                    Hint::char("c", "Compare"),
-                    Hint::char("q", "Reconcile"),
-                    Hint::key("Esc", KeyCode::Esc, "Cancel / close"),
-                ],
-            ];
         }
         if self.references.is_some() {
             return vec![vec![
@@ -333,7 +315,6 @@ impl Manager {
                     vec![
                         Hint::key("F3", KeyCode::F(3), "Instance actions / recovery"),
                         Hint::char("a", "Attach"),
-                        Hint::char("t", "Transfer"),
                         Hint::char("u", "Resume"),
                         Hint::char("p", "Pause"),
                     ],

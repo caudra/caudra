@@ -1,26 +1,49 @@
 use caudra_workspace::{
     ByteRange, LocalPublicationState, LocalTransferCondition, LocalTransferDestination,
     LocalTransferPath, LocalTransferRevision, MutationCondition, OperationId, OperationState,
-    PreparedLocalTransfer, PreparedTransferPublication, RemoteTransferStage, ResourceRevision,
-    TransferContent, TransferPublicationRequest, TransferPublicationState,
-    TransferPublicationStatus, WorkspaceError, WorkspacePath,
+    PreparedDirectoryPublication, PreparedLocalDirectory, PreparedLocalTransfer,
+    PreparedTransferPublication, RemoteTransferStage, ResourceRevision, TransferContent,
+    TransferPublicationRequest, TransferPublicationState, TransferPublicationStatus,
+    WorkspaceError, WorkspacePath,
 };
 use serde_json::Value;
 
 use super::{
     ApprovedParent, FileOutcome, JournalEntry, JournalState, LocalAccess, MAX_REVIEW_BYTES,
-    PlannedFile, RemoteRootIdentity, Side, TransferAction, TransferError, TransferEvent,
-    TransferJournal, TransferPhase, TransferPlan, TransferRun, WorkspaceTransfer,
+    PlannedDirectory, PlannedFile, RemoteRootIdentity, Side, TransferAction, TransferError,
+    TransferEvent, TransferJournal, TransferPhase, TransferPlan, TransferRun, WorkspaceTransfer,
 };
 use crate::CancelToken;
 
 #[derive(Default)]
-struct ActiveTransfer {
+pub(super) struct ActiveTransfer {
+    pub(super) remote_directory: Option<PreparedDirectoryPublication>,
+    pub(super) local_directory: Option<PreparedLocalDirectory>,
     stage: Option<RemoteTransferStage>,
     remote: Option<PreparedTransferPublication>,
     local: Option<PreparedLocalTransfer>,
-    dispatched: bool,
-    untracked_lease: bool,
+    pub(super) dispatched: bool,
+    pub(super) untracked_lease: bool,
+}
+
+enum PlannedEntry<'a> {
+    File(&'a PlannedFile),
+    Directory(&'a PlannedDirectory),
+}
+
+impl PlannedEntry<'_> {
+    fn id(&self) -> &OperationId {
+        match self {
+            Self::File(file) => &file.operation_id,
+            Self::Directory(directory) => &directory.operation_id,
+        }
+    }
+    fn path(&self) -> &WorkspacePath {
+        match self {
+            Self::File(file) => &file.path,
+            Self::Directory(directory) => &directory.path,
+        }
+    }
 }
 
 impl WorkspaceTransfer {
@@ -34,7 +57,8 @@ impl WorkspaceTransfer {
     ) -> TransferRun {
         let mut run = TransferRun::default();
         let approval = async {
-            if plan.review.files.is_empty() || plan.review.files.len() > self.limits.max_selected {
+            let count = plan.review.files.len() + plan.review.directories.len();
+            if count == 0 || count > self.limits.max_selected {
                 return Err(TransferError::Quota);
             }
             let mut bytes = 0_u64;
@@ -64,15 +88,25 @@ impl WorkspaceTransfer {
             run.stopped = Some(error);
             return run;
         }
-        for file in &plan.review.files {
+        for effect in plan
+            .review
+            .directories
+            .iter()
+            .map(PlannedEntry::Directory)
+            .chain(plan.review.files.iter().map(PlannedEntry::File))
+        {
             if cancel.is_cancelled() {
                 run.stopped = Some(TransferError::Cancelled);
                 break;
             }
-            match journal.reserve(plan, file) {
+            let reservation = match effect {
+                PlannedEntry::File(file) => journal.reserve(plan, file),
+                PlannedEntry::Directory(directory) => journal.reserve_directory(plan, directory),
+            };
+            match reservation {
                 Ok(false) => {
                     run.outcomes
-                        .insert(file.operation_id.clone(), FileOutcome::Confirmed);
+                        .insert(effect.id().clone(), FileOutcome::Confirmed);
                     continue;
                 }
                 Err(error) => {
@@ -82,11 +116,18 @@ impl WorkspaceTransfer {
                 Ok(true) => {}
             }
             let mut active = ActiveTransfer::default();
-            let result = self
-                .transfer_file(plan, file, journal, cancel, &mut active)
-                .await;
+            let result = match effect {
+                PlannedEntry::File(file) => {
+                    self.transfer_file(plan, file, journal, cancel, &mut active)
+                        .await
+                }
+                PlannedEntry::Directory(directory) => {
+                    self.transfer_directory(plan, directory, journal, cancel, &mut active)
+                        .await
+                }
+            };
             let (outcome, error) = match result {
-                Ok(revision) => match journal.confirm(&file.operation_id, revision) {
+                Ok(revision) => match journal.confirm(effect.id(), revision) {
                     Ok(()) => (FileOutcome::Confirmed, None),
                     // The durable dispatched record deliberately stays blocking.
                     Err(error) => (FileOutcome::Unknown, Some(error)),
@@ -123,7 +164,7 @@ impl WorkspaceTransfer {
                 FileOutcome::Cancelled => JournalState::Cancelled,
                 FileOutcome::Unknown => JournalState::Unknown,
             };
-            let saved = journal.update(&file.operation_id, |entry| {
+            let saved = journal.update(effect.id(), |entry| {
                 if entry.state != JournalState::Confirmed {
                     entry.state = state;
                 }
@@ -132,8 +173,8 @@ impl WorkspaceTransfer {
             });
             self.settled(
                 &mut run,
-                &file.operation_id,
-                &file.path,
+                effect.id(),
+                effect.path(),
                 outcome,
                 cleanup_pending,
             );
@@ -515,7 +556,9 @@ impl WorkspaceTransfer {
                 return run;
             }
         };
-        for entry in entries.into_iter().filter(|entry| entry.state.blocks()) {
+        for entry in entries.into_iter().filter(|entry| {
+            entry.state.blocks() || (entry.directory.is_some() && entry.cleanup_pending)
+        }) {
             if entry.roots.local != context.roots.local
                 || !same_remote_root(&entry.roots.remote, &context.roots.remote)
             {
@@ -549,6 +592,9 @@ impl WorkspaceTransfer {
         }
         self.bounded(cancel, self.services.authorization.roots(&current.roots))
             .await?;
+        if entry.directory.is_some() {
+            return self.reconcile_directory(entry, journal, cancel).await;
+        }
         if matches!(entry.state, JournalState::Reserved | JournalState::Prepared) {
             // Dispatched is fsynced before any execute call. A crash before it cannot publish.
             journal.update(&entry.operation_id, |current| {
@@ -658,9 +704,21 @@ impl WorkspaceTransfer {
         }
     }
 
-    async fn cleanup(&self, active: &ActiveTransfer) -> bool {
+    pub(super) async fn cleanup(&self, active: &ActiveTransfer) -> bool {
         let cancel = CancelToken::none();
         let mut pending = active.untracked_lease;
+        if let Some(prepared) = &active.local_directory {
+            pending |= self
+                .workspace(&cancel, self.services.local.release_directory(prepared))
+                .await
+                .is_err();
+        }
+        if let Some(prepared) = &active.remote_directory {
+            pending |= !self
+                .workspace(&cancel, self.services.remote.release_directory(prepared))
+                .await
+                .is_ok_and(|result| result.released);
+        }
         if let Some(prepared) = &active.local {
             pending |= self
                 .workspace(&cancel, self.services.local.release(prepared))
@@ -705,7 +763,7 @@ impl WorkspaceTransfer {
     }
 }
 
-fn dispatch(
+pub(super) fn dispatch(
     journal: &mut TransferJournal,
     id: &OperationId,
     active: &mut ActiveTransfer,

@@ -173,6 +173,7 @@ impl Workbench {
         grab_scope!("workbench_view", area);
         self.panes = layout(area, self.sidebar_width, self.sidebar_collapsed);
         let panes = self.panes;
+        self.switcher.clear();
         let buf = frame.buffer_mut();
         chrome::fill(buf, area, self.styles.background);
 
@@ -181,6 +182,17 @@ impl Workbench {
         }
         if let Some(separator) = panes.separator {
             chrome::vertical_rule(buf, separator, self.styles.border);
+        }
+        if self.sidebar == SidebarView::Transfer {
+            self.transfer.render(buf, panes.editor, &self.styles);
+            chrome::render_line(
+                buf,
+                panes.status,
+                Line::from(
+                    "Transfer · Ctrl+X 1/2/3/4 views · Tab local/sandbox · C cancel · Esc back",
+                ),
+            );
+            return;
         }
         self.render_editor(buf, panes.editor);
         self.render_status(buf, panes.status);
@@ -255,29 +267,56 @@ impl Workbench {
         self.panes.header = header;
         let focused = self.focus == Focus::Sidebar;
         let context = self.header_context();
-        let pointed = self
-            .hovering(header)
-            .and_then(|at| header_at(at.0, header.x));
-        let switcher = SidebarView::ALL
+        let mut entries = SidebarView::ALL.to_vec();
+        if self.transfer.available() {
+            entries.push(SidebarView::Transfer);
+        }
+        let compact = entries
+            .iter()
+            .map(|view| view.title().width() + TAB_GAP.width())
+            .sum::<usize>()
+            > usize::from(header.width);
+        let mut x = header.x;
+        let switcher = entries
             .into_iter()
             .flat_map(|view| {
+                let label = if compact {
+                    match view {
+                        SidebarView::Explorer => "1:F",
+                        SidebarView::SourceControl => "2:G",
+                        SidebarView::Search => "3:?",
+                        SidebarView::Transfer => "4:T",
+                    }
+                } else {
+                    view.title()
+                };
+                let gap = TAB_GAP.width() as u16;
+                let width = label.width() as u16;
+                let rect = Rect::new(x.saturating_add(gap), header.y, width, header.height);
+                x = rect.right();
+                if rect.right() > header.right() {
+                    return Vec::new();
+                }
+                self.switcher.push((rect, view));
                 let active = view == self.sidebar;
                 let mut style = match (active, focused) {
                     (true, true) => self.styles.title,
                     (true, false) => self.styles.text,
                     (false, _) => self.styles.dim,
                 };
-                if pointed == Some(view) && !active {
+                if self.hover.is_some_and(|at| rect.contains(at.into())) && !active {
                     style = style.patch(self.styles.hover);
                 }
-                [
+                vec![
                     Span::styled(TAB_GAP, self.styles.background),
-                    Span::styled(view.title(), style),
+                    Span::styled(label, style),
                 ]
             })
             .collect();
         let mut right = Vec::new();
-        if let Some(label) = self.header_button() {
+        if !self.transfer.available()
+            && let Some(label) = self.header_button()
+        {
             let pointed = self
                 .hovering(header)
                 .is_some_and(|at| button_at(at.0, header, context.width(), label));
@@ -287,7 +326,9 @@ impl Workbench {
             ));
             right.push(Span::styled(TAB_GAP, self.styles.background));
         }
-        right.push(Span::styled(context, self.styles.dim));
+        if !self.transfer.available() {
+            right.push(Span::styled(context, self.styles.dim));
+        }
         chrome::render_line(
             buf,
             header,
@@ -298,6 +339,7 @@ impl Workbench {
             SidebarView::Explorer => self.render_tree(buf, body),
             SidebarView::SourceControl => self.render_scm(buf, body),
             SidebarView::Search => self.render_search(buf, body, focused),
+            SidebarView::Transfer => self.transfer.render_sidebar(buf, body, &self.styles),
         }
     }
 
@@ -325,7 +367,7 @@ impl Workbench {
                 true => FLAT_LABEL,
                 false => TREE_LABEL,
             }),
-            SidebarView::Search => None,
+            SidebarView::Search | SidebarView::Transfer => None,
         }
     }
 
@@ -1182,6 +1224,7 @@ pub(crate) fn tab_at(editor: &Editor, column: u16, strip: Rect) -> Option<TabHit
 /// Which view the switcher segment at `column` selects, measured the same way
 /// [`Workbench::render_sidebar`] lays them out. The gaps between them are not
 /// buttons.
+#[cfg(test)]
 pub(crate) fn header_at(column: u16, origin: u16) -> Option<SidebarView> {
     let mut left = column.checked_sub(origin)? as usize;
     for view in SidebarView::ALL {

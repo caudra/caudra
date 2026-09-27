@@ -159,7 +159,7 @@ Holding `Alt` while turning the wheel scrolls four times as far. A middle-click 
 | `i` / `b` / `g` / `l` | Images: approved offline Import, Build, GC or Inspect |
 | `g` / `F4` / `F6` | Live network preview/apply; Test rules (no probe); discard action draft |
 
-See [Managed Sandboxes](/docs/sandboxes/#tui-manager) for instance actions and [image forms](/docs/sandboxes/#images-and-template-catalog) for the host picker and approved probe. The [Transfer panel](/docs/sandboxes/#tui-transfer-review) has separate controls. Escape there requests cancellation and waits for cleanup, unlike closing a lifecycle action.
+See [Managed Sandboxes](/docs/sandboxes/#tui-manager) for instance actions and [image forms](/docs/sandboxes/#images-and-template-catalog) for the host picker and approved probe. File uploads and downloads live in the [workbench Transfer view](/docs/workbench/#transfer), available after attaching to a sandbox. Leaving Transfer requests cancellation and waits for cleanup.
 
 ## Workbench
 
@@ -168,7 +168,7 @@ See [Managed Sandboxes](/docs/sandboxes/#tui-manager) for instance actions and [
 | `Esc` / `Ctrl+X w` | Back to the transcript |
 | `Ctrl+B` | Show or hide the sidebar |
 | `Ctrl+X -` / `Ctrl+X =` | Narrow / widen the sidebar |
-| `Ctrl+X 1` / `Ctrl+X 2` / `Ctrl+X 3` | Explorer / source control / search |
+| `Ctrl+X 1` / `Ctrl+X 2` / `Ctrl+X 3` / `Ctrl+X 4` | Explorer / source control / search / attached sandbox transfer |
 | `Tab` / `Shift+Tab` | Leave the sidebar for the editor |
 | `Ctrl+P` | Open a file by name |
 | `F5` | Reread the tree and the repository |

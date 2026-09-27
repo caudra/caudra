@@ -70,8 +70,11 @@ pub(super) fn connector(storage: StateDir, cwd: PathBuf) -> SandboxConnector {
             }
             Ok(SandboxAttachment {
                 name: name.clone(),
+                revision: revision.clone(),
+                attached_revision: Controller::new(&storage)?.store().get(&name)?.revision()?,
                 binding: Box::new(binding),
                 runtime: Box::new(PreparedSandbox { runtime, registry }),
+                initial_seed: None,
             })
         };
         prepare().map_err(|error| error.to_string())
@@ -106,6 +109,17 @@ pub(super) fn transfer_connector(state: StateDir) -> TransferConnector {
                 &link.remote_root,
                 &state,
             )?;
+            if let Some(attached) = &link.attached_binding {
+                let binding = attached.binding();
+                if binding.authority() != remote.binding.authority()
+                    || binding.principal() != remote.binding.principal()
+                    || binding.project() != remote.binding.project()
+                {
+                    bail!(
+                        "Transfer connection does not match the attached authenticated workspace"
+                    );
+                }
+            }
             let expected = controller.store().get(&link.name)?.revision()?;
             let validation_state = state.clone();
             let host_validity = host.validity.clone();

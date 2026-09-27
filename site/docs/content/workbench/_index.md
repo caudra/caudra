@@ -7,9 +7,9 @@ group = "Guides"
 
 # Workbench
 
-The workbench is a file explorer, tabbed editor, source control view, and project search, laid out the way an IDE lays them out. It takes over the terminal beside the transcript, so you can read a file, stage a change, or point the agent at an exact line without leaving Caudra.
+The workbench combines a file explorer, tabbed editor, source control, project search, and sandbox file transfers. It takes over the terminal beside the transcript, so you can read a file, stage a change, or point the agent at an exact line without leaving Caudra.
 
-Press `Ctrl+X w` to open it, or run `/workbench`. `Esc` or `Ctrl+X w` goes back to the transcript. `Esc` drops a live selection in the editor first, so leaving from one takes a second press, while `Ctrl+X w` always leaves at once. The session keeps running while the workbench is on screen.
+Press `Ctrl+X w` to open it, or run `/workbench`. `Esc` or `Ctrl+X w` goes back to the transcript. `Esc` drops a live selection in the editor first, so leaving from one takes a second press. Leaving an active Transfer view waits for cancellation and cleanup. The session keeps running while the workbench is on screen.
 
 ## Layout
 
@@ -220,6 +220,42 @@ A directory outside a repository says so rather than failing.
 The first `Enter` runs the search. Once results are current, `Enter` opens the selected row: a file heading opens the top of the file, a match opens that line. Editing the query or a toggle makes the results stale again, so the next `Enter` searches.
 
 The walk respects `.gitignore` and skips `.git`, binaries, and files above the size limit. Results stream in as they are found and stop at 5000 matches, which the pane says out loud rather than pretending the list is complete.
+
+## Transfer
+
+After attaching to a sandbox, select `TRANSFER` or press `Ctrl+X 4`. The editor area shows local files on the left and sandbox files on the right. Your open editor tabs keep their contents and cursor positions. Local-only sessions and direct Workcell connections do not expose this view.
+
+Choose an existing absolute local directory and an existing workspace-relative sandbox directory, then Compare. Both roots stay visible. The sandbox root is relative to the exposed Workcell workspace, not the guest filesystem. A remote conversation path is never used as a local directory automatically.
+
+Linked navigation opens matching relative directories on both sides. A missing counterpart stays visible as missing. Turn linking off to compare different existing directories. Changing the root pair discards the old review and requires a fresh comparison.
+
+Rows distinguish identical files, local-only files, sandbox-only files, changed files, type conflicts, and excluded or incomplete entries. Comparison checks content and executable metadata rather than choosing the newest timestamp. Directory badges summarize descendants. A directory with matching names can still contain changed or unreadable files.
+
+Select files or folders, choose Upload or Download, then review the exact effects before executing. Folder selection includes eligible descendants and empty directories. Skipped entries remain visible. An oversized selection requires a smaller selection or root, rather than silently copying only part of it. File/directory type conflicts cannot be overwritten by a transfer.
+
+Empty-directory creation requires negotiated directory-publication support. Local directory publication currently requires Linux and private staging on the same filesystem as the destination, outside the transferred tree. When that support is unavailable, file transfers remain available.
+
+Inspect shows a read-only text comparison or a binary summary. Text previews are bounded and mark truncation. Inspecting a file does not authorize copying it. The review lists new files, overwrites and directory creation, and native permissions still apply on both ends.
+
+| Key | Action |
+|-----|--------|
+| `Tab` / `Shift+Tab` | Switch the active pane |
+| `Enter` | Enter a folder or inspect a file |
+| `Backspace` | Navigate to the parent |
+| `Space` | Select or deselect a file or folder |
+| `L` / `S` | Edit the local or sandbox root |
+| `N` | Toggle linked navigation |
+| `U` / `D` | Choose Upload or Download |
+| `=` / `F5` | Compare again |
+| `R` | Review the selection |
+| `A` | Approve the displayed executable review |
+| `C` | Cancel the transfer connection |
+| `Q` | Reconcile recorded uncertain outcomes |
+| `Esc` | Close the current field or detail, then leave Transfer |
+
+While a transfer connection holds the editing guard, ordinary editing, saves, source-control mutations and composer submission are blocked across Caudra sessions. Save or discard dirty buffers and let active work settle before connecting. Leaving Transfer cancels its worker and waits for cleanup before returning to editing. External editors and processes are outside this guard.
+
+Transfers do not delete destination-only files or synchronize automatically. Earlier confirmed operations remain applied after a later failure. Unknown outcomes require Reconcile, which queries recorded status without retrying publication. See [reviewed transfers](/docs/sandboxes/#reviewed-file-transfers) for permissions, exclusions, CLI commands and recovery guarantees.
 
 ## Sending a reference to the agent
 

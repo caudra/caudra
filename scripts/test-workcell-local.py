@@ -393,7 +393,11 @@ def main():
                                 return
                             time.sleep(0.01)
                     if (
-                        method == "ai.workcell/transfer/publicationStatus"
+                        method
+                        in (
+                            "ai.workcell/transfer/publicationStatus",
+                            "ai.workcell/transfer/directoryStatus",
+                        )
                         and (temp / "drop-operation-response.unknown").exists()
                     ):
                         request = json.loads(request_body)
@@ -408,7 +412,9 @@ def main():
                                     "preparationId": None,
                                     "invocationId": None,
                                     "requestDigest": None,
-                                    "file": None,
+                                    "directory"
+                                    if method == "ai.workcell/transfer/directoryStatus"
+                                    else "file": None,
                                 },
                             }
                         ).encode()

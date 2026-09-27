@@ -1,7 +1,6 @@
 mod form;
 mod image;
 mod live;
-mod transfer;
 mod view;
 
 use super::scrollbar::{Scrollbar, ScrollbarMouse};
@@ -72,7 +71,6 @@ pub(crate) enum SandboxAction {
         effect: StoreEffect,
     },
     Live(Box<LiveRequest>),
-    Transfer(crate::sandbox::transfer::TransferCommand),
 }
 
 #[derive(Default)]
@@ -246,7 +244,7 @@ struct Manager {
     live_form: Option<LiveForm>,
     report_draft: Option<LiveForm>,
     retained_live: Option<RetainedLive>,
-    transfer: Option<transfer::TransferPanel>,
+    pending_seed: Option<crate::sandbox::InitialSeed>,
     conflict: Option<Result<Arc<LoadedSandboxes>, String>>,
     snapshot: Option<SandboxSnapshot>,
     view: SandboxView,
@@ -308,7 +306,6 @@ impl SandboxManager {
                 || state.live_pending.is_some()
                 || state.live_form.is_some()
                 || state.report_draft.is_some()
-                || state.transfer.is_some()
             {
                 return SandboxAction::None;
             }
@@ -330,7 +327,7 @@ impl SandboxManager {
             live_form: None,
             report_draft: None,
             retained_live: None,
-            transfer: None,
+            pending_seed: None,
             conflict: None,
             snapshot: None,
             view,
@@ -434,16 +431,31 @@ impl SandboxManager {
             }) => {
                 state.live_form = None;
                 state.document = None;
-                state.transfer = Some(transfer::TransferPanel::seed(name, revision, local, remote));
-                state.status = "Workcell identity verified. Initial seed asks for a separate file review and both-end permissions; nothing exported.".into();
+                state.pending_seed = Some(crate::sandbox::InitialSeed {
+                    name,
+                    revision,
+                    local,
+                    remote,
+                });
+                state.status = "Created without attaching or uploading. Select the new instance and explicitly Attach to open Workbench Transfer for initial seed review. F6 cancels the seed offer.".into();
                 None
             }
-            Ok(LiveOutcome::Attachment(attachment)) => {
+            Ok(LiveOutcome::Attachment(mut attachment)) => {
                 if !state.open {
                     state.status = "Workcell verified, but the manager was closed. Workspace unchanged; reopen and explicitly Attach again.".into();
                     return None;
                 }
                 state.status = "Workcell verified. Checking session transition gates…".into();
+                attachment.initial_seed = state
+                    .pending_seed
+                    .take()
+                    .filter(|seed| {
+                        seed.name == attachment.name && seed.revision == attachment.revision
+                    })
+                    .map(|mut seed| {
+                        seed.revision = attachment.attached_revision.clone();
+                        seed
+                    });
                 Some(attachment)
             }
             Ok(LiveOutcome::Report(report)) => {
@@ -669,10 +681,6 @@ impl SandboxManager {
                 return;
             }
             state.reset_mouse();
-            if let Some(panel) = state.transfer.as_mut() {
-                panel.scroll(position, delta);
-                return;
-            }
             if state.confirmation.is_some() {
                 state.detail_scroll = state
                     .detail_scroll
@@ -1423,8 +1431,8 @@ impl Manager {
             self.cancel_selections();
         }
         self.reset_mouse();
-        if self.transfer.is_some() {
-            return self.transfer_key(event);
+        if event.code == KeyCode::F(6) {
+            self.pending_seed = None;
         }
         if event.kind == KeyEventKind::Repeat
             && (self.confirmation.is_some() || !self.form.as_ref().is_some_and(|form| form.editing))
@@ -1626,10 +1634,6 @@ impl Manager {
             KeyCode::Char('a') if self.view == SandboxView::Instances => {
                 self.open_live(live::Kind::Attach)
             }
-            KeyCode::Char('t') if self.view == SandboxView::Instances => {
-                self.open_transfer();
-                SandboxAction::None
-            }
             KeyCode::Char('d') if self.view == SandboxView::Instances => {
                 self.open_live(live::Kind::Detach)
             }
@@ -1771,10 +1775,6 @@ impl Manager {
     }
 
     fn paste(&mut self, text: &str) {
-        if let Some(panel) = self.transfer.as_mut() {
-            panel.paste(text);
-            return;
-        }
         if self.live_pending.is_some() {
             return;
         }
@@ -2123,8 +2123,7 @@ impl Manager {
             .or_else(|| {
                 (self.editor_area.contains(at)
                     && self.confirmation.is_none()
-                    && self.live_pending.is_none()
-                    && self.transfer.is_none())
+                    && self.live_pending.is_none())
                 .then_some(Control::Editor)
             });
         self.hovered = hit.clone();
@@ -2135,9 +2134,6 @@ impl Manager {
             if let Some(key) = hint.handle_mouse(event) {
                 return self.handle_key(key);
             }
-        }
-        if let Some(panel) = self.transfer.as_mut() {
-            return panel.mouse(event);
         }
         if event.kind == MouseEventKind::Moved {
             if !self.editor_area.is_empty() && self.confirmation.is_none() {
@@ -2297,9 +2293,6 @@ impl Manager {
         {
             picker.reset_mouse();
         }
-        if let Some(panel) = self.transfer.as_mut() {
-            panel.reset_mouse();
-        }
         for hint in &mut self.hints {
             hint.reset();
         }
@@ -2312,7 +2305,7 @@ impl Manager {
     }
 
     fn control_enabled(&self, control: &Control) -> bool {
-        if self.transfer.is_some() || self.live_pending.is_some() {
+        if self.live_pending.is_some() {
             return false;
         }
         if self.confirmation.is_some() {
@@ -3053,6 +3046,80 @@ on_exit = "detach"
     }
 
     #[test]
+    fn instances_transfer_key_has_no_modal_or_live_action() {
+        let (_directory, _, mut manager) = fixture();
+        live_instance(&mut manager, false);
+        assert!(matches!(
+            press(&mut manager, KeyCode::Char('t')),
+            SandboxAction::None
+        ));
+        assert!(manager.state.as_ref().unwrap().live_form.is_none());
+        assert!(manager.state.as_ref().unwrap().confirmation.is_none());
+        assert!(!manager.pending());
+        assert!(!manager.dirty());
+    }
+
+    #[test_case(true, true, false; "matching_explicit_attachment")]
+    #[test_case(false, true, false; "different_instance")]
+    #[test_case(true, false, false; "changed_instance_revision")]
+    #[test_case(true, true, true; "cancelled_offer")]
+    fn seed_intent_only_follows_matching_explicit_attachment(
+        name_matches: bool,
+        revision_matches: bool,
+        cancel: bool,
+    ) {
+        let (_directory, _, mut manager) = fixture();
+        live_instance(&mut manager, false);
+        press(&mut manager, KeyCode::Char('a'));
+        manager.handle_key(key::SANDBOX_APPLY.to_key_event());
+        let SandboxAction::Live(request) = press(&mut manager, KeyCode::Char('s')) else {
+            panic!("attachment review required");
+        };
+        let LiveOperation::Attach { name, revision } = &request.operation else {
+            panic!("explicit attach required");
+        };
+        manager.state.as_mut().unwrap().pending_seed = Some(crate::sandbox::InitialSeed {
+            name: if name_matches {
+                name.clone()
+            } else {
+                SandboxName::parse("different").unwrap()
+            },
+            revision: if revision_matches {
+                revision.clone()
+            } else {
+                Revision::parse(TEMPLATE_REVISION).unwrap()
+            },
+            local: std::env::temp_dir(),
+            remote: WorkspacePath::root(),
+        });
+        if cancel {
+            press(&mut manager, KeyCode::F(6));
+        }
+        let attachment = manager
+            .receive_live(LiveReply {
+                ticket: request.ticket,
+                scope: request.scope,
+                result: Ok(LiveOutcome::Attachment(SandboxAttachment {
+                    name: name.clone(),
+                    revision: revision.clone(),
+                    attached_revision: Revision::parse(TEMPLATE_REVISION).unwrap(),
+                    binding: Box::new(StoredWorkspaceBinding::local_from_cwd("/tmp")),
+                    runtime: Box::new(()),
+                    initial_seed: None,
+                })),
+            })
+            .unwrap();
+        assert_eq!(
+            attachment.initial_seed.is_some(),
+            name_matches && revision_matches && !cancel
+        );
+        if let Some(seed) = attachment.initial_seed {
+            assert_eq!(seed.revision, attachment.attached_revision);
+        }
+        assert!(!manager.pending());
+    }
+
+    #[test]
     fn close_does_not_cancel_vm_action_or_install_late_attachment() {
         let (_directory, _, mut manager) = fixture();
         live_instance(&mut manager, false);
@@ -3070,8 +3137,11 @@ on_exit = "detach"
         let binding = StoredWorkspaceBinding::local_from_cwd("/tmp");
         let attachment = SandboxAttachment {
             name: SandboxName::parse(LIVE_NAME).unwrap(),
+            revision: request.scope.configuration_revision.clone(),
+            attached_revision: request.scope.configuration_revision.clone(),
             binding: Box::new(binding),
             runtime: Box::new(()),
+            initial_seed: None,
         };
         assert!(
             manager

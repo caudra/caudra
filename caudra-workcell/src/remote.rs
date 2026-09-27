@@ -1167,6 +1167,7 @@ struct RemoteJournalState {
 
 #[derive(Clone)]
 struct RecoveryOperation {
+    operation_kind: String,
     publication_cwd: Option<WorkspacePath>,
     publication_id: Option<OperationId>,
     host_instance_id: String,
@@ -1431,6 +1432,7 @@ impl RemoteMutationJournal {
             .iter()
             .filter(|(_, pending)| pending.reachable)
             .map(|(operation_id, pending)| RecoveryOperation {
+                operation_kind: pending.operation_kind.clone(),
                 publication_cwd: pending.publication_cwd.clone(),
                 publication_id: pending.publication_id.clone(),
                 host_instance_id: pending.host_instance_id.clone(),
@@ -3110,7 +3112,12 @@ impl RemoteWorkcellClient {
         } else {
             operation_is_terminal(&status.state)
         };
-        if remove {
+        if remove
+            && !expected_operation
+                .journal
+                .as_ref()
+                .is_some_and(|journal| transfer::is_directory_publication(&journal.operation_kind))
+        {
             self.0
                 .operations
                 .lock()
@@ -9434,6 +9441,107 @@ mod tests {
         MutationHost { host, files }
     }
 
+    #[test_case(false; "normal_release")]
+    #[test_case(true; "retry_deferred_release")]
+    fn completed_directory_publications_retain_exact_cleanup_until_release(defer: bool) {
+        use caudra_workspace::{DirectoryPublicationRequest, WorkspaceTransferService};
+        use workcell::CatalogRevision;
+
+        const PUBLICATIONS: usize = 16;
+        let prepared = Mutex::new(None::<(Value, Value, bool)>);
+        let host = ScriptedHost::rpc(move |method, params| match method {
+            contract::TRANSFER_DIRECTORY_PREPARE_METHOD => {
+                let mut request = params.clone();
+                request.as_object_mut().unwrap().remove("_meta");
+                let wire: contract::TransferDirectoryPrepareRequest =
+                    serde_json::from_value(request).unwrap();
+                let digest = CatalogRevision::for_serializable(&wire).unwrap();
+                let operation = json!({
+                    "version":"v1", "preparationId":wire.publication_id, "expiresAtUnixMs":u64::MAX,
+                    "binding":{"host":params["host"], "argumentDigest":digest.as_str(),
+                        "contract":{"id":contract::TRANSFER_DIRECTORY_PUBLICATION_CONTRACT_ID,"version":"v1","resultVersion":"v1"}},
+                    "intent":{"kind":"transfer","mutating":true,"resources":[{"display":wire.path,"access":"write","resourceId":"directory","scope":["directory"],"revision":null}]}
+                });
+                *prepared.lock().unwrap() = Some((operation.clone(), params.clone(), defer));
+                Ok(
+                    json!({"version":"v1", "publicationId":wire.publication_id, "operation":operation}),
+                )
+            }
+            contract::EXECUTE_METHOD => {
+                let prepared = prepared.lock().unwrap();
+                let (operation, request, _) = prepared.as_ref().unwrap();
+                let mut status = serde_json::to_value(completed_status()).unwrap();
+                status["preparationId"] = params["preparationId"].clone();
+                status["invocationId"] = params["invocationId"].clone();
+                status["binding"] = operation["binding"].clone();
+                status["expiresAtUnixMs"] = operation["expiresAtUnixMs"].clone();
+                status["outcome"]["result"]["structuredContent"] = json!({
+                    "version":"v1", "publicationId":request["publicationId"], "state":"completed",
+                    "preparationId":params["preparationId"], "invocationId":params["invocationId"],
+                    "requestDigest":operation["binding"]["argumentDigest"],
+                    "directory":{"path":request["path"],"resourceId":"directory","createdDirectories":[]}
+                });
+                Ok(status)
+            }
+            contract::RELEASE_METHOD => {
+                let mut prepared = prepared.lock().unwrap();
+                let (_, _, deferred) = prepared.as_mut().unwrap();
+                let released = !*deferred;
+                *deferred = false;
+                Ok(json!({"version":"v1","state":"completed","released":released}))
+            }
+            _ => panic!("unexpected directory method {method}"),
+        });
+        let temp = tempfile::tempdir().unwrap();
+        let mut client = snapshot_client(
+            &host.endpoint,
+            &StateDir::from_path(temp.path().join("state")),
+        );
+        let capabilities = &mut Arc::get_mut(&mut client.0).unwrap().descriptor.capabilities;
+        capabilities
+            .reviewed_transfer
+            .as_mut()
+            .unwrap()
+            .directory_publication = true;
+        capabilities
+            .workspace
+            .as_mut()
+            .unwrap()
+            .limits
+            .max_path_bytes = contract::MAX_WORKSPACE_PATH_BYTES as u32;
+        smol::block_on(async {
+            for index in 0..PUBLICATIONS {
+                let request = DirectoryPublicationRequest {
+                    publication_id: OperationId::new(format!("directory-{index}")).unwrap(),
+                    path: WorkspacePath::new(format!("directory-{index}")).unwrap(),
+                    create_directories: Vec::new(),
+                };
+                let prepared = client
+                    .prepare_directory(client.session_binding(), client.root_cursor(), &request)
+                    .await
+                    .unwrap();
+                let result = client.execute_directory(&prepared).await.unwrap();
+                assert!(matches!(result.state, OperationState::Completed { .. }));
+                assert!(client.pending_remote_operations().is_empty());
+                assert!(
+                    client
+                        .0
+                        .operations
+                        .lock()
+                        .unwrap()
+                        .entries
+                        .contains_key(&prepared.operation.preparation_id)
+                );
+                let release = client.release_directory(&prepared).await.unwrap();
+                assert_eq!(release.released, !defer);
+                if defer {
+                    assert!(client.release_directory(&prepared).await.unwrap().released);
+                }
+                assert!(client.0.operations.lock().unwrap().entries.is_empty());
+            }
+        });
+    }
+
     fn nonroot_mutation_client(host: &MutationHost, state: &StateDir) -> RemoteWorkcellClient {
         let mut client = snapshot_client(&host.host.endpoint, state);
         let inner = Arc::get_mut(&mut client.0).unwrap();
@@ -11248,6 +11356,7 @@ mod tests {
             (pending.dispatched_at, pending.cursor.clone())
         };
         let recovery = RecoveryOperation {
+            operation_kind: operation.operation_kind.clone(),
             publication_cwd: None,
             publication_id: None,
             host_instance_id: "instance".to_owned(),
@@ -11293,6 +11402,7 @@ mod tests {
             (pending.dispatched_at, pending.cursor.clone())
         };
         let recovery = RecoveryOperation {
+            operation_kind: operation.operation_kind.clone(),
             publication_cwd: None,
             publication_id: None,
             host_instance_id: "instance".to_owned(),

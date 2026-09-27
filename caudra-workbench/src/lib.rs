@@ -18,6 +18,7 @@ mod scm;
 pub mod scroll;
 mod search;
 mod style;
+pub mod transfer;
 mod view;
 
 pub use action::WorkbenchAction;
@@ -132,6 +133,7 @@ pub enum SidebarView {
     Explorer,
     SourceControl,
     Search,
+    Transfer,
 }
 
 impl SidebarView {
@@ -142,6 +144,7 @@ impl SidebarView {
             Self::Explorer => "FILES",
             Self::SourceControl => "GIT",
             Self::Search => "FIND",
+            Self::Transfer => "TRANSFER",
         }
     }
 
@@ -535,6 +538,8 @@ pub struct Workbench {
     /// tabs behind it.
     closing: Vec<WorkbenchPath>,
     flash: Option<String>,
+    transfer: transfer::TransferState,
+    switcher: Vec<(Rect, SidebarView)>,
 }
 
 impl Workbench {
@@ -584,6 +589,8 @@ impl Workbench {
             input: None,
             closing: Vec::new(),
             flash: None,
+            transfer: transfer::TransferState::default(),
+            switcher: Vec::new(),
         }
     }
 
@@ -615,6 +622,13 @@ impl Workbench {
     }
 
     pub fn close(&mut self) {
+        if self.transfer.connection_active() {
+            return;
+        }
+        if self.sidebar == SidebarView::Transfer {
+            self.transfer.close();
+            self.sidebar = SidebarView::Explorer;
+        }
         self.open = false;
         self.cancel_pending_opens();
         for tab in self.editor.tabs_mut() {
@@ -986,7 +1000,13 @@ impl Workbench {
     /// Whether a background worker owes an answer, so the host knows to look
     /// again rather than sleeping until the next key.
     pub fn is_busy(&self) -> bool {
+        self.transfer.connection_active() || self.backend_busy()
+    }
+
+    fn backend_busy(&self) -> bool {
         !self.remote_pending.is_empty()
+            || !self.pending_save.is_empty()
+            || !self.pending_open.is_empty()
             || (self.open && self.editor.tabs().iter().any(|tab| tab.remote_reload))
             || self
                 .remote_backend
@@ -999,6 +1019,35 @@ impl Workbench {
 
     pub fn blocks_workspace_change(&self) -> bool {
         self.editor.tabs().iter().any(Tab::is_dirty) || self.is_busy()
+    }
+
+    pub fn blocks_transfer_start(&self) -> bool {
+        self.editor.tabs().iter().any(Tab::is_dirty)
+            || self.backend_busy()
+            || self.transfer.lease_active()
+    }
+
+    pub fn refresh_after_transfer(&mut self) {
+        if self.remote_backend.is_some() {
+            self.invalidate_remote(None);
+            self.refresh_remote_tree();
+            self.refresh_remote_scm();
+            self.reload_remote_targets();
+        } else {
+            self.tree.reload();
+            self.scm.refresh();
+        }
+        for tab in self.editor.tabs_mut() {
+            if tab.path.local().is_some()
+                && tab.is_file()
+                && tab.is_editable()
+                && tab.reload_from_disk().is_err()
+            {
+                tab.conflict = true;
+            }
+        }
+        self.palette.invalidate();
+        self.apply_marks();
     }
 
     /// Drains whatever the background workers have produced. Reports whether
@@ -1689,7 +1738,11 @@ impl Workbench {
     /// rather than flashed: reopening is a convenience, and the reader did not
     /// ask for them now.
     pub fn restore(&mut self, layout: Layout) {
-        self.sidebar = layout.sidebar;
+        self.sidebar = if layout.sidebar == SidebarView::Transfer {
+            SidebarView::Explorer
+        } else {
+            layout.sidebar
+        };
         self.sidebar_collapsed = layout.sidebar_collapsed;
         self.set_sidebar_width(layout.sidebar_width);
         self.show_hidden = layout.show_hidden;
@@ -1715,6 +1768,9 @@ impl Workbench {
     }
 
     pub fn text_input_active(&self) -> bool {
+        if self.transfer_input_active() {
+            return self.open && self.transfer.text_input_active();
+        }
         if !self.open {
             return false;
         }
@@ -1739,6 +1795,10 @@ impl Workbench {
     /// rendered view takes it only to refuse it, since the composer it would
     /// otherwise reach is hidden behind the workbench.
     pub fn paste(&mut self, text: &str) -> bool {
+        if self.transfer_input_active() {
+            self.transfer.paste(text);
+            return true;
+        }
         if self.focus != Focus::Editor {
             return false;
         }
@@ -1762,6 +1822,23 @@ impl Workbench {
     /// Routes a mouse event by the pane it landed in, using the geometry the
     /// last frame recorded. Anything outside a pane is left alone.
     pub fn handle_mouse(&mut self, event: MouseEvent) -> WorkbenchAction {
+        if self.transfer_input_active()
+            && event.kind == MouseEventKind::Down(MouseButton::Left)
+            && let Some((_, view)) = self
+                .switcher
+                .iter()
+                .find(|(rect, _)| rect.contains((event.column, event.row).into()))
+        {
+            return self.transfer_switch(*view);
+        }
+        if self.transfer_input_active() {
+            let clicks = if event.kind == MouseEventKind::Down(MouseButton::Left) {
+                self.clicks.press((event.column, event.row), Instant::now())
+            } else {
+                0
+            };
+            return self.transfer.mouse(event, clicks);
+        }
         let at = (event.column, event.row);
         // The panel is anchored to a cell, so what could move the cell out from
         // under it takes it down first. Named one by one rather than as
@@ -1868,7 +1945,7 @@ impl Workbench {
                 match self.sidebar {
                     SidebarView::Explorer => self.tree.set_scroll(offset as usize, rows),
                     SidebarView::Search => self.search.set_scroll(offset as usize, rows),
-                    SidebarView::SourceControl => {}
+                    SidebarView::SourceControl | SidebarView::Transfer => {}
                 }
             }
             return Some(WorkbenchAction::Consumed);
@@ -1892,6 +1969,10 @@ impl Workbench {
     /// configured scroll size, so this is its own entry point rather than a
     /// [`MouseEvent`] the caller has to build.
     pub fn scroll(&mut self, column: u16, row: u16, delta: isize) {
+        if self.transfer_input_active() {
+            self.transfer.scroll(delta);
+            return;
+        }
         let at = (column, row);
         if self.sidebar == SidebarView::SourceControl
             && self
@@ -1913,7 +1994,7 @@ impl Workbench {
             match self.sidebar {
                 SidebarView::Explorer => self.tree.scroll_by(delta, rows),
                 SidebarView::Search => self.search.scroll_by(delta, rows),
-                SidebarView::SourceControl => {}
+                SidebarView::SourceControl | SidebarView::Transfer => {}
             }
         } else if self.panes.text.contains(at.into()) {
             let text = self.panes.text;
@@ -1981,9 +2062,12 @@ impl Workbench {
             return WorkbenchAction::Consumed;
         }
         if self.panes.header.contains(position) {
-            if let Some(view) = view::header_at(at.0, self.panes.header.x) {
-                self.focus = Focus::Sidebar;
-                self.sidebar = view;
+            if let Some((_, view)) = self
+                .switcher
+                .iter()
+                .find(|(rect, _)| rect.contains(position))
+            {
+                return self.transfer_switch(*view);
             } else if self.header_button().is_some_and(|label| {
                 view::button_at(
                     at.0,
@@ -2517,7 +2601,7 @@ impl Workbench {
             }
             // Source control routes through `press_scm`: its rows belong to a
             // section rather than to one list filling the sidebar.
-            SidebarView::SourceControl => {}
+            SidebarView::SourceControl | SidebarView::Transfer => {}
             SidebarView::Search => {
                 let row = self.search.scroll() + offset;
                 self.search.select_index(row);
@@ -2751,6 +2835,9 @@ impl Workbench {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> WorkbenchAction {
+        if self.transfer_input_active() {
+            return self.transfer_key(key);
+        }
         // Everything else here consumes, because a full-screen takeover that
         // leaked keys to the hidden composer would type into it. Copy is one
         // exception: with nothing selected there is nothing to take, and the
@@ -2876,16 +2963,17 @@ impl Workbench {
             (keys::VIEW_EXPLORER, SidebarView::Explorer),
             (keys::VIEW_SOURCE_CONTROL, SidebarView::SourceControl),
             (keys::VIEW_SEARCH, SidebarView::Search),
+            (keys::VIEW_TRANSFER, SidebarView::Transfer),
         ] {
             if bind.matches(key) {
                 if view != SidebarView::Search {
                     self.cancel_remote_search();
                 }
-                self.sidebar = view;
-                self.sidebar_collapsed = false;
-                self.focus = Focus::Sidebar;
-                return WorkbenchAction::Consumed;
+                return self.transfer_switch(view);
             }
+        }
+        if self.transfer_input_active() {
+            return WorkbenchAction::Consumed;
         }
         if keys::SEND_TO_COMPOSER.matches(key) {
             return self.reference().unwrap_or(WorkbenchAction::Consumed);
@@ -2933,7 +3021,7 @@ impl Workbench {
             && match self.sidebar {
                 SidebarView::SourceControl => self.scm_leader(key),
                 SidebarView::Search => self.search_leader(key),
-                SidebarView::Explorer => false,
+                SidebarView::Explorer | SidebarView::Transfer => false,
             };
         match claimed {
             true => WorkbenchAction::Consumed,
@@ -3276,6 +3364,7 @@ impl Workbench {
             SidebarView::Explorer => self.explorer_key(key),
             SidebarView::SourceControl => self.source_control_key(key),
             SidebarView::Search => self.search_key(key),
+            SidebarView::Transfer => return self.transfer.key(key),
         }
         WorkbenchAction::Consumed
     }
@@ -4328,7 +4417,7 @@ impl Workbench {
         match self.sidebar {
             SidebarView::Explorer => self.tree.collapse_all(),
             SidebarView::SourceControl => self.scm.toggle_flat(),
-            SidebarView::Search => {}
+            SidebarView::Search | SidebarView::Transfer => {}
         }
     }
 

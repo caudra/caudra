@@ -78,7 +78,7 @@ use ratatui::{Terminal, backend::TestBackend};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     os::unix::fs::PermissionsExt,
     path::Path,
     sync::atomic::{AtomicBool, Ordering},
@@ -103,6 +103,13 @@ const INVENTORY_RESTART: &str = "inventory-restart/deep/file.bin";
 const INVENTORY_CONTENT: &[u8] = b"\xff\0reviewed inventory bytes";
 const PRIVATE_STATE_MODE: u32 = 0o700;
 const NATIVE_FILE: &str = "native/deep/reviewed.txt";
+const NATIVE_UPLOAD_DIRECTORY: &str = "native-empty-upload/deep/leaf";
+const NATIVE_DOWNLOAD_DIRECTORY: &str = "native-empty-download/deep/leaf";
+const NATIVE_UNCERTAIN_DIRECTORY: &str = "native-empty-uncertain";
+const NATIVE_DIRECTORY_FAULT: &[u8] = b"native directory publication";
+const EXECUTE_METHOD: &str = "ai.workcell/execute";
+const RPC_REQUEST_TRACE: &str = "batch-rpc-trace";
+const TRANSFER_SESSION_ID: &str = "transfer-session";
 const ISOLATED_PYTHON_RESOURCE: &str = "isolated-python";
 const PYTHON_SUM: &str = "1 + 1";
 const PYTHON_SUM_RESULT: &str = "result: 2";
@@ -432,7 +439,15 @@ async fn production_inventory_transfer(
             .len(),
         parents.len()
     );
-    native_reviewed_session(&client, remote_path, approval.clone()).await;
+    native_reviewed_session(
+        &client,
+        remote_path,
+        approval.clone(),
+        selection,
+        credential,
+        remote_state,
+    )
+    .await;
     fs::create_dir_all(local.path().join("inventory-restart/deep")).unwrap();
     fs::write(local.path().join(INVENTORY_RESTART), INVENTORY_CONTENT).unwrap();
     let comparison = engine.compare(&CancelToken::none()).await.unwrap();
@@ -500,6 +515,9 @@ async fn native_reviewed_session(
     client: &RemoteWorkcellClient,
     remote_path: &Path,
     buffers: Arc<TransferTestHost>,
+    selection: &RemoteWorkcellSelection,
+    credential: &NamedBearerCredential,
+    remote_state: &StateDir,
 ) {
     let local = tempfile::tempdir().unwrap();
     let state = tempfile::tempdir().unwrap();
@@ -545,24 +563,26 @@ async fn native_reviewed_session(
         .resolve_directory_cursor(client.session_binding(), client.root_cursor(), &remote_root)
         .await
         .unwrap();
+    let remote = RemoteRootIdentity {
+        binding: client.session_binding().clone(),
+        cursor: resolved.cursor,
+        cwd: remote_root.clone(),
+    };
+    let host = || TransferSessionHost {
+        permissions: permissions.clone(),
+        permission_events: EventSender::new(events.clone(), 0),
+        buffers: buffers.clone(),
+        progress: buffers.clone(),
+        cancel: CancelToken::none(),
+        validity: Arc::new(|| Ok(())),
+    };
     let mut session = TransferSession::open(
         local.path().into(),
         client.clone(),
-        RemoteRootIdentity {
-            binding: client.session_binding().clone(),
-            cursor: resolved.cursor,
-            cwd: remote_root.clone(),
-        },
+        remote.clone(),
         &TransferPolicy::default(),
         &StateDir::from_path(state.path().into()),
-        TransferSessionHost {
-            permissions,
-            permission_events: EventSender::new(events, 0),
-            buffers: buffers.clone(),
-            progress: buffers,
-            cancel: CancelToken::none(),
-            validity: Arc::new(|| Ok(())),
-        },
+        host(),
     )
     .await
     .unwrap();
@@ -613,7 +633,139 @@ async fn native_reviewed_session(
             .await
             .is_err()
     );
+    assert!(session.supports_directory_publication());
+    fs::create_dir_all(local.path().join(NATIVE_UPLOAD_DIRECTORY)).unwrap();
+    let sandbox_root = remote_path.join(remote_root.as_str());
+    fs::create_dir_all(sandbox_root.join(NATIVE_DOWNLOAD_DIRECTORY)).unwrap();
+    for (direction, path, destination) in [
+        (
+            TransferAction::Push,
+            NATIVE_UPLOAD_DIRECTORY,
+            sandbox_root.join(NATIVE_UPLOAD_DIRECTORY),
+        ),
+        (
+            TransferAction::Pull,
+            NATIVE_DOWNLOAD_DIRECTORY,
+            local.path().join(NATIVE_DOWNLOAD_DIRECTORY),
+        ),
+    ] {
+        assert!(
+            session
+                .compare(&CancelToken::none())
+                .await
+                .unwrap()
+                .complete()
+        );
+        let plan = session
+            .review_selection(
+                direction,
+                &[WorkspacePath::new(path).unwrap()],
+                &CancelToken::none(),
+            )
+            .await
+            .unwrap();
+        assert!(plan.review().files.is_empty());
+        assert_eq!(plan.review().directories.len(), 1);
+        assert!(!destination.exists());
+        let result = session
+            .execute(plan.digest(), &CancelToken::none())
+            .await
+            .unwrap();
+        assert!(result.stopped.is_none(), "{result:?}");
+        assert_eq!(result.cleanup_deferred, json!([]), "{result:?}");
+        assert!(destination.is_dir());
+        assert_eq!(fs::read_dir(destination).unwrap().count(), 0);
+    }
+    fs::create_dir(local.path().join(NATIVE_UNCERTAIN_DIRECTORY)).unwrap();
+    session.compare(&CancelToken::none()).await.unwrap();
+    let preview = session
+        .preview(&selected[0], &CancelToken::none())
+        .await
+        .unwrap();
+    assert!(preview.local_preview.is_some());
+    assert!(preview.remote_preview.is_some());
+    let plan = session
+        .review_selection(
+            TransferAction::Push,
+            &[WorkspacePath::new(NATIVE_UNCERTAIN_DIRECTORY).unwrap()],
+            &CancelToken::none(),
+        )
+        .await
+        .unwrap();
+    fs::write(&buffers.fault, NATIVE_DIRECTORY_FAULT).unwrap();
+    fs::write(
+        buffers.fault.with_extension("unknown"),
+        NATIVE_DIRECTORY_FAULT,
+    )
+    .unwrap();
+    let result = session
+        .execute(plan.digest(), &CancelToken::none())
+        .await
+        .unwrap();
+    let outcomes: BTreeMap<OperationId, FileOutcome> =
+        serde_json::from_value(result.outcomes.clone()).unwrap();
+    assert_eq!(
+        outcomes.get(&plan.review().directories[0].operation_id),
+        Some(&FileOutcome::Unknown),
+        "{result:?}"
+    );
+    assert!(sandbox_root.join(NATIVE_UNCERTAIN_DIRECTORY).is_dir());
     drop(session);
+    fs::remove_file(&buffers.fault).unwrap();
+    fs::remove_file(buffers.fault.with_extension("unknown")).unwrap();
+    let execute_requests = || {
+        fs::read_to_string(buffers.fault.with_file_name(RPC_REQUEST_TRACE))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .filter(|request| request["method"] == EXECUTE_METHOD)
+            .count()
+    };
+    let executions_before_recovery = execute_requests();
+    assert!(executions_before_recovery > 0);
+    let restarted = RemoteWorkcellClient::connect(
+        selection,
+        Some(credential.clone()),
+        SessionBindingId::new(TRANSFER_SESSION_ID).unwrap(),
+        RemoteOperationJournal::open(remote_state).unwrap(),
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    let resolved = restarted
+        .resolve_directory_cursor(
+            restarted.session_binding(),
+            restarted.root_cursor(),
+            &remote_root,
+        )
+        .await
+        .unwrap();
+    let mut session = TransferSession::open(
+        local.path().into(),
+        restarted.clone(),
+        RemoteRootIdentity {
+            binding: restarted.session_binding().clone(),
+            cursor: resolved.cursor,
+            cwd: remote_root,
+        },
+        &TransferPolicy::default(),
+        &StateDir::from_path(state.path().into()),
+        host(),
+    )
+    .await
+    .unwrap();
+    let recovered = session.reconcile(&CancelToken::none()).await.unwrap();
+    assert!(recovered.stopped.is_none(), "{recovered:?}");
+    assert_eq!(recovered.cleanup_deferred, json!([]), "{recovered:?}");
+    let outcomes: BTreeMap<OperationId, FileOutcome> =
+        serde_json::from_value(recovered.outcomes).unwrap();
+    assert_eq!(
+        outcomes.get(&plan.review().directories[0].operation_id),
+        Some(&FileOutcome::Confirmed)
+    );
+    assert_eq!(execute_requests(), executions_before_recovery);
+    drop(session);
+    drop(events);
     let subjects = prompts.await;
     assert!(
         subjects
@@ -626,7 +778,7 @@ async fn native_reviewed_session(
             .any(|subject| matches!(subject, PermissionSubject::RemoteNative { .. }))
     );
     eprintln!(
-        "PASS shared UI/CLI transfer session, independent nested root, explicit review, native both-end prompts, denial and consumed plan"
+        "PASS shared UI/CLI transfer session, native permissions, empty directory Push/Pull and lost-response restart recovery without replay"
     );
 }
 
@@ -712,7 +864,7 @@ fn reviewed_transfer() {
             RemoteWorkcellClient::connect(
                 &selection,
                 Some(credential.clone()),
-                SessionBindingId::new("transfer-session").unwrap(),
+                SessionBindingId::new(TRANSFER_SESSION_ID).unwrap(),
                 RemoteOperationJournal::open(&state).unwrap(),
                 CancellationToken::new(),
             )
@@ -1383,7 +1535,7 @@ async fn concurrent_registry_regressions(
     );
     let fault = PathBuf::from(env::var_os("WORKCELL_TEST_FAULT").unwrap());
     let gate = fault.with_file_name("batch-execute-gate");
-    let trace = fault.with_file_name("batch-rpc-trace");
+    let trace = fault.with_file_name(RPC_REQUEST_TRACE);
     let baseline_state = tempfile::tempdir().unwrap();
     let baseline = with_remote_baseline(&mut ctx, client, baseline_state.path());
     let first = json!({"command":format!("printf '{BATCH_CONTENT}' > {BATCH_FIRST}; printf '{BATCH_CONTENT}'")});
@@ -1711,7 +1863,7 @@ async fn lapsed_preparation_regression(client: &RemoteWorkcellClient, root: &Pat
     let shorten = fault.with_file_name("short-preparation-ttl");
     let expiry = fault.with_file_name("short-preparation-expiry");
     let diagnostics = fault.with_file_name("rpc-diagnostics");
-    let trace = fault.with_file_name("batch-rpc-trace");
+    let trace = fault.with_file_name(RPC_REQUEST_TRACE);
     fs::write(&diagnostics, "").unwrap();
     fs::write(&trace, "").unwrap();
     let _ = fs::remove_file(&expiry);

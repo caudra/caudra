@@ -54,6 +54,7 @@ use caudra_storage::sessions::{
 use caudra_storage::state::WorkspaceTabs;
 use caudra_storage::workflow::WorkflowRunStatus;
 use caudra_storage::workspace_binding::StoredWorkspaceBinding;
+use caudra_workbench::WorkbenchAction;
 use caudra_workspace::WorkspaceControlCommand;
 #[cfg(not(windows))]
 use crossterm::event::KeyEventKind;
@@ -168,6 +169,7 @@ pub struct EventLoopParams {
     pub permission_authority_factory: Option<PermissionAuthorityFactory>,
     pub sandbox_connector: Option<SandboxConnector>,
     pub transfer_connector: Option<crate::sandbox::transfer::TransferConnector>,
+    pub initial_seed: Option<crate::sandbox::InitialSeed>,
     pub sandbox_readiness: Option<SandboxReadiness>,
     /// The sandbox the runtime was built on. Carried rather than looked up,
     /// because the selection that built the runtime already named it and the
@@ -1360,6 +1362,23 @@ struct SessionTransition {
 }
 
 impl SessionTransition {
+    fn release_settled<'a>(
+        reservations: &mut Vec<Self>,
+        apps: impl IntoIterator<Item = &'a App>,
+    ) -> bool {
+        if reservations.is_empty()
+            || apps.into_iter().any(|app| {
+                app.sandbox_live.reply.is_some()
+                    || app.sandbox_live.transfer.is_some()
+                    || app.sandbox_live.attachment.is_some()
+            })
+        {
+            return false;
+        }
+        reservations.clear();
+        true
+    }
+
     fn reserve(handles: &AgentHandles) -> Result<Self, String> {
         let background = handles
             .background
@@ -1520,6 +1539,7 @@ impl<'t> EventLoop<'t> {
             permission_authority_factory,
             sandbox_connector,
             transfer_connector,
+            initial_seed,
             sandbox_readiness,
             sandbox_name,
             timeouts,
@@ -1664,6 +1684,7 @@ impl<'t> EventLoop<'t> {
         }
         let focused = focused.min(runtimes.len() - 1);
         let app = &mut runtimes[focused].app;
+        app.install_initial_seed(initial_seed);
         app.exit_on_done = exit_on_done;
         if needs_login {
             app.login_picker.open(app.storage.clone());
@@ -2026,6 +2047,14 @@ impl<'t> EventLoop<'t> {
     }
 
     fn sandbox_gate(&mut self, transition: bool) -> Result<Vec<SessionTransition>, String> {
+        self.sandbox_admission(transition, None)
+    }
+
+    fn sandbox_admission(
+        &mut self,
+        transition: bool,
+        transfer_owner: Option<usize>,
+    ) -> Result<Vec<SessionTransition>, String> {
         if self
             .sessions
             .iter()
@@ -2036,8 +2065,12 @@ impl<'t> EventLoop<'t> {
                     .into(),
             );
         }
-        for runtime in &self.sessions {
-            if let Some(reason) = runtime.app.sandbox_action_blocker(transition) {
+        for (index, runtime) in self.sessions.iter().enumerate() {
+            if let Some(reason) = if transfer_owner == Some(index) {
+                runtime.app.transfer_start_blocker()
+            } else {
+                runtime.app.sandbox_action_blocker(transition)
+            } {
                 return Err(reason.into());
             }
             if let Some(binding) = runtime.app.state.session.workspace_binding()
@@ -2093,19 +2126,55 @@ impl<'t> EventLoop<'t> {
     }
 
     fn poll_sandbox_actions(&mut self) -> Dirty {
+        self.release_settled_sandbox_reservations();
         let mut dirty = Dirty::NO;
         for index in 0..self.sessions.len() {
-            if let Some(command) = self.sessions[index].app.sandbox_live.transfer_queued.take() {
-                let admitted = if matches!(
+            if self.sessions[index].app.sandbox_live.transfer.is_some()
+                && self.sessions[index]
+                    .app
+                    .sandbox_live
+                    .transfer_queued
+                    .as_ref()
+                    .is_some_and(|(_, command)| {
+                        matches!(
+                            command,
+                            crate::sandbox::transfer::TransferCommand::Open { .. }
+                        )
+                    })
+            {
+                continue;
+            }
+            if let Some((scope, command)) =
+                self.sessions[index].app.sandbox_live.transfer_queued.take()
+            {
+                if !self.sessions[index].app.transfer_scope_current(&scope) {
+                    self.sessions[index].app.transfer_failed(
+                        "Attachment or transfer roots changed; compare again".into(),
+                    );
+                    continue;
+                }
+                let opening = matches!(
                     command,
                     crate::sandbox::transfer::TransferCommand::Open { .. }
-                ) {
-                    self.sandbox_gate(false).map(|_| ())
+                );
+                let queues: Vec<_> = self
+                    .sessions
+                    .iter()
+                    .map(|runtime| runtime.handles.queue.clone())
+                    .collect();
+                let _claims: Vec<_> = queues.iter().map(|queue| queue.lock_dispatch()).collect();
+                let admitted = if opening {
+                    self.sandbox_admission(false, Some(index))
                 } else {
-                    Ok(())
+                    Ok(Vec::new())
                 };
                 match admitted {
-                    Ok(()) => self.sessions[index].app.start_transfer(command),
+                    Ok(reservations) => {
+                        self.sessions[index].app.start_transfer(command);
+                        if opening && self.sessions[index].app.sandbox_live.transfer.is_some() {
+                            self.sandbox_workflows = reservations;
+                        }
+                    }
                     Err(error) => self.sessions[index].app.transfer_failed(error),
                 }
                 dirty = Dirty::YES;
@@ -2224,16 +2293,22 @@ impl<'t> EventLoop<'t> {
                 dirty = Dirty::YES;
             }
         }
+        self.release_settled_sandbox_reservations();
+        dirty
+    }
+
+    fn release_settled_sandbox_reservations(&mut self) {
         if self.sandbox.is_none()
             && self.sandbox_control.is_none()
-            && self
-                .sessions
-                .iter()
-                .all(|runtime| runtime.app.sandbox_live.reply.is_none())
+            && SessionTransition::release_settled(
+                &mut self.sandbox_workflows,
+                self.sessions.iter().map(|runtime| &runtime.app),
+            )
         {
-            self.sandbox_workflows.clear();
+            for runtime in &self.sessions {
+                runtime.handles.queue.wake_dispatch();
+            }
         }
-        dirty
     }
 
     /// Keep the switch pointed at the theme actually in use. Picking from
@@ -2382,6 +2457,36 @@ impl<'t> EventLoop<'t> {
     }
 
     fn handle_ui_action(&mut self, action: UiAction) {
+        if crate::sandbox::transfer::active() {
+            let message = "Cancel Transfer and await cleanup before editing sessions";
+            match &action {
+                UiAction::OpenEditor { reply_tx, .. } => {
+                    let _ = reply_tx.send(-1);
+                    return;
+                }
+                UiAction::Session {
+                    req: SessionRequest::Focus { .. },
+                    ..
+                } => self.cancel_transfers(),
+                UiAction::Session { reply_tx, .. }
+                | UiAction::Model { reply_tx, .. }
+                | UiAction::Task { reply_tx, .. } => {
+                    let _ = reply_tx.send(Err(message.into()));
+                    return;
+                }
+                UiAction::RunCommand { reply_tx, .. } => {
+                    let _ = reply_tx.send(Err(message.into()));
+                    return;
+                }
+                UiAction::OpenWorkbench { .. }
+                | UiAction::OpenWin { .. }
+                | UiAction::Builtin(_) => {
+                    self.focused_app().flash(message.into());
+                    return;
+                }
+                _ => {}
+            }
+        }
         match action {
             UiAction::Flash(msg) => {
                 self.focused_app().flash(msg);
@@ -2592,6 +2697,9 @@ impl<'t> EventLoop<'t> {
     /// busy: mailbox wakes and settled workflow runs share the preamble, so a
     /// burst of either wakes the model once.
     fn start_mailbox_runs(&mut self) -> Dirty {
+        if crate::sandbox::transfer::active() {
+            return Dirty::NO;
+        }
         let ready: Vec<_> = self
             .sessions
             .iter_mut()
@@ -2654,6 +2762,9 @@ impl<'t> EventLoop<'t> {
     }
 
     fn start_goal_checkins(&mut self) -> Dirty {
+        if crate::sandbox::transfer::active() {
+            return Dirty::NO;
+        }
         let ready: Vec<_> = self
             .sessions
             .iter()
@@ -2993,6 +3104,12 @@ impl<'t> EventLoop<'t> {
     /// focused session is a blank idle one (nothing worth keeping), otherwise
     /// as a new runtime so the session you came from stays live.
     fn focus_session(&mut self, id: CaudraId) -> Result<(), String> {
+        if crate::sandbox::transfer::active() && self.sessions[self.focused].id() != id {
+            self.cancel_transfers();
+            return Err(
+                "Cancelling Transfer; retry switching sessions after cleanup completes".into(),
+            );
+        }
         if let Some(i) = self.position(id) {
             validate_session_focus(
                 &self.sessions[i].app.state.session,
@@ -3038,6 +3155,17 @@ impl<'t> EventLoop<'t> {
         let idx = self.push_runtime(runtime);
         self.focused = idx;
         Ok(())
+    }
+
+    fn cancel_transfers(&mut self) {
+        for runtime in &mut self.sessions {
+            if runtime.app.sandbox_live.transfer.is_some() {
+                let action = runtime.app.workbench.cancel_transfer();
+                if let WorkbenchAction::Transfer(action) = action {
+                    runtime.app.handle_transfer_action(action);
+                }
+            }
+        }
     }
 
     /// Handles one input event plus any leftover produced while coalescing
@@ -3162,6 +3290,9 @@ impl<'t> EventLoop<'t> {
     }
 
     fn dispatch(&mut self, mut idx: usize, actions: Vec<Action>) {
+        if crate::sandbox::transfer::active() {
+            return;
+        }
         for action in actions {
             if self.relocation.is_some() {
                 break;
@@ -4293,19 +4424,78 @@ fn background_flash(title: &str, previous: SessionStatus, status: SessionStatus)
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::tests::test_app;
     use crate::components::{key, test_model};
+    use crate::sandbox::transfer::{TransferCommand, TransferLink, TransferScope};
+    use caudra_agent::background::BackgroundTasks;
     use caudra_agent::snapshots::{
         ConflictPolicy, JournalState, RestoreTarget, SnapshotKey, workspace_key,
     };
     use caudra_agent::{DoneReason, McpSnapshotReader};
     use caudra_config::PermissionsConfig;
+    use caudra_config::sandbox::Revision;
     use caudra_providers::{ImageMediaType, ImageSource, TokenUsage};
     use caudra_storage::sessions::{
         PendingConversationRevert, PendingRestoreKind, PendingRestoreOperation, PendingRestorePhase,
     };
+    use caudra_workspace::WorkspacePath;
     use crossterm::event::KeyCode;
     use tempfile::TempDir;
     use test_case::test_case;
+
+    #[test]
+    fn settled_transfer_reservations_release_before_queued_compare() {
+        const REVISION: &str =
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let mut app = test_app();
+        let tasks = smol::block_on(BackgroundTasks::spawn(
+            app.storage.clone(),
+            app.state.session.id,
+        ))
+        .unwrap();
+        let mut reservations = vec![SessionTransition {
+            _background: Some(tasks.suspend().unwrap()),
+            _workflow: None,
+        }];
+        let scope = TransferScope {
+            conversation: app.state.session.id,
+            binding: StoredWorkspaceBinding::local_from_cwd("/tmp"),
+            name: SandboxName::parse("test").unwrap(),
+            instance_revision: Revision::parse(REVISION).unwrap(),
+            configuration_revision: Revision::parse(REVISION).unwrap(),
+            generation: 1,
+        };
+        app.sandbox_live.transfer_queued = Some((
+            scope.clone(),
+            TransferCommand::Open {
+                scope: Box::new(scope.clone()),
+                link: Box::new(TransferLink {
+                    name: scope.name,
+                    instance_revision: scope.instance_revision,
+                    configuration_revision: scope.configuration_revision,
+                    local_root: std::env::temp_dir(),
+                    remote_root: WorkspacePath::root(),
+                    attached_binding: None,
+                }),
+            },
+        ));
+        let (_sender, receiver) = flume::bounded(1);
+        app.sandbox_live.reply = Some(receiver);
+        assert!(!SessionTransition::release_settled(
+            &mut reservations,
+            [&app]
+        ));
+        assert!(tasks.suspend().is_err());
+        app.sandbox_live.reply = None;
+        assert!(SessionTransition::release_settled(
+            &mut reservations,
+            [&app]
+        ));
+        assert!(app.sandbox_live.transfer_queued.is_some());
+        let next = crate::agent::reserve_background_transition(&tasks).unwrap();
+        drop(next);
+        smol::block_on(tasks.shutdown()).unwrap();
+    }
 
     const OBSERVATION: &str = "failed";
     const SHELL_RESULT: &str = "command finished";

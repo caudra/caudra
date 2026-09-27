@@ -1,17 +1,19 @@
 use caudra_storage::private_file::{FileRevision, PrivateFile};
 use caudra_workspace::{
-    OperationId, PreparedLocalTransfer, PreparedTransferPublication, RemoteTransferStage,
-    ResourceRevision, TransferContent, TransferDigest, WorkspacePath,
+    DirectoryPublicationRequest, OperationId, PreparedDirectoryPublication, PreparedLocalDirectory,
+    PreparedLocalTransfer, PreparedTransferPublication, RemoteTransferStage, ResourceRevision,
+    TransferContent, TransferDigest, WorkspacePath,
 };
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, path::PathBuf};
 
 use super::{
-    ApprovedParent, FileStamp, PlannedFile, TransferAction, TransferError, TransferPlan,
-    TransferRoots, byte_digest, digest,
+    ApprovedParent, FileStamp, NodeKind, PlannedDirectory, PlannedFile, Side, TransferAction,
+    TransferError, TransferPlan, TransferRoots, byte_digest, digest,
 };
 
-const JOURNAL_VERSION: u32 = 2;
+const JOURNAL_VERSION: u32 = 3;
+const FILE_JOURNAL_VERSION: u32 = 2;
 pub(super) const ROTATE_RECORDS: usize = 64;
 const MAX_BASE_RECORDS: usize = 16_384;
 const MAX_JOURNAL_BYTES: usize = 8 * 1024 * 1024;
@@ -40,6 +42,12 @@ impl JournalState {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JournalEntry {
+    #[serde(default)]
+    pub directory: Option<PlannedDirectory>,
+    #[serde(default)]
+    pub remote_directory: Option<PreparedDirectoryPublication>,
+    #[serde(default)]
+    pub local_directory: Option<PreparedLocalDirectory>,
     pub operation_id: OperationId,
     pub plan_digest: TransferDigest,
     pub filter_digest: TransferDigest,
@@ -59,6 +67,51 @@ pub struct JournalEntry {
 }
 
 impl JournalEntry {
+    fn valid_effect(&self) -> bool {
+        let Some(directory) = &self.directory else {
+            return self.remote_directory.is_none()
+                && self.local_directory.is_none()
+                && self.source().is_ok_and(|source| {
+                    source.node.kind == NodeKind::File && source.node.path == self.path
+                });
+        };
+        let side = if self.action == TransferAction::Pull {
+            Side::Local
+        } else {
+            Side::Remote
+        };
+        let valid_request = |request: &DirectoryPublicationRequest| {
+            request.publication_id == self.operation_id
+                && request.path == self.path
+                && request
+                    .create_directories
+                    .iter()
+                    .all(|path| directory.create_directories.contains(path))
+        };
+        directory.operation_id == self.operation_id
+            && directory.path == self.path
+            && directory.source.path == self.path
+            && directory.source.kind == NodeKind::Directory
+            && directory.directory_side == side
+            && self.local.is_none()
+            && self.remote.is_none()
+            && self.stage.is_none()
+            && self.remote_preparation.is_none()
+            && self.local_preparation.is_none()
+            && self.local_review.is_none()
+            && self
+                .local_directory
+                .as_ref()
+                .is_none_or(|prepared| side == Side::Local && valid_request(&prepared.request))
+            && self.remote_directory.as_ref().is_none_or(|prepared| {
+                side == Side::Remote
+                    && valid_request(&prepared.request)
+                    && prepared.binding == self.roots.remote.binding
+                    && prepared.cursor == self.roots.remote.cursor
+                    && prepared.cwd_path == self.roots.remote.cwd
+            })
+    }
+
     fn terminal(&self) -> bool {
         !self.state.blocks() && !self.cleanup_pending
     }
@@ -84,10 +137,12 @@ impl JournalEntry {
         };
         let left = &self.roots.remote.binding;
         let right = &other.roots.remote.binding;
-        local_path(self) == local_path(other)
+        local_path(self).starts_with(local_path(other))
+            || local_path(other).starts_with(local_path(self))
             || (left.authority() == right.authority()
                 && left.project() == right.project()
-                && remote_path(self) == remote_path(other))
+                && (PathBuf::from(remote_path(self)).starts_with(remote_path(other))
+                    || PathBuf::from(remote_path(other)).starts_with(remote_path(self))))
     }
 }
 
@@ -209,13 +264,19 @@ impl TransferJournal {
             Some(data) => serde_json::from_slice(data).map_err(|_| TransferError::Journal)?,
             None => JournalData::default(),
         };
-        if data.version != JOURNAL_VERSION
+        if !matches!(data.version, JOURNAL_VERSION | FILE_JOURNAL_VERSION)
+            || (data.version == FILE_JOURNAL_VERSION
+                && data.entries.values().any(|entry| {
+                    entry.directory.is_some()
+                        || entry.remote_directory.is_some()
+                        || entry.local_directory.is_some()
+                }))
             || data.entries.len() > MAX_RECORDS
             || data.base.len() > MAX_RECORDS
             || data
                 .entries
                 .iter()
-                .any(|(id, entry)| id != &entry.operation_id)
+                .any(|(id, entry)| id != &entry.operation_id || !entry.valid_effect())
         {
             return Err(TransferError::Journal);
         }
@@ -228,6 +289,7 @@ impl TransferJournal {
     ) -> Result<T, TransferError> {
         let snapshot = self.storage.load()?;
         let mut data = Self::decode(snapshot.data.as_deref())?;
+        data.version = JOURNAL_VERSION;
         let result = apply(&mut data)?;
         let mut bytes = serde_json::to_vec(&data).map_err(|_| TransferError::Journal)?;
         if bytes.len() > MAX_JOURNAL_BYTES {
@@ -275,7 +337,7 @@ impl TransferJournal {
         }
         let page: ArchivePage =
             serde_json::from_slice(&bytes).map_err(|_| TransferError::Journal)?;
-        if page.version != JOURNAL_VERSION
+        if !matches!(page.version, JOURNAL_VERSION | FILE_JOURNAL_VERSION)
             || page.namespace != namespace
             || sequence == 0
             || page.sequence != sequence
@@ -406,15 +468,10 @@ impl TransferJournal {
         plan: &TransferPlan,
         file: &PlannedFile,
     ) -> Result<bool, TransferError> {
-        let root = plan.review.context.roots.local.canonical_path();
-        let archive_root = self.storage.path().with_extension(ARCHIVE_EXTENSION);
-        if self.storage.path().starts_with(root)
-            || archive_root.starts_with(root)
-            || root.starts_with(&archive_root)
-        {
-            return Err(TransferError::Journal);
-        }
         let entry = JournalEntry {
+            directory: None,
+            remote_directory: None,
+            local_directory: None,
             operation_id: file.operation_id.clone(),
             plan_digest: plan.digest.clone(),
             filter_digest: plan.review.filter_digest.clone(),
@@ -431,6 +488,45 @@ impl TransferJournal {
             created_directories: Vec::new(),
             cleanup_pending: false,
         };
+        self.reserve_entry(entry)
+    }
+
+    pub(super) fn reserve_directory(
+        &mut self,
+        plan: &TransferPlan,
+        directory: &PlannedDirectory,
+    ) -> Result<bool, TransferError> {
+        self.reserve_entry(JournalEntry {
+            directory: Some(directory.clone()),
+            remote_directory: None,
+            local_directory: None,
+            operation_id: directory.operation_id.clone(),
+            plan_digest: plan.digest.clone(),
+            filter_digest: plan.review.filter_digest.clone(),
+            roots: plan.review.context.roots.clone(),
+            path: directory.path.clone(),
+            action: plan.review.action.clone(),
+            local: None,
+            remote: None,
+            state: JournalState::Reserved,
+            stage: None,
+            remote_preparation: None,
+            local_preparation: None,
+            local_review: None,
+            created_directories: Vec::new(),
+            cleanup_pending: false,
+        })
+    }
+
+    fn reserve_entry(&mut self, entry: JournalEntry) -> Result<bool, TransferError> {
+        let root = entry.roots.local.canonical_path();
+        let archive_root = self.storage.path().with_extension(ARCHIVE_EXTENSION);
+        if self.storage.path().starts_with(root)
+            || archive_root.starts_with(root)
+            || root.starts_with(&archive_root)
+        {
+            return Err(TransferError::Journal);
+        }
         self.change(|data| {
             if let Some(previous) = data.entries.get(&entry.operation_id) {
                 if previous.plan_digest == entry.plan_digest
@@ -495,6 +591,11 @@ impl TransferJournal {
                 JournalState::Dispatched | JournalState::Unknown
             ) {
                 return Err(TransferError::Journal);
+            }
+            if entry.directory.is_some() {
+                entry.state = JournalState::Confirmed;
+                entry.cleanup_pending = true;
+                return Ok(());
             }
             let source = entry.source()?;
             let (local_revision, remote_revision) = match entry.action {

@@ -6,7 +6,7 @@ use caudra_agent::{
     workspace_transfer::{
         Comparison, OrchestrationLimits, PullBufferGuard, RemoteRootIdentity, TransferAction,
         TransferError, TransferEvents, TransferFilters, TransferJournal, TransferPlan,
-        WorkspaceTransfer,
+        TransferPreview, WorkspaceTransfer,
     },
 };
 use caudra_config::sandbox::TransferPolicy;
@@ -51,6 +51,10 @@ pub struct TransferSession {
 }
 
 impl TransferSession {
+    pub fn supports_directory_publication(&self) -> bool {
+        self.engine.supports_directory_publication()
+    }
+
     pub async fn open(
         local_root: PathBuf,
         remote: RemoteWorkcellClient,
@@ -115,6 +119,15 @@ impl TransferSession {
         Ok(comparison)
     }
 
+    pub async fn preview(
+        &self,
+        path: &WorkspacePath,
+        cancel: &CancelToken,
+    ) -> Result<TransferPreview, TransferError> {
+        let comparison = self.comparison.as_ref().ok_or(TransferError::Stale)?;
+        self.engine.inspect_preview(comparison, path, cancel).await
+    }
+
     pub async fn review(
         &mut self,
         action: TransferAction,
@@ -134,6 +147,23 @@ impl TransferSession {
         let plan = Arc::new(
             self.engine
                 .plan(comparison, action, paths, &parents, cancel)
+                .await?,
+        );
+        self.plan = Some(plan.clone());
+        Ok(plan)
+    }
+
+    pub async fn review_selection(
+        &mut self,
+        action: TransferAction,
+        paths: &[WorkspacePath],
+        cancel: &CancelToken,
+    ) -> Result<Arc<TransferPlan>, TransferError> {
+        self.plan = None;
+        let comparison = self.comparison.as_ref().ok_or(TransferError::Stale)?;
+        let plan = Arc::new(
+            self.engine
+                .plan_selection(comparison, action, paths, cancel)
                 .await?,
         );
         self.plan = Some(plan.clone());

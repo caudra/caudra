@@ -7,9 +7,11 @@ use std::ops::RangeInclusive;
 
 use crate::editor::DocumentKey;
 use crate::fs::backend::WorkbenchPath;
+use crate::transfer::TransferAction;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WorkbenchAction {
+    Transfer(TransferAction),
     /// The workbench handled the event.
     Consumed,
     /// The workbench wants nothing to do with the event. The host resumes its

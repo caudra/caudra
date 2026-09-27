@@ -5,6 +5,7 @@
 //! explicit conditional creations in each reviewed publication. No delete or automatic rollback
 //! is part of this API.
 
+mod directories;
 mod execution;
 mod journal;
 mod manifest;
@@ -16,9 +17,10 @@ use async_trait::async_trait;
 use caudra_storage::{id::CaudraId, private_file::PrivateFileError};
 use caudra_workspace::{
     ByteRange, CollectionRevision, ContinuationToken, LocalTransferPath, LocalTransferService,
-    LocalTransferSource, OperationId, PreparedTransferPublication, RemoteTransferFile, ResourceId,
-    ResourceRevision, SessionWorkspaceBinding, TransferContent, TransferDigest, WorkspaceCursor,
-    WorkspaceError, WorkspacePath, WorkspacePathError, WorkspaceTransferService,
+    LocalTransferSource, OperationId, PreparedDirectoryPublication, PreparedTransferPublication,
+    RemoteTransferFile, ResourceId, ResourceRevision, SessionWorkspaceBinding, TransferContent,
+    TransferDigest, WorkspaceCursor, WorkspaceError, WorkspacePath, WorkspacePathError,
+    WorkspaceTransferService,
 };
 use futures_lite::{future, io::AsyncReadExt};
 use serde::{Deserialize, Serialize};
@@ -48,7 +50,7 @@ const MAX_SELECTED: usize = 128;
 const PREVIEW_BYTES: usize = 4096;
 const MAX_REVIEW_BYTES: usize = 32 * 1024;
 const IO_TIMEOUT: Duration = Duration::from_secs(30);
-const PLAN_DOMAIN: &str = "caudra-reviewed-transfer-v1";
+const PLAN_DOMAIN: &str = "caudra-reviewed-transfer-v2";
 const DIGEST_PREFIX: &str = "sha256:";
 
 #[derive(Debug, Error)]
@@ -257,6 +259,14 @@ pub enum LocalAccess {
 
 #[async_trait]
 pub trait TransferAuthorization: Send + Sync {
+    async fn review_remote_directory(
+        &self,
+        _plan: &TransferPlan,
+        _directory: &PlannedDirectory,
+        _prepared: &PreparedDirectoryPublication,
+    ) -> Result<(), TransferError> {
+        Err(WorkspaceError::PermissionDenied.into())
+    }
     async fn roots(&self, roots: &TransferRoots) -> Result<(), TransferError>;
     async fn local(
         &self,
@@ -305,6 +315,15 @@ pub enum FilePreview {
     BinarySummary { content: TransferContent },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TransferPreview {
+    pub path: WorkspacePath,
+    pub local: Option<FileStamp>,
+    pub remote: Option<FileStamp>,
+    pub local_preview: Option<FilePreview>,
+    pub remote_preview: Option<FilePreview>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApprovedParent {
     pub side: Side,
@@ -336,6 +355,16 @@ pub struct PlannedFile {
     pub directory_side: Side,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlannedDirectory {
+    pub operation_id: OperationId,
+    pub path: WorkspacePath,
+    pub source: InventoryNode,
+    pub parents: Vec<ApprovedParent>,
+    pub create_directories: Vec<WorkspacePath>,
+    pub directory_side: Side,
+}
+
 impl PlannedFile {
     fn source(&self, action: &TransferAction) -> Result<&FileStamp, TransferError> {
         match action {
@@ -352,6 +381,8 @@ pub struct PlanReview {
     pub filter_digest: TransferDigest,
     pub action: TransferAction,
     pub files: Vec<PlannedFile>,
+    pub directories: Vec<PlannedDirectory>,
+    pub skipped: Vec<WorkspacePath>,
     pub metadata: MetadataPolicy,
     pub rollback: RollbackCoverage,
     pub atomic_across_files: bool,
@@ -779,6 +810,8 @@ impl WorkspaceTransfer {
                 && remote_limits.atomic_replace_against_external_writers,
             action,
             files,
+            directories: Vec::new(),
+            skipped: Vec::new(),
             metadata: MetadataPolicy::ContentAndExecutableBitOnly,
             rollback: RollbackCoverage::None,
             atomic_across_files: false,
@@ -860,6 +893,90 @@ impl WorkspaceTransfer {
             }
         }
         Ok(())
+    }
+
+    pub async fn inspect_preview(
+        &self,
+        comparison: &Comparison,
+        path: &WorkspacePath,
+        cancel: &CancelToken,
+    ) -> Result<TransferPreview, TransferError> {
+        self.validate_context(&comparison.context, &comparison.filter_digest, cancel)
+            .await?;
+        self.bounded(
+            cancel,
+            self.services.authorization.roots(&comparison.context.roots),
+        )
+        .await?;
+        let row = comparison
+            .rows
+            .iter()
+            .find(|row| &row.path == path)
+            .ok_or(TransferError::Selection)?;
+        if matches!(
+            row.kind,
+            ComparisonKind::Excluded | ComparisonKind::Unsupported | ComparisonKind::Incomplete
+        ) || row
+            .local_kind
+            .as_ref()
+            .is_some_and(|kind| *kind != NodeKind::File)
+            || row
+                .remote_kind
+                .as_ref()
+                .is_some_and(|kind| *kind != NodeKind::File)
+            || (row.local.is_none() && row.remote.is_none())
+        {
+            return Err(TransferError::Selection);
+        }
+        let mut result = TransferPreview {
+            path: path.clone(),
+            local: row.local.clone(),
+            remote: row.remote.clone(),
+            local_preview: None,
+            remote_preview: None,
+        };
+        for (side, expected, preview) in [
+            (Side::Local, &result.local, &mut result.local_preview),
+            (Side::Remote, &result.remote, &mut result.remote_preview),
+        ] {
+            let node = self.inspect_allowed(&side, path, cancel).await?;
+            match (node, expected) {
+                (None, None) => {}
+                (Some(node), Some(stamp)) if node == stamp.node => {
+                    if self
+                        .stamp(&comparison.context, &side, &node, cancel)
+                        .await?
+                        != *stamp
+                    {
+                        return Err(TransferError::Stale);
+                    }
+                    *preview = Some(
+                        self.preview(&comparison.context, &side, stamp, cancel)
+                            .await?,
+                    );
+                }
+                _ => return Err(TransferError::Stale),
+            }
+        }
+        for (side, expected) in [(Side::Local, &result.local), (Side::Remote, &result.remote)] {
+            let node = self.inspect_allowed(&side, path, cancel).await?;
+            match (node, expected) {
+                (None, None) => {}
+                (Some(node), Some(stamp)) if node == stamp.node => {
+                    if self
+                        .stamp(&comparison.context, &side, &node, cancel)
+                        .await?
+                        != *stamp
+                    {
+                        return Err(TransferError::Stale);
+                    }
+                }
+                _ => return Err(TransferError::Stale),
+            }
+        }
+        self.validate_context(&comparison.context, &comparison.filter_digest, cancel)
+            .await?;
+        Ok(result)
     }
 
     async fn preview(
@@ -970,10 +1087,11 @@ mod tests {
     use super::{
         CleanBufferLease, ComparisonKind, FileOutcome, FilePreview, Inspection, InventoryContext,
         InventoryNode, InventoryPage, JournalState, LocalAccess, LocalRootIdentity, NodeKind,
-        OrchestrationLimits, PlannedFile, PullBufferGuard, RemoteRootIdentity, RollbackCoverage,
-        Side, TransferAction, TransferAuthorization, TransferError, TransferEvent, TransferEvents,
-        TransferFilters, TransferInventory, TransferJournal, TransferPhase, TransferPlan,
-        TransferRoots, TransferServices, WorkspaceTransfer, byte_digest, digest, operation_id,
+        OrchestrationLimits, PlannedDirectory, PlannedFile, PullBufferGuard, RemoteRootIdentity,
+        RollbackCoverage, Side, TransferAction, TransferAuthorization, TransferError,
+        TransferEvent, TransferEvents, TransferFilters, TransferInventory, TransferJournal,
+        TransferPhase, TransferPlan, TransferRoots, TransferServices, WorkspaceTransfer,
+        byte_digest, digest, operation_id,
     };
     use crate::{CancelToken, CancelTrigger};
     use async_trait::async_trait;
@@ -981,14 +1099,16 @@ mod tests {
     use caudra_storage::private_file::PrivateFileError;
     use caudra_workspace::{
         AuthenticatedPrincipalId, AuthorityIdentity, ByteRange, CollectionRevision,
-        ContinuationToken, CwdHandle, DownloadedTransfer, LocalPublicationState,
-        LocalTransferCondition, LocalTransferDestination, LocalTransferPath, LocalTransferReview,
-        LocalTransferRevision, LocalTransferService, LocalTransferSource, MutationCondition,
-        OperationError, OperationHandle, OperationId, OperationPhase, OperationState,
-        OperationStatus, PreparedLocalTransfer, PreparedTransferPublication, ProjectIdentity,
-        ProjectKey, ReleaseResult, RemoteTransferFile, RemoteTransferStage, ResourceId,
-        ResourceRevision, ResourceScope, SealedTransfer, SequenceMetadata, SessionBindingId,
-        SessionWorkspaceBinding, SourceTrustAnchor, TransferContent, TransferLimits, TransferMode,
+        ContinuationToken, CwdHandle, DirectoryPublicationRequest, DirectoryPublicationStatus,
+        DownloadedTransfer, LocalPublicationState, LocalTransferCondition,
+        LocalTransferDestination, LocalTransferPath, LocalTransferReview, LocalTransferRevision,
+        LocalTransferService, LocalTransferSource, MutationCondition, OperationError,
+        OperationHandle, OperationId, OperationPhase, OperationState, OperationStatus,
+        PreparedDirectoryPublication, PreparedLocalDirectory, PreparedLocalTransfer,
+        PreparedTransferPublication, ProjectIdentity, ProjectKey, PublishedTransferDirectory,
+        ReleaseResult, RemoteTransferFile, RemoteTransferStage, ResourceId, ResourceRevision,
+        ResourceScope, SealedTransfer, SequenceMetadata, SessionBindingId, SessionWorkspaceBinding,
+        SourceTrustAnchor, TransferContent, TransferLimits, TransferMode,
         TransferPublicationRequest, TransferPublicationState, TransferPublicationStatus,
         WorkspaceCursor, WorkspaceError, WorkspacePath, WorkspaceTransferService,
     };
@@ -1001,6 +1121,7 @@ mod tests {
         collections::{BTreeMap, BTreeSet},
         fs::{self, Permissions},
         os::unix::fs::PermissionsExt,
+        path::PathBuf,
         process::Command,
         sync::{Arc, Mutex},
     };
@@ -1015,6 +1136,8 @@ mod tests {
     const EXTERNAL: &[u8] = b"external writer";
     const BINARY_SIZE: usize = 6 * 1024 * 1024;
     const JOURNAL_FILE: &str = "transfers.json";
+    const EMPTY_DIRECTORY: &str = "folder/empty";
+    const FOLDER: &str = "folder";
     const PRECONDITION_FAILED: &str = "precondition failed";
     const SUBJECT: &str = "subject";
     const VERSION: &str = "generation-a";
@@ -1108,6 +1231,10 @@ mod tests {
     }
 
     struct FakeState {
+        cancel_directory_preparation: Option<PathBuf>,
+        defer_directory_release: bool,
+        directory_capability: bool,
+        directory_publications: BTreeMap<OperationId, DirectoryPublicationStatus>,
         context: InventoryContext,
         local: BTreeMap<WorkspacePath, TestFile>,
         remote: BTreeMap<WorkspacePath, TestFile>,
@@ -1139,6 +1266,72 @@ mod tests {
     }
 
     impl FakeState {
+        fn cancel_preparation(&self, id: &OperationId) {
+            if let Some(path) = &self.cancel_directory_preparation {
+                let mut journal = TransferJournal::new(path.clone()).unwrap();
+                journal
+                    .update(id, |entry| {
+                        entry.state = JournalState::Cancelled;
+                        entry.cleanup_pending = true;
+                        Ok(())
+                    })
+                    .unwrap();
+            }
+        }
+
+        fn publish_directory(
+            &mut self,
+            request: &DirectoryPublicationRequest,
+            side: Side,
+        ) -> Result<DirectoryPublicationStatus, WorkspaceError> {
+            self.counts.publishes += 1;
+            if self.fail_publish == Some(self.counts.publishes) {
+                return Err(WorkspaceError::Conflict);
+            }
+            let mut created_directories = Vec::new();
+            for path in request.create_directories.iter().chain([&request.path]) {
+                if self.files(&side).contains_key(path) {
+                    return Err(WorkspaceError::Conflict);
+                }
+                self.put(&side, path.as_str(), b"", NodeKind::Directory);
+                if *path != request.path {
+                    created_directories
+                        .push((path.clone(), self.files(&side)[path].node.identity.clone()));
+                }
+            }
+            let status = DirectoryPublicationStatus {
+                publication_id: request.publication_id.clone(),
+                state: TransferPublicationState::Completed,
+                directory: Some(PublishedTransferDirectory {
+                    path: request.path.clone(),
+                    resource_id: self.files(&side)[&request.path].node.identity.clone(),
+                    created_directories,
+                }),
+            };
+            self.directory_publications
+                .insert(request.publication_id.clone(), status.clone());
+            if self.unknown_publish == Some(self.counts.publishes) {
+                return Err(WorkspaceError::IndeterminateOutcome);
+            }
+            Ok(status)
+        }
+
+        fn directory_status(
+            &mut self,
+            id: &OperationId,
+        ) -> Result<DirectoryPublicationStatus, WorkspaceError> {
+            self.counts.status += 1;
+            Ok(self
+                .directory_publications
+                .get(id)
+                .cloned()
+                .unwrap_or(DirectoryPublicationStatus {
+                    publication_id: id.clone(),
+                    state: TransferPublicationState::Unknown,
+                    directory: None,
+                }))
+        }
+
         fn files(&self, side: &Side) -> &BTreeMap<WorkspacePath, TestFile> {
             match side {
                 Side::Local => &self.local,
@@ -1198,6 +1391,25 @@ mod tests {
     }
 
     impl Fixture {
+        async fn directory_plan(&self, action: TransferAction) -> TransferPlan {
+            let source = if action == TransferAction::Pull {
+                Side::Remote
+            } else {
+                Side::Local
+            };
+            {
+                let mut state = self.fake.0.lock().unwrap();
+                for name in [FOLDER, EMPTY_DIRECTORY] {
+                    state.put(&source, name, b"", NodeKind::Directory);
+                }
+            }
+            let comparison = self.engine.compare(&CancelToken::none()).await.unwrap();
+            self.engine
+                .plan_selection(&comparison, action, &[path(FOLDER)], &CancelToken::none())
+                .await
+                .unwrap()
+        }
+
         fn new() -> Self {
             let root = TempDir::new().unwrap();
             let state = Builder::new()
@@ -1215,6 +1427,10 @@ mod tests {
                 safe_remote_traversal: true,
             };
             let fake = Arc::new(Fake(Mutex::new(FakeState {
+                cancel_directory_preparation: None,
+                defer_directory_release: false,
+                directory_capability: true,
+                directory_publications: BTreeMap::new(),
                 context,
                 local: BTreeMap::new(),
                 remote: BTreeMap::new(),
@@ -1378,6 +1594,25 @@ mod tests {
 
     #[async_trait]
     impl TransferAuthorization for Fake {
+        async fn review_remote_directory(
+            &self,
+            _: &TransferPlan,
+            directory: &PlannedDirectory,
+            _: &PreparedDirectoryPublication,
+        ) -> Result<(), TransferError> {
+            let mut state = self.0.lock().unwrap();
+            state.counts.remote_reviews += 1;
+            if let Some(side) = state.mutate_review.take() {
+                state.put(
+                    &side,
+                    &format!("{}/new", directory.path),
+                    EXTERNAL,
+                    NodeKind::File,
+                );
+            }
+            Ok(())
+        }
+
         async fn roots(&self, _: &TransferRoots) -> Result<(), TransferError> {
             if self.0.lock().unwrap().deny_roots {
                 return Err(WorkspaceError::PermissionDenied.into());
@@ -1482,6 +1717,45 @@ mod tests {
 
     #[async_trait]
     impl LocalTransferService for Fake {
+        fn supports_directory_publication(&self) -> bool {
+            self.0.lock().unwrap().directory_capability
+        }
+        async fn prepare_directory(
+            &self,
+            request: &DirectoryPublicationRequest,
+        ) -> Result<PreparedLocalDirectory, WorkspaceError> {
+            let mut state = self.0.lock().unwrap();
+            state.counts.local_prepares += 1;
+            state.cancel_preparation(&request.publication_id);
+            Ok(PreparedLocalDirectory {
+                request: request.clone(),
+            })
+        }
+        async fn execute_directory(
+            &self,
+            prepared: &PreparedLocalDirectory,
+        ) -> Result<DirectoryPublicationStatus, WorkspaceError> {
+            self.0
+                .lock()
+                .unwrap()
+                .publish_directory(&prepared.request, Side::Local)
+        }
+        async fn directory_status(
+            &self,
+            prepared: &PreparedLocalDirectory,
+        ) -> Result<DirectoryPublicationStatus, WorkspaceError> {
+            self.0
+                .lock()
+                .unwrap()
+                .directory_status(&prepared.request.publication_id)
+        }
+        async fn release_directory(
+            &self,
+            _: &PreparedLocalDirectory,
+        ) -> Result<(), WorkspaceError> {
+            Ok(())
+        }
+
         async fn created_directories(
             &self,
             prepared: &PreparedLocalTransfer,
@@ -1602,6 +1876,78 @@ mod tests {
 
     #[async_trait]
     impl WorkspaceTransferService for Fake {
+        fn supports_directory_publication(&self) -> bool {
+            self.0.lock().unwrap().directory_capability
+        }
+        async fn prepare_directory(
+            &self,
+            binding: &SessionWorkspaceBinding,
+            cursor: &WorkspaceCursor,
+            request: &DirectoryPublicationRequest,
+        ) -> Result<PreparedDirectoryPublication, WorkspaceError> {
+            let mut state = self.0.lock().unwrap();
+            state.counts.remote_prepares += 1;
+            state.cancel_preparation(&request.publication_id);
+            Ok(PreparedDirectoryPublication {
+                operation: OperationHandle {
+                    preparation_id: operation_id().unwrap(),
+                    invocation_id: Some(operation_id().unwrap()),
+                    execution_id: None,
+                    expires_at_unix_ms: Some(u64::MAX),
+                },
+                binding: binding.clone(),
+                cursor: cursor.clone(),
+                cwd_path: state.context.roots.remote.cwd.clone(),
+                request_digest: digest(request).unwrap(),
+                request: request.clone(),
+                review: Value::Null,
+            })
+        }
+        async fn execute_directory(
+            &self,
+            prepared: &PreparedDirectoryPublication,
+        ) -> Result<OperationStatus<DirectoryPublicationStatus>, WorkspaceError> {
+            let result = self
+                .0
+                .lock()
+                .unwrap()
+                .publish_directory(&prepared.request, Side::Remote)?;
+            Ok(OperationStatus {
+                handle: prepared.operation.clone(),
+                state: OperationState::Completed {
+                    result,
+                    side_effects_possible: true,
+                },
+                progress: Vec::new(),
+                progress_metadata: SequenceMetadata {
+                    first_retained_sequence: None,
+                    next_sequence: 0,
+                    gap_before_first: false,
+                },
+            })
+        }
+        async fn directory_status(
+            &self,
+            prepared: &PreparedDirectoryPublication,
+        ) -> Result<DirectoryPublicationStatus, WorkspaceError> {
+            self.0
+                .lock()
+                .unwrap()
+                .directory_status(&prepared.request.publication_id)
+        }
+        async fn release_directory(
+            &self,
+            _: &PreparedDirectoryPublication,
+        ) -> Result<ReleaseResult, WorkspaceError> {
+            let mut state = self.0.lock().unwrap();
+            let released = !state.defer_directory_release;
+            state.defer_directory_release = false;
+            Ok(ReleaseResult {
+                state: OperationPhase::Completed,
+                released,
+            })
+        }
+
         fn limits(&self) -> Result<TransferLimits, WorkspaceError> {
             Ok(TransferLimits {
                 max_file_bytes: super::MAX_FILE_BYTES,
@@ -1824,6 +2170,344 @@ mod tests {
                 released: true,
             })
         }
+    }
+
+    #[test]
+    fn terminal_directory_cleanup_is_retryable_and_history_can_compact() {
+        smol::block_on(async {
+            let mut fixture = Fixture::new();
+            for index in 0..=super::journal::ROTATE_RECORDS {
+                let name = format!("directory-{index}");
+                fixture
+                    .fake
+                    .0
+                    .lock()
+                    .unwrap()
+                    .put(&Side::Local, &name, b"", NodeKind::Directory);
+                let comparison = fixture.engine.compare(&CancelToken::none()).await.unwrap();
+                let plan = fixture
+                    .engine
+                    .plan_selection(
+                        &comparison,
+                        TransferAction::Push,
+                        &[path(&name)],
+                        &CancelToken::none(),
+                    )
+                    .await
+                    .unwrap();
+                fixture.fake.0.lock().unwrap().defer_directory_release = true;
+                let run = fixture
+                    .engine
+                    .execute(&plan, &mut fixture.journal, &CancelToken::none())
+                    .await;
+                assert!(run.stopped.is_none(), "{:?}", run.stopped);
+                assert_eq!(run.cleanup_deferred.len(), 1);
+                let run = fixture
+                    .engine
+                    .reconcile(&mut fixture.journal, &CancelToken::none())
+                    .await;
+                assert!(run.stopped.is_none(), "{:?}", run.stopped);
+                assert_eq!(
+                    run.outcomes.values().collect::<Vec<_>>(),
+                    vec![&FileOutcome::Confirmed]
+                );
+                assert!(run.cleanup_deferred.is_empty());
+            }
+            let reopened = TransferJournal::new(fixture.state.path().join(JOURNAL_FILE)).unwrap();
+            assert!(reopened.entries().unwrap().len() < super::journal::ROTATE_RECORDS);
+            assert!(
+                reopened
+                    .audit()
+                    .unwrap()
+                    .values()
+                    .any(|audit| audit.confirmed > 0)
+            );
+            assert_eq!(
+                fixture.fake.0.lock().unwrap().counts.publishes,
+                super::journal::ROTATE_RECORDS + 1
+            );
+        });
+    }
+
+    #[test_case(TransferAction::Push; "push")]
+    #[test_case(TransferAction::Pull; "pull")]
+    #[test_case(TransferAction::Seed; "seed")]
+    fn empty_directory_effects_publish_and_reconcile_without_replay(action: TransferAction) {
+        smol::block_on(async {
+            let mut fixture = Fixture::new();
+            let plan = fixture.directory_plan(action).await;
+            assert!(plan.review.files.is_empty());
+            assert_eq!(plan.review.directories.len(), 1);
+            let id = plan.review.directories[0].operation_id.clone();
+            fixture.fake.0.lock().unwrap().unknown_publish = Some(1);
+            let run = fixture
+                .engine
+                .execute(&plan, &mut fixture.journal, &CancelToken::none())
+                .await;
+            assert_eq!(run.outcomes[&id], FileOutcome::Unknown);
+            let mut reopened =
+                TransferJournal::new(fixture.state.path().join(JOURNAL_FILE)).unwrap();
+            let run = fixture
+                .engine
+                .reconcile(&mut reopened, &CancelToken::none())
+                .await;
+            assert!(run.stopped.is_none(), "{:?}", run.stopped);
+            assert_eq!(run.outcomes[&id], FileOutcome::Confirmed);
+            assert!(run.cleanup_deferred.is_empty());
+            assert!(reopened.base().unwrap().is_empty());
+            let replay = fixture
+                .engine
+                .execute(&plan, &mut reopened, &CancelToken::none())
+                .await;
+            assert!(replay.stopped.is_none());
+            assert_eq!(fixture.fake.0.lock().unwrap().counts.publishes, 1);
+            assert_eq!(reopened.entries().unwrap()[0].created_directories.len(), 2);
+        });
+    }
+
+    #[test]
+    fn unknown_directory_effect_blocks_descendant_file_publication() {
+        smol::block_on(async {
+            let mut fixture = Fixture::new();
+            let plan = fixture.directory_plan(TransferAction::Push).await;
+            fixture.fake.0.lock().unwrap().unknown_publish = Some(1);
+            fixture
+                .engine
+                .execute(&plan, &mut fixture.journal, &CancelToken::none())
+                .await;
+            let child = format!("{EMPTY_DIRECTORY}/{FILE}");
+            fixture.put(Side::Local, &child, BEFORE);
+            let comparison = fixture.engine.compare(&CancelToken::none()).await.unwrap();
+            let plan = fixture
+                .engine
+                .plan_selection(
+                    &comparison,
+                    TransferAction::Push,
+                    &[path(&child)],
+                    &CancelToken::none(),
+                )
+                .await
+                .unwrap();
+            let run = fixture
+                .engine
+                .execute(&plan, &mut fixture.journal, &CancelToken::none())
+                .await;
+            assert!(matches!(run.stopped, Some(TransferError::RecoveryRequired)));
+            assert_eq!(fixture.fake.0.lock().unwrap().counts.publishes, 1);
+        });
+    }
+
+    #[test]
+    fn version_two_file_journals_load_without_rewriting_and_upgrade_on_change() {
+        smol::block_on(async {
+            let mut fixture = Fixture::new();
+            fixture.put(Side::Local, FILE, BEFORE);
+            let plan = fixture.plan(TransferAction::Push, &[FILE]).await;
+            fixture
+                .journal
+                .reserve(&plan, &plan.review.files[0])
+                .unwrap();
+            let path = fixture.state.path().join(JOURNAL_FILE);
+            let mut data: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            data["version"] = json!(2);
+            for record in data["entries"].as_object_mut().unwrap().values_mut() {
+                for key in ["directory", "remote_directory", "local_directory"] {
+                    record.as_object_mut().unwrap().remove(key);
+                }
+            }
+            let before = serde_json::to_vec(&data).unwrap();
+            fs::write(&path, &before).unwrap();
+            assert_eq!(fixture.journal.entries().unwrap().len(), 1);
+            assert_eq!(fs::read(&path).unwrap(), before);
+            let run = fixture
+                .engine
+                .reconcile(&mut fixture.journal, &CancelToken::none())
+                .await;
+            assert!(run.stopped.is_none());
+            let data: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            assert_eq!(data["version"], json!(3));
+            assert_eq!(fixture.fake.0.lock().unwrap().counts.publishes, 0);
+        });
+    }
+
+    #[test_case(TransferAction::Push; "push")]
+    #[test_case(TransferAction::Pull; "pull")]
+    fn newly_nonempty_source_directories_invalidate_review(action: TransferAction) {
+        smol::block_on(async {
+            let mut fixture = Fixture::new();
+            let source = if action == TransferAction::Pull {
+                Side::Remote
+            } else {
+                Side::Local
+            };
+            let plan = fixture.directory_plan(action).await;
+            fixture.put(source, &format!("{EMPTY_DIRECTORY}/{FILE}"), BEFORE);
+            let run = fixture
+                .engine
+                .execute(&plan, &mut fixture.journal, &CancelToken::none())
+                .await;
+            assert!(matches!(run.stopped, Some(TransferError::Stale)));
+            assert_eq!(fixture.fake.0.lock().unwrap().counts.publishes, 0);
+        });
+    }
+
+    #[test_case(TransferAction::Push; "push")]
+    #[test_case(TransferAction::Pull; "pull")]
+    fn mixed_folder_selection_deduplicates_shared_ancestors_and_reports_skips(
+        action: TransferAction,
+    ) {
+        smol::block_on(async {
+            let mut fixture = Fixture::new();
+            let source = if action == TransferAction::Pull {
+                Side::Remote
+            } else {
+                Side::Local
+            };
+            fixture.directory_plan(action.clone()).await;
+            let file = format!("{FOLDER}/{FILE}");
+            let excluded = format!("{FOLDER}/.env");
+            fixture.put(source.clone(), &file, BEFORE);
+            fixture.put(source.clone(), &excluded, BEFORE);
+            fixture.put(source, &format!("{FOLDER}-other"), BEFORE);
+            let comparison = fixture.engine.compare(&CancelToken::none()).await.unwrap();
+            let plan = fixture
+                .engine
+                .plan_selection(
+                    &comparison,
+                    action,
+                    &[path(FOLDER), path(&file)],
+                    &CancelToken::none(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(plan.review.files.len(), 1);
+            assert_eq!(plan.review.directories.len(), 1);
+            assert_eq!(plan.review.skipped, vec![path(&excluded)]);
+            let run = fixture
+                .engine
+                .execute(&plan, &mut fixture.journal, &CancelToken::none())
+                .await;
+            assert!(run.stopped.is_none(), "{:?}", run.stopped);
+            assert_eq!(run.outcomes.len(), 2);
+            assert!(run.cleanup_deferred.is_empty());
+        });
+    }
+
+    #[test_case(TransferAction::Push; "push")]
+    #[test_case(TransferAction::Pull; "pull")]
+    fn unsupported_directory_publication_fails_closed(action: TransferAction) {
+        smol::block_on(async {
+            let fixture = Fixture::new();
+            fixture.directory_plan(action.clone()).await;
+            fixture.fake.0.lock().unwrap().directory_capability = false;
+            assert!(!fixture.engine.supports_directory_publication());
+            let comparison = fixture.engine.compare(&CancelToken::none()).await.unwrap();
+            assert!(matches!(
+                fixture
+                    .engine
+                    .plan_selection(&comparison, action, &[path(FOLDER)], &CancelToken::none())
+                    .await,
+                Err(TransferError::Workspace(WorkspaceError::UnsupportedEntry))
+            ));
+            assert_eq!(fixture.fake.0.lock().unwrap().counts.publishes, 0);
+        });
+    }
+
+    #[test_case(TransferAction::Push; "push")]
+    #[test_case(TransferAction::Pull; "pull")]
+    fn directory_preparation_cannot_resurrect_cancelled_reservation(action: TransferAction) {
+        smol::block_on(async {
+            let mut fixture = Fixture::new();
+            let plan = fixture.directory_plan(action).await;
+            fixture.fake.0.lock().unwrap().cancel_directory_preparation =
+                Some(fixture.state.path().join(JOURNAL_FILE));
+            let run = fixture
+                .engine
+                .execute(&plan, &mut fixture.journal, &CancelToken::none())
+                .await;
+            assert!(matches!(run.stopped, Some(TransferError::RecoveryRequired)));
+            assert_eq!(fixture.fake.0.lock().unwrap().counts.publishes, 0);
+            assert!(!fixture.journal.entries().unwrap()[0].state.blocks());
+        });
+    }
+
+    #[test_case(JournalState::Reserved; "reserved")]
+    #[test_case(JournalState::Prepared; "prepared")]
+    fn stale_directory_reconciliation_cannot_clear_dispatched_state(snapshot_state: JournalState) {
+        smol::block_on(async {
+            let mut fixture = Fixture::new();
+            let plan = fixture.directory_plan(TransferAction::Push).await;
+            let directory = &plan.review.directories[0];
+            fixture.journal.reserve_directory(&plan, directory).unwrap();
+            fixture
+                .journal
+                .update(&directory.operation_id, |entry| {
+                    entry.state = snapshot_state;
+                    Ok(())
+                })
+                .unwrap();
+            let snapshot = fixture.journal.entries().unwrap().remove(0);
+            let mut concurrent =
+                TransferJournal::new(fixture.state.path().join(JOURNAL_FILE)).unwrap();
+            concurrent
+                .update(&directory.operation_id, |entry| {
+                    entry.state = JournalState::Dispatched;
+                    entry.cleanup_pending = true;
+                    Ok(())
+                })
+                .unwrap();
+            assert!(matches!(
+                fixture
+                    .engine
+                    .reconcile_directory(&snapshot, &mut fixture.journal, &CancelToken::none())
+                    .await,
+                Err(TransferError::RecoveryRequired)
+            ));
+            let current = concurrent.entries().unwrap().remove(0);
+            assert_eq!(current.state, JournalState::Dispatched);
+            assert!(current.cleanup_pending);
+        });
+    }
+
+    #[test_case(Side::Local; "local")]
+    #[test_case(Side::Remote; "remote")]
+    fn inspection_is_bounded_revision_bound_and_never_prepares_publication(side: Side) {
+        smol::block_on(async {
+            let mut fixture = Fixture::new();
+            fixture.engine.limits.preview_bytes = BEFORE.len() - 1;
+            fixture.put(side.clone(), FILE, BEFORE);
+            let comparison = fixture.engine.compare(&CancelToken::none()).await.unwrap();
+            let preview = fixture
+                .engine
+                .inspect_preview(&comparison, &path(FILE), &CancelToken::none())
+                .await
+                .unwrap();
+            let preview = if side == Side::Local {
+                preview.local_preview
+            } else {
+                preview.remote_preview
+            };
+            assert!(
+                matches!(preview, Some(FilePreview::TextPrefix { truncated: true, text }) if text.len() == BEFORE.len() - 1)
+            );
+            fixture.put(side, FILE, AFTER);
+            assert!(matches!(
+                fixture
+                    .engine
+                    .inspect_preview(&comparison, &path(FILE), &CancelToken::none())
+                    .await,
+                Err(TransferError::Stale)
+            ));
+            let state = fixture.fake.0.lock().unwrap();
+            assert_eq!(
+                state.counts.local_prepares
+                    + state.counts.remote_prepares
+                    + state.counts.publishes
+                    + state.counts.stages,
+                0
+            );
+            assert!(fixture.journal.entries().unwrap().is_empty());
+        });
     }
 
     #[test]
@@ -2771,6 +3455,7 @@ mod tests {
                 entry["operation_id"] = json!(id);
                 entry["state"] = json!(state);
                 entry["path"] = json!(id);
+                entry["local"]["node"]["path"] = json!(id);
                 entry["cleanup_pending"] = json!(cleanup_pending);
                 entries.insert(id, entry);
             }
@@ -2820,7 +3505,7 @@ mod tests {
             let mut data: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
             match shape {
                 "v1" => data["version"] = json!(1),
-                "future" => data["version"] = json!(3),
+                "future" => data["version"] = json!(4),
                 "archives" => {
                     data.as_object_mut().unwrap().remove(shape);
                 }

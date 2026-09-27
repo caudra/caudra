@@ -180,8 +180,75 @@ pub struct TransferPublicationStatus {
     pub created_directories: Vec<(WorkspacePath, ResourceId)>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DirectoryPublicationRequest {
+    pub publication_id: OperationId,
+    pub path: WorkspacePath,
+    pub create_directories: Vec<WorkspacePath>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PreparedDirectoryPublication {
+    pub operation: OperationHandle,
+    pub binding: SessionWorkspaceBinding,
+    pub cursor: WorkspaceCursor,
+    pub cwd_path: WorkspacePath,
+    pub request_digest: TransferDigest,
+    pub request: DirectoryPublicationRequest,
+    pub review: Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PreparedLocalDirectory {
+    pub request: DirectoryPublicationRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PublishedTransferDirectory {
+    pub path: WorkspacePath,
+    pub resource_id: ResourceId,
+    pub created_directories: Vec<(WorkspacePath, ResourceId)>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DirectoryPublicationStatus {
+    pub publication_id: OperationId,
+    pub state: TransferPublicationState,
+    pub directory: Option<PublishedTransferDirectory>,
+}
+
 #[async_trait]
 pub trait WorkspaceTransferService: Send + Sync {
+    fn supports_directory_publication(&self) -> bool {
+        false
+    }
+    async fn prepare_directory(
+        &self,
+        _binding: &SessionWorkspaceBinding,
+        _cursor: &WorkspaceCursor,
+        _request: &DirectoryPublicationRequest,
+    ) -> Result<PreparedDirectoryPublication, WorkspaceError> {
+        Err(WorkspaceError::UnsupportedEntry)
+    }
+    async fn execute_directory(
+        &self,
+        _prepared: &PreparedDirectoryPublication,
+    ) -> Result<OperationStatus<DirectoryPublicationStatus>, WorkspaceError> {
+        Err(WorkspaceError::UnsupportedEntry)
+    }
+    async fn directory_status(
+        &self,
+        _prepared: &PreparedDirectoryPublication,
+    ) -> Result<DirectoryPublicationStatus, WorkspaceError> {
+        Err(WorkspaceError::UnsupportedEntry)
+    }
+    async fn release_directory(
+        &self,
+        _prepared: &PreparedDirectoryPublication,
+    ) -> Result<ReleaseResult, WorkspaceError> {
+        Err(WorkspaceError::UnsupportedEntry)
+    }
+
     fn limits(&self) -> Result<TransferLimits, WorkspaceError>;
 
     async fn stage(
@@ -309,12 +376,46 @@ pub enum LocalPublicationState {
 
 #[async_trait]
 pub trait LocalTransferAuthorization: Send + Sync {
+    async fn authorize_directory(
+        &self,
+        _request: &DirectoryPublicationRequest,
+    ) -> Result<(), WorkspaceError> {
+        Err(WorkspaceError::PermissionDenied)
+    }
     /// Independent host approval; remote approval must never authorize local publication.
     async fn authorize(&self, review: &LocalTransferReview) -> Result<(), WorkspaceError>;
 }
 
 #[async_trait]
 pub trait LocalTransferService: Send + Sync {
+    fn supports_directory_publication(&self) -> bool {
+        false
+    }
+    async fn prepare_directory(
+        &self,
+        _request: &DirectoryPublicationRequest,
+    ) -> Result<PreparedLocalDirectory, WorkspaceError> {
+        Err(WorkspaceError::UnsupportedEntry)
+    }
+    async fn execute_directory(
+        &self,
+        _prepared: &PreparedLocalDirectory,
+    ) -> Result<DirectoryPublicationStatus, WorkspaceError> {
+        Err(WorkspaceError::UnsupportedEntry)
+    }
+    async fn directory_status(
+        &self,
+        _prepared: &PreparedLocalDirectory,
+    ) -> Result<DirectoryPublicationStatus, WorkspaceError> {
+        Err(WorkspaceError::UnsupportedEntry)
+    }
+    async fn release_directory(
+        &self,
+        _prepared: &PreparedLocalDirectory,
+    ) -> Result<(), WorkspaceError> {
+        Err(WorkspaceError::UnsupportedEntry)
+    }
+
     async fn created_directories(
         &self,
         _prepared: &PreparedLocalTransfer,

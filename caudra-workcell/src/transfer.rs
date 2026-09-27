@@ -14,9 +14,10 @@ use async_trait::async_trait;
 use caudra_agent::workspace_transfer::LocalRootIdentity;
 use caudra_storage::{id::CaudraId, private_file::PrivateFile};
 use caudra_workspace::{
-    LocalPublicationState, LocalTransferAuthorization, LocalTransferCondition,
-    LocalTransferDestination, LocalTransferPath, LocalTransferReview, LocalTransferRevision,
-    LocalTransferService, LocalTransferSource, OperationId, PreparedLocalTransfer, ResourceId,
+    DirectoryPublicationRequest, DirectoryPublicationStatus, LocalPublicationState,
+    LocalTransferAuthorization, LocalTransferCondition, LocalTransferDestination,
+    LocalTransferPath, LocalTransferReview, LocalTransferRevision, LocalTransferService,
+    LocalTransferSource, OperationId, PreparedLocalDirectory, PreparedLocalTransfer, ResourceId,
     ResourceRevision, TransferContent, TransferDigest, TransferLimits, TransferMode,
     WorkspaceError, WorkspacePath,
 };
@@ -31,6 +32,9 @@ use workcell::files::{
     BinaryError, BinaryPublicationContent, FileToolGroup, PreparedBinaryPublication,
 };
 use workcell::host_contract as contract;
+
+mod directory;
+use directory::{DirectoryOutcomes, LocalDirectoryPreparation};
 
 pub(crate) const STREAM_BUFFER_BYTES: usize = 64 * 1024;
 const MAX_FILE_BYTES: u64 = 512 * 1024 * 1024;
@@ -412,6 +416,8 @@ pub struct LocalTransferPublisher {
     maximum: u64,
     preparations: Mutex<HashMap<OperationId, LocalPreparation>>,
     outcomes: Option<Arc<LocalOutcomes>>,
+    directory_outcomes: Option<Arc<DirectoryOutcomes>>,
+    directory_preparations: Mutex<HashMap<OperationId, LocalDirectoryPreparation>>,
 }
 
 impl LocalTransferPublisher {
@@ -449,6 +455,8 @@ impl LocalTransferPublisher {
             staging: PrivateStaging::default(),
             preparations: Mutex::new(HashMap::new()),
             outcomes: None,
+            directory_outcomes: None,
+            directory_preparations: Mutex::new(HashMap::new()),
             root: identity,
             maximum: MAX_FILE_BYTES,
         })
@@ -471,10 +479,23 @@ impl LocalTransferPublisher {
     ) -> Result<Self, WorkspaceError> {
         let identity =
             LocalRootIdentity::capture(&root).map_err(|_| WorkspaceError::PermissionDenied)?;
+        let directory_outcomes = if cfg!(target_os = "linux") {
+            match DirectoryOutcomes::open(
+                identity.clone(),
+                status_path.with_extension("directories.json"),
+            ) {
+                Ok(outcomes) => Some(Arc::new(outcomes)),
+                Err(WorkspaceError::UnsupportedEntry) => None,
+                Err(error) => return Err(error),
+            }
+        } else {
+            None
+        };
         let outcomes = Arc::new(LocalOutcomes::open(identity.clone(), status_path)?);
         let mut publisher =
             Self::new(identity.canonical_path().to_path_buf(), authorization).await?;
         publisher.outcomes = Some(outcomes);
+        publisher.directory_outcomes = directory_outcomes;
         Ok(publisher)
     }
 
@@ -496,6 +517,38 @@ impl LocalTransferPublisher {
 
 #[async_trait]
 impl LocalTransferService for LocalTransferPublisher {
+    fn supports_directory_publication(&self) -> bool {
+        cfg!(target_os = "linux") && self.directory_outcomes.is_some()
+    }
+
+    async fn prepare_directory(
+        &self,
+        request: &DirectoryPublicationRequest,
+    ) -> Result<PreparedLocalDirectory, WorkspaceError> {
+        self.prepare_local_directory(request).await
+    }
+
+    async fn execute_directory(
+        &self,
+        prepared: &PreparedLocalDirectory,
+    ) -> Result<DirectoryPublicationStatus, WorkspaceError> {
+        self.execute_local_directory(prepared).await
+    }
+
+    async fn directory_status(
+        &self,
+        prepared: &PreparedLocalDirectory,
+    ) -> Result<DirectoryPublicationStatus, WorkspaceError> {
+        self.local_directory_status(prepared).await
+    }
+
+    async fn release_directory(
+        &self,
+        prepared: &PreparedLocalDirectory,
+    ) -> Result<(), WorkspaceError> {
+        self.release_local_directory(prepared)
+    }
+
     async fn created_directories(
         &self,
         prepared: &PreparedLocalTransfer,
@@ -780,9 +833,10 @@ mod tests {
     };
     use async_trait::async_trait;
     use caudra_workspace::{
-        LocalPublicationState, LocalTransferAuthorization, LocalTransferCondition,
-        LocalTransferDestination, LocalTransferPath, LocalTransferReview, LocalTransferService,
-        LocalTransferSource, TransferContent, TransferMode, WorkspaceError, WorkspacePath,
+        DirectoryPublicationRequest, LocalPublicationState, LocalTransferAuthorization,
+        LocalTransferCondition, LocalTransferDestination, LocalTransferPath, LocalTransferReview,
+        LocalTransferService, LocalTransferSource, OperationId, TransferContent, TransferMode,
+        TransferPublicationState, WorkspaceError, WorkspacePath,
     };
     use futures_lite::io::Cursor;
     use serde_json::Value;
@@ -802,6 +856,114 @@ mod tests {
     const CANARY: &[u8] = b"local canary must not change";
     const PRIVATE_DIRECTORY_MODE: u32 = 0o700;
     const NESTED_DESTINATION: &str = "new/deep/file";
+
+    #[cfg(target_os = "linux")]
+    #[test_case(0o040; "group_readable")]
+    #[test_case(0o020; "group_writable")]
+    #[test_case(0o010; "group_searchable")]
+    #[test_case(0o004; "world_readable")]
+    #[test_case(0o002; "world_writable")]
+    #[test_case(0o001; "world_searchable")]
+    fn durable_publisher_rejects_nonprivate_staging_parent_without_destination_effects(
+        extra_permissions: u32,
+    ) {
+        const CANARY_PATH: &str = "canary";
+        smol::block_on(async {
+            let root = tempfile::tempdir().unwrap();
+            let state = tempfile::tempdir().unwrap();
+            let canary = root.path().join(CANARY_PATH);
+            fs::write(&canary, CANARY).unwrap();
+            let identity = fs::metadata(&canary).unwrap().ino();
+            fs::set_permissions(
+                state.path(),
+                fs::Permissions::from_mode(PRIVATE_DIRECTORY_MODE | extra_permissions),
+            )
+            .unwrap();
+
+            let result = LocalTransferPublisher::new_durable(
+                root.path().into(),
+                state.path().join("status.json"),
+                Arc::new(Authorization(AtomicBool::new(true))),
+            )
+            .await;
+
+            assert!(matches!(result, Err(WorkspaceError::PermissionDenied)));
+            assert_eq!(fs::read(&canary).unwrap(), CANARY);
+            assert_eq!(fs::metadata(&canary).unwrap().ino(), identity);
+            assert_eq!(fs::read_dir(root.path()).unwrap().count(), 1);
+            assert!(!root.path().join(NESTED_DESTINATION).exists());
+        });
+    }
+
+    #[test_case(false, false; "durable_success")]
+    #[test_case(true, false; "racing_destination")]
+    #[test_case(false, true; "denied_execute")]
+    fn standalone_directory_publication_is_reviewed_durable_and_not_replayed(
+        race: bool,
+        deny: bool,
+    ) {
+        smol::block_on(async {
+            let root = tempfile::tempdir().unwrap();
+            let state = tempfile::tempdir().unwrap();
+            fs::set_permissions(
+                state.path(),
+                fs::Permissions::from_mode(PRIVATE_DIRECTORY_MODE),
+            )
+            .unwrap();
+            let status = state.path().join("status.json");
+            let auth = Arc::new(Authorization(AtomicBool::new(true)));
+            let publisher = LocalTransferPublisher::new_durable(
+                root.path().into(),
+                status.clone(),
+                auth.clone(),
+            )
+            .await
+            .unwrap();
+            let request = DirectoryPublicationRequest {
+                publication_id: OperationId::new("directory-publication").unwrap(),
+                path: WorkspacePath::new(NESTED_DESTINATION).unwrap(),
+                create_directories: ["new", "new/deep"]
+                    .into_iter()
+                    .map(|path| WorkspacePath::new(path).unwrap())
+                    .collect(),
+            };
+            let prepared = publisher.prepare_directory(&request).await.unwrap();
+            assert!(!root.path().join("new").exists());
+            if race {
+                fs::create_dir_all(root.path().join(NESTED_DESTINATION)).unwrap();
+            }
+            if deny {
+                auth.0.store(false, Ordering::Release);
+            }
+            let result = publisher.execute_directory(&prepared).await;
+            if deny {
+                assert!(matches!(result, Err(WorkspaceError::PermissionDenied)));
+                assert!(!root.path().join("new").exists());
+                return;
+            }
+            let result = result.unwrap();
+            if race {
+                assert_ne!(result.state, TransferPublicationState::Completed);
+                return;
+            }
+            assert_eq!(result.state, TransferPublicationState::Completed);
+            assert!(root.path().join(NESTED_DESTINATION).is_dir());
+            publisher.release_directory(&prepared).await.unwrap();
+            drop(publisher);
+            let publisher = LocalTransferPublisher::new_durable(root.path().into(), status, auth)
+                .await
+                .unwrap();
+            assert_eq!(publisher.directory_status(&prepared).await.unwrap(), result);
+            assert!(publisher.execute_directory(&prepared).await.is_err());
+            assert!(publisher.prepare_directory(&request).await.is_err());
+            fs::rename(root.path().join("new"), root.path().join("old")).unwrap();
+            fs::create_dir_all(root.path().join(NESTED_DESTINATION)).unwrap();
+            assert_eq!(
+                publisher.directory_status(&prepared).await.unwrap().state,
+                TransferPublicationState::Indeterminate
+            );
+        });
+    }
 
     #[test]
     fn missing_local_directory_recovery_metadata_is_rejected_without_rewriting() {
@@ -1012,6 +1174,16 @@ mod tests {
 
     #[async_trait]
     impl LocalTransferAuthorization for Authorization {
+        async fn authorize_directory(
+            &self,
+            _: &DirectoryPublicationRequest,
+        ) -> Result<(), WorkspaceError> {
+            if self.0.load(Ordering::Acquire) {
+                Ok(())
+            } else {
+                Err(WorkspaceError::PermissionDenied)
+            }
+        }
         async fn authorize(&self, _: &LocalTransferReview) -> Result<(), WorkspaceError> {
             if self.0.load(Ordering::Acquire) {
                 Ok(())

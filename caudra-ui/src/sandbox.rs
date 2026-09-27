@@ -41,8 +41,19 @@ pub(crate) const NETWORK_SAVE_UNKNOWN: &str = "Save publication is uncertain: th
 
 pub struct SandboxAttachment {
     pub name: SandboxName,
+    pub revision: Revision,
+    pub attached_revision: Revision,
     pub binding: Box<StoredWorkspaceBinding>,
     pub runtime: Box<dyn Any + Send>,
+    pub initial_seed: Option<InitialSeed>,
+}
+
+#[derive(Clone)]
+pub struct InitialSeed {
+    pub name: SandboxName,
+    pub revision: Revision,
+    pub local: PathBuf,
+    pub remote: WorkspacePath,
 }
 
 pub type SandboxConnector =
@@ -65,7 +76,7 @@ pub(crate) struct SandboxWorkers {
     pub name: Option<SandboxName>,
     pub attachment: Option<SandboxAttachment>,
     pub transfer_connector: Option<transfer::TransferConnector>,
-    pub transfer_queued: Option<transfer::TransferCommand>,
+    pub transfer_queued: Option<(transfer::TransferScope, transfer::TransferCommand)>,
     pub transfer: Option<transfer::TransferWorker>,
     pub network_save: Option<(StoreTicket, Arc<LoadedSandboxes>)>,
     pub network_queue: VecDeque<NetworkReconcileRequest>,
@@ -808,15 +819,9 @@ fn execute_live(
                     review,
                 ))?;
                 if let Some((local, remote)) = seed {
-                    let _verified = connector.ok_or_else(|| {
-                        color_eyre::eyre::eyre!(
-                            "Workcell verification unavailable; initial seed not started"
-                        )
-                    })?(name.clone(), record.revision()?)
-                    .map_err(|error| color_eyre::eyre::eyre!(error))?;
                     return Ok(LiveOutcome::Seed {
                         name: name.clone(),
-                        revision: controller.store().get(name)?.revision()?,
+                        revision: record.revision()?,
                         local: local.clone(),
                         remote: remote.clone(),
                     });

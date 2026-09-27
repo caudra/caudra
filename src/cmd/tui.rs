@@ -1258,6 +1258,7 @@ pub fn run(mut cli: Cli, tightened: Vec<PathBuf>) -> Result<ExitCode> {
         .as_deref()
         .and_then(|name| SandboxName::parse(name).ok());
     drop(sandbox_progress);
+    let mut initial_seed = None;
     let workcell_runtime_ms = lap();
 
     let (mut stack, _) = build_stack(
@@ -1510,6 +1511,7 @@ pub fn run(mut cli: Cli, tightened: Vec<PathBuf>) -> Result<ExitCode> {
                     runtime_cwd.clone(),
                 )),
                 transfer_connector: Some(super::sandbox::transfer_connector(storage.clone())),
+                initial_seed: initial_seed.take(),
                 sandbox_readiness: Some({
                     let runtime = Arc::clone(&workcell_runtime);
                     Arc::new(move || {
@@ -1648,6 +1650,7 @@ pub fn run(mut cli: Cli, tightened: Vec<PathBuf>) -> Result<ExitCode> {
                 drop(stack);
                 workcell_runtime = Arc::new(prepared.runtime);
                 sandbox_name = Some(attachment.name.clone());
+                initial_seed = attachment.initial_seed;
                 let (new_stack, new_warnings) = build_stack(&cli, &cwd, &storage, None, true).context("Sandbox runtime is verified; source sessions remain saved. Reopen --sandbox if UI setup failed")?;
                 let resolved = resolve_remote_sessions(
                     false,

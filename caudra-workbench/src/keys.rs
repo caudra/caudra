@@ -115,6 +115,7 @@ pub const CUT_CHORD: Bind = leader!(KeyCode::Char('x'), "x");
 pub const VIEW_EXPLORER: Bind = leader!(KeyCode::Char('1'), "1");
 pub const VIEW_SOURCE_CONTROL: Bind = leader!(KeyCode::Char('2'), "2");
 pub const VIEW_SEARCH: Bind = leader!(KeyCode::Char('3'), "3");
+pub const VIEW_TRANSFER: Bind = leader!(KeyCode::Char('4'), "4");
 pub const SEND_TO_COMPOSER: Bind = leader!(KeyCode::Enter, "Enter");
 /// `k` for emacs' kill-buffer, which leaves `w` to the search pane.
 pub const CLOSE_TAB: Bind = leader!(KeyCode::Char('k'), "k");
@@ -182,6 +183,7 @@ pub const LEADER_BINDS: &[Bind] = &[
     VIEW_EXPLORER,
     VIEW_SOURCE_CONTROL,
     VIEW_SEARCH,
+    VIEW_TRANSFER,
     SEND_TO_COMPOSER,
     CLOSE_TAB,
     TOGGLE_WRAP,

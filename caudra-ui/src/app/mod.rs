@@ -24,6 +24,7 @@ mod stash;
 pub(crate) mod tasks;
 #[cfg(test)]
 pub(crate) mod tests;
+mod transfer;
 pub(crate) mod view;
 mod workbench;
 pub(crate) mod workflow;
@@ -1604,12 +1605,8 @@ impl App {
     }
 
     pub fn update(&mut self, msg: Msg) -> Vec<Action> {
-        if crate::sandbox::transfer::active()
-            && !self.permission_prompt.is_open()
-            && !(self.sandbox_manager.is_open() && self.sandbox_manager.transfer_open())
-            && matches!(msg, Msg::Key(_) | Msg::Paste(_) | Msg::Mouse(_))
-        {
-            return vec![];
+        if crate::sandbox::transfer::active() && !matches!(msg, Msg::Agent(_)) {
+            return self.transfer_input(msg);
         }
         match msg {
             Msg::Key(key) => {
@@ -2474,7 +2471,20 @@ impl App {
     }
 
     fn handle_workbench_action(&mut self, action: WorkbenchAction) -> Vec<Action> {
+        if crate::sandbox::transfer::active()
+            && !matches!(
+                action,
+                WorkbenchAction::Transfer(_)
+                    | WorkbenchAction::Consumed
+                    | WorkbenchAction::Passthrough
+                    | WorkbenchAction::Flash(_)
+                    | WorkbenchAction::Copy(_)
+            )
+        {
+            return Vec::new();
+        }
         match action {
+            WorkbenchAction::Transfer(action) => self.handle_transfer_action(action),
             WorkbenchAction::Consumed | WorkbenchAction::Passthrough => {}
             WorkbenchAction::Close => self.close_permission_source(),
             WorkbenchAction::Flash(message) => self.status_bar.flash(message),
@@ -3191,7 +3201,7 @@ impl App {
         // The workbench answers first so a pane can claim a letter the
         // transcript spends elsewhere, and passes back what it does not want.
         if self.workbench.is_open() {
-            match self.workbench.handle_leader(key) {
+            match self.workbench_leader(key) {
                 WorkbenchAction::Passthrough => {}
                 action => return self.handle_workbench_action(action),
             }

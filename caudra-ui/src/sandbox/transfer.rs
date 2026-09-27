@@ -6,6 +6,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
     thread::{self, JoinHandle},
+    time::Duration,
 };
 
 use async_trait::async_trait;
@@ -15,19 +16,21 @@ use caudra_agent::{
     workspace_transfer::{
         CleanBufferLease, ComparisonRow, InventoryContext, LocalRootIdentity, PlanReview,
         PullBufferGuard, TransferAction, TransferError, TransferEvent, TransferEvents,
+        TransferPreview as FileComparisonPreview,
     },
 };
 use caudra_config::load_permissions;
 use caudra_config::sandbox::{Revision, SandboxName};
-use caudra_storage::StateDir;
+use caudra_storage::{StateDir, id::CaudraId, workspace_binding::StoredWorkspaceBinding};
 use caudra_workcell::{TransferReport, TransferSession, TransferSessionHost};
 use caudra_workspace::{TransferDigest, WorkspacePath};
 use flume::{Receiver, Sender};
-
-use super::SandboxSnapshotRequest;
+use futures_lite::future;
+use smol::Timer;
 
 static TRANSFER_ACTIVE: AtomicBool = AtomicBool::new(false);
 const EVENT_CAPACITY: usize = 512;
+const VALIDITY_INTERVAL: Duration = Duration::from_secs(2);
 
 pub fn active() -> bool {
     TRANSFER_ACTIVE.load(Ordering::Acquire)
@@ -53,27 +56,39 @@ pub struct TransferLink {
     pub configuration_revision: Revision,
     pub local_root: PathBuf,
     pub remote_root: WorkspacePath,
+    pub attached_binding: Option<StoredWorkspaceBinding>,
 }
 
 pub type TransferConnector = Arc<
     dyn Fn(TransferLink, TransferSessionHost) -> Result<TransferConnection, String> + Send + Sync,
 >;
 
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct TransferScope {
+    pub conversation: CaudraId,
+    pub binding: StoredWorkspaceBinding,
+    pub name: SandboxName,
+    pub instance_revision: Revision,
+    pub configuration_revision: Revision,
+    pub generation: u64,
+}
+
 pub(crate) enum TransferCommand {
     Open {
-        scope: SandboxSnapshotRequest,
-        link: TransferLink,
+        scope: Box<TransferScope>,
+        link: Box<TransferLink>,
     },
     Compare,
+    Inspect(WorkspacePath),
     Review(TransferAction, Vec<WorkspacePath>),
     Execute(TransferDigest),
     Reconcile,
-    Close,
 }
 
 pub(crate) enum TransferReply {
-    Compared(Arc<ComparisonView>, serde_json::Value),
+    Compared(Arc<ComparisonView>, serde_json::Value, bool),
     Reviewed(Arc<TransferPreview>),
+    Inspected(Box<FileComparisonPreview>),
     Finished(Box<TransferReport>),
     Failed(String),
     Closed,
@@ -85,30 +100,9 @@ pub(crate) struct ComparisonView {
     pub complete: bool,
 }
 
-impl ComparisonView {
-    pub fn context(&self) -> &InventoryContext {
-        &self.context
-    }
-    pub fn rows(&self) -> &[ComparisonRow] {
-        &self.rows
-    }
-    pub fn complete(&self) -> bool {
-        self.complete
-    }
-}
-
 pub(crate) struct TransferPreview {
     pub digest: TransferDigest,
     pub review: PlanReview,
-}
-
-impl TransferPreview {
-    pub fn digest(&self) -> &TransferDigest {
-        &self.digest
-    }
-    pub fn review(&self) -> &PlanReview {
-        &self.review
-    }
 }
 
 struct Progress(Sender<TransferEvent>);
@@ -136,7 +130,11 @@ impl PullBufferGuard for TransferBuffers {
 }
 
 pub(crate) struct TransferWorker {
-    pub scope: SandboxSnapshotRequest,
+    pub scope: TransferScope,
+    pub directory_effects: bool,
+    pub recovery_required: bool,
+    pub completed: usize,
+    pub total: usize,
     pub replies: Receiver<TransferReply>,
     pub progress: Receiver<TransferEvent>,
     pub permissions: Arc<PermissionManager>,
@@ -148,7 +146,7 @@ pub(crate) struct TransferWorker {
 
 impl TransferWorker {
     pub fn start(
-        scope: SandboxSnapshotRequest,
+        scope: TransferScope,
         mut link: TransferLink,
         connector: TransferConnector,
         state: &StateDir,
@@ -196,7 +194,7 @@ impl TransferWorker {
                 match result {
                     Ok(mut connection) => smol::block_on(async {
                         let mut command = TransferCommand::Compare;
-                        loop {
+                        'commands: loop {
                             if let Err(error) = (connection.validate)() {
                                 let _ = reply_tx.send(TransferReply::Failed(error));
                                 break;
@@ -212,20 +210,26 @@ impl TransferWorker {
                                                     complete: comparison.complete(),
                                                 }),
                                                 connection.session.recovery()?,
+                                                connection.session.supports_directory_publication(),
                                             ))
                                         },
                                     )
                                 }
-                                TransferCommand::Review(action, paths) => {
-                                    connection.session.review(action, &paths, &token).await.map(
-                                        |plan| {
-                                            TransferReply::Reviewed(Arc::new(TransferPreview {
-                                                digest: plan.digest().clone(),
-                                                review: plan.review().clone(),
-                                            }))
-                                        },
-                                    )
-                                }
+                                TransferCommand::Review(action, paths) => connection
+                                    .session
+                                    .review_selection(action, &paths, &token)
+                                    .await
+                                    .map(|plan| {
+                                        TransferReply::Reviewed(Arc::new(TransferPreview {
+                                            digest: plan.digest().clone(),
+                                            review: plan.review().clone(),
+                                        }))
+                                    }),
+                                TransferCommand::Inspect(path) => connection
+                                    .session
+                                    .preview(&path, &token)
+                                    .await
+                                    .map(|preview| TransferReply::Inspected(Box::new(preview))),
                                 TransferCommand::Execute(digest) => connection
                                     .session
                                     .execute(&digest, &token)
@@ -236,8 +240,9 @@ impl TransferWorker {
                                     .reconcile(&token)
                                     .await
                                     .map(|report| TransferReply::Finished(Box::new(report))),
-                                TransferCommand::Close | TransferCommand::Open { .. } => break,
+                                TransferCommand::Open { .. } => break,
                             };
+                            let refresh = matches!(result, Ok(TransferReply::Finished(_)));
                             let _ =
                                 reply_tx.send(result.unwrap_or_else(|error| {
                                     TransferReply::Failed(error.to_string())
@@ -245,9 +250,33 @@ impl TransferWorker {
                             if token.is_cancelled() {
                                 break;
                             }
-                            match token.race(receiver.recv_async()).await {
-                                Ok(Ok(next)) => command = next,
-                                _ => break,
+                            if refresh {
+                                command = TransferCommand::Compare;
+                                continue;
+                            }
+                            loop {
+                                let next = token
+                                    .race(future::or(
+                                        async { Some(receiver.recv_async().await) },
+                                        async {
+                                            Timer::after(VALIDITY_INTERVAL).await;
+                                            None
+                                        },
+                                    ))
+                                    .await;
+                                match next {
+                                    Ok(Some(Ok(next))) => {
+                                        command = next;
+                                        break;
+                                    }
+                                    Ok(None) => {
+                                        if let Err(error) = (connection.validate)() {
+                                            let _ = reply_tx.send(TransferReply::Failed(error));
+                                            break 'commands;
+                                        }
+                                    }
+                                    _ => break 'commands,
+                                }
                             }
                         }
                     }),
@@ -255,11 +284,16 @@ impl TransferWorker {
                         let _ = reply_tx.send(TransferReply::Failed(error));
                     }
                 }
+                drop(_lease);
                 let _ = reply_tx.send(TransferReply::Closed);
             })
             .map_err(|error| error.to_string())?;
         Ok(Self {
             scope,
+            directory_effects: false,
+            recovery_required: false,
+            completed: 0,
+            total: 0,
             replies,
             progress,
             permissions,
@@ -281,6 +315,18 @@ impl TransferWorker {
             cancel.cancel();
         }
     }
+
+    pub fn settled(&self) -> bool {
+        self.join.as_ref().is_none_or(JoinHandle::is_finished)
+    }
+
+    #[cfg(test)]
+    pub fn finish(mut self) {
+        self.cancel();
+        if let Some(join) = self.join.take() {
+            join.join().unwrap();
+        }
+    }
 }
 
 pub fn transfer_permissions(local_root: PathBuf, state: &StateDir) -> PermissionManager {
@@ -295,7 +341,7 @@ pub fn transfer_permissions(local_root: PathBuf, state: &StateDir) -> Permission
 impl Drop for TransferWorker {
     fn drop(&mut self) {
         self.cancel();
-        if let Some(join) = self.join.take() {
+        if let Some(join) = self.join.take().filter(JoinHandle::is_finished) {
             let _ = join.join();
         }
     }
@@ -303,10 +349,13 @@ impl Drop for TransferWorker {
 
 #[cfg(test)]
 mod tests {
-    use super::{CancelToken, SandboxSnapshotRequest, TransferWorker};
+    use super::{CancelToken, TransferScope, TransferWorker};
     use caudra_agent::permissions::PermissionManager;
-    use caudra_config::{PermissionsConfig, sandbox::Revision};
-    use caudra_storage::id::CaudraId;
+    use caudra_config::{
+        PermissionsConfig,
+        sandbox::{Revision, SandboxName},
+    };
+    use caudra_storage::{id::CaudraId, workspace_binding::StoredWorkspaceBinding};
     use std::{
         sync::{
             Arc,
@@ -319,10 +368,11 @@ mod tests {
         "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
     #[test]
-    fn cancel_keeps_worker_owned_until_cleanup_is_awaited() {
+    fn drop_requests_cancel_without_blocking_cleanup() {
         let (cancel, token) = CancelToken::new();
         let (release, cleanup) = flume::bounded(1);
         let (cancelled, observed) = flume::bounded(1);
+        let (settled, finished) = flume::bounded(1);
         let done = Arc::new(AtomicBool::new(false));
         let completed = done.clone();
         let join = thread::spawn(move || {
@@ -330,16 +380,23 @@ mod tests {
             cancelled.send(()).unwrap();
             cleanup.recv().unwrap();
             completed.store(true, Ordering::Release);
+            settled.send(()).unwrap();
         });
         let (commands, _) = flume::bounded(1);
         let (_, replies) = flume::unbounded();
         let (_, progress) = flume::unbounded();
         let mut worker = TransferWorker {
-            scope: SandboxSnapshotRequest {
+            directory_effects: false,
+            recovery_required: false,
+            completed: 0,
+            total: 0,
+            scope: TransferScope {
                 conversation: CaudraId::generate(),
-                manager_session: 1,
+                binding: StoredWorkspaceBinding::local_from_cwd("/tmp"),
+                name: SandboxName::parse("test").unwrap(),
+                instance_revision: Revision::parse(REVISION).unwrap(),
                 configuration_revision: Revision::parse(REVISION).unwrap(),
-                configuration_epoch: 0,
+                generation: 1,
             },
             replies,
             progress,
@@ -356,8 +413,10 @@ mod tests {
         worker.cancel();
         observed.recv().unwrap();
         assert!(!done.load(Ordering::Acquire));
-        release.send(()).unwrap();
+        assert!(!worker.settled());
         drop(worker);
+        release.send(()).unwrap();
+        finished.recv().unwrap();
         assert!(done.load(Ordering::Acquire));
     }
 }

@@ -2,9 +2,10 @@ use std::{future::Future, time::Duration};
 
 use async_trait::async_trait;
 use caudra_workspace::{
-    ByteContent, ByteRange, DownloadedTransfer, LocalTransferSource, Mutation, MutationCondition,
-    MutationEntryResult, MutationKind, MutationRequest, MutationResult, OperationError,
-    OperationId, OperationState, OperationStatus, PreparedTransferPublication, ReadBytesRequest,
+    ByteContent, ByteRange, DirectoryPublicationRequest, DirectoryPublicationStatus,
+    DownloadedTransfer, LocalTransferSource, Mutation, MutationCondition, MutationEntryResult,
+    MutationKind, MutationRequest, MutationResult, OperationError, OperationId, OperationState,
+    OperationStatus, PreparedDirectoryPublication, PreparedTransferPublication, ReadBytesRequest,
     ReleaseResult, RemoteTransferFile, RemoteTransferStage, ResourceRevision, SealedTransfer,
     SessionWorkspaceBinding, TransferContent, TransferDigest, TransferLimits, TransferMode,
     TransferPublicationRequest, TransferPublicationState, TransferPublicationStatus,
@@ -32,6 +33,12 @@ use smol::Unblock;
 use tokio_util::sync::CancellationToken;
 use url::Url;
 use workcell::{CatalogRevision, host_contract as contract};
+
+mod directory;
+
+pub(super) fn is_directory_publication(kind: &str) -> bool {
+    kind == directory::DIRECTORY_KIND
+}
 
 use super::{
     CursorRecord, MAX_HTTP_RESPONSE_BYTES, OCTET_STREAM, PreparedWorkspaceContext,
@@ -610,6 +617,9 @@ impl RemoteWorkcellClient {
         &self,
         operation: &RecoveryOperation,
     ) -> Result<(), RemoteWorkcellError> {
+        if operation.operation_kind == directory::DIRECTORY_KIND {
+            return self.recover_directory(operation).await;
+        }
         let publication_id = operation
             .publication_id
             .as_ref()
@@ -745,6 +755,42 @@ impl RemoteWorkcellClient {
 
 #[async_trait]
 impl WorkspaceTransferService for RemoteWorkcellClient {
+    fn supports_directory_publication(&self) -> bool {
+        self.transfer_capability()
+            .is_ok_and(|capability| capability.directory_publication)
+    }
+
+    async fn prepare_directory(
+        &self,
+        binding: &SessionWorkspaceBinding,
+        cursor: &WorkspaceCursor,
+        request: &DirectoryPublicationRequest,
+    ) -> Result<PreparedDirectoryPublication, WorkspaceError> {
+        self.prepare_directory_transfer(binding, cursor, request)
+            .await
+    }
+
+    async fn execute_directory(
+        &self,
+        prepared: &PreparedDirectoryPublication,
+    ) -> Result<OperationStatus<DirectoryPublicationStatus>, WorkspaceError> {
+        self.execute_directory_transfer(prepared).await
+    }
+
+    async fn directory_status(
+        &self,
+        prepared: &PreparedDirectoryPublication,
+    ) -> Result<DirectoryPublicationStatus, WorkspaceError> {
+        self.directory_transfer_status(prepared).await
+    }
+
+    async fn release_directory(
+        &self,
+        prepared: &PreparedDirectoryPublication,
+    ) -> Result<ReleaseResult, WorkspaceError> {
+        self.release_directory_transfer(prepared).await
+    }
+
     fn limits(&self) -> Result<TransferLimits, WorkspaceError> {
         let capability = self.transfer_capability()?;
         Ok(negotiated_limits(Some(capability)))

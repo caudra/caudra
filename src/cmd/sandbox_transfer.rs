@@ -125,6 +125,7 @@ pub(super) fn run(args: SandboxTransferArgs, state: &StateDir) -> Result<()> {
         configuration_revision: saved.saved().revision().clone(),
         local_root: args.local_root.clone(),
         remote_root: WorkspacePath::new(&args.remote_root)?,
+        attached_binding: None,
     };
     let paths = args
         .selected

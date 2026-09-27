@@ -13,11 +13,11 @@ The terminal UI, model connections, credentials and conversation state stay on t
 
 ## Compatibility and release status
 
-Caudra pins the published Workcell commit `3194bbb3c974b99cfbe147554a60f4ba3805fd9b`, including the reviewed-transfer contracts. This is a hard compatibility break with older remote contracts. Matching version labels alone do not establish compatibility. There is no raw-transfer fallback or automatic state migration.
+Caudra pins its Workcell dependency in `Cargo.toml`. Reviewed transfers require compatible remote contracts, and empty-directory publication requires its additional negotiated capability. Matching version labels alone do not establish compatibility. There is no raw-transfer fallback.
 
 Use compatible Caudra, e2b-libvirt and in-guest Workcell builds. Image manifests require `protocolVersion = "2026-07-28"`, `transferProtocol = "workcell-reviewed-v1"`, `remoteWorkspace = true` and `reviewedTransfer = true`. Caudra also validates workspace identity and the [required live capabilities](/docs/remote-workspaces/#prepare-the-server), including durable snapshots, reviewed publication and the complete operation lifecycle, before attachment. Doctor reads provider metadata but does not boot-test an image.
 
-Current persisted shapes are sandbox configuration and instance-store version `1`, remote workspace binding version `2`, remote operation journal version `5`, and transfer journal/archive version `2`. Lifecycle intents require explicit postcondition fields for their action: the requested policy and revision, or the requested lease with a minimum deadline when that lease is finite. Directory recovery metadata is required. Incompatible configuration, remote bindings, journal versions and incomplete intents fail without migration or rewriting their state. Inspect unresolved effects with the originating build before adopting a current workspace. Existing local embedded sessions still load, including sessions without a stored workspace binding.
+Current persisted shapes are sandbox configuration and instance-store version `1`, remote workspace binding version `2`, remote operation journal version `5`, and transfer journal/archive version `3`. File-only version `2` transfer records remain readable and are upgraded on a journal write. Existing version `2` archive pages remain readable. Other incompatible journal versions are refused. Lifecycle intents require explicit postcondition fields for their action: the requested policy and revision, or the requested lease with a minimum deadline when that lease is finite. Directory recovery metadata is required. Incompatible configuration, remote bindings and incomplete intents fail without rewriting their state. Inspect unresolved effects with the originating build before adopting a current workspace. Existing local embedded sessions still load, including sessions without a stored workspace binding.
 
 ## Configure and connect
 
@@ -46,7 +46,7 @@ caudra sandbox attach borrowed --provider local --instance INSTANCE_ID --cwd .
 caudra --sandbox borrowed
 ```
 
-Borrowing verifies identity without taking ownership of the disk. No files are copied by Create or Attach. An optional initial-seed root in the TUI Create form opens a separate transfer review after creation and verification.
+Borrowing verifies identity without taking ownership of the disk. No files are copied by Create or Attach. An optional initial-seed root in the TUI Create form is carried to the workbench Transfer view after you explicitly attach to the created sandbox. Upload still requires comparison, review and approval.
 
 ### Resume a conversation or VM
 
@@ -134,7 +134,7 @@ From the list or detail action context:
 | View | Actions |
 |------|---------|
 | Profiles | `n` New, `d` Duplicate, Delete stages profile deletion, `g` Network policies, `t` Transfer policies, `v` Create VM |
-| Instances | `a` Attach, `u` Resume, `p` Pause, `e` Extend, `g` Network, `t` Transfer, `r` Reconcile, `z` Cancel create, `f` Acknowledge failure, `d` Detach, Delete reviews disk deletion |
+| Instances | `a` Attach, `u` Resume, `p` Pause, `e` Extend, `g` Network, `r` Reconcile, `z` Cancel create, `f` Acknowledge failure, `d` Detach, Delete reviews disk deletion |
 | Providers | `h` Doctor, `k` lifecycle credential editor |
 | Images | `i` Import, `b` Build, `g` GC, `l` offline Inspect |
 
@@ -144,7 +144,7 @@ Live reviews bind to the displayed identity and revision. Enter alone does not a
 
 A control action on the current sandbox first saves, quiesces and detaches that runtime. Pause, Delete, Detach and failure acknowledgement leave it detached. A failed control also leaves it detached and recoverable, without switching tools to the host. Other runtime holders can still block the action.
 
-Closing the manager does not cancel an accepted lifecycle or image operation. Cancel create is a separate action and can race completion. The Transfer panel has its own Escape behavior: it requests cancellation and waits for worker cleanup. See [keybindings](/docs/keybindings/#sandbox-manager) and the controls below.
+Closing the manager does not cancel an accepted lifecycle or image operation. Cancel create is a separate action and can race completion. File transfers live in the [workbench Transfer view](/docs/workbench/#transfer). Leaving that view requests cancellation and waits for worker cleanup. Transfer-policy editing remains in Profiles.
 
 ## Images and template catalog
 
@@ -203,13 +203,15 @@ Both roots, the authenticated remote authority, file revisions, content digests 
 
 Transfers handle regular binary and text files with content and executable-bit metadata only. They do not follow symlinks, cross mounts or nested repositories, or copy devices, sockets, FIFOs, ownership, setuid bits, ACLs or xattrs. Protected names include `.env*`, repository metadata, credential stores and `.caudra` anywhere in the path. Gitignore and configured excludes add filtering, not authorization. Hidden files are considered by the inventory. Renaming secrets to an ordinary source filename is not content-based secret detection, so review every export.
 
+Copying empty directories requires negotiated directory-publication support on both ends. Unsupported directory effects are reported rather than replaced with shell commands or placeholder files. New directories use safe publisher defaults and do not copy source ownership or extended attributes.
+
 Selecting a remote workspace does not authorize arbitrary host writes. Compare and preview can ask for native read permissions. Execute consents to the displayed plan, then checks native permissions on both ends, including actual destination and new-parent effects. Normal deny rules still apply. Pulled files do not gain configuration or workflow trust merely because the transfer was approved.
 
 ### TUI transfer review
 
-Select a saved instance in `/sandbox instances` and press `t`. Enter both roots and press Enter to Compare. Use `s` for Seed, `p` for Push or `l` for Pull, then Space to select exact file rows. Changing direction clears the selection. `r` reviews the selection, `x` requests native permissions and executes that exact plan, `c` compares again, and `q` reconciles recorded outcomes.
+Attach to the sandbox, open `/workbench`, and select Transfer or press `Ctrl+X 4`. Choose both roots and Compare. The local and sandbox panes support linked or independent folder navigation, file and folder selection, change badges and read-only inspection. Upload maps to Push and Download maps to Pull. An initial-seed handoff uses create-only Seed semantics. The sandbox manager no longer contains a file-transfer mode.
 
-The review lists new files, overwrites and any required new directories. Text diffs use bounded prefixes and mark truncation. Binary previews report size and digest. A truncated overall review cannot be executed until you select fewer files. Changed roots, filters, source/destination revisions or instance state require a fresh review. Unsaved Caudra editor buffers block Pull. The CLI cannot inspect buffers in other editors, so save or close them separately.
+The review lists new files, overwrites and directory effects, including selected empty directories. Text diffs use bounded prefixes and mark truncation. Binary previews report size and digest. A truncated overall review cannot be executed until you select fewer entries. Changed roots, filters, source/destination revisions or instance state require a fresh review. Unsaved Caudra editor buffers block admission, and ordinary editing remains blocked until the transfer worker closes and drains. The CLI cannot inspect buffers in other editors, so save or close them separately.
 
 ### Exact CLI commands and prompts
 
@@ -239,9 +241,9 @@ Permission prompts can occur before and after plan consent. EOF, invalid or mism
 
 ### Partial outcomes and recovery
 
-Publication is journaled before effects and settled per file. Inspect result IDs, operation IDs, stopped reasons and deferred cleanup. A later conflict, cancellation or connection loss does not undo earlier confirmed files. Uploaded staging bytes alone are not a published file.
+Publication is journaled before effects and settled per operation. Inspect result IDs, operation IDs, stopped reasons and deferred cleanup. A later conflict, cancellation or connection loss does not undo earlier confirmed files or directories. Uploaded staging bytes alone are not a published file.
 
-Use `q` or `sandbox transfer reconcile` with the original roots to query recorded publication status. It does not resend uploads or publications. Records from other roots or authorities remain visible for recovery but are not reconciled against the wrong workspace. Unknown outcomes stay blocked. Matching current bytes alone do not prove whether an uncertain operation ran. Once recovery settles, Compare again and review any remaining work as a new plan.
+Use Reconcile in Transfer or `sandbox transfer reconcile` with the original roots to query recorded publication status. It does not resend uploads or publications. Records from other roots or authorities remain visible for recovery but are not reconciled against the wrong workspace. Unknown outcomes stay blocked. Matching current bytes alone do not prove whether an uncertain operation ran. Once recovery settles, Compare again and review any remaining work as a new plan.
 
 Keep the persistent client transfer journal and its archive pages. They retain operation receipts and last-confirmed transfer bases across restarts. Do not delete them to bypass recovery blocks. There is no transfer-specific force-acknowledgement command.
 
