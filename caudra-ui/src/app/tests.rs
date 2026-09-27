@@ -781,7 +781,7 @@ mod background_runtime {
     use caudra_workflow::{
         LaunchRequest, RunStatus, WorkflowEvent, WorkflowRequest, WorkflowResponse,
     };
-    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
     use futures_lite::future::poll_once;
     use serde_json::{Value, json};
     use test_case::test_case;
@@ -791,8 +791,11 @@ mod background_runtime {
     use crate::agent::shared_queue::QueueItem;
     use crate::agent::{AgentHandles, ModelSlot, QueuedMessage, reserve_background_transition};
     use crate::app::SubmitOutcome;
+    use crate::app::tasks::TaskActivity;
     use crate::chat::Chat;
+    use crate::components::status_bar::StatusBarHitTarget;
     use crate::components::{Action, DisplayRole, key};
+    use crate::repaint::{Dirty, expect::OWED};
 
     const PARENT: &str = "Implement the change and launch the independent audit.";
     const CHILD: &str = "Audit the implementation independently.";
@@ -1113,6 +1116,16 @@ mod background_runtime {
             };
             let request = fixture.compact().await;
             let before = fixture.handles.history.load_full();
+            while let Ok(envelope) = fixture.handles.agent_rx.try_recv() {
+                fixture.app.update(Msg::Agent(Box::new(envelope)));
+            }
+            assert_eq!(
+                fixture.app.task_activity(),
+                TaskActivity {
+                    agents: 1 + usize::from(with_workflow),
+                    shells: 0
+                }
+            );
             fixture.child.reply.send(final_response()).unwrap();
             background.notified().await;
             if let Some((run_id, child)) = workflow_child {
@@ -1134,6 +1147,7 @@ mod background_runtime {
             }
             assert_eq!(workflow.active_count(), 0);
             assert_eq!(background.active_count(), 0);
+            assert_eq!(fixture.app.task_activity(), TaskActivity::default());
             assert!(background.has_pending());
             assert!(fixture.handles.history.load().messages == before.messages);
             request
@@ -1592,6 +1606,147 @@ mod background_runtime {
             drop(admission);
             fixture.app.flush_task_controls().await;
             assert_eq!(background.status(&id).unwrap().state, before);
+            fixture.close().await;
+        }));
+    }
+
+    #[test_case(false; "main_idle")]
+    #[test_case(true; "child_view")]
+    fn activity_counts_runtime_admission_and_settlement_without_stale_chats(child_view: bool) {
+        smol::block_on(bounded(async {
+            let mut fixture = Fixture::after_final().await;
+            let runtime = fixture.handles.background.as_ref().unwrap().clone();
+            let task = runtime.list().remove(0);
+            let mut chats = fixture.app.chats.split_off(1);
+            assert_eq!(
+                fixture.app.task_activity(),
+                TaskActivity {
+                    agents: 1,
+                    shells: 0
+                }
+            );
+            assert_eq!(test_app().task_activity(), TaskActivity::default());
+            fixture.app.chats.append(&mut chats);
+            if child_view {
+                fixture.app.focus_task(&task.task_id).unwrap();
+            }
+            let active_chat = fixture.app.active_chat;
+            assert_eq!(fixture.app.status, Status::Idle);
+            assert!(super::rendered(&mut fixture.app).contains("[tasks · 1]"));
+            fixture.child.reply.send(final_response()).unwrap();
+            loop {
+                runtime.notified().await;
+                if !runtime.status(&task.task_id).unwrap().active() {
+                    break;
+                }
+            }
+            assert_eq!(fixture.app.task_activity(), TaskActivity::default());
+            assert_eq!(fixture.app.reconcile_tasks(), Dirty::YES, "{OWED}");
+            assert!(!super::rendered(&mut fixture.app).contains("[tasks ·"));
+            assert!(
+                fixture
+                    .app
+                    .status_hits
+                    .iter()
+                    .all(|hit| hit.target != StatusBarHitTarget::Tasks)
+            );
+            assert_eq!(fixture.app.active_chat, active_chat);
+            assert!(fixture.app.task_hint_text().is_some());
+            fixture.close().await;
+        }));
+    }
+
+    #[test_case(false, false; "main_shell")]
+    #[test_case(true, false; "child_owned_shell_in_child_chat")]
+    #[test_case(false, true; "stale_main_shell")]
+    #[test_case(true, true; "stale_child_shell")]
+    fn activity_shell_click_selects_live_details_without_switching_chat(child: bool, stale: bool) {
+        smol::block_on(bounded(async {
+            let mut fixture = Fixture::after_final().await;
+            let runtime = fixture.handles.background.as_ref().unwrap().clone();
+            let owner = runtime.list().remove(0);
+            let scope = if child {
+                fixture.app.focus_task(&owner.task_id).unwrap();
+                runtime.child_scope(&owner.invocation_id)
+            } else {
+                runtime.main_scope()
+            };
+            let card = scope
+                .admit_shell(
+                    ShellJobMetadata {
+                        call_id: SHELL_CALL.into(),
+                        root_call_id: SHELL_CALL.into(),
+                        command: SHELL_COMMAND.into(),
+                        workdir: ".".into(),
+                        timeout_ms: SHELL_TIMEOUT_MS,
+                        mode: "build".into(),
+                    },
+                    |cancel, _| async move {
+                        cancel.cancelled().await;
+                        ToolDoneEvent::error(SHELL_CALL.into(), SHELL_PROGRESS)
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                fixture.app.task_activity(),
+                TaskActivity {
+                    agents: 1,
+                    shells: 1
+                }
+            );
+            let index = fixture.app.active_chat;
+            let chats = fixture.app.chats.len();
+            let hit = super::status_hit(&mut fixture.app, StatusBarHitTarget::Shells);
+            fixture.app.update(super::mouse_event(
+                MouseEventKind::Moved,
+                hit.area.x,
+                hit.area.y,
+            ));
+            assert_eq!(fixture.app.status_hover, Some(StatusBarHitTarget::Shells));
+            if stale {
+                runtime.stop().await.unwrap();
+                assert_eq!(fixture.app.task_activity(), TaskActivity::default());
+            }
+            for kind in [
+                MouseEventKind::Down(MouseButton::Left),
+                MouseEventKind::Up(MouseButton::Left),
+            ] {
+                assert!(
+                    fixture
+                        .app
+                        .update(super::mouse_event(kind, hit.area.x, hit.area.y))
+                        .is_empty()
+                );
+            }
+            assert!(fixture.app.task_picker.is_open());
+            assert_eq!(fixture.app.status_hover, None);
+            assert_eq!(fixture.app.active_chat, index);
+            assert_eq!(fixture.app.chats.len(), chats);
+            assert_eq!(fixture.app.status, Status::Idle);
+            if stale {
+                assert_ne!(
+                    fixture.app.task_picker.selected_id().as_deref(),
+                    Some(card.task_id.as_str())
+                );
+            } else {
+                assert_eq!(
+                    fixture.app.task_picker.selected_id().as_deref(),
+                    Some(card.task_id.as_str())
+                );
+                assert!(super::rendered_wide(&mut fixture.app, 140).contains(SHELL_COMMAND));
+                assert!(runtime.status(&card.task_id).unwrap().active());
+                runtime.stop().await.unwrap();
+            }
+            fixture.app.task_picker.close();
+            assert_eq!(fixture.app.task_activity(), TaskActivity::default());
+            super::rendered(&mut fixture.app);
+            assert!(fixture.app.status_hits.iter().all(|hit| {
+                !matches!(
+                    hit.target,
+                    StatusBarHitTarget::Tasks | StatusBarHitTarget::Shells
+                )
+            }));
             fixture.close().await;
         }));
     }
@@ -6892,6 +7047,61 @@ fn clicking_the_goal_chip_opens_the_goal_modal() {
     assert!(click_status(&mut app, StatusBarHitTarget::Goal).is_empty());
 
     assert!(app.goal_modal.is_open());
+}
+
+#[test_case(false, false; "main")]
+#[test_case(true, false; "child")]
+#[test_case(false, true; "stale_main")]
+#[test_case(true, true; "stale_child")]
+fn activity_task_chip_opens_picker_and_clears_hover_in_any_chat(child: bool, stale: bool) {
+    let mut app = app_with_subagent();
+    if child {
+        app.focus_task(TASK_ID).unwrap();
+    }
+    let active_chat = app.active_chat;
+    let hit = status_hit(&mut app, StatusBarHitTarget::Tasks);
+    app.update(mouse_event(MouseEventKind::Moved, hit.area.x, hit.area.y));
+    assert_eq!(app.status_hover, Some(StatusBarHitTarget::Tasks));
+    if stale {
+        finish_subagent(&mut app, TASK_ID, false);
+    }
+    for kind in [
+        MouseEventKind::Down(MouseButton::Left),
+        MouseEventKind::Up(MouseButton::Left),
+    ] {
+        assert!(
+            app.update(mouse_event(kind, hit.area.x, hit.area.y))
+                .is_empty()
+        );
+    }
+    assert!(app.task_picker.is_open());
+    assert_eq!(app.active_chat, active_chat);
+    assert_eq!(app.status_hover, None);
+    assert!(app.task_hint_text().is_some());
+}
+
+#[test]
+fn activity_task_hits_clear_on_resize_and_completion_but_composer_hint_remains() {
+    let mut app = app_with_subagent();
+    status_hit(&mut app, StatusBarHitTarget::Tasks);
+    rendered_wide(&mut app, 1);
+    assert!(
+        app.status_hits
+            .iter()
+            .all(|hit| hit.target != StatusBarHitTarget::Tasks)
+    );
+    status_hit(&mut app, StatusBarHitTarget::Tasks);
+    finish_subagent(&mut app, TASK_ID, false);
+    assert_eq!(app.task_activity().agents, 0);
+    rendered(&mut app);
+    assert!(
+        app.status_hits
+            .iter()
+            .all(|hit| hit.target != StatusBarHitTarget::Tasks)
+    );
+    assert!(app.task_hint_text().is_some());
+    app.tasks_browse();
+    assert!(app.task_picker.is_open());
 }
 
 #[test]

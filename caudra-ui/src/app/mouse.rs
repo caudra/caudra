@@ -1082,6 +1082,14 @@ impl App {
                 self.goal_modal.open();
                 Vec::new()
             }
+            StatusBarHitTarget::Tasks => {
+                self.clear_control_hovers();
+                self.tasks_browse()
+            }
+            StatusBarHitTarget::Shells => {
+                self.clear_control_hovers();
+                self.shells_browse()
+            }
             StatusBarHitTarget::Context => {
                 self.clear_control_hovers();
                 self.execute_context("");

@@ -15,6 +15,7 @@ use caudra_config::ExecutionMode;
 use caudra_providers::project_messages;
 use caudra_storage::background::{JobKind, JobOwner};
 use caudra_storage::id::CaudraId;
+use caudra_workflow::{RosterState, RunSnapshot, RunStatus};
 use serde::Serialize;
 
 use crate::app::App;
@@ -98,6 +99,52 @@ pub(crate) struct TaskInfo {
     pub(crate) focused: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) runtime: Option<TaskCard>,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(super) struct TaskActivity {
+    pub(super) agents: usize,
+    pub(super) shells: usize,
+}
+
+impl TaskActivity {
+    fn new<'a>(
+        runtime: &[TaskCard],
+        workflows: &[RunSnapshot],
+        chats: impl Iterator<Item = TaskState<'a>>,
+    ) -> Self {
+        let mut tasks: HashMap<_, _> = runtime
+            .iter()
+            .map(|task| (task.task_id.as_str(), (task.kind.clone(), task.active())))
+            .collect();
+        for run in workflows {
+            for agent in &run.roster {
+                if let Some(id) = agent.task_id.as_deref() {
+                    tasks.entry(id).or_insert((
+                        JobKind::Agent,
+                        run.status == RunStatus::Active
+                            && matches!(agent.state, RosterState::Pending | RosterState::Running),
+                    ));
+                }
+            }
+        }
+        for chat in chats {
+            tasks
+                .entry(chat.id.as_ref())
+                .or_insert((JobKind::Agent, chat.status == TaskStatus::Working));
+        }
+        let mut activity = Self::default();
+        for (id, (kind, active)) in tasks {
+            if !active || id == MAIN_TASK_ID {
+                continue;
+            }
+            match kind {
+                JobKind::Agent => activity.agents += 1,
+                JobKind::Shell => activity.shells += 1,
+            }
+        }
+        activity
+    }
 }
 
 impl App {
@@ -369,6 +416,25 @@ impl App {
         })
     }
 
+    pub(super) fn task_activity(&self) -> TaskActivity {
+        let runtime = self
+            .background
+            .as_ref()
+            .map(BackgroundTasks::list)
+            .unwrap_or_default();
+        TaskActivity::new(
+            &runtime,
+            self.workflow.runs(),
+            self.chats.iter().filter_map(|chat| {
+                Some(TaskState {
+                    id: chat.task_id()?,
+                    name: &chat.name,
+                    status: chat.task_status(),
+                })
+            }),
+        )
+    }
+
     pub(crate) fn tasks(&self) -> Vec<TaskInfo> {
         let mut runtime = self
             .background
@@ -538,6 +604,20 @@ impl App {
         Vec::new()
     }
 
+    pub(super) fn shells_browse(&mut self) -> Vec<Action> {
+        let actions = self.tasks_browse();
+        if let Some(task) = self.background.as_ref().and_then(|runtime| {
+            runtime
+                .list()
+                .into_iter()
+                .find(|task| task.kind == JobKind::Shell && task.active())
+        }) {
+            self.task_picker.select(&task.task_id);
+            let _ = self.refresh_task_picker();
+        }
+        actions
+    }
+
     /// Keeps an open picker in step with the chats behind it.
     pub(crate) fn refresh_task_picker(&mut self) -> Dirty {
         if !self.task_picker.is_open() {
@@ -704,6 +784,125 @@ mod tests {
     const MISSING_ID: &str = "toolu_nope";
     const BUILD_NAME: &str = "build";
     const UNCHANGED_CHAT: usize = 2;
+
+    fn activity_card(id: &str, status: &str, kind: JobKind) -> TaskCard {
+        serde_json::from_value(serde_json::json!({
+            "task_id": id, "invocation_id": id, "call_id": id, "root_call_id": id,
+            "label": BUILD_NAME, "state": status, "kind": kind, "background": true,
+            "mode": "build", "generation": 1, "created_at": 0, "updated_at": 0
+        }))
+        .unwrap()
+    }
+
+    #[test_case("queued", true; "queued")]
+    #[test_case("running", true; "running")]
+    #[test_case("cancelling", true; "cancelling")]
+    #[test_case("succeeded", false; "succeeded")]
+    #[test_case("failed", false; "failed")]
+    #[test_case("cancelled", false; "cancelled")]
+    fn activity_counts_runtime_states_without_transcripts(status: &str, active: bool) {
+        let cards = [
+            activity_card(TASK_ID, status, JobKind::Agent),
+            activity_card(OTHER_ID, status, JobKind::Shell),
+        ];
+        assert_eq!(
+            TaskActivity::new(&cards, &[], std::iter::empty()),
+            TaskActivity {
+                agents: usize::from(active),
+                shells: usize::from(active),
+            }
+        );
+    }
+
+    #[test_case("running", TaskStatus::Working, 1; "deduplicate")]
+    #[test_case("cancelled", TaskStatus::Working, 0; "runtime_overrides_stale_chat")]
+    #[test_case("running", TaskStatus::Done, 1; "resumed_runtime_overrides_finished_chat")]
+    fn activity_counts_prefer_runtime(status: &str, chat_status: TaskStatus, agents: usize) {
+        let id = Arc::from(TASK_ID);
+        let cards = [activity_card(TASK_ID, status, JobKind::Agent)];
+        let chats = [state(&id, chat_status), state(&id, chat_status)];
+        assert_eq!(
+            TaskActivity::new(&cards, &[], chats.into_iter()),
+            TaskActivity { agents, shells: 0 }
+        );
+    }
+
+    #[test]
+    fn activity_counts_merge_foreground_chats_and_mixed_shell_owners() {
+        let main = Arc::from(MAIN_TASK_ID);
+        let task = Arc::from(TASK_ID);
+        let finished = Arc::from(ERROR_ID);
+        let mut child_shell = activity_card(OTHER_ID, "cancelling", JobKind::Shell);
+        child_shell.owner = JobOwner::Child {
+            invocation_id: TASK_ID.into(),
+        };
+        let cards = [
+            child_shell,
+            activity_card(MISSING_ID, "queued", JobKind::Shell),
+        ];
+        let chats = [
+            state(&main, TaskStatus::Working),
+            state(&task, TaskStatus::Working),
+            state(&finished, TaskStatus::Error),
+        ];
+        assert_eq!(
+            TaskActivity::new(&cards, &[], chats.into_iter()),
+            TaskActivity {
+                agents: 1,
+                shells: 2
+            }
+        );
+        assert_eq!(
+            TaskActivity::new(&[], &[], std::iter::empty()),
+            TaskActivity::default()
+        );
+    }
+
+    #[test_case(RosterState::Pending, true; "queued_agent")]
+    #[test_case(RosterState::Running, true; "running_agent")]
+    #[test_case(RosterState::Completed, false; "completed_agent")]
+    #[test_case(RosterState::Failed, false; "failed_agent")]
+    #[test_case(RosterState::Cancelled, false; "cancelled_agent")]
+    fn activity_counts_workflow_agents_not_runs(status: RosterState, active: bool) {
+        let mut run: RunSnapshot = serde_json::from_value(serde_json::json!({
+            "run_id": OTHER_ID, "display_name": BUILD_NAME, "workflow_name": BUILD_NAME,
+            "source_kind": "builtin", "status": "active", "revision": 1,
+            "execution_epoch": 1, "agent_budget": 1, "created_at": 0, "updated_at": 0,
+            "roster": [{
+                "call_key": 1, "label": BUILD_NAME, "task_id": TASK_ID,
+                "state": status, "tokens_used": 0, "duration_ms": 0
+            }]
+        }))
+        .unwrap();
+        let id = Arc::from(TASK_ID);
+        let count = |run: &RunSnapshot, runtime: &[TaskCard]| {
+            TaskActivity::new(
+                runtime,
+                std::slice::from_ref(run),
+                [state(&id, TaskStatus::Working)].into_iter(),
+            )
+        };
+        assert_eq!(count(&run, &[]).agents, usize::from(active));
+        let terminal = [activity_card(TASK_ID, "cancelled", JobKind::Agent)];
+        assert_eq!(count(&run, &terminal), TaskActivity::default());
+        for status in [
+            RunStatus::Paused,
+            RunStatus::BudgetLimited,
+            RunStatus::Interrupted,
+            RunStatus::Completed,
+            RunStatus::Cancelled,
+            RunStatus::Failed,
+        ] {
+            run.status = status;
+            assert_eq!(count(&run, &[]), TaskActivity::default());
+        }
+        run.status = RunStatus::Active;
+        run.roster.clear();
+        assert_eq!(
+            TaskActivity::new(&[], &[run], std::iter::empty()),
+            TaskActivity::default()
+        );
+    }
 
     fn app_with_two_subagents() -> App {
         let mut app = app_with_subagent_id(TASK_ID);

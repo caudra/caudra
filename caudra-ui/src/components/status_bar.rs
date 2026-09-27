@@ -25,6 +25,8 @@ const TRUNCATE_PREFIX: &str = "..";
 const HOME_ABBREVIATION: &str = "~";
 const CWD_MODEL_SEPARATOR: &str = "  ";
 const BACK_TO_MAIN_LABEL: &str = "[< Main]";
+const TASKS_LABEL: &str = "tasks";
+const SHELLS_LABEL: &str = "shell";
 /// Replaces the countdown under the pointer: the control has to say what a
 /// click does, and the seconds left stop mattering once you mean to skip them.
 const RETRY_NOW_LABEL: &str = " · retry now";
@@ -152,6 +154,8 @@ pub enum StatusBarHitTarget {
     Model,
     Thinking,
     Goal,
+    Tasks,
+    Shells,
     Context,
     Usage,
     Workflows,
@@ -190,6 +194,8 @@ impl StatusBarHitTarget {
             | Self::Cwd
             | Self::ResumeAutoScroll
             | Self::Yolo
+            | Self::Tasks
+            | Self::Shells
             | Self::Sandbox => ChatScope::Any,
             Self::Mode
             | Self::Model
@@ -274,6 +280,8 @@ pub struct StatusBarContext<'a> {
     pub yolo: bool,
     pub restoring: bool,
     pub goal: Option<&'a GoalSnapshot>,
+    pub active_tasks: usize,
+    pub active_shells: usize,
     /// The composer is running a shell line, so the chip names bash rather than
     /// a mode and there is nothing for a click to toggle.
     pub bash_input: bool,
@@ -910,6 +918,25 @@ impl StatusBar {
             (offset, width)
         });
 
+        let mut activity_hits = Vec::new();
+        for (count, label, target) in [
+            (ctx.active_tasks, TASKS_LABEL, StatusBarHitTarget::Tasks),
+            (ctx.active_shells, SHELLS_LABEL, StatusBarHitTarget::Shells),
+        ] {
+            if count == 0 {
+                continue;
+            }
+            let label = format!("[{label} · {count}]");
+            let offset = left_spans.iter().map(Span::width).sum::<usize>() + " ".width();
+            let width = label.width();
+            left_spans.push(Span::raw(" "));
+            left_spans.push(Span::styled(
+                label,
+                hover_style(theme::current().status_notice, ctx.hovered == Some(target)),
+            ));
+            activity_hits.push((target, offset, width));
+        }
+
         let mut retry_hit = ctx.retry_info.map(|retry| {
             let hovered = ctx.hovered == Some(StatusBarHitTarget::Retry);
             let countdown = if hovered {
@@ -957,6 +984,9 @@ impl StatusBar {
             resume_hit =
                 resume_hit.map(|(offset, width)| (offset.saturating_sub(short_saving), width));
             goal_hit = goal_hit.map(|(offset, width)| (offset.saturating_sub(short_saving), width));
+            for (_, offset, _) in &mut activity_hits {
+                *offset = offset.saturating_sub(short_saving);
+            }
             retry_hit =
                 retry_hit.map(|(offset, width)| (offset.saturating_sub(short_saving), width));
         }
@@ -1015,6 +1045,9 @@ impl StatusBar {
         );
         for (target, offset, width) in right_hits {
             push_hit(&mut hits, ctx, right_area, offset, width, target);
+        }
+        for (target, offset, width) in activity_hits {
+            push_hit(&mut hits, ctx, left_area, offset, width, target);
         }
         if let Some((offset, width)) = goal_hit {
             push_hit(
@@ -1786,6 +1819,8 @@ mod tests {
         hovered: Option<StatusBarHitTarget>,
         hover_hint: Option<&'a str>,
         goal: Option<&'a GoalSnapshot>,
+        active_tasks: usize,
+        active_shells: usize,
         retry_info: Option<&'a RetryInfo>,
         workflows: Option<WorkflowChip>,
         main_chat: bool,
@@ -1807,6 +1842,8 @@ mod tests {
                 hovered: None,
                 hover_hint: None,
                 goal: None,
+                active_tasks: 0,
+                active_shells: 0,
                 retry_info: None,
                 workflows: None,
                 main_chat: true,
@@ -1829,6 +1866,8 @@ mod tests {
             hovered,
             hover_hint,
             goal,
+            active_tasks,
+            active_shells,
             retry_info,
             workflows,
             main_chat,
@@ -1871,6 +1910,8 @@ mod tests {
             yolo,
             restoring: false,
             goal,
+            active_tasks,
+            active_shells,
             bash_input: false,
             hovered,
             hover_hint,
@@ -1936,6 +1977,8 @@ mod tests {
             yolo: true,
             restoring: false,
             goal: None,
+            active_tasks: 0,
+            active_shells: 0,
             bash_input: false,
             hovered: None,
             hover_hint: None,
@@ -2661,6 +2704,120 @@ mod tests {
         assert!(chip.starts_with(GOAL_CHIP_PREFIX), "{chip}");
         assert!(chip.ends_with(']'), "{chip}");
         assert_eq!(text.chars().nth(usize::from(hit.area.x) - 1), Some(' '));
+    }
+
+    #[test_case(0, 0; "empty")]
+    #[test_case(1, 0; "tasks_only")]
+    #[test_case(0, 1; "shells_only")]
+    #[test_case(9, 10; "mixed_digits")]
+    #[test_case(100, 99; "three_digits")]
+    fn activity_chips_have_independent_counts_and_exact_hits(tasks: usize, shells: usize) {
+        for main_chat in [true, false] {
+            let (text, hits, _) = render_at(Fixture {
+                active_tasks: tasks,
+                active_shells: shells,
+                main_chat,
+                ..Default::default()
+            });
+            for (count, label, target) in [
+                (tasks, TASKS_LABEL, StatusBarHitTarget::Tasks),
+                (shells, SHELLS_LABEL, StatusBarHitTarget::Shells),
+            ] {
+                let hit = hits.iter().find(|hit| hit.target == target);
+                assert_eq!(hit.is_some(), count > 0);
+                assert_eq!(target.scope(), ChatScope::Any);
+                if let Some(hit) = hit {
+                    assert_eq!(bar_glyphs(&text, hit), format!("[{label} · {count}]"));
+                    assert_eq!(text.chars().nth(usize::from(hit.area.x) - 1), Some(' '));
+                } else {
+                    assert!(!text.contains(&format!("[{label} ·")));
+                }
+            }
+        }
+    }
+
+    #[test_case(StatusBarHitTarget::Tasks; "tasks")]
+    #[test_case(StatusBarHitTarget::Shells; "shells")]
+    fn activity_chips_keep_notice_style_and_hover_in_any_chat(target: StatusBarHitTarget) {
+        for main_chat in [true, false] {
+            for hovered in [None, Some(target)] {
+                let (_, hits, styles) = render_at(Fixture {
+                    active_tasks: 1,
+                    active_shells: 1,
+                    main_chat,
+                    hovered,
+                    ..Default::default()
+                });
+                let hit = hits.iter().find(|hit| hit.target == target).unwrap();
+                let start = usize::from(hit.area.x);
+                let end = usize::from(hit.area.right());
+                assert!(!styles[start - 1].add_modifier.contains(Modifier::REVERSED));
+                for style in &styles[start..end] {
+                    assert_eq!(style.fg, theme::current().status_notice.fg);
+                    assert_eq!(
+                        style.add_modifier.contains(Modifier::REVERSED),
+                        hovered.is_some()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test_case(false; "plain")]
+    #[test_case(true; "goal_retry_workflows_sandbox")]
+    fn activity_hits_follow_mode_shortening_and_never_claim_clipped_chips(crowded: bool) {
+        let goal = active_goal();
+        let retry = RetryInfo {
+            message: RETRY_MESSAGE.into(),
+            deadline: Instant::now() + RETRY_REMAINING,
+            attempt: RETRY_ATTEMPT,
+        };
+        let mut shortened = false;
+        for width in 0..=240 {
+            let (text, hits, _) = render_at(Fixture {
+                width,
+                active_tasks: 10,
+                active_shells: 2,
+                goal: crowded.then_some(&goal),
+                retry_info: crowded.then_some(&retry),
+                workflows: crowded.then(ladder_workflows).flatten(),
+                sandbox: crowded.then_some(SANDBOX_NAME),
+                ..Default::default()
+            });
+            for (target, label, count) in [
+                (StatusBarHitTarget::Tasks, TASKS_LABEL, 10),
+                (StatusBarHitTarget::Shells, SHELLS_LABEL, 2),
+            ] {
+                let label = format!("[{label} · {count}]");
+                if let Some(hit) = hits.iter().find(|hit| hit.target == target) {
+                    assert_eq!(bar_glyphs(&text, hit), label);
+                    assert!(hit.area.right() <= width);
+                    shortened |= text.contains(MODE_SHORT_LABEL);
+                    assert!(
+                        hits.iter()
+                            .filter(|other| other.target != target)
+                            .all(|other| { other.area.intersection(hit.area).is_empty() })
+                    );
+                } else {
+                    assert!(!text.contains(&label), "{MISSING_HIT_MSG}");
+                }
+            }
+            if width == 240 && crowded {
+                for target in [
+                    StatusBarHitTarget::Goal,
+                    StatusBarHitTarget::Tasks,
+                    StatusBarHitTarget::Shells,
+                    StatusBarHitTarget::Retry,
+                    StatusBarHitTarget::Workflows,
+                    StatusBarHitTarget::Sandbox,
+                ] {
+                    assert!(hits.iter().any(|hit| hit.target == target), "{target:?}");
+                }
+                assert!(text.find(GOAL_CHIP_PREFIX) < text.find("[tasks ·"));
+                assert!(text.find("[tasks ·") < text.find("[shell ·"));
+            }
+        }
+        assert!(shortened, "{NO_SHORT_MODE_MSG}");
     }
 
     /// The label is the whole control: the space ahead of it separates it from

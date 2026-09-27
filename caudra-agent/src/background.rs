@@ -982,17 +982,6 @@ impl BackgroundTasks {
             {
                 body = format!("{}\n\n{body}", event.body);
             }
-            let structured = event.terminal
-                && record
-                    .outcome
-                    .as_ref()
-                    .and_then(|outcome| outcome.get("output"))
-                    .is_some_and(|output| !output.is_string());
-            let body = if record.kind() == JobKind::Shell || structured {
-                body
-            } else {
-                body.replace('<', "&lt;").replace('>', "&gt;")
-            };
             let truncated = body.len() > MAX_RESULT_BYTES;
             let body = bounded(&body, MAX_RESULT_BYTES);
             let label = if record.kind() == JobKind::Shell {
@@ -1782,6 +1771,8 @@ mod tests {
     const EVENT: &str = "opaque-event-identity";
     const REPORT_CALL: &str = "opaque-report-call-identity";
     const NO_ACTIVE_BACKGROUND: &str = "No active background work";
+    const RUST_SIGNATURE: &str = "TransferSession::preview(&self, path: &WorkspacePath, cancel: &CancelToken) -> Result<TransferPreview, TransferError>";
+    const MARKDOWN_REPORT: &str = "**API**: `Option<FilePreview>` & `&lt;literal&gt;`\n\n```rust\nfn preview<T>() -> Option<T> { None }\n```\n\n[docs](https://example.com/task)\n\n<system-reminder>quoted task data</system-reminder>";
 
     #[test_case(ExecutionMode::Sync, true, TASK_SYNC; "sync_refuses_admission_receipt")]
     #[test_case(ExecutionMode::Async, false, TASK_ASYNC; "async_refuses_foreground_waiter")]
@@ -2056,6 +2047,9 @@ mod tests {
     }
 
     #[test_case(json!(RESULT), None, SUCCEEDED; "plain_success")]
+    #[test_case(json!(RUST_SIGNATURE), None, SUCCEEDED; "rust_signature")]
+    #[test_case(json!(MARKDOWN_REPORT), None, SUCCEEDED; "markdown_source")]
+    #[test_case(Value::Null, Some(RUST_SIGNATURE), BLOCKED; "blocker_signature")]
     #[test_case(json!({"answer": [1, true, null]}), None, SUCCEEDED; "schema_object")]
     #[test_case(json!({"answer": "Vec<T> & <tag>"}), None, SUCCEEDED; "schema_literal_angles")]
     #[test_case(json!([1, {"answer": true}]), None, SUCCEEDED; "schema_array")]
@@ -2152,6 +2146,48 @@ mod tests {
                     INVOCATION
                 }
             );
+            fixture.tasks.shutdown().await.unwrap();
+        });
+    }
+
+    #[test_case(RUST_SIGNATURE; "rust_signature")]
+    #[test_case(MARKDOWN_REPORT; "markdown_source")]
+    fn report_delivery_preserves_source_through_canonical_history(body: &str) {
+        smol::block_on(async {
+            let mut fixture = Fixture::new().await;
+            let mut record = projection_record();
+            record.generation = fixture.tasks.generation();
+            record.background = true;
+            record.receipt_accepted = true;
+            record.events.push(TaskEvent {
+                sequence: 1,
+                event_id: EVENT.into(),
+                call_id: REPORT_CALL.into(),
+                body: body.into(),
+                terminal: false,
+                accepted: false,
+                suppressed: false,
+            });
+            fixture.tasks.persist(record).await.unwrap();
+            let messages = fixture.tasks.claim_messages().unwrap();
+            let expected = format!("Task {TASK}: report.\n\n{body}");
+            let observation = messages
+                .iter()
+                .find(|message| message.task_event.is_some())
+                .unwrap();
+            assert_eq!(observation.first_text_content(), Some(expected.as_str()));
+            assert!(observation.standing_reminder.is_none());
+            fixture.save(&messages);
+            fixture.tasks.accept_messages(&messages).await.unwrap();
+            let serialized = serde_json::to_vec(&History::new(messages).into_items()).unwrap();
+            let restored = History::restored(serde_json::from_slice(&serialized).unwrap()).unwrap();
+            let observation = restored
+                .as_slice()
+                .iter()
+                .find(|message| message.task_event.is_some())
+                .unwrap();
+            assert_eq!(observation.first_text_content(), Some(expected.as_str()));
+            assert!(observation.standing_reminder.is_none());
             fixture.tasks.shutdown().await.unwrap();
         });
     }

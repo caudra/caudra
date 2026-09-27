@@ -653,6 +653,7 @@ impl App {
                     .as_deref()
                     .unwrap_or(&self.state.applied_model)
             });
+        let activity = self.task_activity();
         let ctx = StatusBarContext {
             status: &self.status,
             mode,
@@ -700,6 +701,8 @@ impl App {
             yolo: self.permissions.is_yolo(),
             restoring: self.restoring.load(Ordering::Relaxed),
             goal: goal.as_ref(),
+            active_tasks: activity.agents,
+            active_shells: activity.shells,
             bash_input: self.is_bash_input(),
             hovered: (!self.has_modal_overlay())
                 .then_some(self.status_hover)

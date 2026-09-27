@@ -363,9 +363,10 @@ pub(crate) fn has_active(output: &ToolOutput) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{delivery, markdown_body, render};
-    use crate::components::code_view::RowTarget;
-    use caudra_agent::TaskCard;
-    use caudra_providers::TaskEventOrigin;
+    use crate::chat::history_to_display;
+    use crate::components::{DisplayRole, code_view::RowTarget};
+    use caudra_agent::{History, TaskCard};
+    use caudra_providers::{Message, TaskEventOrigin};
     use caudra_storage::background::{JobKind, ShellJobMetadata};
     use ratatui::{style::Modifier, text::Line};
     use serde_json::{Value, json};
@@ -374,6 +375,10 @@ mod tests {
 
     const LINK: &str = "https://example.com/task";
     const MARKDOWN: &str = "# Findings\n\n**Strong** and `code` with [docs](https://example.com/task).\n\n- first\n- second\n\n```rust\nlet value = 1;\n```\n\n| Name | Value |\n| --- | --- |\n| a | b |";
+    const RUST_SIGNATURE: &str = "TransferSession::preview(&self, path: &WorkspacePath, cancel: &CancelToken) -> Result<TransferPreview, TransferError>";
+    const INLINE_TYPE: &str = "Option<FilePreview>";
+    const CODE: &str = "fn preview<T>() -> Option<T> { None }";
+    const LITERAL_ENTITIES: &str = "&lt;literal&gt;";
 
     fn text(lines: &[Line<'_>]) -> String {
         lines
@@ -487,6 +492,60 @@ mod tests {
                 .all(|span| !span.content.chars().any(char::is_control))
         }));
         assert!(links.is_aligned(&lines));
+    }
+
+    #[test_case(false; "live")]
+    #[test_case(true; "restored")]
+    fn task_delivery_preserves_rust_syntax_and_literal_entities(restored: bool) {
+        let origin = TaskEventOrigin {
+            task_id: "readable-task".into(),
+            invocation_id: "private-invocation".into(),
+            event_id: "private-event".into(),
+        };
+        let source = format!(
+            "Task readable-task: report.\n\n**API**: {RUST_SIGNATURE}\n\n`{INLINE_TYPE}` & `{LITERAL_ENTITIES}`\n\n```rust\n{CODE}\n```\n\n[docs]({LINK})"
+        );
+        let items = History::new(vec![Message::task_observation(
+            source.clone(),
+            origin.clone(),
+        )])
+        .into_items();
+        let items = if restored {
+            serde_json::from_slice(&serde_json::to_vec(&items).unwrap()).unwrap()
+        } else {
+            items
+        };
+        let (messages, pending) =
+            history_to_display(&items, &Default::default(), &Default::default(), false);
+        assert!(pending.is_empty());
+        assert_eq!(messages.len(), 1);
+        let message = &messages[0];
+        assert_eq!(message.text, source);
+        let DisplayRole::TaskDelivery(actual_origin) = &message.role else {
+            panic!("expected attributed task delivery");
+        };
+        assert_eq!(actual_origin.as_ref(), &origin);
+        let (lines, links) = delivery(actual_origin, &message.text, 200);
+        let shown = text(&lines);
+        for expected in [
+            RUST_SIGNATURE,
+            INLINE_TYPE,
+            CODE,
+            LITERAL_ENTITIES,
+            "open chat",
+        ] {
+            assert!(shown.contains(expected), "missing {expected}: {shown}");
+        }
+        assert!(!shown.contains("**API**"));
+        assert!(!shown.contains("private-"));
+        assert!(links.is_aligned(&lines));
+        assert!(
+            links
+                .rows
+                .iter()
+                .flatten()
+                .any(|link| link.as_deref() == Some(LINK))
+        );
     }
 
     #[test_case(false; "card")]
