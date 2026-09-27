@@ -2695,8 +2695,9 @@ mod tests {
     /// Both sources share one `tool_search`, and the request builds it by
     /// running built-in deferral first. Whichever ran first used to claim the
     /// name and leave the other's tools uncatalogued.
-    #[test]
-    fn a_builtin_catalog_does_not_hide_the_deferred_mcp_tools() {
+    #[test_case(true; "builtin_exhausted_first")]
+    #[test_case(false; "mcp_exhausted_first")]
+    fn a_builtin_catalog_does_not_hide_the_deferred_mcp_tools(builtin_first: bool) {
         let defs = vec![
             tool_def("srv", "alpha", "", json!({})),
             tool_def("srv", "beta", "", json!({})),
@@ -2712,21 +2713,50 @@ mod tests {
             std::iter::empty(),
         );
 
-        let mut tools = json!([]);
-        let mut sections: Vec<String> = builtin
-            .request_snapshot()
-            .extend_declared(&mut tools)
-            .into_iter()
-            .collect();
-        sections.extend(handle.request_snapshot().extend_declared(&mut tools));
-        crate::tools::deferral::push_catalog(&mut tools, &sections);
+        for (builtin_loaded, mcp_loaded, search_count) in [
+            (false, false, 1),
+            (builtin_first, !builtin_first, 1),
+            (true, true, 0),
+        ] {
+            if builtin_loaded {
+                builtin.mark_loaded(BUILTIN_DEFERRED);
+            }
+            if mcp_loaded {
+                for name in ["srv.alpha", "srv.beta", "srv.gamma"] {
+                    handle.mark_loaded(name);
+                }
+            }
 
-        assert_eq!(tool_names(&tools), vec![TOOL_SEARCH_TOOL_NAME]);
-        let description = tools.as_array().unwrap()[0]["description"]
-            .as_str()
-            .unwrap();
-        assert!(description.contains(BUILTIN_DEFERRED), "got: {description}");
-        assert!(description.contains("srv: alpha"), "got: {description}");
+            let mut tools = json!([]);
+            let mut sections: Vec<String> = builtin
+                .request_snapshot()
+                .extend_declared(&mut tools)
+                .into_iter()
+                .collect();
+            sections.extend(handle.request_snapshot().extend_declared(&mut tools));
+            crate::tools::deferral::push_catalog(&mut tools, &sections);
+
+            let catalogs: Vec<_> = tools
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|tool| tool["name"] == TOOL_SEARCH_TOOL_NAME)
+                .collect();
+            assert_eq!(catalogs.len(), search_count);
+            for catalog in catalogs {
+                let description = catalog["description"].as_str().unwrap();
+                assert_eq!(
+                    description.contains(BUILTIN_DEFERRED),
+                    !builtin_loaded,
+                    "got: {description}"
+                );
+                assert_eq!(
+                    description.contains("srv:"),
+                    !mcp_loaded,
+                    "got: {description}"
+                );
+            }
+        }
     }
 
     /// A plugin or server owning the name is a real conflict, unlike the two

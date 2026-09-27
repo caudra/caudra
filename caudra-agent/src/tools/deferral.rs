@@ -442,6 +442,12 @@ fn haystack(definition: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::template::Vars;
+    use crate::tools::{
+        DescriptionContext, ToolAudience, ToolDefinitions, ToolEffect, ToolFilter, ToolRegistry,
+        ToolSource, WORKFLOW_TOOL_NAME,
+        native::{OWNER, workflow::WorkflowTool},
+    };
     use test_case::test_case;
 
     const GRAPH: &str = "code_graph";
@@ -505,6 +511,126 @@ mod tests {
 
     fn lonely(description: &str) -> DeferralSession {
         DeferralSession::new(vec![tool(LONELY, None, description)], std::iter::empty())
+    }
+
+    fn workflow_definitions(
+        config: &AgentConfig,
+        deferral: BuiltinDeferral,
+        audience: ToolAudience,
+    ) -> ToolDefinitions {
+        let registry = ToolRegistry::new();
+        registry
+            .register_audited(
+                Arc::new(WorkflowTool),
+                ToolSource::Native {
+                    owner: OWNER.into(),
+                    contract: WORKFLOW_TOOL_NAME.into(),
+                    trusted: true,
+                },
+                ToolEffect::Orchestrator,
+            )
+            .unwrap();
+        let model = Model::from_spec(FAST_SPEC).unwrap();
+        let filter = ToolFilter::from_config(config, &model, &[]);
+        registry.definitions_split(
+            &Vars::new(),
+            &DescriptionContext {
+                filter: &filter,
+                audience,
+                workflows_available: true,
+            },
+            false,
+            &deferred_names(&config.allowed_tools, deferral),
+        )
+    }
+
+    #[test_case(false ; "workflow_only")]
+    #[test_case(true ; "another_tool_pending")]
+    fn workflow_loads_independently_and_updates_the_catalog(other_pending: bool) {
+        let mut definitions = workflow_definitions(
+            &AgentConfig::default(),
+            BuiltinDeferral::Lazy,
+            ToolAudience::MAIN,
+        );
+        assert!(names(&definitions.declared).is_empty());
+        assert_eq!(definitions.deferred.len(), 1);
+        let expected = definitions.deferred[0].definition.clone();
+        if other_pending {
+            definitions
+                .deferred
+                .push(tool(LONELY, None, LONELY_DESCRIPTION));
+        }
+        let session = DeferralSession::new(definitions.deferred, std::iter::empty());
+        let mut tools = definitions.declared.clone();
+        session.request_snapshot().extend_tools(&mut tools);
+        assert_eq!(names(&tools), [TOOL_SEARCH_TOOL_NAME]);
+        assert!(catalog_description(&session).contains(WORKFLOW_TOOL_NAME));
+
+        let outcome = session.search(WORKFLOW_TOOL_NAME).unwrap();
+        assert_eq!(outcome.loaded, [Arc::from(WORKFLOW_TOOL_NAME)]);
+        let mut tools = definitions.declared;
+        session.request_snapshot().extend_tools(&mut tools);
+        assert_eq!(tools[0], expected);
+        if other_pending {
+            assert_eq!(names(&tools), [WORKFLOW_TOOL_NAME, TOOL_SEARCH_TOOL_NAME]);
+            let description = catalog_description(&session);
+            assert!(!description.contains(WORKFLOW_TOOL_NAME));
+            assert!(description.contains(LONELY));
+        } else {
+            assert_eq!(names(&tools), [WORKFLOW_TOOL_NAME]);
+        }
+    }
+
+    #[test_case(BuiltinDeferral::EagerByClass, false ; "eager_by_model")]
+    #[test_case(BuiltinDeferral::EagerByConfig, false ; "eager_by_config")]
+    #[test_case(BuiltinDeferral::Lazy, true ; "explicitly_allowed")]
+    fn workflow_respects_eager_overrides(deferral: BuiltinDeferral, explicitly_allowed: bool) {
+        let config = AgentConfig {
+            allowed_tools: if explicitly_allowed {
+                vec![WORKFLOW_TOOL_NAME.into()]
+            } else {
+                Vec::new()
+            },
+            ..Default::default()
+        };
+        let definitions = workflow_definitions(&config, deferral, ToolAudience::MAIN);
+        assert!(definitions.deferred.is_empty());
+        let mut tools = definitions.declared;
+        DeferralSession::new(definitions.deferred, std::iter::empty())
+            .request_snapshot()
+            .extend_tools(&mut tools);
+        assert_eq!(names(&tools), [WORKFLOW_TOOL_NAME]);
+    }
+
+    #[test_case(ToolAudience::MAIN, true, false ; "disabled")]
+    #[test_case(ToolAudience::MAIN, false, true ; "filtered_out")]
+    #[test_case(ToolAudience::GENERAL_SUB, false, false ; "general_subagent")]
+    #[test_case(ToolAudience::RESEARCH_SUB, false, false ; "research_subagent")]
+    fn excluded_workflow_does_not_create_a_catalog(
+        audience: ToolAudience,
+        disabled: bool,
+        filtered: bool,
+    ) {
+        let config = AgentConfig {
+            disabled_tools: if disabled {
+                vec![WORKFLOW_TOOL_NAME.into()]
+            } else {
+                Vec::new()
+            },
+            allowed_tools: if filtered {
+                vec![MAP.into()]
+            } else {
+                Vec::new()
+            },
+            ..Default::default()
+        };
+        let definitions = workflow_definitions(&config, BuiltinDeferral::Lazy, audience);
+        assert!(definitions.deferred.is_empty());
+        let mut tools = definitions.declared;
+        DeferralSession::new(definitions.deferred, std::iter::empty())
+            .request_snapshot()
+            .extend_tools(&mut tools);
+        assert!(names(&tools).is_empty());
     }
 
     /// The catalog is what the model reads when deciding to spend a load, so
@@ -696,5 +822,21 @@ mod tests {
         let mut tools = json!([{ "name": MAP }]);
         session.request_snapshot().extend_tools(&mut tools);
         assert_eq!(names(&tools), [MAP, REFS, TOOL_SEARCH_TOOL_NAME]);
+    }
+
+    #[test_case(false ; "no_deferred_tools")]
+    #[test_case(true ; "all_candidates_already_declared")]
+    fn no_catalog_is_added_when_nothing_can_be_loaded(already_declared: bool) {
+        let session = if already_declared {
+            session()
+        } else {
+            DeferralSession::default()
+        };
+        let mut tools = json!([{ "name": MAP }, { "name": REFS }, { "name": LONELY }]);
+        let expected = tools.clone();
+
+        session.request_snapshot().extend_tools(&mut tools);
+
+        assert_eq!(tools, expected, "{NOTHING_DEFERRED}");
     }
 }

@@ -241,6 +241,7 @@ pub const DEFERRED_BUILTIN_TOOLS: &[DeferredBuiltin] = &[
     DeferredBuiltin::alone("execution_environment"),
     DeferredBuiltin::alone("image_generate"),
     DeferredBuiltin::alone("python_execution"),
+    DeferredBuiltin::alone("workflow"),
 ];
 
 pub struct DeferredBuiltin {
