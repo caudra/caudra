@@ -6,6 +6,8 @@
 mod binary;
 mod catalog;
 mod diff;
+#[cfg(unix)]
+mod directory_publication;
 mod error;
 mod gitignore;
 mod glob;
@@ -36,6 +38,8 @@ pub use binary::{
 #[cfg(feature = "mcp")]
 pub use catalog::catalog;
 pub use catalog::specs;
+#[cfg(unix)]
+pub use directory_publication::{DirectoryPublicationStaging, PreparedDirectoryPublication};
 pub use error::FilesystemError;
 pub use group::FileToolGroup;
 #[cfg(all(feature = "index", feature = "mcp"))]

@@ -1418,6 +1418,14 @@ impl WorkcellServer {
                         request.invocation_id.clone(),
                     );
                 }
+                #[cfg(unix)]
+                if let PreparedRemoteOperation::DirectoryPublication(prepared) = operation.as_mut()
+                {
+                    prepared.bind_execution(
+                        request.preparation_id.clone(),
+                        request.invocation_id.clone(),
+                    );
+                }
                 let progress = Some(ToolProgressContext {
                     mcp: mcp_progress,
                     remote: Some(RemoteProgressContext {
@@ -2084,6 +2092,16 @@ impl WorkcellServer {
                     Ok(output) => {
                         typed_tool_result(&output, "Reviewed binary publication completed".into())
                     }
+                    Err(error) => operation_error_result(error.code(), error.to_string()),
+                }
+            }
+            #[cfg(unix)]
+            PreparedRemoteOperation::DirectoryPublication(prepared) => {
+                match prepared.execute(&cancellation).await {
+                    Ok(output) => typed_tool_result(
+                        &output,
+                        "Reviewed directory publication completed".into(),
+                    ),
                     Err(error) => operation_error_result(error.code(), error.to_string()),
                 }
             }
@@ -2779,7 +2797,8 @@ impl FailureEffectPolicy {
     fn for_operation(operation: &PreparedRemoteOperation) -> Self {
         match operation {
             #[cfg(unix)]
-            PreparedRemoteOperation::TransferPublication(_) => Self::TransferPublication,
+            PreparedRemoteOperation::TransferPublication(_)
+            | PreparedRemoteOperation::DirectoryPublication(_) => Self::TransferPublication,
             PreparedRemoteOperation::FileWrite(_)
             | PreparedRemoteOperation::FileEdit(_)
             | PreparedRemoteOperation::FileApplyPatch(_) => Self::FileMutation,

@@ -13,22 +13,34 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 use workcell_host_contract::{
-    ContractVersion, Identifier, MAX_TRANSFER_JOURNAL_BYTES as MAX_JOURNAL_BYTES,
+    ContractVersion, Identifier, MAX_ID_BYTES, MAX_TRANSFER_JOURNAL_BYTES as MAX_JOURNAL_BYTES,
     MAX_TRANSFER_JOURNAL_STORAGE_BYTES as MAX_JOURNAL_STORAGE_BYTES, MAX_TRANSFER_JOURNALS,
-    Revision, TRANSFER_OUTCOME_RETENTION_MS, TransferPublicationState, TransferStatusResponse,
+    Revision, TRANSFER_OUTCOME_RETENTION_MS, TransferDirectory, TransferPublicationState,
+    TransferStatusResponse,
 };
 
 use super::reviewed::{TransferError, hex_digest, unix_ms};
 
 const PRIVATE_MODE: Mode = Mode::from_raw_mode(0o600);
+const MAX_JSON_ID_BYTES: usize = 6 * MAX_ID_BYTES + 2;
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub(super) struct Journal {
     pub status: TransferStatusResponse,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub directory: Option<DirectoryJournal>,
     pub cwd: String,
     pub updated_at: u64,
     pub expires_at: u64,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub(super) struct DirectoryJournal {
+    pub version: ContractVersion,
+    #[serde(deserialize_with = "Option::deserialize")]
+    pub receipt: Option<TransferDirectory>,
 }
 
 pub(super) struct JournalStore {
@@ -200,6 +212,36 @@ impl JournalStore {
         cwd: String,
         digest: Revision,
     ) -> Result<(), TransferError> {
+        self.reserve_publication(id, cwd, digest, None, 0)
+    }
+
+    pub fn reserve_directory(
+        &mut self,
+        id: Identifier,
+        cwd: String,
+        digest: Revision,
+        receipt_size_bound: usize,
+    ) -> Result<(), TransferError> {
+        self.reserve_publication(
+            id,
+            cwd,
+            digest,
+            Some(DirectoryJournal {
+                version: ContractVersion::V1,
+                receipt: None,
+            }),
+            receipt_size_bound,
+        )
+    }
+
+    fn reserve_publication(
+        &mut self,
+        id: Identifier,
+        cwd: String,
+        digest: Revision,
+        directory: Option<DirectoryJournal>,
+        receipt_size_bound: usize,
+    ) -> Result<(), TransferError> {
         self.prune()?;
         if self.records.contains_key(&id) {
             return Err(TransferError::Replay);
@@ -207,7 +249,8 @@ impl JournalStore {
         if self.records.len() >= MAX_TRANSFER_JOURNALS as usize {
             return Err(TransferError::Limit);
         }
-        self.put(Journal {
+        let journal = Journal {
+            directory,
             cwd,
             updated_at: unix_ms(),
             expires_at: unix_ms() + workcell_host_contract::TRANSFER_TTL_MS,
@@ -220,7 +263,24 @@ impl JournalStore {
                 request_digest: Some(digest),
                 file: None,
             },
-        })
+        };
+        if journal.directory.is_some() {
+            let mut settled = journal.clone();
+            settled.status.state = TransferPublicationState::Indeterminate;
+            settled.updated_at = u64::MAX;
+            settled.expires_at = u64::MAX;
+            let envelope = serde_json::to_vec(&settled)
+                .map_err(|_| TransferError::Storage)?
+                .len();
+            if envelope
+                .saturating_add(2 * MAX_JSON_ID_BYTES)
+                .saturating_add(receipt_size_bound)
+                > MAX_JOURNAL_BYTES as usize
+            {
+                return Err(TransferError::Limit);
+            }
+        }
+        self.put(journal)
     }
 
     pub fn get(&self, id: &Identifier) -> Option<Journal> {
@@ -449,6 +509,72 @@ mod tests {
                 Err(TransferError::Replay)
             ));
             assert_eq!(workspace.path().join("target").exists(), applied);
+        }
+    }
+
+    #[test]
+    fn directory_receipts_reserve_serialized_completion_envelopes_before_effects() {
+        let workspace = tempfile::tempdir().unwrap();
+        let private = tempfile::tempdir().unwrap();
+        fs::set_permissions(private.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let namespace = Identifier::new("directories").unwrap();
+        let id = Identifier::new("publication").unwrap();
+        let digest = Revision::new("sha256:request").unwrap();
+        let mut store = JournalStore::open(private.path(), workspace.path(), &namespace).unwrap();
+        let bound = super::MAX_JOURNAL_BYTES as usize - 4096;
+        assert!(matches!(
+            store.reserve_directory(id.clone(), "\"".repeat(2048), digest.clone(), bound),
+            Err(TransferError::Limit)
+        ));
+        assert!(store.get(&id).is_none());
+        store
+            .reserve_directory(id.clone(), ".".into(), digest, bound)
+            .unwrap();
+        assert!(store.get(&id).unwrap().directory.is_some());
+        assert_eq!(fs::read_dir(workspace.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn directory_crash_recovery_preserves_uncertainty_and_blocks_cross_kind_replay() {
+        for applied in [false, true] {
+            let workspace = tempfile::tempdir().unwrap();
+            let private = tempfile::tempdir().unwrap();
+            fs::set_permissions(private.path(), fs::Permissions::from_mode(0o700)).unwrap();
+            let namespace = Identifier::new("directories").unwrap();
+            let id = Identifier::new("publication").unwrap();
+            let digest = Revision::new("sha256:request").unwrap();
+            let mut store =
+                JournalStore::open(private.path(), workspace.path(), &namespace).unwrap();
+            store
+                .reserve_directory(id.clone(), ".".into(), digest.clone(), 1024)
+                .unwrap();
+            let mut pending = store.get(&id).unwrap();
+            pending.status.state = TransferPublicationState::Publishing;
+            pending.status.preparation_id = Some(Identifier::new("preparation").unwrap());
+            pending.status.invocation_id = Some(Identifier::new("invocation").unwrap());
+            store.put(pending).unwrap();
+            if applied {
+                fs::create_dir(workspace.path().join("empty")).unwrap();
+            }
+            drop(store);
+            let mut recovered =
+                JournalStore::open(private.path(), workspace.path(), &namespace).unwrap();
+            let outcome = recovered.get(&id).unwrap();
+            assert_eq!(
+                outcome.status.state,
+                TransferPublicationState::Indeterminate
+            );
+            assert!(outcome.directory.unwrap().receipt.is_none());
+            assert!(outcome.status.invocation_id.is_some());
+            assert!(matches!(
+                recovered.reserve_directory(id.clone(), ".".into(), digest.clone(), 1024),
+                Err(TransferError::Replay)
+            ));
+            assert!(matches!(
+                recovered.reserve(id.clone(), ".".into(), digest),
+                Err(TransferError::Replay)
+            ));
+            assert_eq!(workspace.path().join("empty").exists(), applied);
         }
     }
 

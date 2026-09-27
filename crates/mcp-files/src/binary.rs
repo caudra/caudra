@@ -752,7 +752,7 @@ fn copy_digest(
     Ok((digest_revision(digest.finalize())?, size))
 }
 
-fn revision(value: &str) -> Result<Revision, BinaryError> {
+pub(super) fn revision(value: &str) -> Result<Revision, BinaryError> {
     digest_revision(Sha256::digest(value.as_bytes()))
 }
 
@@ -775,7 +775,7 @@ pub(super) fn directory_identity(id: (u64, u64)) -> Result<ResourceId, BinaryErr
     .map_err(|_| BinaryError::Inaccessible)
 }
 
-fn intent(
+pub(super) fn intent(
     path: &str,
     access: ResourceAccess,
     revision: Option<Revision>,

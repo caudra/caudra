@@ -78,6 +78,25 @@ the byte POST never creates them. The resolver remains `mcp-files`; descriptor-r
 reinforce its policy rather than adding server-side path resolution. No archive extraction, permission
 policy override, or arbitrary destination in the byte POST is supported.
 
+The additive directory-only publication contract uses the same authenticated prepare/execute ledger
+and durable journal without a byte stage. It requires explicit missing ancestors and `mustNotExist`.
+Native preparation checks write permission and discloses canonical ancestor/target scopes before
+effects; native hosts still own authorization. Descriptor-relative no-follow/no-mount traversal is
+Linux-only and fails closed elsewhere. Directory staging requires an explicit owner-only trusted root
+outside every exported/mutable workspace namespace; the standalone server uses private transfer
+storage, and native embedders must supply a `DirectoryPublicationStaging` handle. The retained root
+descriptor anchors creation and opening, not a name in the attacker-writable destination parent.
+Device mismatch fails before staging. No-replace rename exposes the staged inode at the reviewed
+destination, and the exact held identity is checked
+before descending. A foreign ordinary directory at that destination is not adopted. Expanded paths,
+escaped receipt size and the serialized completion envelope are bounded during preparation. Durable
+completion returns the settled receipt without another fallible cwd lookup. Partial publication is
+indeterminate, not permission to replay; file and directory publications share operation-ID fencing.
+Cleanup verifies the retained identity, removes only that empty staging directory and syncs its parent.
+Failed cleanup or staging that has disappeared/moved is indeterminate even before final publication.
+The trusted-root requirement is not isolation from arbitrary same-UID access to that root outside the
+exported workspace boundary; crash-left directories there require operator reconciliation.
+
 The private journal is process-locked and generation/principal scoped, with count and byte ceilings.
 Publishing is durable before the effect, completed outcomes follow file/directory sync, and an
 interrupted publication is indeterminate rather than retried or inferred successful from matching

@@ -140,6 +140,8 @@ pub(crate) enum PreparedRemoteOperation {
     WorkspaceMutation(PreparedWorkspaceMutation),
     #[cfg(unix)]
     TransferPublication(crate::transfer::reviewed::PreparedPublication),
+    #[cfg(unix)]
+    DirectoryPublication(crate::transfer::reviewed::PreparedDirectoryTransfer),
     ScmMutation(PreparedScmMutation),
     SnapshotCapture(PreparedSnapshotCapture),
     SnapshotRestore(PreparedSnapshotRestore),
@@ -200,6 +202,8 @@ impl PreparedRemoteOperation {
             Self::WorkspaceMutation(prepared) => prepared.retained_bytes(),
             #[cfg(unix)]
             Self::TransferPublication(prepared) => prepared.retained_bytes(),
+            #[cfg(unix)]
+            Self::DirectoryPublication(prepared) => prepared.retained_bytes(),
             Self::ScmMutation(prepared) => prepared.retained_bytes(),
             Self::SnapshotCapture(prepared) => prepared.retained_bytes(),
             Self::SnapshotRestore(prepared) | Self::SnapshotUnrevert(prepared) => {

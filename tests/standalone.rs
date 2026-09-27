@@ -3576,6 +3576,8 @@ async fn transfer_capabilities_and_routes_require_authenticated_rooted_private_s
                 "download",
                 "preparePublication",
                 "publicationStatus",
+                "prepareDirectory",
+                "directoryStatus",
                 "inventory",
             ] {
                 let refused = final_sse_json(
@@ -3962,5 +3964,181 @@ async fn reviewed_binary_transfer_uses_authenticated_bytes_exact_ledger_executio
     let descriptor = reviewed_discovery(&client, &endpoint).await;
     let status = reviewed_rpc(&client, &endpoint, "ai.workcell/transfer/publicationStatus", json!({"version":"v1","host":remote_host_binding(&descriptor),"cwdHandle":descriptor["cwd"]["handle"],"publicationId":"binary-publication"})).await;
     assert_eq!(status["result"], durable);
+    assert_eq!(restarted.shutdown().await, ShutdownOutcome::Completed);
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn reviewed_directory_publication_is_authenticated_releasable_and_recovers_lost_responses() {
+    use workcell_host_contract::{
+        TRANSFER_DIRECTORY_PREPARE_METHOD, TRANSFER_DIRECTORY_STATUS_METHOD,
+        TransferDirectoryPrepareResponse,
+    };
+
+    const PUBLICATION: &str = "directory-publication";
+    const DESTINATION: &str = "empty/nested/leaf";
+    let root = tempfile::tempdir().unwrap();
+    let private = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(private.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let http = reviewed_transfer_server(root.path(), private.path()).await;
+    let endpoint = format!("http://{}/mcp", http.address());
+    let client = Client::new();
+    let descriptor = reviewed_discovery(&client, &endpoint).await;
+    assert_eq!(
+        descriptor["capabilities"]["reviewedTransfer"]["directoryPublication"],
+        true
+    );
+    let binding = json!({"version":"v1","host":remote_host_binding(&descriptor),"cwdHandle":descriptor["cwd"]["handle"]});
+    let scoped = |extra: Value| {
+        let mut params = binding.clone();
+        params
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        params
+    };
+    let request = scoped(
+        json!({"publicationId":PUBLICATION,"path":DESTINATION,"createDirectories":["empty","empty/nested"],"precondition":{"kind":"mustNotExist"}}),
+    );
+    let anonymous = post_rpc(
+        &client,
+        &endpoint,
+        None,
+        remote_request(1, TRANSFER_DIRECTORY_PREPARE_METHOD, request.clone()),
+    )
+    .await;
+    assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+    let mut other = request.clone();
+    other["host"]["principalId"] = json!("other-principal");
+    assert!(
+        reviewed_rpc(&client, &endpoint, TRANSFER_DIRECTORY_PREPARE_METHOD, other).await["error"]
+            .is_object()
+    );
+    let mut replacement = request.clone();
+    replacement["precondition"] = json!({"kind":"revision","revision":"sha256:replacement"});
+    assert!(
+        reviewed_rpc(
+            &client,
+            &endpoint,
+            TRANSFER_DIRECTORY_PREPARE_METHOD,
+            replacement
+        )
+        .await["error"]
+            .is_object()
+    );
+    assert!(!root.path().join("empty").exists());
+    let prepared = reviewed_rpc(
+        &client,
+        &endpoint,
+        TRANSFER_DIRECTORY_PREPARE_METHOD,
+        request,
+    )
+    .await;
+    let prepared: TransferDirectoryPrepareResponse =
+        serde_json::from_value(prepared["result"].clone()).unwrap();
+    prepared.operation.intent.validate().unwrap();
+    assert_eq!(
+        prepared.operation.binding.contract.id.as_str(),
+        "ai.workcell/transfer-directory-publication"
+    );
+    assert!(prepared.operation.intent.mutating);
+    assert!(!root.path().join("empty").exists());
+    let status_request = scoped(json!({"publicationId":PUBLICATION}));
+    let before = reviewed_rpc(
+        &client,
+        &endpoint,
+        TRANSFER_DIRECTORY_STATUS_METHOD,
+        status_request.clone(),
+    )
+    .await;
+    assert_eq!(before["result"]["state"], "prepared");
+    assert_eq!(
+        before["result"]["preparationId"],
+        serde_json::to_value(&prepared.operation.preparation_id).unwrap()
+    );
+    assert_eq!(
+        before["result"]["requestDigest"],
+        serde_json::to_value(&prepared.operation.binding.argument_digest).unwrap()
+    );
+    let execute = json!({"version":"v1","host":remote_host_binding(&descriptor),"preparationId":prepared.operation.preparation_id,"invocationId":"directory-invocation"});
+    let completed = reviewed_rpc(&client, &endpoint, "ai.workcell/execute", execute.clone()).await;
+    assert_eq!(completed["result"]["state"], "completed", "{completed}");
+    assert_eq!(
+        std::fs::read_dir(root.path().join(DESTINATION))
+            .unwrap()
+            .count(),
+        0
+    );
+    let durable = reviewed_rpc(
+        &client,
+        &endpoint,
+        TRANSFER_DIRECTORY_STATUS_METHOD,
+        status_request.clone(),
+    )
+    .await["result"]
+        .clone();
+    assert_eq!(durable["state"], "completed");
+    assert_eq!(durable["invocationId"], "directory-invocation");
+    assert_eq!(durable["directory"]["path"], DESTINATION);
+    assert_eq!(
+        durable["directory"]["createdDirectories"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    assert!(durable.get("file").is_none());
+    assert!(
+        reviewed_rpc(
+            &client,
+            &endpoint,
+            "ai.workcell/transfer/publicationStatus",
+            status_request
+        )
+        .await["error"]
+            .is_object()
+    );
+    std::fs::write(root.path().join(DESTINATION).join("external"), b"preserved").unwrap();
+    assert_eq!(
+        reviewed_rpc(&client, &endpoint, "ai.workcell/execute", execute).await["result"],
+        completed["result"]
+    );
+    assert!(root.path().join(DESTINATION).join("external").exists());
+
+    let release_request = scoped(
+        json!({"publicationId":"released-directory","path":"released","createDirectories":[],"precondition":{"kind":"mustNotExist"}}),
+    );
+    let release = reviewed_rpc(
+        &client,
+        &endpoint,
+        TRANSFER_DIRECTORY_PREPARE_METHOD,
+        release_request,
+    )
+    .await;
+    let release = reviewed_rpc(&client, &endpoint, "ai.workcell/release", json!({"version":"v1","host":remote_host_binding(&descriptor),"preparationId":release["result"]["operation"]["preparationId"],"invocationId":null})).await;
+    assert!(release.get("error").is_none(), "{release}");
+    let released = reviewed_rpc(
+        &client,
+        &endpoint,
+        TRANSFER_DIRECTORY_STATUS_METHOD,
+        scoped(json!({"publicationId":"released-directory"})),
+    )
+    .await;
+    assert_eq!(released["result"]["state"], "cancelled");
+    assert!(!root.path().join("released").exists());
+    assert_eq!(http.shutdown().await, ShutdownOutcome::Completed);
+
+    let restarted = reviewed_transfer_server(root.path(), private.path()).await;
+    let endpoint = format!("http://{}/mcp", restarted.address());
+    let descriptor = reviewed_discovery(&client, &endpoint).await;
+    let status = reviewed_rpc(&client, &endpoint, TRANSFER_DIRECTORY_STATUS_METHOD, json!({"version":"v1","host":remote_host_binding(&descriptor),"cwdHandle":descriptor["cwd"]["handle"],"publicationId":PUBLICATION})).await;
+    assert_eq!(status["result"], durable);
+    let replay = reviewed_rpc(&client, &endpoint, TRANSFER_DIRECTORY_PREPARE_METHOD, json!({"version":"v1","host":remote_host_binding(&descriptor),"cwdHandle":descriptor["cwd"]["handle"],"publicationId":PUBLICATION,"path":"other-target","createDirectories":[],"precondition":{"kind":"mustNotExist"}})).await;
+    assert_eq!(
+        replay["error"]["data"]["code"],
+        "transferPublicationReserved"
+    );
+    assert!(!root.path().join("other-target").exists());
     assert_eq!(restarted.shutdown().await, ShutdownOutcome::Completed);
 }

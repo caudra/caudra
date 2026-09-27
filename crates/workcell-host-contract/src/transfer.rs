@@ -13,6 +13,10 @@ pub const TRANSFER_DOWNLOAD_METHOD: &str = "ai.workcell/transfer/download";
 pub const TRANSFER_PREPARE_METHOD: &str = "ai.workcell/transfer/preparePublication";
 pub const TRANSFER_STATUS_METHOD: &str = "ai.workcell/transfer/publicationStatus";
 pub const TRANSFER_INVENTORY_METHOD: &str = "ai.workcell/transfer/inventory";
+pub const TRANSFER_DIRECTORY_PREPARE_METHOD: &str = "ai.workcell/transfer/prepareDirectory";
+pub const TRANSFER_DIRECTORY_STATUS_METHOD: &str = "ai.workcell/transfer/directoryStatus";
+pub const TRANSFER_DIRECTORY_PUBLICATION_CONTRACT_ID: &str =
+    "ai.workcell/transfer-directory-publication";
 pub const MAX_TRANSFER_INVENTORY_ENTRIES: usize = 4096;
 pub const MAX_TRANSFER_INVENTORY_BYTES: usize = 2 * 1024 * 1024;
 pub const MAX_TRANSFER_DEPTH: usize = 32;
@@ -41,6 +45,8 @@ pub struct ReviewedTransferCapability {
     pub single_range: bool,
     pub durable_outcomes: bool,
     pub creates_directories: bool,
+    #[serde(default)]
+    pub directory_publication: bool,
     /// Root-only descriptor traversal, no symlinks, mount crossings (including bind mounts),
     /// special-file reads, or nested repositories. Unsupported hosts refuse inventory.
     pub safe_inventory: bool,
@@ -159,6 +165,61 @@ pub struct TransferPrepareResponse {
     pub version: ContractVersion,
     pub publication_id: Identifier,
     pub operation: PrepareResponse,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct TransferDirectoryPrepareRequest {
+    pub version: ContractVersion,
+    #[serde(flatten)]
+    pub binding: WorkspaceRequestBinding,
+    pub publication_id: Identifier,
+    pub path: WorkspacePath,
+    #[serde(deserialize_with = "deserialize_directories")]
+    pub create_directories: Vec<WorkspacePath>,
+    pub precondition: TransferPrecondition,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct TransferDirectoryPrepareResponse {
+    pub version: ContractVersion,
+    pub publication_id: Identifier,
+    pub operation: PrepareResponse,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct TransferDirectory {
+    pub path: WorkspacePath,
+    pub resource_id: ResourceId,
+    #[serde(deserialize_with = "deserialize_directory_identities")]
+    pub created_directories: Vec<(WorkspacePath, ResourceId)>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct TransferDirectoryStatusRequest {
+    pub version: ContractVersion,
+    #[serde(flatten)]
+    pub binding: WorkspaceRequestBinding,
+    pub publication_id: Identifier,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct TransferDirectoryStatusResponse {
+    pub version: ContractVersion,
+    pub publication_id: Identifier,
+    pub state: TransferPublicationState,
+    #[serde(deserialize_with = "Option::deserialize")]
+    pub preparation_id: Option<Identifier>,
+    #[serde(deserialize_with = "Option::deserialize")]
+    pub invocation_id: Option<Identifier>,
+    #[serde(deserialize_with = "Option::deserialize")]
+    pub request_digest: Option<Revision>,
+    #[serde(deserialize_with = "Option::deserialize")]
+    pub directory: Option<TransferDirectory>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

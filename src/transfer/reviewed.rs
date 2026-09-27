@@ -26,13 +26,17 @@ use workcell_host_contract::{
     WorkspaceRequestBinding,
 };
 use workcell_mcp_files::{
-    BinaryError, BinaryPublicationContent, FileToolGroup, PreparedBinaryPublication,
-    VerifiedBinaryFile,
+    BinaryError, BinaryPublicationContent, DirectoryPublicationStaging, FileToolGroup,
+    PreparedBinaryPublication, VerifiedBinaryFile,
 };
 
 use super::journal::JournalStore;
 
 const EXPIRY_INTERVAL: Duration = Duration::from_secs(1);
+
+#[path = "directory.rs"]
+mod directory;
+pub(crate) use directory::PreparedDirectoryTransfer;
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum TransferError {
@@ -92,6 +96,7 @@ struct Inner {
     usage: Arc<Mutex<Usage>>,
     pub io: Arc<Semaphore>,
     journals: Mutex<JournalStore>,
+    directory_staging: DirectoryPublicationStaging,
 }
 
 #[derive(Default)]
@@ -167,6 +172,7 @@ impl ReviewedTransfers {
             usage: Arc::new(Mutex::new(Usage::default())),
             io: Arc::new(Semaphore::new(MAX_TRANSFER_CONCURRENCY as usize)),
             journals: Mutex::new(journals),
+            directory_staging: DirectoryPublicationStaging::open(root)?,
         }));
         let weak = Arc::downgrade(&manager.0);
         tokio::spawn(async move {
@@ -188,6 +194,7 @@ impl ReviewedTransfers {
             single_range: true,
             durable_outcomes: true,
             creates_directories: true,
+            directory_publication: cfg!(target_os = "linux"),
             safe_inventory: cfg!(target_os = "linux"),
             atomic_replace_against_external_writers: false,
             limits: ReviewedTransferLimits {
@@ -540,7 +547,7 @@ impl ReviewedTransfers {
         let cwd = self.validate(binding).await?;
         let mut store = lock(&self.0.journals);
         match store.get(id) {
-            Some(mut journal) if journal.cwd == cwd => {
+            Some(mut journal) if journal.cwd == cwd && journal.directory.is_none() => {
                 if journal.status.state == TransferPublicationState::Prepared
                     && unix_ms() >= journal.expires_at
                 {
@@ -809,14 +816,15 @@ mod tests {
         Disconnect,
     }
 
-    fn id(value: &str) -> Identifier {
+    pub(super) fn id(value: &str) -> Identifier {
         Identifier::new(value).unwrap()
     }
-    fn digest(bytes: &[u8]) -> Revision {
+    pub(super) fn digest(bytes: &[u8]) -> Revision {
         Revision::new(format!("sha256:{}", hex_digest(Sha256::digest(bytes)))).unwrap()
     }
 
-    async fn fixture() -> (TempDir, TempDir, ReviewedTransfers, WorkspaceRequestBinding) {
+    pub(super) async fn fixture() -> (TempDir, TempDir, ReviewedTransfers, WorkspaceRequestBinding)
+    {
         let root = tempfile::tempdir().unwrap();
         let private = tempfile::tempdir().unwrap();
         fs::set_permissions(private.path(), fs::Permissions::from_mode(0o700)).unwrap();

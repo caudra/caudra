@@ -171,12 +171,14 @@ The neutral request and response types live in `workcell-host-contract`. These c
 | `ai.workcell/transfer/download` | `path`, `revision`, `digest` | Selected revision's `downloadId`, relative `downloadPath`, deadline |
 | `ai.workcell/transfer/preparePublication` | `publicationId`, `stageId`, `digest`, `sizeBytes`, `path`, `createDirectories`, `precondition`, `mode` | Exact common-ledger `operation` for review |
 | `ai.workcell/transfer/publicationStatus` | `publicationId` | Durable per-file outcome, request digest and operation IDs |
+| `ai.workcell/transfer/prepareDirectory` | `publicationId`, `path`, `createDirectories`, `precondition` | Reviewed directory-only common-ledger `operation`; requires `directoryPublication` |
+| `ai.workcell/transfer/directoryStatus` | `publicationId` | Durable directory receipt, request digest and operation IDs |
 | `ai.workcell/transfer/inventory` | `policy`, optional `inspect` | Root-only bounded entries, revision, ignore digest, completeness and optional inspection; requires `safeInventory` |
 
 Digests are lowercase `sha256:` plus 64 hex digits. A publication precondition is
 `{"kind":"mustNotExist"}` or `{"kind":"revision","revision":"<transfer/stat revision>"}`.
 Modes are `regular` (0644) and `executable` (0755); ownership, special bits, ACLs and xattrs are not
-copied. Only regular files are supported. Missing parents must be named explicitly in the required
+copied. Byte transfer supports only regular files. Missing parents must be named explicitly in the required
 `createDirectories` array, shallowest first; use `[]` when none are needed. Each creation is reviewed
 and conditional. Symlinks and protected paths are refused. No archives are extracted and no directories
 are implicitly created. File metadata includes `createdDirectories` pairs of path and resource ID.
@@ -190,6 +192,33 @@ stage can be consumed by one preparation. Common `ai.workcell/execute`, `ai.work
 `ai.workcell/cancel` and `ai.workcell/release` methods operate on the returned preparation, using contract
 `ai.workcell/transfer-publication`, version/result version `v1`. Byte-state release cancels an unexecuted
 publication using that stage; it is not undo for an already published file.
+
+Directory-only publication uses `prepareDirectory -> review -> execute`, without a byte stage or
+dummy file. Its separate contract is `ai.workcell/transfer-directory-publication`, with the same
+common execute/status/cancel/release methods. It accepts only `mustNotExist`; `createDirectories`
+must name exactly the missing ancestors, excluding the destination. The native equivalents are
+`FileToolGroup::prepare_directory_publication` and `execute_directory_publication`. Preparation is
+effect-free and exposes all canonical resource intents; dropping it releases the preparation.
+Directory receipts contain `path`, an inventory-compatible inode `resourceId`, and ancestor
+`createdDirectories` pairs. `directoryStatus` has the same durable identity fields as file status,
+but a nullable `directory` instead of `file`. Publication IDs share the file journal's replay fence.
+Expanded paths, JSON-escaped receipts and completion-journal envelopes are bounded before effects.
+Native embedders own authorization and durable recovery, as with native binary publication.
+Native preparation also requires a `DirectoryPublicationStaging` handle opened from an existing,
+absolute, owner-only host directory. Keep this directory outside every exported or mutable workspace
+namespace and outside workspace ancestors. The standalone server uses its existing private transfer
+storage root. A different filesystem from the destination is refused before staging effects.
+
+On Linux, each directory is staged in that trusted private root through its retained descriptor,
+never in the writable destination parent. It is opened before publication, synced,
+then renamed without replacing an existing destination. The published identity must match the held
+descriptor before descendants are created. Missing ancestors are individually durable, not a tree
+transaction; cancellation or failure after a publication is indeterminate. No symlinks or mount
+crossings are followed. Other same-UID processes can still move ancestors or interfere with staging;
+this is not isolation from arbitrary same-UID access outside the workspace into the trusted staging
+root. Cleanup is explicit and synced; failed cleanup, missing/moved staging, or an unexpected identity
+is indeterminate even before final publication. Crash-left `.workcell-directory-*` directories in
+private storage may require operator reconciliation.
 
 The operation preview includes canonical target and ancestor resource IDs/scopes, the existing target
 revision when replacing, and parent write effects for same-filesystem staging. Publication shares the
@@ -231,7 +260,8 @@ reconciliation rather than automatic deletion.
 
 The descriptor's `capabilities.reviewedTransfer` object reports `version: "v1"`, `privateStaging`,
 `sealedPublication`, `conditionalDownload`, `singleRange`, `durableOutcomes`, and `createsDirectories`
-as true. `safeInventory` is true on Linux; unsupported hosts refuse inventory.
+as true. `safeInventory` and `directoryPublication` are true on Linux; unsupported hosts refuse
+inventory and directory-only publication. An absent `directoryPublication` means unsupported.
 `atomicReplaceAgainstExternalWriters` is false. `limits` carries `maxFileBytes`, `maxStages`,
 `maxReservedBytes`, `maxConcurrentIo`, `stageTtlMs`, `ioTimeoutMs`, `maxJournals`, `maxJournalBytes`,
 `maxJournalStorageBytes`, `outcomeRetentionMs`, and `streamBufferBytes`. There is no `fileTransfer`

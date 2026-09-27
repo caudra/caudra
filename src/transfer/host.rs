@@ -2,10 +2,13 @@ use rmcp::{ErrorData, model::CustomResult};
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 use workcell_host_contract::{
-    ContractVersion, OperationBinding, OperationIntent, OperationKind, TRANSFER_DOWNLOAD_METHOD,
-    TRANSFER_INVENTORY_METHOD, TRANSFER_PREPARE_METHOD, TRANSFER_PUBLICATION_CONTRACT_ID,
-    TRANSFER_RELEASE_METHOD, TRANSFER_SEAL_METHOD, TRANSFER_STAGE_METHOD, TRANSFER_STAT_METHOD,
-    TRANSFER_STATUS_METHOD, TransferDownloadRequest, TransferInventoryRequest,
+    ContractVersion, OperationBinding, OperationIntent, OperationKind,
+    TRANSFER_DIRECTORY_PREPARE_METHOD, TRANSFER_DIRECTORY_PUBLICATION_CONTRACT_ID,
+    TRANSFER_DIRECTORY_STATUS_METHOD, TRANSFER_DOWNLOAD_METHOD, TRANSFER_INVENTORY_METHOD,
+    TRANSFER_PREPARE_METHOD, TRANSFER_PUBLICATION_CONTRACT_ID, TRANSFER_RELEASE_METHOD,
+    TRANSFER_SEAL_METHOD, TRANSFER_STAGE_METHOD, TRANSFER_STAT_METHOD, TRANSFER_STATUS_METHOD,
+    TransferDirectoryPrepareRequest, TransferDirectoryPrepareResponse,
+    TransferDirectoryStatusRequest, TransferDownloadRequest, TransferInventoryRequest,
     TransferPrepareRequest, TransferPrepareResponse, TransferStageRequest, TransferStageSelector,
     TransferStatRequest, TransferStatResponse, TransferStatusRequest,
 };
@@ -30,6 +33,8 @@ pub(super) fn is_method(method: &str) -> bool {
             | TRANSFER_PREPARE_METHOD
             | TRANSFER_STATUS_METHOD
             | TRANSFER_INVENTORY_METHOD
+            | TRANSFER_DIRECTORY_PREPARE_METHOD
+            | TRANSFER_DIRECTORY_STATUS_METHOD
     )
 }
 
@@ -47,6 +52,61 @@ impl WorkcellServer {
             .and_then(|transfer| transfer.reviewed.as_ref())
             .ok_or_else(method_not_found)?;
         let value = match method {
+            TRANSFER_DIRECTORY_PREPARE_METHOD => {
+                let request = parse_custom::<TransferDirectoryPrepareRequest>(params.clone())?;
+                let digest = argument_digest(&params)?;
+                let publication_id = request.publication_id.clone();
+                let binding = OperationBinding {
+                    host: request.binding.host.clone(),
+                    contract: fixed_contract(TRANSFER_DIRECTORY_PUBLICATION_CONTRACT_ID)?,
+                    argument_digest: digest.clone(),
+                };
+                remote.validate_host(&binding.host).map_err(remote_error)?;
+                let reservation = remote
+                    .reserve_preparation_wait(SMALL_PREPARATION_RESERVATION_BYTES, token)
+                    .await
+                    .map_err(remote_error)?;
+                let prepared = manager
+                    .prepare_directory(request, digest, token)
+                    .await
+                    .map_err(transfer_error)?;
+                let intent = OperationIntent {
+                    kind: OperationKind::Transfer,
+                    mutating: true,
+                    resources: prepared.resources().to_vec(),
+                };
+                let operation = remote
+                    .prepare_reserved(
+                        reservation,
+                        PreparedRemoteOperation::DirectoryPublication(prepared),
+                        binding,
+                        intent,
+                    )
+                    .map_err(remote_error)?;
+                if let Err(error) = manager.record_preparation(
+                    &publication_id,
+                    &operation.preparation_id,
+                    operation.expires_at_unix_ms,
+                ) {
+                    let _ =
+                        remote.release(&operation.preparation_id, None, &operation.binding.host);
+                    return Err(transfer_error(error));
+                }
+                serde_json::to_value(TransferDirectoryPrepareResponse {
+                    version: ContractVersion::V1,
+                    publication_id,
+                    operation,
+                })
+            }
+            TRANSFER_DIRECTORY_STATUS_METHOD => {
+                let request = parse_custom::<TransferDirectoryStatusRequest>(params)?;
+                serde_json::to_value(
+                    manager
+                        .directory_status(&request.binding, &request.publication_id)
+                        .await
+                        .map_err(transfer_error)?,
+                )
+            }
             TRANSFER_INVENTORY_METHOD => serde_json::to_value(
                 manager
                     .inventory(parse_custom::<TransferInventoryRequest>(params)?, token)
