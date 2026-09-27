@@ -20,6 +20,7 @@ use crate::components::{
 use crate::markdown::truncate_output;
 
 use crate::selection::Selection;
+use caudra_agent::background::BackgroundTasks;
 use caudra_agent::permissions::PermissionRequest;
 use caudra_agent::tools::native::question::asked_questions;
 use caudra_agent::tools::{
@@ -28,7 +29,8 @@ use caudra_agent::tools::{
 use caudra_agent::types::{Answer, QuestionEvent, WorkflowRunCard};
 use caudra_agent::{
     AgentEvent, BatchToolEntry, BufferSnapshot, COMPACTION_ANCHOR, CallStage, CommitRef,
-    EMPTY_RESPONSE_RULE, Mention, SubagentProgress, ToolDoneEvent, ToolOutput, ToolStartEvent,
+    EMPTY_RESPONSE_RULE, Mention, SubagentProgress, TaskCard, ToolDoneEvent, ToolOutput,
+    ToolStartEvent,
 };
 use caudra_config::{ToolOutputLines, UiConfig};
 use caudra_lua::WinView;
@@ -320,6 +322,7 @@ impl Chat {
             }
             AgentEvent::QueueDrained | AgentEvent::SessionTitle { .. } => {}
             AgentEvent::StreamReset
+            | AgentEvent::TaskAdmitted(_)
             | AgentEvent::Retry { .. }
             | AgentEvent::SubagentProgress { .. } => {
                 unreachable!("handled before handle_event")
@@ -375,10 +378,21 @@ impl Chat {
                 }
                 self.stall_pending = true;
             }
-            AgentEvent::Injected { text } => {
+            AgentEvent::Injected {
+                text,
+                task_event: Some(origin),
+            } => {
+                self.messages_panel.flush();
+                self.messages_panel
+                    .push(DisplayMessage::injected(text, Some(origin)));
+            }
+            AgentEvent::Injected {
+                text,
+                task_event: None,
+            } => {
                 if self.show_reminders {
                     self.messages_panel.flush();
-                    let row = DisplayMessage::new(DisplayRole::Injected, text);
+                    let row = DisplayMessage::injected(text, None);
                     match self.stall_pending.then_some(self.stall_row).flatten() {
                         Some(index) => self.messages_panel.replace(index, row),
                         None => {
@@ -785,6 +799,22 @@ impl Chat {
         self.messages_panel.set_tool_progress(tool_id, report);
     }
 
+    pub(crate) fn task_card_update(&mut self, card: TaskCard) -> bool {
+        self.messages_panel.task_card_update(card)
+    }
+
+    pub(crate) fn reconcile_task_cards(&mut self, runtime: &BackgroundTasks) -> bool {
+        self.messages_panel.reconcile_task_cards(runtime)
+    }
+
+    pub(crate) fn task_hit_at(&self, row: u16, area: Rect) -> Option<String> {
+        self.messages_panel.task_hit_at(row, area)
+    }
+
+    pub(crate) fn task_prompt(&self, call_id: &str) -> Option<String> {
+        self.messages_panel.task_prompt(call_id)
+    }
+
     /// Streaming output, addressed the same way a report is: a batch runs its
     /// children under ids of its own, and one of those names a roster row
     /// rather than a card.
@@ -872,7 +902,6 @@ impl Chat {
         self.messages_panel.memory_hit_at(row, area)
     }
 
-    #[cfg(test)]
     pub fn message_count(&self) -> usize {
         self.messages_panel.message_count()
     }
@@ -953,10 +982,11 @@ pub fn history_to_display(
                 origin: UserOrigin::Observation | UserOrigin::Synthetic,
                 text,
                 steering,
+                task_event,
                 ..
             } => {
-                if show_reminders && text != COMPACTION_ANCHOR {
-                    let row = DisplayMessage::new(DisplayRole::Injected, text.clone());
+                if task_event.is_some() || (show_reminders && text != COMPACTION_ANCHOR) {
+                    let row = DisplayMessage::injected(text.clone(), task_event.clone());
                     // A stall left one pair per attempt behind. Restoring it as
                     // one row keeps the record without replaying the repetition
                     // that a live run already collapsed.
@@ -1318,7 +1348,11 @@ mod tests {
         IndexSourceRange, SharedBuf, ToolDoneEvent, ToolOutput, ToolStartEvent, TurnCompleteEvent,
     };
     use caudra_config::UiConfig;
-    use caudra_providers::{Billing, ContentBlock, Message, Role};
+    use caudra_providers::{
+        Billing, ContentBlock, Message, Role, StandingReminderKind, TaskEventOrigin,
+        project_messages,
+    };
+    use ratatui::{Terminal, backend::TestBackend};
     use test_case::test_case;
 
     fn tool_start(id: &str, tool: &str) -> AgentEvent {
@@ -1402,10 +1436,21 @@ mod tests {
     const REPLY_TEXT: &str = "on it";
     const INJECTED_TEXT: &str = "# Environment\n\ncwd: /tmp";
     const SYNTHETIC_TEXT: &str = "# Goal check-in";
+    const BACKGROUND_REMINDER: &str =
+        "<system-reminder>\n# Background work\n\nNo active background work.\n</system-reminder>";
     const MENTION_BODY: &str = "<file path=\"a.rs\">fn main() {}</file>";
     const INDEX_SKELETON: &str = "fns:\n  pub run() [2]";
     const INDEX_ANNOTATION: &str = "2 lines";
     const SESSION_CWD: &str = "/project";
+    const TASK_OBSERVATION: &str = "neat-wanted-cowbird completed: All checks passed.";
+    const PRIVATE_INVOCATION: &str = "private-invocation";
+    const PRIVATE_EVENT: &str = "private-event";
+    const DELIVERY_TASK: &str = "neat-wanted-cowbird";
+    const DELIVERY_SUCCESS: &str = "All checks passed.";
+    const DELIVERY_BLOCKER: &str = "Permission is needed before continuing.";
+    const DELIVERY_PREVIEW: &str =
+        "First useful line.\nResult truncated; tool_output calm-blue-wren";
+    const DELIVERY_UNICODE: &str = "調査の結果は正常です。界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界界";
 
     fn chat() -> Chat {
         Chat::new(
@@ -2123,6 +2168,236 @@ mod tests {
         );
     }
 
+    #[test_case(false; "hidden_reminders")]
+    #[test_case(true; "visible_reminders")]
+    fn task_observation_is_not_a_host_continuation_reminder(show_reminders: bool) {
+        let messages = [
+            Message::task_observation(
+                TASK_OBSERVATION.into(),
+                TaskEventOrigin {
+                    task_id: TASK_ID.into(),
+                    invocation_id: PRIVATE_INVOCATION.into(),
+                    event_id: PRIVATE_EVENT.into(),
+                },
+            ),
+            Message::observation(INJECTED_TEXT.into()),
+        ];
+        let history = crate::history_items(&messages);
+        let display = history_to_display(
+            &history,
+            &empty_outputs(),
+            &ToolOutputLines::default(),
+            show_reminders,
+        )
+        .0;
+        assert!(
+            matches!(&display[0].role, DisplayRole::TaskDelivery(origin) if origin.task_id == TASK_ID)
+        );
+        assert_eq!(display[0].text, TASK_OBSERVATION);
+        assert_eq!(display.len(), 1 + usize::from(show_reminders));
+        if show_reminders {
+            assert_eq!(display[1].role, DisplayRole::Injected);
+            assert_eq!(display[1].text, INJECTED_TEXT);
+        }
+    }
+
+    #[test_case(false; "hidden")]
+    #[test_case(true; "visible")]
+    fn background_reminder_live_and_reloaded_visibility_preserves_model_history(
+        show_reminders: bool,
+    ) {
+        let mut message = Message::observation(BACKGROUND_REMINDER.into());
+        message.standing_reminder = Some(StandingReminderKind::BackgroundWork);
+        let history = crate::history_items(&[message]);
+        let encoded = serde_json::to_value(&history).unwrap();
+        let restored: Vec<HistoryItem> = serde_json::from_value(encoded).unwrap();
+        assert_eq!(restored, history);
+        assert!(matches!(
+            restored[0].kind,
+            HistoryItemKind::User {
+                standing_reminder: Some(StandingReminderKind::BackgroundWork),
+                task_event: None,
+                ..
+            }
+        ));
+        let model_history = project_messages(&restored).unwrap();
+        assert_eq!(
+            model_history[0].first_text_content(),
+            Some(BACKGROUND_REMINDER)
+        );
+        assert_eq!(
+            model_history[0].standing_reminder,
+            Some(StandingReminderKind::BackgroundWork)
+        );
+        let (display, restore) = history_to_display(
+            &restored,
+            &empty_outputs(),
+            &ToolOutputLines::default(),
+            show_reminders,
+        );
+        assert!(restore.is_empty());
+        assert_eq!(display.len(), usize::from(show_reminders));
+        let mut live = chat();
+        live.show_reminders = show_reminders;
+        assert!(matches!(
+            live.handle_event(
+                AgentEvent::Injected {
+                    text: BACKGROUND_REMINDER.into(),
+                    task_event: None,
+                },
+                None,
+            ),
+            ChatEventResult::Continue
+        ));
+        assert_eq!(live.message_count(), display.len());
+        if show_reminders {
+            assert_eq!(display[0].role, DisplayRole::Injected);
+            assert_eq!(live.message_at(0).unwrap().role, display[0].role);
+            assert_eq!(live.message_at(0).unwrap().text, display[0].text);
+        }
+    }
+
+    #[test_case(60, "success", DELIVERY_SUCCESS; "narrow_success")]
+    #[test_case(127, "success", DELIVERY_SUCCESS; "wide_success")]
+    #[test_case(60, "failure", DELIVERY_BLOCKER; "narrow_failure")]
+    #[test_case(127, "blocked", DELIVERY_BLOCKER; "wide_blocked")]
+    #[test_case(60, "blocked", DELIVERY_UNICODE; "wrapped_blocker")]
+    #[test_case(60, "success", DELIVERY_PREVIEW; "truncated_result")]
+    #[test_case(60, "report", DELIVERY_UNICODE; "wrapped_report")]
+    #[test_case(28, "blocked", DELIVERY_BLOCKER; "wrapped_status")]
+    fn task_delivery_live_and_reloaded_buffers_and_targets_agree(
+        width: u16,
+        state: &str,
+        body: &str,
+    ) {
+        let origin = TaskEventOrigin {
+            task_id: DELIVERY_TASK.into(),
+            invocation_id: PRIVATE_INVOCATION.into(),
+            event_id: PRIVATE_EVENT.into(),
+        };
+        let text = format!("Task {DELIVERY_TASK}: {state}.\n\n{body}");
+        let mut live = chat();
+        live.show_reminders = false;
+        live.handle_event(
+            AgentEvent::Injected {
+                text: text.clone(),
+                task_event: Some(origin.clone()),
+            },
+            None,
+        );
+        let area = Rect::new(0, 0, width, 40);
+        let mut terminal = Terminal::new(TestBackend::new(width, area.height)).unwrap();
+        terminal
+            .draw(|frame| live.view(frame, area, false, false))
+            .unwrap();
+        let before = terminal.backend().buffer().clone();
+        let shown: String = before.content.iter().map(|cell| cell.symbol()).collect();
+        assert_eq!(shown.matches(DELIVERY_TASK).count(), 1, "{shown}");
+        assert_eq!(shown.matches(state).count(), 1, "{shown}");
+        assert!(!shown.contains(PRIVATE_INVOCATION), "{shown}");
+        assert!(!shown.contains(PRIVATE_EVENT), "{shown}");
+        assert!(!shown.contains("\"output\":"), "{shown}");
+        let expected_style = match state {
+            "success" => crate::theme::current().tool_success,
+            "failure" => crate::theme::current().tool_error,
+            "blocked" => crate::theme::current().tool_warning,
+            _ => crate::theme::current().tool_dim,
+        };
+        let (state_column, state_row) = (0..area.height)
+            .find_map(|row| {
+                let line: String = (0..width)
+                    .map(|column| before[(column, row)].symbol())
+                    .collect();
+                line.find(state)
+                    .map(|column| (line[..column].chars().count() as u16, row))
+            })
+            .unwrap();
+        assert_eq!(
+            before[(state_column, state_row)].fg,
+            expected_style.fg.unwrap()
+        );
+        if body == DELIVERY_SUCCESS {
+            assert!(shown.contains(DELIVERY_SUCCESS), "{shown}");
+            assert!(!shown.contains("tool_output"), "{shown}");
+            assert!(!shown.contains("Full outcome"), "{shown}");
+        }
+        if body == DELIVERY_UNICODE {
+            assert_eq!(
+                shown.matches('界').count(),
+                body.matches('界').count(),
+                "{shown}"
+            );
+        }
+        if body == DELIVERY_PREVIEW {
+            assert_eq!(shown.matches("calm-blue-wren").count(), 1, "{shown}");
+        }
+        let row = (0..area.height)
+            .find(|&row| {
+                let text: String = (0..width)
+                    .map(|column| before[(column, row)].symbol())
+                    .collect();
+                text.contains(DELIVERY_TASK)
+            })
+            .unwrap();
+        assert_eq!(live.task_hit_at(row, area).as_deref(), Some(DELIVERY_TASK));
+        let encoded =
+            serde_json::to_value(Message::task_observation(text.clone(), origin.clone())).unwrap();
+        let restored: Message = serde_json::from_value(encoded).unwrap();
+        let history = crate::history_items(&[restored]);
+        let (display, _) = history_to_display(
+            &history,
+            &empty_outputs(),
+            &ToolOutputLines::default(),
+            false,
+        );
+        assert_eq!(display.len(), 1);
+        assert_eq!(display[0].role, DisplayRole::TaskDelivery(Box::new(origin)));
+        assert_eq!(display[0].text, text);
+        live.load_messages(display);
+        terminal
+            .draw(|frame| live.view(frame, area, false, false))
+            .unwrap();
+        assert_eq!(terminal.backend().buffer(), &before);
+        assert_eq!(live.task_hit_at(row, area).as_deref(), Some(DELIVERY_TASK));
+    }
+
+    #[test_case(true; "typed_origin_wins_over_heading")]
+    #[test_case(false; "text_alone_is_not_a_delivery")]
+    fn task_delivery_navigation_never_infers_identity_from_text(typed: bool) {
+        let text = format!("Task {DELIVERY_TASK}: success.\n\n{DELIVERY_SUCCESS}");
+        let origin = typed.then(|| TaskEventOrigin {
+            task_id: TASK_ID.into(),
+            invocation_id: PRIVATE_INVOCATION.into(),
+            event_id: PRIVATE_EVENT.into(),
+        });
+        let mut chat = chat();
+        chat.show_reminders = true;
+        chat.handle_event(
+            AgentEvent::Injected {
+                text,
+                task_event: origin,
+            },
+            None,
+        );
+        let area = Rect::new(0, 0, 127, 40);
+        let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+        terminal
+            .draw(|frame| chat.view(frame, area, false, false))
+            .unwrap();
+        let row = (0..area.height)
+            .find(|&row| {
+                let text: String = (0..area.width)
+                    .map(|column| terminal.backend().buffer()[(column, row)].symbol())
+                    .collect();
+                text.contains(DELIVERY_TASK)
+            })
+            .unwrap();
+        assert_eq!(
+            chat.task_hit_at(row, area).as_deref(),
+            typed.then_some(TASK_ID)
+        );
+    }
+
     /// The exact shape of a fresh session: the environment and the mode are
     /// announced under the first message, so the transcript opens on what was
     /// typed rather than on two reminders.
@@ -2515,6 +2790,7 @@ mod tests {
         chat.handle_event(
             AgentEvent::Injected {
                 text: INJECTED_TEXT.into(),
+                task_event: None,
             },
             None,
         );

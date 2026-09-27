@@ -22,6 +22,7 @@ use crate::sandbox::{
     LiveOperation, NETWORK_RECOVERY, NetworkGate, SandboxAttachment, SandboxConnector,
     SandboxControl, SandboxReadiness,
 };
+use caudra_agent::background::BackgroundTransition;
 use caudra_agent::command::CustomCommand;
 use caudra_agent::permissions::PermissionManager;
 use caudra_agent::prompt::profile::{
@@ -63,6 +64,7 @@ use serde_json::json;
 use tracing::{info, warn};
 
 use crate::agent::{AgentCommand, AgentHandles, ModelSlot, shared_queue::QueueItem};
+use crate::app::background_delivery::DeliveryReply;
 use crate::app::permission_editor::{ConversationPermissions, attach_session_permissions};
 use crate::app::shell::{
     RemoteShellTarget, ShellEvent, spawn_remote_cd, spawn_remote_control, spawn_remote_shell,
@@ -383,6 +385,7 @@ struct SessionRuntime {
     /// so a new task would inherit the old one's status.
     last_tasks: Vec<(Arc<str>, TaskStatus)>,
     notifications: RunNotificationState,
+    restore_transitions: Vec<SessionTransition>,
 }
 
 impl SessionRuntime {
@@ -408,10 +411,25 @@ impl SessionRuntime {
     }
 
     fn work_quiescent(&self) -> bool {
+        self.parent_ready()
+            && self.handles.active_background_tasks() == 0
+            && self
+                .handles
+                .background
+                .as_ref()
+                .is_none_or(|background| !background.has_pending())
+            && self.app.background_claims.is_empty()
+            && !self.app.background_delivery.pending()
+            && self.app.shell.active_ids().is_empty()
+    }
+
+    fn delivery_idle(&self) -> bool {
+        self.handles.queue.is_empty() && !self.handles.queue.is_processing()
+    }
+
+    fn parent_ready(&self) -> bool {
         self.handles.queue.is_empty()
             && !self.handles.queue.is_processing()
-            && self.handles.active_background_tasks() == 0
-            && self.app.shell.active_ids().is_empty()
             && !self.app.holds_recovery_text()
             && !self
                 .app
@@ -926,6 +944,7 @@ fn recover_stored_sessions_in_cwd(
 /// Everything needed to bring up a new session runtime after startup.
 struct SpawnCtx {
     storage: StateDir,
+    background_enabled: bool,
     config: AgentConfig,
     ui_config: UiConfig,
     snapshots: SnapshotsConfig,
@@ -1152,6 +1171,7 @@ impl SpawnCtx {
             remote_project_context.clone(),
             self.host_cwd.clone(),
             self.local_documents.clone(),
+            self.background_enabled,
         );
         let agent_spawn_ms = lap();
         let mut app = App::new(
@@ -1242,6 +1262,7 @@ impl SpawnCtx {
             last_status: SessionStatus::Idle,
             last_tasks: Vec::new(),
             notifications: RunNotificationState::default(),
+            restore_transitions: Vec::new(),
         })
     }
 }
@@ -1330,12 +1351,35 @@ pub(crate) struct EventLoop<'t> {
     relocation: Option<PendingRelocation>,
     sandbox: Option<SandboxAttachment>,
     sandbox_control: Option<SandboxControl>,
-    sandbox_workflows: Vec<WorkflowTransition>,
+    sandbox_workflows: Vec<SessionTransition>,
+}
+
+struct SessionTransition {
+    _background: Option<BackgroundTransition>,
+    _workflow: Option<WorkflowTransition>,
+}
+
+impl SessionTransition {
+    fn reserve(handles: &AgentHandles) -> Result<Self, String> {
+        let background = handles
+            .background
+            .as_ref()
+            .map(crate::agent::reserve_background_transition)
+            .transpose()?;
+        let workflow = handles
+            .workflow_handle()
+            .map(|workflow| smol::block_on(workflow.suspend()).map_err(|error| error.to_string()))
+            .transpose()?;
+        Ok(Self {
+            _background: background,
+            _workflow: workflow,
+        })
+    }
 }
 
 struct PendingRelocation {
     handoff: SessionRelocationHandoff,
-    _workflows: Vec<WorkflowTransition>,
+    _workflows: Vec<SessionTransition>,
 }
 
 /// Empty sessions are deleted only after becoming idle, so both transitions
@@ -1361,6 +1405,8 @@ enum Wake {
     InputGone,
     Ui(UiAction),
     Agent(usize, Box<caudra_agent::Envelope>),
+    Background,
+    Delivery(usize, Box<DeliveryReply>),
     Shell(usize, ShellEvent),
     Warn(String),
     Title(GeneratedTitle),
@@ -1548,6 +1594,7 @@ impl<'t> EventLoop<'t> {
         let notifier = terminal::TerminalNotifier::new(ui_config.notifications);
         let mut ctx = SpawnCtx {
             storage,
+            background_enabled: !exit_on_done,
             config,
             ui_config,
             snapshots,
@@ -1775,6 +1822,12 @@ impl<'t> EventLoop<'t> {
         sel = sel.recv(&self.warn_rx, |res| res.ok().map(Wake::Warn));
         sel = sel.recv(&self.title_rx, |res| res.ok().map(Wake::Title));
         for (i, rt) in self.sessions.iter().enumerate() {
+            sel = sel.recv(&rt.app.background_delivery.replies, move |res| {
+                res.ok().map(|reply| Wake::Delivery(i, Box::new(reply)))
+            });
+            if rt.handles.background.is_some() {
+                sel = sel.recv(&rt.handles.background_wake_rx, |_| Some(Wake::Background));
+            }
             if !rt.handles.agent_rx.is_disconnected() {
                 sel = sel.recv(&rt.handles.agent_rx, move |res| {
                     res.ok().map(|env| Wake::Agent(i, Box::new(env)))
@@ -1793,6 +1846,13 @@ impl<'t> EventLoop<'t> {
             Wake::InputGone => return Err(eyre!("terminal input reader stopped")),
             Wake::Ui(action) => self.handle_ui_action(action),
             Wake::Agent(i, envelope) => self.handle_agent(i, envelope),
+            Wake::Background => {}
+            Wake::Delivery(index, reply) => {
+                if let Err(error) = self.sessions[index].app.apply_delivery_reply(*reply) {
+                    self.sessions[index].app.suppress_background_wakes();
+                    self.sessions[index].app.flash(error);
+                }
+            }
             Wake::Shell(i, event) => self.handle_shell_event(i, event),
             Wake::Warn(warning) => {
                 // The one place every background warning passes through. A
@@ -1834,15 +1894,12 @@ impl<'t> EventLoop<'t> {
             return;
         }
         let workspace = change.workspace.clone();
-        let _transition = match self.sessions[index].handles.workflow_handle() {
-            Some(workflow) => match smol::block_on(workflow.suspend()) {
-                Ok(transition) => Some(transition),
-                Err(error) => {
-                    self.sessions[index].app.flash(error.to_string());
-                    return;
-                }
-            },
-            None => None,
+        let _transition = match SessionTransition::reserve(&self.sessions[index].handles) {
+            Ok(transition) => transition,
+            Err(error) => {
+                self.sessions[index].app.flash(error);
+                return;
+            }
         };
         let context = Arc::clone(&change.context);
         let display_path = change.display_path.clone();
@@ -1872,6 +1929,22 @@ impl<'t> EventLoop<'t> {
     fn checkpoint_all(&mut self) {
         for rt in &mut self.sessions {
             rt.app.checkpoint();
+            if !rt.restore_transitions.is_empty() && !rt.app.has_lifecycle_work() {
+                match self
+                    .ctx
+                    .storage_writer
+                    .save_sync(Arc::clone(&rt.app.state.session))
+                {
+                    Ok(()) => rt.restore_transitions.clear(),
+                    Err(error) => rt.app.flash(error.to_string()),
+                }
+            }
+            let final_save = rt.delivery_idle();
+            if let Err(error) = rt.app.persist_background_delivery(final_save) {
+                rt.app.suppress_background_wakes();
+                rt.app
+                    .flash(format!("Failed to persist background delivery: {error}"));
+            }
         }
     }
 
@@ -1952,7 +2025,7 @@ impl<'t> EventLoop<'t> {
         dirty
     }
 
-    fn sandbox_gate(&mut self, transition: bool) -> Result<Vec<WorkflowTransition>, String> {
+    fn sandbox_gate(&mut self, transition: bool) -> Result<Vec<SessionTransition>, String> {
         if self
             .sessions
             .iter()
@@ -1981,10 +2054,7 @@ impl<'t> EventLoop<'t> {
         }
         let mut workflows = Vec::new();
         for runtime in &self.sessions {
-            if let Some(workflow) = runtime.handles.workflow_handle() {
-                workflows
-                    .push(smol::block_on(workflow.suspend()).map_err(|error| error.to_string())?);
-            }
+            workflows.push(SessionTransition::reserve(&runtime.handles)?);
         }
         let database =
             SessionDatabase::open_state(&self.ctx.storage).map_err(|error| error.to_string())?;
@@ -2125,13 +2195,26 @@ impl<'t> EventLoop<'t> {
                     self.sandbox_gate(transition)
                 };
                 match admitted {
-                    Ok(_workflows) => self.sessions[index].app.start_sandbox_live(*request),
+                    Ok(workflows) => {
+                        if transition {
+                            self.sandbox_workflows = workflows;
+                        }
+                        self.sessions[index].app.start_sandbox_live(*request);
+                    }
                     Err(error) => self.sessions[index].app.sandbox_failed(error),
                 }
                 dirty = Dirty::YES;
             }
             if let Some(attachment) = self.sessions[index].app.sandbox_live.attachment.take() {
-                match self.sandbox_gate(true) {
+                let reserved = if self.sandbox_workflows.is_empty() {
+                    self.sandbox_gate(true)
+                } else if self.sessions.iter().all(SessionRuntime::quiescent) {
+                    Ok(std::mem::take(&mut self.sandbox_workflows))
+                } else {
+                    self.sandbox_workflows.clear();
+                    Err(CWD_BUSY_ERR.into())
+                };
+                match reserved {
                     Ok(workflows) => {
                         self.sandbox_workflows = workflows;
                         self.sandbox = Some(attachment);
@@ -2140,6 +2223,15 @@ impl<'t> EventLoop<'t> {
                 }
                 dirty = Dirty::YES;
             }
+        }
+        if self.sandbox.is_none()
+            && self.sandbox_control.is_none()
+            && self
+                .sessions
+                .iter()
+                .all(|runtime| runtime.app.sandbox_live.reply.is_none())
+        {
+            self.sandbox_workflows.clear();
         }
         dirty
     }
@@ -2187,10 +2279,20 @@ impl<'t> EventLoop<'t> {
     fn handle_agent(&mut self, idx: usize, envelope: Box<caudra_agent::Envelope>) {
         let rt = &mut self.sessions[idx];
         let current = is_current_top_level(rt.app.run_id, &envelope);
+        let terminal = current
+            && matches!(
+                &envelope.event,
+                AgentEvent::Done { .. } | AgentEvent::Error { .. }
+            );
         match &envelope.event {
             AgentEvent::QueueDrained => {
                 if current {
                     rt.notifications.on_drain();
+                    let final_save = rt.delivery_idle();
+                    if let Err(error) = rt.app.persist_background_delivery(final_save) {
+                        rt.app.suppress_background_wakes();
+                        rt.app.flash(error);
+                    }
                 }
                 return;
             }
@@ -2209,6 +2311,14 @@ impl<'t> EventLoop<'t> {
             _ => {}
         }
         let actions = self.sessions[idx].app.update(Msg::Agent(envelope));
+        if terminal {
+            let rt = &mut self.sessions[idx];
+            let final_save = rt.delivery_idle();
+            if let Err(error) = rt.app.persist_background_delivery(final_save) {
+                rt.app.suppress_background_wakes();
+                rt.app.flash(error);
+            }
+        }
         self.dispatch(idx, actions);
     }
 
@@ -2397,11 +2507,11 @@ impl<'t> EventLoop<'t> {
     /// starts or ends shows up there without polling.
     fn emit_task_changes(&mut self) -> Dirty {
         let handle = &self.ctx.lua_event_handle;
-        let mut changed = false;
+        let mut dirty = Dirty::NO;
         for rt in &mut self.sessions {
+            dirty |= rt.app.reconcile_tasks();
             let session_id = rt.app.state.session.id;
             diff_task_states(&mut rt.last_tasks, rt.app.task_states(), |task| {
-                changed = true;
                 handle.fire_autocmd(
                     "TaskStatusChanged",
                     json!({
@@ -2413,10 +2523,7 @@ impl<'t> EventLoop<'t> {
                 );
             });
         }
-        if !changed {
-            return Dirty::NO;
-        }
-        self.focused_app().refresh_task_picker()
+        dirty | self.focused_app().refresh_task_picker()
     }
 
     fn emit_notifications(&mut self) {
@@ -2490,12 +2597,46 @@ impl<'t> EventLoop<'t> {
             .iter_mut()
             .enumerate()
             .filter_map(|(index, runtime)| {
-                if !runtime.quiescent() || runtime.app.sandbox_network_dispatch_blocker().is_some()
+                if !runtime.parent_ready()
+                    || SessionStatus::of(&runtime.app) != SessionStatus::Idle
+                    || runtime.app.automatic_wakes_suppressed
+                    || runtime.app.sandbox_network_dispatch_blocker().is_some()
                 {
                     return None;
                 }
+                if let Err(error) = runtime.app.persist_background_delivery(true) {
+                    runtime.app.suppress_background_wakes();
+                    runtime.app.flash(error);
+                    return None;
+                }
+                if runtime.app.background_delivery.pending() {
+                    return None;
+                }
+                let _ = runtime.handles.background_wake_resume.try_send(());
                 let mut preamble = runtime.handles.claim_mailbox_wake();
-                preamble.extend(runtime.app.claim_workflow_completions());
+                match runtime.app.claim_workflow_completions() {
+                    Ok(messages) => preamble.extend(messages),
+                    Err(error) => {
+                        runtime.app.suppress_background_wakes();
+                        runtime.app.release_background_claims();
+                        runtime.app.flash(error);
+                        return None;
+                    }
+                }
+                if let Some(background) = &runtime.handles.background {
+                    match background.claim_messages() {
+                        Ok(messages) => {
+                            runtime.app.background_claims = messages.clone();
+                            preamble.extend(messages);
+                        }
+                        Err(error) => {
+                            runtime.app.suppress_background_wakes();
+                            runtime.app.release_background_claims();
+                            runtime.app.flash(error);
+                            return None;
+                        }
+                    }
+                }
                 (!preamble.is_empty()).then_some((index, preamble))
             })
             .collect();
@@ -2503,6 +2644,10 @@ impl<'t> EventLoop<'t> {
         let dirty = Dirty::from(!ready.is_empty());
         for (index, preamble) in ready {
             let actions = self.sessions[index].app.start_mailbox_run(preamble);
+            if actions.is_empty() {
+                self.sessions[index].app.suppress_background_wakes();
+                self.sessions[index].app.release_background_claims();
+            }
             self.dispatch(index, actions);
         }
         dirty
@@ -2515,6 +2660,7 @@ impl<'t> EventLoop<'t> {
             .enumerate()
             .filter_map(|(index, runtime)| {
                 (runtime.quiescent()
+                    && !runtime.app.automatic_wakes_suppressed
                     && runtime.app.sandbox_network_dispatch_blocker().is_none()
                     && runtime.app.goal_checkin_due()
                     && runtime.handles.active_background_tasks() == 0)
@@ -3117,6 +3263,29 @@ impl<'t> EventLoop<'t> {
         )
     }
 
+    fn reserve_workspace_restore(&mut self, idx: usize) -> Result<(), String> {
+        if !self.workspace_group_quiescent(idx) {
+            return Err(crate::app::REVERT_BUSY_MSG.into());
+        }
+        let target = &self.sessions[idx].app.state.session;
+        let mut transitions = Vec::new();
+        for runtime in &self.sessions {
+            let session = &runtime.app.state.session;
+            let same_workspace = match target.workspace_binding() {
+                Some(binding) => session.workspace_binding() == Some(binding),
+                None => {
+                    canonical_cwd(Path::new(&target.cwd))?
+                        == canonical_cwd(Path::new(&session.cwd))?
+                }
+            };
+            if same_workspace {
+                transitions.push(SessionTransition::reserve(&runtime.handles)?);
+            }
+        }
+        self.sessions[idx].restore_transitions = transitions;
+        Ok(())
+    }
+
     fn relocation_available(&self) -> Result<(), String> {
         if self.ctx.storage.is_ephemeral()
             || self
@@ -3199,10 +3368,7 @@ impl<'t> EventLoop<'t> {
         }
         let mut workflows = Vec::new();
         for runtime in &self.sessions {
-            if let Some(workflow) = runtime.handles.workflow_handle() {
-                workflows
-                    .push(smol::block_on(workflow.suspend()).map_err(|error| error.to_string())?);
-            }
+            workflows.push(SessionTransition::reserve(&runtime.handles)?);
         }
         let database =
             SessionDatabase::open_state(&self.ctx.storage).map_err(|error| error.to_string())?;
@@ -3269,13 +3435,11 @@ impl<'t> EventLoop<'t> {
 
         let mut transitions = Vec::new();
         for runtime in &self.sessions {
-            if let Some(workflow) = runtime.handles.workflow_handle() {
-                match smol::block_on(workflow.suspend()) {
-                    Ok(transition) => transitions.push(transition),
-                    Err(error) => {
-                        self.sessions[idx].app.flash(error.to_string());
-                        return;
-                    }
+            match SessionTransition::reserve(&runtime.handles) {
+                Ok(transition) => transitions.push(transition),
+                Err(error) => {
+                    self.sessions[idx].app.flash(error);
+                    return;
                 }
             }
         }
@@ -3402,8 +3566,17 @@ impl<'t> EventLoop<'t> {
                 let rt = &mut self.sessions[idx];
                 rt.notifications.reset();
                 let _ = rt.handles.cmd_tx.try_send(AgentCommand::Cancel { run_id });
+                rt.app.stop_background_work();
             }
             Action::CancelSubagent { tool_use_id } => {
+                if let Some(background) = &self.sessions[idx].handles.background
+                    && background.status(&tool_use_id).is_ok()
+                {
+                    if let Err(error) = smol::block_on(background.cancel(&tool_use_id)) {
+                        self.sessions[idx].app.flash(error);
+                    }
+                    return;
+                }
                 let _ = self.sessions[idx]
                     .handles
                     .cmd_tx
@@ -3486,30 +3659,24 @@ impl<'t> EventLoop<'t> {
                 );
             }
             Action::RevertSession { source, mode } => {
-                if !self.workspace_group_quiescent(idx) {
-                    self.sessions[idx]
-                        .app
-                        .flash(crate::app::REVERT_BUSY_MSG.into());
+                if let Err(error) = self.reserve_workspace_restore(idx) {
+                    self.sessions[idx].app.flash(error);
                     return;
                 }
                 let actions = self.sessions[idx].app.revert_at(source, mode);
                 self.dispatch(idx, actions);
             }
             Action::RewindSession(entry) => {
-                if !self.workspace_group_quiescent(idx) {
-                    self.sessions[idx]
-                        .app
-                        .flash(crate::app::REVERT_BUSY_MSG.into());
+                if let Err(error) = self.reserve_workspace_restore(idx) {
+                    self.sessions[idx].app.flash(error);
                     return;
                 }
                 let actions = self.sessions[idx].app.rewind_to(entry);
                 self.dispatch(idx, actions);
             }
             Action::UnrevertSession => {
-                if !self.workspace_group_quiescent(idx) {
-                    self.sessions[idx]
-                        .app
-                        .flash(crate::app::REVERT_BUSY_MSG.into());
+                if let Err(error) = self.reserve_workspace_restore(idx) {
+                    self.sessions[idx].app.flash(error);
                     return;
                 }
                 let actions = self.sessions[idx].app.unrevert();

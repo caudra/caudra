@@ -2160,7 +2160,7 @@ mod tests {
             let output_ref = done.output_ref.as_ref().unwrap();
             assert_eq!(
                 store
-                    .read(session.id(), output_ref.id, 1, 2_000)
+                    .read(session.id(), output_ref.id.clone(), 1, 2_000)
                     .unwrap()
                     .text,
                 full_output

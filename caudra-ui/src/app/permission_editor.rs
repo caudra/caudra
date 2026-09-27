@@ -957,6 +957,15 @@ impl App {
     }
 
     pub(super) fn request_permission_answer(&mut self, decision: PermissionDecision) {
+        if self
+            .task_interactions
+            .permissions
+            .get(&decision.request_id)
+            .is_some_and(|origin| !self.task_response_current(origin))
+        {
+            self.resolve_permission_prompt(&decision.request_id);
+            return;
+        }
         let manager = self
             .sandbox_live
             .transfer
@@ -975,7 +984,21 @@ impl App {
             }
             return;
         }
+        let task = self
+            .task_interactions
+            .permissions
+            .get(&decision.request_id)
+            .cloned();
+        let background = self.background.clone();
         self.permission_job_for(manager, None, true, move |manager| {
+            if let Some(origin) = task
+                && !super::tasks::task_response_current(background.as_ref(), &origin)
+            {
+                return Ok(PermissionReply::Answered {
+                    request: decision.request_id,
+                    accepted: true,
+                });
+            }
             let transient = matches!(
                 decision.answer,
                 PermissionAnswer::AllowOnce
@@ -996,6 +1019,7 @@ impl App {
     /// title names. The prompt does not record which chat asked, and a chat
     /// without the call has nothing to settle.
     fn resolve_permission_prompt(&mut self, request_id: &str) {
+        self.task_interactions.permissions.remove(request_id);
         if !self.permission_prompt.resolve(request_id) {
             return;
         }

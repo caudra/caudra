@@ -947,10 +947,11 @@ impl App {
             caudra_agent::goal_kickoff_message(condition),
         ));
         if self.status == Status::Streaming {
-            let Some(ref shared) = self.queue.shared else {
+            let Some(shared) = self.queue.shared.clone() else {
                 self.flash(NO_QUEUE_ERR.into());
                 return vec![];
             };
+            self.rearm_background();
             shared.push(QueueItem::Message {
                 text: msg.text,
                 image_count: 0,
@@ -983,6 +984,7 @@ impl App {
             return false;
         };
         let input = self.build_agent_input(&msg);
+        self.rearm_background();
         shared.push(QueueItem::Message {
             text: msg.text,
             image_count: msg.images.len(),
@@ -1169,6 +1171,9 @@ impl App {
         &mut self,
         preamble: Vec<caudra_providers::Message>,
     ) -> Vec<Action> {
+        if self.automatic_wakes_suppressed || self.status != Status::Idle {
+            return Vec::new();
+        }
         let mut input = self.build_agent_input(&QueuedMessage {
             text: String::new(),
             images: Vec::new(),
@@ -1264,6 +1269,10 @@ impl App {
             return Vec::new();
         }
         self.run_id += 1;
+        self.background_delivery.invalidate();
+        if !input.message.is_empty() || !input.images.is_empty() || input.resume {
+            self.rearm_background();
+        }
         self.goal_deferred = false;
         self.clear_exit_request();
         // New work supersedes text held for recovery after an agent error.

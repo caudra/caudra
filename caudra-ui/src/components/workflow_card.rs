@@ -157,7 +157,7 @@ pub(crate) fn render(
         lines.push(labelled(ERROR_LABEL, error, t.tool_error));
     }
     let rows = (0..lines.len())
-        .map(|line| (Some(line) == scratch_line).then_some(RowTarget(SCRATCH_ROW)))
+        .map(|line| (Some(line) == scratch_line).then_some(RowTarget::Item(SCRATCH_ROW)))
         .collect();
     (lines, rows)
 }

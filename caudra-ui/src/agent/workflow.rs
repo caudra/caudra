@@ -12,6 +12,7 @@ use async_lock::Mutex as AsyncMutex;
 use caudra_agent::agent::task_runner::{
     HostExtras, ModeResolver, ModelResolver, SubagentTaskRunner, WorkflowHostContext,
 };
+use caudra_agent::background::BackgroundTasks;
 use caudra_agent::context::ContextPublisher;
 use caudra_agent::mcp::McpSession;
 use caudra_agent::permissions::PermissionManager;
@@ -48,6 +49,7 @@ pub(crate) type SharedMode = Arc<ArcSwap<AgentMode>>;
 /// What the workflow host captures once, drawn from the same inputs the
 /// session's first agent loop starts with.
 pub(crate) struct WorkflowSpawn<'a> {
+    pub(crate) background: Option<BackgroundTasks>,
     pub(crate) state_dir: StateDir,
     pub(crate) session_id: CaudraId,
     pub(crate) model_slot: &'a Arc<ArcSwap<ModelSlot>>,
@@ -155,6 +157,7 @@ impl WorkflowSession {
             tool_filter,
             model_policy: Arc::clone(spawn.model_policy),
             workflow: None,
+            background: None,
         };
         drop(slot);
         let mode: SharedMode = Arc::new(ArcSwap::from_pointee(AgentMode::default()));
@@ -210,6 +213,13 @@ impl WorkflowSession {
             warn!(%error, session_id = %spawn.session_id, "workflow runtime unavailable for this session")
         })
         .ok()?;
+        if let Some(background) = spawn.background
+            && let Err(error) = smol::block_on(runtime.handle().bind_background(background))
+        {
+            warn!(%error, session_id = %spawn.session_id, "workflow background admission binding failed");
+            smol::block_on(runtime.shutdown());
+            return None;
+        }
         info!(
             session_id = %spawn.session_id,
             instructions_ms,

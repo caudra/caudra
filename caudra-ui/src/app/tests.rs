@@ -60,7 +60,7 @@ use caudra_lua::{BuiltinAction, HintReader, KeymapReader, LuaCommandInfo, LuaCom
 use caudra_providers::model_registry::{self, Binding};
 use caudra_providers::{
     Billing, ContentBlock, HistoryItemKind, Message, RequestOptions, Role, THINKING_USAGE,
-    TokenUsage, UserOrigin, expand_message, project_messages,
+    TaskEventOrigin, TokenUsage, UserOrigin, expand_message, project_messages,
 };
 use caudra_storage::id::CaudraId;
 use caudra_storage::permission_patterns::{
@@ -102,6 +102,7 @@ use ratatui::layout::{Position, Rect};
 use ratatui::text::Line;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::slice::from_ref;
 use std::time::Duration;
 use tempfile::TempDir;
 use test_case::test_case;
@@ -468,6 +469,7 @@ pub(crate) fn agent_msg(event: AgentEvent) -> Msg {
 
 fn agent_msg_with_run_id(event: AgentEvent, run_id: u64) -> Msg {
     Msg::Agent(Box::new(Envelope {
+        task: None,
         event,
         subagent: None,
         run_id,
@@ -535,6 +537,7 @@ fn subagent_msg_with_run_id(
     run_id: u64,
 ) -> Msg {
     Msg::Agent(Box::new(Envelope {
+        task: None,
         event,
         subagent: Some(subagent_info(parent_id, name.unwrap_or("Agent"))),
         run_id,
@@ -551,6 +554,7 @@ fn subagent_msg_with_prompt(
     let mut info = subagent_info(parent_id, name.unwrap_or("Agent"));
     info.prompt = prompt.map(String::from);
     Msg::Agent(Box::new(Envelope {
+        task: None,
         event,
         subagent: Some(info),
         run_id: 1,
@@ -562,6 +566,7 @@ fn subagent_msg_with_model(event: AgentEvent, parent_id: &str, name: &str, model
     let mut info = subagent_info(parent_id, name);
     info.model = Some(model.into());
     Msg::Agent(Box::new(Envelope {
+        task: None,
         event,
         subagent: Some(info),
         run_id: 1,
@@ -571,6 +576,7 @@ fn subagent_msg_with_model(event: AgentEvent, parent_id: &str, name: &str, model
 
 fn subagent_msg_with_info(event: AgentEvent, subagent: SubagentInfo) -> Msg {
     Msg::Agent(Box::new(Envelope {
+        task: None,
         event,
         subagent: Some(subagent),
         run_id: 1,
@@ -692,6 +698,917 @@ fn mailbox_wake_starts_without_an_empty_user_bubble() {
     ));
     assert_eq!(app.status, Status::Streaming);
     assert!(app.main_chat().segment_search_texts().is_empty());
+}
+
+#[test_case(false; "report_after_final_answer")]
+#[test_case(true; "stop_suppresses_report")]
+fn normal_done_keeps_background_continuation_eligible(stopped: bool) {
+    const REPORT: &str = "The audit found a missing validation check.";
+    const FINAL: &str = "Implementation is ready; the audit is still running.";
+    let mut app = streaming_app();
+    app.main_chat()
+        .push(DisplayMessage::new(DisplayRole::Assistant, FINAL.into()));
+    end_turn(&mut app);
+    assert_eq!(app.status, Status::Idle);
+    assert!(app.state.goal.status().is_none());
+    let run_id = app.run_id;
+    if stopped {
+        app.handle_cancel();
+        assert!(app.cancelling_run.is_none());
+    }
+    let observation = Message::observation(REPORT.into());
+    let actions = app.start_mailbox_run(vec![observation.clone()]);
+    if stopped {
+        assert!(actions.is_empty());
+        assert!(app.automatic_wakes_suppressed);
+        type_and_submit(&mut app, REPORT);
+        assert!(!app.automatic_wakes_suppressed);
+    } else {
+        assert_eq!(app.run_id, run_id + 1);
+        assert!(matches!(actions.as_slice(), [Action::SendMessage(input)]
+            if input.message.is_empty() && input.preamble.len() == 1 && input.preamble[0].first_text_content() == observation.first_text_content()));
+        assert_eq!(app.main_chat().last_message_text(), FINAL);
+        app.update(agent_msg_with_run_id(done(), app.run_id));
+        assert!(
+            !app.start_mailbox_run(vec![Message::observation(REPORT.into())])
+                .is_empty()
+        );
+    }
+}
+
+#[test_case(DoneReason::MaxTurns; "turn_budget")]
+#[test_case(DoneReason::MaxTokens; "token_budget")]
+#[test_case(DoneReason::Cancelled; "cancelled")]
+fn terminal_limits_suppress_background_continuation(reason: DoneReason) {
+    const REPORT: &str = "A later report must not restart an exhausted turn.";
+    let mut app = streaming_app();
+    app.update(agent_msg(AgentEvent::Done {
+        usage: TokenUsage::default(),
+        num_turns: 1,
+        reason,
+    }));
+    assert!(
+        app.start_mailbox_run(vec![Message::observation(REPORT.into())])
+            .is_empty()
+    );
+}
+
+mod background_runtime {
+    use std::path::Path;
+    use std::sync::{Arc, Once};
+    use std::time::Duration;
+
+    use arc_swap::ArcSwap;
+    use caudra_agent::prompt::profile::PromptProfileCatalog;
+    use caudra_agent::tools::native::task::configure_background;
+    use caudra_agent::tools::{ToolRegistry, native};
+    use caudra_agent::types::BACKGROUND_EVENT_RUN_ID;
+    use caudra_agent::{
+        AgentConfig, AgentEvent, Envelope, McpConfigErrors, SubagentHistoryStore, SubagentInfo,
+        TaskProvenance,
+    };
+    use caudra_config::ModelPolicy;
+    use caudra_lua::EventHandle;
+    use caudra_providers::provider::{BoxFuture, Provider};
+    use caudra_providers::{
+        AgentError, CacheKey, ContentBlock, Message, Model, ModelInfo, ProviderEvent,
+        RequestOptions, Role, StandingReminderKind, StopReason, StreamResponse, Timeouts,
+        project_messages,
+    };
+    use caudra_storage::id::{CaudraId, SessionRef};
+    use caudra_workflow::{
+        LaunchRequest, RunStatus, WorkflowEvent, WorkflowRequest, WorkflowResponse,
+    };
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use futures_lite::future::poll_once;
+    use serde_json::{Value, json};
+    use test_case::test_case;
+
+    use super::{App, Msg, Status, subagent_info, test_app};
+    use crate::AppSession;
+    use crate::agent::shared_queue::QueueItem;
+    use crate::agent::{AgentHandles, ModelSlot, QueuedMessage, reserve_background_transition};
+    use crate::app::SubmitOutcome;
+    use crate::chat::Chat;
+    use crate::components::{Action, DisplayRole, key};
+
+    const PARENT: &str = "Implement the change and launch the independent audit.";
+    const CHILD: &str = "Audit the implementation independently.";
+    const TASK: &str = "background-audit";
+    const REPORT_CALL: &str = "audit-report";
+    const REPORT: &str = "The audit found a missing input validation check.";
+    const FINAL: &str = "Implementation is ready; the audit is still running.";
+    const SUMMARY: &str = "The audit was delegated and was last observed running.";
+    const EMPTY_BACKGROUND: &str = "No active background work";
+    const COMPACT_COMMAND: &str = "/compact";
+    const REVIEW_WORKFLOW: &str = "review-changes";
+    const WORKFLOW_BUDGET: u32 = 1;
+    const TIMEOUT: Duration = Duration::from_secs(30);
+    const REPEATED_CHECKPOINTS: usize = 16;
+    static REGISTER: Once = Once::new();
+
+    struct Request {
+        messages: Vec<Message>,
+        reply: flume::Sender<Result<StreamResponse, AgentError>>,
+    }
+
+    struct ControlledProvider(flume::Sender<Request>);
+
+    impl Provider for ControlledProvider {
+        fn stream_message<'a>(
+            &'a self,
+            _: &'a Model,
+            messages: &'a [Message],
+            _: &'a str,
+            _: &'a Value,
+            _: &'a flume::Sender<ProviderEvent>,
+            _: RequestOptions,
+            _: Option<&'a CacheKey>,
+        ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
+            Box::pin(async move {
+                let (reply, result) = flume::bounded(1);
+                self.0
+                    .send_async(Request {
+                        messages: messages.to_vec(),
+                        reply,
+                    })
+                    .await
+                    .map_err(|_| AgentError::Channel)?;
+                result.recv_async().await.map_err(|_| AgentError::Channel)?
+            })
+        }
+
+        fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+    }
+
+    fn response(content: ContentBlock, stop: StopReason) -> Result<StreamResponse, AgentError> {
+        Ok(StreamResponse {
+            message: Message {
+                role: Role::Assistant,
+                content: vec![content],
+                ..Default::default()
+            },
+            stop_reason: Some(stop),
+            ..Default::default()
+        })
+    }
+
+    fn final_response() -> Result<StreamResponse, AgentError> {
+        response(
+            ContentBlock::Text { text: FINAL.into() },
+            StopReason::EndTurn,
+        )
+    }
+
+    struct Fixture {
+        app: Box<App>,
+        handles: AgentHandles,
+        requests: flume::Receiver<Request>,
+        child: Request,
+    }
+
+    impl Fixture {
+        async fn after_final() -> Self {
+            Self::after_final_with_reminders(true).await
+        }
+
+        async fn after_final_with_reminders(show_reminders: bool) -> Self {
+            REGISTER.call_once(|| native::register(ToolRegistry::global()).unwrap());
+            let mut app = Box::new(test_app());
+            app.ui_config.show_reminders = show_reminders;
+            app.chats[0] = Chat::new(
+                app.chats[0].name.clone(),
+                Path::new(&app.state.session.cwd),
+                app.ui_config.clone(),
+                EventHandle::disconnected_for_test(),
+            );
+            app.state.mode = super::Mode::Build;
+            app.permissions.set_session_yolo(Some(true));
+            app.storage_writer
+                .save_sync(Arc::clone(&app.state.session))
+                .unwrap();
+            let (requests, received) = flume::unbounded();
+            let slot = Arc::new(ArcSwap::from_pointee(ModelSlot {
+                model: app.state.model.clone(),
+                provider: Arc::new(ControlledProvider(requests)),
+            }));
+            let handles = AgentHandles::spawn(
+                &slot,
+                Vec::new(),
+                Vec::new(),
+                AgentConfig {
+                    generate_titles: false,
+                    compaction_requirements: false,
+                    ..Default::default()
+                },
+                app.ui_config.tool_output_lines,
+                &app.permissions,
+                Some(SessionRef::from(app.state.session.id)),
+                None,
+                Timeouts::default(),
+                EventHandle::disconnected_for_test(),
+                None,
+                McpConfigErrors::new(Default::default()),
+                Arc::new(ModelPolicy::default()),
+                app.state.goal.clone(),
+                SubagentHistoryStore::default(),
+                None,
+                Arc::new(PromptProfileCatalog::default()),
+                Some(app.storage.clone()),
+                Arc::clone(&app.workspace_baseline),
+                None,
+                None,
+                None,
+                None,
+                true,
+            );
+            handles.apply_to_app(&mut app);
+            let SubmitOutcome::Started(actions) = app.submit_prompt(QueuedMessage {
+                text: PARENT.into(),
+                images: Vec::new(),
+                mentions: Vec::new(),
+                commits: Vec::new(),
+                paste_ranges: Vec::new(),
+            }) else {
+                panic!("parent prompt was not admitted");
+            };
+            enqueue(&app, &handles, actions);
+            received
+                .recv_async()
+                .await
+                .unwrap()
+                .reply
+                .send(response(
+                    ContentBlock::ToolUse {
+                        id: TASK.into(),
+                        name: "task".into(),
+                        input: json!({"description": TASK, "prompt": CHILD, "background": true}),
+                        thought_signature: None,
+                    },
+                    StopReason::ToolUse,
+                ))
+                .unwrap();
+            let mut child = None;
+            for _ in 0..2 {
+                let request = received.recv_async().await.unwrap();
+                for message in &request.messages {
+                    for block in &message.content {
+                        if let ContentBlock::ToolResult {
+                            is_error: true,
+                            content,
+                            ..
+                        } = block
+                        {
+                            panic!("task admission failed: {content}");
+                        }
+                    }
+                }
+                if request.messages.iter().any(|message| {
+                    message
+                        .first_text_content()
+                        .is_some_and(|text| text.starts_with(CHILD))
+                }) {
+                    child = Some(request);
+                } else {
+                    request.reply.send(final_response()).unwrap();
+                }
+            }
+            let mut fixture = Self {
+                app,
+                handles,
+                requests: received,
+                child: child.expect("child request"),
+            };
+            fixture.drain_parent().await;
+            assert_eq!(fixture.app.status, Status::Idle);
+            assert_eq!(
+                fixture.handles.background.as_ref().unwrap().active_count(),
+                1
+            );
+            fixture
+        }
+
+        async fn compact(&mut self) -> Request {
+            assert_eq!(self.app.status, Status::Idle);
+            let actions = self.app.execute_command(super::cmd(COMPACT_COMMAND), 0);
+            assert!(matches!(actions.as_slice(), [Action::Compact]));
+            self.handles.queue.push(QueueItem::Compact {
+                run_id: self.app.run_id,
+            });
+            self.requests.recv_async().await.unwrap()
+        }
+
+        async fn drain_parent(&mut self) {
+            loop {
+                let envelope = self.handles.agent_rx.recv_async().await.unwrap();
+                if envelope.run_id == self.app.run_id
+                    && matches!(envelope.event, AgentEvent::QueueDrained)
+                {
+                    break;
+                }
+                self.app.update(Msg::Agent(Box::new(envelope)));
+            }
+            self.app.flush_background_delivery(true).await.unwrap();
+        }
+
+        fn envelope(&self, event: AgentEvent) -> Envelope {
+            let task = self
+                .handles
+                .background
+                .as_ref()
+                .unwrap()
+                .list()
+                .into_iter()
+                .find(|task| task.call_id == TASK)
+                .unwrap();
+            Envelope {
+                event,
+                subagent: Some(SubagentInfo {
+                    task_id: task.task_id.clone(),
+                    ..subagent_info(TASK, TASK)
+                }),
+                run_id: BACKGROUND_EVENT_RUN_ID,
+                workflow: None,
+                task: Some(Arc::new(TaskProvenance {
+                    session_id: self.app.state.session.id,
+                    task_id: task.task_id,
+                    invocation_id: task.invocation_id,
+                })),
+            }
+        }
+
+        async fn close(self) {
+            self.handles
+                .background
+                .as_ref()
+                .unwrap()
+                .shutdown()
+                .await
+                .unwrap();
+            self.handles.cancel();
+        }
+    }
+
+    fn enqueue(app: &App, handles: &AgentHandles, actions: Vec<Action>) {
+        for action in actions {
+            let Action::SendMessage(input) = action else {
+                panic!("expected parent run");
+            };
+            handles.queue.push(QueueItem::Message {
+                text: input.message.clone(),
+                image_count: input.images.len(),
+                paste_ranges: Vec::new(),
+                input,
+                run_id: app.run_id,
+                admission: caudra_agent::PromptAdmission::Queue,
+                displayed: true,
+            });
+        }
+    }
+
+    async fn bounded(test: impl Future<Output = ()>) {
+        futures_lite::future::or(test, async {
+            smol::Timer::after(TIMEOUT).await;
+            panic!("background TUI test did not reach its event barrier");
+        })
+        .await;
+    }
+
+    #[test_case(false, false; "hidden_task")]
+    #[test_case(true, false; "visible_task")]
+    #[test_case(false, true; "hidden_task_and_workflow")]
+    #[test_case(true, true; "visible_task_and_workflow")]
+    fn idle_compact_samples_finished_background_work_before_done(
+        show_reminders: bool,
+        with_workflow: bool,
+    ) {
+        smol::block_on(bounded(async {
+            let mut fixture = Fixture::after_final_with_reminders(show_reminders).await;
+            let background = fixture.handles.background.as_ref().unwrap().clone();
+            let workflow = fixture.handles.workflow_handle().unwrap();
+            let workflow_child = if with_workflow {
+                let WorkflowResponse::Started(run) = workflow
+                    .request(WorkflowRequest::Start(LaunchRequest {
+                        name: REVIEW_WORKFLOW.into(),
+                        args: json!({"scope": PARENT}),
+                        agent_budget: Some(WORKFLOW_BUDGET),
+                    }))
+                    .await
+                    .unwrap()
+                else {
+                    panic!("workflow was not started");
+                };
+                Some((run.run_id, fixture.requests.recv_async().await.unwrap()))
+            } else {
+                None
+            };
+            let request = fixture.compact().await;
+            let before = fixture.handles.history.load_full();
+            fixture.child.reply.send(final_response()).unwrap();
+            background.notified().await;
+            if let Some((run_id, child)) = workflow_child {
+                child.reply.send(Err(AgentError::Channel)).unwrap();
+                loop {
+                    let envelope = fixture.handles.agent_rx.recv_async().await.unwrap();
+                    let finished = matches!(
+                        &envelope.event,
+                        AgentEvent::Workflow(event) if matches!(
+                            event.as_ref(),
+                            WorkflowEvent::Snapshot(run) if run.run_id == run_id && run.status == RunStatus::Completed
+                        )
+                    );
+                    fixture.app.update(Msg::Agent(Box::new(envelope)));
+                    if finished {
+                        break;
+                    }
+                }
+            }
+            assert_eq!(workflow.active_count(), 0);
+            assert_eq!(background.active_count(), 0);
+            assert!(background.has_pending());
+            assert!(fixture.handles.history.load().messages == before.messages);
+            request
+                .reply
+                .send(response(
+                    ContentBlock::Text {
+                        text: SUMMARY.into(),
+                    },
+                    StopReason::EndTurn,
+                ))
+                .unwrap();
+            let mut reminder = None;
+            let mut summary_seen = false;
+            let mut done = false;
+            loop {
+                let envelope = fixture.handles.agent_rx.recv_async().await.unwrap();
+                if envelope.subagent.is_none() && envelope.run_id == fixture.app.run_id {
+                    match &envelope.event {
+                        AgentEvent::TurnComplete(turn) => {
+                            assert!(turn.message.is_compaction_summary);
+                            assert!(!done);
+                            summary_seen = true;
+                        }
+                        AgentEvent::Injected {
+                            text,
+                            task_event: None,
+                        } => {
+                            assert!(summary_seen);
+                            assert!(!done);
+                            assert!(reminder.is_none());
+                            assert!(text.contains(EMPTY_BACKGROUND), "{text}");
+                            let snapshot = fixture.handles.history.load_full();
+                            let messages = project_messages(&snapshot.messages).unwrap();
+                            let last = messages.last().unwrap();
+                            assert_eq!(last.first_text_content(), Some(text.as_str()));
+                            assert_eq!(
+                                last.standing_reminder,
+                                Some(StandingReminderKind::BackgroundWork)
+                            );
+                            assert!(last.task_event.is_none());
+                            reminder = Some(text.clone());
+                        }
+                        AgentEvent::Done { .. } => {
+                            assert!(reminder.is_some());
+                            assert!(!done);
+                            done = true;
+                        }
+                        AgentEvent::QueueDrained => break,
+                        AgentEvent::Error { message } => panic!("{message}"),
+                        _ => {}
+                    }
+                }
+                assert!(
+                    fixture
+                        .app
+                        .update(Msg::Agent(Box::new(envelope)))
+                        .is_empty()
+                );
+                fixture.app.checkpoint();
+            }
+            assert!(done);
+            assert_eq!(fixture.app.status, Status::Idle);
+            assert!(fixture.requests.is_empty());
+            assert!(fixture.handles.queue.is_empty());
+            assert!(background.has_pending());
+            fixture.app.flush_background_delivery(true).await.unwrap();
+            let saved =
+                AppSession::load(fixture.app.state.session.id, &fixture.app.storage).unwrap();
+            let history = crate::active_session_history(&saved).unwrap();
+            let messages = project_messages(&history).unwrap();
+            let last = messages.last().unwrap();
+            assert_eq!(
+                last.standing_reminder,
+                Some(StandingReminderKind::BackgroundWork)
+            );
+            assert_eq!(last.first_text_content(), reminder.as_deref());
+            assert!(last.task_event.is_none());
+            let live = fixture.app.main_chat();
+            assert_eq!(
+                (0..live.message_count())
+                    .filter(|&index| {
+                        let row = live.message_at(index).unwrap();
+                        row.role == DisplayRole::Injected
+                            && Some(row.text.as_str()) == reminder.as_deref()
+                    })
+                    .count(),
+                usize::from(show_reminders),
+            );
+            fixture.close().await;
+        }));
+    }
+
+    #[test_case(Some(AgentError::Channel); "failed")]
+    #[test_case(Some(AgentError::Cancelled); "cancelled")]
+    #[test_case(None; "empty")]
+    fn idle_compact_does_not_snapshot_an_unsuccessful_summary(error: Option<AgentError>) {
+        smol::block_on(bounded(async {
+            let mut fixture = Fixture::after_final().await;
+            let request = fixture.compact().await;
+            let before = fixture.handles.history.load_full();
+            request
+                .reply
+                .send(match error {
+                    Some(error) => Err(error),
+                    None => Ok(StreamResponse::default()),
+                })
+                .unwrap();
+            loop {
+                let envelope = fixture.handles.agent_rx.recv_async().await.unwrap();
+                let failed = envelope.subagent.is_none()
+                    && matches!(envelope.event, AgentEvent::Error { .. });
+                assert!(!matches!(
+                    envelope.event,
+                    AgentEvent::Injected { .. } | AgentEvent::Done { .. }
+                ));
+                fixture.app.update(Msg::Agent(Box::new(envelope)));
+                fixture.app.checkpoint();
+                if failed {
+                    break;
+                }
+            }
+            assert_eq!(fixture.handles.history.load().messages, before.messages);
+            assert_eq!(
+                crate::active_session_history(&fixture.app.state.session).unwrap(),
+                *before.messages
+            );
+            assert!(fixture.requests.is_empty());
+            fixture.close().await;
+        }));
+    }
+
+    #[test_case(true; "prepared_tools_already_capability_configured")]
+    fn prepared_task_tools_match_session_capability(supported: bool) {
+        smol::block_on(bounded(async {
+            let fixture = Fixture::after_final().await;
+            assert_eq!(fixture.handles.background.is_some(), supported);
+            let prepared = fixture.handles.btw_prompt.load();
+            let mut configured = prepared.tools.clone();
+            configure_background(&mut configured, supported);
+            assert_eq!(prepared.tools, configured);
+            let definitions = prepared.tools.as_array().unwrap();
+            let task = definitions
+                .iter()
+                .find(|tool| tool["name"] == "task")
+                .unwrap();
+            assert!(
+                task["input_schema"]["properties"]
+                    .get("background")
+                    .is_some()
+            );
+            assert!(
+                definitions
+                    .iter()
+                    .any(|tool| tool["name"] == "task_control")
+            );
+            fixture.close().await;
+        }));
+    }
+
+    #[test_case(false; "report_after_final_while_child_runs")]
+    #[test_case(true; "stop_suppresses_postfinal_report")]
+    fn real_report_after_final_resumes_only_an_armed_parent(stopped: bool) {
+        smol::block_on(bounded(async {
+            let mut fixture = Fixture::after_final().await;
+            let background = fixture.handles.background.as_ref().unwrap().clone();
+            fixture
+                .child
+                .reply
+                .send(response(
+                    ContentBlock::ToolUse {
+                        id: REPORT_CALL.into(),
+                        name: "report_to_parent".into(),
+                        input: json!({"message": REPORT}),
+                        thought_signature: None,
+                    },
+                    StopReason::ToolUse,
+                ))
+                .unwrap();
+            fixture.child = fixture.requests.recv_async().await.unwrap();
+            background.notified().await;
+            assert_eq!(background.active_count(), 1);
+            if stopped {
+                fixture.app.handle_cancel();
+                background.stop().await.unwrap();
+                assert!(background.claim_messages().unwrap().is_empty());
+                assert!(!background.has_pending());
+            } else {
+                let messages = background.claim_messages().unwrap();
+                assert!(messages.iter().any(|message| message.task_event.is_some()));
+                let actions = fixture.app.start_mailbox_run(messages);
+                enqueue(&fixture.app, &fixture.handles, actions);
+                let request = fixture.requests.recv_async().await.unwrap();
+                assert!(
+                    request
+                        .messages
+                        .iter()
+                        .any(|message| message.task_event.is_some())
+                );
+                request.reply.send(final_response()).unwrap();
+                fixture.drain_parent().await;
+                assert!(!background.has_pending());
+                assert_eq!(background.active_count(), 1);
+            }
+            fixture.close().await;
+        }));
+    }
+
+    #[test_case("valid", true; "current_child_survives_main_done")]
+    #[test_case("session", false; "foreign_session")]
+    #[test_case("invocation", false; "stale_invocation")]
+    #[test_case("child", false; "mismatched_child")]
+    #[test_case("missing", false; "sentinel_without_provenance")]
+    fn session_event_provenance_is_validated(change: &str, accepted: bool) {
+        smol::block_on(bounded(async {
+            let mut fixture = Fixture::after_final().await;
+            let mut envelope = fixture.envelope(AgentEvent::AuthRequired);
+            match change {
+                "session" => {
+                    Arc::make_mut(envelope.task.as_mut().unwrap()).session_id = CaudraId::generate()
+                }
+                "invocation" => {
+                    Arc::make_mut(envelope.task.as_mut().unwrap()).invocation_id =
+                        CaudraId::generate().to_string()
+                }
+                "child" => {
+                    envelope.subagent.as_mut().unwrap().parent_tool_use_id = REPORT_CALL.into()
+                }
+                "missing" => envelope.task = None,
+                _ => {}
+            }
+            fixture.app.run_id += 1;
+            fixture.app.update(Msg::Agent(Box::new(envelope)));
+            assert_eq!(
+                fixture.app.pending_input != super::PendingInput::None,
+                accepted
+            );
+            fixture.close().await;
+        }));
+    }
+
+    #[test]
+    fn workspace_rollback_releases_pending_reports_without_rearming() {
+        smol::block_on(bounded(async {
+            let fixture = Fixture::after_final().await;
+            let background = fixture.handles.background.as_ref().unwrap().clone();
+            fixture.child.reply.send(final_response()).unwrap();
+            background.notified().await;
+            assert!(background.has_pending());
+            let transition = reserve_background_transition(&background).unwrap();
+            background.rearm();
+            assert!(background.claim_messages().unwrap().is_empty());
+            let task_id = background.list()[0].task_id.clone();
+            assert!(background.promote(&task_id).await.is_err());
+            drop(transition);
+            assert!(background.has_pending());
+            let messages = background.claim_messages().unwrap();
+            assert!(messages.iter().any(|message| message.task_event.is_some()));
+            background.release_messages(&messages);
+            fixture.close().await;
+        }));
+    }
+
+    #[test_case(false; "unsaved_claim_released_after_cached_final_save")]
+    #[test_case(true; "compacted_claim_accepted_after_final_save")]
+    fn final_idle_save_reconciles_background_claims_outside_projection(saved: bool) {
+        smol::block_on(bounded(async {
+            let mut fixture = Fixture::after_final().await;
+            let background = fixture.handles.background.as_ref().unwrap().clone();
+            fixture.child.reply.send(final_response()).unwrap();
+            background.notified().await;
+            let messages = background.claim_messages().unwrap();
+            fixture.app.background_claims = messages.clone();
+            if saved {
+                fixture.app.shared_history = None;
+                fixture.app.state.session_mut().meta.history_head = None;
+                fixture
+                    .app
+                    .state
+                    .session_mut()
+                    .replace_messages(crate::history_items(&messages));
+                fixture
+                    .app
+                    .storage_writer
+                    .save_sync(Arc::clone(&fixture.app.state.session))
+                    .unwrap();
+                fixture.app.state.session_mut().replace_messages(Vec::new());
+            }
+            fixture.app.flush_background_delivery(false).await.unwrap();
+            assert!(!background.has_pending());
+            let revision = fixture.app.background_saved_revision;
+            fixture.app.flush_background_delivery(true).await.unwrap();
+            assert_eq!(fixture.app.background_saved_revision, revision);
+            assert!(fixture.app.background_claims.is_empty());
+            assert_eq!(background.has_pending(), !saved);
+            fixture.close().await;
+        }));
+    }
+
+    #[test_case(false; "identical_checkpoints_coalesce")]
+    #[test_case(true; "only_latest_revision_is_queued")]
+    fn parked_admission_does_not_block_checkpoints_or_input(latest: bool) {
+        smol::block_on(bounded(async {
+            let mut fixture = Fixture::after_final().await;
+            let background = fixture.handles.background.as_ref().unwrap().clone();
+            let admission = background.workflow_admission().await.unwrap();
+            fixture.app.background_delivery.invalidate();
+            let started = fixture.app.background_delivery.jobs_started();
+            fixture.app.persist_background_delivery(true).unwrap();
+            if latest {
+                fixture.app.shared_history = None;
+                fixture.app.state.session_mut().meta.history_head = None;
+                fixture
+                    .app
+                    .state
+                    .session_mut()
+                    .replace_messages(crate::history_items(&[Message::user(REPORT.into())]));
+            }
+            for _ in 0..REPEATED_CHECKPOINTS {
+                fixture.app.persist_background_delivery(true).unwrap();
+            }
+            assert_eq!(fixture.app.background_delivery.jobs_started(), started + 1);
+            assert!(fixture.app.background_delivery.pending());
+            fixture.app.update(Msg::Key(KeyEvent::new(
+                KeyCode::Char('x'),
+                KeyModifiers::NONE,
+            )));
+            assert!(!fixture.app.input_box.is_empty());
+            drop(admission);
+            fixture.app.flush_background_delivery(true).await.unwrap();
+            assert_eq!(
+                fixture.app.background_delivery.jobs_started(),
+                started + 1 + u64::from(latest)
+            );
+            fixture.app.persist_background_delivery(true).unwrap();
+            assert!(!fixture.app.background_delivery.pending());
+            fixture.close().await;
+        }));
+    }
+
+    #[test]
+    fn stale_final_worker_cannot_release_a_newer_turns_claim() {
+        smol::block_on(bounded(async {
+            let mut fixture = Fixture::after_final().await;
+            let background = fixture.handles.background.as_ref().unwrap().clone();
+            fixture.child.reply.send(final_response()).unwrap();
+            background.notified().await;
+            let old_claim = background.claim_messages().unwrap();
+            let admission = background.workflow_admission().await.unwrap();
+            fixture.app.background_delivery.invalidate();
+            fixture.app.persist_background_delivery(true).unwrap();
+            fixture.app.run_id += 1;
+            fixture.app.rearm_background();
+            let fence = Arc::clone(&fixture.app.background_delivery.fence);
+            let parent = fence.enter().await;
+            background.release_messages(&old_claim);
+            let new_claim = background.claim_messages().unwrap();
+            assert!(!new_claim.is_empty());
+            fixture.app.background_claims = new_claim;
+            drop(admission);
+            fixture.app.flush_background_delivery(false).await.unwrap();
+            assert!(!background.has_pending());
+            assert!(!fixture.app.background_claims.is_empty());
+            drop(parent);
+            fixture.close().await;
+        }));
+    }
+
+    #[test]
+    fn stop_during_parked_reconciliation_is_responsive_and_rearm_waits_for_drain() {
+        smol::block_on(bounded(async {
+            let mut fixture = Fixture::after_final().await;
+            let background = fixture.handles.background.as_ref().unwrap().clone();
+            let admission = background.workflow_admission().await.unwrap();
+            fixture.app.background_delivery.invalidate();
+            fixture.app.persist_background_delivery(true).unwrap();
+            fixture.app.handle_cancel();
+            fixture.app.stop_background_work();
+            fixture.app.rearm_background();
+            fixture.app.update(Msg::Key(KeyEvent::new(
+                KeyCode::Char('x'),
+                KeyModifiers::NONE,
+            )));
+            assert!(!fixture.app.input_box.is_empty());
+            let fence = Arc::clone(&fixture.app.background_delivery.fence);
+            assert!(poll_once(fence.enter()).await.is_none());
+            drop(admission);
+            fixture.app.flush_background_delivery(true).await.unwrap();
+            assert_eq!(background.active_count(), 0);
+            assert!(!fixture.app.automatic_wakes_suppressed);
+            assert!(poll_once(fence.enter()).await.is_some());
+            assert!(background.workflow_admission().await.is_ok());
+            fixture.app.poll_background_delivery().unwrap();
+            fixture.close().await;
+        }));
+    }
+
+    #[test]
+    fn workflow_runtime_is_bound_to_the_session_supervisor_before_tools() {
+        smol::block_on(bounded(async {
+            let fixture = Fixture::after_final().await;
+            let background = fixture.handles.background.as_ref().unwrap().clone();
+            let workflow = fixture.handles.workflow_handle().unwrap();
+            assert!(workflow.bind_background(background).await.is_err());
+            fixture.close().await;
+        }));
+    }
+
+    #[test_case(false; "live_invocation_receives_auth_reply")]
+    #[test_case(true; "stopped_invocation_rejects_queued_auth_reply")]
+    fn interaction_response_rechecks_invocation_liveness(stopped: bool) {
+        smol::block_on(bounded(async {
+            let mut fixture = Fixture::after_final().await;
+            let background = fixture.handles.background.as_ref().unwrap().clone();
+            let (sender, receiver) = flume::unbounded();
+            let mut envelope = fixture.envelope(AgentEvent::AuthRequired);
+            envelope.subagent.as_mut().unwrap().answer_tx = Some(sender);
+            fixture.app.update(Msg::Agent(Box::new(envelope)));
+            if stopped {
+                background.stop().await.unwrap();
+                background.rearm();
+            }
+            fixture.app.handle_submit_with_admission(
+                super::Submission::empty(),
+                caudra_agent::PromptAdmission::Queue,
+            );
+            assert_eq!(receiver.try_recv().is_ok(), !stopped);
+            fixture.close().await;
+        }));
+    }
+
+    #[test_case(false; "invocation_changed")]
+    #[test_case(true; "generation_changed_under_gate")]
+    fn task_picker_mutations_are_async_and_fenced(generation_changed: bool) {
+        smol::block_on(bounded(async {
+            let mut fixture = Fixture::after_final().await;
+            let background = fixture.handles.background.as_ref().unwrap().clone();
+            let mut task = background.list().remove(0);
+            let id = task.task_id.clone();
+            let before = background.status(&id).unwrap().state;
+            let admission = background.workflow_admission().await.unwrap();
+            if !generation_changed {
+                task.invocation_id.push_str("-obsolete");
+            }
+            fixture.app.handle_task_picker_action(
+                crate::components::task_picker::TaskPickerAction::Control {
+                    task: Box::new(task),
+                    promote: false,
+                },
+            );
+            fixture.app.update(Msg::Key(key(KeyCode::Char('x'))));
+            assert!(!fixture.app.input_box.is_empty());
+            if generation_changed {
+                background.suppress_wakes();
+                background.rearm();
+            }
+            drop(admission);
+            fixture.app.flush_task_controls().await;
+            assert_eq!(background.status(&id).unwrap().state, before);
+            fixture.close().await;
+        }));
+    }
+
+    #[test]
+    fn workspace_reservation_and_plan_transition_drain_owned_children() {
+        smol::block_on(bounded(async {
+            let mut fixture = Fixture::after_final().await;
+            let background = fixture.handles.background.as_ref().unwrap().clone();
+            assert!(reserve_background_transition(&background).is_err());
+            let task_id = background.list()[0].task_id.clone();
+            assert!(background.promote(&task_id).await.is_ok());
+            fixture.app.enter_plan();
+            assert_eq!(fixture.app.state.mode, super::Mode::Plan);
+            assert_eq!(background.active_count(), 0);
+            let transition = reserve_background_transition(&background).unwrap();
+            background.rearm();
+            assert!(background.promote(&task_id).await.is_err());
+            drop(transition);
+            background.rearm();
+            assert!(background.suspend().is_ok());
+            fixture.close().await;
+        }));
+    }
 }
 
 fn with_text(app: &mut App) {
@@ -1583,6 +2500,107 @@ fn type_and_submit(app: &mut App, text: &str) -> Vec<Action> {
         app.update(Msg::Key(key(KeyCode::Char(c))));
     }
     app.update(Msg::Key(key(KeyCode::Enter)))
+}
+
+#[test_case("/tasks"; "plural")]
+#[test_case("/task"; "singular")]
+#[test_case("/tasks list"; "plural_list")]
+#[test_case("/task list"; "singular_list")]
+fn task_commands_open_local_picker_without_transcript(command: &str) {
+    let mut app = app_with_subagent();
+    let before = app.chats[0].message_count();
+    let actions = type_and_submit(&mut app, command);
+    assert!(actions.is_empty());
+    assert!(app.task_picker.is_open());
+    assert_eq!(app.chats[0].message_count(), before);
+}
+
+#[test_case("/tasks status"; "missing_id")]
+#[test_case("/tasks list extra"; "extra_list_id")]
+#[test_case("/task cancel id extra"; "extra_cancel_argument")]
+#[test_case("/tasks invalid id"; "invalid_operation")]
+#[test_case("/task status id extra more"; "many_extra_arguments")]
+fn malformed_task_commands_never_send_or_steer(command: &str) {
+    let mut app = app_with_subagent();
+    app.active_chat = 1;
+    let before = app.chats[1].message_count();
+    let actions = type_and_submit(&mut app, command);
+    assert!(actions.is_empty());
+    assert_eq!(app.chats[1].message_count(), before);
+    assert!(!app.task_picker.is_open());
+}
+
+#[test_case("/tasks"; "plural")]
+#[test_case("/task"; "alias")]
+fn task_status_selects_without_preview_then_enter_opens(command: &str) {
+    let mut app = app_with_subagent();
+    assert!(type_and_submit(&mut app, &format!("{command} status {TASK_ID}")).is_empty());
+    assert!(app.task_picker.is_open());
+    assert_eq!(app.active_chat, 0);
+    assert!(app.update(Msg::Key(key(KeyCode::Enter))).is_empty());
+    assert_eq!(app.active_chat, 1);
+    assert!(!app.task_picker.is_open());
+}
+
+#[test_case(false, "standalone"; "without_streamed_prediction")]
+#[test_case(true, "standalone"; "adopt_streamed_prediction")]
+#[test_case(false, "entry"; "batch_without_prediction")]
+#[test_case(true, "entry"; "batch_adopts_prediction")]
+#[test_case(false, "root"; "batch_root_parameters")]
+#[test_case(false, "flat"; "batch_root_flat_parameters")]
+fn task_admission_creates_navigable_chat_before_first_child_event(predicted: bool, shape: &str) {
+    const ASSIGNED_TASK: &str = "neat-wanted-cowbird";
+    const ASSIGNED_PROMPT: &str = "Wait for a permit, then inspect the source";
+    let batch = shape != "standalone";
+    let mut app = streaming_app();
+    let call_id = if batch {
+        format!("{TASK_ID}:0")
+    } else {
+        TASK_ID.to_owned()
+    };
+    let mut start = if batch {
+        batch_roster(TASK_ID, 1)
+    } else {
+        tool_start(TASK_ID, "task")
+    };
+    if let AgentEvent::ToolStart(event) = &mut start {
+        let input = Some(serde_json::json!({ "prompt": ASSIGNED_PROMPT }));
+        if shape == "root" {
+            event.raw_input = Some(
+                serde_json::json!({ "tool_calls": [{ "tool": "task", "parameters": input }] }),
+            );
+        } else if shape == "flat" {
+            event.raw_input = Some(
+                serde_json::json!({ "tool_calls": [{ "tool": "task", "prompt": ASSIGNED_PROMPT }] }),
+            );
+        } else if let Some(ToolOutput::Batch { entries, .. }) = &mut event.output {
+            entries[0].raw_input = input;
+        } else {
+            event.raw_input = input;
+        }
+    }
+    app.update(agent_msg(start));
+    if predicted {
+        app.delegation_delta(caudra_agent::Delegation {
+            parent_tool_use_id: call_id.clone(),
+            name: Some(RESEARCH_NAME.into()),
+            prompt: Some(ASSIGNED_PROMPT.into()),
+            task_id: None,
+        });
+    }
+    let card = serde_json::from_value(serde_json::json!({
+        "task_id": ASSIGNED_TASK, "invocation_id": "private-invocation",
+        "call_id": call_id, "root_call_id": TASK_ID, "label": RESEARCH_NAME,
+        "state": "queued", "background": true, "mode": "build",
+        "generation": 1, "created_at": 1, "updated_at": 1
+    }))
+    .unwrap();
+    app.update(agent_msg(AgentEvent::TaskAdmitted(card)));
+    app.discard_pending_delegations_under(TASK_ID);
+    assert!(app.focus_task(ASSIGNED_TASK).is_ok());
+    assert_eq!(app.chats.len(), 2);
+    assert_eq!(app.chats[1].name, RESEARCH_NAME);
+    assert_eq!(app.chats[1].message_at(0).unwrap().text, ASSIGNED_PROMPT);
 }
 
 pub(crate) fn cancel_app(app: &mut App) {
@@ -6036,6 +7054,7 @@ fn clicking_completed_task_in_main_chat_focuses_its_stable_chat() {
     let mut info = subagent_info(PARENT_TOOL_ID, RESEARCH_NAME);
     info.task_id = TASK_ID.into();
     app.update(Msg::Agent(Box::new(Envelope {
+        task: None,
         event: AgentEvent::TextDelta { text: "hi".into() },
         subagent: Some(info),
         run_id: 1,
@@ -6054,6 +7073,55 @@ fn clicking_completed_task_in_main_chat_focuses_its_stable_chat() {
     app.update(mouse_event(MouseEventKind::Down(MouseButton::Left), 5, 0));
     app.update(mouse_event(MouseEventKind::Up(MouseButton::Left), 5, 0));
 
+    assert_eq!(
+        app.chats[app.active_chat].task_id().map(|id| id.as_ref()),
+        Some(TASK_ID)
+    );
+}
+
+#[test_case(false; "live")]
+#[test_case(true; "restored")]
+fn clicking_task_delivery_opens_chat_named_by_typed_origin(restored: bool) {
+    const DELIVERY_TEXT: &str = "Task friendly-test-wren: success.\n\nUseful delivered result.";
+    const INVOCATION: &str = "private-invocation";
+    const EVENT: &str = "private-event";
+    let mut app = app_with_subagent();
+    let origin = TaskEventOrigin {
+        task_id: TASK_ID.into(),
+        invocation_id: INVOCATION.into(),
+        event_id: EVENT.into(),
+    };
+    if restored {
+        let history =
+            crate::history_items(&[Message::task_observation(DELIVERY_TEXT.into(), origin)]);
+        let (display, _) =
+            crate::chat::history_to_display(&history, &HashMap::new(), &Default::default(), false);
+        app.chats[0].load_messages(display);
+    } else {
+        app.chats[0].handle_event(
+            AgentEvent::Injected {
+                text: DELIVERY_TEXT.into(),
+                task_event: Some(origin),
+            },
+            None,
+        );
+    }
+    let area = Rect::new(0, 0, 60, 30);
+    set_zone(&mut app, SelectionZone::Messages, area);
+    let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+    terminal
+        .draw(|frame| app.chats[0].view(frame, area, false, false))
+        .unwrap();
+    let row = (0..area.height)
+        .find(|&row| {
+            let text: String = (0..area.width)
+                .map(|column| terminal.backend().buffer()[(column, row)].symbol())
+                .collect();
+            text.contains("open chat")
+        })
+        .unwrap();
+    app.update(mouse_event(MouseEventKind::Down(MouseButton::Left), 5, row));
+    app.update(mouse_event(MouseEventKind::Up(MouseButton::Left), 5, row));
     assert_eq!(
         app.chats[app.active_chat].task_id().map(|id| id.as_ref()),
         Some(TASK_ID)
@@ -11375,10 +12443,191 @@ fn fork_selects_the_subagent_history_version_on_its_branch() {
         &second
     );
     assert!(
-        !after_continuation
+        after_continuation
             .session
             .subagent_messages()
             .contains_key("continuation-call")
+    );
+}
+
+#[test_case(false; "typed_direct_launch")]
+#[test_case(true; "typed_batch_launch")]
+fn typed_task_outputs_select_launch_versions_for_restore_and_fork(batch: bool) {
+    const TASK: &str = "neat-wanted-cowbird";
+    const FIRST_CALL: &str = "first-launch";
+    const NEXT_CALL: &str = "next-launch";
+    const FIRST_TEXT: &str = "initial investigation";
+    const NEXT_TEXT: &str = "continued investigation";
+    const PRIVATE_INVOCATION: &str = "not-a-history-version";
+    let (_temp, _, _, mut app) = tempdir_app();
+    let tool = if batch { "batch" } else { "task" };
+    let mut messages = Vec::new();
+    for call in [FIRST_CALL, NEXT_CALL] {
+        messages.push(Message::user(call.into()));
+        messages.push(Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::tool_use(call, tool, serde_json::json!({}))],
+            ..Default::default()
+        });
+        messages.push(Message {
+            role: Role::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: call.into(),
+                content: String::new(),
+                is_error: false,
+                output_ref: None,
+            }],
+            ..Default::default()
+        });
+        let launch = if batch {
+            format!("{call}:0")
+        } else {
+            call.into()
+        };
+        let card = serde_json::from_value(serde_json::json!({
+            "task_id": TASK, "invocation_id": PRIVATE_INVOCATION,
+            "call_id": launch, "root_call_id": call, "label": RESEARCH_NAME,
+            "state": "succeeded", "background": true, "mode": "build",
+            "generation": 1, "created_at": 1, "updated_at": 2
+        }))
+        .unwrap();
+        let mut output = ToolOutput::Tasks(vec![card]);
+        if batch {
+            let AgentEvent::ToolStart(event) = batch_roster(call, 1) else {
+                unreachable!()
+            };
+            let Some(ToolOutput::Batch { mut entries, .. }) = event.output else {
+                unreachable!()
+            };
+            entries[0].output = Some(output);
+            entries[0].status = caudra_agent::BatchToolStatus::Success;
+            output = ToolOutput::Batch {
+                entries,
+                text: String::new(),
+            };
+        }
+        app.state
+            .session_mut()
+            .insert_tool_output(call.into(), output);
+        app.state.session_mut().set_subagent_history(
+            launch,
+            crate::history_items(&[Message::user(
+                if call == FIRST_CALL {
+                    FIRST_TEXT
+                } else {
+                    NEXT_TEXT
+                }
+                .into(),
+            )]),
+            Some(caudra_storage::sessions::StoredSubagentTaskSpec::version()),
+        );
+    }
+    let items = crate::history_items(&messages);
+    app.state.session_mut().replace_messages(items.clone());
+    app.state.session_mut().set_subagent_history(
+        TASK.into(),
+        crate::history_items(&[Message::user(FIRST_TEXT.into())]),
+        Some(caudra_storage::sessions::StoredSubagentTaskSpec::default()),
+    );
+    app.state.session_mut().set_subagents(vec![StoredSubagent {
+        tool_use_id: TASK.into(),
+        parent_tool_use_id: Some(if batch {
+            format!("{NEXT_CALL}:0")
+        } else {
+            NEXT_CALL.into()
+        }),
+        root_tool_use_id: Some(NEXT_CALL.into()),
+        name: RESEARCH_NAME.into(),
+        model: None,
+        thinking: None,
+        fast: false,
+        outcome: StoredSubagentOutcome::Done,
+    }]);
+    for (index, expected) in [(1, FIRST_TEXT), (4, NEXT_TEXT)] {
+        let forked = app
+            .fork_at(DisplaySource::ToolCall {
+                id: items[index].id,
+                result_id: Some(items[index + 1].id),
+            })
+            .unwrap();
+        let histories = crate::agent::stored_subagent_history(&forked.session).snapshot();
+        let selected_call = if index == 1 { FIRST_CALL } else { NEXT_CALL };
+        let selected_call = if batch {
+            format!("{selected_call}:0")
+        } else {
+            selected_call.into()
+        };
+        assert_eq!(
+            histories.records()[TASK].version_id(),
+            Some(selected_call.as_str())
+        );
+        assert_eq!(
+            histories.histories()[TASK][0].first_text_content(),
+            Some(expected)
+        );
+    }
+    let histories = crate::agent::stored_subagent_history(&app.state.session).snapshot();
+    assert_eq!(
+        histories.histories()[TASK][0].first_text_content(),
+        Some(NEXT_TEXT)
+    );
+    app.reset_ui_chrome();
+    app.restore_display();
+    app.focus_task(TASK).unwrap();
+    assert_eq!(
+        app.chats[app.active_chat].message_at(0).unwrap().text,
+        NEXT_TEXT
+    );
+    app.state.session_mut().meta.history_head = Some(items[2].id);
+    app.state.session_mut().set_subagent_history(
+        TASK.into(),
+        crate::history_items(&[Message::user(NEXT_TEXT.into())]),
+        Some(caudra_storage::sessions::StoredSubagentTaskSpec::default()),
+    );
+    let seeded = crate::agent::stored_subagent_history(&app.state.session);
+    let selected = if batch {
+        format!("{FIRST_CALL}:0")
+    } else {
+        FIRST_CALL.into()
+    };
+    assert_eq!(
+        seeded.snapshot().records()[TASK].version_id(),
+        Some(selected.as_str())
+    );
+    let continuation = seeded.continue_task_with(TASK, Default::default()).unwrap();
+    assert_eq!(
+        continuation.history().unwrap()[0].first_text_content(),
+        Some(FIRST_TEXT)
+    );
+    let mut missing = AppSession::new(&app.state.session.model, &app.state.session.cwd);
+    missing.replace_messages(crate::active_session_history(&app.state.session).unwrap());
+    for (call, output) in app.state.session.tool_outputs() {
+        missing.insert_tool_output(call.clone(), output.as_ref().clone());
+    }
+    missing.set_subagents(app.state.session.subagents().to_vec());
+    missing.set_subagent_history(
+        TASK.into(),
+        crate::history_items(&[Message::user(NEXT_TEXT.into())]),
+        Some(caudra_storage::sessions::StoredSubagentTaskSpec::default()),
+    );
+    let seed = crate::agent::stored_subagent_history(&missing);
+    assert!(!seed.snapshot().records().contains_key(TASK));
+    assert!(seed.reserve(TASK).is_err());
+    app.state.session = Arc::new(missing);
+    app.reset_ui_chrome();
+    app.restore_display();
+    assert!(app.focus_task(TASK).is_err());
+    let forked = app
+        .fork_at(DisplaySource::ToolCall {
+            id: items[1].id,
+            result_id: Some(items[2].id),
+        })
+        .unwrap();
+    assert!(!forked.session.subagent_messages().contains_key(TASK));
+    assert!(
+        crate::agent::stored_subagent_history(&forked.session)
+            .reserve(TASK)
+            .is_err()
     );
 }
 
@@ -11502,7 +12751,7 @@ fn fork_copies_only_reachable_managed_outputs_including_nested_subagents() {
     ] {
         assert_eq!(
             store
-                .read(forked.session.id, output_ref.id, 1, 10)
+                .read(forked.session.id, output_ref.id.clone(), 1, 10)
                 .unwrap()
                 .text,
             expected
@@ -11512,6 +12761,87 @@ fn fork_copies_only_reachable_managed_outputs_including_nested_subagents() {
         store.read(forked.session.id, outside_ref.id, 1, 10),
         Err(ToolOutputError::NotFound { .. })
     ));
+}
+
+#[test_case(false; "single_reference")]
+#[test_case(true; "duplicate_references")]
+fn fork_reloads_truncated_task_observation_without_output_retrieval(duplicate: bool) {
+    const TASK: &str = "bright-calm-wren";
+    const INVOCATION: &str = "private-background-invocation";
+    const EVENT: &str = "private-background-event";
+    const OUTCOME: &str =
+        r#"{"output":"Complete background result beyond the preview","success":true}"#;
+    const UNRELATED: &str = "Unrelated output mentioned only in prose";
+    const ACK: &str = "The background task finished.";
+    let (_temp, storage, _, mut app) = tempdir_app();
+    let source = app.state.session.id;
+    let store = ToolOutputStore::new(storage.clone());
+    let reference = store.put(source, OUTCOME).unwrap();
+    let unrelated = store.put(source, UNRELATED).unwrap();
+    let origin = TaskEventOrigin {
+        task_id: TASK.into(),
+        invocation_id: INVOCATION.into(),
+        event_id: EVENT.into(),
+    };
+    let delivery = format!(
+        "Task {TASK}: success.\n\nResult preview truncated.\nRead full outcome: tool_output {}\nMentioned only: {}",
+        reference.id, unrelated.id,
+    );
+    let mut observation = Message::task_observation(delivery.clone(), origin.clone());
+    observation.retained_output_refs = vec![reference.clone()];
+    if duplicate {
+        observation.retained_output_refs.push(reference.clone());
+    }
+    let mut messages = vec![
+        Message::user("Run a background task".into()),
+        observation.clone(),
+    ];
+    if duplicate {
+        let mut repeated = observation;
+        repeated
+            .task_event
+            .as_mut()
+            .unwrap()
+            .event_id
+            .push_str("-next");
+        messages.push(repeated);
+    }
+    messages.push(Message {
+        role: Role::Assistant,
+        content: vec![ContentBlock::Text { text: ACK.into() }],
+        ..Default::default()
+    });
+    let items = crate::history_items(&messages);
+    let head = items.last().unwrap().id;
+    app.state.session_mut().replace_messages(items);
+    app.state.session_mut().save(&storage).unwrap();
+    app.state.session = Arc::new(AppSession::load(source, &storage).unwrap());
+    let mut forked = app.fork_at(DisplaySource::AssistantText(head)).unwrap();
+    let target = forked.session.id;
+    forked.session.save(&storage).unwrap();
+    let reloaded = AppSession::load(target, &storage).unwrap();
+    let projected = project_messages(reloaded.messages()).unwrap();
+    let delivered = projected
+        .iter()
+        .find(|message| message.task_event.as_ref() == Some(&origin))
+        .unwrap();
+    assert_eq!(delivered.retained_output_refs, from_ref(&reference));
+    assert_eq!(delivered.first_text_content(), Some(delivery.as_str()));
+    let read = store.read(target, reference.id.clone(), 1, 10).unwrap();
+    assert_eq!(read.text, OUTCOME);
+    assert_eq!(read.total_bytes, OUTCOME.len());
+    assert!(matches!(
+        store.read(target, unrelated.id, 1, 10),
+        Err(ToolOutputError::NotFound { .. })
+    ));
+    app.state.session = Arc::new(reloaded);
+    app.reset_ui_chrome();
+    app.restore_display();
+    let chat = app.main_chat();
+    let display = (0..chat.message_count()).filter_map(|index| chat.message_at(index)).find(|message| {
+        matches!(&message.role, DisplayRole::TaskDelivery(saved) if **saved == origin)
+    }).unwrap();
+    assert_eq!(display.text, delivery);
 }
 
 /// Reloading a compacted session used to stop at the border, because the
@@ -12380,6 +13710,7 @@ fn app_with_subagent_tx(id: &str) -> (App, flume::Receiver<String>, flume::Recei
     app.run_id = 1;
     app.answer_tx = Some(main_tx);
     app.update(Msg::Agent(Box::new(Envelope {
+        task: None,
         event: AgentEvent::TextDelta { text: "x".into() },
         subagent: Some(subagent_info_with_tx(id, "research", Some(sub_tx))),
         run_id: 1,
@@ -12517,6 +13848,7 @@ fn stale_auth_required_after_cancel_is_dropped() {
     app.run_id = 2;
     let count_before = app.chats[0].message_count();
     app.update(Msg::Agent(Box::new(Envelope {
+        task: None,
         event: AgentEvent::AuthRequired,
         subagent: None,
         run_id: 1,

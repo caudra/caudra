@@ -149,7 +149,7 @@ async fn load_pre_persisted(
     let has_instructions = done.output.instructions().is_some();
     let result = match (&done.output_ref, &ctx.session_id, &ctx.tool_output_store) {
         (Some(output_ref), Some(session_id), Some(store)) => {
-            let id = output_ref.id;
+            let id = output_ref.id.clone();
             let preview = !has_instructions
                 && (output_ref.line_count > limits.max_lines
                     || output_ref.byte_count > limits.max_bytes);
@@ -583,7 +583,7 @@ mod tests {
         assert!(done.output.as_text().len() <= limits.max_bytes);
         assert_eq!(
             store
-                .read(session.id(), output_ref.id, 1, 2_000)
+                .read(session.id(), output_ref.id.clone(), 1, 2_000)
                 .unwrap()
                 .text,
             text
@@ -680,7 +680,9 @@ mod tests {
         assert!(model_output.ends_with("model-only guidance"));
         assert_eq!(model_output.matches("model-only guidance").count(), 1);
 
-        let stored = store.read(session.id(), output_ref.id, 1, 2_000).unwrap();
+        let stored = store
+            .read(session.id(), output_ref.id.clone(), 1, 2_000)
+            .unwrap();
         assert_eq!(stored.text, format!("{full_text}\n\nmodel-only guidance"));
     }
 
@@ -701,7 +703,7 @@ mod tests {
         assert_eq!(done.output.as_text(), text);
         assert_eq!(
             store
-                .read(session.id(), output_ref.id, 1, 2_000)
+                .read(session.id(), output_ref.id.clone(), 1, 2_000)
                 .unwrap()
                 .text,
             text
@@ -725,7 +727,7 @@ mod tests {
         assert!(done.model_output.as_ref().unwrap().len() <= ctx.config.max_output_bytes);
         assert_eq!(
             store
-                .read(session.id(), output_ref.id, 1, 2_000)
+                .read(session.id(), output_ref.id.clone(), 1, 2_000)
                 .unwrap()
                 .text,
             text
@@ -1020,7 +1022,11 @@ mod tests {
         smol::block_on(limit(&mut done, &ctx));
 
         let output_ref = done.output_ref.unwrap();
-        assert!(store.read(session.id(), output_ref.id, 1, 2_000).is_ok());
+        assert!(
+            store
+                .read(session.id(), output_ref.id.clone(), 1, 2_000)
+                .is_ok()
+        );
         assert!(
             store
                 .read(SessionRef::generate().id(), output_ref.id, 1, 2_000)
@@ -1103,7 +1109,9 @@ mod tests {
         let complete_ref = done.output_ref.as_ref().unwrap();
         assert_ne!(complete_ref.id, original_ref.id);
         assert_eq!(
-            store.load_text(session.id(), complete_ref.id).unwrap(),
+            store
+                .load_text(session.id(), complete_ref.id.clone())
+                .unwrap(),
             expected
         );
         assert!(fits(

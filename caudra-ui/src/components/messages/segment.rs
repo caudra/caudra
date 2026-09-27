@@ -1183,9 +1183,10 @@ mod tests {
         let mut seg = seg_with_base(8, None);
         seg.highlight_range = Some((1, 3));
         seg.rows = vec![None; 8];
-        seg.rows[7] = Some(RowTarget(9));
-        let hl_rows: Vec<Option<RowTarget>> =
-            (0..replacement_lines).map(|i| Some(RowTarget(i))).collect();
+        seg.rows[7] = Some(RowTarget::Item(9));
+        let hl_rows: Vec<Option<RowTarget>> = (0..replacement_lines)
+            .map(|i| Some(RowTarget::Item(i)))
+            .collect();
 
         seg.apply_highlight_result(
             (0..replacement_lines).map(|_| Line::raw("hl")).collect(),
@@ -1197,7 +1198,7 @@ mod tests {
         assert_eq!(&seg.rows[1..1 + replacement_lines], hl_rows.as_slice());
         assert_eq!(
             seg.rows.last().copied().flatten(),
-            Some(RowTarget(9)),
+            Some(RowTarget::Item(9)),
             "a row after the splice moves with its line"
         );
     }
@@ -1212,7 +1213,7 @@ mod tests {
 
         seg.apply_highlight_result(
             (0..3).map(|_| Line::raw("hl")).collect(),
-            vec![Some(RowTarget(0))],
+            vec![Some(RowTarget::Item(0))],
             None,
         );
 

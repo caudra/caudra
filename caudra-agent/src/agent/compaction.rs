@@ -23,7 +23,9 @@ use super::side_model::{self, SideModel};
 use super::streaming::{StreamError, stream_with_retry};
 use crate::cancel::CancelToken;
 use crate::nudge::Nudge;
-use crate::{AgentError, AgentEvent, DoneReason, EventSender, TurnCompleteEvent};
+use crate::{
+    AgentError, AgentEvent, BackgroundReminderContext, DoneReason, EventSender, TurnCompleteEvent,
+};
 
 const CONTINUE_AFTER_COMPACT: &str = "Continue if you have next steps, or stop and ask for clarification if you are unsure how to proceed. If the summary contains a todo list, restore it with todo_write and keep it updated. If you learned important project context during this session, consider saving it to memory before it's lost.";
 /// The turn the summary answers. It has to be in the history for the roles to
@@ -107,17 +109,31 @@ pub(super) fn continue_message(config: &AgentConfig) -> String {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+pub(super) struct CompactionContext<'a> {
+    pub cancel: &'a CancelToken,
+    pub retry_now: &'a Nudge,
+    pub config: &'a AgentConfig,
+    pub extractor: Option<&'a SideModel>,
+    pub session: Option<BackgroundReminderContext<'a>>,
+}
+
 pub(super) async fn compact_history(
     provider: &dyn Provider,
     model: &Model,
     history: &mut History,
     event_tx: &EventSender,
-    cancel: &CancelToken,
-    retry_now: &Nudge,
-    config: &AgentConfig,
-    extractor: Option<&SideModel>,
+    context: CompactionContext<'_>,
 ) -> Result<CompactionOutcome, AgentError> {
+    let CompactionContext {
+        cancel,
+        retry_now,
+        config,
+        extractor,
+        session,
+    } = context;
+    let had_background = session
+        .as_ref()
+        .is_some_and(|session| session.had_context(history));
     let compact_start = std::time::Instant::now();
     let head_end = head_end(
         history.as_slice(),
@@ -230,6 +246,12 @@ pub(super) async fn compact_history(
     }
     let usage = response.usage;
     let result = finish_compact(response, history, head_end, event_tx, compact_start, model);
+    if result.is_ok()
+        && had_background
+        && let Some(session) = session
+    {
+        session.refresh(history, event_tx, config.background_reminder_turns, true);
+    }
     Ok(CompactionOutcome {
         usage,
         result,
@@ -391,7 +413,7 @@ fn retained_output_refs(messages: &[Message]) -> Vec<caudra_storage::tool_output
                 })
                 .chain(message.retained_output_refs.iter())
         })
-        .filter(|output_ref| retained_ids.insert(output_ref.id))
+        .filter(|output_ref| retained_ids.insert(&output_ref.id))
         .cloned()
         .collect()
 }
@@ -419,6 +441,27 @@ pub async fn compact(
     config: &AgentConfig,
     extractor: Option<&SideModel>,
 ) -> Result<CompactionSpend, AgentError> {
+    compact_with_session(
+        provider,
+        model,
+        history,
+        event_tx,
+        config,
+        extractor,
+        BackgroundReminderContext::default(),
+    )
+    .await
+}
+
+pub async fn compact_with_session(
+    provider: &dyn Provider,
+    model: &Model,
+    history: &mut History,
+    event_tx: &EventSender,
+    config: &AgentConfig,
+    extractor: Option<&SideModel>,
+    session: BackgroundReminderContext<'_>,
+) -> Result<CompactionSpend, AgentError> {
     event_tx.send(AgentEvent::Compacting)?;
     let cancel = CancelToken::none();
     let compacted = compact_history(
@@ -426,10 +469,13 @@ pub async fn compact(
         model,
         history,
         event_tx,
-        &cancel,
-        &Nudge::default(),
-        config,
-        extractor,
+        CompactionContext {
+            cancel: &cancel,
+            retry_now: &Nudge::default(),
+            config,
+            extractor,
+            session: Some(session),
+        },
     )
     .await?;
     compacted.result?;
@@ -438,6 +484,7 @@ pub async fn compact(
         history.push(Message::synthetic(post.to_string()));
         event_tx.send(AgentEvent::Injected {
             text: post.to_string(),
+            task_event: None,
         })?;
     }
 
@@ -1258,10 +1305,13 @@ mod tests {
                 &default_model(),
                 &mut history,
                 &EventSender::new(raw_tx, 0),
-                &CancelToken::none(),
-                &Nudge::default(),
-                &AgentConfig::default(),
-                None,
+                CompactionContext {
+                    cancel: &CancelToken::none(),
+                    retry_now: &Nudge::default(),
+                    config: &AgentConfig::default(),
+                    extractor: None,
+                    session: None,
+                },
             )
             .await
             .unwrap()
@@ -1682,10 +1732,13 @@ mod tests {
                 &default_model(),
                 &mut history,
                 &EventSender::new(raw_tx, 0),
-                &CancelToken::none(),
-                &Nudge::default(),
-                &AgentConfig::default(),
-                None,
+                CompactionContext {
+                    cancel: &CancelToken::none(),
+                    retry_now: &Nudge::default(),
+                    config: &AgentConfig::default(),
+                    extractor: None,
+                    session: None,
+                },
             )
             .await
             .unwrap()
@@ -1728,10 +1781,13 @@ mod tests {
                 &default_model(),
                 &mut history,
                 &EventSender::new(raw_tx, 0),
-                &CancelToken::none(),
-                &Nudge::default(),
-                &AgentConfig::default(),
-                None,
+                CompactionContext {
+                    cancel: &CancelToken::none(),
+                    retry_now: &Nudge::default(),
+                    config: &AgentConfig::default(),
+                    extractor: None,
+                    session: None,
+                },
             )
             .await
             .unwrap()

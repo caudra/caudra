@@ -67,6 +67,7 @@ pub const MIN_MAX_INPUT_LINES: u32 = 1;
 pub const MAX_SERVER_NAME_LEN: usize = 64;
 
 pub const DEFAULT_COMPACTION_BUFFER: CompactionBuffer = CompactionBuffer::Percent(20);
+pub const DEFAULT_BACKGROUND_REMINDER_TURNS: u32 = 0;
 /// Windows that already exclude output need less held back, since the reserve
 /// only has to absorb estimation drift rather than a whole response.
 pub const DEFAULT_INPUT_BUDGET_COMPACTION_BUFFER: CompactionBuffer = CompactionBuffer::Percent(10);
@@ -177,6 +178,7 @@ pub const CAUDRA_NATIVE_TOOL_NAMES: &[&str] = &[
     "question",
     "skill",
     "task",
+    "task_control",
     "todo_write",
     "tool_output",
     "view_image",
@@ -988,6 +990,7 @@ pub struct AgentFileConfig {
     pub compaction_instructions: Option<String>,
     pub post_compaction_instructions: Option<String>,
     pub compaction_requirements: Option<bool>,
+    pub background_reminder_turns: Option<u32>,
     pub generate_titles: Option<bool>,
     pub stale_read_check: Option<bool>,
     pub tool_json_repair: Option<bool>,
@@ -1015,6 +1018,7 @@ impl AgentFileConfig {
             compaction_instructions,
             post_compaction_instructions,
             compaction_requirements,
+            background_reminder_turns,
             generate_titles,
             stale_read_check,
             tool_json_repair,
@@ -1715,7 +1719,7 @@ impl ToolOutputLines {
     pub const FIELD_TOOLS: &[(&'static str, &'static [&'static str])] = &[
         ("bash", &["shell"]),
         ("python_execution", &["python_execution"]),
-        ("task", &["task"]),
+        ("task", &["task", "task_control"]),
         (
             "index",
             &[
@@ -1803,7 +1807,7 @@ impl ToolOutputLines {
         match name {
             "bash" | "shell" => self.bash,
             "python_execution" => self.python_execution,
-            "task" => self.task,
+            "task" | "task_control" => self.task,
             "index" | "file_index" | "code_map" | "code_context" | "code_refs" | "code_impact"
             | "code_expand" => self.index,
             "file_grep" | "file_glob" | "grep" | "glob" => self.grep,
@@ -1870,6 +1874,12 @@ pub struct AgentConfig {
         desc = "Append a `# User requirements` section to every compaction summary: what the user asked for, constrained, and decided, read from their own messages and answered questions across every earlier compaction, and extracted by the Extract model so the conversation model never sees the request"
     )]
     pub compaction_requirements: bool,
+
+    #[config(
+        default = DEFAULT_BACKGROUND_REMINDER_TURNS,
+        desc = "Committed main-agent response groups between unchanged active background-work reminders; 0 disables periodic refresh only, not state-change or post-compaction reminders"
+    )]
+    pub background_reminder_turns: u32,
 
     #[config(
         default = true,
@@ -1977,6 +1987,9 @@ impl AgentConfig {
             compaction_instructions: file.compaction_instructions,
             post_compaction_instructions: file.post_compaction_instructions,
             compaction_requirements: file.compaction_requirements.unwrap_or(true),
+            background_reminder_turns: file
+                .background_reminder_turns
+                .unwrap_or(DEFAULT_BACKGROUND_REMINDER_TURNS),
             generate_titles: file.generate_titles.unwrap_or(true),
             stale_read_check: file.stale_read_check.unwrap_or(true),
             tool_json_repair: file.tool_json_repair.unwrap_or(true),
@@ -3161,6 +3174,9 @@ mod tests {
     use test_case::test_case;
 
     const NO_DEFAULT_DELETION: &str = "retention must delete nothing until a user opts in";
+    const BACKGROUND_REMINDER_FIELD: &str = "background_reminder_turns";
+    const CUSTOM_BACKGROUND_REMINDER_TURNS: u32 = 13;
+    const UNSIGNED_REMINDER_ERROR: &str = "expected u32";
     const EMPTY_SOURCE_DIGEST: &str =
         "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
     const ABC_SOURCE_DIGEST: &str =
@@ -3714,6 +3730,82 @@ mod tests {
                 .agent
                 .compaction_requirements,
             expected
+        );
+    }
+
+    #[test_case("", 0 ; "default_disabled")]
+    #[test_case("background_reminder_turns = 0", 0 ; "periodic_disabled")]
+    #[test_case("background_reminder_turns = 13", CUSTOM_BACKGROUND_REMINDER_TURNS ; "custom")]
+    fn background_reminder_config(source: &str, expected: u32) {
+        let raw: RawConfig = toml::from_str(&format!("[agent]\n{source}")).unwrap();
+        let config = raw.into_config(false).unwrap();
+        config.validate().unwrap();
+        assert_eq!(config.agent.background_reminder_turns, expected);
+        assert_eq!(
+            serde_json::to_value(&config.agent).unwrap()[BACKGROUND_REMINDER_FIELD],
+            expected
+        );
+    }
+
+    #[test_case(-1_i64 ; "negative")]
+    #[test_case(i64::from(u32::MAX) + 1 ; "overflow")]
+    fn background_reminder_config_rejects_invalid_unsigned(value: i64) {
+        let source = format!("[agent]\n{BACKGROUND_REMINDER_FIELD} = {value}");
+        let error = toml::from_str::<RawConfig>(&source).unwrap_err();
+        assert!(error.to_string().contains(UNSIGNED_REMINDER_ERROR));
+    }
+
+    #[test_case(CUSTOM_BACKGROUND_REMINDER_TURNS, 0 ; "disable_on_reload")]
+    #[test_case(0, CUSTOM_BACKGROUND_REMINDER_TURNS ; "enable_on_reload")]
+    fn background_reminder_config_merge_and_reload(initial: u32, updated: u32) {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("config.toml");
+        for value in [initial, updated] {
+            fs::write(
+                &path,
+                format!("[agent]\n{BACKGROUND_REMINDER_FIELD} = {value}"),
+            )
+            .unwrap();
+            let mut raw = RawConfig::default();
+            raw.merge(toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap());
+            raw.merge(RawConfig::default());
+            let config = raw.into_config(false).unwrap();
+            config.validate().unwrap();
+            assert_eq!(config.agent.background_reminder_turns, value);
+        }
+        let mut raw: RawConfig =
+            toml::from_str(&format!("[agent]\n{BACKGROUND_REMINDER_FIELD} = {initial}")).unwrap();
+        raw.merge(
+            toml::from_str(&format!("[agent]\n{BACKGROUND_REMINDER_FIELD} = {updated}")).unwrap(),
+        );
+        assert_eq!(
+            raw.into_config(false)
+                .unwrap()
+                .agent
+                .background_reminder_turns,
+            updated
+        );
+    }
+
+    #[test_case(DEFAULT_BACKGROUND_REMINDER_TURNS)]
+    fn background_reminder_config_metadata(default: u32) {
+        assert_eq!(AgentConfig::default().background_reminder_turns, default);
+        let field = AgentConfig::FIELDS
+            .iter()
+            .find(|field| field.name == BACKGROUND_REMINDER_FIELD)
+            .unwrap();
+        assert_eq!(field.ty, "u32");
+        assert_eq!(field.default.format_default(), default.to_string());
+        assert_eq!(field.min, None);
+        assert!(
+            field
+                .description
+                .contains("0 disables periodic refresh only")
+        );
+        assert!(
+            field
+                .description
+                .contains("state-change or post-compaction")
         );
     }
 

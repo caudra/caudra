@@ -46,6 +46,9 @@ pub trait PickerItem {
     fn detail(&self) -> Option<&str> {
         None
     }
+    fn badge(&self) -> Option<&str> {
+        None
+    }
     fn section(&self) -> Option<&str> {
         None
     }
@@ -807,6 +810,9 @@ fn render_ready<T: PickerItem>(
         area,
         content_rows + SEARCH_ROW + footer_rows + error_rows + requested_info_rows,
     );
+    if s.popup_area != popup {
+        s.invalidate_mouse_geometry();
+    }
     let info_rows = requested_info_rows.min(
         inner
             .height
@@ -991,7 +997,18 @@ fn detail_row(label: &str, detail: &str, trailing_gap: usize, width: u16) -> Det
     DetailRow { label, detail, pad }
 }
 
-fn truncate_label(label: &str, max_width: usize) -> String {
+fn badge_row(label: &str, detail: &str, trailing_gap: usize, width: u16) -> DetailRow {
+    let room = usize::from(width).saturating_sub(trailing_gap + usize::from(DETAIL_RIGHT_PAD));
+    let detail = truncate_label(detail, room);
+    let label = truncate_label(
+        label,
+        room.saturating_sub(detail.width() + LABEL_DETAIL_GAP),
+    );
+    let pad = room.saturating_sub(label.width() + detail.width());
+    DetailRow { label, detail, pad }
+}
+
+pub(super) fn truncate_label(label: &str, max_width: usize) -> String {
     if label.width() <= max_width {
         return label.to_string();
     }
@@ -1106,12 +1123,21 @@ fn render_list<T: PickerItem>(
         } else {
             item.detail()
         };
+        let trailing = item.badge().map(|badge| match detail {
+            Some(detail) => format!("{badge}  {detail}"),
+            None => badge.to_owned(),
+        });
+        let detail = trailing.as_deref().or(detail);
         let suffix_gap = 2usize;
         let suffix_w = suffix.map(|s| s.width()).unwrap_or(0);
         let trailing_gap = suffix_w + if suffix_w > 0 { suffix_gap } else { 0 };
         let line = match detail {
             Some(detail) => {
-                let row = detail_row(&label, detail, trailing_gap, area.width);
+                let row = if item.badge().is_some() {
+                    badge_row(&label, detail, trailing_gap, area.width)
+                } else {
+                    detail_row(&label, detail, trailing_gap, area.width)
+                };
                 let mut spans = Vec::with_capacity(7);
                 if let Some(cb) = checkbox {
                     spans.push(cb);

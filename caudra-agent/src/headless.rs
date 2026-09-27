@@ -1,11 +1,13 @@
 use std::borrow::Cow;
 use std::collections::HashSet;
+use std::future::Future;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use arc_swap::ArcSwap;
+use arc_swap::{ArcSwap, ArcSwapOption};
 use async_lock::Mutex;
 #[cfg(test)]
 use caudra_config::ToolKey;
@@ -14,11 +16,11 @@ use caudra_providers::Timeouts;
 use caudra_providers::model::{Model, ModelPurpose};
 use caudra_providers::provider::{self, Provider};
 use caudra_providers::{
-    CacheKey, HistoryItem, HistoryItemKind, TokenUsage, active_history_items, merge_history_items,
-    resolve_history_head,
+    CacheKey, HistoryItem, HistoryItemKind, Message, TokenUsage, WorkflowEventOrigin,
+    active_history_items, merge_history_items, resolve_history_head,
 };
 #[cfg(test)]
-use caudra_providers::{ContentBlock, Message, Role};
+use caudra_providers::{ContentBlock, Role};
 use caudra_storage::id::{CaudraId, SessionRef};
 use caudra_storage::local_documents::LocalDocumentStore;
 use caudra_storage::permission_state::PermissionRuleRecord;
@@ -31,7 +33,9 @@ use caudra_storage::sessions::{
 };
 use caudra_storage::workspace_binding::StoredWorkspaceBinding;
 use caudra_storage::{StateDir, StorageError};
-use caudra_workflow::{RunSnapshot, WorkflowRequest, WorkflowResponse};
+use caudra_workflow::{
+    RunSnapshot, RunStatus, WorkflowError, WorkflowEvent, WorkflowRequest, WorkflowResponse,
+};
 use caudra_workspace::{
     CommandText, DirectoryNavigation, ExecRequest, LocalDocumentRef, OperationProgressKind,
     OperationState, OperationStatus, WorkspaceCursor, WorkspaceError, WorkspaceSession,
@@ -45,7 +49,8 @@ use crate::agent::task_runner::{
     HostExtras, ModeResolver, ModelResolver, SubagentTaskRunner, WorkflowHostContext,
 };
 use crate::agent::{self, History};
-use crate::cancel::{CancelMap, CancelToken};
+use crate::background::{BackgroundTasks, BackgroundTransition};
+use crate::cancel::{CancelMap, CancelToken, CancelTrigger};
 use crate::commits;
 use crate::mentions;
 use crate::permissions::editor::{PermissionEditError, PermissionPublication};
@@ -57,18 +62,19 @@ use crate::tools::{
     BuiltinDeferral, DeferralSession, DeferredTool, DescriptionContext, FileReadTracker,
     LocalTools, PathLocks, ToolAudience, ToolDefinitions, ToolFilter, ToolRegistry, deferral,
 };
+use crate::types::BACKGROUND_EVENT_RUN_ID;
 use crate::workflow::{RuntimeDeps, WorkflowHandle, WorkflowRuntime, WorkspaceRebind};
 use crate::{
     Agent, AgentConfig, AgentError, AgentEvent, AgentInput, AgentMode, AgentParams, AgentRunParams,
     BaselineGate, DoneReason, Envelope, EventSender, GoalHandle, ImageSource, McpHandle,
     McpSession, PermissionsConfig, SessionMailbox, StoredSession, SubagentHistorySnapshot,
-    SubagentHistoryStore, ToolOutput, ToolOutputLines, WorkspaceBaseline, open_stored_session,
+    SubagentHistoryStore, ThinkingConfig, ToolOutput, ToolOutputLines, WorkspaceBaseline,
+    open_stored_session,
 };
 
 /// Bytes of a run's report or result carried into the next prompt.
 const COMPLETION_TEXT_LIMIT: usize = 8 * 1024;
 const TRUNCATED_SUFFIX: &str = "…[truncated]";
-const COMPLETION_SEPARATOR: &str = "\n\n";
 const REMOTE_COMMAND_TIMEOUT: Duration = Duration::from_secs(300);
 const REMOTE_COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const REMOTE_COMMAND_PROGRESS_GAP: &str = "[remote progress gap]";
@@ -78,6 +84,8 @@ const REMOTE_COMMAND_INDETERMINATE: &str =
     "Remote command outcome is indeterminate; it will not be retried";
 const REMOTE_COMMAND_TRUNCATED: &str = "[truncated]";
 const SESSION_DATABASE_UNAVAILABLE: &str = "session database unavailable";
+const STALE_WORKFLOW_CONTROL: &str =
+    "Workflow control was superseded by a session stop or mode change";
 
 struct SessionPermissionPublication {
     database: Arc<StdMutex<SessionDatabase>>,
@@ -230,18 +238,10 @@ impl SessionStore {
             });
         let mut reachable = reachable_subagent_ids(&active_history, &session);
         let mut versions =
-            crate::active_task_history_versions_with_batch_state(&active_history, |call_id| {
-                session
-                    .tool_outputs()
-                    .get(call_id)
-                    .and_then(|output| output.state())
+            crate::active_task_history_versions_with_outputs(&active_history, |call_id| {
+                session.tool_outputs().get(call_id).map(Arc::as_ref)
             });
-        reachable.extend(
-            versions
-                .iter()
-                .filter(|(_, version_id)| session.subagent_messages().contains_key(*version_id))
-                .map(|(task_id, _)| task_id.clone()),
-        );
+        reachable.extend(versions.keys().cloned());
         for subagent in session.subagents() {
             if reachable.contains(&subagent.tool_use_id)
                 && !versions.contains_key(&subagent.tool_use_id)
@@ -263,10 +263,7 @@ impl SessionStore {
             .filter(|task_id| !version_ids.contains(task_id.as_str()))
             .filter_map(|task_id| {
                 let version_id = versions.get(task_id).unwrap_or(task_id);
-                let items = session
-                    .subagent_messages()
-                    .get(version_id)
-                    .or_else(|| session.subagent_messages().get(task_id))?;
+                let items = session.subagent_messages().get(version_id)?;
                 match History::restored(items.as_ref().clone()) {
                     Ok(history) => Some((task_id.clone(), Arc::new(history.into_vec()))),
                     Err(error) => {
@@ -282,7 +279,8 @@ impl SessionStore {
             .filter(|(task_id, spec)| reachable.contains(*task_id) && !spec.is_version())
             .map(|(task_id, spec)| (task_id.clone(), spec.clone()))
             .collect();
-        let subagent_history = SubagentHistoryStore::seeded_with_specs(subagent_messages, specs);
+        let subagent_history =
+            SubagentHistoryStore::seeded_with_versions(subagent_messages, specs, versions);
         let persisted_subagent_history = subagent_history.snapshot();
         Self {
             dir,
@@ -404,7 +402,10 @@ impl SessionStore {
         let mut merged = self.session.messages().to_vec();
         if let Err(error) = merge_history_items(&mut merged, history.active_items()) {
             warn!(%error, "refusing to persist invalid history graph");
-            return Ok(());
+            return Err(SessionError::CorruptDatabaseValue {
+                field: "history",
+                reason: error.to_string(),
+            });
         }
         self.session.merge_history(history.snapshot(), merged);
         self.session
@@ -1453,6 +1454,7 @@ pub fn spawn(mut params: HeadlessParams) -> HeadlessHandle {
                     tool_filter,
                     model_policy: Arc::clone(&params.model_policy),
                     workflow: None,
+                    background: None,
                 },
                 AgentRunParams {
                     history: &mut history,
@@ -1574,6 +1576,8 @@ pub struct InteractiveParams {
 
 pub struct InteractiveHandle {
     pub event_rx: Receiver<Envelope>,
+    pub run_rx: Receiver<InteractiveRun>,
+    pub background: Option<BackgroundTasks>,
     pub tool_names: Vec<String>,
     pub input_tx: flume::Sender<AgentInput>,
     pub answer_tx: flume::Sender<String>,
@@ -1585,10 +1589,56 @@ pub struct InteractiveHandle {
     pub permissions: Arc<PermissionManager>,
     /// The session's workflow runtime, when `workflow_mode` asked for one.
     pub workflow: Option<WorkflowHandle>,
+    mode_route: Arc<InteractiveModeRoute>,
     workspace_change_tx: flume::Sender<WorkspaceChangeRequest>,
     remote_workspace: Option<Arc<StdMutex<RemoteWorkspaceState>>>,
     workspace_baseline: Option<Arc<WorkspaceBaseline>>,
     pub task: smol::Task<()>,
+}
+
+pub struct InteractiveRun {
+    pub run_id: u64,
+    pub started: Instant,
+    pub automatic: bool,
+    pub task_event_ids: Vec<String>,
+    pub workflow_events: Vec<WorkflowEventOrigin>,
+}
+
+#[derive(Default)]
+struct InteractiveModeRoute {
+    control_epoch: AtomicU64,
+    mode: ArcSwapOption<AgentMode>,
+    admission: Mutex<()>,
+    turn: Mutex<()>,
+    active: StdMutex<Option<CancelTrigger>>,
+}
+
+impl InteractiveModeRoute {
+    fn cancel_run(&self) {
+        self.active
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
+    }
+}
+
+struct ActiveInteractiveRun(Arc<InteractiveModeRoute>);
+
+impl Drop for ActiveInteractiveRun {
+    fn drop(&mut self) {
+        self.0.cancel_run();
+    }
+}
+
+struct BackgroundDelivery {
+    tasks: BackgroundTasks,
+    messages: Vec<Message>,
+}
+
+impl Drop for BackgroundDelivery {
+    fn drop(&mut self) {
+        self.tasks.release_messages(&self.messages);
+    }
 }
 
 struct RemoteWorkspaceState {
@@ -1635,6 +1685,8 @@ impl InteractiveHandle {
     ) -> Self {
         Self {
             event_rx: flume::unbounded().1,
+            run_rx: flume::unbounded().1,
+            background: None,
             tool_names: Vec::new(),
             input_tx: flume::unbounded().0,
             answer_tx,
@@ -1645,6 +1697,7 @@ impl InteractiveHandle {
             session_lease,
             permissions,
             workflow: None,
+            mode_route: Arc::default(),
             workspace_change_tx: flume::unbounded().0,
             remote_workspace: None,
             workspace_baseline: None,
@@ -1675,6 +1728,64 @@ impl InteractiveHandle {
             .send(model.clone())
             .map_err(|_| AgentError::Channel)?;
         Ok(model)
+    }
+
+    pub async fn set_mode(&self, mode: AgentMode, yolo: bool) -> Result<(), String> {
+        self.mode_route.control_epoch.fetch_add(1, Ordering::AcqRel);
+        let _admission = self.mode_route.admission.lock().await;
+        self.mode_route.mode.store(Some(Arc::new(mode)));
+        self.mode_route.cancel_run();
+        let _turn = self.mode_route.turn.lock().await;
+        let _background_transition = self
+            .background
+            .as_ref()
+            .map(BackgroundTasks::suspend)
+            .transpose()?;
+        drain_session_work(self.background.as_ref(), self.workflow.as_ref()).await?;
+        self.permissions.set_session_yolo(Some(yolo));
+        Ok(())
+    }
+
+    pub async fn interrupt(&self) -> Result<(), String> {
+        self.mode_route.control_epoch.fetch_add(1, Ordering::AcqRel);
+        let _admission = self.mode_route.admission.lock().await;
+        self.mode_route.cancel_run();
+        let _turn = self.mode_route.turn.lock().await;
+        drain_session_work(self.background.as_ref(), self.workflow.as_ref()).await
+    }
+
+    pub fn workflow_control(
+        &self,
+        request: WorkflowRequest,
+    ) -> impl Future<Output = Result<WorkflowResponse, WorkflowError>> + Send + 'static + use<>
+    {
+        let route = Arc::clone(&self.mode_route);
+        let epoch = route.control_epoch.load(Ordering::Acquire);
+        let background = self.background.clone();
+        let workflow = self.workflow.clone();
+        async move {
+            let workflow = workflow.ok_or(WorkflowError::Unavailable)?;
+            if !matches!(
+                &request,
+                WorkflowRequest::Start(_) | WorkflowRequest::Resume { .. }
+            ) {
+                return workflow.request(request).await;
+            }
+            loop {
+                let admission = route.admission.lock().await;
+                if route.control_epoch.load(Ordering::Acquire) != epoch {
+                    return Err(WorkflowError::Internal(STALE_WORKFLOW_CONTROL.into()));
+                }
+                if let Some(_turn) = route.turn.try_lock() {
+                    if let Some(background) = &background {
+                        background.rearm();
+                    }
+                    return workflow.request(request).await;
+                }
+                drop(admission);
+                drop(route.turn.lock().await);
+            }
+        }
     }
 
     pub async fn change_remote_directory(&self, path: &str) -> Result<String, String> {
@@ -1890,6 +2001,19 @@ pub async fn prepare_interactive(
 pub async fn spawn_prepared_interactive(
     prepared: PreparedInteractive,
 ) -> Result<InteractiveHandle, InteractiveStartError> {
+    spawn_prepared_session(prepared, false).await
+}
+
+pub async fn spawn_persistent_interactive(
+    params: InteractiveParams,
+) -> Result<InteractiveHandle, InteractiveStartError> {
+    spawn_prepared_session(prepare_interactive(params).await?, true).await
+}
+
+async fn spawn_prepared_session(
+    prepared: PreparedInteractive,
+    background_enabled: bool,
+) -> Result<InteractiveHandle, InteractiveStartError> {
     let PreparedInteractive {
         mut params,
         mut history,
@@ -1938,14 +2062,26 @@ pub async fn spawn_prepared_interactive(
     let subagent_history = store.subagent_history.clone();
     let state_dir = store.dir.clone();
     let initial_history_head = store.history_head();
+    let background = if background_enabled {
+        Some(
+            BackgroundTasks::spawn(state_dir.clone(), session_id)
+                .await
+                .map_err(InteractiveStartError)?,
+        )
+    } else {
+        None
+    };
 
     let (raw_tx, event_rx) = flume::unbounded::<Envelope>();
+    let (run_tx, run_rx) = flume::unbounded();
     let (agent_tx, agent_rx) = flume::unbounded::<Envelope>();
     let (input_tx, input_rx) = flume::unbounded::<AgentInput>();
     let (answer_tx, answer_rx) = flume::unbounded::<String>();
     let (cancel_tx, cancel_rx) = flume::bounded::<()>(1);
     let (model_tx, model_rx) = flume::unbounded::<Model>();
     let (workspace_change_tx, workspace_change_rx) = flume::unbounded::<WorkspaceChangeRequest>();
+    let (workflow_wake_tx, workflow_wake_rx) = flume::bounded::<()>(1);
+    let mode_route = Arc::new(InteractiveModeRoute::default());
     let remote_workspace = params
         .workspace_session
         .clone()
@@ -2037,6 +2173,7 @@ pub async fn spawn_prepared_interactive(
         tool_filter: tool_filter.clone(),
         model_policy: Arc::clone(&params.model_policy),
         workflow: None,
+        background: background.clone(),
     };
 
     // Workflow agents resolve the provider at launch, so a model switched
@@ -2045,8 +2182,17 @@ pub async fn spawn_prepared_interactive(
         Arc::clone(&provider),
         Arc::new(model.clone()),
     )));
-    let runtime = match params.workflow_mode.take() {
+    let mut runtime = match params.workflow_mode.take() {
         Some(mode) => {
+            let mode: ModeResolver = Arc::new({
+                let mode_route = Arc::clone(&mode_route);
+                move || {
+                    mode_route
+                        .mode
+                        .load_full()
+                        .map_or_else(|| mode(), |mode| (*mode).clone())
+                }
+            });
             let model: ModelResolver = Arc::new({
                 let live_model = Arc::clone(&live_model);
                 move || {
@@ -2086,6 +2232,24 @@ pub async fn spawn_prepared_interactive(
         None => None,
     };
     let workflow = runtime.as_ref().map(WorkflowRuntime::handle);
+    if let (Some(workflow), Some(background)) = (&workflow, &background)
+        && let Err(error) = workflow.bind_background(background.clone()).await
+    {
+        if let Some(runtime) = runtime.take() {
+            runtime.shutdown().await;
+        }
+        if let Err(error) = background.shutdown().await {
+            warn!(%error, "background shutdown after workflow binding failure failed");
+        }
+        return Err(InteractiveStartError(error.to_string()));
+    }
+    if background_enabled
+        && workflow
+            .as_ref()
+            .is_some_and(|workflow| workflow.pending_completions() > 0)
+    {
+        let _ = workflow_wake_tx.try_send(());
+    }
     let model_route = workflow.as_ref().map(|_| InteractiveModelRoute {
         model: Arc::clone(&live_model),
         timeouts: params.timeouts,
@@ -2097,8 +2261,10 @@ pub async fn spawn_prepared_interactive(
 
     let handle_workspace_baseline = workspace_baseline.clone();
     let task = smol::spawn({
+        let mode_route = Arc::clone(&mode_route);
         let permissions = Arc::clone(&permissions);
         let workflow = workflow.clone();
+        let background = background.clone();
         let live_model = Arc::clone(&live_model);
         let remote_workspace = remote_workspace.clone();
         async move {
@@ -2106,8 +2272,17 @@ pub async fn spawn_prepared_interactive(
                 let store = Arc::clone(&store);
                 let raw_tx = raw_tx.clone();
                 let workspace_baseline = workspace_baseline.clone();
+                let background = background.clone();
+                let workflow_wake_tx = workflow_wake_tx.clone();
                 async move {
                     while let Ok(envelope) = agent_rx.recv_async().await {
+                        if (envelope.task.is_some() || envelope.run_id == BACKGROUND_EVENT_RUN_ID)
+                            && !background
+                                .as_ref()
+                                .is_some_and(|tasks| tasks.owns_event(&envelope))
+                        {
+                            continue;
+                        }
                         let persistence_error = if let Some(store) = &mut *store.lock().await {
                             let result = store.record_event(&envelope).err();
                             if let Some(baseline) = &workspace_baseline {
@@ -2118,6 +2293,17 @@ pub async fn spawn_prepared_interactive(
                             None
                         };
                         let run_id = envelope.run_id;
+                        if background_enabled
+                            && matches!(&envelope.event, AgentEvent::Workflow(event) if matches!(event.as_ref(), WorkflowEvent::Snapshot(snapshot) if snapshot.outbox_pending))
+                        {
+                            let _ = workflow_wake_tx.try_send(());
+                        }
+                        if persistence_error.is_some()
+                            && let Some(background) = &background
+                            && let Err(error) = background.stop().await
+                        {
+                            warn!(%error, "background stop after persistence failure failed");
+                        }
                         if raw_tx.send_async(envelope).await.is_err() {
                             break;
                         }
@@ -2129,6 +2315,7 @@ pub async fn spawn_prepared_interactive(
                                     },
                                     subagent: None,
                                     run_id,
+                                    task: None,
                                     workflow: None,
                                 })
                                 .await
@@ -2140,28 +2327,105 @@ pub async fn spawn_prepared_interactive(
                 }
             });
             let mut run_id: u64 = 0;
-            let mut acked_completions = HashSet::new();
+            let mut continuation: Option<(AgentMode, ThinkingConfig, bool)> = None;
 
             loop {
+                if background_enabled && input_rx.is_disconnected() {
+                    break;
+                }
                 enum NextInput {
                     Prompt(Result<AgentInput, flume::RecvError>),
                     Workspace(Box<Result<WorkspaceChangeRequest, flume::RecvError>>),
+                    Stop,
+                    Background,
+                    Workflow,
                 }
-                let next = futures_lite::future::race(
-                    async { NextInput::Prompt(input_rx.recv_async().await) },
+                let next = futures_lite::future::or(
                     async {
-                        NextInput::Workspace(Box::new(workspace_change_rx.recv_async().await))
+                        if cancel_rx.recv_async().await.is_err() {
+                            futures_lite::future::pending::<()>().await;
+                        }
+                        NextInput::Stop
                     },
+                    futures_lite::future::or(
+                        async { NextInput::Prompt(input_rx.recv_async().await) },
+                        futures_lite::future::or(
+                            async {
+                                NextInput::Workspace(Box::new(
+                                    workspace_change_rx.recv_async().await,
+                                ))
+                            },
+                            futures_lite::future::or(
+                                async {
+                                    if let Some(background) = &background {
+                                        background.notified().await;
+                                    } else {
+                                        futures_lite::future::pending::<()>().await;
+                                    }
+                                    NextInput::Background
+                                },
+                                async {
+                                    if !background_enabled {
+                                        futures_lite::future::pending::<()>().await;
+                                    }
+                                    if workflow_wake_rx.recv_async().await.is_err() {
+                                        futures_lite::future::pending::<()>().await;
+                                    }
+                                    NextInput::Workflow
+                                },
+                            ),
+                        ),
+                    ),
                 )
                 .await;
+                let admission = mode_route.admission.lock().await;
+                let _turn = mode_route.turn.lock().await;
+                let automatic = matches!(next, NextInput::Background | NextInput::Workflow);
                 let mut input = match next {
-                    NextInput::Prompt(Ok(input)) => input,
+                    NextInput::Prompt(Ok(input)) => {
+                        if let Some(background) = &background {
+                            background.rearm();
+                        }
+                        input
+                    }
                     NextInput::Prompt(Err(_)) => break,
+                    NextInput::Stop => {
+                        mode_route.control_epoch.fetch_add(1, Ordering::AcqRel);
+                        stop_session_work(background.as_ref(), workflow.as_ref()).await;
+                        continue;
+                    }
+                    NextInput::Background | NextInput::Workflow => {
+                        let Some((mode, thinking, fast)) = &continuation else {
+                            continue;
+                        };
+                        let Some(background) = &background else {
+                            continue;
+                        };
+                        match background.workflow_admission().await {
+                            Ok(permit) => drop(permit),
+                            Err(_) => continue,
+                        }
+                        AgentInput {
+                            message: String::new(),
+                            mode: mode.clone(),
+                            thinking: thinking.clone(),
+                            fast: *fast,
+                            images: Vec::new(),
+                            mentions: Vec::new(),
+                            commits: Vec::new(),
+                            preamble: Vec::new(),
+                            prompt: None,
+                            resume: false,
+                        }
+                    }
                     NextInput::Workspace(change) => {
                         let Ok(change) = *change else {
                             continue;
                         };
                         if !input_rx.is_empty()
+                            || background.as_ref().is_some_and(|tasks| {
+                                tasks.active_count() > 0 || tasks.has_pending()
+                            })
                             || params
                                 .workspace_session
                                 .as_ref()
@@ -2172,6 +2436,14 @@ pub async fn spawn_prepared_interactive(
                             ));
                             continue;
                         }
+                        let _background_transition =
+                            match prepare_background_transition(background.as_ref()).await {
+                                Ok(transition) => transition,
+                                Err(error) => {
+                                    let _ = change.response.send(Err(error));
+                                    continue;
+                                }
+                            };
                         let transition = match crate::workflow::prepare_workspace_transition(
                             workflow.as_ref(),
                             base.subagent_cancels.active_count(),
@@ -2269,16 +2541,97 @@ pub async fn spawn_prepared_interactive(
                         continue;
                     }
                 };
+                if let Some(mode) = mode_route.mode.load_full() {
+                    input.mode = (*mode).clone();
+                }
+                if !automatic {
+                    continuation = Some((input.mode.clone(), input.thinking.clone(), input.fast));
+                }
+                let started = Instant::now();
+                let workflow_delivery = match &workflow {
+                    Some(workflow) => match completion_messages(workflow).await {
+                        Ok(messages) => messages,
+                        Err(message) => {
+                            let _ = EventSender::new(agent_tx.clone(), run_id)
+                                .send(AgentEvent::Error { message });
+                            stop_session_work(background.as_ref(), Some(workflow)).await;
+                            run_id += 1;
+                            continue;
+                        }
+                    },
+                    None => Vec::new(),
+                };
+                let delivery = match &background {
+                    Some(tasks) => match tasks.claim_messages() {
+                        Ok(messages) => Some(BackgroundDelivery {
+                            tasks: tasks.clone(),
+                            messages,
+                        }),
+                        Err(message) => {
+                            let _ = EventSender::new(agent_tx.clone(), run_id)
+                                .send(AgentEvent::Error { message });
+                            if let Err(error) = tasks.stop().await {
+                                warn!(%error, "background stop failed");
+                            }
+                            run_id += 1;
+                            continue;
+                        }
+                    },
+                    None => None,
+                };
+                if automatic
+                    && workflow_delivery.is_empty()
+                    && delivery
+                        .as_ref()
+                        .is_none_or(|delivery| delivery.messages.is_empty())
+                {
+                    continue;
+                }
+                if let Some(delivery) = &delivery {
+                    input
+                        .preamble
+                        .splice(0..0, delivery.messages.iter().cloned());
+                }
+                input.preamble.extend(workflow_delivery.iter().cloned());
+                if background_enabled {
+                    let _ = run_tx.send(InteractiveRun {
+                        run_id,
+                        started,
+                        automatic,
+                        task_event_ids: input
+                            .preamble
+                            .iter()
+                            .filter_map(|message| {
+                                message
+                                    .task_event
+                                    .as_ref()
+                                    .map(|origin| origin.event_id.clone())
+                            })
+                            .collect(),
+                        workflow_events: workflow_delivery
+                            .iter()
+                            .filter_map(|message| message.workflow_event.clone())
+                            .collect(),
+                    });
+                }
                 let input_mode = input.mode.clone();
                 let (trigger, cancel) = CancelToken::new();
+                *mode_route
+                    .active
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner()) = Some(trigger);
+                let _active_run = ActiveInteractiveRun(Arc::clone(&mode_route));
                 let cancel_task = smol::spawn({
                     let cancel_rx = cancel_rx.clone();
+                    let mode_route = Arc::clone(&mode_route);
                     async move {
                         if cancel_rx.recv_async().await.is_ok() {
-                            trigger.cancel();
+                            mode_route.control_epoch.fetch_add(1, Ordering::AcqRel);
+                            mode_route.cancel_run();
                         }
                     }
                 });
+                drop(admission);
 
                 // MCP connects in the background, so a prompt that beats it waits
                 // here instead of shipping a turn without the MCP tools. The wait
@@ -2299,6 +2652,21 @@ pub async fn spawn_prepared_interactive(
                                 params.remote_project_context.as_ref().is_none_or(|old| {
                                     old.manifest_revision() != context.manifest_revision()
                                 });
+                            let _background_transition = if changed {
+                                match prepare_background_transition(background.as_ref()).await {
+                                    Ok(transition) => transition,
+                                    Err(message) => {
+                                        let _ = error_tx.send(AgentEvent::Error { message });
+                                        cancel_task.cancel().await;
+                                        stop_session_work(background.as_ref(), workflow.as_ref())
+                                            .await;
+                                        run_id += 1;
+                                        continue;
+                                    }
+                                }
+                            } else {
+                                None
+                            };
                             let transition = if changed {
                                 match crate::workflow::prepare_workspace_transition(
                                     workflow.as_ref(),
@@ -2316,6 +2684,8 @@ pub async fn spawn_prepared_interactive(
                                         permissions.invalidate_remote_permission_asset();
                                         let _ = error_tx.send(AgentEvent::Error { message });
                                         cancel_task.cancel().await;
+                                        stop_session_work(background.as_ref(), workflow.as_ref())
+                                            .await;
                                         run_id += 1;
                                         continue;
                                     }
@@ -2332,6 +2702,7 @@ pub async fn spawn_prepared_interactive(
                                     ),
                                 });
                                 cancel_task.cancel().await;
+                                stop_session_work(background.as_ref(), workflow.as_ref()).await;
                                 run_id += 1;
                                 continue;
                             }
@@ -2344,6 +2715,7 @@ pub async fn spawn_prepared_interactive(
                                     message: error.to_string(),
                                 });
                                 cancel_task.cancel().await;
+                                stop_session_work(background.as_ref(), workflow.as_ref()).await;
                                 run_id += 1;
                                 continue;
                             }
@@ -2354,6 +2726,7 @@ pub async fn spawn_prepared_interactive(
                                 message: format!("Remote project context unavailable: {error}"),
                             });
                             cancel_task.cancel().await;
+                            stop_session_work(background.as_ref(), workflow.as_ref()).await;
                             run_id += 1;
                             continue;
                         }
@@ -2385,6 +2758,8 @@ pub async fn spawn_prepared_interactive(
                                 let _ = error_tx.send(AgentEvent::Error {
                                     message: e.user_message(),
                                 });
+                                cancel_task.cancel().await;
+                                stop_session_work(background.as_ref(), workflow.as_ref()).await;
                                 run_id += 1;
                                 continue;
                             }
@@ -2408,6 +2783,7 @@ pub async fn spawn_prepared_interactive(
                             message: e.user_message(),
                         });
                         cancel_task.cancel().await;
+                        stop_session_work(background.as_ref(), workflow.as_ref()).await;
                         run_id += 1;
                         continue;
                     }
@@ -2415,13 +2791,6 @@ pub async fn spawn_prepared_interactive(
                 let turn_tool_filter =
                     ToolFilter::from_config(&params.config, &turn_model, &params.excluded_tools)
                         .for_remote_workspace(params.workspace_session.is_some());
-
-                if let Some(workflow) = &workflow
-                    && let Some(context) =
-                        completion_context(workflow, &mut acked_completions).await
-                {
-                    input.message = format!("{context}{COMPLETION_SEPARATOR}{}", input.message);
-                }
 
                 let definitions = tool_definitions(
                     &vars,
@@ -2481,8 +2850,6 @@ pub async fn spawn_prepared_interactive(
                     system.push_str(append);
                 }
 
-                while answer_rx.lock().await.try_recv().is_ok() {}
-
                 let history_head = store
                     .lock()
                     .await
@@ -2517,13 +2884,18 @@ pub async fn spawn_prepared_interactive(
                 )
                 .with_loaded_instructions(baseline.loaded().clone())
                 .with_user_response_rx(Arc::clone(&answer_rx))
-                .with_cancel(cancel)
+                .with_cancel(cancel.clone())
                 .with_local_tools(Arc::clone(&params.local_tools))
                 .with_mcp(mcp.clone());
 
                 let result = agent.run(input).await;
                 drop(agent);
                 cancel_task.cancel().await;
+
+                if cancel.is_cancelled() || !matches!(result, Ok(DoneReason::EndTurn)) {
+                    mode_route.control_epoch.fetch_add(1, Ordering::AcqRel);
+                    stop_session_work(background.as_ref(), workflow.as_ref()).await;
+                }
 
                 if let Err(ref e) = result {
                     error!(error = %e, "agent error");
@@ -2532,6 +2904,7 @@ pub async fn spawn_prepared_interactive(
                     });
                 }
 
+                let mut persisted = false;
                 if let Some(store) = &mut *store.lock().await {
                     store.set_mode(&input_mode);
                     if matches!(result, Ok(DoneReason::Cancelled)) {
@@ -2541,7 +2914,37 @@ pub async fn spawn_prepared_interactive(
                         let _ = EventSender::new(raw_tx.clone(), run_id).send(AgentEvent::Error {
                             message: format!("Failed to persist session: {error}"),
                         });
+                    } else {
+                        persisted = true;
                     }
+                }
+                if let Some(tasks) = &background {
+                    let accepted = if persisted {
+                        finalize_background_history(tasks, history.as_slice()).await
+                    } else {
+                        if let Err(error) = tasks.finalize_messages(&[]).await {
+                            warn!(%error, "background claim reconciliation after failed save failed");
+                        }
+                        Err(SESSION_DATABASE_UNAVAILABLE.to_owned())
+                    };
+                    if let Err(message) = accepted {
+                        let _ = error_tx.send(AgentEvent::Error { message });
+                        stop_session_work(background.as_ref(), workflow.as_ref()).await;
+                    }
+                }
+                if let Some(workflow) = &workflow
+                    && let Err(message) =
+                        acknowledge_workflow_messages(workflow, &workflow_delivery).await
+                {
+                    let _ = error_tx.send(AgentEvent::Error { message });
+                    stop_session_work(background.as_ref(), Some(workflow)).await;
+                }
+                if background_enabled
+                    && workflow
+                        .as_ref()
+                        .is_some_and(|workflow| workflow.pending_completions() > 0)
+                {
+                    let _ = workflow_wake_tx.try_send(());
                 }
                 run_id += 1;
             }
@@ -2549,6 +2952,12 @@ pub async fn spawn_prepared_interactive(
             // Active runs are interrupted and their agents drained before the
             // session is saved, so nothing writes to it afterwards.
             base.subagent_cancels.cancel_all();
+            if let Some(background) = &background
+                && let Err(message) = background.shutdown().await
+            {
+                let _ =
+                    EventSender::new(agent_tx.clone(), run_id).send(AgentEvent::Error { message });
+            }
             if let Some(runtime) = runtime {
                 runtime.shutdown().await;
             }
@@ -2572,6 +2981,8 @@ pub async fn spawn_prepared_interactive(
 
     Ok(InteractiveHandle {
         event_rx,
+        run_rx,
+        background,
         tool_names,
         input_tx,
         answer_tx,
@@ -2582,11 +2993,74 @@ pub async fn spawn_prepared_interactive(
         session_lease,
         permissions,
         workflow,
+        mode_route,
         workspace_change_tx,
         remote_workspace,
         workspace_baseline: handle_workspace_baseline,
         task,
     })
+}
+
+async fn stop_session_work(
+    background: Option<&BackgroundTasks>,
+    workflow: Option<&WorkflowHandle>,
+) {
+    if let Err(error) = drain_session_work(background, workflow).await {
+        warn!(%error, "session work stop failed");
+    }
+}
+
+async fn drain_session_work(
+    background: Option<&BackgroundTasks>,
+    workflow: Option<&WorkflowHandle>,
+) -> Result<(), String> {
+    if let Some(background) = background {
+        background.stop().await?;
+    }
+    if let Some(workflow) = workflow {
+        let response = workflow
+            .request(WorkflowRequest::Status { run_id: None })
+            .await
+            .map_err(|error| error.to_string())?;
+        let WorkflowResponse::Runs(runs) = response else {
+            return Err("Workflow status unavailable while stopping session".into());
+        };
+        for run in runs {
+            if matches!(
+                run.status,
+                RunStatus::Active | RunStatus::Paused | RunStatus::BudgetLimited
+            ) {
+                workflow
+                    .request(WorkflowRequest::Stop { run_id: run.run_id })
+                    .await
+                    .map_err(|error| error.to_string())?;
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn prepare_background_transition(
+    background: Option<&BackgroundTasks>,
+) -> Result<Option<BackgroundTransition>, String> {
+    let Some(background) = background else {
+        return Ok(None);
+    };
+    if background.active_count() > 0 || background.has_pending() {
+        return Err("Workspace changes require quiescent background tasks".into());
+    }
+    let transition = background.suspend()?;
+    transition.drain().await?;
+    Ok(Some(transition))
+}
+
+async fn finalize_background_history(
+    background: &BackgroundTasks,
+    messages: &[Message],
+) -> Result<(), String> {
+    background.finalize_messages(messages).await?;
+    background.settle_launches(messages).await?;
+    Ok(())
 }
 
 pub async fn spawn_interactive(
@@ -2596,46 +3070,69 @@ pub async fn spawn_interactive(
     spawn_prepared_interactive(prepared).await
 }
 
-/// What finished since the last prompt, as one block per run for the next
-/// one. Every notice it carries is acknowledged, so a run is reported once
-/// per revision even when the runtime loses the ack.
-async fn completion_context(
-    workflow: &WorkflowHandle,
-    acked: &mut HashSet<(String, u64)>,
-) -> Option<String> {
+async fn completion_messages(workflow: &WorkflowHandle) -> Result<Vec<Message>, String> {
     if workflow.pending_completions() == 0 {
-        return None;
+        return Ok(Vec::new());
     }
     let runs = match workflow
         .request(WorkflowRequest::Status { run_id: None })
         .await
     {
         Ok(WorkflowResponse::Runs(runs)) => runs,
-        Ok(_) => Vec::new(),
-        Err(error) => {
-            warn!(%error, "workflow completions could not be read");
-            return None;
-        }
+        Ok(_) => return Err("Workflow status unavailable while claiming completions".into()),
+        Err(error) => return Err(error.to_string()),
     };
-    let mut blocks = Vec::new();
+    let mut messages = Vec::new();
     for run in runs.into_iter().filter(|run| run.outbox_pending) {
-        let notice = (run.run_id.clone(), run.revision);
-        if acked.contains(&notice) {
-            continue;
-        }
-        blocks.push(completion_block(&run));
-        if let Err(error) = workflow
-            .request(WorkflowRequest::AckCompletion {
-                run_id: run.run_id,
-                revision: run.revision,
-            })
+        let origin = WorkflowEventOrigin {
+            run_id: run.run_id.clone(),
+            revision: run.revision,
+        };
+        if workflow
+            .received_completion(origin.clone())
             .await
+            .map_err(|error| error.to_string())?
         {
-            warn!(%error, "workflow completion could not be acknowledged");
+            workflow
+                .request(WorkflowRequest::AckCompletion {
+                    run_id: origin.run_id,
+                    revision: origin.revision,
+                })
+                .await
+                .map_err(|error| error.to_string())?;
+        } else {
+            messages.push(Message::workflow_observation(
+                completion_block(&run),
+                origin,
+            ));
         }
-        acked.insert(notice);
     }
-    (!blocks.is_empty()).then(|| blocks.join(COMPLETION_SEPARATOR))
+    Ok(messages)
+}
+
+async fn acknowledge_workflow_messages(
+    workflow: &WorkflowHandle,
+    claimed: &[Message],
+) -> Result<(), String> {
+    for origin in claimed
+        .iter()
+        .filter_map(|message| message.workflow_event.as_ref())
+    {
+        if workflow
+            .received_completion(origin.clone())
+            .await
+            .map_err(|error| error.to_string())?
+        {
+            workflow
+                .request(WorkflowRequest::AckCompletion {
+                    run_id: origin.run_id.clone(),
+                    revision: origin.revision,
+                })
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+    }
+    Ok(())
 }
 
 fn completion_block(run: &RunSnapshot) -> String {
@@ -2682,7 +3179,11 @@ fn extract_tool_names(tools: &Value) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use caudra_providers::{AgentError, ProviderEvent, RequestOptions, StopReason, StreamResponse};
+    use caudra_providers::{
+        AgentError, ProviderEvent, RequestOptions, StandingReminderKind, StopReason,
+        StreamResponse, TaskEventOrigin,
+    };
+    use caudra_storage::background::TaskRecord;
     use caudra_storage::permission_state::PermissionRuleRecord;
     use caudra_storage::permission_state::mutation::{
         PermissionMutation, PermissionRecordIdentity, prepare_mutation,
@@ -2695,11 +3196,15 @@ mod tests {
     use test_case::test_case;
 
     use super::*;
+    use crate::agent::subagent::TaskIdentity;
+    use crate::agent::task_runner::TaskRequest;
+    use crate::background::TaskDelivery;
     use crate::permissions::{
         PermissionAnswer, PermissionError, PermissionLifetime, PermissionRequest, RevokedRuleScope,
     };
     use crate::tools::PermissionScopes;
     use crate::tools::registry::BoxFuture;
+    use crate::tools::test_support::stub_ctx_with;
     use crate::workflow::store::WorkflowStore;
 
     const SESSION_ID: &str = "CNK1hV6GWoysH3KQMm5wu";
@@ -3273,6 +3778,237 @@ mod tests {
         assert_eq!(lease.history().unwrap()[0].user_text(), Some("investigate"));
     }
 
+    #[test_case(false, false, true, true; "direct_rewind")]
+    #[test_case(false, true, true, true; "direct_continuation")]
+    #[test_case(true, false, true, true; "batch_rewind")]
+    #[test_case(true, true, true, true; "batch_continuation")]
+    #[test_case(false, false, false, true; "direct_recover_exact")]
+    #[test_case(true, false, false, true; "batch_recover_exact")]
+    #[test_case(false, false, false, false; "direct_missing_refuses_latest")]
+    #[test_case(true, false, false, false; "batch_missing_refuses_latest")]
+    fn reload_phrase_task_selects_typed_history_before_continuing(
+        batch: bool,
+        continued: bool,
+        loaded: bool,
+        durable: bool,
+    ) {
+        const TASK: &str = "happy-cute-tick";
+        const LAUNCH: &str = "launch-call";
+        const CONTINUATION: &str = "continuation-call";
+        const NEXT: &str = "next-call";
+        const RUNTIME: &str = "runtime-not-history";
+        const STALE: &str = "wrong branch";
+        const MISSING: &str = "selected task history version is unavailable";
+        let tmp = TempDir::new().unwrap();
+        let mut store = store_in(&tmp);
+        let mut history = History::default();
+        let mut first_head = None;
+        let database = SessionDatabase::open(&store.dir).unwrap();
+        let tool_result = |call: &str| Message {
+            role: Role::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: call.into(),
+                content: String::new(),
+                is_error: false,
+                output_ref: None,
+            }],
+            ..Default::default()
+        };
+        for call in [LAUNCH, CONTINUATION] {
+            let version = if batch {
+                format!("{call}-child")
+            } else {
+                call.into()
+            };
+            let output: ToolOutput = serde_json::from_value(serde_json::json!({"Tasks": [{
+                "task_id": TASK, "call_id": version, "invocation_id": RUNTIME,
+                "root_call_id": call, "label": TASK, "state": "succeeded", "mode": "build",
+                "background": true, "generation": 1, "created_at": 0, "updated_at": 0
+            }]}))
+            .unwrap();
+            let output = if batch {
+                serde_json::from_value(serde_json::json!({"Batch": {
+                    "entries": [{"tool": "task", "summary": TASK, "status": "Success", "output": output}],
+                    "text": ""
+                }})).unwrap()
+            } else {
+                output
+            };
+            store.session.insert_tool_output(call.into(), output);
+            if loaded || call == CONTINUATION {
+                store.session.set_subagent_history(
+                    version.clone(),
+                    History::new(vec![Message::user(call.into())]).into_items(),
+                    Some(crate::SubagentTaskSpec::version()),
+                );
+            }
+            if durable || call == CONTINUATION {
+                database
+                    .save_background_task(
+                        session_id(),
+                        &TaskRecord {
+                            created_at: 0,
+                            updated_at: 0,
+                            sequence: if call == LAUNCH { 1 } else { 2 },
+                            task_id: TASK.into(),
+                            invocation_id: format!("{RUNTIME}-{call}"),
+                            root_call_id: call.into(),
+                            generation: 1,
+                            state: "succeeded".into(),
+                            background: true,
+                            receipt_accepted: true,
+                            mode: "build".into(),
+                            request: serde_json::json!({"call_id": version, "label": TASK}),
+                            outcome: None,
+                            output_ref: None,
+                            history: serde_json::to_value(vec![Message::user(call.into())])
+                                .unwrap(),
+                            spec: serde_json::to_value(crate::SubagentTaskSpec::default()).unwrap(),
+                            events: Vec::new(),
+                        },
+                    )
+                    .unwrap();
+            }
+            history.push(Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::tool_use(
+                    call,
+                    if batch { "batch" } else { "task" },
+                    serde_json::json!({}),
+                )],
+                ..Default::default()
+            });
+            history.push(tool_result(call));
+            if call == LAUNCH {
+                first_head = history.active_items().last().map(|item| item.id);
+            }
+        }
+        for id in [TASK, RUNTIME] {
+            store.session.set_subagent_history(
+                id.into(),
+                History::new(vec![Message::user(STALE.into())]).into_items(),
+                Some(crate::SubagentTaskSpec::default()),
+            );
+        }
+        store
+            .session
+            .replace_messages(history.active_items().to_vec());
+        if !continued {
+            store.session.meta.history_head = first_head;
+            history = History::restored(
+                active_history_items(store.session.messages(), first_head).unwrap(),
+            )
+            .unwrap();
+        }
+        store.save().unwrap();
+        drop(store);
+
+        let mut reopened = store_in(&tmp);
+        let selected = if continued { CONTINUATION } else { LAUNCH };
+        let version = if batch {
+            format!("{selected}-child")
+        } else {
+            selected.into()
+        };
+        assert_eq!(
+            reopened.subagent_history.selected_version(TASK).as_deref(),
+            Some(version.as_str())
+        );
+        let provider = WorkflowSession::new(false);
+        let mode = AgentMode::Build;
+        let mut ctx = stub_ctx_with(&mode, None, Some(NEXT));
+        ctx.subagent_history = reopened.subagent_history.clone();
+        ctx.provider = provider.provider.clone();
+        let tasks =
+            smol::block_on(BackgroundTasks::spawn(reopened.dir.clone(), session_id())).unwrap();
+        let result = smol::block_on(tasks.execute(
+            &ctx,
+            TaskRequest {
+                task: TaskIdentity::Continue(TASK.into()),
+                call_id: NEXT.into(),
+                prompt: Some(NEXT.into()),
+                label: TASK.into(),
+                mode: None,
+                profile: None,
+                model_job: None,
+                output_schema: None,
+                provenance: None,
+            },
+            false,
+        ));
+        smol::block_on(tasks.shutdown()).unwrap();
+        if !loaded && !durable {
+            assert!(
+                matches!(result, Err(error) if error == format!("{MISSING}: {TASK} at {version}"))
+            );
+            assert!(provider.provider.requests.lock().unwrap().is_empty());
+            assert!(
+                !reopened
+                    .subagent_history
+                    .snapshot()
+                    .records()
+                    .contains_key(TASK)
+            );
+            return;
+        }
+        assert!(matches!(result.unwrap(), TaskDelivery::Foreground(outcome, _) if outcome.success));
+        let requests = provider.provider.requests.lock().unwrap();
+        let observed = &requests[0];
+        assert!(
+            observed
+                .iter()
+                .any(|message| message.user_text() == Some(selected))
+        );
+        assert!(
+            observed
+                .iter()
+                .any(|message| message.user_text() == Some(NEXT))
+        );
+        assert!(
+            !observed
+                .iter()
+                .any(|message| message.user_text() == Some(STALE))
+        );
+        if !continued {
+            assert!(
+                !observed
+                    .iter()
+                    .any(|message| message.user_text() == Some(CONTINUATION))
+            );
+        }
+        history.push(Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::tool_use(
+                NEXT,
+                "task",
+                serde_json::json!({"task_id": TASK}),
+            )],
+            ..Default::default()
+        });
+        history.push(tool_result(NEXT));
+        reopened
+            .record_turn(&history, MODEL_SPEC.into(), &permission_manager())
+            .unwrap();
+        drop(reopened);
+
+        let reopened = store_in(&tmp);
+        let lease = reopened
+            .subagent_history
+            .continue_task_with(TASK, Default::default())
+            .unwrap();
+        let messages = lease.history().unwrap();
+        assert_eq!(messages[0].user_text(), Some(selected));
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.user_text() == Some(NEXT))
+        );
+        assert_eq!(
+            reopened.subagent_history.selected_version(TASK).as_deref(),
+            Some(NEXT)
+        );
+    }
+
     #[test]
     fn record_event_persists_tool_state_and_subagent_descriptor() {
         let tmp = TempDir::new().unwrap();
@@ -3290,6 +4026,7 @@ mod tests {
                 event: AgentEvent::ToolDone(Box::new(done)),
                 subagent: None,
                 run_id: 0,
+                task: None,
                 workflow: None,
             })
             .unwrap();
@@ -3306,6 +4043,7 @@ mod tests {
                 },
                 subagent: None,
                 run_id: 0,
+                task: None,
                 workflow: None,
             })
             .unwrap();
@@ -3316,6 +4054,7 @@ mod tests {
                 event: AgentEvent::ToolDone(Box::new(nested_done)),
                 subagent: None,
                 run_id: 0,
+                task: None,
                 workflow: None,
             })
             .unwrap();
@@ -3360,6 +4099,7 @@ mod tests {
                     event: AgentEvent::ToolDone(Box::new(done)),
                     subagent: None,
                     run_id: 0,
+                    task: None,
                     workflow: None,
                 })
                 .unwrap();
@@ -3392,6 +4132,7 @@ mod tests {
                     },
                     subagent: None,
                     run_id: 0,
+                    task: None,
                     workflow: None,
                 })
                 .unwrap();
@@ -3403,6 +4144,7 @@ mod tests {
                 event: AgentEvent::ToolDone(Box::new(done)),
                 subagent: None,
                 run_id: 0,
+                task: None,
                 workflow: None,
             })
             .unwrap();
@@ -3652,6 +4394,7 @@ complete(#{ report: first.output });
     const SECOND_PROMPT: &str = "and now?";
     const COMPLETION_HEADING: &str = "Workflow echo (echo) finished with status completed.";
     const EVENTS_CLOSED: &str = "the session dropped its event channel";
+    const TASK_INJECTION_MISSING: &str = "turn ended without task injection";
     const NO_RUNTIME: &str = "the session must attach a workflow runtime";
     const AGENT_NEVER_STARTED: &str = "the workflow agent never reached the provider";
     const REPORTED_ONCE: &str = "a completion is reported in one prompt only";
@@ -3662,6 +4405,7 @@ complete(#{ report: first.output });
     /// request so a test can wait for an agent to be in flight.
     struct ScriptedProvider {
         hang: bool,
+        responses: StdMutex<Option<Receiver<StreamResponse>>>,
         started: flume::Sender<()>,
         requests: std::sync::Mutex<Vec<Vec<Message>>>,
         models: std::sync::Mutex<Vec<String>>,
@@ -3718,6 +4462,10 @@ complete(#{ report: first.output });
                 if self.hang {
                     futures_lite::future::pending().await
                 }
+                let responses = self.responses.lock().unwrap().clone();
+                if let Some(responses) = responses {
+                    return Ok(responses.recv_async().await.unwrap());
+                }
                 Ok(StreamResponse {
                     message: Message {
                         role: Role::Assistant,
@@ -3766,6 +4514,7 @@ complete(#{ report: first.output });
                 project: project.canonicalize().unwrap(),
                 provider: Arc::new(ScriptedProvider {
                     hang,
+                    responses: StdMutex::new(None),
                     started: started_tx,
                     requests: std::sync::Mutex::new(Vec::new()),
                     models: std::sync::Mutex::new(Vec::new()),
@@ -3784,6 +4533,15 @@ complete(#{ report: first.output });
             &self,
             workflows: bool,
             workspace: Option<WorkspaceSession>,
+        ) -> InteractiveHandle {
+            self.spawn_session(workflows, workspace, false).await
+        }
+
+        async fn spawn_session(
+            &self,
+            workflows: bool,
+            workspace: Option<WorkspaceSession>,
+            background: bool,
         ) -> InteractiveHandle {
             let binding = workspace.as_ref().map(|workspace| {
                 StoredWorkspaceBinding::new_with_cursor(
@@ -3856,14 +4614,17 @@ complete(#{ report: first.output });
                 host_cwd: None,
                 local_documents: None,
             };
-            spawn_prepared_interactive(PreparedInteractive {
-                params,
-                history: History::default(),
-                model: Model::from_spec(MODEL_SPEC).unwrap(),
-                provider: Arc::clone(&self.provider) as Arc<dyn Provider>,
-                store,
-                workspace_baseline: None,
-            })
+            spawn_prepared_session(
+                PreparedInteractive {
+                    params,
+                    history: History::default(),
+                    model: Model::from_spec(MODEL_SPEC).unwrap(),
+                    provider: Arc::clone(&self.provider) as Arc<dyn Provider>,
+                    store,
+                    workspace_baseline: None,
+                },
+                background,
+            )
             .await
             .unwrap()
         }
@@ -3873,6 +4634,545 @@ complete(#{ report: first.output });
         let InteractiveHandle { input_tx, task, .. } = handle;
         drop(input_tx);
         task.await;
+    }
+
+    struct ControlledChild {
+        responses: Receiver<StreamResponse>,
+        started: flume::Sender<()>,
+    }
+
+    impl Provider for ControlledChild {
+        fn stream_message<'a>(
+            &'a self,
+            _: &'a Model,
+            _: &'a [Message],
+            _: &'a str,
+            _: &'a Value,
+            _: &'a flume::Sender<ProviderEvent>,
+            _: RequestOptions,
+            _: Option<&'a CacheKey>,
+        ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
+            Box::pin(async move {
+                self.started.send(()).unwrap();
+                Ok(self.responses.recv_async().await.unwrap())
+            })
+        }
+
+        fn list_models(
+            &self,
+        ) -> BoxFuture<'_, Result<Vec<caudra_providers::ModelInfo>, AgentError>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+    }
+
+    async fn background_child(
+        tasks: &BackgroundTasks,
+        id: &str,
+    ) -> (flume::Sender<StreamResponse>, Receiver<()>, String) {
+        background_child_in(tasks, id, AgentMode::Build).await
+    }
+
+    async fn background_child_in(
+        tasks: &BackgroundTasks,
+        id: &str,
+        mode: AgentMode,
+    ) -> (flume::Sender<StreamResponse>, Receiver<()>, String) {
+        let (responses, rx) = flume::unbounded();
+        let (started, starts) = flume::unbounded();
+        let mut ctx = stub_ctx_with(&mode, None, Some(id));
+        ctx.provider = Arc::new(ControlledChild {
+            responses: rx,
+            started,
+        });
+        let (event_tx, events) = flume::unbounded();
+        ctx.event_tx = EventSender::new(event_tx, 0);
+        let TaskDelivery::Background(receipt) = tasks
+            .execute(
+                &ctx,
+                TaskRequest {
+                    prompt: Some(PROMPT.into()),
+                    label: id.into(),
+                    task: TaskIdentity::Derive,
+                    mode: None,
+                    profile: None,
+                    model_job: None,
+                    output_schema: None,
+                    call_id: id.into(),
+                    provenance: None,
+                },
+                true,
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("expected background receipt")
+        };
+        let admission = events.recv_async().await.unwrap();
+        let AgentEvent::TaskAdmitted(card) = admission.event else {
+            panic!("expected task admission")
+        };
+        assert_eq!(card.task_id, receipt.task_id);
+        assert_eq!(card.invocation_id, receipt.invocation_id);
+        assert_eq!(card.call_id, id);
+        assert_ne!(card.task_id, id);
+        assert_eq!(card.task_id.split('-').count(), 3);
+        tasks
+            .settle_launches(&[Message {
+                role: Role::User,
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: id.into(),
+                    content: "admitted".into(),
+                    is_error: false,
+                    output_ref: None,
+                }],
+                ..Default::default()
+            }])
+            .await
+            .unwrap();
+        starts.recv_async().await.unwrap();
+        (responses, starts, card.task_id)
+    }
+
+    #[test]
+    fn background_reminders_do_not_repeat_by_default_or_wake_idle_parent() {
+        const CHILD: &str = "reminder-child";
+        const RESPONSE_GROUPS: u32 = 16;
+        smol::block_on(async {
+            let session = WorkflowSession::new(false);
+            let handle = session.spawn_session(false, None, true).await;
+            let tasks = handle.background.as_ref().unwrap();
+            let (_child, _, task_id) = background_child(tasks, CHILD).await;
+            for index in 0..=RESPONSE_GROUPS {
+                handle.input_tx.send(prompt(PROMPT)).unwrap();
+                wait_for_turn(&handle.event_rx).await;
+                let run = handle.run_rx.recv_async().await.unwrap();
+                assert!(!run.automatic);
+                assert!(run.task_event_ids.is_empty());
+                let requests = session.provider.requests.lock().unwrap();
+                assert_eq!(requests.len(), index as usize + 1);
+                let snapshots: Vec<_> = requests
+                    .last()
+                    .unwrap()
+                    .iter()
+                    .filter(|message| {
+                        message.standing_reminder == Some(StandingReminderKind::BackgroundWork)
+                    })
+                    .collect();
+                assert_eq!(snapshots.len(), 1);
+                assert!(
+                    snapshots
+                        .last()
+                        .unwrap()
+                        .first_text_content()
+                        .unwrap()
+                        .contains(&task_id)
+                );
+                assert!(handle.run_rx.is_empty());
+            }
+            shutdown_interactive(handle).await;
+            let database = SessionDatabase::open(&session.state_dir).unwrap();
+            let records = database.background_tasks(session_id()).unwrap();
+            assert!(
+                records
+                    .iter()
+                    .all(|record| record.events.iter().all(|event| !event.accepted))
+            );
+        });
+    }
+
+    #[test_case(false; "terminal_after_final_answer")]
+    #[test_case(true; "report_while_sibling_active")]
+    fn background_delivery_starts_another_parent_run_without_user_input(report: bool) {
+        const CHILD: &str = "detached-child";
+        const SIBLING: &str = "detached-sibling";
+        const REPORT_CALL: &str = "report-call";
+        smol::block_on(async {
+            let session = WorkflowSession::new(false);
+            let handle = session.spawn_session(false, None, true).await;
+            let tasks = handle.background.as_ref().unwrap();
+            handle.input_tx.send(prompt(PROMPT)).unwrap();
+            wait_for_turn(&handle.event_rx).await;
+            let first = handle.run_rx.recv_async().await.unwrap();
+            assert!(!first.automatic);
+            let (child, starts, task_id) = background_child(tasks, CHILD).await;
+            let sibling = if report {
+                Some(background_child(tasks, SIBLING).await)
+            } else {
+                None
+            };
+            child
+                .send(StreamResponse {
+                    message: Message {
+                        role: Role::Assistant,
+                        content: vec![if report {
+                            ContentBlock::tool_use(
+                                REPORT_CALL,
+                                "report_to_parent",
+                                serde_json::json!({"message": ANSWER}),
+                            )
+                        } else {
+                            ContentBlock::Text {
+                                text: ANSWER.into(),
+                            }
+                        }],
+                        ..Default::default()
+                    },
+                    stop_reason: Some(if report {
+                        StopReason::ToolUse
+                    } else {
+                        StopReason::EndTurn
+                    }),
+                    ..Default::default()
+                })
+                .unwrap();
+            if report {
+                starts.recv_async().await.unwrap();
+            }
+            let (text, origin) = wait_for_task_injection(&handle.event_rx).await;
+            wait_for_turn(&handle.event_rx).await;
+            let second = handle.run_rx.recv_async().await.unwrap();
+            assert!(second.automatic);
+            assert!(second.run_id > first.run_id);
+            assert_eq!(second.task_event_ids.len(), 1);
+            assert_eq!(session.provider.user_prompts(), vec![PROMPT, PROMPT]);
+            {
+                let requests = session.provider.requests.lock().unwrap();
+                let message = requests
+                    .last()
+                    .unwrap()
+                    .iter()
+                    .find(|message| message.task_event.as_ref() == Some(&origin))
+                    .unwrap();
+                assert_eq!(message.user_text(), Some(text.as_str()));
+            }
+            assert_eq!(origin.task_id, task_id);
+            assert_eq!(origin.event_id, second.task_event_ids[0]);
+            assert_eq!(
+                origin.invocation_id,
+                tasks.status(&task_id).unwrap().invocation_id
+            );
+            assert!(text.contains(ANSWER));
+            assert!(!text.contains(&origin.invocation_id));
+            assert!(!text.contains(&origin.event_id));
+            assert!(!text.contains("tool_output"));
+            if report {
+                assert_eq!(tasks.active_count(), 2);
+            }
+            shutdown_interactive(handle).await;
+            drop(sibling);
+            let database = SessionDatabase::open(&session.state_dir).unwrap();
+            assert!(
+                database
+                    .background_event_accepted(session_id(), &second.task_event_ids[0])
+                    .unwrap()
+            );
+        });
+    }
+
+    #[test_case(false; "acp_opt_out")]
+    #[test_case(true; "sdk_opt_in")]
+    fn background_capability_requires_explicit_session_opt_in(enabled: bool) {
+        smol::block_on(async {
+            let session = WorkflowSession::new(false);
+            let handle = session.spawn_session(false, None, enabled).await;
+            assert_eq!(handle.background.is_some(), enabled);
+            shutdown_interactive(handle).await;
+        });
+    }
+
+    #[test]
+    fn busy_report_is_acknowledged_from_saved_history_without_an_idle_claim() {
+        const CHILD: &str = "busy-child";
+        const REPORT_CALL: &str = "busy-report";
+        smol::block_on(async {
+            let session = WorkflowSession::new(false);
+            let (responses, rx) = flume::unbounded();
+            *session.provider.responses.lock().unwrap() = Some(rx);
+            let handle = session.spawn_session(false, None, true).await;
+            handle.input_tx.send(prompt(PROMPT)).unwrap();
+            session.started.recv_async().await.unwrap();
+            let tasks = handle.background.as_ref().unwrap();
+            let (child, starts, task_id) = background_child(tasks, CHILD).await;
+            child
+                .send(StreamResponse {
+                    message: Message {
+                        role: Role::Assistant,
+                        content: vec![ContentBlock::tool_use(
+                            REPORT_CALL,
+                            "report_to_parent",
+                            serde_json::json!({"message": ANSWER}),
+                        )],
+                        ..Default::default()
+                    },
+                    stop_reason: Some(StopReason::ToolUse),
+                    ..Default::default()
+                })
+                .unwrap();
+            starts.recv_async().await.unwrap();
+            assert!(tasks.has_pending());
+            let answer = || StreamResponse {
+                message: Message {
+                    role: Role::Assistant,
+                    content: vec![ContentBlock::Text {
+                        text: ANSWER.into(),
+                    }],
+                    ..Default::default()
+                },
+                stop_reason: Some(StopReason::EndTurn),
+                ..Default::default()
+            };
+            responses.send(answer()).unwrap();
+            session.started.recv_async().await.unwrap();
+            assert!(!tasks.has_pending());
+            let origin = {
+                let requests = session.provider.requests.lock().unwrap();
+                requests
+                    .last()
+                    .unwrap()
+                    .iter()
+                    .find_map(|message| message.task_event.as_ref().cloned())
+                    .unwrap()
+            };
+            let (text, injected_origin) = wait_for_task_injection(&handle.event_rx).await;
+            assert_eq!(injected_origin, origin);
+            assert_eq!(origin.task_id, task_id);
+            assert!(text.contains(ANSWER));
+            responses.send(answer()).unwrap();
+            wait_for_turn(&handle.event_rx).await;
+            let runs: Vec<_> = handle.run_rx.try_iter().collect();
+            assert_eq!(runs.len(), 1);
+            assert!(runs[0].task_event_ids.is_empty());
+            shutdown_interactive(handle).await;
+            let database = SessionDatabase::open(&session.state_dir).unwrap();
+            assert!(
+                database
+                    .background_event_accepted(session_id(), &origin.event_id)
+                    .unwrap()
+            );
+            let record = database
+                .background_tasks(session_id())
+                .unwrap()
+                .into_iter()
+                .find(|record| record.task_id == task_id)
+                .unwrap();
+            assert!(
+                record
+                    .events
+                    .iter()
+                    .any(|event| event.event_id == origin.event_id && event.accepted)
+            );
+        });
+    }
+
+    #[test]
+    fn stopping_background_work_suppresses_late_wakes_and_next_user_turn_is_not_cancelled() {
+        const CHILD: &str = "stopped-child";
+        smol::block_on(async {
+            let session = WorkflowSession::new(false);
+            let handle = session.spawn_session(false, None, true).await;
+            handle.input_tx.send(prompt(PROMPT)).unwrap();
+            wait_for_turn(&handle.event_rx).await;
+            let tasks = handle.background.as_ref().unwrap();
+            let _child = background_child(tasks, CHILD).await;
+            tasks.stop().await.unwrap();
+            assert_eq!(tasks.active_count(), 0);
+            assert!(!tasks.has_pending());
+            handle.cancel_tx.send(()).unwrap();
+            handle.input_tx.send(prompt(SECOND_PROMPT)).unwrap();
+            wait_for_turn(&handle.event_rx).await;
+            assert_eq!(session.provider.user_prompts(), vec![PROMPT, SECOND_PROMPT]);
+            assert!(handle.run_rx.try_iter().all(|run| !run.automatic));
+            shutdown_interactive(handle).await;
+        });
+    }
+
+    #[test_case(false; "idle_build_parent")]
+    #[test_case(true; "active_build_parent")]
+    fn acknowledged_plan_transition_drains_build_work_and_clamps_later_reports(active: bool) {
+        const CHILD: &str = "downgraded-build-child";
+        const PLAN_CHILD: &str = "new-plan-child";
+        const PLAN_FILE: &str = "plan.md";
+        smol::block_on(async {
+            let session = WorkflowSession::new(false);
+            let (_responses, rx) = flume::unbounded();
+            if active {
+                *session.provider.responses.lock().unwrap() = Some(rx);
+            }
+            let handle = session.spawn_session(false, None, true).await;
+            handle.input_tx.send(prompt(PROMPT)).unwrap();
+            if active {
+                session.started.recv_async().await.unwrap();
+            } else {
+                wait_for_turn(&handle.event_rx).await;
+            }
+            let tasks = handle.background.as_ref().unwrap();
+            let (child, _, _) = background_child(tasks, CHILD).await;
+            assert_eq!(tasks.active_count(), 1);
+            let plan = AgentMode::Plan(session.project.join(PLAN_FILE));
+            handle.set_mode(plan.clone(), false).await.unwrap();
+            if active {
+                wait_for_turn(&handle.event_rx).await;
+            }
+            assert_eq!(tasks.active_count(), 0);
+            assert!(!tasks.has_pending());
+            let answer = || StreamResponse {
+                message: Message {
+                    role: Role::Assistant,
+                    content: vec![ContentBlock::Text {
+                        text: ANSWER.into(),
+                    }],
+                    ..Default::default()
+                },
+                stop_reason: Some(StopReason::EndTurn),
+                ..Default::default()
+            };
+            assert!(child.send(answer()).is_err());
+            *session.provider.responses.lock().unwrap() = None;
+            handle.input_tx.send(prompt(SECOND_PROMPT)).unwrap();
+            wait_for_turn(&handle.event_rx).await;
+            let (child, _, _) = background_child_in(tasks, PLAN_CHILD, plan).await;
+            child.send(answer()).unwrap();
+            wait_for_turn(&handle.event_rx).await;
+            {
+                let requests = session.provider.requests.lock().unwrap();
+                let latest_mode = requests
+                    .last()
+                    .unwrap()
+                    .iter()
+                    .rev()
+                    .filter_map(Message::first_text_content)
+                    .find(|text| {
+                        text.contains(crate::prompt::PLAN_MODE_MARKER)
+                            || text.contains(crate::prompt::BUILD_MODE_MARKER)
+                    })
+                    .unwrap();
+                assert!(latest_mode.contains(crate::prompt::PLAN_MODE_MARKER));
+            }
+            assert!(handle.run_rx.try_iter().last().unwrap().automatic);
+            shutdown_interactive(handle).await;
+        });
+    }
+
+    #[test]
+    fn acknowledged_plan_transition_drains_active_workflows() {
+        const PLAN_FILE: &str = "plan.md";
+        smol::block_on(async {
+            let session = WorkflowSession::new(true);
+            let handle = session.spawn_session(true, None, true).await;
+            let workflow = handle.workflow.as_ref().unwrap();
+            trust_and_start(workflow).await;
+            session.started.recv_async().await.unwrap();
+            assert_eq!(workflow.active_count(), 1);
+            handle
+                .set_mode(AgentMode::Plan(session.project.join(PLAN_FILE)), false)
+                .await
+                .unwrap();
+            assert_eq!(workflow.active_count(), 0);
+            assert_eq!(workflow.state().runs[0].status, RunStatus::Cancelled);
+            shutdown_interactive(handle).await;
+        });
+    }
+
+    #[test_case(true; "interrupt_then_explicit_resume")]
+    #[test_case(false; "plan_mode_then_explicit_start")]
+    fn explicit_workflow_controls_rearm_without_model_requests_rearming(resume: bool) {
+        const PLAN_FILE: &str = "plan.md";
+        smol::block_on(async {
+            let session = WorkflowSession::new(true);
+            let handle = session.spawn_session(true, None, true).await;
+            let workflow = handle.workflow.as_ref().unwrap();
+            let run = trust_and_start(workflow).await;
+            session.started.recv_async().await.unwrap();
+            let request = || {
+                if resume {
+                    WorkflowRequest::Resume {
+                        run_id: run.run_id.clone(),
+                        agent_budget: None,
+                    }
+                } else {
+                    WorkflowRequest::Start(caudra_workflow::LaunchRequest {
+                        name: WORKFLOW_NAME.into(),
+                        args: serde_json::json!({}),
+                        agent_budget: None,
+                    })
+                }
+            };
+            let superseded = handle.workflow_control(request());
+            if resume {
+                handle.interrupt().await.unwrap();
+            } else {
+                handle
+                    .set_mode(AgentMode::Plan(session.project.join(PLAN_FILE)), false)
+                    .await
+                    .unwrap();
+            }
+            assert_eq!(workflow.active_count(), 0);
+            assert!(workflow.request(request()).await.is_err());
+            assert!(
+                handle
+                    .background
+                    .as_ref()
+                    .unwrap()
+                    .workflow_admission()
+                    .await
+                    .is_err()
+            );
+            assert!(
+                matches!(superseded.await, Err(WorkflowError::Internal(message)) if message == STALE_WORKFLOW_CONTROL)
+            );
+            handle.workflow_control(request()).await.unwrap();
+            session.started.recv_async().await.unwrap();
+            assert_eq!(workflow.active_count(), 1);
+            if !resume {
+                let requests = session.provider.requests.lock().unwrap();
+                assert!(
+                    requests
+                        .last()
+                        .unwrap()
+                        .iter()
+                        .filter_map(Message::first_text_content)
+                        .any(|text| text.contains(crate::prompt::TASK_PLAN_CONTRACT))
+                );
+            }
+            shutdown_interactive(handle).await;
+        });
+    }
+
+    #[test]
+    fn waiting_explicit_workflow_start_does_not_block_interrupt_or_rearm_after_it() {
+        smol::block_on(async {
+            let session = WorkflowSession::new(true);
+            let handle = session.spawn_session(true, None, true).await;
+            handle.input_tx.send(prompt(PROMPT)).unwrap();
+            session.started.recv_async().await.unwrap();
+            let mut waiting = Box::pin(handle.workflow_control(WorkflowRequest::Start(
+                caudra_workflow::LaunchRequest {
+                    name: WORKFLOW_NAME.into(),
+                    args: serde_json::json!({}),
+                    agent_budget: None,
+                },
+            )));
+            assert!(
+                futures_lite::future::poll_once(&mut waiting)
+                    .await
+                    .is_none()
+            );
+            let waiting = smol::spawn(waiting);
+            handle.interrupt().await.unwrap();
+            assert!(
+                matches!(waiting.await, Err(WorkflowError::Internal(message)) if message == STALE_WORKFLOW_CONTROL)
+            );
+            assert!(
+                handle
+                    .background
+                    .as_ref()
+                    .unwrap()
+                    .workflow_admission()
+                    .await
+                    .is_err()
+            );
+            shutdown_interactive(handle).await;
+        });
     }
 
     #[test_case(false, PermissionLifetime::Once; "acp_once")]
@@ -4027,6 +5327,23 @@ complete(#{ report: first.output });
                 && snapshot.status == status
             {
                 return;
+            }
+        }
+    }
+
+    async fn wait_for_task_injection(events: &Receiver<Envelope>) -> (String, TaskEventOrigin) {
+        loop {
+            let envelope = events.recv_async().await.expect(EVENTS_CLOSED);
+            match envelope.event {
+                AgentEvent::Injected {
+                    text,
+                    task_event: Some(origin),
+                } => return (text, origin),
+                AgentEvent::Done { .. } if envelope.subagent.is_none() => {
+                    panic!("{TASK_INJECTION_MISSING}")
+                }
+                AgentEvent::Error { message } => panic!("turn failed: {message}"),
+                _ => {}
             }
         }
     }
@@ -4269,15 +5586,35 @@ complete(#{ report: first.output });
             wait_for_run(&handle.event_rx, &run.run_id, RunStatus::Completed).await;
             assert_eq!(workflow.pending_completions(), 1);
 
+            let read_only_claim = completion_messages(&workflow).await.unwrap();
+            assert_eq!(
+                read_only_claim[0].workflow_event,
+                Some(WorkflowEventOrigin {
+                    run_id: run.run_id.clone(),
+                    revision: workflow.state().runs[0].revision
+                })
+            );
+            assert_eq!(workflow.pending_completions(), 1);
+
             handle.input_tx.send(prompt(PROMPT)).unwrap();
             wait_for_turn(&handle.event_rx).await;
             handle.input_tx.send(prompt(SECOND_PROMPT)).unwrap();
             wait_for_turn(&handle.event_rx).await;
 
             let prompts = session.provider.user_prompts();
-            let reported =
-                format!("{COMPLETION_HEADING}\nReport: {ANSWER}{COMPLETION_SEPARATOR}{PROMPT}");
-            assert!(prompts.contains(&reported), "got {prompts:?}");
+            let reported = format!("{COMPLETION_HEADING}\nReport: {ANSWER}");
+            assert!(prompts.contains(&PROMPT.to_owned()), "got {prompts:?}");
+            {
+                let requests = session.provider.requests.lock().unwrap();
+                assert!(
+                    requests
+                        .last()
+                        .unwrap()
+                        .iter()
+                        .any(|message| message.is_observation()
+                            && message.first_text_content() == Some(reported.as_str()))
+                );
+            }
             assert!(
                 prompts.contains(&SECOND_PROMPT.to_owned()),
                 "{REPORTED_ONCE}: got {prompts:?}"
@@ -4292,6 +5629,109 @@ complete(#{ report: first.output });
                 workflow.request(WorkflowRequest::List).await,
                 Err(WorkflowError::Unavailable)
             );
+        });
+    }
+
+    #[test_case(false; "acp_does_not_wake")]
+    #[test_case(true; "sdk_wakes_without_task_events")]
+    fn workflow_completion_after_parent_done_respects_background_capability(enabled: bool) {
+        smol::block_on(async {
+            let session = WorkflowSession::new(false);
+            let handle = session.spawn_session(true, None, enabled).await;
+            handle.input_tx.send(prompt(PROMPT)).unwrap();
+            wait_for_turn(&handle.event_rx).await;
+            if enabled {
+                assert!(!handle.run_rx.recv_async().await.unwrap().automatic);
+            }
+            let workflow = handle.workflow.as_ref().unwrap();
+            let run = trust_and_start(workflow).await;
+            wait_for_run(&handle.event_rx, &run.run_id, RunStatus::Completed).await;
+            if enabled {
+                wait_for_turn(&handle.event_rx).await;
+                let automatic = handle.run_rx.recv_async().await.unwrap();
+                assert!(automatic.automatic);
+                assert!(automatic.task_event_ids.is_empty());
+                assert_eq!(automatic.workflow_events.len(), 1);
+                assert_eq!(automatic.workflow_events[0].run_id, run.run_id);
+            } else {
+                assert_eq!(workflow.pending_completions(), 1);
+                assert_eq!(session.provider.requests.lock().unwrap().len(), 2);
+                handle.input_tx.send(prompt(SECOND_PROMPT)).unwrap();
+                wait_for_turn(&handle.event_rx).await;
+            }
+            {
+                let _turn = handle.mode_route.turn.lock().await;
+                assert_eq!(workflow.pending_completions(), 0);
+                let requests = session.provider.requests.lock().unwrap();
+                let report = requests
+                    .last()
+                    .unwrap()
+                    .iter()
+                    .find(|message| {
+                        message
+                            .workflow_event
+                            .as_ref()
+                            .is_some_and(|origin| origin.run_id == run.run_id)
+                    })
+                    .unwrap();
+                assert!(report.is_observation());
+                assert!(report.task_event.is_none());
+            }
+            shutdown_interactive(handle).await;
+        });
+    }
+
+    #[test]
+    fn saved_workflow_receipt_prevents_reinjection_after_compaction_and_recovery() {
+        const SUMMARY: &str = "Compacted workflow conversation";
+        smol::block_on(async {
+            let session = WorkflowSession::new(false);
+            let handle = session.spawn(true).await;
+            let workflow = handle.workflow.as_ref().unwrap();
+            let run = trust_and_start(workflow).await;
+            wait_for_run(&handle.event_rx, &run.run_id, RunStatus::Completed).await;
+            let claims = completion_messages(workflow).await.unwrap();
+            assert_eq!(claims.len(), 1);
+            acknowledge_workflow_messages(workflow, &claims)
+                .await
+                .unwrap();
+            assert_eq!(workflow.pending_completions(), 1);
+            shutdown_interactive(handle).await;
+            {
+                let mut store = SessionStore::open_in(
+                    session.state_dir.clone(),
+                    session_id(),
+                    &session.project.to_string_lossy(),
+                    MODEL_SPEC,
+                )
+                .unwrap();
+                let permissions = permission_manager();
+                store
+                    .record_turn(
+                        &History::new(claims.clone()),
+                        MODEL_SPEC.into(),
+                        &permissions,
+                    )
+                    .unwrap();
+                let compacted = History::new(vec![Message::observation(SUMMARY.into())]);
+                store
+                    .record_turn(&compacted, MODEL_SPEC.into(), &permissions)
+                    .unwrap();
+            }
+            let handle = session.spawn(true).await;
+            let workflow = handle.workflow.as_ref().unwrap();
+            assert!(
+                workflow
+                    .received_completion(claims[0].workflow_event.clone().unwrap())
+                    .await
+                    .unwrap()
+            );
+            acknowledge_workflow_messages(workflow, &claims)
+                .await
+                .unwrap();
+            assert!(completion_messages(workflow).await.unwrap().is_empty());
+            assert_eq!(workflow.pending_completions(), 0);
+            shutdown_interactive(handle).await;
         });
     }
 

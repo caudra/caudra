@@ -308,6 +308,7 @@ pub fn run(
             | AgentEvent::ToolOutput { .. }
             | AgentEvent::ToolAnnotation { .. }
             | AgentEvent::ToolDone(_)
+            | AgentEvent::TaskAdmitted(_)
             | AgentEvent::BatchProgress(_)
             | AgentEvent::Question(_)
             | AgentEvent::QueueItemConsumed { .. }

@@ -173,7 +173,7 @@ fn project<'a>(messages: &'a [Message], tools: &Value) -> Cow<'a, [Message]> {
         else {
             unreachable!("candidate shape changed while cloning history");
         };
-        let id = output_ref.id;
+        let id = &output_ref.id;
         *content = format!(
             "{PRUNED_MARKER} Full output ID: {id}. Use {TOOL_OUTPUT_TOOL_NAME}(output_id=\"{id}\", offset=1, limit={READ_LIMIT}), optionally with pattern=\"...\" to search it.]"
         );

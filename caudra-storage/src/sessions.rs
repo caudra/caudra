@@ -91,6 +91,8 @@ pub enum SessionError {
     AlreadyExists { id: CaudraId },
     #[error("session {id} is already open in another Caudra instance")]
     SessionInUse { id: CaudraId },
+    #[error("session {id} has active or undelivered background tasks")]
+    BackgroundTasksPending { id: CaudraId },
     #[error(
         "session {id} was modified concurrently: expected write version {expected}, found {actual}"
     )]

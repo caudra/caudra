@@ -1,11 +1,16 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
+use crate::ToolOutput;
+use crate::tools::native::batch::child_tool_use_id;
 use caudra_providers::{HistoryItem, HistoryItemKind, Message};
 pub use caudra_storage::sessions::{
     StoredMode as SubagentTaskMode, StoredSubagentTaskSpec as SubagentTaskSpec,
 };
 use thiserror::Error;
+
+const TASK_ID_ATTEMPTS: usize = 64;
+const TASK_ID_EXHAUSTED: &str = "task identity allocation exhausted after 64 attempts";
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum SubagentHistoryError {
@@ -143,6 +148,7 @@ struct State {
     revision: u64,
     records: Arc<HashMap<String, Arc<SubagentHistoryRecord>>>,
     active: HashSet<String>,
+    selected_versions: HashMap<String, String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -151,27 +157,75 @@ pub struct SubagentHistoryStore {
 }
 
 impl SubagentHistoryStore {
+    pub(crate) fn reserve_unconfigured(
+        &self,
+        task_id: &str,
+    ) -> Result<SubagentHistoryLease, String> {
+        self.reserve_inner(task_id.to_owned(), None)
+            .map_err(|error| error.to_string())
+    }
+
+    pub(crate) fn reserve_generated(
+        &self,
+        occupied: impl FnMut(&str) -> Result<bool, String>,
+    ) -> Result<SubagentHistoryLease, String> {
+        self.reserve_generated_with(
+            || caudra_storage::random_task_id().map_err(|error| error.to_string()),
+            occupied,
+        )
+    }
+
+    fn reserve_generated_with(
+        &self,
+        mut candidate: impl FnMut() -> Result<String, String>,
+        mut occupied: impl FnMut(&str) -> Result<bool, String>,
+    ) -> Result<SubagentHistoryLease, String> {
+        for _ in 0..TASK_ID_ATTEMPTS {
+            let task_id = candidate()?;
+            let mut state = self.lock();
+            if state.active.contains(&task_id)
+                || state.records.contains_key(&task_id)
+                || state.selected_versions.contains_key(&task_id)
+                || occupied(&task_id)?
+            {
+                continue;
+            }
+            state.active.insert(task_id.clone());
+            drop(state);
+            return Ok(SubagentHistoryLease::new(self.clone(), task_id, None, None));
+        }
+        Err(TASK_ID_EXHAUSTED.into())
+    }
+
     pub fn seeded(histories: HashMap<String, Arc<Vec<Message>>>) -> Self {
         Self::seeded_with_specs(histories, HashMap::new())
     }
 
     pub fn seeded_with_specs(
         histories: HashMap<String, Arc<Vec<Message>>>,
+        specs: HashMap<String, SubagentTaskSpec>,
+    ) -> Self {
+        Self::seeded_with_versions(histories, specs, HashMap::new())
+    }
+
+    pub fn seeded_with_versions(
+        histories: HashMap<String, Arc<Vec<Message>>>,
         mut specs: HashMap<String, SubagentTaskSpec>,
+        mut selected_versions: HashMap<String, String>,
     ) -> Self {
         let records = histories
             .into_iter()
             .map(|(task_id, messages)| {
                 let spec = specs.remove(&task_id);
-                (
-                    task_id,
-                    Arc::new(SubagentHistoryRecord::new(messages, spec)),
-                )
+                let mut record = SubagentHistoryRecord::new(messages, spec);
+                record.version_id = selected_versions.remove(&task_id);
+                (task_id, Arc::new(record))
             })
             .collect();
         Self {
             state: Arc::new(Mutex::new(State {
                 records: Arc::new(records),
+                selected_versions,
                 ..State::default()
             })),
         }
@@ -215,7 +269,7 @@ impl SubagentHistoryStore {
         if state.active.contains(&task_id) {
             return Err(SubagentHistoryError::AlreadyActive { task_id });
         }
-        if state.records.contains_key(&task_id) {
+        if state.records.contains_key(&task_id) || state.selected_versions.contains_key(&task_id) {
             return Err(SubagentHistoryError::AlreadyCompleted { task_id });
         }
         state.active.insert(task_id.clone());
@@ -324,6 +378,40 @@ impl SubagentHistoryStore {
         self.lock().active.contains(task_id)
     }
 
+    pub(crate) fn selected_version(&self, task_id: &str) -> Option<String> {
+        let state = self.lock();
+        state.selected_versions.get(task_id).cloned().or_else(|| {
+            state
+                .records
+                .get(task_id)
+                .and_then(|record| record.version_id().map(str::to_owned))
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn active_count(&self) -> usize {
+        self.lock().active.len()
+    }
+
+    pub(crate) fn restore_version(
+        &self,
+        task_id: String,
+        history: Arc<Vec<Message>>,
+        spec: SubagentTaskSpec,
+        version_id: String,
+    ) -> Result<(), SubagentHistoryError> {
+        let mut state = self.lock();
+        if state.active.contains(&task_id) {
+            return Err(SubagentHistoryError::AlreadyActive { task_id });
+        }
+        let mut record = SubagentHistoryRecord::new(history, Some(spec));
+        record.version_id = Some(version_id);
+        state.selected_versions.remove(&task_id);
+        Arc::make_mut(&mut state.records).insert(task_id, Arc::new(record));
+        state.revision += 1;
+        Ok(())
+    }
+
     fn lock(&self) -> MutexGuard<'_, State> {
         self.state
             .lock()
@@ -339,6 +427,7 @@ impl SubagentHistoryStore {
     ) {
         let mut state = self.lock();
         state.active.remove(&task_id);
+        state.selected_versions.remove(&task_id);
         let mut record = SubagentHistoryRecord::new(history, spec);
         record.version_id = version_id;
         Arc::make_mut(&mut state.records).insert(task_id, Arc::new(record));
@@ -358,6 +447,92 @@ pub fn active_task_history_versions_with_batch_state<'a>(
     history: &[HistoryItem],
     mut batch_state: impl FnMut(&str) -> Option<&'a serde_json::Value>,
 ) -> HashMap<String, String> {
+    selected_history_versions(history, |call_id| {
+        batch_state(call_id).map(batch_task_history_versions)
+    })
+}
+
+pub fn active_task_history_versions_with_outputs<'a>(
+    history: &[HistoryItem],
+    mut output: impl FnMut(&str) -> Option<&'a ToolOutput>,
+) -> HashMap<String, String> {
+    selected_history_versions(history, |call_id| {
+        output(call_id).map(|output| task_output_history_versions(output, Some(call_id)))
+    })
+}
+
+fn task_output_history_versions(
+    output: &ToolOutput,
+    call_id: Option<&str>,
+) -> HashMap<String, String> {
+    match output {
+        ToolOutput::Tasks(cards) => cards
+            .iter()
+            .filter(|card| !card.call_id.is_empty())
+            .map(|card| (card.task_id.clone(), card.call_id.clone()))
+            .collect(),
+        ToolOutput::Batch { entries, .. } => entries
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| matches!(entry.tool.as_str(), "task" | "batch"))
+            .flat_map(|(index, entry)| {
+                let child_call = call_id.map(|id| child_tool_use_id(Some(id), index));
+                let mut selected = entry
+                    .output
+                    .as_ref()
+                    .map(|output| task_output_history_versions(output, child_call.as_deref()))
+                    .unwrap_or_default();
+                if entry.tool == "task"
+                    && selected.is_empty()
+                    && let Some(child_call) = child_call
+                {
+                    let task_id = entry
+                        .model_suffix
+                        .as_deref()
+                        .and_then(metadata_task_id)
+                        .or_else(|| {
+                            entry
+                                .raw_input
+                                .as_ref()
+                                .and_then(|input| input.get("task_id"))
+                                .and_then(serde_json::Value::as_str)
+                        })
+                        .unwrap_or(&child_call);
+                    selected.insert(task_id.to_owned(), child_call);
+                }
+                selected
+            })
+            .collect(),
+        _ => output
+            .state()
+            .map(batch_task_history_versions)
+            .unwrap_or_default(),
+    }
+}
+
+fn metadata_task_id(output: &str) -> Option<&str> {
+    output
+        .rsplit_once("<task_metadata>")?
+        .1
+        .split_once("</task_metadata>")?
+        .0
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("task_id: "))
+}
+
+fn selected_history_versions(
+    history: &[HistoryItem],
+    mut output_versions: impl FnMut(&str) -> Option<HashMap<String, String>>,
+) -> HashMap<String, String> {
+    let results: HashMap<_, _> = history
+        .iter()
+        .filter_map(|item| match &item.kind {
+            HistoryItemKind::ToolResult {
+                call_id, content, ..
+            } => Some((call_id.as_str(), content.as_str())),
+            _ => None,
+        })
+        .collect();
     let mut versions = HashMap::new();
     for item in history {
         match &item.kind {
@@ -367,15 +542,21 @@ pub fn active_task_history_versions_with_batch_state<'a>(
                 input,
                 ..
             } if name == "task" => {
-                let task_id = input
-                    .get("task_id")
-                    .and_then(serde_json::Value::as_str)
+                let typed = output_versions(call_id).unwrap_or_default();
+                if !typed.is_empty() {
+                    versions.extend(typed);
+                    continue;
+                }
+                let task_id = results
+                    .get(call_id.as_str())
+                    .and_then(|output| metadata_task_id(output))
+                    .or_else(|| input.get("task_id").and_then(serde_json::Value::as_str))
                     .unwrap_or(call_id);
                 versions.insert(task_id.to_owned(), call_id.clone());
             }
             HistoryItemKind::ToolCall { call_id, name, .. } if name == "batch" => {
-                if let Some(state) = batch_state(call_id) {
-                    versions.extend(batch_task_history_versions(state));
+                if let Some(selected) = output_versions(call_id) {
+                    versions.extend(selected);
                 }
             }
             _ => {}
@@ -393,21 +574,38 @@ pub fn batch_task_history_versions(state: &serde_json::Value) -> HashMap<String,
                 }
             }
             serde_json::Value::Object(values) => {
+                if values
+                    .get("tool")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|tool| !matches!(tool, "task" | "batch"))
+                {
+                    return;
+                }
+                if let Some(cards) = values.get("Tasks") {
+                    if let Ok(output) =
+                        serde_json::from_value::<ToolOutput>(serde_json::json!({"Tasks": cards}))
+                    {
+                        versions.extend(task_output_history_versions(&output, None));
+                    }
+                    return;
+                }
                 if values.get("tool").and_then(serde_json::Value::as_str) == Some("task") {
+                    if let Some(output) = values.get("output")
+                        && let Ok(output) = serde_json::from_value::<ToolOutput>(output.clone())
+                    {
+                        let typed = task_output_history_versions(&output, None);
+                        if !typed.is_empty() {
+                            versions.extend(typed);
+                            return;
+                        }
+                    }
                     let task_id = values
                         .get("output")
                         .and_then(serde_json::Value::as_str)
-                        .and_then(|output| {
-                            output.split("<task_metadata>").skip(1).find_map(|block| {
-                                block.split("</task_metadata>").next().and_then(|metadata| {
-                                    metadata
-                                        .lines()
-                                        .find_map(|line| line.trim().strip_prefix("task_id: "))
-                                })
-                            })
-                        });
+                        .and_then(metadata_task_id);
                     let invocation_id = values
-                        .get("invocation_id")
+                        .get("call_id")
+                        .or_else(|| values.get("invocation_id"))
                         .and_then(serde_json::Value::as_str);
                     if let (Some(task_id), Some(invocation_id)) = (task_id, invocation_id) {
                         versions.insert(task_id.to_owned(), invocation_id.to_owned());
@@ -452,6 +650,11 @@ pub struct SubagentHistoryLease {
 }
 
 impl SubagentHistoryLease {
+    pub(crate) fn with_spec(mut self, spec: SubagentTaskSpec) -> Self {
+        self.spec = Some(spec);
+        self
+    }
+
     fn new(
         store: SubagentHistoryStore,
         task_id: String,
@@ -511,6 +714,9 @@ impl Drop for SubagentHistoryLease {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Barrier;
+    use std::thread;
+    use test_case::test_case;
 
     const TASK_ID: &str = "task-1";
     const UNKNOWN_ID: &str = "missing";
@@ -518,6 +724,185 @@ mod tests {
     const SECOND_PROMPT: &str = "second prompt";
     const PROFILE: &str = "review";
     const OTHER_PROFILE: &str = "custom";
+    const PHRASE: &str = "happy-cute-tick";
+    const OTHER_PHRASE: &str = "brave-calm-fox";
+    const LAUNCH: &str = "launch-call";
+    const CONTINUATION: &str = "continuation-call";
+    const RUNTIME: &str = "runtime-invocation-not-history";
+
+    #[test_case(false; "active")]
+    #[test_case(true; "completed")]
+    fn generated_reservation_skips_live_and_completed_collisions(completed: bool) {
+        let store = SubagentHistoryStore::default();
+        let occupied = store.reserve(PHRASE).unwrap();
+        let active = if completed {
+            occupied.complete(history(FIRST_PROMPT));
+            None
+        } else {
+            Some(occupied)
+        };
+        let mut candidates = [PHRASE, OTHER_PHRASE].into_iter();
+        let lease = store
+            .reserve_generated_with(|| Ok(candidates.next().unwrap().into()), |_| Ok(false))
+            .unwrap();
+        assert_eq!(lease.task_id(), OTHER_PHRASE);
+        assert!(store.is_active(OTHER_PHRASE));
+        drop(lease);
+        assert!(!store.is_active(OTHER_PHRASE));
+        drop(active);
+    }
+
+    #[test_case(false; "live")]
+    #[test_case(true; "durable")]
+    fn generated_reservation_is_bounded_and_skips_durable_ids(durable: bool) {
+        let store = SubagentHistoryStore::default();
+        let occupied = (!durable).then(|| store.reserve(PHRASE).unwrap());
+        let mut attempts = 0;
+        let error = store
+            .reserve_generated_with(
+                || {
+                    attempts += 1;
+                    Ok(PHRASE.into())
+                },
+                |_| Ok(durable),
+            )
+            .unwrap_err();
+        assert_eq!(error, TASK_ID_EXHAUSTED);
+        assert_eq!(attempts, TASK_ID_ATTEMPTS);
+        drop(occupied);
+        assert_eq!(store.active_count(), 0);
+        let mut candidates = [PHRASE, OTHER_PHRASE].into_iter();
+        let lease = store
+            .reserve_generated_with(
+                || Ok(candidates.next().unwrap().into()),
+                |id| Ok(id == PHRASE),
+            )
+            .unwrap();
+        assert_eq!(lease.task_id(), OTHER_PHRASE);
+    }
+
+    #[test]
+    fn concurrent_allocators_reserve_distinct_candidates_atomically() {
+        let store = SubagentHistoryStore::default();
+        let barrier = Arc::new(Barrier::new(2));
+        let jobs: Vec<_> = (0..2)
+            .map(|_| {
+                let store = store.clone();
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    let mut candidates = [PHRASE, OTHER_PHRASE].into_iter();
+                    barrier.wait();
+                    store
+                        .reserve_generated_with(
+                            || Ok(candidates.next().unwrap().into()),
+                            |_| Ok(false),
+                        )
+                        .unwrap()
+                })
+            })
+            .collect();
+        let leases: Vec<_> = jobs.into_iter().map(|job| job.join().unwrap()).collect();
+        assert_ne!(leases[0].task_id(), leases[1].task_id());
+        assert_eq!(store.active_count(), 2);
+        drop(leases);
+        assert_eq!(store.active_count(), 0);
+    }
+
+    fn task_call(call_id: &str, name: &str, task_id: Option<&str>) -> HistoryItem {
+        let id = caudra_storage::id::CaudraId::generate();
+        HistoryItem {
+            id,
+            parent_id: None,
+            supersedes: None,
+            group_id: id,
+            kind: HistoryItemKind::ToolCall {
+                call_id: call_id.into(),
+                name: name.into(),
+                input: serde_json::json!({"task_id": task_id}),
+                thought_signature: None,
+                source: None,
+            },
+        }
+    }
+
+    fn card(task_id: &str, call_id: &str) -> ToolOutput {
+        serde_json::from_value(serde_json::json!({"Tasks": [{
+            "task_id": task_id, "call_id": call_id, "invocation_id": RUNTIME,
+            "root_call_id": LAUNCH, "label": FIRST_PROMPT, "state": "succeeded", "mode": "build",
+            "background": true, "generation": 1, "created_at": 0, "updated_at": 0,
+            "result": null, "result_preview": null, "result_truncated": false, "reports": [], "reports_truncated": false
+        }]})).unwrap()
+    }
+
+    #[test_case("task"; "direct")]
+    #[test_case("batch"; "batch")]
+    fn typed_launch_versions_survive_reload_and_rewind(name: &str) {
+        let wrap = |output: ToolOutput| {
+            if name == "batch" {
+                serde_json::from_value(serde_json::json!({"Batch": {"entries": [{"tool": "task", "summary": FIRST_PROMPT, "status": "Success", "output": output}], "text": ""}})).unwrap()
+            } else {
+                output
+            }
+        };
+        let first = wrap(card(PHRASE, LAUNCH));
+        let next = wrap(card(PHRASE, CONTINUATION));
+        let history = vec![
+            task_call(LAUNCH, name, None),
+            task_call(CONTINUATION, name, Some(PHRASE)),
+        ];
+        let encoded = serde_json::to_string(&history).unwrap();
+        let restored: Vec<HistoryItem> = serde_json::from_str(&encoded).unwrap();
+        let outputs = |id: &str| Some(if id == LAUNCH { &first } else { &next });
+        assert_eq!(
+            active_task_history_versions_with_outputs(&restored, outputs)[PHRASE],
+            CONTINUATION
+        );
+        assert_eq!(
+            active_task_history_versions_with_outputs(&restored[..1], outputs)[PHRASE],
+            LAUNCH
+        );
+    }
+
+    #[test]
+    fn foreground_batch_metadata_uses_the_stable_child_launch_after_reload() {
+        let output: ToolOutput = serde_json::from_value(serde_json::json!({"Batch": {
+            "entries": [{"tool": "task", "summary": FIRST_PROMPT, "status": "Success",
+                "output": {"Markdown": {"text": FIRST_PROMPT}},
+                "model_suffix": format!("<task_metadata>\ntask_id: {PHRASE}\n</task_metadata>")
+            }], "text": ""
+        }}))
+        .unwrap();
+        let output: ToolOutput =
+            serde_json::from_str(&serde_json::to_string(&output).unwrap()).unwrap();
+        let history = [
+            task_call(LAUNCH, "batch", None),
+            task_call(CONTINUATION, "batch", None),
+        ];
+        let selected = active_task_history_versions_with_outputs(&history, |_| Some(&output));
+        assert_eq!(selected[PHRASE], child_tool_use_id(Some(CONTINUATION), 0));
+        let rewound = active_task_history_versions_with_outputs(&history[..1], |_| Some(&output));
+        assert_eq!(rewound[PHRASE], child_tool_use_id(Some(LAUNCH), 0));
+    }
+
+    #[test_case(PHRASE; "phrase")]
+    #[test_case(TASK_ID; "legacy")]
+    fn direct_result_metadata_selects_actual_id_without_an_output_snapshot(task_id: &str) {
+        let call = task_call(LAUNCH, "task", None);
+        let mut result = call.clone();
+        result.kind = HistoryItemKind::ToolResult {
+            call_id: LAUNCH.into(),
+            content: format!("<task_metadata>\ntask_id: {task_id}\n</task_metadata>"),
+            is_error: false,
+            output_ref: None,
+            images: Vec::new(),
+        };
+        let history = [call, result, task_call(CONTINUATION, "task", Some(task_id))];
+        assert_eq!(
+            active_task_history_versions(&history)[task_id],
+            CONTINUATION
+        );
+        assert_eq!(active_task_history_versions(&history[..2])[task_id], LAUNCH);
+    }
 
     fn history(prompt: &str) -> Arc<Vec<Message>> {
         Arc::new(vec![Message::user(prompt.into())])

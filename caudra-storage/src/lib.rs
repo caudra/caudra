@@ -3,6 +3,7 @@
 //! `atomic_write_permissions` sets file mode before persist (for auth keys at 0600).
 
 pub mod auth;
+pub mod background;
 pub mod id;
 pub mod input_history;
 pub mod local_documents;
@@ -38,6 +39,8 @@ pub mod workflow_scratch;
 pub mod workflow_source;
 pub mod workflow_trust;
 pub mod workspace_binding;
+
+pub use words::random_task_id;
 
 use std::env;
 use std::fs::{self, File, OpenOptions};

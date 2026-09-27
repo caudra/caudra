@@ -187,14 +187,32 @@ Part of what the model reads was written by Caudra rather than typed by you. The
 | Instruction change | On the first message after you edit or create an instruction file, and again to withdraw that when you put the file back |
 | Goal check-in | While a goal is running, to report progress against it |
 | Continuation | After a nudge or a compaction, to say what the model should pick up |
+| Background work | Before an already-scheduled main request when task/workflow state changes or the configured response interval expires, and after successful compaction of a session with background work |
 
-None of this lives in the system prompt. Anything that changes during a session would invalidate the cached prefix on every change, so it reaches the model as a message instead, and it is sent only when it differs from the last time Caudra said it.
+These runtime snapshots arrive as messages, keeping the cached system prefix stable. Most are sent only when their content changes. Background-work snapshots can also repeat at a configured interval or after compaction.
 
 Where one lands depends on whether anything else still holds a copy. A standing reminder — the environment, a mode announcement, an instruction change — is appended after the message it steers, and rewinding that message takes the reminder with it, because Caudra re-sends it on the next turn anyway. A one-shot notice — a finished background task, a settled workflow, the output of a `/!` command, an MCP prompt's canned exchange — is appended before the message, because it happened first and the transcript is the only place it still exists, so a rewind has to spare it.
 
 Each one appears in the transcript as a dim row folded to its heading. Click the row to read the exact text the model was sent, and click again to fold it back. Mentioned file contents are the exception: the model gets them, and the transcript shows the `@path` you typed rather than the body behind it.
 
 Set `ui.show_reminders = false` to keep the transcript to the conversation alone. The messages still reach the model.
+
+### Background-work awareness
+
+Caudra keeps the main agent aware of delegated work with a compact snapshot of background tasks and active workflows. It includes task IDs, short assignments, current states, and counts for entries that do not fit. It reads runtime state without polling tools or consuming result notifications.
+
+Periodic refresh is disabled by default (`0`). To opt in, a conservative starting interval is 32 parent response groups:
+
+```toml
+[agent]
+background_reminder_turns = 32
+```
+
+The interval counts parent response groups committed to history. A response with several tool calls counts once, as does a committed partial or reasoning-only response. Child responses, compaction summaries, and retries without a committed response do not advance the count. Set `0` to disable periodic refresh. State-change and successful post-compaction refresh remain enabled.
+
+Reminders accompany requests the main agent was already going to make. They do not wake an idle chat, poll on a timer, or override Stop. Actual task reports and outcomes retain their [automatic continuation behavior](/docs/sessions/#background-tasks).
+
+Compaction preserves a Delegated work section with assignments, scope, expected results, and the parent's next steps. After summarization, Caudra reads runtime state again so a child that finished during compaction is not described as still running. Summary status is last observed. The host snapshot supplies current execution state, while attributed reports supply results. When nothing remains active, a clearing snapshot does not claim that the user's overall request is complete.
 
 ## Four places to put knowledge
 

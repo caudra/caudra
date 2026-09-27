@@ -173,7 +173,13 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
     BuiltinCommand {
         name: "/tasks",
         description: "Browse tasks and steer running subagents",
-        max_args: 0,
+        max_args: usize::MAX,
+        scope: ChatScope::Any,
+    },
+    BuiltinCommand {
+        name: "/task",
+        description: "Task controls: list, status <id>, background <id> (without restart), cancel <id>",
+        max_args: usize::MAX,
         scope: ChatScope::Any,
     },
     BuiltinCommand {

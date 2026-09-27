@@ -49,7 +49,10 @@ pub(crate) fn render(
 /// are held by reference and have no file on this host, so they answer `None`
 /// and the click falls through to the card's own control.
 pub(crate) fn note_path(output: &MemoryOutput, target: RowTarget) -> Option<PathBuf> {
-    origins(output).get(target.0)?.path().map(PathBuf::from)
+    origins(output)
+        .get(target.index())?
+        .path()
+        .map(PathBuf::from)
 }
 
 /// Every note the card drew, in the order it drew them. Both the renderer and
@@ -157,7 +160,7 @@ impl Card {
 /// Every row of a note answers for it, the way a batch child's rows do: an open
 /// note is one thing to click, not a header with unaddressed text beneath it.
 fn clickable(origin: &MemoryOrigin, index: usize) -> Option<RowTarget> {
-    origin.path().is_some().then_some(RowTarget(index))
+    origin.path().is_some().then_some(RowTarget::Item(index))
 }
 
 /// The note's body as the document it is. Painted at the width it will sit at
@@ -348,7 +351,7 @@ mod tests {
         }
     }
 
-    #[test_case(file_note(NOTE), Some(RowTarget(0)) ; "a_note_on_this_host")]
+    #[test_case(file_note(NOTE), Some(RowTarget::Item(0)) ; "a_note_on_this_host")]
     #[test_case(remote(NOTE), None ; "a_note_held_by_reference")]
     fn a_row_answers_for_the_note_a_click_could_open(
         note: MemoryNote,
@@ -365,10 +368,10 @@ mod tests {
         let output = notes(Vec::from([file_note(NOTE), file_note(OTHER)]), Vec::new());
 
         assert_eq!(
-            note_path(&output, RowTarget(1)),
+            note_path(&output, RowTarget::Item(1)),
             Some(PathBuf::from(format!("/notes/{OTHER}")))
         );
-        assert_eq!(note_path(&output, RowTarget(9)), None, "{CLICK_MSG}");
+        assert_eq!(note_path(&output, RowTarget::Item(9)), None, "{CLICK_MSG}");
     }
 
     /// An index is flattened across its groups, so a note filed under the
@@ -387,7 +390,7 @@ mod tests {
         ]));
 
         assert_eq!(
-            note_path(&output, RowTarget(1)),
+            note_path(&output, RowTarget::Item(1)),
             Some(PathBuf::from(format!("/notes/{OTHER}")))
         );
     }

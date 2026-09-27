@@ -56,7 +56,14 @@ const SECTIONS: &[(&str, &[&str])] = &[
     ),
     (
         "Agent & Knowledge",
-        &["task", "workflow", "todo_write", "memory", "skill"],
+        &[
+            "task",
+            "task_control",
+            "workflow",
+            "todo_write",
+            "memory",
+            "skill",
+        ],
     ),
     ("Media", &["image_generate"]),
     ("Web", &["webfetch", "websearch"]),
@@ -215,7 +222,7 @@ fn extract_params(schema: &Value) -> Vec<Param> {
         let raw_type = prop
             .get("type")
             .and_then(|t| t.as_str())
-            .unwrap_or("string");
+            .unwrap_or("any (JSON)");
         let raw_desc = prop
             .get("description")
             .and_then(|d| d.as_str())
@@ -282,6 +289,14 @@ fn write_tool_entry(out: &mut String, name: &str, info: &ToolInfo, opt_in: &Hash
     writeln!(out).unwrap();
     writeln!(out, "{summary}").unwrap();
     writeln!(out).unwrap();
+    if name == "task" {
+        writeln!(
+            out,
+            "See [background tasks](/docs/sessions/#background-tasks) for execution, automatic continuation, inspection, and shutdown. Background execution is available in the TUI and stream-JSON SDK, not one-shot print or ACP. `batch` alone does not make foreground tasks asynchronous. Do not poll, sleep, or duplicate delegated work. Continue independent work or end the interim turn while awaiting reports. Resume a task ID only after its invocation settles."
+        )
+        .unwrap();
+        writeln!(out).unwrap();
+    }
     if name == "python_execution" {
         writeln!(
             out,
@@ -517,8 +532,55 @@ static DATE_RE: std::sync::LazyLock<Regex> =
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{
+        DATE_PLACEHOLDER, DATE_RE, SECTIONS, extract_default, extract_params, generate,
+        load_registry_with_builtins, redact_path,
+    };
+    use serde_json::{Value, json};
+    use std::collections::HashSet;
     use test_case::test_case;
+
+    #[test_case(json!({}), "any (JSON)"; "unconstrained_json")]
+    #[test_case(json!({"type": "object"}), "object"; "object")]
+    #[test_case(json!({"type": "string"}), "string"; "string")]
+    #[test_case(json!({"type": "boolean"}), "boolean"; "boolean")]
+    fn extracts_parameter_type(mut property: Value, expected: &str) {
+        const DESCRIPTION: &str = "JSON Schema (object)";
+        property["description"] = json!(DESCRIPTION);
+        let schema = json!({"properties": {"output_schema": property, "other": property}});
+        let params = extract_params(&schema);
+        assert_eq!(params.len(), 2);
+        for param in params {
+            assert_eq!(param.ty, expected);
+            assert_eq!(param.description, DESCRIPTION);
+        }
+    }
+
+    #[test]
+    fn task_reference_preserves_async_guidance_and_schema_contract() {
+        const TASK_HEADING: &str = "### `task` {#task}";
+        const EXPECTED: &[&str] = &[
+            "In sessions that expose `background`",
+            "Reports and final outcomes can resume this chat even after you end your turn.",
+            "[background tasks](/docs/sessions/#background-tasks)",
+            "not one-shot print or ACP",
+            "`batch` alone does not make foreground tasks asynchronous.",
+            "Do not poll, sleep, or duplicate delegated work.",
+            "Resume a task ID only after its invocation settles.",
+            "| `output_schema` | any (JSON) | no | JSON Schema (object)",
+        ];
+        let page = generate();
+        let task = page
+            .split_once(TASK_HEADING)
+            .expect("task reference")
+            .1
+            .split("\n### ")
+            .next()
+            .unwrap();
+        for expected in EXPECTED {
+            assert!(task.contains(expected), "missing task guidance: {expected}");
+        }
+    }
 
     #[test_case("2026-07-05", "YYYY-MM-DD"; "simple date")]
     #[test_case("today is 2026-07-05 here", "today is YYYY-MM-DD here"; "embedded date")]

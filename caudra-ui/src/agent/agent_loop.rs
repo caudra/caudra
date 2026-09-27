@@ -1,8 +1,10 @@
 use std::path::PathBuf;
 use std::{env, sync::Arc};
 
+use crate::app::background_delivery::DeliveryFence;
 use arc_swap::ArcSwap;
 use caudra_agent::agent;
+use caudra_agent::background::BackgroundTasks;
 use caudra_agent::context::{
     BuiltinToolsInput, ContextCapture, ContextInventory, ContextPublisher, ContextReadiness,
     ContextSnapshot,
@@ -15,6 +17,7 @@ use caudra_agent::prompt::profile::{
 };
 use caudra_agent::template;
 use caudra_agent::template::Vars;
+use caudra_agent::tools::native::task::configure_background;
 use caudra_agent::tools::{
     BuiltinDeferral, DeferralSession, DeferredTool, DescriptionContext, FileReadTracker, PathLocks,
     ToolAudience, ToolDefinitions, ToolFilter, ToolRegistry, deferral,
@@ -22,9 +25,10 @@ use caudra_agent::tools::{
 use caudra_agent::workflow::{WorkflowHandle, WorkspaceRebind};
 use caudra_agent::{
     Agent, AgentConfig, AgentEvent, AgentInput, AgentMode, AgentParams, AgentRunParams,
-    BaselineGate, CancelMap, CancelToken, CancelTrigger, DoneReason, Envelope, EventSender,
-    GoalHandle, History, InstructionBaseline, Instructions, McpCommand, Nudge, PromptRole,
-    SessionMailbox, SharedHistory, SubagentHistoryStore, ToolOutputLines, WorkspaceBaseline,
+    BackgroundReminderContext, BaselineGate, CancelMap, CancelToken, CancelTrigger, DoneReason,
+    Envelope, EventSender, GoalHandle, History, InstructionBaseline, Instructions, McpCommand,
+    Nudge, PromptRole, SessionMailbox, SharedHistory, SubagentHistoryStore, ToolOutputLines,
+    WorkspaceBaseline,
 };
 use caudra_config::ModelPolicy;
 use caudra_lua::EventHandle;
@@ -81,6 +85,8 @@ pub(super) struct AgentLoop {
     system_prompt_profile: Option<Arc<SystemPromptProfile>>,
     prompt_profiles: Arc<PromptProfileCatalog>,
     workflow: Option<WorkflowHandle>,
+    background: Option<BackgroundTasks>,
+    delivery_fence: Arc<DeliveryFence>,
     /// Published on every run so workflow agents start under the mode the
     /// user last committed, however long ago their run was launched.
     mode: SharedMode,
@@ -126,6 +132,8 @@ impl AgentLoop {
         system_prompt_profile: Option<Arc<SystemPromptProfile>>,
         prompt_profiles: Arc<PromptProfileCatalog>,
         workflow: Option<WorkflowHandle>,
+        background: Option<BackgroundTasks>,
+        delivery_fence: Arc<DeliveryFence>,
         mode: SharedMode,
         path_locks: Arc<PathLocks>,
         baseline: Arc<WorkspaceBaseline>,
@@ -190,6 +198,8 @@ impl AgentLoop {
             system_prompt_profile,
             prompt_profiles,
             workflow,
+            background,
+            delivery_fence,
             mode,
             baseline,
             workspace_session,
@@ -413,13 +423,17 @@ impl AgentLoop {
             &self.model_policy,
         )
         .await;
-        let spend = agent::compact(
+        let spend = agent::compact_with_session(
             &*provider,
             &model,
             &mut self.history,
             event_tx,
             &self.config,
             extractor.as_ref(),
+            BackgroundReminderContext {
+                background: self.background.as_ref(),
+                workflow: self.workflow.as_ref(),
+            },
         )
         .await?;
         self.goal.record_external_usage(
@@ -467,6 +481,8 @@ impl AgentLoop {
         let Some(input) = inputs.last_mut() else {
             return Ok(());
         };
+        let delivery_fence = Arc::clone(&self.delivery_fence);
+        let _parent = delivery_fence.enter().await;
         let selected_slot = self.model_slot.load_full();
         let purpose = model_purpose(&input.mode);
         let effective_slot = if purpose == ModelPurpose::Plan {
@@ -553,8 +569,6 @@ impl AgentLoop {
         let (trigger, cancel) = CancelToken::new();
         self.set_cancel_trigger(run_id, trigger);
 
-        while self.answer_rx.lock().await.try_recv().is_ok() {}
-
         let active_prompt_profile_name: Arc<str> = Arc::from(
             self.system_prompt_profile
                 .as_ref()
@@ -600,6 +614,7 @@ impl AgentLoop {
                 tool_filter,
                 model_policy: Arc::clone(&self.model_policy),
                 workflow: self.workflow.clone(),
+                background: self.background.clone(),
             },
             AgentRunParams {
                 history: &mut self.history,
@@ -681,7 +696,7 @@ impl AgentLoop {
             audience: ToolAudience::MAIN,
             workflows_available: self.workflow.is_some(),
         };
-        ToolRegistry::global().definitions_split(
+        let mut definitions = ToolRegistry::global().definitions_split(
             &vars,
             &ctx,
             examples,
@@ -689,7 +704,9 @@ impl AgentLoop {
                 &self.config.allowed_tools,
                 BuiltinDeferral::resolve(&self.config, model),
             ),
-        )
+        );
+        configure_background(&mut definitions.declared, self.background.is_some());
+        definitions
     }
 
     async fn read_instructions(&mut self) -> Result<Instructions, AgentError> {

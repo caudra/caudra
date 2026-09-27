@@ -16,7 +16,9 @@ use super::tool_display::{
     batch_sigil_style, compact_args_for, header_spans, header_timeout, header_workdir,
     inflected_header, names_tool, progress_lines, scroll_footer_text, title,
 };
-use super::{ToolProgress, environment_card, is_collapsible, memory_card, workflow_card};
+use super::{
+    ToolProgress, environment_card, is_collapsible, memory_card, task_card, workflow_card,
+};
 use caudra_agent::tools::{
     PYTHON_EXECUTION_TOOL_NAME, SHELL_TOOL_NAME, TASK_TOOL_NAME, timeout_annotation,
 };
@@ -1026,7 +1028,7 @@ fn render_batch(entries: &[BatchToolEntry], highlight: bool, limits: &RenderLimi
         // Every row of a child answers for it, whether or not a click would
         // change what is drawn: this is also how a dispatched child's rows are
         // traced back to the subagent they belong to.
-        let target = Some(RowTarget(index));
+        let target = Some(RowTarget::Item(index));
         // The separator sits above a child that exists, so the trunk always has
         // somewhere left to go: drawn blank it would cut the tree in two at
         // every body.
@@ -1048,7 +1050,9 @@ fn render_batch(entries: &[BatchToolEntry], highlight: bool, limits: &RenderLimi
         // Once the body carries the script, the row keeps only what the body
         // does not say. The same trade a card's header makes, and for the same
         // reason: the body's copy is the numbered, highlighted one.
-        let summary = match has_body && body_repeats_summary(entry) {
+        let summary = match has_body
+            && (body_repeats_summary(entry) || matches!(entry.output, Some(ToolOutput::Tasks(_))))
+        {
             true => "",
             false => &inflected,
         };
@@ -1130,6 +1134,7 @@ fn render_batch(entries: &[BatchToolEntry], highlight: bool, limits: &RenderLimi
             }
             let history_start = combined.lines.len();
             combined.lines.extend(history);
+            combined.rows.resize(combined.lines.len(), None);
             combined = child_view(
                 combined,
                 progress_window,
@@ -1146,7 +1151,16 @@ fn render_batch(entries: &[BatchToolEntry], highlight: bool, limits: &RenderLimi
             if let Some(span) = body.span {
                 spans_out.push(span.shifted(lines.len(), Some(index)));
             }
-            rows.resize(rows.len() + body.lines.len(), target);
+            rows.extend((0..body.lines.len()).map(|row| {
+                if let Some(output) = entry.output.as_ref()
+                    && let Some(Some(task)) = body.rows.get(row)
+                    && let Some(task) = task_card::target_index(output, *task)
+                {
+                    Some(RowTarget::Task { child: index, task })
+                } else {
+                    target
+                }
+            }));
             match body.source {
                 Some(source) => trace.record(lines.len(), source),
                 None => trace.abandon(),
@@ -1305,7 +1319,9 @@ fn child_body(
     // one that forgets the script. `render_tool_content` draws the script
     // itself, which is why structured output is the exception here rather than
     // a case alongside the others.
-    let text = if entry.status == BatchToolStatus::Error {
+    let text = if entry.status == BatchToolStatus::Error
+        && !matches!(output, Some(ToolOutput::Tasks(_)))
+    {
         Some(plain_body(
             &output.map_or(String::new(), ToolOutput::as_text),
             limits.width,
@@ -1344,6 +1360,7 @@ fn child_body(
                 render_tool_content(entry.input.as_ref(), output, highlight, limits.clone());
             ChildBody {
                 lines: content.lines,
+                rows: content.rows,
                 source: content.source,
                 truncation: content.truncation,
                 span: None,
@@ -1359,6 +1376,7 @@ fn child_body(
 /// behind points a copy at text that was never drawn.
 struct ChildBody {
     lines: Vec<Line<'static>>,
+    rows: Vec<Option<RowTarget>>,
     /// `None` where a renderer in the body named no source at all, which hands
     /// the card it lands in back to the scraping fallback.
     source: Option<BodySource>,
@@ -1369,6 +1387,7 @@ struct ChildBody {
 impl ChildBody {
     fn traced(lines: Vec<Line<'static>>, source: BodySource) -> Self {
         Self {
+            rows: vec![None; lines.len()],
             lines,
             source: Some(source),
             truncation: false,
@@ -1377,6 +1396,7 @@ impl ChildBody {
     }
 
     fn keep_rows(&mut self, kept: Range<usize>) {
+        self.rows = self.rows.get(kept.clone()).unwrap_or_default().to_vec();
         self.source = self.source.take().and_then(|source| source.keep_rows(kept));
     }
 
@@ -1389,6 +1409,7 @@ impl ChildBody {
     /// Marks a line the body was closed with, which is chrome wherever it came
     /// from: a scroll footer or a truncation notice.
     fn push_chrome(&mut self) {
+        self.rows.push(None);
         if let Some(source) = self.source.as_mut() {
             source.push_chrome(1);
         }
@@ -1450,6 +1471,9 @@ fn with_script(
         lines.push(Line::default());
     }
     let shift = lines.len();
+    let mut rows = script.rows;
+    rows.resize(shift, None);
+    rows.extend(body.rows);
     lines.extend(body.lines);
     // The two halves were painted from different texts, so their ranges are
     // rebased onto the one the card ends up holding rather than spliced.
@@ -1463,6 +1487,7 @@ fn with_script(
     ChildBody {
         source: trace.finish(&lines),
         lines,
+        rows,
         truncation: body.truncation,
         span: body.span.map(|span| span.shift_lines(shift)),
     }
@@ -2994,7 +3019,19 @@ pub type BatchStartedMap = HashMap<String, ChildStarted>;
 /// index, or the scratch file line of a workflow card. A child is folded or
 /// whole, so its summary row and its body are one control.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct RowTarget(pub usize);
+pub enum RowTarget {
+    Item(usize),
+    Task { child: usize, task: usize },
+}
+
+impl RowTarget {
+    pub fn index(self) -> usize {
+        match self {
+            Self::Item(index) => index,
+            Self::Task { child, .. } => child,
+        }
+    }
+}
 
 pub struct ToolContent {
     pub lines: Vec<Line<'static>>,
@@ -3195,6 +3232,12 @@ pub fn render_tool_content(
             let (card_lines, rows) = workflow_card::render(card, limits.width);
             output_rows = rows;
             (card_lines, false)
+        }
+        Some(ToolOutput::Tasks(tasks)) => {
+            let (lines, rows, truncated) =
+                task_card::render(tasks, limits.bounded_budget(), limits.width);
+            output_rows = rows;
+            (lines, truncated)
         }
         // Each child owns how much of itself it shows, so the card reports no
         // truncation of its own: there is no one thing for it to open.
@@ -4847,7 +4890,7 @@ mod tests {
         );
         assert_eq!(
             card.rows[..title.len()],
-            vec![Some(RowTarget(0)); title.len()],
+            vec![Some(RowTarget::Item(0)); title.len()],
             "{TITLE_HANGS}"
         );
         assert_eq!(
@@ -5040,7 +5083,7 @@ mod tests {
         );
         assert_eq!(
             targets(&rows),
-            vec![RowTarget(0), RowTarget(1)],
+            vec![RowTarget::Item(0), RowTarget::Item(1)],
             "{EXPECT_ROW}"
         );
     }
@@ -5052,7 +5095,12 @@ mod tests {
         assert_eq!(lines.len(), rows.len());
         assert_eq!(
             targets(&rows),
-            vec![RowTarget(0), RowTarget(0), RowTarget(0), RowTarget(1)],
+            vec![
+                RowTarget::Item(0),
+                RowTarget::Item(0),
+                RowTarget::Item(0),
+                RowTarget::Item(1)
+            ],
             "every row of an open child answers for it, folded rows for theirs"
         );
     }
@@ -5081,7 +5129,10 @@ mod tests {
     #[test]
     fn a_summary_row_names_its_own_child() {
         let (_, rows) = batch(BatchViews::new([1]));
-        assert_eq!(unique_targets(&rows), vec![RowTarget(0), RowTarget(1)]);
+        assert_eq!(
+            unique_targets(&rows),
+            vec![RowTarget::Item(0), RowTarget::Item(1)]
+        );
     }
 
     /// A child is folded or whole, so a click anywhere in an open one puts it
@@ -5097,7 +5148,7 @@ mod tests {
         );
         assert_eq!(
             rows.iter()
-                .filter(|row| **row == Some(RowTarget(1)))
+                .filter(|row| **row == Some(RowTarget::Item(1)))
                 .count(),
             1 + 6,
             "the summary row and every body row name the same child"
@@ -5115,7 +5166,7 @@ mod tests {
             "the opened child is whole and the other is still put away"
         );
         assert!(
-            unique_targets(&rows).contains(&RowTarget(0)),
+            unique_targets(&rows).contains(&RowTarget::Item(0)),
             "a folded sibling stays clickable"
         );
     }
@@ -5592,7 +5643,7 @@ mod tests {
             .lines
             .iter()
             .zip(card.rows.iter())
-            .filter(|(_, row)| **row == Some(RowTarget(0)))
+            .filter(|(_, row)| **row == Some(RowTarget::Item(0)))
             .map(|(line, _)| line_text(line))
             .collect();
         let tally = SubagentProgress::tally(BATCHING_TOOLS, Duration::ZERO);
@@ -5723,7 +5774,7 @@ mod tests {
             assert_eq!(card.spans.len(), 1, "{HISTORY_WINDOW_MSG}");
             assert_eq!(card.spans[0].history_start, Some(0), "{HISTORY_WINDOW_MSG}");
             assert!(
-                card.rows.iter().all(|row| *row == Some(RowTarget(0))),
+                card.rows.iter().all(|row| *row == Some(RowTarget::Item(0))),
                 "{HISTORY_WINDOW_MSG}"
             );
             assert!(
@@ -5800,7 +5851,7 @@ mod tests {
                 .collect();
             assert_eq!(shown, expected[start..end], "{HISTORY_REACHABLE_MSG}");
             assert!(
-                card.rows.iter().all(|row| *row == Some(RowTarget(0))),
+                card.rows.iter().all(|row| *row == Some(RowTarget::Item(0))),
                 "{HISTORY_WINDOW_MSG}"
             );
             let source = card.source.as_ref().expect(ROWS_PER_CARD_LINE);
@@ -5930,7 +5981,9 @@ mod tests {
             "{TREE_MSG}"
         );
         assert!(
-            card.rows[..4].iter().all(|row| *row == Some(RowTarget(0))),
+            card.rows[..4]
+                .iter()
+                .all(|row| *row == Some(RowTarget::Item(0))),
             "every row of a child answers for the child that owns it"
         );
     }
@@ -6500,7 +6553,7 @@ mod tests {
             "a child holding something back has to say so: {CHILD_BUDGET_MSG}"
         );
         assert!(
-            unique_targets(&rows).contains(&RowTarget(0)),
+            unique_targets(&rows).contains(&RowTarget::Item(0)),
             "and the row it says it on has to take the click"
         );
     }
@@ -6511,7 +6564,7 @@ mod tests {
 
         assert_eq!(body_count(&lines), WRITE_BUDGET * 2, "{CHANGED_MSG}");
         assert!(
-            unique_targets(&rows).contains(&RowTarget(0)),
+            unique_targets(&rows).contains(&RowTarget::Item(0)),
             "an opened child stays a control, or it could not be put back"
         );
     }
@@ -6523,7 +6576,7 @@ mod tests {
         let (lines, rows) = write_batch(2, BatchViews::default());
 
         assert_eq!(lines.len(), rows.len(), "the rows stay parallel");
-        assert_eq!(unique_targets(&rows), vec![RowTarget(0)]);
+        assert_eq!(unique_targets(&rows), vec![RowTarget::Item(0)]);
     }
 
     fn ranked_row(name: &str, inbound: usize) -> CodeGraphRow {

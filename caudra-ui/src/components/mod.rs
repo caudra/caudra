@@ -53,6 +53,7 @@ pub(crate) mod storage_modal;
 pub(crate) mod stream_modal;
 pub(crate) mod streaming_content;
 pub(crate) mod system_prompt_modal;
+pub(crate) mod task_card;
 pub(crate) mod task_picker;
 pub(crate) mod text_editor;
 pub(crate) mod theme_picker;
@@ -80,7 +81,7 @@ use caudra_agent::{
     ToolOutput,
 };
 use caudra_providers::model_registry::Binding;
-use caudra_providers::{CaudraId, HistoryItem, ModelPurpose};
+use caudra_providers::{CaudraId, HistoryItem, ModelPurpose, TaskEventOrigin};
 use caudra_storage::sessions::SessionRelocation;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent};
 use ratatui::Frame;
@@ -1129,6 +1130,13 @@ pub struct DisplayMessage {
 }
 
 impl DisplayMessage {
+    pub(crate) fn injected(text: String, task_event: Option<TaskEventOrigin>) -> Self {
+        let role = task_event.map_or(DisplayRole::Injected, |origin| {
+            DisplayRole::TaskDelivery(Box::new(origin))
+        });
+        Self::new(role, text)
+    }
+
     pub fn new(role: DisplayRole, text: String) -> Self {
         Self {
             role,
@@ -1245,6 +1253,7 @@ pub enum DisplayRole {
     /// Harness chatter: what the run did on the user's behalf, never
     /// something a model or a person said.
     Notice,
+    TaskDelivery(Box<TaskEventOrigin>),
     /// A message the harness wrote into the conversation. Unlike a notice it
     /// has a body worth reading, so it collapses to its heading and opens on a
     /// click.

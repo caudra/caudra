@@ -39,7 +39,9 @@ use crate::mcp::McpSession;
 use crate::permissions::PermissionManager;
 use crate::prompt::ResolvedSlots;
 use crate::prompt::profile::PromptProfileCatalog;
-use crate::subagent_history::{SubagentHistoryStore, SubagentTaskMode};
+use crate::subagent_history::{
+    SubagentHistoryLease, SubagentHistoryStore, SubagentTaskMode, SubagentTaskSpecCandidate,
+};
 use crate::template::Vars;
 use crate::tools::registry::ToolRegistry;
 use crate::tools::{
@@ -106,7 +108,7 @@ pub struct TaskRequest {
     pub provenance: Option<WorkflowProvenance>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TaskOutcome {
     /// `None` when no subagent was opened, so there is nothing to resume.
     pub task_id: Option<String>,
@@ -127,6 +129,14 @@ pub struct TaskOutcome {
 pub type TaskFuture<'a> = Pin<Box<dyn Future<Output = TaskOutcome> + Send + 'a>>;
 
 pub trait TaskRunner: Send + Sync {
+    fn reserve_task(&self, task_id: Option<&str>) -> Result<SubagentHistoryLease, String> {
+        let history = SubagentHistoryStore::default();
+        match task_id {
+            Some(id) => history.reserve_unconfigured(id),
+            None => history.reserve_generated(|_| Ok(false)),
+        }
+    }
+
     fn rebind_workspace(
         &self,
         _workspace: &WorkspaceRebind,
@@ -187,64 +197,151 @@ impl From<String> for Failure {
 /// `request.provenance`, whatever the context says.
 pub async fn run_task(ctx: &ToolContext, request: TaskRequest) -> TaskOutcome {
     let started = Instant::now();
-    let ctx = &ToolContext {
-        tool_use_id: Some(request.call_id),
-        event_tx: match request.provenance {
-            Some(provenance) => ctx.event_tx.clone().with_workflow(provenance),
-            None => ctx.event_tx.clone(),
-        },
-        steering_observations: None,
-        steering_order: Vec::new(),
-        speculative: None,
-        ..ctx.clone()
-    };
-    // Compile early: a bad schema costs zero tokens.
-    let captured = Arc::new(Mutex::new(Captured::default()));
-    // A validated report satisfies the output contract even without a prose tail.
-    // It does not authorize the agent to suppress cancellation or runtime errors.
-    let report_ready = Arc::new(AtomicBool::new(false));
-    let validating = request.output_schema.is_some();
-    let (local_definitions, local_tools) = match request.output_schema.as_ref() {
-        None => (Vec::new(), LocalTools::default()),
-        Some(schema) => match structured_output_tool(schema, &captured, &report_ready) {
-            Ok((definition, tools)) => (vec![definition], tools),
-            Err(message) => return finish(started, None, None, 0, Err(message.into())),
-        },
-    };
-    let Ok(_permit) = ctx.cancel.race(PERMITS.load().acquire_arc()).await else {
-        return finish(started, None, None, 0, Err(cancelled_failure().into()));
-    };
-    let mode = clamp_mode(&request.task, request.mode, &ctx.mode);
-    let mut session = match subagent::open_task(
-        ctx,
-        subagent::TaskOptions {
-            name: request.label,
-            task_id: request.task,
-            profile: request.profile,
-            mode,
-            model_job: request.model_job,
-            local_definitions,
-            local_tools,
-        },
-    )
-    .await
-    {
-        Ok(session) => OpenSession(session.with_report_ready(report_ready)),
-        Err(message) => return finish(started, None, None, 0, Err(message.into())),
-    };
-    let task_id = session.0.id().to_owned();
-    let effective_mode = session.0.task_mode();
-    let verdict = converse(&mut session.0, request.prompt, validating, &captured).await;
-    let usage = session.0.usage();
-    let tokens_used = u64::from(usage.total_input()) + u64::from(usage.output);
-    drop(session);
-    finish(
-        started,
-        Some(task_id),
-        Some(effective_mode),
-        tokens_used,
-        verdict,
-    )
+    match PreparedTask::prepare(ctx, request, None).await {
+        Ok(task) => task.run(&ctx.cancel).await,
+        Err(message) => finish(started, None, None, 0, Err(message.into())),
+    }
+}
+
+pub(crate) struct PreparedTask {
+    session: OpenSession,
+    prompt: Option<String>,
+    validating: bool,
+    captured: Arc<Mutex<Captured>>,
+    reporter: Option<crate::background::TaskReporter>,
+    started: Instant,
+}
+
+impl PreparedTask {
+    pub(crate) async fn prepare(
+        ctx: &ToolContext,
+        request: TaskRequest,
+        reporter: Option<crate::background::TaskReporter>,
+    ) -> Result<Self, String> {
+        let started = Instant::now();
+        let ctx = &ToolContext {
+            tool_use_id: Some(request.call_id),
+            event_tx: match request.provenance {
+                Some(provenance) => ctx.event_tx.clone().with_workflow(provenance),
+                None => ctx.event_tx.clone(),
+            },
+            steering_observations: None,
+            steering_order: Vec::new(),
+            speculative: None,
+            ..ctx.clone()
+        };
+        // Compile early: a bad schema costs zero tokens.
+        let captured = Arc::new(Mutex::new(Captured::default()));
+        // A validated report satisfies the output contract even without a prose tail.
+        // It does not authorize the agent to suppress cancellation or runtime errors.
+        let report_ready = Arc::new(AtomicBool::new(false));
+        let validating = request.output_schema.is_some();
+        let (mut local_definitions, mut local_tools) = match request.output_schema.as_ref() {
+            None => (Vec::new(), LocalTools::default()),
+            Some(schema) => match structured_output_tool(schema, &captured, &report_ready) {
+                Ok((definition, tools)) => (vec![definition], tools),
+                Err(message) => return Err(message),
+            },
+        };
+        if let Some(reporter) = &reporter {
+            let (definition, handler) =
+                crate::tools::native::report_to_parent::tool(reporter.clone());
+            local_definitions.push(definition);
+            Arc::make_mut(&mut local_tools)
+                .insert(crate::tools::native::report_to_parent::NAME.into(), handler);
+        }
+        let mode = clamp_mode(&request.task, request.mode, &ctx.mode);
+        let mut session = match subagent::open_task(
+            ctx,
+            subagent::TaskOptions {
+                name: request.label,
+                task_id: request.task,
+                profile: request.profile,
+                mode,
+                model_job: request.model_job,
+                local_definitions,
+                local_tools,
+            },
+        )
+        .await
+        {
+            Ok(session) => OpenSession(session.with_report_ready(report_ready)),
+            Err(message) => return Err(message),
+        };
+        if let Some(reporter) = &reporter {
+            session.0.set_terminal_report(Arc::clone(&reporter.blocked));
+        }
+        Ok(Self {
+            session,
+            prompt: request.prompt,
+            validating,
+            captured,
+            reporter,
+            started,
+        })
+    }
+
+    pub(crate) fn mode(&self) -> SubagentTaskMode {
+        self.session.0.task_mode()
+    }
+
+    pub(crate) fn checkpoint(&self) -> Result<(Value, Value), String> {
+        self.session.0.checkpoint()
+    }
+
+    pub(crate) fn discard(mut self) {
+        self.session.0.discard_unstarted();
+    }
+
+    pub(crate) async fn run(self, cancel: &CancelToken) -> TaskOutcome {
+        self.run_with_permits(cancel, PERMITS.load_full()).await
+    }
+
+    pub(crate) async fn run_with_permits(
+        mut self,
+        cancel: &CancelToken,
+        permits: Arc<Semaphore>,
+    ) -> TaskOutcome {
+        let started = self.started;
+        let session = &mut self.session;
+        let task_id = session.0.id().to_owned();
+        let effective_mode = session.0.task_mode();
+        let permit = cancel.race(permits.acquire_arc()).await;
+        let verdict = if let Ok(_permit) = permit {
+            if let Some(reporter) = &self.reporter
+                && let Err(error) = reporter.running().await
+            {
+                session.0.close();
+                return finish(
+                    started,
+                    Some(task_id),
+                    Some(effective_mode),
+                    0,
+                    Err(error.into()),
+                );
+            }
+            converse(
+                &mut session.0,
+                self.prompt,
+                self.validating,
+                &self.captured,
+                self.reporter.as_ref(),
+            )
+            .await
+        } else {
+            Err(cancelled_failure().into())
+        };
+        let usage = session.0.usage();
+        let tokens_used = u64::from(usage.total_input()) + u64::from(usage.output);
+        session.0.close();
+        finish(
+            started,
+            Some(task_id),
+            Some(effective_mode),
+            tokens_used,
+            verdict,
+        )
+    }
 }
 
 fn finish(
@@ -308,6 +405,7 @@ async fn converse(
     prompt: Option<String>,
     validating: bool,
     captured: &Mutex<Captured>,
+    reporter: Option<&crate::background::TaskReporter>,
 ) -> Result<Value, Failure> {
     let message = prompt.map(|mut message| {
         if validating {
@@ -316,6 +414,9 @@ async fn converse(
         message
     });
     let mut reply = session.prompt(message).await?;
+    if let Some(reporter) = reporter.filter(|reporter| reporter.blocked.load(Ordering::Acquire)) {
+        return Err(reporter.blocker().into());
+    }
     // Only healthy runs with an unmet contract may request another response;
     // the shared steering state bounds both these prompts and inner repairs.
     while if validating {
@@ -336,6 +437,10 @@ async fn converse(
             break;
         };
         reply = corrected;
+        if let Some(reporter) = reporter.filter(|reporter| reporter.blocked.load(Ordering::Acquire))
+        {
+            return Err(reporter.blocker().into());
+        }
     }
 
     Ok(report(
@@ -658,6 +763,7 @@ impl WorkflowHostContext {
             json_repair: Arc::default(),
             model_policy: Arc::clone(&self.model_policy),
             workflow: None,
+            background: None,
             steering_observations: None,
             steering_order: Vec::new(),
             speculative: None,
@@ -678,6 +784,21 @@ impl SubagentTaskRunner {
 }
 
 impl TaskRunner for SubagentTaskRunner {
+    fn reserve_task(&self, task_id: Option<&str>) -> Result<SubagentHistoryLease, String> {
+        let history = &self.host.subagent_history;
+        match task_id {
+            Some(id) if history.snapshot().records().contains_key(id) => history
+                .continue_task_with(id, SubagentTaskSpecCandidate::default())
+                .map_err(|error| error.to_string()),
+            Some(id) => history.reserve_unconfigured(id),
+            None => subagent::reserve_task_identity(
+                history,
+                self.host.tool_output_store.as_deref(),
+                self.host.session_id.as_ref().map(SessionRef::id),
+            ),
+        }
+    }
+
     fn rebind_workspace(&self, workspace: &WorkspaceRebind) -> Result<Arc<dyn TaskRunner>, String> {
         if self.host.subagent_cancels.active_count() != 0 {
             return Err("workflow agents must be quiescent before changing workspace".into());
@@ -1494,13 +1615,14 @@ mod tests {
             assert_eq!(outcome.error, None);
             assert!(outcome.success && !outcome.cancelled);
             assert_eq!(outcome.output, expected);
-            assert_eq!(outcome.task_id.as_deref(), Some(CALL_ID));
+            assert_ne!(outcome.task_id.as_deref(), Some(CALL_ID));
+            assert_eq!(outcome.task_id.as_deref().unwrap().split('-').count(), 3);
             let expected_tokens = FIRST_TURN.total_input()
                 + FIRST_TURN.output
                 + SECOND_TURN.total_input()
                 + SECOND_TURN.output;
             assert_eq!(outcome.tokens_used, u64::from(expected_tokens));
-            assert_retired(&ctx, CALL_ID);
+            assert_retired(&ctx, outcome.task_id.as_deref().unwrap());
         });
     }
 
@@ -1542,7 +1664,7 @@ mod tests {
                 outcome.tokens_used,
                 requests as u64 * u64::from(FIRST_TURN.total_input() + FIRST_TURN.output)
             );
-            assert_retired(&ctx, CALL_ID);
+            assert_retired(&ctx, outcome.task_id.as_deref().unwrap());
         });
     }
 
@@ -1604,7 +1726,7 @@ mod tests {
                         + SECOND_TURN.output
                 )
             );
-            assert_retired(&ctx, CALL_ID);
+            assert_retired(&ctx, outcome.task_id.as_deref().unwrap());
         });
     }
 
@@ -1651,7 +1773,7 @@ mod tests {
                 outcome.tokens_used,
                 u64::from(FIRST_TURN.total_input() + FIRST_TURN.output)
             );
-            assert_retired(&ctx, CALL_ID);
+            assert_retired(&ctx, outcome.task_id.as_deref().unwrap());
         });
     }
 
@@ -1701,7 +1823,7 @@ mod tests {
                 outcome.tokens_used,
                 u64::from(responses * (FIRST_TURN.total_input() + FIRST_TURN.output))
             );
-            assert_retired(&ctx, CALL_ID);
+            assert_retired(&ctx, outcome.task_id.as_deref().unwrap());
         });
     }
 
@@ -1992,7 +2114,7 @@ mod tests {
                 outcome.tokens_used,
                 u64::from(usage.total_input() + usage.output)
             );
-            assert_retired(&ctx, CALL_ID);
+            assert_retired(&ctx, outcome.task_id.as_deref().unwrap());
         });
     }
 
@@ -2417,7 +2539,7 @@ mod tests {
                 u64::from(expected_usage.total_input() + expected_usage.output)
             );
             assert_eq!(observed.lock().unwrap().len(), 2);
-            assert_retired(&ctx, CALL_ID);
+            assert_retired(&ctx, outcome.task_id.as_deref().unwrap());
         });
     }
 
@@ -2601,7 +2723,7 @@ mod tests {
                 outcome.tokens_used,
                 u64::from(FIRST_TURN.total_input() + FIRST_TURN.output)
             );
-            assert_retired(&ctx, CALL_ID);
+            assert_retired(&ctx, outcome.task_id.as_deref().unwrap());
         });
     }
 
@@ -2620,7 +2742,7 @@ mod tests {
                 Some(format!("{ERROR_PREFIX}{}", subagent::CANCELLED).as_str())
             );
             assert_eq!(outcome.output, Value::Null);
-            assert_retired(&ctx, CALL_ID);
+            assert_retired(&ctx, outcome.task_id.as_deref().unwrap());
         });
     }
 
@@ -2641,7 +2763,9 @@ mod tests {
             assert_eq!(outcome.error, None);
             assert_eq!(outcome.output, Value::String(SUMMARY.into()));
             let snapshot = ctx.subagent_history.snapshot();
-            let stored = snapshot.records()[CALL_ID].spec().expect("task spec");
+            let stored = snapshot.records()[outcome.task_id.as_deref().unwrap()]
+                .spec()
+                .expect("task spec");
             assert_eq!(stored.mode, SubagentTaskMode::Plan);
         });
     }

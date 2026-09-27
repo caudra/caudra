@@ -311,8 +311,47 @@ impl KeyPool {
 
 #[cfg(test)]
 pub(crate) mod test_support {
+    use caudra_storage::tool_outputs::ToolOutputRef;
+
+    use crate::{Message, TaskEventOrigin, WorkflowEventOrigin};
+
     pub(crate) const CREDENTIAL_IN_URL: &str =
         "credentials travel in headers, never in a URL a dry run shows";
+    pub(crate) const TASK_ID: &str = "host-task";
+    pub(crate) const READABLE_OUTPUT_ID: &str = "brisk-calm-otter";
+    pub(crate) const LEGACY_OUTPUT_ID: &str = "CNK1hV6GWoysH3KQMm5wv";
+    const INVOCATION_ID: &str = "host-invocation";
+    const EVENT_ID: &str = "host-event";
+    const RUN_ID: &str = "host-workflow";
+    const REVISION: u64 = 3;
+
+    pub(crate) fn task_event_origin() -> TaskEventOrigin {
+        TaskEventOrigin {
+            task_id: TASK_ID.into(),
+            invocation_id: INVOCATION_ID.into(),
+            event_id: EVENT_ID.into(),
+        }
+    }
+
+    pub(crate) fn task_observation_with_output_refs(text: &str) -> Message {
+        let mut message = Message::task_observation(text.into(), task_event_origin());
+        message.retained_output_refs = [READABLE_OUTPUT_ID, LEGACY_OUTPUT_ID]
+            .into_iter()
+            .map(|id| ToolOutputRef {
+                id: id.parse().unwrap(),
+                byte_count: text.len(),
+                line_count: text.lines().count(),
+            })
+            .collect();
+        message
+    }
+
+    pub(crate) fn workflow_event_origin() -> WorkflowEventOrigin {
+        WorkflowEventOrigin {
+            run_id: RUN_ID.into(),
+            revision: REVISION,
+        }
+    }
 }
 
 #[cfg(test)]

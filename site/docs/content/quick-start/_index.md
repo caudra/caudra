@@ -96,10 +96,10 @@ Type what you want done, press Enter, watch it work. Worth knowing on day one:
 - **Sessions.** `/new` starts a second session while the first keeps working in the background; `/sessions` jumps between them. Tomorrow, `caudra --continue` resumes where you left off.
 - **Message actions.** Click `⋮` beside a conversation message to fork or revert there. Right-clicking the message is an optional shortcut when the terminal forwards it. See [Sessions, Forks, and Revert](/docs/sessions/) for history boundaries, file snapshots, conflicts, and unrevert.
 - **Queue and steering.** While Caudra works, `Enter` sends the prompt next, `Ctrl+X g` guides the current run, and `Ctrl+X x` stops and replaces it. See [Queue and Steering](/docs/queue/).
-- **Tasks.** Click a task call to inspect its subagent transcript. Send guidance from the task input while it runs, then click `[< Main]` to return. `/tasks`, `Ctrl+X a`, or the task count above the input opens every task. Details in [Commands](/docs/commands/#tasks).
+- **Tasks.** Click a task call to inspect its subagent transcript. Send guidance from the task input while it runs, then click `[< Main]` to return. `/tasks`, `Ctrl+X a`, or the task count above the input opens every task. See [task navigation](/docs/commands/#tasks) and [background tasks](/docs/sessions/#background-tasks).
 - **Dismissing a modal.** `Esc` closes the panel or picker in front of you, and so does a press anywhere outside it. That press is swallowed, so it does not also act on what is under it. The permission prompt, the question form, the plan form, and the paste editor stay where they are, because each is waiting on an answer or holding text only you have. On the question form, `Esc` answers nothing and the agent carries on. `Ctrl+C` stops the agent that asked, so the run waits for your next message.
 - **Your shell.** Prefix input with `!` to run a command yourself (`!cargo test`). `!!` hides command and output from the agent.
-- **Escape hatch.** `Esc Esc` cancels a streaming response. When idle, it rewinds instead.
+- **Escape hatch.** `Esc Esc` stops the main run and all session tasks and workflows. With no session work left, it opens rewind instead. See [Stop and replace](/docs/queue/#stop-and-replace).
 - **Help.** `F1` lists every keybinding, or see [Keybindings](/docs/keybindings/).
 
 ## Default model (optional)

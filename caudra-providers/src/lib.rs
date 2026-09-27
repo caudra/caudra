@@ -50,7 +50,7 @@ pub use types::{
     INVALID_TOOL_JSON_KEY, ImageMediaType, ImageSource, InvalidToolInput, MAX_TOOL_INPUT_BYTES,
     MIN_THINKING_BUDGET, Message, MessageKind, ProviderEvent, ProviderUsage, ReasoningOption,
     ReasoningOptions, ReasoningSource, ReasoningTransport, RequestOptions, ResolvedThinking,
-    ResponsesReasoning, Role, SteeringKind, SteeringOrigin, StopReason, StreamResponse,
-    THINKING_USAGE, ThinkingConfig, ToolNameAliases, UsageLimit, adapt_images_for_model,
-    invalid_tool_input,
+    ResponsesReasoning, Role, StandingReminderKind, SteeringKind, SteeringOrigin, StopReason,
+    StreamResponse, THINKING_USAGE, TaskEventOrigin, ThinkingConfig, ToolNameAliases, UsageLimit,
+    WorkflowEventOrigin, adapt_images_for_model, invalid_tool_input,
 };

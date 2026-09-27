@@ -1334,10 +1334,29 @@ impl App {
     /// resolves through `parent_task_ids` and a predicted one answers for
     /// itself; a row that delegates nothing names no chat either way.
     fn task_id_at(&self, row: u16, area: Rect) -> Option<String> {
+        if let Some(id) = self.chats[0].task_hit_at(row, area) {
+            return Some(id);
+        }
         let id = self.chats[0]
             .dispatched_id_at(row, area)
             .or_else(|| self.chats[0].tool_id_at(row, area).map(str::to_owned))?;
-        Some(self.parent_task_ids.get(&id).cloned().unwrap_or(id))
+        self.parent_task_ids
+            .get(&id)
+            .cloned()
+            .or_else(|| self.pending_delegations.contains(&id).then_some(id.clone()))
+            .or_else(|| {
+                self.state
+                    .session
+                    .subagents()
+                    .iter()
+                    .find(|task| {
+                        task.parent_tool_use_id
+                            .as_deref()
+                            .unwrap_or(&task.tool_use_id)
+                            == id
+                    })
+                    .map(|task| task.tool_use_id.clone())
+            })
     }
 
     fn update_transcript_hover(&mut self, row: u16, col: u16) {

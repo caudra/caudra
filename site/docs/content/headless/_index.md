@@ -94,9 +94,40 @@ echo '{"type":"user","message":{"content":"explain this repo"}}' \
   | caudra --print --input-format stream-json --max-turns 3
 ```
 
+### Background tasks
+
+Stream-JSON sessions support [background tasks](/docs/sessions/#background-tasks). The `init` message advertises `background_tasks` and `task_controls`. One-shot `--print`, including `--output-format stream-json` without stream input, and ACP do not support background execution.
+
+Task controls use the same `control_request` envelope as workflow controls:
+
+```json
+{"type":"control_request","request_id":"t1","request":{"subtype":"task_status","task_id":"calm-bright-heron"}}
+```
+
+| Subtype | Arguments | Effect |
+|---------|-----------|--------|
+| `task_list` | None | List session-owned tasks |
+| `task_status` | `task_id` | Return one task's status |
+| `task_cancel` | `task_id` | Cancel one task |
+| `task_promote` | `task_id` | Move a foreground task to the background without restarting it |
+
+A successful `control_response` carries the task list or status in `response.response`. Failures use `response.error`.
+
+New task IDs are short `adjective-adjective-noun` phrases. Pass the returned ID unchanged. Older IDs remain valid.
+
+Task status `result` is now a native JSON outcome object, replacing the JSON-encoded string. Read `result.output` directly, preserving its object, array, scalar, or string type. Do not JSON-decode `result` a second time. This corrects the SDK wire shape without rewriting saved outcomes.
+
+If an outcome exceeds the status limit, `result` is omitted, `result_truncated` is `true`, and `result_preview` contains bounded text. The preview may be incomplete JSON and is not a complete result. The full outcome is retained in the session's output store. When `output_ref` is present, pass its `id` as `output_id` to `tool_output` to read or search that outcome. New output handles use wordlist names and older IDs remain valid. Model-facing status and terminal notices include retrieval guidance when their result is incomplete. Complete short results do not prompt another fetch.
+
+`reports_truncated` marks shortened or omitted report text. Task lists omit result and report details to stay lightweight. Request `task_status` for details and the retained output reference.
+
+A parent `result` ends that run, not the session's background work. Keep stdin open to receive automatic continuation after reports and outcomes arrive. Each parent run emits a `system` message with subtype `turn_start`. Its `run_id`, `automatic`, `task_event_ids`, and `workflow_events` also appear under `run` in the matching `result`. The result's `background_active` counts active managed tasks. Permission requests can still arrive from children after the parent result.
+
+The `interrupt` control stops the parent and all session tasks and workflows and suppresses late automatic continuations. A new user prompt re-enables them. Closing stdin cancels and drains owned work. It does not leave a daemon running.
+
 ### Workflows
 
-A stream-json session runs a workflow runtime beside the agent. Scripts under `.caudra/workflows/<name>.rhai` in the project can be started, watched, paused, and resumed from the wire, and the model can reach the same runtime through the [`workflow` tool](/docs/tools/#workflow). Runs outlive individual turns and are journaled, so a session resumed with `--resume` can pick a run up where it stopped.
+A stream-json session runs a workflow runtime beside the agent. Scripts under `.caudra/workflows/<name>.rhai` in the project can be started, watched, paused, and resumed from the wire, and the model can reach the same runtime through the [`workflow` tool](/docs/tools/#workflow). Runs outlive individual turns and keep a journal. Pause a run before closing the session if you intend to resume it later.
 
 The `init` message says whether the runtime is attached and which controls it answers:
 
@@ -172,23 +203,21 @@ Agents a workflow launches stream as subagents. Their `assistant` and `user` mes
 
 #### Completion context
 
-A finished, failed, or paused run leaves a completion notice. Caudra prepends the pending notices to the content of the next `user` message, one block per run, and acknowledges each one so it is delivered once per `(run_id, revision)`. There is no automatic model turn: the report reaches the model with your next prompt.
+A finished, failed, or paused run leaves a completion notice. Caudra delivers pending notices as context at the next safe parent-run boundary and acknowledges delivery per `(run_id, revision)`. If the parent has already answered, the SDK starts an automatic run without another user prompt, using the same [continuation lifecycle](#background-tasks) as background tasks.
 
 ```
 Workflow review (review) finished with status completed.
 Report: Two findings, both in src/auth.rs ...
 Scratch file: /tmp/caudra/review/run-1.md
-
-<your prompt>
 ```
 
 `Report:` is the `report` string of the run's result. Without one, the whole result is inlined as `Result:`. Either is cut at 8 KiB. A paused run adds `Paused:` with its message and a failed run adds `Error:`.
 
-Send `workflow_ack` yourself only when you handle a notice from a `snapshot` event directly and do not want it in the next prompt.
+Send `workflow_ack` yourself only when you handle a pending notice from a `snapshot` event directly and do not want the model to consume it. Delivery can already have started by the time your acknowledgement arrives.
 
 #### Restart and resume
 
-Closing stdin marks every active run `interrupted` before the session saves, and the same happens when the process dies. Resume the session with `--resume <ID>` and call `workflow_resume` with the run id: the run replays its journal and continues from the last committed phase. A resume is at-least-once. Work that an agent had started but not committed runs again.
+Closing stdin stops and drains session-owned work before saving. Workflow runs left active at shutdown become `interrupted` and cannot resume. Pause a run first, then reopen the session with `--resume <ID>` and use `workflow_resume`. See [How resume works](/docs/workflows/#how-resume-works) for journal replay and its at-least-once effects.
 
 ## Examples
 

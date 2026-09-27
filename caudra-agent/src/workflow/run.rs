@@ -5,6 +5,8 @@
 //! shutdown has committed the next epoch the store refuses whatever the
 //! attempt still had in flight.
 
+use crate::background_reminder::RuntimeHealth;
+use arc_swap::ArcSwap;
 use std::sync::Arc;
 
 use caudra_providers::ModelPurpose;
@@ -49,6 +51,7 @@ pub(super) struct RunEnv {
     pub events: Sender<Envelope>,
     pub mode: ModeResolver,
     pub published: Published,
+    pub health: Arc<ArcSwap<RuntimeHealth>>,
 }
 
 /// The immutable inputs of one attempt: the script and args the row holds,
@@ -70,6 +73,17 @@ pub(super) struct Interrupt {
 pub(super) struct ActiveRun {
     pub control: Sender<Interrupt>,
     pub task: smol::Task<()>,
+}
+
+impl ActiveRun {
+    pub async fn interrupt(self, status: RunStatus) -> Option<RunSnapshot> {
+        let Self { control, task } = self;
+        let (reply, answer) = flume::bounded(1);
+        let _ = control.send_async(Interrupt { status, reply }).await;
+        drop(control);
+        task.await;
+        answer.try_recv().ok()
+    }
 }
 
 enum HostCommand {
@@ -268,6 +282,18 @@ struct Driver {
     waiters: Vec<Sender<RunSnapshot>>,
 }
 
+impl Drop for Driver {
+    fn drop(&mut self) {
+        if self.env.published.load().runs.iter().any(|run| {
+            run.run_id == self.snapshot.run_id
+                && run.execution_epoch == self.epoch
+                && run.status == RunStatus::Active
+        }) {
+            self.env.health.store(Arc::new(RuntimeHealth::Unavailable));
+        }
+    }
+}
+
 impl Driver {
     async fn drive(
         mut self,
@@ -305,8 +331,13 @@ impl Driver {
                 Event::Agent(done) => self.agent_done(done).await,
             }
         }
+        if let Some(control_rx) = control_rx.take() {
+            self.waiters
+                .extend(control_rx.try_iter().map(|interrupt| interrupt.reply));
+        }
         if let Err(error) = self.reload().await {
             warn!(run_id = %self.snapshot.run_id, %error, "workflow run could not be reread after its attempt");
+            return;
         }
         for waiter in self.waiters.drain(..) {
             let _ = waiter.send(self.snapshot.clone());
@@ -391,8 +422,33 @@ impl Driver {
                 Ok((key, request))
             })
             .collect::<Result<_, HostError>>()?;
+        let mut reserved = Vec::with_capacity(keyed.len());
+        for (key, request) in keyed {
+            let stored = self
+                .env
+                .store
+                .load_call(self.snapshot.run_id.clone(), key.0)
+                .await
+                .map_err(host_failure)?;
+            let previous = stored
+                .as_ref()
+                .and_then(|call| call.task_id.as_deref())
+                .or_else(|| {
+                    self.snapshot
+                        .roster
+                        .iter()
+                        .find(|entry| entry.call_key == key.0)
+                        .and_then(|entry| entry.task_id.as_deref())
+                });
+            let lease = self
+                .env
+                .runner
+                .reserve_task(previous)
+                .map_err(HostError::Failed)?;
+            reserved.push((key, request, lease));
+        }
         self.snapshot.usage.agents_admitted = admitted;
-        for (key, request) in &keyed {
+        for (key, request, lease) in &reserved {
             self.roster_upsert(AgentRosterEntry {
                 call_key: key.0,
                 label: label_of(*key, request),
@@ -400,7 +456,7 @@ impl Driver {
                     .phase
                     .clone()
                     .or_else(|| self.snapshot.phase.clone()),
-                task_id: Some(task_id(&self.snapshot.run_id, *key)),
+                task_id: Some(lease.task_id().to_owned()),
                 state: RosterState::Running,
                 tokens_used: 0,
                 duration_ms: 0,
@@ -418,7 +474,7 @@ impl Driver {
         if !applied {
             return Err(HostError::Cancelled);
         }
-        for (key, request) in keyed {
+        for (key, request, lease) in reserved {
             let request_value = agent_request_value(request);
             self.env
                 .store
@@ -428,23 +484,23 @@ impl Driver {
                     kind: stored_call_kind(kind),
                     request_hash: hash_request(kind, &request_value).to_string(),
                     request: request_value.to_string(),
-                    task_id: Some(task_id(&self.snapshot.run_id, key)),
+                    task_id: Some(lease.task_id().to_owned()),
                 })
                 .await
                 .map_err(host_failure)?;
-            self.spawn_agent(key, request);
+            self.spawn_agent(key, request, TaskIdentity::Reserved(lease));
         }
         self.publish();
         Ok(())
     }
 
-    fn spawn_agent(&mut self, key: CallKey, request: &AgentRequest) {
+    fn spawn_agent(&mut self, key: CallKey, request: &AgentRequest, task: TaskIdentity) {
         let (trigger, cancel) = self.cancel.child();
         let provenance = self.provenance(key.0, request.phase.clone());
         let task_request = TaskRequest {
             prompt: Some(request.prompt.clone()),
             label: label_of(key, request),
-            task: TaskIdentity::Fresh(task_id(&self.snapshot.run_id, key)),
+            task,
             mode: Some(match request.capability_mode {
                 CapabilityMode::ReadOnly => SubagentTaskMode::Plan,
                 CapabilityMode::Build => SubagentTaskMode::Build,
@@ -769,7 +825,8 @@ impl Driver {
                 self.epoch,
                 patch,
             )
-            .await?;
+            .await
+            .inspect_err(|_| self.env.health.store(Arc::new(RuntimeHealth::Unavailable)))?;
         match update {
             WorkflowUpdate::Applied { revision } => {
                 self.snapshot.revision = revision;
@@ -791,8 +848,9 @@ impl Driver {
             .env
             .store
             .load_run(self.snapshot.run_id.clone())
-            .await?
-            .ok_or_else(|| WorkflowError::Internal(RUN_ROW_MISSING.to_owned()))?;
+            .await
+            .and_then(|row| row.ok_or_else(|| WorkflowError::Internal(RUN_ROW_MISSING.to_owned())))
+            .inspect_err(|_| self.env.health.store(Arc::new(RuntimeHealth::Unavailable)))?;
         let logs = std::mem::take(&mut self.snapshot.logs);
         let phase_history = std::mem::take(&mut self.snapshot.phase_history);
         self.snapshot = snapshot_from_row(&row);
@@ -927,9 +985,34 @@ fn scratch_failure(error: WorkflowError) -> HostError {
 
 #[cfg(test)]
 mod tests {
+    use caudra_workflow::RunStatus;
+    use futures_lite::future::poll_once;
     use test_case::test_case;
 
-    use super::{ModelJob, ModelPurpose, model_purpose};
+    use super::{ActiveRun, ModelJob, ModelPurpose, model_purpose};
+
+    #[test_case(RunStatus::Paused; "pause")]
+    #[test_case(RunStatus::Cancelled; "stop")]
+    #[test_case(RunStatus::Interrupted; "shutdown")]
+    fn queued_interrupt_disconnects_when_driver_exits_without_receiving(status: RunStatus) {
+        smol::block_on(async {
+            let (control, receiver) = flume::unbounded();
+            let queued = receiver.clone();
+            let (release, finish) = flume::bounded(1);
+            let task = smol::spawn(async move {
+                finish.recv_async().await.unwrap();
+                assert_eq!(receiver.len(), 1);
+                drop(receiver);
+            });
+            let active = ActiveRun { control, task };
+            let mut interrupt = Box::pin(active.interrupt(status));
+            assert!(poll_once(&mut interrupt).await.is_none());
+            assert_eq!(queued.len(), 1);
+            drop(queued);
+            release.send(()).unwrap();
+            assert!(interrupt.await.is_none());
+        });
+    }
 
     /// The `subagent` case is the one worth pinning: it must resolve to no
     /// override, not to a purpose that would route a subagent to itself.

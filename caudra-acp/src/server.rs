@@ -1906,6 +1906,7 @@ mod tests {
             event_tx
                 .send(Envelope {
                     event: AgentEvent::PermissionRequest(Box::new(request)),
+                    task: None,
                     subagent: Some(caudra_agent::SubagentInfo {
                         parent_tool_use_id: "task-call".into(),
                         task_id: "task-1".into(),

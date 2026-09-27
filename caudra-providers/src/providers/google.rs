@@ -755,8 +755,11 @@ async fn parse_sse(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::providers::test_support::CREDENTIAL_IN_URL;
-    use crate::{ReasoningOptions, SteeringKind};
+    use crate::providers::test_support::{
+        CREDENTIAL_IN_URL, task_event_origin, task_observation_with_output_refs,
+        workflow_event_origin,
+    };
+    use crate::{ReasoningOptions, StandingReminderKind, SteeringKind};
     use std::sync::Arc;
     use test_case::test_case;
 
@@ -792,11 +795,14 @@ mod tests {
         assert_eq!(tools[0].2, &expected);
     }
 
-    #[test_case(SteeringKind::Recovery ; "recovery")]
-    #[test_case(SteeringKind::Advisory ; "advisory")]
-    fn steering_metadata_is_not_on_wire(kind: SteeringKind) {
-        let wire =
-            convert_messages(&[Message::steering(STEERING_TEXT.into(), STEERING_RULE, kind)]);
+    #[test_case(Message::steering(STEERING_TEXT.into(), STEERING_RULE, SteeringKind::Recovery) ; "recovery")]
+    #[test_case(Message::steering(STEERING_TEXT.into(), STEERING_RULE, SteeringKind::Advisory) ; "advisory")]
+    #[test_case(Message::task_observation(STEERING_TEXT.into(), task_event_origin()) ; "task_event")]
+    #[test_case(task_observation_with_output_refs(STEERING_TEXT); "retained_task_outputs")]
+    #[test_case(Message::workflow_observation(STEERING_TEXT.into(), workflow_event_origin()) ; "workflow_event")]
+    #[test_case(Message::standing_reminder(STEERING_TEXT.into(), StandingReminderKind::BackgroundWork) ; "background_reminder")]
+    fn observation_metadata_is_not_on_wire(message: Message) {
+        let wire = convert_messages(&[message]);
         assert_eq!(
             wire,
             vec![json!({"role": "user", "parts": [{"text": STEERING_TEXT}]})]

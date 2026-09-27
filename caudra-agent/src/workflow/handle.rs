@@ -2,12 +2,17 @@
 //! over a channel and answer asynchronously; the read model is a lock-free
 //! swap the UI and the `workflow` tool can load on every frame.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
+use crate::background::BackgroundTasks;
+use crate::background_reminder::{RuntimeHealth, RuntimeSnapshot};
 use crate::remote_project_context::RemoteProjectContext;
 use arc_swap::ArcSwap;
+use caudra_providers::WorkflowEventOrigin;
 use caudra_workflow::{RunStatus, WorkflowError, WorkflowRequest, WorkflowResponse, WorkflowState};
 use caudra_workspace::WorkspaceSession;
+
+const INVALID_RECEIPT_RESPONSE: &str = "invalid workflow receipt response";
 
 pub struct WorkspaceRebind {
     pub workspace: WorkspaceSession,
@@ -16,7 +21,11 @@ pub struct WorkspaceRebind {
 }
 
 pub(crate) enum RuntimeRequest {
-    Workflow(WorkflowRequest),
+    BindBackground(BackgroundTasks),
+    ReceivedCompletion(WorkflowEventOrigin),
+    Workflow(WorkflowRequest, Option<u64>),
+    #[cfg(test)]
+    Park(flume::Sender<()>, flume::Receiver<()>),
     Suspend(Arc<()>),
     Rebind(Arc<()>, WorkspaceRebind),
     Commit(Arc<()>),
@@ -60,11 +69,18 @@ impl Drop for WorkflowTransition {
 pub struct WorkflowHandle {
     requests: RequestSender,
     state: Arc<ArcSwap<WorkflowState>>,
+    pub(super) background: Arc<OnceLock<BackgroundTasks>>,
+    pub(super) health: Arc<ArcSwap<RuntimeHealth>>,
 }
 
 impl WorkflowHandle {
     pub(crate) fn new(requests: RequestSender, state: Arc<ArcSwap<WorkflowState>>) -> Self {
-        Self { requests, state }
+        Self {
+            requests,
+            state,
+            background: Arc::new(OnceLock::new()),
+            health: Arc::new(ArcSwap::from_pointee(RuntimeHealth::Current)),
+        }
     }
 
     /// A handle whose runtime is `answer`, for testing callers in isolation.
@@ -76,7 +92,7 @@ impl WorkflowHandle {
         smol::spawn(async move {
             while let Ok((request, reply)) = inbox.recv_async().await {
                 let result = match request {
-                    RuntimeRequest::Workflow(request) => answer(request),
+                    RuntimeRequest::Workflow(request, _) => answer(request),
                     _ => Ok(WorkflowResponse::Ack),
                 };
                 let _ = reply.send(result);
@@ -94,7 +110,25 @@ impl WorkflowHandle {
         &self,
         request: WorkflowRequest,
     ) -> Result<WorkflowResponse, WorkflowError> {
-        self.send(RuntimeRequest::Workflow(request)).await
+        let generation = if matches!(
+            request,
+            WorkflowRequest::Start(_) | WorkflowRequest::Resume { .. }
+        ) {
+            self.background.get().map(BackgroundTasks::generation)
+        } else {
+            None
+        };
+        self.send(RuntimeRequest::Workflow(request, generation))
+            .await
+    }
+
+    #[cfg(test)]
+    pub(super) async fn park(
+        &self,
+        entered: flume::Sender<()>,
+        release: flume::Receiver<()>,
+    ) -> Result<WorkflowResponse, WorkflowError> {
+        self.send(RuntimeRequest::Park(entered, release)).await
     }
 
     pub async fn suspend(&self) -> Result<WorkflowTransition, WorkflowError> {
@@ -105,6 +139,25 @@ impl WorkflowHandle {
         self.send(RuntimeRequest::Suspend(Arc::clone(&transition.token)))
             .await?;
         Ok(transition)
+    }
+
+    pub async fn bind_background(&self, background: BackgroundTasks) -> Result<(), WorkflowError> {
+        self.send(RuntimeRequest::BindBackground(background))
+            .await
+            .map(|_| ())
+    }
+
+    pub async fn received_completion(
+        &self,
+        origin: WorkflowEventOrigin,
+    ) -> Result<bool, WorkflowError> {
+        match self
+            .send(RuntimeRequest::ReceivedCompletion(origin))
+            .await?
+        {
+            WorkflowResponse::Acked(received) => Ok(received),
+            _ => Err(WorkflowError::Internal(INVALID_RECEIPT_RESPONSE.into())),
+        }
     }
 
     async fn send(&self, request: RuntimeRequest) -> Result<WorkflowResponse, WorkflowError> {
@@ -121,6 +174,29 @@ impl WorkflowHandle {
 
     pub fn state(&self) -> Arc<WorkflowState> {
         self.state.load_full()
+    }
+
+    pub(crate) fn reminder_snapshot(&self) -> RuntimeSnapshot {
+        let state = self.state();
+        let mut health = self.health.load().as_ref().clone();
+        if self.requests.is_disconnected() && health != RuntimeHealth::Closed {
+            health = RuntimeHealth::Unavailable;
+        }
+        let mut snapshot = RuntimeSnapshot::new(health, !state.runs.is_empty());
+        for run in state
+            .runs
+            .iter()
+            .filter(|run| run.status == RunStatus::Active)
+        {
+            snapshot.add(
+                "workflow",
+                &run.run_id,
+                "running",
+                &run.workflow_name,
+                run.phase.as_deref(),
+            );
+        }
+        snapshot
     }
 
     /// Runs whose script is executing right now.
@@ -147,9 +223,30 @@ impl WorkflowHandle {
 #[cfg(test)]
 mod tests {
     use super::{RuntimeRequest, WorkflowHandle};
+    use crate::background_reminder::RuntimeHealth;
     use arc_swap::ArcSwap;
     use caudra_workflow::WorkflowState;
     use std::sync::Arc;
+
+    #[test]
+    fn read_only_health_distinguishes_closed_and_disconnected() {
+        let (requests, received) = flume::unbounded();
+        let handle = WorkflowHandle::new(
+            requests,
+            Arc::new(ArcSwap::from_pointee(WorkflowState::default())),
+        );
+        assert_eq!(handle.reminder_snapshot().health, RuntimeHealth::Current);
+        handle.health.store(Arc::new(RuntimeHealth::Stopping));
+        assert_eq!(handle.reminder_snapshot().health, RuntimeHealth::Stopping);
+        assert!(received.is_empty());
+        drop(received);
+        assert_eq!(
+            handle.reminder_snapshot().health,
+            RuntimeHealth::Unavailable
+        );
+        handle.health.store(Arc::new(RuntimeHealth::Closed));
+        assert_eq!(handle.reminder_snapshot().health, RuntimeHealth::Closed);
+    }
 
     #[test]
     fn cancelling_suspend_releases_only_its_own_reservation() {

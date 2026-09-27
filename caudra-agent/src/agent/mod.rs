@@ -22,7 +22,8 @@ mod tool_roster;
 
 pub(crate) use compaction::compaction_reserve;
 pub use compaction::{
-    COMPACTION_ANCHOR, CompactionSpend, Spend, auto_compact_enabled, compact, resolve_extractor,
+    COMPACTION_ANCHOR, CompactionSpend, Spend, auto_compact_enabled, compact, compact_with_session,
+    resolve_extractor,
 };
 pub use goal::{
     DEFAULT_GOAL_CONTINUATION_LIMIT, GoalError, GoalHandle, GoalResult, GoalSnapshot, GoalStatus,

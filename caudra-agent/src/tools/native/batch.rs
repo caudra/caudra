@@ -1350,6 +1350,36 @@ mod tests {
     const EXPECT_MODEL_ONLY: &str = "guidance a child addressed to the model belongs in the answer the model reads, never in \
          the annotation the card draws beside the child's header";
 
+    #[test]
+    fn typed_task_receipt_retains_model_suffix_in_batch_and_snapshot() {
+        let card = serde_json::from_value(json!({
+            "task_id": "task-1", "invocation_id": "internal-invocation",
+            "call_id": "batch-1:0", "root_call_id": BATCH_ID,
+            "label": BODY, "state": "queued", "background": true, "mode": "build",
+            "generation": 1, "created_at": 1, "updated_at": 1
+        }))
+        .unwrap();
+        let receipt = super::super::task::receipt(card);
+        let mut done = ToolDoneEvent::error(READ.into(), BODY);
+        done.is_error = false;
+        done.output = receipt.output.unwrap();
+        done.model_suffix = receipt.model_suffix;
+        let mut row = entry("task", BatchToolStatus::Pending, BODY);
+        settle_entry(&mut row, &done);
+        let restored: BatchToolEntry =
+            serde_json::from_value(serde_json::to_value(&row).unwrap()).unwrap();
+        assert!(matches!(restored.output, Some(ToolOutput::Tasks(_))));
+        assert_eq!(restored.model_suffix, row.model_suffix);
+        let model = render_llm(&[restored]);
+        assert!(model.contains("<task_metadata>"));
+        assert!(model.contains("Reports and the final outcome will arrive automatically"));
+        assert!(!model.contains("internal-invocation"));
+        let visible = row.output.unwrap().as_display_text();
+        assert!(!visible.contains("<task_metadata>"));
+        assert!(!visible.contains("internal-invocation"));
+        assert!(!visible.contains("Reports and the final outcome will arrive automatically"));
+    }
+
     /// `task` hands back a `<task_metadata>` block so the model can resume the
     /// subagent. Folded into the annotation it reached the model and the
     /// child's row alike, and the card drew the raw block after the header.

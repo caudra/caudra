@@ -19,6 +19,9 @@ Output exactly the Markdown structure inside <template>, with the section order 
 ### Active
 - [work in progress, partial edits, current investigation, or "(none)"]
 
+### Delegated work
+- [task ID or resumable workflow ID, assigned objective and scope/constraints, expected result or dependency, parent's next step after delivery, and last observed status; or "(none)"]
+
 ### Blocked
 - [blockers, failing commands with their exact error, unresolved questions, or "(none)"]
 
@@ -39,4 +42,7 @@ Rules:
 - Reproduce file paths, symbols, commands, error strings, URLs, and identifiers exactly. Never paraphrase an identifier.
 - If a tool result was truncated and its output ID was given, carry that ID into the summary so the full output can be re-read.
 - Record what was tried and failed, and why, so it is not retried.
+- Preserve unfinished delegated work even when the parent ended its turn. An admission receipt, launch-tool success, or silence is not evidence of completion.
+- Keep important results already delivered, without copying child transcripts. Preserve full-output handles only when omitted content is still needed.
+- Delegation status is last observed. The latest host background-work snapshot supplies current execution state, but does not replace assignment constraints or actual result reports. Do not invent a live task ledger.
 - Do not mention this summary or that context was dropped.

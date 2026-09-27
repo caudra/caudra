@@ -660,6 +660,8 @@ mod tests {
             workflow_run_count: WORKFLOW_RUN_COUNT,
             workflow_call_count: WORKFLOW_CALL_COUNT,
             workflow_bytes: WORKFLOW_BYTES,
+            background_invocation_count: 0,
+            background_bytes: 0,
             tool_output_file_bytes: TOOL_OUTPUT_BYTES,
             snapshot_bytes: SNAPSHOT_BYTES,
             archive_bytes: ARCHIVE_BYTES,

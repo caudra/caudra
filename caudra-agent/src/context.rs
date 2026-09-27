@@ -23,6 +23,7 @@ const MEMORY_READ_COMMAND: &str = "read";
 const BILLED_TO_PROFILES: &str = "profiles";
 const BILLED_TO_MEMORY: &str = "memory";
 const BILLED_TO_SKILLS: &str = "skills";
+const REQUEST_UNAVAILABLE: &str = "unavailable in this request";
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ContextKey {
@@ -429,16 +430,19 @@ impl BuiltinToolsInput<'_> {
                     self.model,
                     self.deferral,
                 );
-                let state = match report.state {
-                    ToolState::On => ContextBuiltinState::Declared,
-                    ToolState::Lazy => ContextBuiltinState::Deferred,
-                    ToolState::Off => ContextBuiltinState::Disabled,
+                let (state, reason) = match report.state {
+                    ToolState::On => (ContextBuiltinState::Declared, report.reason),
+                    ToolState::Lazy if deferred_tokens.contains_key(name) => {
+                        (ContextBuiltinState::Deferred, report.reason)
+                    }
+                    ToolState::Lazy => (ContextBuiltinState::Disabled, Some(REQUEST_UNAVAILABLE)),
+                    ToolState::Off => (ContextBuiltinState::Disabled, report.reason),
                 };
                 ContextBuiltinTool {
                     name: name.to_owned(),
                     source: entry.source.as_log_field().into_owned(),
                     state,
-                    reason: report.reason,
+                    reason,
                     tokens: deferred_tokens.get(name).copied().unwrap_or_default(),
                     billed_to: None,
                 }
@@ -931,6 +935,15 @@ impl ContextBuiltinInventory {
         self.catalog_tokens = 0;
         self.unattributed_tokens = unattributed;
 
+        for tool in &mut self.tools {
+            if tool.state == ContextBuiltinState::Declared {
+                tool.state = ContextBuiltinState::Disabled;
+                tool.reason = Some(REQUEST_UNAVAILABLE);
+                tool.tokens = 0;
+                tool.billed_to = None;
+            }
+        }
+
         for definition in definitions {
             let BuiltinDefinition {
                 name,
@@ -944,6 +957,7 @@ impl ContextBuiltinInventory {
             match self.tools.iter_mut().find(|tool| tool.name == *name) {
                 Some(tool) => {
                     tool.state = ContextBuiltinState::Declared;
+                    tool.reason = None;
                     tool.tokens = *tokens;
                     tool.billed_to = *billed_to;
                 }
@@ -1061,6 +1075,8 @@ mod tests {
     const CROWDED_ROWS: u32 = 60;
     const CROWDED_ROW_TOKENS: u32 = 20;
     const CROWDED_EXCESS: u32 = 30;
+    const TASK_CONTROL_NAME: &str = "task_control";
+    const CONFIG_DISABLED_REASON: &str = "disabled in configuration";
 
     fn model(context_window: u32, window_excludes_output: bool) -> Model {
         let mut model = Model::from_spec(MODEL_SPEC).unwrap();
@@ -1216,6 +1232,56 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(active, active_profile.into_iter().collect::<Vec<_>>());
+    }
+
+    #[test_case(ContextBuiltinState::Declared, false, ContextBuiltinState::Disabled, Some(REQUEST_UNAVAILABLE); "capability_removed_control")]
+    #[test_case(ContextBuiltinState::Deferred, false, ContextBuiltinState::Deferred, Some(CONFIG_DISABLED_REASON); "deferred_definition_kept")]
+    #[test_case(ContextBuiltinState::Disabled, false, ContextBuiltinState::Disabled, Some(CONFIG_DISABLED_REASON); "disabled_reason_kept")]
+    #[test_case(ContextBuiltinState::Declared, true, ContextBuiltinState::Declared, None; "declared_definition")]
+    #[test_case(ContextBuiltinState::Deferred, true, ContextBuiltinState::Declared, None; "loaded_deferred_definition")]
+    #[test_case(ContextBuiltinState::Disabled, true, ContextBuiltinState::Declared, None; "request_overrides_prediction")]
+    fn builtin_availability_follows_actual_request(
+        initial: ContextBuiltinState,
+        present: bool,
+        expected: ContextBuiltinState,
+        reason: Option<&'static str>,
+    ) {
+        let mut inventory = ContextBuiltinInventory {
+            tools: vec![ContextBuiltinTool {
+                name: TASK_CONTROL_NAME.into(),
+                source: String::new(),
+                state: initial,
+                reason: Some(CONFIG_DISABLED_REASON),
+                tokens: CROWDED_ROW_TOKENS,
+                billed_to: None,
+            }],
+            ..ContextBuiltinInventory::default()
+        };
+        let definitions = if present {
+            vec![BuiltinDefinition {
+                name: TASK_CONTROL_NAME.into(),
+                tokens: CROWDED_EXCESS,
+                billed_to: None,
+            }]
+        } else {
+            Vec::new()
+        };
+
+        inventory.apply_request_tokens(&definitions, 0);
+
+        let tool = &inventory.tools[0];
+        assert_eq!(tool.state, expected);
+        assert_eq!(tool.reason, reason);
+        assert_eq!(
+            tool.tokens,
+            if present {
+                CROWDED_EXCESS
+            } else if initial == ContextBuiltinState::Declared {
+                0
+            } else {
+                CROWDED_ROW_TOKENS
+            }
+        );
     }
 
     #[test]

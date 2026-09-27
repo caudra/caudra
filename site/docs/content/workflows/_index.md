@@ -54,7 +54,7 @@ The status bar keeps a chip while any run is going. One active run shows as `[wf
 
 Workflow agents are ordinary subagents. They ask for permission through the normal prompts, respect the current permission mode as a ceiling, share `task_max_concurrent` with `task` calls, and open in the same transcript viewer. They do not appear as task cards in the main transcript. A prompt raised by a workflow agent names the run, the phase, and the agent label, because a run outlives the turn that started it and the task id alone identifies nothing you can see.
 
-Pressing Esc cancels the main turn and leaves workflow runs alone. Stop them from the inspector.
+`Esc Esc` stops the main turn and all session tasks and workflows and suppresses automatic continuation. Stop one run from the inspector when other work should continue. See [Stop and replace](/docs/queue/#stop-and-replace).
 
 ## The inspector
 
@@ -313,6 +313,6 @@ Every workflow agent also takes a slot from `task_max_concurrent`, so a `paralle
 
 ## Other frontends
 
-The stream-JSON SDK exposes the same catalog and controls over `control_request` and reports runs as `system` messages. It does not start a turn when a run finishes. The result rides on the next prompt instead. See [Headless Mode](/docs/headless/#workflows).
+The stream-JSON SDK exposes the same catalog and controls over `control_request` and reports runs as `system` messages. Like the TUI, it starts an automatic parent run for pending completion notices at a safe boundary, including after a normal final answer. See [Headless Mode](/docs/headless/#workflows) for wire events and shutdown behavior.
 
 One-shot `--print` and ACP sessions have no workflow runtime. The `workflow` tool is not offered there.

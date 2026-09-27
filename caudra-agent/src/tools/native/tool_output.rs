@@ -50,7 +50,7 @@ const MAX_OUTPUT_LINES: usize = 2000;
 
 static OUTPUT_ID_PARAM: ParamSchema = ParamSchema::Primitive {
     kind: ParamKind::String,
-    description: "Opaque ID from a tool-output truncation notice.",
+    description: "Output handle from a truncation notice or task result. New handles use wordlist names; existing IDs remain valid. Pass the handle unchanged.",
 };
 static OFFSET_PARAM: ParamSchema = ParamSchema::Primitive {
     kind: ParamKind::Integer,

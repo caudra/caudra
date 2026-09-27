@@ -14,8 +14,10 @@ pub mod image_generate;
 mod local_document;
 pub mod memory;
 pub mod question;
+pub(crate) mod report_to_parent;
 pub mod skill;
 pub mod task;
+pub mod task_control;
 pub mod todo_write;
 mod tool_output;
 mod view_image;
@@ -115,6 +117,11 @@ fn entries_with_skill(skill: skill::SkillTool) -> Vec<(Arc<dyn Tool>, ToolSource
         ),
         entry(skill, ToolEffect::ReadOnly, skill::DESCRIPTION),
         entry(task::TaskTool, ToolEffect::Orchestrator, task::DESCRIPTION),
+        entry(
+            task_control::TaskControl,
+            ToolEffect::Orchestrator,
+            task_control::DESCRIPTION,
+        ),
         entry(
             todo_write::TodoWrite,
             ToolEffect::Isolated,

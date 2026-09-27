@@ -187,6 +187,38 @@ impl App {
     }
 
     pub(crate) fn enter_plan(&mut self) {
+        let transition = match self
+            .background
+            .as_ref()
+            .map(|background| background.suspend())
+            .transpose()
+        {
+            Ok(transition) => transition,
+            Err(error) => {
+                self.flash(error);
+                return;
+            }
+        };
+        if self.background.is_some() || self.has_session_work() {
+            self.automatic_wakes_suppressed = true;
+            self.release_background_claims();
+            if let Some(background) = &self.background
+                && let Err(error) = smol::block_on(background.stop())
+            {
+                self.flash(error);
+                return;
+            }
+            if let Err(error) = self.workflow.stop_all() {
+                self.flash(error);
+                return;
+            }
+            if let Some(transition) = &transition
+                && let Err(error) = smol::block_on(transition.drain())
+            {
+                self.flash(error);
+                return;
+            }
+        }
         if let (Some(store), Some(workspace)) = (&self.local_documents, &self.workspace_session) {
             if let Err(error) = self.state.plan.allocate_remote(
                 store,

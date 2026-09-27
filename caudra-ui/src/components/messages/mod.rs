@@ -24,7 +24,7 @@ use super::{
         BatchLiveMap, BatchProgressMap, BatchStartedMap, BatchViewMap, CardPolicy, Disclosure,
         RowTarget, ScrollSpan, ScrollWindow,
     },
-    memory_card, review, workflow_card,
+    memory_card, review, task_card, workflow_card,
     workflow_card::CardHit,
 };
 use crate::animation::spinner_str;
@@ -59,13 +59,14 @@ use crossterm::event::MouseEvent;
 
 use super::scrollbar::{ScrollHint, Scrollbar, ScrollbarMouse};
 use super::streaming_content::StreamingContent;
+use caudra_agent::background::BackgroundTasks;
 use caudra_agent::commits::{self, CommitRef};
 use caudra_agent::mentions::{self, Mention};
 use caudra_agent::tools::{BATCH_TOOL_NAME, SHELL_TOOL_NAME, ToolEffect};
 use caudra_agent::{
     BatchToolEntry, BatchToolStatus, BufferSnapshot, CallStage, EventSender, InstructionBlock,
-    NO_FILES_FOUND, ReasoningSummary, SharedBuf, SubagentProgress, ToolDoneEvent, ToolOutput,
-    ToolStartEvent, format_live_duration, format_settled_duration, reasoning_summary,
+    NO_FILES_FOUND, ReasoningSummary, SharedBuf, SubagentProgress, TaskCard, ToolDoneEvent,
+    ToolOutput, ToolStartEvent, format_live_duration, format_settled_duration, reasoning_summary,
     streaming_reasoning_summary,
 };
 use caudra_lua::{EventHandle, WARM_TOOL_CAP, WinView};
@@ -219,6 +220,26 @@ fn review_label(source: DisplaySource) -> &'static str {
         DisplaySource::Reasoning(_) => "thinking",
         DisplaySource::ToolCall { .. } => "tool call",
         DisplaySource::ToolResult(_) => "tool result",
+    }
+}
+
+fn collect_task_identities(output: &ToolOutput, identities: &mut HashMap<String, String>) {
+    match output {
+        ToolOutput::Tasks(tasks) => {
+            identities.extend(
+                tasks
+                    .iter()
+                    .map(|task| (task.invocation_id.clone(), task.task_id.clone())),
+            );
+        }
+        ToolOutput::Batch { entries, .. } => {
+            for entry in entries {
+                if let Some(output) = &entry.output {
+                    collect_task_identities(output, identities);
+                }
+            }
+        }
+        _ => {}
     }
 }
 
@@ -934,6 +955,7 @@ pub struct MessagesPanel {
     /// index. Live chrome rather than part of the roster: `BatchToolEntry` is
     /// persisted, and what a subagent was doing is stale the moment it stops.
     batch_child_progress: BatchProgressMap,
+    task_cards: HashMap<String, TaskCard>,
     /// What each dispatched batch child has streamed so far, by parent tool id
     /// and child index. A batch keeps the live row for itself, so a child's
     /// output arrives addressed to an id no header has and is kept here until
@@ -1081,6 +1103,7 @@ impl MessagesPanel {
             shell_raw: HashSet::new(),
             batch_views: BatchViewMap::new(),
             batch_child_progress: BatchProgressMap::new(),
+            task_cards: HashMap::new(),
             batch_child_output: BatchLiveMap::new(),
             batch_child_started: BatchStartedMap::new(),
             card_bars: HashMap::new(),
@@ -1690,6 +1713,7 @@ impl MessagesPanel {
         self.shell_raw.clear();
         self.batch_views.clear();
         self.batch_child_progress.clear();
+        self.task_cards.clear();
         self.batch_child_output.clear();
         self.batch_child_started.clear();
         for scroll in self.card_scroll.values_mut() {
@@ -2024,10 +2048,156 @@ impl MessagesPanel {
         self.mark_card_dirty(tool_id);
     }
 
-    /// Brings the card of `run` up to its latest state, whether a slash
-    /// command opened the card under the run's own id or the `workflow` tool
-    /// drew it under the call's. `false` when the transcript has no card for
-    /// the run.
+    pub(crate) fn task_card_update(&mut self, mut card: TaskCard) -> bool {
+        card.result = None;
+        card.result_preview = None;
+        card.result_truncated = false;
+        card.reports.clear();
+        card.reports_truncated = false;
+        if self.task_cards.get(&card.call_id) == Some(&card) {
+            return false;
+        }
+        let call_id = card.call_id.clone();
+        let active = card.active();
+        let dependents: Vec<_> = self
+            .messages
+            .iter()
+            .filter_map(|message| {
+                message
+                    .tool_output
+                    .as_deref()
+                    .filter(|output| task_card::contains_invocation(output, &card.invocation_id))
+                    .and(message.role.tool_id())
+                    .map(str::to_owned)
+            })
+            .collect();
+        self.task_cards.insert(call_id.clone(), card);
+        let parent = batch_child_id(&call_id);
+        if !active {
+            if let Some((parent, index)) = parent {
+                self.settle_child_progress(parent, index);
+            } else if let Some(msg) = self.find_tool_msg_mut(&call_id)
+                && let Some(progress) = &mut msg.progress
+            {
+                progress.settle();
+            }
+        }
+        self.mark_card_dirty(parent.map_or(call_id.as_str(), |(parent, _)| parent));
+        for dependent in dependents {
+            self.mark_card_dirty(&dependent);
+        }
+        true
+    }
+
+    pub(crate) fn reconcile_task_cards(&mut self, runtime: &BackgroundTasks) -> bool {
+        let mut identities: HashMap<String, String> = self
+            .task_cards
+            .values()
+            .map(|task| (task.invocation_id.clone(), task.task_id.clone()))
+            .collect();
+        for message in &self.messages {
+            if let Some(output) = message.tool_output.as_deref() {
+                collect_task_identities(output, &mut identities);
+            }
+        }
+        let mut changed = false;
+        for (invocation, task_id) in identities {
+            if let Ok(card) = runtime.status_invocation(&task_id, &invocation) {
+                changed |= self.task_card_update(card);
+            }
+        }
+        changed
+    }
+
+    pub(crate) fn task_hit_at(&self, row: u16, area: Rect) -> Option<String> {
+        if area.height == 0 {
+            return None;
+        }
+        let width = self.viewport_width;
+        let doc_row = self.doc_row(row, area);
+        let (_, segment, start) = self.cache.segment_at_row(doc_row, width)?;
+        let rel = u16::try_from(doc_row - start).ok()?;
+        if rel < segment.chrome(width).margin_top {
+            return None;
+        }
+        if let Some(message) = segment.msg_index.and_then(|index| self.messages.get(index))
+            && let DisplayRole::TaskDelivery(origin) = &message.role
+        {
+            return Some(origin.task_id.clone());
+        }
+        let call_id = segment.tool_id.as_deref()?;
+        let target = segment.row_target_at(rel, width);
+        let output = self
+            .messages
+            .iter()
+            .rfind(|msg| msg.role.tool_id() == Some(call_id))?
+            .tool_output
+            .as_deref();
+        if let Some(output) = output
+            && let Some(target) = target
+            && let Some(index) = task_card::target_index(output, target)
+        {
+            return task_card::task_at(output, index).map(|task| task.task_id.clone());
+        }
+        match output {
+            Some(ToolOutput::Tasks(tasks)) => tasks
+                .first()
+                .filter(|_| tasks.len() == 1)
+                .map(|task| task.task_id.clone()),
+            Some(ToolOutput::Batch { entries, .. }) => {
+                let target = target?;
+                let index = target.index();
+                match entries.get(index)?.output.as_ref() {
+                    Some(ToolOutput::Tasks(tasks)) => {
+                        let task = match target {
+                            RowTarget::Task { task, .. } => task,
+                            RowTarget::Item(_) if tasks.len() == 1 => 0,
+                            _ => return None,
+                        };
+                        tasks.get(task).map(|task| task.task_id.clone())
+                    }
+                    _ => self
+                        .task_cards
+                        .get(&format!("{call_id}:{index}"))
+                        .map(|task| task.task_id.clone()),
+                }
+            }
+            _ => self
+                .task_cards
+                .get(call_id)
+                .map(|task| task.task_id.clone()),
+        }
+    }
+
+    pub(crate) fn task_prompt(&self, call_id: &str) -> Option<String> {
+        let (parent, child) = batch_child_id(call_id)
+            .map_or((call_id, None), |(parent, child)| (parent, Some(child)));
+        let message = self
+            .messages
+            .iter()
+            .rfind(|msg| msg.role.tool_id() == Some(parent))?;
+        let input = match child {
+            Some(index) => {
+                let entry = match message.tool_output.as_deref() {
+                    Some(ToolOutput::Batch { entries, .. }) => entries
+                        .get(index)
+                        .and_then(|entry| entry.raw_input.as_ref()),
+                    _ => None,
+                };
+                entry.or_else(|| {
+                    let call = message
+                        .tool_raw_input
+                        .as_deref()?
+                        .get("tool_calls")?
+                        .get(index)?;
+                    Some(call.get("parameters").unwrap_or(call))
+                })?
+            }
+            None => message.tool_raw_input.as_deref()?,
+        };
+        input.get("prompt")?.as_str().map(str::to_owned)
+    }
+
     pub fn workflow_card_update(&mut self, run: &RunSnapshot) -> bool {
         let card = WorkflowRunCard::from(run);
         let slash_id = workflow_card::card_id(&run.run_id);
@@ -2117,7 +2287,12 @@ impl MessagesPanel {
         index: usize,
         report: SubagentProgress,
     ) -> bool {
-        if !self.batch_child_running(tool_id, index) {
+        if !self.batch_child_running(tool_id, index)
+            && !self
+                .task_cards
+                .get(&format!("{tool_id}:{index}"))
+                .is_some_and(|task| task.active())
+        {
             return false;
         }
         let children = Arc::make_mut(
@@ -2226,6 +2401,13 @@ impl MessagesPanel {
     }
 
     fn settle_child_progress(&mut self, tool_id: &str, index: usize) {
+        if self
+            .task_cards
+            .get(&format!("{tool_id}:{index}"))
+            .is_some_and(|task| task.active())
+        {
+            return;
+        }
         if let Some(scroll) = self.card_scroll.get_mut(&child_scroll_id(tool_id, index)) {
             scroll.history_base = None;
         }
@@ -2297,8 +2479,14 @@ impl MessagesPanel {
         // batch, so no row is left counting against a clock that has stopped.
         if let Some(children) = self.batch_child_progress.get_mut(&event.id) {
             Arc::make_mut(children)
-                .values_mut()
-                .for_each(ToolProgress::settle);
+                .iter_mut()
+                .filter(|(index, _)| {
+                    !self
+                        .task_cards
+                        .get(&format!("{}:{index}", event.id))
+                        .is_some_and(|task| task.active())
+                })
+                .for_each(|(_, progress)| progress.settle());
         }
         self.batch_child_output.remove(&event.id);
         self.batch_child_started.remove(&event.id);
@@ -2316,7 +2504,12 @@ impl MessagesPanel {
                 ToolStatus::Success
             };
         }
-        if let Some(progress) = &mut msg.progress {
+        if let Some(progress) = &mut msg.progress
+            && !self
+                .task_cards
+                .get(&event.id)
+                .is_some_and(|task| task.active())
+        {
             progress.settle();
         }
         msg.live_body = None;
@@ -2393,7 +2586,12 @@ impl MessagesPanel {
     }
 
     pub fn set_tool_progress(&mut self, tool_id: &str, report: SubagentProgress) {
-        if !self.tool_in_progress(tool_id) {
+        if !self.tool_in_progress(tool_id)
+            && !self
+                .task_cards
+                .get(tool_id)
+                .is_some_and(|task| task.active())
+        {
             return;
         }
         self.update_tool(tool_id, |msg| {
@@ -2622,6 +2820,7 @@ impl MessagesPanel {
     /// is far more often than a frame.
     fn has_in_progress(&self) -> bool {
         self.messages.iter().rev().any(Self::is_running)
+            || self.task_cards.values().any(TaskCard::active)
     }
 
     fn is_running(msg: &DisplayMessage) -> bool {
@@ -2658,7 +2857,6 @@ impl MessagesPanel {
         true
     }
 
-    #[cfg(test)]
     pub fn message_count(&self) -> usize {
         self.messages.len()
     }
@@ -2852,7 +3050,7 @@ impl MessagesPanel {
         let (_, segment, start) = self.cache.segment_at_row(doc_row, self.viewport_width)?;
         let rel = u16::try_from(doc_row - start).ok()?;
         let tool_id = segment.tool_id.as_deref()?;
-        let RowTarget(index) = segment.row_target_at(rel, self.viewport_width)?;
+        let index = segment.row_target_at(rel, self.viewport_width)?.index();
         Some(format!("{tool_id}:{index}"))
     }
 
@@ -3497,9 +3695,9 @@ impl MessagesPanel {
         }
         // A batch child answers for itself, before the card-wide expansion the
         // rest of the body falls back to.
-        if let Some(RowTarget(index)) = seg.row_target_at(rel, width) {
+        if let Some(target) = seg.row_target_at(rel, width) {
             let tool_id = tool_id.to_owned();
-            self.toggle_batch_child(&tool_id, index);
+            self.toggle_batch_child(&tool_id, target.index());
             return true;
         }
         let tool_id = tool_id.to_owned();
@@ -4277,6 +4475,12 @@ impl MessagesPanel {
                 .and_then(|index| self.messages.get(index));
             let (heading, metadata, body, fenced) = match fragment.kind {
                 SegmentKind::User => ("User".to_owned(), None, fragment.text.as_str(), false),
+                SegmentKind::TaskDelivery => (
+                    "Task delivery".to_owned(),
+                    None,
+                    fragment.text.as_str(),
+                    false,
+                ),
                 SegmentKind::Assistant => {
                     match message.and_then(|message| message.plan_path.as_deref()) {
                         Some(plan_path) => (
@@ -4640,6 +4844,7 @@ impl MessagesPanel {
             batch_progress: &self.batch_child_progress,
             batch_live: &self.batch_child_output,
             batch_started: &self.batch_child_started,
+            task_cards: Some(&self.task_cards),
             cwd: self.cwd.clone(),
         }
     }
@@ -5015,9 +5220,6 @@ impl MessagesPanel {
                 let DisplayRole::Tool(tool) = &msg.role else {
                     return None;
                 };
-                if tool.status != ToolStatus::InProgress {
-                    return None;
-                }
                 // A batch keeps a clock per child, since the reports belong to
                 // rows the card has no header for and it carries none itself.
                 // The header clock asks the renderer's own question, so the set
@@ -5363,6 +5565,7 @@ fn merge_batch_snapshot(msg: &mut DisplayMessage, mut incoming: Vec<BatchToolEnt
 fn same_display_item(left: &DisplayMessage, right: &DisplayMessage) -> bool {
     match (&left.role, &right.role) {
         (DisplayRole::Tool(left), DisplayRole::Tool(right)) => left.id == right.id,
+        (DisplayRole::TaskDelivery(left), DisplayRole::TaskDelivery(right)) => left == right,
         (DisplayRole::User, DisplayRole::User)
         | (DisplayRole::Assistant, DisplayRole::Assistant)
         | (DisplayRole::Thinking, DisplayRole::Thinking)
@@ -5436,6 +5639,7 @@ fn segment_kind(role: &DisplayRole) -> SegmentKind {
         DisplayRole::Error => SegmentKind::Error,
         DisplayRole::Done => SegmentKind::Done,
         DisplayRole::Notice | DisplayRole::Injected => SegmentKind::Assistant,
+        DisplayRole::TaskDelivery(_) => SegmentKind::TaskDelivery,
         DisplayRole::Tool(_) => SegmentKind::ToolBlock,
     }
 }
@@ -5456,7 +5660,7 @@ fn segment_styles(
             Some(theme.user_message_style()),
             Some(Style::new().fg(accent)),
         ),
-        SegmentKind::ToolBlock | SegmentKind::Instruction => {
+        SegmentKind::ToolBlock | SegmentKind::Instruction | SegmentKind::TaskDelivery => {
             (Some(theme.panel_style()), Some(theme.subtle_border_style()))
         }
         SegmentKind::Error => (Some(theme.panel_style()), Some(theme.error)),
@@ -5482,6 +5686,12 @@ fn build_message_lines(
     if matches!(msg.role, DisplayRole::Thinking) {
         return build_thinking_lines(msg, width, diagram_pans, window);
     }
+    if let DisplayRole::TaskDelivery(origin) = &msg.role {
+        return BuiltMessage::bare(
+            task_card::delivery(origin, &msg.text, width),
+            msg.text.clone(),
+        );
+    }
     let style = match &msg.role {
         DisplayRole::User => user_style(),
         DisplayRole::Assistant => assistant_style(),
@@ -5489,7 +5699,7 @@ fn build_message_lines(
         DisplayRole::Error => error_style(),
         DisplayRole::Done => done_style(),
         DisplayRole::Notice | DisplayRole::Injected => notice_style(),
-        DisplayRole::Tool(_) => unreachable!(),
+        DisplayRole::Tool(_) | DisplayRole::TaskDelivery(_) => unreachable!(),
     };
     let prefix = if msg.plan_path.is_some() {
         ""

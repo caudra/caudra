@@ -4,6 +4,7 @@
 //! places, one per transition: `start_run`, `handle_cancel`, and
 //! `AgentHandles::respawn`. Everything else only reads it.
 
+pub(crate) mod background_delivery;
 mod btw;
 mod delegation;
 mod extract;
@@ -109,6 +110,7 @@ use crate::sandbox::{SandboxWorkers, StoreReply};
 use crate::selection::{SelectionState, SelectionZone, ZoneRegistry};
 use crate::{AppSession, PatternDiscoveryMode, PatternDiscoveryOutcome, PatternSuggestionLoader};
 use arc_swap::{ArcSwap, ArcSwapOption};
+use caudra_agent::background::BackgroundTasks;
 use caudra_agent::commits::repo;
 use caudra_agent::context::{ContextKey, ContextSnapshot, ContextStore};
 use caudra_agent::mentions;
@@ -117,7 +119,7 @@ use caudra_agent::prompt::profile::PromptProfileCatalog;
 use caudra_agent::snapshots::{
     SESSION_SNAPSHOTS_DIR, SnapshotError, SnapshotLimits, SnapshotStore, workspace_key,
 };
-use caudra_agent::types::WorkflowProvenance;
+use caudra_agent::types::{BACKGROUND_EVENT_RUN_ID, WorkflowProvenance};
 use caudra_agent::workspace_baseline::{BaselineOutcome, WorkspaceBaseline};
 use caudra_agent::{
     AgentEvent, AgentInput, AgentMode, CommitRef, Envelope, GoalVerdict, ImageSource,
@@ -455,6 +457,13 @@ pub struct App {
     pub(crate) state: session_state::SessionState,
     pub exit_request: ExitRequest,
     pub(crate) exit_on_done: bool,
+    pub(crate) background: Option<BackgroundTasks>,
+    task_interactions: tasks::TaskInteractions,
+    task_controls: tasks::TaskControls,
+    pub(crate) background_claims: Vec<Message>,
+    background_saved_revision: Option<u64>,
+    pub(crate) background_delivery: background_delivery::BackgroundDelivery,
+    pub(crate) automatic_wakes_suppressed: bool,
     pub(crate) queue: MessageQueue,
     queue_editor: Option<queue::QueueEditor>,
     task_queue_selection: Option<(String, QueueItemId)>,
@@ -689,6 +698,13 @@ impl App {
             state,
             exit_request: ExitRequest::None,
             exit_on_done: false,
+            background: None,
+            task_interactions: tasks::TaskInteractions::default(),
+            task_controls: tasks::TaskControls::default(),
+            background_claims: Vec::new(),
+            background_saved_revision: None,
+            background_delivery: background_delivery::BackgroundDelivery::default(),
+            automatic_wakes_suppressed: false,
             queue: MessageQueue::default(),
             queue_editor: None,
             task_queue_selection: None,
@@ -1678,6 +1694,21 @@ impl App {
     /// is parked on. A dismissal is an unparseable reply by design: the tool
     /// reads anything it cannot make answers of as "the user declined".
     fn handle_question_form_action(&mut self, action: QuestionFormAction) -> Vec<Action> {
+        if !matches!(action, QuestionFormAction::Consumed)
+            && self
+                .task_interactions
+                .question
+                .as_ref()
+                .is_some_and(|origin| !self.task_response_current(origin))
+        {
+            self.question_form.close();
+            self.question_subagent = None;
+            self.task_interactions.question = None;
+            return Vec::new();
+        }
+        if !matches!(action, QuestionFormAction::Consumed) {
+            self.task_interactions.question = None;
+        }
         let reply = match action {
             QuestionFormAction::Consumed => return Vec::new(),
             // Nothing is sent back: the parked tool ends on its own cancel
@@ -1710,7 +1741,7 @@ impl App {
         let routed = subagent_id.and_then(|id| self.subagent_answers.get(id));
         if let Some(tx) = routed {
             let _ = tx.try_send(answer);
-        } else {
+        } else if !subagent_id.is_some_and(|id| self.session_owns_task(id)) {
             self.send_answer(answer);
         }
     }
@@ -3652,7 +3683,7 @@ impl App {
                         if let Some(t) = self.last_esc.take()
                             && t.elapsed() < self.status_bar.flash_duration
                         {
-                            if streaming {
+                            if streaming || self.has_session_work() {
                                 self.handle_cancel()
                             } else {
                                 self.open_rewind_picker()
@@ -3660,7 +3691,7 @@ impl App {
                         } else {
                             self.last_esc = Some(Instant::now());
                             self.status_bar.flash(
-                                if streaming {
+                                if streaming || self.has_session_work() {
                                     FLASH_CANCEL
                                 } else {
                                     FLASH_REWIND
@@ -3725,8 +3756,16 @@ impl App {
         match std::mem::take(&mut self.pending_input) {
             PendingInput::AuthRetry { waiters } => {
                 for subagent_id in waiters {
+                    if subagent_id
+                        .as_ref()
+                        .and_then(|id| self.task_interactions.auth.get(id))
+                        .is_some_and(|origin| !self.task_response_current(origin))
+                    {
+                        continue;
+                    }
                     self.send_to_agent(subagent_id.as_deref(), String::new());
                 }
+                self.task_interactions.auth.clear();
                 return vec![];
             }
             PendingInput::None => {}
@@ -3767,13 +3806,16 @@ impl App {
         if self.cancelling_run.is_some() {
             return Vec::new();
         }
-        let cancelled_run = self.begin_main_cancel(false, true);
+        let cancelled_run = self.begin_main_cancel(false, self.status == Status::Streaming);
         vec![Action::CancelAgent {
             run_id: cancelled_run,
         }]
     }
 
     pub(super) fn begin_main_cancel(&mut self, preserve_queue: bool, await_terminal: bool) -> u64 {
+        self.automatic_wakes_suppressed = true;
+        self.release_background_claims();
+        self.workflow.suppress_completions();
         self.cancel_queue_edit();
         let cancelled_run = self.run_id;
         self.run_id += 1;
@@ -3854,6 +3896,35 @@ impl App {
     }
 
     fn handle_agent_event(&mut self, mut envelope: Envelope) -> Vec<Action> {
+        let session_owned = self
+            .background
+            .as_ref()
+            .is_some_and(|background| background.owns_event(&envelope));
+        if (envelope.task.is_some() || envelope.run_id == BACKGROUND_EVENT_RUN_ID) && !session_owned
+        {
+            return Vec::new();
+        }
+        if let Some(origin) = &envelope.task {
+            match &envelope.event {
+                AgentEvent::PermissionRequest(request)
+                | AgentEvent::PermissionRequestUpdated(request) => {
+                    self.task_interactions
+                        .permissions
+                        .insert(request.id.clone(), Arc::clone(origin));
+                }
+                AgentEvent::Question(_) => {
+                    self.task_interactions.question = Some(Arc::clone(origin))
+                }
+                AgentEvent::AuthRequired => {
+                    self.task_interactions
+                        .auth
+                        .insert(origin.task_id.clone(), Arc::clone(origin));
+                }
+                _ => {}
+            }
+        } else if matches!(envelope.event, AgentEvent::Question(_)) {
+            self.task_interactions.question = None;
+        }
         // Sent under their own run id, ahead of the stale-run filter: a run
         // outlives the turn that launched it and reports through every one
         // after it.
@@ -3955,6 +4026,29 @@ impl App {
             }
             return vec![];
         }
+        if let AgentEvent::TaskAdmitted(card) = &envelope.event {
+            if !session_owned && envelope.run_id != self.run_id {
+                return Vec::new();
+            }
+            let mut info = envelope.subagent.clone().unwrap_or_else(|| SubagentInfo {
+                parent_tool_use_id: card.call_id.clone(),
+                task_id: card.task_id.clone(),
+                name: card.label.clone(),
+                prompt: self.chats[0].task_prompt(&card.call_id),
+                model: None,
+                thinking: None,
+                fast: false,
+                answer_tx: None,
+                steer_tx: None,
+            });
+            info.name.clone_from(&card.label);
+            if info.prompt.is_none() {
+                info.prompt = self.chats[0].task_prompt(&card.call_id);
+            }
+            self.resolve_or_create_chat(&info);
+            self.chats[0].task_card_update(card.clone());
+            return Vec::new();
+        }
         if let AgentEvent::SubagentHistory {
             task_id,
             parent_tool_use_id,
@@ -3965,7 +4059,8 @@ impl App {
             spec,
         } = &envelope.event
         {
-            if envelope.run_id != self.run_id
+            if !session_owned
+                && envelope.run_id != self.run_id
                 && !crate::active_session_history(&self.state.session).is_ok_and(|items| {
                     caudra_agent::history_tool_call_ids(&items).contains(root_tool_use_id)
                         || reachable_subagent_ids(
@@ -4012,7 +4107,7 @@ impl App {
                     Some(caudra_storage::sessions::StoredSubagentTaskSpec::version()),
                 );
             }
-            if envelope.run_id == self.run_id {
+            if session_owned || envelope.run_id == self.run_id {
                 let sub_idx = self
                     .chat_index
                     .get(task_id.as_str())
@@ -4030,7 +4125,9 @@ impl App {
                             steer_tx: None,
                         })
                     });
-                self.chats[sub_idx].mark_finished(TaskOutcome::Unknown, DONE_TEXT);
+                if !session_owned {
+                    self.chats[sub_idx].mark_finished(TaskOutcome::Unknown, DONE_TEXT);
+                }
                 self.sync_subagents();
             } else {
                 let mut subagents = self.state.session.subagents().to_vec();
@@ -4066,7 +4163,8 @@ impl App {
             }
             return vec![];
         }
-        if envelope.run_id != self.run_id
+        if !session_owned
+            && envelope.run_id != self.run_id
             && !matches!(envelope.event, AgentEvent::ModelUsage { .. })
         {
             let cancelled_terminal = envelope.subagent.is_none()
@@ -4111,6 +4209,20 @@ impl App {
                 &envelope.event,
                 AgentEvent::Done { .. } | AgentEvent::Error { .. }
             );
+
+        if envelope.subagent.is_none()
+            && matches!(
+                &envelope.event,
+                AgentEvent::Done {
+                    reason: caudra_agent::DoneReason::MaxTurns
+                        | caudra_agent::DoneReason::MaxTokens
+                        | caudra_agent::DoneReason::Cancelled,
+                    ..
+                } | AgentEvent::Error { .. }
+            )
+        {
+            self.suppress_background_wakes();
+        }
 
         match &envelope.event {
             AgentEvent::ToolStart(event) => self.fire_session_autocmd(
@@ -4185,6 +4297,7 @@ impl App {
             }
             if subagent_id.is_none()
                 && let Some(task_id) = self.parent_task_ids.get(&e.id)
+                && !self.session_owns_task(task_id)
                 && let Some(&sub_idx) = self.chat_index.get(task_id)
             {
                 let (outcome, text) = if e.is_error {
@@ -4260,6 +4373,19 @@ impl App {
         // that already shows the work itself. A batch child has no header, so
         // the same report is addressed to its row in the roster instead.
         if let AgentEvent::SubagentProgress { progress } = envelope.event {
+            if let Some(origin) = &envelope.task {
+                if self.task_response_current(origin)
+                    && let Some(runtime) = &self.background
+                    && let Ok(card) =
+                        runtime.status_invocation(&origin.task_id, &origin.invocation_id)
+                    && card.active()
+                {
+                    let call_id = card.call_id.clone();
+                    self.chats[0].task_card_update(card);
+                    self.chats[0].set_tool_progress(&call_id, progress);
+                }
+                return Vec::new();
+            }
             if let Some(tool_id) = &parent_tool_use_id {
                 self.chats[0].set_tool_progress(tool_id, progress);
             }
@@ -4468,6 +4594,7 @@ impl App {
         }
 
         if let ChatEventResult::PermissionRequestResolved { request_id } = result {
+            self.task_interactions.permissions.remove(&request_id);
             self.permission_prompt.resolve_pending(&request_id);
             self.chats[chat_idx].approval_settled(&request_id);
             return vec![];
@@ -4519,10 +4646,7 @@ impl App {
                     if !self.goal_deferred {
                         self.state.turns += 1;
                         self.terminalize_turn(MISSING_TOOL_COMPLETION);
-                        self.preserve_all_unconsumed_steers();
-                        self.chat_index.clear();
-                        self.subagent_answers.clear();
-                        self.subagent_steers.clear();
+                        self.retain_session_task_routes();
                     }
                     self.status = Status::Idle;
                     self.fire_session_autocmd("TurnEnd", serde_json::json!({}));
@@ -4541,15 +4665,13 @@ impl App {
                     };
                     self.status = Status::error(message.clone());
                     self.status_bar.clear_flash();
-                    self.subagent_answers.clear();
+                    self.automatic_wakes_suppressed = true;
                     self.terminalize_turn(&message);
-                    self.preserve_all_unconsumed_steers();
-                    self.subagent_steers.clear();
+                    self.retain_session_task_routes();
                     self.recoverable_queue = self.queue.pending_prompts();
                     self.recoverable_queue_together =
                         self.queue.delivery() == caudra_agent::QueueDelivery::TogetherNextTurn;
                     self.queue.clear();
-                    self.chat_index.clear();
                     self.fire_session_autocmd(
                         "TurnError",
                         serde_json::json!({ "message": message }),
@@ -4619,6 +4741,10 @@ impl App {
                     chat.push_user_message(prompt);
                 }
                 self.sync_subagents();
+            } else if self.chats[idx].message_count() == 0
+                && let Some(prompt) = &subagent.prompt
+            {
+                self.chats[idx].push_user_message(prompt);
             }
             return idx;
         }
@@ -4757,7 +4883,7 @@ impl App {
             "/stash-pop" => self.run_builtin(BuiltinAction::StashPop),
             "/stash-list" => self.run_builtin(BuiltinAction::StashList),
             "/memory" => self.memory_browse(),
-            "/tasks" => self.tasks_browse(),
+            "/tasks" | "/task" => self.execute_task_control(&cmd.args),
             "/workflows" => self.workflows_browse(),
             "/workflow" => self.execute_workflow(&cmd.args),
             "/deep-research" => {
@@ -5453,6 +5579,7 @@ impl App {
             | self.commit_popup.tick()
             | self.refresh_session_picker()
             | self.poll_workflow_replies()
+            | self.poll_task_controls()
             | self.tick_workbench()
             | self.poll_commit_index()
             | self.thinking_picker.tick()
@@ -5749,7 +5876,7 @@ impl App {
 
     fn finish_subagents(&mut self, outcome: TaskOutcome, text: &str) {
         self.discard_all_pending_delegations();
-        self.retain_resolved_subagents(outcome, text);
+        self.retain_resolved_subagents(outcome, text, false);
         self.chat_index.clear();
     }
 
@@ -5757,9 +5884,16 @@ impl App {
     /// shell commands that outlive the agent.
     fn terminalize_turn(&mut self, message: &str) {
         self.discard_all_pending_delegations();
-        self.retain_resolved_subagents(TaskOutcome::Error, ERROR_TEXT);
+        self.retain_resolved_subagents(TaskOutcome::Error, ERROR_TEXT, true);
         self.chats[0].fail_in_progress_except(message.into(), self.shell.active_ids());
         for chat in self.chats.iter_mut().skip(1) {
+            if chat.task_id().is_some_and(|id| {
+                self.background
+                    .as_ref()
+                    .is_some_and(|background| background.status(id).is_ok())
+            }) {
+                continue;
+            }
             chat.fail_in_progress_with_message(message.into());
         }
     }
@@ -5767,9 +5901,21 @@ impl App {
     /// Marks unfinished subagent chats as ended and drops them from
     /// `chat_index`, so the session records only the children that really
     /// completed.
-    fn retain_resolved_subagents(&mut self, outcome: TaskOutcome, text: &str) {
+    fn retain_resolved_subagents(
+        &mut self,
+        outcome: TaskOutcome,
+        text: &str,
+        preserve_session_tasks: bool,
+    ) {
         self.chat_index.retain(|_, &mut sub_idx| {
-            if self.chats[sub_idx].is_finished() {
+            if self.chats[sub_idx].is_finished()
+                || preserve_session_tasks
+                    && self.chats[sub_idx].task_id().is_some_and(|id| {
+                        self.background
+                            .as_ref()
+                            .is_some_and(|background| background.status(id).is_ok())
+                    })
+            {
                 true
             } else {
                 self.chats[sub_idx].mark_finished(outcome, text);

@@ -1,6 +1,9 @@
 //! Async agent loop with tools.
 
 pub mod agent;
+pub mod background;
+mod background_reminder;
+pub use background_reminder::BackgroundReminderContext;
 pub mod cancel;
 pub mod child_guard;
 pub mod nudge;
@@ -61,7 +64,7 @@ pub use subagent_history::{
     SubagentHistoryError, SubagentHistoryLease, SubagentHistoryRecord, SubagentHistorySnapshot,
     SubagentHistoryStore, SubagentTaskMode, SubagentTaskSpec, SubagentTaskSpecCandidate,
     active_task_history_versions, active_task_history_versions_with_batch_state,
-    batch_task_history_versions, history_tool_call_ids,
+    active_task_history_versions_with_outputs, batch_task_history_versions, history_tool_call_ids,
 };
 pub use workspace_baseline::{BaselineGate, BaselineOutcome, WorkspaceBaseline};
 
@@ -85,9 +88,9 @@ pub use types::{
     MEMORY_REFERENCE_LABEL, MEMORY_REVISION_LABEL, MEMORY_TAG_SEPARATOR, MemoryNote,
     MemoryNoteEntry, MemoryOrigin, MemoryOutput, MemoryTagGroup, NO_FILES_FOUND, PatchedFile,
     QueueConsumedItem, SearchCap, SharedBuf, ShellFilterInfo, ShellOutput, SnapshotLine,
-    SnapshotSpan, SpanStyle, SubagentActivity, SubagentInfo, SubagentProgress, TextOutput,
-    ToolAccounting, ToolDoneEvent, ToolInput, ToolOutput, ToolOutputLimits, ToolStartEvent,
-    TurnCompleteEvent,
+    SnapshotSpan, SpanStyle, SubagentActivity, SubagentInfo, SubagentProgress, TaskCard,
+    TaskOutput, TaskProvenance, TextOutput, ToolAccounting, ToolDoneEvent, ToolInput, ToolOutput,
+    ToolOutputLimits, ToolStartEvent, TurnCompleteEvent,
 };
 pub use types::{
     ReasoningSummary, format_live_duration, format_settled_duration, reasoning_summary,

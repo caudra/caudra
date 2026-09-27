@@ -16,7 +16,8 @@ use caudra_providers::model_registry::{self, Binding};
 use caudra_providers::provider::{self, Provider};
 use caudra_providers::{
     Billing, CacheKey, ContentBlock, Message, Model, ModelError, ModelPurpose, ReasoningSource,
-    RequestOptions, Role, StopReason, StreamResponse, Timeouts, TokenUsage, estimate_tokens_cached,
+    RequestOptions, Role, StandingReminderKind, StopReason, StreamResponse, Timeouts, TokenUsage,
+    estimate_tokens_cached,
 };
 
 use super::commit_preamble;
@@ -39,7 +40,7 @@ use super::tool_dispatch::{self, RecentCalls, ResponseObservations, ToolObservat
 use crate::cancel::{CancelMap, CancelToken};
 use crate::context::{
     BuiltinToolsInput, ContextCapture, ContextInventory, ContextPublisher, ContextReadiness,
-    ContextSnapshot,
+    ContextSnapshot, estimate_context_usage,
 };
 use crate::mcp::{McpRequestSnapshot, McpSession};
 use crate::nudge::Nudge;
@@ -50,9 +51,9 @@ use crate::tools::{Deadline, FileReadTracker, LocalTools, PathLocks, ToolAudienc
 use crate::workflow::WorkflowHandle;
 use crate::workspace_baseline::BaselineGate;
 use crate::{
-    AgentConfig, AgentError, AgentEvent, AgentInput, AgentMode, CommitRef, DoneReason, EventSender,
-    ExtractedCommand, InterruptSource, Mention, QueueConsumedItem, SessionMailbox,
-    SubagentHistoryStore, TurnCompleteEvent,
+    AgentConfig, AgentError, AgentEvent, AgentInput, AgentMode, BackgroundReminderContext,
+    CommitRef, DoneReason, EventSender, ExtractedCommand, InterruptSource, Mention,
+    QueueConsumedItem, SessionMailbox, SubagentHistoryStore, TurnCompleteEvent,
 };
 use caudra_config::{ModelPolicy, ToolOutputLines};
 use caudra_storage::id::SessionRef;
@@ -102,6 +103,7 @@ const RESUME_PROMPT: &str =
 const UNBOUND_EVALUATOR: &str = "default";
 const LOCAL_PLAN_WRITE_TOOLS: &str = "`file_write`, `file_edit`, or `file_apply_patch`";
 const REMOTE_PLAN_WRITE_TOOLS: &str = "`local_document_write` or `local_document_apply_patch`";
+const REQUEST_CONTEXT_TOO_LARGE: &str = "The decorated request exceeds the model context window after context maintenance. Reduce the retained context or use a model with a larger context window.";
 
 /// Resolves an explicit or global binding against the selected Chat model.
 /// With no binding, the caller's effective model is the automatic fallback.
@@ -236,6 +238,7 @@ impl MeasuredContext {
 
 #[derive(Clone)]
 pub struct AgentParams {
+    pub background: Option<crate::background::BackgroundTasks>,
     pub provider: Arc<dyn Provider>,
     pub model: Model,
     pub chat_provider: Arc<dyn Provider>,
@@ -370,6 +373,8 @@ pub struct Agent<'h> {
     local_tools: LocalTools,
     model_policy: Arc<ModelPolicy>,
     workflow: Option<WorkflowHandle>,
+    background: Option<crate::background::BackgroundTasks>,
+    terminal_report: Option<Arc<AtomicBool>>,
     goal: GoalHandle,
     goal_evaluator: Option<ResolvedEvaluator>,
     goal_blocks: u32,
@@ -377,7 +382,11 @@ pub struct Agent<'h> {
 }
 
 impl<'h> Agent<'h> {
-    pub fn new(params: AgentParams, run: AgentRunParams<'h>) -> Self {
+    pub fn new(params: AgentParams, mut run: AgentRunParams<'h>) -> Self {
+        crate::tools::native::task::configure_background(
+            &mut run.tools,
+            params.background.is_some(),
+        );
         let shared_route = Arc::ptr_eq(&params.provider, &params.chat_provider)
             && params.model.provider == params.chat_model.provider
             && params.model.id == params.chat_model.id;
@@ -470,6 +479,8 @@ impl<'h> Agent<'h> {
             local_tools: LocalTools::default(),
             model_policy: params.model_policy,
             workflow: params.workflow,
+            background: params.background,
+            terminal_report: None,
             goal: GoalHandle::default(),
             goal_evaluator: None,
             goal_blocks: 0,
@@ -492,6 +503,11 @@ impl<'h> Agent<'h> {
 
     pub(crate) fn with_report_ready(mut self, ready: Arc<AtomicBool>) -> Self {
         self.report_ready = Some(ready);
+        self
+    }
+
+    pub(crate) fn with_terminal_report(mut self, ready: Arc<AtomicBool>) -> Self {
+        self.terminal_report = Some(ready);
         self
     }
 
@@ -630,6 +646,10 @@ impl<'h> Agent<'h> {
             self.recent_calls = RecentCalls::with_threshold(state.repeat_threshold());
             self.steering = Arc::new(Mutex::new(state));
         }
+        if let Some(background) = &self.background {
+            self.steering = background.steering(Arc::clone(&self.steering));
+            self.shared_steering = true;
+        }
         {
             let mut steering = steering::lock(&self.steering);
             if steering.bind_model(&self.model, &self.config.steering) {
@@ -682,6 +702,7 @@ impl<'h> Agent<'h> {
                 if sanitize_cancelled_history(self.history, self.rollback_len) {
                     let _ = self.event_tx.send(AgentEvent::Injected {
                         text: CANCEL_MARKER.into(),
+                        task_event: None,
                     });
                 }
                 self.publish_prepared_context();
@@ -702,12 +723,23 @@ impl<'h> Agent<'h> {
                 if let Some(text) =
                     sanitize_failed_history(self.history, self.rollback_len, &e.user_message())
                 {
-                    let _ = self.event_tx.send(AgentEvent::Injected { text });
+                    let _ = self.event_tx.send(AgentEvent::Injected {
+                        text,
+                        task_event: None,
+                    });
                 }
                 self.publish_prepared_context();
+                if let Some(background) = &self.background {
+                    background.suppress_wakes();
+                }
                 return Err(e);
             }
         };
+        if matches!(reason, DoneReason::MaxTurns | DoneReason::Cancelled)
+            && let Some(background) = &self.background
+        {
+            background.suppress_wakes();
+        }
         self.emit_done(reason)?;
 
         Ok(reason)
@@ -920,9 +952,10 @@ impl<'h> Agent<'h> {
         if !message.is_mention()
             && let Some(ContentBlock::Text { text }) = message.content.first()
         {
-            let _ = self
-                .event_tx
-                .send(AgentEvent::Injected { text: text.clone() });
+            let _ = self.event_tx.send(AgentEvent::Injected {
+                text: text.clone(),
+                task_event: message.task_event.clone(),
+            });
         }
         self.history.push(message);
     }
@@ -1063,6 +1096,24 @@ impl<'h> Agent<'h> {
         // before this request, not after the one that abandoned it: the model
         // must learn what already ran before it decides what to run next.
         self.report_speculative();
+        let preflight_compacted =
+            if self.audience.contains(ToolAudience::MAIN) && self.root_tool_use_id.is_none() {
+                BackgroundReminderContext {
+                    background: self.background.as_ref(),
+                    workflow: self.workflow.as_ref(),
+                }
+                .refresh(
+                    self.history,
+                    &self.event_tx,
+                    self.config.background_reminder_turns,
+                    false,
+                );
+                self.history.as_slice().iter().any(|message| {
+                    message.standing_reminder == Some(StandingReminderKind::BackgroundWork)
+                }) && self.preflight_context().await?
+            } else {
+                false
+            };
         let sent_at_history_len = self.history.len();
         self.tool_name_aliases = None;
         let repair_state = Arc::new(RepairState::default());
@@ -1256,6 +1307,13 @@ impl<'h> Agent<'h> {
         if self.cancel.is_cancelled() {
             return Err(AgentError::Cancelled);
         }
+        if self
+            .terminal_report
+            .as_ref()
+            .is_some_and(|ready| ready.load(Ordering::Acquire))
+        {
+            return Ok(TurnOutcome::Done(DoneReason::EndTurn));
+        }
         // Every rule bounds its own interventions, and interleaved rules can
         // still spend turn after turn on a run that produces nothing. Counting
         // the turns is what ends that, whichever rule was speaking.
@@ -1290,13 +1348,35 @@ impl<'h> Agent<'h> {
             }
             return Ok(TurnOutcome::Continue);
         }
-        let compacted = self.try_auto_compact().await?;
+        let compacted = !preflight_compacted && self.try_auto_compact().await?;
         if self.cancel.is_cancelled() {
             return Err(AgentError::Cancelled);
         }
         if queued {
             self.publish_prepared_context();
             return Ok(TurnOutcome::Continue);
+        }
+        if let Some(background) = self.background.clone() {
+            background
+                .settle_launches(self.history.as_slice())
+                .await
+                .map_err(|message| AgentError::Tool {
+                    tool: crate::tools::TASK_TOOL_NAME.into(),
+                    message,
+                })?;
+            let messages = background
+                .claim_messages()
+                .map_err(|message| AgentError::Tool {
+                    tool: crate::tools::TASK_TOOL_NAME.into(),
+                    message,
+                })?;
+            if !messages.is_empty() {
+                for message in messages {
+                    self.push_injected(message);
+                }
+                self.publish_prepared_context();
+                return Ok(TurnOutcome::Continue);
+            }
         }
         // A captured structured report satisfies missing prose only. This is
         // deliberately not an error handler: cancellation, failed dispatch,
@@ -1776,6 +1856,15 @@ impl<'h> Agent<'h> {
             self.publish_prepared_context();
         }
         result?;
+        if let Some(background) = &self.background {
+            background
+                .settle_launches(self.history.as_slice())
+                .await
+                .map_err(|message| AgentError::Tool {
+                    tool: crate::tools::TASK_TOOL_NAME.into(),
+                    message,
+                })?;
+        }
         Ok(observations.take())
     }
 
@@ -1855,6 +1944,7 @@ impl<'h> Agent<'h> {
             live_sink: None,
             model_policy: Arc::clone(&self.model_policy),
             workflow: self.workflow.clone(),
+            background: self.background.clone(),
             speculative: None,
         }
     }
@@ -1865,6 +1955,63 @@ impl<'h> Agent<'h> {
     fn context_size(&self) -> Option<u32> {
         self.measured
             .and_then(|measured| measured.extended_by(self.history.as_slice()))
+    }
+
+    fn request_context_size(&self) -> u32 {
+        let (tools, _) = self.request_tools();
+        let projected = self.projected_history(tools.as_ref());
+        let estimated = estimate_context_usage(
+            &self.model,
+            &self.system,
+            &self.tools,
+            tools.as_ref(),
+            projected.as_ref(),
+        )
+        .used();
+        estimated.max(self.context_size().unwrap_or_default())
+    }
+
+    async fn preflight_context(&mut self) -> Result<bool, AgentError> {
+        let mut input = self.request_context_size();
+        let compacted = self.auto_compact
+            && compaction::is_overflow(
+                &TokenUsage {
+                    input,
+                    ..Default::default()
+                },
+                &self.model,
+                self.config.compaction_buffer,
+            );
+        if compacted {
+            if let Some(background) = &self.background {
+                background
+                    .settle_launches(self.history.as_slice())
+                    .await
+                    .map_err(|message| AgentError::Tool {
+                        tool: crate::tools::TASK_TOOL_NAME.into(),
+                        message,
+                    })?;
+            }
+            self.event_tx.send(AgentEvent::Compacting)?;
+            self.do_compact().await?;
+            input = self.request_context_size();
+        }
+        let input_ceiling = if self.model.window_excludes_output {
+            self.model.context_window
+        } else {
+            self.model
+                .context_window
+                .saturating_sub(self.model.max_output_tokens.unwrap_or_default())
+        };
+        if input >= input_ceiling {
+            return Err(AgentError::Config {
+                message: format!(
+                    "{REQUEST_CONTEXT_TOO_LARGE} Estimated input: {input}; input ceiling: {input_ceiling}; window: {}.",
+                    self.model.context_window
+                ),
+            });
+        }
+        Ok(compacted)
     }
 
     async fn try_auto_compact(&mut self) -> Result<bool, AgentError> {
@@ -1915,10 +2062,18 @@ impl<'h> Agent<'h> {
             &compact_model,
             self.history,
             &self.event_tx,
-            &self.cancel,
-            &self.retry_now,
-            &self.config,
-            extractor.as_ref(),
+            compaction::CompactionContext {
+                cancel: &self.cancel,
+                retry_now: &self.retry_now,
+                config: &self.config,
+                extractor: extractor.as_ref(),
+                session: (self.audience.contains(ToolAudience::MAIN)
+                    && self.root_tool_use_id.is_none())
+                .then_some(BackgroundReminderContext {
+                    background: self.background.as_ref(),
+                    workflow: self.workflow.as_ref(),
+                }),
+            },
         )
         .await?;
         let usage = compacted.usage;
@@ -1931,6 +2086,7 @@ impl<'h> Agent<'h> {
                 .record_usage(spend.usage, spend.cost, spend.billing);
         }
         compacted.result?;
+        self.measured = None;
         self.rollback_len = self.history.len();
         steering::lock(&self.steering).reset_patterns();
         self.recent_calls =
@@ -2014,7 +2170,12 @@ fn last_announced<'a>(history: &'a [Message], marker: &str) -> Option<&'a str> {
     history
         .iter()
         .rev()
-        .filter(|message| message.is_observation())
+        .filter(|message| {
+            message.is_observation()
+                && message.task_event.is_none()
+                && message.workflow_event.is_none()
+                && message.standing_reminder.is_none()
+        })
         .find_map(|message| message.user_text().filter(|text| text.contains(marker)))
 }
 
@@ -2040,7 +2201,12 @@ fn last_announced_mode(history: &[Message]) -> AnnouncedMode {
     history
         .iter()
         .rev()
-        .filter(|message| message.is_observation())
+        .filter(|message| {
+            message.is_observation()
+                && message.task_event.is_none()
+                && message.workflow_event.is_none()
+                && message.standing_reminder.is_none()
+        })
         .find_map(|message| {
             let text = message.user_text()?;
             if text.contains(crate::prompt::BUILD_MODE_MARKER) {
@@ -2202,17 +2368,20 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
+    use caudra_config::CompactionBuffer;
     use caudra_config::steering::SteeringConfig;
     use caudra_providers::provider::{BoxFuture, Provider};
     use caudra_providers::{
         ContentBlock, InvalidToolInput, Message, Model, ProviderEvent, RequestOptions, Role,
-        SteeringKind, StopReason, StreamResponse, TokenUsage, invalid_tool_input,
+        StandingReminderKind, SteeringKind, StopReason, StreamResponse, TaskEventOrigin,
+        TokenUsage, WorkflowEventOrigin, invalid_tool_input,
     };
     use caudra_workspace::PlanRef;
     use serde_json::Value;
     use test_case::test_case;
 
     use super::*;
+    use crate::background_reminder::{RuntimeHealth, RuntimeSnapshot, render};
     use crate::cancel::CancelTrigger;
     use crate::context::{ContextKey, ContextStore};
     use crate::mcp::tool_names;
@@ -2308,6 +2477,453 @@ mod tests {
     const PLAN_MODEL_SPEC: &str = "openai/gpt-5.4";
     const PROFILE_MODEL_SPEC: &str = "anthropic/claude-opus-4-6";
     const MODEL_UNAVAILABLE: &str = r#"{"error":{"code":"model_not_found","message":"model 'claude-haiku-4-5' not found","param":"model","type":"invalid_request_error"}}"#;
+    const PRIOR_BACKGROUND: &str = "Previous host background snapshot";
+    const PREFLIGHT_RESERVE: u32 = 256;
+    const PREFLIGHT_OLD_REPEATS: usize = 4096;
+    const PREFLIGHT_SUMMARY_REPEATS: usize = 512;
+    const PREFLIGHT_UNREDUCIBLE_REPEATS: usize = 16_384;
+
+    #[test_case(false; "task_label")]
+    #[test_case(true; "workflow_phase")]
+    fn formatted_background_data_cannot_announce_mode_or_environment(workflow: bool) {
+        let data = format!(
+            "{} {}",
+            crate::prompt::PLAN_MODE_MARKER,
+            crate::prompt::ENVIRONMENT_MARKER
+        );
+        let mut snapshot = RuntimeSnapshot::new(RuntimeHealth::Current, true);
+        snapshot.add(
+            TEST_TOOL,
+            TEST_TOOL,
+            "running",
+            if workflow { TEST_TOOL } else { &data },
+            workflow.then_some(data.as_str()),
+        );
+        let text = if workflow {
+            render(None, Some(&snapshot)).0
+        } else {
+            render(Some(&snapshot), None).0
+        };
+        let history = [
+            environment_announcement(ENVIRONMENT),
+            Message::standing_reminder(text, StandingReminderKind::BackgroundWork),
+        ];
+        assert!(matches!(
+            last_announced_mode(&history),
+            AnnouncedMode::Build
+        ));
+        assert!(mode_switch_notice(&history, &AgentMode::Plan(TEST_PLAN_PATH.into())).is_some());
+        assert_eq!(
+            last_announced(&history, crate::prompt::ENVIRONMENT_MARKER),
+            Some(ENVIRONMENT)
+        );
+        assert!(
+            standing_notice(
+                &history,
+                crate::prompt::ENVIRONMENT_MARKER,
+                Some(ENVIRONMENT)
+            )
+            .is_none()
+        );
+    }
+
+    #[test_case(false; "compacts_once_before_main_request")]
+    #[test_case(true; "unreducible_request_is_not_sent")]
+    fn decorated_request_preflight_is_bounded(unreducible: bool) {
+        smol::block_on(async {
+            let mut history = History::new(vec![
+                Message::user(GO.repeat(PREFLIGHT_OLD_REPEATS)),
+                text_response(StopReason::EndTurn).message,
+                Message::user(GO.into()),
+                Message::standing_reminder(
+                    PRIOR_BACKGROUND.into(),
+                    StandingReminderKind::BackgroundWork,
+                ),
+            ]);
+            let mut summary = text_response(StopReason::EndTurn);
+            if unreducible {
+                summary.message.content = vec![ContentBlock::Text {
+                    text: GO.repeat(PREFLIGHT_UNREDUCIBLE_REPEATS),
+                }];
+            }
+            let mut main = text_response(StopReason::EndTurn);
+            main.usage.input = u32::MAX;
+            let provider = MockProvider::new(vec![summary, main]);
+            let captured = Arc::clone(&provider.captured_messages);
+            let (mut agent, events) = make_agent(provider, &mut history);
+            agent.auto_compact = true;
+            agent.config.compaction_buffer = Some(CompactionBuffer::Tokens(PREFLIGHT_RESERVE));
+            let before = agent.request_context_size();
+            let window = before + PREFLIGHT_RESERVE + 1;
+            Arc::make_mut(&mut agent.model).context_window = window;
+            Arc::make_mut(&mut agent.model).max_output_tokens = Some(PREFLIGHT_RESERVE);
+            agent.measured = Some(MeasuredContext {
+                reported: before,
+                history_len: agent.history.len(),
+            });
+            assert!(!compaction::is_overflow(
+                &TokenUsage {
+                    input: before,
+                    ..Default::default()
+                },
+                &agent.model,
+                agent.config.compaction_buffer
+            ));
+            let outcome = agent.turn().await;
+            if unreducible {
+                assert!(
+                    matches!(outcome, Err(AgentError::Config { message }) if message.starts_with(REQUEST_CONTEXT_TOO_LARGE))
+                );
+                assert_eq!(agent.num_turns, 0);
+            } else {
+                assert!(matches!(
+                    outcome.unwrap(),
+                    TurnOutcome::Done(DoneReason::EndTurn)
+                ));
+                assert_eq!(agent.num_turns, 1);
+            }
+            let requests = captured.lock().unwrap();
+            assert_eq!(requests.len(), if unreducible { 1 } else { 2 });
+            assert_eq!(
+                events
+                    .try_iter()
+                    .filter(|envelope| matches!(envelope.event, AgentEvent::Compacting))
+                    .count(),
+                1
+            );
+            if !unreducible {
+                let sent = requests.last().unwrap();
+                assert!(
+                    estimate_context_usage(
+                        &agent.model,
+                        &agent.system,
+                        &agent.tools,
+                        &agent.tools,
+                        sent
+                    )
+                    .used()
+                        < window
+                );
+                assert!(sent.iter().any(|message| message.standing_reminder
+                    == Some(StandingReminderKind::BackgroundWork)));
+            }
+        });
+    }
+
+    #[test_case(false; "shared_window_reserves_requested_output")]
+    #[test_case(true; "input_only_window_preserves_full_input_budget")]
+    fn post_compaction_preflight_accounts_for_output_allowance(window_excludes_output: bool) {
+        smol::block_on(async {
+            let mut history = History::new(vec![
+                Message::user(GO.repeat(PREFLIGHT_OLD_REPEATS)),
+                text_response(StopReason::EndTurn).message,
+                Message::user(GO.into()),
+                Message::standing_reminder(
+                    PRIOR_BACKGROUND.into(),
+                    StandingReminderKind::BackgroundWork,
+                ),
+            ]);
+            let mut summary = text_response(StopReason::EndTurn);
+            summary.message.content = vec![ContentBlock::Text {
+                text: GO.repeat(PREFLIGHT_SUMMARY_REPEATS),
+            }];
+            let mut main = text_response(StopReason::EndTurn);
+            main.usage.input = u32::MAX;
+            let provider = MockProvider::new(vec![summary, main]);
+            let captured = Arc::clone(&provider.captured_messages);
+            let (mut agent, events) = make_agent(provider, &mut history);
+            agent.auto_compact = true;
+            agent.config.compaction_buffer = Some(CompactionBuffer::Tokens(PREFLIGHT_RESERVE));
+            let before = agent.request_context_size();
+            let window = before + PREFLIGHT_RESERVE + 1;
+            let model = Arc::make_mut(&mut agent.model);
+            model.context_window = window;
+            model.max_output_tokens = Some(window - PREFLIGHT_RESERVE);
+            model.window_excludes_output = window_excludes_output;
+            agent.measured = Some(MeasuredContext {
+                reported: before,
+                history_len: agent.history.len(),
+            });
+            let outcome = agent.turn().await;
+            if window_excludes_output {
+                assert!(matches!(
+                    outcome.unwrap(),
+                    TurnOutcome::Done(DoneReason::EndTurn)
+                ));
+            } else {
+                assert!(
+                    matches!(outcome, Err(AgentError::Config { message }) if message.starts_with(REQUEST_CONTEXT_TOO_LARGE))
+                );
+                assert!(agent.measured.is_none());
+            }
+            assert_eq!(agent.num_turns, u32::from(window_excludes_output));
+            let requests = captured.lock().unwrap();
+            assert_eq!(requests.len(), 1 + usize::from(window_excludes_output));
+            assert_eq!(
+                events
+                    .try_iter()
+                    .filter(|envelope| matches!(envelope.event, AgentEvent::Compacting))
+                    .count(),
+                1
+            );
+            let decorated = if window_excludes_output {
+                requests.last().unwrap().as_slice()
+            } else {
+                agent.history.as_slice()
+            };
+            let input = estimate_context_usage(
+                &agent.model,
+                &agent.system,
+                &agent.tools,
+                &agent.tools,
+                decorated,
+            )
+            .used();
+            assert!(input < window);
+            assert!(input >= window - agent.model.max_output_tokens.unwrap());
+        });
+    }
+
+    #[test_case(ToolAudience::MAIN, None, false; "no_background_above_threshold")]
+    #[test_case(ToolAudience::MAIN, None, true; "no_background_above_window")]
+    #[test_case(ToolAudience::GENERAL_SUB, None, false; "child_above_threshold")]
+    #[test_case(ToolAudience::GENERAL_SUB, None, true; "child_above_window")]
+    #[test_case(ToolAudience::MAIN, Some(TEST_TOOL), false; "rooted_child_above_threshold")]
+    #[test_case(ToolAudience::MAIN, Some(TEST_TOOL), true; "rooted_child_above_window")]
+    fn unrelated_requests_keep_existing_context_admission(
+        audience: ToolAudience,
+        root: Option<&str>,
+        above_window: bool,
+    ) {
+        smol::block_on(async {
+            let child = audience != ToolAudience::MAIN || root.is_some();
+            let mut history = History::new(vec![
+                Message::user(GO.repeat(PREFLIGHT_OLD_REPEATS)),
+                text_response(StopReason::EndTurn).message,
+                Message::user(GO.into()),
+                if child {
+                    Message::standing_reminder(
+                        PRIOR_BACKGROUND.into(),
+                        StandingReminderKind::BackgroundWork,
+                    )
+                } else {
+                    Message::observation(PRIOR_BACKGROUND.into())
+                },
+            ]);
+            let provider = MockProvider::new(vec![text_response(StopReason::EndTurn)]);
+            let captured = Arc::clone(&provider.captured_messages);
+            let (mut agent, events) = make_agent(provider, &mut history);
+            agent.audience = audience;
+            agent.root_tool_use_id = root.map(str::to_owned);
+            agent.auto_compact = true;
+            agent.config.compaction_buffer = Some(CompactionBuffer::Tokens(PREFLIGHT_RESERVE));
+            let before = agent.request_context_size();
+            Arc::make_mut(&mut agent.model).context_window =
+                before - 1 + if above_window { 0 } else { PREFLIGHT_RESERVE };
+            agent.measured = Some(MeasuredContext {
+                reported: before,
+                history_len: agent.history.len(),
+            });
+            let sent_len = agent.history.len();
+            assert!(compaction::is_overflow(
+                &TokenUsage {
+                    input: before,
+                    ..Default::default()
+                },
+                &agent.model,
+                agent.config.compaction_buffer
+            ));
+            assert!(matches!(
+                agent.turn().await.unwrap(),
+                TurnOutcome::Done(DoneReason::EndTurn)
+            ));
+            assert_eq!(agent.num_turns, 1);
+            assert_eq!(agent.history.len(), sent_len + 1);
+            assert_eq!(agent.measured.unwrap().history_len, sent_len);
+            let requests = captured.lock().unwrap();
+            assert_eq!(requests.len(), 1);
+            assert_eq!(requests[0].len(), sent_len);
+            assert_eq!(
+                requests[0]
+                    .iter()
+                    .filter(|message| message.standing_reminder
+                        == Some(StandingReminderKind::BackgroundWork))
+                    .count(),
+                usize::from(child)
+            );
+            assert!(!events.try_iter().any(|envelope| matches!(
+                envelope.event,
+                AgentEvent::Compacting | AgentEvent::CompactionDone | AgentEvent::Injected { .. }
+            )));
+        });
+    }
+
+    #[test]
+    fn post_compaction_reminder_remains_preflight_relevant_without_new_decoration() {
+        smol::block_on(async {
+            let mut history = History::new(vec![Message::standing_reminder(
+                PRIOR_BACKGROUND.into(),
+                StandingReminderKind::BackgroundWork,
+            )]);
+            let provider = MockProvider::new(vec![text_response(StopReason::EndTurn)]);
+            let captured = Arc::clone(&provider.captured_messages);
+            let (mut agent, events) = make_agent(provider, &mut history);
+            agent.do_compact().await.unwrap();
+            let history_len = agent.history.len();
+            assert_eq!(
+                agent
+                    .history
+                    .as_slice()
+                    .iter()
+                    .filter(|message| message.standing_reminder
+                        == Some(StandingReminderKind::BackgroundWork))
+                    .count(),
+                1
+            );
+            assert!(agent.measured.is_none());
+            let input = agent.request_context_size();
+            Arc::make_mut(&mut agent.model).context_window = input;
+            agent.auto_compact = false;
+            let injected = events
+                .try_iter()
+                .filter(|envelope| matches!(envelope.event, AgentEvent::Injected { .. }))
+                .count();
+            assert!(injected > 0);
+            assert!(
+                matches!(agent.turn().await, Err(AgentError::Config { message }) if message.starts_with(REQUEST_CONTEXT_TOO_LARGE))
+            );
+            assert_eq!(agent.history.len(), history_len);
+            assert_eq!(agent.num_turns, 0);
+            assert_eq!(captured.lock().unwrap().len(), 1);
+            assert!(events.is_empty());
+        });
+    }
+
+    #[test_case(ToolAudience::MAIN, None, true; "main")]
+    #[test_case(ToolAudience::GENERAL_SUB, None, false; "subagent")]
+    #[test_case(ToolAudience::MAIN, Some(TEST_TOOL), false; "rooted_child")]
+    fn background_request_hook_is_main_only(
+        audience: ToolAudience,
+        root: Option<&str>,
+        refresh: bool,
+    ) {
+        smol::block_on(async {
+            let captured = Arc::new(Mutex::new(Vec::new()));
+            let mut history = History::new(vec![Message::standing_reminder(
+                PRIOR_BACKGROUND.into(),
+                StandingReminderKind::BackgroundWork,
+            )]);
+            let (mut agent, _events) = make_agent(
+                RequestCapturingProvider {
+                    captured: Arc::clone(&captured),
+                },
+                &mut history,
+            );
+            agent.audience = audience;
+            agent.root_tool_use_id = root.map(str::to_owned);
+            agent.config.generate_titles = false;
+            assert_eq!(
+                agent.run(default_input()).await.unwrap(),
+                DoneReason::EndTurn
+            );
+            assert_eq!(agent.num_turns, 1);
+            let messages = captured.lock().unwrap();
+            let reminders = messages
+                .iter()
+                .filter(|message| {
+                    message.standing_reminder == Some(StandingReminderKind::BackgroundWork)
+                })
+                .count();
+            assert_eq!(reminders, 1 + usize::from(refresh));
+            assert_eq!(agent.measured.unwrap().history_len, messages.len());
+        });
+    }
+
+    #[test_case(false; "automatic")]
+    #[test_case(true; "queued")]
+    fn background_compaction_refresh_does_not_reuse_old_context_measurement(queued: bool) {
+        smol::block_on(async {
+            let mut history = History::new(vec![Message::standing_reminder(
+                PRIOR_BACKGROUND.into(),
+                StandingReminderKind::BackgroundWork,
+            )]);
+            let (mut agent, _events) = make_agent(
+                MockProvider::new(vec![
+                    text_response(StopReason::EndTurn),
+                    text_response(StopReason::EndTurn),
+                ]),
+                &mut history,
+            );
+            agent.config.generate_titles = false;
+            agent.auto_compact = true;
+            agent.measured = Some(MeasuredContext {
+                reported: u32::MAX,
+                history_len: 1,
+            });
+            if queued {
+                agent.interrupt_source =
+                    Some(MockInterruptSource::new(vec![ExtractedCommand::Compact(0)]));
+                assert!(agent.handle_queued_command().await.unwrap());
+            } else {
+                assert!(agent.try_auto_compact().await.unwrap());
+            }
+            assert!(agent.measured.is_none());
+            assert!(!agent.try_auto_compact().await.unwrap());
+            let snapshots = agent
+                .history
+                .as_slice()
+                .iter()
+                .filter(|message| {
+                    message.standing_reminder == Some(StandingReminderKind::BackgroundWork)
+                })
+                .count();
+            assert_eq!(snapshots, 1);
+            assert!(matches!(
+                agent.turn().await.unwrap(),
+                TurnOutcome::Done(DoneReason::EndTurn)
+            ));
+            assert_eq!(
+                agent
+                    .history
+                    .as_slice()
+                    .iter()
+                    .filter(|message| message.standing_reminder
+                        == Some(StandingReminderKind::BackgroundWork))
+                    .count(),
+                snapshots
+            );
+        });
+    }
+
+    #[test_case(false; "provider_failure")]
+    #[test_case(true; "cancelled")]
+    fn failed_background_compaction_has_no_success_snapshot(cancelled: bool) {
+        smol::block_on(async {
+            let mut history = History::new(vec![Message::standing_reminder(
+                PRIOR_BACKGROUND.into(),
+                StandingReminderKind::BackgroundWork,
+            )]);
+            let (mut agent, events) = make_agent(
+                MockProvider::with_results(vec![Err(AgentError::api(
+                    AUTH_ERROR_STATUS,
+                    AUTH_ERROR_MESSAGE,
+                ))]),
+                &mut history,
+            );
+            if cancelled {
+                let (trigger, token) = CancelToken::new();
+                trigger.cancel();
+                agent.cancel = token;
+            }
+            assert!(agent.do_compact().await.is_err());
+            assert_eq!(agent.history.len(), 1);
+            assert!(
+                !events
+                    .try_iter()
+                    .any(|envelope| matches!(envelope.event, AgentEvent::Injected { .. }))
+            );
+        });
+    }
 
     struct MockInterruptSource {
         commands: Mutex<VecDeque<ExtractedCommand>>,
@@ -2331,6 +2947,7 @@ mod tests {
         responses: Mutex<Vec<Result<StreamResponse, AgentError>>>,
         captured_tools: Arc<Mutex<Vec<Value>>>,
         captured_models: Arc<Mutex<Vec<String>>>,
+        captured_messages: Arc<Mutex<Vec<Vec<Message>>>>,
     }
 
     impl MockProvider {
@@ -2343,6 +2960,7 @@ mod tests {
                 responses: Mutex::new(responses),
                 captured_tools: Arc::default(),
                 captured_models: Arc::default(),
+                captured_messages: Arc::default(),
             }
         }
     }
@@ -2351,7 +2969,7 @@ mod tests {
         fn stream_message<'a>(
             &'a self,
             model: &'a Model,
-            _: &'a [Message],
+            messages: &'a [Message],
             _: &'a str,
             tools: &'a Value,
             _: &'a flume::Sender<ProviderEvent>,
@@ -2361,6 +2979,10 @@ mod tests {
             Box::pin(async {
                 self.captured_tools.lock().unwrap().push(tools.clone());
                 self.captured_models.lock().unwrap().push(model.spec());
+                self.captured_messages
+                    .lock()
+                    .unwrap()
+                    .push(messages.to_vec());
                 let mut responses = self.responses.lock().unwrap();
                 assert!(!responses.is_empty(), "MockProvider: no more responses");
                 responses.remove(0)
@@ -2814,6 +3436,7 @@ mod tests {
                 tool_filter: crate::tools::ToolFilter::All,
                 model_policy: Arc::new(ModelPolicy::default()),
                 workflow: None,
+                background: None,
             },
             AgentRunParams {
                 history,
@@ -3770,6 +4393,53 @@ mod tests {
         });
     }
 
+    #[test_case(false; "task_like_text_has_no_origin")]
+    #[test_case(true; "typed_task_origin_is_preserved")]
+    fn injected_preamble_origin_is_copied_from_message(attributed: bool) {
+        const TASK: &str = "friendly-task-name";
+        const INVOCATION: &str = "opaque-invocation";
+        const EVENT: &str = "opaque-event";
+        const TEXT: &str = "Task friendly-task-name: success.\n\nVerified the result.";
+        smol::block_on(async {
+            let origin = attributed.then(|| TaskEventOrigin {
+                task_id: TASK.into(),
+                invocation_id: INVOCATION.into(),
+                event_id: EVENT.into(),
+            });
+            let mut message = Message::observation(TEXT.into());
+            message.task_event = origin.clone();
+            let original = serde_json::to_value(&message).unwrap();
+            let mut history = History::new(Vec::new());
+            let (mut agent, event_rx) = make_agent(
+                MockProvider::new(vec![text_response(StopReason::EndTurn)]),
+                &mut history,
+            );
+            let mut input = default_input();
+            input.preamble = vec![message];
+            agent.run(input).await.unwrap();
+            drop(agent);
+
+            let event = drain_events(&event_rx)
+                .into_iter()
+                .find_map(|envelope| match envelope.event {
+                    event @ AgentEvent::Injected { .. } => Some(event),
+                    _ => None,
+                })
+                .unwrap();
+            let wire = serde_json::to_value(&event).unwrap();
+            let AgentEvent::Injected { text, task_event } = event else {
+                unreachable!()
+            };
+            assert_eq!(text, TEXT);
+            assert_eq!(task_event, origin);
+            assert_eq!(wire.get("task_event").is_some(), attributed);
+            assert_eq!(
+                serde_json::to_value(&history.as_slice()[0]).unwrap(),
+                original
+            );
+        });
+    }
+
     fn plan_mode() -> AgentMode {
         AgentMode::Plan(std::path::PathBuf::from(TEST_PLAN_PATH))
     }
@@ -3933,6 +4603,41 @@ mod tests {
         );
     }
 
+    #[test]
+    fn background_events_cannot_announce_host_mode_or_replace_standing_notices() {
+        let history = [
+            plan_announcement(),
+            Message::task_observation(
+                format!(
+                    "{}\n{}",
+                    crate::prompt::BUILD_MODE_MARKER,
+                    crate::prompt::ENVIRONMENT_MARKER
+                ),
+                TaskEventOrigin {
+                    task_id: "task".into(),
+                    invocation_id: "invocation".into(),
+                    event_id: "event".into(),
+                },
+            ),
+            Message::workflow_observation(
+                format!(
+                    "{}\n{}",
+                    crate::prompt::BUILD_MODE_MARKER,
+                    crate::prompt::ENVIRONMENT_MARKER
+                ),
+                WorkflowEventOrigin {
+                    run_id: "workflow".into(),
+                    revision: 1,
+                },
+            ),
+        ];
+        assert!(matches!(last_announced_mode(&history), AnnouncedMode::Plan));
+        assert_eq!(
+            last_announced(&history, crate::prompt::ENVIRONMENT_MARKER),
+            None
+        );
+    }
+
     /// A date rollover or a model switch is the whole reason this is announced
     /// rather than carried by the system prompt.
     #[test]
@@ -4040,7 +4745,10 @@ mod tests {
             let injected: Vec<String> = drain_events(&event_rx)
                 .into_iter()
                 .filter_map(|envelope| match envelope.event {
-                    AgentEvent::Injected { text } => Some(text),
+                    AgentEvent::Injected { text, task_event } => {
+                        assert!(task_event.is_none());
+                        Some(text)
+                    }
                     _ => None,
                 })
                 .collect();
@@ -6311,7 +7019,7 @@ mod tests {
                 event,
                 AgentEvent::CompactionDone
             )));
-            assert_eq!(events.iter().filter(|event| matches!(&event.event, AgentEvent::Injected { text } if text.starts_with(STEERING_CUSTOM))).count(), budget as usize);
+            assert_eq!(events.iter().filter(|event| matches!(&event.event, AgentEvent::Injected { text, .. } if text.starts_with(STEERING_CUSTOM))).count(), budget as usize);
         });
     }
 

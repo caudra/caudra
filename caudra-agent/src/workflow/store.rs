@@ -10,6 +10,8 @@ use std::thread::{self, JoinHandle};
 use caudra_storage::StateDir;
 use caudra_storage::id::CaudraId;
 use caudra_storage::sessions::SessionDatabase;
+#[cfg(test)]
+use caudra_storage::workflow::WorkflowRunStatus;
 use caudra_storage::workflow::{
     WorkflowCallFinish, WorkflowCallRow, WorkflowCallStart, WorkflowEventKind, WorkflowEventRow,
     WorkflowHistoryRow, WorkflowRunPatch, WorkflowRunRow, WorkflowUpdate,
@@ -39,6 +41,8 @@ struct Worker {
 pub struct WorkflowStore {
     commands: flume::Sender<Command>,
     thread: Arc<Mutex<Option<JoinHandle<()>>>>,
+    #[cfg(test)]
+    terminal_failure: Arc<Mutex<Option<flume::Sender<()>>>>,
 }
 
 impl WorkflowStore {
@@ -64,6 +68,8 @@ impl WorkflowStore {
         Ok(Self {
             commands,
             thread: Arc::new(Mutex::new(Some(thread))),
+            #[cfg(test)]
+            terminal_failure: Arc::default(),
         })
     }
 
@@ -79,6 +85,15 @@ impl WorkflowStore {
         expected_epoch: u64,
         patch: WorkflowRunPatch,
     ) -> Result<WorkflowUpdate, WorkflowError> {
+        #[cfg(test)]
+        if patch
+            .status
+            .is_some_and(|status| status != WorkflowRunStatus::Active)
+            && let Some(failed) = self.terminal_failure.lock().unwrap().take()
+        {
+            let _ = failed.send(());
+            return Err(WorkflowError::Unavailable);
+        }
         self.call(move |worker| {
             worker
                 .database
@@ -96,6 +111,11 @@ impl WorkflowStore {
                 .map_err(storage)
         })
         .await
+    }
+
+    #[cfg(test)]
+    pub(super) fn fail_next_terminal_update(&self, failed: flume::Sender<()>) {
+        *self.terminal_failure.lock().unwrap() = Some(failed);
     }
 
     /// Recent runs of every other session, newest first.
@@ -218,9 +238,31 @@ impl WorkflowStore {
 
     pub async fn ack_outbox(&self, run_id: String, revision: u64) -> Result<bool, WorkflowError> {
         self.call(move |worker| {
+            if worker
+                .database
+                .load_workflow_run(&run_id)
+                .map_err(storage)?
+                .is_none_or(|run| run.session_id != worker.session_id)
+            {
+                return Ok(false);
+            }
             worker
                 .database
                 .ack_workflow_outbox(&run_id, revision)
+                .map_err(storage)
+        })
+        .await
+    }
+
+    pub async fn received_completion(
+        &self,
+        run_id: String,
+        revision: u64,
+    ) -> Result<bool, WorkflowError> {
+        self.call(move |worker| {
+            worker
+                .database
+                .workflow_receipt_exists(worker.session_id, &run_id, revision)
                 .map_err(storage)
         })
         .await
@@ -288,6 +330,7 @@ fn storage(error: impl std::fmt::Display) -> WorkflowError {
 
 #[cfg(test)]
 mod tests {
+    use caudra_providers::{Message, WorkflowEventOrigin, expand_message};
     use std::fs;
 
     use caudra_storage::workflow::{
@@ -443,6 +486,20 @@ mod tests {
                 !store.ack_outbox(RUN_ID.into(), 0).await.unwrap(),
                 "{OUTBOX_ACK_IS_EXACT}"
             );
+            assert!(!store.ack_outbox(RUN_ID.into(), 1).await.unwrap());
+            let mut session: StoredSession = observer.load(session_id).unwrap();
+            let observation = Message::workflow_observation(
+                RESULT.into(),
+                WorkflowEventOrigin {
+                    run_id: RUN_ID.into(),
+                    revision: 1,
+                },
+            );
+            for item in expand_message(&observation, None) {
+                session.push_message(item);
+            }
+            session.save(&state_dir).unwrap();
+            assert!(store.received_completion(RUN_ID.into(), 1).await.unwrap());
             assert!(store.ack_outbox(RUN_ID.into(), 1).await.unwrap());
             assert!(store.pending_outbox().await.unwrap().is_empty());
 

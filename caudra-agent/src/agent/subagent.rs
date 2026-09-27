@@ -20,7 +20,7 @@ use caudra_providers::provider;
 use caudra_providers::{
     CacheKey, HistoryItem, Message, ThinkingConfig, TokenUsage, add_cost, expand_message,
 };
-use caudra_storage::id::CaudraId;
+use caudra_storage::{id::CaudraId, sessions::SessionDatabase, tool_outputs::ToolOutputStore};
 
 use super::steering::{SharedSteering, Steering};
 use super::{ModelRoute, resolve_model_for_purpose};
@@ -36,8 +36,8 @@ use crate::{
     ActivityChild, Agent, AgentEvent, AgentInput, AgentMode, AgentParams, AgentRunParams,
     BatchToolStatus, CallStage, DoneReason, Envelope, EventSender, History, InterruptSource,
     McpSession, SteeringQueue, SteeringQueueReceiver, SubagentActivity, SubagentHistoryError,
-    SubagentHistoryLease, SubagentInfo, SubagentProgress, SubagentTaskMode, SubagentTaskSpec,
-    SubagentTaskSpecCandidate, ToolOutput, reasoning_summary, steering_queue,
+    SubagentHistoryLease, SubagentHistoryStore, SubagentInfo, SubagentProgress, SubagentTaskMode,
+    SubagentTaskSpec, SubagentTaskSpecCandidate, ToolOutput, reasoning_summary, steering_queue,
 };
 
 pub const STRUCTURED_OUTPUT_TOOL: &str = "structured_output";
@@ -344,6 +344,7 @@ impl ProgressRelay {
             subagent: subagent_info.get().cloned(),
             run_id: parent_tx.run_id(),
             workflow: envelope.workflow.clone(),
+            task: envelope.task.clone(),
         });
     }
 }
@@ -385,9 +386,24 @@ pub struct Subagent {
     closed: bool,
     steering: SharedSteering,
     report_ready: Option<Arc<AtomicBool>>,
+    terminal_report: Option<Arc<AtomicBool>>,
 }
 
 impl Subagent {
+    pub(crate) fn discard_unstarted(&mut self) {
+        self.closed = true;
+        self.parent_cancels.retire(&self.task_id, self.cancel_slot);
+        self.history_lease.take();
+    }
+
+    pub(crate) fn checkpoint(&self) -> Result<(JsonValue, JsonValue), String> {
+        let history =
+            serde_json::to_value(self.history.as_slice()).map_err(|error| error.to_string())?;
+        let spec = serde_json::to_value(self.history_lease.as_ref().and_then(|lease| lease.spec()))
+            .map_err(|error| error.to_string())?;
+        Ok((history, spec))
+    }
+
     pub fn close(&mut self) {
         if self.closed {
             return;
@@ -484,6 +500,10 @@ impl Subagent {
     pub(crate) fn with_report_ready(mut self, ready: Arc<AtomicBool>) -> Self {
         self.report_ready = Some(ready);
         self
+    }
+
+    pub(crate) fn set_terminal_report(&mut self, ready: Arc<AtomicBool>) {
+        self.terminal_report = Some(ready);
     }
 
     pub(crate) async fn correct_report(
@@ -586,6 +606,9 @@ impl Subagent {
         if let Some(ready) = &self.report_ready {
             agent = agent.with_report_ready(Arc::clone(ready));
         }
+        if let Some(ready) = &self.terminal_report {
+            agent = agent.with_terminal_report(Arc::clone(ready));
+        }
 
         let result = agent
             .run(AgentInput {
@@ -671,13 +694,14 @@ struct Resolved {
 }
 
 /// How a task session is named, and whether it starts from history.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub enum TaskIdentity {
-    /// A new task named after the calling tool use, as the `task` tool does.
     Derive,
     /// A new task under an id the caller chose, such as a workflow engine
     /// that must find the same task again after a restart.
     Fresh(String),
+    Exact(String),
+    Reserved(SubagentHistoryLease),
     /// Continues an earlier task's history.
     Continue(String),
 }
@@ -690,12 +714,14 @@ impl TaskIdentity {
 
     pub fn is_continuation(&self) -> bool {
         matches!(self, Self::Continue(_))
+            || matches!(self, Self::Reserved(lease) if lease.history().is_some())
     }
 
-    fn requested(&self) -> Option<&str> {
+    pub(crate) fn requested(&self) -> Option<&str> {
         match self {
             Self::Derive => None,
-            Self::Fresh(id) | Self::Continue(id) => Some(id),
+            Self::Fresh(id) | Self::Exact(id) | Self::Continue(id) => Some(id),
+            Self::Reserved(lease) => Some(lease.task_id()),
         }
     }
 }
@@ -754,13 +780,38 @@ pub async fn open_task(ctx: &ToolContext, opts: TaskOptions) -> Result<Subagent,
                 )
                 .map_err(|error| error.to_string())?,
         ),
-        TaskIdentity::Derive | TaskIdentity::Fresh(_) => {
+        TaskIdentity::Exact(_) | TaskIdentity::Fresh(_) => {
             let spec = SubagentTaskSpec {
                 profile_name: opts.profile.unwrap_or(default_spec.profile_name),
                 mode: opts.mode.unwrap_or(default_spec.mode),
                 ..SubagentTaskSpec::default()
             };
-            reserve_fresh(ctx, ids.task_id.clone(), Some(spec))?
+            let lease = ctx
+                .subagent_history
+                .reserve_with_spec(ids.task_id.clone(), spec)
+                .map_err(|error| error.to_string())?;
+            (ids.task_id.clone(), lease)
+        }
+        TaskIdentity::Reserved(lease) => {
+            let spec = lease.spec().cloned().unwrap_or_else(|| SubagentTaskSpec {
+                profile_name: opts.profile.unwrap_or(default_spec.profile_name),
+                mode: opts.mode.unwrap_or(default_spec.mode),
+                ..SubagentTaskSpec::default()
+            });
+            (lease.task_id().to_owned(), lease.with_spec(spec))
+        }
+        TaskIdentity::Derive => {
+            let spec = SubagentTaskSpec {
+                profile_name: opts.profile.unwrap_or(default_spec.profile_name),
+                mode: opts.mode.unwrap_or(default_spec.mode),
+                ..SubagentTaskSpec::default()
+            };
+            let lease = reserve_task_identity(
+                &ctx.subagent_history,
+                ctx.tool_output_store.as_deref(),
+                ctx.session_id.as_ref().map(|id| id.id()),
+            )?;
+            (lease.task_id().to_owned(), lease.with_spec(spec))
         }
     };
     let spec = history_lease
@@ -833,14 +884,23 @@ pub async fn open_task(ctx: &ToolContext, opts: TaskOptions) -> Result<Subagent,
             smol::unblock(move || crate::agent::load_instruction_text(&cwd)).await
         }
     };
-    let base_filter = ToolFilter::from_config(&ctx.config, &model, &[]).for_mode(&mode);
-    let assembled = crate::prompt::assemble_task_with_filter(
+    let base_filter = ToolFilter::from_config(&ctx.config, &model, &[])
+        .intersect(&ctx.tool_filter)
+        .for_mode(&mode);
+    let mut assembled = crate::prompt::assemble_task_with_filter(
         prompt_id,
         &ctx.prompt_slots,
         &base_filter,
         &instructions,
         profile.as_deref(),
     );
+    if opts
+        .local_tools
+        .contains_key(crate::tools::native::report_to_parent::NAME)
+    {
+        assembled.push_str("\n\n");
+        assembled.push_str(crate::tools::native::report_to_parent::CONTRACT);
+    }
     let mut definitions = ctx.registry.definitions_split(
         &vars,
         &DescriptionContext {
@@ -982,6 +1042,27 @@ pub fn generated_session_id() -> String {
     format!("session-{}", CaudraId::generate())
 }
 
+pub(crate) fn reserve_task_identity(
+    history: &SubagentHistoryStore,
+    outputs: Option<&ToolOutputStore>,
+    session: Option<CaudraId>,
+) -> Result<SubagentHistoryLease, String> {
+    let database = outputs
+        .zip(session)
+        .map(|(outputs, session)| {
+            SessionDatabase::open(outputs.state_dir())
+                .map(|database| (database, session))
+                .map_err(|error| error.to_string())
+        })
+        .transpose()?;
+    history.reserve_generated(|id| match &database {
+        Some((database, session)) => database
+            .task_identity_exists(*session, id)
+            .map_err(|error| error.to_string()),
+        None => Ok(false),
+    })
+}
+
 /// A tool call that ran twice under one id collides with its own history, so
 /// a taken id is answered with a fresh one rather than an error.
 fn reserve_fresh(
@@ -999,9 +1080,13 @@ fn reserve_fresh(
             SubagentHistoryError::AlreadyActive { .. }
             | SubagentHistoryError::AlreadyCompleted { .. },
         ) => {
-            let fresh = generated_session_id();
-            let lease = reserve(fresh.clone()).map_err(|error| error.to_string())?;
-            Ok((fresh, lease))
+            let lease = reserve_task_identity(
+                &ctx.subagent_history,
+                ctx.tool_output_store.as_deref(),
+                ctx.session_id.as_ref().map(|id| id.id()),
+            )?
+            .with_spec(spec.unwrap_or_else(SubagentTaskSpec::generic));
+            Ok((lease.task_id().to_owned(), lease))
         }
         Err(error) => Err(error.to_string()),
     }
@@ -1072,6 +1157,7 @@ fn build(
     )
     .including(resolved.deferred.iter().map(|tool| tool.name.to_string()))
     .intersect(&ToolFilter::from_config(&ctx.config, &resolved.model, &[]))
+    .intersect(&ctx.tool_filter)
     .including(local_tools.keys().cloned())
     .for_mode(&resolved.mode);
 
@@ -1118,6 +1204,7 @@ fn build(
             ctx.config.steering.resolve(&resolved.model.spec()),
         ))),
         report_ready: None,
+        terminal_report: None,
         params: AgentParams {
             provider: resolved.provider,
             model: resolved.model,
@@ -1153,6 +1240,7 @@ fn build(
             tool_filter,
             model_policy: Arc::clone(&ctx.model_policy),
             workflow: None,
+            background: None,
         },
         system: resolved.system,
         tools: resolved.tools,
@@ -1615,6 +1703,7 @@ mod tests {
             subagent: None,
             run_id: RUN_ID,
             workflow: None,
+            task: None,
         }
     }
 

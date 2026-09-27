@@ -33,7 +33,9 @@ A prompt that is already waiting can take over the same way. Choose Replace curr
 
 Deleting a pending replacement turns the operation into a plain cancellation. Caudra waits for the old run to stop before accepting another replacement, while normal Up next prompts can still be queued.
 
-`Esc Esc` is different. It cancels the active run and clears its queue. To pick the cancelled turn back up later, use `/continue`, which resumes without adding a message of your own. See [Commands](/docs/commands/#resuming-after-an-interruption).
+`Esc Esc` stops the main run and all session tasks and workflows, clears the queue, and suppresses automatic continuation from late reports or completion notices. To pick the cancelled turn back up later, use `/continue`, which resumes without adding a message of your own. See [Commands](/docs/commands/#resuming-after-an-interruption).
+
+Replacing a main run also stops its session tasks and workflows before the replacement starts. A new user turn re-enables automatic continuation. For task-specific cancellation and promotion, see [Background tasks](/docs/sessions/#background-tasks).
 
 ## Recovery
 

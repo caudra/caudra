@@ -31,6 +31,7 @@ Commands marked Main only act on the main session's turn or history. They stay l
 | `/stash-list` | Browse stashed prompts |  |
 | `/memory` | View, edit, and delete memory files |  |
 | `/tasks` | Browse tasks and steer running subagents |  |
+| `/task` | Task controls: list, status <id>, background <id> (without restart), cancel <id> |  |
 | `/workflows` | Browse, trust, and launch workflows | Main only |
 | `/workflow` | Start a workflow, or list, pause, resume, and stop runs | Main only |
 | `/deep-research` | Research a question with the deep-research workflow | Main only |
@@ -98,6 +99,12 @@ Stashing is for drafts you do not want to send yet. To line up prompts Caudra sh
 
 Each `task` subagent has a separate transcript. Open the task picker with `/tasks` or `Ctrl+X a`, click the task count above the input, or click a task call in the main chat. Click `[< Main]` in a task's status bar to return. The picker also lists Main and supports previewing every transcript.
 
+`/tasks list` opens or refreshes the picker. `/tasks status <task_id>` opens it with that task selected and its details visible. Press Enter or click the row to open its chat. Escape restores the original focus. Inspection stays local and does not send a model prompt or add transcript messages.
+
+`/tasks background <task_id>` lets a foreground task continue asynchronously without restarting it. `/tasks cancel <task_id>` cancels that invocation. The picker offers `Ctrl+B` to promote and `Ctrl+K` to cancel an eligible selected task. Ordinary letters filter the list. Main and finished tasks have no execution controls. Singular `/task` forms remain compatibility aliases. See [background tasks](/docs/sessions/#background-tasks) for delivery and shutdown behavior.
+
+Background rows show a right-aligned `bg` indicator beside the state or spinner, including after completion. Task labels stay unchanged. Newly created task IDs are short `adjective-adjective-noun` phrases. Older IDs remain valid for inspection, control, and continuation.
+
 An input box appears while the focused task is running. Press Enter to queue guidance for its next turn boundary. Pending guidance stays visible above the input until the subagent consumes it. Task transcripts survive session reloads, and later `task` calls can continue one by passing its `task_id`.
 
 That input box is a full composer. Typing `/` opens the palette, `Ctrl+S` inserts a file path, `Ctrl+X e` edits the draft in the [workbench](/docs/workbench/#plans-memory-notes-and-prompt-drafts), and `Ctrl+V` attaches an image to the guidance. A custom `/project:` or `/user:` command expands its template and steers the focused task rather than the main session.
@@ -106,7 +113,7 @@ Commands that reach the main session's turn or history have no task equivalent, 
 
 ## Workflows
 
-A workflow is a script that launches subagents in phases, keeps a journal, and can be paused and resumed. Each session runs one workflow runtime, and a run keeps going through model switches and cancelled turns: `Esc Esc` stops the main turn and leaves every run alone. A run belongs to the session that started it and stays with that session when you switch to another.
+A workflow is a script that launches subagents in phases, keeps a journal, and can be paused and resumed. Each session runs one workflow runtime. Runs continue after a normal main-turn completion. `Esc Esc` stops the main turn, background tasks, and workflows, and suppresses automatic completion turns. A run belongs to the session that started it and stays with that session when you switch to another.
 
 `/workflows` opens the catalog: every script from the built-ins, the project's `.caudra/workflows/`, and your user config, with the ones that failed to parse listed under it. A project or user script runs only after its content digest has been trusted. `Enter` on an untrusted entry shows the digest and asks you to confirm it, and a script that changes on disk needs trusting again. `Enter` on a trusted entry fills the composer with `/workflow <name> ` so you can add the arguments.
 
@@ -116,7 +123,7 @@ A workflow is a script that launches subagents in phases, keeps a journal, and c
 
 The status bar shows `[wf:N]` while N runs are working, and `[wf:N+M]` once M runs are paused or out of budget and waiting on you.
 
-A run that finishes, fails, pauses, or runs out of budget leaves a notice. Caudra waits until the session is idle, then starts one turn of its own whose first message carries every pending notice, drawn in the transcript as an injected message, so the model reads the report and can act on it. The notice names the run and its status, then the `report` string of its result or the whole result when there is none, the scratch file path when the script wrote one, and the pause message or error. Reports are cut at 8 KiB. Each notice is delivered once per run revision and acknowledged in the runtime, which is the same rule the [headless surface](/docs/headless/#completion-context) follows.
+A run that finishes, fails, pauses, or runs out of budget leaves a notice. When the main chat is ready, Caudra starts a turn carrying pending notices so the model can act on them. Other background work can continue. The notice names the run and its status, then the `report` string of its result or the whole result when there is none, the scratch file path when the script wrote one, and the pause message or error. Reports are cut at 8 KiB. A run revision is acknowledged after its observation is durably saved in the main history. The [headless surface](/docs/headless/#completion-context) uses the same receipt rule.
 
 Closing Caudra interrupts every active run, and an interrupted run is over. Pause a run you mean to pick up later: resuming a paused run replays its journal and continues from the last committed phase, and work an agent had started but not committed runs again. The model reaches the same runtime through the [`workflow` tool](/docs/tools/#workflow).
 

@@ -47,6 +47,8 @@ Authentication, providers, and permissions come from your normal Caudra config. 
 
 Project MCP startup trust must already be approved through `/mcp` in the TUI. ACP returns an actionable session error instead of silently omitting a parked server.
 
+ACP supports foreground subagents, but not [background tasks](/docs/sessions/#background-tasks) or workflows. Use the TUI or [stream-JSON SDK](/docs/headless/#background-tasks) for session-owned work that continues after a parent answer.
+
 ```bash
 caudra acp
 caudra acp -m anthropic/claude-sonnet-4-6

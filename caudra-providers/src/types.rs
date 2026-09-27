@@ -300,10 +300,29 @@ pub struct SteeringOrigin {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskEventOrigin {
+    pub task_id: String,
+    pub invocation_id: String,
+    pub event_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct WorkflowEventOrigin {
+    pub run_id: String,
+    pub revision: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SteeringKind {
     Recovery,
     Advisory,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StandingReminderKind {
+    BackgroundWork,
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -318,6 +337,12 @@ pub struct Message {
     pub kind: MessageKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub steering: Option<SteeringOrigin>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_event: Option<TaskEventOrigin>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow_event: Option<WorkflowEventOrigin>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub standing_reminder: Option<StandingReminderKind>,
     /// Host-only producer identity used to gate provider-private replay.
     #[serde(skip)]
     pub reasoning_source: Option<ReasoningSource>,
@@ -373,6 +398,28 @@ impl Message {
 
     pub fn is_observation(&self) -> bool {
         self.kind == MessageKind::Observation
+    }
+
+    pub fn standing_reminder(text: String, kind: StandingReminderKind) -> Self {
+        Self {
+            standing_reminder: Some(kind),
+            ..Self::observation(text)
+        }
+    }
+
+    pub fn task_observation(text: String, origin: TaskEventOrigin) -> Self {
+        Self {
+            retained_subagent_ids: vec![origin.task_id.clone()],
+            task_event: Some(origin),
+            ..Self::observation(text)
+        }
+    }
+
+    pub fn workflow_observation(text: String, origin: WorkflowEventOrigin) -> Self {
+        Self {
+            workflow_event: Some(origin),
+            ..Self::observation(text)
+        }
     }
 
     pub fn steering(text: String, rule: &str, kind: SteeringKind) -> Self {
@@ -1263,10 +1310,12 @@ mod tests {
         assert!(decoded.first_user_text().is_none());
     }
 
-    #[test_case(json!({"role": "user", "content": [{"type": "text", "text": STEERING_TEXT}]}))]
-    fn legacy_message_has_no_steering(encoded: Value) {
+    #[test_case(json!({"role": "user", "content": [{"type": "text", "text": STEERING_TEXT}]}) ; "turn")]
+    #[test_case(json!({"role": "user", "kind": "observation", "content": [{"type": "text", "text": STEERING_TEXT}]}) ; "observation")]
+    fn legacy_message_has_no_provenance(encoded: Value) {
         let message: Message = serde_json::from_value(encoded.clone()).unwrap();
         assert!(message.steering.is_none());
+        assert!(message.task_event.is_none());
         assert_eq!(serde_json::to_value(message).unwrap(), encoded);
     }
 

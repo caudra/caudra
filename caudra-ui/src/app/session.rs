@@ -31,6 +31,7 @@ use caudra_storage::sessions::{
     SessionDatabase, SessionLease, SessionLocation, SessionMeta, StoredActiveGoal,
     StoredGoalResult, StoredImage, StoredPasteRange, StoredPlanTarget, StoredPromptAdmission,
     StoredQueuedDraft, StoredQueuedPrompt, StoredSubagent, StoredSubagentOutcome,
+    StoredSubagentTaskSpec,
 };
 use caudra_storage::tool_outputs::{ToolOutputId, ToolOutputRef, ToolOutputStore};
 use caudra_workspace::{PreparedSnapshotOperation, SnapshotOperationPreview};
@@ -522,6 +523,10 @@ impl App {
     }
 
     pub(super) fn reset_ui_chrome(&mut self) {
+        self.release_background_claims();
+        self.task_interactions = super::tasks::TaskInteractions::default();
+        self.background_saved_revision = None;
+        self.automatic_wakes_suppressed = true;
         self.cancel_queue_edit();
         self.review.discard();
         self.chats.clear();
@@ -652,25 +657,18 @@ impl App {
                     .cloned(),
             );
         }
-        let mut subagent_versions = caudra_agent::active_task_history_versions_with_batch_state(
-            &active_history,
-            |call_id| {
+        let mut subagent_versions =
+            caudra_agent::active_task_history_versions_with_outputs(&active_history, |call_id| {
                 self.state
                     .session
                     .tool_outputs()
                     .get(call_id)
-                    .and_then(|output| output.state())
-            },
-        );
+                    .map(AsRef::as_ref)
+            });
         for subagent in self.state.session.subagents() {
             if reachable_subagents.contains(&subagent.tool_use_id)
                 && !subagent_versions.contains_key(&subagent.tool_use_id)
                 && let Some(version_id) = &subagent.parent_tool_use_id
-                && self
-                    .state
-                    .session
-                    .subagent_messages()
-                    .contains_key(version_id)
             {
                 subagent_versions.insert(subagent.tool_use_id.clone(), version_id.clone());
             }
@@ -770,17 +768,7 @@ impl App {
                 let version_id = subagent_versions
                     .get(&subagent.tool_use_id)
                     .unwrap_or(&subagent.tool_use_id);
-                let messages = self
-                    .state
-                    .session
-                    .subagent_messages()
-                    .get(version_id)
-                    .or_else(|| {
-                        self.state
-                            .session
-                            .subagent_messages()
-                            .get(&subagent.tool_use_id)
-                    })?;
+                let messages = self.state.session.subagent_messages().get(version_id)?;
                 Some((subagent.clone(), Arc::clone(messages)))
             })
             .collect();
@@ -1879,12 +1867,12 @@ impl App {
             self.state.session.subagents(),
         );
         let mut versions =
-            caudra_agent::active_task_history_versions_with_batch_state(&ancestor, |call_id| {
+            caudra_agent::active_task_history_versions_with_outputs(&ancestor, |call_id| {
                 self.state
                     .session
                     .tool_outputs()
                     .get(call_id)
-                    .and_then(|output| output.state())
+                    .map(AsRef::as_ref)
             });
         reachable.extend(
             versions
@@ -1957,11 +1945,6 @@ impl App {
             if reachable.contains(&subagent.tool_use_id)
                 && !versions.contains_key(&subagent.tool_use_id)
                 && let Some(version_id) = &subagent.parent_tool_use_id
-                && self
-                    .state
-                    .session
-                    .subagent_messages()
-                    .contains_key(version_id)
             {
                 versions.insert(subagent.tool_use_id.clone(), version_id.clone());
             }
@@ -1983,13 +1966,7 @@ impl App {
             .filter(|task_id| !version_ids.contains(task_id.as_str()))
         {
             let version_id = versions.get(task_id).unwrap_or(task_id);
-            let Some(history) = self
-                .state
-                .session
-                .subagent_messages()
-                .get(version_id)
-                .or_else(|| self.state.session.subagent_messages().get(task_id))
-            else {
+            let Some(history) = self.state.session.subagent_messages().get(version_id) else {
                 continue;
             };
             collect_tool_output_refs(history, &mut output_ids, &mut output_refs);
@@ -2003,6 +1980,13 @@ impl App {
                     .get(task_id)
                     .cloned(),
             );
+            if version_id != task_id {
+                child.set_subagent_history(
+                    version_id.clone(),
+                    history.to_vec(),
+                    Some(StoredSubagentTaskSpec::version()),
+                );
+            }
         }
         for tool_id in &stored_tool_ids {
             if let Some(output) = self.state.session.tool_outputs().get(tool_id) {
@@ -2490,6 +2474,12 @@ pub(crate) fn reachable_subagent_ids(
     subagents: &[StoredSubagent],
 ) -> HashSet<String> {
     let mut reachable = tool_call_ids(items);
+    reachable.extend(
+        caudra_agent::active_task_history_versions_with_outputs(items, |call_id| {
+            tool_outputs.get(call_id).map(AsRef::as_ref)
+        })
+        .into_keys(),
+    );
     let mut active_calls = caudra_agent::history_tool_call_ids(items);
     // A worklist rather than a rescan: choosing the next id by walking
     // `reachable` for an unvisited one costs a pass over the whole set per
@@ -2513,17 +2503,15 @@ pub(crate) fn reachable_subagent_ids(
         let Some(task_id) = pending.pop() else {
             break;
         };
-        if let Some(state) = tool_outputs.get(&task_id).and_then(|output| output.state()) {
-            let mut discovered = HashSet::new();
-            collect_task_metadata_from_value(state, &mut discovered);
-            for id in discovered {
-                if reachable.insert(id.clone()) {
-                    pending.push(id);
-                }
-            }
-        }
         if let Some(history) = histories.get(&task_id) {
-            for id in tool_call_ids(history) {
+            let mut discovered = tool_call_ids(history);
+            discovered.extend(
+                caudra_agent::active_task_history_versions_with_outputs(history, |call_id| {
+                    tool_outputs.get(call_id).map(AsRef::as_ref)
+                })
+                .into_keys(),
+            );
+            for id in discovered {
                 if reachable.insert(id.clone()) {
                     pending.push(id);
                 }
@@ -2532,51 +2520,6 @@ pub(crate) fn reachable_subagent_ids(
         }
     }
     reachable
-}
-
-fn collect_task_metadata_from_value(value: &serde_json::Value, ids: &mut HashSet<String>) {
-    match value {
-        serde_json::Value::String(text) => collect_task_metadata(text, ids),
-        serde_json::Value::Array(values) => {
-            for value in values {
-                collect_task_metadata_from_value(value, ids);
-            }
-        }
-        serde_json::Value::Object(values) => {
-            if let Some(tool) = values.get("tool").and_then(serde_json::Value::as_str) {
-                if tool == "task" {
-                    if let Some(invocation_id) = values
-                        .get("invocation_id")
-                        .and_then(serde_json::Value::as_str)
-                    {
-                        ids.insert(invocation_id.to_owned());
-                    }
-                    if let Some(output) = values.get("output").and_then(serde_json::Value::as_str) {
-                        collect_task_metadata(output, ids);
-                    }
-                }
-                return;
-            }
-            for value in values.values() {
-                collect_task_metadata_from_value(value, ids);
-            }
-        }
-        _ => {}
-    }
-}
-
-fn collect_task_metadata(content: &str, ids: &mut HashSet<String>) {
-    for block in content.split("<task_metadata>").skip(1) {
-        let Some(metadata) = block.split("</task_metadata>").next() else {
-            continue;
-        };
-        if let Some(task_id) = metadata
-            .lines()
-            .find_map(|line| line.trim().strip_prefix("task_id: "))
-        {
-            ids.insert(task_id.to_owned());
-        }
-    }
 }
 
 fn collect_tool_output_refs(
@@ -2590,7 +2533,11 @@ fn collect_tool_output_refs(
                 output_ref: Some(output_ref),
                 ..
             } => push_tool_output_ref(output_ref, ids, references),
-            HistoryItemKind::AssistantText {
+            HistoryItemKind::User {
+                retained_output_refs,
+                ..
+            }
+            | HistoryItemKind::AssistantText {
                 retained_output_refs,
                 ..
             } => {
@@ -2608,7 +2555,7 @@ fn push_tool_output_ref(
     ids: &mut HashSet<ToolOutputId>,
     references: &mut Vec<ToolOutputRef>,
 ) {
-    if ids.insert(output_ref.id) {
+    if ids.insert(output_ref.id.clone()) {
         references.push(output_ref.clone());
     }
 }
@@ -3053,4 +3000,51 @@ fn now_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_secs())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::collect_tool_output_refs;
+    use caudra_providers::{ContentBlock, Message, Role};
+    use caudra_storage::tool_outputs::ToolOutputRef;
+    use std::collections::HashSet;
+    use test_case::test_case;
+
+    const OUTPUT_ID: &str = "calm-blue-wren";
+    const PROSE_ONLY_ID: &str = "bright-small-heron";
+    const OUTCOME: &str = "Complete retained task outcome";
+
+    #[test_case(1; "single_observation")]
+    #[test_case(3; "repeated_observations_and_refs")]
+    fn retained_observation_refs_are_counted_once_across_history_kinds(copies: usize) {
+        let reference = ToolOutputRef {
+            id: OUTPUT_ID.parse().unwrap(),
+            byte_count: OUTCOME.len(),
+            line_count: 1,
+        };
+        let mut observation = Message::observation(PROSE_ONLY_ID.into());
+        observation.retained_output_refs = vec![reference.clone(); copies];
+        let mut messages = vec![observation; copies];
+        messages.push(Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::Text {
+                text: OUTCOME.into(),
+            }],
+            retained_output_refs: vec![reference.clone()],
+            ..Default::default()
+        });
+        let items = crate::history_items(&messages);
+        let mut ids = HashSet::new();
+        let mut references = Vec::new();
+        collect_tool_output_refs(&items, &mut ids, &mut references);
+        assert_eq!(
+            references
+                .iter()
+                .map(|reference| reference.byte_count)
+                .sum::<usize>(),
+            OUTCOME.len()
+        );
+        assert_eq!(ids.len(), 1);
+        assert_eq!(references, [reference]);
+    }
 }

@@ -6,9 +6,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use caudra_providers::{
-    AgentError, Billing, ContentBlock, Message, Role, StopReason, TokenUsage,
+    AgentError, Billing, ContentBlock, Message, Role, StopReason, TaskEventOrigin, TokenUsage,
     estimate_tokens_cached, token_label,
 };
+use caudra_storage::id::CaudraId;
 use caudra_storage::tool_ledger::ToolOutcome;
 use caudra_storage::tool_outputs::ToolOutputRef;
 use caudra_storage::usage_ledger::LedgerPurpose;
@@ -18,6 +19,7 @@ use caudra_workflow::{
 use caudra_workspace::LocalDocumentRef;
 use flume::Sender;
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 use strum::Display;
 
 use crate::agent::{GoalResult, GoalVerdict};
@@ -30,6 +32,7 @@ pub const INDEX_TRUNCATED: &str = "[truncated]";
 /// outlive agent turns, so they never belong to one. One below the UI's
 /// restore sentinel, which already claims `u64::MAX`.
 pub const WORKFLOW_EVENT_RUN_ID: u64 = u64::MAX - 1;
+pub const BACKGROUND_EVENT_RUN_ID: u64 = u64::MAX - 2;
 /// How much of a run's report or result a transcript card quotes.
 pub const MAX_CARD_PREVIEW_BYTES: usize = 2048;
 /// Log lines a card keeps under its roster while the run works.
@@ -265,9 +268,8 @@ pub struct BatchToolEntry {
     /// Guidance the child addressed to the model alone, such as the task id a
     /// `task` child hands back to be resumed with. Kept apart from the
     /// annotation because that one is read by both sides, and folding the two
-    /// together drew a metadata block on the card. Lives only until the batch
-    /// assembles its answer, which is the text that is persisted.
-    #[serde(skip)]
+    /// together drew a metadata block on the card.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_suffix: Option<String>,
 }
 
@@ -999,6 +1001,106 @@ impl PhaseMark {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TaskCard {
+    pub task_id: String,
+    pub invocation_id: String,
+    pub call_id: String,
+    pub root_call_id: String,
+    pub label: String,
+    pub state: String,
+    pub background: bool,
+    pub mode: String,
+    pub generation: u64,
+    pub created_at: u64,
+    pub updated_at: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_ref: Option<ToolOutputRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_preview: Option<String>,
+    #[serde(default)]
+    pub result_truncated: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reports: Vec<String>,
+    #[serde(default)]
+    pub reports_truncated: bool,
+}
+
+pub type TaskOutput = Vec<TaskCard>;
+
+impl TaskCard {
+    pub fn active(&self) -> bool {
+        matches!(self.state.as_str(), "queued" | "running" | "cancelling")
+    }
+
+    pub fn model_value(&self) -> Value {
+        let mut value = json!({
+            "task_id": self.task_id,
+            "state": self.state,
+            "background": self.background,
+            "mode": self.mode,
+        });
+        if let Some(result) = &self.result {
+            value["result"] = result.clone();
+        }
+        if self.result_truncated {
+            value["result_truncated"] = Value::Bool(true);
+            value["result_preview"] = json!(self.result_preview);
+        }
+        if let Some(reference) = self.incomplete_output_ref() {
+            value["output_ref"] = json!(reference);
+            value["read_output"] = task_output_access(reference);
+        }
+        if !self.reports.is_empty() {
+            value["reports"] = json!(self.reports);
+        }
+        if self.reports_truncated {
+            value["reports_truncated"] = Value::Bool(true);
+        }
+        value
+    }
+
+    fn incomplete_output_ref(&self) -> Option<&ToolOutputRef> {
+        self.output_ref
+            .as_ref()
+            .filter(|_| self.result_truncated || self.result.is_none())
+    }
+
+    pub fn display_text(&self) -> String {
+        let background = if self.background { " · bg" } else { "" };
+        let mut text = format!(
+            "{} · {} · {}{background}\n{}",
+            self.task_id, self.state, self.mode, self.label
+        );
+        if let Some(result) = &self.result {
+            let _ = write!(text, "\n{result}");
+        }
+        if let Some(preview) = &self.result_preview {
+            let _ = write!(text, "\nResult preview (truncated):\n{preview}");
+        }
+        if let Some(reference) = self.incomplete_output_ref() {
+            let _ = write!(
+                text,
+                "\nRead complete task outcome: {}",
+                task_output_access(reference)
+            );
+        }
+        for report in &self.reports {
+            let _ = write!(text, "\n{report}");
+        }
+        if self.reports_truncated {
+            text.push_str("\nReports truncated; open task for full output.");
+        }
+        text
+    }
+}
+
+pub(crate) fn task_output_access(reference: &ToolOutputRef) -> Value {
+    json!({"tool": "tool_output", "output_id": reference.id, "offset": 1})
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ToolOutput {
     Plain(TextOutput),
@@ -1089,6 +1191,7 @@ pub enum ToolOutput {
     },
     /// A workflow run the transcript follows live and restores settled.
     WorkflowRun(Box<WorkflowRunCard>),
+    Tasks(TaskOutput),
 }
 
 /// How far a search reached before a bound stopped it. Both counts are lower
@@ -1214,6 +1317,7 @@ impl ToolOutput {
                     .to_string(),
             ),
             Self::WorkflowRun(card) => Some(card.headline()),
+            Self::Tasks(cards) => Some(counted(cards.len(), "task")),
             Self::Environment { headline, .. } => Some(headline.clone()),
             _ => None,
         }
@@ -1285,7 +1389,8 @@ impl ToolOutput {
             | Self::TodoList(_)
             | Self::Answers(_)
             | Self::Environment { .. }
-            | Self::WorkflowRun(_) => Some(self.as_display_text()),
+            | Self::WorkflowRun(_)
+            | Self::Tasks(_) => Some(self.as_display_text()),
             _ => None,
         }
     }
@@ -1304,6 +1409,9 @@ impl ToolOutput {
 
     pub fn as_text(&self) -> String {
         match self {
+            Self::Tasks(cards) => {
+                json!(cards.iter().map(TaskCard::model_value).collect::<Vec<_>>()).to_string()
+            }
             Self::Diff { summary, .. } => summary.clone(),
             Self::TodoList(_) => "ok".into(),
             Self::Shell(output) => output.model_text.clone(),
@@ -1440,6 +1548,11 @@ impl ToolOutput {
                 .collect::<Vec<_>>()
                 .join("\n"),
             Self::WorkflowRun(card) => card.display_text(),
+            Self::Tasks(cards) => cards
+                .iter()
+                .map(TaskCard::display_text)
+                .collect::<Vec<_>>()
+                .join("\n\n"),
             Self::TodoList(items) => {
                 if items.is_empty() {
                     return "No todos.".into();
@@ -1712,6 +1825,7 @@ impl From<Option<StopReason>> for DoneReason {
 #[derive(Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentEvent {
+    TaskAdmitted(TaskCard),
     TextDelta {
         text: String,
     },
@@ -1884,6 +1998,8 @@ pub enum AgentEvent {
     /// was. `@mention` file bodies are excluded; the user already sees the path.
     Injected {
         text: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        task_event: Option<TaskEventOrigin>,
     },
     /// Deferred tools moved into the request array. Reported because the user
     /// is paying for it: the tools array changes, so the provider's prompt
@@ -2585,6 +2701,14 @@ pub struct EventSender {
     tx: Sender<Envelope>,
     run_id: u64,
     workflow: Option<WorkflowProvenance>,
+    task: Option<Arc<TaskProvenance>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskProvenance {
+    pub session_id: CaudraId,
+    pub task_id: String,
+    pub invocation_id: String,
 }
 
 impl EventSender {
@@ -2593,7 +2717,18 @@ impl EventSender {
             tx,
             run_id,
             workflow: None,
+            task: None,
         }
+    }
+
+    pub fn with_task(mut self, task: TaskProvenance) -> Self {
+        self.run_id = BACKGROUND_EVENT_RUN_ID;
+        self.task = Some(Arc::new(task));
+        self
+    }
+
+    pub fn task(&self) -> Option<&TaskProvenance> {
+        self.task.as_deref()
     }
 
     /// Every envelope sent from here on carries `workflow`.
@@ -2608,6 +2743,7 @@ impl EventSender {
             tx,
             run_id: self.run_id,
             workflow: self.workflow.clone(),
+            task: self.task.clone(),
         }
     }
 
@@ -2622,6 +2758,10 @@ impl EventSender {
     pub fn send_envelope(&self, mut envelope: Envelope) -> Result<(), AgentError> {
         if envelope.workflow.is_none() {
             envelope.workflow = self.workflow.clone();
+        }
+        if envelope.task.is_none() && self.task.is_some() {
+            envelope.task = self.task.clone();
+            envelope.run_id = self.run_id;
         }
         self.tx.try_send(envelope).map_err(|_| AgentError::Channel)
     }
@@ -2648,6 +2788,7 @@ impl EventSender {
             subagent: None,
             run_id: self.run_id,
             workflow: self.workflow.clone(),
+            task: self.task.clone(),
         }
     }
 }
@@ -2661,6 +2802,8 @@ pub struct Envelope {
     pub run_id: u64,
     #[serde(flatten, skip_serializing_if = "Option::is_none")]
     pub workflow: Option<WorkflowProvenance>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task: Option<Arc<TaskProvenance>>,
 }
 
 #[cfg(test)]
@@ -3955,6 +4098,7 @@ mod tests {
                 subagent: None,
                 run_id: 1,
                 workflow: None,
+                task: None,
             })
             .unwrap();
         sender
@@ -3963,6 +4107,7 @@ mod tests {
                 subagent: None,
                 run_id: 1,
                 workflow: Some(foreign.clone()),
+                task: None,
             })
             .unwrap();
 
@@ -4013,5 +4158,50 @@ mod tests {
             .filter(|key| key.starts_with("workflow_"))
             .collect();
         assert!(keys.is_empty(), "unexpected keys: {keys:?}");
+    }
+
+    #[test]
+    fn task_identity_survives_rebinding_relay_and_serialization() {
+        let (tx, _) = flume::unbounded();
+        let origin = TaskProvenance {
+            session_id: CaudraId::generate(),
+            task_id: "task".into(),
+            invocation_id: "invocation".into(),
+        };
+        let sender = EventSender::new(tx, 1).with_task(origin.clone());
+        let (tx, rx) = flume::unbounded();
+        let rebound = sender.rebind(tx);
+        rebound.send(AgentEvent::AuthRequired).unwrap();
+        let envelope = rx.recv().unwrap();
+        assert_eq!(envelope.task.as_deref(), Some(&origin));
+        assert_eq!(envelope.run_id, BACKGROUND_EVENT_RUN_ID);
+        let value = serde_json::to_value(&envelope).unwrap();
+        assert_eq!(value["task"]["session_id"], origin.session_id.to_string());
+        rebound
+            .send_envelope(Envelope {
+                event: AgentEvent::AuthRequired,
+                subagent: None,
+                run_id: 1,
+                workflow: None,
+                task: None,
+            })
+            .unwrap();
+        let relayed = rx.recv().unwrap();
+        assert_eq!(relayed.task.as_deref(), Some(&origin));
+        assert_eq!(relayed.run_id, BACKGROUND_EVENT_RUN_ID);
+        let foreign = TaskProvenance {
+            invocation_id: "other-invocation".into(),
+            ..origin
+        };
+        rebound
+            .send_envelope(Envelope {
+                event: AgentEvent::AuthRequired,
+                subagent: None,
+                run_id: BACKGROUND_EVENT_RUN_ID,
+                workflow: None,
+                task: Some(Arc::new(foreign.clone())),
+            })
+            .unwrap();
+        assert_eq!(rx.recv().unwrap().task.as_deref(), Some(&foreign));
     }
 }

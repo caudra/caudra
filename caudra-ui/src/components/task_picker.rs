@@ -4,14 +4,18 @@
 //! every refresh rebuilds the rows from [`crate::app::App::tasks`], and
 //! previewing is a real focus with a restore on cancel.
 
+use caudra_agent::TaskCard;
 use caudra_grab::grab_scope;
-use crossterm::event::{KeyEvent, MouseEvent};
+use caudra_storage::now_epoch;
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent};
 use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
 
 use crate::app::tasks::{TaskInfo, TaskStatus};
-use crate::components::keybindings::key;
-use crate::components::list_picker::{ListPicker, PickerAction, PickerItem};
+use crate::components::keybindings::{Bind, key};
+use crate::components::list_picker::{ListPicker, PickerAction, PickerItem, truncate_label};
+use crate::components::modal::Modal;
+use crate::components::tool_display::task_details;
 use crate::components::{Hint, Overlay};
 use crate::repaint::Cadence;
 
@@ -22,6 +26,20 @@ const RUNNING_SECTION: &str = "Running";
 const FINISHED_SECTION: &str = "Finished";
 const DONE_SUFFIX: &str = "done";
 const ERROR_SUFFIX: &str = "error";
+const DETAIL_CHARS: usize = 512;
+const DETAIL_ROWS: u16 = 6;
+const WIDTH_PERCENT: u16 = 85;
+const LIST_ROOM: u16 = 10;
+const PROMOTE: Bind = Bind {
+    code: KeyCode::Char('b'),
+    modifiers: KeyModifiers::CONTROL,
+    label: "Ctrl+B",
+};
+const CANCEL: Bind = Bind {
+    code: KeyCode::Char('k'),
+    modifiers: KeyModifiers::CONTROL,
+    label: "Ctrl+K",
+};
 
 /// `Preview` is the reason this must not be dropped: the picker moved the
 /// selection but only the app can focus the task behind it, so a discarded
@@ -33,17 +51,24 @@ pub enum TaskPickerAction {
     /// the float is the one being previewed.
     Preview(String),
     /// Committed: keep the previewed task and close.
-    Opened,
+    Opened(String),
+    Control {
+        task: Box<TaskCard>,
+        promote: bool,
+    },
     /// Cancelled. The app restores whichever task was focused on open.
     Closed(Option<String>),
 }
 
+#[derive(PartialEq)]
 pub struct TaskItem {
     id: String,
     name: String,
     suffix: Option<&'static str>,
     section: Option<&'static str>,
     running: bool,
+    search: String,
+    runtime: Option<TaskCard>,
 }
 
 impl PickerItem for TaskItem {
@@ -51,8 +76,22 @@ impl PickerItem for TaskItem {
         &self.name
     }
 
-    fn suffix(&self) -> Option<&str> {
-        self.suffix
+    fn search_text(&self) -> &str {
+        &self.search
+    }
+
+    fn detail(&self) -> Option<&str> {
+        self.runtime
+            .as_ref()
+            .map(|task| task.state.as_str())
+            .or(self.suffix)
+    }
+
+    fn badge(&self) -> Option<&str> {
+        self.runtime
+            .as_ref()
+            .is_some_and(|task| task.background)
+            .then_some("bg")
     }
 
     fn section(&self) -> Option<&str> {
@@ -66,6 +105,7 @@ impl PickerItem for TaskItem {
 
 pub struct TaskPicker {
     picker: ListPicker<TaskItem>,
+    details: Option<TaskCard>,
     /// What was focused when the picker opened, restored unless the user
     /// commits, so a cancelled preview never sticks.
     origin: Option<String>,
@@ -77,17 +117,24 @@ pub struct TaskPicker {
 impl TaskPicker {
     pub fn new() -> Self {
         let mut picker = ListPicker::new()
+            .with_width_percent(WIDTH_PERCENT)
             .with_max_visible(MAX_VISIBLE)
             .with_footer_builder(footer);
         picker.set_empty_text(EMPTY_TEXT);
         Self {
             picker,
+            details: None,
             origin: None,
             previewed: None,
         }
     }
 
     pub fn open(&mut self, tasks: Vec<TaskInfo>) {
+        self.details = tasks
+            .iter()
+            .find(|task| task.focused)
+            .or(tasks.first())
+            .and_then(|task| task.runtime.clone());
         let focused = tasks
             .iter()
             .find(|task| task.focused)
@@ -104,15 +151,36 @@ impl TaskPicker {
     /// Rebuilds the rows in place when a task changes status. The selection is
     /// restored by id, so a task moving from Running to Finished does not drag
     /// the cursor with it.
-    pub fn refresh(&mut self, tasks: Vec<TaskInfo>) {
+    pub fn refresh(&mut self, tasks: Vec<TaskInfo>) -> bool {
         if !self.picker.is_open() {
-            return;
+            return false;
         }
         let selected = self.selected_id();
-        self.picker.replace_items(build_items(tasks));
+        let details = tasks
+            .iter()
+            .find(|task| Some(task.id.as_ref()) == selected.as_deref())
+            .and_then(|task| task.runtime.clone());
+        let detail_changed = self.details != details;
+        self.details = details;
+        let items = build_items(tasks);
+        if items
+            .iter()
+            .enumerate()
+            .all(|(index, item)| self.picker.item(index) == Some(item))
+            && self.picker.item(items.len()).is_none()
+        {
+            return detail_changed;
+        }
+        self.picker.replace_items(items);
         if let Some(id) = selected {
             self.picker.select_item_by(|item| item.id == id);
         }
+        true
+    }
+
+    pub fn select(&mut self, id: &str) -> bool {
+        self.picker.clear_search();
+        self.picker.select_item_by(|item| item.id == id)
     }
 
     pub fn is_open(&self) -> bool {
@@ -121,6 +189,7 @@ impl TaskPicker {
 
     pub fn close(&mut self) {
         self.picker.close();
+        self.details = None;
         self.origin = None;
         self.previewed = None;
     }
@@ -141,6 +210,21 @@ impl TaskPicker {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> TaskPickerAction {
+        if PROMOTE.matches(key) || CANCEL.matches(key) {
+            let promote = PROMOTE.matches(key);
+            return self
+                .picker
+                .selected_item()
+                .and_then(|item| {
+                    let task = item.runtime.as_ref()?;
+                    (task.active() && task.state != "cancelling" && (!promote || !task.background))
+                        .then(|| TaskPickerAction::Control {
+                            task: Box::new(task.clone()),
+                            promote,
+                        })
+                })
+                .unwrap_or(TaskPickerAction::Consumed);
+        }
         let action = self.picker.handle_key(key);
         self.map_action(action)
     }
@@ -156,10 +240,68 @@ impl TaskPicker {
 
     pub fn view(&mut self, frame: &mut Frame, area: Rect) -> Rect {
         grab_scope!("task_picker", area);
+        let info = self.picker.selected_item().map(|item| {
+            let runtime = self
+                .details
+                .as_ref()
+                .filter(|task| task.task_id == item.id)
+                .or(item.runtime.as_ref());
+            let text = runtime.map_or_else(
+                || format!("{}\n{}", item.id, item.name),
+                |task| {
+                    let end = if task.active() {
+                        now_epoch()
+                    } else {
+                        task.updated_at
+                    };
+                    format!(
+                        "{} · {} · {}\n{}\n{} · {}s elapsed\n{}",
+                        task.task_id,
+                        task.state,
+                        task.mode,
+                        task.label,
+                        if task.background {
+                            "background"
+                        } else {
+                            "foreground"
+                        },
+                        end.saturating_sub(task.created_at),
+                        task_details(task)
+                    )
+                },
+            );
+            let mut chars = text.chars();
+            let mut text: String = chars.by_ref().take(DETAIL_CHARS).collect();
+            if chars.next().is_some() {
+                text.push('…');
+            }
+            let rows = DETAIL_ROWS.min(area.height.saturating_sub(LIST_ROOM) / 2) as usize;
+            let width = Modal::inner_width(area.width, WIDTH_PERCENT) as usize;
+            let mut lines = text
+                .lines()
+                .take(rows)
+                .map(|line| truncate_label(line, width))
+                .collect::<Vec<_>>();
+            lines.resize(rows, " ".into());
+            lines.join("\n")
+        });
+        self.picker
+            .set_info_text(info.filter(|text| !text.is_empty()));
+        let task = self
+            .picker
+            .selected_item()
+            .and_then(|item| item.runtime.as_ref());
+        self.picker.set_footer_builder(match task {
+            Some(task) if task.active() && task.state != "cancelling" && !task.background => {
+                foreground_footer
+            }
+            Some(task) if task.active() && task.state != "cancelling" => background_footer,
+            _ => footer,
+        });
         self.picker.view(frame, area)
     }
 
-    fn selected_id(&self) -> Option<String> {
+    pub(crate) fn selected_id(&self) -> Option<String> {
         self.picker.selected_item().map(|item| item.id.clone())
     }
 
@@ -178,9 +320,9 @@ impl TaskPicker {
     fn map_action(&mut self, action: PickerAction<TaskItem>) -> TaskPickerAction {
         match action {
             PickerAction::Consumed | PickerAction::Toggle(..) => self.preview(),
-            PickerAction::Select(_) => {
+            PickerAction::Select(item) => {
                 self.close();
-                TaskPickerAction::Opened
+                TaskPickerAction::Opened(item.id)
             }
             PickerAction::Close => {
                 let origin = self.origin.take();
@@ -213,25 +355,51 @@ fn footer() -> Vec<Hint> {
     ]
 }
 
+fn foreground_footer() -> Vec<Hint> {
+    let mut hints = background_footer();
+    hints.push(Hint::bind(PROMOTE, "background"));
+    hints
+}
+
+fn background_footer() -> Vec<Hint> {
+    let mut hints = footer();
+    hints.push(Hint::bind(CANCEL, "stop task"));
+    hints
+}
+
 /// The main chat comes first and has no status. The subagents follow, running
 /// ones above finished ones so a long job never gets buried under the ones
 /// that already returned. Within a section, chat order.
 fn build_items(tasks: Vec<TaskInfo>) -> Vec<TaskItem> {
     let (mut main, mut running, mut finished) = (Vec::new(), Vec::new(), Vec::new());
-    for task in tasks {
+    for mut task in tasks {
+        if let Some(runtime) = &mut task.runtime {
+            runtime.result = None;
+            runtime.result_preview = None;
+            runtime.result_truncated = false;
+            runtime.reports.clear();
+            runtime.reports_truncated = false;
+        }
         let id = task.id.to_string();
-        let (suffix, bucket) = match task.status {
+        let status = task
+            .runtime
+            .as_ref()
+            .map(crate::app::tasks::runtime_status)
+            .or(task.status);
+        let (suffix, bucket) = match status {
             None => (None, &mut main),
             Some(TaskStatus::Working) => (None, &mut running),
             Some(TaskStatus::Done) => (Some(DONE_SUFFIX), &mut finished),
             Some(TaskStatus::Error) => (Some(ERROR_SUFFIX), &mut finished),
         };
         bucket.push(TaskItem {
+            search: format!("{} {}", task.name, task.id),
             id,
             name: task.name,
             suffix,
             section: None,
-            running: task.status == Some(TaskStatus::Working),
+            running: status == Some(TaskStatus::Working),
+            runtime: task.runtime,
         });
     }
     for (heading, bucket) in [
@@ -248,13 +416,337 @@ fn build_items(tasks: Vec<TaskInfo>) -> Vec<TaskItem> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::animation::test_clock::FrozenSpinner;
     use crate::components::key as key_event;
-    use crossterm::event::KeyCode;
+    use caudra_storage::tool_outputs::ToolOutputRef;
+    use crossterm::event::{KeyCode, MouseButton, MouseEventKind};
+    use ratatui::{Terminal, backend::TestBackend};
     use std::sync::Arc;
+    use test_case::test_case;
+    use unicode_width::UnicodeWidthStr;
 
     const MAIN_ID: &str = "main";
     const RUNNING_ID: &str = "toolu_running";
     const DONE_ID: &str = "toolu_done";
+    const LABEL: &str = "等待 sixty seconds 界";
+    const INVOCATION: &str = "private-invocation";
+    const CLICK_LABEL: &str = "Completed investigation";
+    const CLICK_RESULT: &str = "Hydrated task result";
+    const OTHER_LABEL: &str = "Other investigation";
+    const CLICK_ROW_MISSING: &str = "the completed task has a visible list row";
+    const OUTPUT_ID: &str = "calm-blue-wren";
+
+    fn click_tasks(hydrated: bool, background: bool, state: &str) -> Vec<TaskInfo> {
+        let mut target = runtime_task(state, background);
+        target.name = CLICK_LABEL.into();
+        let runtime = target.runtime.as_mut().unwrap();
+        runtime.label = CLICK_LABEL.into();
+        if hydrated {
+            runtime.result = Some(serde_json::json!({ "output": CLICK_RESULT }));
+        }
+        vec![
+            task(MAIN_ID, "Main", None, true),
+            target,
+            task(DONE_ID, OTHER_LABEL, Some(TaskStatus::Done), false),
+        ]
+    }
+
+    fn paint_picker(picker: &mut TaskPicker, terminal: &mut Terminal<TestBackend>) -> Rect {
+        let mut popup = Rect::default();
+        terminal
+            .draw(|frame| popup = picker.view(frame, frame.area()))
+            .unwrap();
+        popup
+    }
+
+    fn task_row(terminal: &Terminal<TestBackend>, popup: Rect) -> Position {
+        let buffer = terminal.backend().buffer();
+        let y = (popup.y..popup.bottom())
+            .rfind(|&y| {
+                let row: String = (popup.x..popup.right())
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect();
+                row.contains(CLICK_LABEL)
+            })
+            .expect(CLICK_ROW_MISSING);
+        Position::new(popup.x + 2, y)
+    }
+
+    fn mouse_at(kind: MouseEventKind, position: Position) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column: position.x,
+            row: position.y,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    #[test_case(false; "foreground_result")]
+    #[test_case(true; "background_result")]
+    fn pressed_task_opens_after_selected_detail_hydration_and_render(background: bool) {
+        let mut picker = TaskPicker::new();
+        picker.open(click_tasks(false, background, "succeeded"));
+        assert_eq!(picker.selected_id().as_deref(), Some(MAIN_ID));
+        let mut terminal = Terminal::new(TestBackend::new(127, 30)).unwrap();
+        let popup = paint_picker(&mut picker, &mut terminal);
+        let position = task_row(&terminal, popup);
+        assert!(
+            matches!(picker.handle_mouse(mouse_at(MouseEventKind::Down(MouseButton::Left), position)), TaskPickerAction::Preview(id) if id == RUNNING_ID)
+        );
+        assert!(picker.refresh(click_tasks(true, background, "succeeded")));
+        assert_eq!(paint_picker(&mut picker, &mut terminal), popup);
+        assert_eq!(task_row(&terminal, popup), position);
+        let painted: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(painted.contains(CLICK_RESULT));
+        assert!(!picker.refresh(click_tasks(true, background, "succeeded")));
+        assert!(
+            matches!(picker.handle_mouse(mouse_at(MouseEventKind::Up(MouseButton::Left), position)), TaskPickerAction::Opened(id) if id == RUNNING_ID)
+        );
+        assert!(!picker.is_open());
+    }
+
+    #[test_case(""; "empty_success")]
+    #[test_case(CLICK_RESULT; "small_success")]
+    fn complete_picker_result_hides_retrieval_without_dropping_reference(result: &str) {
+        let mut task = runtime_task("succeeded", true);
+        let runtime = task.runtime.as_mut().unwrap();
+        runtime.result = Some(serde_json::json!({ "output": result, "error": null }));
+        runtime.output_ref = Some(ToolOutputRef {
+            id: OUTPUT_ID.parse().unwrap(),
+            byte_count: result.len(),
+            line_count: 1,
+        });
+        let mut picker = TaskPicker::new();
+        picker.open(vec![task]);
+        let mut terminal = Terminal::new(TestBackend::new(127, 30)).unwrap();
+        paint_picker(&mut picker, &mut terminal);
+        let shown: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(!shown.contains(OUTPUT_ID), "{shown}");
+        assert!(!shown.contains("tool_output"), "{shown}");
+        assert!(!shown.contains("Full outcome"), "{shown}");
+        if !result.is_empty() {
+            assert!(shown.contains(result), "{shown}");
+        }
+        assert_eq!(
+            picker
+                .picker
+                .selected_item()
+                .unwrap()
+                .runtime
+                .as_ref()
+                .unwrap()
+                .output_ref
+                .as_ref()
+                .unwrap()
+                .id
+                .to_string(),
+            OUTPUT_ID
+        );
+    }
+
+    #[test_case("reorder"; "reordered_rows")]
+    #[test_case("remove"; "removed_row")]
+    #[test_case("resize"; "resized_popup")]
+    fn changed_task_geometry_invalidates_pending_press(change: &str) {
+        let mut picker = TaskPicker::new();
+        picker.open(click_tasks(false, true, "succeeded"));
+        let mut terminal = Terminal::new(TestBackend::new(127, 30)).unwrap();
+        let popup = paint_picker(&mut picker, &mut terminal);
+        let position = task_row(&terminal, popup);
+        let _ = picker.handle_mouse(mouse_at(MouseEventKind::Down(MouseButton::Left), position));
+        let mut tasks = click_tasks(true, true, "succeeded");
+        match change {
+            "reorder" => tasks.swap(1, 2),
+            "remove" => {
+                tasks.remove(1);
+            }
+            _ => terminal = Terminal::new(TestBackend::new(117, 30)).unwrap(),
+        }
+        picker.refresh(tasks);
+        paint_picker(&mut picker, &mut terminal);
+        assert!(!matches!(
+            picker.handle_mouse(mouse_at(MouseEventKind::Up(MouseButton::Left), position)),
+            TaskPickerAction::Opened(_)
+        ));
+        assert!(picker.is_open());
+    }
+
+    #[test_case(false; "summary")]
+    #[test_case(true; "hydrated_detail")]
+    fn promotion_refreshes_badge_once_without_selection_or_preview_loop(hydrated: bool) {
+        let mut picker = TaskPicker::new();
+        picker.open(click_tasks(hydrated, false, "running"));
+        assert!(picker.select(RUNNING_ID));
+        let _ = picker.preview();
+        assert!(picker.refresh(click_tasks(hydrated, true, "running")));
+        assert_eq!(picker.selected_id().as_deref(), Some(RUNNING_ID));
+        assert_eq!(picker.picker.selected_item().unwrap().badge(), Some("bg"));
+        assert!(!picker.refresh(click_tasks(hydrated, true, "running")));
+        assert!(matches!(picker.preview(), TaskPickerAction::Consumed));
+        assert!(matches!(picker.cancel(), TaskPickerAction::Closed(Some(id)) if id == MAIN_ID));
+    }
+
+    fn runtime_task(state: &str, background: bool) -> TaskInfo {
+        let mut item = task(RUNNING_ID, LABEL, Some(TaskStatus::Working), false);
+        item.runtime = Some(
+            serde_json::from_value(serde_json::json!({
+                "task_id": RUNNING_ID, "invocation_id": INVOCATION,
+                "call_id": "launch", "root_call_id": "launch", "label": LABEL,
+                "state": state, "background": background, "mode": "build",
+                "generation": 1, "created_at": 1, "updated_at": 2
+            }))
+            .unwrap(),
+        );
+        item
+    }
+
+    #[test_case("running", 127; "running_wide")]
+    #[test_case("succeeded", 127; "finished_wide")]
+    #[test_case("running", 28; "running_narrow_unicode")]
+    #[test_case("cancelled", 28; "cancelled_narrow_unicode")]
+    fn background_badge_composes_with_right_edge_status(state: &str, width: u16) {
+        let _clock = FrozenSpinner::at(0);
+        let mut picker = TaskPicker::new();
+        picker.open(vec![
+            task(MAIN_ID, "Main", None, true),
+            runtime_task(state, true),
+        ]);
+        let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
+        let mut popup = Rect::default();
+        terminal
+            .draw(|frame| popup = picker.view(frame, frame.area()))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let expected = if state == "running" {
+            "bg  ⠋"
+        } else if state == "succeeded" {
+            "bg  succeeded"
+        } else {
+            "bg  cancelled"
+        };
+        let mut badge = None;
+        for y in popup.y..popup.bottom() {
+            let row: String = (popup.x..popup.right())
+                .map(|x| buffer[(x, y)].symbol())
+                .collect();
+            if row.contains(expected) {
+                badge = Some((y, row));
+            }
+        }
+        let (y, row) = badge.expect("background row retains badge and execution status");
+        assert!(
+            row.trim_end_matches('│').trim_end().ends_with(expected),
+            "{row}"
+        );
+        let detail = if state == "running" {
+            format!("bg  {}", crate::animation::spinner_str(0))
+        } else {
+            expected.to_owned()
+        };
+        assert_eq!(
+            buffer[(popup.right() - 2 - detail.width() as u16, y)].symbol(),
+            "b",
+            "{row}"
+        );
+        assert!(!row.contains(INVOCATION));
+    }
+
+    #[test_case(false; "foreground")]
+    #[test_case(true; "main")]
+    fn only_background_tasks_have_badges(main: bool) {
+        let items = build_items(vec![if main {
+            task(MAIN_ID, "Main", None, true)
+        } else {
+            runtime_task("running", false)
+        }]);
+        assert_eq!(items[0].badge(), None);
+    }
+
+    #[test_case("running", true; "running")]
+    #[test_case("failed", false; "failed")]
+    #[test_case("blocked", false; "blocked")]
+    #[test_case("interrupted", false; "interrupted")]
+    fn runtime_state_overrides_unfinished_chat(state: &str, spinning: bool) {
+        let items = build_items(vec![runtime_task(state, true)]);
+        assert_eq!(items[0].is_spinning(), spinning);
+        assert_eq!(items[0].detail(), Some(state));
+        assert_eq!(items[0].label(), LABEL);
+    }
+
+    #[test_case(KeyCode::Enter; "enter_without_preview")]
+    fn preselection_opens_explicit_identity(code: KeyCode) {
+        let mut picker = opened();
+        assert!(picker.select(DONE_ID));
+        assert!(
+            matches!(picker.handle_key(key_event(code)), TaskPickerAction::Opened(id) if id == DONE_ID)
+        );
+    }
+
+    #[test_case('b'; "b_filters")]
+    #[test_case('k'; "k_filters")]
+    fn plain_letters_remain_filter_input(letter: char) {
+        let mut picker = opened();
+        let action = picker.handle_key(key_event(KeyCode::Char(letter)));
+        assert!(!matches!(action, TaskPickerAction::Control { .. }));
+        assert_eq!(picker.picker.search_text(), letter.to_string());
+    }
+
+    #[test_case(true; "promote")]
+    #[test_case(false; "cancel")]
+    fn controls_capture_displayed_invocation(promote: bool) {
+        let mut picker = TaskPicker::new();
+        picker.open(vec![runtime_task("running", false)]);
+        let action = picker.handle_key(if promote { PROMOTE } else { CANCEL }.to_key_event());
+        assert!(
+            matches!(action, TaskPickerAction::Control { task, promote: actual } if task.invocation_id == INVOCATION && actual == promote)
+        );
+    }
+
+    #[test_case("succeeded"; "terminal")]
+    #[test_case("cancelling"; "cancelling")]
+    fn inactive_controls_are_disabled(state: &str) {
+        let mut picker = TaskPicker::new();
+        picker.open(vec![runtime_task(state, false)]);
+        assert!(matches!(
+            picker.handle_key(CANCEL.to_key_event()),
+            TaskPickerAction::Consumed
+        ));
+        assert!(matches!(
+            picker.handle_key(PROMOTE.to_key_event()),
+            TaskPickerAction::Consumed
+        ));
+    }
+
+    #[test_case("running"; "promotion")]
+    #[test_case("failed"; "settlement")]
+    fn refresh_preserves_filter_selection_and_escape_origin(state: &str) {
+        let mut picker = TaskPicker::new();
+        picker.open(vec![
+            task(MAIN_ID, "Main", None, true),
+            runtime_task("running", false),
+        ]);
+        picker.picker.set_search_text(RUNNING_ID);
+        let _ = picker.preview();
+        assert!(picker.refresh(vec![
+            task(MAIN_ID, "Main", None, false),
+            runtime_task(state, true)
+        ]));
+        assert_eq!(picker.selected_id().as_deref(), Some(RUNNING_ID));
+        assert_eq!(picker.picker.search_text(), RUNNING_ID);
+        assert!(matches!(picker.cancel(), TaskPickerAction::Closed(Some(id)) if id == MAIN_ID));
+    }
 
     fn task(id: &str, name: &str, status: Option<TaskStatus>, focused: bool) -> TaskInfo {
         TaskInfo {
@@ -262,6 +754,7 @@ mod tests {
             name: name.into(),
             status,
             focused,
+            runtime: None,
         }
     }
 
@@ -337,7 +830,7 @@ mod tests {
         let mut picker = opened();
         let _ = picker.handle_key(key_event(KeyCode::Down));
         let action = picker.handle_key(key_event(KeyCode::Enter));
-        assert!(matches!(action, TaskPickerAction::Opened));
+        assert!(matches!(action, TaskPickerAction::Opened(id) if id == RUNNING_ID));
         assert!(!picker.is_open());
     }
 

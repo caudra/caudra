@@ -8,13 +8,15 @@
 //! `CaudraId` canonical form.
 
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::io::{self, BufRead, Write};
 use std::mem;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use caudra_agent::headless::{self, InteractiveHandle, InteractiveParams};
+use caudra_agent::background::BackgroundTasks;
+use caudra_agent::headless::{self, InteractiveHandle, InteractiveParams, InteractiveRun};
 use caudra_agent::mcp;
 use caudra_agent::permissions::{
     PermissionAnswer, PermissionLifetime, PermissionManager, PluginRuleStore,
@@ -22,8 +24,7 @@ use caudra_agent::permissions::{
 use caudra_agent::prompt::ResolvedSlots;
 use caudra_agent::prompt::profile::{BUILTIN_PROFILE_NAME, PromptProfileCatalog};
 use caudra_agent::tools::QUESTION_TOOL_NAME;
-use caudra_agent::types::WorkflowProvenance;
-use caudra_agent::workflow::WorkflowHandle;
+use caudra_agent::types::{BACKGROUND_EVENT_RUN_ID, TaskProvenance, WorkflowProvenance};
 use caudra_agent::{
     AgentConfig, AgentEvent, AgentInput, AgentMode, DoneReason, Envelope, History,
     PermissionsConfig, StoredSession,
@@ -32,12 +33,14 @@ use caudra_config::{ModelPolicy, SnapshotsConfig};
 use caudra_providers::model::Model;
 use caudra_providers::{
     Billing, HistoryItem, HistoryItemKind, ImageSource, StopReason, ThinkingConfig, Timeouts,
-    TokenUsage, add_cost,
+    TokenUsage, WorkflowEventOrigin, add_cost,
 };
 use caudra_storage::id::SessionRef;
 use caudra_storage::local_documents::LocalDocumentStore;
 use caudra_storage::permission_state::PermissionRuleRecord;
-use caudra_storage::sessions::{SessionError, SessionLease, StoredMode, StoredPlanTarget};
+use caudra_storage::sessions::{
+    SessionError, SessionLease, StoredMode, StoredPlanTarget, StoredSubagentTaskSpec,
+};
 use caudra_storage::tool_outputs::{ToolOutputRef, ToolOutputStore};
 use caudra_storage::workspace_binding::StoredWorkspaceBinding;
 use caudra_storage::{StateDir, StorageError};
@@ -56,6 +59,7 @@ use tracing::warn;
 use crate::cli::Cli;
 
 const WORKFLOW_SYSTEM_SUBTYPE: &str = "workflow";
+const TASK_CONTROLS: &[&str] = &["task_list", "task_status", "task_cancel", "task_promote"];
 const WORKFLOW_LIST: &str = "workflow_list";
 const WORKFLOW_VALIDATE: &str = "workflow_validate";
 const WORKFLOW_START: &str = "workflow_start";
@@ -192,6 +196,8 @@ struct SystemPayload {
 
 #[derive(Serialize)]
 struct AssistantPayload {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    task: Option<Arc<TaskProvenance>>,
     message: AssistantMessage,
     #[serde(skip_serializing_if = "Option::is_none")]
     parent_tool_use_id: Option<String>,
@@ -212,6 +218,8 @@ struct AssistantMessage {
 
 #[derive(Serialize)]
 struct UserPayload {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    task: Option<Arc<TaskProvenance>>,
     message: UserMessage,
     #[serde(skip_serializing_if = "Option::is_none")]
     parent_tool_use_id: Option<String>,
@@ -248,6 +256,10 @@ struct UserMessage {
 
 #[derive(Serialize)]
 struct ResultPayload {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    run: Option<RunInfo>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    background_active: Option<usize>,
     subtype: &'static str,
     is_error: bool,
     duration_ms: u128,
@@ -266,6 +278,25 @@ struct ResultPayload {
 #[derive(Serialize)]
 struct StreamEventPayload {
     event: Value,
+}
+
+#[derive(Serialize)]
+struct RunInfo {
+    run_id: u64,
+    automatic: bool,
+    task_event_ids: Vec<String>,
+    workflow_events: Vec<WorkflowEventOrigin>,
+}
+
+impl From<&InteractiveRun> for RunInfo {
+    fn from(run: &InteractiveRun) -> Self {
+        Self {
+            run_id: run.run_id,
+            automatic: run.automatic,
+            task_event_ids: run.task_event_ids.clone(),
+            workflow_events: run.workflow_events.clone(),
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -291,6 +322,8 @@ struct ControlRequestPayload {
 
 #[derive(Serialize)]
 struct ControlRequestInner {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    task: Option<Arc<TaskProvenance>>,
     subtype: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_name: Option<String>,
@@ -593,6 +626,8 @@ impl SdkWriter {
         duration_ms: u128,
     ) -> Result<()> {
         self.emit(WireInner::Result(ResultPayload {
+            run: None,
+            background_active: None,
             subtype: if output.is_error { "error" } else { "success" },
             is_error: output.is_error,
             duration_ms,
@@ -631,8 +666,8 @@ pub struct SdkParams {
 struct Shared {
     model: Model,
     permission_mode: PermissionMode,
-    turn_start: Instant,
     pending: HashMap<String, String>,
+    task_permissions: HashMap<String, (BackgroundTasks, Envelope)>,
     resolved_permission_requests: HashSet<String>,
     workspace_session: Option<WorkspaceSession>,
     local_documents: Option<Arc<LocalDocumentStore>>,
@@ -642,8 +677,12 @@ struct Shared {
 
 impl Shared {
     fn agent_mode(&mut self, cwd: &Path) -> AgentMode {
-        if self.permission_mode != PermissionMode::Plan || self.workspace_session.is_none() {
-            return self.permission_mode.agent_mode(cwd);
+        self.agent_mode_for(self.permission_mode, cwd)
+    }
+
+    fn agent_mode_for(&mut self, permission_mode: PermissionMode, cwd: &Path) -> AgentMode {
+        if permission_mode != PermissionMode::Plan || self.workspace_session.is_none() {
+            return permission_mode.agent_mode(cwd);
         }
         if self.remote_plan.is_none()
             && let (Some(workspace), Some(store)) = (&self.workspace_session, &self.local_documents)
@@ -804,8 +843,8 @@ pub fn run(params: SdkParams) -> Result<()> {
     let shared = Arc::new(Mutex::new(Shared {
         model: startup_model.clone(),
         permission_mode: requested_permission_mode,
-        turn_start: Instant::now(),
         pending: HashMap::new(),
+        task_permissions: HashMap::new(),
         resolved_permission_requests: HashSet::new(),
         workspace_session: workspace_session.clone(),
         local_documents: local_documents.clone(),
@@ -819,7 +858,7 @@ pub fn run(params: SdkParams) -> Result<()> {
         let cwd = cwd.clone();
         move || shared.lock().unwrap().agent_mode(&cwd)
     });
-    let handle = smol::block_on(headless::spawn_interactive(InteractiveParams {
+    let handle = smol::block_on(headless::spawn_persistent_interactive(InteractiveParams {
         model,
         config,
         permissions_config,
@@ -897,12 +936,18 @@ pub fn run(params: SdkParams) -> Result<()> {
                 "mcp_servers": sdk_mcp_servers,
                 "slash_commands": [],
                 "output_style": "default",
+                "background_tasks": handle.background.is_some(),
+                "task_controls": TASK_CONTROLS,
             }),
             handle.workflow.is_some(),
         ),
     )?;
 
     let pump = EventPump {
+        run_rx: handle.run_rx.clone(),
+        pending_runs: HashMap::new(),
+        run: None,
+        background: handle.background.clone(),
         writer: writer.clone(),
         shared: Arc::clone(&shared),
         permissions: Arc::clone(&handle.permissions),
@@ -916,162 +961,167 @@ pub fn run(params: SdkParams) -> Result<()> {
     }
     .spawn(handle.event_rx.clone());
 
-    for line in io::stdin().lock().lines() {
-        let line = line.context("read stdin")?;
-        if line.is_empty() {
-            continue;
-        }
-
-        let msg: InboundMessage = match serde_json::from_str(&line) {
-            Ok(msg) => msg,
-            Err(e) => {
-                eprintln!("warning: ignoring malformed input line: {e}");
+    let input_result = (|| -> Result<()> {
+        for line in io::stdin().lock().lines() {
+            let line = line.context("read stdin")?;
+            if line.is_empty() {
                 continue;
             }
-        };
 
-        match msg.msg_type.as_str() {
-            "user" => {
-                let Some(user) = parse_or_warn::<InboundUser>(msg.payload, "user message") else {
-                    continue;
-                };
-                let content = user.message.content;
-                let prompt = content_text(&content).unwrap_or_else(|| content.to_string());
-                let images = content_images(&content);
-                if images.is_empty()
-                    && let Some(args) = prompt
-                        .strip_prefix("/remote")
-                        .filter(|args| args.is_empty() || args.starts_with(char::is_whitespace))
-                {
-                    match smol::block_on(handle.remote_control(args)) {
-                        Ok(status) => {
-                            writer.emit_system("remote", serde_json::json!({ "status": status }))?
-                        }
-                        Err(error) => writer
-                            .emit_system("remote_error", serde_json::json!({ "error": error }))?,
-                    }
+            let msg: InboundMessage = match serde_json::from_str(&line) {
+                Ok(msg) => msg,
+                Err(e) => {
+                    eprintln!("warning: ignoring malformed input line: {e}");
                     continue;
                 }
-                if remote_environment.is_some()
-                    && images.is_empty()
-                    && let Some(path) = remote_cd_path(&prompt)
-                {
-                    match smol::block_on(handle.change_remote_directory(path)) {
-                        Ok(cwd) => {
-                            shared.lock().unwrap().workspace_session =
-                                handle.remote_workspace_session();
-                            writer.emit_system("cwd", serde_json::json!({ "cwd": cwd }))?
-                        }
-                        Err(error) => writer
-                            .emit_system("cwd_error", serde_json::json!({ "error": error }))?,
-                    }
-                    continue;
-                }
-                if remote_environment.is_some()
-                    && images.is_empty()
-                    && let Some(command) = headless::direct_shell_command(&prompt)
-                {
-                    let started = Instant::now();
-                    let output = match (
-                        handle.remote_workspace_session(),
-                        handle.remote_workspace_baseline(),
-                    ) {
-                        (Some(workspace), Some(baseline)) => {
-                            smol::block_on(headless::execute_remote_command(
-                                &workspace,
-                                &baseline,
-                                command,
-                                &caudra_agent::CancelToken::none(),
-                                max_output_lines,
-                                max_output_bytes,
-                                |_| {},
-                            ))
-                        }
-                        _ => headless::RemoteCommandOutput {
-                            output: "Remote command execution is unavailable".into(),
-                            is_error: true,
-                        },
+            };
+
+            match msg.msg_type.as_str() {
+                "user" => {
+                    let Some(user) = parse_or_warn::<InboundUser>(msg.payload, "user message")
+                    else {
+                        continue;
                     };
-                    writer.emit_direct_command_result(output, started.elapsed().as_millis())?;
-                    continue;
-                }
-                let mode = {
-                    let mut shared = shared.lock().unwrap();
-                    shared.turn_start = Instant::now();
-                    shared.agent_mode(&cwd)
-                };
-                let mentions = if remote_environment.is_some() {
-                    caudra_agent::mentions::scan_remote(&prompt)
+                    let content = user.message.content;
+                    let prompt = content_text(&content).unwrap_or_else(|| content.to_string());
+                    let images = content_images(&content);
+                    if images.is_empty()
+                        && let Some(args) = prompt
+                            .strip_prefix("/remote")
+                            .filter(|args| args.is_empty() || args.starts_with(char::is_whitespace))
+                    {
+                        match smol::block_on(handle.remote_control(args)) {
+                            Ok(status) => writer
+                                .emit_system("remote", serde_json::json!({ "status": status }))?,
+                            Err(error) => writer.emit_system(
+                                "remote_error",
+                                serde_json::json!({ "error": error }),
+                            )?,
+                        }
+                        continue;
+                    }
+                    if remote_environment.is_some()
+                        && images.is_empty()
+                        && let Some(path) = remote_cd_path(&prompt)
+                    {
+                        match smol::block_on(handle.change_remote_directory(path)) {
+                            Ok(cwd) => {
+                                shared.lock().unwrap().workspace_session =
+                                    handle.remote_workspace_session();
+                                writer.emit_system("cwd", serde_json::json!({ "cwd": cwd }))?
+                            }
+                            Err(error) => writer
+                                .emit_system("cwd_error", serde_json::json!({ "error": error }))?,
+                        }
+                        continue;
+                    }
+                    if remote_environment.is_some()
+                        && images.is_empty()
+                        && let Some(command) = headless::direct_shell_command(&prompt)
+                    {
+                        let started = Instant::now();
+                        let output = match (
+                            handle.remote_workspace_session(),
+                            handle.remote_workspace_baseline(),
+                        ) {
+                            (Some(workspace), Some(baseline)) => {
+                                smol::block_on(headless::execute_remote_command(
+                                    &workspace,
+                                    &baseline,
+                                    command,
+                                    &caudra_agent::CancelToken::none(),
+                                    max_output_lines,
+                                    max_output_bytes,
+                                    |_| {},
+                                ))
+                            }
+                            _ => headless::RemoteCommandOutput {
+                                output: "Remote command execution is unavailable".into(),
+                                is_error: true,
+                            },
+                        };
+                        writer.emit_direct_command_result(output, started.elapsed().as_millis())?;
+                        continue;
+                    }
+                    let mode = {
+                        let mut shared = shared.lock().unwrap();
+                        shared.agent_mode(&cwd)
+                    };
+                    let mentions = if remote_environment.is_some() {
+                        caudra_agent::mentions::scan_remote(&prompt)
+                            .into_iter()
+                            .map(|(_, mention)| mention)
+                            .collect()
+                    } else {
+                        caudra_agent::mentions::scan(&prompt, |path| cwd.join(path).exists())
+                            .into_iter()
+                            .map(|(_, mention)| mention)
+                            .collect()
+                    };
+                    let commits = caudra_agent::commits::scan(&prompt, |_| true)
                         .into_iter()
-                        .map(|(_, mention)| mention)
-                        .collect()
-                } else {
-                    caudra_agent::mentions::scan(&prompt, |path| cwd.join(path).exists())
-                        .into_iter()
-                        .map(|(_, mention)| mention)
-                        .collect()
-                };
-                let commits = caudra_agent::commits::scan(&prompt, |_| true)
-                    .into_iter()
-                    .map(|(_, commit)| commit)
-                    .collect();
-                let input = AgentInput {
-                    message: prompt,
-                    mode,
-                    images,
-                    mentions,
-                    commits,
-                    preamble: Vec::new(),
-                    thinking: thinking.clone(),
-                    fast,
-                    prompt: None,
-                    resume: false,
-                };
-                if handle.input_tx.send(input).is_err() {
-                    break;
+                        .map(|(_, commit)| commit)
+                        .collect();
+                    let input = AgentInput {
+                        message: prompt,
+                        mode,
+                        images,
+                        mentions,
+                        commits,
+                        preamble: Vec::new(),
+                        thinking: thinking.clone(),
+                        fast,
+                        prompt: None,
+                        resume: false,
+                    };
+                    if handle.input_tx.send(input).is_err() {
+                        break;
+                    }
                 }
+                "control_request" => {
+                    let Some(cr) =
+                        parse_or_warn::<InboundControlRequest>(msg.payload, "control_request")
+                    else {
+                        continue;
+                    };
+                    handle_control_request(
+                        &cr,
+                        &writer,
+                        &handle,
+                        &shared,
+                        &startup_model,
+                        &model_policy,
+                    )?;
+                }
+                "control_response" => {
+                    let Some(cr) =
+                        parse_or_warn::<InboundControlResponse>(msg.payload, "control_response")
+                    else {
+                        continue;
+                    };
+                    answer_permission_response(&shared, &handle.permissions, cr.response);
+                }
+                "control_cancel_request" => {
+                    let Some(ccr) = parse_or_warn::<InboundControlCancelRequest>(
+                        msg.payload,
+                        "control_cancel_request",
+                    ) else {
+                        continue;
+                    };
+                    answer_pending_permission(
+                        &shared,
+                        &handle.permissions,
+                        &ccr.request_id,
+                        PermissionAnswer::Deny,
+                    );
+                }
+                other => warn!("unknown inbound message type: {other}"),
             }
-            "control_request" => {
-                let Some(cr) =
-                    parse_or_warn::<InboundControlRequest>(msg.payload, "control_request")
-                else {
-                    continue;
-                };
-                handle_control_request(
-                    &cr,
-                    &writer,
-                    &handle,
-                    &shared,
-                    &startup_model,
-                    &model_policy,
-                )?;
-            }
-            "control_response" => {
-                let Some(cr) =
-                    parse_or_warn::<InboundControlResponse>(msg.payload, "control_response")
-                else {
-                    continue;
-                };
-                answer_permission_response(&shared, &handle.permissions, cr.response);
-            }
-            "control_cancel_request" => {
-                let Some(ccr) = parse_or_warn::<InboundControlCancelRequest>(
-                    msg.payload,
-                    "control_cancel_request",
-                ) else {
-                    continue;
-                };
-                answer_pending_permission(
-                    &shared,
-                    &handle.permissions,
-                    &ccr.request_id,
-                    PermissionAnswer::Deny,
-                );
-            }
-            other => warn!("unknown inbound message type: {other}"),
         }
-    }
 
+        Ok(())
+    })();
+    let _ = handle.cancel_tx.try_send(());
     let InteractiveHandle { input_tx, task, .. } = handle;
     drop(input_tx);
     smol::block_on(async {
@@ -1080,7 +1130,7 @@ pub fn run(params: SdkParams) -> Result<()> {
     });
     drop(writer);
     let _ = writer_thread.join();
-    Ok(())
+    input_result
 }
 
 fn remote_cd_path(prompt: &str) -> Option<&str> {
@@ -1186,18 +1236,10 @@ fn resolve_session(
             ensure_fork_target_available(&storage, &target)?;
             let mut reachable = reachable_subagent_ids(&history, &session);
             let mut versions =
-                caudra_agent::active_task_history_versions_with_batch_state(&history, |call_id| {
-                    session
-                        .tool_outputs()
-                        .get(call_id)
-                        .and_then(|output| output.state())
+                caudra_agent::active_task_history_versions_with_outputs(&history, |call_id| {
+                    session.tool_outputs().get(call_id).map(Arc::as_ref)
                 });
-            reachable.extend(
-                versions
-                    .iter()
-                    .filter(|(_, version_id)| session.subagent_messages().contains_key(*version_id))
-                    .map(|(task_id, _)| task_id.clone()),
-            );
+            reachable.extend(versions.keys().cloned());
             for subagent in session.subagents() {
                 if reachable.contains(&subagent.tool_use_id)
                     && !versions.contains_key(&subagent.tool_use_id)
@@ -1223,7 +1265,6 @@ fn resolve_session(
                     session
                         .subagent_messages()
                         .get(version_id)
-                        .or_else(|| session.subagent_messages().get(task_id))
                         .map(|items| (task_id, items))
                 })
                 .map(|(task_id, items)| {
@@ -1415,11 +1456,15 @@ fn copy_history_outputs<'a>(
             HistoryItemKind::AssistantText {
                 retained_output_refs,
                 ..
+            }
+            | HistoryItemKind::User {
+                retained_output_refs,
+                ..
             } => retained_output_refs,
             _ => &[],
         };
         for output_ref in output_refs {
-            if seen.insert(output_ref.id) {
+            if seen.insert(output_ref.id.clone()) {
                 references.push(output_ref.clone());
             }
         }
@@ -1461,7 +1506,20 @@ fn save_sdk_fork(
         stored_tool_ids.extend(all_tool_call_ids(history));
     }
     let copied_task_ids: HashSet<String> = subagent_histories.keys().cloned().collect();
+    let versions = caudra_agent::active_task_history_versions_with_outputs(history, |call_id| {
+        source.tool_outputs().get(call_id).map(Arc::as_ref)
+    });
     for (task_id, history) in subagent_histories {
+        if let Some(version_id) = versions
+            .get(&task_id)
+            .filter(|version| *version != &task_id)
+        {
+            fork.set_subagent_history(
+                version_id.clone(),
+                history.clone(),
+                Some(StoredSubagentTaskSpec::version()),
+            );
+        }
         let spec = source.subagent_task_specs().get(&task_id).cloned();
         fork.set_subagent_history(task_id, history, spec);
     }
@@ -1714,19 +1772,32 @@ fn handle_control_request(
                 None,
             )
         }
-        "interrupt" => {
-            let _ = handle.cancel_tx.try_send(());
-            writer.emit_control_response(&cr.request_id, ok, None)
+        "interrupt" => match smol::block_on(handle.interrupt()) {
+            Ok(()) => writer.emit_control_response(&cr.request_id, ok, None),
+            Err(error) => writer.emit_control_response(&cr.request_id, None, Some(error)),
+        },
+        subtype if TASK_CONTROLS.contains(&subtype) => {
+            handle_task_control_request(cr, writer, handle.background.as_ref())
         }
         "set_permission_mode" => {
             let mode_str = cr.request.extra.get("mode").and_then(Value::as_str);
             match mode_str.and_then(PermissionMode::parse) {
                 Some(mode) => {
-                    shared.lock().unwrap().permission_mode = mode;
-                    handle
-                        .permissions
-                        .set_session_yolo(Some(mode == PermissionMode::BypassPermissions));
-                    writer.emit_control_response(&cr.request_id, ok, None)
+                    let agent_mode = shared
+                        .lock()
+                        .unwrap()
+                        .agent_mode_for(mode, &handle.permissions.project_cwd());
+                    match smol::block_on(
+                        handle.set_mode(agent_mode, mode == PermissionMode::BypassPermissions),
+                    ) {
+                        Ok(()) => {
+                            shared.lock().unwrap().permission_mode = mode;
+                            writer.emit_control_response(&cr.request_id, ok, None)
+                        }
+                        Err(error) => {
+                            writer.emit_control_response(&cr.request_id, None, Some(error))
+                        }
+                    }
                 }
                 None => writer.emit_control_response(
                     &cr.request_id,
@@ -1760,7 +1831,7 @@ fn handle_control_request(
         }
         other => match workflow_request(other, &cr.request.extra) {
             Some(Ok(request)) => {
-                forward_workflow_request(writer, handle.workflow.as_ref(), &cr.request_id, request);
+                forward_workflow_request(writer, &cr.request_id, handle.workflow_control(request));
                 Ok(())
             }
             Some(Err(message)) => writer.emit_control_response(&cr.request_id, None, Some(message)),
@@ -1770,6 +1841,36 @@ fn handle_control_request(
                 Some(format!("unsupported: {other}")),
             ),
         },
+    }
+}
+
+fn handle_task_control_request(
+    cr: &InboundControlRequest,
+    writer: &SdkWriter,
+    tasks: Option<&BackgroundTasks>,
+) -> Result<()> {
+    let result = smol::block_on(async {
+        let tasks = tasks.ok_or("Background tasks unavailable".to_owned())?;
+        let subtype = cr.request.subtype.as_str();
+        if subtype == "task_list" {
+            return serde_json::to_value(tasks.list()).map_err(|error| error.to_string());
+        }
+        let id = cr
+            .request
+            .extra
+            .get("task_id")
+            .and_then(Value::as_str)
+            .ok_or("task_id is required".to_owned())?;
+        let status = match subtype {
+            "task_cancel" => tasks.cancel(id).await,
+            "task_promote" => tasks.promote(id).await,
+            _ => tasks.status(id),
+        }?;
+        serde_json::to_value(status).map_err(|error| error.to_string())
+    });
+    match result {
+        Ok(status) => writer.emit_control_response(&cr.request_id, Some(status), None),
+        Err(error) => writer.emit_control_response(&cr.request_id, None, Some(error)),
     }
 }
 
@@ -1846,19 +1947,13 @@ fn workflow_request(subtype: &str, extra: &Value) -> Option<Result<WorkflowReque
 /// to stop, and the client's permission replies must keep flowing meanwhile.
 fn forward_workflow_request(
     writer: &SdkWriter,
-    workflow: Option<&WorkflowHandle>,
     request_id: &str,
-    request: WorkflowRequest,
+    answer: impl Future<Output = Result<WorkflowResponse, WorkflowError>> + Send + 'static,
 ) {
     let writer = writer.clone();
-    let workflow = workflow.cloned();
     let request_id = request_id.to_owned();
     smol::spawn(async move {
-        let answer = match workflow {
-            Some(workflow) => workflow.request(request).await,
-            None => Err(WorkflowError::Unavailable),
-        };
-        let (response, error) = workflow_control_response(answer);
+        let (response, error) = workflow_control_response(answer.await);
         if let Err(error) = writer.emit_control_response(&request_id, response, error) {
             warn!(%error, request_id, "workflow control response not delivered");
         }
@@ -2021,10 +2116,15 @@ fn answer_pending_permission(
     shared: &Mutex<Shared>,
     permissions: &PermissionManager,
     sdk_request_id: &str,
-    answer: PermissionAnswer,
+    mut answer: PermissionAnswer,
 ) -> bool {
     let request_id = {
         let mut shared = shared.lock().unwrap();
+        if let Some((tasks, envelope)) = shared.task_permissions.remove(sdk_request_id)
+            && !tasks.event_is_current(&envelope)
+        {
+            answer = PermissionAnswer::Deny;
+        }
         if let Some(request_id) = shared.pending.remove(sdk_request_id) {
             Some(request_id)
         } else if shared.resolved_permission_requests.remove(sdk_request_id) {
@@ -2051,6 +2151,10 @@ fn answer_pending_permission(
 }
 
 struct EventPump {
+    run_rx: Receiver<InteractiveRun>,
+    pending_runs: HashMap<u64, InteractiveRun>,
+    run: Option<InteractiveRun>,
+    background: Option<BackgroundTasks>,
     writer: SdkWriter,
     shared: Arc<Mutex<Shared>>,
     permissions: Arc<PermissionManager>,
@@ -2103,10 +2207,7 @@ impl EventPump {
         self.cost = None;
         self.subscription_cost = None;
         self.auxiliary_usage = TokenUsage::default();
-        let pending = mem::take(&mut self.shared.lock().unwrap().pending);
-        for request_id in pending.into_values() {
-            self.permissions.answer(&request_id, PermissionAnswer::Deny);
-        }
+        self.run = None;
     }
 
     fn emit_turn_result(
@@ -2116,11 +2217,16 @@ impl EventPump {
         num_turns: u32,
         usage: TokenUsage,
     ) -> Result<()> {
-        let duration_ms = self.shared.lock().unwrap().turn_start.elapsed().as_millis();
+        let duration_ms = self
+            .run
+            .as_ref()
+            .map_or(0, |run| run.started.elapsed().as_millis());
         // Zero on an unpriced model, which is what its turns reported too.
         let total_cost_usd = self.cost.unwrap_or_default();
         let subscription_cost_usd = self.subscription_cost.unwrap_or_default();
         self.writer.emit(WireInner::Result(ResultPayload {
+            run: self.run.as_ref().map(RunInfo::from),
+            background_active: self.background.as_ref().map(BackgroundTasks::active_count),
             subtype: if is_error {
                 "error_during_execution"
             } else {
@@ -2141,6 +2247,33 @@ impl EventPump {
     }
 
     fn handle(&mut self, envelope: Envelope) -> Result<()> {
+        if (envelope.task.is_some() || envelope.run_id == BACKGROUND_EVENT_RUN_ID)
+            && !self
+                .background
+                .as_ref()
+                .is_some_and(|tasks| tasks.owns_event(&envelope))
+        {
+            return Ok(());
+        }
+        for run in self.run_rx.try_iter() {
+            self.pending_runs.insert(run.run_id, run);
+        }
+        let parent_event =
+            envelope.subagent.is_none() && envelope.workflow.is_none() && envelope.task.is_none();
+        if parent_event && let Some(run) = self.pending_runs.remove(&envelope.run_id) {
+            self.reset_turn();
+            self.writer
+                .emit_system("turn_start", serde_json::to_value(RunInfo::from(&run))?)?;
+            self.run = Some(run);
+        }
+        let detached = envelope.workflow.is_some()
+            || envelope.task.as_ref().is_some_and(|child| {
+                self.background.as_ref().is_some_and(|tasks| {
+                    tasks
+                        .status(&child.task_id)
+                        .is_ok_and(|task| task.background)
+                })
+            });
         let parent_tool_use_id = envelope
             .subagent
             .as_ref()
@@ -2148,27 +2281,27 @@ impl EventPump {
 
         match &envelope.event {
             AgentEvent::TextDelta { text } => {
-                if self.include_partial_messages {
+                if self.include_partial_messages && parent_event {
                     let model = self.model_id();
                     let events = self.synth.text_delta(&model, text);
                     self.emit_stream(events)?;
                 }
             }
             AgentEvent::ThinkingDelta { text } => {
-                if self.include_partial_messages {
+                if self.include_partial_messages && parent_event {
                     let model = self.model_id();
                     let events = self.synth.thinking_delta(&model, text);
                     self.emit_stream(events)?;
                 }
             }
             AgentEvent::ThinkingBoundary => {
-                if self.include_partial_messages {
+                if self.include_partial_messages && parent_event {
                     let events = self.synth.thinking_boundary();
                     self.emit_stream(events)?;
                 }
             }
             AgentEvent::ToolPending { id, name } => {
-                if self.include_partial_messages {
+                if self.include_partial_messages && parent_event {
                     let model = self.model_id();
                     let events =
                         self.synth
@@ -2177,7 +2310,7 @@ impl EventPump {
                 }
             }
             AgentEvent::ToolInputDelta { id, delta, .. } => {
-                if self.include_partial_messages {
+                if self.include_partial_messages && parent_event {
                     let events = self.synth.tool_input_delta(id, delta);
                     self.emit_stream(events)?;
                 }
@@ -2186,7 +2319,7 @@ impl EventPump {
                 let name = ts.tool.to_string();
                 let input = ts.raw_input.clone().unwrap_or(Value::Null);
 
-                if self.include_partial_messages {
+                if self.include_partial_messages && parent_event {
                     let model = self.model_id();
                     let events = self.synth.tool_use(
                         &model,
@@ -2219,6 +2352,17 @@ impl EventPump {
             | AgentEvent::Injected { .. }
             | AgentEvent::ToolsLoaded { .. }
             | AgentEvent::PromptProgress { .. } => {}
+            AgentEvent::TaskAdmitted(task) => {
+                self.writer.emit_system(
+                    "task_admitted",
+                    serde_json::json!({
+                        "task": task,
+                        "parent_tool_use_id": parent_tool_use_id.as_deref().unwrap_or(&task.call_id),
+                        "workflow": envelope.workflow,
+                        "run_id": envelope.run_id,
+                    }),
+                )?;
+            }
             AgentEvent::Workflow(event) => {
                 self.writer.emit_system(
                     WORKFLOW_SYSTEM_SUBTYPE,
@@ -2229,7 +2373,7 @@ impl EventPump {
                 )?;
             }
             AgentEvent::StreamReset => {
-                if self.include_partial_messages {
+                if self.include_partial_messages && parent_event {
                     let events = self.synth.finish_message(&TokenUsage::default());
                     self.emit_stream(events)?;
                 }
@@ -2242,14 +2386,16 @@ impl EventPump {
             | AgentEvent::GoalClearedAfterError { .. } => {}
             AgentEvent::GoalEvaluation { cost, billing, .. }
             | AgentEvent::GoalEvaluationFailed { cost, billing, .. } => {
-                self.add_spend(*cost, *billing);
+                if !detached {
+                    self.add_spend(*cost, *billing);
+                }
             }
             AgentEvent::Retry {
                 attempt,
                 message,
                 delay_ms,
             } => {
-                if self.include_partial_messages {
+                if self.include_partial_messages && parent_event {
                     let events = self.synth.finish_message(&TokenUsage::default());
                     self.emit_stream(events)?;
                 }
@@ -2264,17 +2410,25 @@ impl EventPump {
                 )?;
             }
             AgentEvent::TurnComplete(tc) => {
-                self.add_spend(tc.cost, tc.billing);
-                if self.include_partial_messages {
+                if detached {
+                    self.writer.emit_system("background_usage", serde_json::json!({
+                        "usage": tc.usage, "cost": tc.cost, "billing": tc.billing,
+                        "parent_tool_use_id": parent_tool_use_id, "run_id": envelope.run_id, "task": envelope.task,
+                    }))?;
+                } else {
+                    self.add_spend(tc.cost, tc.billing);
+                }
+                if self.include_partial_messages && parent_event {
                     let events = self.synth.finish_message(&tc.usage);
                     self.emit_stream(events)?;
                 }
 
                 let content_value = serde_json::to_value(&tc.message.content)?;
-                if parent_tool_use_id.is_none() {
+                if parent_event {
                     self.result_text = content_text(&content_value).unwrap_or_default();
                 }
                 self.writer.emit(WireInner::Assistant(AssistantPayload {
+                    task: envelope.task.clone(),
                     message: AssistantMessage {
                         id: wire_uuid(),
                         model: tc.model.clone(),
@@ -2293,8 +2447,10 @@ impl EventPump {
                 billing,
                 ..
             } => {
-                self.add_spend(*cost, *billing);
-                if parent_tool_use_id.is_none() {
+                if !detached {
+                    self.add_spend(*cost, *billing);
+                }
+                if parent_event {
                     self.auxiliary_usage += *usage;
                 }
                 self.writer.emit_system(
@@ -2303,11 +2459,15 @@ impl EventPump {
                         "accounting": envelope.event,
                         "parent_tool_use_id": parent_tool_use_id,
                         "workflow": envelope.workflow,
+                        "run_id": envelope.run_id,
+                        "background": detached,
+                        "task": envelope.task,
                     }),
                 )?;
             }
             AgentEvent::ToolResultsSubmitted { message } => {
                 self.writer.emit(WireInner::User(UserPayload {
+                    task: envelope.task.clone(),
                     message: UserMessage {
                         role: "user",
                         content: serde_json::to_value(&message.content)?,
@@ -2331,6 +2491,23 @@ impl EventPump {
                     .unwrap()
                     .pending
                     .insert(req_id.clone(), request.id.clone());
+                if let Some(tasks) = &self.background
+                    && envelope.task.is_some()
+                {
+                    self.shared.lock().unwrap().task_permissions.insert(
+                        req_id.clone(),
+                        (
+                            tasks.clone(),
+                            Envelope {
+                                event: AgentEvent::PermissionRequest(request.clone()),
+                                subagent: envelope.subagent.clone(),
+                                run_id: envelope.run_id,
+                                workflow: envelope.workflow.clone(),
+                                task: envelope.task.clone(),
+                            },
+                        ),
+                    );
+                }
                 let tool_name = request.tool.to_string();
 
                 let emitted = self
@@ -2338,6 +2515,7 @@ impl EventPump {
                     .emit(WireInner::ControlRequest(ControlRequestPayload {
                         request_id: req_id.clone(),
                         request: ControlRequestInner {
+                            task: envelope.task.clone(),
                             subtype: "can_use_tool",
                             tool_name: Some(caudra_to_claude_tool_name(&tool_name).into()),
                             input: Some(request.input.clone()),
@@ -2345,7 +2523,9 @@ impl EventPump {
                         },
                     }));
                 if let Err(error) = emitted {
-                    self.shared.lock().unwrap().pending.remove(&req_id);
+                    let mut shared = self.shared.lock().unwrap();
+                    shared.pending.remove(&req_id);
+                    shared.task_permissions.remove(&req_id);
                     self.permissions.answer(&request.id, PermissionAnswer::Deny);
                     return Err(error);
                 }
@@ -2362,6 +2542,7 @@ impl EventPump {
                         .collect();
                     for sdk_request_id in &ids {
                         shared.pending.remove(sdk_request_id);
+                        shared.task_permissions.remove(sdk_request_id);
                         shared
                             .resolved_permission_requests
                             .insert(sdk_request_id.clone());
@@ -2381,17 +2562,29 @@ impl EventPump {
                 num_turns,
                 reason,
             } => {
+                if !parent_event {
+                    return Ok(());
+                }
                 self.shared
                     .lock()
                     .unwrap()
                     .resolved_permission_requests
                     .clear();
                 // An interrupted run leaves a partial answer, so it is not a success.
-                let is_error = *reason == DoneReason::Cancelled;
+                let is_error = *reason != DoneReason::EndTurn;
                 let result = mem::take(&mut self.result_text);
                 self.emit_turn_result(is_error, result, *num_turns, *usage)?;
             }
             AgentEvent::Error { message } => {
+                if !parent_event {
+                    return self.writer.emit_system(
+                        "background_error",
+                        serde_json::json!({
+                            "message": message, "parent_tool_use_id": parent_tool_use_id,
+                            "run_id": envelope.run_id, "task": envelope.task,
+                        }),
+                    );
+                }
                 self.emit_turn_result(true, message.clone(), 0, self.auxiliary_usage)?;
             }
         }
@@ -2424,11 +2617,13 @@ fn map_tool_names_in_content(content: &Value) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use caudra_agent::SubagentInfo;
     use caudra_agent::permissions::PermissionRequest;
     use caudra_agent::tools::PermissionScopes;
     use caudra_agent::types::WORKFLOW_EVENT_RUN_ID;
-    use caudra_providers::{ContentBlock, Message, Role};
+    use caudra_agent::{SubagentInfo, TaskCard, ToolOutput};
+    use caudra_providers::{ContentBlock, Message, Role, TaskEventOrigin};
+    use caudra_storage::background::TaskRecord;
+    use caudra_storage::sessions::SessionDatabase;
     use caudra_storage::usage_ledger::LedgerPurpose;
     use caudra_workflow::{RunSnapshot, RunStatus, RunUsage, SourceKind};
     use tempfile::TempDir;
@@ -2448,6 +2643,178 @@ mod tests {
         "session workspace identity changed; fork or explicitly rebind the session";
     const FORK_HISTORY: &str = "history retained without source authority";
     const SOURCE_PLAN: &str = "/source/plan.md";
+    const PHRASE_TASK: &str = "happy-cute-tick";
+    const TASK_CALL: &str = "task-launch-call";
+    const TASK_INVOCATION: &str = "task-runtime-invocation";
+    const TASK_EVENT: &str = "task-result-event";
+    const TASK_SUCCEEDED: &str = "succeeded";
+    const LARGE_TASK_RESULT_BYTES: usize = 64 * 1024;
+
+    fn task_record(output: Value) -> TaskRecord {
+        TaskRecord {
+            created_at: 0,
+            updated_at: 0,
+            sequence: 1,
+            task_id: PHRASE_TASK.into(),
+            invocation_id: TASK_INVOCATION.into(),
+            root_call_id: TASK_CALL.into(),
+            generation: 1,
+            state: TASK_SUCCEEDED.into(),
+            background: true,
+            receipt_accepted: true,
+            mode: "build".into(),
+            request: serde_json::json!({"call_id": TASK_CALL, "label": PHRASE_TASK}),
+            outcome: Some(serde_json::json!({
+                "task_id": PHRASE_TASK, "mode": "build", "success": true, "cancelled": false,
+                "output": output, "error": null, "tokens_used": 0, "duration_ms": 0
+            })),
+            output_ref: None,
+            history: serde_json::json!([]),
+            spec: Value::Null,
+            events: Vec::new(),
+        }
+    }
+
+    #[test_case(serde_json::json!({"answer": [1, true, null]}), false; "object")]
+    #[test_case(serde_json::json!([1, {"answer": true}]), false; "array")]
+    #[test_case(serde_json::json!("answer"), false; "text")]
+    #[test_case(serde_json::json!("x".repeat(LARGE_TASK_RESULT_BYTES)), true; "large_result_reference")]
+    fn task_status_and_tool_result_preserve_native_outcome(output: Value, oversized: bool) {
+        let temp = TempDir::new().unwrap();
+        let storage = StateDir::from_path(temp.path().into());
+        let mut session = StoredSession::new("provider/model", "/repo");
+        session.save(&storage).unwrap();
+        let record = task_record(output.clone());
+        SessionDatabase::open(&storage)
+            .unwrap()
+            .save_background_task(session.id, &record)
+            .unwrap();
+        let tasks = smol::block_on(BackgroundTasks::spawn(storage.clone(), session.id)).unwrap();
+        let (mut pump, out, _) =
+            permission_event_pump(permission_manager(), PermissionMode::Default);
+        handle_task_control_request(
+            &InboundControlRequest {
+                request_id: TASK_CALL.into(),
+                request: InboundControlRequestInner {
+                    subtype: "task_status".into(),
+                    extra: serde_json::json!({"task_id": PHRASE_TASK}),
+                },
+            },
+            &pump.writer,
+            Some(&tasks),
+        )
+        .unwrap();
+        let response = next_message(&out);
+        let status = &response["response"]["response"];
+        assert_eq!(response["type"], "control_response");
+        assert_eq!(status["task_id"], PHRASE_TASK);
+        assert_eq!(status["invocation_id"], TASK_INVOCATION);
+        assert_eq!(status["state"], TASK_SUCCEEDED);
+        assert_eq!(status["result_truncated"], oversized);
+        if oversized {
+            assert!(status.get("result").is_none());
+            assert!(status["result_preview"].is_string());
+        } else {
+            assert_eq!(status["result"], record.outcome.clone().unwrap());
+            assert_eq!(status["result"]["output"], output);
+        }
+        let reference: ToolOutputRef =
+            serde_json::from_value(status["output_ref"].clone()).unwrap();
+        let full = ToolOutputStore::new(storage)
+            .load_text(session.id, reference.id.clone())
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&full).unwrap(),
+            record.outcome.clone().unwrap()
+        );
+
+        let content = ToolOutput::Tasks(vec![tasks.status(PHRASE_TASK).unwrap()]).as_text();
+        pump.handle(Envelope {
+            event: AgentEvent::ToolResultsSubmitted {
+                message: Box::new(Message {
+                    role: Role::User,
+                    content: vec![ContentBlock::ToolResult {
+                        tool_use_id: TASK_CALL.into(),
+                        content,
+                        is_error: false,
+                        output_ref: None,
+                    }],
+                    ..Default::default()
+                }),
+            },
+            subagent: None,
+            run_id: 1,
+            task: None,
+            workflow: None,
+        })
+        .unwrap();
+        let message = next_message(&out);
+        let cards: Value = serde_json::from_str(
+            message["message"]["content"][0]["content"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(cards[0]["task_id"], PHRASE_TASK);
+        if oversized {
+            assert!(cards[0].get("result").is_none());
+            assert_eq!(cards[0]["result_truncated"], true);
+            assert_eq!(cards[0]["output_ref"], status["output_ref"]);
+            assert_eq!(
+                cards[0]["read_output"]["output_id"],
+                reference.id.to_string()
+            );
+        } else {
+            assert_eq!(cards[0]["result"], record.outcome.unwrap());
+            assert_eq!(cards[0]["result"]["output"], output);
+            assert!(cards[0].get("output_ref").is_none());
+            assert!(cards[0].get("read_output").is_none());
+        }
+        for key in ["invocation_id", "call_id", "root_call_id", "generation"] {
+            assert!(cards[0].get(key).is_none());
+        }
+        assert!(out.is_empty());
+        smol::block_on(tasks.shutdown()).unwrap();
+    }
+
+    #[test_case(false; "foreground")]
+    #[test_case(true; "background")]
+    fn task_admission_is_a_lifecycle_event_without_a_new_user_turn(background: bool) {
+        const RUN: u64 = 42;
+        let (mut pump, out, _) =
+            permission_event_pump(permission_manager(), PermissionMode::Default);
+        pump.run = Some(InteractiveRun {
+            run_id: RUN,
+            started: Instant::now(),
+            automatic: false,
+            task_event_ids: Vec::new(),
+            workflow_events: Vec::new(),
+        });
+        pump.result_text = REPAIR_PARENT.into();
+        pump.synth.text_delta(&pump.model_id(), REPAIR_PARENT);
+        let mut card = TaskCard::from(&task_record(Value::Null));
+        card.state = "queued".into();
+        card.result = None;
+        card.background = background;
+        pump.handle(Envelope {
+            event: AgentEvent::TaskAdmitted(card.clone()),
+            subagent: None,
+            run_id: RUN,
+            task: None,
+            workflow: None,
+        })
+        .unwrap();
+        let message = next_message(&out);
+        assert_eq!(message["type"], "system");
+        assert_eq!(message["subtype"], "task_admitted");
+        assert_eq!(message["task"], serde_json::to_value(card).unwrap());
+        assert_eq!(message["parent_tool_use_id"], TASK_CALL);
+        assert_eq!(message["run_id"], RUN);
+        assert!(out.is_empty());
+        assert_eq!(pump.run.as_ref().unwrap().run_id, RUN);
+        assert_eq!(pump.result_text, REPAIR_PARENT);
+        assert!(pump.synth.started);
+    }
 
     fn permission_manager() -> Arc<PermissionManager> {
         Arc::new(PermissionManager::new_nonpersistent(
@@ -2461,8 +2828,8 @@ mod tests {
         Arc::new(Mutex::new(Shared {
             model: Model::from_spec("anthropic/claude-sonnet-4-20250514").unwrap(),
             permission_mode: PermissionMode::Default,
-            turn_start: Instant::now(),
             pending,
+            task_permissions: HashMap::new(),
             resolved_permission_requests: HashSet::new(),
             workspace_session: None,
             local_documents: None,
@@ -2526,6 +2893,10 @@ mod tests {
         let shared = shared_with_pending(HashMap::new());
         shared.lock().unwrap().permission_mode = permission_mode;
         let pump = EventPump {
+            run_rx: flume::unbounded().1,
+            pending_runs: HashMap::new(),
+            run: None,
+            background: None,
             writer: SdkWriter {
                 session_id: SessionRef::generate(),
                 out_tx,
@@ -2545,6 +2916,165 @@ mod tests {
 
     fn history_messages(items: Vec<HistoryItem>) -> Vec<Message> {
         History::restored(items).unwrap().into_vec()
+    }
+
+    #[test_case(false; "normal_completion")]
+    #[test_case(true; "failed_parent")]
+    fn parent_result_preserves_child_permission_requests(failed: bool) {
+        smol::block_on(async {
+            let manager = permission_manager();
+            let (mut pump, out, shared) =
+                permission_event_pump(Arc::clone(&manager), PermissionMode::Default);
+            let (child, events) = pending_permission(
+                Arc::clone(&manager),
+                CAUDRA_REQUEST_ID,
+                REPAIR_PARENT,
+                serde_json::json!({"command": REPAIR_PARENT}),
+            );
+            pump.handle(events.recv_async().await.unwrap()).unwrap();
+            let request = next_message(&out);
+            pump.handle(Envelope {
+                event: if failed {
+                    AgentEvent::Error {
+                        message: REPAIR_FAILURE.into(),
+                    }
+                } else {
+                    AgentEvent::Done {
+                        usage: TokenUsage::default(),
+                        num_turns: 1,
+                        reason: DoneReason::EndTurn,
+                    }
+                },
+                subagent: None,
+                run_id: 1,
+                task: None,
+                workflow: None,
+            })
+            .unwrap();
+            assert_eq!(shared.lock().unwrap().pending.len(), 1);
+            assert_eq!(next_message(&out)["type"], "result");
+            answer_permission_response(
+                &shared,
+                &manager,
+                InboundControlResponseInner {
+                    subtype: "success".into(),
+                    request_id: request["request_id"].as_str().unwrap().into(),
+                    response: serde_json::json!({"behavior": "allow"}),
+                },
+            );
+            assert!(child.await);
+        });
+    }
+
+    #[test_case(false; "user_run")]
+    #[test_case(true; "automatic_run")]
+    fn admission_metadata_correlates_start_and_result(automatic: bool) {
+        const RUN: u64 = 42;
+        const EVENT: &str = "task-report-event";
+        const WORKFLOW_RUN: &str = "workflow-run";
+        let (mut pump, out, _) =
+            permission_event_pump(permission_manager(), PermissionMode::Default);
+        let (tx, rx) = flume::unbounded();
+        pump.run_rx = rx;
+        tx.send(InteractiveRun {
+            run_id: RUN,
+            started: Instant::now(),
+            automatic,
+            task_event_ids: vec![EVENT.into()],
+            workflow_events: vec![WorkflowEventOrigin {
+                run_id: WORKFLOW_RUN.into(),
+                revision: RUN,
+            }],
+        })
+        .unwrap();
+        pump.handle(Envelope {
+            event: AgentEvent::Done {
+                usage: TokenUsage::default(),
+                num_turns: 1,
+                reason: DoneReason::EndTurn,
+            },
+            subagent: None,
+            run_id: RUN,
+            task: None,
+            workflow: None,
+        })
+        .unwrap();
+        let start = next_message(&out);
+        let result = next_message(&out);
+        assert_eq!(start["subtype"], "turn_start");
+        assert_eq!(start["run_id"], RUN);
+        assert_eq!(result["run"]["run_id"], RUN);
+        assert_eq!(result["run"]["automatic"], automatic);
+        assert_eq!(result["run"]["task_event_ids"], serde_json::json!([EVENT]));
+        assert_eq!(
+            result["run"]["workflow_events"],
+            serde_json::json!([{ "run_id": WORKFLOW_RUN, "revision": RUN }])
+        );
+    }
+
+    #[test_case(false; "missing_provenance")]
+    #[test_case(true; "foreign_provenance")]
+    fn unowned_task_events_cannot_finalize_the_parent(tagged: bool) {
+        let (mut pump, out, _) =
+            permission_event_pump(permission_manager(), PermissionMode::Default);
+        pump.result_text = REPAIR_PARENT.into();
+        pump.handle(Envelope {
+            event: AgentEvent::Error {
+                message: REPAIR_FAILURE.into(),
+            },
+            subagent: None,
+            run_id: BACKGROUND_EVENT_RUN_ID,
+            workflow: None,
+            task: tagged.then(|| {
+                Arc::new(TaskProvenance {
+                    session_id: SessionRef::generate().id(),
+                    task_id: REPAIR_PARENT.into(),
+                    invocation_id: REPAIR_PARENT.into(),
+                })
+            }),
+        })
+        .unwrap();
+        assert!(out.is_empty());
+        assert_eq!(pump.result_text, REPAIR_PARENT);
+    }
+
+    #[test]
+    fn unowned_task_permission_response_is_denied() {
+        smol::block_on(async {
+            let temp = TempDir::new().unwrap();
+            let tasks = BackgroundTasks::spawn(
+                StateDir::from_path(temp.path().into()),
+                SessionRef::generate().id(),
+            )
+            .await
+            .unwrap();
+            let manager = permission_manager();
+            let (child, events) = pending_permission(
+                Arc::clone(&manager),
+                CAUDRA_REQUEST_ID,
+                REPAIR_PARENT,
+                serde_json::json!({"command": REPAIR_PARENT}),
+            );
+            let event = events.recv_async().await.unwrap();
+            let shared = shared_with_pending(HashMap::from([(
+                CAUDRA_REQUEST_ID.into(),
+                CAUDRA_REQUEST_ID.into(),
+            )]));
+            shared
+                .lock()
+                .unwrap()
+                .task_permissions
+                .insert(CAUDRA_REQUEST_ID.into(), (tasks.clone(), event));
+            answer_pending_permission(
+                &shared,
+                &manager,
+                CAUDRA_REQUEST_ID,
+                PermissionAnswer::AllowOnce,
+            );
+            assert!(!child.await);
+            assert!(shared.lock().unwrap().task_permissions.is_empty());
+            tasks.shutdown().await.unwrap();
+        });
     }
 
     #[test_case(false; "done")]
@@ -2584,6 +3114,7 @@ mod tests {
                 },
                 subagent,
                 run_id: 1,
+                task: None,
                 workflow: None,
             })
             .unwrap();
@@ -2619,6 +3150,7 @@ mod tests {
             event,
             subagent: None,
             run_id: 1,
+            task: None,
             workflow: None,
         })
         .unwrap();
@@ -2723,6 +3255,7 @@ mod tests {
             ..Default::default()
         };
         let payload = UserPayload {
+            task: None,
             message: UserMessage {
                 role: "user",
                 content: serde_json::to_value(&message.content).unwrap(),
@@ -2805,7 +3338,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            store.load_text(target.id(), output_ref.id).unwrap(),
+            store.load_text(target.id(), output_ref.id.clone()).unwrap(),
             "complete artifact"
         );
         assert_eq!(
@@ -2819,6 +3352,105 @@ mod tests {
                 ..
             } if reference == &output_ref
         )));
+    }
+
+    #[test]
+    fn fork_copies_task_notice_output_without_a_retrieval_call() {
+        let temp = TempDir::new().unwrap();
+        let storage = StateDir::from_path(temp.path().to_path_buf());
+        let store = ToolOutputStore::new(storage.clone());
+        let source = SessionRef::generate();
+        let target = SessionRef::generate();
+        let complete = "x".repeat(LARGE_TASK_RESULT_BYTES);
+        let reference = store.put(source.id(), &complete).unwrap();
+        let origin = TaskEventOrigin {
+            task_id: PHRASE_TASK.into(),
+            invocation_id: TASK_INVOCATION.into(),
+            event_id: TASK_EVENT.into(),
+        };
+        let mut notice = Message::task_observation(
+            format!("Task {PHRASE_TASK}: success.\n\n[truncated]"),
+            origin.clone(),
+        );
+        notice.retained_output_refs.push(reference.clone());
+        let items = History::new(vec![notice]).into_items();
+        let restored = serde_json::from_value(serde_json::to_value(items).unwrap()).unwrap();
+        let forked = rebase_history(restored).unwrap();
+
+        copy_history_outputs(&storage, &source, &target, [forked.as_slice()]).unwrap();
+
+        assert_eq!(
+            store.load_text(target.id(), reference.id.clone()).unwrap(),
+            complete
+        );
+        let messages = history_messages(forked);
+        assert_eq!(messages[0].task_event.as_ref(), Some(&origin));
+        assert_eq!(messages[0].retained_output_refs, [reference]);
+    }
+
+    #[test_case(false; "direct")]
+    #[test_case(true; "batch")]
+    fn sdk_fork_preserves_selected_task_version_stream(batch: bool) {
+        const ROOT_CALL: &str = "root-launch";
+        const SELECTED: &str = "selected earlier history";
+        const LATEST: &str = "latest must not replace selected";
+        let temp = TempDir::new().unwrap();
+        let storage = StateDir::from_path(temp.path().into());
+        let mut source = StoredSession::new("provider/model", "/repo");
+        let target = SessionRef::generate();
+        let output = ToolOutput::Tasks(vec![TaskCard::from(&task_record(Value::Null))]);
+        let output = if batch {
+            serde_json::from_value(serde_json::json!({"Batch": {
+                "entries": [{"tool": "task", "summary": PHRASE_TASK, "status": "Success", "output": output}],
+                "text": ""
+            }})).unwrap()
+        } else {
+            output
+        };
+        source.insert_tool_output(ROOT_CALL.into(), output);
+        source.set_subagent_history(
+            PHRASE_TASK.into(),
+            History::new(vec![Message::user(LATEST.into())]).into_items(),
+            Some(StoredSubagentTaskSpec::default()),
+        );
+        let selected = History::new(vec![Message::user(SELECTED.into())]).into_items();
+        source.set_subagent_history(
+            TASK_CALL.into(),
+            selected.clone(),
+            Some(StoredSubagentTaskSpec::version()),
+        );
+        let history = History::new(vec![Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::tool_use(
+                ROOT_CALL,
+                if batch { "batch" } else { "task" },
+                serde_json::json!({}),
+            )],
+            ..Default::default()
+        }])
+        .into_items();
+        save_sdk_fork(
+            &storage,
+            &source,
+            &target,
+            &history,
+            HashMap::from([(PHRASE_TASK.into(), selected.clone())]),
+            None,
+            "/repo",
+        )
+        .unwrap();
+        let restored = caudra_agent::load_stored_session(target.id(), &storage).unwrap();
+        let versions = caudra_agent::active_task_history_versions_with_outputs(
+            restored.messages(),
+            |call_id| restored.tool_outputs().get(call_id).map(Arc::as_ref),
+        );
+        assert_eq!(versions[PHRASE_TASK], TASK_CALL);
+        assert_eq!(restored.subagent_messages()[TASK_CALL].as_ref(), &selected);
+        assert!(restored.subagent_task_specs()[TASK_CALL].is_version());
+        assert_eq!(
+            restored.subagent_messages()[PHRASE_TASK].as_ref(),
+            &selected
+        );
     }
 
     #[test]
@@ -3300,6 +3932,7 @@ mod tests {
             },
             subagent: None,
             run_id: 0,
+            task: None,
             workflow: None,
         })
         .unwrap();
@@ -3307,6 +3940,7 @@ mod tests {
             event: AgentEvent::StreamReset,
             subagent: None,
             run_id: 0,
+            task: None,
             workflow: None,
         })
         .unwrap();
@@ -3423,6 +4057,8 @@ mod tests {
     fn wire_result_serializes_correctly() {
         let msg = WireMessage {
             inner: WireInner::Result(ResultPayload {
+                run: None,
+                background_active: None,
                 subtype: "success",
                 is_error: false,
                 duration_ms: 1000,
@@ -3515,6 +4151,7 @@ mod tests {
             inner: WireInner::ControlRequest(ControlRequestPayload {
                 request_id: "req_5".into(),
                 request: ControlRequestInner {
+                    task: None,
                     subtype: "can_use_tool",
                     tool_name: Some("Read".into()),
                     input: Some(serde_json::json!({"path": "/tmp"})),
@@ -3640,6 +4277,7 @@ mod tests {
             event: AgentEvent::PermissionRequest(Box::new(request)),
             subagent: None,
             run_id: 0,
+            task: None,
             workflow: None,
         })
         .unwrap();
@@ -3672,6 +4310,7 @@ mod tests {
                 event,
                 subagent: None,
                 run_id: 0,
+                task: None,
                 workflow: None,
             })
             .unwrap();
@@ -3989,6 +4628,7 @@ mod tests {
             event,
             subagent,
             run_id: WORKFLOW_EVENT_RUN_ID,
+            task: None,
             workflow: Some(provenance()),
         }
     }
@@ -4078,6 +4718,7 @@ mod tests {
                 steer_tx: None,
             }),
             run_id: 1,
+            task: None,
             workflow: None,
         })
         .unwrap();
@@ -4178,7 +4819,7 @@ mod tests {
             out_tx,
         };
 
-        forward_workflow_request(&writer, None, "req_1", WorkflowRequest::List);
+        forward_workflow_request(&writer, "req_1", async { Err(WorkflowError::Unavailable) });
 
         let message: Value =
             serde_json::from_str(&smol::block_on(out_rx.recv_async()).unwrap()).unwrap();

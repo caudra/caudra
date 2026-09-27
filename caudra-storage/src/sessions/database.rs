@@ -77,7 +77,7 @@ use crate::{
 pub const SESSIONS_DB_FILE: &str = "caudra.sqlite";
 pub const SESSIONS_DB_LOCK_FILE: &str = "caudra.sqlite.lock";
 
-const SCHEMA_VERSION: i64 = 11;
+const SCHEMA_VERSION: i64 = 13;
 const APPLICATION_ID: i64 = i32::from_be_bytes(*b"CAUD") as i64;
 /// Pages copied per step of the pre-migration backup. The whole file is copied
 /// under the initialization lock, so this only bounds how long the backup holds
@@ -423,6 +423,15 @@ CREATE TABLE workflow_calls (
 ) STRICT;
 "#;
 
+const WORKFLOW_RECEIPTS_TABLE: &str = "
+CREATE TABLE workflow_receipts (
+    session_id BLOB NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    run_id TEXT NOT NULL,
+    revision INTEGER NOT NULL CHECK(revision >= 0),
+    PRIMARY KEY(session_id, run_id, revision)
+) WITHOUT ROWID;
+";
+
 /// The timeline of a run: every phase it entered and every line it logged,
 /// in the order they happened. Viewing data only; replay never reads it.
 const WORKFLOW_EVENTS_TABLE: &str = r#"
@@ -578,6 +587,16 @@ const MIGRATIONS: &[Migration] = &[
         from: 10,
         to: 11,
         sql: SUBAGENT_REQUEST_COLUMNS,
+    },
+    Migration {
+        from: 11,
+        to: 12,
+        sql: crate::background::TABLES,
+    },
+    Migration {
+        from: 12,
+        to: 13,
+        sql: WORKFLOW_RECEIPTS_TABLE,
     },
 ];
 
@@ -817,7 +836,8 @@ CREATE TABLE pending_archives (
 /// What a fresh database gets: every migration already folded in.
 fn full_schema() -> String {
     format!(
-        "{SCHEMA}{USAGE_LEDGER_TABLE}{WORKFLOW_TABLES}{WORKFLOW_EVENTS_TABLE}{PERMISSION_REVISION_SCHEMA}{TOOL_USAGE_TABLES}"
+        "{SCHEMA}{USAGE_LEDGER_TABLE}{WORKFLOW_TABLES}{WORKFLOW_EVENTS_TABLE}{WORKFLOW_RECEIPTS_TABLE}{PERMISSION_REVISION_SCHEMA}{TOOL_USAGE_TABLES}{}",
+        crate::background::TABLES
     )
 }
 
@@ -995,6 +1015,8 @@ pub struct SessionStorageStats {
     pub workflow_run_count: u64,
     pub workflow_call_count: u64,
     pub workflow_bytes: u64,
+    pub background_invocation_count: u64,
+    pub background_bytes: u64,
     pub tool_output_file_bytes: u64,
     pub snapshot_bytes: u64,
     pub archive_bytes: u64,
@@ -1608,6 +1630,11 @@ impl SessionDatabase {
             self.connection
                 .query_row("SELECT count(*) FROM cleanup_jobs", [], |row| row.get(0))?;
         let workflow = workflow_totals(&self.connection)?;
+        let (background_invocation_count, background_bytes) = self.connection.query_row(
+            "SELECT count(*), coalesce(sum(bytes), 0) + (SELECT coalesce(sum(length(event_id)), 0) FROM background_receipts) FROM background_tasks",
+            [],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+        )?;
         let state_path = self.state_dir.path();
         Ok(SessionStorageStats {
             database_bytes: files.database,
@@ -1628,6 +1655,11 @@ impl SessionDatabase {
             workflow_run_count: workflow.run_count,
             workflow_call_count: workflow.call_count,
             workflow_bytes: workflow.bytes,
+            background_invocation_count: from_i64(
+                background_invocation_count,
+                "background invocation count",
+            )?,
+            background_bytes: from_i64(background_bytes, "background bytes")?,
             tool_output_file_bytes: directory_bytes(&state_path.join(TOOL_OUTPUT_DIR)),
             snapshot_bytes: directory_bytes(&state_path.join(SESSION_SNAPSHOT_DIR)),
             archive_bytes: directory_bytes(
@@ -1799,10 +1831,11 @@ impl SessionDatabase {
     pub fn session_facts(&self, cwd: Option<&str>) -> Result<Vec<SessionFacts>, SessionError> {
         let mut statement = self.connection.prepare(&format!(
             "SELECT id, title, cwd, created_at, updated_at, last_opened_at, pinned, trimmed_at,\
-                    logical_bytes + {SESSION_WORKFLOW_BYTES}, \
+                    logical_bytes + {SESSION_WORKFLOW_BYTES} + {}, \
                     json_extract(metadata, '$.pending_revert') IS NOT NULL \
              FROM sessions WHERE ?1 IS NULL OR cwd = ?1 \
-             ORDER BY max(updated_at, coalesce(last_opened_at, 0)) DESC, id DESC"
+             ORDER BY max(updated_at, coalesce(last_opened_at, 0)) DESC, id DESC",
+            crate::background::SESSION_BYTES
         ))?;
         let mut rows = statement.query(params![cwd])?;
         let mut facts = Vec::new();
@@ -1840,6 +1873,9 @@ impl SessionDatabase {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let root = root_on(&transaction, id)?;
+        if crate::background::protects_session(&transaction, id)? {
+            return Err(SessionError::BackgroundTasksPending { id });
+        }
         let (rows, bytes) = transaction.query_row(
             "SELECT count(*), coalesce(sum(byte_count), 0) FROM tool_outputs \
              WHERE session_id = ?1 AND byte_count > ?2",
@@ -2413,6 +2449,9 @@ impl SessionDatabase {
                     reason: RELOCATION_WORKFLOW,
                 });
             }
+            if crate::background::protects_session(&transaction, expected.id)? {
+                return Err(SessionError::BackgroundTasksPending { id: expected.id });
+            }
             let mut metadata: Value = deserialize_json(&root.metadata, "session metadata")?;
             let object =
                 metadata
@@ -2688,6 +2727,15 @@ impl SessionDatabase {
             let mut rows = statement.query(params![id.as_bytes().as_slice()])?;
             while let Some(row) = rows.next()? {
                 let payload = payload_from_row(row, 0, "payload")?;
+                visit(&payload);
+            }
+        }
+        {
+            let mut statement = transaction
+                .prepare("SELECT payload FROM background_tasks WHERE session_id = ?1")?;
+            let mut rows = statement.query(params![id.as_bytes().as_slice()])?;
+            while let Some(row) = rows.next()? {
+                let payload: String = row.get(0)?;
                 visit(&payload);
             }
         }
@@ -5195,6 +5243,27 @@ fn insert_history(
     ordinal: usize,
     payload: &str,
 ) -> Result<(), SessionError> {
+    let message: Value = serde_json::from_str(payload).map_err(StorageError::from)?;
+    if let Some(origin) = message.get("workflow_event")
+        && let Some(run_id) = origin.get("run_id").and_then(Value::as_str)
+        && let Some(revision) = origin.get("revision").and_then(Value::as_u64)
+    {
+        validate_identifier("workflow receipt run id", run_id)?;
+        transaction.execute(
+            "INSERT OR IGNORE INTO workflow_receipts(session_id, run_id, revision) VALUES (?1, ?2, ?3)",
+            params![session_id.as_bytes().as_slice(), run_id, to_i64(revision, "workflow receipt revision")?],
+        )?;
+    }
+    if let Some(event) = message
+        .get("task_event")
+        .and_then(|origin| origin.get("event_id"))
+        .and_then(Value::as_str)
+    {
+        transaction.execute(
+            "INSERT OR IGNORE INTO background_receipts(session_id, event_id) VALUES (?1, ?2)",
+            params![session_id.as_bytes().as_slice(), event],
+        )?;
+    }
     transaction.execute(
         "INSERT INTO main_history_items (session_id, ordinal, payload, byte_count) \
          VALUES (?1, ?2, ?3, ?4)",
@@ -8703,6 +8772,30 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
     }
 
     #[test]
+    fn schema_twelve_migrates_workflow_receipts() {
+        const PREVIOUS_SCHEMA: i64 = 12;
+        const RUN_ID: &str = "receipt-migration-run";
+        let (_temp, state_dir) = state_dir();
+        let database = SessionDatabase::open(&state_dir).unwrap();
+        database
+            .connection
+            .execute_batch("DROP TABLE workflow_receipts")
+            .unwrap();
+        database
+            .connection
+            .pragma_update(None, "user_version", PREVIOUS_SCHEMA)
+            .unwrap();
+        drop(database);
+        let database = SessionDatabase::open(&state_dir).unwrap();
+        assert_eq!(database.stats().unwrap().schema_version, SCHEMA_VERSION);
+        assert!(
+            !database
+                .workflow_receipt_exists(CaudraId::generate(), RUN_ID, 0)
+                .unwrap()
+        );
+    }
+
+    #[test]
     fn historical_v1_without_schema_identity_requires_a_reset() {
         let (_temp, state_dir) = state_dir();
         let path = state_dir.path().join(SESSIONS_DB_FILE);
@@ -9118,7 +9211,13 @@ CREATE TABLE subagent_history_items (
             .pragma_update(None, "auto_vacuum", "INCREMENTAL")
             .unwrap();
         connection.execute_batch("VACUUM").unwrap();
-        connection.execute_batch(&full_schema()).unwrap();
+        connection
+            .execute_batch(
+                &full_schema()
+                    .replace(crate::background::TABLES, "")
+                    .replace(WORKFLOW_RECEIPTS_TABLE, ""),
+            )
+            .unwrap();
         connection
             .execute_batch(HISTORY_TABLES_BEFORE_COMPRESSION)
             .unwrap();
@@ -9205,7 +9304,13 @@ CREATE TABLE subagents (
             .pragma_update(None, "auto_vacuum", "INCREMENTAL")
             .unwrap();
         connection.execute_batch("VACUUM").unwrap();
-        connection.execute_batch(&full_schema()).unwrap();
+        connection
+            .execute_batch(
+                &full_schema()
+                    .replace(crate::background::TABLES, "")
+                    .replace(WORKFLOW_RECEIPTS_TABLE, ""),
+            )
+            .unwrap();
         connection
             .execute_batch(SUBAGENTS_BEFORE_REQUEST_COLUMNS)
             .unwrap();

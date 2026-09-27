@@ -1090,7 +1090,13 @@ mod tests {
     use test_case::test_case;
 
     use super::EventParser;
-    use crate::{ContentBlock, Message, Model, ProviderEvent, SteeringKind, invalid_tool_input};
+    use crate::providers::test_support::{
+        task_event_origin, task_observation_with_output_refs, workflow_event_origin,
+    };
+    use crate::{
+        ContentBlock, Message, Model, ProviderEvent, StandingReminderKind, SteeringKind,
+        invalid_tool_input,
+    };
 
     const STEERING_TEXT: &str = "Continue with a useful response.";
     const STEERING_RULE: &str = "empty_output";
@@ -1159,10 +1165,14 @@ mod tests {
         assert_eq!(wire[0]["content"][0]["input"], input);
     }
 
-    #[test_case(SteeringKind::Recovery ; "recovery")]
-    #[test_case(SteeringKind::Advisory ; "advisory")]
-    fn steering_metadata_is_not_on_wire(kind: SteeringKind) {
-        let messages = [Message::steering(STEERING_TEXT.into(), STEERING_RULE, kind)];
+    #[test_case(Message::steering(STEERING_TEXT.into(), STEERING_RULE, SteeringKind::Recovery) ; "recovery")]
+    #[test_case(Message::steering(STEERING_TEXT.into(), STEERING_RULE, SteeringKind::Advisory) ; "advisory")]
+    #[test_case(Message::task_observation(STEERING_TEXT.into(), task_event_origin()) ; "task_event")]
+    #[test_case(task_observation_with_output_refs(STEERING_TEXT); "retained_task_outputs")]
+    #[test_case(Message::workflow_observation(STEERING_TEXT.into(), workflow_event_origin()) ; "workflow_event")]
+    #[test_case(Message::standing_reminder(STEERING_TEXT.into(), StandingReminderKind::BackgroundWork) ; "background_reminder")]
+    fn observation_metadata_is_not_on_wire(message: Message) {
+        let messages = [message];
         let wire = serde_json::to_value(super::build_wire_messages(&messages)).unwrap();
         assert_eq!(
             wire,

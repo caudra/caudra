@@ -52,7 +52,9 @@ pub(crate) const SESSION_WORKFLOW_BYTES: &str = "coalesce((SELECT sum(bytes) FRO
         WHERE runs.session_id = sessions.id), 0) \
      + coalesce((SELECT sum(events.bytes) FROM workflow_run_events AS events \
         JOIN workflow_runs AS runs ON runs.run_id = events.run_id \
-        WHERE runs.session_id = sessions.id), 0)";
+         WHERE runs.session_id = sessions.id), 0) \
+     + coalesce((SELECT sum(length(CAST(run_id AS BLOB))) FROM workflow_receipts \
+         WHERE session_id = sessions.id), 0)";
 const RUN_COLUMNS: &str = "run_id, session_id, display_name, workflow_name, source_kind, \
      source_path, source_digest, language_version, abi_version, source, args, objective, \
      launch_mode, status, pause_kind, pause_message, revision, execution_epoch, phase, \
@@ -732,10 +734,26 @@ impl SessionDatabase {
     pub fn ack_workflow_outbox(&self, run_id: &str, revision: u64) -> Result<bool, SessionError> {
         let changed = self.connection().execute(
             "UPDATE workflow_runs SET outbox_pending = 0 \
-             WHERE run_id = ?1 AND revision = ?2 AND outbox_pending = 1",
+             WHERE run_id = ?1 AND revision = ?2 AND outbox_pending = 1 \
+             AND EXISTS (SELECT 1 FROM workflow_receipts AS receipt \
+                 WHERE receipt.session_id = workflow_runs.session_id \
+                 AND receipt.run_id = workflow_runs.run_id AND receipt.revision = workflow_runs.revision)",
             params![run_id, signed(revision)?],
         )?;
         Ok(changed == 1)
+    }
+
+    pub fn workflow_receipt_exists(
+        &self,
+        session_id: CaudraId,
+        run_id: &str,
+        revision: u64,
+    ) -> Result<bool, SessionError> {
+        self.connection().query_row(
+            "SELECT EXISTS(SELECT 1 FROM workflow_receipts WHERE session_id = ?1 AND run_id = ?2 AND revision = ?3)",
+            params![session_id.as_bytes().as_slice(), run_id, signed(revision)?],
+            |row| row.get(0),
+        ).map_err(Into::into)
     }
 
     /// Bytes every workflow row of a session accounts for.
@@ -755,7 +773,8 @@ pub(crate) fn workflow_totals(connection: &Connection) -> Result<WorkflowTotals,
                 (SELECT coalesce(sum(bytes), 0) FROM workflow_runs), \
                 (SELECT count(*) FROM workflow_calls), \
                 (SELECT coalesce(sum(bytes), 0) FROM workflow_calls), \
-                (SELECT coalesce(sum(bytes), 0) FROM workflow_run_events)",
+                (SELECT coalesce(sum(bytes), 0) FROM workflow_run_events) + \
+                (SELECT coalesce(sum(length(CAST(run_id AS BLOB))), 0) FROM workflow_receipts)",
         [],
         |row| {
             Ok((
@@ -1040,7 +1059,7 @@ fn unsigned(value: i64, field: &'static str) -> Result<u64, SessionError> {
 
 #[cfg(test)]
 mod tests {
-    use serde_json::Value;
+    use serde_json::{Value, json};
     use tempfile::TempDir;
     use test_case::test_case;
 
@@ -1082,6 +1101,25 @@ mod tests {
     }
 
     type TestSession = Session<TestMessage, Value, Value>;
+
+    #[derive(Clone, Serialize, Deserialize)]
+    struct ReceiptMessage {
+        workflow_event: Value,
+    }
+
+    impl TitleSource for ReceiptMessage {
+        fn first_user_text(&self) -> Option<&str> {
+            None
+        }
+    }
+
+    type ReceiptSession = Session<ReceiptMessage, Value, Value>;
+
+    fn receipt(revision: u64) -> ReceiptMessage {
+        ReceiptMessage {
+            workflow_event: json!({"run_id": RUN_ID, "revision": revision}),
+        }
+    }
 
     fn open() -> (TempDir, StateDir, SessionDatabase, CaudraId) {
         let temp = TempDir::new().unwrap();
@@ -1264,7 +1302,7 @@ mod tests {
 
     #[test]
     fn outbox_delivers_once_per_revision() {
-        let (_temp, _state_dir, database, session_id) = open();
+        let (_temp, _state_dir, mut database, session_id) = open();
         database
             .insert_workflow_run(&run(session_id, RUN_ID))
             .unwrap();
@@ -1282,6 +1320,10 @@ mod tests {
             !database.ack_workflow_outbox(RUN_ID, 0).unwrap(),
             "{OUTBOX_ACK_IS_EXACT}"
         );
+        assert!(!database.ack_workflow_outbox(RUN_ID, 1).unwrap());
+        let mut session: ReceiptSession = database.load(session_id).unwrap();
+        session.push_message(receipt(1));
+        database.save(&session, None).unwrap();
         assert!(database.ack_workflow_outbox(RUN_ID, 1).unwrap());
         assert!(!database.ack_workflow_outbox(RUN_ID, 1).unwrap());
         assert!(
@@ -1329,6 +1371,76 @@ mod tests {
         assert!(
             calls.iter().all(|call| call.bytes > 0),
             "{BYTES_ARE_ACCOUNTED}"
+        );
+    }
+
+    #[test]
+    fn workflow_receipts_share_history_commit_survive_compaction_and_isolate_sessions() {
+        let (_temp, _state_dir, mut database, session_id) = open();
+        database
+            .insert_workflow_run(&run(session_id, RUN_ID))
+            .unwrap();
+        let patch = WorkflowRunPatch {
+            status: Some(WorkflowRunStatus::Paused),
+            outbox_pending: Some(true),
+            ..WorkflowRunPatch::default()
+        };
+        database.update_workflow_run(RUN_ID, 0, 0, &patch).unwrap();
+        let mut session: ReceiptSession = database.load(session_id).unwrap();
+        session.push_message(receipt(1));
+        session.push_message(receipt(u64::MAX));
+        assert!(database.save(&session, None).is_err());
+        assert!(
+            !database
+                .workflow_receipt_exists(session_id, RUN_ID, 1)
+                .unwrap()
+        );
+        assert!(
+            database
+                .load::<ReceiptMessage, Value, Value>(session_id)
+                .unwrap()
+                .messages()
+                .is_empty()
+        );
+
+        let mut foreign = ReceiptSession::new(MODEL, CWD);
+        foreign.push_message(receipt(1));
+        database.save(&foreign, None).unwrap();
+        assert!(!database.ack_workflow_outbox(RUN_ID, 1).unwrap());
+
+        session.replace_messages(vec![receipt(1)]);
+        database.save(&session, None).unwrap();
+        session.replace_messages(Vec::new());
+        database.save(&session, None).unwrap();
+        assert!(
+            database
+                .workflow_receipt_exists(session_id, RUN_ID, 1)
+                .unwrap()
+        );
+        let before = database.load_workflow_run(RUN_ID).unwrap().unwrap();
+        assert!(database.ack_workflow_outbox(RUN_ID, 1).unwrap());
+        let after = database.load_workflow_run(RUN_ID).unwrap().unwrap();
+        assert_eq!(before.revision, after.revision);
+        assert_eq!(before.execution_epoch, after.execution_epoch);
+        database.update_workflow_run(RUN_ID, 1, 0, &patch).unwrap();
+        assert!(!database.ack_workflow_outbox(RUN_ID, 1).unwrap());
+        assert!(!database.ack_workflow_outbox(RUN_ID, 2).unwrap());
+        assert_eq!(
+            database.pending_workflow_outbox(session_id).unwrap(),
+            [(RUN_ID.into(), 2)]
+        );
+        let bytes = database.workflow_bytes(session_id).unwrap();
+        assert!(bytes > database.load_workflow_run(RUN_ID).unwrap().unwrap().bytes);
+        database.delete(session_id, None).unwrap();
+        assert!(
+            !database
+                .workflow_receipt_exists(session_id, RUN_ID, 1)
+                .unwrap()
+        );
+        assert!(
+            database
+                .workflow_receipt_exists(foreign.id, RUN_ID, 1)
+                .unwrap()
         );
     }
 

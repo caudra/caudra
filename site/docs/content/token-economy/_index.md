@@ -32,7 +32,7 @@ file_read main.rs            index main.rs
                              + file_read offset=812 limit=40
 ```
 
-**Subagents as garbage collectors.** A `task` subagent gets its own isolated context. It can search, read files, and hit dead ends as much as it wants while only its final summary enters the main conversation. Its transcript stays attached to the task for later `task_id` continuation without inflating the main context. System prompt profiles can assign a different model to their subagents when a task needs a cheaper or stronger model.
+**Subagents as garbage collectors.** A `task` subagent gets its own isolated context. It can search, read files, and hit dead ends without adding its whole transcript to the main conversation. The parent receives its final summary and any intentional [child reports](/docs/sessions/#child-reports). Its transcript stays attached to the task for later `task_id` continuation without inflating the main context. System prompt profiles can assign a different model to their subagents when a task needs a cheaper or stronger model.
 
 ```
 main context                subagent context (isolated)

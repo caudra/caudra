@@ -7,6 +7,7 @@ pub(super) enum SegmentKind {
     ToolInline,
     ToolBlock,
     Instruction,
+    TaskDelivery,
     Error,
     Done,
 }
@@ -23,6 +24,7 @@ impl SegmentKind {
             Self::Thinking => "transcript_thinking",
             Self::ToolInline | Self::ToolBlock => "transcript_tool",
             Self::Instruction => "transcript_instruction",
+            Self::TaskDelivery => "transcript_task_delivery",
             Self::Error => "transcript_error",
             Self::Done => "transcript_done",
         }
@@ -53,6 +55,7 @@ impl SegmentChrome {
             SegmentKind::User
                 | SegmentKind::ToolBlock
                 | SegmentKind::Instruction
+                | SegmentKind::TaskDelivery
                 | SegmentKind::Error
         );
         // A tool row's kind crosses between `ToolInline` and `ToolBlock` every

@@ -7,7 +7,7 @@ group = "Reference"
 
 # Tools
 
-Caudra ships with 30 built-in tools in this reference (30 requiring no plugin opt-in, 0 opt-in via plugin options). Availability depends on the selected workspace backend. Tools marked **opt-in** are off until you enable them under `plugins` in [Configuration](/docs/configuration/).
+Caudra ships with 31 built-in tools in this reference (31 requiring no plugin opt-in, 0 opt-in via plugin options). Availability depends on the selected workspace backend. Tools marked **opt-in** are off until you enable them under `plugins` in [Configuration](/docs/configuration/).
 
 First-party file, web, shell, index, Python, and environment tools run through protocol-neutral Workcell contracts. Workcell owns schemas, validation, execution bounds, atomic file changes, network policy, subprocess cleanup, cancellation, and the bundled worker lifecycle. Caudra owns registration, authorization, retained session output, and model or UI presentation. Release builds pin an exact Workcell revision.
 
@@ -128,7 +128,7 @@ Page or search managed tool output owned by the current session. Omit `pattern` 
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
-| `output_id` | string | yes |  | Opaque ID from a tool-output truncation notice. |
+| `output_id` | string | yes |  | Output handle from a truncation notice or task result. New handles use wordlist names; existing IDs remain valid. Pass the handle unchanged. |
 | `pattern` | string | no |  | Regex to search for. Omit to read lines instead. |
 | `offset` | integer | no | 1 | Starting line, 1-indexed. |
 | `limit` | integer | no |  | Lines to return when reading, or matches when searching. Reading defaults to 200 and caps at 2000. Searching defaults to 100 and caps at 200. |
@@ -286,16 +286,28 @@ Use this tool when you need to ask the user questions during execution. This all
 
 ### `task` {#task}
 
-Launch an autonomous subagent to perform tasks independently. Best combined with batch.
+Delegate a bounded task to an autonomous subagent with its own context. Foreground tasks wait for completion. In sessions that expose `background`, use `background: true` for independent work: the call returns an admission receipt while the child continues. Reports and final outcomes can resume this chat even after you end your turn.
+
+See [background tasks](/docs/sessions/#background-tasks) for execution, automatic continuation, inspection, and shutdown. Background execution is available in the TUI and stream-JSON SDK, not one-shot print or ACP. `batch` alone does not make foreground tasks asynchronous. Do not poll, sleep, or duplicate delegated work. Continue independent work or end the interim turn while awaiting reports. Resume a task ID only after its invocation settles.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `description` | string | yes | Short (3-5 words) description of the task |
 | `prompt` | string | no | Detailed task prompt for the agent. Required for a new task; omit it to resume a task_id with no new work. |
-| `task_id` | string | no | Set this only to resume. Continues the subagent from an earlier task_id with its existing history instead of starting fresh. |
+| `task_id` | string | no | Resume a settled task, not an active one. Continues its existing history with locked mode/profile. Unknown task IDs fail. |
 | `mode` | string | no | Subagent mode. A new task defaults to the caller's own mode and is capped by it; omitted continuations retain their stored mode. |
 | `profile` | string | no | System prompt profile. Defaults to the parent profile for a new task; use "builtin" explicitly for Caudra's built-in prompt. Omitted continuations retain their stored profile. |
-| `output_schema` | string | no | JSON Schema (object) the subagent's final result must match. When set, the result is returned as a validated JSON string. |
+| `output_schema` | any (JSON) | no | JSON Schema (object) for the successful final payload only, not launch receipts, intermediate reports or non-success outcomes. The successful result is returned as validated JSON. |
+| `background` | boolean | no | Return after admission instead of waiting for completion. Requires session background capability. Reports and final outcomes automatically resume this chat, even after your turn ends. Default false. |
+
+### `task_control` {#task_control}
+
+Inspect or control tasks owned by this session. Actions: list, status, cancel, background. background promotes a running foreground task without restarting it. Reports and outcomes are delivered automatically where background execution is enabled; do not repeatedly poll. An active or cancelling task cannot be resumed with task_id.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `action` | string | yes |  |
+| `task_id` | string | no | Required except for list. |
 
 ### `workflow` {#workflow}
 
@@ -305,7 +317,7 @@ Run durable, multi-agent workflows: scripted plans that launch subagents in phas
 |-----------|------|----------|-------------|
 | `action` | string | yes | What to do. |
 | `name` | string | no | Workflow name, for validate and start. |
-| `args` | string | no | Object the script receives as `args` on start. |
+| `args` | any (JSON) | no | Object the script receives as `args` on start. |
 | `agent_budget` | integer | no | Most agents the run may launch, for start and resume. |
 | `run_id` | string | no | Run id, for status, inspect, pause, resume, and stop. |
 | `limit` | integer | no | Most runs a history answer lists. |

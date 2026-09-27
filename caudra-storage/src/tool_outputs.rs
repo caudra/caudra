@@ -23,12 +23,13 @@ use regex_automata::util::start::Config as StartConfig;
 use rustix::fd::OwnedFd;
 #[cfg(unix)]
 use rustix::fs::{AtFlags, FileType, Mode, OFlags};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 #[cfg(not(unix))]
 use tempfile::NamedTempFile;
 use thiserror::Error;
 
-use crate::id::{CaudraId, CaudraIdParseError};
+use crate::id::CaudraId;
+use crate::words::random_task_id;
 use crate::{StateDir, StorageError, lock_session_artifacts, sync_parent_dir};
 
 pub(crate) const TOOL_OUTPUT_DIR: &str = "tool-output";
@@ -46,6 +47,8 @@ const MAX_GREP_MATCHES: usize = 200;
 const MAX_GREP_CONTEXT: usize = 5;
 const ORPHAN_GRACE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 const ID_GENERATION_ATTEMPTS: usize = 8;
+const MAX_OUTPUT_ID_BYTES: usize = 64;
+const OUTPUT_ID_WORDS: usize = 3;
 const SCAN_BUFFER_BYTES: usize = 64 * 1024;
 #[cfg(unix)]
 const TEMP_FILE_MODE: u32 = 0o600;
@@ -53,13 +56,24 @@ const TEMP_FILE_MODE: u32 = 0o600;
 const DIRECTORY_MODE: u32 = 0o700;
 const OMITTED: &str = "[...]";
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize)]
 #[serde(transparent)]
-pub struct ToolOutputId(CaudraId);
+pub struct ToolOutputId(String);
+
+#[derive(Clone, Debug, PartialEq, Eq, Error)]
+#[error("invalid tool output ID: expected three lowercase words or a canonical legacy ID")]
+pub struct ToolOutputIdParseError;
 
 impl ToolOutputId {
-    fn generate() -> Self {
-        Self(CaudraId::generate())
+    fn generate() -> Result<Self, ToolOutputError> {
+        let phrase = random_task_id().map_err(std::io::Error::other)?;
+        phrase
+            .parse()
+            .map_err(|error| std::io::Error::other(error).into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
     }
 }
 
@@ -70,10 +84,34 @@ impl fmt::Display for ToolOutputId {
 }
 
 impl FromStr for ToolOutputId {
-    type Err = CaudraIdParseError;
+    type Err = ToolOutputIdParseError;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        value.parse().map(Self)
+        if value.is_empty() || value.len() > MAX_OUTPUT_ID_BYTES {
+            return Err(ToolOutputIdParseError);
+        }
+        let mut words = value.split('-');
+        let readable = (0..OUTPUT_ID_WORDS).all(|_| {
+            words.next().is_some_and(|word| {
+                !word.is_empty() && word.bytes().all(|byte| byte.is_ascii_lowercase())
+            })
+        }) && words.next().is_none();
+        if readable
+            || value
+                .parse::<CaudraId>()
+                .is_ok_and(|id| id.to_string() == value)
+        {
+            Ok(Self(value.to_owned()))
+        } else {
+            Err(ToolOutputIdParseError)
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ToolOutputId {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        value.parse().map_err(serde::de::Error::custom)
     }
 }
 
@@ -266,7 +304,6 @@ pub struct ToolOutputSink {
     state_dir: StateDir,
     file: Option<StagedOutput>,
     directory: OutputDirectory,
-    final_name: String,
     id: ToolOutputId,
     byte_count: usize,
     newline_count: usize,
@@ -315,7 +352,14 @@ impl ToolOutputSink {
         Ok(())
     }
 
-    pub fn finish(mut self) -> Result<ToolOutputRef, ToolOutputError> {
+    pub fn finish(self) -> Result<ToolOutputRef, ToolOutputError> {
+        self.finish_with(ToolOutputId::generate)
+    }
+
+    fn finish_with(
+        mut self,
+        mut generate: impl FnMut() -> Result<ToolOutputId, ToolOutputError>,
+    ) -> Result<ToolOutputRef, ToolOutputError> {
         if self.write_failed {
             return Err(ToolOutputError::SinkWriteFailed);
         }
@@ -327,17 +371,28 @@ impl ToolOutputSink {
         // Cleanup and recreation use this same cross-process lock, so an old
         // generation cannot delete an output while publication is in flight.
         let _artifact_lock = lock_session_artifacts(&self.state_dir)?;
-        self.directory.publish(&mut file, &self.final_name)?;
-        self.directory.sync()?;
-        Ok(ToolOutputRef {
-            id: self.id,
-            byte_count: self.byte_count,
-            line_count: logical_line_count(
-                self.byte_count,
-                self.newline_count,
-                self.ends_with_newline,
-            ),
-        })
+        for attempt in 0..ID_GENERATION_ATTEMPTS {
+            if attempt > 0 {
+                self.id = generate()?;
+            }
+            match self.directory.publish(&mut file, &output_name(&self.id)) {
+                Ok(()) => {
+                    self.directory.sync()?;
+                    return Ok(ToolOutputRef {
+                        id: self.id.clone(),
+                        byte_count: self.byte_count,
+                        line_count: logical_line_count(
+                            self.byte_count,
+                            self.newline_count,
+                            self.ends_with_newline,
+                        ),
+                    });
+                }
+                Err(error) if error.kind() == ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Err(ToolOutputError::IdCollision)
     }
 
     pub fn discard(mut self) -> Result<(), ToolOutputError> {
@@ -429,7 +484,11 @@ impl OutputDirectory {
 
     #[cfg(not(unix))]
     fn contains(&self, name: &str) -> std::io::Result<bool> {
-        self.path.join(name).try_exists()
+        match fs::symlink_metadata(self.path.join(name)) {
+            Ok(_) => Ok(true),
+            Err(error) if error.kind() == ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error),
+        }
     }
 
     #[cfg(unix)]
@@ -654,6 +713,10 @@ fn not_regular_file() -> std::io::Error {
 }
 
 impl ToolOutputStore {
+    pub fn state_dir(&self) -> &StateDir {
+        &self.state_dir
+    }
+
     pub fn new(state_dir: StateDir) -> Self {
         Self::with_max_bytes(state_dir, DEFAULT_MAX_STORED_BYTES)
     }
@@ -674,11 +737,19 @@ impl ToolOutputStore {
     }
 
     pub fn begin(&self, session_id: CaudraId) -> Result<ToolOutputSink, ToolOutputError> {
+        self.begin_with(session_id, ToolOutputId::generate)
+    }
+
+    fn begin_with(
+        &self,
+        session_id: CaudraId,
+        mut generate: impl FnMut() -> Result<ToolOutputId, ToolOutputError>,
+    ) -> Result<ToolOutputSink, ToolOutputError> {
         let mut directory = OutputDirectory::open(&self.state_dir, session_id, true)?;
 
         for _ in 0..ID_GENERATION_ATTEMPTS {
-            let id = ToolOutputId::generate();
-            let final_name = output_name(id);
+            let id = generate()?;
+            let final_name = output_name(&id);
             if directory.contains(&final_name)? {
                 continue;
             }
@@ -693,7 +764,6 @@ impl ToolOutputStore {
                 state_dir: self.state_dir.clone(),
                 file: Some(file),
                 directory,
-                final_name,
                 id,
                 byte_count: 0,
                 newline_count: 0,
@@ -726,7 +796,7 @@ impl ToolOutputStore {
         byte_offset: usize,
     ) -> Result<ToolOutputReadResult, ToolOutputError> {
         validate_page(offset, limit)?;
-        let mut file = self.open_output(session_id, id)?;
+        let mut file = self.open_output(session_id, &id)?;
         let mut scan = ReadScan::new(offset - 1, limit.min(MAX_READ_LINES), byte_offset);
         let summary = scan_utf8_lines(&mut file, self.max_bytes, session_id, id, &mut scan)?;
         scan.finish()?;
@@ -772,7 +842,7 @@ impl ToolOutputStore {
         let limit = limit.min(MAX_GREP_MATCHES);
         let context_before = context_before.min(MAX_GREP_CONTEXT);
         let context_after = context_after.min(MAX_GREP_CONTEXT);
-        let mut file = self.open_output(session_id, id)?;
+        let mut file = self.open_output(session_id, &id)?;
         let mut scan = GrepScan::new(
             &nfa,
             hybrid.as_ref(),
@@ -817,7 +887,7 @@ impl ToolOutputStore {
             });
         }
 
-        let mut file = self.open_output(session_id, id)?;
+        let mut file = self.open_output(session_id, &id)?;
         let total_bytes = usize::try_from(file.metadata()?.len()).unwrap_or(usize::MAX);
         self.ensure_size(total_bytes)?;
         let payload_bytes = max_bytes.saturating_sub(1);
@@ -845,13 +915,13 @@ impl ToolOutputStore {
         let mut seen = HashSet::new();
         let mut sources = Vec::new();
         for reference in references {
-            if !seen.insert(reference.id) {
+            if !seen.insert(&reference.id) {
                 continue;
             }
-            let file = self.open_output(source, reference.id)?;
+            let file = self.open_output(source, &reference.id)?;
             let byte_count = usize::try_from(file.metadata()?.len()).unwrap_or(usize::MAX);
             self.ensure_size(byte_count)?;
-            sources.push((reference.id, file, byte_count));
+            sources.push((reference.id.clone(), file, byte_count));
         }
         if source == target {
             return Ok(());
@@ -885,13 +955,13 @@ impl ToolOutputStore {
             }
             output.file_mut()?.flush()?;
             output.file()?.sync_all()?;
-            staged.push((*id, output));
+            staged.push((id.clone(), output));
         }
 
         let mut published: Vec<(String, usize)> = Vec::with_capacity(staged.len());
         let _artifact_lock = lock_session_artifacts(&self.state_dir)?;
         for index in 0..staged.len() {
-            let name = output_name(staged[index].0);
+            let name = output_name(&staged[index].0);
             if let Err(error) = directory.publish(&mut staged[index].1, &name) {
                 for (published_name, published_index) in &published {
                     if let Ok(file) = staged[*published_index].1.file() {
@@ -1041,7 +1111,7 @@ impl ToolOutputStore {
         session_id: CaudraId,
         id: ToolOutputId,
     ) -> Result<String, ToolOutputError> {
-        let file = self.open_output(session_id, id)?;
+        let file = self.open_output(session_id, &id)?;
         let mut bytes = Vec::new();
         file.take(self.max_bytes.saturating_add(1) as u64)
             .read_to_end(&mut bytes)?;
@@ -1053,13 +1123,17 @@ impl ToolOutputStore {
         })
     }
 
-    fn open_output(&self, session_id: CaudraId, id: ToolOutputId) -> Result<File, ToolOutputError> {
+    fn open_output(
+        &self,
+        session_id: CaudraId,
+        id: &ToolOutputId,
+    ) -> Result<File, ToolOutputError> {
         let directory =
             OutputDirectory::open(&self.state_dir, session_id, false).map_err(|error| {
                 if error.kind() == ErrorKind::NotFound {
                     ToolOutputError::NotFound {
                         session_id,
-                        output_id: id,
+                        output_id: id.clone(),
                     }
                 } else {
                     StorageError::Io(error).into()
@@ -1069,7 +1143,7 @@ impl ToolOutputStore {
             if error.kind() == ErrorKind::NotFound {
                 ToolOutputError::NotFound {
                     session_id,
-                    output_id: id,
+                    output_id: id.clone(),
                 }
             } else {
                 StorageError::Io(error).into()
@@ -1088,11 +1162,11 @@ impl ToolOutputStore {
 
     #[cfg(test)]
     fn output_path(&self, session_id: CaudraId, id: ToolOutputId) -> PathBuf {
-        self.session_dir(session_id).join(output_name(id))
+        self.session_dir(session_id).join(output_name(&id))
     }
 }
 
-fn output_name(id: ToolOutputId) -> String {
+fn output_name(id: &ToolOutputId) -> String {
     format!("{id}.{OUTPUT_EXTENSION}")
 }
 
@@ -1244,7 +1318,7 @@ fn scan_utf8_lines(
         let valid_text = std::str::from_utf8(&decoded[..valid_len]).map_err(|source| {
             ToolOutputError::InvalidUtf8 {
                 session_id,
-                output_id,
+                output_id: output_id.clone(),
                 source,
             }
         })?;
@@ -2308,13 +2382,15 @@ fn remove_artifact(path: &Path, is_dir: bool) -> Result<bool, ToolOutputError> {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::sync::Barrier;
+    use std::thread;
     use std::time::Duration;
 
     use tempfile::TempDir;
     use test_case::test_case;
 
     use super::*;
-    use crate::sessions::{Session, persisted_session_ids};
+    use crate::sessions::{Session, SessionDatabase, persisted_session_ids};
     use serde_json::Value;
 
     const TEST_MAX_BYTES: usize = 1024 * 1024;
@@ -2324,6 +2400,11 @@ mod tests {
     const MISSING_TEXT: &str = "missing";
     const STREAMED_TEXT: &str = "alpha\r\nβeta\n\nend\n";
     const HUGE_LINE_NEEDLE: &str = "needle-at-the-end";
+    const READABLE_ID: &str = "brisk-calm-otter";
+    const RETRY_ID: &str = "bright-quiet-panda";
+    const LEGACY_ID: &str = "CNK1hV6GWoysH3KQMm5wv";
+    const LEGACY_REF: &str = r#"{"id":"CNK1hV6GWoysH3KQMm5wv","byte_count":19,"line_count":4}"#;
+    const READABLE_REF: &str = r#"{"id":"brisk-calm-otter","byte_count":19,"line_count":4}"#;
 
     fn test_store() -> (TempDir, ToolOutputStore) {
         let temp = tempfile::tempdir().unwrap();
@@ -2367,13 +2448,13 @@ mod tests {
         let (_temp, store) = test_store();
         let session_id = CaudraId::generate();
         let mut sink = store.begin(session_id).unwrap();
-        let id = sink.id;
+        let id = sink.id.clone();
 
         sink.append("alpha\r\n").unwrap();
         sink.append("βeta").unwrap();
         sink.append("\n\nend\n").unwrap();
 
-        assert!(!store.output_path(session_id, id).exists());
+        assert!(!store.output_path(session_id, id.clone()).exists());
         let reference = sink.finish().unwrap();
         assert_eq!(reference.id, id);
         assert_eq!(reference.byte_count, STREAMED_TEXT.len());
@@ -2452,12 +2533,12 @@ mod tests {
         let (_temp, store) = test_store();
         let session_id = CaudraId::generate();
         let mut sink = store.begin(session_id).unwrap();
-        let id = sink.id;
+        let id = sink.id.clone();
         let temp_path = sink.file.as_ref().unwrap().path().to_path_buf();
         sink.append("accepted").unwrap();
 
         assert!(temp_path.exists());
-        assert!(!store.output_path(session_id, id).exists());
+        assert!(!store.output_path(session_id, id.clone()).exists());
 
         sink.finish().unwrap();
         assert!(!temp_path.exists());
@@ -2472,7 +2553,7 @@ mod tests {
         let (_temp, store) = test_store();
         let session_id = CaudraId::generate();
         let mut sink = store.begin(session_id).unwrap();
-        let id = sink.id;
+        let id = sink.id.clone();
         let temp_path = sink.file.as_ref().unwrap().path().to_path_buf();
         sink.append("discarded").unwrap();
 
@@ -2489,7 +2570,10 @@ mod tests {
         let (id, temp_path) = {
             let mut sink = store.begin(session_id).unwrap();
             sink.append("dropped").unwrap();
-            (sink.id, sink.file.as_ref().unwrap().path().to_path_buf())
+            (
+                sink.id.clone(),
+                sink.file.as_ref().unwrap().path().to_path_buf(),
+            )
         };
 
         assert!(!temp_path.exists());
@@ -2503,9 +2587,12 @@ mod tests {
         let other = CaudraId::generate();
         let reference = store.put(owner, EXACT_TEXT).unwrap();
 
-        assert_eq!(store.load_text(owner, reference.id).unwrap(), EXACT_TEXT);
+        assert_eq!(
+            store.load_text(owner, reference.id.clone()).unwrap(),
+            EXACT_TEXT
+        );
         assert!(matches!(
-            store.load_text(other, reference.id),
+            store.load_text(other, reference.id.clone()),
             Err(ToolOutputError::NotFound {
                 session_id,
                 output_id
@@ -2561,7 +2648,7 @@ mod tests {
 
         loop {
             let page = store
-                .read_at(session_id, reference.id, offset, 1, byte_offset)
+                .read_at(session_id, reference.id.clone(), offset, 1, byte_offset)
                 .unwrap();
             restored.push_str(&page.text);
             let Some(next_offset) = page.next_offset else {
@@ -2595,7 +2682,7 @@ mod tests {
         let reference = sink.finish().unwrap();
 
         let read = store
-            .read_at(session_id, reference.id, 1, 1, prefix_bytes)
+            .read_at(session_id, reference.id.clone(), 1, 1, prefix_bytes)
             .unwrap();
         let grep = store
             .grep(session_id, reference.id, HUGE_LINE_NEEDLE, 1, 1, 0, 0)
@@ -2616,7 +2703,7 @@ mod tests {
         let session_id = CaudraId::generate();
         let reference = store.put(session_id, PAGED_TEXT).unwrap();
 
-        let first = store.read(session_id, reference.id, 2, 2).unwrap();
+        let first = store.read(session_id, reference.id.clone(), 2, 2).unwrap();
         let second = store
             .read(session_id, reference.id, first.next_offset.unwrap(), 2)
             .unwrap();
@@ -2637,7 +2724,7 @@ mod tests {
         let reference = store.put(session_id, GREP_TEXT).unwrap();
 
         let first = store
-            .grep(session_id, reference.id, r"error \d+", 1, 1, 1, 1)
+            .grep(session_id, reference.id.clone(), r"error \d+", 1, 1, 1, 1)
             .unwrap();
         let second = store
             .grep(
@@ -2723,13 +2810,13 @@ mod tests {
         let (_temp, store) = test_store();
         let session_id = CaudraId::generate();
         let reference = store.put(session_id, "visible\nhidden").unwrap();
-        let path = store.output_path(session_id, reference.id);
+        let path = store.output_path(session_id, reference.id.clone());
         let mut bytes = fs::read(&path).unwrap();
         *bytes.last_mut().unwrap() = 0xff;
         fs::write(path, bytes).unwrap();
 
         assert!(matches!(
-            store.read(session_id, reference.id, 1, 1),
+            store.read(session_id, reference.id.clone(), 1, 1),
             Err(ToolOutputError::InvalidUtf8 { .. })
         ));
         assert!(matches!(
@@ -2769,7 +2856,7 @@ mod tests {
         let first = store
             .grep(
                 session_id,
-                reference.id,
+                reference.id.clone(),
                 "match-",
                 1,
                 MAX_GREP_MATCHES,
@@ -2821,7 +2908,7 @@ mod tests {
         let result = store
             .grep(
                 session_id,
-                reference.id,
+                reference.id.clone(),
                 "match",
                 1,
                 MAX_GREP_MATCHES,
@@ -2844,13 +2931,15 @@ mod tests {
         let session_id = CaudraId::generate();
         let text = format!("HEAD{}TAIL", "蟹".repeat(100_000));
         let reference = store.put(session_id, &text).unwrap();
-        let path = store.output_path(session_id, reference.id);
+        let path = store.output_path(session_id, reference.id.clone());
         let mut bytes = fs::read(&path).unwrap();
         let middle = bytes.len() / 2;
         bytes[middle] = 0xff;
         fs::write(path, bytes).unwrap();
 
-        let preview = store.preview(session_id, reference.id, 8, 240).unwrap();
+        let preview = store
+            .preview(session_id, reference.id.clone(), 8, 240)
+            .unwrap();
 
         assert!(preview.head.starts_with("HEAD"));
         assert!(preview.tail.ends_with("TAIL"));
@@ -2900,7 +2989,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            fs::read(store.output_path(target, reference.id)).unwrap(),
+            fs::read(store.output_path(target, reference.id.clone())).unwrap(),
             EXACT_TEXT.as_bytes()
         );
         assert_eq!(
@@ -2919,7 +3008,7 @@ mod tests {
         let target = CaudraId::generate();
         let reference = store.put(source, EXACT_TEXT).unwrap();
         let bytes = vec![0xff; 128 * 1024];
-        fs::write(store.output_path(source, reference.id), &bytes).unwrap();
+        fs::write(store.output_path(source, reference.id.clone()), &bytes).unwrap();
 
         store
             .copy_session_outputs(source, target, std::slice::from_ref(&reference))
@@ -2939,7 +3028,7 @@ mod tests {
         let first = store.put(source, "first").unwrap();
         let second = store.put(source, "second").unwrap();
         fs::create_dir_all(store.session_dir(target)).unwrap();
-        let preexisting_path = store.output_path(target, second.id);
+        let preexisting_path = store.output_path(target, second.id.clone());
         fs::write(&preexisting_path, "preexisting").unwrap();
 
         let error = store
@@ -2962,7 +3051,11 @@ mod tests {
         let source = CaudraId::generate();
         let target = CaudraId::generate();
         let reference = store.put(source, "source").unwrap();
-        fs::write(store.output_path(source, reference.id), "source-too-large").unwrap();
+        fs::write(
+            store.output_path(source, reference.id.clone()),
+            "source-too-large",
+        )
+        .unwrap();
 
         let error = store
             .copy_session_outputs(source, target, std::slice::from_ref(&reference))
@@ -2983,17 +3076,17 @@ mod tests {
         let reference = store.put(source, "inside").unwrap();
         let outside = store.state_dir.path().join("outside.txt");
         fs::write(&outside, "outside").unwrap();
-        let path = store.output_path(source, reference.id);
+        let path = store.output_path(source, reference.id.clone());
         fs::remove_file(&path).unwrap();
         symlink(&outside, &path).unwrap();
 
-        assert!(store.read(source, reference.id, 1, 1).is_err());
+        assert!(store.read(source, reference.id.clone(), 1, 1).is_err());
         assert!(
             store
-                .grep(source, reference.id, "outside", 1, 1, 0, 0)
+                .grep(source, reference.id.clone(), "outside", 1, 1, 0, 0)
                 .is_err()
         );
-        assert!(store.preview(source, reference.id, 1, 16).is_err());
+        assert!(store.preview(source, reference.id.clone(), 1, 16).is_err());
         assert!(
             store
                 .copy_session_outputs(source, target, std::slice::from_ref(&reference))
@@ -3042,11 +3135,11 @@ mod tests {
         let (_temp, store) = test_store();
         let session_id = CaudraId::generate();
         let reference = store.put(session_id, "regular").unwrap();
-        let path = store.output_path(session_id, reference.id);
+        let path = store.output_path(session_id, reference.id.clone());
         fs::remove_file(&path).unwrap();
         fs::create_dir(&path).unwrap();
 
-        assert!(store.read(session_id, reference.id, 1, 1).is_err());
+        assert!(store.read(session_id, reference.id.clone(), 1, 1).is_err());
         assert!(
             store
                 .grep(session_id, reference.id, "regular", 1, 1, 0, 0)
@@ -3182,10 +3275,285 @@ mod tests {
         assert!(!store.output_path(session.id, unreferenced.id).exists());
     }
 
-    #[test]
-    fn tool_output_id_rejects_invalid_values() {
-        let result = MISSING_TEXT.parse::<ToolOutputId>();
+    #[test_case(READABLE_ID; "readable")]
+    #[test_case(LEGACY_ID; "legacy")]
+    #[test_case("1111111111111111"; "legacy_leading_zeros")]
+    fn output_ids_round_trip_exact_canonical_text(raw: &str) {
+        let id: ToolOutputId = raw.parse().unwrap();
+        assert_eq!(id.as_str(), raw);
+        assert_eq!(id.to_string(), raw);
+        let json = serde_json::to_string(raw).unwrap();
+        assert_eq!(serde_json::to_string(&id).unwrap(), json);
+        assert_eq!(serde_json::from_str::<ToolOutputId>(&json).unwrap(), id);
+    }
 
-        assert!(result.is_err());
+    #[test_case(""; "empty")]
+    #[test_case(MISSING_TEXT; "one_word")]
+    #[test_case("brisk-calm"; "two_words")]
+    #[test_case("brisk-calm-small-otter"; "four_words")]
+    #[test_case("-calm-otter"; "empty_first")]
+    #[test_case("brisk--otter"; "empty_middle")]
+    #[test_case("brisk-calm-"; "empty_last")]
+    #[test_case("Brisk-calm-otter"; "uppercase")]
+    #[test_case("brisk-calm-otter "; "trailing_space")]
+    #[test_case(" brisk-calm-otter"; "leading_space")]
+    #[test_case("brisk-calm-otter\n"; "newline")]
+    #[test_case("brisk\t-calm-otter"; "tab")]
+    #[test_case("brisk-calm-ottér"; "unicode")]
+    #[test_case("brisk-calm-otter\0"; "nul")]
+    #[test_case("../brisk-calm-otter"; "parent_path")]
+    #[test_case("brisk-calm-.."; "parent_component")]
+    #[test_case("/brisk-calm-otter"; "absolute_path")]
+    #[test_case("brisk/calm/otter"; "slash")]
+    #[test_case("brisk\\calm\\otter"; "backslash")]
+    #[test_case("brisk-calm-otter.txt"; "extension")]
+    #[test_case("brisk-calm-otter1"; "digit")]
+    #[test_case(" CNK1hV6GWoysH3KQMm5wv"; "legacy_space")]
+    #[test_case("1CNK1hV6GWoysH3KQMm5wv"; "legacy_extra_zero")]
+    fn output_ids_reject_invalid_parse_and_deserialization(raw: &str) {
+        assert_eq!(raw.parse::<ToolOutputId>(), Err(ToolOutputIdParseError));
+        assert!(serde_json::from_value::<ToolOutputId>(Value::String(raw.into())).is_err());
+    }
+
+    #[test_case(0, true; "at_bound")]
+    #[test_case(1, false; "above_bound")]
+    fn output_ids_enforce_length_bound(extra: usize, valid: bool) {
+        let raw = format!("{}-b-c", "a".repeat(MAX_OUTPUT_ID_BYTES - 4 + extra));
+        assert_eq!(raw.parse::<ToolOutputId>().is_ok(), valid);
+        assert_eq!(
+            serde_json::from_value::<ToolOutputId>(Value::String(raw)).is_ok(),
+            valid
+        );
+    }
+
+    #[test]
+    fn new_outputs_use_shared_wordlist_ids() {
+        let (_temp, store) = test_store();
+        let session_id = CaudraId::generate();
+        let reference = store.put(session_id, EXACT_TEXT).unwrap();
+        let words: Vec<_> = reference.id.as_str().split('-').collect();
+        assert_eq!(words.len(), OUTPUT_ID_WORDS);
+        let adjectives = include_str!("words/adjectives.txt");
+        let nouns = include_str!("words/nouns.txt");
+        assert!(adjectives.lines().any(|word| word == words[0]));
+        assert!(adjectives.lines().any(|word| word == words[1]));
+        assert_ne!(words[0], words[1]);
+        assert!(nouns.lines().any(|word| word == words[2]));
+        assert_eq!(
+            store.load_text(session_id, reference.id).unwrap(),
+            EXACT_TEXT
+        );
+    }
+
+    #[test_case(false; "retry")]
+    #[test_case(true; "exhaustion")]
+    fn begin_retries_collisions_before_staging(exhaust: bool) {
+        let (_temp, store) = test_store();
+        let session_id = CaudraId::generate();
+        let mut first = store
+            .begin_with(session_id, || Ok(READABLE_ID.parse().unwrap()))
+            .unwrap();
+        first.append(EXACT_TEXT).unwrap();
+        let reference = first.finish().unwrap();
+        let mut attempts = 0;
+        let result = store.begin_with(session_id, || {
+            attempts += 1;
+            Ok(if exhaust || attempts == 1 {
+                READABLE_ID
+            } else {
+                RETRY_ID
+            }
+            .parse()
+            .unwrap())
+        });
+        if exhaust {
+            assert!(matches!(result, Err(ToolOutputError::IdCollision)));
+            assert_eq!(attempts, ID_GENERATION_ATTEMPTS);
+        } else {
+            let sink = result.unwrap();
+            assert_eq!(attempts, 2);
+            assert_eq!(sink.id.as_str(), RETRY_ID);
+            assert!(!store.output_path(session_id, sink.id.clone()).exists());
+            sink.discard().unwrap();
+        }
+        assert_eq!(
+            store.load_text(session_id, reference.id).unwrap(),
+            EXACT_TEXT
+        );
+        assert_eq!(
+            fs::read_dir(store.session_dir(session_id)).unwrap().count(),
+            1
+        );
+    }
+
+    #[test]
+    fn finish_collision_exhaustion_preserves_winner_and_cleans_stage() {
+        let (_temp, store) = test_store();
+        let session_id = CaudraId::generate();
+        let mut winner = store
+            .begin_with(session_id, || Ok(READABLE_ID.parse().unwrap()))
+            .unwrap();
+        let mut loser = store
+            .begin_with(session_id, || Ok(READABLE_ID.parse().unwrap()))
+            .unwrap();
+        winner.append(EXACT_TEXT).unwrap();
+        loser.append(PAGED_TEXT).unwrap();
+        let temp_path = loser.file.as_ref().unwrap().path().to_path_buf();
+        let reference = winner.finish().unwrap();
+        let mut retries = 0;
+        let error = loser
+            .finish_with(|| {
+                retries += 1;
+                Ok(READABLE_ID.parse().unwrap())
+            })
+            .unwrap_err();
+        assert!(matches!(error, ToolOutputError::IdCollision));
+        assert_eq!(retries, ID_GENERATION_ATTEMPTS - 1);
+        assert!(!temp_path.exists());
+        assert_eq!(
+            fs::read_dir(store.session_dir(session_id)).unwrap().count(),
+            1
+        );
+        assert_eq!(
+            store.load_text(session_id, reference.id).unwrap(),
+            EXACT_TEXT
+        );
+    }
+
+    #[test]
+    fn concurrent_sinks_retry_publication_without_overwriting() {
+        let (_temp, store) = test_store();
+        let session_id = CaudraId::generate();
+        let barrier = Barrier::new(2);
+        let outputs = thread::scope(|scope| {
+            let handles: Vec<_> = [EXACT_TEXT, PAGED_TEXT]
+                .into_iter()
+                .map(|text| {
+                    let barrier = &barrier;
+                    let store = &store;
+                    scope.spawn(move || {
+                        let mut sink = store
+                            .begin_with(session_id, || Ok(READABLE_ID.parse().unwrap()))
+                            .unwrap();
+                        sink.append(text).unwrap();
+                        barrier.wait();
+                        let mut retries = 0;
+                        let reference = sink
+                            .finish_with(|| {
+                                retries += 1;
+                                Ok(RETRY_ID.parse().unwrap())
+                            })
+                            .unwrap();
+                        assert_eq!(
+                            store.load_text(session_id, reference.id.clone()).unwrap(),
+                            text
+                        );
+                        (reference, retries)
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert_ne!(outputs[0].0.id, outputs[1].0.id);
+        assert_eq!(outputs.iter().map(|(_, retries)| retries).sum::<usize>(), 1);
+        assert_eq!(
+            fs::read_dir(store.session_dir(session_id)).unwrap().count(),
+            2
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn publication_retries_a_dangling_symlink_without_following_it() {
+        use std::os::unix::fs::symlink;
+
+        let (_temp, store) = test_store();
+        let session_id = CaudraId::generate();
+        let mut sink = store
+            .begin_with(session_id, || Ok(READABLE_ID.parse().unwrap()))
+            .unwrap();
+        sink.append(EXACT_TEXT).unwrap();
+        let path = store.output_path(session_id, sink.id.clone());
+        let outside = store.state_dir.path().join(MISSING_TEXT);
+        symlink(&outside, &path).unwrap();
+        let reference = sink.finish_with(|| Ok(RETRY_ID.parse().unwrap())).unwrap();
+        assert_eq!(reference.id.as_str(), RETRY_ID);
+        assert_eq!(fs::read_link(path).unwrap(), outside);
+        assert!(!outside.exists());
+        assert_eq!(
+            store.load_text(session_id, reference.id).unwrap(),
+            EXACT_TEXT
+        );
+    }
+
+    #[test_case(LEGACY_REF; "legacy")]
+    #[test_case(READABLE_REF; "readable")]
+    fn persisted_fixtures_reload_copy_lookup_cleanup_and_accounting(fixture: &str) {
+        let (_temp, store) = test_store();
+        let mut session: Session<Value, Value, Value> = Session::new("model", "/project");
+        let reference: ToolOutputRef = serde_json::from_str(fixture).unwrap();
+        fs::create_dir_all(store.session_dir(session.id)).unwrap();
+        fs::write(
+            store.output_path(session.id, reference.id.clone()),
+            PAGED_TEXT,
+        )
+        .unwrap();
+        session.push_message(serde_json::json!({"output_ref": reference}));
+        session.save(&store.state_dir).unwrap();
+        let mut reloaded = ToolOutputStore::new(store.state_dir.clone());
+        reloaded.orphan_grace = Duration::ZERO;
+        let references = reloaded.referenced_outputs(session.id).unwrap();
+        assert!(references.contains(&reference.id));
+        let page = reloaded
+            .read(session.id, reference.id.clone(), 1, MAX_READ_LINES)
+            .unwrap();
+        assert_eq!(page.text, PAGED_TEXT.trim_end());
+        assert_eq!(page.total_bytes, reference.byte_count);
+        assert_eq!(page.total_lines, reference.line_count);
+        let grep = reloaded
+            .grep(session.id, reference.id.clone(), "two", 1, 1, 0, 0)
+            .unwrap();
+        assert_eq!(grep.rows[0].line_number, 2);
+        let target = CaudraId::generate();
+        assert!(matches!(
+            reloaded.read(target, reference.id.clone(), 1, 1),
+            Err(ToolOutputError::NotFound { .. })
+        ));
+        assert!(matches!(
+            reloaded.grep(target, reference.id.clone(), "two", 1, 1, 0, 0),
+            Err(ToolOutputError::NotFound { .. })
+        ));
+        reloaded
+            .copy_session_outputs(session.id, target, &[reference.clone(), reference.clone()])
+            .unwrap();
+        assert_eq!(
+            reloaded.load_text(target, reference.id.clone()).unwrap(),
+            PAGED_TEXT
+        );
+        let database = SessionDatabase::open(&store.state_dir).unwrap();
+        assert_eq!(
+            database.stats().unwrap().tool_output_file_bytes,
+            (PAGED_TEXT.len() * 2) as u64
+        );
+        assert_eq!(reloaded.count_orphans(&[session.id]).unwrap(), 1);
+        assert_eq!(reloaded.cleanup_orphans(&[session.id]).unwrap(), 1);
+        assert!(
+            reloaded
+                .output_path(session.id, reference.id.clone())
+                .exists()
+        );
+        assert!(!reloaded.session_dir(target).exists());
+        assert_eq!(
+            database.stats().unwrap().tool_output_file_bytes,
+            PAGED_TEXT.len() as u64
+        );
+        reloaded.delete_session(session.id).unwrap();
+        assert!(matches!(
+            reloaded.load_text(session.id, reference.id),
+            Err(ToolOutputError::NotFound { .. })
+        ));
     }
 }

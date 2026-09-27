@@ -11,6 +11,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
+use caudra_agent::background::{BackgroundTasks, BackgroundTransition};
 use caudra_agent::context::{ContextKey, ContextStore};
 use caudra_agent::permissions::PermissionManager;
 use caudra_agent::prompt::profile::PromptProfileCatalog;
@@ -25,10 +26,12 @@ use caudra_agent::{
 use caudra_config::ModelPolicy;
 use caudra_lua::EventHandle;
 use caudra_storage::StateDir;
+use caudra_storage::id::CaudraId;
 use caudra_storage::id::SessionRef;
 use caudra_storage::local_documents::LocalDocumentStore;
 use caudra_storage::sessions::SessionLease;
 use caudra_workspace::WorkspaceSession;
+use futures_lite::future;
 
 use self::cancel_map::new_run_cancel_map;
 use caudra_providers::provider::Provider;
@@ -37,11 +40,30 @@ use serde_json::Value;
 use tracing::{info, warn};
 
 use crate::app::App;
+use crate::app::background_delivery::DeliveryFence;
 
 use self::agent_loop::AgentLoop;
 use self::command_router::spawn_command_router;
 pub(crate) use self::shared_queue::{QueueSender, QueuedMessage};
 use self::workflow::{SharedMode, WorkflowSession, WorkflowSpawn, answer_channel};
+
+const TRANSITION_DRAIN_TIMEOUT: Duration = Duration::from_secs(3);
+const BACKGROUND_TRANSITION_BUSY: &str =
+    "Wait for background tasks to settle before changing the workspace";
+
+pub(crate) fn reserve_background_transition(
+    tasks: &BackgroundTasks,
+) -> Result<BackgroundTransition, String> {
+    let transition = tasks.suspend()?;
+    if tasks.active_count() != 0 {
+        return Err(BACKGROUND_TRANSITION_BUSY.into());
+    }
+    smol::block_on(future::or(transition.drain(), async {
+        smol::Timer::after(TRANSITION_DRAIN_TIMEOUT).await;
+        Err(BACKGROUND_TRANSITION_BUSY.into())
+    }))?;
+    Ok(transition)
+}
 
 pub(crate) struct ModelSlot {
     pub(crate) model: Model,
@@ -100,6 +122,14 @@ pub(crate) struct AgentHandles {
     /// Session-lifetime: `respawn` carries it over untouched and only a change
     /// of session id replaces it.
     workflow: Option<WorkflowSession>,
+    pub(crate) background: Option<BackgroundTasks>,
+    delivery_fence: Arc<DeliveryFence>,
+    background_enabled: bool,
+    session_id: Option<CaudraId>,
+    subagent_history: SubagentHistoryStore,
+    pub(crate) background_wake_rx: flume::Receiver<()>,
+    pub(crate) background_wake_resume: flume::Sender<()>,
+    _background_notifier: Option<smol::Task<()>>,
     /// Tab-lifetime, like the output channel: the loop being replaced and the
     /// workflow agents that outlive it may still be writing, so every
     /// generation queues on the same per-file locks.
@@ -145,7 +175,17 @@ impl AgentHandles {
         >,
         host_cwd: Option<PathBuf>,
         local_documents: Option<Arc<LocalDocumentStore>>,
+        background_enabled: bool,
     ) -> Self {
+        let background = background_enabled
+            .then(|| state_dir.clone())
+            .flatten()
+            .zip(session_id.as_ref())
+            .and_then(|(storage, session)| {
+                smol::block_on(BackgroundTasks::spawn(storage, session.id()))
+                    .map_err(|error| warn!(%error, "background tasks unavailable"))
+                    .ok()
+            });
         spawn_agent_internal(
             flume::unbounded(),
             model_slot,
@@ -166,6 +206,9 @@ impl AgentHandles {
             system_prompt_profile,
             Arc::clone(&prompt_profiles),
             WorkflowSlot::Fresh(state_dir),
+            background,
+            background_enabled,
+            Arc::default(),
             PathLocks::fresh(),
             baseline,
             workspace_session,
@@ -182,6 +225,11 @@ impl AgentHandles {
     /// Interrupts every run of this session and waits for the runtime to
     /// close. Idempotent, so exit can call it ahead of the agent join.
     pub(crate) fn shutdown_workflow(&mut self) {
+        if let Some(background) = self.background.take()
+            && let Err(error) = smol::block_on(background.shutdown())
+        {
+            warn!(%error, "background task shutdown failed");
+        }
         if let Some(workflow) = self.workflow.take() {
             workflow.shutdown();
         }
@@ -225,6 +273,9 @@ impl AgentHandles {
         }
         app.state.goal = self.goal.clone();
         app.workflow.set_handle(self.workflow_handle());
+        app.background = self.background.clone();
+        app.background_delivery.invalidate();
+        app.background_delivery.fence = Arc::clone(&self.delivery_fence);
         let restore_tx =
             caudra_agent::EventSender::new(self.agent_tx.clone(), crate::app::RESTORE_RUN_ID);
         app.restore_event_tx = Some(restore_tx.clone());
@@ -244,9 +295,7 @@ impl AgentHandles {
     ) {
         self.workspace_session = Some(workspace);
         self.remote_project_context = Some(context);
-        if let Some(workflow) = self.workflow.take() {
-            workflow.shutdown();
-        }
+        self.shutdown_workflow();
     }
 
     pub(crate) fn send_mcp(&self, cmd: McpCommand) {
@@ -266,7 +315,12 @@ impl AgentHandles {
     /// working after the turn that started them, and both must be over before
     /// the session counts as quiescent.
     pub(crate) fn active_background_tasks(&self) -> usize {
-        self.subagent_cancels.active_count() + self.active_workflow_runs()
+        self.subagent_cancels.active_count()
+            + self.active_workflow_runs()
+            + self
+                .background
+                .as_ref()
+                .map_or(0, BackgroundTasks::active_count)
     }
 
     pub(crate) fn active_workflow_runs(&self) -> usize {
@@ -295,7 +349,31 @@ impl AgentHandles {
         if let Err(e) = smol::block_on(slot.provider.reload_auth()) {
             warn!(error = %e, "failed to reload auth, continuing with existing credentials");
         }
-        let subagent_history = stored_subagent_history(&app.state.session);
+        let same_session = self.session_id == Some(app.state.session.id);
+        let subagent_history = if same_session {
+            self.subagent_history.clone()
+        } else {
+            stored_subagent_history(&app.state.session)
+        };
+        let background = if same_session && self.background.is_some() {
+            self.background.clone()
+        } else {
+            if let Some(background) = self.background.take()
+                && let Err(error) = smol::block_on(background.shutdown())
+            {
+                warn!(%error, "background task shutdown failed");
+            }
+            if !self.background_enabled {
+                None
+            } else {
+                smol::block_on(BackgroundTasks::spawn(
+                    app.storage.clone(),
+                    app.state.session.id,
+                ))
+                .map_err(|error| app.flash(error))
+                .ok()
+            }
+        };
         // The runtime follows the session, not the loop: a respawn under the
         // same id keeps every run going, and a loaded or reset session gets
         // its own only once the previous one has stopped and drained.
@@ -330,6 +408,13 @@ impl AgentHandles {
             app.state.system_prompt_profile.clone(),
             Arc::clone(&self.prompt_profiles),
             workflow,
+            background,
+            self.background_enabled,
+            if same_session {
+                Arc::clone(&self.delivery_fence)
+            } else {
+                Arc::default()
+            },
             Arc::clone(&self.path_locks),
             Arc::clone(&app.workspace_baseline),
             self.workspace_session.clone(),
@@ -343,7 +428,13 @@ impl AgentHandles {
         self.apply_to_app(app);
         app.refresh_workflow_cards();
         app.flush_restored_queue();
-        old.cancel();
+        if same_session {
+            let _ = old.cmd_tx.try_send(AgentCommand::Cancel {
+                run_id: app.run_id - 1,
+            });
+        } else {
+            old.cancel();
+        }
     }
 
     pub(crate) fn is_finished(&self) -> bool {
@@ -416,6 +507,9 @@ fn spawn_agent_internal(
     system_prompt_profile: Option<Arc<SystemPromptProfile>>,
     prompt_profiles: Arc<PromptProfileCatalog>,
     workflow: WorkflowSlot,
+    background: Option<BackgroundTasks>,
+    background_enabled: bool,
+    delivery_fence: Arc<DeliveryFence>,
     path_locks: Arc<PathLocks>,
     baseline: Arc<WorkspaceBaseline>,
     workspace_session: Option<WorkspaceSession>,
@@ -423,6 +517,20 @@ fn spawn_agent_internal(
     host_cwd: Option<PathBuf>,
     local_documents: Option<Arc<LocalDocumentStore>>,
 ) -> AgentHandles {
+    let (background_wake_tx, background_wake_rx) = flume::bounded(1);
+    let (background_wake_resume, resume_rx) = flume::bounded(1);
+    let background_notifier = background.clone().map(|background| {
+        smol::spawn(async move {
+            loop {
+                background.notified().await;
+                if background_wake_tx.send_async(()).await.is_err()
+                    || resume_rx.recv_async().await.is_err()
+                {
+                    break;
+                }
+            }
+        })
+    });
     let (cmd_tx, cmd_rx) = flume::unbounded::<AgentCommand>();
     let (answer_tx, answer_rx) = match &workflow {
         WorkflowSlot::Reuse(current) => current.answer_channel(),
@@ -470,6 +578,7 @@ fn spawn_agent_internal(
                 .zip(session_id.as_ref())
                 .and_then(|(state_dir, session_id)| {
                     WorkflowSession::spawn(WorkflowSpawn {
+                        background: background.clone(),
                         state_dir,
                         session_id: session_id.id(),
                         model_slot,
@@ -527,7 +636,7 @@ fn spawn_agent_internal(
         cancel_map,
         retry_now,
         init_cancel,
-        session_id,
+        session_id.clone(),
         mailbox.clone(),
         timeouts,
         lua_handle,
@@ -538,6 +647,8 @@ fn spawn_agent_internal(
         system_prompt_profile,
         Arc::clone(&prompt_profiles),
         workflow.as_ref().map(WorkflowSession::handle),
+        background.clone(),
+        Arc::clone(&delivery_fence),
         mode,
         Arc::clone(&path_locks),
         baseline,
@@ -571,6 +682,14 @@ fn spawn_agent_internal(
         prompt_profiles,
         mailbox,
         workflow,
+        background,
+        background_enabled,
+        delivery_fence,
+        session_id: session_id.map(|session| session.id()),
+        subagent_history,
+        background_wake_rx,
+        background_wake_resume,
+        _background_notifier: background_notifier,
         path_locks,
         workspace_session,
         remote_project_context,
@@ -586,11 +705,8 @@ pub(crate) fn stored_subagent_history(session: &crate::AppSession) -> SubagentHi
         Vec::new()
     });
     let mut versions =
-        caudra_agent::active_task_history_versions_with_batch_state(&active_history, |call_id| {
-            session
-                .tool_outputs()
-                .get(call_id)
-                .and_then(|output| output.state())
+        caudra_agent::active_task_history_versions_with_outputs(&active_history, |call_id| {
+            session.tool_outputs().get(call_id).map(AsRef::as_ref)
         });
     let mut reachable = crate::app::reachable_subagent_ids(
         &active_history,
@@ -660,7 +776,6 @@ pub(crate) fn stored_subagent_history(session: &crate::AppSession) -> SubagentHi
         if reachable.contains(&subagent.tool_use_id)
             && !versions.contains_key(&subagent.tool_use_id)
             && let Some(version_id) = &subagent.parent_tool_use_id
-            && session.subagent_messages().contains_key(version_id)
         {
             versions.insert(subagent.tool_use_id.clone(), version_id.clone());
         }
@@ -677,10 +792,7 @@ pub(crate) fn stored_subagent_history(session: &crate::AppSession) -> SubagentHi
         .filter(|task_id| !version_ids.contains(task_id.as_str()))
         .filter_map(|task_id| {
             let version_id = versions.get(task_id).unwrap_or(task_id);
-            let items = session
-                .subagent_messages()
-                .get(version_id)
-                .or_else(|| session.subagent_messages().get(task_id))?;
+            let items = session.subagent_messages().get(version_id)?;
             match project_messages(items) {
                 Ok(messages) => Some((task_id.clone(), Arc::new(messages))),
                 Err(error) => {
@@ -696,7 +808,7 @@ pub(crate) fn stored_subagent_history(session: &crate::AppSession) -> SubagentHi
         .filter(|(task_id, spec)| reachable.contains(*task_id) && !spec.is_version())
         .map(|(task_id, spec)| (task_id.clone(), spec.clone()))
         .collect();
-    SubagentHistoryStore::seeded_with_specs(histories, specs)
+    SubagentHistoryStore::seeded_with_versions(histories, specs, versions)
 }
 
 #[cfg(test)]
@@ -806,6 +918,7 @@ mod tests {
             None,
             None,
             None,
+            false,
         );
         (handles, model_slot, permissions)
     }

@@ -6,6 +6,7 @@ use crate::components::code_view::ScrollSpan;
 use crate::components::prompt_progress::PROMPT_PROGRESS_LABEL;
 use crate::components::tool_display::{
     AWAITING_APPROVAL, FOLLOWING, NOTICE_PREFIX, PAUSED, WRITING_PROMPT, scroll_footer_text,
+    task_details,
 };
 use crate::repaint::expect::{OWED, QUIET};
 use crate::selection::{Selection, SelectionZone};
@@ -21,6 +22,8 @@ use caudra_agent::{
     ShellFilterInfo, ShellOutput, SnapshotLine, SnapshotSpan, SpanStyle, SubagentActivity,
     SubagentProgress, ToolAccounting, ToolInput, ToolOutput,
 };
+use caudra_storage::id::CaudraId;
+use caudra_storage::tool_outputs::ToolOutputRef;
 use caudra_workbench::scroll::SCROLLBAR_THUMB;
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
@@ -34,6 +37,385 @@ use test_case::test_case;
 use unicode_width::UnicodeWidthStr;
 
 const SPINNER_GLYPHS: &str = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏";
+const LIVE_TASK_ID: &str = "neat-wanted-cowbird";
+const LIVE_INVOCATION: &str = "private-invocation";
+const LIVE_LABEL: &str = "Wait sixty seconds";
+const LIVE_STATE: &str = "running";
+const FAILED_STATE: &str = "failed";
+const METADATA_SENTINEL: &str = "<task_metadata>private-model-data</task_metadata>";
+const NEXT_TASK_CALL: &str = "continued-launch";
+const NEXT_INVOCATION: &str = "next-private-invocation";
+const FOREGROUND_RESULT: &str = "The foreground investigation found the answer.";
+const CONTROL_RESULT: &str = "second-task-result";
+const READABLE_RESULT: &str = "readable first line\nreadable second line";
+const OUTCOME_PREVIEW: &str =
+    r#"{"error":null,"output":"readable first line\nreadable second line"#;
+const OUTCOME_ERROR: &str = "permission denied";
+const COMPLETED_STATE: &str = "completed";
+const BLOCKED_STATE: &str = "blocked";
+const TASK_BADGE: &str = "[background]";
+const TASK_MODE: &str = "build";
+const TASK_SUCCESS: &str = "All checks passed.";
+
+fn live_task_card(call: &str, state: &str) -> TaskCard {
+    serde_json::from_value(serde_json::json!({
+        "task_id": LIVE_TASK_ID, "invocation_id": LIVE_INVOCATION,
+        "call_id": call, "root_call_id": TOOL_ID, "label": LIVE_LABEL,
+        "state": state, "background": true, "mode": "build",
+        "generation": 1, "created_at": 1, "updated_at": 2
+    }))
+    .unwrap()
+}
+
+#[test_case(60, COMPLETED_STATE, TASK_SUCCESS; "narrow_success")]
+#[test_case(127, COMPLETED_STATE, TASK_SUCCESS; "wide_success")]
+#[test_case(60, FAILED_STATE, OUTCOME_ERROR; "narrow_error")]
+#[test_case(127, FAILED_STATE, OUTCOME_ERROR; "wide_error")]
+#[test_case(60, BLOCKED_STATE, OUTCOME_ERROR; "narrow_blocked")]
+#[test_case(127, BLOCKED_STATE, OUTCOME_ERROR; "wide_blocked")]
+#[test_case(60, COMPLETED_STATE, ""; "narrow_empty")]
+#[test_case(127, COMPLETED_STATE, ""; "wide_empty")]
+fn task_card_buffer_has_aligned_facts_and_one_identity(width: u16, state: &str, result: &str) {
+    let mut panel = panel_with_tools(&[(TOOL_ID, "task_control")]);
+    panel.set_view(ViewMode::Expanded);
+    let mut task = live_task_card(TOOL_ID, state);
+    task.result = Some(serde_json::json!({
+        "output": result, "error": null, "duration_ms": 2000, "tokens_used": 1200
+    }));
+    task.output_ref = Some(ToolOutputRef {
+        id: CaudraId::generate().to_string().parse().unwrap(),
+        byte_count: result.len(),
+        line_count: 1,
+    });
+    panel.tool_done(ToolDoneEvent {
+        output: ToolOutput::Tasks(vec![task]),
+        ..done(TOOL_ID)
+    });
+    panel.messages[0].text = LIVE_LABEL.into();
+    let buffer = render(&mut panel, width, 40);
+    let shown = visible_text(&buffer);
+    for identity in [LIVE_LABEL, LIVE_TASK_ID, state, TASK_BADGE] {
+        assert_eq!(shown.matches(identity).count(), 1, "{shown}");
+    }
+    assert!(!shown.contains(LIVE_INVOCATION), "{shown}");
+    assert!(!shown.contains("tool_output"), "{shown}");
+    assert!(!shown.contains("\"output\":"), "{shown}");
+    let column = shown
+        .lines()
+        .find(|line| line.contains(LIVE_TASK_ID))
+        .unwrap()
+        .find(LIVE_TASK_ID)
+        .unwrap();
+    for (label, value) in [
+        ("Mode", TASK_MODE),
+        ("Duration", "2.0s"),
+        ("Usage", "1k tokens"),
+    ] {
+        let line = shown.lines().find(|line| line.contains(label)).unwrap();
+        assert_eq!(line.find(value), Some(column), "{shown}");
+    }
+    if result.is_empty() {
+        assert!(!shown.contains("Result"), "{shown}");
+    } else {
+        assert!(shown.contains(result), "{shown}");
+    }
+    let row = screen_row_of(&shown, state).unwrap();
+    let line = shown.lines().nth(row).unwrap();
+    let column = line[..line.find(state).unwrap()].width();
+    let expected = match state {
+        FAILED_STATE => theme::current().tool_error,
+        BLOCKED_STATE => theme::current().tool_warning,
+        _ => theme::current().tool_success,
+    };
+    assert_eq!(
+        buffer.backend().buffer()[(column as u16, row as u16)].fg,
+        expected.fg.unwrap()
+    );
+}
+
+#[test_case(false; "complete_outcome")]
+#[test_case(true; "truncated_outcome")]
+fn task_details_decode_output_and_only_show_missing_outcome_reference(truncated: bool) {
+    let mut task = live_task_card(TOOL_ID, FAILED_STATE);
+    let reference = ToolOutputRef {
+        id: CaudraId::generate().to_string().parse().unwrap(),
+        byte_count: OUTCOME_PREVIEW.len(),
+        line_count: 1,
+    };
+    task.output_ref = Some(reference.clone());
+    if truncated {
+        task.result_preview = Some(OUTCOME_PREVIEW.into());
+        task.result_truncated = true;
+    } else {
+        task.result =
+            Some(serde_json::json!({ "output": READABLE_RESULT, "error": OUTCOME_ERROR }));
+    }
+    let details = task_details(&task);
+    assert!(details.contains(READABLE_RESULT), "{details}");
+    assert_eq!(
+        details.contains(&reference.id.to_string()),
+        truncated,
+        "{details}"
+    );
+    assert!(!details.contains("\\n"), "{details}");
+    assert!(!details.contains("\"output\":"), "{details}");
+    if !truncated {
+        assert!(details.contains(OUTCOME_ERROR));
+    }
+    let mut panel = panel_with_tools(&[(TOOL_ID, "task_control")]);
+    panel.set_view(ViewMode::Expanded);
+    panel.tool_done(ToolDoneEvent {
+        output: ToolOutput::Tasks(vec![task]),
+        ..done(TOOL_ID)
+    });
+    let shown = visible_text(&render(&mut panel, 127, 40));
+    assert_eq!(
+        shown.contains(&reference.id.to_string()),
+        truncated,
+        "{shown}"
+    );
+    assert!(!shown.contains("\"output\":"), "{shown}");
+    let row = screen_row_of(&shown, "readable first line").unwrap() as u16;
+    assert_eq!(
+        panel.task_hit_at(row, Rect::new(0, 0, 127, 40)).as_deref(),
+        Some(LIVE_TASK_ID)
+    );
+}
+
+#[test_case(false; "standalone")]
+#[test_case(true; "settled_batch")]
+fn task_receipt_keeps_current_execution_live_without_rewriting_output(child: bool) {
+    let _clock = FrozenSpinner::at(0);
+    let mut panel = panel_with_history_task(child, 0);
+    let call = if child {
+        format!("{TOOL_ID}:{MIDDLE_CHILD}")
+    } else {
+        TOOL_ID.to_owned()
+    };
+    let task = live_task_card(&call, LIVE_STATE);
+    panel.task_card_update(task.clone());
+    report_task_history(&mut panel, child, child_report());
+    let receipt = ToolOutput::Tasks(vec![task]);
+    let output = if child {
+        ToolOutput::Batch {
+            entries: vec![
+                BatchToolEntry {
+                    output: Some(receipt),
+                    status: BatchToolStatus::Success,
+                    ..running_child(TASK_TOOL_NAME)
+                },
+                running_child(TASK_TOOL_NAME),
+            ],
+            text: METADATA_SENTINEL.into(),
+        }
+    } else {
+        receipt
+    };
+    panel.tool_done(ToolDoneEvent {
+        output,
+        model_suffix: Some(METADATA_SENTINEL.into()),
+        ..done(TOOL_ID)
+    });
+    let stored = serde_json::to_value(panel.messages[0].tool_output.as_ref()).unwrap();
+    let mut report = child_report();
+    report.tools += 1;
+    let expected_tools = report.tools;
+    report_task_history(&mut panel, child, report);
+    assert!(task_history_progress(&panel, child).is_live());
+    assert_eq!(
+        task_history_progress(&panel, child).report.tools,
+        expected_tools
+    );
+    let shown = visible_text(&render(&mut panel, 127, 40));
+    assert!(shown.contains(LIVE_TASK_ID), "{shown}");
+    assert!(shown.contains(LIVE_STATE), "{shown}");
+    assert!(
+        SPINNER_GLYPHS.chars().any(|glyph| shown.contains(glyph)),
+        "{shown}"
+    );
+    assert!(!shown.contains(METADATA_SENTINEL), "{shown}");
+    assert!(!shown.contains(LIVE_INVOCATION), "{shown}");
+    panel.task_card_update(live_task_card(&call, FAILED_STATE));
+    assert!(!task_history_progress(&panel, child).is_live());
+    assert_eq!(
+        serde_json::to_value(panel.messages[0].tool_output.as_ref()).unwrap(),
+        stored
+    );
+    let shown = visible_text(&render(&mut panel, 127, 40));
+    assert!(shown.contains(FAILED_STATE), "{shown}");
+    if !child {
+        assert!(
+            !SPINNER_GLYPHS.chars().any(|glyph| shown.contains(glyph)),
+            "{shown}"
+        );
+    }
+    if child {
+        assert!(!panel.set_batch_child_progress(TOOL_ID, MIDDLE_CHILD, child_report()));
+    } else {
+        panel.set_tool_progress(TOOL_ID, child_report());
+    }
+    assert_eq!(
+        task_history_progress(&panel, child).report.tools,
+        expected_tools
+    );
+}
+
+#[test_case(false; "standalone")]
+#[test_case(true; "batch")]
+fn typed_task_rows_open_underlying_chat(child: bool) {
+    let mut panel = panel_with_history_task(child, 0);
+    let task = live_task_card(&task_history_key(child), LIVE_STATE);
+    let output = if child {
+        ToolOutput::Batch {
+            entries: vec![BatchToolEntry {
+                output: Some(ToolOutput::Tasks(vec![task])),
+                status: BatchToolStatus::Success,
+                ..running_child(TASK_TOOL_NAME)
+            }],
+            text: String::new(),
+        }
+    } else {
+        ToolOutput::Tasks(vec![task])
+    };
+    panel.tool_done(ToolDoneEvent {
+        output,
+        ..done(TOOL_ID)
+    });
+    let shown = visible_text(&render(&mut panel, 127, 40));
+    let row = screen_row_of(&shown, LIVE_TASK_ID).unwrap() as u16;
+    assert_eq!(
+        panel.task_hit_at(row, Rect::new(0, 0, 127, 40)).as_deref(),
+        Some(LIVE_TASK_ID)
+    );
+}
+
+#[test_case(false, 0, 127; "live")]
+#[test_case(true, 0, 60; "restored_wrapped")]
+#[test_case(false, 1, 127; "batch_live")]
+#[test_case(true, 1, 60; "batch_restored_wrapped")]
+#[test_case(false, 2, 127; "nested_batch_live")]
+#[test_case(true, 2, 60; "nested_batch_restored_wrapped")]
+fn task_control_list_rows_keep_distinct_chat_targets(restored: bool, depth: usize, width: u16) {
+    let mut panel = panel_with_tools(&[(
+        TOOL_ID,
+        if depth > 0 {
+            BATCH_TOOL_NAME
+        } else {
+            "task_control"
+        },
+    )]);
+    panel.set_view(ViewMode::Expanded);
+    let first = live_task_card(TOOL_ID, LIVE_STATE);
+    let mut second = live_task_card(NEXT_TASK_CALL, FAILED_STATE);
+    second.task_id = NEXT_TASK_CALL.into();
+    second.label = "Inspect 界界界界界界界界界界界界界界界界界界界界界界".into();
+    second.result = Some(serde_json::json!(CONTROL_RESULT));
+    let mut output = ToolOutput::Tasks(vec![first, second]);
+    for level in 0..depth {
+        output = ToolOutput::Batch {
+            entries: vec![BatchToolEntry {
+                output: Some(output),
+                status: BatchToolStatus::Success,
+                ..running_child(if level == 0 {
+                    "task_control"
+                } else {
+                    BATCH_TOOL_NAME
+                })
+            }],
+            text: METADATA_SENTINEL.into(),
+        };
+    }
+    let output = if restored {
+        serde_json::from_value(serde_json::to_value(output).unwrap()).unwrap()
+    } else {
+        output
+    };
+    panel.tool_done(ToolDoneEvent {
+        output,
+        ..done(TOOL_ID)
+    });
+    if restored {
+        panel.load_messages(panel.messages.clone());
+    }
+    if depth > 1 {
+        panel.toggle_batch_child(TOOL_ID, 0);
+    }
+    let shown = visible_text(&render(&mut panel, width, 60));
+    for id in [LIVE_TASK_ID, NEXT_TASK_CALL] {
+        let row = screen_row_of(&shown, id).unwrap() as u16;
+        assert_eq!(
+            panel
+                .task_hit_at(row, Rect::new(0, 0, width, 60))
+                .as_deref(),
+            Some(id)
+        );
+    }
+    let row = screen_row_of(&shown, CONTROL_RESULT).unwrap() as u16;
+    assert_eq!(
+        panel
+            .task_hit_at(row, Rect::new(0, 0, width, 60))
+            .as_deref(),
+        Some(NEXT_TASK_CALL)
+    );
+    assert!(shown.contains(FAILED_STATE), "{shown}");
+    assert!(shown.contains(LIVE_STATE), "{shown}");
+    assert!(!shown.contains(METADATA_SENTINEL));
+}
+
+#[test]
+fn task_control_live_overlay_keeps_other_tasks_and_recorded_results() {
+    let mut panel = panel_with_tools(&[(TOOL_ID, "task_control")]);
+    panel.set_view(ViewMode::Expanded);
+    let first = live_task_card(NEXT_TASK_CALL, LIVE_STATE);
+    let mut second = live_task_card("another-call", COMPLETED_STATE);
+    second.task_id = "another-task".into();
+    second.invocation_id = NEXT_INVOCATION.into();
+    second.result = Some(serde_json::json!(CONTROL_RESULT));
+    panel.tool_done(ToolDoneEvent {
+        output: ToolOutput::Tasks(vec![first, second]),
+        ..done(TOOL_ID)
+    });
+    let before = visible_text(&render(&mut panel, 127, 40));
+    assert!(before.contains(LIVE_STATE));
+    panel.task_card_update(live_task_card(NEXT_TASK_CALL, BLOCKED_STATE));
+    let after = visible_text(&render(&mut panel, 127, 40));
+    assert!(after.contains(BLOCKED_STATE), "{after}");
+    assert!(!after.contains(LIVE_STATE), "{after}");
+    assert!(after.contains(CONTROL_RESULT), "{after}");
+}
+
+#[test_case(false; "background_continuation")]
+#[test_case(true; "foreground_result_preserved")]
+fn a_new_invocation_does_not_reanimate_old_task_cards(foreground: bool) {
+    let mut panel = panel_with_history_task(false, 0);
+    let mut first = live_task_card(TOOL_ID, FAILED_STATE);
+    first.background = !foreground;
+    let output = if foreground {
+        ToolOutput::Markdown(FOREGROUND_RESULT.into())
+    } else {
+        ToolOutput::Tasks(vec![first.clone()])
+    };
+    panel.tool_done(ToolDoneEvent {
+        output,
+        ..done(TOOL_ID)
+    });
+    panel.task_card_update(first);
+    panel.tool_start(start(NEXT_TASK_CALL, TASK_TOOL_NAME));
+    let mut next = live_task_card(NEXT_TASK_CALL, LIVE_STATE);
+    next.invocation_id = NEXT_INVOCATION.into();
+    panel.task_card_update(next);
+    panel.set_tool_progress(NEXT_TASK_CALL, child_report());
+    panel.set_tool_progress(TOOL_ID, child_report());
+    assert!(panel.messages[0].progress.is_none());
+    assert_eq!(panel.task_cards[TOOL_ID].state, FAILED_STATE);
+    let shown = visible_text(&render(&mut panel, 127, 40));
+    if foreground {
+        assert!(shown.contains(FOREGROUND_RESULT), "{shown}");
+    } else {
+        assert!(shown.contains(FAILED_STATE), "{shown}");
+    }
+    assert!(shown.contains(LIVE_STATE), "{shown}");
+}
 /// A working directory nothing resolves under, for the hover tests that are
 /// not about mentions.
 const NO_PROJECT: &str = "/caudra-no-such-project";
@@ -6650,7 +7032,7 @@ fn batch_row(panel: &MessagesPanel, target: RowTarget) -> u16 {
 }
 
 fn batch_child_row(panel: &MessagesPanel, index: usize) -> u16 {
-    batch_row(panel, RowTarget(index))
+    batch_row(panel, RowTarget::Item(index))
 }
 
 /// Arms a child's window and offers it a wheel burst, which is what a press

@@ -27,6 +27,43 @@ A session is recorded once it holds something worth keeping, such as a prompt, a
 typed draft, or a queued message. Starting Caudra and quitting leaves no session
 behind, so the picker and `caudra --continue` skip it.
 
+## Background tasks
+
+In the TUI and [stream-JSON SDK](/docs/headless/#background-tasks), the model can delegate independent work with [`task`](/docs/tools/#task) using `background: true`. The call returns an admission receipt with a task ID while the child is queued or working. Admission does not mean success. Foreground execution remains the default and waits for the result. A `batch` still waits for foreground calls, so each task that should return early needs its own `background: true`.
+
+The parent can keep working on a separate scope. When nothing independent remains, it gives a normal final answer explaining what is still pending. Background reports and final outcomes then start another parent run automatically at a safe boundary, even after that answer. The parent checks them against the latest instructions, verifies claims, and continues the original work without asking whether to continue. This works while the session stays open and automatic continuation has not been stopped. There is no need to poll, sleep, or repeat the delegated work.
+
+The main agent also receives bounded [background-work reminders](/docs/context/#background-work-awareness) when state changes and after compaction. Periodic refresh during ongoing work is opt-in through `agent.background_reminder_turns`, which defaults to `0` (disabled). These reminders do not start idle turns.
+
+### Inspect and control tasks
+
+Open `/tasks` or press `Ctrl+X a` to inspect transcripts and steer running children. These commands act locally without sending a model prompt or adding transcript messages:
+
+| Command | Effect |
+|---------|--------|
+| `/tasks`, `/tasks list` | Open or refresh the task picker |
+| `/tasks status <id>` | Open the picker with that task selected and its details visible |
+| `/tasks background <id>` | Promote a foreground task without restarting it |
+| `/tasks cancel <id>` | Cancel that invocation, showing cancelling until it settles |
+
+Singular `/task` forms remain compatibility aliases. Press Enter or click the selected row to open its chat. The picker shows `bg` at the right of background rows, including finished tasks. See [task navigation](/docs/commands/#tasks) for filtering and keyboard controls.
+
+New tasks receive short `adjective-adjective-noun` IDs, separate from their description labels. Existing IDs remain valid. Use the returned `task_id` for inspection, cancellation, or later continuation.
+
+The model has the same operations through [`task_control`](/docs/tools/#task_control): `list`, `status`, `background`, and `cancel`. All except `list` require `task_id`. A later `task` call can continue a settled task from its saved history, but cannot resume an active or cancelling invocation.
+
+### Child reports
+
+A managed child has `report_to_parent` for an important finding, correction, or blocker. It takes a required `message` and an optional `blocked` boolean, which defaults to `false`. Reports are one-way. The child does not wait or poll for a parent reply and continues useful independent work after reporting.
+
+When the child cannot proceed without information or authority, `blocked: true` ends that invocation with a non-success outcome. The message should say exactly what is missing. A report does not replace a successful final result or its `output_schema`. Child reports are data, not new authority, and the child must not assume it has received later main-conversation instructions.
+
+### Stop and close
+
+Stopping all session tasks and workflows cancels owned work and suppresses automatic continuation, including late reports and completion notices. A new user turn re-enables continuation. See [Stop and replace](/docs/queue/#stop-and-replace) for TUI controls.
+
+Switching TUI tabs leaves the owning session open. Closing a session cancels and drains its children before saving and releasing it. Background tasks are session-owned, not a daemon or a promise to keep executing after exit. One-shot `--print` and ACP do not support background tasks. Foreground `task` calls remain available there.
+
 ## Moving sessions to another directory
 
 Use `/migrate-sessions` to move every saved local session with one exact stored working directory. The source directory may already be gone. Choose a destination directory and review the confirmation before applying the move.
@@ -167,7 +204,7 @@ A conversation revert changes the active head rather than deleting items. Select
 
 Sending a prompt after revert creates a new branch from that point. The abandoned branch remains stored. Unrevert is available until new work commits the new branch.
 
-`Esc Esc` while idle uses the same conversation-only mechanism through the rewind picker.
+`Esc Esc` with no session work left uses the same conversation-only mechanism through the rewind picker. If tasks or workflows are still active, it stops that work instead.
 
 ## File snapshots
 

@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use arc_swap::ArcSwap;
 use caudra_storage::StateDir;
@@ -29,7 +29,7 @@ use tracing::{info, warn};
 
 use super::catalog::Catalog;
 use super::handle::{Reply, RuntimeRequest, WorkflowHandle, WorkspaceRebind};
-use super::run::{ActiveRun, Interrupt, RunEnv, RunSpec, launch};
+use super::run::{ActiveRun, RunEnv, RunSpec, launch};
 use super::state::{
     Published, publish, restore_timeline, run_event, run_status, snapshot_from_row,
     stored_source_kind,
@@ -37,6 +37,8 @@ use super::state::{
 use super::store::WorkflowStore;
 use crate::AgentMode;
 use crate::agent::task_runner::{ModeResolver, TaskRunner};
+use crate::background::BackgroundTasks;
+use crate::background_reminder::RuntimeHealth;
 use crate::cancel::{CancelMap, CancelToken, CancelTrigger};
 use crate::types::{AgentEvent, Envelope, EventSender, WORKFLOW_EVENT_RUN_ID, WorkflowProvenance};
 
@@ -55,6 +57,9 @@ const DEFAULT_HISTORY_RUNS: usize = 20;
 const CALL_LABEL_FIELD: &str = "label";
 const CALL_PROMPT_FIELD: &str = "prompt";
 const CALL_NAME_FIELD: &str = "name";
+const INVALID_BACKGROUND_BINDING: &str =
+    "workflow background binding must be unique and session-owned";
+const STALE_ADMISSION: &str = "workflow admission belongs to an obsolete session generation";
 
 pub struct RuntimeDeps {
     pub state_dir: StateDir,
@@ -79,6 +84,8 @@ pub struct WorkflowRuntime {
     task: smol::Task<()>,
     root: CancelTrigger,
     subagent_cancels: Arc<CancelMap<String>>,
+    #[cfg(test)]
+    store: WorkflowStore,
 }
 
 impl WorkflowRuntime {
@@ -90,6 +97,9 @@ impl WorkflowRuntime {
         if interrupted > 0 {
             info!(interrupted, "workflow runs lost with the previous process");
         }
+        for (run_id, revision) in store.pending_outbox().await? {
+            store.ack_outbox(run_id, revision).await?;
+        }
         let rows = store.load_runs().await?;
         let mut runs = Vec::with_capacity(rows.len());
         for row in &rows {
@@ -100,6 +110,8 @@ impl WorkflowRuntime {
         let published: Published = Arc::new(ArcSwap::from_pointee(WorkflowState { runs }));
         let (requests, inbox) = flume::unbounded();
         let handle = WorkflowHandle::new(requests, Arc::clone(&published));
+        #[cfg(test)]
+        let test_store = store.clone();
         let (root_trigger, root) = CancelToken::new();
         let subagent_cancels = Arc::clone(&deps.subagent_cancels);
         let user_config_dir = deps.user_config_dir.or_else(|| config_dir().ok());
@@ -116,17 +128,22 @@ impl WorkflowRuntime {
                 events: deps.events,
                 mode: deps.mode,
                 published,
+                health: Arc::clone(&handle.health),
             },
             root,
             active: HashMap::new(),
             suspended: None,
             pending_workspace: None,
+            background: Arc::clone(&handle.background),
+            health: Arc::clone(&handle.health),
         };
         Ok(Self {
             handle,
             task: smol::spawn(manager.serve(inbox)),
             root: root_trigger,
             subagent_cancels,
+            #[cfg(test)]
+            store: test_store,
         })
     }
 
@@ -155,6 +172,8 @@ struct Manager {
     active: HashMap<String, ActiveRun>,
     suspended: Option<Arc<()>>,
     pending_workspace: Option<(Arc<dyn TaskRunner>, WorkspaceRebind)>,
+    background: Arc<OnceLock<BackgroundTasks>>,
+    health: Arc<ArcSwap<RuntimeHealth>>,
 }
 
 impl Manager {
@@ -162,13 +181,40 @@ impl Manager {
     /// the runs are interrupted and the store closed before the task ends.
     async fn serve(mut self, inbox: Receiver<(RuntimeRequest, Reply)>) {
         while let Ok((request, reply)) = inbox.recv_async().await {
-            if matches!(request, RuntimeRequest::Workflow(WorkflowRequest::Shutdown)) {
+            if matches!(
+                request,
+                RuntimeRequest::Workflow(WorkflowRequest::Shutdown, _)
+            ) {
                 self.shutdown().await;
                 let _ = reply.send(Ok(WorkflowResponse::Ack));
                 return;
             }
             let response = match request {
-                RuntimeRequest::Workflow(request) => self.handle(request).await,
+                #[cfg(test)]
+                RuntimeRequest::Park(entered, release) => {
+                    let _ = entered.send(());
+                    let _ = release.recv_async().await;
+                    Ok(WorkflowResponse::Ack)
+                }
+                RuntimeRequest::ReceivedCompletion(origin) => self
+                    .env
+                    .store
+                    .received_completion(origin.run_id, origin.revision)
+                    .await
+                    .map(WorkflowResponse::Acked),
+                RuntimeRequest::BindBackground(background) => {
+                    if background.session_id() != self.session_id {
+                        Err(internal(INVALID_BACKGROUND_BINDING))
+                    } else {
+                        self.background
+                            .set(background)
+                            .map(|_| WorkflowResponse::Ack)
+                            .map_err(|_| internal(INVALID_BACKGROUND_BINDING))
+                    }
+                }
+                RuntimeRequest::Workflow(request, generation) => {
+                    self.handle(request, generation).await
+                }
                 RuntimeRequest::Suspend(token) => {
                     if self.suspended.is_some()
                         || self
@@ -187,6 +233,7 @@ impl Manager {
                             run.task.await;
                         }
                         self.suspended = Some(token);
+                        self.health.store(Arc::new(RuntimeHealth::Stopping));
                         Ok(WorkflowResponse::Ack)
                     }
                 }
@@ -198,6 +245,7 @@ impl Manager {
                     {
                         self.pending_workspace = None;
                         self.suspended = None;
+                        self.health.store(Arc::new(RuntimeHealth::Current));
                     }
                     Ok(WorkflowResponse::Ack)
                 }
@@ -242,6 +290,7 @@ impl Manager {
     async fn handle(
         &mut self,
         request: WorkflowRequest,
+        generation: Option<u64>,
     ) -> Result<WorkflowResponse, WorkflowError> {
         if self.suspended.is_some()
             && matches!(
@@ -251,6 +300,23 @@ impl Manager {
         {
             return Err(internal("workspace transition in progress"));
         }
+        let _admission = if matches!(
+            request,
+            WorkflowRequest::Start(_) | WorkflowRequest::Resume { .. }
+        ) {
+            match self.background.get() {
+                Some(background) => {
+                    let guard = background.workflow_admission().await.map_err(internal)?;
+                    if generation != Some(background.generation()) {
+                        return Err(internal(STALE_ADMISSION));
+                    }
+                    Some(guard)
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
         match request {
             WorkflowRequest::List => Ok(WorkflowResponse::Catalog(self.scan().await.to_catalog())),
             WorkflowRequest::Validate { name } => self.validate(name).await,
@@ -365,6 +431,9 @@ impl Manager {
         agent_budget: Option<u32>,
     ) -> Result<WorkflowResponse, WorkflowError> {
         let row = self.load_row(&run_id).await?;
+        if row.session_id != self.session_id {
+            return Err(WorkflowError::UnknownRun { run_id });
+        }
         let status = run_status(row.status);
         let admitted = u32::try_from(row.agents_admitted).unwrap_or(u32::MAX);
         let budget_raised = agent_budget.is_some_and(|budget| budget > admitted);
@@ -484,18 +553,7 @@ impl Manager {
             .active
             .remove(run_id)
             .ok_or_else(|| WorkflowError::Internal(DRIVER_MISSING.to_owned()))?;
-        let (reply, answer) = flume::bounded(1);
-        let mut snapshot = None;
-        if active
-            .control
-            .send_async(Interrupt { status, reply })
-            .await
-            .is_ok()
-        {
-            snapshot = answer.recv_async().await.ok();
-        }
-        active.task.await;
-        let snapshot = match snapshot {
+        let snapshot = match active.interrupt(status).await {
             Some(snapshot) => snapshot,
             None => snapshot_from_row(&self.load_row(run_id).await?),
         };
@@ -588,8 +646,16 @@ impl Manager {
     async fn ack(&self, run_id: String, revision: u64) -> Result<WorkflowResponse, WorkflowError> {
         let acked = self.env.store.ack_outbox(run_id.clone(), revision).await?;
         if acked {
-            let snapshot = snapshot_from_row(&self.load_row(&run_id).await?);
-            publish(&self.env.published, &snapshot);
+            self.env.published.rcu(|state| {
+                let mut runs = state.runs.clone();
+                if let Some(run) = runs
+                    .iter_mut()
+                    .find(|run| run.run_id == run_id && run.revision == revision)
+                {
+                    run.outbox_pending = false;
+                }
+                WorkflowState { runs }
+            });
         }
         Ok(WorkflowResponse::Acked(acked))
     }
@@ -597,6 +663,7 @@ impl Manager {
     /// Interrupts what is still running and joins the drivers of runs that
     /// already ended, so nothing writes to the store after it closes.
     async fn shutdown(&mut self) {
+        self.health.store(Arc::new(RuntimeHealth::Stopping));
         let run_ids: Vec<String> = self.active.keys().cloned().collect();
         for run_id in run_ids {
             let running = self
@@ -611,6 +678,7 @@ impl Manager {
             }
         }
         self.env.store.clone().shutdown().await;
+        self.health.store(Arc::new(RuntimeHealth::Closed));
     }
 
     fn launch(&mut self, snapshot: RunSnapshot, spec: RunSpec) -> Result<(), WorkflowError> {
@@ -827,6 +895,7 @@ mod tests {
     use std::path::Path;
     use std::sync::Mutex;
 
+    use caudra_providers::{Message, WorkflowEventOrigin, expand_message};
     use caudra_storage::sessions::{SessionDatabase, SessionRelocation};
     use caudra_storage::workflow::{WorkflowCallState, WorkflowEventKind, WorkflowSourceKind};
     use caudra_workflow::RosterState;
@@ -938,6 +1007,59 @@ complete(first.output.echo);
     const SCRATCH_PREVIEW_IS_ITS_PATH: &str = "a scratch call previews the bare path it wrote";
     const HISTORY_IS_FOREIGN: &str = "history must list only other sessions' runs";
 
+    #[test_case(true; "stop_then_shutdown")]
+    #[test_case(false; "shutdown_without_stop")]
+    fn failed_terminal_commit_marks_cached_active_run_unavailable_with_manager_alive(stop: bool) {
+        smol::block_on(async {
+            let fixture = Fixture::new();
+            fixture.user_workflow(BLOCKING, BLOCKING_BODY);
+            let runtime = fixture.spawn().await;
+            let handle = runtime.handle();
+            let started = start(&handle, BLOCKING, None).await;
+            fixture.started().await;
+            assert_eq!(handle.reminder_snapshot().health, RuntimeHealth::Current);
+            let (failed_tx, failed_rx) = flume::bounded(1);
+            runtime.store.fail_next_terminal_update(failed_tx);
+            fixture.release.send(()).unwrap();
+            failed_rx.recv_async().await.unwrap();
+            if stop {
+                assert!(matches!(
+                    handle
+                        .request(WorkflowRequest::Stop {
+                            run_id: started.run_id.clone()
+                        })
+                        .await,
+                    Err(WorkflowError::InvalidTransition {
+                        status: RunStatus::Active,
+                        ..
+                    })
+                ));
+                assert_eq!(
+                    handle.reminder_snapshot().health,
+                    RuntimeHealth::Unavailable
+                );
+            }
+            let cached = run(
+                &handle,
+                WorkflowRequest::Status {
+                    run_id: Some(started.run_id.clone()),
+                },
+            )
+            .await;
+            assert_eq!(cached.status, RunStatus::Active);
+            assert!(handle.request(WorkflowRequest::List).await.is_ok());
+            let persisted = runtime
+                .store
+                .load_run(started.run_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(persisted.status, WorkflowRunStatus::Active);
+            runtime.shutdown().await;
+            assert_eq!(handle.reminder_snapshot().health, RuntimeHealth::Closed);
+        });
+    }
+
     /// Answers each agent by its label: `block-*` parks until released or
     /// cancelled, `fail-*` fails without opening a session, anything else
     /// succeeds echoing its prompt. Every start is announced so a test can
@@ -982,7 +1104,7 @@ complete(first.output.echo);
                     .unwrap()
                     .push((label.clone(), events.workflow().cloned()));
                 let _ = self.started.send(label.clone());
-                let task_id = Some(format!("task-{label}"));
+                let task_id = Some(request.task.requested().unwrap().to_owned());
                 if label.starts_with(BLOCK_PREFIX)
                     && cancel.race(self.release.recv_async()).await.is_err()
                 {
@@ -1087,6 +1209,26 @@ complete(first.output.echo);
 
         async fn spawn(&self) -> WorkflowRuntime {
             self.spawn_as(self.session_id).await
+        }
+
+        fn save_receipt(&self, run: &RunSnapshot, compact: bool) {
+            let mut database = SessionDatabase::open(&self.state_dir).unwrap();
+            let mut session: StoredSession = database.load(self.session_id).unwrap();
+            let message = Message::workflow_observation(
+                FAILURE.into(),
+                WorkflowEventOrigin {
+                    run_id: run.run_id.clone(),
+                    revision: run.revision,
+                },
+            );
+            for item in expand_message(&message, session.messages().last().map(|item| item.id)) {
+                session.push_message(item);
+            }
+            database.save(&session, None).unwrap();
+            if compact {
+                session.replace_messages(Vec::new());
+                database.save(&session, None).unwrap();
+            }
         }
 
         fn relocate(&mut self) {
@@ -1273,7 +1415,11 @@ complete(first.output.echo);
                     ),
                 ]
             );
-            assert_eq!(calls[0].task_id.as_deref(), Some("task-worker-1"));
+            assert_eq!(calls[0].task_id, done.roster[0].task_id);
+            let task_id = calls[0].task_id.as_deref().unwrap();
+            assert_eq!(task_id.split('-').count(), 3);
+            let result: Value = serde_json::from_str(calls[0].result.as_deref().unwrap()).unwrap();
+            assert_eq!(result["agent_id"], task_id);
             let events = store.load_events(started.run_id.clone()).await.unwrap();
             assert_eq!(
                 events
@@ -1509,6 +1655,18 @@ complete(first.output.echo);
             fixture.release.send(()).unwrap();
             let done = fixture.wait_for(&run_id, RunStatus::Completed).await;
 
+            assert_eq!(
+                done.roster
+                    .iter()
+                    .map(|entry| &entry.task_id)
+                    .collect::<Vec<_>>(),
+                stopped
+                    .roster
+                    .iter()
+                    .map(|entry| &entry.task_id)
+                    .collect::<Vec<_>>()
+            );
+
             assert_eq!(done.result, Some(json!(["one", "two"])));
             assert_eq!(
                 fixture.runner.labels(),
@@ -1522,6 +1680,105 @@ complete(first.output.echo);
                     (SECOND_KEY, RosterState::Completed)
                 ]
             );
+            runtime.shutdown().await;
+        });
+    }
+
+    #[test_case(false; "active")]
+    #[test_case(true; "paused")]
+    fn foreign_runs_are_inspectable_but_cannot_be_controlled(paused: bool) {
+        smol::block_on(async {
+            let owner = Fixture::new();
+            owner.user_workflow(BLOCKING, BLOCKING_BODY);
+            let runtime = owner.spawn().await;
+            let owned = runtime.handle();
+            let started = start(&owned, BLOCKING, None).await;
+            owner.started().await;
+            if paused {
+                owned
+                    .request(WorkflowRequest::Pause {
+                        run_id: started.run_id.clone(),
+                    })
+                    .await
+                    .unwrap();
+            }
+            let mut requester = Fixture::new();
+            requester.state_dir = owner.state_dir.clone();
+            requester.session_id = requester.new_session();
+            let foreign_runtime = requester.spawn().await;
+            let foreign = foreign_runtime.handle();
+            let database = SessionDatabase::open(&owner.state_dir).unwrap();
+            let before = database
+                .load_workflow_run(&started.run_id)
+                .unwrap()
+                .unwrap();
+            let calls = owner.runner.labels();
+            for request in [
+                WorkflowRequest::Resume {
+                    run_id: started.run_id.clone(),
+                    agent_budget: None,
+                },
+                WorkflowRequest::Pause {
+                    run_id: started.run_id.clone(),
+                },
+                WorkflowRequest::Stop {
+                    run_id: started.run_id.clone(),
+                },
+            ] {
+                assert_eq!(
+                    foreign.request(request).await,
+                    Err(WorkflowError::UnknownRun {
+                        run_id: started.run_id.clone()
+                    })
+                );
+                assert_eq!(
+                    database
+                        .load_workflow_run(&started.run_id)
+                        .unwrap()
+                        .unwrap(),
+                    before
+                );
+                assert!(requester.runner.labels().is_empty());
+                assert_eq!(owner.runner.labels(), calls);
+            }
+            assert!(matches!(
+                foreign
+                    .request(WorkflowRequest::Inspect {
+                        run_id: started.run_id.clone()
+                    })
+                    .await
+                    .unwrap(),
+                WorkflowResponse::Detail(_)
+            ));
+            assert!(matches!(
+                foreign
+                    .request(WorkflowRequest::CallBodies {
+                        run_id: started.run_id.clone(),
+                        call_key: None
+                    })
+                    .await
+                    .unwrap(),
+                WorkflowResponse::CallBodies(_)
+            ));
+            assert_eq!(run_history(&foreign).await[0].run.run_id, started.run_id);
+            assert_eq!(
+                foreign
+                    .request(WorkflowRequest::AckCompletion {
+                        run_id: started.run_id.clone(),
+                        revision: before.revision
+                    })
+                    .await,
+                Ok(WorkflowResponse::Acked(false))
+            );
+            assert_eq!(
+                database
+                    .load_workflow_run(&started.run_id)
+                    .unwrap()
+                    .unwrap(),
+                before
+            );
+            assert!(foreign.state().runs.is_empty());
+            foreign_runtime.shutdown().await;
             runtime.shutdown().await;
         });
     }
@@ -2005,8 +2262,12 @@ complete(first.output.echo);
                 "{ACK_IS_EXACT}"
             );
             assert_eq!(handle.pending_completions(), 1, "{ACK_IS_EXACT}");
+            assert_eq!(ack(done.revision).await, Ok(WorkflowResponse::Acked(false)));
+            fixture.save_receipt(&done, false);
             assert_eq!(ack(done.revision).await, Ok(WorkflowResponse::Acked(true)));
             assert_eq!(handle.pending_completions(), 0);
+            assert_eq!(handle.state().runs[0].logs, done.logs);
+            assert_eq!(handle.state().runs[0].revision, done.revision);
             assert_eq!(
                 ack(done.revision).await,
                 Ok(WorkflowResponse::Acked(false)),
@@ -2046,6 +2307,234 @@ complete(first.output.echo);
                 fixture.wait_for(&run.run_id, RunStatus::Completed).await;
             }
             runtime.shutdown().await;
+        });
+    }
+
+    #[test_case(false; "saved_history")]
+    #[test_case(true; "compacted_history")]
+    fn recovery_reconciles_saved_completion_without_reinjection(compact: bool) {
+        smol::block_on(async {
+            let fixture = Fixture::new();
+            fixture.user_workflow(ECHO, ECHO_BODY);
+            let runtime = fixture.spawn().await;
+            let started = start(&runtime.handle(), ECHO, None).await;
+            let done = fixture
+                .wait_for(&started.run_id, RunStatus::Completed)
+                .await;
+            let origin = WorkflowEventOrigin {
+                run_id: done.run_id.clone(),
+                revision: done.revision,
+            };
+            assert!(
+                !runtime
+                    .handle()
+                    .received_completion(origin.clone())
+                    .await
+                    .unwrap()
+            );
+            fixture.save_receipt(&done, compact);
+            assert!(
+                runtime
+                    .handle()
+                    .received_completion(origin.clone())
+                    .await
+                    .unwrap()
+            );
+            assert_eq!(runtime.handle().pending_completions(), 1);
+            runtime.shutdown().await;
+            let recovered = fixture.spawn().await;
+            assert_eq!(recovered.handle().pending_completions(), 0);
+            let restored = recovered.handle().state().runs[0].clone();
+            assert_eq!(restored.revision, done.revision);
+            assert_eq!(restored.execution_epoch, done.execution_epoch);
+            assert!(
+                recovered
+                    .handle()
+                    .received_completion(origin)
+                    .await
+                    .unwrap()
+            );
+            recovered.shutdown().await;
+        });
+    }
+
+    #[test_case(false; "start")]
+    #[test_case(true; "resume")]
+    fn bound_admission_obeys_stop_rearm_and_workspace_reservation(resume: bool) {
+        smol::block_on(async {
+            let fixture = Fixture::new();
+            fixture.user_workflow(BLOCKING, BLOCKING_BODY);
+            let runtime = fixture.spawn().await;
+            let handle = runtime.handle();
+            let background = BackgroundTasks::spawn(fixture.state_dir.clone(), fixture.session_id)
+                .await
+                .unwrap();
+            handle.bind_background(background.clone()).await.unwrap();
+            let request = if resume {
+                let started = start(&handle, BLOCKING, None).await;
+                handle
+                    .request(WorkflowRequest::Pause {
+                        run_id: started.run_id.clone(),
+                    })
+                    .await
+                    .unwrap();
+                WorkflowRequest::Resume {
+                    run_id: started.run_id,
+                    agent_budget: None,
+                }
+            } else {
+                WorkflowRequest::Start(LaunchRequest {
+                    name: BLOCKING.into(),
+                    args: json!({}),
+                    agent_budget: None,
+                })
+            };
+            let guard = background.workflow_admission().await.unwrap();
+            let mut launch = Box::pin(handle.request(request.clone()));
+            assert!(futures_lite::future::poll_once(&mut launch).await.is_none());
+            let mut stop = Box::pin(background.stop());
+            assert!(futures_lite::future::poll_once(&mut stop).await.is_none());
+            background.rearm();
+            drop(guard);
+            assert!(launch.await.is_err());
+            stop.await.unwrap();
+            assert!(handle.request(request.clone()).await.is_err());
+            let transition = background.suspend().unwrap();
+            background.rearm();
+            transition.drain().await.unwrap();
+            assert!(handle.request(request.clone()).await.is_err());
+            drop(transition);
+            assert!(handle.request(request.clone()).await.is_err());
+            background.rearm();
+            let transition = background.suspend().unwrap();
+            assert!(handle.request(request.clone()).await.is_err());
+            drop(transition);
+            assert!(handle.request(request).await.is_ok());
+            runtime.shutdown().await;
+            background.shutdown().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn cancelled_launch_caller_does_not_abandon_manager_owned_admission() {
+        smol::block_on(async {
+            let fixture = Fixture::new();
+            fixture.user_workflow(BLOCKING, BLOCKING_BODY);
+            let runtime = fixture.spawn().await;
+            let handle = runtime.handle();
+            let background = BackgroundTasks::spawn(fixture.state_dir.clone(), fixture.session_id)
+                .await
+                .unwrap();
+            handle.bind_background(background.clone()).await.unwrap();
+            let guard = background.workflow_admission().await.unwrap();
+            let mut launch = Box::pin(handle.request(WorkflowRequest::Start(LaunchRequest {
+                name: BLOCKING.into(),
+                args: json!({}),
+                agent_budget: None,
+            })));
+            assert!(futures_lite::future::poll_once(&mut launch).await.is_none());
+            drop(launch);
+            drop(guard);
+            handle
+                .request(WorkflowRequest::Status { run_id: None })
+                .await
+                .unwrap();
+            assert_eq!(handle.active_count(), 1);
+            background.stop().await.unwrap();
+            let snapshot = handle.state();
+            assert_eq!(snapshot.runs.len(), 1);
+            for run in &snapshot.runs {
+                handle
+                    .request(WorkflowRequest::Stop {
+                        run_id: run.run_id.clone(),
+                    })
+                    .await
+                    .unwrap();
+            }
+            assert_eq!(handle.active_count(), 0);
+            runtime.shutdown().await;
+            background.shutdown().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn waiting_workflow_admission_cannot_cross_a_rearmed_generation() {
+        smol::block_on(async {
+            let fixture = Fixture::new();
+            let background = BackgroundTasks::spawn(fixture.state_dir.clone(), fixture.session_id)
+                .await
+                .unwrap();
+            let guard = background.workflow_admission().await.unwrap();
+            let mut pending = Box::pin(background.workflow_admission());
+            assert!(
+                futures_lite::future::poll_once(&mut pending)
+                    .await
+                    .is_none()
+            );
+            background.suppress_wakes();
+            background.rearm();
+            drop(guard);
+            assert!(pending.await.is_err());
+            assert!(background.workflow_admission().await.is_ok());
+            background.shutdown().await.unwrap();
+        });
+    }
+
+    #[test_case(false; "start")]
+    #[test_case(true; "resume")]
+    fn queued_workflow_requests_keep_their_submission_generation(resume: bool) {
+        smol::block_on(async {
+            let fixture = Fixture::new();
+            fixture.user_workflow(BLOCKING, BLOCKING_BODY);
+            let runtime = fixture.spawn().await;
+            let handle = runtime.handle();
+            let cloned_before_binding = handle.clone();
+            let background = BackgroundTasks::spawn(fixture.state_dir.clone(), fixture.session_id)
+                .await
+                .unwrap();
+            handle.bind_background(background.clone()).await.unwrap();
+            let request = if resume {
+                let started = start(&handle, BLOCKING, None).await;
+                handle
+                    .request(WorkflowRequest::Pause {
+                        run_id: started.run_id.clone(),
+                    })
+                    .await
+                    .unwrap();
+                WorkflowRequest::Resume {
+                    run_id: started.run_id,
+                    agent_budget: None,
+                }
+            } else {
+                WorkflowRequest::Start(LaunchRequest {
+                    name: BLOCKING.into(),
+                    args: json!({}),
+                    agent_budget: None,
+                })
+            };
+            let database = SessionDatabase::open(&fixture.state_dir).unwrap();
+            let before = database.load_workflow_runs(fixture.session_id).unwrap();
+            let calls = fixture.runner.labels();
+            let (entered_tx, entered) = flume::bounded(1);
+            let (release, release_rx) = flume::bounded(1);
+            let mut parked = Box::pin(handle.park(entered_tx, release_rx));
+            assert!(futures_lite::future::poll_once(&mut parked).await.is_none());
+            entered.recv_async().await.unwrap();
+            let mut queued = Box::pin(cloned_before_binding.request(request.clone()));
+            assert!(futures_lite::future::poll_once(&mut queued).await.is_none());
+            background.stop().await.unwrap();
+            background.rearm();
+            release.send(()).unwrap();
+            parked.await.unwrap();
+            assert_eq!(queued.await, Err(internal(STALE_ADMISSION)));
+            assert_eq!(
+                database.load_workflow_runs(fixture.session_id).unwrap(),
+                before
+            );
+            assert_eq!(fixture.runner.labels(), calls);
+            assert!(cloned_before_binding.request(request).await.is_ok());
+            runtime.shutdown().await;
+            background.shutdown().await.unwrap();
         });
     }
 

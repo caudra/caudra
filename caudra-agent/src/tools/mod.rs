@@ -465,6 +465,7 @@ where
 
 #[derive(Clone)]
 pub struct ToolContext {
+    pub background: Option<crate::background::BackgroundTasks>,
     pub steering_observations: Option<ResponseObservations>,
     pub steering_order: Vec<usize>,
     pub provider: Arc<dyn Provider>,
@@ -794,6 +795,7 @@ pub fn interpreter_ctx(
         live_sink: None,
         model_policy: Arc::new(ModelPolicy::default()),
         workflow: None,
+        background: None,
     }
 }
 

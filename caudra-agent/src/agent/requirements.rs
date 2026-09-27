@@ -513,6 +513,10 @@ mod tests {
             display_text: display_text.map(str::to_owned),
             origin,
             steering: None,
+            task_event: None,
+            workflow_event: None,
+            standing_reminder: None,
+            retained_output_refs: Vec::new(),
         })
     }
 

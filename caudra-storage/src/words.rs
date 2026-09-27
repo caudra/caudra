@@ -54,9 +54,13 @@ fn phrase(seed: &[u8; SEED_BYTES]) -> String {
 }
 
 pub(crate) fn random_phrase() -> String {
+    random_task_id().expect("rng failed")
+}
+
+pub fn random_task_id() -> Result<String, getrandom::Error> {
     let mut seed = [0u8; SEED_BYTES];
-    getrandom::fill(&mut seed).expect("rng failed");
-    phrase(&seed)
+    getrandom::fill(&mut seed)?;
+    Ok(phrase(&seed))
 }
 
 /// The same phrase for the same value, on every run and every machine.

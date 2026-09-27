@@ -6,14 +6,13 @@
 //! authority in `AgentHandles`.
 
 use std::borrow::Cow;
+use std::collections::HashSet;
 
 use caudra_agent::workflow::WorkflowHandle;
-use caudra_providers::Message;
-#[cfg(test)]
-use caudra_workflow::RunStatus;
+use caudra_providers::{Message, WorkflowEventOrigin};
 use caudra_workflow::{
-    LaunchRequest, LogLine, MAX_AGENT_BUDGET, MAX_RUN_LOG_ENTRIES, RunSnapshot, WorkflowError,
-    WorkflowEvent, WorkflowRequest, WorkflowResponse,
+    LaunchRequest, LogLine, MAX_AGENT_BUDGET, MAX_RUN_LOG_ENTRIES, RunSnapshot, RunStatus,
+    WorkflowError, WorkflowEvent, WorkflowRequest, WorkflowResponse,
 };
 use serde_json::{Value, json};
 use tracing::{debug, warn};
@@ -59,10 +58,14 @@ const ERROR_LABEL: &str = "\nError: ";
 /// bound the headless surface uses, so a model sees one format everywhere.
 const NOTICE_BODY_LIMIT: usize = 8 * 1024;
 const TRUNCATED_MARKER: &str = "\u{2026}[truncated]";
+const INVALID_ACK: &str = "Workflow completion acknowledgment returned an unexpected response";
 
 pub(crate) struct WorkflowUi {
     handle: Option<WorkflowHandle>,
     runs: Vec<RunSnapshot>,
+    claimed: Vec<WorkflowEventOrigin>,
+    ready: Vec<Message>,
+    suppressed: HashSet<String>,
     reply_tx: flume::Sender<Reply>,
     reply_rx: flume::Receiver<Reply>,
     /// Requests a test would have shipped, and the switch that lets it ship
@@ -88,7 +91,6 @@ pub(crate) enum Intent {
         call_key: Option<u64>,
     },
     History,
-    Ack,
 }
 
 pub(crate) struct Reply {
@@ -111,6 +113,9 @@ impl WorkflowUi {
         Self {
             handle: None,
             runs: Vec::new(),
+            claimed: Vec::new(),
+            ready: Vec::new(),
+            suppressed: HashSet::new(),
             reply_tx,
             reply_rx,
             #[cfg(test)]
@@ -156,6 +161,10 @@ impl WorkflowUi {
             return true;
         }
         self.handle.is_some()
+    }
+
+    pub(super) fn runtime_handle(&self) -> Option<WorkflowHandle> {
+        self.handle.clone()
     }
 
     pub(crate) fn runs(&self) -> &[RunSnapshot] {
@@ -244,29 +253,152 @@ impl WorkflowUi {
         true
     }
 
-    /// Every notice waiting for a quiet turn, each acknowledged at the
-    /// revision it was read at. The mirror clears them on the spot so the
-    /// next claim cannot repeat one whose ack has not landed yet.
-    pub(crate) fn claim_completions(&mut self) -> Vec<Message> {
-        let pending: Vec<(String, u64, String)> = self
+    pub(super) fn delivery_snapshot(&self) -> WorkflowDelivery {
+        let pending: Vec<_> = self
             .runs
-            .iter_mut()
-            .filter(|run| run.outbox_pending)
+            .iter()
+            .filter(|run| {
+                run.outbox_pending
+                    && !self.suppressed.contains(&run.run_id)
+                    && !self.claimed.iter().any(|origin| {
+                        origin.run_id == run.run_id && origin.revision == run.revision
+                    })
+                    && !self.ready.iter().any(|message| {
+                        message.workflow_event.as_ref().is_some_and(|origin| {
+                            origin.run_id == run.run_id && origin.revision == run.revision
+                        })
+                    })
+            })
             .map(|run| {
-                run.outbox_pending = false;
-                (run.run_id.clone(), run.revision, completion_notice(run))
+                (
+                    WorkflowEventOrigin {
+                        run_id: run.run_id.clone(),
+                        revision: run.revision,
+                    },
+                    completion_notice(run),
+                )
             })
             .collect();
-        pending
+        WorkflowDelivery {
+            handle: self.handle.clone(),
+            claims: self.claimed.clone(),
+            pending,
+            #[cfg(test)]
+            scripted: self.scripted,
+        }
+    }
+
+    pub(crate) fn claim_completions(&mut self) -> Result<Vec<Message>, String> {
+        if self.handle.is_none() {
+            self.ready.extend(
+                self.delivery_snapshot()
+                    .pending
+                    .into_iter()
+                    .map(|(origin, text)| Message::workflow_observation(text, origin)),
+            );
+        }
+        let messages: Vec<_> = std::mem::take(&mut self.ready)
             .into_iter()
-            .map(|(run_id, revision, notice)| {
-                self.dispatch(
-                    Intent::Ack,
-                    WorkflowRequest::AckCompletion { run_id, revision },
-                );
-                Message::observation(notice)
+            .filter(|message| {
+                message.workflow_event.as_ref().is_some_and(|origin| {
+                    !self.suppressed.contains(&origin.run_id)
+                        && self.runs.iter().any(|run| {
+                            run.run_id == origin.run_id && run.revision == origin.revision
+                        })
+                })
             })
-            .collect()
+            .collect();
+        for message in &messages {
+            if let Some(origin) = &message.workflow_event {
+                self.set_outbox(origin, false);
+                self.claimed.push(origin.clone());
+            }
+        }
+        Ok(messages)
+    }
+
+    pub(crate) fn has_claims(&self) -> bool {
+        !self.claimed.is_empty()
+    }
+
+    pub(super) fn apply_delivery(&mut self, result: WorkflowDeliveryResult) {
+        for origin in result.acked {
+            #[cfg(test)]
+            self.sent.push(WorkflowRequest::AckCompletion {
+                run_id: origin.run_id.clone(),
+                revision: origin.revision,
+            });
+            self.set_outbox(&origin, false);
+            self.claimed.retain(|claim| claim != &origin);
+        }
+        for origin in result.released {
+            self.set_outbox(&origin, true);
+            self.claimed.retain(|claim| claim != &origin);
+        }
+        for message in result.ready {
+            if let Some(origin) = &message.workflow_event
+                && !self.suppressed.contains(&origin.run_id)
+                && self
+                    .runs
+                    .iter()
+                    .any(|run| run.run_id == origin.run_id && run.revision == origin.revision)
+                && !self.claimed.contains(origin)
+                && !self
+                    .ready
+                    .iter()
+                    .any(|ready| ready.workflow_event == message.workflow_event)
+            {
+                self.set_outbox(origin, false);
+                self.ready.push(message);
+            }
+        }
+    }
+
+    fn set_outbox(&mut self, origin: &WorkflowEventOrigin, pending: bool) {
+        if let Some(run) = self
+            .runs
+            .iter_mut()
+            .find(|run| run.run_id == origin.run_id && run.revision == origin.revision)
+        {
+            run.outbox_pending = pending;
+        }
+    }
+
+    pub(crate) fn release_completions(&mut self) {
+        for origin in std::mem::take(&mut self.claimed) {
+            self.set_outbox(&origin, true);
+        }
+        for message in std::mem::take(&mut self.ready) {
+            if let Some(origin) = message.workflow_event {
+                self.set_outbox(&origin, true);
+            }
+        }
+    }
+
+    pub(crate) fn suppress_completions(&mut self) {
+        self.ready.clear();
+        self.suppressed
+            .extend(self.runs.iter().map(|run| run.run_id.clone()));
+    }
+
+    pub(crate) fn stop_all(&mut self) -> Result<(), String> {
+        self.suppress_completions();
+        let Some(handle) = self.handle.clone() else {
+            return Ok(());
+        };
+        for run in &handle.state().runs {
+            self.suppressed.insert(run.run_id.clone());
+            if matches!(
+                run.status,
+                RunStatus::Active | RunStatus::Paused | RunStatus::BudgetLimited
+            ) {
+                smol::block_on(handle.request(WorkflowRequest::Stop {
+                    run_id: run.run_id.clone(),
+                }))
+                .map_err(|error| error.to_string())?;
+            }
+        }
+        Ok(())
     }
 
     fn poll(&self) -> Option<Reply> {
@@ -276,6 +408,76 @@ impl WorkflowUi {
     #[cfg(test)]
     pub(crate) fn inject_reply(&self, reply: Reply) {
         self.reply_tx.send(reply).unwrap();
+    }
+}
+
+pub(super) struct WorkflowDelivery {
+    handle: Option<WorkflowHandle>,
+    pub claims: Vec<WorkflowEventOrigin>,
+    pub pending: Vec<(WorkflowEventOrigin, String)>,
+    #[cfg(test)]
+    scripted: bool,
+}
+
+#[derive(Default)]
+pub(super) struct WorkflowDeliveryResult {
+    acked: Vec<WorkflowEventOrigin>,
+    released: Vec<WorkflowEventOrigin>,
+    ready: Vec<Message>,
+}
+
+impl WorkflowDelivery {
+    pub(super) async fn run(&self, final_save: bool) -> Result<WorkflowDeliveryResult, String> {
+        let mut result = WorkflowDeliveryResult::default();
+        for origin in &self.claims {
+            if self.received(origin).await? {
+                self.ack(origin).await?;
+                result.acked.push(origin.clone());
+            } else if final_save {
+                result.released.push(origin.clone());
+            }
+        }
+        for (origin, notice) in &self.pending {
+            if self.received(origin).await? {
+                self.ack(origin).await?;
+                result.acked.push(origin.clone());
+            } else {
+                result.ready.push(Message::workflow_observation(
+                    notice.clone(),
+                    origin.clone(),
+                ));
+            }
+        }
+        Ok(result)
+    }
+
+    async fn received(&self, origin: &WorkflowEventOrigin) -> Result<bool, String> {
+        match &self.handle {
+            Some(handle) => handle
+                .received_completion(origin.clone())
+                .await
+                .map_err(|error| error.to_string()),
+            None => Ok(false),
+        }
+    }
+
+    async fn ack(&self, origin: &WorkflowEventOrigin) -> Result<(), String> {
+        #[cfg(test)]
+        if self.scripted {
+            return Ok(());
+        }
+        let handle = self.handle.as_ref().ok_or(UNAVAILABLE_MSG)?;
+        match handle
+            .request(WorkflowRequest::AckCompletion {
+                run_id: origin.run_id.clone(),
+                revision: origin.revision,
+            })
+            .await
+            .map_err(|error| error.to_string())?
+        {
+            WorkflowResponse::Acked(_) => Ok(()),
+            _ => Err(INVALID_ACK.into()),
+        }
     }
 }
 
@@ -308,6 +510,7 @@ impl App {
         }
         match parse_launch(args) {
             Ok(launch) => {
+                self.rearm_background();
                 self.workflow
                     .dispatch(Intent::Launch, WorkflowRequest::Start(launch));
             }
@@ -352,6 +555,10 @@ impl App {
     }
 
     fn control_workflow(&mut self, control: RunControl, run_id: String, agent_budget: Option<u32>) {
+        if control == RunControl::Resume {
+            self.rearm_background();
+            self.workflow.suppressed.remove(&run_id);
+        }
         let request = match control {
             RunControl::Pause => WorkflowRequest::Pause { run_id },
             RunControl::Resume => WorkflowRequest::Resume {
@@ -567,14 +774,6 @@ impl App {
             (Intent::Inspect | Intent::CallBodies { .. } | Intent::History, Err(error)) => {
                 debug!(%error, "workflow inspection could not be answered");
             }
-            (Intent::Ack, Ok(WorkflowResponse::Acked(acked))) => {
-                if !acked {
-                    debug!("workflow completion moved on before its acknowledgement");
-                }
-            }
-            (Intent::Ack, Err(error)) => {
-                warn!(%error, "workflow completion could not be acknowledged");
-            }
             (_, Err(error)) => self.flash(error.to_string()),
             (intent, Ok(response)) => {
                 warn!(?intent, ?response, "unexpected workflow reply");
@@ -596,7 +795,7 @@ impl App {
 
     /// Notices for the runs that settled since the last quiet turn, as the
     /// preamble of the one about to start.
-    pub(crate) fn claim_workflow_completions(&mut self) -> Vec<Message> {
+    pub(crate) fn claim_workflow_completions(&mut self) -> Result<Vec<Message>, String> {
         self.workflow.claim_completions()
     }
 
@@ -734,10 +933,17 @@ fn bounded(body: &str) -> Cow<'_, str> {
 
 #[cfg(test)]
 mod tests {
+    use arc_swap::ArcSwap;
+    use std::sync::Arc;
     use std::time::Duration;
 
+    use caudra_agent::agent::task_runner::{TaskFuture, TaskRequest, TaskRunner};
     use caudra_agent::types::{WORKFLOW_EVENT_RUN_ID, WorkflowProvenance};
-    use caudra_agent::{AgentEvent, Envelope, SubagentActivity, SubagentInfo, SubagentProgress};
+    use caudra_agent::workflow::{RuntimeDeps, WorkflowRuntime};
+    use caudra_agent::{
+        AgentEvent, AgentMode, CancelMap, CancelToken, Envelope, EventSender, HistorySnapshot,
+        SubagentActivity, SubagentInfo, SubagentProgress,
+    };
     use caudra_workflow::{
         CatalogEntry, RunDetail, RunHistoryEntry, RunUsage, SourceKind, WorkflowCatalog,
     };
@@ -757,6 +963,8 @@ mod tests {
     use caudra_agent::ToolOutput;
 
     const RUN_ID: &str = "run-1";
+    const UNEXPECTED_AGENT: &str = "Receipt fixture must not launch an agent";
+    const COMPACTED: &str = "Compacted conversation without a workflow outcome.";
     const DISPLAY_NAME: &str = "deep-research-1";
     const REPORT: &str = "Findings: the answer is 42.";
     const REPORT_PATH: &str = "/tmp/scratch/report.md";
@@ -909,27 +1117,79 @@ mod tests {
         .len()
     }
 
+    struct NoAgent;
+
+    impl TaskRunner for NoAgent {
+        fn run(&self, _: TaskRequest, _: CancelToken, _: EventSender) -> TaskFuture<'_> {
+            Box::pin(async { panic!("{UNEXPECTED_AGENT}") })
+        }
+    }
+
+    fn receipt_app() -> (App, WorkflowRuntime) {
+        let mut app = test_app();
+        app.storage_writer
+            .save_sync(Arc::clone(&app.state.session))
+            .unwrap();
+        let runtime = receipt_runtime(&app);
+        app.workflow.set_handle(Some(runtime.handle()));
+        app.workflow.script();
+        (app, runtime)
+    }
+
+    fn receipt_runtime(app: &App) -> WorkflowRuntime {
+        smol::block_on(WorkflowRuntime::spawn(RuntimeDeps {
+            state_dir: app.storage.clone(),
+            session_id: app.state.session.id,
+            cwd: app.state.session.cwd.clone().into(),
+            user_config_dir: Some(app.storage.path().join("receipt-test-config")),
+            remote_project_context: None,
+            runner: Arc::new(NoAgent),
+            events: flume::unbounded().0,
+            mode: Arc::new(AgentMode::default),
+            subagent_cancels: Arc::new(CancelMap::default()),
+        }))
+        .unwrap()
+    }
+
+    fn snapshot_messages(app: &mut App, messages: &[Message]) {
+        app.shared_history = Some(Arc::new(ArcSwap::from_pointee(HistorySnapshot::new(
+            crate::history_items(messages),
+        ))));
+        app.checkpoint_now();
+    }
+
+    fn claim(app: &mut App) -> Vec<Message> {
+        smol::block_on(app.flush_background_delivery(false)).unwrap();
+        app.claim_workflow_completions().unwrap()
+    }
+
     #[test]
     fn claiming_completions_announces_once_and_acks_at_the_read_revision() {
-        let mut ui = WorkflowUi::new();
+        let (mut app, runtime) = receipt_app();
         let mut done = run(RunStatus::Completed);
         done.outbox_pending = true;
-        ui.apply(done);
+        app.workflow.apply(done);
 
-        let first = ui.claim_completions();
-        let second = ui.claim_completions();
+        let first = claim(&mut app);
+        let second = claim(&mut app);
 
         assert_eq!(first.len(), 1, "{ONE_ANNOUNCEMENT}");
         assert!(first[0].is_observation());
         assert!(second.is_empty(), "{ONE_ANNOUNCEMENT}");
+        assert!(app.workflow.sent.is_empty(), "{ACK_AT_READ_REVISION}");
+        smol::block_on(app.flush_background_delivery(false)).unwrap();
+        assert!(app.workflow.sent.is_empty(), "{ACK_AT_READ_REVISION}");
+        snapshot_messages(&mut app, &first);
+        smol::block_on(app.flush_background_delivery(false)).unwrap();
         assert_eq!(
-            ui.sent,
+            app.workflow.sent,
             vec![WorkflowRequest::AckCompletion {
                 run_id: RUN_ID.into(),
                 revision: 7,
             }],
             "{ACK_AT_READ_REVISION}"
         );
+        smol::block_on(runtime.shutdown());
     }
 
     #[test]
@@ -938,15 +1198,221 @@ mod tests {
         let mut paused = run(RunStatus::Paused);
         paused.outbox_pending = true;
         ui.apply(paused);
-        assert_eq!(ui.claim_completions().len(), 1);
+        assert_eq!(ui.claim_completions().unwrap().len(), 1);
 
         let mut done = run(RunStatus::Completed);
         done.revision = 9;
         done.outbox_pending = true;
         ui.apply(done);
 
-        assert_eq!(ui.claim_completions().len(), 1, "{ONE_ANNOUNCEMENT}");
+        assert_eq!(
+            ui.claim_completions().unwrap().len(),
+            1,
+            "{ONE_ANNOUNCEMENT}"
+        );
         assert_eq!(ui.runs().len(), 1);
+    }
+
+    #[test_case(false; "released_claim_is_retryable")]
+    #[test_case(true; "stop_suppresses_old_claim")]
+    fn rejected_delivery_never_acknowledges_a_workflow(stopped: bool) {
+        let mut ui = WorkflowUi::new();
+        let mut done = run(RunStatus::Completed);
+        done.outbox_pending = true;
+        ui.apply(done);
+        assert_eq!(ui.claim_completions().unwrap().len(), 1);
+        if stopped {
+            ui.suppress_completions();
+        }
+        ui.release_completions();
+        assert!(ui.sent.is_empty());
+        assert_eq!(ui.claim_completions().unwrap().is_empty(), stopped);
+    }
+
+    #[test]
+    fn a_completed_workflow_does_not_wait_for_its_active_sibling() {
+        let mut app = streaming_app();
+        let mut active = run(RunStatus::Active);
+        active.run_id = OTHER_DISPLAY_NAME.into();
+        app.workflow.apply(active);
+        let mut done = run(RunStatus::Completed);
+        done.outbox_pending = true;
+        app.workflow.apply(done);
+        end_turn(&mut app);
+        let messages = claim(&mut app);
+        let actions = app.start_mailbox_run(messages);
+        assert!(
+            matches!(actions.as_slice(), [Action::SendMessage(input)] if input.message.is_empty() && input.preamble.len() == 1)
+        );
+        assert!(app.workflow.sent.is_empty());
+        assert_eq!(app.workflow.count(RunStatus::Active), 1);
+    }
+
+    #[test]
+    fn workflow_claim_is_acknowledged_only_after_durable_parent_history() {
+        let (mut app, runtime) = receipt_app();
+        let mut done = run(RunStatus::Completed);
+        done.outbox_pending = true;
+        app.workflow.apply(done);
+        let messages = claim(&mut app);
+        app.shared_history = Some(Arc::new(ArcSwap::from_pointee(HistorySnapshot::new(
+            crate::history_items(&messages),
+        ))));
+        app.checkpoint_now();
+        assert!(app.workflow.sent.is_empty());
+        smol::block_on(app.flush_background_delivery(true)).unwrap();
+        assert!(
+            matches!(app.workflow.sent.as_slice(), [WorkflowRequest::AckCompletion { run_id, .. }] if run_id == RUN_ID)
+        );
+        assert!(!app.workflow.has_claims());
+        let saved = crate::load_app_session(app.state.session.id, &app.storage).unwrap();
+        assert!(
+            caudra_providers::project_messages(saved.messages())
+                .unwrap()
+                .iter()
+                .any(|message| message.workflow_event == messages[0].workflow_event)
+        );
+        smol::block_on(runtime.shutdown());
+    }
+
+    #[test_case(false; "claim_saved_before_ack_and_compacted")]
+    #[test_case(true; "receipt_saved_before_claim_and_compacted")]
+    fn compacted_receipt_prevents_redelivery(saved_before_claim: bool) {
+        let (mut app, runtime) = receipt_app();
+        let mut done = run(RunStatus::Completed);
+        done.outbox_pending = true;
+        let origin = WorkflowEventOrigin {
+            run_id: done.run_id.clone(),
+            revision: done.revision,
+        };
+        let notice = completion_notice(&done);
+        app.workflow.apply(done);
+        let messages = if saved_before_claim {
+            vec![Message::workflow_observation(notice, origin.clone())]
+        } else {
+            claim(&mut app)
+        };
+        snapshot_messages(&mut app, &messages);
+        app.storage_writer
+            .save_sync(Arc::clone(&app.state.session))
+            .unwrap();
+        app.shared_history = None;
+        app.state.session_mut().meta.history_head = None;
+        app.state
+            .session_mut()
+            .replace_messages(crate::history_items(&[Message::synthetic(
+                COMPACTED.into(),
+            )]));
+        app.storage_writer
+            .save_sync(Arc::clone(&app.state.session))
+            .unwrap();
+        if saved_before_claim {
+            assert!(claim(&mut app).is_empty());
+        } else {
+            smol::block_on(app.flush_background_delivery(true)).unwrap();
+        }
+        assert!(!app.workflow.has_claims());
+        assert!(!app.workflow.runs()[0].outbox_pending);
+        assert_eq!(
+            app.workflow.sent,
+            vec![WorkflowRequest::AckCompletion {
+                run_id: origin.run_id,
+                revision: origin.revision
+            }]
+        );
+        smol::block_on(runtime.shutdown());
+    }
+
+    #[test_case("text"; "legacy_text_does_not_ack")]
+    #[test_case("revision"; "other_revision_does_not_ack")]
+    #[test_case("run"; "other_run_does_not_ack")]
+    fn identical_text_cannot_accept_a_workflow_claim(change: &str) {
+        let (mut app, runtime) = receipt_app();
+        let mut done = run(RunStatus::Completed);
+        done.outbox_pending = true;
+        app.workflow.apply(done);
+        let mut messages = claim(&mut app);
+        match change {
+            "text" => messages[0].workflow_event = None,
+            "revision" => messages[0].workflow_event.as_mut().unwrap().revision += 1,
+            "run" => {
+                messages[0].workflow_event.as_mut().unwrap().run_id = OTHER_DISPLAY_NAME.into()
+            }
+            _ => unreachable!(),
+        }
+        snapshot_messages(&mut app, &messages);
+        smol::block_on(app.flush_background_delivery(false)).unwrap();
+        assert!(app.workflow.has_claims());
+        let saved_revision = app.background_saved_revision;
+        smol::block_on(app.flush_background_delivery(true)).unwrap();
+        assert_eq!(app.background_saved_revision, saved_revision);
+        assert!(!app.workflow.has_claims());
+        assert!(app.workflow.sent.is_empty());
+        assert_eq!(claim(&mut app).len(), 1);
+        smol::block_on(runtime.shutdown());
+    }
+
+    #[test]
+    fn unchanged_history_retries_failed_workflow_reconciliation() {
+        let (mut app, runtime) = receipt_app();
+        let mut done = run(RunStatus::Completed);
+        done.outbox_pending = true;
+        app.workflow.apply(done);
+        let messages = claim(&mut app);
+        snapshot_messages(&mut app, &messages);
+        smol::block_on(runtime.shutdown());
+        assert!(smol::block_on(app.flush_background_delivery(false)).is_err());
+        assert!(app.workflow.has_claims());
+        let saved_revision = app.background_saved_revision;
+        let runtime = receipt_runtime(&app);
+        app.workflow.handle = Some(runtime.handle());
+        smol::block_on(app.flush_background_delivery(true)).unwrap();
+        assert_eq!(app.background_saved_revision, saved_revision);
+        assert!(!app.workflow.has_claims());
+        assert_eq!(app.workflow.sent.len(), 1);
+        smol::block_on(runtime.shutdown());
+    }
+
+    #[test]
+    fn stale_worker_failure_after_stop_is_not_reported() {
+        let (mut app, runtime) = receipt_app();
+        let mut done = run(RunStatus::Completed);
+        done.outbox_pending = true;
+        app.workflow.apply(done);
+        smol::block_on(runtime.shutdown());
+        app.persist_background_delivery(false).unwrap();
+        let reply = smol::block_on(app.background_delivery.replies.recv_async()).unwrap();
+        app.handle_cancel();
+        assert!(app.apply_delivery_reply(reply).is_ok());
+        assert!(!app.background_delivery.pending());
+    }
+
+    #[test]
+    fn saved_old_revision_cannot_clear_a_newer_pending_completion() {
+        let (mut app, runtime) = receipt_app();
+        let mut paused = run(RunStatus::Paused);
+        paused.outbox_pending = true;
+        app.workflow.apply(paused);
+        let messages = claim(&mut app);
+        let mut done = run(RunStatus::Completed);
+        done.revision += 1;
+        done.outbox_pending = true;
+        let latest = done.revision;
+        app.workflow.apply(done);
+        snapshot_messages(&mut app, &messages);
+        smol::block_on(app.flush_background_delivery(true)).unwrap();
+        assert!(app.workflow.ready.iter().any(|message| {
+            message
+                .workflow_event
+                .as_ref()
+                .is_some_and(|origin| origin.revision == latest)
+        }));
+        let latest_messages = claim(&mut app);
+        assert_eq!(
+            latest_messages[0].workflow_event.as_ref().unwrap().revision,
+            latest
+        );
+        smol::block_on(runtime.shutdown());
     }
 
     #[test]
@@ -1015,6 +1481,7 @@ mod tests {
 
     fn workflow_envelope(event: WorkflowEvent) -> Msg {
         Msg::Agent(Box::new(Envelope {
+            task: None,
             event: AgentEvent::Workflow(Box::new(event)),
             subagent: None,
             run_id: WORKFLOW_EVENT_RUN_ID,
@@ -1026,6 +1493,7 @@ mod tests {
     /// the run and call it belongs to.
     fn agent_progress_envelope() -> Msg {
         Msg::Agent(Box::new(Envelope {
+            task: None,
             event: AgentEvent::SubagentProgress {
                 progress: SubagentProgress {
                     activity: SubagentActivity::Responding,
@@ -1049,6 +1517,7 @@ mod tests {
     /// nobody can answer is a run that hangs until it is stopped.
     fn workflow_agent_envelope(event: AgentEvent) -> Msg {
         Msg::Agent(Box::new(Envelope {
+            task: None,
             event,
             subagent: Some(SubagentInfo {
                 parent_tool_use_id: TASK_ID.into(),
@@ -1675,7 +2144,7 @@ mod tests {
 
         app.update(snapshot_envelope(paused));
         assert_eq!(app.workflow_counts(), (0, 1));
-        assert_eq!(app.claim_workflow_completions().len(), 1);
+        assert_eq!(claim(&mut app).len(), 1);
     }
 
     #[test]

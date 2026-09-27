@@ -1,4 +1,4 @@
-use super::{DisplayMessage, ToolProgress, ToolStatus, escape_terminal_controls};
+use super::{DisplayMessage, ToolProgress, ToolStatus, escape_terminal_controls, task_card};
 
 use super::code_view;
 use super::status_bar::collapse_home;
@@ -30,7 +30,7 @@ use caudra_markdown::render::truncate_long_lines;
 use crate::markdown::{LinkMap, expand_notice, should_truncate, text_to_painted};
 use caudra_agent::{
     ActivityChild, BatchToolStatus, BufferSnapshot, CallStage, InstructionBlock, NO_FILES_FOUND,
-    ShellOutput, SnapshotSpan, SpanStyle, SubagentActivity, SubagentProgress, ToolInput,
+    ShellOutput, SnapshotSpan, SpanStyle, SubagentActivity, SubagentProgress, TaskCard, ToolInput,
     ToolOutput, format_live_duration, format_settled_duration,
     tools::{
         FILE_READ_TOOL_NAME, FILE_WRITE_TOOL_NAME, IMAGE_GENERATE_TOOL_NAME,
@@ -41,8 +41,74 @@ use caudra_agent::{
 use caudra_workcell::{CURRENT_WORKDIR, effective_timeout, requested_workdir};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
+use serde_json::Value;
 
 use crate::render_worker::RenderWorker;
+
+const JSON_ESCAPE_CHARS: usize = 6;
+
+pub(crate) fn task_details(task: &TaskCard) -> String {
+    let mut lines = Vec::new();
+    if let Some(result) = &task.result {
+        if let Some(error) = result.get("error").and_then(Value::as_str) {
+            lines.push(format!("Error: {error}"));
+        }
+        let output = result.get("output").unwrap_or(result);
+        if !output.is_null() && output.as_str() != Some("") {
+            lines.push(readable_task_value(output));
+        }
+    } else if let Some(preview) = &task.result_preview {
+        lines.push(format!(
+            "Result preview (truncated):\n{}",
+            readable_task_preview(preview)
+        ));
+    }
+    lines.extend(task.reports.iter().cloned());
+    if task.result_truncated
+        && let Some(reference) = &task.output_ref
+    {
+        lines.push(format!("Full outcome: tool_output {}", reference.id));
+    } else if task.result_truncated || task.reports_truncated {
+        lines.push("Open task chat for complete output.".into());
+    }
+    lines.join("\n")
+}
+
+fn readable_task_value(value: &Value) -> String {
+    match value {
+        Value::String(text) => text.clone(),
+        _ => serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string()),
+    }
+}
+
+fn readable_task_preview(preview: &str) -> String {
+    if let Ok(value) = serde_json::from_str::<Value>(preview) {
+        return readable_task_value(value.get("output").unwrap_or(&value));
+    }
+    let preview = preview
+        .split_once("\"output\":")
+        .map_or(preview, |(_, output)| output)
+        .trim_start();
+    if preview.starts_with('"') {
+        if let Some(Ok(text)) = serde_json::Deserializer::from_str(preview)
+            .into_iter::<String>()
+            .next()
+        {
+            return text;
+        }
+        let mut end = preview.len();
+        for _ in 0..=JSON_ESCAPE_CHARS {
+            if let Ok(text) = serde_json::from_str::<String>(&format!("{}\"", &preview[..end])) {
+                return text;
+            }
+            if end == 0 {
+                break;
+            }
+            end = preview.floor_char_boundary(end - 1);
+        }
+    }
+    preview.to_owned()
+}
 
 #[derive(Clone)]
 pub struct RenderCtx<'a> {
@@ -69,6 +135,7 @@ pub struct RenderCtx<'a> {
     pub batch_live: &'a BatchLiveMap,
     /// When each batch's still-running children started, by parent tool id.
     pub batch_started: &'a BatchStartedMap,
+    pub task_cards: Option<&'a HashMap<String, TaskCard>>,
     /// The session's working directory, which a call's `workdir` argument is
     /// resolved against until its result says where the call ran. `None`
     /// names no directory for a call that has no result yet.
@@ -844,6 +911,9 @@ pub(super) fn compact_args_for(
     raw_input: Option<&serde_json::Value>,
     output: Option<&ToolOutput>,
 ) -> Option<String> {
+    if matches!(output, Some(ToolOutput::Tasks(_))) {
+        return None;
+    }
     let row = compact_row(tool);
     compact_args(
         raw_input,
@@ -1077,6 +1147,7 @@ impl HighlightRequest {
             // highlights the fences inside it.
             | ToolOutput::Memory(_)
             | ToolOutput::WorkflowRun(_)
+            | ToolOutput::Tasks(_)
             | ToolOutput::Image { .. } => None,
             // Children carry their own code and diffs, so a batch reaches the
             // highlighting worker exactly as a lone child would. A batch with
@@ -1173,6 +1244,9 @@ impl Indicator {
     /// the answer is empty, and `0 matches` reads like any other count at a
     /// glance. The output is what knows, so the color comes from there.
     fn resolve(status: ToolStatus, output: Option<&ToolOutput>) -> Self {
+        if output.is_some_and(task_card::has_active) {
+            return Self::InProgress;
+        }
         match (Self::from(status), output) {
             (Self::Success, Some(output)) if found_nothing(output) => Self::Warning,
             (indicator, _) => indicator,
@@ -2248,11 +2322,29 @@ pub fn build_tool_lines(
     rctx: &RenderCtx,
     expansion: Option<Disclosure>,
 ) -> ToolLines {
+    let projected = rctx
+        .task_cards
+        .and_then(|cards| {
+            project_task_output(msg.role.tool_id()?, msg.tool_output.as_deref(), cards)
+        })
+        .map(|output| {
+            let mut projected = msg.clone();
+            projected.tool_output = Some(Arc::new(output));
+            projected.render_snapshot = None;
+            projected.render_header = None;
+            projected.live_body = None;
+            truncate_to_header(&mut projected.text);
+            projected
+        });
+    let msg = projected.as_ref().unwrap_or(msg);
     let tool_name = msg.role.tool_name().unwrap_or("?");
-    let (header, body) = match msg.text.split_once('\n') {
+    let (mut header, body) = match msg.text.split_once('\n') {
         Some((h, b)) => (h, Some(b)),
         None => (msg.text.as_str(), None),
     };
+    if expansion.is_some() && matches!(msg.tool_output.as_deref(), Some(ToolOutput::Tasks(_))) {
+        header = "";
+    }
     let expanded = expansion.unwrap_or_default();
     // The card's own record of what is running, until a snapshot supersedes
     // it. Resolved before the header, which defers to it.
@@ -2319,7 +2411,9 @@ pub fn build_tool_lines(
     let progress_body = msg
         .progress
         .as_ref()
-        .filter(|_| b.is_in_progress() && (!rctx.compact || expansion.is_some()))
+        .filter(|progress| {
+            (b.is_in_progress() || progress.is_live()) && (!rctx.compact || expansion.is_some())
+        })
         .map(|progress| {
             let window = b
                 .limits
@@ -2433,6 +2527,50 @@ pub fn build_tool_lines(
         msg.tool_output.clone(),
         TOOL_BODY_INDENT,
     )
+}
+
+fn project_task_output(
+    call_id: &str,
+    output: Option<&ToolOutput>,
+    cards: &HashMap<String, TaskCard>,
+) -> Option<ToolOutput> {
+    if let Some(ToolOutput::Tasks(tasks)) = output {
+        let mut projected = None;
+        for (index, task) in tasks.iter().enumerate() {
+            if let Some(card) = cards.get(&task.call_id)
+                && card.invocation_id == task.invocation_id
+                && card != task
+            {
+                let task = &mut projected.get_or_insert_with(|| tasks.clone())[index];
+                task.state = card.state.clone();
+                task.background = card.background;
+                task.updated_at = card.updated_at;
+            }
+        }
+        return projected.map(ToolOutput::Tasks);
+    }
+    if let Some(card) = cards.get(call_id) {
+        if !card.background && !card.active() {
+            return None;
+        }
+        return Some(ToolOutput::Tasks(vec![card.clone()]));
+    }
+    if let Some(ToolOutput::Batch { entries, text }) = output {
+        let mut projected = None;
+        for (index, entry) in entries.iter().enumerate() {
+            if let Some(output) =
+                project_task_output(&format!("{call_id}:{index}"), entry.output.as_ref(), cards)
+            {
+                let entries = projected.get_or_insert_with(|| entries.clone());
+                entries[index].output = Some(output);
+            }
+        }
+        return projected.map(|entries| ToolOutput::Batch {
+            entries,
+            text: text.clone(),
+        });
+    }
+    None
 }
 
 pub fn truncate_to_header(text: &mut String) {
@@ -2672,6 +2810,7 @@ mod tests {
             batch_progress: &NO_PROGRESS,
             batch_live: &NO_LIVE,
             batch_started: &NO_STARTED,
+            task_cards: None,
             cwd: None,
         }
     }
