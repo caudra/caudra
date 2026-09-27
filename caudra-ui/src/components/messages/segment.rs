@@ -513,7 +513,18 @@ impl Segment {
             let new_end = s + hl_lines.len();
             let link_rows = hl_lines
                 .iter()
-                .map(|line| vec![None; line.spans.len()])
+                .enumerate()
+                .map(|(index, line)| {
+                    if self.lines.get(s + index) == Some(line) {
+                        self.links
+                            .rows
+                            .get(s + index)
+                            .cloned()
+                            .unwrap_or_else(|| vec![None; line.spans.len()])
+                    } else {
+                        vec![None; line.spans.len()]
+                    }
+                })
                 .collect::<Vec<_>>();
             tl.lines.splice(s..req.range.1, hl_lines);
             tl.links.rows.splice(s..req.range.1, link_rows);
@@ -583,7 +594,14 @@ impl Segment {
             let new_end = start + indented.len();
             let link_rows = indented
                 .iter()
-                .map(|line| vec![None; line.spans.len()])
+                .enumerate()
+                .map(|(index, line)| {
+                    if self.lines.get(start + index) == Some(line) {
+                        self.links.rows[start + index].clone()
+                    } else {
+                        vec![None; line.spans.len()]
+                    }
+                })
                 .collect::<Vec<_>>();
             let mut rows = rows;
             rows.resize(new_end - start, None);
@@ -863,6 +881,7 @@ fn wrapped_rows(line: &Line<'_>, width: u16) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::components::task_card;
     use test_case::test_case;
 
     const OTHER_THEME: &str = "dracula";
@@ -1218,6 +1237,34 @@ mod tests {
         );
 
         assert_eq!(seg.rows.len(), seg.lines.len(), "{EXPECT_ROWS_ALIGNED}");
+    }
+
+    #[test_case(false; "unchanged_markdown")]
+    #[test_case(true; "replaced_line_drops_stale_target")]
+    fn task_links_survive_highlight_splicing(replace: bool) {
+        const TARGET: &str = "https://example.com/task";
+        let (lines, links) = task_card::markdown_body("[task](https://example.com/task)", WIDTH);
+        let mut seg = Segment {
+            highlight_range: Some((0, lines.len())),
+            lines: lines.clone(),
+            links,
+            ..Segment::default()
+        };
+        let replacement = if replace {
+            vec![Line::raw("replacement")]
+        } else {
+            lines
+        };
+        seg.apply_highlight_result(replacement, Vec::new(), None);
+        assert!(seg.links.is_aligned(&seg.lines));
+        assert_eq!(
+            seg.links
+                .rows
+                .iter()
+                .flatten()
+                .any(|target| target.as_deref() == Some(TARGET)),
+            !replace
+        );
     }
 
     /// Folding changes which lines the range holds, so a reused highlight

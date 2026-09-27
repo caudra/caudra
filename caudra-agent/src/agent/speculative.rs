@@ -329,6 +329,7 @@ impl SpeculativeRuns {
                 .unwrap_or_else(|e| e.into_inner())
                 .clone();
             ctx.tool_use_id = Some(top.id.clone());
+            ctx.local_root_tool_use_id = Some(top.id.clone());
             ctx.root_tool_use_id = ctx
                 .root_tool_use_id
                 .clone()
@@ -502,6 +503,7 @@ impl SpeculativeRuns {
             return;
         };
         ctx.tool_use_id = Some(batch::child_tool_use_id(Some(batch_id), index));
+        ctx.local_root_tool_use_id = Some(batch_id.to_owned());
         ctx.root_tool_use_id = ctx
             .root_tool_use_id
             .clone()

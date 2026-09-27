@@ -94,6 +94,13 @@ pub enum SessionError {
     #[error("session {id} has active or undelivered background tasks")]
     BackgroundTasksPending { id: CaudraId },
     #[error(
+        "child invocation {invocation_id} is already checkpointed for a different task than {task_id}"
+    )]
+    JobOwnerTaskMismatch {
+        invocation_id: String,
+        task_id: String,
+    },
+    #[error(
         "session {id} was modified concurrently: expected write version {expected}, found {actual}"
     )]
     ConcurrentSessionWriter {

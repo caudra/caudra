@@ -3,7 +3,9 @@ use std::collections::BTreeMap;
 use caudra_providers::{AssistantTextState, HistoryItemKind, Message, StandingReminderKind};
 
 use crate::{
-    AgentEvent, EventSender, History, background::BackgroundTasks, workflow::WorkflowHandle,
+    AgentEvent, EventSender, History,
+    background::{BackgroundTasks, JobScope},
+    workflow::WorkflowHandle,
 };
 
 pub(crate) const MAX_BACKGROUND_ROWS: usize = 8;
@@ -20,6 +22,7 @@ const UNKNOWN: &str =
 #[derive(Default)]
 pub struct BackgroundReminderContext<'a> {
     pub background: Option<&'a BackgroundTasks>,
+    pub jobs: Option<&'a JobScope>,
     pub workflow: Option<&'a WorkflowHandle>,
 }
 
@@ -86,7 +89,9 @@ impl RuntimeSnapshot {
 impl BackgroundReminderContext<'_> {
     fn snapshots(&self) -> (Option<RuntimeSnapshot>, Option<RuntimeSnapshot>) {
         (
-            self.background.map(BackgroundTasks::reminder_snapshot),
+            self.jobs
+                .map(JobScope::reminder_snapshot)
+                .or_else(|| self.background.map(BackgroundTasks::reminder_snapshot)),
             self.workflow.map(WorkflowHandle::reminder_snapshot),
         )
     }

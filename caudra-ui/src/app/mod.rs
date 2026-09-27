@@ -135,6 +135,7 @@ use caudra_providers::{
     ResolvedThinking, ThinkingConfig, TokenUsage, add_cost, project_messages,
 };
 use caudra_storage::StateDir;
+use caudra_storage::background::JobKind;
 use caudra_storage::id::{CaudraId, SessionRef};
 use caudra_storage::input_history::InputHistory;
 use caudra_storage::model::persist_model;
@@ -3904,6 +3905,44 @@ impl App {
         {
             return Vec::new();
         }
+        if let Some(origin) = &envelope.task
+            && let Some(runtime) = &self.background
+            && let Ok(card) = runtime.status_invocation(&origin.task_id, &origin.invocation_id)
+            && card.kind == JobKind::Shell
+            && matches!(
+                envelope.event,
+                AgentEvent::SubagentProgress { .. }
+                    | AgentEvent::ToolOutput { .. }
+                    | AgentEvent::ToolAnnotation { .. }
+                    | AgentEvent::ToolSnapshot { .. }
+                    | AgentEvent::ToolHeaderSnapshot { .. }
+                    | AgentEvent::LiveToolBuf { .. }
+                    | AgentEvent::Done { .. }
+                    | AgentEvent::Error { .. }
+            )
+        {
+            if let Some(index) = self.job_owner_chat(&card) {
+                let call_id = card.call_id.clone();
+                let active = card.active();
+                self.chats[index].task_card_update(card);
+                match &envelope.event {
+                    AgentEvent::SubagentProgress { progress } if active => {
+                        self.chats[index].set_tool_progress(&call_id, progress.clone());
+                    }
+                    AgentEvent::ToolOutput { id, .. }
+                    | AgentEvent::ToolAnnotation { id, .. }
+                    | AgentEvent::ToolSnapshot { id, .. }
+                    | AgentEvent::ToolHeaderSnapshot { id, .. }
+                    | AgentEvent::LiveToolBuf { id, .. }
+                        if active && id == &call_id =>
+                    {
+                        self.chats[index].handle_event(envelope.event, None);
+                    }
+                    _ => {}
+                }
+            }
+            return Vec::new();
+        }
         if let Some(origin) = &envelope.task {
             match &envelope.event {
                 AgentEvent::PermissionRequest(request)
@@ -4028,6 +4067,13 @@ impl App {
         }
         if let AgentEvent::TaskAdmitted(card) = &envelope.event {
             if !session_owned && envelope.run_id != self.run_id {
+                return Vec::new();
+            }
+            if card.kind == JobKind::Shell {
+                if let Some(index) = self.job_owner_chat(card) {
+                    self.chats[index].task_card_update(card.clone());
+                }
+                let _ = self.refresh_task_picker();
                 return Vec::new();
             }
             let mut info = envelope.subagent.clone().unwrap_or_else(|| SubagentInfo {

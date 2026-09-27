@@ -30,6 +30,7 @@ use caudra_storage::id::CaudraId;
 use caudra_storage::id::SessionRef;
 use caudra_storage::local_documents::LocalDocumentStore;
 use caudra_storage::sessions::SessionLease;
+use caudra_storage::tool_outputs::ToolOutputStore;
 use caudra_workspace::WorkspaceSession;
 use futures_lite::future;
 
@@ -193,6 +194,7 @@ impl AgentHandles {
             archived_history,
             config,
             tool_output_lines,
+            state_dir.clone().map(ToolOutputStore::new).map(Arc::new),
             permissions,
             mcp_handle,
             mcp_config_errors,
@@ -395,6 +397,7 @@ impl AgentHandles {
             crate::archived_session_history(&app.state.session),
             config,
             tool_output_lines,
+            Some(Arc::new(ToolOutputStore::new(app.storage.clone()))),
             permissions,
             self.mcp_handle.clone(),
             self.mcp_config_errors.clone(),
@@ -494,6 +497,7 @@ fn spawn_agent_internal(
     archived_history: Vec<HistoryItem>,
     config: AgentConfig,
     tool_output_lines: ToolOutputLines,
+    tool_output_store: Option<Arc<ToolOutputStore>>,
     permissions: &Arc<PermissionManager>,
     mcp_handle: Option<McpHandle>,
     mcp_config_errors: McpConfigErrors,
@@ -623,6 +627,7 @@ fn spawn_agent_internal(
         Arc::clone(&effective_model_slot),
         config,
         tool_output_lines,
+        tool_output_store,
         initial_history,
         archived_history,
         Arc::clone(&shared_history),

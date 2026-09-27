@@ -20,7 +20,9 @@ use caudra_providers::provider;
 use caudra_providers::{
     CacheKey, HistoryItem, Message, ThinkingConfig, TokenUsage, add_cost, expand_message,
 };
-use caudra_storage::{id::CaudraId, sessions::SessionDatabase, tool_outputs::ToolOutputStore};
+use caudra_storage::{
+    background::JobOwner, id::CaudraId, sessions::SessionDatabase, tool_outputs::ToolOutputStore,
+};
 
 use super::steering::{SharedSteering, Steering};
 use super::{ModelRoute, resolve_model_for_purpose};
@@ -402,6 +404,19 @@ impl Subagent {
         let spec = serde_json::to_value(self.history_lease.as_ref().and_then(|lease| lease.spec()))
             .map_err(|error| error.to_string())?;
         Ok((history, spec))
+    }
+
+    pub(crate) fn report_ready(&self) -> bool {
+        self.report_ready
+            .as_ref()
+            .is_some_and(|ready| ready.load(Ordering::Acquire))
+    }
+
+    pub(crate) async fn drain_jobs(&self) -> Result<(), String> {
+        if let Some(jobs) = &self.params.jobs {
+            jobs.cancel_and_drain().await?;
+        }
+        Ok(())
     }
 
     pub fn close(&mut self) {
@@ -887,9 +902,18 @@ pub async fn open_task(ctx: &ToolContext, opts: TaskOptions) -> Result<Subagent,
     let base_filter = ToolFilter::from_config(&ctx.config, &model, &[])
         .intersect(&ctx.tool_filter)
         .for_mode(&mode);
+    let guidance = crate::prompt::execution_guidance(
+        &ctx.config,
+        false,
+        ctx.job_scope().is_some(),
+        false,
+        base_filter.matches(crate::tools::SHELL_TOOL_NAME)
+            && ctx.registry.get(crate::tools::SHELL_TOOL_NAME).is_some(),
+    );
+    let prompt_slots = ctx.prompt_slots.with_execution_guidance(&guidance);
     let mut assembled = crate::prompt::assemble_task_with_filter(
         prompt_id,
-        &ctx.prompt_slots,
+        &prompt_slots,
         &base_filter,
         &instructions,
         profile.as_deref(),
@@ -913,6 +937,13 @@ pub async fn open_task(ctx: &ToolContext, opts: TaskOptions) -> Result<Subagent,
             &ctx.config.allowed_tools,
             BuiltinDeferral::resolve(&ctx.config, &model),
         ),
+    );
+    crate::tools::execution::configure_tools(
+        &mut definitions.declared,
+        &mut definitions.deferred,
+        &ctx.config,
+        false,
+        ctx.job_scope().is_some(),
     );
     definitions
         .declared
@@ -1212,6 +1243,7 @@ fn build(
             chat_model: Model::clone(&ctx.chat_model),
             config: ctx.config.clone(),
             tool_output_lines: caudra_config::ToolOutputLines::default(),
+            tool_output_store: ctx.tool_output_store.clone(),
             permissions: Arc::clone(&ctx.permissions),
             session_id: ctx.session_id.clone(),
             cache_key: Some(CacheKey::task(ctx.session_id.as_ref(), &resolved.task_id)),
@@ -1241,6 +1273,16 @@ fn build(
             model_policy: Arc::clone(&ctx.model_policy),
             workflow: None,
             background: None,
+            jobs: ctx.job_scope().map(|scope| {
+                if ctx.audience == ToolAudience::MAIN
+                    && matches!(scope.owner(), JobOwner::Child { .. })
+                {
+                    scope
+                } else {
+                    scope.child_scope(ids.parent_tool_use_id.clone())
+                }
+            }),
+            task_id: Some(resolved.task_id.clone()),
         },
         system: resolved.system,
         tools: resolved.tools,

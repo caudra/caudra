@@ -31,6 +31,7 @@ use caudra_storage::sessions::{
     SessionCursor, SessionDatabase, SessionError, SessionLease, StoredMode, StoredPlanTarget,
     StoredSubagent, StoredSubagentOutcome,
 };
+use caudra_storage::tool_outputs::ToolOutputStore;
 use caudra_storage::workspace_binding::StoredWorkspaceBinding;
 use caudra_storage::{StateDir, StorageError};
 use caudra_workflow::{
@@ -1285,8 +1286,8 @@ pub fn spawn(mut params: HeadlessParams) -> HeadlessHandle {
     let AgentSetup {
         vars,
         instructions,
-        tools,
-        deferred,
+        mut tools,
+        mut deferred,
         tool_filter,
     } = setup(
         &params.model,
@@ -1307,6 +1308,21 @@ pub fn spawn(mut params: HeadlessParams) -> HeadlessHandle {
         params.workspace_session.is_some(),
     );
 
+    crate::tools::execution::configure_tools(
+        &mut tools,
+        &mut deferred,
+        &params.config,
+        false,
+        false,
+    );
+    params.prompt_slots = crate::tools::execution::execution_slots(
+        &params.prompt_slots,
+        &params.config,
+        false,
+        false,
+        &tools,
+        &deferred,
+    );
     let system = params.local_documents.as_ref().map_or_else(
         || {
             agent::build_system_prompt(
@@ -1428,6 +1444,7 @@ pub fn spawn(mut params: HeadlessParams) -> HeadlessHandle {
                     chat_model: model,
                     config: params.config,
                     tool_output_lines: ToolOutputLines::default(),
+                    tool_output_store: crate::tool_output::default_store(),
                     permissions,
                     session_id: Some(session_ref_clone.clone()),
                     cache_key: Some(CacheKey::session(&session_ref_clone)),
@@ -1455,6 +1472,8 @@ pub fn spawn(mut params: HeadlessParams) -> HeadlessHandle {
                     model_policy: Arc::clone(&params.model_policy),
                     workflow: None,
                     background: None,
+                    jobs: None,
+                    task_id: None,
                 },
                 AgentRunParams {
                     history: &mut history,
@@ -2026,8 +2045,8 @@ async fn spawn_prepared_session(
     let AgentSetup {
         mut vars,
         instructions,
-        tools,
-        deferred,
+        mut tools,
+        mut deferred,
         tool_filter,
     } = setup(
         &model,
@@ -2048,6 +2067,13 @@ async fn spawn_prepared_session(
         params.workspace_session.is_some(),
     );
 
+    crate::tools::execution::configure_tools(
+        &mut tools,
+        &mut deferred,
+        &params.config,
+        background_enabled,
+        background_enabled,
+    );
     let mut baseline = agent::InstructionBaseline::adopt(instructions, history.epoch());
 
     let initial_messages = history.as_slice();
@@ -2145,6 +2171,7 @@ async fn spawn_prepared_session(
         chat_model: model.clone(),
         config: params.config.clone(),
         tool_output_lines: ToolOutputLines::default(),
+        tool_output_store: Some(Arc::new(ToolOutputStore::new(state_dir.clone()))),
         permissions: Arc::clone(&permissions),
         session_id: Some(session_ref.clone()),
         cache_key: Some(CacheKey::session(&session_ref)),
@@ -2174,6 +2201,8 @@ async fn spawn_prepared_session(
         model_policy: Arc::clone(&params.model_policy),
         workflow: None,
         background: background.clone(),
+        jobs: None,
+        task_id: None,
     };
 
     // Workflow agents resolve the provider at launch, so a model switched
@@ -2792,7 +2821,7 @@ async fn spawn_prepared_session(
                     ToolFilter::from_config(&params.config, &turn_model, &params.excluded_tools)
                         .for_remote_workspace(params.workspace_session.is_some());
 
-                let definitions = tool_definitions(
+                let mut definitions = tool_definitions(
                     &vars,
                     &turn_model,
                     &params.config,
@@ -2811,6 +2840,21 @@ async fn spawn_prepared_session(
                     },
                 );
 
+                crate::tools::execution::configure_tools(
+                    &mut definitions.declared,
+                    &mut definitions.deferred,
+                    &params.config,
+                    background.is_some(),
+                    background.is_some(),
+                );
+                let execution_slots = crate::tools::execution::execution_slots(
+                    &params.prompt_slots,
+                    &params.config,
+                    background.is_some(),
+                    background.is_some(),
+                    &definitions.declared,
+                    &definitions.deferred,
+                );
                 let instructions = {
                     let current = match &params.remote_project_context {
                         Some(context) => {
@@ -2829,7 +2873,7 @@ async fn spawn_prepared_session(
                         || {
                             agent::build_system_prompt(
                                 baseline.text(),
-                                &params.prompt_slots,
+                                &execution_slots,
                                 &turn_tool_filter,
                                 params.system_prompt_profile.as_deref(),
                             )
@@ -2837,7 +2881,7 @@ async fn spawn_prepared_session(
                         |store| {
                             agent::build_system_prompt_for_remote(
                                 baseline.text(),
-                                &params.prompt_slots,
+                                &execution_slots,
                                 &turn_tool_filter,
                                 params.system_prompt_profile.as_deref(),
                                 store,
@@ -3189,7 +3233,6 @@ mod tests {
         PermissionMutation, PermissionRecordIdentity, prepare_mutation,
     };
     use caudra_storage::sessions::generate_title;
-    use caudra_storage::tool_outputs::ToolOutputStore;
     use caudra_storage::workflow::WorkflowRunStatus;
     use caudra_workflow::{RunStatus, WorkflowError, WorkflowEvent};
     use tempfile::TempDir;
@@ -3847,6 +3890,8 @@ mod tests {
                     .save_background_task(
                         session_id(),
                         &TaskRecord {
+                            payload: Default::default(),
+                            owner: Default::default(),
                             created_at: 0,
                             updated_at: 0,
                             sequence: if call == LAUNCH { 1 } else { 2 },
@@ -5324,9 +5369,14 @@ complete(#{ report: first.output });
             if let AgentEvent::Workflow(event) = &envelope.event
                 && let WorkflowEvent::Snapshot(snapshot) = event.as_ref()
                 && snapshot.run_id == run_id
-                && snapshot.status == status
             {
-                return;
+                if snapshot.status == status {
+                    return;
+                }
+                assert!(
+                    !snapshot.status.is_terminal(),
+                    "unexpected workflow outcome: {snapshot:?}"
+                );
             }
         }
     }
@@ -5386,12 +5436,8 @@ complete(#{ report: first.output });
             route.install(Arc::clone(&session.provider) as Arc<dyn Provider>, model);
 
             let run = trust_and_start(&workflow).await;
-            session
-                .started
-                .recv_async()
-                .await
-                .expect(AGENT_NEVER_STARTED);
             wait_for_run(&handle.event_rx, &run.run_id, RunStatus::Completed).await;
+            session.started.try_recv().expect(AGENT_NEVER_STARTED);
 
             assert_eq!(session.provider.models(), vec![UPDATED_MODEL_ID]);
             let InteractiveHandle { input_tx, task, .. } = handle;

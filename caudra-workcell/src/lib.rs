@@ -155,6 +155,16 @@ const REMOTE_EXECUTION_TIMEOUT: Duration = Duration::from_secs(600);
 const SHELL_COMPLETION_ALLOWANCE_MS: u64 = 30_000;
 const SHELL_EXECUTION_TIMEOUT: Duration =
     Duration::from_millis(SHELL_MAX_TIMEOUT_MS + SHELL_COMPLETION_ALLOWANCE_MS);
+const SHELL_DESCRIPTION_REPLACEMENTS: &[(&str, &str)] = &[
+    (
+        "- A command that does not exit on its own, such as a server or a watcher, holds the call until its timeout.",
+        "- A command that does not exit on its own, such as a server or a watcher, runs until its execution timeout unless cancelled.",
+    ),
+    (
+        "- Background execution is unsupported; descendants that retain output pipes are terminated.",
+        "- Descendants that retain output pipes after the command exits are terminated.",
+    ),
+];
 const REMOTE_RECONCILE_TIMEOUT: Duration = Duration::from_secs(10);
 const REMOTE_RECONCILE_MAX_POLLS: usize = 4;
 const REMOTE_DEADLINE_BEFORE_DISPATCH: &str =
@@ -640,7 +650,7 @@ impl Tool for RemoteWorkcellTool {
     }
 
     fn description(&self, _ctx: &DescriptionContext) -> Cow<'_, str> {
-        Cow::Borrowed(&self.spec.description)
+        workcell_base_description(self.kind, &self.spec.description)
     }
 
     fn schema(&self) -> Value {
@@ -816,7 +826,7 @@ impl Tool for WorkcellTool {
     }
 
     fn description(&self, _ctx: &DescriptionContext) -> Cow<'_, str> {
-        Cow::Borrowed(&self.spec.description)
+        workcell_base_description(self.kind, &self.spec.description)
     }
 
     fn schema(&self) -> Value {
@@ -846,6 +856,26 @@ impl Tool for WorkcellTool {
             prepared: Mutex::new(None),
         }))
     }
+}
+
+fn workcell_base_description(kind: ToolKind, description: &str) -> Cow<'_, str> {
+    let replacement = |line| {
+        SHELL_DESCRIPTION_REPLACEMENTS
+            .iter()
+            .find_map(|(previous, current)| (line == *previous).then_some(*current))
+    };
+    if kind != ToolKind::Shell || !description.lines().any(|line| replacement(line).is_some()) {
+        return Cow::Borrowed(description);
+    }
+    let mut normalized = String::with_capacity(description.len());
+    for line in description.split_inclusive('\n') {
+        let text = line.strip_suffix('\n').unwrap_or(line);
+        normalized.push_str(replacement(text).unwrap_or(text));
+        if line.ends_with('\n') {
+            normalized.push('\n');
+        }
+    }
+    Cow::Owned(normalized)
 }
 
 /// The outbound proxy for the web tools, read from the ambient environment.
@@ -918,6 +948,13 @@ enum Input {
 }
 
 impl Input {
+    fn shell_timeout(&self) -> Option<Duration> {
+        match self {
+            Self::Shell(input) => input.timeout_ms().ok().map(Duration::from_millis),
+            _ => None,
+        }
+    }
+
     fn parse(kind: ToolKind, input: Value) -> Result<Self, String> {
         match kind {
             ToolKind::FileRead => parse_input("file_read", input).map(Self::FileRead),
@@ -2026,6 +2063,10 @@ impl ToolKind {
 }
 
 impl ToolInvocation for RemoteWorkcellInvocation {
+    fn shell_timeout(&self) -> Option<Duration> {
+        self.input.shell_timeout()
+    }
+
     fn start_header(&self) -> HeaderFuture {
         HeaderFuture::Ready(HeaderResult::plain(input_header(&self.input)))
     }
@@ -2631,6 +2672,10 @@ fn remote_code_graph_result(
 }
 
 impl ToolInvocation for WorkcellInvocation {
+    fn shell_timeout(&self) -> Option<Duration> {
+        self.input.shell_timeout()
+    }
+
     fn start_header(&self) -> HeaderFuture {
         HeaderFuture::Ready(HeaderResult::plain(input_header(&self.input)))
     }
@@ -4596,6 +4641,8 @@ impl ShellProgressSink for NativeProgressSink {
 mod tests {
     use super::*;
     use caudra_agent::agent::mention_preamble;
+    use caudra_agent::agent::tool_dispatch::{self, Emit};
+    use caudra_agent::background::{BackgroundTasks, JobScope};
     use caudra_agent::cancel::CancelToken;
     use caudra_agent::permissions::pattern_recognition::{CommandObservation, ShellEffectStatus};
     use caudra_agent::permissions::{
@@ -4606,21 +4653,36 @@ mod tests {
         permission_rule_covers_request, permission_rule_covers_resource,
         review::{COMMAND_TEMPLATE_EXECUTION_NOTICE, review_for_rule},
     };
+    use caudra_agent::template::Vars;
+    use caudra_agent::tools::execution::configure_tools;
     use caudra_agent::tools::{FileReadTracker, STALE_READ_MSG, interpreter_ctx};
-    use caudra_agent::{AgentMode, ContentBlock, Envelope, EventSender, Mention, Message};
-    use caudra_config::{DefaultEffect, Effect, PermissionRule, PermissionsConfig, ToolKey};
+    use caudra_agent::{
+        AgentMode, ContentBlock, Envelope, EventSender, History, Mention, Message, StoredSession,
+        TaskCard, ToolFilter,
+    };
+    use caudra_config::{
+        AgentConfig, DefaultEffect, Effect, ExecutionMode, PermissionRule, PermissionsConfig,
+        ToolKey,
+    };
     use caudra_storage::{
         StateDir,
+        background::JobKind,
+        id::SessionRef,
         permission_patterns::{
             ArgumentDomain, ArgumentRole, OptionLikePolicy, PatternToken, SlotCombinations,
         },
         permission_state::PermissionState,
+        sessions::SessionDatabase,
+        tool_outputs::ToolOutputStore,
     };
     use caudra_workspace::{OperationHandle, OperationId, OperationProgress, SequenceMetadata};
+    use futures_lite::io::{AsyncReadExt, AsyncWriteExt};
     use serde_json::json;
     use smol::lock::Mutex as AsyncMutex;
+    use smol::net::TcpListener;
     use std::any::TypeId;
     use std::ops::RangeInclusive;
+    use std::slice;
     use std::sync::Arc;
     use tempfile::TempDir;
     use test_case::test_case;
@@ -4668,6 +4730,272 @@ mod tests {
     const ENVIRONMENT_MAX_MODEL_LINES: usize = 40;
     const REMOTE_ENVIRONMENT_MODEL_TEXT: &str = "authoritative remote environment text";
     const INVALID_REMOTE_RESULT: &str = "invalid remote Workcell result:";
+    const EMBEDDED_SHELL_CALL: &str = "embedded-shell-call";
+    const EMBEDDED_SHELL_READY: &[u8] = b"ready\n";
+    const EMBEDDED_SHELL_OUTPUT: &str = "embedded-shell-terminal";
+    const EMBEDDED_SHELL_RELEASE: &[u8] = b"release\n";
+    const EMBEDDED_SHELL_TIMEOUT_SECS: u64 = 10;
+    const EMBEDDED_SHELL_TEST_TIMEOUT: Duration = Duration::from_secs(20);
+    const EMBEDDED_SHELL_TEST_EXPIRED: &str =
+        "embedded shell smoke test exceeded its bounded deadline";
+    const PREMATURE_SHELL_ACK: &str =
+        "task event must be durably saved in parent history before acknowledgment";
+    const SHELL_SUCCEEDED: &str = "succeeded";
+    const SHELL_CANCELLED_STATE: &str = "cancelled";
+
+    async fn bounded_shell_test<T>(operation: impl Future<Output = T>) -> T {
+        future::race(operation, async {
+            smol::Timer::after(EMBEDDED_SHELL_TEST_TIMEOUT).await;
+            panic!("{EMBEDDED_SHELL_TEST_EXPIRED}");
+        })
+        .await
+    }
+
+    async fn settled_shell(scope: &JobScope, task_id: &str) -> TaskCard {
+        loop {
+            let revision = scope.revision();
+            let card = scope.status(task_id).unwrap();
+            if !card.active() {
+                return card;
+            }
+            scope.wait_for_change(revision).await.unwrap();
+        }
+    }
+
+    #[test_case(ExecutionMode::Auto, false; "timeout_routed_completion")]
+    #[test_case(ExecutionMode::Async, false; "forced_async_completion")]
+    #[test_case(ExecutionMode::Async, true; "cancel_cleans_parent_and_descendant")]
+    fn embedded_shell_async_dispatch_smoke(mode: ExecutionMode, cancel: bool) {
+        smol::block_on(bounded_shell_test(async {
+            let root = TempDir::new().unwrap();
+            let (_host, registry) = host_and_registry(root.path());
+            let dir = StateDir::from_path(root.path().join("state"));
+            let mut session =
+                StoredSession::new(EMBEDDED_SHELL_CALL, root.path().to_str().unwrap());
+            session.save(&dir).unwrap();
+            let tasks = BackgroundTasks::spawn(dir.clone(), session.id)
+                .await
+                .unwrap();
+            let scope = tasks.main_scope();
+            let mut ctx = context(root.path(), Arc::clone(&registry), CancelToken::none());
+            let (events_tx, events) = flume::unbounded();
+            ctx.event_tx = EventSender::new(events_tx, 0);
+            let (_response_tx, response_rx) = flume::unbounded();
+            ctx.user_response_rx = Some(Arc::new(AsyncMutex::new(response_rx)));
+            ctx.jobs = Some(scope.clone());
+            ctx.session_id = Some(SessionRef::from_id(session.id));
+            ctx.tool_output_store = Some(Arc::new(ToolOutputStore::new(dir.clone())));
+            ctx.config.shell_execution = mode.clone();
+            if mode == ExecutionMode::Auto {
+                ctx.config.shell_async_threshold_secs = 1;
+            }
+            ctx.config.shell_output_filter = false;
+            let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let command = format!(
+                "exec 3<>/dev/tcp/127.0.0.1/{port}; bash -c 'printf \"ready\\n\" >&3; IFS= read -r release <&3; printf \"{EMBEDDED_SHELL_OUTPUT}\\n\"' & wait"
+            );
+            let input = json!({"command":command, "timeoutSec":EMBEDDED_SHELL_TIMEOUT_SECS});
+            let dispatch = tool_dispatch::run(
+                &registry,
+                None,
+                EMBEDDED_SHELL_CALL.into(),
+                SHELL_TOOL_NAME,
+                &input,
+                &ctx,
+                Emit::Notify,
+            );
+            let (done, ()) = future::zip(dispatch, async {
+                loop {
+                    let event = events.recv_async().await.unwrap();
+                    if let AgentEvent::PermissionRequest(request) = event.event {
+                        assert!(
+                            ctx.permissions
+                                .answer(&request.id, PermissionAnswer::AllowOnce)
+                        );
+                        break;
+                    }
+                }
+            })
+            .await;
+            assert!(!done.is_error, "{}", done.output.as_text());
+            assert!(done.accounting.outcome.is_none());
+            let receipt_text = done.output.as_text();
+            let ToolOutput::Tasks(cards) = done.output else {
+                panic!("expected shell admission receipt");
+            };
+            assert_eq!(cards.len(), 1);
+            let card = &cards[0];
+            assert_eq!(card.kind, JobKind::Shell);
+            assert_eq!(card.shell.as_ref().unwrap().command, command);
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut ready = vec![0; EMBEDDED_SHELL_READY.len()];
+            socket.read_exact(&mut ready).await.unwrap();
+            assert_eq!(ready, EMBEDDED_SHELL_READY);
+            assert!(scope.status(&card.task_id).unwrap().active());
+            let mut eof = [0];
+            assert!(future::poll_once(socket.read(&mut eof)).await.is_none());
+            assert!(scope.claim_messages().unwrap().is_empty());
+            if cancel {
+                scope.cancel(&card.task_id).await.unwrap();
+            } else {
+                socket.write_all(EMBEDDED_SHELL_RELEASE).await.unwrap();
+            }
+            let terminal = settled_shell(&scope, &card.task_id).await;
+            assert_eq!(
+                terminal.state,
+                if cancel {
+                    SHELL_CANCELLED_STATE
+                } else {
+                    SHELL_SUCCEEDED
+                }
+            );
+            assert_eq!(socket.read(&mut eof).await.unwrap(), 0);
+            assert!(scope.claim_messages().unwrap().is_empty());
+            let record = SessionDatabase::open(&dir)
+                .unwrap()
+                .background_tasks(session.id)
+                .unwrap()
+                .pop()
+                .unwrap();
+            assert!(!record.receipt_accepted);
+            assert_eq!(
+                record.events.iter().filter(|event| event.terminal).count(),
+                1
+            );
+            assert!(record.output_ref.is_some());
+            if !cancel {
+                let output: ToolOutput =
+                    serde_json::from_value(record.outcome.unwrap()["shell"].clone()).unwrap();
+                let ToolOutput::Shell(output) = output else {
+                    panic!("expected terminal shell output");
+                };
+                assert_eq!(output.exit_code, Some(0));
+                assert!(!output.timed_out);
+                assert_eq!(output.stdout.matches(EMBEDDED_SHELL_OUTPUT).count(), 1);
+                assert!(output.stderr.is_empty());
+            }
+            let receipt = Message {
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: EMBEDDED_SHELL_CALL.into(),
+                    content: receipt_text,
+                    is_error: false,
+                    output_ref: None,
+                }],
+                ..Message::default()
+            };
+            session.replace_messages(History::new(vec![receipt.clone()]).into_items());
+            session.save(&dir).unwrap();
+            scope
+                .settle_launches(slice::from_ref(&receipt))
+                .await
+                .unwrap();
+            let messages = scope.claim_messages().unwrap();
+            let delivered = messages
+                .iter()
+                .filter_map(|message| message.task_event.as_ref())
+                .collect::<Vec<_>>();
+            assert_eq!(delivered.len(), 1);
+            assert_eq!(delivered[0].task_id, card.task_id);
+            assert_eq!(
+                scope.accept_messages(&messages).await.unwrap_err(),
+                PREMATURE_SHELL_ACK
+            );
+            let mut history = vec![receipt];
+            history.extend(messages.clone());
+            session.replace_messages(History::new(history).into_items());
+            session.save(&dir).unwrap();
+            scope.accept_messages(&messages).await.unwrap();
+            assert!(scope.claim_messages().unwrap().is_empty());
+            assert!(!scope.pending());
+            assert!(
+                !events
+                    .try_iter()
+                    .any(|event| matches!(event.event, AgentEvent::ToolDone(_)))
+            );
+            tasks.shutdown().await.unwrap();
+        }));
+    }
+
+    #[test_case(ExecutionMode::Sync; "sync")]
+    #[test_case(ExecutionMode::Auto; "auto")]
+    #[test_case(ExecutionMode::Async; "async_mode")]
+    fn embedded_shell_catalog_execution_contract(mode: ExecutionMode) {
+        let root = TempDir::new().unwrap();
+        let (_host, registry) = host_and_registry(root.path());
+        let original_schema = registry.get(SHELL_TOOL_NAME).unwrap().tool.schema();
+        for supported in [false, true] {
+            let config = AgentConfig {
+                shell_execution: mode.clone(),
+                ..AgentConfig::default()
+            };
+            let mut definitions = registry.definitions_split(
+                &Vars::new(),
+                &DescriptionContext {
+                    filter: &ToolFilter::Only(vec![SHELL_TOOL_NAME.into()]),
+                    audience: ToolAudience::MAIN,
+                    workflows_available: false,
+                },
+                false,
+                &[SHELL_TOOL_NAME],
+            );
+            configure_tools(
+                &mut definitions.declared,
+                &mut definitions.deferred,
+                &config,
+                false,
+                supported,
+            );
+            let Some(effective) = mode.effective(supported) else {
+                assert!(definitions.deferred.is_empty());
+                continue;
+            };
+            assert_eq!(definitions.deferred.len(), 1);
+            let definition = &definitions.deferred[0].definition;
+            assert_eq!(definition["input_schema"], original_schema);
+            assert!(
+                definition["input_schema"]["properties"]
+                    .get("background")
+                    .is_none()
+            );
+            let description = definition["description"].as_str().unwrap().to_lowercase();
+            assert!(description.contains("timeout"));
+            match effective {
+                ExecutionMode::Sync => {
+                    for forbidden in ["background", "async", "receipt"] {
+                        assert!(!description.contains(forbidden), "{description}");
+                    }
+                }
+                ExecutionMode::Auto => {
+                    assert!(description.contains("120 seconds"));
+                    assert!(description.contains("receipt"));
+                }
+                ExecutionMode::Async => {
+                    for forbidden in ["foreground", "synchronous", "holds the call", "120 seconds"]
+                    {
+                        assert!(!description.contains(forbidden), "{description}");
+                    }
+                    assert!(description.contains("receipt"));
+                }
+            }
+        }
+    }
+
+    #[test_case(ToolKind::FileRead; "other_tool")]
+    #[test_case(ToolKind::Shell; "noncanonical_shell_prose")]
+    fn base_description_does_not_scrub_unrelated_prose(kind: ToolKind) {
+        for (previous, _) in SHELL_DESCRIPTION_REPLACEMENTS {
+            let description = if kind == ToolKind::Shell {
+                format!("Quoted instruction: {previous}\n")
+            } else {
+                format!("{previous}\n")
+            };
+            assert!(matches!(
+                workcell_base_description(kind, &description),
+                Cow::Borrowed(value) if value == description
+            ));
+        }
+    }
 
     #[test]
     fn selected_remote_endpoint_cannot_also_be_generic_mcp() {
@@ -4738,6 +5066,36 @@ mod tests {
     #[test_case(ToolKind::Code => REMOTE_EXECUTION_TIMEOUT ; "so does the code worker, which bounds itself")]
     fn the_execution_ceiling_is_raised_only_for_the_shell(kind: ToolKind) -> Duration {
         remote_execution_ceiling(kind)
+    }
+
+    #[test_case(None; "default")]
+    #[test_case(Some(1); "minimum")]
+    #[test_case(Some(SHELL_MAX_TIMEOUT_SECS); "maximum")]
+    #[test_case(Some(0); "zero")]
+    #[test_case(Some(SHELL_MAX_TIMEOUT_SECS + 1); "above_maximum")]
+    fn shell_timeout_metadata_matches_the_prepared_execution(timeout_sec: Option<u64>) {
+        let root = TempDir::new().unwrap();
+        let (host, registry) = host_and_registry(root.path());
+        let ctx = context(root.path(), registry, CancelToken::none());
+        let input = json!({"command": DEADLINE_COMMAND, "timeoutSec": timeout_sec});
+        let invocation = WorkcellInvocation {
+            host: Arc::clone(&host.inner),
+            input: Input::parse(ToolKind::Shell, input.clone()).unwrap(),
+            raw_input: Some(input.clone()),
+            prepared: Mutex::new(None),
+        };
+        let timeout = invocation.shell_timeout();
+        let result = smol::block_on(invocation.preflight(&ctx));
+        assert_eq!(result.is_ok(), timeout.is_some());
+        assert_eq!(invocation.shell_timeout(), timeout);
+        assert_eq!(invocation.permission_input(), Some(&input));
+        if let Some(timeout) = timeout {
+            let prepared = smol::block_on(invocation.take_prepared(&ctx)).unwrap();
+            let PreparedExecution::Shell(_, shell) = prepared.execution else {
+                panic!("expected prepared shell");
+            };
+            assert_eq!(timeout, Duration::from_millis(shell.timeout_ms()));
+        }
     }
 
     /// What a header may promise is exactly what the executor will enforce, so
@@ -6165,12 +6523,16 @@ mod tests {
         let ctx = context(root, Arc::clone(registry), CancelToken::none());
         let registered = registry.get("shell").expect("shell tool");
         let invocation = registered.tool.parse(&input).expect("shell input");
+        let timeout = effective_timeout(SHELL_TOOL_NAME, &input);
+        assert_eq!(invocation.shell_timeout(), timeout);
         assert_eq!(invocation.permission_input(), Some(&input));
         let intent = invocation
             .preflight(&ctx)
             .await
             .expect("preflight")
             .expect("intent");
+        assert_eq!(invocation.shell_timeout(), timeout);
+        assert_eq!(invocation.permission_input(), Some(&input));
         let ToolSource::Native {
             owner, contract, ..
         } = &registered.source

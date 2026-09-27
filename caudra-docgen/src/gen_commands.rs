@@ -131,9 +131,9 @@ const TASKS: &str = r#"## Tasks
 
 Each `task` subagent has a separate transcript. Open the task picker with `/tasks` or `Ctrl+X a`, click the task count above the input, or click a task call in the main chat. Click `[< Main]` in a task's status bar to return. The picker also lists Main and supports previewing every transcript.
 
-`/tasks list` opens or refreshes the picker. `/tasks status <task_id>` opens it with that task selected and its details visible. Press Enter or click the row to open its chat. Escape restores the original focus. Inspection stays local and does not send a model prompt or add transcript messages.
+`/tasks list` opens or refreshes the picker. `/tasks status <task_id>` opens it with that task selected and its details visible. Press Enter or click an agent row to open its chat. Shell jobs show command details and bounded output instead of a transcript. Escape restores the original focus. Inspection stays local and does not send a model prompt or add transcript messages.
 
-`/tasks background <task_id>` lets a foreground task continue asynchronously without restarting it. `/tasks cancel <task_id>` cancels that invocation. The picker offers `Ctrl+B` to promote and `Ctrl+K` to cancel an eligible selected task. Ordinary letters filter the list. Main and finished tasks have no execution controls. Singular `/task` forms remain compatibility aliases. See [background tasks](/docs/sessions/#background-tasks) for delivery and shutdown behavior.
+`/tasks background <task_id>` lets a foreground agent task continue asynchronously without restarting it when `agent.task_execution = "auto"`. `/tasks cancel <task_id>` cancels that invocation. The picker offers `Ctrl+B` to promote and `Ctrl+K` to cancel an eligible selected task. Shell jobs cannot be promoted or resumed. Ordinary letters filter the list. Main and finished tasks have no execution controls. Singular `/task` forms remain compatibility aliases. See [background tasks](/docs/sessions/#background-tasks) for execution policies, delivery, and shutdown behavior.
 
 Background rows show a right-aligned `bg` indicator beside the state or spinner, including after completion. Task labels stay unchanged. Newly created task IDs are short `adjective-adjective-noun` phrases. Older IDs remain valid for inspection, control, and continuation.
 

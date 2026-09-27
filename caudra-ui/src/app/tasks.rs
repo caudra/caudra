@@ -1,4 +1,4 @@
-//! A task is a subagent chat, addressed by its `tool_use_id`. The main chat
+//! A task is an agent chat or a supervised shell job. The main chat
 //! goes by [`MAIN_TASK_ID`] and carries no status, since its work is the
 //! session's own and `caudra.session.live()` already reports that.
 //!
@@ -11,7 +11,9 @@ use caudra_agent::{AgentEvent, Envelope, SubagentInfo, TaskCard, TaskProvenance}
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use caudra_config::ExecutionMode;
 use caudra_providers::project_messages;
+use caudra_storage::background::{JobKind, JobOwner};
 use caudra_storage::id::CaudraId;
 use serde::Serialize;
 
@@ -26,8 +28,10 @@ pub(crate) const MAIN_TASK_ID: &str = "main";
 const UNKNOWN_TASK_ERR: &str = "unknown task: ";
 const TASK_NOUN: &str = "task";
 const TASKS_NOUN: &str = "tasks";
-const TASK_USAGE: &str = "Usage: /tasks [list | status <id> | background <id> | cancel <id>]";
+const TASK_USAGE: &str = "Usage: /tasks [list | status <id> | cancel <id>]";
+const AUTO_TASK_USAGE: &str = "Usage: /tasks [list | status <id> | background <id> | cancel <id>]";
 const TASK_UNAVAILABLE: &str = "Background tasks are unavailable in this session";
+const PROMOTION_UNAVAILABLE: &str = "Only agent tasks in auto execution mode can be promoted";
 
 /// How a chat ended, from the vaguest to the most specific. `SubagentHistory`
 /// only sees the transcript close, and the `ToolDone` carrying `is_error`
@@ -110,6 +114,12 @@ impl App {
             self.flash(TASK_UNAVAILABLE.into());
             return;
         };
+        if promote
+            && (task.kind != JobKind::Agent || runtime.task_execution() != ExecutionMode::Auto)
+        {
+            self.flash(PROMOTION_UNAVAILABLE.into());
+            return;
+        }
         let session = runtime.session_id();
         let generation = task.generation;
         let epoch = self.background_delivery.fence.epoch();
@@ -293,7 +303,17 @@ impl App {
                     Err(error) => self.flash(error),
                 }
             }
-            _ => self.flash(TASK_USAGE.into()),
+            _ => self.flash(
+                if self
+                    .background
+                    .as_ref()
+                    .is_some_and(|runtime| runtime.task_execution() == ExecutionMode::Auto)
+                {
+                    AUTO_TASK_USAGE.into()
+                } else {
+                    TASK_USAGE.into()
+                },
+            ),
         }
         Vec::new()
     }
@@ -349,8 +369,6 @@ impl App {
         })
     }
 
-    /// The same walk widened to every chat, so the main chat at index 0 lands
-    /// first on its own and no extra code path has to place it.
     pub(crate) fn tasks(&self) -> Vec<TaskInfo> {
         let mut runtime = self
             .background
@@ -364,7 +382,8 @@ impl App {
         {
             *task = detail;
         }
-        self.chats
+        let mut tasks: Vec<_> = self
+            .chats
             .iter()
             .enumerate()
             .map(|(idx, chat)| {
@@ -387,13 +406,36 @@ impl App {
                     }),
                 }
             })
-            .collect()
+            .collect();
+        tasks.extend(
+            runtime
+                .into_iter()
+                .filter(|task| task.kind == JobKind::Shell)
+                .map(|task| TaskInfo {
+                    id: Arc::from(task.task_id.as_str()),
+                    name: task.label.clone(),
+                    status: Some(runtime_status(&task)),
+                    focused: false,
+                    runtime: Some(task),
+                }),
+        );
+        tasks
     }
 
     /// The only writer of `active_chat` outside the chat cycling keys. Tasks
     /// are looked up by id, never by position and never through `chat_index`,
     /// a routing cache wiped at the end of every turn.
     pub(crate) fn focus_task(&mut self, id: &str) -> Result<(), String> {
+        if self.background.as_ref().is_some_and(|runtime| {
+            runtime
+                .status(id)
+                .is_ok_and(|task| task.kind == JobKind::Shell)
+        }) {
+            self.tasks_browse();
+            self.task_picker.select(id);
+            let _ = self.refresh_task_picker();
+            return Ok(());
+        }
         self.leave_active_chat();
         self.task_queue_viewport = 0;
         self.active_chat = if id == MAIN_TASK_ID {
@@ -482,6 +524,11 @@ pub(super) fn task_response_current(
 /// status changes, so it can never disagree with the chats it lists.
 impl App {
     pub(super) fn tasks_browse(&mut self) -> Vec<Action> {
+        self.task_picker.set_promotion_enabled(
+            self.background
+                .as_ref()
+                .is_some_and(|runtime| runtime.task_execution() == ExecutionMode::Auto),
+        );
         let _ = self.reconcile_tasks();
         if self.task_picker.is_open() {
             let _ = self.refresh_task_picker();
@@ -496,6 +543,11 @@ impl App {
         if !self.task_picker.is_open() {
             return Dirty::NO;
         }
+        self.task_picker.set_promotion_enabled(
+            self.background
+                .as_ref()
+                .is_some_and(|runtime| runtime.task_execution() == ExecutionMode::Auto),
+        );
         let tasks = self.tasks();
         Dirty::from(self.task_picker.refresh(tasks))
     }
@@ -506,6 +558,12 @@ impl App {
         };
         let mut changed = false;
         for task in runtime.list() {
+            if task.kind == JobKind::Shell {
+                if let Some(index) = self.job_owner_chat(&task) {
+                    changed |= self.chats[index].task_card_update(task);
+                }
+                continue;
+            }
             let index = self
                 .chats
                 .iter()
@@ -538,11 +596,28 @@ impl App {
             }
             changed |= self.chats[0].task_card_update(task);
         }
-        changed |= self.chats[0].reconcile_task_cards(&runtime);
+        for chat in &mut self.chats {
+            changed |= chat.reconcile_task_cards(&runtime);
+        }
         if changed {
             self.sync_subagents();
         }
         Dirty::from(changed)
+    }
+
+    pub(super) fn job_owner_chat(&self, task: &TaskCard) -> Option<usize> {
+        match &task.owner {
+            JobOwner::Main => Some(0),
+            JobOwner::Child { invocation_id } => {
+                let owner = self.background.as_ref()?.list().into_iter().find(|owner| {
+                    owner.invocation_id == *invocation_id && owner.kind == JobKind::Agent
+                })?;
+                self.chats.iter().position(|chat| {
+                    chat.task_id()
+                        .is_some_and(|id| id.as_ref() == owner.task_id)
+                })
+            }
+        }
     }
 
     pub(super) fn handle_task_picker_action(&mut self, action: TaskPickerAction) -> Vec<Action> {
@@ -566,7 +641,14 @@ impl App {
     /// composer's top row advertises the picker as the way back out to every
     /// other task.
     pub(crate) fn task_hint_text(&self) -> Option<String> {
-        let count = self.task_states().count();
+        let count = self.chats.len().saturating_sub(1)
+            + self.background.as_ref().map_or(0, |runtime| {
+                runtime
+                    .list()
+                    .iter()
+                    .filter(|task| task.kind == JobKind::Shell)
+                    .count()
+            });
         if count == 0 {
             return None;
         }

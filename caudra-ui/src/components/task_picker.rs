@@ -6,18 +6,21 @@
 
 use caudra_agent::TaskCard;
 use caudra_grab::grab_scope;
+use caudra_storage::background::JobKind;
 use caudra_storage::now_epoch;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent};
 use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
+use ratatui::text::Line;
 
 use crate::app::tasks::{TaskInfo, TaskStatus};
+use crate::components::code_view::{WrappedRows, truncation_line};
 use crate::components::keybindings::{Bind, key};
-use crate::components::list_picker::{ListPicker, PickerAction, PickerItem, truncate_label};
+use crate::components::list_picker::{ListPicker, PickerAction, PickerItem};
 use crate::components::modal::Modal;
-use crate::components::tool_display::task_details;
-use crate::components::{Hint, Overlay};
+use crate::components::{Hint, Overlay, escape_terminal_controls, task_card};
 use crate::repaint::Cadence;
+use crate::theme;
 
 const TITLE: &str = " Tasks ";
 const MAX_VISIBLE: u16 = 15;
@@ -26,7 +29,6 @@ const RUNNING_SECTION: &str = "Running";
 const FINISHED_SECTION: &str = "Finished";
 const DONE_SUFFIX: &str = "done";
 const ERROR_SUFFIX: &str = "error";
-const DETAIL_CHARS: usize = 512;
 const DETAIL_ROWS: u16 = 6;
 const WIDTH_PERCENT: u16 = 85;
 const LIST_ROOM: u16 = 10;
@@ -106,6 +108,7 @@ impl PickerItem for TaskItem {
 pub struct TaskPicker {
     picker: ListPicker<TaskItem>,
     details: Option<TaskCard>,
+    promotion_enabled: bool,
     /// What was focused when the picker opened, restored unless the user
     /// commits, so a cancelled preview never sticks.
     origin: Option<String>,
@@ -124,6 +127,7 @@ impl TaskPicker {
         Self {
             picker,
             details: None,
+            promotion_enabled: true,
             origin: None,
             previewed: None,
         }
@@ -146,6 +150,14 @@ impl TaskPicker {
         }
         self.previewed = focused.clone();
         self.origin = focused;
+    }
+
+    pub fn set_promotion_enabled(&mut self, enabled: bool) {
+        self.promotion_enabled = enabled;
+    }
+
+    fn can_promote(&self, task: &TaskCard) -> bool {
+        self.promotion_enabled && task.kind == JobKind::Agent && !task.background
     }
 
     /// Rebuilds the rows in place when a task changes status. The selection is
@@ -217,11 +229,13 @@ impl TaskPicker {
                 .selected_item()
                 .and_then(|item| {
                     let task = item.runtime.as_ref()?;
-                    (task.active() && task.state != "cancelling" && (!promote || !task.background))
-                        .then(|| TaskPickerAction::Control {
-                            task: Box::new(task.clone()),
-                            promote,
-                        })
+                    (task.active()
+                        && task.state != "cancelling"
+                        && (!promote || self.can_promote(task)))
+                    .then(|| TaskPickerAction::Control {
+                        task: Box::new(task.clone()),
+                        promote,
+                    })
                 })
                 .unwrap_or(TaskPickerAction::Consumed);
         }
@@ -255,7 +269,7 @@ impl TaskPicker {
                         task.updated_at
                     };
                     format!(
-                        "{} · {} · {}\n{}\n{} · {}s elapsed\n{}",
+                        "{} · {} · {}\n{}\n{} · {}s elapsed",
                         task.task_id,
                         task.state,
                         task.mode,
@@ -266,33 +280,46 @@ impl TaskPicker {
                             "foreground"
                         },
                         end.saturating_sub(task.created_at),
-                        task_details(task)
                     )
                 },
             );
-            let mut chars = text.chars();
-            let mut text: String = chars.by_ref().take(DETAIL_CHARS).collect();
-            if chars.next().is_some() {
-                text.push('…');
-            }
-            let rows = DETAIL_ROWS.min(area.height.saturating_sub(LIST_ROOM) / 2) as usize;
-            let width = Modal::inner_width(area.width, WIDTH_PERCENT) as usize;
-            let mut lines = text
+            let shell = runtime.is_some_and(|task| task.kind == JobKind::Shell);
+            let room = area.height.saturating_sub(LIST_ROOM) / 2;
+            let rows = if shell { room } else { DETAIL_ROWS.min(room) } as usize;
+            let width = Modal::inner_width(area.width, WIDTH_PERCENT);
+            let facts = text
                 .lines()
-                .take(rows)
-                .map(|line| truncate_label(line, width))
+                .map(|line| {
+                    Line::styled(escape_terminal_controls(line), theme::current().item_desc)
+                })
                 .collect::<Vec<_>>();
-            lines.resize(rows, " ".into());
-            lines.join("\n")
+            let mut lines = WrappedRows::new(facts, 0, width).lines();
+            if let Some(task) = runtime {
+                lines.extend(task_card::shell_facts(task, width));
+                lines.extend(task_card::details(task, width).0);
+            }
+            if rows > 0 && lines.len() > rows {
+                let hidden = lines.len() - rows + 1;
+                lines.truncate(rows - 1);
+                lines.push(truncation_line(hidden));
+            }
+            lines.resize(rows, Line::default());
+            lines
         });
         self.picker
-            .set_info_text(info.filter(|text| !text.is_empty()));
+            .set_info_lines(info.filter(|lines| !lines.is_empty()));
         let task = self
             .picker
             .selected_item()
             .and_then(|item| item.runtime.as_ref());
         self.picker.set_footer_builder(match task {
-            Some(task) if task.active() && task.state != "cancelling" && !task.background => {
+            Some(task)
+                if task.kind == JobKind::Shell && task.active() && task.state != "cancelling" =>
+            {
+                shell_running_footer
+            }
+            Some(task) if task.kind == JobKind::Shell => shell_footer,
+            Some(task) if task.active() && task.state != "cancelling" && self.can_promote(task) => {
                 foreground_footer
             }
             Some(task) if task.active() && task.state != "cancelling" => background_footer,
@@ -321,6 +348,13 @@ impl TaskPicker {
         match action {
             PickerAction::Consumed | PickerAction::Toggle(..) => self.preview(),
             PickerAction::Select(item) => {
+                if item
+                    .runtime
+                    .as_ref()
+                    .is_some_and(|task| task.kind == JobKind::Shell)
+                {
+                    return TaskPickerAction::Preview(item.id);
+                }
                 self.close();
                 TaskPickerAction::Opened(item.id)
             }
@@ -364,6 +398,19 @@ fn foreground_footer() -> Vec<Hint> {
 fn background_footer() -> Vec<Hint> {
     let mut hints = footer();
     hints.push(Hint::bind(CANCEL, "stop task"));
+    hints
+}
+
+fn shell_footer() -> Vec<Hint> {
+    vec![
+        Hint::bind(key::ENTER, "details"),
+        Hint::bind(key::ESC, "cancel"),
+    ]
+}
+
+fn shell_running_footer() -> Vec<Hint> {
+    let mut hints = shell_footer();
+    hints.push(Hint::bind(CANCEL, "stop command"));
     hints
 }
 
@@ -420,7 +467,7 @@ mod tests {
     use crate::components::key as key_event;
     use caudra_storage::tool_outputs::ToolOutputRef;
     use crossterm::event::{KeyCode, MouseButton, MouseEventKind};
-    use ratatui::{Terminal, backend::TestBackend};
+    use ratatui::{Terminal, backend::TestBackend, style::Modifier};
     use std::sync::Arc;
     use test_case::test_case;
     use unicode_width::UnicodeWidthStr;
@@ -612,6 +659,43 @@ mod tests {
         item
     }
 
+    #[test_case(false; "result")]
+    #[test_case(true; "report")]
+    fn details_render_markdown_before_row_budget(report: bool) {
+        const BODY: &str = "**Finding** with `code`\n\n- checked\n- another\n- final";
+        let mut task = runtime_task("succeeded", false);
+        let card = task.runtime.as_mut().unwrap();
+        if report {
+            card.reports = vec![BODY.into()];
+        } else {
+            card.result = Some(serde_json::json!({"output": BODY}));
+        }
+        let mut picker = TaskPicker::new();
+        picker.open(vec![task]);
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal
+            .draw(|frame| {
+                picker.view(frame, frame.area());
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let painted = buffer
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(painted.contains("Finding"));
+        assert!(!painted.contains("**Finding**"));
+        assert!(!painted.contains("`code`"));
+        assert!(
+            buffer
+                .content
+                .iter()
+                .any(|cell| cell.symbol() == "F" && cell.modifier.contains(Modifier::BOLD))
+        );
+        assert!(!painted.contains("final"));
+    }
+
     #[test_case("running", 127; "running_wide")]
     #[test_case("succeeded", 127; "finished_wide")]
     #[test_case("running", 28; "running_narrow_unicode")]
@@ -711,6 +795,41 @@ mod tests {
         let action = picker.handle_key(if promote { PROMOTE } else { CANCEL }.to_key_event());
         assert!(
             matches!(action, TaskPickerAction::Control { task, promote: actual } if task.invocation_id == INVOCATION && actual == promote)
+        );
+    }
+
+    #[test_case(true, JobKind::Agent, true; "auto_agent")]
+    #[test_case(false, JobKind::Agent, false; "fixed_agent")]
+    #[test_case(true, JobKind::Shell, false; "auto_shell")]
+    #[test_case(false, JobKind::Shell, false; "fixed_shell")]
+    fn promotion_requires_policy_and_agent_kind(enabled: bool, kind: JobKind, allowed: bool) {
+        let mut item = runtime_task("running", false);
+        item.runtime.as_mut().unwrap().kind = kind;
+        let mut picker = TaskPicker::new();
+        picker.set_promotion_enabled(enabled);
+        picker.open(vec![item]);
+        assert_eq!(
+            matches!(
+                picker.handle_key(PROMOTE.to_key_event()),
+                TaskPickerAction::Control { promote: true, .. }
+            ),
+            allowed
+        );
+        assert!(matches!(
+            picker.handle_key(CANCEL.to_key_event()),
+            TaskPickerAction::Control { promote: false, .. }
+        ));
+    }
+
+    #[test_case("running"; "active")]
+    #[test_case("succeeded"; "settled")]
+    fn shell_selection_requests_details_not_chat(state: &str) {
+        let mut item = runtime_task(state, true);
+        item.runtime.as_mut().unwrap().kind = JobKind::Shell;
+        let mut picker = TaskPicker::new();
+        picker.open(vec![item]);
+        assert!(
+            matches!(picker.handle_key(key_event(KeyCode::Enter)), TaskPickerAction::Preview(id) if id == RUNNING_ID)
         );
     }
 

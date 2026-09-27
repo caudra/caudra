@@ -1,0 +1,1159 @@
+use std::fmt;
+use std::future::Future;
+use std::panic::AssertUnwindSafe;
+
+use caudra_providers::Message;
+use caudra_storage::{
+    background::{JobOwner, JobPayload, MAX_INVOCATIONS, ShellJobMetadata, TaskEvent, TaskRecord},
+    id::CaudraId,
+    now_epoch, random_task_id,
+    sessions::SessionDatabase,
+    tool_ledger::ToolOutcome,
+    tool_outputs::ToolOutputStore,
+};
+use futures_lite::FutureExt;
+use serde_json::{Value, json};
+
+use super::{
+    BackgroundTasks, CLOSED, DriverGuard, MAX_ACTIVE, MAX_ID_BYTES, MAX_REQUEST_BYTES,
+    MAX_RESULT_BYTES, STALE_INVOCATION, TRANSITION, bounded, deliverable,
+};
+use crate::{
+    CancelToken, History, TaskCard, TaskProvenance, ToolDoneEvent, ToolOutput,
+    background_reminder::RuntimeSnapshot,
+};
+
+const MAX_OWNER_ACTIVE: usize = 16;
+const ID_ATTEMPTS: usize = 64;
+const CAPACITY: &str = "session or owner shell admission capacity exhausted";
+const RETRY_MISMATCH: &str = "shell retry differs from the admitted request";
+const FOREIGN_JOB: &str = "job does not belong to this invocation";
+const SHELL_PANIC: &str =
+    "owned shell execution panicked; execution effects may require reconciliation";
+
+#[derive(Clone)]
+pub struct JobScope {
+    tasks: BackgroundTasks,
+    owner: JobOwner,
+    generation: u64,
+}
+
+impl fmt::Debug for JobScope {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("JobScope")
+            .field("owner", &self.owner)
+            .field("generation", &self.generation)
+            .finish_non_exhaustive()
+    }
+}
+
+impl BackgroundTasks {
+    pub fn main_scope(&self) -> JobScope {
+        JobScope {
+            tasks: self.clone(),
+            owner: JobOwner::Main,
+            generation: self.generation(),
+        }
+    }
+
+    pub fn child_scope(&self, invocation_id: impl Into<String>) -> JobScope {
+        JobScope {
+            tasks: self.clone(),
+            owner: JobOwner::Child {
+                invocation_id: invocation_id.into(),
+            },
+            generation: self.generation(),
+        }
+    }
+}
+
+impl JobScope {
+    pub fn child_scope(&self, invocation_id: impl Into<String>) -> Self {
+        Self {
+            tasks: self.tasks.clone(),
+            owner: JobOwner::Child {
+                invocation_id: invocation_id.into(),
+            },
+            generation: self.generation,
+        }
+    }
+
+    pub fn owner(&self) -> &JobOwner {
+        &self.owner
+    }
+
+    pub(crate) fn reminder_snapshot(&self) -> RuntimeSnapshot {
+        self.tasks.reminder_snapshot_for(&self.owner)
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub fn session_id(&self) -> CaudraId {
+        self.tasks.session_id()
+    }
+
+    pub fn revision(&self) -> u64 {
+        self.tasks
+            .lock()
+            .revisions
+            .get(&self.owner)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    fn current(&self) -> Result<(), String> {
+        let state = self.tasks.lock();
+        if state.generation != self.generation {
+            return Err(STALE_INVOCATION.into());
+        }
+        if let Some(error) = &state.failure {
+            return Err(error.clone());
+        }
+        if !state.open
+            || state.shutdown
+            || state.pending_stops > 0
+            || state.closed_owners.contains(&self.owner)
+        {
+            return Err(CLOSED.into());
+        }
+        Ok(())
+    }
+
+    pub fn has_pending(&self) -> bool {
+        self.tasks.has_pending_for(&self.owner, self.generation)
+    }
+
+    pub fn pending(&self) -> bool {
+        self.tasks.lock().records.values().any(|record| {
+            self.owns(record)
+                && (record.active() || record.events.iter().any(|event| deliverable(record, event)))
+        })
+    }
+
+    pub async fn wait(&self) -> Result<(), String> {
+        loop {
+            let listener = self.tasks.0.changed.listen();
+            self.current()?;
+            if self.has_pending() || !self.pending() {
+                return Ok(());
+            }
+            listener.await;
+        }
+    }
+
+    pub async fn wait_for_change(&self, revision: u64) -> Result<u64, String> {
+        loop {
+            let listener = self.tasks.0.changed.listen();
+            self.current()?;
+            let current = self.revision();
+            if current != revision {
+                return Ok(current);
+            }
+            listener.await;
+        }
+    }
+
+    fn owns(&self, record: &TaskRecord) -> bool {
+        record.owner == self.owner && record.generation == self.generation
+    }
+
+    pub fn list(&self) -> Vec<TaskCard> {
+        self.tasks
+            .list()
+            .into_iter()
+            .filter(|card| card.owner == self.owner && card.generation == self.generation)
+            .collect()
+    }
+
+    pub fn status(&self, task_id: &str) -> Result<TaskCard, String> {
+        let card = self.tasks.status(task_id)?;
+        if card.owner != self.owner || card.generation != self.generation {
+            return Err(FOREIGN_JOB.into());
+        }
+        Ok(card)
+    }
+
+    pub async fn cancel(&self, task_id: &str) -> Result<TaskCard, String> {
+        let card = self.status(task_id)?;
+        self.tasks
+            .cancel_invocation(task_id, &card.invocation_id, self.generation)
+            .await
+    }
+
+    pub fn claim_messages(&self) -> Result<Vec<Message>, String> {
+        self.tasks.claim_messages_for(&self.owner, self.generation)
+    }
+
+    pub async fn accept_messages(&self, messages: &[Message]) -> Result<(), String> {
+        self.tasks
+            .reconcile_messages(messages, false, &self.owner, Some(self.generation))
+            .await
+    }
+
+    pub async fn finalize_messages(&self, messages: &[Message]) -> Result<(), String> {
+        self.tasks
+            .reconcile_messages(messages, true, &self.owner, Some(self.generation))
+            .await
+    }
+
+    pub fn release_messages(&self, messages: &[Message]) {
+        self.tasks
+            .release_messages_for(messages, &self.owner, Some(self.generation));
+    }
+
+    pub async fn checkpoint(&self, task_id: &str, messages: &[Message]) -> Result<(), String> {
+        let JobOwner::Child { invocation_id } = &self.owner else {
+            return Err("main job receipts must be checkpointed with the session history".into());
+        };
+        let dir = self.tasks.0.dir.clone();
+        let session = self.session_id();
+        let invocation = invocation_id.clone();
+        let task_id = task_id.to_owned();
+        let history = History::new(messages.to_vec()).into_items();
+        {
+            let _gate = self.tasks.0.gate.lock().await;
+            if self.generation != self.tasks.generation() {
+                return Err(STALE_INVOCATION.into());
+            }
+            smol::unblock(move || {
+                SessionDatabase::open(&dir)
+                    .and_then(|database| {
+                        database.checkpoint_job_owner(session, &invocation, &task_id, &history)
+                    })
+                    .map_err(|error| error.to_string())
+            })
+            .await?;
+        }
+        self.settle_launches(messages).await
+    }
+
+    pub async fn settle_launches(&self, messages: &[Message]) -> Result<(), String> {
+        self.tasks
+            .settle_launches_for(messages, &self.owner, Some(self.generation))
+            .await
+    }
+
+    pub async fn admit_shell<F, Fut>(
+        &self,
+        metadata: ShellJobMetadata,
+        execute: F,
+    ) -> Result<TaskCard, String>
+    where
+        F: FnOnce(CancelToken, TaskProvenance) -> Fut + Send + 'static,
+        Fut: Future<Output = ToolDoneEvent> + Send + 'static,
+    {
+        if [&metadata.call_id, &metadata.root_call_id]
+            .iter()
+            .any(|id| id.is_empty() || id.len() > MAX_ID_BYTES)
+            || matches!(&self.owner, JobOwner::Child { invocation_id } if invocation_id.is_empty() || invocation_id.len() > MAX_ID_BYTES)
+            || metadata.command.is_empty()
+            || metadata.timeout_ms == 0
+        {
+            return Err(
+                "shell admission requires bounded identities, a command and a positive timeout"
+                    .into(),
+            );
+        }
+        let mut request = json!({"call_id": metadata.call_id, "label": metadata.command});
+        if serde_json::to_vec(&metadata)
+            .map_err(|error| error.to_string())?
+            .len()
+            > MAX_REQUEST_BYTES
+        {
+            return Err("shell metadata exceeds admission byte limit".into());
+        }
+        let gate = self.tasks.0.gate.lock_arc().await;
+        self.current()?;
+        {
+            let state = self.tasks.lock();
+            if state.transition.is_some() {
+                return Err(TRANSITION.into());
+            }
+            if let Some(record) = state.records.values().find(|record| {
+                self.owns(record)
+                    && record.request.get("call_id").and_then(Value::as_str)
+                        == Some(&metadata.call_id)
+            }) {
+                return if record.payload == JobPayload::Shell(metadata) {
+                    Ok(TaskCard::from(record))
+                } else {
+                    Err(RETRY_MISMATCH.into())
+                };
+            }
+            if state.records.len() >= MAX_INVOCATIONS
+                || state
+                    .records
+                    .values()
+                    .filter(|record| record.active())
+                    .count()
+                    >= MAX_ACTIVE
+                || state
+                    .records
+                    .values()
+                    .filter(|record| self.owns(record) && record.active())
+                    .count()
+                    >= MAX_OWNER_ACTIVE
+            {
+                return Err(CAPACITY.into());
+            }
+        }
+        let dir = self.tasks.0.dir.clone();
+        let session = self.tasks.session_id();
+        let task_id = smol::unblock(move || {
+            let database = SessionDatabase::open(&dir).map_err(|error| error.to_string())?;
+            for _ in 0..ID_ATTEMPTS {
+                let id = random_task_id().map_err(|error| error.to_string())?;
+                if !database
+                    .task_identity_exists(session, &id)
+                    .map_err(|error| error.to_string())?
+                {
+                    return Ok(id);
+                }
+            }
+            Err("could not reserve a unique shell job identity".to_owned())
+        })
+        .await?;
+        self.current()?;
+        if let JobOwner::Child { invocation_id } = &self.owner {
+            let state = self.tasks.lock();
+            let owner = state.records.get(invocation_id);
+            request["owner_call_id"] = json!(
+                owner
+                    .and_then(|record| record.request.get("call_id").and_then(Value::as_str))
+                    .unwrap_or(invocation_id)
+            );
+            if let Some(owner) = owner {
+                request["owner_task_id"] = json!(owner.task_id);
+            }
+        }
+        let invocation_id = CaudraId::generate().to_string();
+        let record = TaskRecord {
+            payload: JobPayload::Shell(metadata.clone()),
+            owner: self.owner.clone(),
+            created_at: now_epoch(),
+            updated_at: now_epoch(),
+            sequence: self.tasks.next_sequence(),
+            task_id: task_id.clone(),
+            invocation_id: invocation_id.clone(),
+            root_call_id: metadata.root_call_id,
+            generation: self.generation,
+            state: "queued".into(),
+            background: true,
+            receipt_accepted: false,
+            mode: metadata.mode,
+            request,
+            outcome: None,
+            output_ref: None,
+            history: Value::Null,
+            spec: Value::Null,
+            events: Vec::new(),
+        };
+        let (trigger, cancel) = CancelToken::new();
+        let (admitted_tx, admitted_rx) = flume::bounded(1);
+        let scope = self.clone();
+        let driver_id = invocation_id.clone();
+        {
+            let mut state = self.tasks.lock();
+            state.jobs.retain(|_, job| !job.is_finished());
+            state.admitting.insert(invocation_id.clone());
+            state
+                .drivers
+                .insert(invocation_id.clone(), (self.owner.clone(), self.generation));
+            state.cancels.insert(invocation_id.clone(), trigger);
+            let job = smol::spawn(async move {
+                let _driver = DriverGuard {
+                    tasks: scope.tasks.clone(),
+                    invocation: driver_id.clone(),
+                };
+                let card = TaskCard::summary(&record);
+                let provenance = TaskProvenance {
+                    session_id: session,
+                    task_id,
+                    invocation_id: driver_id.clone(),
+                };
+                let admitted = scope.tasks.persist(record).await;
+                scope.tasks.lock().admitting.remove(&driver_id);
+                if let Err(error) = admitted {
+                    scope.tasks.lock().cancels.remove(&driver_id);
+                    drop(gate);
+                    let error = match execute_shell(execute, cancel, provenance).await {
+                        Ok(_) => error,
+                        Err(cleanup) => {
+                            scope.tasks.lock().failure = Some(cleanup.clone());
+                            format!("{error}; {cleanup}")
+                        }
+                    };
+                    let _ = admitted_tx.send(Err(error));
+                    scope.tasks.0.changed.notify(usize::MAX);
+                    return;
+                }
+                if scope.current().is_err() {
+                    scope.tasks.lock().cancels.remove(&driver_id);
+                }
+                drop(gate);
+                let _ = admitted_tx.send(Ok(card));
+                let result = scope
+                    .run_shell(&driver_id, cancel, provenance, execute)
+                    .await;
+                if let Err(error) = result {
+                    let mut state = scope.tasks.lock();
+                    state.failure = Some(error.clone());
+                    state.open = false;
+                    if let Some(record) = state.records.get_mut(&driver_id) {
+                        record.state = "interrupted".into();
+                        record.outcome = Some(json!({"error": error}));
+                    }
+                }
+                scope.tasks.lock().cancels.remove(&driver_id);
+                scope.tasks.0.changed.notify(usize::MAX);
+            });
+            state.jobs.insert(invocation_id, job);
+        }
+        admitted_rx
+            .recv_async()
+            .await
+            .map_err(|_| "shell admission ended before settlement".to_owned())?
+    }
+
+    async fn run_shell<F, Fut>(
+        &self,
+        invocation: &str,
+        cancel: CancelToken,
+        provenance: TaskProvenance,
+        execute: F,
+    ) -> Result<(), String>
+    where
+        F: FnOnce(CancelToken, TaskProvenance) -> Fut,
+        Fut: Future<Output = ToolDoneEvent>,
+    {
+        let started = async {
+            let _gate = self.tasks.0.gate.lock().await;
+            let mut record = self.tasks.record(invocation)?;
+            if record.state == "queued" {
+                record.state = "running".into();
+                self.tasks.persist(record).await?;
+            }
+            Ok::<_, String>(())
+        }
+        .await;
+        if let Err(error) = started {
+            self.tasks.lock().cancels.remove(invocation);
+            execute_shell(execute, cancel, provenance).await?;
+            return Err(error);
+        }
+        let done = execute_shell(execute, cancel.clone(), provenance).await?;
+        let _gate = self.tasks.0.gate.lock().await;
+        let mut record = self.tasks.record(invocation)?;
+        record.state =
+            if cancel.is_cancelled() || done.accounting.outcome == Some(ToolOutcome::Cancelled) {
+                "cancelled"
+            } else if done.accounting.outcome == Some(ToolOutcome::Timeout)
+                || matches!(&done.output, ToolOutput::Shell(shell) if shell.timed_out)
+            {
+                "timed_out"
+            } else if done.is_error {
+                "failed"
+            } else {
+                "succeeded"
+            }
+            .into();
+        let terminal = done.composed_model_output();
+        let reference = match done.output_ref {
+            Some(reference) => reference,
+            None => {
+                let dir = self.tasks.0.dir.clone();
+                let session = self.tasks.session_id();
+                let retained = terminal.clone();
+                smol::unblock(move || {
+                    ToolOutputStore::new(dir)
+                        .put(session, &retained)
+                        .map_err(|error| error.to_string())
+                })
+                .await?
+            }
+        };
+        record.output_ref = Some(reference);
+        record.outcome = Some(
+            json!({"output": bounded(&terminal, MAX_RESULT_BYTES), "shell": done.output, "is_error": done.is_error, "duration_ms": done.accounting.duration_ms, "outcome": done.accounting.outcome}),
+        );
+        let suppressed = self.current().is_err();
+        record.events.push(TaskEvent {
+            sequence: self.tasks.next_sequence(),
+            event_id: CaudraId::generate().to_string(),
+            call_id: invocation.into(),
+            body: bounded(&terminal, MAX_RESULT_BYTES),
+            terminal: true,
+            accepted: false,
+            suppressed,
+        });
+        self.tasks.persist(record).await
+    }
+
+    pub async fn cancel_and_drain(&self) -> Result<(), String> {
+        let (tx, rx) = flume::bounded(1);
+        let scope = self.clone();
+        let id = CaudraId::generate();
+        {
+            let mut state = self.tasks.lock();
+            if state.generation != self.generation {
+                return Err(STALE_INVOCATION.into());
+            }
+            state.closed_owners.insert(self.owner.clone());
+            state.stop_running.insert(id);
+            let job = smol::spawn(async move {
+                let result = scope.drain_owned().await;
+                let _ = tx.send(result);
+                scope.tasks.lock().stop_running.remove(&id);
+                scope.tasks.0.changed.notify(usize::MAX);
+            });
+            state.stop_jobs.insert(id, job);
+        }
+        let result = rx
+            .recv_async()
+            .await
+            .map_err(|_| "owner drain ended before settlement".to_owned())?;
+        let job = self.tasks.lock().stop_jobs.remove(&id);
+        if let Some(job) = job {
+            job.await;
+        }
+        result
+    }
+
+    async fn drain_owned(&self) -> Result<(), String> {
+        let mut failure = None;
+        {
+            let _gate = self.tasks.0.gate.lock().await;
+            let records = self
+                .tasks
+                .lock()
+                .records
+                .values()
+                .filter(|record| self.owns(record))
+                .cloned()
+                .collect::<Vec<_>>();
+            for mut record in records {
+                self.tasks.lock().cancels.remove(&record.invocation_id);
+                if record.active() {
+                    record.state = "cancelling".into();
+                }
+                for event in &mut record.events {
+                    event.suppressed = true;
+                }
+                if let Err(error) = self.tasks.persist(record).await {
+                    failure = Some(error);
+                }
+            }
+        }
+        loop {
+            let listener = self.tasks.0.changed.listen();
+            let running = {
+                let state = self.tasks.lock();
+                state.drivers.values().any(|(owner, generation)| {
+                    *owner == self.owner && *generation == self.generation
+                })
+            };
+            if !running {
+                break;
+            }
+            listener.await;
+        }
+        let jobs = {
+            let mut state = self.tasks.lock();
+            let ids = state
+                .records
+                .values()
+                .filter(|record| self.owns(record))
+                .map(|record| record.invocation_id.clone())
+                .collect::<Vec<_>>();
+            ids.into_iter()
+                .filter_map(|id| state.jobs.remove(&id))
+                .collect::<Vec<_>>()
+        };
+        for job in jobs {
+            job.await;
+        }
+        failure
+            .or_else(|| self.tasks.lock().failure.clone())
+            .map_or(Ok(()), Err)
+    }
+}
+
+async fn execute_shell<F, Fut>(
+    execute: F,
+    cancel: CancelToken,
+    provenance: TaskProvenance,
+) -> Result<ToolDoneEvent, String>
+where
+    F: FnOnce(CancelToken, TaskProvenance) -> Fut,
+    Fut: Future<Output = ToolDoneEvent>,
+{
+    AssertUnwindSafe(async move { execute(cancel, provenance).await })
+        .catch_unwind()
+        .await
+        .map_err(|_| SHELL_PANIC.into())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    use caudra_config::ExecutionMode;
+    use caudra_providers::{ContentBlock, Message, Role};
+    use caudra_storage::{StateDir, background::JobKind, sessions::SessionDatabase};
+    use futures_lite::future::poll_once;
+    use serde_json::json;
+    use tempfile::TempDir;
+    use test_case::test_case;
+
+    use super::{
+        BackgroundTasks, CLOSED, FOREIGN_JOB, RETRY_MISMATCH, STALE_INVOCATION, ShellJobMetadata,
+    };
+    use crate::{
+        AgentEvent, Envelope, History, StoredSession, SubagentInfo, TaskProvenance, ToolDoneEvent,
+        background_reminder::render, types::BACKGROUND_EVENT_RUN_ID,
+    };
+
+    const CALL: &str = "shell-call";
+    const ROOT: &str = "enclosing-batch";
+    const CHILD: &str = "child-invocation";
+    const OTHER: &str = "other-invocation";
+    const COMMAND: &str = "printf bounded-output";
+    const OUTPUT: &str = "bounded-output";
+    const TIMEOUT_MS: u64 = 120_000;
+    const LITERAL_OUTPUT: &str = "<html> & output > destination\n";
+    const PREMATURE_ACK: &str =
+        "task event must be durably saved in parent history before acknowledgment";
+
+    struct Fixture {
+        _temp: TempDir,
+        dir: StateDir,
+        session: StoredSession,
+        tasks: BackgroundTasks,
+    }
+
+    impl Fixture {
+        async fn new() -> Self {
+            let temp = tempfile::tempdir().unwrap();
+            let dir = StateDir::from_path(temp.path().to_owned());
+            let mut session = StoredSession::new("test-model", temp.path().to_str().unwrap());
+            session.save(&dir).unwrap();
+            let tasks = BackgroundTasks::spawn(dir.clone(), session.id)
+                .await
+                .unwrap();
+            Self {
+                _temp: temp,
+                dir,
+                session,
+                tasks,
+            }
+        }
+    }
+
+    fn metadata() -> ShellJobMetadata {
+        ShellJobMetadata {
+            call_id: CALL.into(),
+            root_call_id: ROOT.into(),
+            command: COMMAND.into(),
+            workdir: ".".into(),
+            timeout_ms: TIMEOUT_MS,
+            mode: "build".into(),
+        }
+    }
+
+    fn done() -> ToolDoneEvent {
+        let mut done = ToolDoneEvent::error(CALL.into(), OUTPUT);
+        done.is_error = false;
+        done
+    }
+
+    fn receipt() -> Message {
+        Message {
+            role: Role::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: ROOT.into(),
+                content: "admitted".into(),
+                is_error: false,
+                output_ref: None,
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test_case(ExecutionMode::Sync; "task_sync_does_not_disable_shell")]
+    #[test_case(ExecutionMode::Async; "task_async_does_not_change_shell")]
+    fn shell_policy_independence_and_scoped_reminders(mode: ExecutionMode) {
+        smol::block_on(async {
+            let fixture = Fixture::new().await;
+            fixture.tasks.set_task_execution(mode);
+            let main = fixture.tasks.main_scope();
+            let child = fixture.tasks.child_scope(CHILD);
+            let main_card = main
+                .admit_shell(metadata(), |cancel, _| async move {
+                    cancel.cancelled().await;
+                    done()
+                })
+                .await
+                .unwrap();
+            let child_card = child
+                .admit_shell(metadata(), |cancel, _| async move {
+                    cancel.cancelled().await;
+                    done()
+                })
+                .await
+                .unwrap();
+            let (main_text, _, _) = render(Some(&main.reminder_snapshot()), None);
+            let (child_text, _, _) = render(Some(&child.reminder_snapshot()), None);
+            assert!(main_text.contains(&main_card.task_id));
+            assert!(!main_text.contains(&child_card.task_id));
+            assert!(child_text.contains(&child_card.task_id));
+            assert!(!child_text.contains(&main_card.task_id));
+            fixture.tasks.shutdown().await.unwrap();
+        });
+    }
+
+    #[test_case(false; "admission_failure_never_executes")]
+    #[test_case(true; "terminal_failure_never_delivers_success")]
+    fn durable_save_failures_do_not_advertise_execution_or_success(after_admission: bool) {
+        smol::block_on(async {
+            let fixture = Fixture::new().await;
+            let scope = fixture.tasks.main_scope();
+            let executions = Arc::new(AtomicUsize::new(0));
+            let count = Arc::clone(&executions);
+            let (release_tx, release_rx) = flume::bounded(1);
+            let (started_tx, started_rx) = flume::bounded(1);
+            let factory = move |_, _| async move {
+                count.fetch_add(1, Ordering::SeqCst);
+                started_tx.send(()).unwrap();
+                release_rx.recv_async().await.unwrap();
+                done()
+            };
+            let card = if after_admission {
+                Some(scope.admit_shell(metadata(), factory).await.unwrap())
+            } else {
+                None
+            };
+            if after_admission {
+                started_rx.recv_async().await.unwrap();
+            }
+            SessionDatabase::open(&fixture.dir)
+                .unwrap()
+                .delete(
+                    fixture.session.id,
+                    fixture.session.persisted_write_version(),
+                )
+                .unwrap();
+            if after_admission {
+                release_tx.send(()).unwrap();
+                assert!(fixture.tasks.join_jobs().await.is_err());
+                assert_eq!(
+                    scope.status(&card.unwrap().task_id).unwrap().state,
+                    "interrupted"
+                );
+                assert!(!scope.has_pending());
+                assert!(scope.claim_messages().is_err());
+            } else {
+                let count = Arc::clone(&executions);
+                assert!(
+                    scope
+                        .admit_shell(metadata(), move |cancel, _| async move {
+                            if !cancel.is_cancelled() {
+                                count.fetch_add(1, Ordering::SeqCst);
+                            }
+                            done()
+                        })
+                        .await
+                        .is_err()
+                );
+                assert_eq!(executions.load(Ordering::SeqCst), 0);
+                assert!(fixture.tasks.list().is_empty());
+                fixture.tasks.shutdown().await.unwrap();
+            }
+        });
+    }
+
+    #[test_case(false; "main_owner")]
+    #[test_case(true; "child_owner")]
+    fn durable_admission_and_owner_receipt_gate(child: bool) {
+        smol::block_on(async {
+            let mut fixture = Fixture::new().await;
+            let scope = if child {
+                fixture.tasks.child_scope(CHILD)
+            } else {
+                fixture.tasks.main_scope()
+            };
+            let other = fixture.tasks.child_scope(OTHER);
+            let dir = fixture.dir.clone();
+            let session_id = fixture.session.id;
+            let card = scope
+                .admit_shell(metadata(), move |_, provenance| async move {
+                    let records = SessionDatabase::open(&dir)
+                        .unwrap()
+                        .background_tasks(session_id)
+                        .unwrap();
+                    let record = records
+                        .iter()
+                        .find(|record| record.invocation_id == provenance.invocation_id)
+                        .unwrap();
+                    assert_eq!(record.kind(), JobKind::Shell);
+                    assert!(record.history.is_null());
+                    assert!(record.spec.is_null());
+                    done()
+                })
+                .await
+                .unwrap();
+            fixture.tasks.join_jobs().await.unwrap();
+            assert_eq!(card.kind, JobKind::Shell);
+            assert!(scope.pending());
+            assert!(scope.claim_messages().unwrap().is_empty());
+            assert_eq!(other.status(&card.task_id).unwrap_err(), FOREIGN_JOB);
+            assert_eq!(other.cancel(&card.task_id).await.unwrap_err(), FOREIGN_JOB);
+            assert_eq!(other.revision(), 0);
+            other.settle_launches(&[receipt()]).await.unwrap();
+            assert!(scope.claim_messages().unwrap().is_empty());
+            if child {
+                scope.checkpoint(CHILD, &[receipt()]).await.unwrap();
+            } else {
+                fixture
+                    .session
+                    .replace_messages(History::new(vec![receipt()]).into_items());
+                fixture.session.save(&fixture.dir).unwrap();
+                scope.settle_launches(&[receipt()]).await.unwrap();
+            }
+            if child {
+                assert!(fixture.tasks.claim_messages().unwrap().is_empty());
+            }
+            let messages = scope.claim_messages().unwrap();
+            assert_eq!(
+                messages
+                    .iter()
+                    .filter(|message| message.task_event.is_some())
+                    .count(),
+                1
+            );
+            assert_eq!(
+                scope.accept_messages(&messages).await.unwrap_err(),
+                PREMATURE_ACK
+            );
+            if child {
+                scope.checkpoint(CHILD, &messages).await.unwrap();
+            } else {
+                fixture
+                    .session
+                    .replace_messages(History::new(messages.clone()).into_items());
+                fixture.session.save(&fixture.dir).unwrap();
+            }
+            scope.accept_messages(&messages).await.unwrap();
+            assert!(!scope.pending());
+            assert!(scope.claim_messages().unwrap().is_empty());
+            fixture.tasks.shutdown().await.unwrap();
+        });
+    }
+
+    #[test_case(false; "admission_save_failure")]
+    #[test_case(true; "running_save_failure")]
+    fn persistence_failure_awaits_abandon_even_without_admission_waiter(running: bool) {
+        smol::block_on(async {
+            let fixture = Fixture::new().await;
+            let scope = fixture.tasks.child_scope(CHILD);
+            let (committed_tx, committed_rx) = flume::bounded(1);
+            let (resume_tx, resume_rx) = flume::bounded(1);
+            if running {
+                fixture.tasks.lock().admission_committed = Some((committed_tx, resume_rx));
+            }
+            let mut database = SessionDatabase::open(&fixture.dir).unwrap();
+            if !running {
+                database
+                    .delete(
+                        fixture.session.id,
+                        fixture.session.persisted_write_version(),
+                    )
+                    .unwrap();
+            }
+            let (cleanup_tx, cleanup_rx) = flume::bounded(1);
+            let (release_tx, release_rx) = flume::bounded(1);
+            let owned = scope.clone();
+            let tasks = fixture.tasks.clone();
+            let waiter = smol::spawn(async move {
+                owned
+                    .admit_shell(metadata(), move |cancel, _| async move {
+                        assert!(cancel.is_cancelled());
+                        {
+                            let _gate = tasks.0.gate.lock().await;
+                        }
+                        cleanup_tx.send(()).unwrap();
+                        release_rx.recv_async().await.unwrap();
+                        done()
+                    })
+                    .await
+            });
+            if running {
+                committed_rx.recv_async().await.unwrap();
+                database
+                    .delete(
+                        fixture.session.id,
+                        fixture.session.persisted_write_version(),
+                    )
+                    .unwrap();
+                waiter.cancel().await;
+                resume_tx.send(()).unwrap();
+            } else {
+                cleanup_rx.recv_async().await.unwrap();
+                waiter.cancel().await;
+            }
+            if running {
+                cleanup_rx.recv_async().await.unwrap();
+            }
+            let mut drain = Box::pin(scope.cancel_and_drain());
+            assert!(poll_once(&mut drain).await.is_none());
+            release_tx.send(()).unwrap();
+            assert_eq!(drain.await.is_err(), running);
+            assert!(fixture.tasks.lock().drivers.is_empty());
+        });
+    }
+
+    #[test_case(false; "main_shell")]
+    #[test_case(true; "child_shell")]
+    fn shell_envelopes_validate_owner_and_deliver_literal_output(child: bool) {
+        smol::block_on(async {
+            let fixture = Fixture::new().await;
+            let scope = if child {
+                fixture.tasks.child_scope(CHILD)
+            } else {
+                fixture.tasks.main_scope()
+            };
+            let card = scope
+                .admit_shell(metadata(), |_, _| async {
+                    let mut done = ToolDoneEvent::error(CALL.into(), LITERAL_OUTPUT);
+                    done.is_error = false;
+                    done
+                })
+                .await
+                .unwrap();
+            fixture.tasks.join_jobs().await.unwrap();
+            let child_info = SubagentInfo {
+                parent_tool_use_id: CHILD.into(),
+                task_id: OTHER.into(),
+                name: OTHER.into(),
+                prompt: None,
+                model: None,
+                thinking: None,
+                fast: false,
+                answer_tx: None,
+                steer_tx: None,
+            };
+            let mut envelope = Envelope {
+                event: AgentEvent::TaskAdmitted(card.clone()),
+                subagent: child.then_some(child_info.clone()),
+                run_id: BACKGROUND_EVENT_RUN_ID,
+                workflow: None,
+                task: Some(Arc::new(TaskProvenance {
+                    session_id: fixture.session.id,
+                    task_id: card.task_id.clone(),
+                    invocation_id: card.invocation_id.clone(),
+                })),
+            };
+            assert!(fixture.tasks.owns_event(&envelope));
+            if child {
+                envelope.subagent.as_mut().unwrap().parent_tool_use_id = OTHER.into();
+            } else {
+                envelope.subagent = Some(child_info);
+            }
+            assert!(!fixture.tasks.owns_event(&envelope));
+            if child {
+                envelope.subagent = None;
+                assert!(!fixture.tasks.owns_event(&envelope));
+            }
+            scope.settle_launches(&[receipt()]).await.unwrap();
+            let messages = scope.claim_messages().unwrap();
+            let result = messages
+                .iter()
+                .find(|message| message.task_event.is_some())
+                .unwrap()
+                .first_text_content()
+                .unwrap();
+            assert_eq!(
+                result,
+                format!("Shell {}: success.\n\n{LITERAL_OUTPUT}", card.task_id)
+            );
+            fixture.tasks.shutdown().await.unwrap();
+        });
+    }
+
+    #[test_case(false; "factory_panics")]
+    #[test_case(true; "execution_panics")]
+    fn shell_panics_settle_the_owned_driver(asynchronous: bool) {
+        smol::block_on(async {
+            let fixture = Fixture::new().await;
+            let card = fixture
+                .tasks
+                .main_scope()
+                .admit_shell(metadata(), move |_, _| {
+                    assert!(asynchronous, "factory panic");
+                    async { panic!("execution panic") }
+                })
+                .await
+                .unwrap();
+            assert_eq!(
+                fixture.tasks.join_jobs().await.unwrap_err(),
+                super::SHELL_PANIC
+            );
+            assert_eq!(
+                fixture.tasks.status(&card.task_id).unwrap().result,
+                Some(json!({"error": super::SHELL_PANIC}))
+            );
+            assert_eq!(fixture.tasks.active_count(), 0);
+        });
+    }
+
+    #[test_case(false; "ordinary_receipt_waiter")]
+    #[test_case(true; "dropped_admission_waiter")]
+    fn execution_is_owned_and_retry_is_not_reexecuted(drop_waiter: bool) {
+        smol::block_on(async {
+            let fixture = Fixture::new().await;
+            let scope = fixture.tasks.main_scope();
+            let executions = Arc::new(AtomicUsize::new(0));
+            let count = Arc::clone(&executions);
+            let (committed_tx, committed_rx) = flume::bounded(1);
+            let (resume_tx, resume_rx) = flume::bounded(1);
+            if drop_waiter {
+                fixture.tasks.lock().admission_committed = Some((committed_tx, resume_rx));
+            }
+            let waiter_scope = scope.clone();
+            let waiter = smol::spawn(async move {
+                waiter_scope
+                    .admit_shell(metadata(), move |_, _| async move {
+                        count.fetch_add(1, Ordering::SeqCst);
+                        done()
+                    })
+                    .await
+            });
+            if drop_waiter {
+                committed_rx.recv_async().await.unwrap();
+                waiter.cancel().await;
+                resume_tx.send(()).unwrap();
+            } else {
+                waiter.await.unwrap();
+            }
+            fixture.tasks.join_jobs().await.unwrap();
+            let retry = scope
+                .admit_shell(metadata(), |_, _| async { panic!("retry executed") })
+                .await
+                .unwrap();
+            assert_eq!(retry.state, "succeeded");
+            assert_eq!(executions.load(Ordering::SeqCst), 1);
+            let mut changed = metadata();
+            changed.command = OUTPUT.into();
+            assert_eq!(
+                scope
+                    .admit_shell(changed, |_, _| async { done() })
+                    .await
+                    .unwrap_err(),
+                RETRY_MISMATCH
+            );
+            fixture.tasks.shutdown().await.unwrap();
+        });
+    }
+
+    #[test_case(false; "owner_cleanup")]
+    #[test_case(true; "concurrent_session_stop")]
+    fn cancellation_waits_for_owned_cleanup(concurrent_stop: bool) {
+        smol::block_on(async {
+            let fixture = Fixture::new().await;
+            let scope = fixture.tasks.child_scope(CHILD);
+            let (cancelled_tx, cancelled_rx) = flume::bounded(1);
+            let (clean_tx, clean_rx) = flume::bounded(1);
+            scope
+                .admit_shell(metadata(), move |cancel, _| async move {
+                    cancel.cancelled().await;
+                    cancelled_tx.send(()).unwrap();
+                    clean_rx.recv_async().await.unwrap();
+                    done()
+                })
+                .await
+                .unwrap();
+            let drain_scope = scope.clone();
+            let drain = smol::spawn(async move { drain_scope.cancel_and_drain().await });
+            cancelled_rx.recv_async().await.unwrap();
+            let tasks = fixture.tasks.clone();
+            let mut stop = Box::pin(async move {
+                if concurrent_stop {
+                    tasks.stop().await
+                } else {
+                    Ok(())
+                }
+            });
+            if concurrent_stop {
+                assert!(poll_once(&mut stop).await.is_none());
+            }
+            let mut drain = Box::pin(drain);
+            assert!(poll_once(&mut drain).await.is_none());
+            clean_tx.send(()).unwrap();
+            drain.await.unwrap();
+            stop.await.unwrap();
+            assert!(!scope.pending());
+            assert_eq!(
+                scope
+                    .admit_shell(metadata(), |_, _| async { done() })
+                    .await
+                    .unwrap_err(),
+                CLOSED
+            );
+            fixture.tasks.shutdown().await.unwrap();
+        });
+    }
+
+    #[test_case(false; "new_generation_fences_old_handle")]
+    #[test_case(true; "recovery_never_replays")]
+    fn stopped_and_restored_jobs_do_not_execute_again(restore: bool) {
+        smol::block_on(async {
+            let fixture = Fixture::new().await;
+            let scope = fixture.tasks.main_scope();
+            let card = scope
+                .admit_shell(metadata(), |_, _| async { done() })
+                .await
+                .unwrap();
+            fixture.tasks.join_jobs().await.unwrap();
+            if restore {
+                let mut record = fixture.tasks.record(&card.invocation_id).unwrap();
+                record.state = "running".into();
+                record.outcome = None;
+                record.events.clear();
+                fixture.tasks.persist(record).await.unwrap();
+                let restored = BackgroundTasks::spawn(fixture.dir.clone(), fixture.session.id)
+                    .await
+                    .unwrap();
+                assert_eq!(restored.status(&card.task_id).unwrap().state, "interrupted");
+                assert_eq!(restored.active_count(), 0);
+                assert!(restored.claim_messages().unwrap().is_empty());
+                restored.shutdown().await.unwrap();
+            } else {
+                fixture.tasks.stop().await.unwrap();
+                fixture.tasks.rearm();
+                assert_eq!(
+                    scope
+                        .admit_shell(metadata(), |_, _| async { done() })
+                        .await
+                        .unwrap_err(),
+                    STALE_INVOCATION
+                );
+                assert_eq!(
+                    scope.cancel_and_drain().await.unwrap_err(),
+                    STALE_INVOCATION
+                );
+                fixture
+                    .tasks
+                    .main_scope()
+                    .admit_shell(metadata(), |_, _| async { done() })
+                    .await
+                    .unwrap();
+                fixture.tasks.shutdown().await.unwrap();
+            }
+        });
+    }
+}

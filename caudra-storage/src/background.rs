@@ -15,6 +15,9 @@ pub const MAX_INVOCATIONS: usize = 128;
 pub const MAX_REPORTS: usize = 32;
 pub const MAX_RECORD_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_SESSION_BYTES: usize = 64 * 1024 * 1024;
+const JOB_EVENT_FIELD: &str = "job event provenance";
+const INVALID_JOB_EVENT: &str =
+    "job event does not match its recorded task, event, or owning invocation";
 pub(crate) const TABLES: &str = r#"
 CREATE TABLE background_tasks (
     session_id BLOB NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
@@ -31,6 +34,42 @@ CREATE TABLE background_receipts (
 "#;
 pub(crate) const SESSION_BYTES: &str = "coalesce((SELECT sum(bytes) FROM background_tasks WHERE session_id = sessions.id), 0) + coalesce((SELECT sum(length(event_id)) FROM background_receipts WHERE session_id = sessions.id), 0)";
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JobKind {
+    #[default]
+    Agent,
+    Shell,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum JobOwner {
+    #[default]
+    Main,
+    Child {
+        invocation_id: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShellJobMetadata {
+    pub call_id: String,
+    pub root_call_id: String,
+    pub command: String,
+    pub workdir: String,
+    pub timeout_ms: u64,
+    pub mode: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "metadata", rename_all = "snake_case")]
+pub enum JobPayload {
+    #[default]
+    Agent,
+    Shell(ShellJobMetadata),
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskEvent {
     pub sequence: u64,
@@ -44,6 +83,10 @@ pub struct TaskEvent {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskRecord {
+    #[serde(default)]
+    pub payload: JobPayload,
+    #[serde(default)]
+    pub owner: JobOwner,
     pub created_at: u64,
     pub updated_at: u64,
     pub sequence: u64,
@@ -59,15 +102,85 @@ pub struct TaskRecord {
     pub outcome: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_ref: Option<ToolOutputRef>,
+    #[serde(default, skip_serializing_if = "Value::is_null")]
     pub history: Value,
+    #[serde(default, skip_serializing_if = "Value::is_null")]
     pub spec: Value,
     pub events: Vec<TaskEvent>,
 }
 
 impl TaskRecord {
+    pub fn kind(&self) -> JobKind {
+        match self.payload {
+            JobPayload::Agent => JobKind::Agent,
+            JobPayload::Shell(_) => JobKind::Shell,
+        }
+    }
+
     pub fn active(&self) -> bool {
         matches!(self.state.as_str(), "queued" | "running" | "cancelling")
     }
+}
+
+pub fn accept_owned_job_event(
+    transaction: &Transaction<'_>,
+    session: CaudraId,
+    owner: &JobOwner,
+    message: &Value,
+) -> Result<(), SessionError> {
+    let Some(origin) = message.get("task_event") else {
+        return Ok(());
+    };
+    let (Some(invocation), Some(task), Some(event)) = (
+        origin.get("invocation_id").and_then(Value::as_str),
+        origin.get("task_id").and_then(Value::as_str),
+        origin.get("event_id").and_then(Value::as_str),
+    ) else {
+        return Ok(());
+    };
+    let payload: Option<String> = transaction
+        .query_row(
+            "SELECT payload FROM background_tasks WHERE session_id = ?1 AND invocation_id = ?2",
+            params![session.as_bytes().as_slice(), invocation],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(payload) = payload else {
+        return Ok(());
+    };
+    SessionDatabase::validate_len("background task", payload.len(), MAX_RECORD_BYTES)?;
+    let record: TaskRecord = serde_json::from_str(&payload).map_err(StorageError::from)?;
+    if record.task_id != task
+        || !record
+            .events
+            .iter()
+            .any(|candidate| candidate.event_id == event)
+    {
+        return Err(SessionError::CorruptDatabaseValue {
+            field: JOB_EVENT_FIELD,
+            reason: INVALID_JOB_EVENT.into(),
+        });
+    }
+    if record.owner != *owner {
+        let historical_child = matches!((&record.owner, owner), (JobOwner::Child { .. }, JobOwner::Child { .. }))
+            && transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM background_receipts WHERE session_id = ?1 AND event_id = ?2)",
+                params![session.as_bytes().as_slice(), event], |row| row.get::<_, bool>(0),
+            )?;
+        return if historical_child {
+            Ok(())
+        } else {
+            Err(SessionError::CorruptDatabaseValue {
+                field: JOB_EVENT_FIELD,
+                reason: INVALID_JOB_EVENT.into(),
+            })
+        };
+    }
+    transaction.execute(
+        "INSERT OR IGNORE INTO background_receipts(session_id, event_id) VALUES (?1, ?2)",
+        params![session.as_bytes().as_slice(), event],
+    )?;
+    Ok(())
 }
 
 impl SessionDatabase {
@@ -80,6 +193,7 @@ impl SessionDatabase {
             "SELECT EXISTS(SELECT 1 FROM subagent_streams WHERE session_id = ?1 AND subagent_id = ?2)
              OR EXISTS(SELECT 1 FROM subagents WHERE session_id = ?1 AND tool_use_id = ?2)
              OR EXISTS(SELECT 1 FROM background_tasks WHERE session_id = ?1 AND json_extract(payload, '$.task_id') = ?2)
+             OR EXISTS(SELECT 1 FROM job_owner_checkpoints WHERE session_id = ?1 AND task_id = ?2)
              OR EXISTS(SELECT 1 FROM workflow_calls c JOIN workflow_runs r USING(run_id) WHERE r.session_id = ?1 AND c.task_id = ?2)
              OR EXISTS(SELECT 1 FROM workflow_runs r, json_each(r.roster) entry WHERE r.session_id = ?1 AND json_extract(entry.value, '$.task_id') = ?2)",
             params![session.as_bytes().as_slice(), task_id],
@@ -208,10 +322,14 @@ mod tests {
     use serde::{Deserialize, Serialize};
     use serde_json::{Value, json};
     use std::fs::{self, File, FileTimes};
+    use std::slice::from_ref;
     use std::time::SystemTime;
     use test_case::test_case;
 
-    use super::{TaskEvent, TaskRecord};
+    use super::{
+        JobKind, JobOwner, JobPayload, ShellJobMetadata, TaskEvent, TaskRecord,
+        accept_owned_job_event,
+    };
     use crate::{
         StateDir,
         id::CaudraId,
@@ -224,6 +342,8 @@ mod tests {
     const EVENT: &str = "event";
     const MODEL: &str = "test/model";
     const CWD: &str = "/project";
+    const CHILD: &str = "exact-child-invocation";
+    const OTHER_CHILD: &str = "other-child-invocation";
 
     #[derive(Clone, Serialize, Deserialize)]
     struct TestMessage {
@@ -240,6 +360,8 @@ mod tests {
 
     fn record() -> TaskRecord {
         TaskRecord {
+            payload: Default::default(),
+            owner: Default::default(),
             created_at: 1,
             updated_at: 1,
             sequence: 1,
@@ -277,6 +399,146 @@ mod tests {
                 .unwrap()
                 .output_ref
                 .is_none()
+        );
+    }
+
+    #[test_case(false; "legacy_agent")]
+    #[test_case(true; "shell_without_agent_history")]
+    fn job_record_migration_preserves_kind_and_owner(shell: bool) {
+        let mut task = record();
+        if shell {
+            task.payload = JobPayload::Shell(ShellJobMetadata {
+                call_id: TASK.into(),
+                root_call_id: TASK.into(),
+                command: TASK.into(),
+                workdir: CWD.into(),
+                timeout_ms: 120_000,
+                mode: "build".into(),
+            });
+            task.owner = JobOwner::Child {
+                invocation_id: CHILD.into(),
+            };
+            task.history = Value::Null;
+            task.spec = Value::Null;
+        }
+        let mut value = serde_json::to_value(&task).unwrap();
+        if !shell {
+            value.as_object_mut().unwrap().remove("payload");
+            value.as_object_mut().unwrap().remove("owner");
+        } else {
+            assert!(value.get("history").is_none());
+            assert!(value.get("spec").is_none());
+        }
+        let restored: TaskRecord = serde_json::from_value(value).unwrap();
+        assert_eq!(
+            restored.kind(),
+            if shell {
+                JobKind::Shell
+            } else {
+                JobKind::Agent
+            }
+        );
+        assert_eq!(restored.owner, task.owner);
+        assert_eq!(restored.events[0].event_id, EVENT);
+    }
+
+    #[test_case(false; "rollback_does_not_accept")]
+    #[test_case(true; "commit_accepts_exact_owner_only")]
+    fn owner_receipts_share_history_transaction(commit: bool) {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = StateDir::from_path(temp.path().to_path_buf());
+        let mut session = TestSession::new(MODEL, CWD);
+        session.save(&dir).unwrap();
+        let mut task = record();
+        task.owner = JobOwner::Child {
+            invocation_id: CHILD.into(),
+        };
+        let database = SessionDatabase::open(&dir).unwrap();
+        database.save_background_task(session.id, &task).unwrap();
+        let message = json!({"task_event": {"invocation_id": INVOCATION, "task_id": TASK, "event_id": EVENT}});
+        for owner in [
+            JobOwner::Main,
+            JobOwner::Child {
+                invocation_id: OTHER_CHILD.into(),
+            },
+        ] {
+            let transaction = database.connection().unchecked_transaction().unwrap();
+            assert!(accept_owned_job_event(&transaction, session.id, &owner, &message).is_err());
+            transaction.commit().unwrap();
+            assert!(
+                !database
+                    .background_event_accepted(session.id, EVENT)
+                    .unwrap()
+            );
+        }
+        let transaction = database.connection().unchecked_transaction().unwrap();
+        accept_owned_job_event(&transaction, session.id, &task.owner, &message).unwrap();
+        if commit {
+            transaction.commit().unwrap();
+        } else {
+            transaction.rollback().unwrap();
+        }
+        assert_eq!(
+            database
+                .background_event_accepted(session.id, EVENT)
+                .unwrap(),
+            commit
+        );
+    }
+
+    #[test]
+    fn continuation_preserves_only_previously_accepted_child_events() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = StateDir::from_path(temp.path().to_path_buf());
+        let mut session = TestSession::new(MODEL, CWD);
+        session.save(&dir).unwrap();
+        let database = SessionDatabase::open(&dir).unwrap();
+        let mut task = record();
+        task.owner = JobOwner::Child {
+            invocation_id: CHILD.into(),
+        };
+        database.save_background_task(session.id, &task).unwrap();
+        let message = json!({"task_event": {"invocation_id": INVOCATION, "task_id": TASK, "event_id": EVENT}});
+        assert!(
+            database
+                .checkpoint_job_owner(session.id, OTHER_CHILD, TASK, from_ref(&message))
+                .is_err()
+        );
+        database
+            .checkpoint_job_owner(session.id, CHILD, TASK, from_ref(&message))
+            .unwrap();
+        database
+            .checkpoint_job_owner(session.id, OTHER_CHILD, TASK, from_ref(&message))
+            .unwrap();
+        let mut forged = message.clone();
+        forged["task_event"]["task_id"] = json!(OTHER_CHILD);
+        assert!(
+            database
+                .checkpoint_job_owner(session.id, OTHER_CHILD, TASK, &[forged])
+                .is_err()
+        );
+        let transaction = database.connection().unchecked_transaction().unwrap();
+        assert!(
+            accept_owned_job_event(&transaction, session.id, &JobOwner::Main, &message).is_err()
+        );
+    }
+
+    #[test]
+    fn owner_checkpoints_reserve_task_identities_without_agent_streams() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = StateDir::from_path(temp.path().to_path_buf());
+        let mut session = TestSession::new(MODEL, CWD);
+        session.save(&dir).unwrap();
+        let database = SessionDatabase::open(&dir).unwrap();
+        assert!(!database.task_identity_exists(session.id, TASK).unwrap());
+        database
+            .checkpoint_job_owner::<Value>(session.id, CHILD, TASK, &[])
+            .unwrap();
+        assert!(database.task_identity_exists(session.id, TASK).unwrap());
+        assert!(
+            !database
+                .task_identity_exists(CaudraId::generate(), TASK)
+                .unwrap()
         );
     }
 

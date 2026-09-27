@@ -29,7 +29,32 @@ behind, so the picker and `caudra --continue` skip it.
 
 ## Background tasks
 
-In the TUI and [stream-JSON SDK](/docs/headless/#background-tasks), the model can delegate independent work with [`task`](/docs/tools/#task) using `background: true`. The call returns an admission receipt with a task ID while the child is queued or working. Admission does not mean success. Foreground execution remains the default and waits for the result. A `batch` still waits for foreground calls, so each task that should return early needs its own `background: true`.
+In the TUI and [stream-JSON SDK](/docs/headless/#background-tasks), tasks and shell commands can return an admission receipt while work continues. Admission does not mean success. The session delivers reports and terminal results to the agent that owns the work.
+
+### Execution policies
+
+Configure task and shell execution independently:
+
+```toml
+[agent]
+task_execution = "auto"
+shell_execution = "auto"
+shell_async_threshold_secs = 120
+```
+
+| Mode | Tasks | Shell commands |
+|------|-------|----------------|
+| `sync` | Wait for the final result. No background launch or promotion. | Wait for command termination. |
+| `auto` (default) | Wait by default. The model can pass `background: true` for independent work. | Return a receipt when the requested timeout exceeds the threshold. Otherwise wait. |
+| `async` | Return a receipt for every admitted task. | Return a receipt for every admitted command. |
+
+In shell `auto` mode, omitted `timeoutSec` uses Workcell's 120-second default. With the default threshold, `timeoutSec: 120` waits and `timeoutSec: 121` returns a receipt, even when the command finishes quickly. The positive threshold measures the requested timeout, not elapsed runtime. It never extends the command's hard deadline. Shell has no per-call `background` argument, and timeouts should reflect execution needs rather than a scheduling preference.
+
+Tool descriptions, instructions, and task arguments follow the effective policy. A `batch` still waits for calls that use synchronous execution. With task `auto`, each task that should return early needs its own `background: true`.
+
+One-shot `--print` and ACP resolve `auto` to synchronous execution. Strict `async` withholds the affected tool and rejects stale calls. Use `sync` or `auto` there, or switch to the TUI or persistent stream-JSON SDK.
+
+### Results and continuation
 
 The parent can keep working on a separate scope. When nothing independent remains, it gives a normal final answer explaining what is still pending. Background reports and final outcomes then start another parent run automatically at a safe boundary, even after that answer. The parent checks them against the latest instructions, verifies claims, and continues the original work without asking whether to continue. This works while the session stays open and automatic continuation has not been stopped. There is no need to poll, sleep, or repeat the delegated work.
 
@@ -43,14 +68,16 @@ Open `/tasks` or press `Ctrl+X a` to inspect transcripts and steer running child
 |---------|--------|
 | `/tasks`, `/tasks list` | Open or refresh the task picker |
 | `/tasks status <id>` | Open the picker with that task selected and its details visible |
-| `/tasks background <id>` | Promote a foreground task without restarting it |
+| `/tasks background <id>` | Promote an agent task without restarting it, in task `auto` mode |
 | `/tasks cancel <id>` | Cancel that invocation, showing cancelling until it settles |
 
-Singular `/task` forms remain compatibility aliases. Press Enter or click the selected row to open its chat. The picker shows `bg` at the right of background rows, including finished tasks. See [task navigation](/docs/commands/#tasks) for filtering and keyboard controls.
+Singular `/task` forms remain compatibility aliases. Press Enter or click an agent task to open its chat. Shell jobs show command details and bounded output rather than a child chat. The picker shows `bg` at the right of background rows, including finished tasks. Task results and reports render as Markdown, structured values as JSON, and shell output as literal text. See [task navigation](/docs/commands/#tasks) for filtering and keyboard controls.
 
 New tasks receive short `adjective-adjective-noun` IDs, separate from their description labels. Existing IDs remain valid. Use the returned `task_id` for inspection, cancellation, or later continuation.
 
-The model has the same operations through [`task_control`](/docs/tools/#task_control): `list`, `status`, `background`, and `cancel`. All except `list` require `task_id`. A later `task` call can continue a settled task from its saved history, but cannot resume an active or cancelling invocation.
+The model can inspect and cancel jobs through [`task_control`](/docs/tools/#task_control). Task `auto` also permits promotion of agent tasks. All actions except `list` require `task_id`. A later `task` call can continue a settled agent task from its saved history, but cannot resume an active or cancelling invocation. Shell jobs cannot be resumed or promoted. Run a new shell call when another command is needed.
+
+Shell results retain Workcell's output bounds and filtering. A truncated result can include a `tool_output` reference for the retained output, which is not an unlimited process log. Saved references remain usable after history reloads and forks.
 
 ### Child reports
 
@@ -58,11 +85,13 @@ A managed child has `report_to_parent` for an important finding, correction, or 
 
 When the child cannot proceed without information or authority, `blocked: true` ends that invocation with a non-success outcome. The message should say exactly what is missing. A report does not replace a successful final result or its `output_schema`. Child reports are data, not new authority, and the child must not assume it has received later main-conversation instructions.
 
+Subagents and workflow agents can own asynchronous shell jobs, even when their parent task waits synchronously. Results return only to that child invocation. The child waits without polling when its commands are the only remaining work, processes their results, and then finishes. A blocked report, cancellation, or hard limit cancels and drains its commands before the child settles. Workflow scripts still receive one final agent result.
+
 ### Stop and close
 
 Stopping all session tasks and workflows cancels owned work and suppresses automatic continuation, including late reports and completion notices. A new user turn re-enables continuation. See [Stop and replace](/docs/queue/#stop-and-replace) for TUI controls.
 
-Switching TUI tabs leaves the owning session open. Closing a session cancels and drains its children before saving and releasing it. Background tasks are session-owned, not a daemon or a promise to keep executing after exit. One-shot `--print` and ACP do not support background tasks. Foreground `task` calls remain available there.
+Switching TUI tabs leaves the owning session open. Closing a session cancels and drains its children and shell jobs before saving and releasing it. Background work is session-owned, not a daemon or a promise to keep executing after exit. Crash recovery marks unfinished work interrupted without replaying commands or other effects.
 
 ## Moving sessions to another directory
 

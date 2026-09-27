@@ -37,6 +37,7 @@ use super::steering::{
 use super::streaming::{StreamError, stream_with_retry};
 use super::title;
 use super::tool_dispatch::{self, RecentCalls, ResponseObservations, ToolObservation};
+use crate::background::JobScope;
 use crate::cancel::{CancelMap, CancelToken};
 use crate::context::{
     BuiltinToolsInput, ContextCapture, ContextInventory, ContextPublisher, ContextReadiness,
@@ -56,12 +57,15 @@ use crate::{
     QueueConsumedItem, SessionMailbox, SubagentHistoryStore, TurnCompleteEvent,
 };
 use caudra_config::{ModelPolicy, ToolOutputLines};
+use caudra_storage::background::JobOwner;
 use caudra_storage::id::SessionRef;
 use caudra_storage::local_documents::LocalDocumentStore;
+use caudra_storage::tool_outputs::ToolOutputStore;
 use caudra_storage::usage_ledger::LedgerPurpose;
 use caudra_workspace::WorkspaceSession;
 
 const MAX_REAUTH_ATTEMPTS: u32 = 2;
+const OWNED_JOB_IDENTITY_MISSING: &str = "owned shell work has no task identity";
 /// Multiplied by the attempt, so a stall that keeps stalling waits longer
 /// each time instead of billing a full cached prefix every couple of seconds.
 const STALL_BACKOFF: Duration = Duration::from_secs(2);
@@ -239,12 +243,15 @@ impl MeasuredContext {
 #[derive(Clone)]
 pub struct AgentParams {
     pub background: Option<crate::background::BackgroundTasks>,
+    pub jobs: Option<JobScope>,
+    pub task_id: Option<String>,
     pub provider: Arc<dyn Provider>,
     pub model: Model,
     pub chat_provider: Arc<dyn Provider>,
     pub chat_model: Model,
     pub config: AgentConfig,
     pub tool_output_lines: ToolOutputLines,
+    pub tool_output_store: Option<Arc<ToolOutputStore>>,
     pub permissions: Arc<PermissionManager>,
     pub session_id: Option<SessionRef>,
     /// What the provider routes this conversation's prompt cache by. The
@@ -342,6 +349,7 @@ pub struct Agent<'h> {
     mcp: Option<McpSession>,
     config: AgentConfig,
     tool_output_lines: ToolOutputLines,
+    tool_output_store: Option<Arc<ToolOutputStore>>,
     reauth_attempts: u32,
     permissions: Arc<PermissionManager>,
     opts: RequestOptions,
@@ -374,6 +382,8 @@ pub struct Agent<'h> {
     model_policy: Arc<ModelPolicy>,
     workflow: Option<WorkflowHandle>,
     background: Option<crate::background::BackgroundTasks>,
+    jobs: Option<JobScope>,
+    task_id: Option<String>,
     terminal_report: Option<Arc<AtomicBool>>,
     goal: GoalHandle,
     goal_evaluator: Option<ResolvedEvaluator>,
@@ -383,10 +393,20 @@ pub struct Agent<'h> {
 
 impl<'h> Agent<'h> {
     pub fn new(params: AgentParams, mut run: AgentRunParams<'h>) -> Self {
-        crate::tools::native::task::configure_background(
+        let jobs = params
+            .jobs
+            .clone()
+            .or_else(|| params.background.as_ref().map(|tasks| tasks.main_scope()));
+        crate::tools::execution::configure_tools(
             &mut run.tools,
+            &mut run.deferred,
+            &params.config,
             params.background.is_some(),
+            jobs.is_some(),
         );
+        if let Some(background) = &params.background {
+            background.set_task_execution(params.config.task_execution.clone());
+        }
         let shared_route = Arc::ptr_eq(&params.provider, &params.chat_provider)
             && params.model.provider == params.chat_model.provider
             && params.model.id == params.chat_model.id;
@@ -454,6 +474,7 @@ impl<'h> Agent<'h> {
             reauth_attempts: 0,
             opts: RequestOptions::default(),
             session_id: params.session_id,
+            tool_output_store: params.tool_output_store,
             cache_key: params.cache_key,
             workspace_session: params.workspace_session,
             remote_project_context: params.remote_project_context,
@@ -480,6 +501,8 @@ impl<'h> Agent<'h> {
             model_policy: params.model_policy,
             workflow: params.workflow,
             background: params.background,
+            jobs,
+            task_id: params.task_id,
             terminal_report: None,
             goal: GoalHandle::default(),
             goal_evaluator: None,
@@ -688,7 +711,17 @@ impl<'h> Agent<'h> {
         // Every frontend enters here, so busy time is measured here; a turn
         // that failed was still busy.
         let busy_since = Instant::now();
-        let result = self.run_loop().await;
+        let mut result = self.run_loop().await;
+        if (!matches!(result, Ok(DoneReason::EndTurn)) || self.terminal_report_ready())
+            && let Some(jobs) = self.child_jobs()
+            && let Err(message) = jobs.cancel_and_drain().await
+        {
+            if result.is_ok() {
+                result = Err(Self::job_error(message));
+            } else {
+                warn!(%message, "owned command cleanup failed after agent error");
+            }
+        }
         if let Some(runs) = self.speculative.clone() {
             runs.abandon_unfinished();
             self.drain_repair_usage(&runs.repair_state());
@@ -974,14 +1007,124 @@ impl<'h> Agent<'h> {
                 }
                 return Ok(DoneReason::MaxTurns);
             }
+            self.inject_owned_results().await?;
             if initial {
                 self.inject_advisory();
                 initial = false;
             }
             match self.turn().await? {
                 TurnOutcome::Continue => {}
-                TurnOutcome::Done(reason) => return Ok(reason),
+                TurnOutcome::Done(reason) => {
+                    if reason == DoneReason::EndTurn
+                        && !self.terminal_report_ready()
+                        && self.child_jobs().is_some_and(|jobs| jobs.pending())
+                        && steering::lock(&self.steering).turn_limit_reached(self.config.max_turns)
+                    {
+                        return Ok(DoneReason::MaxTurns);
+                    }
+                    if reason == DoneReason::EndTurn
+                        && !self.terminal_report_ready()
+                        && self.wait_for_owned_results().await?
+                    {
+                        continue;
+                    }
+                    return Ok(reason);
+                }
             }
+        }
+    }
+
+    fn terminal_report_ready(&self) -> bool {
+        self.terminal_report
+            .as_ref()
+            .is_some_and(|ready| ready.load(Ordering::Acquire))
+    }
+
+    fn child_jobs(&self) -> Option<JobScope> {
+        self.jobs
+            .as_ref()
+            .filter(|jobs| matches!(jobs.owner(), JobOwner::Child { .. }))
+            .cloned()
+    }
+
+    fn job_error(message: String) -> AgentError {
+        AgentError::Tool {
+            tool: crate::tools::SHELL_TOOL_NAME.into(),
+            message,
+        }
+    }
+
+    async fn checkpoint_owned_jobs(&self) -> Result<(), AgentError> {
+        let Some(jobs) = self.child_jobs() else {
+            return Ok(());
+        };
+        if jobs.list().is_empty() {
+            return Ok(());
+        }
+        let task_id = self
+            .task_id
+            .as_deref()
+            .ok_or_else(|| Self::job_error(OWNED_JOB_IDENTITY_MISSING.into()))?;
+        jobs.checkpoint(task_id, self.history.as_slice())
+            .await
+            .map_err(Self::job_error)
+    }
+
+    async fn inject_owned_results(&mut self) -> Result<bool, AgentError> {
+        let Some(jobs) = self.child_jobs() else {
+            return Ok(false);
+        };
+        if !jobs.has_pending() {
+            return Ok(false);
+        }
+        let messages = jobs.claim_messages().map_err(Self::job_error)?;
+        if messages.is_empty() {
+            return Ok(false);
+        }
+        let task_id = self
+            .task_id
+            .as_deref()
+            .ok_or_else(|| Self::job_error(OWNED_JOB_IDENTITY_MISSING.into()))?;
+        let mut checkpoint = self.history.as_slice().to_vec();
+        checkpoint.extend(messages.iter().cloned());
+        if let Err(error) = jobs.checkpoint(task_id, &checkpoint).await {
+            jobs.release_messages(&messages);
+            return Err(Self::job_error(error));
+        }
+        if let Some(ready) = &self.report_ready {
+            ready.store(false, Ordering::Release);
+        }
+        self.response_text = None;
+        for message in &messages {
+            self.push_injected(message.clone());
+        }
+        jobs.accept_messages(&messages)
+            .await
+            .map_err(Self::job_error)?;
+        self.publish_prepared_context();
+        Ok(true)
+    }
+
+    async fn wait_for_owned_results(&mut self) -> Result<bool, AgentError> {
+        let Some(jobs) = self.child_jobs() else {
+            return Ok(false);
+        };
+        loop {
+            if self.cancel.is_cancelled() {
+                return Err(AgentError::Cancelled);
+            }
+            let revision = jobs.revision();
+            if self.inject_owned_results().await? {
+                return Ok(true);
+            }
+            if !jobs.pending() {
+                return Ok(false);
+            }
+            self.cancel
+                .race(jobs.wait_for_change(revision))
+                .await
+                .map_err(|_| AgentError::Cancelled)?
+                .map_err(Self::job_error)?;
         }
     }
 
@@ -1096,24 +1239,26 @@ impl<'h> Agent<'h> {
         // before this request, not after the one that abandoned it: the model
         // must learn what already ran before it decides what to run next.
         self.report_speculative();
-        let preflight_compacted =
-            if self.audience.contains(ToolAudience::MAIN) && self.root_tool_use_id.is_none() {
-                BackgroundReminderContext {
-                    background: self.background.as_ref(),
-                    workflow: self.workflow.as_ref(),
-                }
-                .refresh(
-                    self.history,
-                    &self.event_tx,
-                    self.config.background_reminder_turns,
-                    false,
-                );
-                self.history.as_slice().iter().any(|message| {
-                    message.standing_reminder == Some(StandingReminderKind::BackgroundWork)
-                }) && self.preflight_context().await?
-            } else {
-                false
-            };
+        let main_session =
+            self.audience.contains(ToolAudience::MAIN) && self.root_tool_use_id.is_none();
+        let preflight_compacted = if main_session || self.child_jobs().is_some() {
+            BackgroundReminderContext {
+                background: self.background.as_ref().filter(|_| main_session),
+                jobs: self.jobs.as_ref(),
+                workflow: self.workflow.as_ref().filter(|_| main_session),
+            }
+            .refresh(
+                self.history,
+                &self.event_tx,
+                self.config.background_reminder_turns,
+                false,
+            );
+            self.history.as_slice().iter().any(|message| {
+                message.standing_reminder == Some(StandingReminderKind::BackgroundWork)
+            }) && self.preflight_context().await?
+        } else {
+            false
+        };
         let sent_at_history_len = self.history.len();
         self.tool_name_aliases = None;
         let repair_state = Arc::new(RepairState::default());
@@ -1856,6 +2001,7 @@ impl<'h> Agent<'h> {
             self.publish_prepared_context();
         }
         result?;
+        self.checkpoint_owned_jobs().await?;
         if let Some(background) = &self.background {
             background
                 .settle_launches(self.history.as_slice())
@@ -1911,9 +2057,10 @@ impl<'h> Agent<'h> {
             local_documents: self.local_documents.clone(),
             task_environment: self.task_environment.clone(),
             context_publisher: self.context_publisher.clone(),
-            tool_output_store: crate::tool_output::default_store(),
+            tool_output_store: self.tool_output_store.clone(),
             tool_use_id: None,
             root_tool_use_id: self.root_tool_use_id.clone(),
+            local_root_tool_use_id: None,
             user_response_rx: self.user_response_rx.clone(),
             loaded_instructions: self.loaded_instructions.clone(),
             cancel: self.cancel.clone(),
@@ -1945,6 +2092,7 @@ impl<'h> Agent<'h> {
             model_policy: Arc::clone(&self.model_policy),
             workflow: self.workflow.clone(),
             background: self.background.clone(),
+            jobs: self.jobs.clone(),
             speculative: None,
         }
     }
@@ -2044,19 +2192,20 @@ impl<'h> Agent<'h> {
         // A subagent's user is its caller, whose requirements are the task
         // prompt it already holds; only the conversation with a person has a
         // list worth keeping.
-        let extractor =
-            if self.audience.contains(ToolAudience::MAIN) && self.root_tool_use_id.is_none() {
-                compaction::resolve_extractor(
-                    &self.config,
-                    &self.provider,
-                    &self.model,
-                    self.timeouts,
-                    &self.model_policy,
-                )
-                .await
-            } else {
-                None
-            };
+        let main_session =
+            self.audience.contains(ToolAudience::MAIN) && self.root_tool_use_id.is_none();
+        let extractor = if main_session {
+            compaction::resolve_extractor(
+                &self.config,
+                &self.provider,
+                &self.model,
+                self.timeouts,
+                &self.model_policy,
+            )
+            .await
+        } else {
+            None
+        };
         let compacted = compaction::compact_history(
             &*compact_provider,
             &compact_model,
@@ -2067,12 +2216,13 @@ impl<'h> Agent<'h> {
                 retry_now: &self.retry_now,
                 config: &self.config,
                 extractor: extractor.as_ref(),
-                session: (self.audience.contains(ToolAudience::MAIN)
-                    && self.root_tool_use_id.is_none())
-                .then_some(BackgroundReminderContext {
-                    background: self.background.as_ref(),
-                    workflow: self.workflow.as_ref(),
-                }),
+                session: (main_session || self.child_jobs().is_some()).then_some(
+                    BackgroundReminderContext {
+                        background: self.background.as_ref().filter(|_| main_session),
+                        jobs: self.jobs.as_ref(),
+                        workflow: self.workflow.as_ref().filter(|_| main_session),
+                    },
+                ),
             },
         )
         .await?;
@@ -2364,6 +2514,8 @@ fn add_opaque_blob_tokens(total: &mut u32, blob: &str) {
 
 #[cfg(test)]
 mod tests {
+    include!("owned_jobs_tests.rs");
+
     use std::collections::{HashMap, VecDeque};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
@@ -2376,6 +2528,7 @@ mod tests {
         StandingReminderKind, SteeringKind, StopReason, StreamResponse, TaskEventOrigin,
         TokenUsage, WorkflowEventOrigin, invalid_tool_input,
     };
+    use caudra_storage::StateDir;
     use caudra_workspace::PlanRef;
     use serde_json::Value;
     use test_case::test_case;
@@ -3381,6 +3534,14 @@ mod tests {
         provider: impl Provider + 'static,
         history: &mut History,
     ) -> (Agent<'_>, flume::Receiver<Envelope>) {
+        make_agent_with_output_store(provider, history, None)
+    }
+
+    fn make_agent_with_output_store(
+        provider: impl Provider + 'static,
+        history: &mut History,
+        tool_output_store: Option<Arc<ToolOutputStore>>,
+    ) -> (Agent<'_>, flume::Receiver<Envelope>) {
         let (raw_tx, event_rx) = flume::unbounded();
         let provider: Arc<dyn Provider> = Arc::new(provider);
         let model = default_model();
@@ -3398,6 +3559,7 @@ mod tests {
                     ..AgentConfig::default()
                 },
                 tool_output_lines: ToolOutputLines::default(),
+                tool_output_store,
                 permissions: Arc::new(PermissionManager::new_nonpersistent(
                     caudra_config::PermissionsConfig {
                         default: caudra_config::DefaultEffect::Allow,
@@ -3437,6 +3599,8 @@ mod tests {
                 model_policy: Arc::new(ModelPolicy::default()),
                 workflow: None,
                 background: None,
+                jobs: None,
+                task_id: None,
             },
             AgentRunParams {
                 history,
@@ -7034,5 +7198,30 @@ mod tests {
         let session: SessionRef = "CNK1hV6GWoysH3KQMm5wu".parse().expect("valid session id");
         agent.session_id = Some(session.clone());
         assert_eq!(agent.tool_context().session_id, Some(session));
+    }
+
+    #[test_case(false; "explicit_none")]
+    #[test_case(true; "session_store")]
+    fn tool_context_carries_the_output_store(enabled: bool) {
+        let temp = tempfile::tempdir().unwrap();
+        let store = enabled.then(|| {
+            Arc::new(ToolOutputStore::new(StateDir::from_path(
+                temp.path().to_owned(),
+            )))
+        });
+        let mut history = History::default();
+        let (agent, _events) = make_agent_with_output_store(
+            MockProvider::new(Vec::new()),
+            &mut history,
+            store.clone(),
+        );
+        let context = agent.tool_context();
+        match store {
+            Some(store) => assert!(Arc::ptr_eq(
+                context.tool_output_store.as_ref().unwrap(),
+                &store
+            )),
+            None => assert!(context.tool_output_store.is_none()),
+        }
     }
 }

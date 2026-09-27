@@ -9,6 +9,7 @@ use caudra_providers::{
     AgentError, Billing, ContentBlock, Message, Role, StopReason, TaskEventOrigin, TokenUsage,
     estimate_tokens_cached, token_label,
 };
+use caudra_storage::background::{JobKind, JobOwner, ShellJobMetadata};
 use caudra_storage::id::CaudraId;
 use caudra_storage::tool_ledger::ToolOutcome;
 use caudra_storage::tool_outputs::ToolOutputRef;
@@ -1003,6 +1004,12 @@ impl PhaseMark {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TaskCard {
+    #[serde(default)]
+    pub kind: JobKind,
+    #[serde(default)]
+    pub owner: JobOwner,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shell: Option<Box<ShellJobMetadata>>,
     pub task_id: String,
     pub invocation_id: String,
     pub call_id: String,
@@ -1038,10 +1045,18 @@ impl TaskCard {
     pub fn model_value(&self) -> Value {
         let mut value = json!({
             "task_id": self.task_id,
+            "kind": self.kind,
             "state": self.state,
             "background": self.background,
             "mode": self.mode,
         });
+        if let Some(shell) = &self.shell {
+            value["shell"] = json!({
+                "command": shell.command,
+                "workdir": shell.workdir,
+                "timeout_ms": shell.timeout_ms,
+            });
+        }
         if let Some(result) = &self.result {
             value["result"] = result.clone();
         }

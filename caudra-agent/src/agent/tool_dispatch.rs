@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 use tracing::{Instrument, debug, error, info_span, warn};
 
+use crate::background::ShellJobMetadata;
 use crate::mcp::{McpSession, UNKNOWN_MCP};
 use crate::permissions::{PermissionAuthorityProfile, RemotePermissionIdentity, canonical_json};
 use crate::task_set::TaskSet;
@@ -18,13 +19,14 @@ use crate::tools::registry::{
 };
 use crate::tools::{
     DOOM_LOOP_GUIDANCE, LocalToolEntry, LockKey, READ_ONLY_CALL_GUIDANCE,
-    READ_ONLY_TOOL_RESTRICTED, TOOL_SEARCH_TOOL_NAME, ToolContext, ToolEffect, ToolSource,
+    READ_ONLY_TOOL_RESTRICTED, TOOL_SEARCH_TOOL_NAME, ToolContext, ToolEffect, ToolExecResult,
+    ToolSource,
 };
 use crate::{
-    AgentError, AgentEvent, LuaToolProvenance, ToolAccounting, ToolDoneEvent, ToolOutput,
-    ToolStartEvent,
+    AgentError, AgentEvent, AgentMode, LuaToolProvenance, ToolAccounting, ToolDoneEvent,
+    ToolOutput, ToolStartEvent,
 };
-use caudra_config::ToolKey;
+use caudra_config::{ToolKey, resolve_shell_background};
 use caudra_providers::estimate_tokens_cached;
 use caudra_storage::tool_ledger::ToolOutcome as LedgerOutcome;
 
@@ -76,6 +78,13 @@ const GIT_COMMIT: &str = "git commit";
 const GH_PR_CREATE: &str = "gh pr create";
 
 const SNAPSHOT_FAILED: &str = "could not snapshot the workspace before changing it";
+const SHELL_METADATA_INVALID: &str = "validated shell invocation is missing command metadata";
+const SHELL_WORKDIR_FIELD: &str = "workdir";
+const SHELL_DEFAULT_WORKDIR: &str = ".";
+const SHELL_MODE_BUILD: &str = "build";
+const SHELL_MODE_READ_ONLY: &str = "read_only";
+const SHELL_MODE_PLAN: &str = "plan";
+const SHELL_INVOCATION_LOST: &str = "shell execution was already consumed";
 
 const ERROR_CANCELLED: &str = "cancelled";
 const ERROR_TIMEOUT: &str = "timeout";
@@ -87,6 +96,46 @@ const ERROR_OTHER: &str = "error";
 /// A telemetry counter is not worth an unbounded diff; past this,
 /// `similar` returns a coarser but still valid one.
 const DIFF_TIMEOUT: Duration = Duration::from_millis(100);
+
+enum DispatchResult {
+    Completed(ToolDoneEvent),
+    ShellAdmission(ToolDoneEvent),
+}
+
+impl From<ToolDoneEvent> for DispatchResult {
+    fn from(done: ToolDoneEvent) -> Self {
+        Self::Completed(done)
+    }
+}
+
+struct ShellReport {
+    done: ToolDoneEvent,
+    source: String,
+    input: Value,
+    took: Duration,
+}
+
+#[derive(Default)]
+struct PendingShellReport(Mutex<Option<ShellReport>>);
+
+impl Drop for PendingShellReport {
+    fn drop(&mut self) {
+        if let Some(pending) = self
+            .0
+            .get_mut()
+            .unwrap_or_else(|error| error.into_inner())
+            .take()
+        {
+            report(
+                &pending.done,
+                &pending.done.tool,
+                &pending.source,
+                &pending.input,
+                pending.took,
+            );
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ToolOutcome {
@@ -395,8 +444,8 @@ pub async fn run(
     } else {
         None
     };
-    let mut done = match refusal {
-        Some(message) => ToolDoneEvent::error(id, message),
+    let dispatched = match refusal {
+        Some(message) => ToolDoneEvent::error(id, message).into(),
         None if invalid.is_some() && !matches!(repair, Some(Ok(_))) => {
             ctx.mark_tool_result_repairable();
             let mut message = format!("{canonical} {INVALID_INPUT_MESSAGE}");
@@ -409,7 +458,7 @@ pub async fn run(
             }
             let mut done = ToolDoneEvent::error(id, message);
             done.tool = Arc::from(canonical);
-            done
+            done.into()
         }
         _ => {
             let effective = repair
@@ -420,6 +469,10 @@ pub async fn run(
                 .instrument(span)
                 .await
         }
+    };
+    let (mut done, admitted) = match dispatched {
+        DispatchResult::Completed(done) => (done, false),
+        DispatchResult::ShellAdmission(done) => (done, true),
     };
     if let Some(Ok(repair)) = repair
         && repair.method != "unchanged"
@@ -445,9 +498,11 @@ pub async fn run(
     } else {
         input
     };
-    let took = started.elapsed();
-    account(&mut done, &source, took);
-    report(&done, canonical, &source, logged_input, took);
+    if !admitted {
+        let took = started.elapsed();
+        account(&mut done, &source, took);
+        report(&done, canonical, &source, logged_input, took);
+    }
     done
 }
 
@@ -461,7 +516,21 @@ pub(crate) fn repair_schema(
         return ctx.json_repair.schema(name);
     }
     if let Some(entry) = registry.get(name) {
-        return Some(entry.tool.schema());
+        let mut definitions = serde_json::json!([{
+            "name": name,
+            "input_schema": entry.tool.schema(),
+        }]);
+        crate::tools::execution::configure_declared(
+            &mut definitions,
+            &ctx.config,
+            ctx.background.is_some(),
+            ctx.job_scope().is_some(),
+        );
+        return definitions
+            .as_array()?
+            .first()?
+            .get("input_schema")
+            .cloned();
     }
     if let Some(schema) = ctx.json_repair.schema(name) {
         return Some(schema);
@@ -497,7 +566,7 @@ async fn run_inner(
     input: &Value,
     ctx: &ToolContext,
     emit: &mut Emit<'_>,
-) -> ToolDoneEvent {
+) -> DispatchResult {
     // Covers names re-entering from model JSON (batch children, `call_tool`,
     // the interpreter bridge); streamed names are canonicalized in streaming.rs.
     let name = canonical_tool_name(name, ctx);
@@ -542,6 +611,7 @@ async fn run_inner(
             model_output_from_ref: false,
             accounting: ToolAccounting::default(),
         }
+        .into()
     };
 
     // Before the read-only gate: a tool the config turned off should say so
@@ -571,7 +641,9 @@ async fn run_inner(
         return done_error(format!("tool {name} {TOOL_DISABLED_SUFFIX}"));
     }
     if let Some(local) = local {
-        return run_local_tool(local, id, name, input, ctx, emit).await;
+        return run_local_tool(local, id, name, input, ctx, emit)
+            .await
+            .into();
     }
 
     if let Some(ref entry) = entry {
@@ -755,59 +827,143 @@ async fn run_inner(
             )
             .await;
 
-        let result = invocation.execute(ctx).await;
-
-        let elapsed = started.elapsed();
-        match result.output {
-            Ok(mut output) => {
-                set_lua_provenance(&mut output, &entry.source, true);
-                let written_path = result
-                    .written_path
-                    .or_else(|| result.written_paths.first().cloned());
-                debug!(
-                    tool = %name,
-                    source = %entry.source.as_log_field(),
-                    elapsed_ms = elapsed.as_millis() as u64,
-                    "tool ok"
-                );
-                ToolDoneEvent {
-                    id,
-                    tool: tool_id,
-                    output,
-                    is_error: result.is_error,
-                    annotation: result.annotation,
-                    written_path,
-                    written_paths: result.written_paths,
-                    remote_written_paths: result.remote_written_paths,
-                    output_ref: result.output_ref,
-                    output_limits: result.output_limits,
-                    model_suffix: result.model_suffix,
-                    model_output: result.model_output,
-                    model_output_from_ref: result.model_output_from_ref,
-                    accounting: ToolAccounting::default(),
+        if let Some(timeout) = invocation.shell_timeout() {
+            let scope = ctx.job_scope();
+            let background =
+                match resolve_shell_background(&ctx.config, scope.is_some(), timeout.as_secs()) {
+                    Ok(background) => background,
+                    Err(message) => {
+                        invocation.abandon(ctx).await;
+                        return done_error(message.into());
+                    }
+                };
+            if background && let Some(scope) = scope {
+                let permission_input = invocation.permission_input().unwrap_or(input);
+                let Some(command) = permission_input
+                    .get(BASH_COMMAND_FIELD)
+                    .and_then(Value::as_str)
+                else {
+                    invocation.abandon(ctx).await;
+                    return done_error(SHELL_METADATA_INVALID.into());
+                };
+                if ctx.cancel.is_cancelled() {
+                    invocation.abandon(ctx).await;
+                    return done_error(ERROR_CANCELLED.into());
                 }
-            }
-            Err(message) => {
-                warn!(
-                    tool = %name,
-                    source = %entry.source.as_log_field(),
-                    elapsed_ms = elapsed.as_millis() as u64,
-                    error = %message,
-                    "tool failed"
-                );
-                let mut done = done_error(message).with_model_suffix(result.model_suffix);
-                set_lua_provenance(&mut done.output, &entry.source, true);
-                done.annotation = result.annotation;
-                done.remote_written_paths = result.remote_written_paths;
-                done.output_limits = result.output_limits;
-                done.output_ref = result.output_ref;
-                done.model_output = result.model_output;
-                done.model_output_from_ref = result.model_output_from_ref;
-                done
+                if let Err(message) = ctx.deadline.remaining() {
+                    invocation.abandon(ctx).await;
+                    return done_error(message);
+                }
+                let metadata = ShellJobMetadata {
+                    call_id: id.clone(),
+                    root_call_id: ctx
+                        .local_root_tool_use_id
+                        .clone()
+                        .unwrap_or_else(|| id.clone()),
+                    command: command.into(),
+                    workdir: permission_input
+                        .get(SHELL_WORKDIR_FIELD)
+                        .and_then(Value::as_str)
+                        .unwrap_or(SHELL_DEFAULT_WORKDIR)
+                        .into(),
+                    timeout_ms: timeout.as_millis().try_into().unwrap_or(u64::MAX),
+                    mode: match ctx.mode {
+                        AgentMode::Build => SHELL_MODE_BUILD,
+                        AgentMode::ReadOnly => SHELL_MODE_READ_ONLY,
+                        AgentMode::Plan(_) | AgentMode::RemotePlan(_) => SHELL_MODE_PLAN,
+                    }
+                    .into(),
+                };
+                let invocation = Arc::new(Mutex::new(Some(invocation)));
+                let owned_invocation = Arc::clone(&invocation);
+                let mut owned = ctx.clone();
+                owned.speculative = None;
+                owned.steering_observations = None;
+                owned.steering_order.clear();
+                owned.live_sink = None;
+                owned.user_response_rx = None;
+                owned.tool_use_id = Some(id.clone());
+                let source = entry.source.clone();
+                let log_source = tool_source(registry, ctx, name).into_owned();
+                let log_input = if ctx.json_repair.invalid_input(&id).is_some() {
+                    Value::Null
+                } else {
+                    input.clone()
+                };
+                let owned_id = id.clone();
+                let owned_tool = Arc::clone(&tool_id);
+                let pending_report = Arc::new(PendingShellReport::default());
+                let owned_report = Arc::clone(&pending_report);
+                let admitted = scope
+                    .admit_shell(metadata, move |cancel, provenance| async move {
+                        let _guards = (_preparation_guards, _guards);
+                        owned.cancel = cancel;
+                        owned.event_tx = owned.event_tx.clone().with_task(provenance);
+                        let invocation = owned_invocation
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner())
+                            .take();
+                        let result = match invocation {
+                            Some(invocation) => execute_owned_shell(invocation, &owned).await,
+                            None => ToolExecResult::from(Err(SHELL_INVOCATION_LOST.into())),
+                        };
+                        let mut done = finish_invocation(
+                            owned_id,
+                            owned_tool,
+                            &source,
+                            result,
+                            started.elapsed(),
+                        );
+                        crate::tool_output::limit(&mut done, &owned).await;
+                        let took = started.elapsed();
+                        account(&mut done, &log_source, took);
+                        *owned_report
+                            .0
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner()) = Some(ShellReport {
+                            done: done.clone(),
+                            source: log_source,
+                            input: log_input,
+                            took,
+                        });
+                        done
+                    })
+                    .await;
+                if admitted.is_err() {
+                    pending_report
+                        .0
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .take();
+                }
+                if let Ok(pending) = Arc::try_unwrap(invocation)
+                    && let Some(invocation) = pending
+                        .into_inner()
+                        .unwrap_or_else(|error| error.into_inner())
+                {
+                    invocation.abandon(ctx).await;
+                }
+                return match admitted {
+                    Ok(card) => {
+                        ctx.event_tx
+                            .try_send(AgentEvent::TaskAdmitted(card.clone()));
+                        DispatchResult::ShellAdmission(finish_invocation(
+                            id,
+                            tool_id,
+                            &entry.source,
+                            ToolExecResult::from(Ok(ToolOutput::Tasks(vec![card]))),
+                            started.elapsed(),
+                        ))
+                    }
+                    Err(message) => done_error(message),
+                };
             }
         }
+
+        let result = invocation.execute(ctx).await;
+        finish_invocation(id, tool_id, &entry.source, result, started.elapsed()).into()
     } else if name == TOOL_SEARCH_TOOL_NAME && searchable(mcp, ctx) {
-        run_tool_search(mcp, id, input, ctx, emit)
+        run_tool_search(mcp, id, input, ctx, emit).into()
     } else if mcp.is_some_and(|m| m.has_tool(mcp_lookup)) {
         emit_raw_start(
             ctx,
@@ -821,11 +977,87 @@ async fn run_inner(
         if let Err(message) = ensure_revert_point(ctx, ToolEffect::Unknown).await {
             return done_error(message);
         }
-        execute_mcp_tool(ctx, &id, tool_id, mcp_lookup, input).await
+        execute_mcp_tool(ctx, &id, tool_id, mcp_lookup, input)
+            .await
+            .into()
     } else {
         let msg = format!("{UNKNOWN_TOOL_PREFIX}: {mcp_lookup}");
         warn!(tool = %mcp_lookup, "unknown tool");
         done_error(msg)
+    }
+}
+
+async fn execute_owned_shell(
+    invocation: Box<dyn ToolInvocation>,
+    ctx: &ToolContext,
+) -> ToolExecResult {
+    let refusal = if ctx.cancel.is_cancelled() {
+        Some(ERROR_CANCELLED.into())
+    } else {
+        ctx.deadline.remaining().err()
+    };
+    if let Some(message) = refusal {
+        invocation.abandon(ctx).await;
+        return ToolExecResult::from(Err(message));
+    }
+    invocation.execute(ctx).await
+}
+
+fn finish_invocation(
+    id: String,
+    tool: Arc<str>,
+    source: &ToolSource,
+    result: ToolExecResult,
+    elapsed: Duration,
+) -> ToolDoneEvent {
+    match result.output {
+        Ok(mut output) => {
+            set_lua_provenance(&mut output, source, true);
+            let written_path = result
+                .written_path
+                .or_else(|| result.written_paths.first().cloned());
+            debug!(
+                tool = %tool,
+                source = %source.as_log_field(),
+                elapsed_ms = elapsed.as_millis() as u64,
+                "tool ok"
+            );
+            ToolDoneEvent {
+                id,
+                tool,
+                output,
+                is_error: result.is_error,
+                annotation: result.annotation,
+                written_path,
+                written_paths: result.written_paths,
+                remote_written_paths: result.remote_written_paths,
+                output_ref: result.output_ref,
+                output_limits: result.output_limits,
+                model_suffix: result.model_suffix,
+                model_output: result.model_output,
+                model_output_from_ref: result.model_output_from_ref,
+                accounting: ToolAccounting::default(),
+            }
+        }
+        Err(message) => {
+            warn!(
+                tool = %tool,
+                source = %source.as_log_field(),
+                elapsed_ms = elapsed.as_millis() as u64,
+                error = %message,
+                "tool failed"
+            );
+            let mut done = ToolDoneEvent::error(id, message).with_model_suffix(result.model_suffix);
+            done.tool = tool;
+            set_lua_provenance(&mut done.output, source, true);
+            done.annotation = result.annotation;
+            done.remote_written_paths = result.remote_written_paths;
+            done.output_limits = result.output_limits;
+            done.output_ref = result.output_ref;
+            done.model_output = result.model_output;
+            done.model_output_from_ref = result.model_output_from_ref;
+            done
+        }
     }
 }
 
@@ -1258,6 +1490,7 @@ pub(super) async fn process_tool_calls(
         let mut tool_ctx = ToolContext {
             tool_use_id: Some(id.clone()),
             root_tool_use_id: ctx.root_tool_use_id.clone().or_else(|| Some(id.clone())),
+            local_root_tool_use_id: Some(id.clone()),
             steering_order: vec![index],
             ..ctx.clone()
         };
@@ -1471,6 +1704,8 @@ fn account(done: &mut ToolDoneEvent, source: &str, took: Duration) {
 }
 
 fn report(done: &ToolDoneEvent, name: &str, source: &str, input: &Value, took: Duration) {
+    #[cfg(test)]
+    tests::record_report(done);
     let tool_input = caudra_otel::logs_tool_details().then(|| input.to_string());
     caudra_otel::emit::tool_result(&caudra_otel::emit::ToolResult {
         tool_name: name,
@@ -1509,15 +1744,17 @@ async fn dispatch_mcp(
 mod tests {
     use std::collections::HashMap;
     use std::path::PathBuf;
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, LazyLock};
 
     use caudra_config::{
-        DefaultEffect, Effect, PermissionRule, PermissionsConfig, SnapshotsConfig, ToolKey,
+        DefaultEffect, Effect, ExecutionMode, PermissionRule, PermissionsConfig, SnapshotsConfig,
+        ToolKey,
     };
-    use caudra_providers::{INVALID_TOOL_JSON_KEY, InvalidToolInput};
+    use caudra_providers::{ContentBlock, INVALID_TOOL_JSON_KEY, InvalidToolInput, Message, Role};
     use caudra_storage::StateDir;
     use caudra_storage::id::SessionRef;
+    use caudra_storage::sessions::SessionDatabase;
     use caudra_storage::tool_outputs::ToolOutputStore;
     use serde_json::json;
     use tempfile::TempDir;
@@ -1526,6 +1763,7 @@ mod tests {
     use super::*;
     use crate::agent::history::History;
     use crate::agent::speculative::SpeculativeRuns;
+    use crate::background::BackgroundTasks;
     use crate::cancel::CancelToken;
     use crate::permissions::{PERMISSION_DENIED_PREFIX, PermissionManager};
     use crate::snapshots::{SnapshotLimits, SnapshotStore};
@@ -1534,7 +1772,7 @@ mod tests {
     use crate::tools::registry::{PermissionIntent, ToolSource};
     use crate::tools::test_support::{GUARDED_TOOL_NAME, GuardedMock};
     use crate::workspace_baseline::{BaselineGate, WorkspaceBaseline};
-    use crate::{AgentMode, EventSender};
+    use crate::{AgentMode, Envelope, EventSender, ShellOutput, StoredSession, TaskCard};
 
     const OBSERVED_TOOL: &str = "observed";
     const OBSERVED_ERROR: &str = "invalid JSON permission denied";
@@ -1545,6 +1783,828 @@ mod tests {
         "You have called this tool with identical input 2 times in a row. ";
     const OBSERVED_BATCH_ID: &str = "observed-batch";
     const OBSERVED_CHILDREN: usize = 2;
+    const CONTROLLED_SHELL: &str = "controlled_shell";
+    const SHELL_CALL: &str = "controlled-shell-call";
+    const SHELL_ROOT: &str = "controlled-shell-root";
+    const SHELL_COMMAND: &str = "controlled command";
+    const SHELL_RESULT: &str = "controlled terminal output";
+    const SHELL_INDETERMINATE: &str =
+        "Remote Workcell outcome is indeterminate; do not retry automatically";
+    const SHELL_RUNNING: &str = "running";
+    const SHELL_QUEUED: &str = "queued";
+    const SHELL_SUCCEEDED: &str = "succeeded";
+    const SHELL_CANCELLED: &str = "cancelled";
+    const SHELL_CANCELLING: &str = "cancelling";
+    const SHELL_FAILED: &str = "failed";
+    const SHELL_TIMED_OUT: &str = "timed_out";
+    const SHELL_CHILD_OWNER: &str = "shell-child-owner";
+    const SHELL_CHILD_TASK: &str = "shell-child-task";
+    static REPORTED_CALLS: LazyLock<Mutex<HashMap<String, Vec<LedgerOutcome>>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+
+    pub(super) fn record_report(done: &ToolDoneEvent) {
+        if let Some(outcomes) = REPORTED_CALLS.lock().unwrap().get_mut(&done.id) {
+            outcomes.push(done.accounting.outcome.unwrap());
+        }
+    }
+
+    #[derive(Clone)]
+    struct ControlledShell {
+        timeout: Option<Duration>,
+        root: PathBuf,
+        trace: Arc<ShellTrace>,
+        started: flume::Sender<bool>,
+        results: flume::Receiver<ToolExecResult>,
+    }
+
+    #[derive(Default)]
+    struct ShellTrace {
+        prepared: AtomicUsize,
+        executed: AtomicUsize,
+        abandoned: AtomicUsize,
+        display_root: Mutex<Option<String>>,
+    }
+
+    struct ControlledShellInvocation {
+        tool: ControlledShell,
+        input: Value,
+        prepared: AtomicBool,
+    }
+
+    impl Tool for ControlledShell {
+        fn name(&self) -> &str {
+            CONTROLLED_SHELL
+        }
+        fn description(&self, _: &DescriptionContext) -> Cow<'_, str> {
+            CONTROLLED_SHELL.into()
+        }
+        fn schema(&self) -> Value {
+            json!({"type":"object", "properties":{"command":{"type":"string"}}, "required":["command"]})
+        }
+        fn parse(&self, input: &Value) -> Result<Box<dyn ToolInvocation>, ParseError> {
+            Ok(Box::new(ControlledShellInvocation {
+                tool: self.clone(),
+                input: input.clone(),
+                prepared: AtomicBool::new(false),
+            }))
+        }
+    }
+
+    impl ToolInvocation for ControlledShellInvocation {
+        fn shell_timeout(&self) -> Option<Duration> {
+            self.tool.timeout
+        }
+        fn start_header(&self) -> HeaderFuture {
+            HeaderFuture::Ready(HeaderResult::plain(CONTROLLED_SHELL.into()))
+        }
+        fn permission_input(&self) -> Option<&Value> {
+            Some(&self.input)
+        }
+        fn permission_scopes(&self) -> BoxFuture<'_, Option<PermissionScopes>> {
+            Box::pin(std::future::ready(Some(PermissionScopes::single(
+                SHELL_COMMAND.into(),
+            ))))
+        }
+        fn preflight_write_keys(&self, _: &ToolContext) -> Vec<LockKey> {
+            vec![LockKey::Local(self.tool.root.join("prepared"))]
+        }
+        fn mutation_targets(&self, _: &ToolContext) -> Vec<PathBuf> {
+            vec![self.tool.root.join("written")]
+        }
+        fn preflight<'a>(
+            &'a self,
+            _: &'a ToolContext,
+        ) -> BoxFuture<'a, Result<Option<PermissionIntent>, String>> {
+            self.prepared.store(true, Ordering::SeqCst);
+            self.tool.trace.prepared.fetch_add(1, Ordering::SeqCst);
+            Box::pin(std::future::ready(Ok(None)))
+        }
+        fn abandon<'a>(&'a self, _: &'a ToolContext) -> BoxFuture<'a, ()> {
+            assert!(self.prepared.swap(false, Ordering::SeqCst));
+            self.tool.trace.abandoned.fetch_add(1, Ordering::SeqCst);
+            Box::pin(std::future::ready(()))
+        }
+        fn execute<'a>(self: Box<Self>, ctx: &'a ToolContext) -> ExecFuture<'a> {
+            Box::pin(async move {
+                assert!(self.prepared.swap(false, Ordering::SeqCst));
+                assert!(!ctx.cancel.is_cancelled());
+                self.tool.trace.executed.fetch_add(1, Ordering::SeqCst);
+                *self.tool.trace.display_root.lock().unwrap() = ctx.root_tool_use_id.clone();
+                let background = ctx.event_tx.task().is_some();
+                if background {
+                    assert!(ctx.speculative.is_none());
+                    assert!(ctx.steering_observations.is_none());
+                    assert!(ctx.steering_order.is_empty());
+                    assert!(ctx.live_sink.is_none());
+                    assert!(ctx.user_response_rx.is_none());
+                }
+                ctx.event_tx.try_send(AgentEvent::ToolAnnotation {
+                    id: SHELL_CALL.into(),
+                    annotation: SHELL_RUNNING.into(),
+                });
+                self.tool.started.send(background).unwrap();
+                match ctx.cancel.race(self.tool.results.recv_async()).await {
+                    Ok(result) => result.unwrap(),
+                    Err(error) => ToolExecResult::from(Err(error)),
+                }
+            })
+        }
+    }
+
+    struct ShellDispatchFixture {
+        root: TempDir,
+        dir: StateDir,
+        write_version: Option<i64>,
+        tasks: BackgroundTasks,
+        ctx: ToolContext,
+        trace: Arc<ShellTrace>,
+        started: flume::Receiver<bool>,
+        results: flume::Sender<ToolExecResult>,
+        events: flume::Receiver<Envelope>,
+    }
+
+    impl ShellDispatchFixture {
+        async fn new(timeout: Option<Duration>, permission: Effect) -> Self {
+            let root = TempDir::new().unwrap();
+            let dir = StateDir::from_path(root.path().join("state"));
+            let mut session = StoredSession::new(CONTROLLED_SHELL, root.path().to_str().unwrap());
+            session.save(&dir).unwrap();
+            let tasks = BackgroundTasks::spawn(dir.clone(), session.id)
+                .await
+                .unwrap();
+            let permissions = Arc::new(PermissionManager::new_nonpersistent(
+                PermissionsConfig {
+                    rules: vec![PermissionRule {
+                        tool: ToolKey::native(CONTROLLED_SHELL),
+                        scope: None,
+                        effect: permission,
+                    }],
+                    ..Default::default()
+                },
+                root.path().to_owned(),
+                Arc::default(),
+            ));
+            let mut ctx = crate::tools::test_support::stub_ctx_with_permissions(
+                &AgentMode::Build,
+                permissions,
+            );
+            let (event_tx, events) = flume::unbounded();
+            ctx.event_tx = EventSender::new(event_tx, 0);
+            ctx.jobs = Some(tasks.main_scope());
+            ctx.session_id = Some(SessionRef::from_id(session.id));
+            ctx.tool_output_store = Some(Arc::new(ToolOutputStore::new(dir.clone())));
+            ctx.root_tool_use_id = Some(SHELL_ROOT.into());
+            ctx.local_root_tool_use_id = Some(SHELL_ROOT.into());
+            ctx.registry = Arc::new(ToolRegistry::new());
+            let trace = Arc::new(ShellTrace::default());
+            let (started_tx, started) = flume::unbounded();
+            let (results, result_rx) = flume::unbounded();
+            ctx.registry
+                .register(
+                    Arc::new(ControlledShell {
+                        timeout,
+                        root: root.path().to_owned(),
+                        trace: Arc::clone(&trace),
+                        started: started_tx,
+                        results: result_rx,
+                    }),
+                    ToolSource::Native {
+                        owner: CONTROLLED_SHELL.into(),
+                        contract: CONTROLLED_SHELL.into(),
+                        trusted: true,
+                    },
+                )
+                .unwrap();
+            Self {
+                root,
+                dir,
+                write_version: session.persisted_write_version(),
+                tasks,
+                ctx,
+                trace,
+                started,
+                results,
+                events,
+            }
+        }
+
+        async fn dispatch(&self) -> ToolDoneEvent {
+            run(
+                &self.ctx.registry,
+                None,
+                SHELL_CALL.into(),
+                CONTROLLED_SHELL,
+                &json!({"command":SHELL_COMMAND}),
+                &self.ctx,
+                Emit::Notify,
+            )
+            .await
+        }
+
+        async fn settled(&self, card: &TaskCard) -> TaskCard {
+            let scope = self.ctx.job_scope().unwrap();
+            loop {
+                let revision = scope.revision();
+                let card = scope.status(&card.task_id).unwrap();
+                if ![SHELL_QUEUED, SHELL_RUNNING, SHELL_CANCELLING].contains(&card.state.as_str()) {
+                    return card;
+                }
+                scope.wait_for_change(revision).await.unwrap();
+            }
+        }
+    }
+
+    fn shell_result(exit_code: Option<i32>, signal: Option<i32>, timed_out: bool) -> ToolOutput {
+        ToolOutput::Shell(ShellOutput {
+            model_text: SHELL_RESULT.into(),
+            relative_workdir: SHELL_DEFAULT_WORKDIR.into(),
+            timeout_ms: 121_000,
+            duration_ms: 123,
+            exit_code,
+            signal,
+            timed_out,
+            output_limit_exceeded: false,
+            final_sequence: 2,
+            stdout_utf8_bytes: 12,
+            stderr_utf8_bytes: 8,
+            stdout: "shell stdout".into(),
+            stderr: "stderr!!".into(),
+            stdout_capture_truncated: true,
+            stderr_capture_truncated: false,
+            stdout_preview_truncated: false,
+            stderr_preview_truncated: true,
+            stdout_redraws_collapsed: 3,
+            stderr_redraws_collapsed: 4,
+            filter: None,
+        })
+    }
+
+    #[test_case(Some(0), None, false, SHELL_SUCCEEDED; "success")]
+    #[test_case(Some(7), None, false, SHELL_FAILED; "nonzero_exit")]
+    #[test_case(None, Some(15), false, SHELL_FAILED; "signal")]
+    #[test_case(None, Some(9), true, SHELL_TIMED_OUT; "timeout")]
+    fn shell_admission_precedes_completion_and_preserves_owned_result(
+        exit_code: Option<i32>,
+        signal: Option<i32>,
+        timed_out: bool,
+        state: &str,
+    ) {
+        smol::block_on(async {
+            let mut fixture =
+                ShellDispatchFixture::new(Some(Duration::from_secs(121)), Effect::Allow).await;
+            let (cancel, token) = CancelToken::new();
+            fixture.ctx.cancel = token;
+            fixture.ctx.steering_observations = Some(ResponseObservations::new(1));
+            fixture.ctx.steering_order = vec![0];
+            fixture.ctx.live_sink = Some(flume::unbounded().0);
+            fixture.ctx.user_response_rx =
+                Some(Arc::new(async_lock::Mutex::new(flume::unbounded().1)));
+            let done = fixture.dispatch().await;
+            assert!(!done.is_error, "{}", done.output.as_text());
+            assert!(done.accounting.outcome.is_none());
+            let ToolOutput::Tasks(cards) = done.output else {
+                panic!("expected shell admission");
+            };
+            let card = &cards[0];
+            assert_eq!(card.root_call_id, SHELL_ROOT);
+            assert_eq!(card.shell.as_ref().unwrap().command, SHELL_COMMAND);
+            assert!(fixture.started.recv_async().await.unwrap());
+            let keys = [
+                LockKey::Local(fixture.root.path().join("prepared")),
+                LockKey::Local(fixture.root.path().join("written")),
+            ];
+            for key in &keys {
+                assert!(
+                    futures_lite::future::poll_once(
+                        fixture
+                            .ctx
+                            .path_locks
+                            .acquire(std::slice::from_ref(key), &[])
+                    )
+                    .await
+                    .is_none()
+                );
+            }
+            let mut locks = Box::pin(fixture.ctx.path_locks.acquire(&keys, &[]));
+            assert!(
+                futures_lite::future::poll_once(locks.as_mut())
+                    .await
+                    .is_none()
+            );
+            cancel.cancel();
+            let output = shell_result(exit_code, signal, timed_out);
+            let expected = serde_json::to_value(&output).unwrap();
+            let mut result = ToolExecResult::from(Ok(output));
+            result.is_error = state != SHELL_SUCCEEDED;
+            fixture.results.send(result).unwrap();
+            let terminal = fixture.settled(card).await;
+            assert_eq!(terminal.state, state);
+            let _guards = locks.await;
+            let record = SessionDatabase::open(&fixture.dir)
+                .unwrap()
+                .background_tasks(fixture.tasks.session_id())
+                .unwrap()
+                .pop()
+                .unwrap();
+            assert_eq!(record.outcome.unwrap()["shell"], expected);
+            assert!(record.output_ref.is_some());
+            assert_eq!(fixture.trace.executed.load(Ordering::SeqCst), 1);
+            assert_eq!(fixture.trace.abandoned.load(Ordering::SeqCst), 0);
+            let events = fixture.events.try_iter().collect::<Vec<_>>();
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(event.event, AgentEvent::TaskAdmitted(_)))
+                    .count(),
+                1
+            );
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| matches!(event.event, AgentEvent::ToolDone(_)))
+            );
+            assert!(events.iter().any(|event| {
+                event
+                    .task
+                    .as_ref()
+                    .is_some_and(|task| task.task_id == card.task_id)
+            }));
+            fixture.tasks.shutdown().await.unwrap();
+        });
+    }
+
+    #[test_case(ExecutionMode::Auto, Some(120), true, false, false; "threshold_sync")]
+    #[test_case(ExecutionMode::Auto, Some(121), true, true, false; "above_threshold_async")]
+    #[test_case(ExecutionMode::Sync, Some(121), true, false, false; "strict_sync")]
+    #[test_case(ExecutionMode::Async, Some(1), true, true, false; "strict_async")]
+    #[test_case(ExecutionMode::Auto, Some(121), false, false, false; "auto_without_scope")]
+    #[test_case(ExecutionMode::Async, Some(121), false, false, true; "async_without_scope_refused")]
+    #[test_case(ExecutionMode::Async, None, true, false, false; "untyped_tool_stays_sync")]
+    fn shell_dispatch_uses_typed_timeout_and_effective_policy(
+        mode: ExecutionMode,
+        timeout: Option<u64>,
+        supported: bool,
+        background: bool,
+        refused: bool,
+    ) {
+        smol::block_on(async {
+            let mut fixture =
+                ShellDispatchFixture::new(timeout.map(Duration::from_secs), Effect::Allow).await;
+            fixture.ctx.config.shell_execution = mode;
+            if !supported {
+                fixture.ctx.jobs = None;
+                fixture.ctx.background = None;
+            }
+            fixture
+                .results
+                .send(ToolExecResult::from(Ok(shell_result(Some(0), None, false))))
+                .unwrap();
+            let done = fixture.dispatch().await;
+            assert_eq!(done.is_error, refused, "{}", done.output.as_text());
+            if refused {
+                assert_eq!(fixture.trace.executed.load(Ordering::SeqCst), 0);
+                assert_eq!(fixture.trace.abandoned.load(Ordering::SeqCst), 1);
+            } else {
+                assert_eq!(fixture.started.recv_async().await.unwrap(), background);
+                assert_eq!(matches!(done.output, ToolOutput::Tasks(_)), background);
+                assert_eq!(done.accounting.outcome.is_none(), background);
+            }
+            fixture.tasks.shutdown().await.unwrap();
+        });
+    }
+
+    #[test_case(false; "permission_denied")]
+    #[test_case(true; "admission_closed")]
+    fn shell_refusal_abandons_preflight_without_execution(closed: bool) {
+        smol::block_on(async {
+            let fixture = ShellDispatchFixture::new(
+                Some(Duration::from_secs(121)),
+                if closed { Effect::Allow } else { Effect::Deny },
+            )
+            .await;
+            if closed {
+                fixture.tasks.stop().await.unwrap();
+            }
+            let done = fixture.dispatch().await;
+            assert!(done.is_error);
+            assert_eq!(fixture.trace.prepared.load(Ordering::SeqCst), 1);
+            assert_eq!(fixture.trace.executed.load(Ordering::SeqCst), 0);
+            assert_eq!(fixture.trace.abandoned.load(Ordering::SeqCst), 1);
+            assert!(fixture.tasks.list().is_empty());
+            fixture.tasks.shutdown().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn shell_job_cancel_joins_the_owned_execution() {
+        smol::block_on(async {
+            let fixture =
+                ShellDispatchFixture::new(Some(Duration::from_secs(121)), Effect::Allow).await;
+            let done = fixture.dispatch().await;
+            let ToolOutput::Tasks(cards) = done.output else {
+                panic!("expected shell admission");
+            };
+            fixture.started.recv_async().await.unwrap();
+            fixture
+                .tasks
+                .main_scope()
+                .cancel(&cards[0].task_id)
+                .await
+                .unwrap();
+            assert_eq!(fixture.settled(&cards[0]).await.state, SHELL_CANCELLED);
+            assert_eq!(fixture.trace.executed.load(Ordering::SeqCst), 1);
+            fixture.tasks.shutdown().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn shell_remote_indeterminate_result_is_retained_as_a_failure() {
+        smol::block_on(async {
+            let fixture =
+                ShellDispatchFixture::new(Some(Duration::from_secs(121)), Effect::Allow).await;
+            let done = fixture.dispatch().await;
+            let ToolOutput::Tasks(cards) = done.output else {
+                panic!("expected shell admission");
+            };
+            fixture
+                .results
+                .send(ToolExecResult::from(Err(SHELL_INDETERMINATE.into())))
+                .unwrap();
+            let terminal = fixture.settled(&cards[0]).await;
+            assert_eq!(terminal.state, SHELL_FAILED);
+            let record = SessionDatabase::open(&fixture.dir)
+                .unwrap()
+                .background_tasks(fixture.tasks.session_id())
+                .unwrap()
+                .pop()
+                .unwrap();
+            assert!(
+                record.outcome.unwrap()["output"]
+                    .as_str()
+                    .unwrap()
+                    .contains(SHELL_INDETERMINATE)
+            );
+            fixture.tasks.shutdown().await.unwrap();
+        });
+    }
+
+    #[test_case(false; "already_cancelled")]
+    #[test_case(true; "deadline_elapsed")]
+    fn shell_factory_abandons_before_start_when_its_lease_is_stopped(expired: bool) {
+        smol::block_on(async {
+            let mut fixture =
+                ShellDispatchFixture::new(Some(Duration::from_secs(121)), Effect::Allow).await;
+            let invocation = fixture
+                .ctx
+                .registry
+                .get(CONTROLLED_SHELL)
+                .unwrap()
+                .tool
+                .parse(&json!({"command":SHELL_COMMAND}))
+                .unwrap();
+            invocation.preflight(&fixture.ctx).await.unwrap();
+            if expired {
+                fixture.ctx.deadline = crate::tools::Deadline::after(Duration::ZERO);
+            } else {
+                let (trigger, cancel) = CancelToken::new();
+                fixture.ctx.cancel = cancel;
+                trigger.cancel();
+            }
+            let result = execute_owned_shell(invocation, &fixture.ctx).await;
+            assert!(result.output.is_err());
+            assert_eq!(fixture.trace.executed.load(Ordering::SeqCst), 0);
+            assert_eq!(fixture.trace.abandoned.load(Ordering::SeqCst), 1);
+            fixture.tasks.shutdown().await.unwrap();
+        });
+    }
+
+    #[test_case(false; "identical_retry")]
+    #[test_case(true; "changed_retry")]
+    fn shell_retry_releases_unused_preparation_without_a_second_execution(changed: bool) {
+        smol::block_on(async {
+            let fixture =
+                ShellDispatchFixture::new(Some(Duration::from_secs(121)), Effect::Allow).await;
+            let done = fixture.dispatch().await;
+            let ToolOutput::Tasks(cards) = done.output else {
+                panic!("expected shell admission");
+            };
+            fixture
+                .results
+                .send(ToolExecResult::from(Ok(shell_result(Some(0), None, false))))
+                .unwrap();
+            fixture.settled(&cards[0]).await;
+            let command = if changed {
+                CONTROLLED_SHELL
+            } else {
+                SHELL_COMMAND
+            };
+            let retry = run(
+                &fixture.ctx.registry,
+                None,
+                SHELL_CALL.into(),
+                CONTROLLED_SHELL,
+                &json!({"command":command}),
+                &fixture.ctx,
+                Emit::Silent,
+            )
+            .await;
+            assert_eq!(retry.is_error, changed);
+            assert_eq!(fixture.trace.executed.load(Ordering::SeqCst), 1);
+            assert_eq!(fixture.trace.prepared.load(Ordering::SeqCst), 2);
+            assert_eq!(fixture.trace.abandoned.load(Ordering::SeqCst), 1);
+            assert_eq!(fixture.tasks.list().len(), 1);
+            fixture.tasks.shutdown().await.unwrap();
+        });
+    }
+
+    #[test_case(false; "refused_before_factory")]
+    #[test_case(true; "admission_save_invokes_cancelled_factory")]
+    fn shell_admission_failure_reports_only_the_returned_error(save_failure: bool) {
+        smol::block_on(async {
+            let fixture =
+                ShellDispatchFixture::new(Some(Duration::from_secs(121)), Effect::Allow).await;
+            if save_failure {
+                SessionDatabase::open(&fixture.dir)
+                    .unwrap()
+                    .delete(fixture.tasks.session_id(), fixture.write_version)
+                    .unwrap();
+            } else {
+                fixture.tasks.stop().await.unwrap();
+            }
+            let id = SessionRef::generate().to_string();
+            REPORTED_CALLS
+                .lock()
+                .unwrap()
+                .insert(id.clone(), Vec::new());
+            let done = run(
+                &fixture.ctx.registry,
+                None,
+                id.clone(),
+                CONTROLLED_SHELL,
+                &json!({"command":SHELL_COMMAND}),
+                &fixture.ctx,
+                Emit::Silent,
+            )
+            .await;
+            assert!(done.is_error);
+            assert!(fixture.tasks.list().is_empty());
+            assert_eq!(fixture.trace.executed.load(Ordering::SeqCst), 0);
+            assert_eq!(fixture.trace.abandoned.load(Ordering::SeqCst), 1);
+            fixture.tasks.shutdown().await.unwrap();
+            let reported = REPORTED_CALLS.lock().unwrap().remove(&id).unwrap();
+            assert_eq!(reported, [done.accounting.outcome.unwrap()]);
+        });
+    }
+
+    #[test]
+    fn shell_terminal_save_failure_does_not_report_the_admission_receipt() {
+        smol::block_on(async {
+            let fixture =
+                ShellDispatchFixture::new(Some(Duration::from_secs(121)), Effect::Allow).await;
+            let id = SessionRef::generate().to_string();
+            REPORTED_CALLS
+                .lock()
+                .unwrap()
+                .insert(id.clone(), Vec::new());
+            let done = run(
+                &fixture.ctx.registry,
+                None,
+                id.clone(),
+                CONTROLLED_SHELL,
+                &json!({"command":SHELL_COMMAND}),
+                &fixture.ctx,
+                Emit::Silent,
+            )
+            .await;
+            assert!(!done.is_error);
+            assert!(done.accounting.outcome.is_none());
+            fixture.started.recv_async().await.unwrap();
+            assert!(REPORTED_CALLS.lock().unwrap()[&id].is_empty());
+            SessionDatabase::open(&fixture.dir)
+                .unwrap()
+                .delete(fixture.tasks.session_id(), fixture.write_version)
+                .unwrap();
+            fixture
+                .results
+                .send(ToolExecResult::from(Ok(shell_result(Some(0), None, false))))
+                .unwrap();
+            let scope = fixture.tasks.main_scope();
+            loop {
+                let revision = scope.revision();
+                if scope.wait_for_change(revision).await.is_err() {
+                    break;
+                }
+            }
+            assert!(fixture.tasks.shutdown().await.is_err());
+            assert_eq!(
+                REPORTED_CALLS.lock().unwrap().remove(&id).unwrap(),
+                [LedgerOutcome::Ok]
+            );
+        });
+    }
+
+    #[test]
+    fn shell_running_save_failure_reports_the_cancelled_worker_once() {
+        smol::block_on(async {
+            let fixture =
+                ShellDispatchFixture::new(Some(Duration::from_secs(121)), Effect::Allow).await;
+            let (committed_tx, committed_rx) = flume::bounded(1);
+            let (resume_tx, resume_rx) = flume::bounded(1);
+            fixture
+                .tasks
+                .pause_admission_for_test(committed_tx, resume_rx);
+            let id = SessionRef::generate().to_string();
+            REPORTED_CALLS
+                .lock()
+                .unwrap()
+                .insert(id.clone(), Vec::new());
+            let input = json!({"command":SHELL_COMMAND});
+            let dispatch = run(
+                &fixture.ctx.registry,
+                None,
+                id.clone(),
+                CONTROLLED_SHELL,
+                &input,
+                &fixture.ctx,
+                Emit::Silent,
+            );
+            let fail_running_save = async {
+                committed_rx.recv_async().await.unwrap();
+                SessionDatabase::open(&fixture.dir)
+                    .unwrap()
+                    .delete(fixture.tasks.session_id(), fixture.write_version)
+                    .unwrap();
+                resume_tx.send(()).unwrap();
+            };
+            let (done, ()) = futures_lite::future::zip(dispatch, fail_running_save).await;
+            assert!(!done.is_error);
+            assert!(done.accounting.outcome.is_none());
+            let scope = fixture.tasks.main_scope();
+            loop {
+                let revision = scope.revision();
+                if scope.wait_for_change(revision).await.is_err() {
+                    break;
+                }
+            }
+            assert!(fixture.tasks.shutdown().await.is_err());
+            assert_eq!(fixture.trace.executed.load(Ordering::SeqCst), 0);
+            assert_eq!(fixture.trace.abandoned.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                REPORTED_CALLS.lock().unwrap().remove(&id).unwrap(),
+                [LedgerOutcome::Cancelled]
+            );
+        });
+    }
+
+    #[test_case(false; "execution_finishes_first")]
+    #[test_case(true; "admission_waiter_disappears_first")]
+    fn shell_terminal_report_survives_either_owner_finishing_first(waiter_first: bool) {
+        let id = SessionRef::generate().to_string();
+        REPORTED_CALLS
+            .lock()
+            .unwrap()
+            .insert(id.clone(), Vec::new());
+        let mut waiter = Some(Arc::new(PendingShellReport::default()));
+        let worker = Arc::clone(waiter.as_ref().unwrap());
+        let mut done = ToolDoneEvent::error(id.clone(), ERROR_CANCELLED);
+        account(&mut done, SOURCE_NATIVE, Duration::ZERO);
+        if waiter_first {
+            drop(waiter.take());
+        }
+        *worker.0.lock().unwrap() = Some(ShellReport {
+            done,
+            source: SOURCE_NATIVE.into(),
+            input: Value::Null,
+            took: Duration::ZERO,
+        });
+        drop(worker);
+        if !waiter_first {
+            assert!(REPORTED_CALLS.lock().unwrap()[&id].is_empty());
+        }
+        drop(waiter);
+        assert_eq!(
+            REPORTED_CALLS.lock().unwrap().remove(&id).unwrap(),
+            [LedgerOutcome::Cancelled]
+        );
+    }
+
+    #[test_case(false, false; "standalone_child_shell")]
+    #[test_case(true, false; "child_batch_shell")]
+    #[test_case(false, true; "eager_child_shell")]
+    #[test_case(true, true; "eager_child_batch_shell")]
+    fn child_shell_receipt_uses_local_history_root_without_changing_display_provenance(
+        batch: bool,
+        eager: bool,
+    ) {
+        smol::block_on(async {
+            let mut fixture =
+                ShellDispatchFixture::new(Some(Duration::from_secs(121)), Effect::Allow).await;
+            let scope = fixture.tasks.child_scope(SHELL_CHILD_OWNER);
+            fixture.ctx.jobs = Some(scope.clone());
+            fixture.ctx.tool_use_id = Some(SHELL_ROOT.into());
+            fixture
+                .ctx
+                .registry
+                .register(
+                    Arc::new(BatchTool),
+                    ToolSource::Native {
+                        owner: crate::tools::native::OWNER.into(),
+                        contract: BATCH_TOOL_NAME.into(),
+                        trusted: true,
+                    },
+                )
+                .unwrap();
+            let child = json!({"tool":CONTROLLED_SHELL,"parameters":{"command":SHELL_COMMAND}});
+            let (name, input) = if batch {
+                (BATCH_TOOL_NAME, json!({"tool_calls":[child.clone()]}))
+            } else {
+                (CONTROLLED_SHELL, child["parameters"].clone())
+            };
+            if eager {
+                let runs = Arc::new(SpeculativeRuns::new(&fixture.ctx, None));
+                runs.register(SHELL_CALL, name);
+                if batch {
+                    runs.start(SHELL_CALL, 0, &child.to_string());
+                } else {
+                    runs.ready(SHELL_CALL, name, input.clone());
+                }
+                fixture.ctx.speculative = Some(runs);
+                assert!(fixture.started.recv_async().await.unwrap());
+            }
+            let mut history = History::new(vec![Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::ToolUse {
+                    id: SHELL_CALL.into(),
+                    name: name.into(),
+                    input: input.clone(),
+                    thought_signature: None,
+                }],
+                ..Default::default()
+            }]);
+            process_tool_calls(
+                vec![(SHELL_CALL.into(), name.into(), input)],
+                &mut RecentCalls::new(),
+                None,
+                &mut history,
+                &fixture.ctx.event_tx,
+                &fixture.ctx,
+            )
+            .await
+            .unwrap();
+            if !eager {
+                assert!(fixture.started.recv_async().await.unwrap());
+            }
+            let cards = scope.list();
+            assert_eq!(cards.len(), 1);
+            assert_eq!(cards[0].root_call_id, SHELL_CALL);
+            assert_eq!(
+                fixture.trace.display_root.lock().unwrap().as_deref(),
+                Some(SHELL_ROOT)
+            );
+            let record = SessionDatabase::open(&fixture.dir)
+                .unwrap()
+                .background_tasks(fixture.tasks.session_id())
+                .unwrap()
+                .pop()
+                .unwrap();
+            assert!(!record.receipt_accepted);
+            scope
+                .checkpoint(SHELL_CHILD_TASK, history.as_slice())
+                .await
+                .unwrap();
+            let record = SessionDatabase::open(&fixture.dir)
+                .unwrap()
+                .background_tasks(fixture.tasks.session_id())
+                .unwrap()
+                .pop()
+                .unwrap();
+            assert!(record.receipt_accepted);
+            fixture
+                .results
+                .send(ToolExecResult::from(Ok(shell_result(Some(0), None, false))))
+                .unwrap();
+            assert_eq!(fixture.settled(&cards[0]).await.state, SHELL_SUCCEEDED);
+            let terminal = scope.claim_messages().unwrap();
+            assert_eq!(
+                terminal
+                    .iter()
+                    .filter(|message| message.task_event.is_some())
+                    .count(),
+                1
+            );
+            for message in &terminal {
+                history.push(message.clone());
+            }
+            scope
+                .checkpoint(SHELL_CHILD_TASK, history.as_slice())
+                .await
+                .unwrap();
+            scope.accept_messages(&terminal).await.unwrap();
+            assert!(!scope.pending());
+            scope.wait().await.unwrap();
+            fixture.tasks.shutdown().await.unwrap();
+        });
+    }
 
     #[test_case(false; "valid_children")]
     #[test_case(true; "repaired_fallback_children")]

@@ -759,14 +759,16 @@ mod background_runtime {
     use std::time::Duration;
 
     use arc_swap::ArcSwap;
+    use caudra_agent::background::ShellJobMetadata;
     use caudra_agent::prompt::profile::PromptProfileCatalog;
     use caudra_agent::tools::native::task::configure_background;
     use caudra_agent::tools::{ToolRegistry, native};
     use caudra_agent::types::BACKGROUND_EVENT_RUN_ID;
     use caudra_agent::{
-        AgentConfig, AgentEvent, Envelope, McpConfigErrors, SubagentHistoryStore, SubagentInfo,
-        TaskProvenance,
+        AgentConfig, AgentEvent, DoneReason, Envelope, McpConfigErrors, SubagentHistoryStore,
+        SubagentInfo, TaskProvenance,
     };
+    use caudra_agent::{BatchToolStatus, SubagentActivity, ToolDoneEvent, ToolOutput};
     use caudra_config::ModelPolicy;
     use caudra_lua::EventHandle;
     use caudra_providers::provider::{BoxFuture, Provider};
@@ -797,6 +799,11 @@ mod background_runtime {
     const TASK: &str = "background-audit";
     const REPORT_CALL: &str = "audit-report";
     const REPORT: &str = "The audit found a missing input validation check.";
+    const SHELL_CALL: &str = "owned-shell";
+    const SHELL_COMMAND: &str = "printf shell-output";
+    const SHELL_PROGRESS: &str = "shell-owner-progress";
+    const STALE_SHELL_PROGRESS: &str = "stale-shell-progress";
+    const SHELL_TIMEOUT_MS: u64 = 120_000;
     const FINAL: &str = "Implementation is ready; the audit is still running.";
     const SUMMARY: &str = "The audit was delegated and was last observed running.";
     const EMPTY_BACKGROUND: &str = "No active background work";
@@ -1586,6 +1593,154 @@ mod background_runtime {
             fixture.app.flush_task_controls().await;
             assert_eq!(background.status(&id).unwrap().state, before);
             fixture.close().await;
+        }));
+    }
+
+    #[test_case(false, false; "main_shell")]
+    #[test_case(false, true; "main_batched_shell")]
+    #[test_case(true, false; "child_shell")]
+    #[test_case(true, true; "child_batched_shell")]
+    fn shell_jobs_route_after_receipt_without_creating_chats(child: bool, batch: bool) {
+        smol::block_on(bounded(async {
+            let mut fixture = Fixture::after_final().await;
+            let runtime = fixture.handles.background.as_ref().unwrap().clone();
+            let owner = runtime.list().remove(0);
+            let scope = if child {
+                runtime.child_scope(&owner.invocation_id)
+            } else {
+                runtime.main_scope()
+            };
+            let call_id = if batch {
+                format!("{SHELL_CALL}:0")
+            } else {
+                SHELL_CALL.into()
+            };
+            let card = scope
+                .admit_shell(
+                    ShellJobMetadata {
+                        call_id: call_id.clone(),
+                        root_call_id: SHELL_CALL.into(),
+                        command: SHELL_COMMAND.into(),
+                        workdir: ".".into(),
+                        timeout_ms: SHELL_TIMEOUT_MS,
+                        mode: "build".into(),
+                    },
+                    |cancel, _| async move {
+                        cancel.cancelled().await;
+                        ToolDoneEvent::error(SHELL_CALL.into(), SHELL_PROGRESS)
+                    },
+                )
+                .await
+                .unwrap();
+            let index = if child {
+                fixture
+                    .app
+                    .chats
+                    .iter()
+                    .position(|chat| {
+                        chat.task_id()
+                            .is_some_and(|id| id.as_ref() == owner.task_id)
+                    })
+                    .unwrap()
+            } else {
+                0
+            };
+            let chats = fixture.app.chats.len();
+            let start = if batch {
+                super::batch_roster(SHELL_CALL, 1)
+            } else {
+                super::tool_start(SHELL_CALL, "shell")
+            };
+            let mut output = ToolOutput::Tasks(vec![card.clone()]);
+            if let AgentEvent::ToolStart(start) = &start
+                && let Some(ToolOutput::Batch { entries, .. }) = &start.output
+            {
+                let mut entries = entries.clone();
+                entries[0].tool = "shell".into();
+                entries[0].status = BatchToolStatus::Success;
+                entries[0].output = Some(output);
+                output = ToolOutput::Batch {
+                    entries,
+                    text: String::new(),
+                };
+            }
+            fixture.app.chats[index].handle_event(start, None);
+            let provenance = Arc::new(TaskProvenance {
+                session_id: runtime.session_id(),
+                task_id: card.task_id.clone(),
+                invocation_id: card.invocation_id.clone(),
+            });
+            let owner_info =
+                child.then(|| fixture.envelope(AgentEvent::AuthRequired).subagent.unwrap());
+            let envelope = |event| {
+                Msg::Agent(Box::new(Envelope {
+                    event,
+                    subagent: owner_info.clone(),
+                    run_id: BACKGROUND_EVENT_RUN_ID,
+                    workflow: None,
+                    task: Some(Arc::clone(&provenance)),
+                }))
+            };
+            fixture
+                .app
+                .update(envelope(AgentEvent::TaskAdmitted(card.clone())));
+            let mut done = ToolDoneEvent::error(SHELL_CALL.into(), SHELL_PROGRESS);
+            done.is_error = false;
+            done.output = output;
+            fixture.app.chats[index].handle_event(AgentEvent::ToolDone(Box::new(done)), None);
+            fixture.app.run_id += 1;
+            fixture.app.update(envelope(super::progress_event(
+                SubagentActivity::tool(Arc::from("shell"), SHELL_PROGRESS),
+                1,
+            )));
+            fixture.app.active_chat = index;
+            assert!(super::rendered(&mut fixture.app).contains(SHELL_PROGRESS));
+            let mut stale = provenance.as_ref().clone();
+            stale.invocation_id.push_str("-stale");
+            fixture.app.update(Msg::Agent(Box::new(Envelope {
+                event: super::progress_event(
+                    SubagentActivity::tool(Arc::from("shell"), STALE_SHELL_PROGRESS),
+                    2,
+                ),
+                subagent: owner_info.clone(),
+                run_id: BACKGROUND_EVENT_RUN_ID,
+                workflow: None,
+                task: Some(Arc::new(stale)),
+            })));
+            assert!(!super::rendered(&mut fixture.app).contains(STALE_SHELL_PROGRESS));
+            let turns = fixture.app.state.turns;
+            fixture.app.update(envelope(AgentEvent::Done {
+                usage: Default::default(),
+                num_turns: 0,
+                reason: DoneReason::EndTurn,
+            }));
+            assert_eq!(fixture.app.state.turns, turns);
+            assert_eq!(fixture.app.chats.len(), chats);
+            assert!(
+                fixture
+                    .app
+                    .tasks()
+                    .iter()
+                    .any(|task| task.id.as_ref() == card.task_id)
+            );
+            fixture
+                .app
+                .execute_task_control(&format!("status {}", card.task_id));
+            fixture.app.update(Msg::Key(key(KeyCode::Enter)));
+            assert!(fixture.app.task_picker.is_open());
+            assert_eq!(fixture.app.active_chat, index);
+            assert_eq!(fixture.app.chats.len(), chats);
+            assert_eq!(fixture.app.status, Status::Idle);
+            fixture
+                .app
+                .execute_task_control(&format!("cancel {}", card.task_id));
+            fixture.app.flush_task_controls().await;
+            assert!(matches!(
+                runtime.status(&card.task_id).unwrap().state.as_str(),
+                "cancelling" | "cancelled"
+            ));
+            fixture.close().await;
+            assert!(!runtime.status(&card.task_id).unwrap().active());
         }));
     }
 

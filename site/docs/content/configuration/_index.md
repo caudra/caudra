@@ -153,6 +153,9 @@ The `bash`, `python_execution`, and `task` entries apply only when `ui.scroll_ca
 | `post_compaction_instructions` | String | `none` | - | Extra instructions the agent receives after any compaction (e.g. re-read plan.md) |
 | `compaction_requirements` | bool | `true` | - | Append a `# User requirements` section to every compaction summary: what the user asked for, constrained, and decided, read from their own messages and answered questions across every earlier compaction, and extracted by the Extract model so the conversation model never sees the request |
 | `background_reminder_turns` | u32 | `0` | - | Committed main-agent response groups between unchanged active background-work reminders; 0 disables periodic refresh only, not state-change or post-compaction reminders |
+| `task_execution` | string | `auto` | - | Task delivery: sync waits for the completed result, auto lets the model choose, async returns an admission receipt |
+| `shell_execution` | string | `auto` | - | Shell delivery: sync waits for termination, auto routes by requested timeout, async returns an admission receipt |
+| `shell_async_threshold_secs` | u64 | `120` | 1 | Requested shell timeout above which auto delivery returns an admission receipt; independent of the enforced execution deadline |
 | `generate_titles` | bool | `true` | - | Name a new session by summarizing its first prompt with the Title model |
 | `stale_read_check` | bool | `true` | - | Block a write to a file that changed on disk since it was read, and point a failed edit or patch at the change |
 | `tool_json_repair` | bool | `true` | - | Repair malformed tool JSON syntax locally, with one bounded isolated model fallback; independent of eager dispatch |

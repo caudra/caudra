@@ -9,6 +9,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, RwLock, RwLockReadGuard};
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use bitflags::bitflags;
@@ -418,6 +419,9 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 /// knows which authorities and files it will touch.
 pub trait ToolInvocation: Send + Sync {
     fn start_header(&self) -> HeaderFuture;
+    fn shell_timeout(&self) -> Option<Duration> {
+        None
+    }
     fn start_annotation(&self) -> Option<String> {
         None
     }

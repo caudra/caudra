@@ -17,7 +17,7 @@ use caudra_agent::prompt::profile::{
 };
 use caudra_agent::template;
 use caudra_agent::template::Vars;
-use caudra_agent::tools::native::task::configure_background;
+use caudra_agent::tools::execution::{configure_tools, execution_slots};
 use caudra_agent::tools::{
     BuiltinDeferral, DeferralSession, DeferredTool, DescriptionContext, FileReadTracker, PathLocks,
     ToolAudience, ToolDefinitions, ToolFilter, ToolRegistry, deferral,
@@ -37,6 +37,7 @@ use caudra_providers::{
 };
 use caudra_storage::id::SessionRef;
 use caudra_storage::local_documents::LocalDocumentStore;
+use caudra_storage::tool_outputs::ToolOutputStore;
 use caudra_workspace::WorkspaceSession;
 use serde_json::Value;
 use tracing::error;
@@ -51,6 +52,7 @@ pub(super) struct AgentLoop {
     effective_model_slot: Arc<ArcSwap<ModelSlot>>,
     config: AgentConfig,
     tool_output_lines: ToolOutputLines,
+    tool_output_store: Option<Arc<ToolOutputStore>>,
     vars: Vars,
     instructions: InstructionBaseline,
     tools: Value,
@@ -108,6 +110,7 @@ impl AgentLoop {
         effective_model_slot: Arc<ArcSwap<ModelSlot>>,
         config: AgentConfig,
         tool_output_lines: ToolOutputLines,
+        tool_output_store: Option<Arc<ToolOutputStore>>,
         initial_history: Vec<HistoryItem>,
         archived_history: Vec<HistoryItem>,
         shared_history: SharedHistory,
@@ -166,6 +169,7 @@ impl AgentLoop {
             effective_model_slot,
             config,
             tool_output_lines,
+            tool_output_store,
             vars: Vars::default(),
             instructions: InstructionBaseline::default(),
             tools: Value::Null,
@@ -432,6 +436,7 @@ impl AgentLoop {
             extractor.as_ref(),
             BackgroundReminderContext {
                 background: self.background.as_ref(),
+                jobs: None,
                 workflow: self.workflow.as_ref(),
             },
         )
@@ -583,6 +588,7 @@ impl AgentLoop {
                 chat_model: selected_slot.model.clone(),
                 config: self.config.clone(),
                 tool_output_lines: self.tool_output_lines,
+                tool_output_store: self.tool_output_store.clone(),
                 permissions: Arc::clone(&self.permissions),
                 session_id: self.session_id.clone(),
                 cache_key: self.session_id.as_ref().map(CacheKey::session),
@@ -615,6 +621,8 @@ impl AgentLoop {
                 model_policy: Arc::clone(&self.model_policy),
                 workflow: self.workflow.clone(),
                 background: self.background.clone(),
+                jobs: None,
+                task_id: None,
             },
             AgentRunParams {
                 history: &mut self.history,
@@ -705,7 +713,13 @@ impl AgentLoop {
                 BuiltinDeferral::resolve(&self.config, model),
             ),
         );
-        configure_background(&mut definitions.declared, self.background.is_some());
+        configure_tools(
+            &mut definitions.declared,
+            &mut definitions.deferred,
+            &self.config,
+            self.background.is_some(),
+            self.background.is_some(),
+        );
         definitions
     }
 
@@ -815,11 +829,19 @@ impl AgentLoop {
         prompt_slots: &caudra_agent::prompt::ResolvedSlots,
         tool_filter: &ToolFilter,
     ) -> String {
+        let prompt_slots = execution_slots(
+            prompt_slots,
+            &self.config,
+            self.background.is_some(),
+            self.background.is_some(),
+            &self.tools,
+            &self.deferred,
+        );
         self.local_documents.as_ref().map_or_else(
             || {
                 agent::build_system_prompt(
                     self.instructions.text(),
-                    prompt_slots,
+                    &prompt_slots,
                     tool_filter,
                     self.system_prompt_profile.as_deref(),
                 )
@@ -827,7 +849,7 @@ impl AgentLoop {
             |store| {
                 agent::build_system_prompt_for_remote(
                     self.instructions.text(),
-                    prompt_slots,
+                    &prompt_slots,
                     tool_filter,
                     self.system_prompt_profile.as_deref(),
                     store,

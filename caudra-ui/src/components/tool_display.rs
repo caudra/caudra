@@ -3,8 +3,10 @@ use super::{DisplayMessage, ToolProgress, ToolStatus, escape_terminal_controls, 
 use super::code_view;
 use super::status_bar::collapse_home;
 use crate::animation::{spinner_frame, spinner_str};
+use crate::chat::batch_child_id;
 use crate::theme;
 use caudra_config::{ClockFormat, ToolOutputLines};
+use caudra_storage::background::JobKind;
 use code_view::{
     BatchLiveMap, BatchProgressMap, BatchStartedMap, BatchViewMap, BatchViews, BodySource,
     CardPolicy, Disclosure, RenderLimits, RowTarget, ScrollSpan, ScrollWindow, SourceTrace,
@@ -55,7 +57,18 @@ pub(crate) fn task_details(task: &TaskCard) -> String {
         }
         let output = result.get("output").unwrap_or(result);
         if !output.is_null() && output.as_str() != Some("") {
-            lines.push(readable_task_value(output));
+            let shell = (task.kind == JobKind::Shell)
+                .then(|| {
+                    result
+                        .get("shell")
+                        .and_then(|value| serde_json::from_value::<ToolOutput>(value.clone()).ok())
+                })
+                .flatten();
+            lines.push(match shell {
+                Some(ToolOutput::Shell(shell)) if shell.filter.is_some() => shell.model_text,
+                Some(ToolOutput::Shell(shell)) => shell.raw_text(),
+                _ => readable_task_value(output),
+            });
         }
     } else if let Some(preview) = &task.result_preview {
         lines.push(format!(
@@ -69,15 +82,25 @@ pub(crate) fn task_details(task: &TaskCard) -> String {
     {
         lines.push(format!("Full outcome: tool_output {}", reference.id));
     } else if task.result_truncated || task.reports_truncated {
-        lines.push("Open task chat for complete output.".into());
+        lines.push(
+            if task.kind == JobKind::Shell {
+                "Output preview is truncated."
+            } else {
+                "Open task chat for complete output."
+            }
+            .into(),
+        );
     }
-    lines.join("\n")
+    lines.join("\n\n")
 }
 
 fn readable_task_value(value: &Value) -> String {
     match value {
         Value::String(text) => text.clone(),
-        _ => serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string()),
+        _ => {
+            let json = serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string());
+            format!("```json\n{json}\n```")
+        }
     }
 }
 
@@ -107,7 +130,7 @@ fn readable_task_preview(preview: &str) -> String {
             end = preview.floor_char_boundary(end - 1);
         }
     }
-    preview.to_owned()
+    format!("```json\n{preview}\n```")
 }
 
 #[derive(Clone)]
@@ -1761,6 +1784,9 @@ impl ToolLineBuilder {
         if let Some(text) = output.and_then(|o| o.structured_display_text()) {
             self.push_search_text(&text);
         }
+        if let Some(ToolOutput::Batch { text, .. }) = output {
+            self.push_search_text(text);
+        }
     }
 
     fn push_rendered_code(&mut self, input: Option<&ToolInput>, output: Option<&ToolOutput>) {
@@ -1771,8 +1797,10 @@ impl ToolLineBuilder {
             Some(source) => self.source.record(start, source.indented()),
             None => self.source.abandon(),
         }
-        for mut line in content.lines {
+        for (mut line, mut links) in content.lines.into_iter().zip(content.links.rows) {
             line.spans.insert(0, Span::raw(TOOL_BODY_INDENT));
+            links.insert(0, None);
+            self.link_rows.push((self.lines.len(), links));
             self.lines.push(line);
         }
         self.content_range = (start, self.lines.len());
@@ -2322,10 +2350,17 @@ pub fn build_tool_lines(
     rctx: &RenderCtx,
     expansion: Option<Disclosure>,
 ) -> ToolLines {
-    let projected = rctx
-        .task_cards
-        .and_then(|cards| {
-            project_task_output(msg.role.tool_id()?, msg.tool_output.as_deref(), cards)
+    let projected = msg
+        .role
+        .tool_id()
+        .and_then(|call_id| {
+            project_task_output(
+                call_id,
+                msg.tool_output.as_deref(),
+                rctx.task_cards,
+                msg.live_output.as_deref(),
+                rctx.batch_live,
+            )
         })
         .map(|output| {
             let mut projected = msg.clone();
@@ -2532,12 +2567,14 @@ pub fn build_tool_lines(
 fn project_task_output(
     call_id: &str,
     output: Option<&ToolOutput>,
-    cards: &HashMap<String, TaskCard>,
+    cards: Option<&HashMap<String, TaskCard>>,
+    live: Option<&str>,
+    batch_live: &BatchLiveMap,
 ) -> Option<ToolOutput> {
     if let Some(ToolOutput::Tasks(tasks)) = output {
         let mut projected = None;
         for (index, task) in tasks.iter().enumerate() {
-            if let Some(card) = cards.get(&task.call_id)
+            if let Some(card) = cards.and_then(|cards| cards.get(&task.call_id))
                 && card.invocation_id == task.invocation_id
                 && card != task
             {
@@ -2546,21 +2583,46 @@ fn project_task_output(
                 task.background = card.background;
                 task.updated_at = card.updated_at;
             }
+            let current = projected.as_ref().map_or(task, |tasks| &tasks[index]);
+            let live = if task.call_id == call_id {
+                live
+            } else {
+                batch_child_id(&task.call_id)
+                    .and_then(|(parent, index)| batch_live.get(parent)?.get(&index))
+                    .map(String::as_str)
+            };
+            if current.kind == JobKind::Shell
+                && current.active()
+                && let Some(live) = live
+            {
+                let task = &mut projected.get_or_insert_with(|| tasks.clone())[index];
+                task.result = Some(serde_json::json!({"output": live}));
+                task.result_preview = None;
+            }
         }
         return projected.map(ToolOutput::Tasks);
     }
-    if let Some(card) = cards.get(call_id) {
+    if let Some(card) = cards.and_then(|cards| cards.get(call_id)) {
         if !card.background && !card.active() {
             return None;
         }
-        return Some(ToolOutput::Tasks(vec![card.clone()]));
+        let output = ToolOutput::Tasks(vec![card.clone()]);
+        return project_task_output(call_id, Some(&output), None, live, batch_live)
+            .or(Some(output));
     }
     if let Some(ToolOutput::Batch { entries, text }) = output {
         let mut projected = None;
         for (index, entry) in entries.iter().enumerate() {
-            if let Some(output) =
-                project_task_output(&format!("{call_id}:{index}"), entry.output.as_ref(), cards)
-            {
+            if let Some(output) = project_task_output(
+                &format!("{call_id}:{index}"),
+                entry.output.as_ref(),
+                cards,
+                batch_live
+                    .get(call_id)
+                    .and_then(|children| children.get(&index))
+                    .map(String::as_str),
+                batch_live,
+            ) {
                 let entries = projected.get_or_insert_with(|| entries.clone());
                 entries[index].output = Some(output);
             }
@@ -3704,6 +3766,53 @@ mod tests {
         assert!(text.contains("code"));
     }
 
+    #[test_case("{\"output\": {\"note\": \"**literal**\"}}"; "complete")]
+    #[test_case("{\"output\": {\"note\": \"**literal**"; "truncated")]
+    fn structured_task_previews_remain_json(preview: &str) {
+        const LITERAL: &str = "**literal**";
+        let markdown = readable_task_preview(preview);
+        assert!(markdown.starts_with("```json\n"));
+        let (lines, _) = task_card::markdown_body(&markdown, 80);
+        let text = lines
+            .iter()
+            .map(Line::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains(LITERAL));
+        assert!(!text.contains("```"));
+    }
+
+    #[test_case(false; "literal_stdout_and_stderr")]
+    #[test_case(true; "filtered_literal_output")]
+    fn shell_task_details_use_typed_shell_projection(filtered: bool) {
+        const RAW: &str = "**literal stdout**";
+        const FILTERED: &str = "`literal filtered output`";
+        let ToolOutput::Shell(mut shell) = shell_output(filtered) else {
+            unreachable!()
+        };
+        shell.stdout = RAW.into();
+        shell.model_text = FILTERED.into();
+        let expected = if filtered {
+            shell.model_text.clone()
+        } else {
+            shell.raw_text()
+        };
+        let card: TaskCard = serde_json::from_value(serde_json::json!({
+            "kind": "shell", "task_id": "shell-task", "invocation_id": "invocation",
+            "call_id": "shell-call", "root_call_id": "shell-call", "label": "Print", "state": "succeeded",
+            "mode": "build", "background": true, "generation": 1, "created_at": 1, "updated_at": 2,
+            "result": {"output": "model output", "shell": ToolOutput::Shell(shell)},
+        })).unwrap();
+        assert_eq!(task_details(&card), expected);
+        let (lines, _) = task_card::details(&card, UNBROKEN);
+        let rendered = lines
+            .iter()
+            .map(Line::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains(if filtered { FILTERED } else { RAW }));
+    }
+
     #[test]
     fn markdown_tool_output_retains_link_targets() {
         let msg = task_msg("[docs](https://example.com)".into());
@@ -3732,6 +3841,106 @@ mod tests {
                 .as_deref(),
             Some("https://example.com")
         );
+    }
+
+    #[test_case(false, false; "foreground")]
+    #[test_case(false, true; "restored_foreground")]
+    #[test_case(true, false; "batch")]
+    #[test_case(true, true; "restored_batch")]
+    fn typed_task_markdown_keeps_links_and_row_targets(batched: bool, restored: bool) {
+        const LINK: &str = "https://example.com/task";
+        const BODY: &str = "**Finding**: [documentation](https://example.com/task)\n\n- checked";
+        let task: TaskCard = serde_json::from_value(serde_json::json!({
+            "task_id": "readable-task", "invocation_id": "invocation", "call_id": "call",
+            "root_call_id": "call", "label": "Inspect", "state": "succeeded", "mode": "build",
+            "background": false, "generation": 1, "created_at": 1, "updated_at": 2,
+            "result": {"output": BODY}
+        }))
+        .unwrap();
+        let output = ToolOutput::Tasks(vec![task]);
+        let output = if batched {
+            ToolOutput::Batch {
+                entries: vec![BatchToolEntry {
+                    tool: TASK_TOOL_NAME.into(),
+                    effect: ToolEffect::Unknown,
+                    summary: String::new(),
+                    status: BatchToolStatus::Success,
+                    input: None,
+                    raw_input: None,
+                    output: Some(output),
+                    annotation: None,
+                    model_suffix: None,
+                }],
+                text: BODY.into(),
+            }
+        } else {
+            output
+        };
+        let output = if restored {
+            serde_json::from_value(serde_json::to_value(output).unwrap()).unwrap()
+        } else {
+            output
+        };
+        let mut msg = task_msg(String::new());
+        msg.tool_output = Some(Arc::new(output));
+        let views = HashMap::from([("t1".into(), BatchViews::new([0]))]);
+        let ctx = RenderCtx {
+            batch_views: &views,
+            ..test_rctx(48)
+        };
+        let tl = build_tool_lines(
+            &msg,
+            ToolStatus::Success,
+            &ctx,
+            Some(Disclosure {
+                full: true,
+                ..Default::default()
+            }),
+        );
+        assert!(!lines_text(&tl).contains("**Finding**"));
+        assert!(tl.search_text.contains("Finding"));
+        assert!(tl.links.is_aligned(&tl.lines));
+        let (row, span) = tl
+            .links
+            .rows
+            .iter()
+            .enumerate()
+            .find_map(|(row, links)| {
+                links
+                    .iter()
+                    .position(|link| link.as_deref() == Some(LINK))
+                    .map(|span| (row, span))
+            })
+            .unwrap();
+        let column = tl.lines[row].spans[..span]
+            .iter()
+            .map(Span::width)
+            .sum::<usize>() as u16;
+        assert_eq!(
+            tl.links
+                .target_at(&tl.lines, 48, row as u16, column)
+                .as_deref(),
+            Some(LINK)
+        );
+        assert!(tl.rows[row].is_some());
+        assert!(tl.lines.iter().all(|line| line.width() <= 48));
+        if let Some(request) = &tl.highlight {
+            let content = code_view::render_tool_content(
+                request.input.as_deref(),
+                request.output.as_deref(),
+                true,
+                request.limits.clone(),
+            );
+            assert!(content.links.is_aligned(&content.lines));
+            assert!(
+                content
+                    .links
+                    .rows
+                    .iter()
+                    .flatten()
+                    .any(|link| link.as_deref() == Some(LINK))
+            );
+        }
     }
 
     fn task_msg(output: String) -> DisplayMessage {

@@ -6,7 +6,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::highlight::{fallback_span, highlight_line};
-use crate::markdown::{expand_notice, should_truncate, text_to_wrapped, truncation_notice};
+use crate::markdown::{
+    LinkMap, expand_notice, should_truncate, text_to_wrapped, truncation_notice,
+};
 use crate::provenance::LineProvenance;
 use crate::selection::wrap_breaks;
 use crate::theme;
@@ -1002,6 +1004,7 @@ fn render_batch(entries: &[BatchToolEntry], highlight: bool, limits: &RenderLimi
     let t = theme::current();
     let mut lines = Vec::new();
     let mut rows = Vec::new();
+    let mut links = LinkMap::default();
     let mut spans_out = Vec::new();
     let mut trace = SourceTrace::default();
     let mut previous_has_body = false;
@@ -1133,6 +1136,7 @@ fn render_batch(entries: &[BatchToolEntry], highlight: bool, limits: &RenderLimi
                 }
             }
             let history_start = combined.lines.len();
+            combined.links.rows.extend(LinkMap::none_for(&history).rows);
             combined.lines.extend(history);
             combined.rows.resize(combined.lines.len(), None);
             combined = child_view(
@@ -1165,10 +1169,18 @@ fn render_batch(entries: &[BatchToolEntry], highlight: bool, limits: &RenderLimi
                 Some(source) => trace.record(lines.len(), source),
                 None => trace.abandon(),
             }
+            links
+                .rows
+                .extend(LinkMap::none_for(&lines[links.rows.len()..]).rows);
+            links.rows.extend(body.links.rows);
             lines.extend(body.lines);
         }
     }
+    links
+        .rows
+        .extend(LinkMap::none_for(&lines[links.rows.len()..]).rows);
     BatchCard {
+        links,
         source: trace.finish(&lines),
         lines,
         rows,
@@ -1223,6 +1235,7 @@ fn heading_rows(broken: &[Vec<SpanPiece>], heading: BodySource) -> BodySource {
 /// to be readable through: a click resolves a row to the child that owns it,
 /// and a selection resolves it to the text that child answered with.
 struct BatchCard {
+    links: LinkMap,
     lines: Vec<Line<'static>>,
     rows: Vec<Option<RowTarget>>,
     spans: Vec<ScrollSpan>,
@@ -1315,6 +1328,15 @@ fn child_body(
     live: Option<&String>,
 ) -> ChildBody {
     let output = entry.output.as_ref();
+    if entry.status != BatchToolStatus::Error
+        && let Some(ToolOutput::Markdown(text)) = output
+    {
+        let (lines, source, links) = markdown_body(&text.text, limits.width);
+        let mut body = ChildBody::traced(lines, source);
+        body.links = links;
+        let body = child_view(body, limits.scroll, limits.budget, ScrollTail::Settled, "");
+        return with_script(entry, highlight, limits, body);
+    }
     // Every answer that is text goes through one place, so no arm can be the
     // one that forgets the script. `render_tool_content` draws the script
     // itself, which is why structured output is the exception here rather than
@@ -1330,7 +1352,6 @@ fn child_body(
         Some(plain_body(tail, limits.width))
     } else {
         match output {
-            Some(ToolOutput::Markdown(text)) => Some(markdown_body(&text.text, limits.width)),
             Some(ToolOutput::Plain(text) | ToolOutput::ReadDir(text)) => {
                 Some(plain_body(&text.text, limits.width))
             }
@@ -1359,6 +1380,7 @@ fn child_body(
             let content =
                 render_tool_content(entry.input.as_ref(), output, highlight, limits.clone());
             ChildBody {
+                links: content.links,
                 lines: content.lines,
                 rows: content.rows,
                 source: content.source,
@@ -1375,6 +1397,7 @@ fn child_body(
 /// change the line count between here and the card: a row one of them left
 /// behind points a copy at text that was never drawn.
 struct ChildBody {
+    links: LinkMap,
     lines: Vec<Line<'static>>,
     rows: Vec<Option<RowTarget>>,
     /// `None` where a renderer in the body named no source at all, which hands
@@ -1387,6 +1410,7 @@ struct ChildBody {
 impl ChildBody {
     fn traced(lines: Vec<Line<'static>>, source: BodySource) -> Self {
         Self {
+            links: LinkMap::none_for(&lines),
             rows: vec![None; lines.len()],
             lines,
             source: Some(source),
@@ -1396,11 +1420,20 @@ impl ChildBody {
     }
 
     fn keep_rows(&mut self, kept: Range<usize>) {
+        self.links.rows = self
+            .links
+            .rows
+            .get(kept.clone())
+            .unwrap_or_default()
+            .to_vec();
         self.rows = self.rows.get(kept.clone()).unwrap_or_default().to_vec();
         self.source = self.source.take().and_then(|source| source.keep_rows(kept));
     }
 
     fn indented(mut self, continuation: &str) -> Self {
+        for row in &mut self.links.rows {
+            row.insert(0, None);
+        }
         self.lines = indent_all(self.lines, continuation);
         self.source = self.source.map(BodySource::indented);
         self
@@ -1409,6 +1442,7 @@ impl ChildBody {
     /// Marks a line the body was closed with, which is chrome wherever it came
     /// from: a scroll footer or a truncation notice.
     fn push_chrome(&mut self) {
+        self.links.rows.push(vec![None]);
         self.rows.push(None);
         if let Some(source) = self.source.as_mut() {
             source.push_chrome(1);
@@ -1471,6 +1505,11 @@ fn with_script(
         lines.push(Line::default());
     }
     let shift = lines.len();
+    let mut links = script.links;
+    links
+        .rows
+        .extend(LinkMap::none_for(&lines[links.rows.len()..]).rows);
+    links.rows.extend(body.links.rows);
     let mut rows = script.rows;
     rows.resize(shift, None);
     rows.extend(body.rows);
@@ -1486,6 +1525,7 @@ fn with_script(
     }
     ChildBody {
         source: trace.finish(&lines),
+        links,
         lines,
         rows,
         truncation: body.truncation,
@@ -1571,7 +1611,7 @@ fn capped(mut lines: Vec<Line<'static>>, budget: usize) -> (Vec<Line<'static>>, 
 /// Breaking a paragraph here does not put a newline on the clipboard: the rows
 /// of one source line all name that line, so copy reads it back as it was
 /// written rather than as it was drawn.
-fn markdown_body(text: &str, width: u16) -> (Vec<Line<'static>>, BodySource) {
+fn markdown_body(text: &str, width: u16) -> (Vec<Line<'static>>, BodySource, LinkMap) {
     let (painted, parsed) = text_to_wrapped(
         text,
         theme::current().assistant,
@@ -1585,6 +1625,7 @@ fn markdown_body(text: &str, width: u16) -> (Vec<Line<'static>>, BodySource) {
             rows: painted.provenance,
             code: Vec::new(),
         },
+        painted.links,
     )
 }
 
@@ -3034,6 +3075,7 @@ impl RowTarget {
 }
 
 pub struct ToolContent {
+    pub(crate) links: LinkMap,
     pub lines: Vec<Line<'static>>,
     /// Parallel to `lines`. Both render paths build it the same way, so the
     /// highlighted lines carry the same rows as the ones they replace.
@@ -3100,6 +3142,7 @@ pub fn render_tool_content(
     let mut output_spans: Vec<ScrollSpan> = Vec::new();
     let mut trace = SourceTrace::default();
     let mut output_source: Option<BodySource> = None;
+    let mut output_links = LinkMap::default();
     if let Some((language, code)) = input.map(|i| match i {
         ToolInput::Script { language, code } | ToolInput::Code { language, code } => {
             (language, code)
@@ -3234,9 +3277,10 @@ pub fn render_tool_content(
             (card_lines, false)
         }
         Some(ToolOutput::Tasks(tasks)) => {
-            let (lines, rows, truncated) =
+            let (lines, rows, truncated, links) =
                 task_card::render(tasks, limits.bounded_budget(), limits.width);
             output_rows = rows;
+            output_links = links;
             (lines, truncated)
         }
         // Each child owns how much of itself it shows, so the card reports no
@@ -3246,6 +3290,7 @@ pub fn render_tool_content(
             output_rows = card.rows;
             output_spans = card.spans;
             output_source = card.source;
+            output_links = card.links;
             (card.lines, false)
         }
         Some(ToolOutput::ReadDir(_)) => (Vec::new(), false),
@@ -3261,6 +3306,11 @@ pub fn render_tool_content(
         *row = target;
     }
     let body_start = lines.len();
+    let mut links = LinkMap::none_for(&lines);
+    if output_links.rows.is_empty() {
+        output_links = LinkMap::none_for(&output_lines);
+    }
+    links.rows.extend(output_links.rows);
     match output_source {
         Some(source) => trace.record(body_start, source),
         // Rows a renderer drew without naming their source cannot be sliced,
@@ -3276,6 +3326,7 @@ pub fn render_tool_content(
         .collect();
     wrapped_content(
         ToolContent {
+            links,
             lines,
             rows,
             truncation,
@@ -3294,6 +3345,15 @@ pub fn render_tool_content(
 fn wrapped_content(content: ToolContent, width: u16) -> ToolContent {
     let wrapped = WrappedRows::new(content.lines, 0, width);
     ToolContent {
+        links: LinkMap {
+            rows: content
+                .links
+                .rows
+                .iter()
+                .enumerate()
+                .flat_map(|(line, links)| wrapped.spans_of(line, links))
+                .collect(),
+        },
         lines: wrapped.lines(),
         rows: wrapped.expand(content.rows),
         truncation: content.truncation,
@@ -3600,6 +3660,7 @@ mod tests {
             .map(|index| Line::from(format!("row{index} {over_wide}")))
             .collect();
         let content = ToolContent {
+            links: LinkMap::none_for(&lines),
             rows: vec![None; lines.len()],
             lines,
             truncation: false,

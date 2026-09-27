@@ -7461,10 +7461,13 @@ mod tests {
     use crate::transfer::PrivateStaging;
     use crate::{
         Input, REMOTE_DEADLINE_BEFORE_DISPATCH, REMOTE_PREPARATION_RENEWAL, RemoteExecutionCleanup,
-        RemotePreparedState, RemoteWorkcellInvocation, ToolKind,
+        RemotePreparedState, RemoteWorkcellInvocation, RemoteWorkcellTool,
+        SHELL_DESCRIPTION_REPLACEMENTS, ToolKind, WorkcellHost, WorkcellTool,
     };
     use caudra_agent::cancel::CancelToken;
-    use caudra_agent::tools::{Deadline, ToolRegistry};
+    use caudra_agent::tools::{
+        Deadline, DescriptionContext, Tool, ToolAudience, ToolFilter, ToolRegistry,
+    };
     use caudra_config::workcell::{
         RemoteWorkcellSelection, WorkcellEndpoint, WorkcellProfileName, WorkcellSourceRef,
     };
@@ -7487,7 +7490,8 @@ mod tests {
         WorkspaceCapability, WorkspaceCursor, WorkspaceError, WorkspaceMutationService,
         WorkspacePath, WorkspaceReadService, WorkspaceSession, WorkspaceWatchService, WriteContent,
     };
-    use workcell::{ToolManifest, host_contract as contract};
+    use workcell::shell::{DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_SECS};
+    use workcell::{OwnedToolSpec, ToolManifest, host_contract as contract};
 
     const HOST_SNAPSHOT_CEILING: u64 = 100;
     const PLAINTEXT_BEARER_BOUNDARY: &str =
@@ -7521,6 +7525,110 @@ mod tests {
     const CACHE_REGRESSION_ENTRIES: usize = 25_000;
     const CACHE_PRESSURE_LIMIT: usize = 1024;
     const CACHE_CLOCK_STEP: Duration = Duration::from_secs(1);
+    const TIMEOUT_COMMAND: &str = "cargo test";
+
+    #[test_case(true; "pinned_legacy_catalog")]
+    #[test_case(false; "neutral_catalog")]
+    fn embedded_and_remote_shell_descriptions_are_delivery_neutral(legacy: bool) {
+        let root = tempfile::tempdir().unwrap();
+        let host = WorkcellHost::new(root.path(), None).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint =
+            WorkcellEndpoint::parse(&format!("http://{}/mcp", listener.local_addr().unwrap()))
+                .unwrap();
+        let client = snapshot_client(&endpoint, &StateDir::from_path(root.path().join("state")));
+        let ctx = DescriptionContext {
+            filter: &ToolFilter::All,
+            audience: ToolAudience::MAIN,
+            workflows_available: false,
+        };
+        for mut spec in crate::canonical_remote_specs() {
+            let kind = ToolKind::from_name(spec.name).unwrap();
+            let mut expected = spec.description.clone();
+            if kind == ToolKind::Shell {
+                for &(previous, current) in SHELL_DESCRIPTION_REPLACEMENTS {
+                    expected = expected.replace(previous, current);
+                    spec.description = if legacy {
+                        spec.description.replace(current, previous)
+                    } else {
+                        spec.description.replace(previous, current)
+                    };
+                }
+            }
+            let remote = RemoteWorkcellTool {
+                client: client.clone(),
+                kind,
+                spec: OwnedToolSpec::from(&spec),
+            };
+            let local = WorkcellTool {
+                kind,
+                spec,
+                host: Arc::clone(&host.inner),
+            };
+            let local_description = local.description(&ctx);
+            assert_eq!(local_description, expected);
+            assert_eq!(remote.description(&ctx), expected);
+            if kind == ToolKind::Shell {
+                assert!(!local_description.to_lowercase().contains("background"));
+                assert!(!local_description.contains("holds the call"));
+            }
+            assert_eq!(local.schema(), remote.schema());
+            assert_eq!(local.spec.contract_id, remote.spec.contract_id);
+            assert_eq!(local.spec.presentation, remote.spec.presentation);
+        }
+    }
+
+    #[test_case("shell", json!({"command": TIMEOUT_COMMAND}), Some(Duration::from_millis(DEFAULT_TIMEOUT_MS)); "omitted_default")]
+    #[test_case("shell", json!({"command": TIMEOUT_COMMAND, "timeoutSec": null}), Some(Duration::from_millis(DEFAULT_TIMEOUT_MS)); "null_default")]
+    #[test_case("shell", json!({"command": TIMEOUT_COMMAND, "timeoutSec": 1}), Some(Duration::from_secs(1)); "minimum")]
+    #[test_case("shell", json!({"command": TIMEOUT_COMMAND, "timeoutSec": MAX_TIMEOUT_SECS}), Some(Duration::from_secs(MAX_TIMEOUT_SECS)); "maximum")]
+    #[test_case("shell", json!({"command": TIMEOUT_COMMAND, "timeoutSec": 0}), None; "zero_is_not_a_default")]
+    #[test_case("shell", json!({"command": TIMEOUT_COMMAND, "timeoutSec": MAX_TIMEOUT_SECS + 1}), None; "overflow_is_not_clamped")]
+    #[test_case("shell", json!({"command": TIMEOUT_COMMAND, "timeoutSec": -1}), None; "negative_is_rejected")]
+    #[test_case("shell", json!({"command": TIMEOUT_COMMAND, "timeoutSec": "600"}), None; "string_is_rejected")]
+    #[test_case("shell", json!({"command": TIMEOUT_COMMAND, "background": true}), None; "no_delivery_argument")]
+    #[test_case("file_read", json!({"filePath": "Cargo.toml"}), None; "non_shell")]
+    fn shell_timeout_metadata_matches_embedded_and_remote_invocations(
+        name: &str,
+        input: Value,
+        expected: Option<Duration>,
+    ) {
+        let root = tempfile::tempdir().unwrap();
+        let host = WorkcellHost::new(root.path(), None).unwrap();
+        let registry = ToolRegistry::new();
+        host.register(&registry).unwrap();
+        let local = registry.get(name).unwrap().tool.parse(&input);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint =
+            WorkcellEndpoint::parse(&format!("http://{}/mcp", listener.local_addr().unwrap()))
+                .unwrap();
+        let spec = crate::canonical_remote_specs()
+            .into_iter()
+            .find(|spec| spec.name == name)
+            .unwrap();
+        let remote = RemoteWorkcellTool {
+            client: snapshot_client(&endpoint, &StateDir::from_path(root.path().join("state"))),
+            kind: ToolKind::from_name(name).unwrap(),
+            spec: OwnedToolSpec::from(&spec),
+        }
+        .parse(&input);
+        assert_eq!(local.is_ok(), remote.is_ok());
+        assert_eq!(
+            local.as_ref().ok().and_then(|call| call.shell_timeout()),
+            expected
+        );
+        assert_eq!(
+            remote.as_ref().ok().and_then(|call| call.shell_timeout()),
+            expected
+        );
+        if let Ok(call) = remote {
+            assert_eq!(call.permission_input(), Some(&input));
+            assert_eq!(call.shell_timeout(), expected);
+            assert_eq!(call.permission_input(), Some(&input));
+        }
+        listener.set_nonblocking(true).unwrap();
+        assert!(listener.accept().is_err());
+    }
 
     #[test]
     fn authoritative_cursors_survive_capacity_pressure_and_reject_rebinding() {

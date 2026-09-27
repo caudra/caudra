@@ -96,7 +96,9 @@ echo '{"type":"user","message":{"content":"explain this repo"}}' \
 
 ### Background tasks
 
-Stream-JSON sessions support [background tasks](/docs/sessions/#background-tasks). The `init` message advertises `background_tasks` and `task_controls`. One-shot `--print`, including `--output-format stream-json` without stream input, and ACP do not support background execution.
+Persistent stream-JSON sessions support [background tasks and shell jobs](/docs/sessions/#background-tasks). The `init` message advertises `background_jobs`, `background_tasks`, `background_shell`, `job_kinds`, and `task_controls`. The `task_execution` and `shell_execution` objects include configured and effective policies. `shell_execution.async_threshold_secs` gives the requested-timeout threshold.
+
+One-shot `--print`, including `--output-format stream-json` without stream input, and ACP resolve `auto` to synchronous execution. Strict `async` has no effective policy there: the affected tool is withheld and stale calls fail with an actionable error. See [execution policies](/docs/sessions/#execution-policies) for defaults and timeout boundaries.
 
 Task controls use the same `control_request` envelope as workflow controls:
 
@@ -106,12 +108,14 @@ Task controls use the same `control_request` envelope as workflow controls:
 
 | Subtype | Arguments | Effect |
 |---------|-----------|--------|
-| `task_list` | None | List session-owned tasks |
+| `task_list` | None | List session-owned agent and shell jobs |
 | `task_status` | `task_id` | Return one task's status |
 | `task_cancel` | `task_id` | Cancel one task |
-| `task_promote` | `task_id` | Move a foreground task to the background without restarting it |
+| `task_promote` | `task_id` | Promote an agent task without restarting it, in task `auto` mode |
 
 A successful `control_response` carries the task list or status in `response.response`. Failures use `response.error`.
+
+Status `kind` distinguishes `agent` from `shell`. Shell entries carry command metadata and have no child transcript. They support inspection and cancellation, but cannot be promoted or resumed with `task`. Child-owned command results return to that exact child invocation rather than starting a main-agent continuation.
 
 New task IDs are short `adjective-adjective-noun` phrases. Pass the returned ID unchanged. Older IDs remain valid.
 
@@ -123,7 +127,7 @@ If an outcome exceeds the status limit, `result` is omitted, `result_truncated` 
 
 A parent `result` ends that run, not the session's background work. Keep stdin open to receive automatic continuation after reports and outcomes arrive. Each parent run emits a `system` message with subtype `turn_start`. Its `run_id`, `automatic`, `task_event_ids`, and `workflow_events` also appear under `run` in the matching `result`. The result's `background_active` counts active managed tasks. Permission requests can still arrive from children after the parent result.
 
-The `interrupt` control stops the parent and all session tasks and workflows and suppresses late automatic continuations. A new user prompt re-enables them. Closing stdin cancels and drains owned work. It does not leave a daemon running.
+The `interrupt` control stops the parent and all session tasks, shell jobs, and workflows and suppresses late automatic continuations. A new user prompt re-enables them. Closing stdin cancels and drains owned work. It does not leave a daemon running.
 
 ### Workflows
 

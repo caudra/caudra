@@ -3,6 +3,6 @@ An earlier summary appears in the conversation above, followed by the turns that
 - Carry forward objectives, constraints, user directives, decisions, and unfinished work from the earlier summary even when nothing after it mentions them. Drop only what is finished and no longer needed.
 - The later turns are more recent. Where they conflict with the earlier summary, they win: state the corrected fact and drop the stale claim.
 - Move work that has since finished from Active to Completed. Clear resolved blockers, keeping any detail still needed to continue.
-- Carry forward unfinished Delegated work with its exact task or workflow ID, scope, expected result, and the parent's next step. Record important delivered results. Treat status as last observed and defer to newer host background-work snapshots for execution state. A parent's final answer does not settle its children.
+- Carry forward unfinished Delegated work with its exact task or workflow ID, scope, expected result, and the parent's next step. Record important delivered results. Treat status as last observed and defer to newer host status observations for execution state. Do not infer completion without a result.
 - Update Objective, Next Move, and Todo List to the current state, not the state the earlier summary described.
 - If the earlier summary ends with a `# User requirements` section, leave it out entirely: the host maintains that section and attaches it again after you answer.

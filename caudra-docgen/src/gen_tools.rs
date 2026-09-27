@@ -292,7 +292,7 @@ fn write_tool_entry(out: &mut String, name: &str, info: &ToolInfo, opt_in: &Hash
     if name == "task" {
         writeln!(
             out,
-            "See [background tasks](/docs/sessions/#background-tasks) for execution, automatic continuation, inspection, and shutdown. Background execution is available in the TUI and stream-JSON SDK, not one-shot print or ACP. `batch` alone does not make foreground tasks asynchronous. Do not poll, sleep, or duplicate delegated work. Continue independent work or end the interim turn while awaiting reports. Resume a task ID only after its invocation settles."
+            "The published task arguments and instructions follow `agent.task_execution`: `sync` waits for final results and omits `background`, `auto` lets the model choose with `background: true`, and `async` always returns an admission receipt. See [background tasks](/docs/sessions/#background-tasks) for automatic continuation, inspection, and shutdown. The TUI and persistent stream-JSON SDK support background work. Print and ACP resolve `auto` to synchronous execution and withhold strict `async` tools. `batch` alone does not make synchronous calls asynchronous. Resume a task ID only after its invocation settles."
         )
         .unwrap();
         writeln!(out).unwrap();
@@ -306,6 +306,12 @@ fn write_tool_entry(out: &mut String, name: &str, info: &ToolInfo, opt_in: &Hash
         writeln!(out).unwrap();
     }
     if name == "shell" {
+        writeln!(
+            out,
+            "`agent.shell_execution` selects `sync`, `auto`, or `async` independently of task execution. In `auto`, a validated requested timeout above `agent.shell_async_threshold_secs` returns an admission receipt. The default threshold is 120 seconds. This is not elapsed-time promotion and never extends the hard execution deadline. Shell has no per-call `background` argument. See [execution policies](/docs/sessions/#execution-policies) for frontend support and child-owned command results."
+        )
+        .unwrap();
+        writeln!(out).unwrap();
         writeln!(
             out,
             "Caudra shows unfiltered output while the command runs. After completion, the TUI switches to the filtered model-facing result when Workcell reduced it. The output footer names every reduction that ran and toggles between filtered and raw views. Filtering is enabled by default and never changes the reviewed command or structured capture. Set `agent.shell_output_filter = false` or use `--no-rtk` to disable it."
@@ -560,12 +566,13 @@ mod tests {
     fn task_reference_preserves_async_guidance_and_schema_contract() {
         const TASK_HEADING: &str = "### `task` {#task}";
         const EXPECTED: &[&str] = &[
-            "In sessions that expose `background`",
-            "Reports and final outcomes can resume this chat even after you end your turn.",
+            "Delegate a bounded task to an autonomous subagent",
+            "`agent.task_execution`",
+            "`sync` waits for final results and omits `background`",
+            "`async` always returns an admission receipt",
             "[background tasks](/docs/sessions/#background-tasks)",
-            "not one-shot print or ACP",
-            "`batch` alone does not make foreground tasks asynchronous.",
-            "Do not poll, sleep, or duplicate delegated work.",
+            "Print and ACP resolve `auto` to synchronous execution",
+            "`batch` alone does not make synchronous calls asynchronous.",
             "Resume a task ID only after its invocation settles.",
             "| `output_schema` | any (JSON) | no | JSON Schema (object)",
         ];

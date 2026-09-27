@@ -56,6 +56,7 @@ use super::{
     SessionRelocation, SessionRelocationResult, SessionSummary, StoredSubagent,
     StoredSubagentOutcome, StoredSubagentTaskSpec, StoredTokenUsage, StoredToolUsage, next_epoch,
 };
+use crate::background::{JobOwner, accept_owned_job_event};
 use crate::id::CaudraId;
 use crate::retention::SessionFacts;
 use crate::state::{
@@ -77,7 +78,7 @@ use crate::{
 pub const SESSIONS_DB_FILE: &str = "caudra.sqlite";
 pub const SESSIONS_DB_LOCK_FILE: &str = "caudra.sqlite.lock";
 
-const SCHEMA_VERSION: i64 = 13;
+const SCHEMA_VERSION: i64 = 14;
 const APPLICATION_ID: i64 = i32::from_be_bytes(*b"CAUD") as i64;
 /// Pages copied per step of the pre-migration backup. The whole file is copied
 /// under the initialization lock, so this only bounds how long the backup holds
@@ -95,6 +96,11 @@ pub const WAL_RETENTION_LIMIT_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_PAYLOAD_BYTES: usize = 32 * 1024 * 1024;
 const MAX_METADATA_BYTES: usize = 8 * 1024 * 1024;
 const MAX_IDENTIFIER_BYTES: usize = 256;
+const MAX_OWNER_CHECKPOINTS: usize = 128;
+const MAX_OWNER_CHECKPOINT_MESSAGES: usize = 16_384;
+const MAX_OWNER_CHECKPOINT_SESSION_BYTES: usize = 64 * 1024 * 1024;
+const OWNER_CHECKPOINT_FIELD: &str = "job owner checkpoint";
+const EMPTY_OWNER_CHECKPOINT_ID: &str = "owner invocation and task identifiers must not be empty";
 const MAX_PATH_BYTES: usize = 32 * 1024;
 const MAX_JSON_DEPTH: usize = 64;
 const MAX_IMAGES_PER_ITEM: usize = 16;
@@ -598,7 +604,24 @@ const MIGRATIONS: &[Migration] = &[
         to: 13,
         sql: WORKFLOW_RECEIPTS_TABLE,
     },
+    Migration {
+        from: 13,
+        to: 14,
+        sql: JOB_OWNER_CHECKPOINTS_TABLE,
+    },
 ];
+
+const JOB_OWNER_CHECKPOINTS_TABLE: &str = r#"
+CREATE TABLE job_owner_checkpoints (
+    session_id BLOB NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    invocation_id TEXT NOT NULL,
+    task_id TEXT NOT NULL,
+    payload BLOB NOT NULL,
+    byte_count INTEGER NOT NULL CHECK(byte_count >= 0),
+    PRIMARY KEY(session_id, invocation_id)
+) STRICT, WITHOUT ROWID;
+"#;
+const SESSION_OWNER_CHECKPOINT_BYTES: &str = "coalesce((SELECT sum(byte_count + length(CAST(invocation_id AS BLOB)) + length(CAST(task_id AS BLOB))) FROM job_owner_checkpoints WHERE session_id = sessions.id), 0)";
 
 /// What a task's own requests carried, so a restored task footer names the
 /// level it ran at rather than the session's. The table is rebuilt rather than
@@ -836,7 +859,7 @@ CREATE TABLE pending_archives (
 /// What a fresh database gets: every migration already folded in.
 fn full_schema() -> String {
     format!(
-        "{SCHEMA}{USAGE_LEDGER_TABLE}{WORKFLOW_TABLES}{WORKFLOW_EVENTS_TABLE}{WORKFLOW_RECEIPTS_TABLE}{PERMISSION_REVISION_SCHEMA}{TOOL_USAGE_TABLES}{}",
+        "{SCHEMA}{USAGE_LEDGER_TABLE}{WORKFLOW_TABLES}{WORKFLOW_EVENTS_TABLE}{WORKFLOW_RECEIPTS_TABLE}{PERMISSION_REVISION_SCHEMA}{TOOL_USAGE_TABLES}{JOB_OWNER_CHECKPOINTS_TABLE}{}",
         crate::background::TABLES
     )
 }
@@ -1631,7 +1654,7 @@ impl SessionDatabase {
                 .query_row("SELECT count(*) FROM cleanup_jobs", [], |row| row.get(0))?;
         let workflow = workflow_totals(&self.connection)?;
         let (background_invocation_count, background_bytes) = self.connection.query_row(
-            "SELECT count(*), coalesce(sum(bytes), 0) + (SELECT coalesce(sum(length(event_id)), 0) FROM background_receipts) FROM background_tasks",
+            "SELECT count(*), coalesce(sum(bytes), 0) + (SELECT coalesce(sum(length(event_id)), 0) FROM background_receipts) + (SELECT coalesce(sum(byte_count + length(CAST(invocation_id AS BLOB)) + length(CAST(task_id AS BLOB))), 0) FROM job_owner_checkpoints) FROM background_tasks",
             [],
             |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
         )?;
@@ -1831,7 +1854,7 @@ impl SessionDatabase {
     pub fn session_facts(&self, cwd: Option<&str>) -> Result<Vec<SessionFacts>, SessionError> {
         let mut statement = self.connection.prepare(&format!(
             "SELECT id, title, cwd, created_at, updated_at, last_opened_at, pinned, trimmed_at,\
-                    logical_bytes + {SESSION_WORKFLOW_BYTES} + {}, \
+                    logical_bytes + {SESSION_WORKFLOW_BYTES} + {SESSION_OWNER_CHECKPOINT_BYTES} + {}, \
                     json_extract(metadata, '$.pending_revert') IS NOT NULL \
              FROM sessions WHERE ?1 IS NULL OR cwd = ?1 \
              ORDER BY max(updated_at, coalesce(last_opened_at, 0)) DESC, id DESC",
@@ -1948,6 +1971,114 @@ impl SessionDatabase {
 
     pub(crate) fn connection(&self) -> &Connection {
         &self.connection
+    }
+
+    pub fn checkpoint_job_owner<M: Serialize>(
+        &self,
+        session: CaudraId,
+        owner_invocation_id: &str,
+        task_id: &str,
+        messages: &[M],
+    ) -> Result<(), SessionError> {
+        validate_owner_checkpoint_ids(owner_invocation_id, task_id)?;
+        validate_len(
+            "job owner checkpoint messages",
+            messages.len(),
+            MAX_OWNER_CHECKPOINT_MESSAGES,
+        )?;
+        let mut serialized = Vec::with_capacity(messages.len());
+        let mut bytes = 2usize;
+        for message in messages {
+            let payload = serialize_json(message, OWNER_CHECKPOINT_FIELD, MAX_PAYLOAD_BYTES)?;
+            bytes = bytes
+                .saturating_add(payload.len())
+                .saturating_add(usize::from(!serialized.is_empty()));
+            validate_len(OWNER_CHECKPOINT_FIELD, bytes, MAX_PAYLOAD_BYTES)?;
+            serialized.push(payload);
+        }
+        let payload = format!("[{}]", serialized.join(","));
+        validate_json_depth(&payload)?;
+        let compressed = compress_payload(&payload)?;
+        let owner = JobOwner::Child {
+            invocation_id: owner_invocation_id.to_owned(),
+        };
+        let transaction =
+            Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
+        let existing_task: Option<String> = transaction.query_row(
+            "SELECT task_id FROM job_owner_checkpoints WHERE session_id = ?1 AND invocation_id = ?2",
+            params![session.as_bytes().as_slice(), owner_invocation_id],
+            |row| row.get(0),
+        ).optional()?;
+        if existing_task
+            .as_deref()
+            .is_some_and(|existing| existing != task_id)
+        {
+            return Err(SessionError::JobOwnerTaskMismatch {
+                invocation_id: owner_invocation_id.to_owned(),
+                task_id: task_id.to_owned(),
+            });
+        }
+        let (count, existing_bytes): (i64, i64) = transaction.query_row(
+            "SELECT count(*), coalesce(sum(byte_count + length(CAST(invocation_id AS BLOB)) + length(CAST(task_id AS BLOB))), 0) FROM job_owner_checkpoints WHERE session_id = ?1 AND invocation_id != ?2",
+            params![session.as_bytes().as_slice(), owner_invocation_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        validate_len(
+            "job owner checkpoints",
+            from_i64_usize(count, OWNER_CHECKPOINT_FIELD)?.saturating_add(1),
+            MAX_OWNER_CHECKPOINTS,
+        )?;
+        validate_len(
+            "job owner checkpoint session bytes",
+            from_i64_usize(existing_bytes, OWNER_CHECKPOINT_FIELD)?
+                .saturating_add(bytes)
+                .saturating_add(owner_invocation_id.len())
+                .saturating_add(task_id.len()),
+            MAX_OWNER_CHECKPOINT_SESSION_BYTES,
+        )?;
+        transaction.execute(
+            "INSERT INTO job_owner_checkpoints(session_id, invocation_id, task_id, payload, byte_count) VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT(session_id, invocation_id) DO UPDATE SET payload = excluded.payload, byte_count = excluded.byte_count",
+            params![session.as_bytes().as_slice(), owner_invocation_id, task_id, compressed, to_i64(bytes, OWNER_CHECKPOINT_FIELD)?],
+        )?;
+        for message in serialized {
+            let message = serde_json::from_str(&message).map_err(StorageError::from)?;
+            accept_owned_job_event(&transaction, session, &owner, &message)?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn load_job_owner_checkpoint<M: DeserializeOwned>(
+        &self,
+        session: CaudraId,
+        owner_invocation_id: &str,
+        task_id: &str,
+    ) -> Result<Option<Vec<M>>, SessionError> {
+        validate_owner_checkpoint_ids(owner_invocation_id, task_id)?;
+        let stored: Option<Vec<u8>> = self.connection.query_row(
+            "SELECT payload FROM job_owner_checkpoints WHERE session_id = ?1 AND invocation_id = ?2 AND task_id = ?3",
+            params![session.as_bytes().as_slice(), owner_invocation_id, task_id],
+            |row| row.get(0),
+        ).optional()?;
+        stored
+            .map(|stored| {
+                let payload =
+                    zstd::bulk::decompress(&stored, MAX_PAYLOAD_BYTES).map_err(|error| {
+                        SessionError::CorruptDatabaseValue {
+                            field: OWNER_CHECKPOINT_FIELD,
+                            reason: error.to_string(),
+                        }
+                    })?;
+                let messages: Vec<M> =
+                    serde_json::from_slice(&payload).map_err(StorageError::from)?;
+                validate_len(
+                    "job owner checkpoint messages",
+                    messages.len(),
+                    MAX_OWNER_CHECKPOINT_MESSAGES,
+                )?;
+                Ok(messages)
+            })
+            .transpose()
     }
 
     pub(crate) fn state_directory(&self) -> &StateDir {
@@ -2722,6 +2853,7 @@ impl SessionDatabase {
             "SELECT payload FROM main_history_items WHERE session_id = ?1",
             "SELECT payload FROM tool_outputs WHERE session_id = ?1",
             "SELECT payload FROM subagent_history_items WHERE session_id = ?1",
+            "SELECT payload FROM job_owner_checkpoints WHERE session_id = ?1",
         ] {
             let mut statement = transaction.prepare(sql)?;
             let mut rows = statement.query(params![id.as_bytes().as_slice()])?;
@@ -4787,6 +4919,18 @@ fn validate_identifier(kind: &'static str, value: &str) -> Result<(), SessionErr
     validate_len(kind, value.len(), MAX_IDENTIFIER_BYTES)
 }
 
+fn validate_owner_checkpoint_ids(invocation: &str, task: &str) -> Result<(), SessionError> {
+    validate_identifier("job owner invocation id", invocation)?;
+    validate_identifier("job owner task id", task)?;
+    if invocation.is_empty() || task.is_empty() {
+        return Err(SessionError::CorruptDatabaseValue {
+            field: OWNER_CHECKPOINT_FIELD,
+            reason: EMPTY_OWNER_CHECKPOINT_ID.to_owned(),
+        });
+    }
+    Ok(())
+}
+
 fn serialize_task_specs(
     values: &HashMap<String, StoredSubagentTaskSpec>,
 ) -> Result<HashMap<String, String>, SessionError> {
@@ -5254,16 +5398,7 @@ fn insert_history(
             params![session_id.as_bytes().as_slice(), run_id, to_i64(revision, "workflow receipt revision")?],
         )?;
     }
-    if let Some(event) = message
-        .get("task_event")
-        .and_then(|origin| origin.get("event_id"))
-        .and_then(Value::as_str)
-    {
-        transaction.execute(
-            "INSERT OR IGNORE INTO background_receipts(session_id, event_id) VALUES (?1, ?2)",
-            params![session_id.as_bytes().as_slice(), event],
-        )?;
-    }
+    accept_owned_job_event(transaction, session_id, &JobOwner::Main, &message)?;
     transaction.execute(
         "INSERT INTO main_history_items (session_id, ordinal, payload, byte_count) \
          VALUES (?1, ?2, ?3, ?4)",
@@ -5760,6 +5895,7 @@ mod tests {
     use std::sync::Barrier;
 
     use super::*;
+    use crate::background::{JobPayload, ShellJobMetadata, TaskEvent, TaskRecord};
     use crate::permission_state::StructuredPermissionEffect;
     use crate::sessions::{Session, StoredSubagentOutcome, TitleSource};
     use crate::state::{WorkspaceTabs, project_scope, read_workspace_tabs, write_workspace_tabs};
@@ -5848,6 +5984,19 @@ mod tests {
     const HISTORY_SESSION_CAP: usize = 4;
     const HISTORY_LARGE_SESSION_ROWS: usize = HISTORY_SESSION_CAP * 8;
     const HISTORY_STREAM: &str = "history-stream";
+    const CHILD_INVOCATION: &str = "child-invocation";
+    const OTHER_CHILD_INVOCATION: &str = "other-child-invocation";
+    const CHILD_TASK: &str = "child-task";
+    const OTHER_CHILD_TASK: &str = "other-child-task";
+    const OWNER_CHECKPOINT_PREVIOUS_SCHEMA: i64 = 13;
+    const SHELL_INVOCATION: &str = "shell-invocation";
+    const SHELL_TASK: &str = "shell-task";
+    const SHELL_EVENT: &str = "shell-event";
+    const INVALID_SHELL_EVENT: &str = "invalid-shell-event";
+    const SHELL_COMMAND: &str = "printf checkpoint";
+    const SHELL_OUTCOME: &str = "checkpoint";
+    const SHELL_TIMEOUT_MS: u64 = 120_000;
+    const CHECKPOINT_FAILURE: &str = "injected owner checkpoint failure";
     const UNRECOVERED_JOURNAL: &[u8] = b"pending rollback recovery";
     #[cfg(unix)]
     const URI_PATH_COMPONENT: &str = "file: space #%2F?mode=rw&immutable=0-é";
@@ -5879,6 +6028,503 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
         let temp = TempDir::new().unwrap();
         let state_dir = StateDir::from_path(temp.path().to_path_buf());
         (temp, state_dir)
+    }
+
+    fn checkpoint_shell_record(owner: JobOwner) -> TaskRecord {
+        TaskRecord {
+            payload: JobPayload::Shell(ShellJobMetadata {
+                call_id: SHELL_INVOCATION.into(),
+                root_call_id: SHELL_INVOCATION.into(),
+                command: SHELL_COMMAND.into(),
+                workdir: CWD.into(),
+                timeout_ms: SHELL_TIMEOUT_MS,
+                mode: "build".into(),
+            }),
+            owner,
+            created_at: 1,
+            updated_at: 1,
+            sequence: 1,
+            task_id: SHELL_TASK.into(),
+            invocation_id: SHELL_INVOCATION.into(),
+            root_call_id: SHELL_INVOCATION.into(),
+            generation: 1,
+            state: "succeeded".into(),
+            background: true,
+            receipt_accepted: true,
+            mode: "build".into(),
+            request: json!({}),
+            outcome: Some(json!({"success": true})),
+            output_ref: None,
+            history: Value::Null,
+            spec: Value::Null,
+            events: vec![TaskEvent {
+                sequence: 2,
+                event_id: SHELL_EVENT.into(),
+                call_id: SHELL_INVOCATION.into(),
+                body: SHELL_OUTCOME.into(),
+                terminal: true,
+                accepted: false,
+                suppressed: false,
+            }],
+        }
+    }
+
+    fn checkpoint_shell_message(event: &str) -> Value {
+        json!({
+            "text": SHELL_OUTCOME,
+            "task_event": {"task_id": SHELL_TASK, "invocation_id": SHELL_INVOCATION, "event_id": event}
+        })
+    }
+
+    #[test_case(false; "valid_receipt_round_trip")]
+    #[test_case(true; "compaction_keeps_receipt")]
+    fn owner_checkpoint_durably_accepts_real_shell_event(compact: bool) {
+        let (_temp, state) = state_dir();
+        let mut database = SessionDatabase::open(&state).unwrap();
+        let session = TestSession::new(MODEL, CWD);
+        database.save(&session, None).unwrap();
+        let record = checkpoint_shell_record(JobOwner::Child {
+            invocation_id: CHILD_INVOCATION.into(),
+        });
+        database.save_background_task(session.id, &record).unwrap();
+        let mut messages = vec![checkpoint_shell_message(SHELL_EVENT)];
+        database
+            .checkpoint_job_owner(session.id, CHILD_INVOCATION, CHILD_TASK, &messages)
+            .unwrap();
+        if compact {
+            messages = vec![json!(SHELL_OUTCOME)];
+            database
+                .checkpoint_job_owner(session.id, CHILD_INVOCATION, CHILD_TASK, &messages)
+                .unwrap();
+        }
+        drop(database);
+        let database = SessionDatabase::open(&state).unwrap();
+        assert!(
+            database
+                .background_event_accepted(session.id, SHELL_EVENT)
+                .unwrap()
+        );
+        assert_eq!(
+            database
+                .load_job_owner_checkpoint::<Value>(session.id, CHILD_INVOCATION, CHILD_TASK)
+                .unwrap(),
+            Some(messages)
+        );
+        assert!(
+            database
+                .load::<TestMessage, Value, Value>(session.id)
+                .unwrap()
+                .messages()
+                .is_empty()
+        );
+    }
+
+    #[test_case(false; "wrong_child_owner")]
+    #[test_case(true; "invalid_event_after_valid_event")]
+    fn owner_checkpoint_rejects_forged_events_atomically(invalid_event: bool) {
+        let (_temp, state) = state_dir();
+        let mut database = SessionDatabase::open(&state).unwrap();
+        let session = TestSession::new(MODEL, CWD);
+        database.save(&session, None).unwrap();
+        let owner = if invalid_event {
+            CHILD_INVOCATION
+        } else {
+            OTHER_CHILD_INVOCATION
+        };
+        database
+            .save_background_task(
+                session.id,
+                &checkpoint_shell_record(JobOwner::Child {
+                    invocation_id: owner.into(),
+                }),
+            )
+            .unwrap();
+        let mut messages = vec![checkpoint_shell_message(SHELL_EVENT)];
+        if invalid_event {
+            messages.push(checkpoint_shell_message(INVALID_SHELL_EVENT));
+        }
+        assert!(
+            database
+                .checkpoint_job_owner(session.id, CHILD_INVOCATION, CHILD_TASK, &messages)
+                .is_err()
+        );
+        assert!(
+            !database
+                .background_event_accepted(session.id, SHELL_EVENT)
+                .unwrap()
+        );
+        assert!(
+            !database
+                .background_event_accepted(session.id, INVALID_SHELL_EVENT)
+                .unwrap()
+        );
+        assert!(
+            database
+                .load_job_owner_checkpoint::<Value>(session.id, CHILD_INVOCATION, CHILD_TASK)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test_case(false; "history_write_fails")]
+    #[test_case(true; "receipt_write_fails")]
+    fn owner_checkpoint_storage_failure_rolls_back_history_and_receipts(receipt_failure: bool) {
+        let (_temp, state) = state_dir();
+        let mut database = SessionDatabase::open(&state).unwrap();
+        let session = TestSession::new(MODEL, CWD);
+        database.save(&session, None).unwrap();
+        database
+            .save_background_task(
+                session.id,
+                &checkpoint_shell_record(JobOwner::Child {
+                    invocation_id: CHILD_INVOCATION.into(),
+                }),
+            )
+            .unwrap();
+        let previous = vec![json!(OLD_REVIEW)];
+        database
+            .checkpoint_job_owner(session.id, CHILD_INVOCATION, CHILD_TASK, &previous)
+            .unwrap();
+        let table = if receipt_failure {
+            "background_receipts"
+        } else {
+            "job_owner_checkpoints"
+        };
+        database.connection.execute_batch(&format!("CREATE TRIGGER fail_owner_checkpoint BEFORE INSERT ON {table} BEGIN SELECT RAISE(ABORT, '{CHECKPOINT_FAILURE}'); END;")).unwrap();
+        let error = database
+            .checkpoint_job_owner(
+                session.id,
+                CHILD_INVOCATION,
+                CHILD_TASK,
+                &[checkpoint_shell_message(SHELL_EVENT)],
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains(CHECKPOINT_FAILURE));
+        assert!(
+            !database
+                .background_event_accepted(session.id, SHELL_EVENT)
+                .unwrap()
+        );
+        assert_eq!(
+            database
+                .load_job_owner_checkpoint::<Value>(session.id, CHILD_INVOCATION, CHILD_TASK)
+                .unwrap(),
+            Some(previous)
+        );
+    }
+
+    #[test_case(false; "main_accepts_only_main")]
+    #[test_case(true; "main_rejects_child")]
+    fn main_history_validates_shell_event_owner(child: bool) {
+        let (_temp, state) = state_dir();
+        let mut database = SessionDatabase::open(&state).unwrap();
+        let session = TestSession::new(MODEL, CWD);
+        database.save(&session, None).unwrap();
+        let owner = if child {
+            JobOwner::Child {
+                invocation_id: CHILD_INVOCATION.into(),
+            }
+        } else {
+            JobOwner::Main
+        };
+        database
+            .save_background_task(session.id, &checkpoint_shell_record(owner))
+            .unwrap();
+        let message = serde_json::to_string(&checkpoint_shell_message(SHELL_EVENT)).unwrap();
+        let transaction = database.connection.transaction().unwrap();
+        let result = insert_history(&transaction, session.id, 0, &message);
+        if child {
+            assert!(result.is_err());
+            drop(transaction);
+        } else {
+            result.unwrap();
+            transaction.commit().unwrap();
+        }
+        assert_eq!(
+            database
+                .background_event_accepted(session.id, SHELL_EVENT)
+                .unwrap(),
+            !child
+        );
+        let count: i64 = database
+            .connection
+            .query_row("SELECT count(*) FROM main_history_items", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, i64::from(!child));
+    }
+
+    #[test_case(false; "append_root")]
+    #[test_case(true; "replace_root")]
+    fn owner_checkpoint_round_trip_does_not_change_root_cursor_or_branch(replace: bool) {
+        let (_temp, state) = state_dir();
+        let mut root = SessionDatabase::open(&state).unwrap();
+        let mut session = TestSession::new(MODEL, CWD);
+        session.set_subagent_messages(CHILD_TASK.into(), vec![TestMessage(OLD_REVIEW.into())]);
+        let cursor = root.save(&session, None).unwrap();
+        let before = root.stats().unwrap();
+        let before_facts = root.session_facts(None).unwrap()[0].logical_bytes;
+        let messages = vec![json!({"text": ARTIFACT_NAME})];
+        let bytes = serde_json::to_vec(&messages).unwrap().len()
+            + CHILD_INVOCATION.len()
+            + CHILD_TASK.len();
+        let child = SessionDatabase::open(&state).unwrap();
+        child
+            .checkpoint_job_owner(session.id, CHILD_INVOCATION, CHILD_TASK, &messages)
+            .unwrap();
+        assert_eq!(root.stats().unwrap().logical_bytes, before.logical_bytes);
+        assert_eq!(
+            root.stats().unwrap().background_bytes,
+            before.background_bytes + bytes as u64
+        );
+        assert_eq!(
+            root.session_facts(None).unwrap()[0].logical_bytes,
+            before_facts + bytes as u64
+        );
+        if replace {
+            session.replace_messages(vec![TestMessage(ARTIFACT_NAME.into())]);
+        } else {
+            session.push_message(TestMessage(ARTIFACT_NAME.into()));
+        }
+        root.save(&session, Some(&cursor)).unwrap();
+        let mut fork = session.clone();
+        fork.id = CaudraId::generate();
+        fork.set_persisted_write_version(None);
+        root.save(&fork, None).unwrap();
+        drop(child);
+        drop(root);
+        let mut restored = SessionDatabase::open(&state).unwrap();
+        assert_eq!(
+            restored
+                .load_job_owner_checkpoint::<Value>(session.id, CHILD_INVOCATION, CHILD_TASK)
+                .unwrap(),
+            Some(messages.clone())
+        );
+        for (id, invocation, task) in [
+            (session.id, OTHER_CHILD_INVOCATION, CHILD_TASK),
+            (session.id, CHILD_INVOCATION, OTHER_CHILD_TASK),
+            (fork.id, CHILD_INVOCATION, CHILD_TASK),
+        ] {
+            assert!(
+                restored
+                    .load_job_owner_checkpoint::<Value>(id, invocation, task)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        let loaded = restored
+            .load::<TestMessage, Value, Value>(session.id)
+            .unwrap();
+        assert_eq!(loaded.messages(), session.messages());
+        assert_eq!(loaded.subagent_messages(), session.subagent_messages());
+        let payload = serde_json::to_string(&messages).unwrap();
+        let mut visited = false;
+        restored
+            .visit_payload_json(session.id, |value| visited |= value == payload)
+            .unwrap();
+        assert!(visited);
+        let lease = SessionLease::acquire(&state, session.id).unwrap();
+        restored.trim(&lease).unwrap();
+        assert_eq!(
+            restored
+                .load_job_owner_checkpoint::<Value>(session.id, CHILD_INVOCATION, CHILD_TASK)
+                .unwrap(),
+            Some(messages)
+        );
+        drop(lease);
+        restored.delete(session.id, None).unwrap();
+        assert!(
+            restored
+                .load_job_owner_checkpoint::<Value>(session.id, CHILD_INVOCATION, CHILD_TASK)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test_case(false; "invocation_task_binding")]
+    #[test_case(true; "message_limit")]
+    fn invalid_owner_checkpoint_preserves_previous_history(oversized: bool) {
+        let (_temp, state) = state_dir();
+        let mut database = SessionDatabase::open(&state).unwrap();
+        let session = TestSession::new(MODEL, CWD);
+        database.save(&session, None).unwrap();
+        let messages = vec![json!(ARTIFACT_NAME)];
+        database
+            .checkpoint_job_owner(session.id, CHILD_INVOCATION, CHILD_TASK, &messages)
+            .unwrap();
+        let result = if oversized {
+            database.checkpoint_job_owner(
+                session.id,
+                CHILD_INVOCATION,
+                CHILD_TASK,
+                &vec![Value::Null; MAX_OWNER_CHECKPOINT_MESSAGES + 1],
+            )
+        } else {
+            database.checkpoint_job_owner(session.id, CHILD_INVOCATION, OTHER_CHILD_TASK, &messages)
+        };
+        if oversized {
+            assert!(matches!(
+                result,
+                Err(SessionError::LimitExceeded {
+                    maximum: MAX_OWNER_CHECKPOINT_MESSAGES,
+                    ..
+                })
+            ));
+        } else {
+            assert!(matches!(
+                result,
+                Err(SessionError::JobOwnerTaskMismatch { .. })
+            ));
+        }
+        assert_eq!(
+            database
+                .load_job_owner_checkpoint::<Value>(session.id, CHILD_INVOCATION, CHILD_TASK)
+                .unwrap(),
+            Some(messages)
+        );
+    }
+
+    #[test_case(false; "owner_count")]
+    #[test_case(true; "session_bytes")]
+    fn owner_checkpoint_session_limits_fail_without_replacing_history(bytes: bool) {
+        let (_temp, state) = state_dir();
+        let mut database = SessionDatabase::open(&state).unwrap();
+        let session = TestSession::new(MODEL, CWD);
+        database.save(&session, None).unwrap();
+        let messages = [Value::Null];
+        if bytes {
+            database
+                .checkpoint_job_owner(session.id, OTHER_CHILD_INVOCATION, CHILD_TASK, &messages)
+                .unwrap();
+            database
+                .connection
+                .execute(
+                    "UPDATE job_owner_checkpoints SET byte_count = ?1",
+                    [MAX_OWNER_CHECKPOINT_SESSION_BYTES as i64],
+                )
+                .unwrap();
+        } else {
+            for index in 0..MAX_OWNER_CHECKPOINTS {
+                database
+                    .checkpoint_job_owner(
+                        session.id,
+                        &format!("{CHILD_INVOCATION}-{index}"),
+                        CHILD_TASK,
+                        &messages,
+                    )
+                    .unwrap();
+            }
+        }
+        assert!(matches!(
+            database.checkpoint_job_owner(session.id, CHILD_INVOCATION, CHILD_TASK, &messages),
+            Err(SessionError::LimitExceeded { .. })
+        ));
+        assert!(
+            database
+                .load_job_owner_checkpoint::<Value>(session.id, CHILD_INVOCATION, CHILD_TASK)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test_case("", CHILD_TASK; "empty_invocation")]
+    #[test_case(CHILD_INVOCATION, ""; "empty_task")]
+    fn owner_checkpoint_requires_nonempty_identity(invocation: &str, task: &str) {
+        let (_temp, state) = state_dir();
+        let mut database = SessionDatabase::open(&state).unwrap();
+        let session = TestSession::new(MODEL, CWD);
+        database.save(&session, None).unwrap();
+        let error = database
+            .checkpoint_job_owner(session.id, invocation, task, &[Value::Null])
+            .unwrap_err();
+        assert!(
+            matches!(error, SessionError::CorruptDatabaseValue { reason, .. } if reason == EMPTY_OWNER_CHECKPOINT_ID)
+        );
+    }
+
+    #[test_case(MAX_PAYLOAD_BYTES; "oversized_message")]
+    fn owner_checkpoint_payload_limit_is_checked_before_writing(bytes: usize) {
+        let (_temp, state) = state_dir();
+        let mut database = SessionDatabase::open(&state).unwrap();
+        let session = TestSession::new(MODEL, CWD);
+        database.save(&session, None).unwrap();
+        let message = "x".repeat(bytes);
+        assert!(matches!(
+            database.checkpoint_job_owner(session.id, CHILD_INVOCATION, CHILD_TASK, &[message]),
+            Err(SessionError::LimitExceeded {
+                maximum: MAX_PAYLOAD_BYTES,
+                ..
+            })
+        ));
+        assert!(
+            database
+                .load_job_owner_checkpoint::<Value>(session.id, CHILD_INVOCATION, CHILD_TASK)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test_case(OWNER_CHECKPOINT_PREVIOUS_SCHEMA; "schema_13")]
+    fn owner_checkpoint_migration_preserves_root_history(version: i64) {
+        let (_temp, state) = state_dir();
+        let (_fresh_temp, fresh_state) = state_dir();
+        let mut database = SessionDatabase::open(&state).unwrap();
+        let mut session = TestSession::new(MODEL, CWD);
+        session.push_message(TestMessage(ARTIFACT_NAME.into()));
+        database.save(&session, None).unwrap();
+        database
+            .connection
+            .execute_batch("DROP TABLE job_owner_checkpoints")
+            .unwrap();
+        database
+            .connection
+            .pragma_update(None, "user_version", version)
+            .unwrap();
+        drop(database);
+        let database = SessionDatabase::open(&state).unwrap();
+        let fresh = SessionDatabase::open(&fresh_state).unwrap();
+        let backup = Connection::open(
+            state
+                .path()
+                .join(format!("{SESSIONS_DB_FILE}.v{version}.bak")),
+        )
+        .unwrap();
+        let backup_version: i64 = backup
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(backup_version, version, "{BACKUP_KEEPS_ORIGIN}");
+        let backup_payload: Vec<u8> = backup
+            .query_row("SELECT payload FROM main_history_items", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            decode_payload::<TestMessage>(&backup_payload, OWNER_CHECKPOINT_FIELD).unwrap(),
+            session.messages()[0]
+        );
+        assert_eq!(
+            schema_objects(&database),
+            schema_objects(&fresh),
+            "{MIGRATED_MATCHES_FRESH}"
+        );
+        assert_eq!(
+            database
+                .load::<TestMessage, Value, Value>(session.id)
+                .unwrap()
+                .messages(),
+            session.messages()
+        );
+        database
+            .checkpoint_job_owner(session.id, CHILD_INVOCATION, CHILD_TASK, session.messages())
+            .unwrap();
+        assert_eq!(
+            database
+                .load_job_owner_checkpoint::<TestMessage>(session.id, CHILD_INVOCATION, CHILD_TASK)
+                .unwrap()
+                .unwrap(),
+            session.messages()
+        );
     }
 
     fn permission_repair_fixture(
@@ -8779,7 +9425,7 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
         let database = SessionDatabase::open(&state_dir).unwrap();
         database
             .connection
-            .execute_batch("DROP TABLE workflow_receipts")
+            .execute_batch("DROP TABLE workflow_receipts; DROP TABLE job_owner_checkpoints;")
             .unwrap();
         database
             .connection
@@ -9214,6 +9860,7 @@ CREATE TABLE subagent_history_items (
         connection
             .execute_batch(
                 &full_schema()
+                    .replace(JOB_OWNER_CHECKPOINTS_TABLE, "")
                     .replace(crate::background::TABLES, "")
                     .replace(WORKFLOW_RECEIPTS_TABLE, ""),
             )
@@ -9307,6 +9954,7 @@ CREATE TABLE subagents (
         connection
             .execute_batch(
                 &full_schema()
+                    .replace(JOB_OWNER_CHECKPOINTS_TABLE, "")
                     .replace(crate::background::TABLES, "")
                     .replace(WORKFLOW_RECEIPTS_TABLE, ""),
             )

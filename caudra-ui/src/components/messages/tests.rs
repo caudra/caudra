@@ -7889,6 +7889,7 @@ fn pressing_a_childs_bar_moves_its_window() {
 fn grabbing_a_childs_thumb_leaves_the_window_alone() {
     let _clock = FrozenSpinner::at(0);
     let mut panel = panel_with_running_shell();
+    panel.batch_child_started.clear();
     panel.set_batch_child_output("t1", 0, &shell_stream());
     let terminal = render(&mut panel, 80, 24);
     let before = seg_text(&panel, "t1");

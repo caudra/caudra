@@ -33,6 +33,7 @@ use tracing::info;
 use crate::agent::LoadedInstructions;
 use crate::agent::run::AgentParams;
 use crate::agent::subagent::{self, STRUCTURED_OUTPUT_TOOL, Subagent, TaskIdentity};
+use crate::background::JobScope;
 use crate::cancel::{CancelMap, CancelToken};
 use crate::context::ContextPublisher;
 use crate::mcp::McpSession;
@@ -307,7 +308,7 @@ impl PreparedTask {
         let task_id = session.0.id().to_owned();
         let effective_mode = session.0.task_mode();
         let permit = cancel.race(permits.acquire_arc()).await;
-        let verdict = if let Ok(_permit) = permit {
+        let mut verdict = if let Ok(_permit) = permit {
             if let Some(reporter) = &self.reporter
                 && let Err(error) = reporter.running().await
             {
@@ -333,6 +334,9 @@ impl PreparedTask {
         };
         let usage = session.0.usage();
         let tokens_used = u64::from(usage.total_input()) + u64::from(usage.output);
+        if let Err(error) = session.0.drain_jobs().await {
+            verdict = Err(error.into());
+        }
         session.0.close();
         finish(
             started,
@@ -420,6 +424,9 @@ async fn converse(
     // Only healthy runs with an unmet contract may request another response;
     // the shared steering state bounds both these prompts and inner repairs.
     while if validating {
+        if !session.report_ready() {
+            lock(captured).value = None;
+        }
         lock(captured).value.is_none()
     } else {
         reply.text.trim().is_empty()
@@ -562,6 +569,7 @@ pub type ModeResolver = Arc<dyn Fn() -> AgentMode + Send + Sync>;
 /// have carried them is gone.
 #[derive(Clone)]
 pub struct WorkflowHostContext {
+    pub jobs: Option<JobScope>,
     pub model: ModelResolver,
     pub permissions: Arc<PermissionManager>,
     pub path_locks: Arc<PathLocks>,
@@ -619,6 +627,10 @@ impl WorkflowHostContext {
         Self {
             model,
             permissions: Arc::clone(&params.permissions),
+            jobs: params
+                .jobs
+                .clone()
+                .or_else(|| params.background.as_ref().map(|tasks| tasks.main_scope())),
             path_locks: Arc::clone(&params.path_locks),
             baseline: params.baseline.clone(),
             subagent_history: params.subagent_history.clone(),
@@ -630,7 +642,7 @@ impl WorkflowHostContext {
             default_task_prompt_profile_name: Arc::clone(&params.default_task_prompt_profile_name),
             model_policy: Arc::clone(&params.model_policy),
             timeouts: params.timeouts,
-            tool_output_store: crate::tool_output::default_store(),
+            tool_output_store: params.tool_output_store.clone(),
             tool_output_lines: params.tool_output_lines,
             session_id: params.session_id.clone(),
             workspace_session: params.workspace_session.clone(),
@@ -658,6 +670,7 @@ impl WorkflowHostContext {
         Self {
             model,
             permissions: Arc::clone(&ctx.permissions),
+            jobs: ctx.job_scope(),
             path_locks: Arc::clone(&ctx.path_locks),
             baseline: ctx.baseline.clone(),
             subagent_history: ctx.subagent_history.clone(),
@@ -735,6 +748,7 @@ impl WorkflowHostContext {
             tool_output_store: self.tool_output_store.clone(),
             tool_use_id: Some(call_id.to_owned()),
             root_tool_use_id: Some(call_id.to_owned()),
+            local_root_tool_use_id: None,
             user_response_rx: self.user_response_rx.clone(),
             loaded_instructions: self.loaded_instructions.clone(),
             cancel,
@@ -764,6 +778,7 @@ impl WorkflowHostContext {
             model_policy: Arc::clone(&self.model_policy),
             workflow: None,
             background: None,
+            jobs: self.jobs.clone(),
             steering_observations: None,
             steering_order: Vec::new(),
             speculative: None,

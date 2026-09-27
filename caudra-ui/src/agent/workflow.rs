@@ -29,6 +29,7 @@ use caudra_providers::{CacheKey, Timeouts};
 use caudra_storage::StateDir;
 use caudra_storage::id::{CaudraId, SessionRef};
 use caudra_storage::local_documents::LocalDocumentStore;
+use caudra_storage::tool_outputs::ToolOutputStore;
 use caudra_workspace::WorkspaceSession;
 use futures_lite::future;
 use smol::Timer;
@@ -130,6 +131,7 @@ impl WorkflowSession {
             chat_model: slot.model.clone(),
             config: spawn.config.clone(),
             tool_output_lines: spawn.tool_output_lines,
+            tool_output_store: Some(Arc::new(ToolOutputStore::new(spawn.state_dir.clone()))),
             permissions: Arc::clone(spawn.permissions),
             session_id: Some(session_ref.clone()),
             cache_key: Some(CacheKey::session(&session_ref)),
@@ -158,6 +160,8 @@ impl WorkflowSession {
             model_policy: Arc::clone(spawn.model_policy),
             workflow: None,
             background: None,
+            jobs: spawn.background.as_ref().map(BackgroundTasks::main_scope),
+            task_id: None,
         };
         drop(slot);
         let mode: SharedMode = Arc::new(ArcSwap::from_pointee(AgentMode::default()));

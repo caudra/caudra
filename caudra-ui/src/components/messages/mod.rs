@@ -70,6 +70,7 @@ use caudra_agent::{
     streaming_reasoning_summary,
 };
 use caudra_lua::{EventHandle, WARM_TOOL_CAP, WinView};
+use caudra_storage::background::JobKind;
 use caudra_storage::view::ViewMode;
 
 use ratatui::Frame;
@@ -2059,6 +2060,7 @@ impl MessagesPanel {
         }
         let call_id = card.call_id.clone();
         let active = card.active();
+        let shell = card.kind == JobKind::Shell;
         let dependents: Vec<_> = self
             .messages
             .iter()
@@ -2074,6 +2076,16 @@ impl MessagesPanel {
         self.task_cards.insert(call_id.clone(), card);
         let parent = batch_child_id(&call_id);
         if !active {
+            if shell {
+                self.live_bufs.remove(&call_id);
+                self.stop_watching(&call_id);
+                if let Some((parent, index)) = parent {
+                    self.forget_child_output(parent, index);
+                } else if let Some(msg) = self.find_tool_msg_mut(&call_id) {
+                    msg.live_output = None;
+                    msg.render_snapshot = None;
+                }
+            }
             if let Some((parent, index)) = parent {
                 self.settle_child_progress(parent, index);
             } else if let Some(msg) = self.find_tool_msg_mut(&call_id)
@@ -2082,7 +2094,9 @@ impl MessagesPanel {
                 progress.settle();
             }
         }
-        self.mark_card_dirty(parent.map_or(call_id.as_str(), |(parent, _)| parent));
+        if let Some(root) = self.root_tool_id(&call_id) {
+            self.mark_card_dirty(root);
+        }
         for dependent in dependents {
             self.mark_card_dirty(&dependent);
         }
@@ -2123,8 +2137,11 @@ impl MessagesPanel {
         if let Some(message) = segment.msg_index.and_then(|index| self.messages.get(index))
             && let DisplayRole::TaskDelivery(origin) = &message.role
         {
-            return Some(origin.task_id.clone());
+            return (!task_card::is_shell_delivery(origin, &message.text))
+                .then(|| origin.task_id.clone());
         }
+        let agent_target =
+            |task: &TaskCard| (task.kind == JobKind::Agent).then(|| task.task_id.clone());
         let call_id = segment.tool_id.as_deref()?;
         let target = segment.row_target_at(rel, width);
         let output = self
@@ -2137,13 +2154,13 @@ impl MessagesPanel {
             && let Some(target) = target
             && let Some(index) = task_card::target_index(output, target)
         {
-            return task_card::task_at(output, index).map(|task| task.task_id.clone());
+            return task_card::task_at(output, index).and_then(agent_target);
         }
         match output {
             Some(ToolOutput::Tasks(tasks)) => tasks
                 .first()
                 .filter(|_| tasks.len() == 1)
-                .map(|task| task.task_id.clone()),
+                .and_then(agent_target),
             Some(ToolOutput::Batch { entries, .. }) => {
                 let target = target?;
                 let index = target.index();
@@ -2154,18 +2171,15 @@ impl MessagesPanel {
                             RowTarget::Item(_) if tasks.len() == 1 => 0,
                             _ => return None,
                         };
-                        tasks.get(task).map(|task| task.task_id.clone())
+                        tasks.get(task).and_then(agent_target)
                     }
                     _ => self
                         .task_cards
                         .get(&format!("{call_id}:{index}"))
-                        .map(|task| task.task_id.clone()),
+                        .and_then(agent_target),
                 }
             }
-            _ => self
-                .task_cards
-                .get(call_id)
-                .map(|task| task.task_id.clone()),
+            _ => self.task_cards.get(call_id).and_then(agent_target),
         }
     }
 
@@ -2326,7 +2340,9 @@ impl MessagesPanel {
                 .or_default(),
         )
         .insert(index, content.to_owned());
-        self.mark_card_dirty(tool_id);
+        if let Some(root) = self.root_tool_id(tool_id) {
+            self.mark_card_dirty(root);
+        }
         true
     }
 
@@ -2389,6 +2405,9 @@ impl MessagesPanel {
     }
 
     fn batch_child_running(&self, tool_id: &str, index: usize) -> bool {
+        if self.active_shell_call(&format!("{tool_id}:{index}")) {
+            return true;
+        }
         self.messages
             .iter()
             .rfind(|m| matches!(&m.role, DisplayRole::Tool(t) if t.id == tool_id))
@@ -2437,7 +2456,13 @@ impl MessagesPanel {
     }
 
     pub fn tool_output(&mut self, tool_id: &str, content: &str) {
-        if !self.tool_in_progress(tool_id) {
+        if self.tool_card(tool_id).is_none() {
+            if let Some((parent, index)) = batch_child_id(tool_id) {
+                self.set_batch_child_output(parent, index, content);
+            }
+            return;
+        }
+        if !self.tool_in_progress(tool_id) && !self.active_shell_call(tool_id) {
             return;
         }
         let Some(msg) = self
@@ -2469,10 +2494,29 @@ impl MessagesPanel {
     pub fn tool_done(&mut self, event: ToolDoneEvent) {
         self.clear_history_anchors(&event.id);
         self.dirty_cards.remove(&event.id);
-        self.remove_child_live_bufs(&event.id);
-        let retain_live_output = matches!(&event.output, ToolOutput::Shell(_));
-        let had_live_buf = self.retire_live_buf(&event.id);
-        if retain_live_output {
+        let active_shell = |call_id: &str| {
+            self.task_cards
+                .get(call_id)
+                .or_else(|| task_card::find_call(&event.output, call_id))
+                .is_some_and(|task| task.kind == JobKind::Shell && task.active())
+        };
+        let keep_live = active_shell(&event.id);
+        let retained_children: HashSet<_> = self
+            .live_bufs
+            .keys()
+            .filter(|call_id| active_shell(call_id))
+            .cloned()
+            .collect();
+        let child_prefix = format!("{}:", event.id);
+        self.live_bufs
+            .retain(|id, _| !id.starts_with(&child_prefix) || retained_children.contains(id));
+        let retain_live_output = keep_live || matches!(&event.output, ToolOutput::Shell(_));
+        let had_live_buf = if keep_live {
+            self.live_bufs.contains_key(&event.id)
+        } else {
+            self.retire_live_buf(&event.id)
+        };
+        if retain_live_output && !keep_live {
             self.stop_watching(&event.id);
         }
         // A child whose own terminal event never arrived stops here with the
@@ -2488,7 +2532,15 @@ impl MessagesPanel {
                 })
                 .for_each(|(_, progress)| progress.settle());
         }
-        self.batch_child_output.remove(&event.id);
+        if let Some(children) = self.batch_child_output.get_mut(&event.id) {
+            Arc::make_mut(children).retain(|index, _| {
+                task_card::find_call(&event.output, &format!("{}:{index}", event.id))
+                    .is_some_and(|task| task.kind == JobKind::Shell && task.active())
+            });
+            if children.is_empty() {
+                self.batch_child_output.remove(&event.id);
+            }
+        }
         self.batch_child_started.remove(&event.id);
         let Some(msg) = self
             .messages
@@ -2515,7 +2567,7 @@ impl MessagesPanel {
         msg.live_body = None;
         msg.tool_preview_pending = false;
         msg.tool_stage = None;
-        if retain_live_output {
+        if retain_live_output && !keep_live {
             msg.render_snapshot = None;
         }
         truncate_to_header(&mut msg.text);
@@ -2613,16 +2665,22 @@ impl MessagesPanel {
     }
 
     pub fn tool_annotation(&mut self, tool_id: &str, annotation: String) {
-        if self.tool_in_progress(tool_id) {
+        if self.tool_card(tool_id).is_some()
+            && (self.tool_in_progress(tool_id) || self.active_shell_call(tool_id))
+        {
             self.update_tool(tool_id, |msg| msg.annotation = Some(annotation));
         } else if let Some((parent, index)) = batch_child_id(tool_id)
             && self.batch_child_running(parent, index)
-            && let Some(msg) = self.find_tool_msg_mut(parent)
+            && let Some(root) = self.root_tool_id(tool_id)
+            && let Some(indices) = tool_id
+                .strip_prefix(root)
+                .and_then(|suffix| suffix.strip_prefix(':'))
+            && let Some(msg) = self.find_tool_msg_mut(root)
             && let Some(output) = &mut msg.tool_output
-            && let ToolOutput::Batch { entries, .. } = Arc::make_mut(output)
+            && let Some(entry) = batch_entry_mut(Arc::make_mut(output), indices)
         {
-            entries[index].annotation = Some(annotation);
-            self.mark_card_dirty(parent);
+            entry.annotation = Some(annotation);
+            self.mark_card_dirty(root);
         }
     }
 
@@ -4659,6 +4717,32 @@ impl MessagesPanel {
             .is_some_and(|s| s == ToolStatus::InProgress)
     }
 
+    fn active_shell_call(&self, call_id: &str) -> bool {
+        self.shell_call(call_id).is_some_and(TaskCard::active)
+    }
+
+    fn shell_call(&self, call_id: &str) -> Option<&TaskCard> {
+        self.task_cards
+            .get(call_id)
+            .or_else(|| {
+                self.messages
+                    .iter()
+                    .rev()
+                    .filter_map(|message| message.tool_output.as_deref())
+                    .find_map(|output| task_card::find_call(output, call_id))
+            })
+            .filter(|task| task.kind == JobKind::Shell)
+    }
+
+    fn root_tool_id<'a>(&self, mut call_id: &'a str) -> Option<&'a str> {
+        loop {
+            if self.tool_card(call_id).is_some() {
+                return Some(call_id);
+            }
+            call_id = batch_child_id(call_id)?.0;
+        }
+    }
+
     fn watching(&self, tool_id: &str) -> bool {
         self.watched_bufs.iter().any(|(id, _)| id == tool_id)
     }
@@ -4766,6 +4850,9 @@ impl MessagesPanel {
         is_header: bool,
         theme_gen: Option<u64>,
     ) {
+        if theme_gen.is_none() && self.shell_call(tool_id).is_some_and(|task| !task.active()) {
+            return;
+        }
         if self.tool_card(tool_id).is_none()
             && let Some((parent, index)) = batch_child_id(tool_id)
         {
@@ -4878,6 +4965,10 @@ impl MessagesPanel {
     }
 
     pub fn register_live_buf(&mut self, id: String, body: Arc<SharedBuf>) {
+        if self.active_shell_call(&id) {
+            self.live_bufs.insert(id, body);
+            return;
+        }
         if let Some((_, tool)) = self.tool_card(&id) {
             if tool.status != ToolStatus::InProgress {
                 return;
@@ -4891,8 +4982,8 @@ impl MessagesPanel {
     }
 
     fn remove_child_live_bufs(&mut self, parent: &str) {
-        self.live_bufs
-            .retain(|id, _| !batch_child_id(id).is_some_and(|(candidate, _)| candidate == parent));
+        let prefix = format!("{parent}:");
+        self.live_bufs.retain(|id, _| !id.starts_with(&prefix));
     }
 
     /// Snapshots are baked at the last width `view` saw, and a resize
@@ -5529,6 +5620,23 @@ impl MessagesPanel {
     }
 }
 
+fn batch_entry_mut<'a>(
+    output: &'a mut ToolOutput,
+    indices: &str,
+) -> Option<&'a mut BatchToolEntry> {
+    let ToolOutput::Batch { entries, .. } = output else {
+        return None;
+    };
+    let (index, rest) = indices
+        .split_once(':')
+        .map_or((indices, None), |(index, rest)| (index, Some(rest)));
+    let entry = entries.get_mut(index.parse::<usize>().ok()?)?;
+    match rest {
+        Some(rest) => batch_entry_mut(entry.output.as_mut()?, rest),
+        None => Some(entry),
+    }
+}
+
 fn merge_batch_snapshot(msg: &mut DisplayMessage, mut incoming: Vec<BatchToolEntry>, text: String) {
     if let Some(ToolOutput::Batch { entries, .. }) = msg.tool_output.as_deref() {
         for (index, entry) in entries.iter().enumerate() {
@@ -5687,10 +5795,11 @@ fn build_message_lines(
         return build_thinking_lines(msg, width, diagram_pans, window);
     }
     if let DisplayRole::TaskDelivery(origin) = &msg.role {
-        return BuiltMessage::bare(
-            task_card::delivery(origin, &msg.text, width),
-            msg.text.clone(),
-        );
+        let (lines, links) = task_card::delivery(origin, &msg.text, width);
+        return BuiltMessage {
+            links,
+            ..BuiltMessage::bare(lines, msg.text.clone())
+        };
     }
     let style = match &msg.role {
         DisplayRole::User => user_style(),
@@ -5895,6 +6004,153 @@ fn review_search_text(notes: &[review::ParsedNote]) -> String {
         .map(review::ParsedNote::search_text)
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+#[cfg(test)]
+mod shell_receipt_tests {
+    use super::{MessagesPanel, batch_entry_mut};
+    use crate::components::ToolStatus;
+    use crate::components::code_view::Disclosure;
+    use caudra_agent::tools::{BATCH_TOOL_NAME, SHELL_TOOL_NAME, ToolEffect};
+    use caudra_agent::{
+        BatchToolEntry, BatchToolStatus, BufferSnapshot, SharedBuf, SnapshotLine, TaskCard,
+        ToolDoneEvent, ToolOutput, ToolStartEvent,
+    };
+    use caudra_config::UiConfig;
+    use caudra_lua::EventHandle;
+    use caudra_storage::background::JobKind;
+    use serde_json::json;
+    use std::sync::Arc;
+    use test_case::test_case;
+
+    const ROOT: &str = "shell-launch";
+    const OUTPUT: &str = "**literal stdout**";
+    const ANNOTATION: &str = "still running";
+    const LATE: &str = "late output";
+
+    fn receipt(call_id: &str, kind: JobKind) -> TaskCard {
+        serde_json::from_value(json!({
+            "kind": kind, "task_id": "readable-shell", "invocation_id": "invocation",
+            "call_id": call_id, "root_call_id": ROOT, "label": "Print", "state": "running",
+            "mode": "build", "background": true, "generation": 1, "created_at": 1, "updated_at": 2,
+        }))
+        .unwrap()
+    }
+
+    fn batch(output: ToolOutput) -> ToolOutput {
+        ToolOutput::Batch {
+            entries: vec![BatchToolEntry {
+                tool: SHELL_TOOL_NAME.into(),
+                effect: ToolEffect::Unknown,
+                summary: "Print".into(),
+                status: BatchToolStatus::Success,
+                input: None,
+                raw_input: None,
+                output: Some(output),
+                annotation: None,
+                model_suffix: None,
+            }],
+            text: String::new(),
+        }
+    }
+
+    #[test_case(0; "standalone")]
+    #[test_case(1; "batch_child")]
+    #[test_case(2; "nested_batch_child")]
+    fn shell_receipts_accept_progress_until_terminal_state(depth: usize) {
+        let call_id = format!("{ROOT}{}", ":0".repeat(depth));
+        let mut card = receipt(&call_id, JobKind::Shell);
+        let mut output = ToolOutput::Tasks(vec![card.clone()]);
+        for _ in 0..depth {
+            output = batch(output);
+        }
+        let mut panel =
+            MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+        let tool = if depth == 0 {
+            SHELL_TOOL_NAME
+        } else {
+            BATCH_TOOL_NAME
+        };
+        panel.tool_start(ToolStartEvent {
+            id: ROOT.into(),
+            tool: tool.into(),
+            effect: ToolEffect::Unknown,
+            summary: "Print".into(),
+            render_header: None,
+            annotation: None,
+            input: None,
+            raw_input: None,
+            output: Some(output.clone()),
+        });
+        let buf = Arc::new(SharedBuf::new());
+        panel.register_live_buf(call_id.clone(), buf.clone());
+        panel.tool_done(ToolDoneEvent {
+            id: ROOT.into(),
+            tool: tool.into(),
+            output,
+            is_error: false,
+            ..ToolDoneEvent::error(ROOT.into(), "receipt")
+        });
+        assert!(panel.live_bufs.contains_key(&call_id));
+        assert!(!panel.tool_in_progress(ROOT));
+        assert!(panel.active_shell_call(&call_id));
+        panel.tool_annotation(&call_id, ANNOTATION.into());
+        panel.tool_output(&call_id, OUTPUT);
+        let message = panel.messages.last_mut().unwrap();
+        if depth == 0 {
+            assert_eq!(message.annotation.as_deref(), Some(ANNOTATION));
+            assert_eq!(message.live_output.as_deref(), Some(OUTPUT));
+        } else {
+            let indices = call_id.strip_prefix(&format!("{ROOT}:")).unwrap();
+            let entry = batch_entry_mut(
+                Arc::make_mut(message.tool_output.as_mut().unwrap()),
+                indices,
+            )
+            .unwrap();
+            assert_eq!(entry.annotation.as_deref(), Some(ANNOTATION));
+            let (parent, _) = call_id.rsplit_once(':').unwrap();
+            assert_eq!(panel.batch_child_stream(parent, 0), Some(OUTPUT));
+        }
+        assert!(panel.dirty_cards.contains(ROOT));
+        buf.append(SnapshotLine::plain(OUTPUT.into()));
+        let _ = panel.poll_live_bufs();
+        if depth < 2 {
+            let mut ctx = panel.rctx(tool, ROOT);
+            ctx.width = 100;
+            ctx.policy.expanded = true;
+            ctx.policy.scroll_card_lines = 0;
+            let rendered = MessagesPanel::build_tool_segment_lines(
+                panel.messages.last().unwrap(),
+                ToolStatus::Success,
+                &ctx,
+                Some(Disclosure {
+                    full: true,
+                    ..Disclosure::default()
+                }),
+            );
+            let text = rendered
+                .lines
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(text.contains(OUTPUT), "{text}");
+            assert!(!text.contains("open chat"), "{text}");
+        }
+        card.state = "succeeded".into();
+        panel.task_card_update(card);
+        assert!(!panel.active_shell_call(&call_id));
+        assert!(!panel.live_bufs.contains_key(&call_id));
+        panel.tool_output(&call_id, LATE);
+        panel.tool_annotation(&call_id, LATE.into());
+        panel.tool_snapshot(&call_id, BufferSnapshot::plain_text(LATE.into()), None);
+        panel.register_live_buf(call_id.clone(), Arc::new(SharedBuf::new()));
+        assert!(!panel.live_bufs.contains_key(&call_id));
+        let message = panel.messages.last().unwrap();
+        assert_eq!(panel.tool_card(ROOT).unwrap().1.status, ToolStatus::Success);
+        assert_ne!(message.live_output.as_deref(), Some(LATE));
+        assert_ne!(message.annotation.as_deref(), Some(LATE));
+    }
 }
 
 #[cfg(test)]

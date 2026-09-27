@@ -17,7 +17,7 @@ use caudra_grab::grab_scope;
 use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
-use ratatui::text::{Line, Span};
+use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::Paragraph;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -91,7 +91,7 @@ pub struct ListPicker<T> {
     max_visible: Option<u16>,
     footer: Option<FooterBuilder>,
     error_text: Option<String>,
-    info_text: Option<String>,
+    info_text: Option<Text<'static>>,
     empty_text: &'static str,
     width_percent: u16,
     relevance_order: bool,
@@ -133,7 +133,7 @@ struct RenderOptions<'a> {
 struct RenderContent<'a> {
     footer: Option<FooterBuilder>,
     error_text: Option<&'a str>,
-    info_text: Option<&'a str>,
+    info_text: Option<&'a Text<'static>>,
 }
 
 impl<T: PickerItem> State<T> {
@@ -440,7 +440,11 @@ impl<T: PickerItem> ListPicker<T> {
     }
 
     pub fn set_info_text(&mut self, text: Option<String>) {
-        self.info_text = text;
+        self.info_text = text.map(Text::from);
+    }
+
+    pub(crate) fn set_info_lines(&mut self, lines: Option<Vec<Line<'static>>>) {
+        self.info_text = lines.map(Text::from);
     }
 
     pub fn set_empty_text(&mut self, text: &'static str) {
@@ -749,7 +753,7 @@ impl<T: PickerItem> ListPicker<T> {
                 RenderContent {
                     footer,
                     error_text: self.error_text.as_deref(),
-                    info_text: self.info_text.as_deref(),
+                    info_text: self.info_text.as_ref(),
                 },
             ),
         }
@@ -796,7 +800,7 @@ fn render_ready<T: PickerItem>(
     let error_rows = error_text.is_some() as u16;
     let modal_inner_width = Modal::inner_width(area.width, options.width_percent);
     let requested_info_rows = info_text.map_or(0, |text| {
-        Paragraph::new(text)
+        Paragraph::new(text.clone())
             .wrap(ratatui::widgets::Wrap { trim: false })
             .line_count(modal_inner_width.max(1)) as u16
     });
@@ -860,7 +864,7 @@ fn render_ready<T: PickerItem>(
         && info_rows > 0
     {
         frame.render_widget(
-            Paragraph::new(info)
+            Paragraph::new(info.clone())
                 .style(theme::current().item_desc)
                 .wrap(ratatui::widgets::Wrap { trim: false }),
             areas[area_idx],

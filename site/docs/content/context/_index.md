@@ -199,7 +199,7 @@ Set `ui.show_reminders = false` to keep the transcript to the conversation alone
 
 ### Background-work awareness
 
-Caudra keeps the main agent aware of delegated work with a compact snapshot of background tasks and active workflows. It includes task IDs, short assignments, current states, and counts for entries that do not fit. It reads runtime state without polling tools or consuming result notifications.
+Caudra keeps the main agent aware of delegated work with a compact snapshot of background tasks, its own asynchronous shell jobs, and active workflows. It includes readable IDs, short assignments, current states, and counts for entries that do not fit. Child agents receive owner-scoped command state. Their shell jobs are not repeated as independent main-agent assignments. Snapshots read runtime state without polling tools or consuming result notifications.
 
 Periodic refresh is disabled by default (`0`). To opt in, a conservative starting interval is 32 parent response groups:
 

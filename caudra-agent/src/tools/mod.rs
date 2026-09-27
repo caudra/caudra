@@ -6,6 +6,7 @@
 //! anything but the plan file before they reach the tool.
 
 pub mod deferral;
+pub mod execution;
 mod file_tracker;
 pub mod grep;
 pub(crate) mod image_bytes;
@@ -47,6 +48,7 @@ use ignore::WalkBuilder;
 use serde_json::Value;
 
 use crate::agent::LoadedInstructions;
+use crate::background::JobScope;
 use crate::cancel::{CancelMap, CancelToken};
 use crate::context::ContextPublisher;
 use crate::mcp::McpSession;
@@ -466,6 +468,7 @@ where
 #[derive(Clone)]
 pub struct ToolContext {
     pub background: Option<crate::background::BackgroundTasks>,
+    pub jobs: Option<JobScope>,
     pub steering_observations: Option<ResponseObservations>,
     pub steering_order: Vec<usize>,
     pub provider: Arc<dyn Provider>,
@@ -489,6 +492,9 @@ pub struct ToolContext {
     pub tool_output_store: Option<Arc<ToolOutputStore>>,
     pub tool_use_id: Option<String>,
     pub root_tool_use_id: Option<String>,
+    /// The tool result in this conversation that acknowledges owned job admission.
+    /// Unlike the display root, this never names a call in a parent agent's history.
+    pub local_root_tool_use_id: Option<String>,
     pub user_response_rx: Option<Arc<async_lock::Mutex<flume::Receiver<String>>>>,
     pub loaded_instructions: LoadedInstructions,
     pub cancel: CancelToken,
@@ -540,6 +546,12 @@ pub struct ToolContext {
 }
 
 impl ToolContext {
+    pub fn job_scope(&self) -> Option<JobScope> {
+        self.jobs
+            .clone()
+            .or_else(|| self.background.as_ref().map(|tasks| tasks.main_scope()))
+    }
+
     pub fn mark_tool_result_repairable(&self) {
         if let Some(observations) = &self.steering_observations {
             observations.mark_repairable();
@@ -766,6 +778,7 @@ pub fn interpreter_ctx(
         tool_output_store: None,
         tool_use_id: None,
         root_tool_use_id: None,
+        local_root_tool_use_id: None,
         user_response_rx,
         loaded_instructions: LoadedInstructions::new(),
         cancel,
@@ -796,6 +809,7 @@ pub fn interpreter_ctx(
         model_policy: Arc::new(ModelPolicy::default()),
         workflow: None,
         background: None,
+        jobs: None,
     }
 }
 

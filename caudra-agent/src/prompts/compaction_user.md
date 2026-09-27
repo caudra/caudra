@@ -42,7 +42,7 @@ Rules:
 - Reproduce file paths, symbols, commands, error strings, URLs, and identifiers exactly. Never paraphrase an identifier.
 - If a tool result was truncated and its output ID was given, carry that ID into the summary so the full output can be re-read.
 - Record what was tried and failed, and why, so it is not retried.
-- Preserve unfinished delegated work even when the parent ended its turn. An admission receipt, launch-tool success, or silence is not evidence of completion.
+- Preserve unfinished delegated work. Record completion only when supported by a final result, not silence or an acknowledgment.
 - Keep important results already delivered, without copying child transcripts. Preserve full-output handles only when omitted content is still needed.
-- Delegation status is last observed. The latest host background-work snapshot supplies current execution state, but does not replace assignment constraints or actual result reports. Do not invent a live task ledger.
+- Delegation status is last observed. The latest host status observation supplies current execution state, but does not replace assignment constraints or actual result reports. Do not invent a live task ledger.
 - Do not mention this summary or that context was dropped.

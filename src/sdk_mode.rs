@@ -29,7 +29,10 @@ use caudra_agent::{
     AgentConfig, AgentEvent, AgentInput, AgentMode, DoneReason, Envelope, History,
     PermissionsConfig, StoredSession,
 };
-use caudra_config::{ModelPolicy, SnapshotsConfig};
+use caudra_config::{
+    ExecutionMode, ModelPolicy, SnapshotsConfig, effective_shell_execution,
+    effective_task_execution,
+};
 use caudra_providers::model::Model;
 use caudra_providers::{
     Billing, HistoryItem, HistoryItemKind, ImageSource, StopReason, ThinkingConfig, Timeouts,
@@ -60,6 +63,7 @@ use crate::cli::Cli;
 
 const WORKFLOW_SYSTEM_SUBTYPE: &str = "workflow";
 const TASK_CONTROLS: &[&str] = &["task_list", "task_status", "task_cancel", "task_promote"];
+const STALE_TASK_INVOCATION: &str = "Task invocation is no longer current";
 const WORKFLOW_LIST: &str = "workflow_list";
 const WORKFLOW_VALIDATE: &str = "workflow_validate";
 const WORKFLOW_START: &str = "workflow_start";
@@ -860,7 +864,7 @@ pub fn run(params: SdkParams) -> Result<()> {
     });
     let handle = smol::block_on(headless::spawn_persistent_interactive(InteractiveParams {
         model,
-        config,
+        config: config.clone(),
         permissions_config,
         snapshots,
         timeouts,
@@ -936,10 +940,10 @@ pub fn run(params: SdkParams) -> Result<()> {
                 "mcp_servers": sdk_mcp_servers,
                 "slash_commands": [],
                 "output_style": "default",
-                "background_tasks": handle.background.is_some(),
-                "task_controls": TASK_CONTROLS,
             }),
             handle.workflow.is_some(),
+            &config,
+            handle.background.is_some(),
         ),
     )?;
 
@@ -1861,11 +1865,34 @@ fn handle_task_control_request(
             .get("task_id")
             .and_then(Value::as_str)
             .ok_or("task_id is required".to_owned())?;
+        let generation = tasks.generation();
+        let status = tasks.status(id)?;
+        if cr
+            .request
+            .extra
+            .get("invocation_id")
+            .is_some_and(|invocation| invocation.as_str() != Some(&status.invocation_id))
+            || cr
+                .request
+                .extra
+                .get("generation")
+                .is_some_and(|expected| expected.as_u64() != Some(generation))
+        {
+            return Err(STALE_TASK_INVOCATION.into());
+        }
         let status = match subtype {
-            "task_cancel" => tasks.cancel(id).await,
-            "task_promote" => tasks.promote(id).await,
-            _ => tasks.status(id),
-        }?;
+            "task_cancel" => {
+                tasks
+                    .cancel_invocation(id, &status.invocation_id, generation)
+                    .await?
+            }
+            "task_promote" => {
+                tasks
+                    .promote_invocation(id, &status.invocation_id, generation)
+                    .await?
+            }
+            _ => status,
+        };
         serde_json::to_value(status).map_err(|error| error.to_string())
     });
     match result {
@@ -1877,10 +1904,33 @@ fn handle_task_control_request(
 /// The init message with what the session can do beyond the Claude Code
 /// shape: `workflows` says whether a runtime is attached, and
 /// `workflow_controls` names the `control_request` subtypes it answers.
-fn init_payload(mut payload: Value, workflows: bool) -> Value {
+fn init_payload(mut payload: Value, workflows: bool, config: &AgentConfig, jobs: bool) -> Value {
     let controls: &[&str] = if workflows { WORKFLOW_CONTROLS } else { &[] };
     payload["workflows"] = Value::Bool(workflows);
     payload["workflow_controls"] = serde_json::json!(controls);
+    let task_mode = effective_task_execution(config, jobs);
+    let shell_mode = effective_shell_execution(config, jobs);
+    let background_capable = |mode: &Option<ExecutionMode>| {
+        jobs && matches!(mode, Some(ExecutionMode::Auto | ExecutionMode::Async))
+    };
+    payload["background_tasks"] = Value::Bool(background_capable(&task_mode));
+    payload["background_shell"] = Value::Bool(background_capable(&shell_mode));
+    payload["background_jobs"] = Value::Bool(jobs);
+    payload["task_execution"] =
+        serde_json::json!({"configured": config.task_execution, "effective": task_mode});
+    payload["shell_execution"] = serde_json::json!({"configured": config.shell_execution, "effective": shell_mode, "async_threshold_secs": config.shell_async_threshold_secs});
+    payload["job_kinds"] = if jobs {
+        serde_json::json!(["agent", "shell"])
+    } else {
+        serde_json::json!([])
+    };
+    payload["task_controls"] = serde_json::json!(
+        TASK_CONTROLS
+            .iter()
+            .filter(|control| jobs
+                && (**control != "task_promote" || task_mode == Some(ExecutionMode::Auto)))
+            .collect::<Vec<_>>()
+    );
     payload
 }
 
@@ -2622,7 +2672,7 @@ mod tests {
     use caudra_agent::types::WORKFLOW_EVENT_RUN_ID;
     use caudra_agent::{SubagentInfo, TaskCard, ToolOutput};
     use caudra_providers::{ContentBlock, Message, Role, TaskEventOrigin};
-    use caudra_storage::background::TaskRecord;
+    use caudra_storage::background::{JobPayload, ShellJobMetadata, TaskRecord};
     use caudra_storage::sessions::SessionDatabase;
     use caudra_storage::usage_ledger::LedgerPurpose;
     use caudra_workflow::{RunSnapshot, RunStatus, RunUsage, SourceKind};
@@ -2649,9 +2699,115 @@ mod tests {
     const TASK_EVENT: &str = "task-result-event";
     const TASK_SUCCEEDED: &str = "succeeded";
     const LARGE_TASK_RESULT_BYTES: usize = 64 * 1024;
+    const TASK_PROMOTION_ERROR: &str =
+        "task promotion requires task_execution = auto and an agent task";
+
+    #[test_case(false; "unsupported_frontend")]
+    #[test_case(true; "persistent_frontend")]
+    fn init_execution_capabilities_are_independent(jobs: bool) {
+        for task in [
+            ExecutionMode::Sync,
+            ExecutionMode::Auto,
+            ExecutionMode::Async,
+        ] {
+            for shell in [
+                ExecutionMode::Sync,
+                ExecutionMode::Auto,
+                ExecutionMode::Async,
+            ] {
+                let config = AgentConfig {
+                    task_execution: task.clone(),
+                    shell_execution: shell.clone(),
+                    ..Default::default()
+                };
+                let payload = init_payload(serde_json::json!({}), false, &config, jobs);
+                assert_eq!(
+                    payload["task_execution"]["configured"],
+                    serde_json::json!(task)
+                );
+                assert_eq!(
+                    payload["shell_execution"]["configured"],
+                    serde_json::json!(shell)
+                );
+                assert_eq!(
+                    payload["task_execution"]["effective"],
+                    serde_json::json!(task.effective(jobs))
+                );
+                assert_eq!(
+                    payload["shell_execution"]["effective"],
+                    serde_json::json!(shell.effective(jobs))
+                );
+                assert_eq!(
+                    payload["background_tasks"],
+                    jobs && task != ExecutionMode::Sync
+                );
+                assert_eq!(
+                    payload["background_shell"],
+                    jobs && shell != ExecutionMode::Sync
+                );
+                let controls = payload["task_controls"].as_array().unwrap();
+                assert_eq!(
+                    controls.contains(&serde_json::json!("task_promote")),
+                    jobs && task == ExecutionMode::Auto
+                );
+                for control in ["task_list", "task_status", "task_cancel"] {
+                    assert_eq!(controls.contains(&serde_json::json!(control)), jobs);
+                }
+                assert_eq!(
+                    payload["job_kinds"],
+                    if jobs {
+                        serde_json::json!(["agent", "shell"])
+                    } else {
+                        serde_json::json!([])
+                    }
+                );
+            }
+        }
+    }
+
+    #[test_case(ExecutionMode::Sync, Value::Null, TASK_PROMOTION_ERROR; "sync")]
+    #[test_case(ExecutionMode::Async, Value::Null, TASK_PROMOTION_ERROR; "async_mode")]
+    #[test_case(ExecutionMode::Auto, serde_json::json!({"invocation_id": "stale"}), STALE_TASK_INVOCATION; "stale_invocation")]
+    #[test_case(ExecutionMode::Auto, serde_json::json!({"generation": 0}), STALE_TASK_INVOCATION; "stale_generation")]
+    fn stale_sdk_promotion_is_rejected(mode: ExecutionMode, extra: Value, error: &str) {
+        let temp = TempDir::new().unwrap();
+        let storage = StateDir::from_path(temp.path().into());
+        let mut session = StoredSession::new("provider/model", "/repo");
+        session.save(&storage).unwrap();
+        SessionDatabase::open(&storage)
+            .unwrap()
+            .save_background_task(session.id, &task_record(Value::Null))
+            .unwrap();
+        let tasks = smol::block_on(BackgroundTasks::spawn(storage, session.id)).unwrap();
+        tasks.set_task_execution(mode);
+        let (pump, out, _) = permission_event_pump(permission_manager(), PermissionMode::Default);
+        let mut arguments = serde_json::json!({"task_id": PHRASE_TASK});
+        if let Some(extra) = extra.as_object() {
+            arguments.as_object_mut().unwrap().extend(extra.clone());
+        }
+        handle_task_control_request(
+            &InboundControlRequest {
+                request_id: TASK_CALL.into(),
+                request: InboundControlRequestInner {
+                    subtype: "task_promote".into(),
+                    extra: arguments,
+                },
+            },
+            &pump.writer,
+            Some(&tasks),
+        )
+        .unwrap();
+        let response = next_message(&out);
+        assert_eq!(response["response"]["subtype"], "error");
+        assert_eq!(response["response"]["error"], error);
+        assert!(!tasks.status(PHRASE_TASK).unwrap().active());
+        smol::block_on(tasks.shutdown()).unwrap();
+    }
 
     fn task_record(output: Value) -> TaskRecord {
         TaskRecord {
+            payload: Default::default(),
+            owner: Default::default(),
             created_at: 0,
             updated_at: 0,
             sequence: 1,
@@ -2675,16 +2831,32 @@ mod tests {
         }
     }
 
-    #[test_case(serde_json::json!({"answer": [1, true, null]}), false; "object")]
-    #[test_case(serde_json::json!([1, {"answer": true}]), false; "array")]
-    #[test_case(serde_json::json!("answer"), false; "text")]
-    #[test_case(serde_json::json!("x".repeat(LARGE_TASK_RESULT_BYTES)), true; "large_result_reference")]
-    fn task_status_and_tool_result_preserve_native_outcome(output: Value, oversized: bool) {
+    #[test_case(serde_json::json!({"answer": [1, true, null]}), false, false; "object")]
+    #[test_case(serde_json::json!([1, {"answer": true}]), false, false; "array")]
+    #[test_case(serde_json::json!("answer"), false, false; "text")]
+    #[test_case(serde_json::json!("x".repeat(LARGE_TASK_RESULT_BYTES)), true, false; "large_result_reference")]
+    #[test_case(serde_json::json!({"stdout": "shell output", "exit_code": 0}), false, true; "shell_output")]
+    #[test_case(serde_json::json!("x".repeat(LARGE_TASK_RESULT_BYTES)), true, true; "large_shell_output")]
+    fn task_status_and_tool_result_preserve_native_outcome(
+        output: Value,
+        oversized: bool,
+        shell: bool,
+    ) {
         let temp = TempDir::new().unwrap();
         let storage = StateDir::from_path(temp.path().into());
         let mut session = StoredSession::new("provider/model", "/repo");
         session.save(&storage).unwrap();
-        let record = task_record(output.clone());
+        let mut record = task_record(output.clone());
+        if shell {
+            record.payload = JobPayload::Shell(ShellJobMetadata {
+                call_id: TASK_CALL.into(),
+                root_call_id: TASK_CALL.into(),
+                command: "printf shell-output".into(),
+                workdir: ".".into(),
+                timeout_ms: 120_000,
+                mode: "build".into(),
+            });
+        }
         SessionDatabase::open(&storage)
             .unwrap()
             .save_background_task(session.id, &record)
@@ -2710,6 +2882,7 @@ mod tests {
         assert_eq!(status["task_id"], PHRASE_TASK);
         assert_eq!(status["invocation_id"], TASK_INVOCATION);
         assert_eq!(status["state"], TASK_SUCCEEDED);
+        assert_eq!(status["kind"], if shell { "shell" } else { "agent" });
         assert_eq!(status["result_truncated"], oversized);
         if oversized {
             assert!(status.get("result").is_none());
@@ -2773,6 +2946,23 @@ mod tests {
         for key in ["invocation_id", "call_id", "root_call_id", "generation"] {
             assert!(cards[0].get(key).is_none());
         }
+        pump.background = Some(tasks.clone());
+        pump.handle(Envelope {
+            event: AgentEvent::Done {
+                usage: TokenUsage::default(),
+                num_turns: 0,
+                reason: DoneReason::EndTurn,
+            },
+            subagent: None,
+            run_id: BACKGROUND_EVENT_RUN_ID,
+            workflow: None,
+            task: Some(Arc::new(TaskProvenance {
+                session_id: session.id,
+                task_id: PHRASE_TASK.into(),
+                invocation_id: TASK_INVOCATION.into(),
+            })),
+        })
+        .unwrap();
         assert!(out.is_empty());
         smol::block_on(tasks.shutdown()).unwrap();
     }
@@ -4833,7 +5023,12 @@ mod tests {
     #[test_case(true => (true, WORKFLOW_CONTROLS.len()); "with_a_runtime")]
     #[test_case(false => (false, 0); "without_a_runtime")]
     fn init_advertises_workflow_support(workflows: bool) -> (bool, usize) {
-        let payload = init_payload(serde_json::json!({"cwd": "/tmp"}), workflows);
+        let payload = init_payload(
+            serde_json::json!({"cwd": "/tmp"}),
+            workflows,
+            &AgentConfig::default(),
+            false,
+        );
         assert_eq!(payload["cwd"], "/tmp");
         (
             payload["workflows"].as_bool().unwrap(),

@@ -430,6 +430,10 @@ impl BatchCall {
 fn child_context(ctx: &ToolContext, index: usize) -> ToolContext {
     let mut child = ctx.clone();
     child.tool_use_id = Some(child_tool_use_id(ctx.tool_use_id.as_deref(), index));
+    child.local_root_tool_use_id = ctx
+        .local_root_tool_use_id
+        .clone()
+        .or_else(|| ctx.tool_use_id.clone());
     child.steering_order.push(index);
     child.live_sink = None;
     child
@@ -1166,6 +1170,22 @@ mod tests {
             child_context(&ctx, 0).live_sink.is_none(),
             "the live row belongs to the batch, not to a child"
         );
+    }
+
+    #[test_case(None, "local-batch"; "direct_batch_uses_parent_call")]
+    #[test_case(Some("local-receipt"), "local-receipt"; "explicit_local_root_is_preserved")]
+    fn child_receipt_root_is_independent_of_cross_agent_display_root(
+        local: Option<&str>,
+        expected: &str,
+    ) {
+        const DISPLAY_ROOT: &str = "parent-agent-task";
+        let mut ctx = stub_ctx(&AgentMode::Build);
+        ctx.tool_use_id = Some("local-batch".into());
+        ctx.root_tool_use_id = Some(DISPLAY_ROOT.into());
+        ctx.local_root_tool_use_id = local.map(str::to_owned);
+        let child = child_context(&ctx, 0);
+        assert_eq!(child.local_root_tool_use_id.as_deref(), Some(expected));
+        assert_eq!(child.root_tool_use_id.as_deref(), Some(DISPLAY_ROOT));
     }
 
     /// A tool that only returns once every sibling has reached the same
