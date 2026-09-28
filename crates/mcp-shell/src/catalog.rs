@@ -19,7 +19,7 @@ Usage notes:
 - The command parameter is required.
 - Commands must be valid MCP JSON strings, are bounded to 65536 UTF-8 bytes, and are authorized by immutable operator policy before execution. Malformed JSON or non-UTF-8 request payloads are rejected by the MCP transport before tool dispatch.
 - timeoutSec is optional, in seconds from 1 to 21600 (six hours). Omit it unless the command is expected to outlast the 120 second default, so a hung command is reported early. A value outside that range is rejected rather than clamped.
-- A command that does not exit on its own, such as a server or a watcher, holds the call until its timeout.
+- A command that does not exit on its own, such as a server or a watcher, runs until its execution timeout unless cancelled.
 - Use workdir instead of embedding cd commands. It must resolve inside the configured root and defaults to ".".
 - Only the initial working directory is root-confined. Execution is unsafe and unsandboxed: commands can mutate host files, access the network, and read inherited environment variables.
 - Prefer the dedicated file tools when they are available and fit the operation, and prefer the code execution tool for pure computation such as arithmetic, statistics, string processing, and JSON reshaping, because it runs isolated from the host.
@@ -29,7 +29,7 @@ Usage notes:
 - Output is streamed through MCP progress notifications; the final result contains bounded tails and completion accounting.
 - The result is already bounded per stream and, by default, reduced by a built-in filter that keeps errors, warnings, and summaries. Run the command directly instead of piping into head or tail: blind truncation defeats that filter entirely, because it applies only to a single-program command, and it withholds live output until the process exits. Piping into rg or grep to search output is fine.
 - Prefer separate streams to 2>&1. Merged output is filtered as stdout, so stderr diagnostics become subject to stdout line caps instead of being carried in full.
-- Background execution is unsupported; descendants that retain output pipes are terminated."#;
+- Descendants that retain output pipes after the command exits are terminated."#;
 
 #[must_use]
 #[cfg(feature = "mcp")]
@@ -118,6 +118,10 @@ mod tests {
         assert!(description.contains("instead of piping into head or tail"));
         assert!(description.contains("Piping into rg or grep to search output is fine"));
         assert!(description.contains("Prefer separate streams to 2>&1"));
+        assert!(description.contains("runs until its execution timeout unless cancelled"));
+        assert!(description.contains("Descendants that retain output pipes"));
+        assert!(!description.contains("holds the call"));
+        assert!(!description.contains("Background execution is unsupported"));
         assert_eq!(
             tools[0].input_schema["properties"]["timeoutSec"]["description"],
             "Optional timeout in seconds, from 1 to 21600. Omit it for the 120 second default unless the command needs longer; a value outside that range is rejected."
