@@ -2,15 +2,17 @@
 //! the background sweep share this code so a dry run shows exactly what the
 //! sweep would do.
 
+use std::collections::HashSet;
 use std::fs;
-use std::path::Path;
+use std::io;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use jiff::Zoned;
 use serde::Serialize;
 use tracing::{info, warn};
 
-use super::database::SESSION_SNAPSHOT_DIR;
+use super::database::{SESSION_SNAPSHOT_DIR, WORKSPACE_SNAPSHOT_DIR, directory_bytes};
 use super::lease::SessionLease;
 use super::progress::{PRUNE, PruneEvent};
 use super::{
@@ -31,6 +33,9 @@ const OWNER_FILE_MODE: u32 = 0o600;
 /// Orphaned artifact directories younger than this may belong to a session
 /// whose first save has not committed yet.
 const ORPHAN_GRACE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+/// Only a session's snapshot store from before snapshots were git objects
+/// holds this directory.
+const LEGACY_SNAPSHOT_OBJECTS_DIR: &str = "objects";
 const SKIP_OPEN: &str = "open in another Caudra instance";
 const SKIP_PINNED: &str = "pinned";
 
@@ -381,6 +386,9 @@ pub fn prune(
         report.orphan_directories += directories;
         report.orphan_bytes += bytes;
     }
+    let (directories, bytes) = remove_orphan_snapshot_stores(state_dir, &known, now, dry_run)?;
+    report.orphan_directories += directories;
+    report.orphan_bytes += bytes;
     PRUNE.report(PruneEvent::Phase {
         label: TOOL_OUTPUT_PHASE,
     });
@@ -473,45 +481,112 @@ fn remove_orphan_directories(
     now: SystemTime,
     dry_run: bool,
 ) -> Result<(u64, u64), SessionError> {
-    let entries = match fs::read_dir(root) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok((0, 0)),
-        Err(error) => return Err(StorageError::from(error).into()),
-    };
     let mut directories = 0;
     let mut bytes = 0;
-    for entry in entries {
-        let entry = entry.map_err(StorageError::from)?;
-        let path = entry.path();
-        let metadata = fs::symlink_metadata(&path).map_err(StorageError::from)?;
-        if !metadata.is_dir() || metadata.file_type().is_symlink() {
-            continue;
-        }
-        let Some(id) = entry
-            .file_name()
-            .to_str()
-            .and_then(|name| name.parse::<CaudraId>().ok())
-        else {
-            continue;
-        };
-        if known.contains(&id) {
-            continue;
-        }
-        let modified = metadata.modified().map_err(StorageError::from)?;
-        if !now
-            .duration_since(modified)
-            .is_ok_and(|age| age >= ORPHAN_GRACE)
-        {
+    for (path, metadata) in child_directories(root)? {
+        if !is_orphan(&path, &metadata, known, now)? {
             continue;
         }
         directories += 1;
-        bytes += super::database::directory_bytes(&path);
+        bytes += directory_bytes(&path);
         if !dry_run {
             let _artifact_lock = lock_session_artifacts(state_dir)?;
             fs::remove_dir_all(&path).map_err(StorageError::from)?;
         }
     }
     Ok((directories, bytes))
+}
+
+/// Removes the snapshot stores nothing can read again: a session's store in
+/// the format from before snapshots were git objects, and a workspace's shared
+/// repository that no session directory names once it is past the grace
+/// period. The artifact lock is held across the scan, because every capture
+/// holds it while it names a repository. A session directory the orphan pass
+/// removes names nothing, so a dry run skips it the same way.
+fn remove_orphan_snapshot_stores(
+    state_dir: &StateDir,
+    known: &[CaudraId],
+    now: SystemTime,
+    dry_run: bool,
+) -> Result<(u64, u64), SessionError> {
+    let _artifact_lock = (!dry_run)
+        .then(|| lock_session_artifacts(state_dir))
+        .transpose()?;
+    let mut named = HashSet::new();
+    let mut orphans = Vec::new();
+    for (session, metadata) in child_directories(&state_dir.path().join(SESSION_SNAPSHOT_DIR))? {
+        if is_orphan(&session, &metadata, known, now)? {
+            continue;
+        }
+        for (store, _) in child_directories(&session)? {
+            if store.join(LEGACY_SNAPSHOT_OBJECTS_DIR).is_dir() {
+                orphans.push(store);
+            } else if let Some(key) = store.file_name() {
+                named.insert(key.to_owned());
+            }
+        }
+    }
+    for (repository, metadata) in child_directories(&state_dir.path().join(WORKSPACE_SNAPSHOT_DIR))?
+    {
+        if repository
+            .file_name()
+            .is_some_and(|key| !named.contains(key))
+            && is_past_grace(&metadata, now)?
+        {
+            orphans.push(repository);
+        }
+    }
+    let bytes = orphans.iter().map(|orphan| directory_bytes(orphan)).sum();
+    if !dry_run {
+        for orphan in &orphans {
+            fs::remove_dir_all(orphan).map_err(StorageError::from)?;
+        }
+    }
+    Ok((orphans.len() as u64, bytes))
+}
+
+/// The real directories directly in `dir`, none when it is absent. A symlink
+/// is never one: removal must not follow it out of the state directory.
+fn child_directories(dir: &Path) -> Result<Vec<(PathBuf, fs::Metadata)>, SessionError> {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(StorageError::from(error).into()),
+    };
+    let mut directories = Vec::new();
+    for entry in entries {
+        let path = entry.map_err(StorageError::from)?.path();
+        let metadata = fs::symlink_metadata(&path).map_err(StorageError::from)?;
+        if metadata.is_dir() {
+            directories.push((path, metadata));
+        }
+    }
+    Ok(directories)
+}
+
+/// A directory named for a session the database does not know, and old enough
+/// that it cannot be one whose first save is still to commit.
+fn is_orphan(
+    path: &Path,
+    metadata: &fs::Metadata,
+    known: &[CaudraId],
+    now: SystemTime,
+) -> Result<bool, SessionError> {
+    let Some(id) = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.parse::<CaudraId>().ok())
+    else {
+        return Ok(false);
+    };
+    Ok(!known.contains(&id) && is_past_grace(metadata, now)?)
+}
+
+fn is_past_grace(metadata: &fs::Metadata, now: SystemTime) -> Result<bool, SessionError> {
+    let modified = metadata.modified().map_err(StorageError::from)?;
+    Ok(now
+        .duration_since(modified)
+        .is_ok_and(|age| age >= ORPHAN_GRACE))
 }
 
 #[cfg(test)]
@@ -796,6 +871,52 @@ mod tests {
         assert!(fresh_dir.exists());
         assert!(known_dir.exists());
         assert!(report.checkpoint.is_some());
+    }
+
+    /// A workspace repository is shared, so only the absence of every session
+    /// directory naming it makes it an orphan; a legacy store can never be
+    /// read again, so its age does not matter.
+    #[test]
+    fn prune_removes_unnamed_workspace_repositories_and_legacy_stores() {
+        const NAMED: &str = "named";
+        const STALE: &str = "unnamed-stale";
+        const FRESH: &str = "unnamed-fresh";
+        const LEGACY: &str = "legacy";
+        const ORPHANED_MSG: &str = "unnamed stale repositories and legacy stores are orphans";
+
+        let (_temp, state_dir) = state_dir();
+        let mut database = SessionDatabase::open(&state_dir).unwrap();
+        let known = saved_session(&mut database, CWD, epoch(&now(), 1));
+        let session_dir = state_dir
+            .path()
+            .join(SESSION_SNAPSHOT_DIR)
+            .join(known.id.to_string());
+        fs::create_dir_all(session_dir.join(NAMED)).unwrap();
+        let legacy = session_dir.join(LEGACY);
+        fs::create_dir_all(legacy.join(LEGACY_SNAPSHOT_OBJECTS_DIR)).unwrap();
+        let repositories = state_dir.path().join(WORKSPACE_SNAPSHOT_DIR);
+        let old = SystemTime::now() - ORPHAN_GRACE - Duration::from_secs(60);
+        for key in [NAMED, STALE, FRESH] {
+            fs::create_dir_all(repositories.join(key)).unwrap();
+        }
+        for key in [NAMED, STALE] {
+            fs::File::open(repositories.join(key))
+                .unwrap()
+                .set_modified(old)
+                .unwrap();
+        }
+
+        let preview = prune(&mut database, &state_dir, true).unwrap();
+        assert_eq!(preview.orphan_directories, 2, "{ORPHANED_MSG}");
+        assert!(repositories.join(STALE).exists(), "{ORPHANED_MSG}");
+
+        let report = prune(&mut database, &state_dir, false).unwrap();
+
+        assert_eq!(report.orphan_directories, 2, "{ORPHANED_MSG}");
+        assert!(!repositories.join(STALE).exists(), "{ORPHANED_MSG}");
+        assert!(!legacy.exists(), "{ORPHANED_MSG}");
+        assert!(repositories.join(NAMED).exists(), "{ORPHANED_MSG}");
+        assert!(repositories.join(FRESH).exists(), "{ORPHANED_MSG}");
     }
 
     #[test]

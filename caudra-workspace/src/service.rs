@@ -1135,7 +1135,7 @@ pub struct SnapshotRestoreStatus {
 pub struct SnapshotCleanupResult {
     pub deleted_checkpoint_ids: Vec<CheckpointId>,
     pub deleted_snapshots: u32,
-    pub deleted_blobs: u32,
+    pub deleted_objects: u32,
     pub reclaimed_bytes: u64,
 }
 

@@ -581,9 +581,9 @@ pub enum StorageAction {
         /// Emit JSON
         #[arg(long)]
         json: bool,
-        /// Also list the manifests each store holds
+        /// Also list, per session, the start and checkpoint snapshots it names
         #[arg(long)]
-        manifests: bool,
+        checkpoints: bool,
     },
     /// Check database and foreign-key integrity
     Check,

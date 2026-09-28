@@ -32,9 +32,9 @@ const CATEGORY_COUNT: usize = 4;
 const PERCENT_TENTHS_SCALE: u64 = 1_000;
 const COLLAPSED_STORES: usize = 6;
 const LEGEND_GAP: &str = "   ";
-const ID_WIDTH: usize = 22;
 const SIZE_WIDTH: usize = 10;
 const OBJECTS_WIDTH: usize = 8;
+const SESSIONS_WIDTH: usize = 8;
 const SNAPS_WIDTH: usize = 6;
 const ORPHANED_STORE: &str = "(workspace root missing)";
 const LOADING: &str = "Measuring the state directory…";
@@ -441,8 +441,8 @@ fn store_lines(stores: &[StoreEntry], expanded: bool, theme: &Theme) -> Vec<Line
 fn store_header(theme: &Theme) -> Line<'static> {
     Line::from(Span::styled(
         format!(
-            "{:ID_WIDTH$} {:>SIZE_WIDTH$} {:>OBJECTS_WIDTH$} {:>SNAPS_WIDTH$}  Workspace",
-            "Session", "Size", "Objects", "Snaps"
+            "{:>SIZE_WIDTH$} {:>OBJECTS_WIDTH$} {:>SESSIONS_WIDTH$} {:>SNAPS_WIDTH$}  Workspace",
+            "Size", "Objects", "Sessions", "Snaps"
         ),
         theme.tool_dim,
     ))
@@ -455,11 +455,11 @@ fn store_row(entry: &StoreEntry, theme: &Theme) -> Line<'static> {
     );
     Line::from(vec![
         Span::raw(format!(
-            "{:ID_WIDTH$} {:>SIZE_WIDTH$} {:>OBJECTS_WIDTH$} {:>SNAPS_WIDTH$}  ",
-            truncate(&entry.session_id, ID_WIDTH),
+            "{:>SIZE_WIDTH$} {:>OBJECTS_WIDTH$} {:>SESSIONS_WIDTH$} {:>SNAPS_WIDTH$}  ",
             format_iec_bytes(entry.bytes),
             format_integer(entry.objects),
-            format_usize(entry.manifests.len())
+            format_usize(entry.sessions.len()),
+            format_usize(entry.snapshot_count())
         )),
         Span::styled(escape_terminal_controls(&workspace), workspace_style),
     ])
@@ -594,23 +594,12 @@ fn format_percentage(bytes: u64, total: u64) -> String {
     format!("{}.{:01}%", tenths / 10, tenths % 10)
 }
 
-fn truncate(text: &str, width: usize) -> String {
-    let escaped = escape_terminal_controls(text);
-    if escaped.chars().count() <= width {
-        return escaped;
-    }
-    escaped
-        .chars()
-        .take(width.saturating_sub(1))
-        .collect::<String>()
-        + "…"
-}
-
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
 
+    use caudra_agent::snapshots::SessionSnapshots;
     use crossterm::event::{MouseButton, MouseEventKind};
     use ratatui::backend::TestBackend;
     use ratatui::style::Modifier;
@@ -628,11 +617,11 @@ mod tests {
     const WORKFLOW_RUN_COUNT: u64 = 24;
     const WORKFLOW_CALL_COUNT: u64 = 960;
     const WORKFLOW_BYTES: u64 = 3 * 1024 * 1024;
-    const BIG_STORE: &str = "big-store-session";
-    const SMALL_STORE: &str = "small-store-session";
-    const ORPHAN_STORE: &str = "orphan-store-session";
+    const BIG_STORE: &str = "/workspace/atlas";
+    const SMALL_STORE: &str = "/workspace/small";
     const WORKSPACE_KEY: &str = "workspace-key";
-    const MANIFEST: &str = "session-start";
+    const SESSION_ID: &str = "store-session";
+    const START_POINTER: &str = "start";
     const MISSING_TOTAL: &str = "grid must spend every cell";
     const MISSING_ORPHAN: &str = "an orphaned store must be named, not hidden";
     const MISSING_HIDDEN: &str = "a collapsed list must account for what it hid";
@@ -669,14 +658,16 @@ mod tests {
         }
     }
 
-    fn store(session_id: &str, bytes: u64, root: Option<&str>) -> StoreEntry {
+    fn store(bytes: u64, root: Option<&str>) -> StoreEntry {
         StoreEntry {
-            session_id: session_id.to_owned(),
             workspace_key: WORKSPACE_KEY.to_owned(),
             root: root.map(PathBuf::from),
             bytes,
             objects: 12,
-            manifests: vec![MANIFEST.to_owned()],
+            sessions: vec![SessionSnapshots {
+                session_id: SESSION_ID.to_owned(),
+                snapshots: vec![START_POINTER.to_owned()],
+            }],
         }
     }
 
@@ -684,9 +675,8 @@ mod tests {
         (0..count)
             .map(|index| {
                 store(
-                    &format!("store-{index}"),
                     u64::try_from(count - index).unwrap_or(1) * 1024,
-                    Some("/workspace"),
+                    Some(&format!("/workspace/store-{index}")),
                 )
             })
             .collect()
@@ -777,13 +767,13 @@ mod tests {
     #[test]
     fn an_orphaned_store_is_named_not_hidden() {
         let entries = vec![
-            store(BIG_STORE, 4096, Some("/workspace/atlas")),
-            store(ORPHAN_STORE, 2048, None),
-            store(SMALL_STORE, 1024, Some("/workspace/small")),
+            store(4096, Some(BIG_STORE)),
+            store(2048, None),
+            store(1024, Some(SMALL_STORE)),
         ];
         let rendered = text(&store_lines(&entries, false, &theme::current()));
         assert!(rendered.contains(ORPHANED_STORE), "{MISSING_ORPHAN}");
-        assert!(rendered.contains(ORPHAN_STORE), "{MISSING_ORPHAN}");
+        assert!(rendered.contains(SMALL_STORE), "{MISSING_ORPHAN}");
     }
 
     #[test]

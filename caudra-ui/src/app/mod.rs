@@ -122,9 +122,7 @@ use caudra_agent::herdr::PaneMetadata;
 use caudra_agent::mentions;
 use caudra_agent::permissions::{PermissionManager, PermissionPolicyError};
 use caudra_agent::prompt::profile::PromptProfileCatalog;
-use caudra_agent::snapshots::{
-    SESSION_SNAPSHOTS_DIR, SnapshotError, SnapshotLimits, SnapshotStore, workspace_key,
-};
+use caudra_agent::snapshots::{SnapshotError, SnapshotLimits, SnapshotStore, workspace_key};
 use caudra_agent::types::{BACKGROUND_EVENT_RUN_ID, WorkflowProvenance};
 use caudra_agent::workspace_baseline::{BaselineOutcome, WorkspaceBaseline};
 use caudra_agent::{
@@ -166,6 +164,8 @@ use mouse::Autoscroll;
 use mouse::EDGE_SCROLL_LINES;
 pub(crate) use permission_editor::ConversationPermissions;
 pub(crate) use queue::{MessageQueue, SubmitOutcome};
+#[cfg(test)]
+pub(crate) use session::LEGACY_RESTORE_CLEARED;
 use session::{MergedHistory, Sent};
 pub(crate) use session::{
     REVERT_BUSY_MSG, reachable_subagent_ids, recover_pending_workspace_restore, session_has_content,
@@ -195,6 +195,8 @@ const HISTORY_UNREADABLE: &str = "Failed to read session history: ";
 const NO_FILE_REVERT_MSG: &str = "No file revert for this workspace";
 const REMOTE_SNAPSHOT_READY: &str = "Remote workspace snapshot is available";
 const REMOTE_SNAPSHOT_BUSY: &str = "Workspace snapshot capture is busy; final snapshot skipped";
+const REMOTE_SNAPSHOT_PLACEHOLDER_DIR: &str = "remote-snapshot-metadata";
+const REMOTE_SNAPSHOT_PLACEHOLDER_KEY: &str = "remote";
 const NO_FILE_CHANGES_MSG: &str =
     "Nothing has written to this workspace, so there are no file changes to revert";
 const FAST_UNSUPPORTED_MSG: &str = "Fast mode needs a model that sells a fast tier (API only)";
@@ -949,24 +951,23 @@ impl App {
         limits: SnapshotLimits,
     ) -> Result<Arc<SnapshotStore>, SnapshotError> {
         Ok(Arc::new(
-            SnapshotStore::new_managed(
-                storage.clone(),
-                Self::snapshot_store_path(storage, session_id, cwd)?,
-            )
-            .with_limits(limits),
+            SnapshotStore::new_managed(storage.clone(), session_id, &workspace_key(cwd)?)
+                .with_limits(limits),
         ))
     }
 
-    fn snapshot_store_path(
+    /// A remote session's snapshots live on the Workcell host. This store only
+    /// fills the slot, under a directory no local store uses, and writes
+    /// nothing unless something captures into it.
+    pub(crate) fn remote_snapshot_placeholder(
         storage: &StateDir,
-        session_id: caudra_storage::id::CaudraId,
-        cwd: &std::path::Path,
-    ) -> Result<PathBuf, SnapshotError> {
-        Ok(storage
-            .path()
-            .join(SESSION_SNAPSHOTS_DIR)
-            .join(session_id.to_string())
-            .join(workspace_key(cwd)?))
+        session_id: CaudraId,
+    ) -> Arc<SnapshotStore> {
+        Arc::new(SnapshotStore::new(
+            &storage.path().join(REMOTE_SNAPSHOT_PLACEHOLDER_DIR),
+            session_id,
+            REMOTE_SNAPSHOT_PLACEHOLDER_KEY,
+        ))
     }
 
     /// The store and the baseline move together: an agent mid-session must never

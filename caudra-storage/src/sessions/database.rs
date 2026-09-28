@@ -139,6 +139,7 @@ const WAL_SUFFIX: &str = "-wal";
 const SHM_SUFFIX: &str = "-shm";
 const DATABASE_SIDECAR_SUFFIXES: [&str; 3] = [WAL_SUFFIX, SHM_SUFFIX, "-journal"];
 pub(super) const SESSION_SNAPSHOT_DIR: &str = "session-snapshots";
+pub(super) const WORKSPACE_SNAPSHOT_DIR: &str = "workspace-snapshots";
 const CLEANUP_RETRY_DELAY_MS: i64 = 60_000;
 const PENDING_ARCHIVE_ORPHAN_GRACE: Duration = Duration::from_secs(60 * 60);
 const ARTIFACT_CLEANUP_KINDS: [&str; 4] =
@@ -1821,7 +1822,8 @@ impl SessionDatabase {
             )?,
             background_bytes: from_i64(background_bytes, "background bytes")?,
             tool_output_file_bytes: directory_bytes(&state_path.join(TOOL_OUTPUT_DIR)),
-            snapshot_bytes: directory_bytes(&state_path.join(SESSION_SNAPSHOT_DIR)),
+            snapshot_bytes: directory_bytes(&state_path.join(SESSION_SNAPSHOT_DIR))
+                + directory_bytes(&state_path.join(WORKSPACE_SNAPSHOT_DIR)),
             archive_bytes: directory_bytes(
                 &state_path
                     .join(super::SESSIONS_DIR)

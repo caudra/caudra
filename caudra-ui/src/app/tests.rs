@@ -40,7 +40,7 @@ use caudra_agent::permissions::pattern_recognition::{
 use caudra_agent::permissions::{
     PermissionManager, PermissionRequest, PermissionResourceSelector, PermissionRuleRecord,
 };
-use caudra_agent::snapshots::{RestoreFailureKind, RestoreStatus};
+use caudra_agent::snapshots::{RestoreFailureKind, RestoreStatus, SnapshotKey};
 use caudra_agent::tools::{SHELL_TOOL_NAME, ToolEffect};
 use caudra_agent::types::{TodoItem, TodoPriority, TodoStatus};
 use caudra_agent::workspace_baseline::BaselineOutcome;
@@ -11871,7 +11871,7 @@ fn persist_both_restore_intent(app: &mut App, target_head: Option<CaudraId>) -> 
 }
 
 /// A run that never writes must leave the disk as it found it: no store, no
-/// manifests, and nothing for a later exit to close.
+/// snapshots, and nothing for a later exit to close.
 #[test]
 fn a_run_that_writes_nothing_leaves_no_revert_point() {
     const UNTOUCHED_MSG: &str = "a read-only run must capture no workspace state";
@@ -11942,7 +11942,7 @@ fn disabled_snapshots_skip_baseline_run_and_final_captures(existing: bool) {
     if existing {
         assert_eq!(
             app.snapshot_store
-                .load_session_start_manifest()
+                .snapshot_entries(SnapshotKey::SessionStart)
                 .unwrap()
                 .len(),
             1
@@ -11976,8 +11976,12 @@ fn run_snapshots_are_complete_and_associated_with_atomic_heads() {
     assert!(app.snapshot_store.has_session_start());
     assert!(app.snapshot_store.has_checkpoint(initial_head));
     assert_eq!(
-        app.snapshot_store.load_manifest(initial_head).unwrap(),
-        app.snapshot_store.load_session_start_manifest().unwrap()
+        app.snapshot_store
+            .snapshot_id(SnapshotKey::Checkpoint(initial_head))
+            .unwrap(),
+        app.snapshot_store
+            .snapshot_id(SnapshotKey::SessionStart)
+            .unwrap()
     );
 
     let completed = crate::history_items(&[
@@ -11996,8 +12000,12 @@ fn run_snapshots_are_complete_and_associated_with_atomic_heads() {
 
     assert!(app.snapshot_store.has_checkpoint(completed_head));
     assert_ne!(
-        app.snapshot_store.load_manifest(completed_head).unwrap()[SNAPSHOT_FILE].hash,
-        app.snapshot_store.load_manifest(initial_head).unwrap()[SNAPSHOT_FILE].hash
+        app.snapshot_store
+            .snapshot_id(SnapshotKey::Checkpoint(completed_head))
+            .unwrap(),
+        app.snapshot_store
+            .snapshot_id(SnapshotKey::Checkpoint(initial_head))
+            .unwrap()
     );
 }
 
@@ -12093,10 +12101,18 @@ fn cancellation_stays_non_quiescent_until_the_matching_top_level_terminal_event(
     assert_eq!(app.cancelling_run, None);
     assert_eq!(app.status, Status::Streaming);
     assert_eq!(app.queue.text_messages(), ["new work"]);
-    let captured = app.snapshot_store.load_manifest(head).unwrap();
+    let captured = app
+        .snapshot_store
+        .snapshot_id(SnapshotKey::Checkpoint(head))
+        .unwrap();
     std::fs::write(path, CURRENT_CONTENT).unwrap();
     app.update(agent_msg_with_run_id(done(), 7));
-    assert_eq!(app.snapshot_store.load_manifest(head).unwrap(), captured);
+    assert_eq!(
+        app.snapshot_store
+            .snapshot_id(SnapshotKey::Checkpoint(head))
+            .unwrap(),
+        captured
+    );
 }
 
 #[test]
@@ -13728,8 +13744,8 @@ fn fork_copies_ancestor_snapshots_into_child_store_without_restoring_files() {
     assert_eq!(std::fs::read_to_string(path).unwrap(), CURRENT_CONTENT);
 }
 
-/// A bare not-found out of the store names a missing manifest. The user needs
-/// to hear why there is no manifest to miss.
+/// A bare not-found out of the store names a missing snapshot. The user needs
+/// to hear why there is no snapshot to miss.
 #[test]
 fn a_files_revert_without_a_baseline_says_why() {
     const EXPLAINED_MSG: &str = "a revert with no baseline must name the reason";
@@ -17219,7 +17235,12 @@ fn ephemeral_snapshots_are_written_to_the_volatile_root() {
         snapshots(&volatile).join(session_id.to_string()).is_dir(),
         "{VOLATILE_SNAPSHOTS}"
     );
-    assert!(!snapshots(&persistent).exists(), "{PERSISTENT_TRACE}");
+    for dir in [
+        caudra_agent::snapshots::SESSION_SNAPSHOTS_DIR,
+        caudra_agent::snapshots::WORKSPACE_SNAPSHOTS_DIR,
+    ] {
+        assert!(!persistent.join(dir).exists(), "{PERSISTENT_TRACE}");
+    }
 }
 
 fn set_opus_model(app: &mut App) {

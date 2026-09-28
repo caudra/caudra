@@ -2306,8 +2306,8 @@ impl StorageConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SnapshotsConfig {
     pub enabled: bool,
-    /// Doubles as the object-store cap, because a working tree larger than the
-    /// cap is over budget from its very first snapshot.
+    /// Also the retention target for the compressed object store each
+    /// workspace shares across its sessions.
     pub max_bytes: u64,
     pub max_files: u64,
     pub max_file_bytes: u64,
@@ -2340,7 +2340,7 @@ impl SnapshotsConfig {
             default: ConfigValue::U64(DEFAULT_SNAPSHOT_MAX_BYTES_MB),
             min: None,
             env: None,
-            description: "Largest working tree a capture will take, and the cap on one session's object store. A workspace above it loses file revert rather than paying for a snapshot the store cannot keep",
+            description: "Largest working tree a capture will take, and the retention target for the compressed object store each workspace shares across its sessions. A workspace above it loses file revert rather than paying for a snapshot the store cannot keep",
         },
         ConfigField {
             name: "max_files",

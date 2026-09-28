@@ -165,7 +165,7 @@ Revert and unrevert require every live session in the workspace to be idle. Acti
 | Completed tool | Includes the call and result | Empty |
 | Incomplete tool call | Includes the call; history repair supplies an unavailable result | Empty |
 
-The child receives a new session ID and a title such as `Original title (fork #1)`. It copies the selected ancestor path, reachable tool outputs and subagent histories, model and execution settings, and snapshots for that path. Usage totals, goals, queues, pending revert state, conversation permission rules, and explicit YOLO state start clean.
+The child receives a new session ID and a title such as `Original title (fork #1)`. It copies the selected ancestor path, reachable tool outputs and subagent histories, model and execution settings, and the snapshot pointers for that path. The snapshots themselves stay in the shared workspace store, so a fork copies no file data. Usage totals, goals, queues, pending revert state, conversation permission rules, and explicit YOLO state start clean.
 
 Subtasks are different from user-created forks. They share the root conversation's permission rules. Resuming that root restores its rules, while `/new` starts a clean root.
 
@@ -235,11 +235,11 @@ Retention never removes spending records. What a session cost is written to a se
 
 `/storage` shows where the disk went. A proportional bar splits the state directory between the session database, tool output files, workspace snapshots, and archives, and a legend gives each one its exact size. Below it, the database section reports file and write-ahead log sizes, free pages that a prune would reclaim, and the session and item counts behind them.
 
-The snapshot section lists workspace stores largest first with their size, object count, and number of snapshots. A store whose workspace root is gone is marked rather than hidden, because an orphaned store is usually the one worth deleting. `/storage all` lists every store instead of the largest few; the footer command toggles between them.
+The snapshot section lists workspace stores largest first with their size, object count, and the number of sessions and snapshots that use them. A store whose workspace root is gone is marked rather than hidden, because an orphaned store is usually the one worth deleting. `/storage all` lists every store instead of the largest few; the footer command toggles between them.
 
 Measuring walks the snapshot stores on disk, so the modal opens immediately and fills in when the walk finishes. The same figures are available without the TUI from `caudra storage stats` and `caudra storage snapshots`.
 
-To reclaim one store the modal named, trim that session: `caudra storage trim <ID>`. Trimming drops the workspace snapshots, retained tool output files, rewind archives, and the journals and timelines of its workflow runs while the conversation stays and stays resumable, so it is the right answer when a single session has grown out of proportion and you still want its transcript. Pinned sessions are refused and a session open in another process is skipped, so the command is safe to run while Caudra is up. Add `--dry-run` to see the session and its artifact size first.
+To reclaim space in a store the modal named, trim the sessions that use it: `caudra storage trim <ID>`. Trimming drops the session's workspace snapshots, retained tool output files, rewind archives, and the journals and timelines of its workflow runs while the conversation stays and stays resumable, so it is the right answer when a single session has grown out of proportion and you still want its transcript. Snapshot objects that another session still uses stay in the shared store, and the rest are deleted right away. Pinned sessions are refused and a session open in another process is skipped, so the command is safe to run while Caudra is up. Add `--dry-run` to see the session and its artifact size first.
 
 ## Conversation revert
 
@@ -259,7 +259,11 @@ A file restore selects the nearest available snapshot at or before the chosen it
 
 A remote session captures on the Workcell host instead. See [Remote workspaces](/docs/remote-workspaces/#file-snapshots) for how that walk and its retention differ.
 
-Snapshots are content-addressed with SHA-256 and stored under the Caudra state directory in `session-snapshots/<session-id>/<workspace-hash>/`. The object store contains the complete file bytes under their hashes. A checkpoint manifest maps each relative path to its object hash and Unix mode. Unchanged files reuse the same object instead of storing another copy.
+Snapshots are stored as Git objects under the Caudra state directory. Each workspace has one object store in `workspace-snapshots/<workspace-hash>/`, shared by every session that works in it. Objects are zlib-compressed and named by their Git object ID, and a snapshot is a Git tree. An unchanged file or directory reuses the object from an earlier snapshot, so a checkpoint costs about the size of what changed, and a second session in the same workspace stores almost nothing new. Each session keeps small pointer files in `session-snapshots/<session-id>/<workspace-hash>/` that name its snapshots. Git can read any snapshot: `git --git-dir=<store> ls-tree -r <snapshot-id>`.
+
+A capture reads only files that changed. A Git index file beside the objects records the size, timestamps, inode, and owner each file had when it was last read, and a file whose values all still match reuses its stored object. A file modified in the few seconds before a capture starts is always read again, so a write that lands during a capture cannot hide behind an unchanged timestamp.
+
+Snapshots from releases before the Git format are not migrated. A session's old store is deleted the first time it captures or restores, and `caudra storage prune` deletes the rest. A file restore that an older release left unfinished is cleared when its session loads, and Caudra shows a notice because some files may be partly restored.
 
 ### Disable automatic snapshots
 
@@ -279,14 +283,14 @@ Disabling capture does not bypass restore recovery. An unresolved remote restore
 
 ### Limits
 
-Snapshot walks follow `.gitignore`, `.ignore`, the global Git ignore file, and `.git/info/exclude`, whether or not the workspace is a Git repository. Nested repositories, `.git`, symlinks, special files, and paths outside the session directory are not captured, and the walk does not cross a filesystem boundary. Changing a path between captured and ignored or symlink state is outside the restore guarantee because manifests cannot distinguish that state from absence.
+Snapshot walks follow `.gitignore`, `.ignore`, the global Git ignore file, and `.git/info/exclude`, whether or not the workspace is a Git repository. Symbolic links are captured as links: the snapshot stores the link target and a restore recreates the link without following it. Nested repositories, `.git`, special files, files over `max_file_bytes_mb`, and paths outside the session directory are not captured, and the walk does not cross a filesystem boundary. A snapshot records the paths it skipped, and a restore leaves such a path alone when either snapshot skipped it. An ignored path is not recorded, so changing a path between captured and ignored state is outside the restore guarantee.
 
-Objects are stored uncompressed, so a workspace larger than its retention target would sit over budget from the first capture. Caudra measures the tree while walking it and refuses one that does not fit:
+Caudra measures the tree while walking it and refuses one that does not fit before reading any file:
 
 | Setting | Default | Effect |
 | --- | --- | --- |
 | `storage.snapshots.enabled` | `true` | `false` turns capture off for every workspace |
-| `storage.snapshots.max_bytes_mb` | `512` | Both the walk ceiling and the retention target |
+| `storage.snapshots.max_bytes_mb` | `512` | The walk ceiling on file bytes, and the retention target for the compressed store of each workspace |
 | `storage.snapshots.max_files` | `50000` | Walk ceiling on file count |
 | `storage.snapshots.max_file_bytes_mb` | `100` | Files above this are skipped, and the rest of the tree is still captured |
 
@@ -294,12 +298,14 @@ Caudra also refuses a filesystem root and a home directory outright.
 
 A refusal costs file revert rather than the user's work: the tool call proceeds, Caudra reports the reason once, and `/storage` shows it alongside the empty store. The verdict is decided once per workspace and is not re-paid on later calls. Conversation revert is unaffected.
 
-Old checkpoint manifests are removed first when a store passes its retention target. The session-start anchor and data needed by an active revert remain available, so protected data can exceed the target.
+When a workspace store passes its retention target, Caudra removes the oldest checkpoints across all sessions of that workspace, then deletes the objects no remaining snapshot uses. Each session keeps its session-start snapshot and its newest checkpoint, and data needed by an active revert remains available, so protected data can exceed the target.
 
-Restore compares the current file hash and mode with the source snapshot. If a tracked path changed outside the captured run, restore aborts and reports a conflict. Caudra does not overwrite it automatically. Conversation-only revert remains available when file restore cannot proceed.
+Snapshots record only the executable bit of a file, as Git does. A restored file keeps its other permission bits, and a recreated file gets default permissions from your umask.
 
-Only paths that differ between the source and target manifests are touched. Files created after the target are deleted, deleted files are recreated, and unrelated files remain in place. Each file replacement is atomic. A restore spanning several files completes through the journal.
+Restore compares the current content and executable bit of each path with the source snapshot. If a tracked path changed outside the captured run, restore aborts and reports a conflict. Caudra does not overwrite it automatically. Conversation-only revert remains available when file restore cannot proceed.
+
+Only paths that differ between the source and target snapshots are touched. Files created after the target are deleted, deleted files are recreated, and unrelated files remain in place. Each file replacement is atomic. A restore spanning several files completes through the journal.
 
 Before applying changes, Caudra captures the current state of every affected path. Unrevert restores this state before moving the conversation head back. A restore journal records prepare, apply, and verification phases so a later restore can finish an interrupted transaction.
 
-Snapshots cover regular files. They cannot reverse running processes, databases, network calls, Git branches or index state, nested repository state, or commands that changed files outside the session directory. Changes from manual shell commands can appear as conflicts. `/cd` changes the process workspace for every live session and is blocked while any session is busy or has a pending revert.
+Snapshots cover regular files and symbolic links. They cannot reverse running processes, databases, network calls, Git branches or index state, nested repository state, or commands that changed files outside the session directory. Changes from manual shell commands can appear as conflicts. `/cd` changes the process workspace for every live session and is blocked while any session is busy or has a pending revert.

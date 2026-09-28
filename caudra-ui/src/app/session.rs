@@ -56,6 +56,8 @@ pub(crate) const REVERT_BUSY_MSG: &str = "Wait for the session to become idle be
 pub(super) const REVERT_SNAPSHOT_PENDING_MSG: &str =
     "Wait for the remote workspace snapshot to finish, then retry the file restore";
 const NO_REMOTE_FILE_CHANGES: &str = "no file changes";
+pub(crate) const LEGACY_RESTORE_CLEARED: &str = "An unfinished file restore was saved by an older \
+    snapshot format and was cleared; files may be partly restored";
 
 /// Saturates rather than wraps: a goal left open for longer than `u64`
 /// milliseconds is not a number worth panicking over.
@@ -902,12 +904,7 @@ impl App {
             }
         };
         let replacement_store = if self.workspace_baseline.is_remote() {
-            Arc::new(SnapshotStore::new(
-                self.storage
-                    .path()
-                    .join("remote-snapshot-metadata")
-                    .join(replacement.id.to_string()),
-            ))
+            Self::remote_snapshot_placeholder(&self.storage, replacement.id)
         } else {
             match Self::snapshot_store_for(
                 &self.storage,
@@ -2114,7 +2111,7 @@ impl App {
                 Ok((workspace, binding))
             })
             .transpose()?;
-        let snapshot_store = if let Some((workspace, binding)) = &remote_target {
+        let (snapshot_store, restore_notice) = if let Some((workspace, binding)) = &remote_target {
             session
                 .replace_workspace_cursor(binding.clone())
                 .map_err(|error| error.to_string())?;
@@ -2133,12 +2130,10 @@ impl App {
                 &baseline,
                 recovered,
             )?;
-            Arc::new(SnapshotStore::new(
-                self.storage
-                    .path()
-                    .join("remote-snapshot-metadata")
-                    .join(session.id.to_string()),
-            ))
+            (
+                Self::remote_snapshot_placeholder(&self.storage, session.id),
+                None,
+            )
         } else {
             let store = Self::snapshot_store_for(
                 &self.storage,
@@ -2147,8 +2142,9 @@ impl App {
                 self.snapshots_config.into(),
             )
             .map_err(|error| format!("Failed to initialize workspace snapshots: {error}"))?;
-            recover_pending_workspace_restore(&mut session, &store, &self.storage_writer)?;
-            store
+            let notice =
+                recover_pending_workspace_restore(&mut session, &store, &self.storage_writer)?;
+            (store, notice)
         };
         let permissions = Arc::new(self.permissions.fork());
         // A loaded session that holds nothing owns no row worth publishing
@@ -2190,6 +2186,9 @@ impl App {
             self.rebind_workspace_baseline(snapshot_store, cwd);
         }
         self.reconcile_plan_target();
+        self.state
+            .warnings
+            .extend(restore_notice.map(str::to_owned));
         for w in self.state.warnings.drain(..) {
             self.status_bar.flash(w);
         }
@@ -2231,11 +2230,13 @@ impl App {
     }
 }
 
+/// Finishes a restore the session recorded but never saw complete. Answers a
+/// notice for the status bar when the restore had to be dropped instead.
 pub(crate) fn recover_pending_workspace_restore(
     session: &mut AppSession,
     snapshot_store: &SnapshotStore,
     storage_writer: &StorageWriter,
-) -> Result<(), String> {
+) -> Result<Option<&'static str>, String> {
     let cwd = std::path::PathBuf::from(&session.cwd);
     let Some(mut pending) = session.meta.pending_revert.clone() else {
         if snapshot_store
@@ -2243,7 +2244,7 @@ pub(crate) fn recover_pending_workspace_restore(
             .map_err(|error| format!("Failed to inspect workspace restore journal: {error}"))?
             .is_none()
         {
-            return Ok(());
+            return Ok(None);
         }
         if let Some(report) = snapshot_store
             .recover(&cwd)
@@ -2254,7 +2255,7 @@ pub(crate) fn recover_pending_workspace_restore(
                 "Workspace restore journal {operation_id} has no matching session operation"
             ));
         }
-        return Ok(());
+        return Ok(None);
     };
     let Some(operation) = pending.restore_operation.clone() else {
         if snapshot_store
@@ -2262,7 +2263,7 @@ pub(crate) fn recover_pending_workspace_restore(
             .map_err(|error| format!("Failed to inspect workspace restore journal: {error}"))?
             .is_none()
         {
-            return Ok(());
+            return Ok(None);
         }
         if let Some(report) = snapshot_store
             .recover(&cwd)
@@ -2273,9 +2274,12 @@ pub(crate) fn recover_pending_workspace_restore(
                 "Workspace restore journal {operation_id} has no matching session operation"
             ));
         }
-        return Ok(());
+        return Ok(None);
     };
 
+    if operation.phase == PendingRestorePhase::Intent && snapshot_store.is_legacy() {
+        return clear_legacy_restore(session, pending, storage_writer);
+    }
     if operation.phase == PendingRestorePhase::Intent {
         let recovered = snapshot_store
             .recover(&cwd)
@@ -2353,7 +2357,29 @@ pub(crate) fn recover_pending_workspace_restore(
     storage_writer
         .save_sync(Arc::new(session.clone()))
         .map_err(|error| format!("Failed to finalize recovered workspace restore: {error}"))?;
-    Ok(())
+    Ok(None)
+}
+
+/// A restore intent recorded against a store from before snapshots were git
+/// objects cannot be resumed, because nothing can read its journal or its
+/// snapshots any more. Only the operation is dropped, so the session loads as
+/// it stood before the restore began.
+fn clear_legacy_restore(
+    session: &mut AppSession,
+    mut pending: PendingConversationRevert,
+    storage_writer: &StorageWriter,
+) -> Result<Option<&'static str>, String> {
+    let operation = pending
+        .restore_operation
+        .take()
+        .map(|operation| operation.id);
+    tracing::info!(session_id = %session.id, ?operation, "cleared a restore saved by an older snapshot format");
+    let head = crate::session_history_head(session);
+    session.set_conversation_state(head, Some(pending));
+    storage_writer
+        .save_sync(Arc::new(session.clone()))
+        .map_err(|error| format!("Failed to clear an unrecoverable workspace restore: {error}"))?;
+    Ok(Some(LEGACY_RESTORE_CLEARED))
 }
 
 fn validate_restore_report(

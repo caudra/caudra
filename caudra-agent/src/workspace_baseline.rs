@@ -1061,9 +1061,12 @@ mod tests {
     use test_case::test_case;
 
     use super::*;
-    use crate::snapshots::SnapshotLimits;
+    use crate::snapshots::{SnapshotKey, SnapshotLimits};
 
     const FILE: &str = "tracked.txt";
+    const SNAPSHOT_KEY: &str = "workspace";
+    const SNAPSHOTS: &str = "snapshots";
+    const OTHER_SNAPSHOTS: &str = "other-snapshots";
     const CONTENTS: &str = "alpha";
     const READY_MSG: &str = "a mutating call gets a revert point";
     const UNAVAILABLE_MSG: &str = "a refused workspace lets the call through";
@@ -1369,7 +1372,7 @@ mod tests {
                             result: SnapshotOperationResult::Cleanup(SnapshotCleanupResult {
                                 deleted_checkpoint_ids: preview.checkpoint_ids.clone(),
                                 deleted_snapshots: 1,
-                                deleted_blobs: 1,
+                                deleted_objects: 1,
                                 reclaimed_bytes: 1,
                             }),
                             side_effects_possible: true,
@@ -2133,7 +2136,7 @@ mod tests {
         let root = temp.path().join("repo");
         fs::create_dir_all(&root).unwrap();
         fs::write(root.join(FILE), CONTENTS).unwrap();
-        let store = Arc::new(SnapshotStore::new(temp.path().join("snapshots")).with_limits(limits));
+        let store = Arc::new(local_store(&temp, SNAPSHOTS).with_limits(limits));
         let baseline = WorkspaceBaseline::new(
             store,
             root,
@@ -2143,6 +2146,10 @@ mod tests {
             },
         );
         (temp, baseline)
+    }
+
+    fn local_store(temp: &TempDir, name: &str) -> SnapshotStore {
+        SnapshotStore::new(&temp.path().join(name), CaudraId::generate(), SNAPSHOT_KEY)
     }
 
     fn head(sequence: u32) -> CaudraId {
@@ -2189,7 +2196,10 @@ mod tests {
             panic!("{READY_MSG}");
         };
         assert_eq!(
-            store.load_session_start_manifest().unwrap().len(),
+            store
+                .snapshot_entries(SnapshotKey::SessionStart)
+                .unwrap()
+                .len(),
             1,
             "{READY_MSG}"
         );
@@ -2201,7 +2211,7 @@ mod tests {
         let (temp, baseline) = baseline(false, SnapshotLimits::default());
         if rebind {
             baseline.rebind(
-                Arc::new(SnapshotStore::new(temp.path().join("other-snapshots"))),
+                Arc::new(local_store(&temp, OTHER_SNAPSHOTS)),
                 baseline.cwd(),
             );
         }
@@ -2259,10 +2269,7 @@ mod tests {
         let other = temp.path().join("other");
         fs::create_dir_all(&other).unwrap();
         fs::write(other.join(FILE), CONTENTS).unwrap();
-        baseline.rebind(
-            Arc::new(SnapshotStore::new(temp.path().join("other-snapshots"))),
-            other,
-        );
+        baseline.rebind(Arc::new(local_store(&temp, OTHER_SNAPSHOTS)), other);
 
         assert!(baseline.unavailable_reason().is_none(), "{READY_MSG}");
         assert!(

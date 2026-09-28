@@ -4,7 +4,7 @@ use std::env;
 use std::fmt::Write as _;
 use std::sync::Arc;
 
-use caudra_agent::snapshots::{SESSION_SNAPSHOTS_DIR, SnapshotStore, StoreEntry};
+use caudra_agent::snapshots::{SnapshotStore, StoreEntry, collect_garbage};
 use caudra_agent::tools::ToolRegistry;
 use caudra_config::{RetentionConfig, load_env_files};
 use caudra_lua::PluginHost;
@@ -32,7 +32,8 @@ const ID_WIDTH: usize = 22;
 const ACTIVITY_WIDTH: usize = 16;
 const SIZE_WIDTH: usize = 10;
 const OBJECTS_WIDTH: usize = 9;
-const MANIFESTS_WIDTH: usize = 6;
+const SESSIONS_WIDTH: usize = 8;
+const SNAPSHOTS_WIDTH: usize = 6;
 const NO_SNAPSHOTS: &str = "no workspace snapshots";
 const ORPHANED_STORE: &str = "(workspace root missing)";
 const ID_POLICY_CONFLICT: &str = "session IDs and --keep-* rules cannot be combined";
@@ -92,6 +93,16 @@ struct PlanDocument<'a> {
     outcomes: Option<&'a ExecuteReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
     prune: Option<&'a PruneReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    snapshot_garbage_bytes: Option<u64>,
+}
+
+#[derive(Serialize)]
+struct PruneDocument<'a> {
+    #[serde(flatten)]
+    report: &'a PruneReport,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    snapshot_garbage_bytes: Option<u64>,
 }
 
 pub fn run(action: StorageAction, no_plugins: bool, no_jit: bool) -> Result<()> {
@@ -133,13 +144,12 @@ pub fn run(action: StorageAction, no_plugins: bool, no_jit: bool) -> Result<()> 
                 println!("pending_cleanup_jobs: {}", stats.pending_cleanup_jobs);
             }
         }
-        StorageAction::Snapshots { json, manifests } => {
-            let entries =
-                SnapshotStore::store_entries(&state_dir.path().join(SESSION_SNAPSHOTS_DIR));
+        StorageAction::Snapshots { json, checkpoints } => {
+            let entries = SnapshotStore::store_entries(state_dir.path());
             if json {
                 println!("{}", serde_json::to_string_pretty(&entries)?);
             } else {
-                print!("{}", render_snapshots(&entries, manifests));
+                print!("{}", render_snapshots(&entries, checkpoints));
             }
         }
         StorageAction::Check => {
@@ -214,7 +224,11 @@ pub fn run(action: StorageAction, no_plugins: bool, no_jit: bool) -> Result<()> 
                     .then(|| sweep::execute(&mut database, &state_dir, &plan))
                     .transpose()
                     .context("trim sessions")?;
-                report_plan(&plan, dry_run, outcomes.as_ref(), None, json)?;
+                let garbage = collect_released_snapshots(
+                    &state_dir,
+                    outcomes.as_ref().is_some_and(|report| report.acted() > 0),
+                )?;
+                report_plan(&plan, dry_run, outcomes.as_ref(), None, garbage, json)?;
             } else {
                 if policy.policy().is_some() {
                     bail!("{ID_POLICY_CONFLICT}");
@@ -265,10 +279,18 @@ pub fn run(action: StorageAction, no_plugins: bool, no_jit: bool) -> Result<()> 
             let mut database =
                 SessionDatabase::open(&state_dir).context("open session database")?;
             let report = sweep::prune(&mut database, &state_dir, dry_run).context("prune")?;
+            let garbage = collect_released_snapshots(&state_dir, !dry_run)?;
             if json {
-                println!("{}", serde_json::to_string_pretty(&report)?);
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&PruneDocument {
+                        report: &report,
+                        snapshot_garbage_bytes: garbage,
+                    })?
+                );
             } else {
                 print!("{}", render_prune(&report));
+                print!("{}", render_garbage(garbage));
             }
         }
         StorageAction::Usage {
@@ -318,6 +340,8 @@ struct OutcomeDocument<'a> {
     outcomes: &'a ExecuteReport,
     #[serde(skip_serializing_if = "Option::is_none")]
     prune: Option<&'a PruneReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    snapshot_garbage_bytes: Option<u64>,
 }
 
 fn forget_by_policy(
@@ -341,17 +365,18 @@ fn forget_by_policy(
         .then(|| sweep::execute(database, state_dir, &plan))
         .transpose()
         .context("forget sessions")?;
-    let pruned = match &outcomes {
-        Some(report) if options.prune && report.acted() > 0 => {
-            Some(sweep::prune(database, state_dir, false).context("prune")?)
-        }
-        _ => None,
-    };
+    let released = outcomes.as_ref().is_some_and(|report| report.acted() > 0);
+    let pruned = (options.prune && released)
+        .then(|| sweep::prune(database, state_dir, false))
+        .transpose()
+        .context("prune")?;
+    let garbage = collect_released_snapshots(state_dir, released)?;
     report_plan(
         &plan,
         options.dry_run,
         outcomes.as_ref(),
         pruned.as_ref(),
+        garbage,
         options.json,
     )
 }
@@ -394,12 +419,14 @@ fn apply_by_ids(
     } else {
         None
     };
+    let garbage = collect_released_snapshots(state_dir, outcomes.acted() > 0)?;
     if options.json {
         println!(
             "{}",
             serde_json::to_string_pretty(&OutcomeDocument {
                 outcomes: &outcomes,
                 prune: pruned.as_ref(),
+                snapshot_garbage_bytes: garbage,
             })?
         );
     } else {
@@ -407,6 +434,7 @@ fn apply_by_ids(
         if let Some(report) = &pruned {
             print!("{}", render_prune(report));
         }
+        print!("{}", render_garbage(garbage));
     }
     if outcomes.failed() > 0 {
         bail!(
@@ -466,11 +494,21 @@ fn set_pinned(state_dir: &StateDir, raw: &[String], pinned: bool) -> Result<()> 
     Ok(())
 }
 
+/// Released sessions leave their snapshot objects in the workspace store they
+/// share, so a command that released any collects them now rather than at the
+/// next capture over the cap.
+fn collect_released_snapshots(state_dir: &StateDir, released: bool) -> Result<Option<u64>> {
+    released
+        .then(|| collect_garbage(state_dir).context("collect unreferenced snapshot objects"))
+        .transpose()
+}
+
 fn report_plan(
     plan: &Plan,
     dry_run: bool,
     outcomes: Option<&ExecuteReport>,
     prune: Option<&PruneReport>,
+    snapshot_garbage_bytes: Option<u64>,
     json: bool,
 ) -> Result<()> {
     if json {
@@ -481,6 +519,7 @@ fn report_plan(
                 plan,
                 outcomes,
                 prune,
+                snapshot_garbage_bytes,
             })?
         );
     } else {
@@ -491,6 +530,7 @@ fn report_plan(
         if let Some(report) = prune {
             print!("{}", render_prune(report));
         }
+        print!("{}", render_garbage(snapshot_garbage_bytes));
     }
     if let Some(report) = outcomes
         && report.failed() > 0
@@ -631,6 +671,15 @@ fn render_outcomes(action: Action, report: &ExecuteReport) -> String {
         report.failed()
     );
     out
+}
+
+fn render_garbage(freed: Option<u64>) -> String {
+    freed.map_or_else(String::new, |freed| {
+        format!(
+            "\ncollected {} of snapshot objects no session names\n",
+            bytes(freed)
+        )
+    })
 }
 
 fn render_prune(report: &PruneReport) -> String {
@@ -849,7 +898,7 @@ fn render_sessions(rows: &[SessionRow<'_>]) -> String {
     out
 }
 
-fn render_snapshots(entries: &[StoreEntry], manifests: bool) -> String {
+fn render_snapshots(entries: &[StoreEntry], checkpoints: bool) -> String {
     let mut out = String::new();
     if entries.is_empty() {
         let _ = writeln!(out, "{NO_SNAPSHOTS}");
@@ -857,8 +906,8 @@ fn render_snapshots(entries: &[StoreEntry], manifests: bool) -> String {
     }
     let _ = writeln!(
         out,
-        "{:ID_WIDTH$} {:>SIZE_WIDTH$} {:>OBJECTS_WIDTH$} {:>MANIFESTS_WIDTH$} Workspace",
-        "Session", "Size", "Objects", "Snaps"
+        "{:>SIZE_WIDTH$} {:>OBJECTS_WIDTH$} {:>SESSIONS_WIDTH$} {:>SNAPSHOTS_WIDTH$} Workspace",
+        "Size", "Objects", "Sessions", "Snaps"
     );
     let mut total = 0;
     let mut objects = 0;
@@ -867,19 +916,22 @@ fn render_snapshots(entries: &[StoreEntry], manifests: bool) -> String {
         objects += entry.objects;
         let _ = writeln!(
             out,
-            "{:ID_WIDTH$} {:>SIZE_WIDTH$} {:>OBJECTS_WIDTH$} {:>MANIFESTS_WIDTH$} {}",
-            entry.session_id,
+            "{:>SIZE_WIDTH$} {:>OBJECTS_WIDTH$} {:>SESSIONS_WIDTH$} {:>SNAPSHOTS_WIDTH$} {}",
             bytes(entry.bytes),
             entry.objects,
-            entry.manifests.len(),
+            entry.sessions.len(),
+            entry.snapshot_count(),
             entry.root.as_ref().map_or_else(
                 || ORPHANED_STORE.to_owned(),
                 |root| root.display().to_string()
             ),
         );
-        if manifests {
-            for name in &entry.manifests {
-                let _ = writeln!(out, "{:ID_WIDTH$} {name}", "");
+        if checkpoints {
+            for session in &entry.sessions {
+                let _ = writeln!(out, "  session {}", session.session_id);
+                for name in &session.snapshots {
+                    let _ = writeln!(out, "    {name}");
+                }
             }
         }
     }
@@ -932,6 +984,7 @@ fn truncate(text: &str, width: usize) -> String {
 mod tests {
     use test_case::test_case;
 
+    use caudra_agent::snapshots::SessionSnapshots;
     use caudra_storage::usage_ledger::LedgerPurpose;
 
     use super::*;
@@ -946,7 +999,9 @@ mod tests {
     const UNKNOWN_IS_NOT_ZERO: &str =
         "a group with no prompt tokens has no hit rate, which is not a hit rate of zero";
     const WORKSPACE_KEY: &str = "9a3913d670e736996dbc23f4de4fa88f02d249c5081e7cbeaec20d42bc85d002";
-    const SESSION_START_MANIFEST: &str = "session-start.json";
+    const SESSION_ID: &str = "CeSession";
+    const START_POINTER: &str = "start";
+    const CHECKPOINT_ID: &str = "CeCheckpoint";
 
     fn bucket(bucket_start: i64, provider: &str, model: &str, cwd: &str, cost: f64) -> UsageBucket {
         purposed_bucket(
@@ -1167,14 +1222,16 @@ mod tests {
         );
     }
 
-    fn store_entry(session_id: &str, root: Option<&str>, bytes: u64) -> StoreEntry {
+    fn store_entry(root: Option<&str>, bytes: u64) -> StoreEntry {
         StoreEntry {
-            session_id: session_id.to_owned(),
             workspace_key: WORKSPACE_KEY.to_owned(),
             root: root.map(Into::into),
             bytes,
             objects: 2,
-            manifests: vec![SESSION_START_MANIFEST.to_owned()],
+            sessions: vec![SessionSnapshots {
+                session_id: SESSION_ID.to_owned(),
+                snapshots: vec![START_POINTER.to_owned(), CHECKPOINT_ID.to_owned()],
+            }],
         }
     }
 
@@ -1184,16 +1241,18 @@ mod tests {
     fn snapshot_stores_are_reported_largest_first_with_a_total() {
         const ORDER_MSG: &str = "the largest store must be listed first";
         const TOTAL_MSG: &str = "the listing must total what the stores cost";
+        const BIG: &str = "/repo/big";
+        const SMALL: &str = "/repo/small";
         let rendered = render_snapshots(
             &[
-                store_entry("CeBig", Some("/repo/big"), 3 * 1024 * 1024),
-                store_entry("CeSmall", Some("/repo/small"), 1024),
+                store_entry(Some(BIG), 3 * 1024 * 1024),
+                store_entry(Some(SMALL), 1024),
             ],
             false,
         );
 
-        let big = rendered.find("CeBig").expect(ORDER_MSG);
-        let small = rendered.find("CeSmall").expect(ORDER_MSG);
+        let big = rendered.find(BIG).expect(ORDER_MSG);
+        let small = rendered.find(SMALL).expect(ORDER_MSG);
         assert!(big < small, "{ORDER_MSG}");
         assert!(rendered.contains("2 stores"), "{TOTAL_MSG}");
         assert!(
@@ -1206,7 +1265,7 @@ mod tests {
     /// hunting for, so it is named rather than dropped from the listing.
     #[test]
     fn an_orphaned_store_is_named_not_hidden() {
-        let rendered = render_snapshots(&[store_entry("CeLost", None, 512)], false);
+        let rendered = render_snapshots(&[store_entry(None, 512)], false);
         assert!(
             rendered.contains(ORPHANED_STORE),
             "an orphaned store must say so"
@@ -1219,19 +1278,14 @@ mod tests {
         assert_eq!(rendered.trim(), NO_SNAPSHOTS);
     }
 
-    #[test]
-    fn manifests_are_listed_only_when_asked() {
-        const HIDDEN_MSG: &str = "manifests stay out of the default listing";
-        const SHOWN_MSG: &str = "--manifests must list each manifest";
-        let entry = [store_entry("CeM", Some("/repo"), 64)];
-        assert!(
-            !render_snapshots(&entry, false).contains(SESSION_START_MANIFEST),
-            "{HIDDEN_MSG}"
-        );
-        assert!(
-            render_snapshots(&entry, true).contains(SESSION_START_MANIFEST),
-            "{SHOWN_MSG}"
-        );
+    #[test_case(false; "default")]
+    #[test_case(true; "checkpoints")]
+    fn checkpoints_are_listed_only_when_asked(checkpoints: bool) {
+        const LISTED_MSG: &str = "--checkpoints, and only it, lists what each session names";
+        let rendered = render_snapshots(&[store_entry(Some("/repo"), 64)], checkpoints);
+        for named in [SESSION_ID, START_POINTER, CHECKPOINT_ID] {
+            assert_eq!(rendered.contains(named), checkpoints, "{LISTED_MSG}");
+        }
     }
 
     #[test]

@@ -55,7 +55,7 @@ workcell-mcp /srv/workspaces \
   --transfer-root /var/lib/workcell/transfers
 ```
 
-The snapshot directory must already exist, be absolute, belong to the server process identity, have no symlink components, and be inaccessible to group and other users on Unix. It must not overlap the workspace. Snapshot blobs and restore journals stay there, separate from client session records.
+The snapshot directory must already exist, be absolute, belong to the server process identity, have no symlink components, and be inaccessible to group and other users on Unix. It must not overlap the workspace. Snapshot objects and restore journals stay there, separate from client session records.
 
 All five `--remote-*` identifiers and HTTP authentication are required for remote discovery. Keep the workspace generation stable across ordinary process restarts. Change it whenever you replace or reset the workspace. The server generates a separate process-instance identifier to detect lost volatile operation state.
 
@@ -181,7 +181,7 @@ An ordinary server restart preserves durable identity but changes the process in
 
 ## File snapshots
 
-A remote session captures its snapshots on the Workcell host, in the store behind `--snapshot-root`. Each capture covers the session directory. A rewind works like a [local file restore](/docs/sessions/#file-snapshots): it touches only the paths that differ between the capture nearest the current head and the capture nearest the target, and a path changed since the first capture is a conflict.
+A remote session captures its snapshots on the Workcell host, in the store behind `--snapshot-root`. Each capture covers the session directory. The host uses the same Git object format as a [local store](/docs/sessions/#file-snapshots), with one private object store per workspace, and reads only the files whose size, timestamps, or inode changed since the last capture. A rewind works like a [local file restore](/docs/sessions/#file-snapshots): it touches only the paths that differ between the capture nearest the current head and the capture nearest the target, and a path changed since the first capture is a conflict.
 
 Capture is a prepared operation. Caudra starts it and polls status through short requests, so a large capture can outlast an ordinary RPC deadline. The host reports capture phases and applies a 15-minute cooperative budget. Cancellation waits for active filesystem work to publish or roll back. A timeout does not prove that the worker stopped. After a lost reply, Caudra looks up the original checkpoint instead of assuming success or creating a different checkpoint.
 
@@ -189,7 +189,6 @@ Run-completion captures run in the background without blocking the terminal UI. 
 
 Captures use the `storage.snapshots` settings, lowered to the limits the host advertises. `enabled = false` or `--no-snapshots` [disables automatic capture](/docs/sessions/#disable-automatic-snapshots), including session-start and final snapshots, without bypassing restore recovery. The host walk differs from a local one:
 
-- Symlinks are captured as links. A restore recreates the link and never follows it.
 - Per-directory `.gitignore` files apply. `.git/info/exclude` and the global Git ignore file do not.
 - Nested repositories, mounts, sockets, FIFOs, devices, unreadable entries, files over `max_file_bytes_mb`, and files that keep changing while they are read are left out and left alone.
 - A name that is not UTF-8 is counted and left out.

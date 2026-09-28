@@ -1773,7 +1773,7 @@ mod tests {
     };
     use caudra_providers::{ContentBlock, INVALID_TOOL_JSON_KEY, InvalidToolInput, Message, Role};
     use caudra_storage::StateDir;
-    use caudra_storage::id::SessionRef;
+    use caudra_storage::id::{CaudraId, SessionRef};
     use caudra_storage::sessions::SessionDatabase;
     use caudra_storage::tool_outputs::ToolOutputStore;
     use futures_lite::future::poll_once;
@@ -4809,6 +4809,7 @@ mod tests {
     const CAPTURE_MSG: &str = "a call that can change a file captures first";
     const PROCEED_MSG: &str = "a refused workspace costs revert, not the call";
     const BLOCKED_MSG: &str = "a failed capture leaves nothing to revert to, so nothing may change";
+    const SNAPSHOT_KEY: &str = "workspace";
 
     /// A store under a regular file can never be created, which is the one
     /// capture failure a test can provoke without racing the filesystem.
@@ -4827,13 +4828,22 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(root.join("tracked.txt"), "alpha").unwrap();
         let store = match store {
-            BaselineStore::Usable(limits) => {
-                Arc::new(SnapshotStore::new(temp.path().join("snapshots")).with_limits(limits))
-            }
+            BaselineStore::Usable(limits) => Arc::new(
+                SnapshotStore::new(
+                    &temp.path().join("snapshots"),
+                    CaudraId::generate(),
+                    SNAPSHOT_KEY,
+                )
+                .with_limits(limits),
+            ),
             BaselineStore::Broken => {
                 let path = temp.path().join("not-a-directory");
                 std::fs::write(&path, "").unwrap();
-                Arc::new(SnapshotStore::new(path))
+                Arc::new(SnapshotStore::new(
+                    &path,
+                    CaudraId::generate(),
+                    SNAPSHOT_KEY,
+                ))
             }
         };
         let baseline = crate::workspace_baseline::WorkspaceBaseline::new(

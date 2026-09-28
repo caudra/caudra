@@ -25,6 +25,7 @@ strum = { workspace = true }
 caudra-storage = { workspace = true }
 caudra-workspace = { workspace = true }
 caudra-workflow = { workspace = true }
+workcell = { workspace = true }
 grep-regex = { workspace = true }
 regex = { workspace = true }
 globset = { workspace = true }

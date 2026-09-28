@@ -835,6 +835,7 @@ mod tests {
     const PROBE_TEXT: &str = "probe-through-old-sender";
     const RESTORED_TEXT: &str = "restored-queued-message";
     const RESUMED_HISTORY_TEXT: &str = "resumed-conversation";
+    const STUB_SNAPSHOT_KEY: &str = "stub";
 
     struct StubProvider;
 
@@ -914,7 +915,9 @@ mod tests {
             None,
             WorkspaceBaseline::new(
                 Arc::new(caudra_agent::snapshots::SnapshotStore::new(
-                    std::env::temp_dir().join("caudra-agent-test-snapshots"),
+                    &std::env::temp_dir().join("caudra-agent-test-snapshots"),
+                    CaudraId::generate(),
+                    STUB_SNAPSHOT_KEY,
                 )),
                 PathBuf::from("/tmp"),
                 SnapshotsConfig::default(),

@@ -7424,7 +7424,7 @@ fn parse_snapshot_result_unbound(value: &Value) -> Result<SnapshotOperationResul
     Ok(SnapshotOperationResult::Cleanup(SnapshotCleanupResult {
         deleted_checkpoint_ids: checkpoint_ids(&response.deleted_checkpoint_ids)?,
         deleted_snapshots: response.deleted_snapshots,
-        deleted_blobs: response.deleted_blobs,
+        deleted_objects: response.deleted_objects,
         reclaimed_bytes: response.reclaimed_bytes,
     }))
 }
