@@ -7,7 +7,8 @@ use std::time::Duration;
 use crate::attr::AttrSet;
 use crate::handle;
 use crate::logs::{
-    EVENT_API_ERROR, EVENT_API_REQUEST, EVENT_TOOL_DECISION, EVENT_TOOL_RESULT, EVENT_USER_PROMPT,
+    EVENT_API_ERROR, EVENT_API_REQUEST, EVENT_DECISION, EVENT_TOOL_DECISION, EVENT_TOOL_RESULT,
+    EVENT_USER_PROMPT,
 };
 use crate::metrics::{
     ACTIVE_TIME, COMMIT_COUNT, COST_USAGE, LINES_OF_CODE, PULL_REQUEST_COUNT, SESSION_COUNT,
@@ -49,6 +50,7 @@ const MSG_API_REQUEST: &str = "api request";
 const MSG_API_ERROR: &str = "api error";
 const MSG_TOOL_RESULT: &str = "tool result";
 const MSG_TOOL_DECISION: &str = "tool decision";
+const MSG_DECISION: &str = "decision engine";
 
 /// The one entry point for session starts: the id is set before counting, so
 /// a counted session can never miss it.
@@ -214,6 +216,24 @@ pub fn tool_decision(tool_name: &str, decision: &'static str, source: &'static s
                 .with(KEY_SOURCE, source),
         );
     }
+}
+
+pub fn decision(
+    feature: &'static str,
+    effect: &'static str,
+    latency_ms: u64,
+    model: &str,
+    error: Option<&'static str>,
+) {
+    tracing::info!(
+        target: EVENT_DECISION,
+        feature,
+        effect,
+        latency_ms,
+        model,
+        error,
+        MSG_DECISION,
+    );
 }
 
 pub fn lines_of_code(added: u64, removed: u64) {

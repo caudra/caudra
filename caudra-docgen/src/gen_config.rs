@@ -4,9 +4,9 @@ use std::sync::Arc;
 use caudra_agent::tools::ToolRegistry;
 use caudra_config::{
     AgentConfig, ConfigField, DEFAULT_MAX_LOG_FILES, DEFAULT_MAX_OUTPUT_LINES,
-    DEFAULT_MOUSE_SCROLL_LINES, MIN_TOOL_OUTPUT_LINES, ProviderConfig, RetentionConfig,
-    SnapshotsConfig, StorageConfig, TOP_LEVEL_FIELDS, TelemetryConfig, ToolOutputLines, UiConfig,
-    WorktreesConfig,
+    DEFAULT_MOUSE_SCROLL_LINES, DecisionsConfig, MIN_TOOL_OUTPUT_LINES, ProviderConfig,
+    RetentionConfig, SnapshotsConfig, StorageConfig, TOP_LEVEL_FIELDS, TelemetryConfig,
+    ToolOutputLines, UiConfig, WorktreesConfig,
 };
 use caudra_lua::{OptionSpec, OptionType, PluginHost, PluginOptionSpecs};
 
@@ -478,6 +478,186 @@ Disabling the master switch or setting `rules.truncation.enabled = false` stops 
     );
 }
 
+fn write_decisions_section(out: &mut String) {
+    let config = DecisionsConfig::default();
+    writeln!(
+        out,
+        "### `decisions`\n\n\
+         Configure the optional typed decision engine inside `caudra.setup()`. \
+         No endpoint, passive feature, or decision logging is enabled by default. \
+         Explicit workflow [`decide()` calls](/docs/workflows/#typed-decisions) need an endpoint \
+         but do not need a passive feature enabled. Shell duration history can work without an endpoint.\n\n\
+         Connection settings and thresholds are global-only. Projects may set individual features \
+         to `\"off\"`, set `log = false`, or keep or shorten inherited log retention. \
+         Other project overrides are errors, even when they repeat a global value. \
+         Disabling globally required Auto screening or its active content screening restores \
+         prompting for eligible Auto calls.\n\n\
+         | Field | Type | Default | Meaning |\n\
+         |-------|------|---------|---------|\n\
+         | `endpoint` | string | `nil` | Full request URL. HTTPS required except for numeric loopback HTTP. No credentials, query, or fragment. |\n\
+         | `model` | string | `\"{model}\"` | Decision model identifier, nonblank and without control characters. |\n\
+         | `api_key_env` | string | `\"{api_key_env}\"` | Environment variable containing the optional credential, never the credential itself. Project environment values are excluded. |\n\
+         | `allow_remote` | boolean | `{allow_remote}` | Explicit global consent to send decision context to a non-loopback endpoint. |\n\
+         | `timeout_ms` | integer | `{timeout_ms}` | Positive decision-request deadline in milliseconds, separate from shell execution timeouts. |\n\
+         | `log` | boolean | `{log}` | Retain bounded decision records in the separate local `decisions.db`. |\n\
+         | `log_retention_days` | integer | `{retention}` | Positive retention period for decision records. |\n\
+         | `features` | table | all `\"off\"` | Per-feature modes below. |\n\
+         | `thresholds` | table | defaults below | Probability thresholds, all finite and within 0–1 inclusive. |\n\n\
+         `TYPESAFE_BASE_URL` replaces only the origin of an explicitly configured endpoint, \
+         preserving its path. It must be an origin without a path and passes the same endpoint \
+         and remote-opt-in checks. The variable alone never activates the engine. \
+         Requests ignore ambient proxies and do not follow redirects. `localhost` is a DNS name, \
+         not numeric loopback for this policy.\n\n\
+         Redaction is best effort. Decision context can include commands, task text, tool output, \
+         and candidate descriptions. Review what you send and any exports before sharing them. \
+         See [decision advice and logging](/docs/permissions/#decision-engine-advice).\n\n\
+         #### `decisions.features`\n\n\
+         `off` disables the feature. `shadow` collects predictions without applying them. \
+         `advise` adds caution or suggestions. `enforce` applies only the feature-specific behavior \
+         listed below, never permission grants or relaxed executor restrictions. \
+         Unsupported modes are configuration errors. Passive features are suppressed in YOLO.\n\n\
+         | Feature | Default | Supported modes | Behavior beyond shadow |\n\
+         |---------|---------|-----------------|------------------------|",
+        model = config.model,
+        api_key_env = config.api_key_env,
+        allow_remote = config.allow_remote,
+        timeout_ms = config.timeout_ms,
+        log = config.log,
+        retention = config.log_retention_days,
+    )
+    .unwrap();
+    let features = serde_json::to_value(&config.features).unwrap();
+    for (name, modes, behavior) in [
+        (
+            "permission_advice",
+            "`off`, `shadow`, `advise`",
+            "Add warnings to an existing permission prompt without delaying the answer.",
+        ),
+        (
+            "auto_screening",
+            "`off`, `shadow`, `enforce`",
+            "Escalate an eligible Auto call to a prompt on a flag or engine failure. No answer channel means denial.",
+        ),
+        (
+            "shell_effect",
+            "`off`, `shadow`, `advise`",
+            "Warn about possible project writes during Plan review only when `shell_writes` is configured. Never establish read-only authority.",
+        ),
+        (
+            "content_screening",
+            "`off`, `shadow`, `advise`",
+            "Add caution to flagged web/MCP output and tighten upload/credential Auto screening for the session. Content remains available.",
+        ),
+        (
+            "shell_duration",
+            "`off`, `shadow`, `advise`, `enforce`",
+            "Advise with local shell estimates. Enforce may fill an omitted timeout and select delivery at admission. Explicit timeouts stay unchanged. See [shell duration](#shell-duration).",
+        ),
+        (
+            "tool_search",
+            "`off`, `shadow`, `enforce`",
+            "Rerank the existing lexical tool shortlist. This neither loads arbitrary names nor grants execution permission.",
+        ),
+        (
+            "skill_suggestions",
+            "`off`, `shadow`, `advise`",
+            "Suggest a shortlisted skill. The agent still chooses whether to load it.",
+        ),
+        (
+            "goal_prescreen",
+            "`off`, `shadow`, `enforce`",
+            "Skip an unlikely-to-pass goal evaluation within the continuation budget and continue work. Only the normal evaluator can certify completion.",
+        ),
+        (
+            "subagent_routing",
+            "`off`, `shadow`, `enforce`",
+            "Choose a model job for a new unpinned subagent from its task label, not its full prompt. Explicit jobs, profile pins, and continuations keep their routing.",
+        ),
+    ] {
+        writeln!(
+            out,
+            "| `{name}` | `{}` | {modes} | {behavior} |",
+            features[name]
+        )
+        .unwrap();
+    }
+    out.push_str(
+        "\n#### `decisions.thresholds`\n\n\
+         Flag thresholds trigger at or above the configured value. Goal prescreening uses an \
+         at-or-below comparison. Content screening requires both signals in a sampled chunk. \
+         After content is flagged, Auto uses 75% of `auto_flag` for upload and credential flags.\n\n\
+         | Field | Default | Meaning |\n\
+         |-------|---------|---------|\n",
+    );
+    let thresholds = serde_json::to_value(&config.thresholds).unwrap();
+    for (name, meaning) in [
+        ("permission_flag", "Probability for a permission warning."),
+        (
+            "auto_flag",
+            "Probability for escalating an eligible Auto call.",
+        ),
+        (
+            "content_injection",
+            "Probability that sampled content attempts instruction injection.",
+        ),
+        (
+            "content_addressed_to_agent",
+            "Probability that sampled content addresses the agent.",
+        ),
+        (
+            "shell_endless",
+            "Probability that a shell command runs until stopped.",
+        ),
+        (
+            "shell_heavy",
+            "Probability for a heavy-command prior and confidence required for a duration choice.",
+        ),
+        (
+            "routing_confidence",
+            "Confidence required for tool search, skill suggestions, and subagent routing. Tool-search choice probability must also meet it.",
+        ),
+        (
+            "goal_skip_below",
+            "Skip an evaluator at or below this completion probability, within the continuation budget.",
+        ),
+        (
+            "shell_writes",
+            "Optional project-write warning threshold. Omission leaves the warning disabled. No built-in enforcement threshold.",
+        ),
+    ] {
+        let value = &thresholds[name];
+        let default = if value.is_null() {
+            "nil".into()
+        } else {
+            value.to_string()
+        };
+        writeln!(out, "| `{name}` | `{default}` | {meaning} |").unwrap();
+    }
+    out.push_str(
+        "\n#### Shell duration\n\n\
+         `shell_duration` applies only to eligible local native shell calls, not remote workspaces \
+         or managed sandboxes. Measured exact-command history takes priority over command-family \
+         history, and both take priority over a model estimate. Timeouts, cancellations, and failures \
+         are recorded separately from completed latency samples. History is separate from the \
+         opt-in decision log, so `log = false` does not disable duration observations.\n\n\
+         In `advise`, estimates and warnings leave execution unchanged. In `enforce`, an omitted \
+         `timeoutSec` may receive a default based on 1.5 times estimated p90, bounded by the \
+         tool schema's default and maximum. An explicit timeout is never changed. An endless \
+         prediction gives caution only and does not remove the execution deadline.\n\n\
+         With `agent.shell_execution = \"auto\"`, Enforce estimates can select synchronous or \
+         asynchronous delivery at admission, bounded by the effective timeout and \
+         `agent.shell_async_threshold_secs`. Explicit sync/async settings still win. Elapsed \
+         runtime never promotes a synchronous call to asynchronous delivery. An admission \
+         receipt is not completion or success.\n\n\
+         #### Question overrides\n\n\
+         Only the permission question set currently supports a user-global file override: \
+         `~/.config/caudra/decisions/permission.json`. It must be a regular JSON file no larger \
+         than 64 KiB, retain all required question IDs as `noul`, and pass question validation. \
+         It is read when an endpoint and permission advice or Auto screening are enabled. \
+         Projects cannot supply this override. Other feature question sets have no file override.\n\n",
+    );
+}
+
 fn write_tool_output_section(out: &mut String) {
     writeln!(out, "### `ui.tool_output_lines`\n").unwrap();
     writeln!(
@@ -610,6 +790,7 @@ All fields are optional. Typos in field names cause an error right away.
     write_snapshots_section(&mut out);
     write_telemetry_section(&mut out);
     write_worktrees_section(&mut out);
+    write_decisions_section(&mut out);
 
     writeln!(out, "## Plugins\n").unwrap();
     writeln!(
@@ -725,16 +906,65 @@ Related pages: [Skills](/docs/skills/), [CLI](/docs/cli/), [Providers](/docs/pro
 
 #[cfg(test)]
 mod tests {
-    use caudra_config::{AgentConfig, SteeringConfig};
-    use serde_json::Value;
+    use caudra_config::{
+        AgentConfig, DecisionsConfig, SteeringConfig, decisions::RawDecisionsConfig,
+    };
+    use serde_json::{Value, json};
     use test_case::test_case;
 
-    use super::write_steering_section;
+    use super::{write_decisions_section, write_steering_section};
 
     const MODEL: &str = "provider/model";
     const HEADING: &str = "### `agent.steering`";
     const PROMPT_ROW: &str = "| `prompt` | string | `nil` |";
     const RULE_COUNT: usize = 8;
+
+    #[test_case("off")]
+    #[test_case("shadow")]
+    #[test_case("advise")]
+    #[test_case("enforce")]
+    fn decision_reference_modes_match_validation(mode: &str) {
+        let defaults = serde_json::to_value(DecisionsConfig::default().features).unwrap();
+        let mut reference = String::new();
+        write_decisions_section(&mut reference);
+        for (feature, default) in defaults.as_object().unwrap() {
+            let row = reference
+                .lines()
+                .find(|line| line.starts_with(&format!("| `{feature}` |")))
+                .unwrap();
+            assert_eq!(
+                row.split('|').nth(2).unwrap().trim(),
+                format!("`{default}`")
+            );
+            let documented = row
+                .split('|')
+                .nth(3)
+                .unwrap()
+                .contains(&format!("`{mode}`"));
+            let raw: RawDecisionsConfig =
+                serde_json::from_value(json!({"features": {feature: mode}})).unwrap();
+            assert_eq!(documented, raw.resolve(None).is_ok(), "{feature}: {mode}");
+        }
+    }
+
+    #[test]
+    fn decision_reference_covers_threshold_defaults() {
+        let defaults = serde_json::to_value(DecisionsConfig::default().thresholds).unwrap();
+        let mut reference = String::new();
+        write_decisions_section(&mut reference);
+        for (field, value) in defaults.as_object().unwrap() {
+            let default = if value.is_null() {
+                "nil".into()
+            } else {
+                value.to_string()
+            };
+            let prefix = format!("| `{field}` | `{default}` |");
+            assert!(
+                reference.lines().any(|line| line.starts_with(&prefix)),
+                "{field}"
+            );
+        }
+    }
 
     #[test]
     fn steering_reference_matches_resolved_defaults() {

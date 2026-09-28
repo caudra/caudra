@@ -1205,7 +1205,7 @@ impl SpawnCtx {
         let restore_session = !initial_history.is_empty() || session_has_content(&session);
         let (system_prompt_profile_name, system_prompt_profile, profile_warning) =
             self.resolve_prompt_profile(&session);
-        let permissions = Arc::new(self.permissions.fork());
+        let permissions = Arc::new(self.permissions.fork_session());
         // Publishing writes the session out so a conversation grant has a row
         // to be fenced against. A session holding nothing has nothing to keep,
         // so it earns its row at its first run instead of at startup.
@@ -1219,7 +1219,7 @@ impl SpawnCtx {
         } else {
             ConversationPermissions::Pending
         };
-        permissions.set_session_yolo(session.meta.yolo);
+        permissions.set_session_mode(session.meta.permission_mode.clone());
         let goal = caudra_agent::GoalHandle::restored(session.meta.active_goal.as_deref());
         if let Some(limit) = session.meta.goal_continuation_limit {
             goal.set_continuation_limit(limit);

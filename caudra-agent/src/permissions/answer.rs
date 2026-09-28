@@ -19,6 +19,7 @@ pub const DEFAULT_DENY_GUIDANCE: &str =
 pub const DECISION_SOURCE_RULE: &str = "rule";
 
 pub const DECISION_SOURCE_YOLO: &str = "yolo";
+pub const DECISION_SOURCE_AUTO: &str = "auto";
 
 pub const DECISION_SOURCE_USER_ONCE: &str = "user_once";
 

@@ -135,6 +135,7 @@ text_enum! {
         Agent = "agent",
         Parallel = "parallel",
         ScratchFile = "scratch_file",
+        Decision = "decision",
     }
 }
 
@@ -1196,6 +1197,7 @@ mod tests {
 
     #[test_case(WorkflowRunStatus::BudgetLimited, "budget_limited"; "run_status")]
     #[test_case(WorkflowCallKind::ScratchFile, "scratch_file"; "call_kind")]
+    #[test_case(WorkflowCallKind::Decision, "decision"; "decision_call_kind")]
     fn enums_round_trip_through_their_storage_text<T>(value: T, text: &str)
     where
         T: FromStr<Err = UnknownVariant> + PartialEq + fmt::Debug + Copy + fmt::Display,
@@ -1336,14 +1338,23 @@ mod tests {
         );
     }
 
-    #[test]
-    fn calls_journal_start_finish_and_load_in_order() {
+    #[test_case(WorkflowCallKind::Agent; "agent")]
+    #[test_case(WorkflowCallKind::Parallel; "parallel")]
+    #[test_case(WorkflowCallKind::ScratchFile; "scratch_file")]
+    #[test_case(WorkflowCallKind::Decision; "decision")]
+    fn calls_journal_start_finish_and_load_in_order(kind: WorkflowCallKind) {
         let (_temp, _state_dir, database, session_id) = open();
         database
             .insert_workflow_run(&run(session_id, RUN_ID))
             .unwrap();
-        database.start_workflow_call(&start(RUN_ID, 1)).unwrap();
-        database.start_workflow_call(&start(RUN_ID, 0)).unwrap();
+        for call_key in [1, 0] {
+            database
+                .start_workflow_call(&WorkflowCallStart {
+                    kind,
+                    ..start(RUN_ID, call_key)
+                })
+                .unwrap();
+        }
 
         database
             .finish_workflow_call(RUN_ID, 0, &completion())
@@ -1361,6 +1372,7 @@ mod tests {
         let calls = database.load_workflow_calls(RUN_ID).unwrap();
 
         assert_eq!(calls.len(), 2);
+        assert!(calls.iter().all(|call| call.kind == kind));
         assert_eq!(calls[0].call_key, 0);
         assert_eq!(calls[0].state, WorkflowCallState::Completed);
         assert_eq!(calls[0].result.as_deref(), Some(RESULT));

@@ -828,7 +828,7 @@ fn sanitize_input(value: &Value, key: Option<&str>, depth: usize, nodes: &mut us
     }
 }
 
-fn secret_key(key: &str) -> bool {
+pub(crate) fn secret_key(key: &str) -> bool {
     let key = key.to_ascii_lowercase().replace(['-', '_'], "");
     [
         "auth",
@@ -914,7 +914,7 @@ fn redact_url(value: &str) -> String {
     }
 }
 
-fn redact_text(value: &str) -> String {
+pub(crate) fn redact_text(value: &str) -> String {
     if value.contains("-----BEGIN") && value.contains("PRIVATE KEY-----") {
         return REDACTED.into();
     }

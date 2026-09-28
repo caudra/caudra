@@ -33,7 +33,7 @@ const PROMPT_HINT: &str = "tip: to open a session with a message, use `caudra --
 /// `process::exit` deeper in the tree would skip them.
 fn main() -> ExitCode {
     color_eyre::install().ok();
-    let cli = match Cli::try_parse() {
+    let cli = match Cli::try_parse().and_then(Cli::validate) {
         Ok(cli) => cli,
         Err(err) => return report_parse_error(&err),
     };

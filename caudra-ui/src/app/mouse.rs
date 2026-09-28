@@ -12,6 +12,7 @@ use crate::components::stream_modal::StreamAction;
 use crate::components::workflow_card::CardHit;
 use crate::selection::{self, ContentRegion, EdgeScroll, Selection, SelectionState, SelectionZone};
 use caudra_agent::{CommitRef, Mention};
+use caudra_storage::sessions::PermissionMode;
 use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::{Position, Rect};
 use std::path::PathBuf;
@@ -19,7 +20,7 @@ use std::path::PathBuf;
 use crate::repaint::Dirty;
 
 use super::tasks::MAIN_TASK_ID;
-use super::{App, FAST_OFF_MSG, KeyFocus, YOLO_OFF_MSG};
+use super::{AUTO_OFF_MSG, App, FAST_OFF_MSG, KeyFocus, YOLO_OFF_MSG};
 
 pub(super) const EDGE_SCROLL_LINES: i32 = 1;
 pub(super) const EDGE_SCROLL_INTERVAL: Duration = Duration::from_millis(25);
@@ -1137,8 +1138,14 @@ impl App {
             // warned about, taking the hover it was drawn under with it.
             StatusBarHitTarget::Yolo => {
                 self.clear_control_hovers();
-                self.permissions.set_session_yolo(Some(false));
+                self.permissions.set_session_mode(Some(PermissionMode::Ask));
                 self.flash(YOLO_OFF_MSG.into());
+                Vec::new()
+            }
+            StatusBarHitTarget::Auto => {
+                self.clear_control_hovers();
+                self.permissions.set_session_mode(Some(PermissionMode::Ask));
+                self.flash(AUTO_OFF_MSG.into());
                 Vec::new()
             }
             // Off only, on the same terms as yolo: the chip is drawn from the

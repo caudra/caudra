@@ -17,6 +17,7 @@ pub const EVENT_API_REQUEST: &str = "caudra.api_request";
 pub const EVENT_API_ERROR: &str = "caudra.api_error";
 pub const EVENT_TOOL_RESULT: &str = "caudra.tool_result";
 pub const EVENT_TOOL_DECISION: &str = "caudra.tool_decision";
+pub const EVENT_DECISION: &str = "caudra.decision";
 
 /// The complete set of targets the telemetry layer forwards. An event outside
 /// this list reaches the log file only, so a new `tracing` call site can never
@@ -27,6 +28,7 @@ pub const EVENT_NAMES: &[&str] = &[
     EVENT_API_ERROR,
     EVENT_TOOL_RESULT,
     EVENT_TOOL_DECISION,
+    EVENT_DECISION,
 ];
 
 /// Resolves a target back to its `&'static str` so a `LogRecord` can borrow it.

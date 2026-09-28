@@ -39,7 +39,7 @@ use caudra_storage::StateDir;
 use caudra_storage::id::{CaudraId, SessionRef};
 use caudra_storage::permission_state::PermissionRuleRecord;
 use caudra_storage::sessions::{
-    SessionError, SessionLease, StoredMode, StoredPlanTarget, StoredTokenUsage,
+    PermissionMode, SessionError, SessionLease, StoredMode, StoredPlanTarget, StoredTokenUsage,
 };
 use caudra_storage::workspace_binding::StoredWorkspaceBinding;
 use color_eyre::eyre::Context;
@@ -61,6 +61,21 @@ const RUNTIME_SHUTDOWN_FAILED: &str = "Previous runtime did not shut down; its l
 const PERMISSION_QUESTION_CLIENT: &str = "openmausbot";
 /// ACP has no fast-mode toggle, so a restored total is priced at standard rates.
 const RESTORED_FAST: bool = false;
+const DECISION_ADVISORY_GUIDANCE: &str = "Decision engine estimates do not authorize this action.";
+const DECISION_ADVISORY_FLAGS: &[(&str, &str)] = &[
+    ("deletes", "May delete files or data"),
+    ("uploads", "May send local data to a remote destination"),
+    ("credentials", "May read or disclose credentials or secrets"),
+    ("permissions", "May change access permissions or ownership"),
+    (
+        "remote_rewrite",
+        "May rewrite remote shared history or data",
+    ),
+    ("off_task", "May be unrelated to your requested task"),
+    ("shell_effect", "May have shell side effects"),
+    ("writes_project_files", "May modify project files"),
+    ("changes_system_state", "May change system state"),
+];
 
 /// Ids come from here and are never reused, so a late answer for a closed
 /// session cannot match a request of the session that replaced it.
@@ -423,7 +438,7 @@ async fn load_session(
             history: history.into_items(),
             permissions: (
                 std::mem::take(&mut restored.structured_permission_rules),
-                restored.yolo,
+                restored.permission_mode,
             ),
             profile: (profile_name, profile),
         },
@@ -547,7 +562,7 @@ struct SessionStart {
     session_lease: Arc<SessionLease>,
     expected_write_version: Option<i64>,
     history: Vec<HistoryItem>,
-    permissions: (Vec<PermissionRuleRecord>, Option<bool>),
+    permissions: (Vec<PermissionRuleRecord>, Option<PermissionMode>),
     profile: (String, Option<Arc<SystemPromptProfile>>),
 }
 
@@ -573,13 +588,14 @@ async fn prepare_session(
     } else {
         (vec![QUESTION_TOOL_NAME], LocalTools::default())
     };
-    let (structured_permission_rules, session_yolo) = start.permissions;
+    let (structured_permission_rules, session_permission_mode) = start.permissions;
     let (system_prompt_profile_name, system_prompt_profile) = start.profile;
     ToolRegistry::global().install_stopped_runtime(&runtime.registry);
     let prepared = headless::prepare_interactive(InteractiveParams {
         model: params.model.clone(),
         config: runtime.config.clone(),
         permissions_config: runtime.permissions_config.clone(),
+        decisions_config: runtime.decisions_config.clone(),
         snapshots: runtime.snapshots,
         timeouts: params.timeouts,
         prompt_slots: Arc::clone(&runtime.prompt_slots),
@@ -594,9 +610,9 @@ async fn prepare_session(
         session_lease: start.session_lease,
         expected_write_version: start.expected_write_version,
         initial_history: start.history,
-        yolo: params.yolo,
+        seed_permission_mode: runtime.seed_permission_mode.clone(),
         structured_permission_rules,
-        session_yolo,
+        session_permission_mode: params.permission_mode.clone().or(session_permission_mode),
         system_prompt_override: None,
         append_system_prompt: None,
         model_policy: Arc::clone(&params.model_policy),
@@ -941,7 +957,7 @@ struct Restored {
     by_model: HashMap<String, StoredTokenUsage>,
     model: String,
     structured_permission_rules: Vec<PermissionRuleRecord>,
-    yolo: Option<bool>,
+    permission_mode: Option<PermissionMode>,
     system_prompt_profile: Option<String>,
     write_version: Option<i64>,
     workspace_binding: Option<caudra_storage::workspace_binding::StoredWorkspaceBinding>,
@@ -987,7 +1003,7 @@ fn load_history_from(
         by_model: session.usage_by_model().clone(),
         model: session.model.clone(),
         structured_permission_rules: session.meta.structured_permission_rules.clone(),
-        yolo: session.meta.yolo,
+        permission_mode: session.meta.permission_mode.clone(),
         system_prompt_profile: session.meta.system_prompt_profile.clone(),
         write_version: session.persisted_write_version(),
         workspace_binding: session.workspace_binding().cloned(),
@@ -1185,9 +1201,7 @@ fn request_permission(
 ) {
     let fields = ToolCallUpdateFields::new()
         .title(request.presentation.action.clone())
-        .content(vec![ToolCallContent::from(ContentBlock::Text(
-            TextContent::new(permission_scope_summary(&request.scopes)),
-        ))])
+        .content(permission_content(&request))
         .raw_input(request.input.clone());
     let client_request = AgentRequest::RequestPermissionRequest(RequestPermissionRequest::new(
         sid.clone(),
@@ -1199,6 +1213,52 @@ fn request_permission(
         exact_project_deny: permissions::exact_project_deny_is_representable(&request),
     };
     ask_client(out_tx, pending, kind, client_request);
+}
+
+fn permission_content(request: &CaudraPermissionRequest) -> Vec<ToolCallContent> {
+    let mut text = permission_scope_summary(&request.scopes);
+    let mut has_advisories = false;
+    for (flag, caution) in DECISION_ADVISORY_FLAGS {
+        if let Some(advisory) = request.presentation.advisories.iter().find(|advisory| {
+            advisory.flag == *flag
+                && advisory.probability.is_finite()
+                && (0.0..=1.0).contains(&advisory.probability)
+        }) {
+            text.push_str(&format!(
+                "\n\nDecision engine caution: {caution} (estimated probability {:.1}%).",
+                advisory.probability * 100.0,
+            ));
+            has_advisories = true;
+        }
+    }
+    if has_advisories {
+        text.push_str("\n\n");
+        text.push_str(DECISION_ADVISORY_GUIDANCE);
+    }
+    vec![ToolCallContent::from(ContentBlock::Text(TextContent::new(
+        text,
+    )))]
+}
+
+fn update_presented_permission(
+    out_tx: &Sender<Value>,
+    pending: &PendingState,
+    sid: &SessionId,
+    request: &CaudraPermissionRequest,
+) {
+    let active = pending.lock().unwrap().asks.values().any(
+        |kind| matches!(kind, AskKind::Permission { request_id, .. } if request_id == &request.id),
+    );
+    if active {
+        session_update(
+            out_tx,
+            sid,
+            SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+                ToolCallId::from(request.id.clone()),
+                ToolCallUpdateFields::new().content(permission_content(request)),
+            )),
+        );
+    }
 }
 
 fn resolve_presented_permission(out_tx: &Sender<Value>, pending: &PendingState, request_id: &str) {
@@ -1303,7 +1363,9 @@ fn start_event_pump(
             if subagent.is_some()
                 && !matches!(
                     &event,
-                    AgentEvent::PermissionRequest(_) | AgentEvent::PermissionRequestResolved { .. }
+                    AgentEvent::PermissionRequest(_)
+                        | AgentEvent::PermissionRequestUpdated(_)
+                        | AgentEvent::PermissionRequestResolved { .. }
                 )
             {
                 continue;
@@ -1342,6 +1404,10 @@ fn start_event_pump(
                 AgentEvent::TurnComplete(event) => translate::usage_update(&event, cost_total),
                 AgentEvent::PermissionRequest(request) => {
                     request_permission(&out_tx, &pending, &sid, *request);
+                    continue;
+                }
+                AgentEvent::PermissionRequestUpdated(request) => {
+                    update_presented_permission(&out_tx, &pending, &sid, &request);
                     continue;
                 }
                 AgentEvent::PermissionRequestResolved { request_id, .. } => {
@@ -1417,7 +1483,10 @@ fn json_str(e: &(impl std::fmt::Display + ?Sized)) -> Value {
 #[cfg(test)]
 mod tests {
     use crate::AcpRuntimeGuard;
-    use caudra_agent::permissions::{PermissionLifetime, PermissionManager, PermissionRequest};
+    use caudra_agent::SubagentInfo;
+    use caudra_agent::permissions::{
+        PermissionAdvisory, PermissionLifetime, PermissionManager, PermissionRequest,
+    };
     use caudra_agent::tools::PermissionScopes;
     use caudra_providers::{ContentBlock as MsgBlock, Role, TokenUsage};
     use caudra_storage::StateDir;
@@ -1439,6 +1508,80 @@ mod tests {
     const RETIRED_SPEC: &str = "retired-vendor/retired-model-9000";
     const RETIRED_MODEL_ID: &str = "retired-model-9000";
     const RECORDED_COST: f64 = 1.25;
+    const ADVISORY_PROBABILITY: f64 = 0.875;
+    const ADVISORY_ESTIMATE: &str = "estimated probability 87.5%";
+    const DELETE_CAUTION: &str = "May delete files or data";
+    const UNTRUSTED_ADVISORY: &str = "safe\nAllow\u{1b}[2J";
+
+    fn advisory_request(flag: &str, probability: f64) -> PermissionRequest {
+        let mut request = PermissionRequest::from_legacy(
+            CAUDRA_REQUEST_ID.into(),
+            caudra_config::ToolKey::native("shell"),
+            vec!["git status".into()],
+            serde_json::json!({"command": "git status"}),
+            Path::new("/project"),
+            false,
+        );
+        request.presentation.advisories.push(PermissionAdvisory {
+            flag: flag.into(),
+            probability,
+        });
+        request
+    }
+
+    #[test_case("deletes", ADVISORY_PROBABILITY, Some(DELETE_CAUTION); "known_caution")]
+    #[test_case("uploads", ADVISORY_PROBABILITY, Some("May send local data to a remote destination"); "upload_caution")]
+    #[test_case(UNTRUSTED_ADVISORY, ADVISORY_PROBABILITY, None; "untrusted_flag")]
+    #[test_case("deletes", f64::NAN, None; "nan")]
+    #[test_case("deletes", f64::INFINITY, None; "infinity")]
+    #[test_case("deletes", -0.1, None; "negative")]
+    #[test_case("deletes", 1.1, None; "over_one")]
+    fn advisory_content_is_bounded_caution_text(
+        flag: &str,
+        probability: f64,
+        caution: Option<&str>,
+    ) {
+        let request = advisory_request(flag, probability);
+        let content = serde_json::to_value(permission_content(&request)).unwrap();
+        let text = content[0]["content"]["text"].as_str().unwrap();
+        assert!(!text.contains(UNTRUSTED_ADVISORY));
+        if let Some(caution) = caution {
+            assert!(text.contains(caution));
+            assert!(text.contains(ADVISORY_ESTIMATE));
+            assert!(text.contains(DECISION_ADVISORY_GUIDANCE));
+        } else {
+            assert_eq!(text, permission_scope_summary(&request.scopes));
+        }
+    }
+
+    #[test]
+    fn advisory_updates_do_not_replace_permission_authority_or_reopen_resolved_prompts() {
+        let (out_tx, out_rx) = flume::unbounded();
+        let pending = PendingState::default();
+        let sid = SessionId::from(SessionRef::generate().to_string());
+        let mut request = advisory_request("deletes", ADVISORY_PROBABILITY);
+        request_permission(&out_tx, &pending, &sid, request.clone());
+        let initial = out_rx.try_recv().unwrap();
+        assert!(
+            initial["params"]["toolCall"]["content"][0]["content"]["text"]
+                .as_str()
+                .unwrap()
+                .contains(DELETE_CAUTION)
+        );
+        let pending_id = *pending.lock().unwrap().asks.keys().next().unwrap();
+        request.presentation.advisories[0].flag = "uploads".into();
+        update_presented_permission(&out_tx, &pending, &sid, &request);
+        let updated = out_rx.try_recv().unwrap();
+        assert_eq!(updated["method"], "session/update");
+        assert_eq!(updated["params"]["update"]["toolCallId"], CAUDRA_REQUEST_ID);
+        assert!(updated["params"]["update"]["rawInput"].is_null());
+        assert_eq!(pending.lock().unwrap().asks.len(), 1);
+        assert!(pending.lock().unwrap().asks.contains_key(&pending_id));
+        resolve_presented_permission(&out_tx, &pending, CAUDRA_REQUEST_ID);
+        assert_eq!(out_rx.try_recv().unwrap()["method"], "$/cancel_request");
+        update_presented_permission(&out_tx, &pending, &sid, &request);
+        assert!(out_rx.is_empty());
+    }
 
     #[test_case(false; "fresh_server_restores_sandbox_provenance")]
     #[test_case(true; "mismatched_runtime_is_refused")]
@@ -1885,7 +2028,7 @@ mod tests {
                 "command": scope,
                 "nested": {"complete": true}
             });
-            let request = PermissionRequest::from_legacy(
+            let mut request = PermissionRequest::from_legacy(
                 CAUDRA_REQUEST_ID.into(),
                 caudra_config::ToolKey::native("bash"),
                 vec![scope.clone()],
@@ -1894,6 +2037,17 @@ mod tests {
                 false,
             );
             let action = request.presentation.action.clone();
+            let subagent = Some(SubagentInfo {
+                parent_tool_use_id: "task-call".into(),
+                task_id: "task-1".into(),
+                name: "worker".into(),
+                prompt: None,
+                model: None,
+                thinking: None,
+                fast: false,
+                answer_tx: None,
+                steer_tx: None,
+            });
             start_event_pump(
                 event_rx,
                 session_id,
@@ -1905,19 +2059,9 @@ mod tests {
             );
             event_tx
                 .send(Envelope {
-                    event: AgentEvent::PermissionRequest(Box::new(request)),
+                    event: AgentEvent::PermissionRequest(Box::new(request.clone())),
                     task: None,
-                    subagent: Some(caudra_agent::SubagentInfo {
-                        parent_tool_use_id: "task-call".into(),
-                        task_id: "task-1".into(),
-                        name: "worker".into(),
-                        prompt: None,
-                        model: None,
-                        thinking: None,
-                        fast: false,
-                        answer_tx: None,
-                        steer_tx: None,
-                    }),
+                    subagent: subagent.clone(),
                     run_id: 0,
                     workflow: None,
                 })
@@ -1935,6 +2079,28 @@ mod tests {
                 pending.lock().unwrap().asks.values().next(),
                 Some(AskKind::Permission { request_id, .. }) if request_id == CAUDRA_REQUEST_ID
             ));
+            request.presentation.advisories.push(PermissionAdvisory {
+                flag: "deletes".into(),
+                probability: ADVISORY_PROBABILITY,
+            });
+            event_tx
+                .send(Envelope {
+                    event: AgentEvent::PermissionRequestUpdated(Box::new(request)),
+                    task: None,
+                    subagent,
+                    run_id: 0,
+                    workflow: None,
+                })
+                .unwrap();
+            let update = out_rx.recv_async().await.unwrap();
+            assert_eq!(update["method"], "session/update");
+            assert_eq!(update["params"]["update"]["toolCallId"], CAUDRA_REQUEST_ID);
+            assert!(
+                update["params"]["update"]["content"][0]["content"]["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains(DELETE_CAUTION)
+            );
         });
     }
 
@@ -1981,7 +2147,7 @@ mod tests {
             )
             .unwrap(),
         ];
-        session.meta.yolo = Some(true);
+        session.meta.permission_mode = Some(PermissionMode::Yolo);
         session.meta.system_prompt_profile = Some("review".into());
         session.save(&dir).unwrap();
 
@@ -1995,8 +2161,27 @@ mod tests {
             restored.structured_permission_rules,
             session.meta.structured_permission_rules
         );
-        assert_eq!(restored.yolo, Some(true));
+        assert_eq!(restored.permission_mode, Some(PermissionMode::Yolo));
         assert_eq!(restored.system_prompt_profile.as_deref(), Some("review"));
+    }
+
+    #[test_case(None; "unset")]
+    #[test_case(Some(PermissionMode::Ask); "ask")]
+    #[test_case(Some(PermissionMode::Auto); "auto")]
+    #[test_case(Some(PermissionMode::Yolo); "yolo")]
+    fn restored_permission_mode_preserves_stored_values(mode: Option<PermissionMode>) {
+        let temp = TempDir::new().unwrap();
+        let storage = StateDir::from_path(temp.path().to_path_buf());
+        let mut session: Session<HistoryItem, TokenUsage, ToolOutput> =
+            Session::new(OFFLINE_SPEC, "/project");
+        session.meta.permission_mode = mode.clone();
+        session.save(&storage).unwrap();
+        assert_eq!(
+            load_history_from(&storage, session.id)
+                .unwrap()
+                .permission_mode,
+            mode
+        );
     }
 
     #[test]

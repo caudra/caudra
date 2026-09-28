@@ -57,6 +57,8 @@ Commands marked Main only act on the main session's turn or history. They stay l
 | `/goal` | Work until a completion condition is met | Main only |
 | `/goal-clear` | Stop the active completion goal | Main only |
 | `/goal-model` | Assign the completion goal model | Main only |
+| `/auto` | Toggle Auto permissions (skip unmatched prompts, keep safeguards) |  |
+| `/decisions` | Show decision engine configuration and cached status |  |
 | `/yolo` | Toggle YOLO mode (skip all permission prompts) |  |
 | `/thinking` | Set reasoning (off, adaptive/provider default, effort, or token budget) |  |
 | `/fast` | Toggle fast mode (models that sell a fast tier) |  |

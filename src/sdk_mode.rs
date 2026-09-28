@@ -29,6 +29,7 @@ use caudra_agent::{
     AgentConfig, AgentEvent, AgentInput, AgentMode, DoneReason, Envelope, History,
     PermissionsConfig, StoredSession,
 };
+use caudra_config::decisions::DecisionsConfig;
 use caudra_config::{
     ExecutionMode, ModelPolicy, SnapshotsConfig, effective_shell_execution,
     effective_task_execution,
@@ -42,7 +43,8 @@ use caudra_storage::id::SessionRef;
 use caudra_storage::local_documents::LocalDocumentStore;
 use caudra_storage::permission_state::PermissionRuleRecord;
 use caudra_storage::sessions::{
-    SessionError, SessionLease, StoredMode, StoredPlanTarget, StoredSubagentTaskSpec,
+    PermissionMode as StoredPermissionMode, SessionError, SessionLease, StoredMode,
+    StoredPlanTarget, StoredSubagentTaskSpec,
 };
 use caudra_storage::tool_outputs::{ToolOutputRef, ToolOutputStore};
 use caudra_storage::workspace_binding::StoredWorkspaceBinding;
@@ -126,19 +128,21 @@ fn wire_uuid() -> String {
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum PermissionMode {
     Default,
+    Auto,
     AcceptEdits,
     Plan,
     BypassPermissions,
 }
 
 impl PermissionMode {
-    fn resolve(flag: Option<&str>, yolo: bool) -> Self {
+    fn resolve(flag: Option<&str>, yolo: bool, auto: bool) -> Self {
         match flag {
             Some(s) => Self::parse(s).unwrap_or_else(|| {
                 eprintln!("warning: unknown permission mode '{s}', using default");
                 Self::Default
             }),
             None if yolo => Self::BypassPermissions,
+            None if auto => Self::Auto,
             None => Self::Default,
         }
     }
@@ -146,6 +150,7 @@ impl PermissionMode {
     fn parse(s: &str) -> Option<Self> {
         match s {
             "default" => Some(Self::Default),
+            "auto" => Some(Self::Auto),
             "acceptEdits" => Some(Self::AcceptEdits),
             "plan" => Some(Self::Plan),
             "bypassPermissions" => Some(Self::BypassPermissions),
@@ -156,9 +161,26 @@ impl PermissionMode {
     fn as_str(self) -> &'static str {
         match self {
             Self::Default => "default",
+            Self::Auto => "auto",
             Self::AcceptEdits => "acceptEdits",
             Self::Plan => "plan",
             Self::BypassPermissions => "bypassPermissions",
+        }
+    }
+
+    fn storage_mode(self) -> StoredPermissionMode {
+        match self {
+            Self::Auto => StoredPermissionMode::Auto,
+            Self::BypassPermissions => StoredPermissionMode::Yolo,
+            _ => StoredPermissionMode::Ask,
+        }
+    }
+
+    fn preserve_plan(self, current: Self) -> Self {
+        if self == Self::Auto && current == Self::Plan {
+            Self::Plan
+        } else {
+            self
         }
     }
 
@@ -651,6 +673,8 @@ pub struct SdkParams {
     pub model: Model,
     pub config: AgentConfig,
     pub permissions_config: PermissionsConfig,
+    pub decisions_config: DecisionsConfig,
+    pub seed_permission_mode: Option<StoredPermissionMode>,
     pub snapshots: SnapshotsConfig,
     pub timeouts: Timeouts,
     pub prompt_slots: ResolvedSlots,
@@ -712,6 +736,8 @@ pub fn run(params: SdkParams) -> Result<()> {
         model,
         mut config,
         permissions_config,
+        decisions_config,
+        seed_permission_mode,
         snapshots,
         timeouts,
         prompt_slots,
@@ -733,7 +759,7 @@ pub fn run(params: SdkParams) -> Result<()> {
     let max_output_lines = config.max_output_lines;
     let max_output_bytes = config.max_output_bytes;
     let mut requested_permission_mode =
-        PermissionMode::resolve(cli.permission_mode.as_deref(), cli.yolo);
+        PermissionMode::resolve(cli.permission_mode.as_deref(), cli.yolo, cli.auto);
     let system_prompt_override = cli.system_prompt.clone().filter(|s| !s.is_empty());
 
     let cwd = remote_environment.as_ref().map_or_else(
@@ -747,7 +773,7 @@ pub fn run(params: SdkParams) -> Result<()> {
         expected_write_version,
         initial_history,
         structured_permission_rules,
-        session_yolo,
+        session_permission_mode,
         stored_system_prompt_profile,
         restored_plan,
         restored_legacy_plan,
@@ -760,6 +786,8 @@ pub fn run(params: SdkParams) -> Result<()> {
         system_prompt_override.is_some(),
         workspace_binding.as_ref(),
     )?;
+    let session_permission_mode =
+        startup_permission_mode(&cli, requested_permission_mode, session_permission_mode);
     let restored_plan = restored_plan.or_else(|| {
         restored_legacy_plan.as_deref().and_then(|path| {
             workspace_session
@@ -776,7 +804,10 @@ pub fn run(params: SdkParams) -> Result<()> {
                 })
         })
     });
-    if restored_plan_mode && cli.permission_mode.is_none() && !cli.yolo {
+    if restored_plan_mode
+        && ((cli.permission_mode.is_none() && !cli.yolo)
+            || requested_permission_mode == PermissionMode::Auto)
+    {
         requested_permission_mode = PermissionMode::Plan;
     }
     crate::setup::report_session_start(
@@ -866,6 +897,7 @@ pub fn run(params: SdkParams) -> Result<()> {
         model,
         config: config.clone(),
         permissions_config,
+        decisions_config,
         snapshots,
         timeouts,
         prompt_slots: Arc::new(prompt_slots),
@@ -880,9 +912,9 @@ pub fn run(params: SdkParams) -> Result<()> {
         session_lease,
         expected_write_version,
         initial_history,
-        yolo: requested_permission_mode == PermissionMode::BypassPermissions,
+        seed_permission_mode,
         structured_permission_rules,
-        session_yolo,
+        session_permission_mode,
         system_prompt_override,
         append_system_prompt: cli.append_system_prompt.clone().filter(|s| !s.is_empty()),
         model_policy: Arc::clone(&model_policy),
@@ -906,7 +938,7 @@ pub fn run(params: SdkParams) -> Result<()> {
         shared.lock().unwrap().workspace_session = Some(workspace);
     }
     let permission_mode =
-        effective_permission_mode(requested_permission_mode, handle.permissions.is_yolo());
+        effective_permission_mode(requested_permission_mode, handle.permissions.mode());
     shared.lock().unwrap().permission_mode = permission_mode;
 
     let (out_tx, out_rx) = flume::unbounded::<String>();
@@ -1155,7 +1187,7 @@ struct ResolvedSession {
     expected_write_version: Option<i64>,
     initial_history: Vec<HistoryItem>,
     structured_permission_rules: Vec<PermissionRuleRecord>,
-    session_yolo: Option<bool>,
+    session_permission_mode: Option<StoredPermissionMode>,
     stored_system_prompt_profile: Option<String>,
     restored_plan: Option<PlanRef>,
     restored_legacy_plan: Option<PathBuf>,
@@ -1172,13 +1204,13 @@ fn restored_plan(session: &StoredSession) -> Option<PlanRef> {
 fn session_permissions(
     session: &StoredSession,
     fork: bool,
-) -> (Vec<PermissionRuleRecord>, Option<bool>) {
+) -> (Vec<PermissionRuleRecord>, Option<StoredPermissionMode>) {
     if fork {
         (Vec::new(), None)
     } else {
         (
             session.meta.structured_permission_rules.clone(),
-            session.meta.yolo,
+            session.meta.permission_mode.clone(),
         )
     }
 }
@@ -1229,7 +1261,8 @@ fn resolve_session(
                 configured_profile,
                 raw_prompt_override,
             )?;
-            let (structured_permission_rules, session_yolo) = session_permissions(&session, true);
+            let (structured_permission_rules, session_permission_mode) =
+                session_permissions(&session, true);
             let target = cli_session_id.clone().unwrap_or_else(SessionRef::generate);
             if target.id() == session_ref.id() {
                 return Err(eyre!(
@@ -1300,7 +1333,7 @@ fn resolve_session(
                 expected_write_version: Some(0),
                 initial_history: history,
                 structured_permission_rules,
-                session_yolo,
+                session_permission_mode,
                 stored_system_prompt_profile: session.meta.system_prompt_profile.clone(),
                 restored_plan: None,
                 restored_legacy_plan: None,
@@ -1316,14 +1349,15 @@ fn resolve_session(
                 "--session-id cannot replace the resumed session ID without --fork-session"
             ));
         }
-        let (structured_permission_rules, session_yolo) = session_permissions(&session, false);
+        let (structured_permission_rules, session_permission_mode) =
+            session_permissions(&session, false);
         return Ok(ResolvedSession {
             session_id: session_ref,
             session_lease: source_lease.expect("non-fork resume has a lease"),
             expected_write_version: session.persisted_write_version(),
             initial_history: history,
             structured_permission_rules,
-            session_yolo,
+            session_permission_mode,
             stored_system_prompt_profile: session.meta.system_prompt_profile.clone(),
             restored_plan: restored_plan(&session),
             restored_legacy_plan: session
@@ -1356,14 +1390,15 @@ fn resolve_session(
             workspace_binding,
         )?;
         let history = crate::setup::active_session_history(&session)?;
-        let (structured_permission_rules, session_yolo) = session_permissions(&session, false);
+        let (structured_permission_rules, session_permission_mode) =
+            session_permissions(&session, false);
         return Ok(ResolvedSession {
             session_id: session_ref,
             session_lease,
             expected_write_version: session.persisted_write_version(),
             initial_history: history,
             structured_permission_rules,
-            session_yolo,
+            session_permission_mode,
             stored_system_prompt_profile: session.meta.system_prompt_profile.clone(),
             restored_plan: restored_plan(&session),
             restored_legacy_plan: session
@@ -1387,7 +1422,7 @@ fn resolve_session(
         expected_write_version: None,
         initial_history: Vec::new(),
         structured_permission_rules: Vec::new(),
-        session_yolo: None,
+        session_permission_mode: None,
         stored_system_prompt_profile: None,
         restored_plan: None,
         restored_legacy_plan: None,
@@ -1430,11 +1465,28 @@ fn resolve_prompt_profile(
     ))
 }
 
-fn effective_permission_mode(requested: PermissionMode, yolo: bool) -> PermissionMode {
-    match (requested, yolo) {
-        (PermissionMode::Default, true) => PermissionMode::BypassPermissions,
-        (PermissionMode::BypassPermissions, false) => PermissionMode::Default,
-        _ => requested,
+fn startup_permission_mode(
+    cli: &Cli,
+    requested: PermissionMode,
+    restored: Option<StoredPermissionMode>,
+) -> Option<StoredPermissionMode> {
+    if cli.permission_mode.is_some() || cli.yolo || cli.auto {
+        Some(requested.storage_mode())
+    } else {
+        restored
+    }
+}
+
+fn effective_permission_mode(
+    requested: PermissionMode,
+    mode: StoredPermissionMode,
+) -> PermissionMode {
+    match (requested, mode) {
+        (PermissionMode::Plan, _) => PermissionMode::Plan,
+        (_, StoredPermissionMode::Yolo) => PermissionMode::BypassPermissions,
+        (_, StoredPermissionMode::Auto) => PermissionMode::Auto,
+        (PermissionMode::AcceptEdits, StoredPermissionMode::Ask) => PermissionMode::AcceptEdits,
+        (_, StoredPermissionMode::Ask) => PermissionMode::Default,
     }
 }
 
@@ -1787,15 +1839,14 @@ fn handle_control_request(
             let mode_str = cr.request.extra.get("mode").and_then(Value::as_str);
             match mode_str.and_then(PermissionMode::parse) {
                 Some(mode) => {
+                    let execution_mode = mode.preserve_plan(shared.lock().unwrap().permission_mode);
                     let agent_mode = shared
                         .lock()
                         .unwrap()
-                        .agent_mode_for(mode, &handle.permissions.project_cwd());
-                    match smol::block_on(
-                        handle.set_mode(agent_mode, mode == PermissionMode::BypassPermissions),
-                    ) {
+                        .agent_mode_for(execution_mode, &handle.permissions.project_cwd());
+                    match smol::block_on(handle.set_mode(agent_mode, mode.storage_mode())) {
                         Ok(()) => {
-                            shared.lock().unwrap().permission_mode = mode;
+                            shared.lock().unwrap().permission_mode = execution_mode;
                             writer.emit_control_response(&cr.request_id, ok, None)
                         }
                         Err(error) => {
@@ -2676,6 +2727,7 @@ mod tests {
     use caudra_storage::sessions::SessionDatabase;
     use caudra_storage::usage_ledger::LedgerPurpose;
     use caudra_workflow::{RunSnapshot, RunStatus, RunUsage, SourceKind};
+    use clap::Parser;
     use tempfile::TempDir;
     use test_case::test_case;
 
@@ -3650,7 +3702,7 @@ mod tests {
         let mut source = StoredSession::new("provider/model", "/repo");
         source.meta.system_prompt_profile = Some("review".into());
         source.meta.structured_permission_rules = vec![stored_structured_rule()];
-        source.meta.yolo = Some(true);
+        source.meta.permission_mode = Some(StoredPermissionMode::Yolo);
         source.meta.plan_target = Some(StoredPlanTarget::PlanRef {
             reference: caudra_workspace::PlanRef::new(format!("plan-{}", "a".repeat(32))).unwrap(),
         });
@@ -3695,7 +3747,7 @@ mod tests {
         assert_eq!(loaded.subagent_messages()["task-1"].as_ref(), &subagent);
         assert!(loaded.tool_outputs().contains_key("batch-call"));
         assert!(loaded.meta.structured_permission_rules.is_empty());
-        assert_eq!(loaded.meta.yolo, None);
+        assert_eq!(loaded.meta.permission_mode, None);
         assert_eq!(loaded.cwd, "/fork-target");
         assert!(loaded.meta.plan_target.is_none());
         assert!(loaded.meta.pending_revert.is_none());
@@ -3770,14 +3822,17 @@ mod tests {
     fn sdk_resume_restores_permissions_while_fork_starts_clean() {
         let mut session = StoredSession::new("provider/model", "/repo");
         session.meta.structured_permission_rules = vec![stored_structured_rule()];
-        session.meta.yolo = Some(true);
+        session.meta.permission_mode = Some(StoredPermissionMode::Yolo);
 
         let resumed = session_permissions(&session, false);
         let forked = session_permissions(&session, true);
 
         assert_eq!(
             resumed,
-            (session.meta.structured_permission_rules.clone(), Some(true))
+            (
+                session.meta.structured_permission_rules.clone(),
+                Some(StoredPermissionMode::Yolo)
+            )
         );
         assert_eq!(forked, (Vec::new(), None));
     }
@@ -3803,7 +3858,7 @@ mod tests {
                 .unwrap(),
         );
         source.meta.structured_permission_rules = vec![stored_structured_rule()];
-        source.meta.yolo = Some(true);
+        source.meta.permission_mode = Some(StoredPermissionMode::Yolo);
         source.meta.mode = Some(StoredMode::Plan);
         source.meta.plan_path = Some(SOURCE_PLAN.into());
         source.meta.plan_target = Some(StoredPlanTarget::LocalPath {
@@ -3839,7 +3894,7 @@ mod tests {
         .unwrap();
         assert_ne!(fork.workspace_binding(), source.workspace_binding());
         assert!(fork.meta.structured_permission_rules.is_empty());
-        assert_eq!(fork.meta.yolo, None);
+        assert_eq!(fork.meta.permission_mode, None);
         assert_eq!(fork.meta.plan_target, None);
         assert_eq!(fork.meta.plan_path, None);
         assert_ne!(fork.meta.mode, Some(StoredMode::Plan));
@@ -3852,7 +3907,7 @@ mod tests {
     #[test]
     fn remote_session_mismatch_fails_before_permissions_can_be_reused() {
         let mut session = StoredSession::new("provider/model", "/first");
-        session.meta.yolo = Some(true);
+        session.meta.permission_mode = Some(StoredPermissionMode::Yolo);
         let expected = StoredWorkspaceBinding::local_from_cwd("/second");
         let expected = serde_json::from_str::<StoredWorkspaceBinding>(
             &serde_json::to_string(&expected)
@@ -4175,6 +4230,7 @@ mod tests {
     }
 
     #[test_case("default", PermissionMode::Default)]
+    #[test_case("auto", PermissionMode::Auto)]
     #[test_case("acceptEdits", PermissionMode::AcceptEdits)]
     #[test_case("plan", PermissionMode::Plan)]
     #[test_case("bypassPermissions", PermissionMode::BypassPermissions)]
@@ -4186,31 +4242,61 @@ mod tests {
     #[test]
     fn permission_mode_resolve() {
         assert_eq!(
-            PermissionMode::resolve(None, false),
+            PermissionMode::resolve(None, false, false),
             PermissionMode::Default
         );
         assert_eq!(
-            PermissionMode::resolve(None, true),
+            PermissionMode::resolve(None, true, false),
             PermissionMode::BypassPermissions
         );
         assert_eq!(
-            PermissionMode::resolve(Some("plan"), true),
+            PermissionMode::resolve(Some("plan"), true, false),
             PermissionMode::Plan
         );
         assert_eq!(
-            PermissionMode::resolve(Some("bogus"), false),
+            PermissionMode::resolve(Some("bogus"), false, false),
             PermissionMode::Default
         );
     }
 
-    #[test_case(PermissionMode::Default, true => PermissionMode::BypassPermissions ; "stored_yolo_is_reported")]
-    #[test_case(PermissionMode::BypassPermissions, false => PermissionMode::Default ; "stored_off_overrides_flag")]
-    #[test_case(PermissionMode::Plan, true => PermissionMode::Plan ; "plan_mode_is_preserved")]
-    fn effective_mode_tracks_restored_yolo(
+    #[test_case(PermissionMode::Default, StoredPermissionMode::Yolo => PermissionMode::BypassPermissions ; "stored_yolo_is_reported")]
+    #[test_case(PermissionMode::BypassPermissions, StoredPermissionMode::Ask => PermissionMode::Default ; "effective_ask_is_reported")]
+    #[test_case(PermissionMode::Plan, StoredPermissionMode::Yolo => PermissionMode::Plan ; "plan_mode_is_preserved")]
+    #[test_case(PermissionMode::Default, StoredPermissionMode::Auto => PermissionMode::Auto ; "stored_auto_is_reported")]
+    #[test_case(PermissionMode::Plan, StoredPermissionMode::Auto => PermissionMode::Plan ; "auto_keeps_plan")]
+    fn effective_mode_tracks_restored_permissions(
         requested: PermissionMode,
-        yolo: bool,
+        mode: StoredPermissionMode,
     ) -> PermissionMode {
-        effective_permission_mode(requested, yolo)
+        effective_permission_mode(requested, mode)
+    }
+
+    #[test_case(&["caudra"], None, None; "unset_stays_unset")]
+    #[test_case(&["caudra"], Some(StoredPermissionMode::Ask), Some(StoredPermissionMode::Ask); "explicit_ask_restores")]
+    #[test_case(&["caudra"], Some(StoredPermissionMode::Auto), Some(StoredPermissionMode::Auto); "auto_restores")]
+    #[test_case(&["caudra", "--auto"], Some(StoredPermissionMode::Ask), Some(StoredPermissionMode::Auto); "auto_overrides_ask")]
+    #[test_case(&["caudra", "--auto"], Some(StoredPermissionMode::Yolo), Some(StoredPermissionMode::Auto); "auto_overrides_yolo")]
+    #[test_case(&["caudra", "--yolo"], Some(StoredPermissionMode::Auto), Some(StoredPermissionMode::Yolo); "yolo_overrides_auto")]
+    #[test_case(&["caudra", "--permission-mode", "default"], Some(StoredPermissionMode::Auto), Some(StoredPermissionMode::Ask); "default_is_explicit_ask")]
+    #[test_case(&["caudra", "--permission-mode", "auto"], Some(StoredPermissionMode::Ask), Some(StoredPermissionMode::Auto); "sdk_auto_overrides_ask")]
+    fn explicit_startup_permission_mode_wins(
+        args: &[&str],
+        restored: Option<StoredPermissionMode>,
+        expected: Option<StoredPermissionMode>,
+    ) {
+        let cli = Cli::try_parse_from(args).unwrap();
+        let requested = PermissionMode::resolve(cli.permission_mode.as_deref(), cli.yolo, cli.auto);
+        assert_eq!(startup_permission_mode(&cli, requested, restored), expected);
+    }
+
+    #[test_case(PermissionMode::Plan, PermissionMode::Plan; "plan_is_preserved")]
+    #[test_case(PermissionMode::Default, PermissionMode::Auto; "build_enters_auto")]
+    fn auto_control_preserves_plan_execution(current: PermissionMode, expected: PermissionMode) {
+        assert_eq!(PermissionMode::Auto.preserve_plan(current), expected);
+        assert_eq!(
+            PermissionMode::Auto.storage_mode(),
+            StoredPermissionMode::Auto
+        );
     }
 
     #[test]

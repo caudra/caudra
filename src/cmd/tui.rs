@@ -15,6 +15,7 @@ use color_eyre::eyre::{Context, bail, eyre};
 use flume::{RecvTimeoutError as PatternRecvError, Sender as ChannelSender};
 
 use caudra_agent::command::{self, CustomCommand};
+use caudra_agent::decisions::Decisions;
 use caudra_agent::herdr::HerdrEnv;
 use caudra_agent::permissions::pattern_recognition::{PatternCandidate, RecognitionExclusion};
 use caudra_agent::prompt::profile::{PromptProfileCatalog, SystemPromptProfile};
@@ -1265,6 +1266,7 @@ fn after_runtime_release<T, U>(
 }
 
 pub fn run(mut cli: Cli, tightened: Vec<PathBuf>) -> Result<ExitCode> {
+    let permission_mode_override = cli.permission_mode_override();
     // Every phase up to `init_logging` runs without a subscriber, so its cost is
     // invisible unless it is measured here and reported once the sink exists.
     let started = Instant::now();
@@ -1344,6 +1346,10 @@ pub fn run(mut cli: Cli, tightened: Vec<PathBuf>) -> Result<ExitCode> {
         moved_back.extend(super::reconcile_worktrees(&storage, &cwd));
     }
 
+    let seed_permission_mode = permission_mode_override
+        .clone()
+        .unwrap_or_else(|| super::permission_mode_seed(&stack.config));
+
     if cli.is_sdk_mode() {
         let fast = stack.config.always_fast && stack.model.supports_fast();
         let thinking = stack
@@ -1362,6 +1368,8 @@ pub fn run(mut cli: Cli, tightened: Vec<PathBuf>) -> Result<ExitCode> {
             model: stack.model,
             config: stack.config.agent,
             permissions_config: stack.config.permissions,
+            decisions_config: stack.config.decisions,
+            seed_permission_mode: Some(seed_permission_mode),
             snapshots: stack.config.storage.snapshots,
             timeouts,
             prompt_slots,
@@ -1407,6 +1415,8 @@ pub fn run(mut cli: Cli, tightened: Vec<PathBuf>) -> Result<ExitCode> {
             cli.verbose,
             stack.config.agent,
             stack.config.permissions,
+            stack.config.decisions,
+            Some(seed_permission_mode),
             stack.config.storage.snapshots,
             timeouts,
             stack.plugin_host.event_handle(),
@@ -1457,6 +1467,9 @@ pub fn run(mut cli: Cli, tightened: Vec<PathBuf>) -> Result<ExitCode> {
 
     let mut tabs = resolved.tabs;
     let mut focused = resolved.focused;
+    if let Some(mode) = &permission_mode_override {
+        tabs[focused].session.meta.permission_mode = Some(mode.clone());
+    }
     let mut warnings = resolved.warnings;
     warnings.extend(moved_back);
     if !tightened.is_empty() {
@@ -1509,6 +1522,15 @@ pub fn run(mut cli: Cli, tightened: Vec<PathBuf>) -> Result<ExitCode> {
                 stack.plugin_host.plugin_rules(),
             ),
         );
+        permissions.set_seed_mode(
+            permission_mode_override
+                .clone()
+                .unwrap_or_else(|| super::permission_mode_seed(&stack.config)),
+        );
+        permissions.set_decisions(Some(
+            Decisions::new(stack.config.decisions.clone(), &storage)
+                .context("initialize decision engine; check decisions configuration, credentials and question overrides")?,
+        ));
         permissions
             .replace_remote_permission_asset(
                 workcell_runtime
@@ -1962,7 +1984,7 @@ mod tests {
         ArgumentRole, PATTERN_SCHEMA_VERSION, PatternContext, PatternDefinition, PatternToken,
         SlotCombinations,
     };
-    use caudra_storage::sessions::{LedgerEntry, StoredTokenUsage};
+    use caudra_storage::sessions::{LedgerEntry, PermissionMode, StoredTokenUsage};
     use caudra_storage::state::write_workspace_tabs;
     use caudra_storage::usage_ledger::{BUCKET_SECONDS, LedgerPurpose};
     use caudra_workcell::{PatternObligationCount, PatternOmissionReason};
@@ -3499,7 +3521,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let storage = StateDir::from_path(temp.path().join("state"));
         let mut local = AppSession::new(TEST_MODEL, TEST_CWD);
-        local.meta.yolo = Some(true);
+        local.meta.permission_mode = Some(PermissionMode::Yolo);
         local.meta.input_draft = Some(INJECTED_CONFIG_FAILURE.into());
         local.save(&storage).unwrap();
         let binding = StoredWorkspaceBinding::local_from_cwd(TEST_CWD);
@@ -3516,7 +3538,7 @@ mod tests {
         assert_ne!(session.id, local.id);
         assert_eq!(session.workspace_binding(), Some(&remote));
         assert!(session.messages().is_empty());
-        assert!(session.meta.yolo.is_none());
+        assert_eq!(session.meta.permission_mode, None);
         assert!(session.meta.input_draft.is_none());
         assert!(session.meta.structured_permission_rules.is_empty());
         assert_eq!(

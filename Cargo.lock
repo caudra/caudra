@@ -849,6 +849,7 @@ dependencies = [
  "base64 0.23.1",
  "bitflags 2.13.1",
  "caudra-config",
+ "caudra-decision",
  "caudra-diff",
  "caudra-otel",
  "caudra-providers",
@@ -924,6 +925,22 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "caudra-decision"
+version = "0.1.0"
+dependencies = [
+ "async-io",
+ "async-trait",
+ "futures-lite",
+ "isahc",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "test-case",
+ "thiserror 2.0.18",
+ "url",
 ]
 
 [[package]]

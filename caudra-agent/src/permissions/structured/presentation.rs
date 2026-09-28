@@ -40,6 +40,7 @@ pub(super) fn presentation_for(
         risk: risk.clone(),
         risk_summary,
         project: None,
+        advisories: Vec::new(),
         resources: resources
             .iter()
             .map(|resource| {
@@ -206,6 +207,7 @@ mod tests {
             risk_summary: "Shell execution".into(),
             resources: vec![resource.clone(), resource],
             project: None,
+            advisories: Vec::new(),
         };
         let granted = ResourceCoverage {
             origin: RuleOrigin::Project,

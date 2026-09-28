@@ -22,6 +22,23 @@ When interactive Caudra starts in a Herdr pane, it automatically reports native 
 
 `caudra --session <id>` opens a local session in the directory it works in, wherever you run the command, so project config, plugins and MCP servers come from that directory. A session left in a removed worktree moves back to a remaining checkout first.
 
+## caudra decisions
+
+Decision log administration does not start an agent:
+
+```bash
+caudra decisions status
+caudra decisions stats --feature permission
+caudra decisions export --feature permission > decisions.jsonl
+caudra decisions purge --yes
+```
+
+`status` shows effective configuration without contacting the endpoint. Reachability is `not_probed`. `stats` prints JSON with counts, errors, latency percentiles and labelled agreement, using the currently configured thresholds. `export` writes JSONL with only labelled questions in laya-evals format. These commands do not enable logging or create a decision database. `purge --yes` removes recorded decisions and labels, not shell duration history.
+
+`stats` and `export` accept `--feature`. Log feature names are `permission`, `auto`, `shell_effect`, `content`, `shell_duration`, `tool_search`, `skill_suggestions`, `goal`, `subagent_routing`, and `workflow`. They differ from some configuration keys. With no database, statistics are empty and export writes nothing. Administration requires local persistent storage and rejects `--ephemeral` and `--workcell`.
+
+Labels are partial evidence, not a complete evaluation dataset. Tool-search actual-use labels and shell-effect observed-filesystem labels are not collected. Effect fields are a partial action record. A value of `none` does not prove that no advice or routing was applied. Redaction is best effort. Review exported states and question text before sharing them. See [decision engine advice](/docs/permissions/#decision-engine-advice) and [configuration](/docs/configuration/#decisions).
+
 ## Flags by run path
 
 | Flag | TUI | `--print` | SDK (`stream-json`) |

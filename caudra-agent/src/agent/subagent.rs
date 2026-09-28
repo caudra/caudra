@@ -11,17 +11,20 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
 use async_lock::Mutex as AsyncMutex;
-use serde_json::Value as JsonValue;
+use caudra_config::decisions::FeatureMode;
+use caudra_decision::{Answer, DecisionResponse, Question, QuestionSet, QuestionType};
+use serde_json::{Value as JsonValue, json};
 use tracing::info;
 
 use caudra_providers::model::{Model, ModelPurpose};
-use caudra_providers::model_registry::Binding;
+use caudra_providers::model_registry::{self, Binding};
 use caudra_providers::provider;
 use caudra_providers::{
     CacheKey, HistoryItem, Message, ThinkingConfig, TokenUsage, add_cost, expand_message,
 };
 use caudra_storage::{
     background::JobOwner,
+    decision_log::DecisionEffect,
     id::CaudraId,
     sessions::{RuntimeRetry, SessionDatabase},
     tool_outputs::ToolOutputStore,
@@ -31,6 +34,7 @@ use super::steering::{SharedSteering, Steering};
 use super::{ModelRoute, resolve_model_for_purpose};
 use crate::background::JobScope;
 use crate::cancel::{CancelMap, CancelSlot};
+use crate::decisions::{DecisionContext, DecisionFeature, DecisionReceipt, Decisions};
 use crate::prompt::PromptId;
 use crate::prompt::profile::SystemPromptProfile;
 use crate::tools::native::batch::{self, MAX_BATCH_SIZE};
@@ -783,6 +787,7 @@ pub struct GenericOptions {
 }
 
 pub async fn open_task(ctx: &ToolContext, opts: TaskOptions) -> Result<Subagent, String> {
+    let continuation = opts.task_id.is_continuation();
     let ids = Identity::derive(ctx, opts.task_id.requested());
     let default_spec = SubagentTaskSpec {
         profile_name: ctx.default_task_prompt_profile_name.to_string(),
@@ -855,9 +860,58 @@ pub async fn open_task(ctx: &ToolContext, opts: TaskOptions) -> Result<Subagent,
         .resolve(&spec.profile_name)
         .map_err(|error| error.to_string())?;
 
-    let asked = opts.model_job.map(Binding::Same);
+    let vars = ctx.task_environment.clone().set(
+        "{task_system_prompt_profiles}",
+        bindings.task_tool_summary(BUILTIN_TASK_PROFILE_DESCRIPTION),
+    );
+    let instructions = match &ctx.remote_project_context {
+        Some(context) => {
+            crate::agent::load_remote_instructions(context, ctx.host_cwd.as_deref()).text
+        }
+        None => {
+            let cwd = vars.apply("{cwd}").into_owned();
+            smol::unblock(move || crate::agent::load_instruction_text(&cwd)).await
+        }
+    };
+    let mut routed = route_subagent(
+        ctx,
+        continuation,
+        profile.as_deref(),
+        opts.model_job,
+        &opts.name,
+    )
+    .await;
+    let asked = opts
+        .model_job
+        .or_else(|| routed.as_ref().map(|route| route.purpose))
+        .map(Binding::Same);
     let model_binding = subagent_model_binding(profile.as_deref(), asked.as_ref());
-    let (model, provider) = resolve_provider(ctx, model_binding).await?;
+    let baseline = routed.as_ref().and_then(|_| {
+        let binding = model_registry::binding(ModelPurpose::Subagent);
+        Model::resolve_binding_if_available(
+            ModelPurpose::Subagent,
+            binding.as_ref(),
+            if binding.is_some() {
+                &ctx.chat_model
+            } else {
+                &ctx.model
+            },
+            &ctx.model_policy,
+        )
+        .ok()
+    });
+    let resolved = resolve_provider(ctx, model_binding).await;
+    let (model, provider) = match resolved {
+        result
+            if routed.as_ref().is_some_and(|route| {
+                result.is_err() || !ctx.permissions.passive_decision_is_current(route.revision)
+            }) =>
+        {
+            routed = None;
+            resolve_provider(ctx, None).await?
+        }
+        result => result?,
+    };
     announce_model(ctx, &model);
 
     let thinking = profile
@@ -889,19 +943,6 @@ pub async fn open_task(ctx: &ToolContext, opts: TaskOptions) -> Result<Subagent,
             crate::prompt::TASK_BUILD_CONTRACT,
             ToolAudience::GENERAL_SUB,
         ),
-    };
-    let vars = ctx.task_environment.clone().set(
-        "{task_system_prompt_profiles}",
-        bindings.task_tool_summary(BUILTIN_TASK_PROFILE_DESCRIPTION),
-    );
-    let instructions = match &ctx.remote_project_context {
-        Some(context) => {
-            crate::agent::load_remote_instructions(context, ctx.host_cwd.as_deref()).text
-        }
-        None => {
-            let cwd = vars.apply("{cwd}").into_owned();
-            smol::unblock(move || crate::agent::load_instruction_text(&cwd)).await
-        }
     };
     let base_filter = ToolFilter::from_config(&ctx.config, &model, &[])
         .intersect(&ctx.tool_filter)
@@ -959,7 +1000,7 @@ pub async fn open_task(ctx: &ToolContext, opts: TaskOptions) -> Result<Subagent,
     // from the parent's.
     let environment = crate::agent::environment_block(&vars, &model);
 
-    build(
+    let subagent = build(
         ctx,
         ids,
         Resolved {
@@ -982,7 +1023,17 @@ pub async fn open_task(ctx: &ToolContext, opts: TaskOptions) -> Result<Subagent,
         opts.local_tools,
         ctx.opts.fast,
         opts.name,
-    )
+    )?;
+    if let Some(route) = routed
+        && let Some(receipt) = route.receipt
+        && let Some(baseline) = baseline
+        && baseline.spec() != subagent.params.model.spec()
+    {
+        route
+            .decisions
+            .record_effect_detached(&receipt, DecisionEffect::Rerouted);
+    }
+    Ok(subagent)
 }
 
 pub async fn open_generic(ctx: &ToolContext, opts: GenericOptions) -> Result<Subagent, String> {
@@ -1177,6 +1228,128 @@ async fn reserve_fresh(
             Ok((lease.task_id().to_owned(), lease))
         }
         Err(error) => Err(error.to_string()),
+    }
+}
+
+struct SubagentRoute {
+    purpose: ModelPurpose,
+    revision: u64,
+    decisions: Decisions,
+    receipt: Option<DecisionReceipt>,
+}
+
+async fn route_subagent(
+    ctx: &ToolContext,
+    continuation: bool,
+    profile: Option<&SystemPromptProfile>,
+    requested: Option<ModelPurpose>,
+    task_label: &str,
+) -> Option<SubagentRoute> {
+    let revision = ctx.permissions.passive_decision_revision()?;
+    if continuation
+        || requested.is_some()
+        || profile.is_some_and(|profile| profile.subagent_model().is_some())
+        || task_label.trim().is_empty()
+    {
+        return None;
+    }
+    let decisions = ctx.permissions.decisions()?;
+    let feature = DecisionFeature::SubagentRouting;
+    if !decisions.enabled(&feature) {
+        return None;
+    }
+    let questions = subagent_questions()?;
+    let state = json!({"task_label": task_label});
+    let context = DecisionContext {
+        session: ctx
+            .session_id
+            .as_ref()
+            .map(|session| session.as_str().to_owned()),
+        project: ctx.host_cwd.as_ref().map(|cwd| cwd.display().to_string()),
+        meta: json!({"input_scope": "task_label_only"}),
+    };
+    let outcome = ctx
+        .cancel
+        .race(
+            ctx.permissions
+                .run_passive_decision(decisions.evaluate(feature, &state, &questions, &context)),
+        )
+        .await
+        .ok()
+        .flatten()
+        .flatten()?;
+    if !ctx.permissions.passive_decision_is_current(revision)
+        || decisions.mode(&DecisionFeature::SubagentRouting) != &FeatureMode::Enforce
+    {
+        return None;
+    }
+    let purpose = subagent_job(
+        &outcome.result.ok()?,
+        decisions.config().thresholds.routing_confidence,
+    )?;
+    Some(SubagentRoute {
+        purpose,
+        revision,
+        decisions,
+        receipt: outcome.receipt,
+    })
+}
+
+fn subagent_questions() -> Option<QuestionSet> {
+    QuestionSet::new("subagent.v1", [
+        ("difficulty", Question {
+            kind: QuestionType::Score,
+            instructions: json!("Rate the difficulty of the task. A task label is incomplete evidence; use low confidence when uncertain."),
+            criteria: Some(json!(["Simple, mechanical work", "Difficult work requiring deep reasoning"])),
+            labels: None,
+        }),
+        ("mechanical", Question {
+            kind: QuestionType::Noul,
+            instructions: json!("The task is mechanical and has a straightforward procedure."),
+            criteria: None,
+            labels: None,
+        }),
+        ("deep_reasoning", Question {
+            kind: QuestionType::Noul,
+            instructions: json!("The task requires deep reasoning."),
+            criteria: None,
+            labels: None,
+        }),
+    ].into_iter().map(|(id, question)| (id.into(), question)).collect()).ok()
+}
+
+fn subagent_job(response: &DecisionResponse, threshold: f64) -> Option<ModelPurpose> {
+    let Answer::Score(difficulty) = response.answers.get("difficulty")? else {
+        return None;
+    };
+    let Answer::Noul(mechanical) = response.answers.get("mechanical")? else {
+        return None;
+    };
+    let Answer::Noul(deep) = response.answers.get("deep_reasoning")? else {
+        return None;
+    };
+    if [
+        difficulty.metadata.confidence,
+        mechanical.metadata.confidence,
+        deep.metadata.confidence,
+    ]
+    .iter()
+    .any(|confidence| *confidence < threshold)
+    {
+        return None;
+    }
+    if difficulty.score <= 1.0 - threshold
+        && mechanical.noul >= threshold
+        && deep.noul <= 1.0 - threshold
+    {
+        Some(ModelPurpose::Fast)
+    } else if difficulty.score >= threshold
+        && deep.noul >= threshold
+        && mechanical.noul <= 1.0 - threshold
+    {
+        Some(ModelPurpose::Best)
+    } else {
+        None
     }
 }
 
@@ -1389,15 +1562,25 @@ fn expand_history(messages: &[Message]) -> Vec<HistoryItem> {
 #[cfg(test)]
 mod tests {
     use std::path::Path;
+    use std::sync::atomic::AtomicUsize;
 
+    use crate::AgentError;
+    use caudra_config::decisions::DecisionsConfig;
+    use caudra_decision::{DecisionEngine, DecisionError, DecisionRequest};
+    use caudra_providers::provider::{BoxFuture, Provider};
+    use caudra_providers::{ModelInfo, ProviderEvent, RequestOptions, StreamResponse};
+    use caudra_storage::StateDir;
+    use caudra_storage::decision_log::{DecisionLabel, DecisionLog};
+    use caudra_storage::now_epoch;
     use serde_json::json;
+    use std::time::Duration;
 
     use super::*;
     use crate::context::{
         ContextInventory, ContextKey, ContextReadiness, ContextSnapshot, ContextStore,
         ContextUsage, ContextWindow,
     };
-    use crate::permissions::PermissionRequest;
+    use crate::permissions::{PermissionManager, PermissionMode, PermissionRequest};
     use crate::tools::BATCH_TOOL_NAME;
     use crate::tools::DEADLINE_EXCEEDED;
     use crate::tools::registry::Tool;
@@ -1405,13 +1588,321 @@ mod tests {
     use crate::{CancelToken, ToolDoneEvent, TurnCompleteEvent};
     use caudra_config::ToolKey;
     use caudra_providers::{Billing, ContentBlock, Message, Role};
-    use caudra_storage::StateDir;
     use caudra_storage::id::SessionRef;
     use caudra_storage::usage_ledger::LedgerPurpose;
     use tempfile::TempDir;
     use test_case::test_case;
 
     const RUN_ID: u64 = 7;
+    const ROUTING_ENDPOINT: &str = "http://127.0.0.1:1/v1/systemone";
+    const ROUTING_TASK: &str = "Rename a variable";
+    const ROUTING_BASELINE: &str = "anthropic/claude-sonnet-4-6";
+    const ROUTING_FAST: &str = "anthropic/claude-haiku-4-5";
+    const EFFECT_TEST_TIMEOUT: Duration = Duration::from_secs(10);
+    const DUPLICATE_CALL_ERROR: &str = "duplicates call ID";
+
+    struct RevisionChangingProvider {
+        permissions: Arc<PermissionManager>,
+        leave_yolo: bool,
+    }
+
+    impl Provider for RevisionChangingProvider {
+        fn stream_message<'a>(
+            &'a self,
+            _model: &'a Model,
+            _messages: &'a [Message],
+            _system: &'a str,
+            _tools: &'a JsonValue,
+            _event_tx: &'a flume::Sender<ProviderEvent>,
+            _opts: RequestOptions,
+            _cache_key: Option<&'a CacheKey>,
+        ) -> BoxFuture<'a, Result<StreamResponse, AgentError>> {
+            Box::pin(std::future::pending())
+        }
+
+        fn list_models(&self) -> BoxFuture<'_, Result<Vec<ModelInfo>, AgentError>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+
+        fn adjust_model(&self, _model: &mut Model) {
+            self.permissions
+                .set_session_mode(Some(PermissionMode::Yolo));
+            if self.leave_yolo {
+                self.permissions.set_session_mode(Some(PermissionMode::Ask));
+            }
+        }
+    }
+
+    struct RoutingEngine {
+        difficulty: f64,
+        mechanical: f64,
+        deep: f64,
+        confidence: f64,
+        fail: bool,
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl DecisionEngine for RoutingEngine {
+        async fn decide(
+            &self,
+            request: &DecisionRequest,
+            _deadline: Instant,
+        ) -> Result<DecisionResponse, DecisionError> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            if self.fail {
+                return Err(DecisionError::Timeout);
+            }
+            let levels = request.questions["difficulty"].criteria.as_ref().unwrap();
+            Ok(serde_json::from_value(json!({
+                "answers": {
+                    "difficulty": {"type": "score", "score": self.difficulty, "confidence": self.confidence,
+                        "legend": {"0": levels[0], "1": levels[1]},
+                        "probabilities": {"0": 1.0 - self.difficulty, "1": self.difficulty}},
+                    "mechanical": {"type": "noul", "noul": self.mechanical, "confidence": self.confidence},
+                    "deep_reasoning": {"type": "noul", "noul": self.deep, "confidence": self.confidence}
+                }, "usage": {"input_tokens": 0, "output_tokens": 0}
+            })).unwrap())
+        }
+    }
+
+    fn routing_decisions(
+        directory: &TempDir,
+        mode: FeatureMode,
+        engine: RoutingEngine,
+    ) -> Decisions {
+        let mut config = DecisionsConfig {
+            endpoint: Some(ROUTING_ENDPOINT.parse().unwrap()),
+            log: true,
+            ..DecisionsConfig::default()
+        };
+        config.features.subagent_routing = mode;
+        Decisions::with_engine(
+            config,
+            &StateDir::from_path(directory.path().into()),
+            engine,
+        )
+        .unwrap()
+    }
+
+    fn routing_context() -> ToolContext {
+        crate::tools::test_support::stub_ctx_with_permissions(
+            &AgentMode::Build,
+            Arc::new(PermissionManager::new_nonpersistent(
+                caudra_config::PermissionsConfig::default(),
+                Path::new("/tmp").to_path_buf(),
+                Arc::default(),
+            )),
+        )
+    }
+
+    #[test_case(FeatureMode::Enforce, 0.0, 1.0, 0.0, 1.0, false, Some(ModelPurpose::Fast); "fast")]
+    #[test_case(FeatureMode::Enforce, 1.0, 0.0, 1.0, 1.0, false, Some(ModelPurpose::Best); "best")]
+    #[test_case(FeatureMode::Shadow, 0.0, 1.0, 0.0, 1.0, false, None; "shadow")]
+    #[test_case(FeatureMode::Enforce, 0.0, 1.0, 0.0, 0.2, false, None; "low_confidence")]
+    #[test_case(FeatureMode::Enforce, 0.0, 1.0, 1.0, 1.0, false, None; "conflicting_signals")]
+    #[test_case(FeatureMode::Enforce, 0.5, 1.0, 0.0, 1.0, false, None; "uncertain_difficulty")]
+    #[test_case(FeatureMode::Enforce, 0.0, 1.0, 0.0, 1.0, true, None; "engine_error")]
+    fn decision_subagent_route(
+        mode: FeatureMode,
+        difficulty: f64,
+        mechanical: f64,
+        deep: f64,
+        confidence: f64,
+        fail: bool,
+        expected: Option<ModelPurpose>,
+    ) {
+        smol::block_on(async {
+            let directory = tempfile::tempdir().unwrap();
+            let ctx = routing_context();
+            ctx.permissions.set_session_mode(Some(PermissionMode::Ask));
+            let calls = Arc::new(AtomicUsize::new(0));
+            ctx.permissions.set_decisions(Some(routing_decisions(
+                &directory,
+                mode,
+                RoutingEngine {
+                    difficulty,
+                    mechanical,
+                    deep,
+                    confidence,
+                    fail,
+                    calls: Arc::clone(&calls),
+                },
+            )));
+            assert_eq!(
+                route_subagent(&ctx, false, None, None, ROUTING_TASK)
+                    .await
+                    .map(|route| route.purpose),
+                expected
+            );
+            assert_eq!(calls.load(Ordering::Relaxed), 1);
+            assert!(!ctx.permissions.is_yolo());
+        });
+    }
+
+    #[test_case(false, false, false, true, FeatureMode::Enforce; "yolo")]
+    #[test_case(true, false, false, false, FeatureMode::Enforce; "continuation")]
+    #[test_case(false, true, false, false, FeatureMode::Enforce; "explicit_job")]
+    #[test_case(false, false, true, false, FeatureMode::Enforce; "profile_pin")]
+    #[test_case(false, false, false, false, FeatureMode::Off; "off")]
+    fn decision_subagent_routing_guards(
+        continuation: bool,
+        explicit: bool,
+        pinned: bool,
+        yolo: bool,
+        mode: FeatureMode,
+    ) {
+        smol::block_on(async {
+            let directory = tempfile::tempdir().unwrap();
+            let ctx = routing_context();
+            ctx.permissions
+                .set_session_mode(Some(PermissionMode::from(yolo)));
+            let calls = Arc::new(AtomicUsize::new(0));
+            ctx.permissions.set_decisions(Some(routing_decisions(
+                &directory,
+                mode,
+                RoutingEngine {
+                    difficulty: 0.0,
+                    mechanical: 1.0,
+                    deep: 0.0,
+                    confidence: 1.0,
+                    fail: false,
+                    calls: Arc::clone(&calls),
+                },
+            )));
+            let profile = pinned.then(|| profile_pinning(Some(PINNED_MODEL_SPEC)));
+            assert_eq!(
+                route_subagent(
+                    &ctx,
+                    continuation,
+                    profile.as_deref(),
+                    explicit.then_some(ModelPurpose::Fast),
+                    ROUTING_TASK
+                )
+                .await
+                .map(|route| route.purpose),
+                None
+            );
+            assert_eq!(calls.load(Ordering::Relaxed), 0);
+            assert_eq!(ctx.permissions.is_yolo(), yolo);
+        });
+    }
+    #[test_case(false, None, FeatureMode::Enforce, false, false, DecisionEffect::Rerouted; "selected_different_model")]
+    #[test_case(true, None, FeatureMode::Enforce, false, false, DecisionEffect::None; "selected_same_model")]
+    #[test_case(false, Some(false), FeatureMode::Enforce, false, false, DecisionEffect::None; "yolo_during_resolution")]
+    #[test_case(false, Some(true), FeatureMode::Enforce, false, false, DecisionEffect::None; "stale_revision_after_leaving_yolo")]
+    #[test_case(false, None, FeatureMode::Shadow, false, false, DecisionEffect::None; "shadow_route")]
+    #[test_case(false, None, FeatureMode::Enforce, true, false, DecisionEffect::None; "decision_error")]
+    #[test_case(false, None, FeatureMode::Enforce, false, true, DecisionEffect::None; "failed_creation")]
+    fn decision_subagent_effect(
+        same_model: bool,
+        leave_yolo: Option<bool>,
+        mode: FeatureMode,
+        fail: bool,
+        fail_creation: bool,
+        expected: DecisionEffect,
+    ) {
+        smol::block_on(async {
+            let directory = tempfile::tempdir().unwrap();
+            let mut ctx = routing_context();
+            ctx.model = Arc::new(
+                Model::from_spec(if same_model {
+                    ROUTING_FAST
+                } else {
+                    ROUTING_BASELINE
+                })
+                .unwrap(),
+            );
+            ctx.chat_model = Arc::new(Model::from_spec(ROUTING_FAST).unwrap());
+            if let Some(leave_yolo) = leave_yolo {
+                ctx.chat_provider = Arc::new(RevisionChangingProvider {
+                    permissions: Arc::clone(&ctx.permissions),
+                    leave_yolo,
+                });
+            }
+            ctx.permissions.set_decisions(Some(routing_decisions(
+                &directory,
+                mode,
+                RoutingEngine {
+                    difficulty: 0.0,
+                    mechanical: 1.0,
+                    deep: 0.0,
+                    confidence: 1.0,
+                    fail,
+                    calls: Arc::new(AtomicUsize::new(0)),
+                },
+            )));
+            let mut options = task_options(None);
+            options.name = ROUTING_TASK.into();
+            if fail_creation {
+                ctx.subagent_history
+                    .reserve_with_spec(PARENT_ID, SubagentTaskSpec::default())
+                    .unwrap()
+                    .complete(vec![Message {
+                        role: Role::Assistant,
+                        content: vec![ContentBlock::tool_use(TOOL_ID, DEFERRED_TOOL, json!({})); 2],
+                        ..Message::default()
+                    }]);
+                options.task_id = TaskIdentity::Reserved(
+                    ctx.subagent_history
+                        .continue_task_with(
+                            PARENT_ID,
+                            SubagentTaskSpecCandidate {
+                                profile_name: None,
+                                mode: None,
+                            },
+                        )
+                        .unwrap(),
+                );
+            }
+            let opened = open_task(&ctx, options).await;
+            if fail_creation {
+                assert!(opened.err().unwrap().contains(DUPLICATE_CALL_ERROR));
+            } else {
+                let mut subagent = opened.unwrap();
+                assert_eq!(
+                    subagent.params.model.spec(),
+                    if expected == DecisionEffect::Rerouted {
+                        ROUTING_FAST.into()
+                    } else {
+                        ctx.model.spec()
+                    }
+                );
+                subagent.close();
+            }
+            let log =
+                DecisionLog::open_existing(&StateDir::from_path(directory.path().into())).unwrap();
+            if fail_creation {
+                assert!(log.is_none());
+                return;
+            }
+            let mut log = log.unwrap();
+            log.attach_label(
+                1,
+                &DecisionLabel {
+                    expected: json!({"mechanical": true}),
+                    source: ROUTING_TASK.into(),
+                    timestamp: now_epoch(),
+                    meta: JsonValue::Null,
+                },
+            )
+            .unwrap();
+            let deadline = Instant::now() + EFFECT_TEST_TIMEOUT;
+            loop {
+                let mut exported = Vec::new();
+                assert_eq!(log.export_jsonl(&mut exported, None).unwrap(), 1);
+                let row: JsonValue = serde_json::from_slice(&exported).unwrap();
+                let actual: DecisionEffect =
+                    serde_json::from_value(row["caudra"]["effect"].clone()).unwrap();
+                if actual == expected || Instant::now() >= deadline {
+                    assert_eq!(actual, expected);
+                    break;
+                }
+                futures_lite::future::yield_now().await;
+            }
+        });
+    }
+
     const CHILD_WORKFLOW_RUN: &str = "wf-child";
     const PARENT_WORKFLOW_RUN: &str = "wf-parent";
     const PARENT_ID: &str = "task-1";

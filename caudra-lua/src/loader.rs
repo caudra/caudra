@@ -342,6 +342,11 @@ impl PluginHost {
         )? {
             match merged {
                 Some(existing) => existing.merge(raw),
+                None if matches!(rule_policy, PermissionRulePolicy::DenyOnly) => {
+                    let mut restricted = RawConfig::default();
+                    restricted.merge(raw);
+                    *merged = Some(restricted);
+                }
                 None => *merged = Some(raw),
             }
         }
@@ -823,7 +828,8 @@ mod tests {
     use caudra_agent::permissions::PermissionManager;
     use caudra_agent::prompt::{PromptId, ResolvedSlots, Slot};
     use caudra_agent::tools::ToolRegistry;
-    use caudra_config::{PermissionsConfig, ToolKey};
+    use caudra_config::decisions::DecisionsConfigError;
+    use caudra_config::{ConfigError, FeatureMode, PermissionsConfig, ToolKey};
     use std::time::Instant;
     use test_case::test_case;
 
@@ -1315,6 +1321,144 @@ mod tests {
             ran.is_err(),
             "without --no-plugins the broken init.lua must surface as an error"
         );
+    }
+
+    #[test_case("endpoint = 'https://project.example.test/v1/systemone'", "endpoint")]
+    #[test_case("allow_remote = true", "allow_remote")]
+    #[test_case("api_key_env = 'PROJECT_KEY'", "api_key_env")]
+    #[test_case("log = true", "log")]
+    #[test_case("log_retention_days = 999", "log_retention_days")]
+    #[test_case("thresholds = { auto_flag = 1.0 }", "thresholds")]
+    #[test_case(
+        "features = { permission_advice = 'shadow' }",
+        "features.permission_advice"
+    )]
+    #[test_case("features = { auto_screening = 'shadow' }", "features.auto_screening")]
+    fn decision_setup_rejects_project_escalation(source: &str, field: &str) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("init.lua");
+        fs::write(
+            &path,
+            format!("caudra.setup({{ decisions = {{ {source} }} }})"),
+        )
+        .unwrap();
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        for mut merged in [None, Some(RawConfig::default())] {
+            host.run_init_file(
+                &path,
+                "project/init.lua",
+                PermissionRulePolicy::DenyOnly,
+                &mut merged,
+            )
+            .unwrap();
+            assert!(
+                matches!(merged.unwrap().into_config(false), Err(ConfigError::Decisions(DecisionsConfigError::ProjectOverride(actual))) if actual == field)
+            );
+        }
+    }
+
+    #[test]
+    fn decision_setup_global_enablement_and_project_restrictions() {
+        const GLOBAL: &str = "caudra.setup({ decisions = { log = true, features = { permission_advice = 'advise', auto_screening = 'enforce' } } })";
+        const PROJECT: &str = "caudra.setup({ decisions = { log = false, log_retention_days = 7, features = { permission_advice = 'off' } } })";
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("init.lua");
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        let mut merged = None;
+        fs::write(&path, GLOBAL).unwrap();
+        host.run_init_file(
+            &path,
+            "global/init.lua",
+            PermissionRulePolicy::Trusted,
+            &mut merged,
+        )
+        .unwrap();
+        fs::write(&path, PROJECT).unwrap();
+        host.run_init_file(
+            &path,
+            "project/init.lua",
+            PermissionRulePolicy::DenyOnly,
+            &mut merged,
+        )
+        .unwrap();
+        let config = merged.unwrap().into_config(false).unwrap().decisions;
+        assert_eq!(config.features.permission_advice, FeatureMode::Off);
+        assert_eq!(config.features.auto_screening, FeatureMode::Enforce);
+        assert!(!config.log);
+        assert_eq!(config.log_retention_days, 7);
+    }
+
+    #[test_case("always_auto", true)]
+    #[test_case("always_auto", false)]
+    #[test_case("always_yolo", true)]
+    #[test_case("always_yolo", false)]
+    fn permission_mode_setup_is_global_only(field: &str, value: bool) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("init.lua");
+        fs::write(&path, format!("caudra.setup({{ {field} = {value} }})")).unwrap();
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        for mut merged in [None, Some(RawConfig::default())] {
+            host.run_init_file(
+                &path,
+                "project/init.lua",
+                PermissionRulePolicy::DenyOnly,
+                &mut merged,
+            )
+            .unwrap();
+            assert!(
+                matches!(merged.unwrap().into_config(false), Err(ConfigError::ProjectPermissionMode(actual)) if actual == field)
+            );
+        }
+        let mut global = None;
+        host.run_init_file(
+            &path,
+            "global/init.lua",
+            PermissionRulePolicy::Trusted,
+            &mut global,
+        )
+        .unwrap();
+        let config = global.unwrap().into_config(false).unwrap();
+        assert_eq!(
+            if field == "always_auto" {
+                config.always_auto
+            } else {
+                config.always_yolo
+            },
+            value
+        );
+    }
+
+    #[test_case("auto_screening"; "auto_screening_disabled")]
+    #[test_case("content_screening"; "content_screening_disabled")]
+    fn decision_setup_disabling_screening_preserves_required_auto_prompts(feature: &str) {
+        const GLOBAL: &str = "caudra.setup({ always_auto = true, decisions = { features = { auto_screening = 'enforce', content_screening = 'advise' } } })";
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("init.lua");
+        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        let mut merged = None;
+        fs::write(&path, GLOBAL).unwrap();
+        host.run_init_file(
+            &path,
+            "global/init.lua",
+            PermissionRulePolicy::Trusted,
+            &mut merged,
+        )
+        .unwrap();
+        fs::write(
+            &path,
+            format!("caudra.setup({{ decisions = {{ features = {{ {feature} = 'off' }} }} }})"),
+        )
+        .unwrap();
+        host.run_init_file(
+            &path,
+            "project/init.lua",
+            PermissionRulePolicy::DenyOnly,
+            &mut merged,
+        )
+        .unwrap();
+        let config = merged.unwrap().into_config(false).unwrap();
+        assert!(config.always_auto);
+        assert!(config.decisions.auto_screening_restricted);
     }
 
     #[test]

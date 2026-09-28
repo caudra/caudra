@@ -14,6 +14,7 @@ use super::{
     policy::validate_compiled_templates,
     structured::trusted_command_observation,
 };
+use crate::decisions::Decisions;
 use caudra_config::{Effect, PermissionRule, PermissionsConfig, ToolKey};
 use caudra_storage::permission_patterns::PatternDefinition;
 use caudra_storage::permission_state::mutation::{
@@ -21,7 +22,7 @@ use caudra_storage::permission_state::mutation::{
     PermissionSnapshot, prepare_mutation,
 };
 use caudra_storage::permission_state::validate_conversation_record;
-use caudra_storage::sessions::SessionDatabase;
+use caudra_storage::sessions::{PermissionMode, SessionDatabase};
 use caudra_storage::state::{SCOPE_GLOBAL, StateKey, StateStore};
 use caudra_storage::{StateClass, StateDir, now_epoch};
 use serde::{Deserialize, Serialize};
@@ -29,7 +30,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::MutexGuard;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::warn;
@@ -189,18 +190,25 @@ pub struct PermissionManager {
     external_generation: Mutex<Option<PermissionGeneration>>,
     pub(super) broker: Arc<PermissionBroker>,
     pub(super) configured: RwLock<ConfiguredPolicy>,
-    pub(super) yolo: AtomicBool,
-    /// Whether the user set yolo for this session themselves, which is what
-    /// makes it worth persisting.
-    pub(super) yolo_explicit: AtomicBool,
-    /// What `--yolo` / `always_yolo` seeded `yolo` with, so a session with no
-    /// stored intent falls back to the flag instead of to off.
-    pub(super) seed_yolo: bool,
+    permission_mode: Mutex<PermissionModeState>,
+    decisions: Arc<RwLock<Option<Decisions>>>,
     pub(super) project: Mutex<ProjectContext>,
     pub(super) policy: Option<Arc<SharedPermissionState>>,
     pub(super) plugin_rules: Arc<PluginRuleStore>,
     patterns: Arc<Mutex<BTreeMap<PathBuf, PatternDiscovery>>>,
     pattern_dismissals: Arc<Mutex<PatternDismissals>>,
+}
+
+#[derive(Clone)]
+struct PermissionModeState {
+    seed: PermissionMode,
+    stored: Option<PermissionMode>,
+}
+
+impl PermissionModeState {
+    fn mode(&self) -> PermissionMode {
+        self.stored.as_ref().unwrap_or(&self.seed).clone()
+    }
 }
 
 #[derive(Clone)]
@@ -294,7 +302,7 @@ impl PermissionManager {
         policy: Option<Arc<SharedPermissionState>>,
         policy_context_error: Option<String>,
     ) -> Self {
-        let seed_yolo = config.yolo;
+        let seed = PermissionMode::from(config.yolo);
         let configured = configured_policy(config, None);
         let builtin_rules = builtin_rules(&cwd);
 
@@ -344,9 +352,8 @@ impl PermissionManager {
             external_generation: Mutex::new(None),
             broker,
             configured: RwLock::new(configured),
-            yolo: AtomicBool::new(seed_yolo),
-            yolo_explicit: AtomicBool::new(false),
-            seed_yolo,
+            permission_mode: Mutex::new(PermissionModeState { seed, stored: None }),
+            decisions: Arc::default(),
             project: Mutex::new(ProjectContext {
                 cwd,
                 canonical_project: None,
@@ -462,15 +469,22 @@ impl PermissionManager {
             external_generation: Mutex::new(None),
             broker: Arc::clone(&self.broker),
             configured: RwLock::new(configured),
-            yolo: AtomicBool::new(self.is_yolo()),
-            yolo_explicit: AtomicBool::new(self.yolo_explicit.load(Ordering::Relaxed)),
-            seed_yolo: self.seed_yolo,
+            permission_mode: Mutex::new(self.permission_mode().clone()),
+            decisions: Arc::clone(&self.decisions),
             project: Mutex::new(project),
             policy: self.policy.clone(),
             plugin_rules: Arc::clone(&self.plugin_rules),
             patterns: Arc::clone(&self.patterns),
             pattern_dismissals: Arc::clone(&self.pattern_dismissals),
         }
+    }
+
+    pub fn fork_session(&self) -> Self {
+        let mut manager = self.fork();
+        manager.decisions = Arc::new(RwLock::new(
+            manager.decisions().map(|service| service.fresh_session()),
+        ));
+        manager
     }
 
     pub(super) fn structured_conversation_rules(
@@ -484,46 +498,87 @@ impl PermissionManager {
             })
     }
 
-    /// The explicit toggle, so it also claims the session's intent: `/yolo` off
-    /// under `--yolo` genuinely turns the session off and is remembered.
-    pub fn toggle_yolo(&self) -> bool {
-        let _mutation = self
-            .broker
-            .mutation_gate
+    fn permission_mode(&self) -> MutexGuard<'_, PermissionModeState> {
+        self.permission_mode
             .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        let enabled = !self.yolo.fetch_xor(true, Ordering::Relaxed);
-        self.yolo_explicit.store(true, Ordering::Relaxed);
-        self.notify_policy_changed("");
-        enabled
+            .unwrap_or_else(|error| error.into_inner())
     }
 
-    /// Replaces whatever this session was running with: `Some` is the user's
-    /// stored intent, `None` means they never expressed one and the seed
-    /// applies again.
-    pub fn set_session_yolo(&self, stored: Option<bool>) {
+    fn update_mode<T>(&self, update: impl FnOnce(&mut PermissionModeState) -> T) -> T {
         let _mutation = self
             .broker
             .mutation_gate
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        self.yolo
-            .store(stored.unwrap_or(self.seed_yolo), Ordering::Relaxed);
-        self.yolo_explicit
-            .store(stored.is_some(), Ordering::Relaxed);
+        let result = update(&mut self.permission_mode());
         self.notify_policy_changed("");
+        result
+    }
+
+    pub fn mode(&self) -> PermissionMode {
+        self.permission_mode().mode()
+    }
+
+    pub fn decisions(&self) -> Option<Decisions> {
+        self.decisions
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+    }
+
+    pub fn set_decisions(&self, decisions: Option<Decisions>) {
+        let _mutation = self
+            .broker
+            .mutation_gate
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        *self
+            .decisions
+            .write()
+            .unwrap_or_else(|error| error.into_inner()) = decisions;
+        self.notify_policy_changed("");
+    }
+
+    pub fn set_seed_mode(&self, seed: PermissionMode) {
+        self.update_mode(|state| state.seed = seed);
+    }
+
+    pub(crate) fn passive_decision_revision(&self) -> Option<u64> {
+        let revision = self.broker.revision.load(Ordering::Acquire);
+        self.passive_decision_is_current(revision)
+            .then_some(revision)
+    }
+
+    pub(crate) fn passive_decision_is_current(&self, revision: u64) -> bool {
+        !self.is_yolo() && self.broker.revision.load(Ordering::Acquire) == revision
+    }
+
+    pub fn set_session_mode(&self, stored: Option<PermissionMode>) {
+        self.update_mode(|state| state.stored = stored);
+    }
+
+    pub fn persisted_mode(&self) -> Option<PermissionMode> {
+        self.permission_mode().stored.clone()
+    }
+
+    fn toggle_mode(&self, mode: PermissionMode) -> bool {
+        self.update_mode(|state| {
+            let enabled = state.mode() != mode;
+            state.stored = Some(if enabled { mode } else { PermissionMode::Ask });
+            enabled
+        })
+    }
+
+    pub fn toggle_auto(&self) -> bool {
+        self.toggle_mode(PermissionMode::Auto)
+    }
+
+    pub fn toggle_yolo(&self) -> bool {
+        self.toggle_mode(PermissionMode::Yolo)
     }
 
     pub fn is_yolo(&self) -> bool {
-        self.yolo.load(Ordering::Relaxed)
-    }
-
-    /// What the session may persist. A one-shot `--yolo` is a property of the
-    /// invocation, so on its own it stores nothing.
-    pub fn persisted_yolo(&self) -> Option<bool> {
-        self.yolo_explicit
-            .load(Ordering::Relaxed)
-            .then(|| self.is_yolo())
+        self.mode() == PermissionMode::Yolo
     }
 
     /// Outside-cwd paths are not blocked here. They flow through the normal
@@ -1114,16 +1169,94 @@ mod tests {
         PLUGIN_EDIT_PATH, SHELL_WORKDIR, allows_without_prompt, answer_enforcement, default_mgr,
         denied_by_rule, deny_rule, enforce_shell_without_prompt, legacy_request, make_config,
         mgr_with, persistent_manager, plugin_edit_rule, remote_permission_asset, seeded_mgr,
-        shell_request, workcell_shell_subject, yolo_state,
+        shell_request, workcell_shell_subject,
     };
     use crate::permissions::{
-        PermissionAnswer, PermissionLifetime, PermissionManager, PermissionRequest,
+        PermissionAnswer, PermissionLifetime, PermissionManager, PermissionMode, PermissionRequest,
         PermissionRuleRecord, PluginRuleStore,
     };
     use caudra_config::{DefaultEffect, Effect, PermissionsConfig, ToolKey};
     use caudra_storage::StateDir;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
+    use std::sync::atomic::Ordering;
+
+    #[test_case(PermissionMode::Ask, None; "ask_seed")]
+    #[test_case(PermissionMode::Auto, None; "auto_seed")]
+    #[test_case(PermissionMode::Yolo, None; "yolo_seed")]
+    #[test_case(PermissionMode::Auto, Some(PermissionMode::Ask); "stored_ask_overrides_auto")]
+    #[test_case(PermissionMode::Yolo, Some(PermissionMode::Ask); "stored_ask_overrides_yolo")]
+    #[test_case(PermissionMode::Yolo, Some(PermissionMode::Auto); "stored_auto_overrides_yolo")]
+    #[test_case(PermissionMode::Auto, Some(PermissionMode::Yolo); "stored_yolo_overrides_auto")]
+    fn session_mode_replaces_seed_and_forks_independently(
+        seed: PermissionMode,
+        stored: Option<PermissionMode>,
+    ) {
+        let manager = default_mgr();
+        let revision = manager.broker.revision.load(Ordering::Acquire);
+        manager.set_seed_mode(seed.clone());
+        manager.set_session_mode(stored.clone());
+        assert_eq!(manager.mode(), stored.clone().unwrap_or(seed.clone()));
+        assert_eq!(manager.persisted_mode(), stored);
+        assert!(manager.broker.revision.load(Ordering::Acquire) > revision);
+        let fork = manager.fork();
+        assert_eq!(fork.mode(), manager.mode());
+        assert_eq!(fork.persisted_mode(), stored);
+        fork.set_session_mode(None);
+        assert_eq!(fork.mode(), seed);
+        assert_eq!(fork.persisted_mode(), None);
+        assert_eq!(manager.persisted_mode(), stored);
+    }
+
+    #[test_case(PermissionMode::Ask; "from_ask")]
+    #[test_case(PermissionMode::Auto; "from_auto")]
+    #[test_case(PermissionMode::Yolo; "from_yolo")]
+    fn auto_toggle_records_intent_and_is_exclusive(seed: PermissionMode) {
+        let manager = default_mgr();
+        manager.set_seed_mode(seed.clone());
+        let enabled = manager.toggle_auto();
+        assert_eq!(enabled, seed != PermissionMode::Auto);
+        assert_eq!(
+            manager.mode(),
+            if enabled {
+                PermissionMode::Auto
+            } else {
+                PermissionMode::Ask
+            }
+        );
+        assert_eq!(manager.persisted_mode(), Some(manager.mode()));
+        assert!(!manager.is_yolo());
+        assert!(manager.toggle_yolo());
+        assert_eq!(manager.mode(), PermissionMode::Yolo);
+        assert!(manager.toggle_auto());
+        assert_eq!(manager.mode(), PermissionMode::Auto);
+        manager.set_seed_mode(PermissionMode::Yolo);
+        assert_eq!(manager.mode(), PermissionMode::Auto);
+    }
+
+    #[test_case(PermissionMode::Ask; "ask_revision")]
+    #[test_case(PermissionMode::Auto; "auto_revision")]
+    #[test_case(PermissionMode::Yolo; "yolo_revision")]
+    fn passive_decision_revision_rejects_mode_changes(mode: PermissionMode) {
+        let manager = default_mgr();
+        let revision = manager.passive_decision_revision().unwrap();
+        assert!(manager.passive_decision_is_current(revision));
+        manager.set_session_mode(Some(mode.clone()));
+        assert!(!manager.passive_decision_is_current(revision));
+        assert_eq!(
+            manager.passive_decision_revision().is_none(),
+            mode == PermissionMode::Yolo
+        );
+    }
+
+    #[test]
+    fn passive_decision_revision_rejects_service_replacement() {
+        let manager = default_mgr();
+        let revision = manager.passive_decision_revision().unwrap();
+        manager.set_decisions(None);
+        assert!(!manager.passive_decision_is_current(revision));
+    }
+
     #[test]
     fn yolo_mode_allows_but_deny_still_blocks() {
         smol::block_on(async {
@@ -1181,32 +1314,12 @@ mod tests {
         });
     }
 
-    /// A stored intent replaces the seed outright, and no stored intent falls
-    /// back to it: `--yolo` must neither be erased by an untouched session nor
-    /// survive one the user explicitly turned off.
-    #[test_case(false, None        => (false, None)        ; "no_flag_and_no_intent_stays_off")]
-    #[test_case(true,  None        => (true,  None)        ; "the_flag_applies_but_is_never_stored")]
-    #[test_case(false, Some(true)  => (true,  Some(true))  ; "stored_on_comes_back_without_the_flag")]
-    #[test_case(true,  Some(true)  => (true,  Some(true))  ; "the_flag_does_not_wipe_stored_on")]
-    #[test_case(true,  Some(false) => (false, Some(false)) ; "stored_off_overrides_the_flag")]
-    #[test_case(false, Some(false) => (false, Some(false)) ; "stored_off_stays_off")]
-    fn a_stored_yolo_intent_replaces_the_seed(
-        seed: bool,
-        stored: Option<bool>,
-    ) -> (bool, Option<bool>) {
-        let mgr = seeded_mgr(seed);
-        mgr.set_session_yolo(stored);
-        yolo_state(&mgr)
-    }
-
-    /// `/yolo` always drives the effective state, so under `--yolo` it can turn
-    /// the session off, and either way the session now owns the answer.
-    #[test_case(false => (true,  Some(true))  ; "toggling_on_claims_the_session")]
-    #[test_case(true  => (false, Some(false)) ; "toggling_off_under_the_flag_claims_the_session")]
-    fn toggling_yolo_records_the_intent(seed: bool) -> (bool, Option<bool>) {
+    #[test_case(false => (PermissionMode::Yolo, Some(PermissionMode::Yolo)); "toggling_on_claims_the_session")]
+    #[test_case(true => (PermissionMode::Ask, Some(PermissionMode::Ask)); "toggling_off_under_the_flag_claims_the_session")]
+    fn toggling_yolo_records_the_intent(seed: bool) -> (PermissionMode, Option<PermissionMode>) {
         let mgr = seeded_mgr(seed);
         assert_eq!(mgr.toggle_yolo(), !seed);
-        yolo_state(&mgr)
+        (mgr.mode(), mgr.persisted_mode())
     }
 
     #[test]

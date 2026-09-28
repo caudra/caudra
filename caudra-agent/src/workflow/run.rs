@@ -9,21 +9,22 @@ use crate::background_reminder::RuntimeHealth;
 use arc_swap::ArcSwap;
 use std::sync::Arc;
 
+use caudra_decision::DecisionError;
 use caudra_providers::ModelPurpose;
 use caudra_storage::workflow::{
     WorkflowCallFinish, WorkflowCallKind, WorkflowCallStart, WorkflowEventKind, WorkflowRunPatch,
     WorkflowUpdate,
 };
 use caudra_workflow::{
-    AgentRequest, AgentResult, AgentRosterEntry, CallKey, CallKind, CapabilityMode, EngineLimits,
-    HostError, Journal, LogLine, MAX_PHASE_HISTORY, MAX_RUN_LOG_ENTRIES, ModelJob, PhaseRecord,
-    RhaiEngine, RosterState, RunParams, RunSnapshot, RunStatus, WorkflowEngine, WorkflowError,
-    WorkflowEvent, WorkflowHost, WorkflowOutcome, agent_request_value, hash_request,
-    scratch_request_value,
+    AgentRequest, AgentResult, AgentRosterEntry, CallKey, CallKind, CapabilityMode,
+    DecisionRequest, DecisionResult, EngineLimits, HostError, Journal, LogLine, MAX_PHASE_HISTORY,
+    MAX_RUN_LOG_ENTRIES, ModelJob, PhaseRecord, RhaiEngine, RosterState, RunParams, RunSnapshot,
+    RunStatus, WorkflowEngine, WorkflowError, WorkflowEvent, WorkflowHost, WorkflowOutcome,
+    agent_request_value, decision_request_value, hash_request, scratch_request_value,
 };
 use flume::{Receiver, Sender};
 use futures_lite::future;
-use serde_json::Value;
+use serde_json::{Value, json};
 use tracing::{info, warn};
 
 use super::state::{Published, now_secs, publish, snapshot_from_row, stored_status};
@@ -31,6 +32,7 @@ use super::store::WorkflowStore;
 use crate::agent::subagent::TaskIdentity;
 use crate::agent::task_runner::{ModeResolver, TaskOutcome, TaskRequest, TaskRunner};
 use crate::cancel::{CancelToken, CancelTrigger};
+use crate::decisions::{DecisionContext, Decisions};
 use crate::subagent_history::SubagentTaskMode;
 use crate::types::{AgentEvent, Envelope, EventSender, WORKFLOW_EVENT_RUN_ID, WorkflowProvenance};
 
@@ -42,11 +44,17 @@ const AGENT_FAILED_PREFIX: &str = "agent failed: ";
 const RUN_ROW_MISSING: &str = "workflow run row disappeared";
 const KEY_OVERFLOW: &str = "workflow call key overflowed";
 const ENGINE_LOST: &str = "workflow engine stopped without reporting an outcome";
+const DECISION_UNAVAILABLE: &str = "workflow decisions require a configured decision endpoint";
+const DECISION_TIMEOUT: &str = "workflow decision deadline exceeded";
+const DECISION_FAILED: &str = "workflow decision engine failed";
+const DECISION_INVALID: &str = "workflow decision response was invalid";
+const DECISION_REJECTED: &str = "workflow decision request was rejected";
 
 /// What every attempt shares with the runtime that launched it.
 #[derive(Clone)]
 pub(super) struct RunEnv {
     pub store: WorkflowStore,
+    pub decisions: Option<Decisions>,
     pub runner: Arc<dyn TaskRunner>,
     pub events: Sender<Envelope>,
     pub mode: ModeResolver,
@@ -93,6 +101,11 @@ impl ActiveRun {
 }
 
 enum HostCommand {
+    Decision {
+        key: CallKey,
+        request: DecisionRequest,
+        reply: Sender<Result<DecisionResult, HostError>>,
+    },
     Agent {
         key: CallKey,
         request: AgentRequest,
@@ -139,6 +152,14 @@ impl HostAdapter {
 }
 
 impl WorkflowHost for HostAdapter {
+    fn decide(&self, key: CallKey, request: &DecisionRequest) -> Result<DecisionResult, HostError> {
+        self.ask(|reply| HostCommand::Decision {
+            key,
+            request: request.clone(),
+            reply,
+        })?
+    }
+
     fn agent(&self, key: CallKey, request: &AgentRequest) -> Result<AgentResult, HostError> {
         self.ask(|reply| HostCommand::Agent {
             key,
@@ -197,8 +218,20 @@ struct AgentDone {
     outcome: TaskOutcome,
 }
 
+enum CallDone {
+    Agent(AgentDone),
+    Decision {
+        key: CallKey,
+        result: Result<DecisionResult, HostError>,
+        duration_ms: u64,
+    },
+}
+
 /// The host call the engine is blocked on.
 enum Pending {
+    Decision {
+        reply: Sender<Result<DecisionResult, HostError>>,
+    },
     Agent {
         reply: Sender<Result<AgentResult, HostError>>,
     },
@@ -212,6 +245,7 @@ enum Pending {
 impl Pending {
     fn cancel(self) {
         match self {
+            Self::Decision { reply } => drop(reply.send(Err(HostError::Cancelled))),
             Self::Agent { reply } => drop(reply.send(Err(HostError::Cancelled))),
             Self::Parallel { reply, .. } => drop(reply.send(Err(HostError::Cancelled))),
         }
@@ -221,7 +255,7 @@ impl Pending {
 enum Event {
     Host(Result<HostCommand, flume::RecvError>),
     Control(Result<Interrupt, flume::RecvError>),
-    Agent(AgentDone),
+    Done(CallDone),
 }
 
 pub(super) fn launch(
@@ -250,7 +284,7 @@ pub(super) fn launch(
         });
         let _ = host.commands.send(HostCommand::Finished(outcome));
     });
-    let (agents_tx, agents_rx) = flume::unbounded();
+    let (done_tx, done_rx) = flume::unbounded();
     let driver = Driver {
         epoch: snapshot.execution_epoch,
         env,
@@ -258,7 +292,7 @@ pub(super) fn launch(
         cancel,
         admission_cancel,
         trigger: Some(trigger),
-        agents_tx,
+        done_tx,
         pending: None,
         in_flight: 0,
         engine_done: false,
@@ -266,7 +300,7 @@ pub(super) fn launch(
         waiters: Vec::new(),
     };
     let task = smol::spawn(async move {
-        driver.drive(host_rx, control_rx, agents_rx).await;
+        driver.drive(host_rx, control_rx, done_rx).await;
         engine.await;
     });
     ActiveRun {
@@ -286,7 +320,7 @@ struct Driver {
     cancel: CancelToken,
     admission_cancel: CancelToken,
     trigger: Option<CancelTrigger>,
-    agents_tx: Sender<AgentDone>,
+    done_tx: Sender<CallDone>,
     pending: Option<Pending>,
     in_flight: usize,
     engine_done: bool,
@@ -312,7 +346,7 @@ impl Driver {
         mut self,
         host_rx: Receiver<HostCommand>,
         control_rx: Receiver<Interrupt>,
-        agents_rx: Receiver<AgentDone>,
+        done_rx: Receiver<CallDone>,
     ) {
         let mut host_rx = Some(host_rx);
         let mut control_rx = Some(control_rx);
@@ -327,8 +361,8 @@ impl Driver {
                     async { Event::Control(recv_or_pending(control_rx.as_ref()).await) },
                 ),
                 async {
-                    match agents_rx.recv_async().await {
-                        Ok(done) => Event::Agent(done),
+                    match done_rx.recv_async().await {
+                        Ok(done) => Event::Done(done),
                         Err(_) => future::pending().await,
                     }
                 },
@@ -345,7 +379,14 @@ impl Driver {
                 }
                 Event::Control(Ok(interrupt)) => self.interrupt(interrupt).await,
                 Event::Control(Err(_)) => control_rx = None,
-                Event::Agent(done) => self.agent_done(done).await,
+                Event::Done(CallDone::Agent(done)) => self.agent_done(done).await,
+                Event::Done(CallDone::Decision {
+                    key,
+                    result,
+                    duration_ms,
+                }) => {
+                    self.decision_done(key, result, duration_ms).await;
+                }
             }
         }
         if let Some(control_rx) = control_rx.take() {
@@ -363,6 +404,14 @@ impl Driver {
 
     async fn handle_host(&mut self, command: HostCommand) {
         match command {
+            HostCommand::Decision {
+                key,
+                request,
+                reply,
+            } => match self.admit_decision(key, request).await {
+                Ok(()) => self.pending = Some(Pending::Decision { reply }),
+                Err(error) => drop(reply.send(Err(error))),
+            },
             HostCommand::Agent {
                 key,
                 request,
@@ -402,6 +451,107 @@ impl Driver {
                 let _ = reply.send(self.scratch(key, &name, &content).await);
             }
             HostCommand::Finished(outcome) => self.finish(outcome).await,
+        }
+    }
+
+    async fn admit_decision(
+        &mut self,
+        key: CallKey,
+        request: DecisionRequest,
+    ) -> Result<(), HostError> {
+        if self.preempted || self.cancel.is_cancelled() {
+            return Err(HostError::Cancelled);
+        }
+        request.validate()?;
+        let decisions = self
+            .env
+            .decisions
+            .clone()
+            .ok_or_else(|| HostError::Failed(DECISION_UNAVAILABLE.to_owned()))?;
+        let value = decision_request_value(&request);
+        self.env
+            .store
+            .start_call(WorkflowCallStart {
+                run_id: self.snapshot.run_id.clone(),
+                call_key: key.0,
+                kind: WorkflowCallKind::Decision,
+                request_hash: hash_request(CallKind::Decision, &value).to_string(),
+                request: json!({ "redacted": true }).to_string(),
+                task_id: None,
+            })
+            .await
+            .map_err(host_failure)?;
+        let context = DecisionContext {
+            meta: json!({
+                "workflow_name": self.snapshot.workflow_name,
+                "run_id": self.snapshot.run_id,
+                "call_key": key.0,
+            }),
+            ..DecisionContext::default()
+        };
+        let cancel = self.cancel.clone();
+        let done = self.done_tx.clone();
+        self.in_flight += 1;
+        smol::spawn(async move {
+            let (result, duration_ms) = match cancel
+                .race(decisions.workflow(&request, &context))
+                .await
+            {
+                Ok(outcome) => {
+                    let result = outcome
+                        .result
+                        .map_err(decision_failure)
+                        .and_then(|response| {
+                            Ok(DecisionResult {
+                                answers: serde_json::to_value(response.answers)
+                                    .map_err(|_| HostError::Failed(DECISION_INVALID.to_owned()))?,
+                                model: response.model.unwrap_or_else(|| {
+                                    request
+                                        .model
+                                        .unwrap_or_else(|| decisions.config().model.clone())
+                                }),
+                            })
+                        });
+                    (result, outcome.latency_ms)
+                }
+                Err(_) => (Err(HostError::Cancelled), 0),
+            };
+            let _ = done.send(CallDone::Decision {
+                key,
+                result,
+                duration_ms,
+            });
+        })
+        .detach();
+        Ok(())
+    }
+
+    async fn decision_done(
+        &mut self,
+        key: CallKey,
+        mut result: Result<DecisionResult, HostError>,
+        duration_ms: u64,
+    ) {
+        self.in_flight -= 1;
+        if self.preempted || self.cancel.is_cancelled() {
+            result = Err(HostError::Cancelled);
+        }
+        let finish = WorkflowCallFinish {
+            result: result.as_ref().ok().map(json_text),
+            error: result.as_ref().err().map(ToString::to_string),
+            duration_ms,
+            ..WorkflowCallFinish::default()
+        };
+        if let Err(error) = self
+            .env
+            .store
+            .finish_call(self.snapshot.run_id.clone(), key.0, finish)
+            .await
+        {
+            result = Err(host_failure(error));
+        }
+        if let Some(Pending::Decision { reply }) = self.pending.take() {
+            let _ = reply.send(result);
         }
     }
 
@@ -541,12 +691,12 @@ impl Driver {
         let events = EventSender::new(self.env.events.clone(), WORKFLOW_EVENT_RUN_ID)
             .with_workflow(provenance);
         let runner = Arc::clone(&self.env.runner);
-        let done = self.agents_tx.clone();
+        let done = self.done_tx.clone();
         self.in_flight += 1;
         smol::spawn(async move {
             let outcome = runner.run(task_request, cancel, events).await;
             drop(trigger);
-            let _ = done.send(AgentDone { key, outcome });
+            let _ = done.send(CallDone::Agent(AgentDone { key, outcome }));
         })
         .detach();
     }
@@ -647,7 +797,7 @@ impl Driver {
                 }
                 (Err(error), _) => drop(reply.send(Err(error))),
             },
-            None => {}
+            pending @ (Some(Pending::Decision { .. }) | None) => self.pending = pending,
         }
     }
 
@@ -993,6 +1143,7 @@ fn stored_call_kind(kind: CallKind) -> WorkflowCallKind {
         CallKind::Agent => WorkflowCallKind::Agent,
         CallKind::Parallel => WorkflowCallKind::Parallel,
         CallKind::ScratchFile => WorkflowCallKind::ScratchFile,
+        CallKind::Decision => WorkflowCallKind::Decision,
     }
 }
 
@@ -1004,6 +1155,16 @@ fn json_text<T: serde::Serialize>(value: &T) -> String {
 
 fn host_failure(error: WorkflowError) -> HostError {
     HostError::Failed(error.to_string())
+}
+
+fn decision_failure(error: DecisionError) -> HostError {
+    let message = match error {
+        DecisionError::Unreachable | DecisionError::Http { .. } => DECISION_FAILED,
+        DecisionError::Timeout => DECISION_TIMEOUT,
+        DecisionError::Invalid(_) => DECISION_INVALID,
+        DecisionError::Rejected(_) => DECISION_REJECTED,
+    };
+    HostError::Failed(message.to_owned())
 }
 
 fn scratch_failure(error: WorkflowError) -> HostError {

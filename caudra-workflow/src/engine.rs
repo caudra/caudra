@@ -9,9 +9,12 @@ use rhai::{Array, Dynamic, Engine, EvalAltResult, Map, Position, Scope};
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::host::{AgentRequest, HostError, UnknownCapabilityMode, UnknownModelJob, WorkflowHost};
+use crate::host::{
+    AgentRequest, DecisionRequest, HostError, UnknownCapabilityMode, UnknownModelJob, WorkflowHost,
+};
 use crate::journal::{
-    CallKey, CallKind, Journal, agent_request_value, hash_request, scratch_request_value,
+    CallKey, CallKind, Journal, agent_request_value, decision_request_value, hash_request,
+    scratch_request_value,
 };
 use crate::run::{EngineLimits, PauseKind, WorkflowOutcome};
 
@@ -29,6 +32,8 @@ const OPT_OUTPUT_SCHEMA: &str = "output_schema";
 const OPT_PHASE: &str = "phase";
 const OPT_PROFILE: &str = "profile";
 const OPT_MODEL_JOB: &str = "model_job";
+const OPT_MODEL: &str = "model";
+const OPT_TIMEOUT_MS: &str = "timeout_ms";
 const AGENT_OPTIONS: [&str; 7] = [
     OPT_PROMPT,
     OPT_LABEL,
@@ -310,6 +315,21 @@ impl Session {
         json_to_dynamic(&result)
     }
 
+    fn decide(&self, request: DecisionRequest) -> ScriptResult<Dynamic> {
+        request
+            .validate()
+            .map_err(|error| runtime_error(error.to_string()))?;
+        let key = self.reserve_keys(1)?;
+        let result =
+            match self.replayed(key, CallKind::Decision, &decision_request_value(&request))? {
+                Some(result) => result,
+                None => json_value(&host_result(
+                    self.host.call(move |host| host.decide(key, &request)),
+                )?),
+            };
+        json_to_dynamic(&result)
+    }
+
     /// Journaled items are replayed; the rest are sent to the host in contiguous key runs, so a
     /// run that died mid-`parallel` only re-issues the items that never got committed.
     fn parallel(&self, requests: Vec<AgentRequest>) -> ScriptResult<Array> {
@@ -464,6 +484,48 @@ fn unavailable(name: &str) -> ScriptResult<()> {
     )))
 }
 
+fn decision_request(
+    state: Dynamic,
+    questions: Dynamic,
+    options: Map,
+) -> ScriptResult<DecisionRequest> {
+    let mut request = DecisionRequest {
+        state: dynamic_to_json(&state)?,
+        questions: dynamic_to_json(&questions)?,
+        model: None,
+        timeout_ms: None,
+    };
+    for (key, value) in options {
+        match key.as_str() {
+            OPT_MODEL => {
+                request.model = Some(
+                    value
+                        .into_string()
+                        .map_err(|_| runtime_error("decision model must be a string"))?,
+                )
+            }
+            OPT_TIMEOUT_MS => {
+                request.timeout_ms = Some(
+                    value
+                        .as_int()
+                        .ok()
+                        .and_then(|value| u64::try_from(value).ok())
+                        .filter(|value| *value > 0)
+                        .ok_or_else(|| {
+                            runtime_error("decision timeout_ms must be a positive integer")
+                        })?,
+                );
+            }
+            other => {
+                return Err(runtime_error(format!(
+                    "unknown decision option `{other}`; expected model or timeout_ms"
+                )));
+            }
+        }
+    }
+    Ok(request)
+}
+
 pub(crate) fn check_source_size(source: &str, max: usize) -> Result<(), EngineError> {
     if source.len() > max {
         return Err(EngineError::SourceTooLarge {
@@ -497,6 +559,20 @@ pub(crate) fn restricted_engine(limits: &EngineLimits) -> Engine {
 }
 
 fn register_host_api(engine: &mut Engine, session: &Rc<Session>) {
+    let s = Rc::clone(session);
+    engine.register_fn(
+        "decide",
+        move |state: Dynamic, questions: Dynamic| -> ScriptResult<Dynamic> {
+            s.decide(decision_request(state, questions, Map::new())?)
+        },
+    );
+    let s = Rc::clone(session);
+    engine.register_fn(
+        "decide",
+        move |state: Dynamic, questions: Dynamic, options: Map| -> ScriptResult<Dynamic> {
+            s.decide(decision_request(state, questions, options)?)
+        },
+    );
     let s = Rc::clone(session);
     engine.register_fn("agent", move |prompt: &str| -> ScriptResult<Dynamic> {
         s.agent(agent_request(Some(prompt), Map::new())?)
@@ -657,7 +733,7 @@ mod tests {
     use test_case::test_case;
 
     use super::*;
-    use crate::host::{AgentResult, CapabilityMode, ModelJob};
+    use crate::host::{AgentResult, CapabilityMode, DecisionResult, ModelJob};
     use crate::journal::JournalEntry;
     use crate::{DEEP_RESEARCH_SOURCE, REVIEW_CHANGES_SOURCE, ROOT_CAUSE_SOURCE};
 
@@ -667,6 +743,15 @@ mod tests {
     const LOG_PREFIX: &str = "log:";
     const TEST_AGENT_BUDGET: u32 = 16;
     const MUST_NOT_CALL: &str = "must not be called";
+    const DECISION_MODEL: &str = "test-decision-model";
+    const DECISION_BODY: &str = r#"
+        let questions = #{ ready: #{ type: "noul", instructions: "Ready?" } };
+        complete(decide(args, questions));"#;
+    const DECISION_WITH_OPTIONS: &str = r#"
+        let questions = #{ ready: #{ type: "noul", instructions: "Ready?" } };
+        complete(decide(args, questions, #{ model: "test-decision-model", timeout_ms: 400 }));"#;
+    const HOST_CALL_LIMIT: &str = "host calls";
+    const REPLAY_DIVERGENCE: &str = "diverged";
     const BUDGET_COUNTS_ISSUED: &str =
         "budget() counts every agent the script asked for, one per parallel item";
     const BUDGET_SURVIVES_REPLAY: &str =
@@ -742,6 +827,8 @@ mod tests {
         respond: Responder,
         committed: Mutex<Vec<(CallKey, JournalEntry)>>,
         requests: Mutex<Vec<(CallKey, AgentRequest)>>,
+        decisions: Mutex<Vec<(CallKey, DecisionRequest)>>,
+        decision_error: Option<HostError>,
         emissions: Mutex<Vec<String>>,
         scratch: Mutex<Vec<(String, String)>>,
         cancelled: bool,
@@ -764,6 +851,8 @@ mod tests {
                 respond,
                 committed: Mutex::default(),
                 requests: Mutex::default(),
+                decisions: Mutex::default(),
+                decision_error: None,
                 emissions: Mutex::default(),
                 scratch: Mutex::default(),
                 cancelled: false,
@@ -828,6 +917,29 @@ mod tests {
     }
 
     impl WorkflowHost for FakeHost {
+        fn decide(
+            &self,
+            key: CallKey,
+            request: &DecisionRequest,
+        ) -> Result<DecisionResult, HostError> {
+            self.decisions.lock().unwrap().push((key, request.clone()));
+            if let Some(error) = &self.decision_error {
+                return Err(error.clone());
+            }
+            let result = DecisionResult {
+                answers: json!({ "ready": { "type": "noul", "noul": 0.75 } }),
+                model: request
+                    .model
+                    .clone()
+                    .unwrap_or_else(|| DECISION_MODEL.into()),
+            };
+            self.committed
+                .lock()
+                .unwrap()
+                .push((key, JournalEntry::decision(request, &result)));
+            Ok(result)
+        }
+
         fn agent(&self, key: CallKey, request: &AgentRequest) -> Result<AgentResult, HostError> {
             self.record(key, CallKind::Agent, request)
         }
@@ -918,6 +1030,175 @@ mod tests {
             WorkflowOutcome::Failed(message) => message,
             other => panic!("expected Failed, got {other:?}"),
         }
+    }
+
+    #[test_case(DECISION_BODY, None, None; "defaults")]
+    #[test_case(DECISION_WITH_OPTIONS, Some(DECISION_MODEL), Some(400); "options")]
+    fn decision_options_reach_host(body: &str, model: Option<&str>, timeout_ms: Option<u64>) {
+        let host = FakeHost::echo();
+        assert_eq!(
+            run(body, &host),
+            WorkflowOutcome::Completed(json!({
+                "answers": { "ready": { "type": "noul", "noul": 0.75 } }, "model": DECISION_MODEL,
+            }))
+        );
+        let decisions = host.decisions.lock().unwrap();
+        assert_eq!(decisions.len(), 1);
+        let (key, request) = &decisions[0];
+        assert_eq!(*key, CallKey::FIRST);
+        assert_eq!(request.state, json!({ "objective": "test" }));
+        assert_eq!(request.model.as_deref(), model);
+        assert_eq!(request.timeout_ms, timeout_ms);
+        assert!(host.requests().is_empty());
+    }
+
+    #[test_case("#{ unexpected: true }"; "unknown")]
+    #[test_case("#{ model: 1 }"; "model_type")]
+    #[test_case("#{ model: \" \" }"; "model_empty")]
+    #[test_case("#{ timeout_ms: 0 }"; "timeout_zero")]
+    #[test_case("#{ timeout_ms: -1 }"; "timeout_negative")]
+    #[test_case("#{ timeout_ms: 1.5 }"; "timeout_float")]
+    #[test_case("#{ timeout_ms: \"400\" }"; "timeout_string")]
+    fn invalid_decision_options_are_catchable_without_host_call(options: &str) {
+        let host = FakeHost::echo();
+        let body = format!(
+            r#"
+            let questions = #{{ ready: #{{ type: "noul", instructions: "Ready?" }} }};
+            try {{ decide(args, questions, {options}); }} catch (error) {{ complete(true); }}
+            complete(false);"#
+        );
+        assert_eq!(run(&body, &host), WorkflowOutcome::Completed(json!(true)));
+        assert!(host.decisions.lock().unwrap().is_empty());
+    }
+
+    #[test_case(json!({ "state": null, "questions": { "q": { "type": "noul", "instructions": "Ready?" } } }); "missing_state")]
+    #[test_case(json!({ "state": "state", "questions": [] }); "wrong_questions_type")]
+    #[test_case(json!({ "state": "state", "questions": { "q": { "type": "choice", "instructions": "Route?", "criteria": [] } } }); "invalid_criteria")]
+    fn invalid_decision_requests_do_not_reach_host(args: Value) {
+        let host = FakeHost::echo();
+        let body = r#"try { decide(args.state, args.questions); } catch (error) { complete(true); } complete(false);"#;
+        assert_eq!(
+            run_with(
+                body,
+                &args,
+                &Journal::new(),
+                &host,
+                &EngineLimits::default()
+            ),
+            WorkflowOutcome::Completed(json!(true))
+        );
+        assert!(host.decisions.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn decision_replay_uses_committed_result_without_host_dispatch() {
+        let first_host = FakeHost::echo();
+        let first = run(DECISION_WITH_OPTIONS, &first_host);
+        let replay_host = FakeHost {
+            decision_error: Some(HostError::Failed(MUST_NOT_CALL.into())),
+            ..FakeHost::echo()
+        };
+        let replay = run_with(
+            DECISION_WITH_OPTIONS,
+            &json!({ "objective": "test" }),
+            &first_host.journal(),
+            &replay_host,
+            &EngineLimits::default(),
+        );
+        assert_eq!(replay, first);
+        assert!(replay_host.decisions.lock().unwrap().is_empty());
+    }
+
+    #[test_case("args", "questions", "#{ model: \"changed\", timeout_ms: 400 }"; "model")]
+    #[test_case("args", "questions", "#{ model: \"test-decision-model\", timeout_ms: 401 }"; "timeout")]
+    #[test_case("\"changed\"", "questions", "#{ model: \"test-decision-model\", timeout_ms: 400 }"; "state")]
+    #[test_case("args", "#{ changed: #{ type: \"noul\", instructions: \"Different?\" } }", "#{ model: \"test-decision-model\", timeout_ms: 400 }"; "questions")]
+    fn changed_decision_request_refuses_replay(state: &str, questions: &str, options: &str) {
+        let host = FakeHost::echo();
+        run(DECISION_WITH_OPTIONS, &host);
+        let body = format!(
+            r#"let questions = #{{ ready: #{{ type: "noul", instructions: "Ready?" }} }}; complete(decide({state}, {questions}, {options}));"#
+        );
+        let replay_host = FakeHost::echo();
+        let message = failure_message(run_with(
+            &body,
+            &json!({ "objective": "test" }),
+            &host.journal(),
+            &replay_host,
+            &EngineLimits::default(),
+        ));
+        assert!(message.contains(REPLAY_DIVERGENCE), "{message}");
+        assert!(replay_host.decisions.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn decisions_share_keys_and_host_budget_but_not_agent_budget() {
+        let host = FakeHost::echo();
+        let body = r#"
+            let questions = #{ ready: #{ type: "noul", instructions: "Ready?" } };
+            decide(args, questions);
+            agent("one");
+            decide(args, questions);
+            complete(budget().issued);"#;
+        let limits = EngineLimits {
+            max_host_calls: 3,
+            ..EngineLimits::default()
+        };
+        assert_eq!(
+            run_with(body, &json!("state"), &Journal::new(), &host, &limits),
+            WorkflowOutcome::Completed(json!(1))
+        );
+        assert_eq!(
+            host.journal()
+                .iter()
+                .map(|(key, entry)| (key, entry.kind))
+                .collect::<Vec<_>>(),
+            vec![
+                (CallKey(1), CallKind::Decision),
+                (CallKey(2), CallKind::Agent),
+                (CallKey(3), CallKind::Decision),
+            ]
+        );
+        let limited_host = FakeHost::echo();
+        let limits = EngineLimits {
+            max_host_calls: 2,
+            ..limits
+        };
+        let message = failure_message(run_with(
+            body,
+            &json!("state"),
+            &Journal::new(),
+            &limited_host,
+            &limits,
+        ));
+        assert!(message.contains(HOST_CALL_LIMIT), "{message}");
+        assert_eq!(limited_host.decisions.lock().unwrap().len(), 1);
+        let resumed_host = FakeHost::echo();
+        assert_eq!(
+            run_with(
+                body,
+                &json!("state"),
+                &limited_host.journal(),
+                &resumed_host,
+                &EngineLimits::default()
+            ),
+            WorkflowOutcome::Completed(json!(1))
+        );
+        assert_eq!(resumed_host.decisions.lock().unwrap()[0].0, CallKey(3));
+        assert!(resumed_host.requests().is_empty());
+    }
+
+    #[test]
+    fn decision_host_failures_are_catchable() {
+        let host = FakeHost {
+            decision_error: Some(HostError::Failed(MUST_NOT_CALL.into())),
+            ..FakeHost::echo()
+        };
+        let body = r#"try { decide(args, #{ q: #{ type: "noul", instructions: "Ready?" } }); } catch (error) { complete(error); }"#;
+        let WorkflowOutcome::Completed(Value::String(message)) = run(body, &host) else {
+            panic!("expected caught host error");
+        };
+        assert!(message.contains(MUST_NOT_CALL), "{message}");
     }
 
     #[test_case(r#"import "x";"#; "import")]

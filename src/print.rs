@@ -18,11 +18,13 @@ use caudra_agent::{
     AgentConfig, AgentEvent, DoneReason, Envelope, GoalHandle, GoalVerdict, ImageSource,
     PermissionsConfig,
 };
+use caudra_config::decisions::DecisionsConfig;
 use caudra_config::{ModelPolicy, SnapshotsConfig};
 use caudra_lua::EventHandle;
 use caudra_providers::model::Model;
 use caudra_providers::{Billing, TokenUsage, add_cost};
 use caudra_storage::id::SessionRef;
+use caudra_storage::sessions::PermissionMode;
 use clap::ValueEnum;
 use color_eyre::Result;
 use color_eyre::eyre::eyre;
@@ -165,6 +167,8 @@ pub fn run(
     verbose: bool,
     mut config: AgentConfig,
     permissions_config: PermissionsConfig,
+    decisions_config: DecisionsConfig,
+    seed_permission_mode: Option<PermissionMode>,
     snapshots: SnapshotsConfig,
     timeouts: caudra_providers::Timeouts,
     lua_handle: EventHandle,
@@ -222,6 +226,8 @@ pub fn run(
         model: model.clone(),
         config,
         permissions_config,
+        decisions_config,
+        seed_permission_mode,
         snapshots,
         timeouts,
         prompt,
@@ -247,7 +253,7 @@ pub fn run(
         workspace_session,
         remote_project_context,
         local_documents,
-    });
+    })?;
 
     let HeadlessHandle {
         event_rx,

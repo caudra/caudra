@@ -106,7 +106,7 @@ use crate::components::workflow_inspector::WorkflowInspector;
 use crate::components::worktree_picker::{WorktreePicker, WorktreeView};
 use crate::components::{
     Action, DisplayMessage, DisplayRole, DisplaySource, ExitRequest, Overlay, RetryInfo, Status,
-    is_ctrl,
+    escape_terminal_controls, is_ctrl,
 };
 use crate::image;
 use crate::input_document::InputDraft;
@@ -118,6 +118,7 @@ use arc_swap::{ArcSwap, ArcSwapOption};
 use caudra_agent::background::BackgroundTasks;
 use caudra_agent::commits::repo;
 use caudra_agent::context::{ContextKey, ContextSnapshot, ContextStore};
+use caudra_agent::decisions::DecisionStatus;
 use caudra_agent::herdr::PaneMetadata;
 use caudra_agent::mentions;
 use caudra_agent::permissions::{PermissionManager, PermissionPolicyError};
@@ -130,6 +131,7 @@ use caudra_agent::{
     McpConfigErrors, McpPromptInfo, McpSnapshotReader, Mention, PromptAdmission, QueueItemId,
     SharedHistory, SteeringQueue, SubagentInfo, project_for_inspection,
 };
+use caudra_config::decisions::{DecisionsConfig, FeatureMode};
 use caudra_config::{ModelPolicy, PermissionsConfig, SnapshotsConfig, UiConfig};
 use caudra_lua::{
     BuiltinAction, EventHandle, HintReader, HintSnapshot, KeymapReader, LuaCommandReader, WinView,
@@ -186,6 +188,7 @@ const CONTEXT_USAGE: &str = "Usage: /context [all]";
 const STORAGE_USAGE: &str = "Usage: /storage [all]";
 const TOOLS_USAGE: &str = "Usage: /tools";
 const SKILLS_USAGE: &str = "Usage: /skills";
+const DECISIONS_USAGE: &str = "Usage: /decisions";
 const AUTH_EXPIRED_MSG: &str = "Authentication failed. Run `caudra auth login` in another terminal; Caudra will resume automatically, or press Enter to retry now.";
 const WORKFLOW_AUTH_REQUIRED: &str =
     "A workflow agent needs authentication. Run `caudra auth login` in another terminal.";
@@ -205,6 +208,8 @@ const FAST_ON_MSG: &str = "Fast mode: on";
 const FAST_OFF_MSG: &str = "Fast mode: off";
 const YOLO_ON_MSG: &str = "YOLO mode enabled";
 const YOLO_OFF_MSG: &str = "YOLO mode disabled";
+const AUTO_ON_MSG: &str = "Auto permission mode enabled";
+const AUTO_OFF_MSG: &str = "Auto permission mode disabled";
 const AUTO_VIEW_MSG: &str = "View: auto (the newest card stays open)";
 const COMPACT_VIEW_MSG: &str = "View: compact";
 const EXPANDED_VIEW_MSG: &str = "View: expanded";
@@ -3475,6 +3480,10 @@ impl App {
 
     fn intercept_inspection_submission(&mut self, text: &str) -> bool {
         let (token, args) = text.split_once(char::is_whitespace).unwrap_or((text, ""));
+        if token.eq_ignore_ascii_case("/decisions") {
+            self.execute_decisions(args);
+            return true;
+        }
         if token.eq_ignore_ascii_case("/context") {
             self.execute_context(args);
             return true;
@@ -3561,6 +3570,31 @@ impl App {
         self.context_snapshot = Watch::seeded(self.active_context_snapshot());
         self.tools_modal.open();
         self.load_tool_stats();
+    }
+
+    fn execute_decisions(&mut self, args: &str) {
+        if !args.trim().is_empty() {
+            self.flash(DECISIONS_USAGE.into());
+            return;
+        }
+        let text = self.permissions.decisions().map_or_else(
+            || {
+                decision_status_message(
+                    &DecisionsConfig::default(),
+                    &DecisionStatus::default(),
+                    false,
+                )
+            },
+            |decisions| {
+                decision_status_message(
+                    decisions.config(),
+                    &decisions.status(),
+                    decisions.is_tainted(),
+                )
+            },
+        );
+        self.active_chat()
+            .push(DisplayMessage::new(DisplayRole::Notice, text));
     }
 
     fn execute_skills(&mut self) {
@@ -4967,6 +5001,10 @@ impl App {
                 self.execute_tools();
                 vec![]
             }
+            "/decisions" => {
+                self.execute_decisions(&cmd.args);
+                vec![]
+            }
             "/skills" => {
                 self.execute_skills();
                 vec![]
@@ -5067,6 +5105,15 @@ impl App {
             }
             "/sandbox" => {
                 self.open_sandbox(&cmd.args);
+                vec![]
+            }
+            "/auto" => {
+                let msg = if self.permissions.toggle_auto() {
+                    AUTO_ON_MSG
+                } else {
+                    AUTO_OFF_MSG
+                };
+                self.flash(msg.into());
                 vec![]
             }
             "/yolo" => {
@@ -6238,6 +6285,70 @@ impl App {
         actions.extend(self.start_from_queue(&msg));
         actions
     }
+}
+
+fn decision_status_message(
+    config: &DecisionsConfig,
+    status: &DecisionStatus,
+    tainted: bool,
+) -> String {
+    let endpoint = config
+        .endpoint
+        .as_ref()
+        .map(|url| url.origin().ascii_serialization());
+    let reachability = match status.reachable {
+        Some(true) => "reachable (last attempt)",
+        Some(false) => "offline (last attempt)",
+        None => "unknown (not checked)",
+    };
+    let mut lines = vec![
+        format!(
+            "Decision engine: {}",
+            if endpoint.is_some() {
+                "configured"
+            } else {
+                "off"
+            }
+        ),
+        format!(
+            "Endpoint origin: {}",
+            endpoint.as_deref().unwrap_or("not configured")
+        ),
+        format!("Model: {}", escape_terminal_controls(&config.model)),
+        format!(
+            "Logging: {}",
+            if config.log { "enabled" } else { "disabled" }
+        ),
+        format!(
+            "Log write failure: {}",
+            if status.log_failed { "yes" } else { "no" }
+        ),
+        format!("Cached reachability: {reachability}"),
+        format!("Last error: {}", status.last_error.unwrap_or("none")),
+        format!("Session tainted: {}", if tainted { "yes" } else { "no" }),
+        "Feature modes:".into(),
+    ];
+    let features = &config.features;
+    for (name, mode) in [
+        ("permission_advice", &features.permission_advice),
+        ("auto_screening", &features.auto_screening),
+        ("shell_effect", &features.shell_effect),
+        ("content_screening", &features.content_screening),
+        ("shell_duration", &features.shell_duration),
+        ("tool_search", &features.tool_search),
+        ("skill_suggestions", &features.skill_suggestions),
+        ("goal_prescreen", &features.goal_prescreen),
+        ("subagent_routing", &features.subagent_routing),
+    ] {
+        let mode = match mode {
+            FeatureMode::Off => "off",
+            FeatureMode::Shadow => "shadow",
+            FeatureMode::Advise => "advise",
+            FeatureMode::Enforce => "enforce",
+        };
+        lines.push(format!("  {name}: {mode}"));
+    }
+    lines.join("\n")
 }
 
 fn remote_workbench_gate(baseline: Arc<WorkspaceBaseline>) -> MutationGate {

@@ -333,6 +333,18 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         scope: ChatScope::MainOnly,
     },
     BuiltinCommand {
+        name: "/auto",
+        description: "Toggle Auto permissions (skip unmatched prompts, keep safeguards)",
+        max_args: 0,
+        scope: ChatScope::Any,
+    },
+    BuiltinCommand {
+        name: "/decisions",
+        description: "Show decision engine configuration and cached status",
+        max_args: 0,
+        scope: ChatScope::Any,
+    },
+    BuiltinCommand {
         name: "/yolo",
         description: "Toggle YOLO mode (skip all permission prompts)",
         max_args: 0,
@@ -1119,6 +1131,22 @@ mod tests {
             .unwrap();
         assert!(row.disabled);
         assert!(row.takes_args());
+    }
+
+    #[test_case(false; "main")]
+    #[test_case(true; "task")]
+    fn decisions_diagnostics_are_available_without_arguments(task_focused: bool) {
+        const COMMAND: &str = "/decisions";
+        let mut palette = synced(COMMAND);
+        let row = palette
+            .rows(task_focused)
+            .into_iter()
+            .find(|row| row.name == COMMAND)
+            .unwrap();
+        assert!(!row.disabled);
+        assert!(!row.takes_args());
+        assert_eq!(palette.confirm(COMMAND).unwrap().name, COMMAND);
+        assert!(!palette.is_main_only(COMMAND));
     }
 
     fn mouse(kind: MouseEventKind, area: Rect) -> MouseEvent {

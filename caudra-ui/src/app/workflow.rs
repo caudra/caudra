@@ -1137,17 +1137,20 @@ mod tests {
     }
 
     fn receipt_runtime(app: &App) -> WorkflowRuntime {
-        smol::block_on(WorkflowRuntime::spawn(RuntimeDeps {
-            state_dir: app.storage.clone(),
-            session_id: app.state.session.id,
-            cwd: app.state.session.cwd.clone().into(),
-            user_config_dir: Some(app.storage.path().join("receipt-test-config")),
-            remote_project_context: None,
-            runner: Arc::new(NoAgent),
-            events: flume::unbounded().0,
-            mode: Arc::new(AgentMode::default),
-            subagent_cancels: Arc::new(CancelMap::default()),
-        }))
+        smol::block_on(WorkflowRuntime::spawn(
+            RuntimeDeps {
+                state_dir: app.storage.clone(),
+                session_id: app.state.session.id,
+                cwd: app.state.session.cwd.clone().into(),
+                user_config_dir: Some(app.storage.path().join("receipt-test-config")),
+                remote_project_context: None,
+                runner: Arc::new(NoAgent),
+                events: flume::unbounded().0,
+                mode: Arc::new(AgentMode::default),
+                subagent_cancels: Arc::new(CancelMap::default()),
+            },
+            None,
+        ))
         .unwrap()
     }
 

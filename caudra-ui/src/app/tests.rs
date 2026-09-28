@@ -33,6 +33,7 @@ use caudra_agent::command::CustomCommand;
 use caudra_agent::context::{
     ContextInventory, ContextModel, ContextReadiness, ContextReserve, ContextUsage, ContextWindow,
 };
+use caudra_agent::decisions::Decisions;
 use caudra_agent::mcp::config::{McpConfigSource, McpReviewSummary};
 use caudra_agent::permissions::pattern_recognition::{
     CandidateEvidence, InvocationOutcome, ObservationProvenance, PatternCandidate, SupportCount,
@@ -50,6 +51,7 @@ use caudra_agent::{
     SubagentActivity, SubagentProgress, ToolAccounting, ToolDoneEvent, ToolOutput, ToolStartEvent,
     TurnCompleteEvent,
 };
+use caudra_config::decisions::DecisionFeatures;
 use caudra_config::sandbox::SandboxName;
 use caudra_config::{
     Effect, PermissionReviewCandidate, PermissionReviewKind, PermissionRule, PermissionSource,
@@ -70,9 +72,9 @@ use caudra_storage::permission_patterns::{
 use caudra_storage::prompt_stash::{PromptStash, StashEntry};
 use caudra_storage::sessions::{
     PendingConversationRevert, PendingRestoreKind, PendingRestoreOperation, PendingRestorePhase,
-    SessionLocation, StoredActiveGoal, StoredGoalVerdict, StoredImage, StoredMode,
-    StoredPasteRange, StoredPromptAdmission, StoredQueuedDraft, StoredQueuedPrompt, StoredSubagent,
-    StoredSubagentOutcome, StoredTokenUsage,
+    PermissionMode, SessionLocation, SessionMeta, StoredActiveGoal, StoredGoalVerdict, StoredImage,
+    StoredMode, StoredPasteRange, StoredPromptAdmission, StoredQueuedDraft, StoredQueuedPrompt,
+    StoredSubagent, StoredSubagentOutcome, StoredTokenUsage,
 };
 use caudra_storage::thinking::StoredThinking;
 use caudra_storage::tool_outputs::{ToolOutputError, ToolOutputStore};
@@ -108,6 +110,12 @@ use tempfile::TempDir;
 use test_case::test_case;
 
 const WRITER_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
+const DECISIONS_COMMAND: &str = "/decisions";
+const DECISIONS_TEST_ENDPOINT: &str = "http://127.0.0.1:9";
+const DECISIONS_TEST_MODEL: &str = "test-decision-model";
+const DECISIONS_TEST_ERROR: &str = "transport";
+const DECISIONS_NOT_CHECKED: &str = "Cached reachability: unknown (not checked)";
+const DECISIONS_OFF: &str = "Decision engine: off";
 const SNAPSHOT_TEST_TIMEOUT: Duration = Duration::from_secs(10);
 const SNAPSHOT_TEST_BUDGET: Duration = Duration::from_millis(10);
 const SNAPSHOT_TEST_TIMEOUT_MSG: &str = "remote snapshot task did not finish";
@@ -778,6 +786,7 @@ mod background_runtime {
         project_messages,
     };
     use caudra_storage::id::{CaudraId, SessionRef};
+    use caudra_storage::sessions::PermissionMode;
     use caudra_workflow::{
         LaunchRequest, RunStatus, WorkflowEvent, WorkflowRequest, WorkflowResponse,
     };
@@ -896,7 +905,7 @@ mod background_runtime {
                 EventHandle::disconnected_for_test(),
             );
             app.state.mode = super::Mode::Build;
-            app.permissions.set_session_yolo(Some(true));
+            app.permissions.set_session_mode(Some(PermissionMode::Yolo));
             app.storage_writer
                 .save_sync(Arc::clone(&app.state.session))
                 .unwrap();
@@ -6655,7 +6664,7 @@ fn releasing_off_the_resume_control_leaves_the_transcript_paused() {
 
 fn bypassing_app() -> App {
     let app = test_app();
-    app.permissions.set_session_yolo(Some(true));
+    app.permissions.set_session_mode(Some(PermissionMode::Yolo));
     app
 }
 
@@ -6690,7 +6699,10 @@ fn turning_yolo_off_from_the_footer_is_remembered() {
     click_status(&mut app, StatusBarHitTarget::Yolo);
     app.checkpoint();
 
-    assert_eq!(app.state.session.meta.yolo, Some(false));
+    assert_eq!(
+        app.state.session.meta.permission_mode,
+        Some(PermissionMode::Ask)
+    );
 }
 
 /// Permissions are the session's, so a task footer switches off the bypass the
@@ -6698,11 +6710,41 @@ fn turning_yolo_off_from_the_footer_is_remembered() {
 #[test]
 fn a_subagent_footer_turns_yolo_off() {
     let mut app = read_only_task_app();
-    app.permissions.set_session_yolo(Some(true));
+    app.permissions.set_session_mode(Some(PermissionMode::Yolo));
 
     click_status(&mut app, StatusBarHitTarget::Yolo);
 
     assert!(!app.permissions.is_yolo());
+}
+
+#[test_case(false; "main_chat")]
+#[test_case(true; "subagent_chat")]
+fn auto_footer_returns_to_ask_and_remembers_it(subagent: bool) {
+    let mut app = if subagent {
+        read_only_task_app()
+    } else {
+        test_app()
+    };
+    app.permissions.set_seed_mode(PermissionMode::Auto);
+    let hit = status_hit(&mut app, StatusBarHitTarget::Auto);
+    app.update(mouse_event(MouseEventKind::Moved, hit.area.x, hit.area.y));
+    assert_eq!(app.status_hover, Some(StatusBarHitTarget::Auto));
+
+    assert!(click_status(&mut app, StatusBarHitTarget::Auto).is_empty());
+
+    assert_eq!(app.permissions.mode(), PermissionMode::Ask);
+    assert_eq!(app.status_hover, None);
+    assert_eq!(app.status_bar.flash_text(), Some(AUTO_OFF_MSG));
+    app.checkpoint();
+    assert_eq!(
+        app.state.session.meta.permission_mode,
+        Some(PermissionMode::Ask)
+    );
+    let _ = rendered(&mut app);
+    assert!(app.status_hits.iter().all(|hit| !matches!(
+        hit.target,
+        StatusBarHitTarget::Auto | StatusBarHitTarget::Yolo
+    )));
 }
 
 /// A session bound to a sandbox, `connected` saying whether this runtime's own
@@ -9261,6 +9303,158 @@ fn apply_loaded_session_defers_queued_messages_until_respawn() {
     );
 }
 
+#[test_case(false, PermissionMode::Ask; "main_ask")]
+#[test_case(false, PermissionMode::Yolo; "main_yolo")]
+#[test_case(true, PermissionMode::Ask; "task_ask")]
+#[test_case(true, PermissionMode::Yolo; "task_yolo")]
+fn decisions_command_reports_off_without_changing_permissions(task: bool, mode: PermissionMode) {
+    let mut app = if task {
+        read_only_task_app()
+    } else {
+        test_app()
+    };
+    app.permissions.set_session_mode(Some(mode.clone()));
+    assert!(app.run_cmdline("decisions", 0).unwrap().is_empty());
+    assert_eq!(
+        app.active_chat().last_message_role(),
+        Some(&DisplayRole::Notice)
+    );
+    let text = app.active_chat().last_message_text();
+    for expected in [
+        DECISIONS_OFF,
+        DECISIONS_NOT_CHECKED,
+        "Logging: disabled",
+        "permission_advice: off",
+    ] {
+        assert!(text.contains(expected), "{text}");
+    }
+    assert_eq!(app.permissions.mode(), mode);
+}
+
+#[test_case(PermissionMode::Ask; "ask")]
+#[test_case(PermissionMode::Yolo; "yolo")]
+fn decisions_command_reads_configuration_without_probing(mode: PermissionMode) {
+    let mut app = test_app();
+    let config = DecisionsConfig {
+        endpoint: Some(DECISIONS_TEST_ENDPOINT.parse().unwrap()),
+        model: DECISIONS_TEST_MODEL.into(),
+        ..Default::default()
+    };
+    let decisions = Decisions::new(config, &app.storage).unwrap();
+    decisions.mark_tainted();
+    app.permissions.set_decisions(Some(decisions.clone()));
+    app.permissions.set_session_mode(Some(mode.clone()));
+    assert!(app.execute_command(cmd(DECISIONS_COMMAND), 0).is_empty());
+    let text = app.active_chat().last_message_text();
+    for expected in [
+        DECISIONS_TEST_ENDPOINT,
+        DECISIONS_TEST_MODEL,
+        DECISIONS_NOT_CHECKED,
+        "Session tainted: yes",
+    ] {
+        assert!(text.contains(expected), "{text}");
+    }
+    assert_eq!(decisions.status().reachable, None);
+    assert_eq!(decisions.status().last_error, None);
+    assert!(decisions.is_tainted());
+    assert_eq!(app.permissions.mode(), mode);
+}
+
+#[test_case(None, "unknown (not checked)"; "unknown")]
+#[test_case(Some(true), "reachable (last attempt)"; "reachable")]
+#[test_case(Some(false), "offline (last attempt)"; "offline")]
+fn decisions_status_reports_only_cached_health_and_configured_modes(
+    reachable: Option<bool>,
+    expected: &str,
+) {
+    let config = DecisionsConfig {
+        endpoint: Some(DECISIONS_TEST_ENDPOINT.parse().unwrap()),
+        features: DecisionFeatures {
+            permission_advice: FeatureMode::Advise,
+            auto_screening: FeatureMode::Enforce,
+            shell_effect: FeatureMode::Shadow,
+            ..Default::default()
+        },
+        log: true,
+        ..Default::default()
+    };
+    let status = DecisionStatus {
+        reachable,
+        last_error: Some(DECISIONS_TEST_ERROR),
+        log_failed: true,
+    };
+    let text = decision_status_message(&config, &status, true);
+    for expected in [
+        format!("Cached reachability: {expected}"),
+        format!("Last error: {DECISIONS_TEST_ERROR}"),
+        "Decision engine: configured".into(),
+        "Logging: enabled".into(),
+        "Log write failure: yes".into(),
+        "Session tainted: yes".into(),
+        "permission_advice: advise".into(),
+        "auto_screening: enforce".into(),
+        "shell_effect: shadow".into(),
+        "content_screening: off".into(),
+        "shell_duration: off".into(),
+        "tool_search: off".into(),
+        "skill_suggestions: off".into(),
+        "goal_prescreen: off".into(),
+        "subagent_routing: off".into(),
+    ] {
+        assert!(text.contains(&expected), "{text}");
+    }
+}
+
+#[test_case("https://private-user:private-password@example.com:8443/private-path?private-query#private-fragment", "https://example.com:8443"; "remote")]
+#[test_case("http://private-user:private-password@[::1]:8080/private-path?private-query#private-fragment", "http://[::1]:8080"; "ipv6")]
+fn decisions_status_displays_only_the_endpoint_origin(endpoint: &str, origin: &str) {
+    let config = DecisionsConfig {
+        endpoint: Some(endpoint.parse().unwrap()),
+        model: "test-model\n\u{1b}[2J".into(),
+        api_key_env: "PRIVATE_API_KEY_ENV".into(),
+        ..Default::default()
+    };
+    let text = decision_status_message(&config, &DecisionStatus::default(), false);
+    assert!(
+        text.contains(&format!("Endpoint origin: {origin}\n")),
+        "{text}"
+    );
+    for hidden in [
+        "private-user",
+        "private-password",
+        "private-path",
+        "private-query",
+        "private-fragment",
+        "PRIVATE_API_KEY_ENV",
+        "\u{1b}",
+        "test-model\n",
+    ] {
+        assert!(!text.contains(hidden), "{text}");
+    }
+}
+
+#[test_case(DECISIONS_COMMAND, None; "status")]
+#[test_case("/DECISIONS", None; "uppercase")]
+#[test_case("/decisions unexpected", Some(DECISIONS_USAGE); "argument")]
+fn decisions_command_submission_stays_local(command: &str, expected_flash: Option<&str>) {
+    for mut app in [test_app(), steerable_task_app()] {
+        let actions = type_and_submit(&mut app, command);
+        assert!(actions.is_empty());
+        assert_eq!(app.status_bar.flash_text(), expected_flash);
+        if expected_flash.is_none() {
+            assert!(
+                app.active_chat()
+                    .last_message_text()
+                    .contains(DECISIONS_OFF)
+            );
+        }
+        assert!(app.queue.is_empty());
+        if let Some(steers) = app.subagent_steers.get(TASK_ID) {
+            assert!(steers.entries().is_empty());
+        }
+    }
+}
+
 #[test]
 fn yolo_toggle() {
     let mut app = test_app();
@@ -9275,21 +9469,64 @@ fn yolo_toggle() {
     assert!(flash.contains("disabled"), "flash={flash:?}");
 }
 
+#[test_case(PermissionMode::Ask; "ask")]
+#[test_case(PermissionMode::Auto; "auto")]
+#[test_case(PermissionMode::Yolo; "yolo")]
+fn auto_command_toggles_only_ask_and_auto(initial: PermissionMode) {
+    let mut app = test_app();
+    app.permissions.set_session_mode(Some(initial.clone()));
+    app.run_cmdline("auto", 0).unwrap();
+    let enabled = initial != PermissionMode::Auto;
+    let expected = if enabled {
+        PermissionMode::Auto
+    } else {
+        PermissionMode::Ask
+    };
+    assert_eq!(app.permissions.mode(), expected);
+    assert_eq!(
+        app.status_bar.flash_text(),
+        Some(if enabled { AUTO_ON_MSG } else { AUTO_OFF_MSG })
+    );
+    app.checkpoint();
+    assert_eq!(app.state.session.meta.permission_mode, Some(expected));
+}
+
+#[test_case(false; "ask")]
+#[test_case(true; "auto")]
+fn yolo_command_still_requires_explicit_opt_in(auto: bool) {
+    let mut app = test_app();
+    if auto {
+        app.execute_command(cmd("/auto"), 0);
+    }
+    app.execute_command(cmd("/yolo"), 0);
+    assert_eq!(app.permissions.mode(), PermissionMode::Yolo);
+    assert_eq!(app.status_bar.flash_text(), Some(YOLO_ON_MSG));
+    app.execute_command(cmd("/yolo"), 0);
+    assert_eq!(app.permissions.mode(), PermissionMode::Ask);
+    assert_eq!(app.status_bar.flash_text(), Some(YOLO_OFF_MSG));
+}
+
 /// The toggle is session state like mode and thinking, so a checkpoint has to
 /// mirror it or a resume silently downgrades the session's permissions.
 #[test]
 fn checkpoint_mirrors_the_yolo_toggle_into_meta() {
     let mut app = test_app();
     app.checkpoint();
-    assert_eq!(app.state.session.meta.yolo, None);
+    assert_eq!(app.state.session.meta.permission_mode, None);
 
     app.execute_command(cmd("/yolo"), 0);
     app.checkpoint();
-    assert_eq!(app.state.session.meta.yolo, Some(true));
+    assert_eq!(
+        app.state.session.meta.permission_mode,
+        Some(PermissionMode::Yolo)
+    );
 
     app.execute_command(cmd("/yolo"), 0);
     app.checkpoint();
-    assert_eq!(app.state.session.meta.yolo, Some(false));
+    assert_eq!(
+        app.state.session.meta.permission_mode,
+        Some(PermissionMode::Ask)
+    );
 }
 
 fn conversation_permission_record() -> caudra_agent::permissions::PermissionRuleRecord {
@@ -9491,73 +9728,84 @@ fn reset_session_writes_no_row_until_its_first_run() {
     drain_writer(app, writer);
 }
 
-fn app_and_session_with_yolo(seed: bool, stored: Option<bool>) -> (App, AppSession) {
-    let mut app = test_app();
-    if seed {
-        app.permissions = Arc::new(PermissionManager::new_nonpersistent(
-            PermissionsConfig {
-                yolo: true,
-                ..Default::default()
-            },
-            PathBuf::from("/tmp"),
-            Arc::default(),
-        ));
+#[test_case(PermissionMode::Ask, None, PermissionMode::Ask; "inherit_ask")]
+#[test_case(PermissionMode::Auto, None, PermissionMode::Auto; "inherit_auto")]
+#[test_case(PermissionMode::Yolo, None, PermissionMode::Yolo; "inherit_yolo")]
+#[test_case(PermissionMode::Ask, Some(PermissionMode::Yolo), PermissionMode::Yolo; "restore_yolo")]
+#[test_case(PermissionMode::Yolo, Some(PermissionMode::Yolo), PermissionMode::Yolo; "preserve_yolo")]
+#[test_case(PermissionMode::Yolo, Some(PermissionMode::Ask), PermissionMode::Ask; "ask_overrides_yolo")]
+#[test_case(PermissionMode::Ask, Some(PermissionMode::Auto), PermissionMode::Auto; "restore_auto")]
+#[test_case(PermissionMode::Yolo, Some(PermissionMode::Auto), PermissionMode::Auto; "auto_overrides_yolo")]
+#[test_case(PermissionMode::Auto, Some(PermissionMode::Ask), PermissionMode::Ask; "ask_overrides_auto")]
+#[test_case(PermissionMode::Auto, Some(PermissionMode::Yolo), PermissionMode::Yolo; "yolo_overrides_auto")]
+fn permission_mode_restore_and_checkpoint(
+    seed: PermissionMode,
+    stored: Option<PermissionMode>,
+    expected: PermissionMode,
+) {
+    for resume in [false, true] {
+        let mut app = test_app();
+        app.permissions.set_seed_mode(seed.clone());
+        let mut session = AppSession::new("test-model", &app.state.session.cwd);
+        session.meta.permission_mode = stored.clone();
+        crate::push_history_message(&mut session, Message::user(RESUMED_PROMPT.into()));
+        if resume {
+            app.state.session = Arc::new(session);
+            app.restore_resumed_session();
+        } else {
+            let model = app.state.model.clone();
+            app.apply_loaded_session(session, &model).unwrap();
+        }
+        assert_eq!(app.permissions.mode(), expected);
+        app.checkpoint();
+        assert_eq!(app.state.session.meta.permission_mode, stored);
+        let meta: SessionMeta =
+            serde_json::from_str(&serde_json::to_string(&app.state.session.meta).unwrap()).unwrap();
+        assert_eq!(meta.permission_mode, stored);
     }
-    let mut session = AppSession::new("test-model", &app.state.session.cwd);
-    session.meta.yolo = stored;
-    crate::push_history_message(&mut session, Message::user(RESUMED_PROMPT.into()));
-    (app, session)
 }
 
-/// The restored permissions, then what the next checkpoint writes back. Both
-/// matter: `--yolo` and `always_yolo` are properties of the invocation, so a
-/// resume under the flag must neither mark an untouched session nor erase the
-/// intent a marked one already carries.
-#[test_case(false, None        => (false, None)        ; "no_flag_and_nothing_stored_stays_off")]
-#[test_case(true,  None        => (true,  None)        ; "the_flag_applies_without_marking_the_session")]
-#[test_case(false, Some(true)  => (true,  Some(true))  ; "stored_on_comes_back_without_the_flag")]
-#[test_case(true,  Some(true)  => (true,  Some(true))  ; "the_flag_does_not_wipe_stored_on")]
-#[test_case(true,  Some(false) => (false, Some(false)) ; "stored_off_overrides_the_flag")]
-fn resume_applies_stored_yolo(seed: bool, stored: Option<bool>) -> (bool, Option<bool>) {
-    let (mut app, session) = app_and_session_with_yolo(seed, stored);
-    app.state.session = Arc::new(session);
-
+#[test_case(PermissionMode::Ask, PermissionMode::Yolo; "ask_seed")]
+#[test_case(PermissionMode::Auto, PermissionMode::Ask; "auto_seed")]
+#[test_case(PermissionMode::Yolo, PermissionMode::Ask; "yolo_seed")]
+fn reset_permission_mode_returns_to_seed(seed: PermissionMode, stored: PermissionMode) {
+    let mut app = test_app();
+    app.permissions.set_seed_mode(seed.clone());
+    app.state.session_mut().meta.permission_mode = Some(stored.clone());
     app.restore_resumed_session();
+    assert_eq!(app.permissions.mode(), stored);
     app.checkpoint();
-    (app.permissions.is_yolo(), app.state.session.meta.yolo)
-}
-
-/// `focus_session` sends the same key press down this path instead of a fresh
-/// runtime whenever the focused tab is blank and idle, so it has to reach the
-/// same permissions as `resume_applies_stored_yolo`.
-#[test_case(false, None        => (false, None)        ; "no_flag_and_nothing_stored_stays_off")]
-#[test_case(true,  None        => (true,  None)        ; "the_flag_applies_without_marking_the_session")]
-#[test_case(false, Some(true)  => (true,  Some(true))  ; "stored_on_comes_back_without_the_flag")]
-#[test_case(true,  Some(true)  => (true,  Some(true))  ; "the_flag_does_not_wipe_stored_on")]
-#[test_case(true,  Some(false) => (false, Some(false)) ; "stored_off_overrides_the_flag")]
-fn loading_a_session_applies_stored_yolo(seed: bool, stored: Option<bool>) -> (bool, Option<bool>) {
-    let (mut app, session) = app_and_session_with_yolo(seed, stored);
-    let model = app.state.model.clone();
-
-    app.apply_loaded_session(session, &model).unwrap();
-    app.checkpoint();
-    (app.permissions.is_yolo(), app.state.session.meta.yolo)
-}
-
-/// A tab keeps one permission manager for its whole life, so without an
-/// explicit reset `/new` would inherit the resumed session's answer and then
-/// checkpoint it into a session the user never said anything about.
-#[test_case(false => (false, None) ; "a_fresh_session_drops_a_stored_bypass")]
-#[test_case(true  => (true,  None) ; "a_fresh_session_returns_to_the_flag")]
-fn resetting_the_session_falls_back_to_the_yolo_seed(seed: bool) -> (bool, Option<bool>) {
-    let (mut app, session) = app_and_session_with_yolo(seed, Some(!seed));
-    app.state.session = Arc::new(session);
-    app.restore_resumed_session();
-    assert_eq!(app.permissions.is_yolo(), !seed);
-
     app.reset_session();
     app.checkpoint();
-    (app.permissions.is_yolo(), app.state.session.meta.yolo)
+    assert_eq!(app.permissions.mode(), seed);
+    assert_eq!(app.state.session.meta.permission_mode, None);
+}
+
+#[test_case(PermissionMode::Ask; "ask")]
+#[test_case(PermissionMode::Auto; "auto")]
+#[test_case(PermissionMode::Yolo; "yolo")]
+fn permission_mode_survives_durable_checkpoint_and_resume(expected: PermissionMode) {
+    let (_tmp, dir, writer, mut app) = tempdir_app();
+    crate::push_history_message(
+        app.state.session_mut(),
+        Message::user(RESUMED_PROMPT.into()),
+    );
+    app.state.session_mut().meta.permission_mode = Some(expected.clone());
+    app.permissions.set_seed_mode(PermissionMode::Auto);
+    app.restore_resumed_session();
+    app.checkpoint();
+    let id = app.state.session.id;
+    drain_writer(app, writer);
+
+    let stored = AppSession::load(id, &dir).unwrap();
+    assert_eq!(stored.meta.permission_mode, Some(expected.clone()));
+    let resumed_writer = Arc::new(test_writer(dir.clone()));
+    let mut resumed = build_app(dir, Arc::clone(&resumed_writer));
+    resumed.permissions.set_seed_mode(PermissionMode::Yolo);
+    resumed.state.session = Arc::new(stored);
+    resumed.restore_resumed_session();
+    assert_eq!(resumed.permissions.mode(), expected);
+    drain_writer(resumed, resumed_writer);
 }
 
 #[test]
@@ -13718,7 +13966,7 @@ fn fork_copies_execution_settings_but_resets_conversation_state() {
     app.state.system_prompt_profile_name = "review".into();
     app.permissions
         .load_structured_conversation_rules(vec![conversation_permission_record()]);
-    app.permissions.set_session_yolo(Some(true));
+    app.permissions.set_session_mode(Some(PermissionMode::Yolo));
     app.state.token_usage.input = 42;
     app.state.session_mut().meta.input_draft = Some("old draft".into());
     app.state.session_mut().meta.queued_messages = vec![stored_queued_prompt("queued")];
@@ -13746,7 +13994,7 @@ fn fork_copies_execution_settings_but_resets_conversation_state() {
     assert!(child.meta.fast);
     assert_eq!(child.meta.system_prompt_profile.as_deref(), Some("review"));
     assert!(child.meta.structured_permission_rules.is_empty());
-    assert_eq!(child.meta.yolo, None);
+    assert_eq!(child.meta.permission_mode, None);
     assert_eq!(child.token_usage, TokenUsage::default());
     assert!(child.usage_by_model().is_empty());
     assert!(child.meta.input_draft.is_none());
@@ -13764,7 +14012,7 @@ fn fork_discards_remote_plan_authority() {
     app.state.plan = PlanState::RemoteReady(reference.clone());
     app.permissions
         .load_structured_conversation_rules(vec![conversation_permission_record()]);
-    app.permissions.set_session_yolo(Some(true));
+    app.permissions.set_session_mode(Some(PermissionMode::Yolo));
     let items = crate::history_items(&[Message::user("prompt".into())]);
     let source = DisplaySource::User(items[0].id);
     app.state.session_mut().replace_messages(items);
@@ -13773,7 +14021,7 @@ fn fork_discards_remote_plan_authority() {
     assert!(child.meta.plan_path.is_none());
     assert!(!child.meta.plan_written);
     assert!(child.meta.structured_permission_rules.is_empty());
-    assert_eq!(child.meta.yolo, None);
+    assert_eq!(child.meta.permission_mode, None);
     assert_eq!(app.state.plan, PlanState::RemoteReady(reference));
 }
 
