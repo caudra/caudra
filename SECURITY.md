@@ -296,11 +296,15 @@ captures during shutdown. HTTP cannot report graceful completion while a capture
 execution lease. If an execution task is forcibly dropped, its worker token is cancelled even though
 its async budget timer no longer exists; blocked OS I/O remains non-preemptible.
 
-Recovery syncs blob and manifest directories before checkpoint references, including when rename left
-no temporary file. Lookup re-syncs checkpoint references before exposing completion. Rollback stops on
-an uncertain reference unlink or sync rather than deleting referents. An intact receipt whose earlier
-publication and rollback both failed can therefore be made durable by a later successful lookup sync;
-a failed sync refuses the receipt. Store layout directories are synced at open as well.
+Every object is written under a temporary name and flushed before it takes its name, so a crash leaves
+temporary files for cleanup, never a partial object a later capture would reuse. Every object a
+checkpoint names is synced, with its directory, before the checkpoint is written, including objects an
+earlier capture stored. Lookup re-syncs checkpoint references before exposing completion. Rollback
+deletes what the capture staged and removes its checkpoint reference, stopping on an uncertain unlink
+or sync; it never deletes a named object, which only cleanup's reachability collection removes. An
+intact receipt whose earlier publication and rollback both failed can therefore be made durable by a
+later successful lookup sync; a failed sync refuses the receipt. Store layout directories are synced
+at open as well.
 
 Capture walks the directory named by the request's cwd handle, which must still resolve to the
 directory the host issued it for. Every name is opened beneath an already open directory with
@@ -312,25 +316,27 @@ is resolved through its nearest existing ancestor, so a later-created suffix rem
 and malformed suffixes fail startup. A directory that holds its own repository is never entered. Mounts,
 special files, oversized files, unreadable entries, files that never read the same twice, and names
 that are not UTF-8 are left out and counted rather than failing the capture, and a restore never
-touches a path either capture left out. Entry-count, path-byte, depth, ignore-rule, file-count,
-total-byte, manifest, retained snapshot and checkpoint, journal, and total-storage limits are fixed and
-advertised; a client can only lower the per-capture ones. Blob, manifest, checkpoint, and journal
-bytes are charged prospectively under one publication lock, and a failed capture removes what it
-stored. Blob names are content digests and blobs are verified when read; manifest identity is verified
-on every load. Private files use owner-only modes and same-directory create/sync/rename or
-create/link/sync publication.
+touches a path either capture pruned or excluded. Gitignored and protected paths are not recorded,
+only absent, so as in Git a restore removes a path the target ignored and the source captured, and
+only while it still matches the source. Entry-count, path-byte, depth, ignore-rule, file-count,
+total-byte, metadata, retained snapshot and checkpoint, journal, and total-storage limits are fixed and
+advertised; a client can only lower the per-capture ones. Object, checkpoint, and journal bytes are
+charged prospectively under one publication lock, objects at the worst case of Git's compression;
+content the store already holds is not charged again. A failed capture publishes no checkpoint and
+deletes what it staged; objects it had already named reach nothing until cleanup collects them.
+Private files use owner-only modes and same-directory create/sync/rename publication. Snapshot data of
+earlier releases is deleted at open, never interpreted; data in a format this release does not know
+refuses the store instead.
 
-Capture staging is bounded to 64 temporary blob files and 4 MiB, with up to eight scoped fsync workers
-and no input-controlled concurrency. Larger files remain streamed one at a time. The batch is fully
-synced before any immutable blob name becomes visible; deferring those file syncs until after linking
-would let recovery reuse non-durable bytes and is not permitted. Temporary names are excluded from
-blob inventories and are discarded during recovery, never adopted. Staged bytes are charged before
-writing, including deduplication within the pending batch. Worker joins finish before failure cleanup
-or cancellation settlement, and the existing reference-before-referent rollback barriers still apply.
-Staging mismatch, read-error, and cancellation paths explicitly confirm temporary-file removal.
-Failed cleanup returns `rollback_failed` and stops capture without refunding its reservation; it never
-continues past an uncharged orphan or reports clean cancellation. Subsequent capture inventories
-charge surviving temporary bytes; startup recovery removes them.
+Snapshots live in a private bare Git repository that reads no system, global, or environment Git
+configuration and that no Git process runs against. Objects are named by their Git object IDs and
+every object is verified against its ID when read, so a tampered object fails integrity instead of
+restoring altered content. Content that Git's collision detection recognizes as a SHA-1 collision
+attack is refused, and such a file is skipped as unreadable. The stat cache that spares a capture from
+reading unchanged files trusts only an exact match of device, inode, owner, size, and nanosecond change
+and modification times. It records only files that had not changed for five seconds before their
+capture started, so a write racing a read cannot hide behind an unchanged stamp, and a file whose
+cached object the store no longer holds is read again.
 
 A restore is authorized against its prepared plan in the existing operation ledger: write and delete
 intents on the scope for the effects its complete counts include, its own journal, the journal an
@@ -339,25 +345,29 @@ its source and target captures, both of which covered them, and only where the l
 source when prepared. A conflict anywhere refuses execution. Each path is published through a staged
 entry beside it and only while the live entry still carries the device, inode, size, mode, and
 timestamps preparation observed; a mismatch stops the restore rather than choosing the snapshot over a
-later edit. No write, link, or unlink goes through a symlinked or non-directory ancestor. Each
-publication is atomic for one entry, but the complete restore is not. The journal is durable before
-the first effect and records transitions, never paths. Termination can happen after a publication and
-before its journal update, so startup recomputes a restore left `publishing` from its two captures and
-the live workspace: fully applied becomes `completed`, one whose remaining paths all still match the
-source `partial`, and anything else `indeterminate` with reconciliation required. It never replays an
-incomplete restore.
+later edit. No write, link, or unlink goes through a symlinked or non-directory ancestor. A restored
+file gains no permission the file it replaces lacked, except execute for its owner and wherever read
+was allowed, and a created file gets Git's default mode under the umask, which is learned at open from
+a probe file rather than by changing the process-wide umask. Each publication is atomic for one entry,
+but the complete restore is not. The journal is durable before the first effect and records
+transitions, never paths. Termination can happen after a publication and before its journal update, so
+startup recomputes a restore left `publishing` from its two captures and the live workspace: fully
+applied becomes `completed`, one whose remaining paths all still match the source `partial`, and
+anything else `indeterminate` with reconciliation required. It never replays an incomplete restore.
 
 Unrevert restores the same two captures the other way round through the same prepared execution and
 status path, and settles the original restore as reverted once it completes. While one restore awaits
 acknowledgement or unrevert, every other restore is refused, so two restores cannot interleave over the
 same paths. Journal count and byte limits are enforced before execution; only settled journals are
 reclaimable under pressure. Prepared cleanup also uses the common ledger. It names checkpoints, never
-snapshots, retains the exact checkpoint, settled-journal, and snapshot deletion set, and binds one
-server-state resource intent to that plan's digest. Execution refuses unless the store would still plan
-the same set, removes references before referents, and then deletes only blobs no remaining manifest
-names; an unreadable manifest might name any blob, so then none is deleted. Pending preparations,
-retained checkpoints, and every unsettled journal remain reachability roots, so cleanup cannot remove
-state needed for restore, recovery, or unrevert.
+snapshots, retains the exact checkpoint, settled-journal, and snapshot deletion set with a digest of
+the exact objects to collect, and binds one server-state resource intent to that plan's digest.
+Execution refuses unless the store would still plan the same set, removes references before referents,
+and then deletes only objects nothing reaches; an unreadable tree might reach any object, so then the
+plan fails and nothing is deleted, while a missing tree reaches nothing, since no restore can pass
+through it. Pending preparations, retained checkpoints, every unsettled journal, and the stat cache
+remain reachability roots, so cleanup cannot remove state needed for restore, recovery, unrevert, or
+the next capture.
 
 Discovery reports snapshots only after private-store validation and startup recovery succeed. It sets
 `controlPlane: true` only when operations, workspace reads, watch, project assets, writable prepared

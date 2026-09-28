@@ -1,12 +1,12 @@
 #![forbid(unsafe_code)]
 
 //! Workspace snapshots for Workcell hosts: bounded captures of the session directory into a
-//! private content-addressed store, and journaled restores between any two of them.
+//! private git object store, and journaled restores between any two of them.
 
 mod capture;
 mod cleanup;
-mod manifest;
 mod restore;
+mod snapshot;
 mod store;
 
 pub use capture::{SnapshotCapturePhase, SnapshotCaptureProgress, SnapshotCaptureProgressSink};
@@ -28,7 +28,7 @@ use uuid::Uuid;
 use workcell_host_contract::{
     ContractVersion, Cursor, Identifier, MAX_PAGE_SIZE, MAX_SNAPSHOT_CAPTURE_ENTRIES,
     MAX_SNAPSHOT_CAPTURE_PATH_BYTES, MAX_SNAPSHOT_CLEANUP, MAX_SNAPSHOT_COUNT,
-    MAX_SNAPSHOT_FILE_BYTES, MAX_SNAPSHOT_FILES, MAX_SNAPSHOT_JOURNALS, MAX_SNAPSHOT_STORAGE_BYTES,
+    MAX_SNAPSHOT_FILE_BYTES, MAX_SNAPSHOT_FILES, MAX_SNAPSHOT_STORAGE_BYTES,
     MAX_SNAPSHOT_TOTAL_BYTES, ResourceId, Revision, SnapshotAcknowledgeResponse,
     SnapshotCaptureLimits, SnapshotCaptureResponse, SnapshotCleanupPreview,
     SnapshotCleanupResponse, SnapshotInspectResponse, SnapshotLimit, SnapshotRestorePreview,
@@ -39,26 +39,23 @@ use workcell_mcp_files::{
     RootResourceKind, SnapshotTreeError, SnapshotTreeLimit, WorkspaceSnapshotAccess,
     WorkspaceSnapshotScope, root_relative_resource_id,
 };
+use workcell_snapshot_store::{Meta, SnapshotId};
 
 use crate::{
     capture::{CaptureProgress, capture_response, validate_limits},
     cleanup::CleanupPlan,
-    manifest::{MAX_MANIFEST_BYTES, Manifest, SNAPSHOT_ID_PREFIX, StoredEntry},
-    restore::{RestorePlan, StoredJournal},
-    store::{CHECKPOINTS, DIGEST_PREFIX, Store},
+    restore::{JOURNAL_VERSION, LEGACY_JOURNAL_VERSIONS, RestorePlan, StoredJournal},
+    snapshot::{parse_snapshot_id, store_error, summary},
+    store::{CHECKPOINTS, DIGEST_PREFIX, JOURNALS, Store},
 };
 
-const CHECKPOINT_VERSION: &str = "workspace-snapshot-checkpoint.v1";
+const CHECKPOINT_VERSION: &str = "workspace-snapshot-checkpoint.v2";
+/// What earlier releases wrote, which nothing reads any more.
+const LEGACY_CHECKPOINT_VERSIONS: [&str; 1] = ["workspace-snapshot-checkpoint.v1"];
 const CAPTURE_ADMISSION_TIMEOUT: Duration = Duration::from_secs(30);
 const CAPTURE_EXECUTION_BUDGET: Duration = Duration::from_secs(15 * 60);
 const MAX_PRIVATE_METADATA_BYTES: u64 = 2 * 1_024 * 1_024;
 const MAX_EXCLUSIONS: usize = 32;
-/// Room for abandoned temporaries beside every entry the quotas allow.
-const PRIVATE_ENTRY_SLACK: usize = 64;
-const MAX_PRIVATE_ENTRIES: usize = MAX_SNAPSHOT_COUNT * MAX_SNAPSHOT_FILES
-    + MAX_SNAPSHOT_COUNT
-    + MAX_SNAPSHOT_JOURNALS
-    + PRIVATE_ENTRY_SLACK;
 const LEASE_PREFIX: &str = "lease_";
 const CLEANUP_SCOPE_PREFIX: &str = "snapshot-store:cleanup:";
 const CURSOR_SEPARATOR: char = ':';
@@ -119,6 +116,23 @@ struct StoredCheckpoint {
     version: String,
     checkpoint_id: String,
     snapshot_id: String,
+    /// When the snapshot was first captured, which every checkpoint naming it reports.
+    created_at_unix_ms: u64,
+    /// So a retry can hold the snapshot to its own limits without reading every file's size.
+    largest_file_bytes: u64,
+}
+
+/// Only what tells one checkpoint or journal format from another.
+#[derive(Deserialize)]
+struct StoredVersion {
+    version: String,
+}
+
+/// A checkpoint as read back, with the snapshot it names.
+struct Checkpoint {
+    stored: StoredCheckpoint,
+    id: SnapshotId,
+    meta: Meta,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
@@ -247,6 +261,7 @@ impl SnapshotManager {
                 state: Mutex::default(),
             };
             inner.store.remove_temporaries()?;
+            inner.remove_superseded()?;
             inner.load_journals()?;
             Ok::<_, SnapshotError>(inner)
         })
@@ -380,10 +395,10 @@ impl SnapshotManager {
             .try_lock_owned()
             .map_err(|_| SnapshotError::Busy)?;
         self.blocking(publication, move |inner| {
-            let manifest = inner
+            let checkpoint = inner
                 .load_checkpoint(&checkpoint_id)?
                 .ok_or(SnapshotError::NotFound)?;
-            capture_response(&manifest, &checkpoint_id, &scope, true)
+            capture_response(&checkpoint, &scope, true)
         })
         .await
     }
@@ -475,7 +490,9 @@ impl SnapshotManager {
         }
         let publication = Arc::clone(&self.inner.publication).lock_owned().await;
         let plan = self
-            .blocking(publication, move |inner| inner.plan_cleanup(&requested))
+            .blocking(publication, move |inner| {
+                inner.plan_cleanup(&requested).map(|(plan, _)| plan)
+            })
             .await?;
         let preview = plan.preview()?;
         let prepared = PreparedSnapshotCleanup {
@@ -615,14 +632,66 @@ impl SnapshotManager {
 }
 
 impl SnapshotInner {
-    fn load_manifest(&self, snapshot_id: &str) -> Result<Manifest, SnapshotError> {
-        let bytes = self
-            .store
-            .read(&self.store.manifest_path(snapshot_id)?, MAX_MANIFEST_BYTES)?;
-        Manifest::decode(snapshot_id, &bytes)
+    /// Removes what an earlier store format left, which nothing reads any more: its blob and
+    /// manifest directories, and checkpoints and journals of an earlier version. A version no
+    /// release before this one wrote is a later release's, and refuses the store rather than lose
+    /// what it holds.
+    fn remove_superseded(&self) -> Result<(), SnapshotError> {
+        let directories = self.store.remove_legacy_directories()?;
+        let checkpoints = self.remove_legacy_versions(
+            CHECKPOINTS,
+            CHECKPOINT_VERSION,
+            &LEGACY_CHECKPOINT_VERSIONS,
+        )?;
+        let journals =
+            self.remove_legacy_versions(JOURNALS, JOURNAL_VERSION, &LEGACY_JOURNAL_VERSIONS)?;
+        if directories + checkpoints + journals > 0 {
+            tracing::info!(
+                directories,
+                checkpoints,
+                journals,
+                "removed workspace snapshot data an earlier store format left"
+            );
+        }
+        Ok(())
     }
 
-    fn read_checkpoint(&self, path: &Path) -> Result<StoredCheckpoint, SnapshotError> {
+    fn remove_legacy_versions(
+        &self,
+        directory: &str,
+        current: &str,
+        legacy: &[&str],
+    ) -> Result<usize, SnapshotError> {
+        let mut removed = 0;
+        for name in self.store.names(directory)? {
+            let path = self.store.directory(directory).join(name);
+            let Ok(stored) = serde_json::from_slice::<StoredVersion>(
+                &self.store.read(&path, MAX_PRIVATE_METADATA_BYTES)?,
+            ) else {
+                continue;
+            };
+            if legacy.contains(&stored.version.as_str()) {
+                self.store.remove(&path)?;
+                removed += 1;
+            } else if stored.version != current {
+                tracing::warn!(
+                    directory,
+                    version = %stored.version,
+                    "workspace snapshot storage holds a format this release does not know"
+                );
+                return Err(SnapshotError::UnhealthyStorage);
+            }
+        }
+        if removed > 0 {
+            self.store.sync(directory)?;
+        }
+        Ok(removed)
+    }
+
+    fn read_checkpoint(
+        &self,
+        path: &Path,
+    ) -> Result<(StoredCheckpoint, SnapshotId), SnapshotError> {
         let checkpoint: StoredCheckpoint =
             serde_json::from_slice(&self.store.read(path, MAX_PRIVATE_METADATA_BYTES)?)
                 .map_err(|_| SnapshotError::IntegrityFailure)?;
@@ -631,19 +700,47 @@ impl SnapshotInner {
         {
             return Err(SnapshotError::IntegrityFailure);
         }
-        Ok(checkpoint)
+        let id = parse_snapshot_id(&checkpoint.snapshot_id)?;
+        Ok((checkpoint, id))
     }
 
-    fn load_checkpoint(&self, checkpoint_id: &str) -> Result<Option<Manifest>, SnapshotError> {
-        match self.read_checkpoint(&self.store.checkpoint_path(checkpoint_id)) {
-            Ok(checkpoint) => {
-                let manifest = self.load_manifest(&checkpoint.snapshot_id)?;
-                self.store.sync(CHECKPOINTS)?;
-                Ok(Some(manifest))
+    fn load_checkpoint(&self, checkpoint_id: &str) -> Result<Option<Checkpoint>, SnapshotError> {
+        let (stored, id) = match self.read_checkpoint(&self.store.checkpoint_path(checkpoint_id)) {
+            Ok(checkpoint) => checkpoint,
+            Err(SnapshotError::NotFound) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let meta = self
+            .store
+            .objects()
+            .meta(&id)
+            .map_err(|error| store_error(error, &[]))?;
+        self.store.sync(CHECKPOINTS)?;
+        Ok(Some(Checkpoint { stored, id, meta }))
+    }
+
+    /// Every checkpoint with the snapshot it names, skipping any removed while listing.
+    fn checkpoints(&self) -> Result<Vec<(StoredCheckpoint, SnapshotId)>, SnapshotError> {
+        let mut checkpoints = Vec::new();
+        for name in self.store.names(CHECKPOINTS)? {
+            match self.read_checkpoint(&self.store.directory(CHECKPOINTS).join(name)) {
+                Ok(checkpoint) => checkpoints.push(checkpoint),
+                Err(SnapshotError::NotFound) => {}
+                Err(error) => return Err(error),
             }
-            Err(SnapshotError::NotFound) => Ok(None),
-            Err(error) => Err(error),
         }
+        Ok(checkpoints)
+    }
+
+    /// When the earliest checkpoint naming `id` captured it. Equal content has one snapshot
+    /// whenever it is captured, so the snapshot itself records no time.
+    fn created_at(&self, id: &SnapshotId) -> Result<Option<u64>, SnapshotError> {
+        Ok(self
+            .checkpoints()?
+            .into_iter()
+            .filter(|(_, named)| named == id)
+            .map(|(checkpoint, _)| checkpoint.created_at_unix_ms)
+            .min())
     }
 
     fn inspect(
@@ -652,8 +749,14 @@ impl SnapshotInner {
         page_size: u32,
         cursor: Option<&Cursor>,
     ) -> Result<SnapshotInspectResponse, SnapshotError> {
-        let manifest = self.load_manifest(snapshot_id)?;
-        let entries = &manifest.content.entries;
+        let id = parse_snapshot_id(snapshot_id)?;
+        let objects = self.store.objects();
+        let meta = objects
+            .meta(&id)
+            .map_err(|error| store_error(error, &[&id]))?;
+        let entries = objects
+            .entries(&id)
+            .map_err(|error| store_error(error, &[&id]))?;
         let offset = parse_cursor(cursor, snapshot_id, entries.len())?;
         let end = offset
             .saturating_add(usize::try_from(page_size).unwrap_or(usize::MAX))
@@ -662,15 +765,20 @@ impl SnapshotInner {
             .then(|| Cursor::new(format!("{snapshot_id}{CURSOR_SEPARATOR}{end}")))
             .transpose()
             .map_err(|_| SnapshotError::OperationFailed)?;
+        let files = entries[offset..end]
+            .iter()
+            .map(|entry| {
+                let size = objects
+                    .blob_size(&entry.content.oid)
+                    .map_err(|error| store_error(error, &[]))?;
+                snapshot::file(entry, size)
+            })
+            .collect::<Result<_, _>>()?;
         Ok(SnapshotInspectResponse {
             version: ContractVersion::V1,
-            snapshot: manifest.summary(None)?,
-            files: entries[offset..end]
-                .iter()
-                .map(StoredEntry::contract)
-                .collect::<Result<_, _>>()?,
-            exclusions: manifest
-                .content
+            snapshot: summary(&id, &meta, None, self.created_at(&id)?.unwrap_or_default())?,
+            files,
+            exclusions: meta
                 .exclusions
                 .iter()
                 .map(|path| WorkspacePath::new(path.clone()))
@@ -826,22 +934,10 @@ fn configured_exclusion(workspace: &Path, requested: &Path) -> Result<String, Sn
         })
         .collect::<Result<Vec<_>, _>>()?
         .join("/");
-    if relative.is_empty() || !manifest::valid_path(&relative) {
+    if relative.is_empty() || !snapshot::valid_path(&relative) {
         return Err(SnapshotError::InvalidConfiguration);
     }
     Ok(relative)
-}
-
-fn validate_snapshot_id(value: &str) -> Result<(), SnapshotError> {
-    value
-        .strip_prefix(SNAPSHOT_ID_PREFIX)
-        .filter(|hex| valid_hex_digest(hex))
-        .map(|_| ())
-        .ok_or(SnapshotError::IntegrityFailure)
-}
-
-fn valid_hex_digest(value: &str) -> bool {
-    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 fn parse_cursor(
@@ -865,15 +961,7 @@ fn parse_cursor(
 
 fn digest_serializable(value: &impl Serialize) -> Result<String, SnapshotError> {
     let bytes = serde_json::to_vec(value).map_err(|_| SnapshotError::OperationFailed)?;
-    Ok(digest_bytes(&bytes))
-}
-
-fn digest_bytes(bytes: &[u8]) -> String {
-    format_sha256(Sha256::digest(bytes))
-}
-
-fn format_sha256(digest: impl IntoIterator<Item = u8>) -> String {
-    format!("{DIGEST_PREFIX}{}", hex(digest))
+    Ok(format!("{DIGEST_PREFIX}{}", hex_sha256(&bytes)))
 }
 
 fn hex_sha256(bytes: &[u8]) -> String {
@@ -985,26 +1073,41 @@ mod tests {
 
     use rustix::fs::{CWD, FileType, Mode, mknodat};
     use tempfile::TempDir;
+    use test_case::test_case;
     use tokio::sync::Notify;
     use workcell_host_contract::{
-        SnapshotChangeCounts, SnapshotChangeKind, SnapshotEntryKind, SnapshotRestoreState,
-        SnapshotSkipReason, SnapshotSkipped, SnapshotSummary,
+        MAX_SNAPSHOT_JOURNALS, SnapshotChangeCounts, SnapshotChangeKind, SnapshotEntryKind,
+        SnapshotRestoreState, SnapshotSkipReason, SnapshotSkipped, SnapshotSummary,
     };
     use workcell_mcp_files::FileToolGroup;
+    use workcell_snapshot_store::blob_id;
 
     use super::*;
     use crate::{
-        capture::MAX_BLOB_BATCH_FILES,
-        store::{BLOBS, CHECKPOINTS, JOURNALS, MANIFESTS},
+        snapshot::{PERMISSION_BITS, SYMLINK_MODE, blob_revision},
+        store::{CHECKPOINTS, JOURNALS, REPOSITORY, TestHooks},
     };
 
     const ROOT: &str = ".";
+    /// Where git keeps loose objects within the repository.
+    const OBJECTS: &str = "objects";
+    /// Git's id for the blob `AGENTS.md`, as `git hash-object` computes it.
+    const AGENTS_LINK_REVISION: &str = "gitoid:blob:sha1:47dc3e3d863cfb5727b87d785d09abf9743c0a72";
+    const LEGACY_DIRECTORIES: [&str; 2] = ["blobs", "manifests"];
     const PRIVATE_DIRECTORY_MODE: u32 = 0o700;
     const PRIVATE_FILE_MODE: u32 = 0o600;
+    const EXECUTABLE_MODE: u32 = 0o755;
     const BARRIER_TIMEOUT: Duration = Duration::from_secs(10);
     const BENCHMARK_FILES: usize = 20_000;
     const BENCHMARK_DIRECTORIES: usize = 100;
     const BENCHMARK_FILE_BYTES: usize = 128;
+    const QUOTA_FILES: [&str; 2] = ["first file", "second file"];
+    /// Each of [`QUOTA_FILES`] is charged its length, 64 bytes of framing and an eighth of both:
+    /// 84 and 85 bytes.
+    const ROOM_FOR_NO_FILE: u64 = 10;
+    const ROOM_FOR_ONE_FILE: u64 = 100;
+    const NOTHING_STAGED: &str = "a failed capture must delete what it staged";
+    const LATER_CHECKPOINT_VERSION: &str = "workspace-snapshot-checkpoint.v3";
 
     struct CaptureBarrier {
         entered: Notify,
@@ -1065,6 +1168,35 @@ mod tests {
             fs::read_dir(self.storage.path().join(directory))
                 .unwrap()
                 .count()
+        }
+
+        fn objects(&self) -> u64 {
+            self.manager.inner.store.objects().usage().unwrap().objects
+        }
+
+        /// What the object store occupies, whatever captures left staged included.
+        fn object_bytes(&self) -> u64 {
+            self.manager.inner.store.objects().usage().unwrap().bytes
+        }
+
+        fn object_path(&self, hex: &str) -> PathBuf {
+            self.storage
+                .path()
+                .join(REPOSITORY)
+                .join(OBJECTS)
+                .join(&hex[..2])
+                .join(&hex[2..])
+        }
+
+        /// Overwrites a loose object, which git stores read-only.
+        fn tamper(&self, hex: &str) {
+            let path = self.object_path(hex);
+            set_mode(&path, PRIVATE_FILE_MODE);
+            fs::write(path, "tampered").unwrap();
+        }
+
+        fn hooks(&self) -> &TestHooks {
+            &self.manager.inner.store.hooks
         }
 
         async fn try_capture(
@@ -1190,6 +1322,10 @@ mod tests {
         directory
     }
 
+    fn versioned(version: &str) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({ "version": version })).unwrap()
+    }
+
     fn write_private(path: &Path, contents: &[u8]) {
         fs::OpenOptions::new()
             .write(true)
@@ -1208,6 +1344,18 @@ mod tests {
     ) -> Result<SnapshotManager, SnapshotError> {
         let files = FileToolGroup::new(workspace, true, None).await.unwrap();
         SnapshotManager::open(files.workspace_snapshot_access(), storage, exclusions).await
+    }
+
+    fn digest(content: &[u8]) -> Revision {
+        blob_revision(&blob_id(content).unwrap()).unwrap()
+    }
+
+    fn mode(path: &Path) -> u32 {
+        fs::symlink_metadata(path).unwrap().permissions().mode() & PERMISSION_BITS
+    }
+
+    fn set_mode(path: &Path, mode: u32) {
+        fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
     }
 
     fn samples(snapshot: &SnapshotSummary) -> Vec<(&str, SnapshotSkipReason)> {
@@ -1308,18 +1456,70 @@ mod tests {
         let fixture = Fixture::new().await;
         fixture.write("file.txt", "one");
         let first = fixture.capture("first").await;
+        let objects = fixture.objects();
         let second = fixture.capture("second").await;
 
         assert_eq!(first.snapshot_id, second.snapshot_id);
         assert_eq!(first.created_at_unix_ms, second.created_at_unix_ms);
-        assert_eq!(fixture.stored(MANIFESTS), 1);
+        assert_eq!(fixture.objects(), objects);
         assert_eq!(fixture.stored(CHECKPOINTS), 2);
+    }
+
+    #[tokio::test]
+    async fn a_capture_reads_only_files_changed_since_the_last_one() {
+        let fixture = Fixture::new().await;
+        fixture.hooks().settled.store(true, Ordering::SeqCst);
+        fixture.write("kept", "kept");
+        fixture.write("edited", "one");
+        let reads = || fixture.hooks().content_reads.load(Ordering::SeqCst);
+        let first = fixture.capture("first").await;
+        assert_eq!(reads(), 2);
+
+        let unchanged = fixture.capture("unchanged").await;
+        assert_eq!(unchanged.snapshot_id, first.snapshot_id);
+        assert_eq!(reads(), 2);
+        fixture.write("edited", "three");
+        let edited = fixture.capture("edited").await;
+
+        assert_eq!(reads(), 3);
+        assert_eq!(edited.total_bytes, first.total_bytes + 2);
+        fixture.restore(&first, &edited).await;
+        assert_eq!(fixture.read("edited"), "one");
+    }
+
+    #[tokio::test]
+    async fn a_file_the_stat_cache_vouches_for_keeps_its_executable_bit() {
+        let fixture = Fixture::new().await;
+        fixture.hooks().settled.store(true, Ordering::SeqCst);
+        fixture.write("script", "run");
+        set_mode(&fixture.path("script"), EXECUTABLE_MODE);
+        let first = fixture.capture("first").await;
+
+        let cached = fixture.capture("cached").await;
+
+        assert_eq!(fixture.hooks().content_reads.load(Ordering::SeqCst), 1);
+        assert_eq!(cached.snapshot_id, first.snapshot_id);
+    }
+
+    #[tokio::test]
+    async fn a_capture_reads_again_a_file_whose_cached_content_is_gone_from_the_store() {
+        let fixture = Fixture::new().await;
+        fixture.hooks().settled.store(true, Ordering::SeqCst);
+        fixture.write("file.txt", "content");
+        fixture.capture("first").await;
+        let blob = fixture.object_path(&blob_id(b"content").unwrap().to_string());
+        fs::remove_file(&blob).unwrap();
+
+        fixture.capture("second").await;
+        assert_eq!(fixture.hooks().content_reads.load(Ordering::SeqCst), 2);
+        assert!(blob.exists());
     }
 
     #[tokio::test]
     #[ignore = "local 20,000-file snapshot persistence benchmark"]
     async fn capture_persistence_benchmark() {
         let fixture = Fixture::new().await;
+        fixture.hooks().settled.store(true, Ordering::SeqCst);
         for index in 0..BENCHMARK_FILES {
             fixture.write(
                 &format!("dir-{}/file-{index}", index % BENCHMARK_DIRECTORIES),
@@ -1344,121 +1544,51 @@ mod tests {
             first.total_bytes,
             (BENCHMARK_FILES * BENCHMARK_FILE_BYTES) as u64
         );
-        assert_eq!(fixture.stored(BLOBS), BENCHMARK_FILES);
-    }
-
-    #[tokio::test]
-    async fn a_checkpoint_references_only_complete_durable_batches_including_the_final_partial_batch()
-     {
-        let mut fixture = Fixture::new().await;
-        for index in 0..=MAX_BLOB_BATCH_FILES {
-            fixture.write(
-                &format!("unique-{index}"),
-                &format!("{index:0width$}", width = BENCHMARK_FILE_BYTES),
-            );
-        }
-        let summary = fixture.capture("batches").await;
-        assert_eq!(summary.file_count as usize, MAX_BLOB_BATCH_FILES + 1);
-        fixture.reopen().await;
-        let manifest = fixture
-            .manager
-            .inner
-            .load_manifest(summary.snapshot_id.as_str())
-            .unwrap();
-        for entry in manifest.content.entries {
-            assert_eq!(
-                fixture
-                    .manager
-                    .inner
-                    .store
-                    .read_blob(&entry.digest, entry.size_bytes)
-                    .unwrap()
-                    .len(),
-                BENCHMARK_FILE_BYTES
-            );
-        }
         assert_eq!(
-            fs::read_dir(fixture.manager.inner.store.directory(BLOBS))
-                .unwrap()
-                .count(),
-            MAX_BLOB_BATCH_FILES + 1
+            fixture.hooks().content_reads.load(Ordering::SeqCst),
+            BENCHMARK_FILES
         );
     }
 
     #[tokio::test]
-    async fn batch_sync_link_and_cancellation_failures_clean_new_content_without_touching_receipts()
+    async fn a_capture_whose_objects_are_not_durable_publishes_nothing_and_deletes_what_it_staged()
     {
-        for cancel in [false, true] {
-            for sync in [false, true] {
-                let fixture = Fixture::new().await;
-                fixture.write("original.txt", "original");
-                let original = fixture.capture("original").await;
-                for index in 0..MAX_BLOB_BATCH_FILES + 3 {
-                    fixture.write(&format!("new-{index}"), &index.to_string());
-                }
-                let store = &fixture.manager.inner.store;
-                let faults = &store.faults;
-                let calls = if sync {
-                    &faults.blob_sync_calls
-                } else {
-                    &faults.blob_link_calls
-                };
-                let trigger = match (cancel, sync) {
-                    (false, false) => &faults.blob_link_failure,
-                    (false, true) => &faults.blob_sync_failure,
-                    (true, false) => &faults.cancel_after_blob_link,
-                    (true, true) => &faults.cancel_after_blob_sync,
-                };
-                trigger.store(
-                    calls.load(Ordering::SeqCst) + MAX_BLOB_BATCH_FILES + 2,
-                    Ordering::SeqCst,
-                );
-                let failed = fixture
-                    .try_capture("failed-batch", ROOT, &limits())
-                    .await
-                    .unwrap_err();
-                assert_eq!(
-                    failed,
-                    if cancel {
-                        SnapshotError::Cancelled
-                    } else {
-                        SnapshotError::OperationFailed
-                    }
-                );
-                for directory in [BLOBS, MANIFESTS, CHECKPOINTS] {
-                    assert_eq!(fs::read_dir(store.directory(directory)).unwrap().count(), 1);
-                }
-                let scope = WorkspacePath::new(ROOT).unwrap();
-                assert_eq!(
-                    fixture
-                        .manager
-                        .checkpoint(&id("failed-batch"), &scope)
-                        .await
-                        .unwrap_err(),
-                    SnapshotError::NotFound
-                );
-                assert_eq!(
-                    fixture
-                        .manager
-                        .checkpoint(&id("original"), &scope)
-                        .await
-                        .unwrap()
-                        .snapshot,
-                    original
-                );
-                trigger.store(0, Ordering::SeqCst);
-                let recovered = fixture.capture("failed-batch").await;
-                assert_eq!(recovered.file_count as usize, MAX_BLOB_BATCH_FILES + 4);
-                let manifest = fixture
-                    .manager
-                    .inner
-                    .load_manifest(recovered.snapshot_id.as_str())
-                    .unwrap();
-                for entry in manifest.content.entries {
-                    store.read_blob(&entry.digest, entry.size_bytes).unwrap();
-                }
+        let fixture = Fixture::new().await;
+        fixture.write("original.txt", "original");
+        let original = fixture.capture("original").await;
+        let objects = fixture.objects();
+        let bytes = fixture.object_bytes();
+        fixture.write("new.txt", "new");
+        fixture.hooks().object_sync.store(true, Ordering::SeqCst);
+
+        assert_eq!(
+            fixture
+                .try_capture("failed", ROOT, &limits())
+                .await
+                .unwrap_err(),
+            SnapshotError::OperationFailed
+        );
+        assert_eq!(fixture.stored(CHECKPOINTS), 1);
+        let scope = WorkspacePath::new(ROOT).unwrap();
+        assert_eq!(
+            fixture
+                .manager
+                .checkpoint(&id("failed"), &scope)
+                .await
+                .unwrap_err(),
+            SnapshotError::NotFound
+        );
+        fixture.hooks().object_sync.store(false, Ordering::SeqCst);
+        assert_eq!(fixture.objects(), objects);
+        assert_eq!(fixture.object_bytes(), bytes, "{NOTHING_STAGED}");
+        fs::remove_file(fixture.path("new.txt")).unwrap();
+        assert_eq!(
+            fixture.capture("failed").await,
+            SnapshotSummary {
+                checkpoint_id: Some(id("failed")),
+                ..original
             }
-        }
+        );
     }
 
     #[tokio::test]
@@ -1522,27 +1652,25 @@ mod tests {
         let original = fixture.capture("original").await;
         fixture.write("file.txt", "interrupted");
         let store = &fixture.manager.inner.store;
-        store.faults.checkpoint_sync.store(true, Ordering::SeqCst);
-        store.faults.checkpoint_remove.store(true, Ordering::SeqCst);
+        store.hooks.checkpoint_sync.store(true, Ordering::SeqCst);
+        store.hooks.checkpoint_remove.store(true, Ordering::SeqCst);
         let failed = fixture.try_capture("interrupted", ROOT, &limits()).await;
-        for directory in [BLOBS, MANIFESTS, CHECKPOINTS] {
-            assert_eq!(fixture.stored(directory), 2);
-        }
+        assert_eq!(fixture.stored(CHECKPOINTS), 2);
         assert_eq!(failed.unwrap_err(), SnapshotError::RollbackFailed);
         let checkpoint = id("interrupted");
         let scope = WorkspacePath::new(ROOT).unwrap();
-        let stored = fixture
+        let (stored, snapshot) = fixture
             .manager
             .inner
             .read_checkpoint(&store.checkpoint_path(checkpoint.as_str()))
             .unwrap();
-        let expected = fixture
-            .manager
-            .inner
-            .load_manifest(&stored.snapshot_id)
-            .unwrap()
-            .summary(Some(checkpoint.as_str()))
-            .unwrap();
+        let expected = summary(
+            &snapshot,
+            &store.objects().meta(&snapshot).unwrap(),
+            Some(checkpoint.as_str()),
+            stored.created_at_unix_ms,
+        )
+        .unwrap();
         assert_eq!(
             fixture
                 .manager
@@ -1555,7 +1683,7 @@ mod tests {
             store.remove_temporaries().unwrap_err(),
             SnapshotError::OperationFailed
         );
-        store.faults.checkpoint_sync.store(false, Ordering::SeqCst);
+        store.hooks.checkpoint_sync.store(false, Ordering::SeqCst);
         let receipt = fixture
             .manager
             .checkpoint(&checkpoint, &scope)
@@ -1619,7 +1747,6 @@ mod tests {
             if replace {
                 assert_eq!(result.unwrap_err(), SnapshotError::Conflict);
                 assert_eq!(fixture.stored(CHECKPOINTS), 0);
-                assert_eq!(fixture.stored(BLOBS), 0);
             } else {
                 assert_eq!(result.unwrap().snapshot.file_count, 2);
             }
@@ -1683,9 +1810,7 @@ mod tests {
         assert!(fixture.manager.inner.capture.try_lock().is_err());
         release.send(()).unwrap();
         let _settled = fixture.manager.inner.capture.lock().await;
-        for directory in [BLOBS, MANIFESTS, CHECKPOINTS] {
-            assert_eq!(fixture.stored(directory), 0);
-        }
+        assert_eq!(fixture.stored(CHECKPOINTS), 0);
     }
 
     #[tokio::test(start_paused = true)]
@@ -1707,7 +1832,7 @@ mod tests {
                 .manager
                 .prepare_capture(&checkpoint, &bound, &limits())
                 .unwrap();
-            assert_eq!(fixture.stored(BLOBS), 0);
+            assert_eq!(fixture.objects(), 0);
             assert_eq!(fixture.stored(CHECKPOINTS), 0);
             drop(admission);
             let (release, receiver) = mpsc::channel();
@@ -1726,7 +1851,7 @@ mod tests {
                     .await
             });
             barrier.entered.notified().await;
-            assert_eq!(fixture.stored(BLOBS), 1);
+            assert!(fixture.object_bytes() > 0);
             assert_eq!(
                 fixture
                     .manager
@@ -1759,9 +1884,7 @@ mod tests {
                     SnapshotError::Cancelled
                 }
             );
-            for directory in [BLOBS, MANIFESTS, CHECKPOINTS] {
-                assert_eq!(fixture.stored(directory), 0);
-            }
+            assert_eq!(fixture.stored(CHECKPOINTS), 0);
             assert!(fixture.manager.inner.capture.try_lock().is_ok());
             assert!(fixture.manager.inner.publication.try_lock().is_ok());
             drop(workspace.await);
@@ -1931,13 +2054,11 @@ mod tests {
                 .unwrap_err(),
             SnapshotError::Cancelled
         );
-        for directory in [BLOBS, MANIFESTS, CHECKPOINTS] {
-            assert_eq!(fixture.stored(directory), 0);
-        }
+        assert_eq!((fixture.stored(CHECKPOINTS), fixture.objects()), (0, 0));
     }
 
     #[tokio::test]
-    async fn a_capture_past_a_client_limit_names_the_limit_and_keeps_nothing() {
+    async fn a_capture_past_a_client_limit_names_the_limit_and_publishes_nothing() {
         let fixture = Fixture::new().await;
         fixture.write("a", "abc");
         fixture.write("b", "def");
@@ -1972,27 +2093,24 @@ mod tests {
                     .unwrap_err(),
                 refusal
             );
-            for directory in [BLOBS, MANIFESTS, CHECKPOINTS] {
-                assert_eq!(fixture.stored(directory), 0);
-            }
+            assert_eq!(fixture.stored(CHECKPOINTS), 0);
         }
     }
 
+    #[test_case(ROOM_FOR_NO_FILE ; "before storing a file")]
+    #[test_case(ROOM_FOR_ONE_FILE ; "after storing a file")]
     #[tokio::test]
-    async fn a_capture_refused_by_the_storage_quota_removes_the_blobs_it_stored() {
+    async fn a_capture_refused_by_the_storage_quota_stores_nothing(room: u64) {
         let fixture = Fixture::new().await;
-        let first = "first file";
-        fixture.write("a", first);
-        fixture.write("b", "second file");
+        fixture.write("a", QUOTA_FILES[0]);
+        fixture.write("b", QUOTA_FILES[1]);
         let filler = fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .mode(PRIVATE_FILE_MODE)
             .open(fixture.storage.path().join(JOURNALS).join("filler"))
             .unwrap();
-        filler
-            .set_len(MAX_SNAPSHOT_STORAGE_BYTES - u64::try_from(first.len()).unwrap())
-            .unwrap();
+        filler.set_len(MAX_SNAPSHOT_STORAGE_BYTES - room).unwrap();
 
         assert_eq!(
             fixture
@@ -2004,7 +2122,8 @@ mod tests {
                 maximum: Some(MAX_SNAPSHOT_STORAGE_BYTES),
             }
         );
-        assert_eq!(fixture.stored(BLOBS), 0);
+        assert_eq!((fixture.stored(CHECKPOINTS), fixture.objects()), (0, 0));
+        assert_eq!(fixture.object_bytes(), 0, "{NOTHING_STAGED}");
     }
 
     #[tokio::test]
@@ -2130,9 +2249,9 @@ mod tests {
                 ("dangling", SnapshotEntryKind::Symlink),
             ]
         );
-        assert_eq!(files[1].digest.as_str(), digest_bytes(b"AGENTS.md"));
+        assert_eq!(files[1].digest.as_str(), AGENTS_LINK_REVISION);
         assert_eq!(files[1].size_bytes, 9);
-        assert_eq!(files[1].mode, manifest::SYMLINK_MODE);
+        assert_eq!(files[1].mode, SYMLINK_MODE);
         assert_eq!(snapshot.skipped, SnapshotSkipped::default());
     }
 
@@ -2337,16 +2456,42 @@ mod tests {
         assert_eq!(fixture.read("deleted"), "one");
         assert_eq!(fixture.read("edited"), "one");
         assert_eq!(fixture.read("kept"), "same");
-        assert_eq!(
-            fs::metadata(fixture.path("script"))
-                .unwrap()
-                .permissions()
-                .mode()
-                & manifest::PERMISSION_BITS,
-            0o755
-        );
+        assert_eq!(mode(&fixture.path("script")), 0o755);
         assert!(!fixture.path("created/new").exists());
         assert_eq!(fixture.read("untracked"), "later");
+    }
+
+    #[tokio::test]
+    async fn a_restore_keeps_permission_bits_and_changes_only_whether_a_file_is_executable() {
+        let fixture = Fixture::new().await;
+        for (path, permissions) in [("script", 0o640), ("private", 0o600), ("removed", 0o600)] {
+            fixture.write(path, path);
+            set_mode(&fixture.path(path), permissions);
+        }
+        let before = fixture.capture("before").await;
+        set_mode(&fixture.path("script"), 0o750);
+        set_mode(&fixture.path("private"), 0o400);
+        fs::remove_file(fixture.path("removed")).unwrap();
+        let after = fixture.capture("after").await;
+        fixture.write("created by the process", "");
+
+        let (prepared, preview) = fixture.prepare(&before, &after).await.unwrap();
+        assert_eq!(
+            preview.counts,
+            SnapshotChangeCounts {
+                create: 1,
+                replace: 1,
+                ..SnapshotChangeCounts::default()
+            }
+        );
+        fixture.execute(&prepared).await.unwrap();
+
+        assert_eq!(mode(&fixture.path("script")), 0o640);
+        assert_eq!(mode(&fixture.path("private")), 0o400);
+        assert_eq!(
+            mode(&fixture.path("removed")),
+            mode(&fixture.path("created by the process"))
+        );
     }
 
     #[tokio::test]
@@ -2388,11 +2533,8 @@ mod tests {
         );
         assert_eq!(preview.changes[0].kind, SnapshotChangeKind::Conflict);
         assert_eq!(
-            preview.changes[0]
-                .current_revision
-                .as_ref()
-                .map(Revision::as_str),
-            Some(digest_bytes(b"edited later").as_str())
+            preview.changes[0].current_revision,
+            Some(digest(b"edited later"))
         );
         assert_eq!(
             fixture.execute(&prepared).await.unwrap_err(),
@@ -2629,19 +2771,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tampered_blobs_and_manifests_fail_integrity_verification() {
+    async fn tampered_objects_fail_integrity_verification() {
         let fixture = Fixture::new().await;
         fixture.write("file.txt", "before");
         let before = fixture.capture("before").await;
         fixture.write("file.txt", "after");
         let after = fixture.capture("after").await;
-        let blob = fixture
-            .manager
-            .inner
-            .store
-            .blob_path(&digest_bytes(b"before"))
-            .unwrap();
-        fs::write(blob, "tampered").unwrap();
+        fixture.tamper(&blob_id(b"before").unwrap().to_string());
         let (prepared, _) = fixture.prepare(&before, &after).await.unwrap();
 
         assert_eq!(
@@ -2649,13 +2785,11 @@ mod tests {
             SnapshotError::IntegrityFailure
         );
         assert_eq!(fixture.read("file.txt"), "after");
-        let manifest = fixture
-            .manager
-            .inner
-            .store
-            .manifest_path(before.snapshot_id.as_str())
-            .unwrap();
-        fs::write(manifest, "{}").unwrap();
+        fixture.tamper(
+            &parse_snapshot_id(before.snapshot_id.as_str())
+                .unwrap()
+                .to_string(),
+        );
         assert_eq!(
             fixture
                 .manager
@@ -2667,58 +2801,113 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_checkpoint_an_earlier_host_captured_stays_restorable() {
+    async fn cleanup_deletes_nothing_while_a_retained_snapshot_cannot_be_read() {
         let fixture = Fixture::new().await;
-        let legacy = "legacy";
-        let digest = digest_bytes(legacy.as_bytes());
-        let resource_id = path_resource_id("file.txt").unwrap();
-        let content = format!(
-            r#"{{"version":"workspace-snapshot.v1","files":[{{"path":"file.txt","resource_id":"{}","identity":"identity","revision":"{digest}","digest":"{digest}","mode":420,"size_bytes":6}}],"exclusions":[".git"]}}"#,
-            resource_id.as_str()
+        fixture.write("file.txt", "kept");
+        let kept = fixture.capture("kept").await;
+        fixture.write("file.txt", "dropped");
+        fixture.capture("dropped").await;
+        fixture.tamper(
+            &parse_snapshot_id(kept.snapshot_id.as_str())
+                .unwrap()
+                .to_string(),
         );
-        let snapshot_id = format!("{SNAPSHOT_ID_PREFIX}{}", hex_sha256(content.as_bytes()));
-        let store = &fixture.manager.inner.store;
-        let manifest = store.manifest_path(&snapshot_id).unwrap();
-        write_private(
-            &manifest,
-            format!(
-                r#"{{"snapshot_id":"{snapshot_id}","created_at_unix_ms":1,"content":{content}}}"#
-            )
-            .as_bytes(),
-        );
-        write_private(&store.blob_path(&digest).unwrap(), legacy.as_bytes());
-        write_private(
-            &store.checkpoint_path("legacy"),
-            &serde_json::to_vec(&StoredCheckpoint {
-                version: CHECKPOINT_VERSION.to_owned(),
-                checkpoint_id: "legacy".to_owned(),
-                snapshot_id: snapshot_id.clone(),
-            })
-            .unwrap(),
-        );
-        fixture.write("file.txt", "current");
-        let current = fixture.capture("current").await;
-        let captured = fixture
-            .try_capture("legacy", ROOT, &limits())
-            .await
-            .unwrap();
+        let objects = fixture.objects();
 
-        assert!(captured.reused_checkpoint);
-        assert_eq!(captured.snapshot.snapshot_id.as_str(), snapshot_id);
-        fixture.restore(&captured.snapshot, &current).await;
-        assert_eq!(fixture.read("file.txt"), legacy);
-        let tampered = fs::read_to_string(&manifest)
-            .unwrap()
-            .replace(r#""mode":420"#, r#""mode":493"#);
-        fs::write(&manifest, tampered).unwrap();
         assert_eq!(
             fixture
                 .manager
-                .inspect(&captured.snapshot.snapshot_id, 1, None)
+                .prepare_cleanup(&[id("dropped")], usize::MAX)
+                .await
+                .err(),
+            Some(SnapshotError::IntegrityFailure)
+        );
+        assert_eq!(fixture.objects(), objects);
+    }
+
+    #[tokio::test]
+    async fn opening_a_store_an_earlier_host_wrote_removes_what_nothing_reads_any_more() {
+        let mut fixture = Fixture::new().await;
+        fixture.write("file.txt", "current");
+        let current = fixture.capture("current").await;
+        let storage = fixture.storage.path();
+        for directory in LEGACY_DIRECTORIES {
+            fs::create_dir(storage.join(directory)).unwrap();
+            write_private(&storage.join(directory).join("entry"), b"legacy");
+        }
+        let store = &fixture.manager.inner.store;
+        for (index, version) in LEGACY_CHECKPOINT_VERSIONS.into_iter().enumerate() {
+            write_private(
+                &store.checkpoint_path(&format!("legacy-{index}")),
+                &versioned(version),
+            );
+        }
+        for (index, version) in LEGACY_JOURNAL_VERSIONS.into_iter().enumerate() {
+            write_private(
+                &store
+                    .journal_path(&format!("restore_legacy-{index}"))
+                    .unwrap(),
+                &versioned(version),
+            );
+        }
+
+        fixture.reopen().await;
+        for directory in LEGACY_DIRECTORIES {
+            assert!(!fixture.storage.path().join(directory).exists());
+        }
+        assert_eq!(fixture.stored(CHECKPOINTS), 1);
+        assert_eq!(fixture.stored(JOURNALS), 0);
+        let scope = WorkspacePath::new(ROOT).unwrap();
+        assert_eq!(
+            fixture
+                .manager
+                .checkpoint(&id("legacy-0"), &scope)
                 .await
                 .unwrap_err(),
-            SnapshotError::IntegrityFailure
+            SnapshotError::NotFound
         );
+        assert_eq!(
+            fixture
+                .manager
+                .checkpoint(&id("current"), &scope)
+                .await
+                .unwrap()
+                .snapshot,
+            current
+        );
+    }
+
+    #[tokio::test]
+    async fn a_legacy_directory_that_is_a_link_is_removed_without_following_it() {
+        let mut fixture = Fixture::new().await;
+        let outside = TempDir::new().unwrap();
+        let kept = outside.path().join("entry");
+        fs::write(&kept, "outside").unwrap();
+        for directory in LEGACY_DIRECTORIES {
+            symlink(outside.path(), fixture.storage.path().join(directory)).unwrap();
+        }
+
+        fixture.reopen().await;
+
+        for directory in LEGACY_DIRECTORIES {
+            assert!(fs::symlink_metadata(fixture.storage.path().join(directory)).is_err());
+        }
+        assert!(kept.exists());
+    }
+
+    #[tokio::test]
+    async fn opening_a_store_a_later_release_wrote_is_refused_and_keeps_what_it_holds() {
+        let fixture = Fixture::new().await;
+        let checkpoint = fixture.manager.inner.store.checkpoint_path("later");
+        write_private(&checkpoint, &versioned(LATER_CHECKPOINT_VERSION));
+
+        assert_eq!(
+            open_manager(fixture.workspace.path(), fixture.storage.path(), &[])
+                .await
+                .err(),
+            Some(SnapshotError::UnhealthyStorage)
+        );
+        assert!(checkpoint.exists());
     }
 
     #[tokio::test]
@@ -2729,6 +2918,7 @@ mod tests {
         let first = fixture.capture("first").await;
         fixture.write("file.txt", "two");
         let second = fixture.capture("second").await;
+        let objects = fixture.objects();
 
         let (prepared, preview) = fixture
             .manager
@@ -2743,8 +2933,16 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result.deleted_checkpoint_ids, [id("first")]);
-        assert_eq!((result.deleted_snapshots, result.deleted_blobs), (1, 1));
-        assert_eq!(fixture.stored(BLOBS), 2);
+        assert_eq!(result.deleted_snapshots, 1);
+        assert_eq!(
+            u64::from(result.deleted_objects),
+            objects - fixture.objects()
+        );
+        assert!(
+            !fixture
+                .object_path(&blob_id(b"one").unwrap().to_string())
+                .exists()
+        );
         assert_eq!(
             fixture
                 .manager
@@ -2781,8 +2979,11 @@ mod tests {
             .acknowledge(&status.restore_id)
             .await
             .unwrap();
+        let objects = fixture.objects();
         let result = fixture.cleanup(&[]).await;
-        assert_eq!((result.deleted_snapshots, result.deleted_blobs), (2, 2));
+        assert_eq!(result.deleted_snapshots, 2);
+        assert_eq!(u64::from(result.deleted_objects), objects);
+        assert_eq!(fixture.objects(), 0);
         assert_eq!(fixture.stored(JOURNALS), 0);
     }
 
@@ -2840,7 +3041,7 @@ mod tests {
     #[tokio::test]
     async fn startup_removes_abandoned_temporaries() {
         let mut fixture = Fixture::new().await;
-        for directory in [BLOBS, MANIFESTS, CHECKPOINTS, JOURNALS] {
+        for directory in [CHECKPOINTS, JOURNALS] {
             write_private(
                 &fixture
                     .storage
@@ -2852,7 +3053,7 @@ mod tests {
         }
 
         fixture.reopen().await;
-        for directory in [BLOBS, MANIFESTS, CHECKPOINTS, JOURNALS] {
+        for directory in [CHECKPOINTS, JOURNALS] {
             assert_eq!(fixture.stored(directory), 0);
         }
     }

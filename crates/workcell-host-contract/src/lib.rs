@@ -44,10 +44,10 @@ pub const SNAPSHOT_PREPARE_CLEANUP_METHOD: &str = "ai.workcell/snapshot-prepare-
 pub const WORKSPACE_MUTATION_CONTRACT_ID: &str = "workspace.mutation.v1";
 pub const DIRECT_EXEC_CONTRACT_ID: &str = "workspace.exec.v1";
 pub const SCM_MUTATION_CONTRACT_ID: &str = "workspace.scm.mutation.v1";
-pub const SNAPSHOT_RESTORE_CONTRACT_ID: &str = "workspace.snapshot.restore.v2";
-pub const SNAPSHOT_CAPTURE_CONTRACT_ID: &str = "workcell.snapshot.capture.v1";
-pub const SNAPSHOT_UNREVERT_CONTRACT_ID: &str = "workspace.snapshot.unrevert.v2";
-pub const SNAPSHOT_CLEANUP_CONTRACT_ID: &str = "workspace.snapshot.cleanup.v2";
+pub const SNAPSHOT_RESTORE_CONTRACT_ID: &str = "workspace.snapshot.restore.v3";
+pub const SNAPSHOT_CAPTURE_CONTRACT_ID: &str = "workcell.snapshot.capture.v2";
+pub const SNAPSHOT_UNREVERT_CONTRACT_ID: &str = "workspace.snapshot.unrevert.v3";
+pub const SNAPSHOT_CLEANUP_CONTRACT_ID: &str = "workspace.snapshot.cleanup.v3";
 pub const MAX_ARGUMENT_BYTES: usize = 1_048_576;
 pub const MAX_ID_BYTES: usize = 128;
 pub const MAX_DISPLAY_TEXT_BYTES: usize = 65_536;
@@ -475,6 +475,7 @@ pub struct WorkspaceSnapshotLimits {
     pub max_capture_entries: u32,
     pub max_capture_path_bytes: u64,
     pub max_snapshots: u32,
+    /// Compressed objects on disk, plus journals and the stat cache.
     pub max_storage_bytes: u64,
     pub max_concurrent_captures: u32,
     pub max_cleanup_checkpoints: u32,
@@ -977,7 +978,8 @@ pub enum SnapshotLimit {
     CapturePathBytes,
     Depth,
     IgnoreRules,
-    ManifestBytes,
+    /// The recorded scope, pruned paths and exclusions of one snapshot.
+    MetadataBytes,
     PreparedBytes,
     Snapshots,
     Checkpoints,
@@ -995,7 +997,7 @@ impl SnapshotLimit {
             Self::CapturePathBytes => "capturePathBytes",
             Self::Depth => "depth",
             Self::IgnoreRules => "ignoreRules",
-            Self::ManifestBytes => "manifestBytes",
+            Self::MetadataBytes => "metadataBytes",
             Self::PreparedBytes => "preparedBytes",
             Self::Snapshots => "snapshots",
             Self::Checkpoints => "checkpoints",
@@ -1093,7 +1095,10 @@ pub struct SnapshotFile {
     pub path: WorkspacePath,
     pub resource_id: ResourceId,
     pub kind: SnapshotEntryKind,
+    /// The prefixed git object id of the content, or of the raw target for a link.
     pub digest: Revision,
+    /// Git's mode semantics: `0o644`, `0o755` when executable, or `0o777` for a link. Only the
+    /// executable bit is recorded.
     pub mode: u32,
     pub size_bytes: u64,
 }
@@ -1278,7 +1283,7 @@ pub struct SnapshotCleanupResponse {
     #[serde(deserialize_with = "deserialize_checkpoint_ids")]
     pub deleted_checkpoint_ids: Vec<Identifier>,
     pub deleted_snapshots: u32,
-    pub deleted_blobs: u32,
+    pub deleted_objects: u32,
     pub reclaimed_bytes: u64,
 }
 
@@ -2716,7 +2721,7 @@ mod tests {
             SNAPSHOT_CHECKPOINT_METHOD,
             "ai.workcell/snapshot-checkpoint"
         );
-        assert_eq!(SNAPSHOT_CAPTURE_CONTRACT_ID, "workcell.snapshot.capture.v1");
+        assert_eq!(SNAPSHOT_CAPTURE_CONTRACT_ID, "workcell.snapshot.capture.v2");
         let lookup = json!({
             "version":"v1", "host":binding(), "cwdHandle":"cwd", "checkpointId":"checkpoint"
         });

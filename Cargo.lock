@@ -1278,6 +1278,7 @@ dependencies = [
  "gix-glob",
  "gix-hash",
  "gix-hashtable",
+ "gix-index",
  "gix-lock",
  "gix-note",
  "gix-object",
@@ -2432,7 +2433,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "20fd6de4ccfcc187e38bc21cfa543cb5a302cb86a8b114eb7f0bf0dc9f8ac00f"
 dependencies = [
  "io-lifetimes 3.0.1",
- "windows-sys 0.59.0",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -4345,6 +4346,39 @@ dependencies = [
 ]
 
 [[package]]
+name = "test-case"
+version = "3.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "124953e7f67cb0b2fcfb87e899e4ae5a64fb68e2e160767933cc67b646fb0042"
+dependencies = [
+ "test-case-macros",
+]
+
+[[package]]
+name = "test-case-core"
+version = "3.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bd097615b407247e102046ba34426bb594923ab3554cf0f3cdfed050f1a5a3e8"
+dependencies = [
+ "cfg-if",
+ "proc-macro2",
+ "quote",
+ "syn 3.0.4",
+]
+
+[[package]]
+name = "test-case-macros"
+version = "3.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f4ce35ece947bccac166e1ded639133827a953f69a48ba134d17f91108333082"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.4",
+ "test-case-core",
+]
+
+[[package]]
 name = "thiserror"
 version = "2.0.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5668,6 +5702,7 @@ dependencies = [
  "workcell-mcp-shell",
  "workcell-mcp-web",
  "workcell-output-filter",
+ "workcell-snapshot-store",
  "workcell-tool-contract",
  "workcell-workspace-scm",
  "workcell-workspace-snapshot",
@@ -5896,6 +5931,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "workcell-snapshot-store"
+version = "0.1.0"
+dependencies = [
+ "gix",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "test-case",
+ "thiserror",
+]
+
+[[package]]
 name = "workcell-source-icons"
 version = "0.1.0"
 dependencies = [
@@ -5990,12 +6037,15 @@ dependencies = [
  "serde_json",
  "sha2",
  "tempfile",
+ "test-case",
  "thiserror",
  "tokio",
  "tokio-util",
+ "tracing",
  "uuid",
  "workcell-host-contract",
  "workcell-mcp-files",
+ "workcell-snapshot-store",
 ]
 
 [[package]]

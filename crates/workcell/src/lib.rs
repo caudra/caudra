@@ -60,6 +60,8 @@ pub use workcell_workspace_scm as scm;
 #[cfg(feature = "scm")]
 pub use workcell_workspace_scm::ScmGroup;
 
+#[cfg(feature = "snapshot-store")]
+pub use workcell_snapshot_store as snapshot_store;
 #[cfg(feature = "snapshots")]
 pub use workcell_workspace_snapshot as snapshots;
 #[cfg(feature = "snapshots")]

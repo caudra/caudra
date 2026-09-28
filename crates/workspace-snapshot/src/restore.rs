@@ -21,23 +21,33 @@ use workcell_mcp_files::{
     SnapshotTreeContent, SnapshotTreeError, SnapshotTreeExpected, SnapshotTreeObserved,
     SnapshotTreeStamp,
 };
+use workcell_snapshot_store::{Change, Content, EntryKind, SnapshotId, blob_id};
 
 use crate::{
     MAX_PRIVATE_METADATA_BYTES, SnapshotError, SnapshotInner,
-    capture::Stability,
-    capture::read_stable,
-    check_cancelled, digest_bytes, identifier, lock,
-    manifest::{
-        Difference, Manifest, SYMLINK_MODE, StoredEntry, StoredEntryKind, ancestors, differences,
+    capture::{Stability, read_stable},
+    check_cancelled, identifier, lock, path_resource_id, quota_error,
+    snapshot::{
+        OWNER_EXECUTABLE, blob_revision, file_kind, parse_snapshot_id, permission_bits,
+        snapshot_identifier, store_error,
     },
-    path_resource_id, quota_error, revision,
-    store::{JOURNALS, METADATA_SUFFIX, blob_error},
-    tree_error, validate_snapshot_id,
+    store::{JOURNALS, METADATA_SUFFIX},
+    tree_error,
 };
 
-const JOURNAL_VERSION: &str = "workspace-restore-journal.v2";
+pub(crate) const JOURNAL_VERSION: &str = "workspace-restore-journal.v3";
+/// What earlier releases wrote, which nothing reads any more.
+pub(crate) const LEGACY_JOURNAL_VERSIONS: [&str; 2] = [
+    "workspace-restore-journal.v1",
+    "workspace-restore-journal.v2",
+];
 const RESTORE_ID_PREFIX: &str = "restore_";
 const MAX_JOURNAL_STORAGE_BYTES: u64 = 64 * 1_024 * 1_024;
+const READ_BITS: u32 = 0o444;
+const EXECUTE_BITS: u32 = 0o111;
+/// What git creates a file with, before the umask.
+const NEW_FILE_MODE: u32 = 0o666;
+const NEW_EXECUTABLE_MODE: u32 = 0o777;
 
 pub(crate) struct RestorePlan {
     pub(crate) restore_id: String,
@@ -54,16 +64,18 @@ pub(crate) struct RestorePlan {
 struct PlannedChange {
     path: WorkspacePath,
     expected: SnapshotTreeExpected,
-    target: Option<StoredEntry>,
+    target: Option<Content>,
+    /// The permission bits of the file it replaces, which a restored file keeps.
+    replaced_mode: Option<u32>,
 }
 
 enum Live {
     Absent,
     Entry {
-        kind: StoredEntryKind,
-        digest: String,
-        mode: u32,
+        content: Content,
         stamp: SnapshotTreeStamp,
+        /// Permission bits, for a regular file.
+        mode: Option<u32>,
     },
     /// A directory, special file or mount, an entry that would not hold still to be read, or one
     /// behind an ancestor that is not a plain directory. None of these is ever replaced.
@@ -141,17 +153,7 @@ impl RestorePlan {
         let changes = self
             .changes
             .iter()
-            .map(|change| {
-                change
-                    .path
-                    .retained_bytes()
-                    .saturating_add(change.target.as_ref().map_or(0, |entry| {
-                        entry
-                            .path
-                            .capacity()
-                            .saturating_add(entry.digest.capacity())
-                    }))
-            })
+            .map(|change| change.path.retained_bytes())
             .fold(
                 self.changes
                     .capacity()
@@ -207,12 +209,10 @@ impl SnapshotInner {
         token: &CancellationToken,
     ) -> Result<RestorePlan, SnapshotError> {
         self.ensure_acknowledged(unrevert_of)?;
-        let target = self.load_manifest(target_snapshot_id)?;
-        let source = self.load_manifest(source_snapshot_id)?;
         self.plan(
             format!("{RESTORE_ID_PREFIX}{}", Uuid::new_v4()),
-            &target,
-            &source,
+            &parse_snapshot_id(target_snapshot_id)?,
+            &parse_snapshot_id(source_snapshot_id)?,
             unrevert_of,
             token,
         )
@@ -355,28 +355,34 @@ impl SnapshotInner {
         self.reclaim_journals(0)
     }
 
-    pub(crate) fn protected_snapshots(&self) -> BTreeSet<String> {
+    /// Snapshots an undecided restore or a prepared one may still read.
+    pub(crate) fn protected_snapshots(&self) -> Result<BTreeSet<SnapshotId>, SnapshotError> {
         let state = lock(&self.state);
         state
             .journals
             .values()
             .filter(|journal| !journal.reclaimable())
-            .flat_map(|journal| {
-                [
-                    journal.target_snapshot_id.clone(),
-                    journal.source_snapshot_id.clone(),
-                ]
-            })
-            .chain(state.pending.values().flatten().cloned())
+            .flat_map(|journal| [&journal.target_snapshot_id, &journal.source_snapshot_id])
+            .chain(state.pending.values().flatten())
+            .map(|snapshot_id| parse_snapshot_id(snapshot_id))
             .collect()
     }
 
-    pub(crate) fn reclaimable_journals(&self) -> Vec<String> {
+    /// Settled journals, oldest id first, with the snapshots each names.
+    pub(crate) fn reclaimable_journals(&self) -> Vec<(String, [String; 2])> {
         let mut journals = lock(&self.state)
             .journals
             .values()
             .filter(|journal| journal.reclaimable())
-            .map(|journal| journal.restore_id.clone())
+            .map(|journal| {
+                (
+                    journal.restore_id.clone(),
+                    [
+                        journal.target_snapshot_id.clone(),
+                        journal.source_snapshot_id.clone(),
+                    ],
+                )
+            })
             .collect::<Vec<_>>();
         journals.sort_unstable();
         journals
@@ -391,12 +397,16 @@ impl SnapshotInner {
     fn plan(
         &self,
         restore_id: String,
-        target: &Manifest,
-        source: &Manifest,
+        target: &SnapshotId,
+        source: &SnapshotId,
         unrevert_of: Option<&str>,
         token: &CancellationToken,
     ) -> Result<RestorePlan, SnapshotError> {
-        let (scope, differences) = differences(source, target)?;
+        let changes = self
+            .store
+            .objects()
+            .changes(source, target)
+            .map_err(|error| store_error(error, &[source, target]))?;
         let mut planner = Planner {
             inner: self,
             token,
@@ -408,8 +418,8 @@ impl SnapshotInner {
             planned: Vec::new(),
             conflict_count: 0,
         };
-        for difference in differences {
-            planner.visit(&difference)?;
+        for change in &changes.changes {
+            planner.visit(change)?;
         }
         planner.counts.created_directories =
             u32::try_from(planner.created.len()).unwrap_or(u32::MAX);
@@ -421,10 +431,12 @@ impl SnapshotInner {
         let mut sample = planner.conflicts;
         sample.extend(planner.planned);
         sample.truncate(MAX_SNAPSHOT_PREVIEW_CHANGES);
+        let (target_snapshot_id, source_snapshot_id) =
+            (snapshot_identifier(target), snapshot_identifier(source));
         let preview = SnapshotRestorePreview {
             restore_id: identifier(&restore_id)?,
-            target_snapshot_id: identifier(&target.snapshot_id)?,
-            source_snapshot_id: identifier(&source.snapshot_id)?,
+            target_snapshot_id: identifier(&target_snapshot_id)?,
+            source_snapshot_id: identifier(&source_snapshot_id)?,
             counts: planner.counts,
             changes: sample,
             created_directories: created_directories
@@ -435,9 +447,9 @@ impl SnapshotInner {
         };
         Ok(RestorePlan {
             restore_id,
-            scope: scope.to_owned(),
-            target_snapshot_id: target.snapshot_id.clone(),
-            source_snapshot_id: source.snapshot_id.clone(),
+            scope: changes.scope,
+            target_snapshot_id,
+            source_snapshot_id,
             unrevert_of: unrevert_of.map(str::to_owned),
             changes: planner.changes,
             created_directories,
@@ -474,39 +486,32 @@ impl SnapshotInner {
     }
 
     fn publish_change(&self, change: &PlannedChange) -> Result<(), Publication> {
-        let published = match &change.target {
-            None => self.workspace.publish_tree_entry(
-                &change.path,
-                &change.expected,
-                SnapshotTreeContent::Absent,
-            ),
-            Some(entry) if entry.kind == StoredEntryKind::Symlink => {
-                let target = self
-                    .store
-                    .read_blob(&entry.digest, entry.size_bytes)
-                    .map_err(Publication::Refused)?;
-                self.workspace.publish_tree_entry(
-                    &change.path,
-                    &change.expected,
-                    SnapshotTreeContent::Symlink { target: &target },
-                )
-            }
-            Some(entry) => {
-                let mut source = self
-                    .store
-                    .open_blob(&entry.digest, entry.size_bytes)
-                    .map_err(Publication::Refused)?;
-                self.workspace.publish_tree_entry(
-                    &change.path,
-                    &change.expected,
-                    SnapshotTreeContent::File {
-                        source: &mut source,
-                        mode: entry.mode,
-                    },
-                )
-            }
+        let Some(target) = change.target else {
+            return self
+                .workspace
+                .publish_tree_entry(&change.path, &change.expected, SnapshotTreeContent::Absent)
+                .map_err(refusal);
         };
-        published.map_err(refusal)
+        let bytes = self
+            .store
+            .objects()
+            .read_blob(&target.oid)
+            .map_err(|error| Publication::Refused(store_error(error, &[])))?;
+        let mut source = bytes.as_slice();
+        let content = match target.kind {
+            EntryKind::Symlink => SnapshotTreeContent::Symlink { target: &bytes },
+            kind => SnapshotTreeContent::File {
+                source: &mut source,
+                mode: restored_mode(
+                    change.replaced_mode,
+                    kind == EntryKind::Executable,
+                    self.store.umask(),
+                ),
+            },
+        };
+        self.workspace
+            .publish_tree_entry(&change.path, &change.expected, content)
+            .map_err(refusal)
     }
 
     /// The live entry at `path`, read the way a capture reads it.
@@ -519,26 +524,30 @@ impl SnapshotInner {
             Ok(SnapshotTreeObserved::Absent) => Ok(Live::Absent),
             Ok(SnapshotTreeObserved::File(mut file)) => Ok(
                 match read_stable(&mut file.file, MAX_SNAPSHOT_FILE_BYTES, token)? {
-                    Stability::Stable {
-                        digest,
-                        mode,
-                        stamp,
-                        ..
-                    } => Live::Entry {
-                        kind: StoredEntryKind::File,
-                        digest,
-                        mode,
-                        stamp,
-                    },
+                    Stability::Stable { content, metadata } => {
+                        blob_id(&content).map_or(Live::Other, |oid| Live::Entry {
+                            content: Content {
+                                kind: file_kind(&metadata),
+                                oid,
+                            },
+                            stamp: SnapshotTreeStamp::of(&metadata),
+                            mode: Some(permission_bits(&metadata)),
+                        })
+                    }
                     Stability::Oversized | Stability::Unstable => Live::Other,
                 },
             ),
-            Ok(SnapshotTreeObserved::Symlink(link)) => Ok(Live::Entry {
-                kind: StoredEntryKind::Symlink,
-                digest: digest_bytes(&link.target),
-                mode: SYMLINK_MODE,
-                stamp: link.stamp,
-            }),
+            Ok(SnapshotTreeObserved::Symlink(link)) => Ok(blob_id(&link.target).map_or(
+                Live::Other,
+                |oid| Live::Entry {
+                    content: Content {
+                        kind: EntryKind::Symlink,
+                        oid,
+                    },
+                    stamp: link.stamp,
+                    mode: None,
+                },
+            )),
             Ok(SnapshotTreeObserved::Directory | SnapshotTreeObserved::Other)
             | Err(SnapshotTreeError::Blocked | SnapshotTreeError::Protected) => Ok(Live::Other),
             Err(error) => Err(tree_error(error)),
@@ -569,18 +578,16 @@ impl SnapshotInner {
 
     /// Recomputes an interrupted restore from its captures and the live workspace.
     fn reconcile(&self, journal: &mut StoredJournal) {
-        let recomputed = self
-            .load_manifest(&journal.target_snapshot_id)
-            .and_then(|target| {
-                let source = self.load_manifest(&journal.source_snapshot_id)?;
-                self.plan(
-                    journal.restore_id.clone(),
-                    &target,
-                    &source,
-                    None,
-                    &CancellationToken::new(),
-                )
-            });
+        let recomputed = parse_snapshot_id(&journal.target_snapshot_id).and_then(|target| {
+            let source = parse_snapshot_id(&journal.source_snapshot_id)?;
+            self.plan(
+                journal.restore_id.clone(),
+                &target,
+                &source,
+                None,
+                &CancellationToken::new(),
+            )
+        });
         journal.acknowledgement_required = true;
         match recomputed {
             Ok(plan) if plan.conflicts == 0 => {
@@ -649,7 +656,7 @@ impl SnapshotInner {
                 && bytes.saturating_add(reserve) <= MAX_JOURNAL_STORAGE_BYTES
         };
         let mut removed = false;
-        for restore_id in self.reclaimable_journals() {
+        for (restore_id, _) in self.reclaimable_journals() {
             if fits(count, bytes) {
                 break;
             }
@@ -682,54 +689,53 @@ impl SnapshotInner {
 }
 
 impl Planner<'_> {
-    fn visit(&mut self, difference: &Difference<'_>) -> Result<(), SnapshotError> {
+    fn visit(&mut self, change: &Change) -> Result<(), SnapshotError> {
         check_cancelled(self.token)?;
-        let path =
-            WorkspacePath::new(difference.path).map_err(|_| SnapshotError::IntegrityFailure)?;
+        let path = WorkspacePath::new(change.path.as_str())
+            .map_err(|_| SnapshotError::IntegrityFailure)?;
         let live = self.inner.observe(&path, self.token)?;
-        if live.matches(difference.target) {
+        if live.matches(change.target) {
             self.counts.unchanged = self.counts.unchanged.saturating_add(1);
             return Ok(());
         }
-        let expected = match (&live, live.matches(difference.source)) {
-            (Live::Absent, true) => SnapshotTreeExpected::Absent,
-            (Live::Entry { stamp, .. }, true) => SnapshotTreeExpected::Present(stamp.clone()),
-            _ => return self.conflict(difference, &live),
+        let (expected, replaced_mode) = match (&live, live.matches(change.source)) {
+            (Live::Absent, true) => (SnapshotTreeExpected::Absent, None),
+            (Live::Entry { stamp, mode, .. }, true) => {
+                (SnapshotTreeExpected::Present(stamp.clone()), *mode)
+            }
+            _ => return self.conflict(change, &live),
         };
-        if difference.target.is_some() && !self.parents_ready(difference.path)? {
-            return self.conflict(difference, &live);
+        if change.target.is_some() && !self.parents_ready(&change.path)? {
+            return self.conflict(change, &live);
         }
-        let (kind, count) = match (difference.source, difference.target) {
+        let (kind, count) = match (change.source, change.target) {
             (None, _) => (SnapshotChangeKind::Create, &mut self.counts.create),
             (Some(_), Some(_)) => (SnapshotChangeKind::Replace, &mut self.counts.replace),
             (Some(_), None) => (SnapshotChangeKind::Delete, &mut self.counts.delete),
         };
         *count = count.saturating_add(1);
         if self.planned.len() < MAX_SNAPSHOT_PREVIEW_CHANGES {
-            self.planned.push(sample(
-                difference,
-                kind,
-                difference.source.map(|entry| entry.digest.as_str()),
-            )?);
+            self.planned.push(sample(change, kind, change.source)?);
         }
         self.changes.push(PlannedChange {
             path,
             expected,
-            target: difference.target.cloned(),
+            target: change.target,
+            replaced_mode,
         });
         Ok(())
     }
 
-    fn conflict(&mut self, difference: &Difference<'_>, live: &Live) -> Result<(), SnapshotError> {
+    fn conflict(&mut self, change: &Change, live: &Live) -> Result<(), SnapshotError> {
         self.conflict_count += 1;
         self.counts.conflict = self.counts.conflict.saturating_add(1);
         if self.conflicts.len() < MAX_SNAPSHOT_PREVIEW_CHANGES {
             let current = match live {
-                Live::Entry { digest, .. } => Some(digest.as_str()),
+                Live::Entry { content, .. } => Some(*content),
                 Live::Absent | Live::Other => None,
             };
             self.conflicts
-                .push(sample(difference, SnapshotChangeKind::Conflict, current)?);
+                .push(sample(change, SnapshotChangeKind::Conflict, current)?);
         }
         Ok(())
     }
@@ -737,7 +743,7 @@ impl Planner<'_> {
     /// Whether every ancestor is a plain directory or can be created, noting those to create.
     fn parents_ready(&mut self, path: &str) -> Result<bool, SnapshotError> {
         let mut missing = false;
-        for ancestor in ancestors(path) {
+        for ancestor in path.match_indices('/').map(|(index, _)| &path[..index]) {
             let state = match self.directories.get(ancestor) {
                 Some(state) => *state,
                 None if missing => Directory::Missing,
@@ -758,19 +764,11 @@ impl Planner<'_> {
 }
 
 impl Live {
-    fn matches(&self, entry: Option<&StoredEntry>) -> bool {
-        match (self, entry) {
+    /// Equal kind, which for a file is whether it is executable, and equal content.
+    fn matches(&self, content: Option<Content>) -> bool {
+        match (self, content) {
             (Self::Absent, None) => true,
-            (
-                Self::Entry {
-                    kind, digest, mode, ..
-                },
-                Some(entry),
-            ) => {
-                *kind == entry.kind
-                    && *digest == entry.digest
-                    && (*kind == StoredEntryKind::Symlink || *mode == entry.mode)
-            }
+            (Self::Entry { content: live, .. }, Some(content)) => *live == content,
             _ => false,
         }
     }
@@ -837,8 +835,8 @@ impl StoredJournal {
             && journal.applied_files <= journal.total_files
             && journal.created_directories <= journal.total_directories
             && journal.restore_id.starts_with(RESTORE_ID_PREFIX)
-            && validate_snapshot_id(&journal.target_snapshot_id).is_ok()
-            && validate_snapshot_id(&journal.source_snapshot_id).is_ok()
+            && parse_snapshot_id(&journal.target_snapshot_id).is_ok()
+            && parse_snapshot_id(&journal.source_snapshot_id).is_ok()
             && journal
                 .unrevert_of
                 .as_deref()
@@ -869,19 +867,35 @@ impl StoredJournal {
     }
 }
 
+/// A restored file keeps the permission bits of the file it replaces, gaining execute permission
+/// for its owner and whoever may read it, or losing it for everyone. A new file gets the mode git
+/// creates one with under the umask.
+fn restored_mode(replaced: Option<u32>, executable: bool, umask: u32) -> u32 {
+    match replaced {
+        Some(mode) if (mode & OWNER_EXECUTABLE != 0) == executable => mode,
+        Some(mode) if executable => mode | OWNER_EXECUTABLE | (mode & READ_BITS) >> 2,
+        Some(mode) => mode & !EXECUTE_BITS,
+        None if executable => NEW_EXECUTABLE_MODE & !umask,
+        None => NEW_FILE_MODE & !umask,
+    }
+}
+
 fn sample(
-    difference: &Difference<'_>,
+    change: &Change,
     kind: SnapshotChangeKind,
-    current: Option<&str>,
+    current: Option<Content>,
 ) -> Result<SnapshotChange, SnapshotError> {
     Ok(SnapshotChange {
-        path: WorkspacePath::new(difference.path).map_err(|_| SnapshotError::IntegrityFailure)?,
-        resource_id: path_resource_id(difference.path)?,
+        path: WorkspacePath::new(change.path.as_str())
+            .map_err(|_| SnapshotError::IntegrityFailure)?,
+        resource_id: path_resource_id(&change.path)?,
         kind,
-        current_revision: current.map(revision).transpose()?,
-        target_revision: difference
+        current_revision: current
+            .map(|content| blob_revision(&content.oid))
+            .transpose()?,
+        target_revision: change
             .target
-            .map(|entry| revision(&entry.digest))
+            .map(|content| blob_revision(&content.oid))
             .transpose()?,
     })
 }
@@ -894,9 +908,33 @@ fn refusal(error: SnapshotTreeError) -> Publication {
         }
         SnapshotTreeError::Protected => Publication::Refused(SnapshotError::UnsupportedFile),
         SnapshotTreeError::Failed(error) if error.kind() == io::ErrorKind::InvalidData => {
-            Publication::Refused(blob_error(error))
+            Publication::Refused(SnapshotError::IntegrityFailure)
         }
         SnapshotTreeError::Unsettled(_) => Publication::Uncertain,
         error => Publication::Refused(tree_error(error)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use test_case::test_case;
+
+    use super::*;
+
+    const UMASK: u32 = 0o027;
+
+    #[test_case(Some(0o640), false, 0o640; "a plain file stays exactly as it was")]
+    #[test_case(Some(0o750), true, 0o750; "an executable file stays exactly as it was")]
+    #[test_case(Some(0o640), true, 0o750; "execute follows read when a file becomes executable")]
+    #[test_case(Some(0o200), true, 0o300; "the owner can always execute an executable file")]
+    #[test_case(Some(0o751), false, 0o640; "no one can execute a file that is no longer executable")]
+    #[test_case(None, false, 0o640; "a new file gets git's mode under the umask")]
+    #[test_case(None, true, 0o750; "a new executable gets git's mode under the umask")]
+    fn restored_modes_follow_git_and_keep_what_they_replace(
+        replaced: Option<u32>,
+        executable: bool,
+        expected: u32,
+    ) {
+        assert_eq!(restored_mode(replaced, executable, UMASK), expected);
     }
 }

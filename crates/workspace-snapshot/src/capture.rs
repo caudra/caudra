@@ -1,14 +1,16 @@
-//! Capture: one descriptor-relative walk of the scope. Each regular file is read until the stamps
-//! taken around the read agree, its content is stored once by digest, and every entry left out is
-//! counted and recorded so a restore never touches it.
+//! Capture: one descriptor-relative walk of the scope into the object store. A file the stat cache
+//! vouches for is not read again; any other is read until the stamps taken around the read agree.
+//! Every entry left out is counted and recorded, so a restore never touches it.
 
+#[cfg(test)]
+use std::sync::atomic::Ordering;
 use std::{
     fs::{File, Metadata},
     io::{Read, Seek, SeekFrom},
     mem,
     path::PathBuf,
     sync::Arc,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
 use serde::Serialize;
@@ -17,30 +19,33 @@ use workcell_host_contract::{
     ContractVersion, DisplayText, MAX_SNAPSHOT_CAPTURE_ENTRIES, MAX_SNAPSHOT_CAPTURE_PATH_BYTES,
     MAX_SNAPSHOT_COUNT, MAX_SNAPSHOT_FILE_BYTES, MAX_SNAPSHOT_FILES, MAX_SNAPSHOT_SKIPPED_SAMPLES,
     MAX_SNAPSHOT_STORAGE_BYTES, MAX_SNAPSHOT_TOTAL_BYTES, SnapshotCaptureLimits,
-    SnapshotCaptureResponse, SnapshotLimit, SnapshotSkipReason, SnapshotSkipped,
-    SnapshotSkippedEntry,
+    SnapshotCaptureResponse, SnapshotLimit, SnapshotSkipReason,
 };
 use workcell_mcp_files::{
     SnapshotTreeFile, SnapshotTreeLimits, SnapshotTreeLink, SnapshotTreeNode, SnapshotTreeStamp,
     WorkspaceSnapshotScope,
 };
+use workcell_snapshot_store::{
+    Content, Entry, EntryKind, FileStamp, Meta, ObjectId, SkipReason, Skipped, SkippedPath,
+    StatCache, StoreError, blob_id,
+};
 
 use crate::{
-    CHECKPOINT_VERSION, SnapshotError, SnapshotInner, StoredCheckpoint, check_cancelled,
-    digest_bytes, limit_error,
-    manifest::{
-        MANIFEST_VERSION, MAX_MANIFEST_BYTES, Manifest, ManifestContent, PERMISSION_BITS,
-        PrunedEntry, SYMLINK_MODE, StoredEntry, StoredEntryKind,
-    },
-    quota_error,
-    store::{BLOBS, BlobWrite, CHECKPOINTS, MANIFESTS, StagedBlob, Store, digest_stream},
+    CHECKPOINT_VERSION, Checkpoint, SnapshotError, SnapshotInner, StoredCheckpoint,
+    check_cancelled, limit_error, quota_error,
+    snapshot::{file_kind, skip_reason, snapshot_identifier, store_error, summary},
+    store::{CHECKPOINTS, MAX_METADATA_BYTES, TREE_ENTRY_OVERHEAD},
     tree_error, unix_ms,
 };
 
 const STABLE_READ_ATTEMPTS: usize = 3;
 const PROGRESS_INTERVAL: Duration = Duration::from_secs(1);
-pub(crate) const MAX_BLOB_BATCH_FILES: usize = 64;
-const MAX_BLOB_BATCH_BYTES: u64 = 4 * 1_024 * 1_024;
+/// Git's object header and zlib's fixed cost for one object, with room to spare.
+const OBJECT_OVERHEAD: u64 = 64;
+/// The wrapper tree naming the file tree and the metadata, and the metadata's own framing.
+const WRAPPER_BYTES: u64 = 4 * OBJECT_OVERHEAD;
+/// A stat cache entry besides its path: git's index entry, padding included.
+const STAT_ENTRY_OVERHEAD: u64 = 72;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -118,11 +123,10 @@ impl CaptureProgress {
 }
 
 pub(crate) enum Stability {
+    /// The content, and the metadata it was read under, unchanged across the read.
     Stable {
-        digest: String,
-        size: u64,
-        mode: u32,
-        stamp: SnapshotTreeStamp,
+        content: Vec<u8>,
+        metadata: Metadata,
     },
     Oversized,
     /// Every read overlapped a change to the file.
@@ -130,21 +134,23 @@ pub(crate) enum Stability {
 }
 
 struct Capture<'a> {
-    store: &'a Store,
+    inner: &'a SnapshotInner,
     limits: &'a SnapshotCaptureLimits,
     token: &'a CancellationToken,
-    usage: u64,
-    stored_blobs: Vec<PathBuf>,
-    pending_blobs: Vec<StagedBlob>,
-    pending_bytes: u64,
-    stored_manifest: Option<PathBuf>,
-    stored_checkpoint: Option<PathBuf>,
-    entries: Vec<StoredEntry>,
-    pruned: Vec<PrunedEntry>,
-    skipped: SnapshotSkipped,
-    total_bytes: u64,
-    manifest_count: usize,
     progress: &'a mut CaptureProgress,
+    cache: StatCache,
+    /// Storage bytes in use, counting everything this capture reserved.
+    usage: u64,
+    entries: Vec<Entry>,
+    pruned: Vec<SkippedPath>,
+    skipped: Skipped,
+    total_bytes: u64,
+    largest_file_bytes: u64,
+    /// What the trees naming the entries can occupy, as if no directory were shared.
+    tree_bytes: u64,
+    /// What saving the stat cache can add to it.
+    cached_bytes: u64,
+    stored_checkpoint: Option<PathBuf>,
 }
 
 impl SnapshotInner {
@@ -159,58 +165,50 @@ impl SnapshotInner {
     ) -> Result<SnapshotCaptureResponse, SnapshotError> {
         check_cancelled(token)?;
         progress.phase(SnapshotCapturePhase::Scanning);
-        if let Some(manifest) = self.load_checkpoint(checkpoint_id)? {
-            if manifest.content.entries.len() > limits.max_files as usize {
+        if let Some(checkpoint) = self.load_checkpoint(checkpoint_id)? {
+            if checkpoint.meta.file_count > u64::from(limits.max_files) {
                 return Err(limit_error(SnapshotLimit::Files, limits.max_files));
             }
-            let bytes: u64 = manifest
-                .content
-                .entries
-                .iter()
-                .map(|entry| entry.size_bytes)
-                .sum();
-            if bytes > limits.max_total_bytes {
+            if checkpoint.meta.total_bytes > limits.max_total_bytes {
                 return Err(limit_error(
                     SnapshotLimit::TotalBytes,
                     limits.max_total_bytes,
                 ));
             }
-            if manifest
-                .content
-                .entries
-                .iter()
-                .any(|entry| entry.size_bytes > limits.max_file_bytes)
-            {
+            if checkpoint.stored.largest_file_bytes > limits.max_file_bytes {
                 return Err(SnapshotError::InvalidRequest);
             }
-            return capture_response(&manifest, checkpoint_id, scope.path(), true);
+            return capture_response(&checkpoint, scope.path(), true);
         }
         let inventory = self.store.capture_inventory(token)?;
         if inventory.checkpoints >= MAX_SNAPSHOT_COUNT {
             return Err(quota_error(SnapshotLimit::Checkpoints, MAX_SNAPSHOT_COUNT));
         }
+        let started = self.store.capture_started();
         let mut capture = Capture {
-            store: &self.store,
+            inner: self,
             limits,
             token,
+            progress,
+            cache: self.store.objects().stat_cache(),
             usage: inventory.bytes,
-            stored_blobs: Vec::new(),
-            pending_blobs: Vec::new(),
-            pending_bytes: 0,
-            stored_manifest: None,
-            stored_checkpoint: None,
             entries: Vec::new(),
             pruned: Vec::new(),
-            skipped: SnapshotSkipped::default(),
+            skipped: Skipped::default(),
             total_bytes: 0,
-            manifest_count: inventory.manifests,
-            progress,
+            largest_file_bytes: 0,
+            tree_bytes: 0,
+            cached_bytes: 0,
+            stored_checkpoint: None,
         };
         let captured = capture
-            .walk(self, scope)
-            .and_then(|content| capture.publish(self, content, checkpoint_id));
+            .walk(scope)
+            .and_then(|()| capture.publish(scope.path(), checkpoint_id));
         match captured {
-            Ok(manifest) => capture_response(&manifest, checkpoint_id, scope.path(), false),
+            Ok(checkpoint) => {
+                capture.save_cache(scope.path(), started);
+                capture_response(&checkpoint, scope.path(), false)
+            }
             Err(error) => {
                 capture.progress.phase(SnapshotCapturePhase::Rollback);
                 capture.discard()?;
@@ -221,22 +219,19 @@ impl SnapshotInner {
 }
 
 impl Capture<'_> {
-    fn walk(
-        &mut self,
-        inner: &SnapshotInner,
-        scope: &WorkspaceSnapshotScope,
-    ) -> Result<ManifestContent, SnapshotError> {
+    fn walk(&mut self, scope: &WorkspaceSnapshotScope) -> Result<(), SnapshotError> {
         self.progress.phase(SnapshotCapturePhase::Persisting);
         check_cancelled(self.token)?;
         let tree_limits = SnapshotTreeLimits {
             max_entries: MAX_SNAPSHOT_CAPTURE_ENTRIES,
             max_path_bytes: usize::try_from(MAX_SNAPSHOT_CAPTURE_PATH_BYTES).unwrap_or(usize::MAX),
         };
-        let walk = inner
+        let walk = self
+            .inner
             .workspace
             .walk_tree_bound(
                 scope,
-                inner.exclusions.clone(),
+                self.inner.exclusions.clone(),
                 tree_limits,
                 self.token.clone(),
             )
@@ -251,19 +246,7 @@ impl Capture<'_> {
             self.progress
                 .entry(self.entries.len(), self.total_bytes, Instant::now());
         }
-        self.flush_blobs()?;
-        self.entries
-            .sort_unstable_by(|left, right| left.path.cmp(&right.path));
-        self.pruned
-            .sort_unstable_by(|left, right| left.path.cmp(&right.path));
-        Ok(ManifestContent {
-            version: MANIFEST_VERSION.to_owned(),
-            scope: scope.path().to_owned(),
-            entries: mem::take(&mut self.entries),
-            pruned: mem::take(&mut self.pruned),
-            skipped: mem::take(&mut self.skipped),
-            exclusions: inner.exclusions.clone(),
-        })
+        Ok(())
     }
 
     fn file(&mut self, path: String, mut file: SnapshotTreeFile) -> Result<(), SnapshotError> {
@@ -271,11 +254,24 @@ impl Capture<'_> {
             self.skip(path, SnapshotSkipReason::Oversized);
             return Ok(());
         }
-        let (digest, size, mode) =
+        let stamp = FileStamp::of(&file.metadata);
+        if let Some(oid) = self.cache.lookup(&path, &stamp)
+            && self.inner.store.objects().contains(&oid)
+        {
+            self.admit(file.metadata.len())?;
+            self.cached(&path, stamp, oid);
+            self.record(path, file_kind(&file.metadata), oid, file.metadata.len());
+            return Ok(());
+        }
+        #[cfg(test)]
+        self.inner
+            .store
+            .hooks
+            .content_reads
+            .fetch_add(1, Ordering::SeqCst);
+        let (content, metadata) =
             match read_stable(&mut file.file, self.limits.max_file_bytes, self.token)? {
-                Stability::Stable {
-                    digest, size, mode, ..
-                } => (digest, size, mode),
+                Stability::Stable { content, metadata } => (content, metadata),
                 Stability::Oversized => {
                     self.skip(path, SnapshotSkipReason::Oversized);
                     return Ok(());
@@ -285,21 +281,14 @@ impl Capture<'_> {
                     return Ok(());
                 }
             };
+        let size = u64::try_from(content.len()).unwrap_or(u64::MAX);
         self.admit(size)?;
-        file.file
-            .seek(SeekFrom::Start(0))
-            .map_err(|_| SnapshotError::OperationFailed)?;
-        if !self.store_blob(&digest, size, &mut file.file)? {
-            self.skip(path, SnapshotSkipReason::Unstable);
+        let Some(oid) = self.store(&content)? else {
+            self.skip(path, SnapshotSkipReason::Unreadable);
             return Ok(());
-        }
-        self.record(StoredEntry {
-            path,
-            kind: StoredEntryKind::File,
-            digest,
-            mode,
-            size_bytes: size,
-        });
+        };
+        self.cached(&path, FileStamp::of(&metadata), oid);
+        self.record(path, file_kind(&metadata), oid, size);
         Ok(())
     }
 
@@ -309,43 +298,29 @@ impl Capture<'_> {
             self.skip(path, SnapshotSkipReason::Oversized);
             return Ok(());
         }
-        let digest = digest_bytes(&link.target);
         self.admit(size)?;
-        if !self.store_blob(&digest, size, &mut link.target.as_slice())? {
-            return Err(SnapshotError::OperationFailed);
-        }
-        self.record(StoredEntry {
-            path,
-            kind: StoredEntryKind::Symlink,
-            digest,
-            mode: SYMLINK_MODE,
-            size_bytes: size,
-        });
+        let Some(oid) = self.store(&link.target)? else {
+            self.skip(path, SnapshotSkipReason::Unreadable);
+            return Ok(());
+        };
+        self.record(path, EntryKind::Symlink, oid, size);
         Ok(())
     }
 
     fn skip(&mut self, path: String, reason: SnapshotSkipReason) {
-        let skipped = &mut self.skipped;
-        let count = match reason {
-            SnapshotSkipReason::NestedRepository => &mut skipped.nested_repositories,
-            SnapshotSkipReason::Mount => &mut skipped.mounts,
-            SnapshotSkipReason::Special => &mut skipped.special_files,
-            SnapshotSkipReason::Oversized => &mut skipped.oversized_files,
-            SnapshotSkipReason::Unreadable => &mut skipped.unreadable_entries,
-            SnapshotSkipReason::Unstable => &mut skipped.unstable_files,
-            SnapshotSkipReason::Unrepresentable => &mut skipped.unrepresentable_names,
-        };
+        let reason = skip_reason(reason);
+        let count = self.skipped.counts.entry(reason).or_default();
         *count = count.saturating_add(1);
-        if skipped.samples.len() < MAX_SNAPSHOT_SKIPPED_SAMPLES
-            && let Ok(display) = DisplayText::new(path.clone())
+        if self.skipped.samples.len() < MAX_SNAPSHOT_SKIPPED_SAMPLES
+            && DisplayText::new(path.clone()).is_ok()
         {
-            skipped.samples.push(SnapshotSkippedEntry {
-                path: display,
+            self.skipped.samples.push(SkippedPath {
+                path: path.clone(),
                 reason,
             });
         }
-        if reason != SnapshotSkipReason::Unrepresentable {
-            self.pruned.push(PrunedEntry { path, reason });
+        if reason != SkipReason::Unrepresentable {
+            self.pruned.push(SkippedPath { path, reason });
         }
     }
 
@@ -366,77 +341,58 @@ impl Capture<'_> {
         Ok(())
     }
 
-    fn record(&mut self, entry: StoredEntry) {
-        self.total_bytes = self.total_bytes.saturating_add(entry.size_bytes);
-        self.entries.push(entry);
+    fn record(&mut self, path: String, kind: EntryKind, oid: ObjectId, size: u64) {
+        let components = u64::try_from(path.split('/').count()).unwrap_or(u64::MAX);
+        self.tree_bytes = self.tree_bytes.saturating_add(
+            (TREE_ENTRY_OVERHEAD + OBJECT_OVERHEAD)
+                .saturating_mul(components)
+                .saturating_add(u64::try_from(path.len()).unwrap_or(u64::MAX)),
+        );
+        self.total_bytes = self.total_bytes.saturating_add(size);
+        self.largest_file_bytes = self.largest_file_bytes.max(size);
+        self.entries.push(Entry {
+            path,
+            content: Content { kind, oid },
+        });
     }
 
-    /// Stores content the store lacks. `false` means the source no longer held the content hashed.
-    fn store_blob(
-        &mut self,
-        digest: &str,
-        size: u64,
-        source: &mut dyn Read,
-    ) -> Result<bool, SnapshotError> {
-        let path = self.store.blob_path(digest)?;
-        if self.store.exists(&path)? || self.pending_blobs.iter().any(|blob| blob.path == path) {
-            return Ok(true);
-        }
-        if self.pending_bytes.saturating_add(size) > MAX_BLOB_BATCH_BYTES {
-            self.flush_blobs()?;
-        }
-        self.reserve(size)?;
-        if size <= MAX_BLOB_BATCH_BYTES {
-            let Some(staged) = self.store.stage_blob(source, digest, size, self.token)? else {
-                self.usage = self.usage.saturating_sub(size);
-                return Ok(false);
+    fn cached(&mut self, path: &str, stamp: FileStamp, oid: ObjectId) {
+        self.cached_bytes = self.cached_bytes.saturating_add(
+            STAT_ENTRY_OVERHEAD.saturating_add(u64::try_from(path.len()).unwrap_or(u64::MAX)),
+        );
+        self.cache.record(path.to_owned(), stamp, oid);
+    }
+
+    /// Stores content, charging the quota only for what is new: content the store already holds
+    /// costs nothing more. `None` is content git refuses to name, a known SHA-1 collision.
+    fn store(&mut self, content: &[u8]) -> Result<Option<ObjectId>, SnapshotError> {
+        let objects = self.inner.store.objects();
+        let bound = compressed_bound(
+            u64::try_from(content.len())
+                .unwrap_or(u64::MAX)
+                .saturating_add(OBJECT_OVERHEAD),
+        );
+        let reservation = self.reserve(bound);
+        if let Err(refusal) = reservation {
+            return match blob_id(content) {
+                Ok(oid) if objects.contains(&oid) => Ok(Some(oid)),
+                Ok(_) => Err(refusal),
+                Err(_) => Ok(None),
             };
-            self.pending_bytes += size;
-            self.pending_blobs.push(staged);
-            if self.pending_blobs.len() >= MAX_BLOB_BATCH_FILES
-                || self.pending_bytes >= MAX_BLOB_BATCH_BYTES
-            {
-                self.flush_blobs()?;
-            }
-            return Ok(true);
         }
-        match self.store.write_blob(source, digest, size, self.token)? {
-            BlobWrite::Stored => {
-                self.stored_blobs.push(path);
-                Ok(true)
+        match objects.write_blob(content) {
+            Ok(written) => {
+                if !written.new {
+                    self.usage = self.usage.saturating_sub(bound);
+                }
+                Ok(Some(written.oid))
             }
-            BlobWrite::Present => {
-                self.usage = self.usage.saturating_sub(size);
-                Ok(true)
+            Err(StoreError::Collision) => {
+                self.usage = self.usage.saturating_sub(bound);
+                Ok(None)
             }
-            BlobWrite::Mismatch => {
-                self.usage = self.usage.saturating_sub(size);
-                Ok(false)
-            }
+            Err(error) => Err(store_error(error, &[])),
         }
-    }
-
-    fn flush_blobs(&mut self) -> Result<(), SnapshotError> {
-        let synced = self
-            .store
-            .sync_blob_batch(&self.pending_blobs, self.token)?;
-        for (staged, synced) in self.pending_blobs.iter().zip(synced) {
-            if self.store.publish_blob(synced, self.token)? {
-                self.stored_blobs.push(staged.path.clone());
-            } else {
-                self.usage = self.usage.saturating_sub(staged.size);
-            }
-        }
-        self.clear_pending_blobs()
-    }
-
-    fn clear_pending_blobs(&mut self) -> Result<(), SnapshotError> {
-        for staged in &self.pending_blobs {
-            self.store.discard_staged_blob(staged)?;
-        }
-        self.pending_blobs.clear();
-        self.pending_bytes = 0;
-        Ok(())
     }
 
     fn reserve(&mut self, bytes: u64) -> Result<(), SnapshotError> {
@@ -451,88 +407,111 @@ impl Capture<'_> {
         Ok(())
     }
 
-    fn publish(
-        &mut self,
-        inner: &SnapshotInner,
-        content: ManifestContent,
-        checkpoint_id: &str,
-    ) -> Result<Manifest, SnapshotError> {
+    /// Builds the snapshot, makes every object it names durable, then names it by the checkpoint.
+    fn publish(&mut self, scope: &str, checkpoint_id: &str) -> Result<Checkpoint, SnapshotError> {
         self.progress.phase(SnapshotCapturePhase::Publishing);
         check_cancelled(self.token)?;
-        let (manifest, bytes) = Manifest::encode(content, unix_ms())?;
-        let path = self.store.manifest_path(&manifest.snapshot_id)?;
-        self.store.sync(BLOBS)?;
-        let manifest = if self.store.exists(&path)? {
-            inner.load_manifest(&manifest.snapshot_id)?
-        } else {
-            if self.manifest_count >= MAX_SNAPSHOT_COUNT {
-                return Err(quota_error(SnapshotLimit::Snapshots, MAX_SNAPSHOT_COUNT));
-            }
-            if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_MANIFEST_BYTES {
-                return Err(limit_error(
-                    SnapshotLimit::ManifestBytes,
-                    MAX_MANIFEST_BYTES,
-                ));
-            }
-            self.reserve(u64::try_from(bytes.len()).unwrap_or(u64::MAX))?;
-            self.stored_manifest = Some(path.clone());
-            self.store.write_immutable(&path, &bytes)?;
-            manifest
+        let mut entries = mem::take(&mut self.entries);
+        entries.sort_unstable_by(|left, right| left.path.cmp(&right.path));
+        let mut pruned = mem::take(&mut self.pruned);
+        pruned.sort_unstable_by(|left, right| left.path.cmp(&right.path));
+        let meta = Meta {
+            scope: scope.to_owned(),
+            pruned,
+            exclusions: self.inner.exclusions.clone(),
+            skipped: mem::take(&mut self.skipped),
+            file_count: u64::try_from(entries.len()).unwrap_or(u64::MAX),
+            total_bytes: self.total_bytes,
         };
-        self.store.sync(MANIFESTS)?;
-        let checkpoint = serde_json::to_vec(&StoredCheckpoint {
+        let meta_bytes = serde_json::to_vec(&meta)
+            .map_err(|_| SnapshotError::OperationFailed)?
+            .len();
+        let meta_bytes = u64::try_from(meta_bytes).unwrap_or(u64::MAX);
+        if meta_bytes > MAX_METADATA_BYTES {
+            return Err(limit_error(
+                SnapshotLimit::MetadataBytes,
+                MAX_METADATA_BYTES,
+            ));
+        }
+        self.reserve(compressed_bound(
+            self.tree_bytes
+                .saturating_add(meta_bytes)
+                .saturating_add(WRAPPER_BYTES),
+        ))?;
+        let store = &self.inner.store;
+        let id = store
+            .objects()
+            .build(&entries, &meta)
+            .map_err(|error| store_error(error, &[]))?;
+        store.sync_objects()?;
+        let stored = StoredCheckpoint {
             version: CHECKPOINT_VERSION.to_owned(),
             checkpoint_id: checkpoint_id.to_owned(),
-            snapshot_id: manifest.snapshot_id.clone(),
-        })
-        .map_err(|_| SnapshotError::OperationFailed)?;
-        self.reserve(u64::try_from(checkpoint.len()).unwrap_or(u64::MAX))?;
+            snapshot_id: snapshot_identifier(&id),
+            created_at_unix_ms: self.inner.created_at(&id)?.unwrap_or_else(unix_ms),
+            largest_file_bytes: self.largest_file_bytes,
+        };
+        let bytes = serde_json::to_vec(&stored).map_err(|_| SnapshotError::OperationFailed)?;
+        self.reserve(u64::try_from(bytes.len()).unwrap_or(u64::MAX))?;
         check_cancelled(self.token)?;
-        let path = self.store.checkpoint_path(checkpoint_id);
+        let path = store.checkpoint_path(checkpoint_id);
         self.stored_checkpoint = Some(path.clone());
-        self.store.write_atomic(&path, &checkpoint)?;
-        Ok(manifest)
+        store.write_atomic(&path, &bytes)?;
+        Ok(Checkpoint { stored, id, meta })
     }
 
-    /// Removes what this capture stored, including a checkpoint whose write failed only after it
-    /// became visible. Nothing else can name any of it: captures and cleanups are serialized, the
-    /// checkpoint did not exist when the capture began, and a manifest that named a blob before
-    /// this capture kept it from being written.
-    fn discard(&mut self) -> Result<(), SnapshotError> {
-        self.clear_pending_blobs()
-            .map_err(|_| SnapshotError::RollbackFailed)?;
-        for (path, directory) in [
-            (&self.stored_checkpoint, CHECKPOINTS),
-            (&self.stored_manifest, MANIFESTS),
-        ] {
-            if let Some(path) = path {
-                self.store
-                    .remove(path)
-                    .map_err(|_| SnapshotError::RollbackFailed)?;
-                self.store
-                    .sync(directory)
-                    .map_err(|_| SnapshotError::RollbackFailed)?;
-            }
+    /// Saves what this capture read, so the next one need not read it again. Only a cache: when
+    /// it does not fit the quota or cannot be written, the next capture reads everything.
+    fn save_cache(self, scope: &str, started: SystemTime) {
+        let fits = self
+            .usage
+            .checked_add(self.cached_bytes)
+            .is_some_and(|usage| usage <= MAX_SNAPSHOT_STORAGE_BYTES);
+        if fits
+            && let Err(error) = self
+                .inner
+                .store
+                .objects()
+                .save_stat_cache(self.cache, scope, started)
+        {
+            tracing::warn!(%error, "workspace snapshot stat cache was not saved");
         }
-        for path in &self.stored_blobs {
-            self.store
+    }
+
+    /// Deletes what this capture staged and removes the checkpoint should its write have become
+    /// visible before failing. Objects it named stay for collection: nothing names those this
+    /// capture added, and anything may name the others.
+    fn discard(&self) -> Result<(), SnapshotError> {
+        let store = &self.inner.store;
+        if let Err(error) = store.objects().abandon() {
+            tracing::warn!(%error, "staged workspace snapshot objects were not deleted");
+        }
+        if let Some(path) = &self.stored_checkpoint {
+            store
                 .remove(path)
+                .and_then(|()| store.sync(CHECKPOINTS))
                 .map_err(|_| SnapshotError::RollbackFailed)?;
         }
-        self.store
-            .sync(BLOBS)
-            .map_err(|_| SnapshotError::RollbackFailed)
+        Ok(())
     }
 }
 
-/// Reads `file` from its start until the stamps taken around one read agree, so the digest names
-/// content the file held for the whole read.
+/// What stored objects can occupy for `bytes` of their content, headers included. zlib never spends
+/// more than nine bits on a byte, the cost of a fixed Huffman literal, so an eighth covers any
+/// content; `OBJECT_OVERHEAD` covers each object's framing.
+const fn compressed_bound(bytes: u64) -> u64 {
+    bytes.saturating_add(bytes.div_ceil(8))
+}
+
+/// Reads `file` from its start until the metadata taken around one read agrees, so the content is
+/// what the file held for the whole read.
 pub(crate) fn read_stable(
     file: &mut File,
     maximum: u64,
     token: &CancellationToken,
 ) -> Result<Stability, SnapshotError> {
     for _ in 0..STABLE_READ_ATTEMPTS {
+        check_cancelled(token)?;
         let before = file
             .metadata()
             .map_err(|_| SnapshotError::OperationFailed)?;
@@ -541,33 +520,24 @@ pub(crate) fn read_stable(
         }
         file.seek(SeekFrom::Start(0))
             .map_err(|_| SnapshotError::OperationFailed)?;
-        let (digest, size) = digest_stream(file, None, maximum, token)?;
+        let mut content = Vec::with_capacity(usize::try_from(before.len()).unwrap_or(0));
+        Read::by_ref(file)
+            .take(maximum.saturating_add(1))
+            .read_to_end(&mut content)
+            .map_err(|_| SnapshotError::OperationFailed)?;
         let after = file
             .metadata()
             .map_err(|_| SnapshotError::OperationFailed)?;
-        let stamp = SnapshotTreeStamp::of(&after);
-        if SnapshotTreeStamp::of(&before) == stamp && size == after.len() {
+        if SnapshotTreeStamp::of(&before) == SnapshotTreeStamp::of(&after)
+            && u64::try_from(content.len()).ok() == Some(after.len())
+        {
             return Ok(Stability::Stable {
-                digest,
-                size,
-                mode: file_mode(&after),
-                stamp,
+                content,
+                metadata: after,
             });
         }
     }
     Ok(Stability::Unstable)
-}
-
-#[cfg(unix)]
-fn file_mode(metadata: &Metadata) -> u32 {
-    use std::os::unix::fs::PermissionsExt;
-
-    metadata.permissions().mode() & PERMISSION_BITS
-}
-
-#[cfg(not(unix))]
-fn file_mode(metadata: &Metadata) -> u32 {
-    u32::from(metadata.permissions().readonly())
 }
 
 pub(crate) fn validate_limits(limits: &SnapshotCaptureLimits) -> Result<(), SnapshotError> {
@@ -585,355 +555,36 @@ pub(crate) fn validate_limits(limits: &SnapshotCaptureLimits) -> Result<(), Snap
 }
 
 pub(crate) fn capture_response(
-    manifest: &Manifest,
-    checkpoint_id: &str,
+    checkpoint: &Checkpoint,
     scope: &str,
     reused_checkpoint: bool,
 ) -> Result<SnapshotCaptureResponse, SnapshotError> {
-    if manifest.content.scope != scope {
+    if checkpoint.meta.scope != scope {
         return Err(SnapshotError::InvalidRequest);
     }
     Ok(SnapshotCaptureResponse {
         version: ContractVersion::V1,
-        snapshot: manifest.summary(Some(checkpoint_id))?,
+        snapshot: summary(
+            &checkpoint.id,
+            &checkpoint.meta,
+            Some(&checkpoint.stored.checkpoint_id),
+            checkpoint.stored.created_at_unix_ms,
+        )?,
         reused_checkpoint,
     })
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+
+    use workcell_snapshot_store::{ObjectStore, StoreOptions};
+
     use super::*;
-    use crate::store::BlobIo;
-    #[cfg(unix)]
-    use std::os::unix::fs::PermissionsExt;
-    use std::{
-        fs, io,
-        sync::{Mutex, atomic::Ordering},
-    };
-    use tempfile::TempDir;
 
     const ENTRIES: usize = 20_000;
-    #[cfg(unix)]
-    const PRIVATE_MODE: u32 = 0o700;
-    const QUOTA_DATA: &[u8] = b"retained";
-    const EXTRA_DATA: &[u8] = b"extra";
-    const SOURCE_READ_FAILURE: &str = "fixture source read failed";
-    const TEST_LIMITS: SnapshotCaptureLimits = SnapshotCaptureLimits {
-        max_files: MAX_SNAPSHOT_FILES as u32,
-        max_file_bytes: MAX_SNAPSHOT_FILE_BYTES,
-        max_total_bytes: MAX_SNAPSHOT_TOTAL_BYTES,
-    };
-
-    enum StagingFailure {
-        Mismatch,
-        ReadError,
-        Cancelled,
-    }
-
-    struct InterruptedSource {
-        token: CancellationToken,
-        cancel: bool,
-        read: bool,
-    }
-
-    impl Read for InterruptedSource {
-        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
-            if buffer.is_empty() {
-                return Ok(0);
-            }
-            if self.read {
-                return Err(io::Error::other(SOURCE_READ_FAILURE));
-            }
-            self.read = true;
-            buffer[0] = QUOTA_DATA[0];
-            if self.cancel {
-                self.token.cancel();
-            }
-            Ok(1)
-        }
-    }
-
-    fn test_store() -> (TempDir, TempDir, Store) {
-        let workspace = tempfile::tempdir().unwrap();
-        let storage = tempfile::tempdir().unwrap();
-        #[cfg(unix)]
-        fs::set_permissions(storage.path(), fs::Permissions::from_mode(PRIVATE_MODE)).unwrap();
-        let store = Store::open(storage.path(), workspace.path(), None).unwrap();
-        (workspace, storage, store)
-    }
-
-    fn capture<'a>(
-        store: &'a Store,
-        token: &'a CancellationToken,
-        progress: &'a mut CaptureProgress,
-    ) -> Capture<'a> {
-        Capture {
-            store,
-            token,
-            progress,
-            limits: &TEST_LIMITS,
-            usage: store.usage().unwrap(),
-            stored_blobs: Vec::new(),
-            pending_blobs: Vec::new(),
-            pending_bytes: 0,
-            stored_manifest: None,
-            stored_checkpoint: None,
-            entries: Vec::new(),
-            pruned: Vec::new(),
-            skipped: SnapshotSkipped::default(),
-            total_bytes: 0,
-            manifest_count: 0,
-        }
-    }
-
-    #[test]
-    fn bounded_blob_batches_deduplicate_and_sync_every_file_before_any_link() {
-        let (_workspace, _storage, store) = test_store();
-        let token = CancellationToken::new();
-        let mut progress = CaptureProgress::new(None);
-        let mut capture = capture(&store, &token, &mut progress);
-        for index in 0..MAX_BLOB_BATCH_FILES {
-            let data = index.to_string();
-            let digest = digest_bytes(data.as_bytes());
-            let size = data.len() as u64;
-            assert!(
-                capture
-                    .store_blob(&digest, size, &mut data.as_bytes())
-                    .unwrap()
-            );
-            let usage = capture.usage;
-            let pending = capture.pending_blobs.len();
-            assert!(
-                capture
-                    .store_blob(&digest, size, &mut data.as_bytes())
-                    .unwrap()
-            );
-            assert_eq!(capture.usage, usage);
-            assert_eq!(capture.pending_blobs.len(), pending);
-            assert!(pending < MAX_BLOB_BATCH_FILES);
-            assert!(capture.pending_bytes <= MAX_BLOB_BATCH_BYTES);
-            if index + 1 < MAX_BLOB_BATCH_FILES {
-                assert!(store.names(BLOBS).unwrap().is_empty());
-                assert_eq!(store.usage().unwrap(), capture.pending_bytes);
-            }
-        }
-        assert!(capture.pending_blobs.is_empty());
-        assert_eq!(store.names(BLOBS).unwrap().len(), MAX_BLOB_BATCH_FILES);
-        let events = store.faults.blob_io.lock().unwrap();
-        assert_eq!(events.len(), MAX_BLOB_BATCH_FILES * 3);
-        assert!(
-            events[..MAX_BLOB_BATCH_FILES]
-                .iter()
-                .all(|event| matches!(event, BlobIo::Staged(_)))
-        );
-        assert!(
-            events[MAX_BLOB_BATCH_FILES..MAX_BLOB_BATCH_FILES * 2]
-                .iter()
-                .all(|event| *event == BlobIo::Synced)
-        );
-        assert!(
-            events[MAX_BLOB_BATCH_FILES * 2..]
-                .iter()
-                .all(|event| *event == BlobIo::Linked)
-        );
-    }
-
-    #[test]
-    fn byte_caps_flush_before_staging_and_large_blobs_bypass_the_pending_batch() {
-        let (_workspace, _storage, store) = test_store();
-        let token = CancellationToken::new();
-        let mut progress = CaptureProgress::new(None);
-        let mut capture = capture(&store, &token, &mut progress);
-        let size = MAX_BLOB_BATCH_BYTES / 2 + 1;
-        for byte in [1_u8, 2] {
-            let data = vec![byte; size as usize];
-            assert!(
-                capture
-                    .store_blob(&digest_bytes(&data), size, &mut data.as_slice())
-                    .unwrap()
-            );
-            assert_eq!(capture.pending_bytes, size);
-            assert_eq!(capture.pending_blobs.len(), 1);
-            assert_eq!(store.names(BLOBS).unwrap().len(), usize::from(byte - 1));
-        }
-        let large = vec![3; MAX_BLOB_BATCH_BYTES as usize + 1];
-        assert!(
-            capture
-                .store_blob(
-                    &digest_bytes(&large),
-                    large.len() as u64,
-                    &mut large.as_slice()
-                )
-                .unwrap()
-        );
-        assert!(capture.pending_blobs.is_empty());
-        assert_eq!(capture.pending_bytes, 0);
-        assert_eq!(store.names(BLOBS).unwrap().len(), 3);
-        assert_eq!(
-            store
-                .read_blob(&digest_bytes(&large), large.len() as u64)
-                .unwrap(),
-            large
-        );
-    }
-
-    #[test]
-    fn mismatched_staging_releases_quota_and_pending_bytes_are_charged_before_writing() {
-        let (_workspace, _storage, store) = test_store();
-        let token = CancellationToken::new();
-        let mut progress = CaptureProgress::new(None);
-        let mut capture = capture(&store, &token, &mut progress);
-        let digest = digest_bytes(QUOTA_DATA);
-        assert!(
-            !capture
-                .store_blob(
-                    &digest,
-                    QUOTA_DATA.len() as u64,
-                    &mut b"modified".as_slice()
-                )
-                .unwrap()
-        );
-        assert_eq!(capture.usage, 0);
-        assert_eq!(fs::read_dir(store.directory(BLOBS)).unwrap().count(), 0);
-        capture.usage = MAX_SNAPSHOT_STORAGE_BYTES - QUOTA_DATA.len() as u64;
-        let mut source = QUOTA_DATA;
-        assert!(
-            capture
-                .store_blob(&digest, QUOTA_DATA.len() as u64, &mut source)
-                .unwrap()
-        );
-        assert_eq!(capture.usage, MAX_SNAPSHOT_STORAGE_BYTES);
-        let mut source = EXTRA_DATA;
-        assert_eq!(
-            capture
-                .store_blob(
-                    &digest_bytes(EXTRA_DATA),
-                    EXTRA_DATA.len() as u64,
-                    &mut source
-                )
-                .unwrap_err(),
-            quota_error(SnapshotLimit::StorageBytes, MAX_SNAPSHOT_STORAGE_BYTES)
-        );
-        assert_eq!(capture.pending_blobs.len(), 1);
-        capture.discard().unwrap();
-        assert_eq!(fs::read_dir(store.directory(BLOBS)).unwrap().count(), 0);
-    }
-
-    #[test]
-    fn failed_staging_requires_confirmed_cleanup_before_refund_or_clean_cancellation() {
-        for remove_fails in [false, true] {
-            for failure in [
-                StagingFailure::Mismatch,
-                StagingFailure::ReadError,
-                StagingFailure::Cancelled,
-            ] {
-                let (_workspace, _storage, store) = test_store();
-                let token = CancellationToken::new();
-                let mut progress = CaptureProgress::new(None);
-                let mut capture = capture(&store, &token, &mut progress);
-                let reserved = QUOTA_DATA.len() as u64;
-                capture.usage = MAX_SNAPSHOT_STORAGE_BYTES - reserved;
-                store
-                    .faults
-                    .temporary_remove
-                    .store(remove_fails, Ordering::SeqCst);
-                let digest = digest_bytes(QUOTA_DATA);
-                let result = match &failure {
-                    StagingFailure::Mismatch => {
-                        capture.store_blob(&digest, reserved, &mut b"modified".as_slice())
-                    }
-                    StagingFailure::ReadError | StagingFailure::Cancelled => {
-                        let mut source = InterruptedSource {
-                            token: token.clone(),
-                            cancel: matches!(&failure, StagingFailure::Cancelled),
-                            read: false,
-                        };
-                        capture.store_blob(&digest, reserved, &mut source)
-                    }
-                };
-                if remove_fails {
-                    assert_eq!(result.unwrap_err(), SnapshotError::RollbackFailed);
-                    assert_eq!(capture.usage, MAX_SNAPSHOT_STORAGE_BYTES);
-                    assert_eq!(fs::read_dir(store.directory(BLOBS)).unwrap().count(), 1);
-                    let retained = store.usage().unwrap();
-                    assert!(retained > 0 && retained <= reserved);
-                } else {
-                    match failure {
-                        StagingFailure::Mismatch => {
-                            assert!(!result.unwrap());
-                            assert_eq!(capture.usage, MAX_SNAPSHOT_STORAGE_BYTES - reserved);
-                        }
-                        StagingFailure::ReadError => {
-                            assert_eq!(result.unwrap_err(), SnapshotError::OperationFailed)
-                        }
-                        StagingFailure::Cancelled => {
-                            assert_eq!(result.unwrap_err(), SnapshotError::Cancelled)
-                        }
-                    }
-                    assert_eq!(fs::read_dir(store.directory(BLOBS)).unwrap().count(), 0);
-                }
-                assert!(store.names(BLOBS).unwrap().is_empty());
-                assert!(capture.pending_blobs.is_empty());
-                assert!(capture.stored_blobs.is_empty());
-                store.faults.temporary_remove.store(false, Ordering::SeqCst);
-                store.remove_temporaries().unwrap();
-                assert_eq!(store.usage().unwrap(), 0);
-            }
-        }
-    }
-
-    #[test]
-    fn single_blob_sync_link_and_cancel_failures_do_not_hide_failed_temporary_cleanup() {
-        for cancel in [false, true] {
-            for sync in [false, true] {
-                let (_workspace, _storage, store) = test_store();
-                let faults = &store.faults;
-                let trigger = match (cancel, sync) {
-                    (false, false) => &faults.blob_link_failure,
-                    (false, true) => &faults.blob_sync_failure,
-                    (true, false) => &faults.cancel_after_blob_link,
-                    (true, true) => &faults.cancel_after_blob_sync,
-                };
-                trigger.store(1, Ordering::SeqCst);
-                faults.temporary_remove.store(true, Ordering::SeqCst);
-                let mut source = QUOTA_DATA;
-                let result = store.write_blob(
-                    &mut source,
-                    &digest_bytes(QUOTA_DATA),
-                    QUOTA_DATA.len() as u64,
-                    &CancellationToken::new(),
-                );
-                assert_eq!(
-                    result.map(|_| ()).unwrap_err(),
-                    SnapshotError::RollbackFailed
-                );
-                assert!(store.usage().unwrap() >= QUOTA_DATA.len() as u64);
-                faults.temporary_remove.store(false, Ordering::SeqCst);
-                store.remove_temporaries().unwrap();
-                assert_eq!(
-                    fs::read_dir(store.directory(BLOBS)).unwrap().count(),
-                    usize::from(cancel && !sync)
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn a_growing_source_is_detected_without_writing_past_the_staging_reservation() {
-        let mut file = tempfile::tempfile().unwrap();
-        let maximum = QUOTA_DATA.len() as u64 - 1;
-        let mut source = QUOTA_DATA;
-        let (digest, read) = digest_stream(
-            &mut source,
-            Some(&mut file),
-            maximum,
-            &CancellationToken::new(),
-        )
-        .unwrap();
-        assert_eq!(digest, digest_bytes(QUOTA_DATA));
-        assert_eq!(read, QUOTA_DATA.len() as u64);
-        assert_eq!(file.metadata().unwrap().len(), maximum);
-    }
+    const INCOMPRESSIBLE_BYTES: usize = 1_024 * 1_024;
+    const XORSHIFT_SEED: u64 = 0x9e37_79b9_7f4a_7c15;
 
     #[derive(Default)]
     struct ProgressSink(Mutex<Vec<SnapshotCaptureProgress>>);
@@ -962,5 +613,33 @@ mod tests {
         assert_eq!(events[3].files, ENTRIES as u64 + 1);
         assert_eq!(events[3].entries, ENTRIES as u64 + 1);
         assert_eq!(events[3].bytes, ENTRIES as u64 + 1);
+    }
+
+    #[test]
+    fn the_quota_charge_for_an_object_covers_what_storing_incompressible_content_takes() {
+        let storage = tempfile::tempdir().unwrap();
+        let objects = ObjectStore::open(
+            storage.path(),
+            StoreOptions {
+                private: false,
+                max_object_bytes: None,
+            },
+        )
+        .unwrap();
+        let empty = objects.usage().unwrap().bytes;
+        let mut state = XORSHIFT_SEED;
+        let content = (0..INCOMPRESSIBLE_BYTES)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state.to_le_bytes()[0]
+            })
+            .collect::<Vec<_>>();
+        objects.write_blob(&content).unwrap();
+
+        let stored = objects.usage().unwrap().bytes - empty;
+        assert!(stored > content.len() as u64);
+        assert!(stored <= compressed_bound(content.len() as u64 + OBJECT_OVERHEAD));
     }
 }

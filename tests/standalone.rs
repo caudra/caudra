@@ -965,7 +965,7 @@ async fn authenticated_snapshot_restore_is_negotiated_and_uses_the_common_ledger
     )
     .await;
     assert_eq!(
-        preparation["result"]["binding"]["contract"]["id"], "workcell.snapshot.capture.v1",
+        preparation["result"]["binding"]["contract"]["id"], "workcell.snapshot.capture.v2",
         "{preparation}"
     );
     let lookup_params = json!({

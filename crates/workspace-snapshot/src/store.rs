@@ -1,43 +1,63 @@
-//! The private store beneath one validated root: content-addressed blobs and manifests, checkpoint
-//! references and restore journals. Every file is owner-only and appears whole or not at all.
+//! The private store beneath one validated root: the object repository, checkpoint references and
+//! restore journals. Checkpoints and journals are owner-only files that appear whole or not at all.
+//! Objects live in owner-only directories and every read of one is verified against its id.
 
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 #[cfg(test)]
-use std::sync::{
-    Arc, Mutex,
-    atomic::{AtomicBool, AtomicUsize, Ordering},
-};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::{
     fs::{self, File, Metadata, OpenOptions},
     io::{self, Read, Write},
     path::{Component, Path, PathBuf},
-    thread::{self, Builder},
+    time::SystemTime,
 };
 
-use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
-use workcell_host_contract::MAX_ID_BYTES;
-
-use crate::{
-    MAX_PRIVATE_ENTRIES, SnapshotError, check_cancelled, format_sha256, hex_sha256,
-    valid_hex_digest, validate_snapshot_id,
+use workcell_host_contract::{
+    MAX_ID_BYTES, MAX_SNAPSHOT_CAPTURE_ENTRIES, MAX_SNAPSHOT_CAPTURE_PATH_BYTES,
+    MAX_SNAPSHOT_COUNT, MAX_SNAPSHOT_FILE_BYTES, MAX_SNAPSHOT_JOURNALS,
 };
+#[cfg(test)]
+use workcell_snapshot_store::RACY_MARGIN;
+use workcell_snapshot_store::{ObjectStore, StoreOptions};
 
-pub(crate) const BLOBS: &str = "blobs";
-pub(crate) const MANIFESTS: &str = "manifests";
+use crate::{SnapshotError, check_cancelled, hex_sha256};
+
+pub(crate) const REPOSITORY: &str = "repo";
 pub(crate) const CHECKPOINTS: &str = "checkpoints";
 pub(crate) const JOURNALS: &str = "journals";
 pub(crate) const METADATA_SUFFIX: &str = ".json";
 pub(crate) const DIGEST_PREFIX: &str = "sha256:";
-const DIRECTORIES: [&str; 4] = [BLOBS, MANIFESTS, CHECKPOINTS, JOURNALS];
+/// The largest encoded snapshot metadata a capture stores.
+pub(crate) const MAX_METADATA_BYTES: u64 = 32 * 1_024 * 1_024;
+/// No object needs more room than the largest file a capture admits: metadata is bounded below
+/// it, and one tree holds each captured name at most once.
+const MAX_OBJECT_BYTES: u64 = MAX_SNAPSHOT_FILE_BYTES;
+/// A tree entry besides its name: the mode, two separators and a SHA-1 id.
+pub(crate) const TREE_ENTRY_OVERHEAD: u64 = 28;
+const _: () = assert!(
+    MAX_METADATA_BYTES <= MAX_OBJECT_BYTES
+        && MAX_SNAPSHOT_CAPTURE_PATH_BYTES
+            + TREE_ENTRY_OVERHEAD * MAX_SNAPSHOT_CAPTURE_ENTRIES as u64
+            <= MAX_OBJECT_BYTES
+);
+const DIRECTORIES: [&str; 2] = [CHECKPOINTS, JOURNALS];
+/// Where hosts before the object repository kept their blobs and manifests.
+const LEGACY_DIRECTORIES: [&str; 2] = ["blobs", "manifests"];
+/// Created and removed at open to learn the umask, and removed first should a crash have left it.
+#[cfg(unix)]
+const UMASK_PROBE: &str = ".umask-probe";
+#[cfg(unix)]
+const UMASK_PROBE_MODE: u32 = 0o777;
 const TEMPORARY_PREFIX: &str = ".";
 const TEMPORARY_SUFFIX: &str = ".tmp";
 const RESTORE_ID_PREFIX: &str = "restore_";
 const MAX_RESTORE_ID_BYTES: usize = 64;
-const STREAM_BUFFER_BYTES: usize = 64 * 1_024;
-const BLOB_SYNC_WORKERS: usize = 8;
+/// Room for abandoned temporaries beside every checkpoint and journal the quotas allow.
+const PRIVATE_ENTRY_SLACK: usize = 64;
+const MAX_PRIVATE_ENTRIES: usize = MAX_SNAPSHOT_COUNT + MAX_SNAPSHOT_JOURNALS + PRIVATE_ENTRY_SLACK;
 #[cfg(unix)]
 const PRIVATE_FILE_MODE: u32 = 0o600;
 #[cfg(unix)]
@@ -47,38 +67,27 @@ const SHARED_PERMISSION_BITS: u32 = 0o077;
 
 pub(crate) struct Store {
     root: PathBuf,
+    objects: ObjectStore,
+    umask: u32,
     #[cfg(test)]
-    pub(crate) faults: StoreFaults,
+    pub(crate) hooks: TestHooks,
 }
 
 #[cfg(test)]
 #[derive(Default)]
-pub(crate) struct StoreFaults {
+pub(crate) struct TestHooks {
     pub checkpoint_sync: AtomicBool,
     pub checkpoint_remove: AtomicBool,
-    pub temporary_remove: Arc<AtomicBool>,
-    pub blob_sync_failure: AtomicUsize,
-    pub blob_link_failure: AtomicUsize,
-    pub cancel_after_blob_sync: AtomicUsize,
-    pub cancel_after_blob_link: AtomicUsize,
-    pub blob_sync_calls: AtomicUsize,
-    pub blob_link_calls: AtomicUsize,
-    pub blob_io: Mutex<Vec<BlobIo>>,
+    pub object_sync: AtomicBool,
+    /// Counts the files a capture read rather than found unchanged in the stat cache.
+    pub content_reads: AtomicUsize,
+    /// Starts captures late enough that every file already in the workspace counts as settled.
+    pub settled: AtomicBool,
 }
 
-#[cfg(test)]
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) enum BlobIo {
-    Staged(u64),
-    Synced,
-    Linked,
-}
-
-#[derive(Default)]
 pub(crate) struct CaptureInventory {
     pub bytes: u64,
     pub checkpoints: usize,
-    pub manifests: usize,
 }
 
 impl Store {
@@ -95,32 +104,49 @@ impl Store {
             root.push(binding);
             create_private_directory(&root)?;
         }
-        for directory in DIRECTORIES {
+        let repository = root.join(REPOSITORY);
+        for directory in [REPOSITORY, CHECKPOINTS, JOURNALS] {
             create_private_directory(&root.join(directory))?;
         }
+        validate_repository(&repository)?;
+        let objects = ObjectStore::open(
+            &repository,
+            StoreOptions {
+                private: true,
+                max_object_bytes: usize::try_from(MAX_OBJECT_BYTES).ok(),
+            },
+        )
+        .map_err(|_| SnapshotError::InvalidConfiguration)?;
+        sync_directory(&repository)?;
         sync_directory(&root)?;
         sync_directory(root.parent().ok_or(SnapshotError::InvalidConfiguration)?)?;
         Ok(Self {
+            umask: probe_umask(&root)?,
             root,
+            objects,
             #[cfg(test)]
-            faults: StoreFaults::default(),
+            hooks: TestHooks::default(),
         })
     }
 
-    pub(crate) fn manifest_path(&self, snapshot_id: &str) -> Result<PathBuf, SnapshotError> {
-        validate_snapshot_id(snapshot_id)?;
-        Ok(self
-            .root
-            .join(MANIFESTS)
-            .join(format!("{snapshot_id}{METADATA_SUFFIX}")))
+    pub(crate) fn objects(&self) -> &ObjectStore {
+        &self.objects
     }
 
-    pub(crate) fn blob_path(&self, digest: &str) -> Result<PathBuf, SnapshotError> {
-        let hex = digest
-            .strip_prefix(DIGEST_PREFIX)
-            .filter(|hex| valid_hex_digest(hex))
-            .ok_or(SnapshotError::IntegrityFailure)?;
-        Ok(self.root.join(BLOBS).join(hex))
+    /// The permission bits the process umask withholds from a file it creates.
+    pub(crate) fn umask(&self) -> u32 {
+        self.umask
+    }
+
+    /// When a capture starting now counts as started for the stat cache, which trusts only files
+    /// that had settled before then.
+    pub(crate) fn capture_started(&self) -> SystemTime {
+        let now = SystemTime::now();
+        #[cfg(test)]
+        if self.hooks.settled.load(Ordering::SeqCst) {
+            return now + 2 * RACY_MARGIN;
+        }
+        now
     }
 
     /// Checkpoint ids are client-chosen, so their file names are digests of them.
@@ -163,7 +189,8 @@ impl Store {
         Ok(names)
     }
 
-    /// Bytes held by every store file, temporaries included: they occupy the same disk.
+    /// Bytes held by the objects, the stat cache and every Workcell file, temporaries included:
+    /// they occupy the same disk.
     pub(crate) fn usage(&self) -> Result<u64, SnapshotError> {
         Ok(self.capture_inventory(&CancellationToken::new())?.bytes)
     }
@@ -172,7 +199,14 @@ impl Store {
         &self,
         token: &CancellationToken,
     ) -> Result<CaptureInventory, SnapshotError> {
-        let mut inventory = CaptureInventory::default();
+        let mut inventory = CaptureInventory {
+            bytes: self
+                .objects
+                .usage()
+                .map_err(|_| SnapshotError::UnhealthyStorage)?
+                .bytes,
+            checkpoints: 0,
+        };
         for directory in DIRECTORIES {
             for entry in private_entries(&self.root.join(directory))? {
                 check_cancelled(token)?;
@@ -181,13 +215,28 @@ impl Store {
                     .bytes
                     .checked_add(metadata.len())
                     .ok_or(SnapshotError::UnhealthyStorage)?;
-                if !is_temporary(&name) {
-                    inventory.checkpoints += usize::from(directory == CHECKPOINTS);
-                    inventory.manifests += usize::from(directory == MANIFESTS);
-                }
+                inventory.checkpoints +=
+                    usize::from(directory == CHECKPOINTS && !is_temporary(&name));
             }
         }
         Ok(inventory)
+    }
+
+    /// Removes what a host before the object repository stored, which nothing reads any more,
+    /// and returns how many of its directories there were.
+    pub(crate) fn remove_legacy_directories(&self) -> Result<usize, SnapshotError> {
+        let mut removed = 0;
+        for directory in LEGACY_DIRECTORIES {
+            match fs::remove_dir_all(self.root.join(directory)) {
+                Ok(()) => removed += 1,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(_) => return Err(SnapshotError::UnhealthyStorage),
+            }
+        }
+        if removed > 0 {
+            sync_directory(&self.root)?;
+        }
+        Ok(removed)
     }
 
     /// Removes temporaries a crash left behind. Nothing reads them, so none is ever resumed.
@@ -235,39 +284,6 @@ impl Store {
         }
     }
 
-    pub(crate) fn exists(&self, path: &Path) -> Result<bool, SnapshotError> {
-        match private_metadata(path) {
-            Ok(_) => Ok(true),
-            Err(SnapshotError::NotFound) => Ok(false),
-            Err(error) => Err(error),
-        }
-    }
-
-    /// Publishes content-addressed bytes. An existing file must already hold exactly them.
-    pub(crate) fn write_immutable(&self, path: &Path, bytes: &[u8]) -> Result<(), SnapshotError> {
-        let maximum = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
-        match self.read(path, maximum) {
-            Ok(existing) if existing == bytes => return Ok(()),
-            Ok(_) => return Err(SnapshotError::IntegrityFailure),
-            Err(SnapshotError::NotFound) => {}
-            Err(error) => return Err(error),
-        }
-        let parent = path.parent().ok_or(SnapshotError::OperationFailed)?;
-        let mut temporary = Temporary::create(parent)?;
-        temporary.write_all(bytes)?;
-        match fs::hard_link(&temporary.path, path) {
-            Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                if self.read(path, maximum)? != bytes {
-                    return Err(SnapshotError::IntegrityFailure);
-                }
-            }
-            Err(_) => return Err(SnapshotError::OperationFailed),
-        }
-        drop(temporary);
-        sync_directory(parent)
-    }
-
     pub(crate) fn write_atomic(&self, path: &Path, bytes: &[u8]) -> Result<(), SnapshotError> {
         let parent = path.parent().ok_or(SnapshotError::OperationFailed)?;
         let mut temporary = Temporary::create(parent)?;
@@ -280,7 +296,7 @@ impl Store {
     pub(crate) fn remove(&self, path: &Path) -> Result<(), SnapshotError> {
         #[cfg(test)]
         if path.parent() == Some(self.directory(CHECKPOINTS).as_path())
-            && self.faults.checkpoint_remove.load(Ordering::SeqCst)
+            && self.hooks.checkpoint_remove.load(Ordering::SeqCst)
         {
             return Err(SnapshotError::OperationFailed);
         }
@@ -295,307 +311,31 @@ impl Store {
         self.sync_path(&self.root.join(directory))
     }
 
+    /// Makes every object written since the last sync durable. Nothing may name them before.
+    pub(crate) fn sync_objects(&self) -> Result<(), SnapshotError> {
+        #[cfg(test)]
+        if self.hooks.object_sync.load(Ordering::SeqCst) {
+            return Err(SnapshotError::OperationFailed);
+        }
+        self.objects
+            .sync()
+            .map_err(|_| SnapshotError::OperationFailed)
+    }
+
     fn sync_path(&self, path: &Path) -> Result<(), SnapshotError> {
         #[cfg(test)]
-        if path == self.directory(CHECKPOINTS) && self.faults.checkpoint_sync.load(Ordering::SeqCst)
+        if path == self.directory(CHECKPOINTS) && self.hooks.checkpoint_sync.load(Ordering::SeqCst)
         {
             return Err(SnapshotError::OperationFailed);
         }
         sync_directory(path)
     }
-
-    /// Stores `size` bytes from `source` as the blob `digest`, verifying both on the way. The
-    /// caller syncs the blob directory before anything durable names the blob.
-    pub(crate) fn write_blob(
-        &self,
-        source: &mut dyn Read,
-        digest: &str,
-        size: u64,
-        token: &CancellationToken,
-    ) -> Result<BlobWrite, SnapshotError> {
-        let Some(staged) = self.stage_blob(source, digest, size, token)? else {
-            return Ok(BlobWrite::Mismatch);
-        };
-        let published = self
-            .sync_blob(&staged, token)
-            .and_then(|synced| self.publish_blob(synced, token));
-        self.discard_staged_blob(&staged)?;
-        if published? {
-            Ok(BlobWrite::Stored)
-        } else {
-            Ok(BlobWrite::Present)
-        }
-    }
-
-    pub(crate) fn stage_blob(
-        &self,
-        source: &mut dyn Read,
-        digest: &str,
-        size: u64,
-        token: &CancellationToken,
-    ) -> Result<Option<StagedBlob>, SnapshotError> {
-        let path = self.blob_path(digest)?;
-        let mut temporary = Temporary::create(&self.root.join(BLOBS))?;
-        #[cfg(test)]
-        {
-            temporary.remove_failure = Some(self.faults.temporary_remove.clone());
-        }
-        match digest_stream(source, Some(&mut temporary.file), size, token) {
-            Ok((written_digest, written)) if written == size && written_digest == digest => {}
-            result => {
-                temporary.remove()?;
-                return result.map(|_| None);
-            }
-        }
-        #[cfg(test)]
-        self.faults
-            .blob_io
-            .lock()
-            .unwrap()
-            .push(BlobIo::Staged(size));
-        Ok(Some(StagedBlob {
-            path,
-            size,
-            temporary,
-        }))
-    }
-
-    pub(crate) fn sync_blob<'a>(
-        &self,
-        staged: &'a StagedBlob,
-        token: &CancellationToken,
-    ) -> Result<SyncedBlob<'a>, SnapshotError> {
-        self.sync_blob_file(staged, token)?;
-        Ok(SyncedBlob { staged })
-    }
-
-    pub(crate) fn sync_blob_batch<'a>(
-        &self,
-        staged: &'a [StagedBlob],
-        token: &CancellationToken,
-    ) -> Result<Vec<SyncedBlob<'a>>, SnapshotError> {
-        if staged.len() <= 1 {
-            return staged
-                .iter()
-                .map(|blob| self.sync_blob(blob, token))
-                .collect();
-        }
-        thread::scope(|scope| {
-            let mut workers = Vec::new();
-            let mut failure = None;
-            for chunk in staged.chunks(staged.len().div_ceil(BLOB_SYNC_WORKERS)) {
-                match Builder::new().spawn_scoped(scope, || {
-                    chunk
-                        .iter()
-                        .map(|blob| self.sync_blob(blob, token))
-                        .collect::<Result<Vec<_>, _>>()
-                }) {
-                    Ok(worker) => workers.push(worker),
-                    Err(_) => {
-                        failure = Some(SnapshotError::OperationFailed);
-                        break;
-                    }
-                }
-            }
-            let mut synced = Vec::with_capacity(staged.len());
-            for worker in workers {
-                match worker
-                    .join()
-                    .map_err(|_| SnapshotError::OperationFailed)
-                    .and_then(|result| result)
-                {
-                    Ok(mut blobs) => synced.append(&mut blobs),
-                    Err(error) => {
-                        failure.get_or_insert(error);
-                    }
-                }
-            }
-            match failure {
-                Some(error) => Err(error),
-                None => Ok(synced),
-            }
-        })
-    }
-
-    fn sync_blob_file(
-        &self,
-        staged: &StagedBlob,
-        token: &CancellationToken,
-    ) -> Result<(), SnapshotError> {
-        check_cancelled(token)?;
-        #[cfg(test)]
-        let call = self.faults.blob_sync_calls.fetch_add(1, Ordering::SeqCst) + 1;
-        #[cfg(test)]
-        if self.faults.blob_sync_failure.load(Ordering::SeqCst) == call {
-            return Err(SnapshotError::OperationFailed);
-        }
-        staged
-            .temporary
-            .file
-            .sync_all()
-            .map_err(|_| SnapshotError::OperationFailed)?;
-        #[cfg(test)]
-        {
-            self.faults.blob_io.lock().unwrap().push(BlobIo::Synced);
-            if self.faults.cancel_after_blob_sync.load(Ordering::SeqCst) == call {
-                token.cancel();
-            }
-        }
-        Ok(())
-    }
-
-    pub(crate) fn publish_blob(
-        &self,
-        synced: SyncedBlob<'_>,
-        token: &CancellationToken,
-    ) -> Result<bool, SnapshotError> {
-        check_cancelled(token)?;
-        #[cfg(test)]
-        let call = self.faults.blob_link_calls.fetch_add(1, Ordering::SeqCst) + 1;
-        #[cfg(test)]
-        if self.faults.blob_link_failure.load(Ordering::SeqCst) == call {
-            return Err(SnapshotError::OperationFailed);
-        }
-        match fs::hard_link(&synced.staged.temporary.path, &synced.staged.path) {
-            Ok(()) => {
-                #[cfg(test)]
-                {
-                    self.faults.blob_io.lock().unwrap().push(BlobIo::Linked);
-                    if self.faults.cancel_after_blob_link.load(Ordering::SeqCst) == call {
-                        token.cancel();
-                    }
-                }
-                Ok(true)
-            }
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(false),
-            Err(_) => Err(SnapshotError::OperationFailed),
-        }
-    }
-
-    pub(crate) fn discard_staged_blob(&self, staged: &StagedBlob) -> Result<(), SnapshotError> {
-        staged.temporary.remove()
-    }
-
-    /// Opens a blob for streaming. The reader fails at end of input unless it read exactly `size`
-    /// bytes hashing to `digest`, so a corrupt blob never reaches a consumer whole.
-    pub(crate) fn open_blob(&self, digest: &str, size: u64) -> Result<BlobReader, SnapshotError> {
-        let file = open_private(&self.blob_path(digest)?).map_err(|error| match error {
-            SnapshotError::NotFound => SnapshotError::IntegrityFailure,
-            error => error,
-        })?;
-        Ok(BlobReader {
-            file,
-            hasher: Sha256::new(),
-            read: 0,
-            size,
-            digest: digest.to_owned(),
-        })
-    }
-
-    pub(crate) fn read_blob(&self, digest: &str, size: u64) -> Result<Vec<u8>, SnapshotError> {
-        let mut bytes = Vec::new();
-        self.open_blob(digest, size)?
-            .read_to_end(&mut bytes)
-            .map_err(blob_error)?;
-        Ok(bytes)
-    }
-}
-
-pub(crate) struct BlobReader {
-    file: File,
-    hasher: Sha256,
-    read: u64,
-    size: u64,
-    digest: String,
-}
-
-pub(crate) struct StagedBlob {
-    pub path: PathBuf,
-    pub size: u64,
-    temporary: Temporary,
-}
-
-pub(crate) struct SyncedBlob<'a> {
-    staged: &'a StagedBlob,
-}
-
-impl Read for BlobReader {
-    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
-        let count = self.file.read(buffer)?;
-        self.read = self
-            .read
-            .saturating_add(u64::try_from(count).unwrap_or(u64::MAX));
-        self.hasher.update(&buffer[..count]);
-        let complete = count == 0 || self.read > self.size;
-        if complete
-            && (self.read != self.size
-                || format_sha256(self.hasher.clone().finalize()) != self.digest)
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "snapshot blob failed integrity verification",
-            ));
-        }
-        Ok(count)
-    }
-}
-
-/// Integrity failures surface from a blob reader as `InvalidData`.
-pub(crate) fn blob_error(error: io::Error) -> SnapshotError {
-    if error.kind() == io::ErrorKind::InvalidData {
-        SnapshotError::IntegrityFailure
-    } else {
-        SnapshotError::OperationFailed
-    }
-}
-
-/// Digest and length of everything `source` yields, stopping one byte past `maximum` so growth
-/// shows as a longer length rather than an unbounded read. Bytes are copied to `sink` as read.
-pub(crate) fn digest_stream(
-    source: &mut dyn Read,
-    mut sink: Option<&mut File>,
-    maximum: u64,
-    token: &CancellationToken,
-) -> Result<(String, u64), SnapshotError> {
-    let mut source = source.take(maximum.saturating_add(1));
-    let mut hasher = Sha256::new();
-    let mut buffer = vec![0; STREAM_BUFFER_BYTES];
-    let mut total = 0_u64;
-    loop {
-        check_cancelled(token)?;
-        let count = match source.read(&mut buffer) {
-            Ok(0) => break,
-            Ok(count) => count,
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-            Err(error) => return Err(blob_error(error)),
-        };
-        hasher.update(&buffer[..count]);
-        if let Some(sink) = sink.as_mut() {
-            let writable = usize::try_from(maximum.saturating_sub(total))
-                .unwrap_or(usize::MAX)
-                .min(count);
-            sink.write_all(&buffer[..writable])
-                .map_err(|_| SnapshotError::OperationFailed)?;
-        }
-        total = total.saturating_add(u64::try_from(count).unwrap_or(u64::MAX));
-    }
-    Ok((format_sha256(hasher.finalize()), total))
-}
-
-pub(crate) enum BlobWrite {
-    Stored,
-    /// An identical blob already existed; this write created nothing.
-    Present,
-    /// The source did not hold exactly the expected content, so nothing was stored.
-    Mismatch,
 }
 
 /// A private temporary beside its destination, removed on drop unless renamed away.
 struct Temporary {
     path: PathBuf,
     file: File,
-    #[cfg(test)]
-    remove_failure: Option<Arc<AtomicBool>>,
 }
 
 impl Temporary {
@@ -611,12 +351,7 @@ impl Temporary {
         let file = options
             .open(&path)
             .map_err(|_| SnapshotError::OperationFailed)?;
-        Ok(Self {
-            path,
-            file,
-            #[cfg(test)]
-            remove_failure: None,
-        })
+        Ok(Self { path, file })
     }
 
     fn write_all(&mut self, bytes: &[u8]) -> Result<(), SnapshotError> {
@@ -625,27 +360,11 @@ impl Temporary {
             .and_then(|()| self.file.sync_all())
             .map_err(|_| SnapshotError::OperationFailed)
     }
-
-    fn remove(&self) -> Result<(), SnapshotError> {
-        #[cfg(test)]
-        if self
-            .remove_failure
-            .as_ref()
-            .is_some_and(|failure| failure.load(Ordering::SeqCst))
-        {
-            return Err(SnapshotError::RollbackFailed);
-        }
-        match fs::remove_file(&self.path) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-            Err(_) => Err(SnapshotError::RollbackFailed),
-        }
-    }
 }
 
 impl Drop for Temporary {
     fn drop(&mut self) {
-        let _ = self.remove();
+        let _ = fs::remove_file(&self.path);
     }
 }
 
@@ -672,6 +391,22 @@ fn private_entries(directory: &Path) -> Result<impl Iterator<Item = PrivateEntry
             .map_err(|_| SnapshotError::UnhealthyStorage)?;
         Ok((name, metadata))
     }))
+}
+
+/// The repository's layout is the engine's, but everything at its top must be as private as the
+/// rest of the store: nothing there may be a link, shared, or another user's.
+fn validate_repository(repository: &Path) -> Result<(), SnapshotError> {
+    let entries = fs::read_dir(repository).map_err(|_| SnapshotError::InvalidConfiguration)?;
+    for (index, entry) in entries.enumerate() {
+        let metadata = entry
+            .and_then(|entry| entry.metadata())
+            .map_err(|_| SnapshotError::InvalidConfiguration)?;
+        if index >= MAX_PRIVATE_ENTRIES || metadata.file_type().is_symlink() {
+            return Err(SnapshotError::InvalidConfiguration);
+        }
+        validate_private_permissions(&metadata)?;
+    }
+    Ok(())
 }
 
 fn is_temporary(name: &str) -> bool {
@@ -797,6 +532,34 @@ fn create_private_directory(path: &Path) -> Result<(), SnapshotError> {
         }
         Err(_) => Err(SnapshotError::InvalidConfiguration),
     }
+}
+
+/// The umask, read off a file the kernel created under it: asking for it directly would change it
+/// for every thread until it was set back.
+#[cfg(unix)]
+fn probe_umask(root: &Path) -> Result<u32, SnapshotError> {
+    let path = root.join(UMASK_PROBE);
+    let remove = || match fs::remove_file(&path) {
+        Err(error) if error.kind() != io::ErrorKind::NotFound => {
+            Err(SnapshotError::InvalidConfiguration)
+        }
+        _ => Ok(()),
+    };
+    remove()?;
+    let created = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(UMASK_PROBE_MODE)
+        .open(&path)
+        .and_then(|probe| probe.metadata())
+        .map_err(|_| SnapshotError::InvalidConfiguration);
+    remove()?;
+    Ok(UMASK_PROBE_MODE & !created?.permissions().mode())
+}
+
+#[cfg(not(unix))]
+fn probe_umask(_root: &Path) -> Result<u32, SnapshotError> {
+    Ok(0)
 }
 
 #[cfg(unix)]

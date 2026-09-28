@@ -584,13 +584,13 @@ Workspace snapshots are disabled unless an authenticated remote host, writable f
 existing operator-owned private directory are configured together with `--snapshot-root` or
 `WORKCELL_MCP_SNAPSHOT_ROOT`. The directory must be absolute, owned by the process identity, inaccessible
 to group and other users on Unix, free of symlink components, and disjoint from the exposed workspace.
-It has no shared temporary-directory default. Snapshot blobs, manifests, checkpoint mappings, and
-restore journals remain beneath a directory keyed by the complete durable workspace identity under
+It has no shared temporary-directory default. The snapshot object repository, checkpoint mappings,
+and restore journals remain beneath a directory keyed by the complete durable workspace identity under
 that private root. They never cross workspace generations and are never returned as byte payloads or
 exposed by an HTTP route.
 
 `ai.workcell/snapshot-prepare-capture` accepts `version`, the workspace binding, `checkpointId`, and
-`limits`, returning the common `PrepareResponse` with contract `workcell.snapshot.capture.v1`.
+`limits`, returning the common `PrepareResponse` with contract `workcell.snapshot.capture.v2`.
 Preparation validates bounded input and retains the cwd handle's directory identity without scanning
 or waiting for capture admission. Execution checks that identity against the opened scope descriptor
 after admission, before traversing it; replacing the directory refuses the capture, while changing its
@@ -641,44 +641,59 @@ The client lowers `maxFiles`, `maxFileBytes`, and `maxTotalBytes` per capture be
 symlinks are measured by their raw target bytes, not the destination's contents. The file-count and
 total-byte limits refuse the capture, because silently dropping files past a count would restore an arbitrary
 subset. The walk also stops at 250,000 directory entries, 64 MiB of retained path bytes, or a depth of
-128, and a manifest is at most 32 MiB. Every limit and quota refusal carries `data.limit`, naming the
-limit, and `data.maximum` where it has one, so a client can say which setting to change. Immutable
-blobs are SHA-256 addressed and deduplicated, and every blob, manifest, checkpoint, and journal
-publication is charged against the store quota while holding the publication lock. A failed capture
-removes what it stored. Manifests record, per entry, the root-relative path, kind, digest, mode, and
-size, then every pruned path with its reason. `snapshot-inspect` pages that manifest and verifies its
-identity before returning metadata. Manifests written by the previous release remain readable.
+128, and a snapshot's metadata is at most 32 MiB. Every limit and quota refusal carries `data.limit`,
+naming the limit, and `data.maximum` where it has one, so a client can say which setting to change.
 
-New small blobs are staged in private temporary files, in batches of at most 64 files and 4 MiB.
-Staged bytes count against the storage quota and repeated digests share a single pending file. Up to
-eight scoped workers fsync the batch files; every worker finishes successfully before any immutable
-blob name in that batch is linked. Files larger than the byte cap use the existing single-file
-streaming path after draining the batch. No file contents are retained in a whole-workspace buffer.
-Blob-directory, manifest, and checkpoint durability barriers remain in place. Failure or cancellation
-joins all sync workers and removes this capture's staging and new publications, not prior receipts.
-Mismatch and read-error paths confirm temporary-file removal before returning or refunding a staging
-reservation. An unconfirmed removal stops capture with `rollback_failed`, retains its reservation, and
-cannot be reported as clean cancellation. Drop cleanup is only a fallback.
-The opt-in `capture_persistence_benchmark` test measures first and unchanged captures of 20,000 unique
-128-byte files across 100 directories.
+A snapshot is a git tree in a private bare repository that reads no system, global, or environment Git
+configuration. Git can inspect it, but `git gc`, `git prune`, and `git repack` must never run there: the
+store names no refs and reads only loose objects, so they would delete or pack away every snapshot.
+Each entry records its root-relative path, whether it is a file, an executable file, or
+a link, and its content as a blob; a metadata blob records the scope, exclusions, skip counts and
+samples, and every pruned path with its reason. The snapshot ID is `snap_` and the ID of the tree
+holding both, and revisions are prefixed Git object IDs, such as `gitoid:blob:sha1:` and 40 hex digits.
+Equal content therefore has one snapshot and one blob however often it is captured. Every object,
+checkpoint, and journal is charged against the store quota while holding the publication lock, and
+every object is verified against its ID when read. `snapshot-inspect` pages the tree. Snapshot data
+written by earlier releases is deleted when the store opens; those checkpoints are not restorable. A
+checkpoint or journal in a format this release does not know, such as a later release's, fails the
+open with `unhealthy_storage` rather than being deleted.
+
+A capture reads only the files that changed. A stat cache in Git's index format keeps each file's
+device, inode, owner, size, and change and modification times to the nanosecond, with the blob it
+held, for files that had not changed for five seconds before the capture that read them started, so
+an edit within one timestamp tick is never mistaken for no edit. A file matching every field is not
+read again; any other is read until the stat taken around the read agrees. New
+objects are written compressed under temporary names, and each is flushed before it takes its name, so
+a crash leaves only temporary files for cleanup, never a partial object a later capture would reuse.
+One pass flushes every new object and the directories naming it, and those naming objects the capture
+found already stored, before any checkpoint names them. A failed or cancelled capture removes the
+checkpoint it wrote, if any, and deletes what it staged; objects it had already named are left for
+cleanup to collect. The opt-in `capture_persistence_benchmark` test measures first and
+unchanged captures of 20,000 unique 128-byte files across 100 directories.
 
 `snapshot-prepare-restore` names a target snapshot and a source snapshot the workspace is believed to
 match. The restore touches only paths whose entries differ between the two and that both captures
-covered, beneath the deeper of their scopes: a path either side pruned, excluded, or never saw is left
-alone. Each such path is observed now. One that already matches the target counts as unchanged, one
-that matches the source is planned as a create, replace, or delete, and anything else is a conflict. A
-missing ancestor directory is planned for creation; one that is not a plain directory is a conflict.
-Conflicts refuse execution, since restoring over an edit nobody captured would destroy it. The preview
-carries complete counts and bounded samples, conflicts first. Authorization discloses write and delete
-intents on the scope for the effects those counts include, the restore's own journal, and the settled
-journals it may reclaim for room. Execution journals the restore, then publishes each path only while
-its live entry still matches what preparation observed, by device, inode, size, mode, and timestamps.
-Each publication is atomic for one entry, but a portable transaction across files does not exist:
-discovery reports `atomicAcrossFiles: false`. The first refusal stops the restore; if nothing was
-published yet the journal is removed and the refusal returned, otherwise the restore is `partial`. An
-I/O outcome that cannot be known makes it `indeterminate` with `reconciliation_required`. The journal
-records state transitions and counts, not paths, and a restore that a crash left publishing is recomputed
-from its two captures and the live workspace at startup. Nothing is replayed.
+covered, beneath the deeper of their scopes: a path either side pruned or excluded is left alone. A
+path a capture's `.gitignore` rules left out is not recorded, only absent, so as in Git a restore
+removes a path the target ignored and the source captured. As in Git, a file's content and whether it
+is executable count; its other permission bits do not. Each such path is observed now. One that
+already matches the target counts as unchanged, one that matches the source is planned as a create,
+replace, or delete, and anything else is a conflict. A missing ancestor directory is planned for
+creation; one that is not a plain directory is a conflict. Conflicts refuse execution, since
+restoring over an edit nobody captured would destroy it. The preview carries complete counts and
+bounded samples, conflicts first. Authorization discloses write and delete intents on the scope for
+the effects those counts include, the restore's own journal, and the settled journals it may reclaim
+for room. Execution journals the restore, then publishes each path only while its live entry still
+matches what preparation observed, by device, inode, size, mode, and timestamps.
+A restored file keeps the permission bits of the file it replaces, gaining execute permission for its
+owner and wherever it has read permission, or losing it everywhere; a file the restore creates gets
+Git's default mode under the process umask. Each publication is atomic for one entry, but a portable
+transaction across files does not exist: discovery reports `atomicAcrossFiles: false`. The first
+refusal stops the restore; if nothing was published yet the journal is removed and the refusal
+returned, otherwise the restore is `partial`. An I/O outcome that cannot be known makes it
+`indeterminate` with `reconciliation_required`. The journal records state transitions and counts, not
+paths, and a restore that a crash left publishing is recomputed from its two captures and the live
+workspace at startup. Nothing is replayed.
 
 `snapshot-status` reads the durable restore journal. A completed, partial, or indeterminate restore
 awaits a decision: `snapshot-acknowledge` accepts it, and `snapshot-prepare-unrevert` restores the same
@@ -688,13 +703,14 @@ restore awaits a decision, every other restore is refused. Journal count and byt
 before execution, and pressure reclaims only settled journals.
 
 `snapshot-prepare-cleanup` deletes checkpoints, never snapshots directly, because one
-content-addressed snapshot may back the checkpoints of several sessions. It names up to 128 checkpoint
-IDs; the preview separates the ones that exist from the missing ones and counts reclaimable manifest,
-checkpoint, and journal bytes. Blobs are collected on execution, not counted in advance. Preparation
-retains one exact plan: the checkpoints, the settled journals, and every snapshot that no other
-checkpoint, awaiting restore, or pending preparation still names. Authorization is one server-state
-delete intent bound to that plan's digest. Execution refuses unless the store would still plan exactly
-that, removes references before referents, then deletes blobs no remaining manifest names.
+content-addressed snapshot may back the checkpoints of several sessions, and snapshots share every
+object they can. It names up to 128 checkpoint IDs; the preview separates the ones that exist from the
+missing ones and counts reclaimable checkpoint, journal, and object bytes. Preparation retains one
+exact plan: the checkpoints, the settled journals, the snapshots nothing else names, and a digest of
+exactly the objects that no remaining checkpoint, awaiting restore, pending preparation, or stat cache
+entry reaches. Authorization is one server-state delete intent bound to that plan's digest. Execution
+refuses unless the store would still plan exactly that, removes references before referents, then
+deletes those objects, which `deletedObjects` counts. Cancellation leaves them to a later cleanup.
 
 Preparations, terminal outcomes, shell progress, and capture phase/counter progress are held in a
 bounded in-process ledger. Capture progress is emitted at phase transitions and at most once per second
