@@ -155,16 +155,6 @@ const REMOTE_EXECUTION_TIMEOUT: Duration = Duration::from_secs(600);
 const SHELL_COMPLETION_ALLOWANCE_MS: u64 = 30_000;
 const SHELL_EXECUTION_TIMEOUT: Duration =
     Duration::from_millis(SHELL_MAX_TIMEOUT_MS + SHELL_COMPLETION_ALLOWANCE_MS);
-const SHELL_DESCRIPTION_REPLACEMENTS: &[(&str, &str)] = &[
-    (
-        "- A command that does not exit on its own, such as a server or a watcher, holds the call until its timeout.",
-        "- A command that does not exit on its own, such as a server or a watcher, runs until its execution timeout unless cancelled.",
-    ),
-    (
-        "- Background execution is unsupported; descendants that retain output pipes are terminated.",
-        "- Descendants that retain output pipes after the command exits are terminated.",
-    ),
-];
 const REMOTE_RECONCILE_TIMEOUT: Duration = Duration::from_secs(10);
 const REMOTE_RECONCILE_MAX_POLLS: usize = 4;
 const REMOTE_DEADLINE_BEFORE_DISPATCH: &str =
@@ -650,7 +640,7 @@ impl Tool for RemoteWorkcellTool {
     }
 
     fn description(&self, _ctx: &DescriptionContext) -> Cow<'_, str> {
-        workcell_base_description(self.kind, &self.spec.description)
+        Cow::Borrowed(&self.spec.description)
     }
 
     fn schema(&self) -> Value {
@@ -826,7 +816,7 @@ impl Tool for WorkcellTool {
     }
 
     fn description(&self, _ctx: &DescriptionContext) -> Cow<'_, str> {
-        workcell_base_description(self.kind, &self.spec.description)
+        Cow::Borrowed(&self.spec.description)
     }
 
     fn schema(&self) -> Value {
@@ -856,26 +846,6 @@ impl Tool for WorkcellTool {
             prepared: Mutex::new(None),
         }))
     }
-}
-
-fn workcell_base_description(kind: ToolKind, description: &str) -> Cow<'_, str> {
-    let replacement = |line| {
-        SHELL_DESCRIPTION_REPLACEMENTS
-            .iter()
-            .find_map(|(previous, current)| (line == *previous).then_some(*current))
-    };
-    if kind != ToolKind::Shell || !description.lines().any(|line| replacement(line).is_some()) {
-        return Cow::Borrowed(description);
-    }
-    let mut normalized = String::with_capacity(description.len());
-    for line in description.split_inclusive('\n') {
-        let text = line.strip_suffix('\n').unwrap_or(line);
-        normalized.push_str(replacement(text).unwrap_or(text));
-        if line.ends_with('\n') {
-            normalized.push('\n');
-        }
-    }
-    Cow::Owned(normalized)
 }
 
 /// The outbound proxy for the web tools, read from the ambient environment.
@@ -4978,22 +4948,6 @@ mod tests {
                     assert!(description.contains("receipt"));
                 }
             }
-        }
-    }
-
-    #[test_case(ToolKind::FileRead; "other_tool")]
-    #[test_case(ToolKind::Shell; "noncanonical_shell_prose")]
-    fn base_description_does_not_scrub_unrelated_prose(kind: ToolKind) {
-        for (previous, _) in SHELL_DESCRIPTION_REPLACEMENTS {
-            let description = if kind == ToolKind::Shell {
-                format!("Quoted instruction: {previous}\n")
-            } else {
-                format!("{previous}\n")
-            };
-            assert!(matches!(
-                workcell_base_description(kind, &description),
-                Cow::Borrowed(value) if value == description
-            ));
         }
     }
 

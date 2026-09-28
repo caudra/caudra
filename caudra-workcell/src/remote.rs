@@ -7468,8 +7468,8 @@ mod tests {
     use crate::transfer::PrivateStaging;
     use crate::{
         Input, REMOTE_DEADLINE_BEFORE_DISPATCH, REMOTE_PREPARATION_RENEWAL, RemoteExecutionCleanup,
-        RemotePreparedState, RemoteWorkcellInvocation, RemoteWorkcellTool,
-        SHELL_DESCRIPTION_REPLACEMENTS, ToolKind, WorkcellHost, WorkcellTool,
+        RemotePreparedState, RemoteWorkcellInvocation, RemoteWorkcellTool, ToolKind, WorkcellHost,
+        WorkcellTool,
     };
     use caudra_agent::cancel::CancelToken;
     use caudra_agent::tools::{
@@ -7534,9 +7534,8 @@ mod tests {
     const CACHE_CLOCK_STEP: Duration = Duration::from_secs(1);
     const TIMEOUT_COMMAND: &str = "cargo test";
 
-    #[test_case(true; "pinned_legacy_catalog")]
-    #[test_case(false; "neutral_catalog")]
-    fn embedded_and_remote_shell_descriptions_are_delivery_neutral(legacy: bool) {
+    #[test]
+    fn embedded_and_remote_shell_descriptions_are_delivery_neutral() {
         let root = tempfile::tempdir().unwrap();
         let host = WorkcellHost::new(root.path(), None).unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -7549,19 +7548,8 @@ mod tests {
             audience: ToolAudience::MAIN,
             workflows_available: false,
         };
-        for mut spec in crate::canonical_remote_specs() {
+        for spec in crate::canonical_remote_specs() {
             let kind = ToolKind::from_name(spec.name).unwrap();
-            let mut expected = spec.description.clone();
-            if kind == ToolKind::Shell {
-                for &(previous, current) in SHELL_DESCRIPTION_REPLACEMENTS {
-                    expected = expected.replace(previous, current);
-                    spec.description = if legacy {
-                        spec.description.replace(current, previous)
-                    } else {
-                        spec.description.replace(previous, current)
-                    };
-                }
-            }
             let remote = RemoteWorkcellTool {
                 client: client.clone(),
                 kind,
@@ -7573,8 +7561,7 @@ mod tests {
                 host: Arc::clone(&host.inner),
             };
             let local_description = local.description(&ctx);
-            assert_eq!(local_description, expected);
-            assert_eq!(remote.description(&ctx), expected);
+            assert_eq!(remote.description(&ctx), local_description);
             if kind == ToolKind::Shell {
                 assert!(!local_description.to_lowercase().contains("background"));
                 assert!(!local_description.contains("holds the call"));
