@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
@@ -8,6 +9,8 @@ use caudra_providers::{
 };
 use caudra_storage::sessions::next_epoch;
 use tracing::warn;
+
+use crate::types::{TodoItem, ToolDoneEvent, ToolOutput};
 
 pub(crate) const CANCEL_MARKER: &str = "[Cancelled by user]";
 /// Opens the marker a run that died mid-turn leaves behind. A prefix rather than a fixed
@@ -28,6 +31,10 @@ pub struct History {
     /// it exists for readers that need what the user said before a seam,
     /// which the request deliberately no longer carries.
     archived: Vec<HistoryItem>,
+    /// The plan as the last committed todo update left it. The model only ever
+    /// saw "ok" for one, so this is the one place the list survives. `None`
+    /// until an update lands, which is not the same as a list emptied by one.
+    todos: Option<Vec<TodoItem>>,
 }
 
 impl History {
@@ -37,6 +44,7 @@ impl History {
             messages,
             mirror: None,
             archived: Vec::new(),
+            todos: None,
         }
     }
 
@@ -58,6 +66,7 @@ impl History {
             messages,
             mirror: None,
             archived: Vec::new(),
+            todos: None,
         })
     }
 
@@ -72,6 +81,29 @@ impl History {
     pub fn with_archived(mut self, items: Vec<HistoryItem>) -> Self {
         self.archived = items;
         self
+    }
+
+    /// Seeds the plan a restored session last committed; see [`stored_todos`].
+    pub fn with_todos(mut self, todos: Option<Vec<TodoItem>>) -> Self {
+        self.todos = todos;
+        self
+    }
+
+    pub fn todos(&self) -> Option<&[TodoItem]> {
+        self.todos.as_deref()
+    }
+
+    /// Keeps the list the last todo update among `results` set. Called with
+    /// the results about to be committed, while their typed outputs still
+    /// exist: committing reduces each to the text the model reads.
+    pub(crate) fn record_todos(&mut self, results: &[ToolDoneEvent]) {
+        if let Some(items) = results
+            .iter()
+            .rev()
+            .find_map(|done| done.output.todo_update(done.is_error))
+        {
+            self.todos = Some(items.to_vec());
+        }
     }
 
     /// Every item a reader scrolls: the archive, then the active chain. Not a
@@ -243,6 +275,34 @@ impl Default for History {
     fn default() -> Self {
         Self::new(Vec::new())
     }
+}
+
+/// The todo list a stored transcript last committed, read from the typed
+/// outputs its session kept by call ID.
+///
+/// A session keeps one output per ID, the newest. An older result under a
+/// reused ID is therefore unknown, and the scan gives up there rather than
+/// reach past it for a list that may since have been replaced.
+pub fn stored_todos<'i, 'o>(
+    transcript: impl DoubleEndedIterator<Item = &'i HistoryItem>,
+    output: impl Fn(&str) -> Option<&'o ToolOutput>,
+) -> Option<Vec<TodoItem>> {
+    let mut seen = HashSet::new();
+    for item in transcript.rev() {
+        let HistoryItemKind::ToolResult {
+            call_id, is_error, ..
+        } = &item.kind
+        else {
+            continue;
+        };
+        if !seen.insert(call_id.as_str()) {
+            return None;
+        }
+        if let Some(items) = output(call_id).and_then(|output| output.todo_update(*is_error)) {
+            return Some(items.to_vec());
+        }
+    }
+    None
 }
 
 fn expand_messages(messages: &[Message]) -> Vec<HistoryItem> {
@@ -666,10 +726,13 @@ fn one_line(reason: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use caudra_providers::{ContentBlock, Message, Role, SteeringKind};
     use test_case::test_case;
 
     use super::*;
+    use crate::types::{TodoPriority, TodoStatus};
 
     const FIRST: &str = "first";
     const SECOND: &str = "second";
@@ -1583,5 +1646,146 @@ mod tests {
         assert_eq!(snap.messages.len(), 1);
         assert_ne!(history.item_head(), Some(original_id));
         assert_eq!(messages[0].user_text(), Some(SECOND));
+    }
+
+    const PLAN_CALL: &str = "plan";
+    const REPLAN_CALL: &str = "replan";
+    const READ_CALL: &str = "read";
+    const DRAFT: &str = "draft the reminder";
+    const SHIP: &str = "ship the reminder";
+    const COMPACTED: &str = "summary of the work so far";
+    const RESTORE_AGREES: &str = "a restored session must resume the plan the live one held";
+
+    fn plan(content: &str) -> Vec<TodoItem> {
+        vec![TodoItem {
+            content: content.into(),
+            status: TodoStatus::InProgress,
+            priority: TodoPriority::High,
+        }]
+    }
+
+    fn todo_done(call_id: &str, todos: Vec<TodoItem>, is_error: bool) -> ToolDoneEvent {
+        ToolDoneEvent {
+            output: ToolOutput::TodoList(todos),
+            is_error,
+            ..ToolDoneEvent::error(call_id.into(), String::new())
+        }
+    }
+
+    fn failed(call_id: &str) -> ToolDoneEvent {
+        ToolDoneEvent::error(call_id.into(), FAILURE)
+    }
+
+    /// Commits `results` the way tool dispatch does, and keeps each typed
+    /// output under its call ID the way a session store does.
+    fn commit(
+        history: &mut History,
+        outputs: &mut HashMap<String, ToolOutput>,
+        results: Vec<ToolDoneEvent>,
+    ) {
+        let ids: Vec<&str> = results.iter().map(|done| done.id.as_str()).collect();
+        history.push(make_tool_use_msg(&ids));
+        history.record_todos(&results);
+        for done in &results {
+            outputs.insert(done.id.clone(), done.output.clone());
+        }
+        history.push(crate::types::tool_results(results));
+    }
+
+    fn restored_todos(
+        items: &[HistoryItem],
+        outputs: &HashMap<String, ToolOutput>,
+    ) -> Option<Vec<TodoItem>> {
+        stored_todos(items.iter(), |call_id| outputs.get(call_id))
+    }
+
+    #[test_case(vec![vec![todo_done(PLAN_CALL, plan(DRAFT), false)]], Some(plan(DRAFT)) ; "an_update_sets_it")]
+    #[test_case(
+        vec![vec![todo_done(PLAN_CALL, plan(DRAFT), false)], vec![todo_done(REPLAN_CALL, plan(SHIP), false)]],
+        Some(plan(SHIP)) ; "a_later_update_replaces_it"
+    )]
+    #[test_case(
+        vec![vec![todo_done(PLAN_CALL, plan(DRAFT), false), todo_done(REPLAN_CALL, plan(SHIP), false)]],
+        Some(plan(SHIP)) ; "the_last_update_of_one_response_wins"
+    )]
+    #[test_case(
+        vec![vec![todo_done(PLAN_CALL, plan(DRAFT), false)], vec![todo_done(REPLAN_CALL, plan(SHIP), true)]],
+        Some(plan(DRAFT)) ; "a_failed_update_keeps_it"
+    )]
+    #[test_case(
+        vec![vec![todo_done(PLAN_CALL, plan(DRAFT), false)], vec![todo_done(REPLAN_CALL, Vec::new(), false)]],
+        Some(Vec::new()) ; "an_empty_update_clears_it"
+    )]
+    #[test_case(vec![vec![failed(READ_CALL)]], None ; "no_update_leaves_it_unknown")]
+    fn the_plan_is_the_last_successful_update(
+        commits: Vec<Vec<ToolDoneEvent>>,
+        expected: Option<Vec<TodoItem>>,
+    ) {
+        let mut history = History::new(vec![Message::user(GO.into())]);
+        let mut outputs = HashMap::new();
+        for results in commits {
+            commit(&mut history, &mut outputs, results);
+        }
+
+        assert_eq!(history.todos(), expected.as_deref());
+        assert_eq!(
+            restored_todos(&history.transcript_items(), &outputs),
+            expected,
+            "{RESTORE_AGREES}"
+        );
+    }
+
+    #[test]
+    fn a_plan_committed_before_a_compaction_outlives_it() {
+        let mut history = History::new(vec![Message::user(GO.into())]);
+        let mut outputs = HashMap::new();
+        commit(
+            &mut history,
+            &mut outputs,
+            vec![todo_done(PLAN_CALL, plan(DRAFT), false)],
+        );
+        let seam = history.item_at_message_boundary(history.len());
+        history.replace_superseding(vec![Message::user(COMPACTED.into())], seam);
+        commit(&mut history, &mut outputs, vec![failed(READ_CALL)]);
+
+        assert_eq!(history.todos(), Some(plan(DRAFT).as_slice()));
+        assert_eq!(
+            restored_todos(&history.transcript_items(), &outputs),
+            Some(plan(DRAFT)),
+            "{RESTORE_AGREES}"
+        );
+        assert_eq!(
+            restored_todos(history.active_items(), &outputs),
+            None,
+            "the update lives behind the seam, so a restore has to read the archive"
+        );
+    }
+
+    /// A session keeps one output per call ID, so a result under a reused ID
+    /// hides whatever an older result under it said.
+    #[test_case(false => None ; "an_update_overwritten_under_its_id_is_unknown")]
+    #[test_case(true => Some(plan(SHIP)) ; "an_update_newest_under_its_id_is_kept")]
+    fn a_reused_call_id_never_restores_a_plan_it_may_have_replaced(
+        update_last: bool,
+    ) -> Option<Vec<TodoItem>> {
+        let mut history = History::new(vec![Message::user(GO.into())]);
+        let mut outputs = HashMap::new();
+        commit(
+            &mut history,
+            &mut outputs,
+            vec![todo_done(PLAN_CALL, plan(DRAFT), false)],
+        );
+        let update = todo_done(REPLAN_CALL, plan(SHIP), false);
+        let other = failed(REPLAN_CALL);
+        let (first, second) = if update_last {
+            (other, update)
+        } else {
+            (update, other)
+        };
+        commit(&mut history, &mut outputs, vec![first]);
+        commit(&mut history, &mut outputs, vec![second]);
+
+        assert_eq!(history.todos(), Some(plan(SHIP).as_slice()));
+        restored_todos(&history.transcript_items(), &outputs)
     }
 }

@@ -41,7 +41,7 @@ use caudra_agent::permissions::{
     PermissionManager, PermissionRequest, PermissionResourceSelector, PermissionRuleRecord,
 };
 use caudra_agent::snapshots::{RestoreFailureKind, RestoreStatus, SnapshotKey};
-use caudra_agent::tools::{SHELL_TOOL_NAME, ToolEffect};
+use caudra_agent::tools::{SHELL_TOOL_NAME, TODOWRITE_TOOL_NAME, ToolEffect};
 use caudra_agent::types::{TodoItem, TodoPriority, TodoStatus};
 use caudra_agent::workspace_baseline::BaselineOutcome;
 use caudra_agent::{
@@ -910,6 +910,7 @@ mod background_runtime {
                 &slot,
                 Vec::new(),
                 Vec::new(),
+                None,
                 AgentConfig {
                     generate_titles: false,
                     compaction_requirements: false,
@@ -13270,6 +13271,72 @@ fn a_restored_compacted_session_scrolls_past_the_border() {
         "the border still separates the summary from what it replaced"
     );
     assert_eq!(chat.message_at(2).map(|m| m.text.as_str()), Some(SUMMARY));
+}
+
+/// A respawned agent starts from the list the transcript last committed, and
+/// a compaction moves that update out of the active chain into the archive.
+#[test]
+fn a_restored_compacted_session_hands_the_agent_its_todo_list() {
+    const PLAN_CALL: &str = "todo-1";
+    const PLAN: &str = "verify the restored list";
+    const SUMMARY: &str = "## Objective";
+
+    let mut app = test_app();
+    let todos = vec![TodoItem {
+        content: PLAN.into(),
+        status: TodoStatus::InProgress,
+        priority: TodoPriority::High,
+    }];
+    let mut items = crate::history_items(&[
+        Message::user(PLAN.into()),
+        Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::tool_use(
+                PLAN_CALL,
+                TODOWRITE_TOOL_NAME,
+                serde_json::json!({}),
+            )],
+            ..Default::default()
+        },
+        Message {
+            role: Role::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: PLAN_CALL.into(),
+                content: String::new(),
+                is_error: false,
+                output_ref: None,
+            }],
+            ..Default::default()
+        },
+    ]);
+    let superseded = items.last().unwrap().id;
+    let mut compacted = crate::history_items(&[
+        Message::synthetic(caudra_agent::COMPACTION_ANCHOR.into()),
+        Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::Text {
+                text: SUMMARY.into(),
+            }],
+            is_compaction_summary: true,
+            ..Default::default()
+        },
+    ]);
+    compacted[0].supersedes = Some(superseded);
+    let head = compacted.last().unwrap().id;
+    items.extend(compacted);
+    let session = app.state.session_mut();
+    session.replace_messages(items);
+    session.meta.history_head = Some(head);
+    session.insert_tool_output(PLAN_CALL.into(), ToolOutput::TodoList(todos.clone()));
+
+    let session = &app.state.session;
+    let active = crate::active_session_history(session).unwrap();
+    let archived = crate::archived_session_history(session);
+    assert_eq!(crate::session_todos(session, &[], &active), None);
+    assert_eq!(
+        crate::session_todos(session, &archived, &active),
+        Some(todos)
+    );
 }
 
 #[test]

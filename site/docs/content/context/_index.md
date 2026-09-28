@@ -188,6 +188,7 @@ Part of what the model reads was written by Caudra rather than typed by you. The
 | Goal check-in | While a goal is running, to report progress against it |
 | Continuation | After a nudge or a compaction, to say what the model should pick up |
 | Background work | Before an already-scheduled main request when task/workflow state changes or the configured response interval expires, and after successful compaction of a session with background work |
+| Open todo items | When the main agent is about to hand control back while its todo list has pending or in-progress items, at most once per message you send |
 
 These runtime snapshots arrive as messages, keeping the cached system prefix stable. Most are sent only when their content changes. Background-work snapshots can also repeat at a configured interval or after compaction.
 
@@ -213,6 +214,19 @@ The interval counts parent response groups committed to history. A response with
 Reminders accompany requests the main agent was already going to make. They do not wake an idle chat, poll on a timer, or override Stop. Actual task reports and outcomes retain their [automatic continuation behavior](/docs/sessions/#background-tasks).
 
 Compaction preserves a Delegated work section with assignments, scope, expected results, and the parent's next steps. After summarization, Caudra reads runtime state again so a child that finished during compaction is not described as still running. Summary status is last observed. The host snapshot supplies current execution state, while attributed reports supply results. When nothing remains active, a clearing snapshot does not claim that the user's overall request is complete.
+
+### Open todo items
+
+When the main agent ends its answer while its todo list still has pending or in-progress items, Caudra holds the handoff once and sends a reminder. The reminder repeats the whole list as last recorded, including completed and cancelled items. It asks the model to check each open item against the work, correct the list with `todo_write`, and continue any work it can do now. Blocked items, items waiting on you, and background work may stay open. After one more answer, control returns to you whatever the list says.
+
+The reminder adds at most one request per message you send. Subagents never receive it. Runs that are cancelled, fail, or reach the turn limit end as they would without it. A resumed session reads its last list back from the stored transcript, including across compaction.
+
+To turn it off:
+
+```toml
+[agent]
+todo_reminder = false
+```
 
 ## Four places to put knowledge
 

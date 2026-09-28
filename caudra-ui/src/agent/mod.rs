@@ -17,6 +17,7 @@ use caudra_agent::permissions::PermissionManager;
 use caudra_agent::prompt::profile::PromptProfileCatalog;
 use caudra_agent::prompt::profile::{BUILTIN_PROFILE_NAME, SystemPromptProfile};
 use caudra_agent::tools::PathLocks;
+use caudra_agent::types::TodoItem;
 use caudra_agent::workflow::WorkflowHandle;
 use caudra_agent::{
     AgentConfig, AgentMode, BaselineGate, CancelMap, CancelToken, Envelope, HistorySnapshot,
@@ -154,6 +155,7 @@ impl AgentHandles {
         model_slot: &Arc<ArcSwap<ModelSlot>>,
         initial_history: Vec<HistoryItem>,
         archived_history: Vec<HistoryItem>,
+        todos: Option<Vec<TodoItem>>,
         config: AgentConfig,
         tool_output_lines: ToolOutputLines,
         permissions: &Arc<PermissionManager>,
@@ -192,6 +194,7 @@ impl AgentHandles {
             model_slot,
             initial_history,
             archived_history,
+            todos,
             config,
             tool_output_lines,
             state_dir.clone().map(ToolOutputStore::new).map(Arc::new),
@@ -390,11 +393,14 @@ impl AgentHandles {
                 WorkflowSlot::Fresh(Some(app.storage.clone()))
             }
         };
+        let archived = crate::archived_session_history(&app.state.session);
+        let todos = crate::session_todos(&app.state.session, &archived, &history);
         let new = spawn_agent_internal(
             (self.agent_tx.clone(), self.agent_rx.clone()),
             model_slot,
             history,
-            crate::archived_session_history(&app.state.session),
+            archived,
+            todos,
             config,
             tool_output_lines,
             Some(Arc::new(ToolOutputStore::new(app.storage.clone()))),
@@ -495,6 +501,7 @@ fn spawn_agent_internal(
     model_slot: &Arc<ArcSwap<ModelSlot>>,
     initial_history: Vec<HistoryItem>,
     archived_history: Vec<HistoryItem>,
+    todos: Option<Vec<TodoItem>>,
     config: AgentConfig,
     tool_output_lines: ToolOutputLines,
     tool_output_store: Option<Arc<ToolOutputStore>>,
@@ -630,6 +637,7 @@ fn spawn_agent_internal(
         tool_output_store,
         initial_history,
         archived_history,
+        todos,
         Arc::clone(&shared_history),
         Arc::clone(&btw_prompt),
         context_publisher,
@@ -898,6 +906,7 @@ mod tests {
             &model_slot,
             crate::history_items(&initial_history),
             Vec::new(),
+            None,
             AgentConfig::default(),
             ToolOutputLines::default(),
             &permissions,

@@ -323,6 +323,7 @@ pub enum SteeringKind {
 #[serde(rename_all = "snake_case")]
 pub enum StandingReminderKind {
     BackgroundWork,
+    OpenTodos,
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]

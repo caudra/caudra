@@ -32,6 +32,7 @@ pub use goal::{
 };
 pub use history::{
     History, HistorySnapshot, SharedHistory, UNAVAILABLE_RESULT, is_run_failure_marker,
+    stored_todos,
 };
 pub(crate) use instructions::{INSTRUCTION_FILES, LOCAL_INSTRUCTION_FILE};
 pub use instructions::{

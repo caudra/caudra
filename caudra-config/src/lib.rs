@@ -1062,6 +1062,7 @@ pub struct AgentFileConfig {
     pub post_compaction_instructions: Option<String>,
     pub compaction_requirements: Option<bool>,
     pub background_reminder_turns: Option<u32>,
+    pub todo_reminder: Option<bool>,
     pub task_execution: Option<ExecutionMode>,
     pub shell_execution: Option<ExecutionMode>,
     pub shell_async_threshold_secs: Option<u64>,
@@ -1093,6 +1094,7 @@ impl AgentFileConfig {
             post_compaction_instructions,
             compaction_requirements,
             background_reminder_turns,
+            todo_reminder,
             task_execution,
             shell_execution,
             shell_async_threshold_secs,
@@ -1959,6 +1961,12 @@ pub struct AgentConfig {
     )]
     pub background_reminder_turns: u32,
 
+    #[config(
+        default = true,
+        desc = "Before the main agent hands control back with pending or in-progress todos, remind it once per user turn, repeating the full todo list, to verify the work and update the list"
+    )]
+    pub todo_reminder: bool,
+
     #[config(default = ExecutionMode::Auto, ty = "string", default_doc = "auto", desc = "Task delivery: sync waits for the completed result, auto lets the model choose, async returns an admission receipt")]
     pub task_execution: ExecutionMode,
 
@@ -2082,6 +2090,7 @@ impl AgentConfig {
             background_reminder_turns: file
                 .background_reminder_turns
                 .unwrap_or(DEFAULT_BACKGROUND_REMINDER_TURNS),
+            todo_reminder: file.todo_reminder.unwrap_or(true),
             generate_titles: file.generate_titles.unwrap_or(true),
             stale_read_check: file.stale_read_check.unwrap_or(true),
             tool_json_repair: file.tool_json_repair.unwrap_or(true),
@@ -3297,6 +3306,8 @@ mod tests {
     const BACKGROUND_REMINDER_FIELD: &str = "background_reminder_turns";
     const CUSTOM_BACKGROUND_REMINDER_TURNS: u32 = 13;
     const UNSIGNED_REMINDER_ERROR: &str = "expected u32";
+    const TODO_REMINDER_FIELD: &str = "todo_reminder";
+    const BOOLEAN_EXPECTED_ERROR: &str = "expected a boolean";
     const SHELL_THRESHOLD_FIELD: &str = "shell_async_threshold_secs";
     const EMPTY_SOURCE_DIGEST: &str =
         "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
@@ -4025,6 +4036,59 @@ mod tests {
             field
                 .description
                 .contains("state-change or post-compaction")
+        );
+    }
+
+    #[test_case("", true ; "enabled_by_default")]
+    #[test_case("todo_reminder = true", true ; "explicitly_enabled")]
+    #[test_case("todo_reminder = false", false ; "disabled")]
+    fn todo_reminder_config(source: &str, expected: bool) {
+        let raw: RawConfig = toml::from_str(&format!("[agent]\n{source}")).unwrap();
+        let config = raw.into_config(false).unwrap();
+        config.validate().unwrap();
+        assert_eq!(config.agent.todo_reminder, expected);
+        assert_eq!(
+            serde_json::to_value(&config.agent).unwrap()[TODO_REMINDER_FIELD],
+            expected
+        );
+    }
+
+    #[test_case(Some(false), None, false ; "omitted_overlay_keeps_disabled")]
+    #[test_case(Some(false), Some(true), true ; "overlay_reenables")]
+    #[test_case(None, Some(false), false ; "overlay_disables")]
+    fn todo_reminder_config_merge(base: Option<bool>, overlay: Option<bool>, expected: bool) {
+        let layer = |todo_reminder| RawConfig {
+            agent: AgentFileConfig {
+                todo_reminder,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut raw = layer(base);
+        raw.merge(layer(overlay));
+        assert_eq!(
+            raw.into_config(false).unwrap().agent.todo_reminder,
+            expected
+        );
+    }
+
+    #[test]
+    fn todo_reminder_config_rejects_non_boolean() {
+        let source = format!("[agent]\n{TODO_REMINDER_FIELD} = \"off\"");
+        let error = toml::from_str::<RawConfig>(&source).unwrap_err();
+        assert!(error.to_string().contains(BOOLEAN_EXPECTED_ERROR));
+    }
+
+    #[test]
+    fn todo_reminder_metadata_matches_runtime_default() {
+        let field = AgentConfig::FIELDS
+            .iter()
+            .find(|field| field.name == TODO_REMINDER_FIELD)
+            .unwrap();
+        assert_eq!(field.ty, "bool");
+        assert_eq!(
+            field.default.format_default(),
+            AgentConfig::default().todo_reminder.to_string()
         );
     }
 

@@ -1200,6 +1200,7 @@ impl SpawnCtx {
         };
         let active_history_ms = lap();
         let archived_history = crate::archived_session_history(&session);
+        let todos = crate::session_todos(&session, &archived_history, &initial_history);
         let archived_history_ms = lap();
         let restore_session = !initial_history.is_empty() || session_has_content(&session);
         let (system_prompt_profile_name, system_prompt_profile, profile_warning) =
@@ -1230,6 +1231,7 @@ impl SpawnCtx {
             &self.model_slot,
             initial_history,
             archived_history,
+            todos,
             self.config.clone(),
             self.ui_config.tool_output_lines,
             &permissions,

@@ -17,7 +17,7 @@ use caudra_providers::model::{Model, ModelPurpose};
 use caudra_providers::provider::{self, Provider};
 use caudra_providers::{
     CacheKey, HistoryItem, HistoryItemKind, Message, TokenUsage, WorkflowEventOrigin,
-    active_history_items, merge_history_items, resolve_history_head,
+    active_history_items, merge_history_items, resolve_history_head, transcript_history_items,
 };
 #[cfg(test)]
 use caudra_providers::{ContentBlock, Role};
@@ -63,7 +63,7 @@ use crate::tools::{
     BuiltinDeferral, DeferralSession, DeferredTool, DescriptionContext, FileReadTracker,
     LocalTools, PathLocks, ToolAudience, ToolDefinitions, ToolFilter, ToolRegistry, deferral,
 };
-use crate::types::BACKGROUND_EVENT_RUN_ID;
+use crate::types::{BACKGROUND_EVENT_RUN_ID, TodoItem};
 use crate::workflow::{RuntimeDeps, WorkflowHandle, WorkflowRuntime, WorkspaceRebind};
 use crate::{
     Agent, AgentConfig, AgentError, AgentEvent, AgentInput, AgentMode, AgentParams, AgentRunParams,
@@ -147,6 +147,23 @@ impl SessionStore {
             .meta
             .history_head
             .or_else(|| self.session.messages().last().map(|item| item.id))
+    }
+
+    /// The todo list the selected transcript last committed, read back across
+    /// its compaction seams; see [`agent::stored_todos`].
+    fn todos(&self) -> Option<Vec<TodoItem>> {
+        let messages = self.session.messages();
+        let head = resolve_history_head(
+            messages,
+            self.session.meta.history_head,
+            self.session.meta.pending_revert.is_some(),
+        );
+        let transcript = transcript_history_items(messages, head)
+            .inspect_err(|error| warn!(%error, "failed to read the transcript for its todo list"))
+            .ok()?;
+        agent::stored_todos(transcript.iter(), |call_id| {
+            self.session.tool_outputs().get(call_id).map(Arc::as_ref)
+        })
     }
 
     fn open(
@@ -2009,7 +2026,7 @@ pub async fn prepare_interactive(
     }
     Ok(PreparedInteractive {
         params,
-        history,
+        history: history.with_todos(store.todos()),
         model,
         provider,
         store,
@@ -3245,9 +3262,10 @@ mod tests {
     use crate::permissions::{
         PermissionAnswer, PermissionError, PermissionLifetime, PermissionRequest, RevokedRuleScope,
     };
-    use crate::tools::PermissionScopes;
     use crate::tools::registry::BoxFuture;
     use crate::tools::test_support::stub_ctx_with;
+    use crate::tools::{PermissionScopes, TODOWRITE_TOOL_NAME};
+    use crate::types::{TodoPriority, TodoStatus};
     use crate::workflow::store::WorkflowStore;
 
     const SESSION_ID: &str = "CNK1hV6GWoysH3KQMm5wu";
@@ -3258,6 +3276,12 @@ mod tests {
     const PERMISSION_TOOL: &str = "bash";
     const PERMISSION_OPTION: &str = "allow_exact";
     const LOST_PERMISSION_ACK: &str = "permission committed but acknowledgment lost";
+    const PLANNING_PROMPT: &str = "plan the migration";
+    const COMPACTION_SUMMARY: &str = "the migration was planned";
+    const FIRST_TODO_CALL: &str = "todo-1";
+    const REVISED_TODO_CALL: &str = "todo-2";
+    const FIRST_TODO: &str = "draft the schema";
+    const REVISED_TODO: &str = "backfill the rows";
 
     #[test_case("!pwd", Some("pwd"); "visible_command")]
     #[test_case("!! pwd", Some("pwd"); "hidden_command")]
@@ -3735,6 +3759,80 @@ mod tests {
         let loaded = load(&tmp);
         assert_eq!(loaded.messages().len(), 2);
         assert_eq!(loaded.model, "other/model");
+    }
+
+    fn open_todo(content: &str) -> Vec<TodoItem> {
+        vec![TodoItem {
+            content: content.into(),
+            status: TodoStatus::InProgress,
+            priority: TodoPriority::High,
+        }]
+    }
+
+    fn record_todo_update(
+        store: &mut SessionStore,
+        history: &mut History,
+        call_id: &str,
+        todos: Vec<TodoItem>,
+    ) {
+        history.push(Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::tool_use(
+                call_id,
+                TODOWRITE_TOOL_NAME,
+                serde_json::json!({}),
+            )],
+            ..Default::default()
+        });
+        history.push(Message {
+            role: Role::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: call_id.into(),
+                content: String::new(),
+                is_error: false,
+                output_ref: None,
+            }],
+            ..Default::default()
+        });
+        store
+            .session
+            .insert_tool_output(call_id.into(), ToolOutput::TodoList(todos));
+        store
+            .record_turn(history, MODEL_SPEC.into(), &permission_manager())
+            .unwrap();
+    }
+
+    /// The first list is compacted away before the second is written, so a
+    /// reopened session reads across the seam, and a head rewound to the
+    /// compaction summary predates the second list.
+    #[test_case(false => Some(open_todo(REVISED_TODO)) ; "the_latest_list")]
+    #[test_case(true => Some(open_todo(FIRST_TODO)) ; "the_list_at_a_rewound_head")]
+    fn a_reopened_session_restores_its_todo_list(rewound: bool) -> Option<Vec<TodoItem>> {
+        let tmp = TempDir::new().unwrap();
+        let mut store = store_in(&tmp);
+        let mut history = History::new(vec![Message::user(PLANNING_PROMPT.into())]);
+        record_todo_update(
+            &mut store,
+            &mut history,
+            FIRST_TODO_CALL,
+            open_todo(FIRST_TODO),
+        );
+        let seam = history.item_at_message_boundary(history.len());
+        history.replace_superseding(vec![Message::user(COMPACTION_SUMMARY.into())], seam);
+        let summary_head = history.item_head();
+        record_todo_update(
+            &mut store,
+            &mut history,
+            REVISED_TODO_CALL,
+            open_todo(REVISED_TODO),
+        );
+        if rewound {
+            store.session.meta.history_head = summary_head;
+            store.save().unwrap();
+        }
+        drop(store);
+
+        store_in(&tmp).todos()
     }
 
     #[test_case(true, false)]

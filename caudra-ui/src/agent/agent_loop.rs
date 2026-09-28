@@ -22,6 +22,7 @@ use caudra_agent::tools::{
     BuiltinDeferral, DeferralSession, DeferredTool, DescriptionContext, FileReadTracker, PathLocks,
     ToolAudience, ToolDefinitions, ToolFilter, ToolRegistry, deferral,
 };
+use caudra_agent::types::TodoItem;
 use caudra_agent::workflow::{WorkflowHandle, WorkspaceRebind};
 use caudra_agent::{
     Agent, AgentConfig, AgentEvent, AgentInput, AgentMode, AgentParams, AgentRunParams,
@@ -113,6 +114,7 @@ impl AgentLoop {
         tool_output_store: Option<Arc<ToolOutputStore>>,
         initial_history: Vec<HistoryItem>,
         archived_history: Vec<HistoryItem>,
+        todos: Option<Vec<TodoItem>>,
         shared_history: SharedHistory,
         btw_prompt: SharedBtwPrompt,
         context_publisher: ContextPublisher,
@@ -159,7 +161,8 @@ impl AgentLoop {
             Ok(history) => (
                 history
                     .with_mirror(shared_history)
-                    .with_archived(archived_history),
+                    .with_archived(archived_history)
+                    .with_todos(todos),
                 None,
             ),
             Err(error) => (History::default(), Some(error.to_string())),

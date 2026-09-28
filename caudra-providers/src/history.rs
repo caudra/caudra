@@ -1072,22 +1072,23 @@ mod tests {
     const WORKFLOW_REVISION: u64 = 7;
     const BACKGROUND_REMINDER_TEXT: &str =
         "<system-reminder>\n# Background work\nNo active background work\n</system-reminder>";
-    const BACKGROUND_REMINDER_KEY: &str = "standing_reminder";
+    const STANDING_REMINDER_KEY: &str = "standing_reminder";
     const BACKGROUND_REMINDER_VALUE: &str = "background_work";
+    const OPEN_TODOS_REMINDER_VALUE: &str = "open_todos";
     const REMINDER_IMAGE: &str = "reminder-image";
 
-    #[test_case(false, false ; "plain")]
-    #[test_case(true, false ; "multisource")]
-    #[test_case(false, true ; "tool_result")]
-    #[test_case(true, true ; "multisource_tool_result")]
+    #[test_case(StandingReminderKind::BackgroundWork, BACKGROUND_REMINDER_VALUE, false, false ; "plain")]
+    #[test_case(StandingReminderKind::BackgroundWork, BACKGROUND_REMINDER_VALUE, true, false ; "multisource")]
+    #[test_case(StandingReminderKind::BackgroundWork, BACKGROUND_REMINDER_VALUE, false, true ; "tool_result")]
+    #[test_case(StandingReminderKind::BackgroundWork, BACKGROUND_REMINDER_VALUE, true, true ; "multisource_tool_result")]
+    #[test_case(StandingReminderKind::OpenTodos, OPEN_TODOS_REMINDER_VALUE, false, false ; "open_todos")]
     fn standing_reminder_round_trips_message_and_canonical_history(
+        kind: StandingReminderKind,
+        serialized_kind: &str,
         multisource: bool,
         tool_result: bool,
     ) {
-        let mut message = Message::standing_reminder(
-            BACKGROUND_REMINDER_TEXT.into(),
-            StandingReminderKind::BackgroundWork,
-        );
+        let mut message = Message::standing_reminder(BACKGROUND_REMINDER_TEXT.into(), kind);
         let mut items = Vec::new();
         if multisource {
             message.task_event = Some(task_event_origin());
@@ -1121,7 +1122,7 @@ mod tests {
             });
         }
         let encoded = serde_json::to_value(&message).unwrap();
-        assert_eq!(encoded[BACKGROUND_REMINDER_KEY], BACKGROUND_REMINDER_VALUE);
+        assert_eq!(encoded[STANDING_REMINDER_KEY], serialized_kind);
         let decoded: Message = serde_json::from_value(encoded).unwrap();
         assert_eq!(decoded.standing_reminder, message.standing_reminder);
         assert!(decoded.is_observation());
@@ -1165,7 +1166,7 @@ mod tests {
     #[test_case(Message::user(BACKGROUND_REMINDER_TEXT.into()) ; "user_text")]
     fn copied_text_cannot_claim_standing_reminder_kind(message: Message) {
         let encoded = serde_json::to_value(&message).unwrap();
-        assert!(encoded.get(BACKGROUND_REMINDER_KEY).is_none());
+        assert!(encoded.get(STANDING_REMINDER_KEY).is_none());
         let decoded: Message = serde_json::from_value(encoded).unwrap();
         assert!(decoded.standing_reminder.is_none());
         let items = expand_message(&decoded, None);
@@ -1175,7 +1176,7 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .iter()
-                .all(|item| item.get(BACKGROUND_REMINDER_KEY).is_none())
+                .all(|item| item.get(STANDING_REMINDER_KEY).is_none())
         );
         let restored: Vec<HistoryItem> = serde_json::from_value(encoded).unwrap();
         assert!(

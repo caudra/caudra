@@ -107,6 +107,13 @@ pub const RELOCATED_PROMPT: &str = include_str!("prompts/relocated.md");
 pub const RELOCATED_MARKER: &str = "# Working directory changed";
 pub const FROM_SLOT: &str = "{from}";
 pub const TO_SLOT: &str = "{to}";
+/// Holds a handoff once while the todo list still has open items. Quotes the
+/// whole list, not only what is open, because the model answers with a
+/// replacement for all of it.
+pub const OPEN_TODOS_PROMPT: &str = include_str!("prompts/open_todos.md");
+pub const OPEN_TODOS_SLOT: &str = "{open}";
+pub const TOTAL_TODOS_SLOT: &str = "{total}";
+pub const TODOS_SLOT: &str = "{todos}";
 /// Two fragments rather than one with a substituted clause, because the claim
 /// that differs is the useful one: locally the scratch directory is where
 /// `TMPDIR` already points and a command falls into it by itself, and on a

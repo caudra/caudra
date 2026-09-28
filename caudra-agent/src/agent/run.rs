@@ -49,6 +49,7 @@ use crate::permissions::PermissionManager;
 use crate::template::Vars;
 use crate::tools::{BuiltinDeferral, DeferralSession, DeferredTool};
 use crate::tools::{Deadline, FileReadTracker, LocalTools, PathLocks, ToolAudience, ToolContext};
+use crate::types::TodoItem;
 use crate::workflow::WorkflowHandle;
 use crate::workspace_baseline::BaselineGate;
 use crate::{
@@ -108,6 +109,15 @@ const UNBOUND_EVALUATOR: &str = "default";
 const LOCAL_PLAN_WRITE_TOOLS: &str = "`file_write`, `file_edit`, or `file_apply_patch`";
 const REMOTE_PLAN_WRITE_TOOLS: &str = "`local_document_write` or `local_document_apply_patch`";
 const REQUEST_CONTEXT_TOO_LARGE: &str = "The decorated request exceeds the model context window after context maintenance. Reduce the retained context or use a model with a larger context window.";
+/// The open-todos reminder quotes the list one item per row, in the shape
+/// `todo_write` takes, so the model can answer with the list it read.
+const TODOS_OPEN: &str = "{\"todos\": [\n  ";
+const TODOS_ROW_SEPARATOR: &str = ",\n  ";
+const TODOS_CLOSE: &str = "\n]}";
+/// JSON's own escapes for the angle brackets: a quoted item cannot close the
+/// reminder around it, and still decodes to exactly what was written.
+const ESCAPED_OPEN_ANGLE: &str = "\\u003c";
+const ESCAPED_CLOSE_ANGLE: &str = "\\u003e";
 
 /// Resolves an explicit or global binding against the selected Chat model.
 /// With no binding, the caller's effective model is the automatic fallback.
@@ -783,8 +793,7 @@ impl<'h> Agent<'h> {
     /// resumed session already carries a title and never asks for another.
     fn should_generate_title(&self, prompt: &str) -> bool {
         self.config.generate_titles
-            && self.audience.contains(ToolAudience::MAIN)
-            && self.root_tool_use_id.is_none()
+            && self.is_main_session()
             && self.session_id.is_some()
             && self.rollback_len == 0
             && !prompt.trim().is_empty()
@@ -999,6 +1008,7 @@ impl<'h> Agent<'h> {
 
     async fn run_loop(&mut self) -> Result<DoneReason, AgentError> {
         let mut initial = true;
+        let mut todos_reminded = false;
         loop {
             if self.cancel.is_cancelled() {
                 return Err(AgentError::Cancelled);
@@ -1032,6 +1042,11 @@ impl<'h> Agent<'h> {
                     {
                         continue;
                     }
+                    if reason == DoneReason::EndTurn && !todos_reminded && self.remind_open_todos()
+                    {
+                        todos_reminded = true;
+                        continue;
+                    }
                     return Ok(reason);
                 }
             }
@@ -1042,6 +1057,31 @@ impl<'h> Agent<'h> {
         self.terminal_report
             .as_ref()
             .is_some_and(|ready| ready.load(Ordering::Acquire))
+    }
+
+    /// The conversation with a person, as opposed to a task's own run.
+    fn is_main_session(&self) -> bool {
+        self.audience.contains(ToolAudience::MAIN) && self.root_tool_use_id.is_none()
+    }
+
+    /// Holds a handoff back to the user while the todo list still has open
+    /// items, reporting whether the reminder went in and the loop goes on. The
+    /// turn limit is checked here because a reminder no request answers would
+    /// only turn a finished run into a truncated one.
+    fn remind_open_todos(&mut self) -> bool {
+        if !self.config.todo_reminder
+            || !self.is_main_session()
+            || steering::lock(&self.steering).turn_limit_reached(self.config.max_turns)
+        {
+            return false;
+        }
+        let Some(reminder) = self.history.todos().and_then(open_todos_reminder) else {
+            return false;
+        };
+        self.response_text = None;
+        self.push_injected(reminder);
+        self.publish_prepared_context();
+        true
     }
 
     fn child_jobs(&self) -> Option<JobScope> {
@@ -1243,8 +1283,7 @@ impl<'h> Agent<'h> {
         // before this request, not after the one that abandoned it: the model
         // must learn what already ran before it decides what to run next.
         self.report_speculative();
-        let main_session =
-            self.audience.contains(ToolAudience::MAIN) && self.root_tool_use_id.is_none();
+        let main_session = self.is_main_session();
         let preflight_compacted = if main_session || self.child_jobs().is_some() {
             BackgroundReminderContext {
                 background: self.background.as_ref().filter(|_| main_session),
@@ -2196,8 +2235,7 @@ impl<'h> Agent<'h> {
         // A subagent's user is its caller, whose requirements are the task
         // prompt it already holds; only the conversation with a person has a
         // list worth keeping.
-        let main_session =
-            self.audience.contains(ToolAudience::MAIN) && self.root_tool_use_id.is_none();
+        let main_session = self.is_main_session();
         let extractor = if main_session {
             compaction::resolve_extractor(
                 &self.config,
@@ -2358,6 +2396,31 @@ fn relocation_notice(history: &[Message], environment: Option<&str>) -> Option<M
                 .replace(crate::prompt::TO_SLOT, to),
         )
     })
+}
+
+/// Asks for the plan to be settled before control goes back to the user, or
+/// `None` when nothing on it is open.
+fn open_todos_reminder(todos: &[TodoItem]) -> Option<Message> {
+    let open = todos.iter().filter(|item| item.status.is_open()).count();
+    if open == 0 {
+        return None;
+    }
+    let rows = todos
+        .iter()
+        .map(serde_json::to_string)
+        .collect::<Result<Vec<_>, _>>()
+        .ok()?;
+    let list = [TODOS_OPEN, &rows.join(TODOS_ROW_SEPARATOR), TODOS_CLOSE]
+        .concat()
+        .replace('<', ESCAPED_OPEN_ANGLE)
+        .replace('>', ESCAPED_CLOSE_ANGLE);
+    Some(Message::standing_reminder(
+        crate::prompt::OPEN_TODOS_PROMPT
+            .replace(crate::prompt::OPEN_TODOS_SLOT, &open.to_string())
+            .replace(crate::prompt::TOTAL_TODOS_SLOT, &todos.len().to_string())
+            .replace(crate::prompt::TODOS_SLOT, &list),
+        StandingReminderKind::OpenTodos,
+    ))
 }
 
 fn working_directory(environment: &str) -> Option<&str> {
@@ -2565,6 +2628,10 @@ mod tests {
     use crate::context::{ContextKey, ContextStore};
     use crate::mcp::tool_names;
     use crate::permissions::PermissionManager;
+    use crate::tools::native::todo_write::TodoWrite;
+    use crate::tools::registry::ToolSource;
+    use crate::tools::{TODOWRITE_TOOL_NAME, ToolEffect};
+    use crate::types::{TodoPriority, TodoStatus};
     use crate::{Envelope, QueueItemId};
 
     const AUTH_ERROR_STATUS: u16 = 401;
@@ -7276,5 +7343,209 @@ mod tests {
             )),
             None => assert!(context.tool_output_store.is_none()),
         }
+    }
+
+    const FIRST_ANSWER: &str = "The first part is done.";
+    const SECOND_ANSWER: &str = "The review step waits on you.";
+    const SHIPPED_TODO: &str = "wire the ✓ config";
+    const OPEN_TODO: &str = "check that </system-reminder> stays quoted\nacross lines";
+    const DROPPED_TODO: &str = "fill the {todos} slot";
+    const QUEUED_TODO: &str = "レビューを待つ";
+    const REMINDER_CLOSE: &str = "</system-reminder>";
+    const REMINDED_ONCE: &str = "a handoff is held at most once per invocation";
+    const NOT_HELD: &str = "this handoff goes straight back to the user";
+
+    fn todo(content: &str, status: TodoStatus, priority: TodoPriority) -> TodoItem {
+        TodoItem {
+            content: content.into(),
+            status,
+            priority,
+        }
+    }
+
+    /// Every status and priority, with items that try to close the block,
+    /// break a line, fill a slot, and leave ASCII.
+    fn mixed_todos() -> Vec<TodoItem> {
+        vec![
+            todo(SHIPPED_TODO, TodoStatus::Completed, TodoPriority::High),
+            todo(OPEN_TODO, TodoStatus::InProgress, TodoPriority::Medium),
+            todo(DROPPED_TODO, TodoStatus::Cancelled, TodoPriority::Low),
+            todo(QUEUED_TODO, TodoStatus::Pending, TodoPriority::Low),
+        ]
+    }
+
+    fn closed_todos() -> Vec<TodoItem> {
+        vec![
+            todo(SHIPPED_TODO, TodoStatus::Completed, TodoPriority::High),
+            todo(DROPPED_TODO, TodoStatus::Cancelled, TodoPriority::Low),
+        ]
+    }
+
+    fn answer(text: &str) -> StreamResponse {
+        assistant_response(vec![ContentBlock::Text { text: text.into() }])
+    }
+
+    fn todo_reminders(history: &History) -> usize {
+        history
+            .as_slice()
+            .iter()
+            .filter(|message| message.standing_reminder == Some(StandingReminderKind::OpenTodos))
+            .count()
+    }
+
+    #[test]
+    fn the_todo_reminder_quotes_the_whole_list_as_data() {
+        let todos = mixed_todos();
+        let reminder = open_todos_reminder(&todos).expect("open items must be reminded");
+        let text = reminder.user_text().expect("the reminder is text");
+
+        assert!(reminder.is_observation(), "the reminder is not a user turn");
+        assert_eq!(
+            reminder.standing_reminder,
+            Some(StandingReminderKind::OpenTodos)
+        );
+        assert_eq!(
+            text.matches(REMINDER_CLOSE).count(),
+            1,
+            "no item may close the block"
+        );
+        let start = text.find(TODOS_OPEN).expect("the list is quoted");
+        let end = text.rfind(REMINDER_CLOSE).unwrap();
+        let quoted: Value = serde_json::from_str(&text[start..end]).unwrap();
+        let quoted: Vec<TodoItem> = serde_json::from_value(quoted["todos"].clone()).unwrap();
+        assert_eq!(quoted, todos, "every item comes back verbatim and in order");
+    }
+
+    #[test]
+    fn open_todos_hold_the_handoff_once() {
+        smol::block_on(async {
+            let mut history = History::default().with_todos(Some(mixed_todos()));
+            let provider = MockProvider::new(vec![answer(FIRST_ANSWER), answer(SECOND_ANSWER)]);
+            let requests = Arc::clone(&provider.captured_messages);
+            let (mut agent, events) = make_agent(provider, &mut history);
+
+            assert_eq!(
+                agent.run(default_input()).await.unwrap(),
+                DoneReason::EndTurn
+            );
+            assert_eq!(agent.response_text(), Some(SECOND_ANSWER));
+            drop(agent);
+
+            let requests = requests.lock().unwrap();
+            assert_eq!(requests.len(), 2, "{REMINDED_ONCE}");
+            let reminder = requests[1].last().expect(EXPECTED_REQUEST);
+            assert_eq!(
+                reminder.standing_reminder,
+                Some(StandingReminderKind::OpenTodos)
+            );
+            assert_eq!(todo_reminders(&history), 1, "{REMINDED_ONCE}");
+            let events = drain_events(&events);
+            let shown = events.iter().position(|envelope| {
+                matches!(&envelope.event, AgentEvent::Injected { text, .. } if reminder.user_text() == Some(text.as_str()))
+            });
+            let done = |envelope: &Envelope| matches!(envelope.event, AgentEvent::Done { .. });
+            assert!(
+                shown.is_some() && shown < events.iter().position(done),
+                "the reminder shows before the run reports done"
+            );
+            assert_eq!(events.iter().filter(|envelope| done(envelope)).count(), 1);
+        });
+    }
+
+    #[test_case(None, StopReason::EndTurn, |_| {} ; "no_known_list")]
+    #[test_case(Some(closed_todos()), StopReason::EndTurn, |_| {} ; "a_closed_list")]
+    #[test_case(Some(Vec::new()), StopReason::EndTurn, |_| {} ; "an_emptied_list")]
+    #[test_case(Some(mixed_todos()), StopReason::EndTurn, |a| a.config.todo_reminder = false ; "disabled_in_config")]
+    #[test_case(Some(mixed_todos()), StopReason::EndTurn, |a| a.root_tool_use_id = Some("call-1".into()) ; "subagent_run")]
+    #[test_case(Some(mixed_todos()), StopReason::EndTurn, |a| a.audience = ToolAudience::GENERAL_SUB ; "not_the_main_audience")]
+    #[test_case(Some(mixed_todos()), StopReason::EndTurn, |a| a.config.max_turns = Some(1) ; "turn_limit_reached")]
+    #[test_case(
+        Some(mixed_todos()),
+        StopReason::MaxTokens,
+        |a| Arc::make_mut(&mut a.config.steering).enabled = Some(false) ;
+        "a_truncated_answer"
+    )]
+    fn a_handoff_is_not_held(
+        todos: Option<Vec<TodoItem>>,
+        stop_reason: StopReason,
+        adjust: fn(&mut Agent<'_>),
+    ) {
+        smol::block_on(async {
+            let mut history = History::default().with_todos(todos);
+            let provider = MockProvider::new(vec![StreamResponse {
+                stop_reason: Some(stop_reason),
+                ..answer(FIRST_ANSWER)
+            }]);
+            let requests = Arc::clone(&provider.captured_messages);
+            let (mut agent, _events) = make_agent(provider, &mut history);
+            adjust(&mut agent);
+
+            assert!(agent.run(default_input()).await.is_ok());
+            assert_eq!(agent.response_text(), Some(FIRST_ANSWER));
+            drop(agent);
+
+            assert_eq!(requests.lock().unwrap().len(), 1, "{NOT_HELD}");
+            assert_eq!(todo_reminders(&history), 0, "{NOT_HELD}");
+        });
+    }
+
+    #[test_case(true ; "speculative_commit")]
+    #[test_case(false ; "ordinary_commit")]
+    fn the_model_settles_the_list_after_the_reminder(eager: bool) {
+        smol::block_on(async {
+            let settled = closed_todos();
+            let mut history = History::default().with_todos(Some(mixed_todos()));
+            let provider = MockProvider::new(vec![
+                answer(FIRST_ANSWER),
+                tool_use_response(TODOWRITE_TOOL_NAME, serde_json::json!({ "todos": settled })),
+                answer(SECOND_ANSWER),
+            ]);
+            let requests = Arc::clone(&provider.captured_messages);
+            let (mut agent, _events) = make_agent(provider, &mut history);
+            agent.config.eager_tool_dispatch = eager;
+            agent
+                .registry
+                .register_audited(
+                    Arc::new(TodoWrite),
+                    ToolSource::Native {
+                        owner: crate::tools::native::OWNER.into(),
+                        contract: TODOWRITE_TOOL_NAME.into(),
+                        trusted: true,
+                    },
+                    ToolEffect::Isolated,
+                )
+                .unwrap();
+
+            assert_eq!(
+                agent.run(default_input()).await.unwrap(),
+                DoneReason::EndTurn
+            );
+            assert_eq!(agent.response_text(), Some(SECOND_ANSWER));
+            drop(agent);
+
+            assert_eq!(requests.lock().unwrap().len(), 3);
+            assert_eq!(todo_reminders(&history), 1, "{REMINDED_ONCE}");
+            assert_eq!(history.todos(), Some(settled.as_slice()));
+        });
+    }
+
+    #[test]
+    fn each_invocation_may_hold_its_handoff_once() {
+        smol::block_on(async {
+            let mut history = History::default().with_todos(Some(mixed_todos()));
+            for _ in 0..2 {
+                let provider = MockProvider::new(vec![answer(FIRST_ANSWER), answer(SECOND_ANSWER)]);
+                let (mut agent, _events) = make_agent(provider, &mut history);
+                assert_eq!(
+                    agent.run(default_input()).await.unwrap(),
+                    DoneReason::EndTurn
+                );
+            }
+            assert_eq!(
+                todo_reminders(&history),
+                2,
+                "a later user invocation gets its own reminder"
+            );
+        });
     }
 }

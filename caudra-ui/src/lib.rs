@@ -51,6 +51,7 @@ use caudra_agent::permissions::pattern_recognition::{
     PatternCandidate, RecognitionStats, RecognizerLimits,
 };
 use caudra_agent::tools::ToolFilter;
+use caudra_agent::types::TodoItem;
 use caudra_agent::worktree::Request as WorktreeRequest;
 use caudra_providers::{
     HistoryItem, HistoryProjectionError, Message, Model, active_history_items, expand_message,
@@ -199,6 +200,18 @@ pub(crate) fn archived_session_history(session: &AppSession) -> Vec<HistoryItem>
     let active = active_session_history(session).map_or(0, |items| items.len());
     transcript.truncate(transcript.len().saturating_sub(active));
     transcript
+}
+
+/// The todo list the agent restarts with: the last one `archived` and then
+/// `active` committed, read from the session's stored outputs.
+pub(crate) fn session_todos(
+    session: &AppSession,
+    archived: &[HistoryItem],
+    active: &[HistoryItem],
+) -> Option<Vec<TodoItem>> {
+    caudra_agent::stored_todos(archived.iter().chain(active), |call_id| {
+        session.tool_outputs().get(call_id).map(AsRef::as_ref)
+    })
 }
 
 pub(crate) fn history_items(messages: &[Message]) -> Vec<HistoryItem> {

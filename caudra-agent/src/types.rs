@@ -163,6 +163,10 @@ pub enum TodoStatus {
 }
 
 impl TodoStatus {
+    pub fn is_open(self) -> bool {
+        matches!(self, Self::Pending | Self::InProgress)
+    }
+
     pub fn marker(self) -> &'static str {
         match self {
             Self::Completed => "[✓]",
@@ -1343,6 +1347,28 @@ impl ToolOutput {
     pub fn written_path(&self) -> Option<&str> {
         match self {
             Self::WriteCode { path, .. } | Self::Diff { path, .. } => Some(path),
+            _ => None,
+        }
+    }
+
+    /// The todo list this result replaced the plan with, if it did. A batch
+    /// settles each child on its own, so a child that finished counts even
+    /// when the batch as a whole was cancelled, and the last one to set a list
+    /// wins.
+    pub fn todo_update(&self, is_error: bool) -> Option<&[TodoItem]> {
+        match self {
+            Self::TodoList(items) if !is_error => Some(items),
+            Self::Batch { entries, .. } => {
+                entries
+                    .iter()
+                    .rev()
+                    .find_map(|entry| match (entry.status, &entry.output) {
+                        (BatchToolStatus::Success, Some(Self::TodoList(items))) => {
+                            Some(items.as_slice())
+                        }
+                        _ => None,
+                    })
+            }
             _ => None,
         }
     }
@@ -2875,6 +2901,64 @@ mod tests {
         .expect("a roster from an older session still loads");
 
         assert_eq!(entry.effect, ToolEffect::Unknown, "{EXPECT_UNCLASSIFIED}");
+    }
+
+    const EARLIER_TODO: &str = "draft the reminder";
+    const LATER_TODO: &str = "test the reminder";
+
+    fn pending(content: &str) -> Vec<TodoItem> {
+        vec![TodoItem {
+            content: content.into(),
+            status: TodoStatus::Pending,
+            priority: TodoPriority::High,
+        }]
+    }
+
+    fn todo_list(content: &str) -> Option<ToolOutput> {
+        Some(ToolOutput::TodoList(pending(content)))
+    }
+
+    fn batch(children: Vec<(BatchToolStatus, Option<ToolOutput>)>) -> ToolOutput {
+        ToolOutput::Batch {
+            entries: children
+                .into_iter()
+                .map(|(status, output)| BatchToolEntry {
+                    tool: crate::tools::TODOWRITE_TOOL_NAME.into(),
+                    effect: ToolEffect::Isolated,
+                    summary: String::new(),
+                    status,
+                    input: None,
+                    raw_input: None,
+                    output,
+                    annotation: None,
+                    model_suffix: None,
+                })
+                .collect(),
+            text: String::new(),
+        }
+    }
+
+    #[test_case(ToolOutput::TodoList(pending(EARLIER_TODO)), false => Some(pending(EARLIER_TODO)) ; "a_direct_update")]
+    #[test_case(ToolOutput::TodoList(pending(EARLIER_TODO)), true => None ; "a_failed_direct_update")]
+    #[test_case(ToolOutput::TodoList(Vec::new()), false => Some(Vec::new()) ; "an_explicit_clear")]
+    #[test_case(ToolOutput::Plain(EARLIER_TODO.into()), false => None ; "an_unrelated_output")]
+    #[test_case(
+        batch(vec![(BatchToolStatus::Success, todo_list(EARLIER_TODO)), (BatchToolStatus::Success, todo_list(LATER_TODO))]),
+        false => Some(pending(LATER_TODO)) ; "the_last_batched_update"
+    )]
+    #[test_case(
+        batch(vec![(BatchToolStatus::Success, todo_list(EARLIER_TODO)), (BatchToolStatus::Error, todo_list(LATER_TODO))]),
+        false => Some(pending(EARLIER_TODO)) ; "a_batched_update_before_a_failed_one"
+    )]
+    #[test_case(
+        batch(vec![(BatchToolStatus::Success, todo_list(EARLIER_TODO)), (BatchToolStatus::Running, None)]),
+        true => Some(pending(EARLIER_TODO)) ; "a_finished_child_of_a_cancelled_batch"
+    )]
+    fn todo_update_reads_only_successful_replacements(
+        output: ToolOutput,
+        is_error: bool,
+    ) -> Option<Vec<TodoItem>> {
+        output.todo_update(is_error).map(<[TodoItem]>::to_vec)
     }
 
     const ENVIRONMENT_HEADLINE: &str = "ubuntu 24.04 · linux/x86_64";
