@@ -1122,6 +1122,7 @@ fn operation_id() -> Result<OperationId, TransferError> {
 
 #[cfg(all(test, unix))]
 mod tests {
+    use super::journal::ROTATE_RECORDS;
     use super::{
         CleanBufferLease, ComparisonKind, ExclusionReason, FileOutcome, FilePreview, INSPECT_BYTES,
         Inspection, InventoryContext, InventoryNode, InventoryPage, JournalState, LocalAccess,
@@ -1174,6 +1175,8 @@ mod tests {
     const EXTERNAL: &[u8] = b"external writer";
     const BINARY_SIZE: usize = 6 * 1024 * 1024;
     const JOURNAL_FILE: &str = "transfers.json";
+    const TEST_ROTATION_RECORDS: usize = 3;
+    const ROTATION_PASSES: usize = 2;
     const EMPTY_DIRECTORY: &str = "folder/empty";
     const FOLDER: &str = "folder";
     const NESTED_SAME: &str = "folder/same";
@@ -1440,6 +1443,38 @@ mod tests {
     }
 
     impl Fixture {
+        fn rotating() -> Self {
+            let mut fixture = Self::new();
+            fixture.journal.rotation_records = TEST_ROTATION_RECORDS;
+            fixture
+        }
+
+        fn fill_journal(&self, count: usize, state: &str, cleanup_pending: bool) {
+            let journal_path = self.state.path().join(JOURNAL_FILE);
+            let mut data: Value =
+                serde_json::from_slice(&fs::read(&journal_path).unwrap()).unwrap();
+            let template = data["entries"]
+                .as_object()
+                .unwrap()
+                .values()
+                .next()
+                .unwrap()
+                .clone();
+            let mut entries = BTreeMap::new();
+            for index in 0..count {
+                let id = format!("retained-{index}");
+                let mut entry = template.clone();
+                entry["operation_id"] = json!(id);
+                entry["state"] = json!(state);
+                entry["path"] = json!(id);
+                entry["local"]["node"]["path"] = json!(id);
+                entry["cleanup_pending"] = json!(cleanup_pending);
+                entries.insert(id, entry);
+            }
+            data["entries"] = serde_json::to_value(entries).unwrap();
+            fs::write(&journal_path, serde_json::to_vec(&data).unwrap()).unwrap();
+        }
+
         async fn directory_plan(&self, action: TransferAction) -> TransferPlan {
             let source = if action == TransferAction::Pull {
                 Side::Remote
@@ -2224,8 +2259,8 @@ mod tests {
     #[test]
     fn terminal_directory_cleanup_is_retryable_and_history_can_compact() {
         smol::block_on(async {
-            let mut fixture = Fixture::new();
-            for index in 0..=super::journal::ROTATE_RECORDS {
+            let mut fixture = Fixture::rotating();
+            for index in 0..=TEST_ROTATION_RECORDS {
                 let name = format!("directory-{index}");
                 fixture
                     .fake
@@ -2263,7 +2298,7 @@ mod tests {
                 assert!(run.cleanup_deferred.is_empty());
             }
             let reopened = TransferJournal::new(fixture.state.path().join(JOURNAL_FILE)).unwrap();
-            assert!(reopened.entries().unwrap().len() < super::journal::ROTATE_RECORDS);
+            assert!(reopened.entries().unwrap().len() < TEST_ROTATION_RECORDS);
             assert!(
                 reopened
                     .audit()
@@ -2273,7 +2308,7 @@ mod tests {
             );
             assert_eq!(
                 fixture.fake.0.lock().unwrap().counts.publishes,
-                super::journal::ROTATE_RECORDS + 1
+                TEST_ROTATION_RECORDS + 1
             );
         });
     }
@@ -3778,6 +3813,44 @@ mod tests {
         });
     }
 
+    #[test_case(ROTATE_RECORDS - 1, false; "below_threshold")]
+    #[test_case(ROTATE_RECORDS, true; "at_threshold")]
+    fn journal_default_rotation_threshold(count: usize, rotates: bool) {
+        smol::block_on(async {
+            let mut fixture = Fixture::new();
+            fixture.put(Side::Local, FILE, AFTER);
+            let first = fixture.plan(TransferAction::Push, &[FILE]).await;
+            assert!(
+                fixture
+                    .journal
+                    .reserve(&first, &first.review.files[0])
+                    .unwrap()
+            );
+            fixture.fill_journal(count, "Failed", false);
+            let plan = fixture.plan(TransferAction::Push, &[FILE]).await;
+            assert!(
+                fixture
+                    .journal
+                    .reserve(&plan, &plan.review.files[0])
+                    .unwrap()
+            );
+            let reopened = TransferJournal::new(fixture.state.path().join(JOURNAL_FILE)).unwrap();
+            assert_eq!(
+                reopened.entries().unwrap().len(),
+                if rotates { 1 } else { count + 1 }
+            );
+            let audit = reopened.audit().unwrap();
+            if rotates {
+                assert_eq!(audit.len(), 1);
+                let audit = audit.values().next().unwrap();
+                assert_eq!(audit.pages, 1);
+                assert_eq!(audit.failed as usize, count);
+            } else {
+                assert!(audit.is_empty());
+            }
+        });
+    }
+
     #[test_case("Reserved", false; "reserved")]
     #[test_case("Prepared", false; "prepared")]
     #[test_case("Dispatched", false; "dispatched")]
@@ -3793,29 +3866,7 @@ mod tests {
             fixture.put(Side::Local, FILE, AFTER);
             let old = fixture.plan(TransferAction::Push, &[FILE]).await;
             fixture.journal.reserve(&old, &old.review.files[0]).unwrap();
-            let journal_path = fixture.state.path().join(JOURNAL_FILE);
-            let mut data: Value =
-                serde_json::from_slice(&fs::read(&journal_path).unwrap()).unwrap();
-            let template = data["entries"]
-                .as_object()
-                .unwrap()
-                .values()
-                .next()
-                .unwrap()
-                .clone();
-            let mut entries = BTreeMap::new();
-            for index in 0..super::journal::MAX_RECORDS {
-                let id = format!("retained-{index}");
-                let mut entry = template.clone();
-                entry["operation_id"] = json!(id);
-                entry["state"] = json!(state);
-                entry["path"] = json!(id);
-                entry["local"]["node"]["path"] = json!(id);
-                entry["cleanup_pending"] = json!(cleanup_pending);
-                entries.insert(id, entry);
-            }
-            data["entries"] = serde_json::to_value(entries).unwrap();
-            fs::write(&journal_path, serde_json::to_vec(&data).unwrap()).unwrap();
+            fixture.fill_journal(super::journal::MAX_RECORDS, state, cleanup_pending);
             let plan = fixture.plan(TransferAction::Push, &[FILE]).await;
             let run = fixture
                 .engine
@@ -3997,7 +4048,7 @@ mod tests {
     #[test_case(TransferAction::Pull; "pull")]
     fn journal_rotates_repeated_successes_and_reopens_without_replay(action: TransferAction) {
         smol::block_on(async {
-            let mut fixture = Fixture::new();
+            let mut fixture = Fixture::rotating();
             let source = if action == TransferAction::Push {
                 Side::Local
             } else {
@@ -4005,12 +4056,7 @@ mod tests {
             };
             fixture.put(source.clone(), FILE, AFTER);
             let first = fixture.plan(action.clone(), &[FILE]).await;
-            // Rotation is what this measures, and it is `ROTATE_RECORDS` that
-            // triggers one. Crossing that twice proves a second rotation reads
-            // the page the first wrote, which is where an archive chain breaks;
-            // every confirmed entry is evicted at each one, so the hot set never
-            // approaches `MAX_RECORDS` and counting that high only bought time.
-            let total = super::journal::ROTATE_RECORDS * 2 + 2;
+            let total = TEST_ROTATION_RECORDS * ROTATION_PASSES + 1;
             let mut last = first.review.files[0].operation_id.clone();
             for index in 0..total {
                 let plan = if index == 0 {
@@ -4030,7 +4076,7 @@ mod tests {
             let mut reopened =
                 TransferJournal::new(fixture.state.path().join(JOURNAL_FILE)).unwrap();
             let entries = reopened.entries().unwrap();
-            assert!(entries.len() < super::journal::MAX_RECORDS);
+            assert!(entries.len() < TEST_ROTATION_RECORDS);
             assert!(
                 !entries
                     .iter()
@@ -4041,6 +4087,10 @@ mod tests {
             assert_eq!(base[0].operation_id, last);
             let audit = reopened.audit().unwrap();
             assert_eq!(audit.len(), 1);
+            assert_eq!(
+                audit.values().next().unwrap().pages as usize,
+                ROTATION_PASSES
+            );
             assert_eq!(
                 audit.values().next().unwrap().confirmed as usize + entries.len(),
                 total
@@ -4069,7 +4119,7 @@ mod tests {
         pending: bool,
     ) {
         smol::block_on(async {
-            let mut fixture = Fixture::new();
+            let mut fixture = Fixture::rotating();
             fixture.put(Side::Local, FILE, AFTER);
             let first = fixture.plan(TransferAction::Push, &[FILE]).await;
             let id = &first.review.files[0].operation_id;
@@ -4085,7 +4135,7 @@ mod tests {
                     Ok(())
                 })
                 .unwrap();
-            for index in 0..=super::journal::ROTATE_RECORDS {
+            for index in 0..=TEST_ROTATION_RECORDS {
                 fixture.put(Side::Local, SECOND, &index.to_le_bytes());
                 let plan = fixture.plan(TransferAction::Push, &[SECOND]).await;
                 let run = fixture
@@ -4096,6 +4146,13 @@ mod tests {
             }
             let mut reopened =
                 TransferJournal::new(fixture.state.path().join(JOURNAL_FILE)).unwrap();
+            assert!(
+                reopened
+                    .audit()
+                    .unwrap()
+                    .values()
+                    .any(|audit| audit.pages > 0)
+            );
             let retained = reopened
                 .entries()
                 .unwrap()
@@ -4122,10 +4179,10 @@ mod tests {
     #[test_case(true; "corrupt_archive")]
     fn removing_replay_archive_fails_closed(corrupt: bool) {
         smol::block_on(async {
-            let mut fixture = Fixture::new();
+            let mut fixture = Fixture::rotating();
             fixture.put(Side::Local, FILE, AFTER);
             let first = fixture.plan(TransferAction::Push, &[FILE]).await;
-            for index in 0..=super::journal::ROTATE_RECORDS {
+            for index in 0..=TEST_ROTATION_RECORDS {
                 let plan = if index == 0 {
                     &first
                 } else {
@@ -4177,17 +4234,12 @@ mod tests {
     #[test]
     fn completed_history_is_namespaced_and_cannot_starve_another_project() {
         smol::block_on(async {
-            let mut first = Fixture::new();
+            let mut first = Fixture::rotating();
             let mut second = Fixture::new();
             second.journal = TransferJournal::new(first.state.path().join(JOURNAL_FILE)).unwrap();
-            // Two rotations per project is what the claim needs: each one has to
-            // archive under its own namespace and read back the page the previous
-            // left, which is how one project's history is shown not to consume the
-            // other's. Terminal entries are evicted at every rotation, so the
-            // shared hot set never nears `MAX_RECORDS` and looping that far only
-            // repeated a proof already made.
+            second.journal.rotation_records = TEST_ROTATION_RECORDS;
             for fixture in [&mut first, &mut second] {
-                for _ in 0..super::journal::ROTATE_RECORDS * 2 {
+                for _ in 0..TEST_ROTATION_RECORDS * ROTATION_PASSES {
                     fixture.put(Side::Local, FILE, AFTER);
                     let plan = fixture.plan(TransferAction::Push, &[FILE]).await;
                     fixture
@@ -4212,6 +4264,14 @@ mod tests {
                 .await;
             assert!(run.stopped.is_none(), "{:?}", run.stopped);
             assert_eq!(second.journal.base().unwrap().len(), 1);
+            assert!(
+                second
+                    .journal
+                    .audit()
+                    .unwrap()
+                    .values()
+                    .all(|audit| audit.pages as usize >= ROTATION_PASSES)
+            );
         });
     }
 

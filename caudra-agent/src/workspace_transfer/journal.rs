@@ -218,6 +218,8 @@ impl Default for JournalData {
 /// is one durable atomic replacement. A failed durability acknowledgement remains blocked.
 pub struct TransferJournal {
     storage: PrivateFile,
+    #[cfg(test)]
+    pub(super) rotation_records: usize,
 }
 
 impl TransferJournal {
@@ -225,7 +227,20 @@ impl TransferJournal {
     pub fn new(path: PathBuf) -> Result<Self, TransferError> {
         Ok(Self {
             storage: PrivateFile::new(path, MAX_JOURNAL_BYTES)?,
+            #[cfg(test)]
+            rotation_records: ROTATE_RECORDS,
         })
+    }
+
+    fn rotation_records(&self) -> usize {
+        #[cfg(test)]
+        {
+            self.rotation_records
+        }
+        #[cfg(not(test))]
+        {
+            ROTATE_RECORDS
+        }
     }
 
     pub fn entries(&self) -> Result<Vec<JournalEntry>, TransferError> {
@@ -557,7 +572,9 @@ impl TransferJournal {
                 return Err(TransferError::RecoveryRequired);
             }
             // Do not evict operation IDs and accidentally make an old plan replayable.
-            if data.entries.len() >= ROTATE_RECORDS || data.base.len() >= ROTATE_RECORDS {
+            if data.entries.len() >= self.rotation_records()
+                || data.base.len() >= self.rotation_records()
+            {
                 self.compact(data)?;
             }
             if data.entries.len() >= MAX_RECORDS {
