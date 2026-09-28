@@ -710,7 +710,12 @@ impl App {
                 chat.fast
             },
             workflows: workflow_chip(self.workflow.runs()),
-            yolo: self.permissions.is_yolo(),
+            permission_mode: self.permissions.mode(),
+            decisions_offline: !self.permissions.is_yolo()
+                && self.permissions.decisions().is_some_and(|decisions| {
+                    decisions.config().endpoint.is_some()
+                        && decisions.status().reachable == Some(false)
+                }),
             restoring: self.restoring.load(Ordering::Relaxed),
             goal: goal.as_ref(),
             active_tasks: activity.agents,

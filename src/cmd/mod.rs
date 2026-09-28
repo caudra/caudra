@@ -1,4 +1,5 @@
 mod acp;
+mod decisions;
 mod logs;
 mod permissions;
 mod sandbox;
@@ -16,6 +17,7 @@ use color_eyre::Result;
 use color_eyre::eyre::Context;
 
 use caudra_config::Config;
+use caudra_storage::sessions::PermissionMode;
 use caudra_storage::{EphemeralRoot, StateDir};
 
 use crate::cli::{AuthAction, Cli, Command, McpAction, WorkcellAuthAction, normalize_tool_name};
@@ -32,6 +34,16 @@ fn run_storage(persistent: StateDir, ephemeral: bool) -> Result<(StateDir, Optio
     let (storage, root) =
         StateDir::activate_ephemeral(persistent).context("create ephemeral state directory")?;
     Ok((storage, Some(root)))
+}
+
+fn permission_mode_seed(config: &Config) -> PermissionMode {
+    if config.permissions.yolo || config.always_yolo {
+        PermissionMode::Yolo
+    } else if config.always_auto {
+        PermissionMode::Auto
+    } else {
+        PermissionMode::Ask
+    }
 }
 
 /// Every entry point resolves config here, so the CLI tool flags cannot apply
@@ -177,6 +189,9 @@ pub fn dispatch(mut cli: Cli) -> Result<ExitCode> {
             }
             permissions::run(action, database)?;
         }
+        Some(Command::Decisions { action }) => {
+            decisions::run(action, &cli)?;
+        }
         Some(Command::Auth { action }) => {
             let storage = StateDir::resolve().context("resolve data directory")?;
             match action {
@@ -230,8 +245,8 @@ pub fn dispatch(mut cli: Cli) -> Result<ExitCode> {
         Some(Command::Rollback) => {
             update::rollback().map_err(|e| color_eyre::eyre::eyre!("{e}"))?;
         }
-        Some(Command::Acp { model, yolo }) => {
-            acp::run(model.as_deref(), yolo, &cli)?;
+        Some(Command::Acp { model }) => {
+            acp::run(model.as_deref(), &cli)?;
         }
         Some(Command::Tools {
             enabled_only,
@@ -297,4 +312,27 @@ pub fn dispatch(mut cli: Cli) -> Result<ExitCode> {
         None => return tui::run(cli, tightened),
     }
     Ok(ExitCode::SUCCESS)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::permission_mode_seed;
+    use caudra_config::RawConfig;
+    use caudra_storage::sessions::PermissionMode;
+    use test_case::test_case;
+
+    #[test_case(false, false, PermissionMode::Ask; "default_ask")]
+    #[test_case(true, false, PermissionMode::Auto; "global_auto")]
+    #[test_case(false, true, PermissionMode::Yolo; "global_yolo")]
+    #[test_case(true, true, PermissionMode::Yolo; "yolo_takes_precedence")]
+    fn global_permission_seed(auto: bool, yolo: bool, expected: PermissionMode) {
+        let config = RawConfig {
+            always_auto: Some(auto),
+            always_yolo: Some(yolo),
+            ..RawConfig::default()
+        }
+        .into_config(false)
+        .unwrap();
+        assert_eq!(permission_mode_seed(&config), expected);
+    }
 }

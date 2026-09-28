@@ -37,6 +37,7 @@ pub use mailbox::{MailboxError, SessionMailbox};
 pub use nudge::Nudge;
 pub mod command;
 pub mod context;
+pub mod decisions;
 pub mod diff;
 pub mod editable_queue;
 pub mod patch;

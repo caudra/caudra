@@ -1,17 +1,19 @@
+use super::decisions::{advisories, label_answer};
 use super::diagnostics::prompt_reason_message;
 use super::diagnostics::{answer_scope_kind, bounded_log_value};
 use super::manager::PERMISSION_POLL_INTERVAL;
 use super::policy::TRUSTED_UNSCOPED_TOOLS;
 use super::{
-    DECISION_SOURCE_RULE, DECISION_SOURCE_USER_ABORT, DECISION_SOURCE_YOLO, DEFAULT_DENY_GUIDANCE,
-    NORMALIZED_COMMAND_ATTRIBUTE, PERMISSION_DENIED_PREFIX, PERMISSION_LOG_TARGET,
-    PROMPT_LOG_MAX_RESOURCES, PendingDecision, PendingPermission, PendingRegistration,
-    PermissionAnswer, PermissionExecutorKind, PermissionLifetime, PermissionManager,
-    PermissionPolicyError, PermissionRequest, PermissionResource, PermissionResourceAccess,
-    PermissionResourceKind, PermissionSubject, PolicyRule, ResourceCoverage, RuleOrigin,
-    StructuredPermissionDecision, StructuredPermissionEffect, answer_log_fields, command_pattern,
-    normalize_scope_path, permission_rule_intersects_request, permission_rules_resource_standing,
-    prompt_forcing_reason, remove_pending, subject_kind_and_contract, uncovered_resource_summary,
+    DECISION_SOURCE_AUTO, DECISION_SOURCE_RULE, DECISION_SOURCE_USER_ABORT, DECISION_SOURCE_YOLO,
+    DEFAULT_DENY_GUIDANCE, NORMALIZED_COMMAND_ATTRIBUTE, PERMISSION_DENIED_PREFIX,
+    PERMISSION_LOG_TARGET, PROMPT_LOG_MAX_RESOURCES, PendingDecision, PendingPermission,
+    PendingRegistration, PermissionAnswer, PermissionExecutorKind, PermissionLifetime,
+    PermissionManager, PermissionMode, PermissionPolicyError, PermissionRequest,
+    PermissionResource, PermissionResourceAccess, PermissionResourceKind, PermissionSubject,
+    PolicyRule, ResourceCoverage, RuleOrigin, StructuredPermissionDecision,
+    StructuredPermissionEffect, answer_log_fields, command_pattern, normalize_scope_path,
+    permission_rule_intersects_request, permission_rules_resource_standing, prompt_forcing_reason,
+    remove_pending, subject_kind_and_contract, uncovered_resource_summary,
     update_presentation_coverage,
 };
 use crate::CancelToken;
@@ -101,6 +103,8 @@ pub(super) struct EvaluationContext {
 pub(super) struct CurrentPolicy {
     pub(super) coverage: RequestCoverage,
     pub(super) automatic: bool,
+    pub(super) auto_eligible: bool,
+    source: &'static str,
     reason: &'static str,
 }
 
@@ -263,7 +267,8 @@ impl PermissionManager {
         let coverage = self.request_coverage(request, rules, context.builtin_allows);
         let covered = coverage.covered.iter().all(Option::is_some);
         let default = self.default_effect(&request.tool);
-        if !self.is_yolo()
+        let mode = self.mode();
+        if mode != PermissionMode::Yolo
             && !coverage.resolved
             && !context.force_prompt
             && default == DefaultEffect::Deny
@@ -272,12 +277,23 @@ impl PermissionManager {
                 "current permission default denies this request".into(),
             ));
         }
-        let automatic = self.is_yolo()
+        let automatic = mode == PermissionMode::Yolo
             || (!context.forced
                 && !coverage.must_prompt
                 && (covered
                     || (!context.force_prompt
                         && (context.exact_plan_write || default == DefaultEffect::Allow))));
+        let auto_eligible = mode == PermissionMode::Auto
+            && !automatic
+            && default == DefaultEffect::Prompt
+            && !coverage.must_prompt
+            && !context.forced
+            && !context.force_prompt
+            && !context.plan_scoped
+            && !request
+                .resources
+                .iter()
+                .any(|resource| resource.protected || resource.requires_prompt);
         Ok(CurrentPolicy {
             reason: prompt_reason_message(
                 request,
@@ -288,6 +304,14 @@ impl PermissionManager {
             ),
             coverage,
             automatic,
+            auto_eligible,
+            source: if mode == PermissionMode::Yolo {
+                DECISION_SOURCE_YOLO
+            } else if auto_eligible {
+                DECISION_SOURCE_AUTO
+            } else {
+                DECISION_SOURCE_RULE
+            },
         })
     }
 
@@ -442,14 +466,6 @@ impl PermissionManager {
             );
             Ok(())
         };
-        let by_rule = || {
-            if self.yolo.load(Ordering::Relaxed) {
-                DECISION_SOURCE_YOLO
-            } else {
-                DECISION_SOURCE_RULE
-            }
-        };
-
         let make_request = |tool: ToolKey, request_scopes: Vec<String>, force_prompt: bool| {
             if let Some(intent) = intent {
                 let mut intent = intent.clone();
@@ -535,11 +551,33 @@ impl PermissionManager {
         if scopes.plan_scoped {
             contain_authority_to_the_plan(&mut request);
         }
-        let current = self
+        let mut current = self
             .current_policy(&request, &context)
             .map_err(|error| deny(DECISION_SOURCE_RULE, Some(error.to_string())))?;
         if current.automatic {
-            return allowed(by_rule());
+            return allowed(current.source);
+        }
+        let mut receipts = Vec::new();
+        let mut escalation = None;
+        if current.auto_eligible {
+            let screened = self
+                .screen_auto_candidate(&request, &context, cancel)
+                .await
+                .map_err(|error| deny(DECISION_SOURCE_RULE, Some(error.to_string())))?;
+            current = screened.policy;
+            if current.automatic {
+                return allowed(current.source);
+            }
+            if screened.approved {
+                return allowed(DECISION_SOURCE_AUTO);
+            }
+            escalation = screened.escalation;
+            if let Some((service, decision)) = screened.decision {
+                request.presentation.advisories = advisories(&decision);
+                if let Some(receipt) = decision.evaluation.receipt {
+                    receipts.push((service, receipt));
+                }
+            }
         }
         request.add_pattern_candidates(&self.pattern_candidates(), &current.coverage.covered);
         request.presentation.risk_summary = current.reason.into();
@@ -558,6 +596,9 @@ impl PermissionManager {
 
         let Some(_) = user_response_rx else {
             warn!(tool = %tool, scope = %scope_display(), "no permission response channel");
+            if let Some(effect) = self.record_escalation(escalation, &context) {
+                effect.detach();
+            }
             return Err(deny(DECISION_SOURCE_USER_ABORT, None));
         };
 
@@ -594,7 +635,13 @@ impl PermissionManager {
             .send(AgentEvent::PermissionRequest(Box::new(request.clone())))
             .is_err()
         {
+            if let Some(effect) = self.record_escalation(escalation, &context) {
+                effect.detach();
+            }
             return Err(deny(DECISION_SOURCE_USER_ABORT, None));
+        }
+        if let Some(effect) = self.record_escalation(escalation, &context) {
+            effect.detach();
         }
         let forcing_reason = prompt_forcing_reason(
             &request,
@@ -635,6 +682,9 @@ impl PermissionManager {
             "permission prompt raised"
         );
         let waiting_since = Instant::now();
+        let advice_revision = self.broker.revision.load(Ordering::Acquire);
+        let mut advisory_task = self.permission_advice(&request);
+        let mut shell_advisory_task = self.shell_effect_advice(&request, context.plan_scoped);
         let wait = async {
             let mut source_request_id = String::new();
             loop {
@@ -682,7 +732,42 @@ impl PermissionManager {
                         self.poll_permission_changes()?;
                         Ok(None)
                     },
-                )
+                );
+                let wake = futures_lite::future::race(wake, async {
+                    let (service, decision, label_user) = futures_lite::future::race(
+                        async {
+                            let Some(task) = advisory_task.as_mut() else {
+                                return futures_lite::future::pending().await;
+                            };
+                            let (service, decision) = task.await;
+                            advisory_task = None;
+                            (service, decision, true)
+                        },
+                        async {
+                            let Some(task) = shell_advisory_task.as_mut() else {
+                                return futures_lite::future::pending().await;
+                            };
+                            let (service, decision) = task.await;
+                            shell_advisory_task = None;
+                            (service, decision, false)
+                        },
+                    )
+                    .await;
+                    if let Some(decision) = decision {
+                        if let Some(effect) = registration.annotate(
+                            &mut request,
+                            &decision,
+                            advice_revision,
+                            &service,
+                        ) {
+                            effect.detach();
+                        }
+                        if label_user && let Some(receipt) = decision.evaluation.receipt {
+                            receipts.push((service, receipt));
+                        }
+                    }
+                    Ok(None)
+                })
                 .await?;
                 if let Some(decision) = wake {
                     return Ok(decision);
@@ -694,6 +779,20 @@ impl PermissionManager {
             Ok(Err(error)) => Some(PendingDecision::PolicyDenied(error.to_string())),
             Err(_) => None,
         };
+        if let Some(PendingDecision::Explicit(answer)) = &decision {
+            let label_advisory = self
+                .decisions()
+                .filter(|service| service.config().log)
+                .and_then(|_| advisory_task.take());
+            if let Some(label) = label_answer(
+                receipts,
+                label_advisory,
+                answer,
+                waiting_since.elapsed().as_millis() as u64,
+            ) {
+                label.detach();
+            }
+        }
         // Paired with `permission_prompt` by `request_id`: the two together give
         // the prompt rate, what authority the answer bought, and the wait cost.
         let (answer, option_id, lifetime, answer_source) = match &decision {
@@ -743,6 +842,10 @@ impl PermissionManager {
             PendingDecision::MatchedRule => true,
             PendingDecision::PolicyDenied(_) => false,
         };
+        let mut source = match &decision {
+            PendingDecision::Explicit(answer) => answer.decision_source(),
+            PendingDecision::MatchedRule | PendingDecision::PolicyDenied(_) => DECISION_SOURCE_RULE,
+        };
         if allow {
             if cancel.is_cancelled() {
                 return Err(deny(DECISION_SOURCE_USER_ABORT, None));
@@ -750,8 +853,11 @@ impl PermissionManager {
             let current = self
                 .current_policy(&request, &context)
                 .map_err(|error| deny(DECISION_SOURCE_RULE, Some(error.to_string())))?;
-            if matches!(decision, PendingDecision::MatchedRule) && !current.automatic {
-                return Err(deny(DECISION_SOURCE_RULE, None));
+            if matches!(decision, PendingDecision::MatchedRule) {
+                if !current.automatic {
+                    return Err(deny(DECISION_SOURCE_RULE, None));
+                }
+                source = current.source;
             }
             if let PendingDecision::Explicit(answer) = &decision {
                 let remembered = match answer {
@@ -784,10 +890,6 @@ impl PermissionManager {
                 }
             }
         }
-        let source = match &decision {
-            PendingDecision::Explicit(answer) => answer.decision_source(),
-            PendingDecision::MatchedRule | PendingDecision::PolicyDenied(_) => DECISION_SOURCE_RULE,
-        };
         if allow {
             allowed(source)
         } else {
@@ -860,13 +962,13 @@ mod tests {
         CONFINED_READ_ATTRIBUTE, CONFINED_READ_AUTHORITY, CONFINED_READ_VALUE,
         PROMPT_REASON_ASK_RULE, PROMPT_REASON_FORCED, PROMPT_REASON_PROTECTED,
         PROMPT_REASON_UNCOVERED, PermissionAnswer, PermissionAuthorityProfile,
-        PermissionExecutorKind, PermissionLifetime, PermissionManager, PermissionRequest,
-        PermissionResource, PermissionResourceAccess, PermissionResourceKind, PermissionRisk,
-        PermissionRowGrant, PermissionRuleRecord, PermissionSubject, RemotePermissionIdentity,
-        ResourceCoverage, RevokedRuleScope, RuleOrigin, StructuredPermissionDecision,
-        StructuredPermissionEffect, builtin_structured_rules, canonical_json,
-        canonical_json_sha256, filesystem_permission_resource, is_shell_tool, normalize_scope_path,
-        prompt_forcing_reason,
+        PermissionExecutorKind, PermissionLifetime, PermissionManager, PermissionMode,
+        PermissionRequest, PermissionResource, PermissionResourceAccess, PermissionResourceKind,
+        PermissionRisk, PermissionRowGrant, PermissionRuleRecord, PermissionSubject,
+        RemotePermissionIdentity, ResourceCoverage, RevokedRuleScope, RuleOrigin,
+        StructuredPermissionDecision, StructuredPermissionEffect, builtin_structured_rules,
+        canonical_json, canonical_json_sha256, filesystem_permission_resource, is_shell_tool,
+        normalize_scope_path, prompt_forcing_reason,
     };
     use caudra_config::{DefaultEffect, Effect, PermissionRule, PermissionsConfig, ToolKey};
     use caudra_storage::StateDir;
@@ -875,6 +977,162 @@ mod tests {
     use std::sync::Arc;
 
     const REPLACEMENT_COMMAND: &str = "cargo clean";
+    const AUTO_BUILTIN_ASK: &str = "git push origin main";
+
+    #[test_case(FIRST_COMMAND, None, false, true; "unmatched_default_ask_runs")]
+    #[test_case(FIRST_COMMAND, Some(Effect::Ask), false, false; "configured_ask_prompts")]
+    #[test_case(FIRST_COMMAND, Some(Effect::Deny), false, false; "configured_deny_blocks")]
+    #[test_case(FIRST_COMMAND, Some(Effect::Allow), false, true; "configured_allow_runs")]
+    #[test_case(AUTO_BUILTIN_ASK, None, false, false; "builtin_ask_prompts")]
+    #[test_case(FIRST_COMMAND, None, true, false; "forced_prompts")]
+    fn auto_only_skips_unmatched_prompts(
+        command: &str,
+        rule: Option<Effect>,
+        forced: bool,
+        allowed: bool,
+    ) {
+        smol::block_on(async {
+            let rules = rule
+                .into_iter()
+                .map(|effect| shell_policy_rule(command, effect))
+                .collect();
+            let manager = mgr_with(make_config(rules), PathBuf::from(SHELL_WORKDIR));
+            manager.set_session_mode(Some(PermissionMode::Auto));
+            assert_eq!(
+                enforce_shell_without_prompt(&manager, &[command], forced)
+                    .await
+                    .is_ok(),
+                allowed
+            );
+        });
+    }
+
+    #[test_case(DefaultEffect::Prompt, false, true; "ask_is_candidate")]
+    #[test_case(DefaultEffect::Allow, true, false; "allow_is_baseline")]
+    fn auto_candidate_is_not_baseline_automatic(
+        default: DefaultEffect,
+        automatic: bool,
+        eligible: bool,
+    ) {
+        let manager = mgr_with(
+            PermissionsConfig {
+                default,
+                ..Default::default()
+            },
+            PathBuf::from(SHELL_WORKDIR),
+        );
+        manager.set_session_mode(Some(PermissionMode::Auto));
+        let request = shell_request(&[FIRST_COMMAND], workcell_shell_subject());
+        let context = EvaluationContext {
+            revision: *manager.context_revision.read().unwrap(),
+            plan_scoped: false,
+            builtin_allows: true,
+            force_prompt: false,
+            forced: false,
+            exact_plan_write: false,
+        };
+        let current = manager.current_policy(&request, &context).unwrap();
+        assert_eq!(current.automatic, automatic);
+        assert_eq!(current.auto_eligible, eligible);
+        manager.set_session_mode(Some(PermissionMode::Ask));
+        assert_eq!(
+            manager
+                .current_policy(&request, &context)
+                .unwrap()
+                .automatic,
+            automatic
+        );
+    }
+
+    #[test_case(true, false, false; "protected")]
+    #[test_case(false, true, false; "requires_prompt")]
+    #[test_case(false, false, true; "plan_scoped")]
+    fn auto_preserves_resource_and_plan_prompts(
+        protected: bool,
+        requires_prompt: bool,
+        plan_scoped: bool,
+    ) {
+        smol::block_on(async {
+            let manager = default_mgr();
+            manager.set_session_mode(Some(PermissionMode::Auto));
+            let mut intent = shell_intent(&[FIRST_COMMAND]);
+            intent.resources[0].protected = protected;
+            intent.resources[0].requires_prompt = requires_prompt;
+            intent.scopes.plan_scoped = plan_scoped;
+            let (sender, receiver) = flume::unbounded();
+            let events = EventSender::new(sender, 0);
+            assert!(
+                manager
+                    .enforce_with_intent(
+                        &ToolKey::native("shell"),
+                        &intent,
+                        &serde_json::json!({"command": FIRST_COMMAND}),
+                        &events,
+                        None,
+                        CONTROLLED_REQUEST,
+                        &CancelToken::none(),
+                        None,
+                        Some((workcell_shell_subject(), PermissionExecutorKind::Native)),
+                        true,
+                    )
+                    .await
+                    .is_err()
+            );
+            assert!(receiver.is_empty());
+        });
+    }
+
+    #[test_case(PermissionMode::Ask; "ask")]
+    #[test_case(PermissionMode::Auto; "auto")]
+    fn default_deny_is_not_skipped(mode: PermissionMode) {
+        smol::block_on(async {
+            let manager = mgr_with(
+                PermissionsConfig {
+                    default: DefaultEffect::Deny,
+                    ..Default::default()
+                },
+                PathBuf::from(SHELL_WORKDIR),
+            );
+            manager.set_session_mode(Some(mode));
+            assert!(
+                enforce_shell_without_prompt(&manager, &[FIRST_COMMAND], false)
+                    .await
+                    .is_err()
+            );
+        });
+    }
+
+    #[test_case(false; "unmatched_pending_call_stays_pending")]
+    #[test_case(true; "forced_pending_call_stays_pending")]
+    fn switching_to_auto_reevaluates_pending_calls(forced: bool) {
+        smol::block_on(async {
+            let manager = default_mgr();
+            let scopes = crate::tools::PermissionScopes {
+                scopes: vec![FIRST_COMMAND.into()],
+                force_prompt: forced,
+                plan_scoped: false,
+            };
+            let (sender, receiver) = flume::unbounded();
+            let events = EventSender::new(sender, 0);
+            let cancel = CancelToken::none();
+            let mut enforcement =
+                Box::pin(controlled_enforcement(&manager, &scopes, &events, &cancel));
+            assert!(
+                futures_lite::future::poll_once(&mut enforcement)
+                    .await
+                    .is_none()
+            );
+            assert!(matches!(
+                receiver.try_recv().unwrap().event,
+                AgentEvent::PermissionRequest(_)
+            ));
+            manager.toggle_auto();
+            let result = futures_lite::future::poll_once(&mut enforcement).await;
+            assert!(result.is_none());
+            assert!(manager.answer(CONTROLLED_REQUEST, PermissionAnswer::Deny));
+            assert!(enforcement.await.is_err());
+        });
+    }
 
     #[test_case(true, false; "persistent_reviewed_project")]
     #[test_case(false, false; "nonpersistent_canonical_project")]

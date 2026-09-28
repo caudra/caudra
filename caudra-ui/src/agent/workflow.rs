@@ -212,7 +212,7 @@ impl WorkflowSession {
             events: spawn.events,
             mode: mode_resolver,
             subagent_cancels,
-        }))
+        }, spawn.permissions.decisions()))
         .map_err(|error| {
             warn!(%error, session_id = %spawn.session_id, "workflow runtime unavailable for this session")
         })

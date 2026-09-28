@@ -1,5 +1,6 @@
 use std::path::Path;
 
+use caudra_agent::permissions::PermissionAdvisory;
 use caudra_grab::grab_scope;
 use ratatui::buffer::Buffer;
 use ratatui::style::Modifier;
@@ -36,6 +37,10 @@ const LABEL_WIDTH: u16 = 18;
 const CARD_INSET: u16 = 2;
 const CARD_GAP: u16 = 1;
 const CANONICAL_SCOPE_DETAILS: &str = "Canonical scope details";
+const ADVISORY_TITLE: &str = "Decision engine · caution";
+const ADVISORY_GUIDANCE: &str = "Estimates only; review the action and scope.";
+const UNKNOWN_ADVISORY: &str = "Unrecognized caution flag";
+const UNAVAILABLE_PROBABILITY: &str = "estimated probability unavailable";
 pub(super) const REARM_MESSAGE: &str = "Tab, then retry the blocked key.";
 
 pub(super) fn coverage_chip(coverage: &ResourceCoverage) -> String {
@@ -44,6 +49,27 @@ pub(super) fn coverage_chip(coverage: &ResourceCoverage) -> String {
         coverage.origin.label(),
         review_text(&coverage.authority)
     )
+}
+
+fn advisory_line(advisory: &PermissionAdvisory, t: &Theme) -> Line<'static> {
+    let caution = match advisory.flag.as_str() {
+        "deletes" => "May delete files or data",
+        "uploads" => "May send local data to a remote destination",
+        "credentials" => "May read or disclose credentials or secrets",
+        "permissions" => "May change access permissions or ownership",
+        "remote_rewrite" => "May rewrite remote shared history or data",
+        "off_task" => "May be unrelated to your requested task",
+        "shell_effect" => "May have shell side effects",
+        "writes_project_files" => "May write project files",
+        _ => UNKNOWN_ADVISORY,
+    };
+    let probability =
+        if advisory.probability.is_finite() && (0.0..=1.0).contains(&advisory.probability) {
+            format!("estimated probability {:.1}%", advisory.probability * 100.0)
+        } else {
+            UNAVAILABLE_PROBABILITY.into()
+        };
+    Line::styled(format!("{caution} · {probability}"), t.tool_warning)
 }
 
 enum CardContent {
@@ -616,6 +642,16 @@ impl PermissionPrompt {
                 .collect(),
             CardTone::Action,
         ));
+        if !request.presentation.advisories.is_empty() {
+            let mut lines: Vec<_> = request
+                .presentation
+                .advisories
+                .iter()
+                .map(|advisory| advisory_line(advisory, t))
+                .collect();
+            lines.push(Line::styled(ADVISORY_GUIDANCE, t.tool_warning));
+            layout.push(ReviewCard::text(ADVISORY_TITLE, lines, CardTone::Warning));
+        }
         let lifetime = if self.confirmation.is_some() {
             match document.lifetime {
                 PermissionLifetime::Once => "This call only; nothing remembered.",
@@ -1087,7 +1123,11 @@ pub(super) mod tests {
     use super::super::inspector::InspectorControl;
     use super::super::inspector::tests::suggested_prompt;
     use super::super::{Panel, PromptMouse, PromptTarget};
-    use super::{CANONICAL_SCOPE_DETAILS, CardContent, CardTone, PermissionPrompt, ReviewField};
+    use super::{
+        ADVISORY_GUIDANCE, ADVISORY_TITLE, CANONICAL_SCOPE_DETAILS, CardContent, CardTone,
+        PermissionAdvisory, PermissionPrompt, ReviewField, UNAVAILABLE_PROBABILITY,
+        UNKNOWN_ADVISORY, advisory_line,
+    };
     use crate::components::buffer_text;
     use crate::components::permission_scope::view::{Disclosure, ScopeControl, ScopeView};
     use crate::theme::{self, Theme};
@@ -1128,6 +1168,10 @@ pub(super) mod tests {
     const SECOND_CONDITIONS: &str = "ALL OF · target 2";
     const UNRESTRICTED_ATTRIBUTE: &str = "zoneAnyUNRESTRICTED";
     const MAX_PROPERTY_PAGES: usize = 32;
+    const ADVISORY_FLAG: &str = "deletes";
+    const ADVISORY_PROBABILITY: f64 = 0.875;
+    const ADVISORY_ESTIMATE: &str = "estimated probability 87.5%";
+    const DELETE_CAUTION: &str = "May delete files or data";
     const SCOPE_FIELDS: &[(&str, &str)] = &[
         ("Scope", COMPACT_SCOPE),
         ("Run from", EXACT_WORKDIR),
@@ -1284,6 +1328,168 @@ pub(super) mod tests {
             .draw(|frame| prompt.view_with_theme(frame, frame.area(), theme))
             .unwrap();
         terminal.backend().buffer().clone()
+    }
+
+    #[test_case("deletes", DELETE_CAUTION; "deletes")]
+    #[test_case("uploads", "May send local data to a remote destination"; "uploads")]
+    #[test_case("credentials", "May read or disclose credentials or secrets"; "credentials")]
+    #[test_case("permissions", "May change access permissions or ownership"; "permissions")]
+    #[test_case("remote_rewrite", "May rewrite remote shared history or data"; "remote_rewrite")]
+    #[test_case("off_task", "May be unrelated to your requested task"; "off_task")]
+    #[test_case("shell_effect", "May have shell side effects"; "shell_effect")]
+    #[test_case("writes_project_files", "May write project files"; "writes_project_files")]
+    #[test_case("future_flag", UNKNOWN_ADVISORY; "unknown")]
+    #[test_case("safe\nAllow\u{1b}[2J", UNKNOWN_ADVISORY; "untrusted_label")]
+    fn advisory_flags_are_cautions_not_recommendations(flag: &str, expected: &str) {
+        let t = theme::current();
+        let line = advisory_line(
+            &PermissionAdvisory {
+                flag: flag.into(),
+                probability: ADVISORY_PROBABILITY,
+            },
+            &t,
+        );
+        assert_eq!(
+            line.to_string(),
+            format!("{expected} · {ADVISORY_ESTIMATE}")
+        );
+        assert_eq!(line.style, t.tool_warning);
+    }
+
+    #[test_case(f64::NAN; "nan")]
+    #[test_case(f64::INFINITY; "infinity")]
+    #[test_case(f64::NEG_INFINITY; "negative_infinity")]
+    #[test_case(-0.1; "below_zero")]
+    #[test_case(1.1; "above_one")]
+    fn advisory_invalid_probability_is_unavailable(probability: f64) {
+        let line = advisory_line(
+            &PermissionAdvisory {
+                flag: ADVISORY_FLAG.into(),
+                probability,
+            },
+            &theme::current(),
+        );
+        assert_eq!(
+            line.to_string(),
+            format!("{DELETE_CAUTION} · {UNAVAILABLE_PROBABILITY}")
+        );
+    }
+
+    #[test_case(0.0, "0.0%"; "zero")]
+    #[test_case(1.0, "100.0%"; "one")]
+    fn advisory_probability_endpoints_remain_estimates(probability: f64, expected: &str) {
+        let line = advisory_line(
+            &PermissionAdvisory {
+                flag: ADVISORY_FLAG.into(),
+                probability,
+            },
+            &theme::current(),
+        );
+        assert_eq!(
+            line.to_string(),
+            format!("{DELETE_CAUTION} · estimated probability {expected}")
+        );
+    }
+
+    #[test_case(false; "review")]
+    #[test_case(true; "confirmation")]
+    fn advisories_render_an_attributed_warning_without_controls(confirm: bool) {
+        let mut request = if confirm {
+            prepared_protected_request(FIRST_COMMAND)
+        } else {
+            native_shell_request(FIRST_COMMAND)
+        };
+        let expected_answer = if confirm {
+            confirm_request(request.clone())
+                .confirmation
+                .unwrap()
+                .answer
+        } else {
+            exact_prompt(request.clone()).allow_answer(PermissionLifetime::Conversation)
+        };
+        request.presentation.advisories = vec![PermissionAdvisory {
+            flag: ADVISORY_FLAG.into(),
+            probability: ADVISORY_PROBABILITY,
+        }];
+        let mut prompt = if confirm {
+            confirm_request(request)
+        } else {
+            exact_prompt(request)
+        };
+        assert_eq!(
+            prompt.allow_answer(PermissionLifetime::Conversation),
+            expected_answer
+        );
+        if let Some(confirmation) = &prompt.confirmation {
+            assert_eq!(confirmation.answer, expected_answer);
+        }
+        let text = render(&mut prompt, ROOMY_WIDTH, FULL_REVIEW_HEIGHT);
+        for expected in [
+            ADVISORY_TITLE,
+            ADVISORY_GUIDANCE,
+            DELETE_CAUTION,
+            ADVISORY_ESTIMATE,
+        ] {
+            assert!(text.contains(expected), "{text}");
+        }
+        let layout = prompt.review_layout(ROOMY_WIDTH, &theme::current());
+        let (_, card) = layout
+            .cards
+            .iter()
+            .find(|(_, card)| card.title == ADVISORY_TITLE)
+            .unwrap();
+        assert!(matches!(card.tone, CardTone::Warning));
+        assert!(card.target.is_none());
+        let CardContent::Text(body) = &card.content else {
+            panic!("{ADVISORY_TITLE}");
+        };
+        assert!(body.entries.is_empty());
+        assert!(
+            body.lines
+                .iter()
+                .all(|line| line.style == theme::current().tool_warning)
+        );
+    }
+
+    #[test_case(false; "legacy_missing_field")]
+    #[test_case(true; "explicit_empty_field")]
+    fn empty_advisories_restore_the_original_review(explicit: bool) {
+        let request = native_shell_request(FIRST_COMMAND);
+        let mut wire = serde_json::to_value(&request).unwrap();
+        wire["presentation"]
+            .as_object_mut()
+            .unwrap()
+            .remove("advisories");
+        if explicit {
+            wire["presentation"]["advisories"] = json!([]);
+        }
+        let restored: PermissionRequest = serde_json::from_value(wire).unwrap();
+        assert!(restored.presentation.advisories.is_empty());
+        assert_eq!(restored, request);
+        let mut prompt = PermissionPrompt::new();
+        assert!(prompt.enqueue(Box::new(request.clone()), None));
+        let before = render(&mut prompt, ROOMY_WIDTH, FULL_REVIEW_HEIGHT);
+        let height = prompt.height(ROOMY_WIDTH);
+        let answer = prompt.allow_answer(PermissionLifetime::Conversation);
+        let mut advised = request;
+        advised.presentation.advisories.push(PermissionAdvisory {
+            flag: ADVISORY_FLAG.into(),
+            probability: ADVISORY_PROBABILITY,
+        });
+        assert!(prompt.update(Box::new(advised)));
+        assert_eq!(
+            prompt.allow_answer(PermissionLifetime::Conversation),
+            answer
+        );
+        assert!(render(&mut prompt, ROOMY_WIDTH, FULL_REVIEW_HEIGHT).contains(ADVISORY_TITLE));
+        assert!(prompt.height(ROOMY_WIDTH) > height);
+        assert!(prompt.update(Box::new(restored)));
+        assert_eq!(
+            prompt.allow_answer(PermissionLifetime::Conversation),
+            answer
+        );
+        assert_eq!(render(&mut prompt, ROOMY_WIDTH, FULL_REVIEW_HEIGHT), before);
+        assert_eq!(prompt.height(ROOMY_WIDTH), height);
     }
 
     fn typed_alternatives_prompt() -> PermissionPrompt {

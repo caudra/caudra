@@ -162,6 +162,7 @@ Everything after the metadata is ordinary Rhai with these host functions:
 | `pause(kind, message)` | Suspends the run in a resumable state |
 | `complete()`, `complete(value)` | Ends the run with `value` as its result |
 | `write_scratch_file(name, content)` | Writes an artifact and returns its path |
+| `decide(state, questions)`, `decide(state, questions, opts)` | Calls the configured decision endpoint. Returns `#{ answers, model }` |
 | `json_encode(value)` | Serializes a value to JSON text |
 | `budget()` | Returns `#{ issued, limit, remaining }` for the run's agent budget |
 | `args` | The launch arguments, or `()` when none were given |
@@ -189,6 +190,33 @@ A `read-only` agent reads, searches, and fetches, and it may also run a shell co
 Use `fast` for bulk work over a fixed packet, such as a shard of findings to rule on. Use `best` for the one call whose output the user reads. Leave it off, or pass `subagent`, for everything else, and the call runs on whatever the session uses for subagents.
 
 Precedence runs from most specific configuration to least. A `subagent_model` pin on the profile the call names wins over the call's `model_job`, because a user who pinned a model for a profile meant it. Without a pin, `model_job` applies. Without either, the session's subagent binding applies. See [System Prompt Profiles](/docs/system-prompts/#configure-subagents).
+
+### Typed decisions
+
+`decide()` uses the endpoint in your global [`decisions` configuration](/docs/configuration/#decisions). It is available even when passive decision features are off, including in YOLO. Non-loopback endpoints require `allow_remote = true`. Calls go directly to that endpoint without ambient proxies or HTTP redirects.
+
+```rhai
+let result = decide(
+    #{ task: args.objective },
+    #{ deep_reasoning: #{
+        type: "noul",
+        instructions: "Does this task require substantial reasoning?"
+    } }
+);
+let job = if result.answers.deep_reasoning.noul >= 0.9 { "best" } else { "fast" };
+let answer = agent(args.objective, #{ model_job: job });
+complete(answer.output);
+```
+
+Questions are keyed by ID. Supported types are `noul`, `choice`, and `score`. A `noul` answer contains a probability in `noul`. A choice needs named criteria or an array of options. A score needs an ordered array of levels. Calls allow at most 64 questions, 100 choices per question, 10 score levels, and 512 options in total.
+
+The optional third argument accepts `model` and `timeout_ms`. A positive timeout is capped at the configured decision deadline. States are redacted and bounded to 1,500 serialized bytes, with depth and node limits. Oversized states are rejected rather than silently shortened. Dynamic question descriptions are also redacted. A question is rejected if redaction would change an answer label or question ID. Redaction is best effort, so keep credentials and sensitive material out of both states and questions.
+
+Endpoint errors and timeouts are catchable Rhai errors. A successful result is saved before the script continues and replayed on resume without another endpoint call. Calls that failed or were interrupted before their result was committed can run again. The workflow journal omits the decision request body. The separate opt-in decision log stores the redacted state that was sent, questions, and answers. Workflow effects remain `none` there, even if the script acts on an answer.
+
+Decision calls count against the host-call limit, not the agent budget. Their answers are data for the script. They do not grant permissions or change an agent's execution mode.
+
+Explicit `decide()` state is separate from passive subagent routing. The passive router currently sees a task label, not the full prompt. An explicit `model_job` or profile model pin takes precedence over passive routing.
 
 ### Spending the budget
 

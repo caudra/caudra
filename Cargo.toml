@@ -60,6 +60,7 @@ members = [
   "caudra-acp",
   "caudra-agent",
   "caudra-config",
+  "caudra-decision",
   "caudra-sandbox",
   "caudra-diff",
   "caudra-docgen",
@@ -95,6 +96,7 @@ rust-version = "1.98"
 caudra-agent = { path = "caudra-agent" }
 caudra-acp = { path = "caudra-acp" }
 caudra-config = { path = "caudra-config" }
+caudra-decision = { path = "caudra-decision" }
 caudra-sandbox = { path = "caudra-sandbox" }
 caudra-diff = { path = "caudra-diff" }
 caudra-interpreter = { path = "caudra-interpreter" }

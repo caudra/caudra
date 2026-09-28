@@ -14,10 +14,12 @@ use caudra_agent::prompt::ResolvedSlots;
 use caudra_agent::prompt::profile::PromptProfileCatalog;
 use caudra_agent::tools::ToolRegistry;
 use caudra_agent::{AgentConfig, PermissionsConfig};
+use caudra_config::decisions::DecisionsConfig;
 use caudra_config::{ModelPolicy, SnapshotsConfig};
 use caudra_providers::model::Model;
 use caudra_providers::{ThinkingConfig, Timeouts};
 use caudra_storage::local_documents::LocalDocumentStore;
+use caudra_storage::sessions::PermissionMode;
 use caudra_storage::workspace_binding::StoredWorkspaceBinding;
 use caudra_workspace::WorkspaceSession;
 
@@ -28,7 +30,7 @@ pub struct AcpParams {
     pub thinking: ThinkingConfig,
     pub prompt_profiles: Arc<PromptProfileCatalog>,
     pub system_prompt_profile_override: Option<String>,
-    pub yolo: bool,
+    pub permission_mode: Option<PermissionMode>,
     pub model_policy: Arc<ModelPolicy>,
     pub runtime_resolver: AcpRuntimeResolver,
 }
@@ -45,6 +47,8 @@ pub trait AcpRuntimeGuard: Send {
 pub struct AcpRuntime {
     pub config: AgentConfig,
     pub permissions_config: PermissionsConfig,
+    pub decisions_config: DecisionsConfig,
+    pub seed_permission_mode: Option<PermissionMode>,
     pub snapshots: SnapshotsConfig,
     pub prompt_slots: Arc<ResolvedSlots>,
     pub plugin_rules: Arc<PluginRuleStore>,

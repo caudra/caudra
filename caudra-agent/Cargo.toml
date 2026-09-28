@@ -12,6 +12,7 @@ test-support = []
 async-trait = { workspace = true }
 caudra-providers = { workspace = true }
 caudra-config = { workspace = true }
+caudra-decision = { workspace = true }
 caudra-diff = { workspace = true }
 caudra-otel = { workspace = true }
 color-eyre = { workspace = true }

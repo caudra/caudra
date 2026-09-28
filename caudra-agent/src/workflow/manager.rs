@@ -40,6 +40,7 @@ use crate::agent::task_runner::{ModeResolver, TaskRunner};
 use crate::background::BackgroundTasks;
 use crate::background_reminder::RuntimeHealth;
 use crate::cancel::{CancelMap, CancelToken, CancelTrigger};
+use crate::decisions::Decisions;
 use crate::types::{AgentEvent, Envelope, EventSender, WORKFLOW_EVENT_RUN_ID, WorkflowProvenance};
 
 const OBJECTIVE_ARG: &str = "objective";
@@ -91,7 +92,10 @@ pub struct WorkflowRuntime {
 impl WorkflowRuntime {
     /// Opens the store, marks every run the previous process left active as
     /// interrupted, publishes the session's history, and starts serving.
-    pub async fn spawn(deps: RuntimeDeps) -> Result<Self, WorkflowError> {
+    pub async fn spawn(
+        deps: RuntimeDeps,
+        decisions: Option<Decisions>,
+    ) -> Result<Self, WorkflowError> {
         let store = WorkflowStore::spawn(deps.state_dir.clone(), deps.session_id)?;
         let interrupted = store.interrupt_active().await?;
         if interrupted > 0 {
@@ -124,6 +128,7 @@ impl WorkflowRuntime {
             remote_project_context: deps.remote_project_context,
             env: RunEnv {
                 store,
+                decisions,
                 runner: deps.runner,
                 events: deps.events,
                 mode: deps.mode,
@@ -700,12 +705,18 @@ impl Manager {
                 continue;
             };
             let kind = call_kind(call.kind);
-            let request: Value = serde_json::from_str(&call.request).map_err(internal)?;
+            // Decision inputs are omitted from the journal; their original hash still fences replay.
+            let request_hash = if kind == CallKind::Decision {
+                serde_json::from_value(Value::String(call.request_hash)).map_err(internal)?
+            } else {
+                let request: Value = serde_json::from_str(&call.request).map_err(internal)?;
+                hash_request(kind, &request)
+            };
             let result: Value = serde_json::from_str(&result).map_err(internal)?;
             journal
                 .insert(
                     CallKey(call.call_key),
-                    JournalEntry::new(kind, hash_request(kind, &request), result),
+                    JournalEntry::new(kind, request_hash, result),
                 )
                 .map_err(internal)?;
         }
@@ -836,6 +847,7 @@ fn call_kind(kind: WorkflowCallKind) -> CallKind {
         WorkflowCallKind::Agent => CallKind::Agent,
         WorkflowCallKind::Parallel => CallKind::Parallel,
         WorkflowCallKind::ScratchFile => CallKind::ScratchFile,
+        WorkflowCallKind::Decision => CallKind::Decision,
     }
 }
 
@@ -894,7 +906,11 @@ mod tests {
     use std::fs;
     use std::path::Path;
     use std::sync::Mutex;
+    use std::time::{Duration, Instant};
 
+    use async_trait::async_trait;
+    use caudra_config::decisions::DecisionsConfig;
+    use caudra_decision::{DecisionEngine, DecisionError, DecisionRequest, DecisionResponse};
     use caudra_providers::{Message, WorkflowEventOrigin, expand_message};
     use caudra_storage::sessions::{SessionDatabase, SessionRelocation};
     use caudra_storage::workflow::{WorkflowCallState, WorkflowEventKind, WorkflowSourceKind};
@@ -906,6 +922,7 @@ mod tests {
     use super::*;
     use crate::StoredSession;
     use crate::agent::task_runner::{TaskFuture, TaskOutcome, TaskRequest};
+    use crate::workflow::state::stored_status;
 
     const MODEL: &str = "test/model";
     const DESCRIPTION: &str = "A test workflow";
@@ -1006,6 +1023,287 @@ complete(first.output.echo);
     const TIMELINE_IS_KEPT: &str = "phases and log lines must be stored with the run";
     const SCRATCH_PREVIEW_IS_ITS_PATH: &str = "a scratch call previews the bare path it wrote";
     const HISTORY_IS_FOREIGN: &str = "history must list only other sessions' runs";
+    const DECIDING: &str = "deciding";
+    const DECISION_MODEL: &str = "workflow/model";
+    const DECISION_SECRET: &str = "workflow-test-secret";
+    const DECISION_ENDPOINT: &str = "http://127.0.0.1:8000/v1/systemone";
+    const DECISION_TIMEOUT_MS: u64 = 60_000;
+    const CONTROL_TEST_TIMEOUT: Duration = Duration::from_secs(5);
+    const CONTROL_TIMEOUT_ERROR: &str = "workflow control waited for the decision deadline";
+    const CAUGHT: &str = "caught";
+    const DECIDING_BODY: &str = r#"
+let result = decide(#{ command: "ls", api_key: "workflow-test-secret" }, #{ ready: #{ type: "noul", instructions: "Is it ready?" } }, #{ model: "workflow/model" });
+agent("one", #{ label: "block-1" });
+complete(result);
+"#;
+    const DECISION_FAILURE_BODY: &str = r#"
+let result = "not caught";
+try {
+    decide(#{ command: "ls" }, #{ ready: #{ type: "noul", instructions: "Is it ready?" } });
+} catch (error) { result = "caught"; }
+complete(result);
+"#;
+    const DECISION_DEADLINE_BODY: &str = r#"
+let result = "not caught";
+try {
+    decide(#{ command: "ls" }, #{ ready: #{ type: "noul", instructions: "Is it ready?" } }, #{ timeout_ms: 10 });
+} catch (error) { result = "caught"; }
+complete(result);
+"#;
+
+    struct FakeDecisionEngine {
+        requests: Mutex<Vec<DecisionRequest>>,
+        started: flume::Sender<()>,
+        dropped: flume::Sender<()>,
+        error: Option<DecisionError>,
+        block: bool,
+    }
+
+    struct DecisionDrop(flume::Sender<()>);
+
+    impl Drop for DecisionDrop {
+        fn drop(&mut self) {
+            let _ = self.0.send(());
+        }
+    }
+
+    #[async_trait]
+    impl DecisionEngine for FakeDecisionEngine {
+        async fn decide(
+            &self,
+            request: &DecisionRequest,
+            deadline: Instant,
+        ) -> Result<DecisionResponse, DecisionError> {
+            let _drop = DecisionDrop(self.dropped.clone());
+            assert!(deadline <= Instant::now() + Duration::from_millis(DECISION_TIMEOUT_MS));
+            self.requests.lock().unwrap().push(request.clone());
+            let _ = self.started.send(());
+            if self.block {
+                futures_lite::future::pending::<()>().await;
+            }
+            if let Some(error) = &self.error {
+                return Err(error.clone());
+            }
+            Ok(serde_json::from_value(json!({
+                "answers": { "ready": { "type": "noul", "noul": 0.9, "confidence": 0.9 } },
+                "usage": { "input_tokens": 1, "output_tokens": 1 },
+            }))
+            .unwrap())
+        }
+    }
+
+    fn decision_service(
+        fixture: &Fixture,
+        error: Option<DecisionError>,
+        block: bool,
+    ) -> (
+        Decisions,
+        Arc<FakeDecisionEngine>,
+        flume::Receiver<()>,
+        flume::Receiver<()>,
+    ) {
+        let (started, entered) = flume::unbounded();
+        let (dropped, ended) = flume::unbounded();
+        let engine = Arc::new(FakeDecisionEngine {
+            requests: Mutex::new(Vec::new()),
+            started,
+            dropped,
+            error,
+            block,
+        });
+        let config = DecisionsConfig {
+            endpoint: Some(DECISION_ENDPOINT.parse().unwrap()),
+            model: MODEL.into(),
+            timeout_ms: DECISION_TIMEOUT_MS,
+            ..DecisionsConfig::default()
+        };
+        let decisions =
+            Decisions::with_engine(config, &fixture.state_dir, Arc::clone(&engine)).unwrap();
+        (decisions, engine, entered, ended)
+    }
+
+    #[test_case(false; "resume")]
+    #[test_case(true; "restart_without_service")]
+    fn workflow_decision_is_committed_before_reply_and_replayed(restart: bool) {
+        smol::block_on(async {
+            let fixture = Fixture::new();
+            fixture.user_workflow(DECIDING, DECIDING_BODY);
+            let (decisions, engine, _, _) = decision_service(&fixture, None, false);
+            let mut runtime = fixture.spawn_with_decisions(Some(decisions)).await;
+            let handle = runtime.handle();
+            let started = start(&handle, DECIDING, None).await;
+            fixture.started().await;
+            let call = runtime
+                .store
+                .load_call(started.run_id.clone(), FIRST_KEY)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(call.kind, WorkflowCallKind::Decision);
+            assert_eq!(call.state, WorkflowCallState::Completed);
+            assert!(!call.request.contains(DECISION_SECRET));
+            let result: Value = serde_json::from_str(call.result.as_deref().unwrap()).unwrap();
+            assert_eq!(result["model"], DECISION_MODEL);
+            assert_eq!(result["answers"]["ready"]["noul"], 0.9);
+            assert_eq!(engine.requests.lock().unwrap()[0].model, DECISION_MODEL);
+            assert!(
+                !engine.requests.lock().unwrap()[0]
+                    .state
+                    .to_string()
+                    .contains(DECISION_SECRET)
+            );
+            let paused = run(
+                &handle,
+                WorkflowRequest::Pause {
+                    run_id: started.run_id.clone(),
+                },
+            )
+            .await;
+            assert_eq!(paused.status, RunStatus::Paused);
+            if restart {
+                runtime.shutdown().await;
+                runtime = fixture.spawn().await;
+            }
+            let handle = runtime.handle();
+            resume(&handle, &started.run_id, None).await.unwrap();
+            fixture.started().await;
+            fixture.release.send(()).unwrap();
+            let completed = fixture
+                .wait_for(&started.run_id, RunStatus::Completed)
+                .await;
+            assert_eq!(completed.result, Some(result));
+            assert_eq!(
+                engine.requests.lock().unwrap().len(),
+                1,
+                "{JOURNAL_REPLAYS}"
+            );
+            runtime.shutdown().await;
+        });
+    }
+
+    #[test_case(None; "missing_service")]
+    #[test_case(Some(DecisionError::Unreachable); "unreachable")]
+    #[test_case(Some(DecisionError::Timeout); "timeout")]
+    #[test_case(Some(DecisionError::Invalid(FAILURE)); "invalid")]
+    fn workflow_decision_failure_is_catchable(error: Option<DecisionError>) {
+        smol::block_on(async {
+            let fixture = Fixture::new();
+            fixture.user_workflow(DECIDING, DECISION_FAILURE_BODY);
+            let has_service = error.is_some();
+            let decisions = error.map(|error| decision_service(&fixture, Some(error), false).0);
+            let runtime = fixture.spawn_with_decisions(decisions).await;
+            let started = start(&runtime.handle(), DECIDING, Some(0)).await;
+            let completed = fixture
+                .wait_for(&started.run_id, RunStatus::Completed)
+                .await;
+            assert_eq!(completed.result, Some(json!(CAUGHT)));
+            assert_eq!(completed.usage.agents_admitted, 0);
+            let call = runtime
+                .store
+                .load_call(started.run_id, FIRST_KEY)
+                .await
+                .unwrap();
+            if has_service {
+                let call = call.unwrap();
+                assert_eq!(call.state, WorkflowCallState::Failed);
+                assert!(call.result.is_none());
+                assert!(!call.error.unwrap().contains(FAILURE));
+            } else {
+                assert!(call.is_none());
+            }
+            runtime.shutdown().await;
+        });
+    }
+
+    #[test_case(RunStatus::Paused; "pause")]
+    #[test_case(RunStatus::Cancelled; "stop")]
+    #[test_case(RunStatus::Interrupted; "shutdown")]
+    fn workflow_decision_cancellation_drops_pending_engine(status: RunStatus) {
+        smol::block_on(async {
+            let fixture = Fixture::new();
+            fixture.user_workflow(DECIDING, DECISION_FAILURE_BODY);
+            let (decisions, _, entered, ended) = decision_service(&fixture, None, true);
+            let runtime = fixture.spawn_with_decisions(Some(decisions)).await;
+            let handle = runtime.handle();
+            let started = start(&handle, DECIDING, None).await;
+            entered.recv_async().await.unwrap();
+            let interrupt = async {
+                match status {
+                    RunStatus::Paused => {
+                        run(
+                            &handle,
+                            WorkflowRequest::Pause {
+                                run_id: started.run_id.clone(),
+                            },
+                        )
+                        .await;
+                        runtime.shutdown().await;
+                    }
+                    RunStatus::Cancelled => {
+                        run(
+                            &handle,
+                            WorkflowRequest::Stop {
+                                run_id: started.run_id.clone(),
+                            },
+                        )
+                        .await;
+                        runtime.shutdown().await;
+                    }
+                    _ => runtime.shutdown().await,
+                }
+                ended.recv_async().await.unwrap();
+            };
+            futures_lite::future::race(interrupt, async {
+                smol::Timer::after(CONTROL_TEST_TIMEOUT).await;
+                panic!("{CONTROL_TIMEOUT_ERROR}");
+            })
+            .await;
+            let runtime = fixture.spawn().await;
+            let store = &runtime.store;
+            let row = store
+                .load_run(started.run_id.clone())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(row.status, stored_status(status));
+            let call = store
+                .load_call(started.run_id, FIRST_KEY)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(call.state, WorkflowCallState::Failed);
+            assert!(call.result.is_none());
+            runtime.shutdown().await;
+        });
+    }
+
+    #[test_case(true; "pending_engine")]
+    fn workflow_decision_enforces_script_deadline(block: bool) {
+        smol::block_on(async {
+            let fixture = Fixture::new();
+            fixture.user_workflow(DECIDING, DECISION_DEADLINE_BODY);
+            let (decisions, _, _, _) = decision_service(&fixture, None, block);
+            let runtime = fixture.spawn_with_decisions(Some(decisions)).await;
+            let started = start(&runtime.handle(), DECIDING, None).await;
+            let completed = futures_lite::future::race(
+                fixture.wait_for(&started.run_id, RunStatus::Completed),
+                async {
+                    smol::Timer::after(CONTROL_TEST_TIMEOUT).await;
+                    panic!("{CONTROL_TIMEOUT_ERROR}");
+                },
+            )
+            .await;
+            assert_eq!(completed.result, Some(json!(CAUGHT)));
+            let call = runtime
+                .store
+                .load_call(started.run_id, FIRST_KEY)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(call.state, WorkflowCallState::Failed);
+            runtime.shutdown().await;
+        });
+    }
 
     #[test_case(true; "stop_then_shutdown")]
     #[test_case(false; "shutdown_without_stop")]
@@ -1257,17 +1555,32 @@ complete(first.output.echo);
         }
 
         async fn spawn_as(&self, session_id: CaudraId) -> WorkflowRuntime {
-            WorkflowRuntime::spawn(RuntimeDeps {
-                state_dir: self.state_dir.clone(),
-                session_id,
-                cwd: self.project.clone(),
-                user_config_dir: Some(self.config.clone()),
-                remote_project_context: None,
-                runner: Arc::clone(&self.runner) as Arc<dyn TaskRunner>,
-                events: self.events_tx.clone(),
-                mode: Arc::new(|| AgentMode::Build),
-                subagent_cancels: Arc::new(CancelMap::new()),
-            })
+            self.spawn_for(session_id, None).await
+        }
+
+        async fn spawn_with_decisions(&self, decisions: Option<Decisions>) -> WorkflowRuntime {
+            self.spawn_for(self.session_id, decisions).await
+        }
+
+        async fn spawn_for(
+            &self,
+            session_id: CaudraId,
+            decisions: Option<Decisions>,
+        ) -> WorkflowRuntime {
+            WorkflowRuntime::spawn(
+                RuntimeDeps {
+                    state_dir: self.state_dir.clone(),
+                    session_id,
+                    cwd: self.project.clone(),
+                    user_config_dir: Some(self.config.clone()),
+                    remote_project_context: None,
+                    runner: Arc::clone(&self.runner) as Arc<dyn TaskRunner>,
+                    events: self.events_tx.clone(),
+                    mode: Arc::new(|| AgentMode::Build),
+                    subagent_cancels: Arc::new(CancelMap::new()),
+                },
+                decisions,
+            )
             .await
             .unwrap()
         }

@@ -4,6 +4,7 @@
 
 pub mod auth;
 pub mod background;
+pub mod decision_log;
 pub mod id;
 pub mod input_history;
 pub mod local_documents;
@@ -23,6 +24,7 @@ pub mod remote_snapshots;
 pub mod retention;
 pub mod sandbox_auth;
 pub mod sessions;
+pub mod shell_durations;
 pub mod state;
 pub mod theme;
 pub mod thinking;

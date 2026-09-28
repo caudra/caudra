@@ -40,6 +40,7 @@ pub enum LedgerPurpose {
     Btw,
     Extract,
     ToolJsonRepair,
+    Decision,
 }
 
 impl LedgerPurpose {
@@ -52,6 +53,7 @@ impl LedgerPurpose {
             Self::Btw => "btw",
             Self::Extract => "extract",
             Self::ToolJsonRepair => "tool_json_repair",
+            Self::Decision => "decision",
         }
     }
 
@@ -64,6 +66,7 @@ impl LedgerPurpose {
             "btw" => Some(Self::Btw),
             "extract" => Some(Self::Extract),
             "tool_json_repair" => Some(Self::ToolJsonRepair),
+            "decision" => Some(Self::Decision),
             _ => None,
         }
     }
@@ -453,6 +456,7 @@ mod tests {
     #[test_case(LedgerPurpose::Btw ; "btw")]
     #[test_case(LedgerPurpose::Extract ; "extract")]
     #[test_case(LedgerPurpose::ToolJsonRepair ; "tool_json_repair")]
+    #[test_case(LedgerPurpose::Decision ; "decision")]
     fn a_purpose_round_trips_through_the_ledger(purpose: LedgerPurpose) {
         let (_temp, dir) = state_dir();
         ledger(&dir)

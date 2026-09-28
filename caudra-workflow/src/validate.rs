@@ -3,10 +3,12 @@ use std::sync::PoisonError;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 
 use crate::engine::{EngineError, RhaiEngine, RunParams, WorkflowEngine};
-use crate::host::{AgentRequest, AgentResult, HostError, WorkflowHost};
+use crate::host::{
+    AgentRequest, AgentResult, DecisionRequest, DecisionResult, HostError, WorkflowHost,
+};
 use crate::journal::{CallKey, Journal};
 use crate::meta::{MetaError, WorkflowMeta, parse_meta};
 use crate::run::{EngineLimits, WorkflowOutcome};
@@ -14,6 +16,7 @@ use crate::run::{EngineLimits, WorkflowOutcome};
 const SMOKE_QUERY: &str = "smoke query";
 const SMOKE_OBJECTIVE: &str = "smoke objective";
 const SMOKE_AGENT_ID: &str = "smoke";
+const SMOKE_DECISION_MODEL: &str = "smoke";
 const SMOKE_SCRATCH_DIR: &str = "smoke-scratch";
 const SMOKE_MAX_OPERATIONS: u64 = 5_000_000;
 const SMOKE_MAX_HOST_CALLS: u64 = 64;
@@ -70,6 +73,68 @@ impl SmokeHost {
 impl WorkflowHost for SmokeHost {
     fn agent(&self, _key: CallKey, _request: &AgentRequest) -> Result<AgentResult, HostError> {
         Ok(self.inert_result())
+    }
+
+    fn decide(
+        &self,
+        _key: CallKey,
+        request: &DecisionRequest,
+    ) -> Result<DecisionResult, HostError> {
+        request.validate()?;
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        let mut answers = Map::new();
+        if let Some(questions) = request.questions.as_object() {
+            for (id, question) in questions {
+                let answer = match question["type"].as_str() {
+                    Some("choice") => {
+                        let options: Vec<Value> = match &question["criteria"] {
+                            Value::Object(options) => {
+                                options.keys().cloned().map(Value::String).collect()
+                            }
+                            Value::Array(options) => options.clone(),
+                            _ => Vec::new(),
+                        };
+                        let probabilities: Map<String, Value> = options
+                            .iter()
+                            .enumerate()
+                            .map(|(index, option)| {
+                                (
+                                    option
+                                        .as_str()
+                                        .map(str::to_owned)
+                                        .unwrap_or_else(|| option.to_string()),
+                                    json!(if index == 0 { 1.0 } else { 0.0 }),
+                                )
+                            })
+                            .collect();
+                        json!({ "type": "choice", "choice": options.first(), "probabilities": probabilities, "confidence": 1.0 })
+                    }
+                    Some("score") => {
+                        let mut legend = Map::new();
+                        let mut probabilities = Map::new();
+                        if let Some(levels) = question["criteria"].as_array() {
+                            for (index, level) in levels.iter().enumerate() {
+                                legend.insert(index.to_string(), level.clone());
+                                probabilities.insert(
+                                    index.to_string(),
+                                    json!(if index == 0 { 1.0 } else { 0.0 }),
+                                );
+                            }
+                        }
+                        json!({ "type": "score", "score": 0.0, "legend": legend, "probabilities": probabilities, "confidence": 1.0 })
+                    }
+                    _ => json!({ "type": "noul", "noul": 0.0, "confidence": 1.0 }),
+                };
+                answers.insert(id.clone(), answer);
+            }
+        }
+        Ok(DecisionResult {
+            answers: Value::Object(answers),
+            model: request
+                .model
+                .clone()
+                .unwrap_or_else(|| SMOKE_DECISION_MODEL.into()),
+        })
     }
 
     fn parallel(
@@ -152,6 +217,29 @@ mod tests {
     };
 
     const META: &str = r#"let meta = #{ name: "t", description: "d" };"#;
+
+    #[test]
+    fn decisions_smoke_run_with_deterministic_typed_answers() {
+        let source = format!(
+            r#"{META}
+            let result = decide(args, #{{
+                ready: #{{ type: "noul", instructions: "Ready?" }},
+                route: #{{ type: "choice", instructions: "Route?", criteria: #{{ a: "first", b: "second" }} }},
+                level: #{{ type: "score", instructions: "Level?", criteria: ["low", "high"] }}
+            }});
+            complete([result.answers.ready.noul, result.answers.route.choice, result.answers.level.score, result.model]);"#
+        );
+        let report = validate(&source).unwrap();
+        assert_eq!(report.smoke.host_calls, 1);
+        assert_eq!(
+            report.smoke.outcome,
+            WorkflowOutcome::Completed(json!([0.0, "a", 0.0, SMOKE_DECISION_MODEL]))
+        );
+        assert_eq!(
+            validate(&source).unwrap().smoke.outcome,
+            report.smoke.outcome
+        );
+    }
 
     #[test]
     fn deep_research_validates_on_the_inert_path() {

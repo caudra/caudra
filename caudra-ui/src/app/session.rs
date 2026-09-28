@@ -461,7 +461,7 @@ impl App {
                 Some(GoalStatus::Active(_)) | None => None,
             },
             goal_continuation_limit: Some(state.goal.continuation_limit()),
-            yolo: self.permissions.persisted_yolo(),
+            permission_mode: self.permissions.persisted_mode(),
             snapshots_unavailable: self.snapshots_unavailable.clone(),
         };
         if let Some(snapshot) = self.conversation_permissions.published() {
@@ -825,13 +825,9 @@ impl App {
         }
     }
 
-    /// Shared by every restore path: `focus_session` picks between resuming in
-    /// place and spawning a fresh runtime by tab state alone, so the same key
-    /// press has to land on the same permissions. The stored value replaces
-    /// whatever the previous session was running with, and a session that
-    /// stored nothing falls back to `--yolo` / `always_yolo`.
-    fn apply_stored_yolo(&self, meta: &SessionMeta) {
-        self.permissions.set_session_yolo(meta.yolo);
+    fn apply_stored_permission_mode(&self, meta: &SessionMeta) {
+        self.permissions
+            .set_session_mode(meta.permission_mode.clone());
     }
 
     /// Resume at process start: the agent was already spawned with this
@@ -843,7 +839,7 @@ impl App {
                 self.state.session.meta.structured_permission_rules.clone(),
             );
         }
-        self.apply_stored_yolo(&self.state.session.meta);
+        self.apply_stored_permission_mode(&self.state.session.meta);
         self.restore_display();
         self.flush_restored_queue();
         for w in self.state.warnings.drain(..) {
@@ -921,7 +917,7 @@ impl App {
                 }
             }
         };
-        let permissions = Arc::new(self.permissions.fork());
+        let permissions = Arc::new(self.permissions.fork_session());
         let conversation_permissions = self.conversation_permissions.deferred();
         if let Err(error) = self.retire_current_session() {
             self.status_bar
@@ -938,7 +934,7 @@ impl App {
         self.state.goal = GoalHandle::default();
         self.goal_deferred = false;
         self.state.plan = PlanState::None;
-        self.permissions.set_session_yolo(None);
+        self.permissions.set_session_mode(None);
         // Fire before the swap. A handler cleaning up after the session
         // that just ended needs its id, and the stamp always reads
         // whichever session is current.
@@ -2148,7 +2144,7 @@ impl App {
             recover_pending_workspace_restore(&mut session, &store, &self.storage_writer)?;
             store
         };
-        let permissions = Arc::new(self.permissions.fork());
+        let permissions = Arc::new(self.permissions.fork_session());
         // A loaded session that holds nothing owns no row worth publishing
         // against, so it waits for its first run like a fresh one.
         let conversation_permissions = match self.conversation_permissions.deferred() {
@@ -2172,7 +2168,7 @@ impl App {
         self.suspend_permission_editor();
         self.permissions = permissions;
         self.conversation_permissions = conversation_permissions;
-        self.apply_stored_yolo(&session.meta);
+        self.apply_stored_permission_mode(&session.meta);
         self.state =
             SessionState::from_session(session, fallback_model, &self.storage, &self.model_policy);
         if let Some((workspace, binding)) = remote_target {

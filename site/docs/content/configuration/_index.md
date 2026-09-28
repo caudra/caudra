@@ -66,7 +66,8 @@ All fields are optional. Typos in field names cause an error right away.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `always_yolo` | bool | `false` | Start every session with YOLO mode (skip permission prompts, deny rules still apply) |
+| `always_yolo` | bool | `false` | Start every session with YOLO mode (skip permission prompts, deny rules still apply); global config only |
+| `always_auto` | bool | `false` | Start every session with Auto permission mode (preserve required prompts and screen unmatched calls); global config only |
 | `always_fast` | bool | `false` | Start every session with fast mode, on the models that sell a fast tier (ignored otherwise) |
 | `always_thinking` | bool \| string | `false` | Start every session with extended thinking (true/"adaptive", "off", an effort level ("minimal" to "max"), or a token budget) |
 
@@ -380,6 +381,72 @@ A workspace over `max_bytes_mb` or `max_files` is refused rather than captured, 
 | `content_max_length` | integer | `10240` | `CAUDRA_OTEL_CONTENT_MAX_LENGTH` | Character cap on any logged prompt or tool input |
 
 Every field also has an environment variable, shown in the Env column, and the variable wins. See [Telemetry](/docs/telemetry/) for the full picture.
+
+### `decisions`
+
+Configure the optional typed decision engine inside `caudra.setup()`. No endpoint, passive feature, or decision logging is enabled by default. Explicit workflow [`decide()` calls](/docs/workflows/#typed-decisions) need an endpoint but do not need a passive feature enabled. Shell duration history can work without an endpoint.
+
+Connection settings and thresholds are global-only. Projects may set individual features to `"off"`, set `log = false`, or keep or shorten inherited log retention. Other project overrides are errors, even when they repeat a global value. Disabling globally required Auto screening or its active content screening restores prompting for eligible Auto calls.
+
+| Field | Type | Default | Meaning |
+|-------|------|---------|---------|
+| `endpoint` | string | `nil` | Full request URL. HTTPS required except for numeric loopback HTTP. No credentials, query, or fragment. |
+| `model` | string | `"jev-latest"` | Decision model identifier, nonblank and without control characters. |
+| `api_key_env` | string | `"TYPESAFE_API_KEY"` | Environment variable containing the optional credential, never the credential itself. Project environment values are excluded. |
+| `allow_remote` | boolean | `false` | Explicit global consent to send decision context to a non-loopback endpoint. |
+| `timeout_ms` | integer | `400` | Positive decision-request deadline in milliseconds, separate from shell execution timeouts. |
+| `log` | boolean | `false` | Retain bounded decision records in the separate local `decisions.db`. |
+| `log_retention_days` | integer | `90` | Positive retention period for decision records. |
+| `features` | table | all `"off"` | Per-feature modes below. |
+| `thresholds` | table | defaults below | Probability thresholds, all finite and within 0–1 inclusive. |
+
+`TYPESAFE_BASE_URL` replaces only the origin of an explicitly configured endpoint, preserving its path. It must be an origin without a path and passes the same endpoint and remote-opt-in checks. The variable alone never activates the engine. Requests ignore ambient proxies and do not follow redirects. `localhost` is a DNS name, not numeric loopback for this policy.
+
+Redaction is best effort. Decision context can include commands, task text, tool output, and candidate descriptions. Review what you send and any exports before sharing them. See [decision advice and logging](/docs/permissions/#decision-engine-advice).
+
+#### `decisions.features`
+
+`off` disables the feature. `shadow` collects predictions without applying them. `advise` adds caution or suggestions. `enforce` applies only the feature-specific behavior listed below, never permission grants or relaxed executor restrictions. Unsupported modes are configuration errors. Passive features are suppressed in YOLO.
+
+| Feature | Default | Supported modes | Behavior beyond shadow |
+|---------|---------|-----------------|------------------------|
+| `permission_advice` | `"off"` | `off`, `shadow`, `advise` | Add warnings to an existing permission prompt without delaying the answer. |
+| `auto_screening` | `"off"` | `off`, `shadow`, `enforce` | Escalate an eligible Auto call to a prompt on a flag or engine failure. No answer channel means denial. |
+| `shell_effect` | `"off"` | `off`, `shadow`, `advise` | Warn about possible project writes during Plan review only when `shell_writes` is configured. Never establish read-only authority. |
+| `content_screening` | `"off"` | `off`, `shadow`, `advise` | Add caution to flagged web/MCP output and tighten upload/credential Auto screening for the session. Content remains available. |
+| `shell_duration` | `"off"` | `off`, `shadow`, `advise`, `enforce` | Advise with local shell estimates. Enforce may fill an omitted timeout and select delivery at admission. Explicit timeouts stay unchanged. See [shell duration](#shell-duration). |
+| `tool_search` | `"off"` | `off`, `shadow`, `enforce` | Rerank the existing lexical tool shortlist. This neither loads arbitrary names nor grants execution permission. |
+| `skill_suggestions` | `"off"` | `off`, `shadow`, `advise` | Suggest a shortlisted skill. The agent still chooses whether to load it. |
+| `goal_prescreen` | `"off"` | `off`, `shadow`, `enforce` | Skip an unlikely-to-pass goal evaluation within the continuation budget and continue work. Only the normal evaluator can certify completion. |
+| `subagent_routing` | `"off"` | `off`, `shadow`, `enforce` | Choose a model job for a new unpinned subagent from its task label, not its full prompt. Explicit jobs, profile pins, and continuations keep their routing. |
+
+#### `decisions.thresholds`
+
+Flag thresholds trigger at or above the configured value. Goal prescreening uses an at-or-below comparison. Content screening requires both signals in a sampled chunk. After content is flagged, Auto uses 75% of `auto_flag` for upload and credential flags.
+
+| Field | Default | Meaning |
+|-------|---------|---------|
+| `permission_flag` | `0.85` | Probability for a permission warning. |
+| `auto_flag` | `0.85` | Probability for escalating an eligible Auto call. |
+| `content_injection` | `0.9` | Probability that sampled content attempts instruction injection. |
+| `content_addressed_to_agent` | `0.9` | Probability that sampled content addresses the agent. |
+| `shell_endless` | `0.9` | Probability that a shell command runs until stopped. |
+| `shell_heavy` | `0.9` | Probability for a heavy-command prior and confidence required for a duration choice. |
+| `routing_confidence` | `0.9` | Confidence required for tool search, skill suggestions, and subagent routing. Tool-search choice probability must also meet it. |
+| `goal_skip_below` | `0.05` | Skip an evaluator at or below this completion probability, within the continuation budget. |
+| `shell_writes` | `nil` | Optional project-write warning threshold. Omission leaves the warning disabled. No built-in enforcement threshold. |
+
+#### Shell duration
+
+`shell_duration` applies only to eligible local native shell calls, not remote workspaces or managed sandboxes. Measured exact-command history takes priority over command-family history, and both take priority over a model estimate. Timeouts, cancellations, and failures are recorded separately from completed latency samples. History is separate from the opt-in decision log, so `log = false` does not disable duration observations.
+
+In `advise`, estimates and warnings leave execution unchanged. In `enforce`, an omitted `timeoutSec` may receive a default based on 1.5 times estimated p90, bounded by the tool schema's default and maximum. An explicit timeout is never changed. An endless prediction gives caution only and does not remove the execution deadline.
+
+With `agent.shell_execution = "auto"`, Enforce estimates can select synchronous or asynchronous delivery at admission, bounded by the effective timeout and `agent.shell_async_threshold_secs`. Explicit sync/async settings still win. Elapsed runtime never promotes a synchronous call to asynchronous delivery. An admission receipt is not completion or success.
+
+#### Question overrides
+
+Only the permission question set currently supports a user-global file override: `~/.config/caudra/decisions/permission.json`. It must be a regular JSON file no larger than 64 KiB, retain all required question IDs as `noul`, and pass question validation. It is read when an endpoint and permission advice or Auto screening are enabled. Projects cannot supply this override. Other feature question sets have no file override.
 
 ## Plugins
 

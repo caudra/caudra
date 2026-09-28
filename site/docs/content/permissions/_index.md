@@ -23,7 +23,7 @@ Caudra resolves a tool call in this order:
 4. Stored and configured allows cover resources independently. Every unresolved resource needs coverage.
 5. Builtin command-family asks apply when no stored or configured allow covers the command.
 6. Builtin and trusted-plugin policy can allow known operations.
-7. YOLO mode can skip an ask or prompt, but cannot override a deny.
+7. Auto mode can skip an unmatched default prompt. YOLO mode can skip an ask or prompt. Neither overrides a deny rule.
 8. The effective default allows, denies, or prompts.
 
 Allows can combine across resources. A shell chain can use separate grants for `git diff *` and `git status *`. Exact-input rules still apply only to their original complete input.
@@ -45,7 +45,7 @@ Prompt decisions use four lifetimes:
 
 Project and global rules bind to the native tool contract or MCP server authority and tool contract. Explicit filesystem family grants cover the trusted native tools described under [Typed resources](#typed-resources). Replacing a tool, changing an MCP endpoint, or changing an MCP schema does not silently transfer authority.
 
-A user-created fork starts with no conversation grants and no inherited explicit YOLO state. Subtasks share the root conversation's grants. `/new` also starts clean.
+A user-created fork starts with no conversation grants and no inherited explicit permission mode. Subtasks share the root conversation's grants and mode. `/new` also starts clean.
 
 ## Permission prompts
 
@@ -436,8 +436,56 @@ Bundled plugins can declare trusted host policy for resources they own. Builtin 
 
 Lua plugin API capabilities remain separate. `plugin.toml` controls whether plugin code may call filesystem, network, process, and environment APIs. Tool-call permissions control whether the agent may invoke a registered tool.
 
+## Auto mode
+
+`/auto` toggles between Ask and Auto. `--auto` selects Auto at startup. The status bar shows `[auto]`, or `[a]` in a narrow terminal. Clicking the chip returns to Ask. `--auto` and `--yolo` are mutually exclusive.
+
+Auto skips prompts only when no rule covers the call and the tool's default is Prompt. Configured asks, builtin asks, protected paths, and forced prompts still require approval. In plan mode, shell calls that deterministic checks cannot prove read-only still prompt. Deny rules and default Deny remain effective.
+
+An explicit mode choice is saved with the root conversation. A command-line mode overrides the restored choice. Global `always_auto = true` supplies the default when neither exists. Global YOLO settings take precedence if both defaults are enabled. Projects cannot set `always_auto` or `always_yolo`.
+
+Auto works without a decision engine. With enforced engine screening, a flagged call, engine error, or timeout takes the ordinary prompt path. Without a channel for answering that prompt, the call is denied. Disabling globally required screening in project configuration also restores prompting for eligible calls.
+
+Auto is not a security boundary. An engine miss can let an eligible call run. Engine predictions never grant read-only access or weaken deterministic permission rules.
+
+### Decision engine advice
+
+Decision features are opt-in and configured in user-global `caudra.setup()` settings. A project may disable a feature or logging and shorten retention, but cannot redirect the endpoint, change thresholds, or enable a feature. Non-loopback endpoints require `allow_remote = true` because decision context leaves the machine. See the [configuration reference](/docs/configuration/#decisions) for fields, defaults, and supported modes.
+
+Decision requests connect directly to the configured endpoint. They ignore ambient proxy variables and do not follow HTTP redirects, so project environment settings cannot redirect a loopback request.
+
+```lua
+caudra.setup({
+  decisions = {
+    endpoint = "http://127.0.0.1:8000/v1/systemone",
+    timeout_ms = 400,
+    log = false,
+    features = {
+      permission_advice = "shadow",
+      auto_screening = "shadow",
+    },
+  },
+})
+```
+
+Every feature defaults to `off`. `permission_advice = "shadow"` evaluates predictions without changing a prompt. Retaining them requires `log = true`. `"advise"` can add warnings to an already visible prompt without delaying the user's answer. `auto_screening = "shadow"` leaves Auto's deterministic baseline unchanged. `"enforce"` can turn an eligible Auto call into a prompt.
+
+Warnings identify possible deletion, uploads, credential access, permission changes, remote-history rewrites, or work outside the task. They are uncertain predictions, not proof that a call is safe or unsafe. A model's read-only prediction never grants permission.
+
+`shell_effect = "advise"` can warn about possible project writes during Plan review when `thresholds.shell_writes` is explicitly configured. This is caution only. Deterministic checks still decide read-only access. Shadow labels use the deterministic classifier, not observed filesystem changes.
+
+`content_screening = "advise"` samples web and MCP results. When both injection and agent-addressed signals cross their thresholds, Caudra adds caution and tightens upload and credential screening for the session. It keeps the content available. Sampling and predictions can miss an attack, so this is not an injection barrier.
+
+Shell duration advice applies only to eligible local native shell calls. Measured history outranks model estimates. Enforce can fill an omitted timeout and choose delivery at admission, but never changes an explicit timeout or promotes a running synchronous call based on elapsed time. Endless predictions give caution only. See [shell duration configuration](/docs/configuration/#shell-duration) for the limits and separate history storage.
+
+Set `log = true` to retain bounded, redacted decision states and answers in a separate `decisions.db`. Redaction is best effort both before transmission and before storage. It is not a guarantee that sensitive text has been removed. Human permission answers can supply training labels, but approval is not proof that a predicted effect occurred. Effect fields are a partial action record. A value of `none` does not prove that no advice or routing was applied. Tool-search records do not have actual-use labels, and shell-effect records do not have observed-filesystem labels.
+
+Use [`caudra decisions`](/docs/cli/#caudra-decisions) to inspect configuration and manage the log. Review exports before sharing them. Only `decisions/permission.json` in the global configuration directory currently supports a question-file override. See [question overrides](/docs/configuration/#question-overrides).
+
 ## YOLO mode
 
 `/yolo` and `--yolo` skip prompts after deny rules and hard restrictions have run. The status bar shows `[yolo]` while enabled, or `[!]` when the terminal is too narrow to spell it. The warning is the last chip its row gives up, so a narrow terminal drops the reasoning level before it. Clicking it turns YOLO off and brings prompts back, from a task footer as well as the main one.
 
-An explicit `/yolo` choice is stored with the root conversation. A user-created fork and `/new` start without that explicit state. `--yolo` supplies the initial default for a fresh root.
+An explicit `/yolo` choice is stored with the root conversation. A user-created fork and `/new` start without that explicit state. `--yolo` selects YOLO at startup.
+
+Decision-engine screening never interrupts YOLO, including in plan mode. Engine advice is not shown in YOLO. Deterministic denies and hard capability restrictions still apply.

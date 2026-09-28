@@ -82,6 +82,7 @@ fn runtime_resolver(
                 super::configure_native_tools(&config.agent);
                 super::install_native_permission_rules(&plugin_host.plugin_rules(), &cwd);
                 plugin_host.load_production_builtins(&config.plugins)?;
+                let seed_permission_mode = Some(super::permission_mode_seed(&config));
                 Ok(AcpRuntime {
                     prompt_slots: Arc::new(
                         plugin_host
@@ -90,6 +91,8 @@ fn runtime_resolver(
                     ),
                     config: config.agent,
                     permissions_config: config.permissions,
+                    decisions_config: config.decisions,
+                    seed_permission_mode,
                     snapshots: config.storage.snapshots,
                     plugin_rules: plugin_host.plugin_rules(),
                     registry,
@@ -116,7 +119,7 @@ fn runtime_resolver(
     )
 }
 
-pub fn run(model_arg: Option<&str>, yolo: bool, cli: &Cli) -> Result<()> {
+pub fn run(model_arg: Option<&str>, cli: &Cli) -> Result<()> {
     // Every phase up to `init_logging` runs without a subscriber, so its cost is
     // invisible unless it is measured here and reported once the sink exists.
     let started = Instant::now();
@@ -148,7 +151,7 @@ pub fn run(model_arg: Option<&str>, yolo: bool, cli: &Cli) -> Result<()> {
         .context("invalid config")?;
     config.permissions = caudra_config::load_global_permissions();
 
-    if yolo || config.always_yolo {
+    if cli.yolo || config.always_yolo {
         config.permissions.yolo = true;
     }
     config.validate()?;
@@ -200,7 +203,7 @@ pub fn run(model_arg: Option<&str>, yolo: bool, cli: &Cli) -> Result<()> {
         thinking,
         prompt_profiles,
         system_prompt_profile_override: cli.system_prompt_profile.clone(),
-        yolo,
+        permission_mode: cli.permission_mode_override(),
         model_policy: Arc::new(config.provider.model_policy.clone()),
         runtime_resolver: runtime_resolver(
             storage,

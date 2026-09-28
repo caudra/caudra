@@ -1,8 +1,8 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::{self, Write};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use caudra_config_macro::ConfigSection;
@@ -43,13 +43,16 @@ const PROCESS_ONLY_ENV_VARS: &[&str] = &[
     "HERDR_SOCKET_PATH",
     "WORKCELL_MCP_CODE_WORKER",
 ];
+static PROJECT_ENV_KEYS: Mutex<Option<HashSet<String>>> = Mutex::new(None);
 
 pub mod config_version;
+pub mod decisions;
 pub mod providers;
 pub mod sandbox;
 pub mod steering;
 pub mod workcell;
 
+pub use decisions::{DecisionsConfig, FeatureMode};
 pub use steering::SteeringConfig;
 
 pub const DEFAULT_MAX_OUTPUT_BYTES: usize = 50 * 1024;
@@ -396,7 +399,15 @@ pub const TOP_LEVEL_FIELDS: &[ConfigField] = &[
         default: ConfigValue::Bool(false),
         min: None,
         env: None,
-        description: "Start every session with YOLO mode (skip permission prompts, deny rules still apply)",
+        description: "Start every session with YOLO mode (skip permission prompts, deny rules still apply); global config only",
+    },
+    ConfigField {
+        name: "always_auto",
+        ty: "bool",
+        default: ConfigValue::Bool(false),
+        min: None,
+        env: None,
+        description: "Start every session with Auto permission mode (preserve required prompts and screen unmatched calls); global config only",
     },
     ConfigField {
         name: "always_fast",
@@ -418,6 +429,10 @@ pub const TOP_LEVEL_FIELDS: &[ConfigField] = &[
 
 #[derive(Debug, Error)]
 pub enum ConfigError {
+    #[error("invalid project config: {0} is global-only; projects cannot change permission modes")]
+    ProjectPermissionMode(&'static str),
+    #[error(transparent)]
+    Decisions(#[from] decisions::DecisionsConfigError),
     #[error("invalid config: agent.steering.{field}: {message}")]
     InvalidSteering { field: String, message: String },
     #[error("invalid config: {section}.{field} = {value} is below minimum ({min})")]
@@ -501,7 +516,12 @@ impl AlwaysThinking {
 #[derive(Deserialize, Default, Debug)]
 #[serde(default, deny_unknown_fields)]
 pub struct RawConfig {
+    pub decisions: decisions::RawDecisionsConfig,
     pub always_yolo: Option<bool>,
+    pub always_auto: Option<bool>,
+    #[serde(skip)]
+    #[doc(hidden)]
+    pub project_permission_mode_override: Option<&'static str>,
     pub always_fast: Option<bool>,
     pub always_thinking: Option<AlwaysThinking>,
     #[serde(default)]
@@ -515,7 +535,13 @@ pub struct RawConfig {
 
 impl RawConfig {
     pub fn merge(&mut self, overlay: RawConfig) {
-        merge_option!(self, overlay, always_yolo, always_fast, always_thinking);
+        self.project_permission_mode_override = self
+            .project_permission_mode_override
+            .or(overlay.project_permission_mode_override)
+            .or(overlay.always_yolo.map(|_| "always_yolo"))
+            .or(overlay.always_auto.map(|_| "always_auto"));
+        self.decisions.restrict(overlay.decisions);
+        merge_option!(self, overlay, always_fast, always_thinking);
         self.ui.merge(overlay.ui);
         self.agent.merge(overlay.agent);
         self.provider.merge(overlay.provider);
@@ -531,6 +557,9 @@ impl RawConfig {
     }
 
     pub fn into_config(self, no_rtk: bool) -> Result<Config, ConfigError> {
+        if let Some(field) = self.project_permission_mode_override {
+            return Err(ConfigError::ProjectPermissionMode(field));
+        }
         self.validate_plugin_tables()?;
         let index_max_file_size_mb = self.index_max_file_size_mb()?;
         let task_max_concurrent = self.task_max_concurrent()?;
@@ -539,7 +568,9 @@ impl RawConfig {
             self.skill_flag(SKILL_WORKFLOW_DEV_FIELD, DEFAULT_SKILL_WORKFLOW_DEV)?;
         let disabled_tools = self.resolve_disabled_tools()?;
         let config = Config {
+            decisions: self.decisions.resolve_env()?,
             always_yolo: self.always_yolo.unwrap_or(false),
+            always_auto: self.always_auto.unwrap_or(false),
             always_fast: self.always_fast.unwrap_or(false),
             always_thinking: self
                 .always_thinking
@@ -913,10 +944,14 @@ pub fn resolve_shell_background(
     config: &AgentConfig,
     background_supported: bool,
     effective_timeout_secs: u64,
+    expected_secs: Option<u64>,
 ) -> Result<bool, &'static str> {
     match effective_shell_execution(config, background_supported).ok_or(SHELL_ASYNC_UNSUPPORTED)? {
         ExecutionMode::Sync => Ok(false),
-        ExecutionMode::Auto => Ok(effective_timeout_secs > config.shell_async_threshold_secs),
+        ExecutionMode::Auto => Ok(expected_secs
+            .unwrap_or(effective_timeout_secs)
+            .min(effective_timeout_secs)
+            > config.shell_async_threshold_secs),
         ExecutionMode::Async => Ok(true),
     }
 }
@@ -1539,7 +1574,9 @@ impl LoadedPermissionSource {
 
 #[derive(Clone)]
 pub struct Config {
+    pub decisions: DecisionsConfig,
     pub always_yolo: bool,
+    pub always_auto: bool,
     pub always_fast: bool,
     pub always_thinking: Option<StoredThinking>,
     pub ui: UiConfig,
@@ -2676,6 +2713,7 @@ impl PluginsConfig {
 
 impl Config {
     pub fn validate(&self) -> Result<(), ConfigError> {
+        self.decisions.validate()?;
         self.ui.validate_all()?;
         self.agent.validate()?;
         self.agent.steering.validate()?;
@@ -3133,19 +3171,55 @@ fn load_env_files_with_global(cwd: &Path, global: Option<&Path>) {
 }
 
 fn load_env_files_scoped(cwd: &Path, global: Option<&Path>, include_project: bool) {
+    let (vars, project_keys) = env_file_layers(cwd, global, include_project);
+    let mut project_env_keys = PROJECT_ENV_KEYS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    for (key, value) in vars {
+        if env_file_var_is_allowed(&key) && std::env::var_os(&key).is_none() {
+            if project_keys.contains(&key) {
+                project_env_keys
+                    .get_or_insert_with(HashSet::new)
+                    .insert(key.clone());
+            }
+            // SAFETY: single-threaded at startup, before any async runtime
+            unsafe { std::env::set_var(&key, &value) };
+        }
+    }
+}
+
+fn env_file_layers(
+    cwd: &Path,
+    global: Option<&Path>,
+    include_project: bool,
+) -> (HashMap<String, String>, HashSet<String>) {
     let mut vars = HashMap::new();
     if let Some(path) = global {
         collect_env_vars(&path.join(".env"), &mut vars);
     }
+    let mut project_vars = HashMap::new();
     if include_project {
-        collect_env_vars(&cwd.join(PROJECT_DIR).join(".env"), &mut vars);
+        collect_env_vars(&cwd.join(PROJECT_DIR).join(".env"), &mut project_vars);
+        project_vars.remove(decisions::BASE_URL_ENV);
     }
+    let project_keys: HashSet<_> = project_vars.keys().cloned().collect();
+    vars.extend(project_vars);
+    (vars, project_keys)
+}
 
-    for (key, value) in vars {
-        if env_file_var_is_allowed(&key) && std::env::var_os(&key).is_none() {
-            // SAFETY: single-threaded at startup, before any async runtime
-            unsafe { std::env::set_var(&key, &value) };
-        }
+fn global_env_value(key: &str) -> Result<Option<String>, std::env::VarError> {
+    if PROJECT_ENV_KEYS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .as_ref()
+        .is_some_and(|keys| keys.contains(key))
+    {
+        return Ok(None);
+    }
+    match std::env::var(key) {
+        Ok(value) => Ok(Some(value)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(error) => Err(error),
     }
 }
 
@@ -3354,11 +3428,35 @@ mod tests {
                     _ => Ok(false),
                 };
                 assert_eq!(
-                    resolve_shell_background(&config, supported, timeout),
+                    resolve_shell_background(&config, supported, timeout, None),
                     expected
                 );
             }
         }
+    }
+
+    #[test_case(ExecutionMode::Auto, Some(10), 600, false)]
+    #[test_case(ExecutionMode::Auto, Some(600), 10, false)]
+    #[test_case(ExecutionMode::Auto, Some(600), 600, true)]
+    #[test_case(ExecutionMode::Auto, Some(120), 600, false)]
+    #[test_case(ExecutionMode::Auto, None, 600, true)]
+    #[test_case(ExecutionMode::Auto, None, 120, false)]
+    #[test_case(ExecutionMode::Sync, Some(600), 600, false)]
+    #[test_case(ExecutionMode::Async, Some(10), 10, true)]
+    fn shell_prediction_only_routes_at_admission(
+        mode: ExecutionMode,
+        expected: Option<u64>,
+        deadline: u64,
+        background: bool,
+    ) {
+        let config = AgentConfig {
+            shell_execution: mode,
+            ..AgentConfig::default()
+        };
+        assert_eq!(
+            resolve_shell_background(&config, true, deadline, expected),
+            Ok(background)
+        );
     }
 
     #[test_case("task_execution", "auto", None)]
@@ -3652,7 +3750,6 @@ mod tests {
     #[test]
     fn merge_overlay_wins_field_by_field() {
         let mut base = RawConfig {
-            always_yolo: Some(false),
             ui: UiFileConfig {
                 splash_animation: Some(false),
                 notifications: Some(NotificationMethod::Bell),
@@ -3667,7 +3764,6 @@ mod tests {
             ..Default::default()
         };
         let overlay = RawConfig {
-            always_yolo: Some(true),
             ui: UiFileConfig {
                 notifications: Some(NotificationMethod::Off),
                 ..Default::default()
@@ -3680,7 +3776,6 @@ mod tests {
         };
         base.merge(overlay);
 
-        assert_eq!(base.always_yolo, Some(true), "overlay wins");
         assert_eq!(base.agent.max_output_lines, Some(5000), "overlay wins");
         assert_eq!(base.agent.max_output_bytes, Some(80_000), "base preserved");
         assert_eq!(base.ui.splash_animation, Some(false), "base preserved");
@@ -3792,6 +3887,50 @@ mod tests {
             Some(AlwaysThinking::Toggle(true)),
             "overlay wins"
         );
+    }
+
+    #[test_case("", false, false; "defaults")]
+    #[test_case("always_auto = true", true, false; "global_auto")]
+    #[test_case("always_yolo = true", false, true; "global_yolo")]
+    #[test_case("always_auto = true\nalways_yolo = true", true, true; "startup_chooses_precedence")]
+    fn global_permission_mode_defaults_and_resolution(source: &str, auto: bool, yolo: bool) {
+        let raw: RawConfig = toml::from_str(source).unwrap();
+        let config = raw.into_config(false).unwrap();
+        assert_eq!(config.always_auto, auto);
+        assert_eq!(config.always_yolo, yolo);
+    }
+
+    #[test_case("always_auto", true)]
+    #[test_case("always_auto", false)]
+    #[test_case("always_yolo", true)]
+    #[test_case("always_yolo", false)]
+    fn project_permission_mode_values_are_rejected(field: &str, value: bool) {
+        for source in ["", "always_auto = true", "always_yolo = true"] {
+            let mut global: RawConfig = toml::from_str(source).unwrap();
+            let expected = (global.always_auto, global.always_yolo);
+            let project: RawConfig = toml::from_str(&format!("{field} = {value}")).unwrap();
+            global.merge(project);
+            global.merge(RawConfig::default());
+            assert_eq!((global.always_auto, global.always_yolo), expected);
+            assert!(
+                matches!(global.into_config(false), Err(ConfigError::ProjectPermissionMode(actual)) if actual == field)
+            );
+        }
+    }
+
+    #[test_case("always_auto = true", true, false)]
+    #[test_case("always_yolo = true", false, true)]
+    fn project_unrelated_settings_preserve_global_permission_mode(
+        source: &str,
+        auto: bool,
+        yolo: bool,
+    ) {
+        let mut global: RawConfig = toml::from_str(source).unwrap();
+        global.merge(toml::from_str("always_fast = true").unwrap());
+        let config = global.into_config(false).unwrap();
+        assert_eq!(config.always_auto, auto);
+        assert_eq!(config.always_yolo, yolo);
+        assert!(config.always_fast);
     }
 
     #[test_case(AlwaysThinking::Toggle(true), StoredThinking::Adaptive ; "toggle_true")]
@@ -4011,7 +4150,9 @@ mod tests {
     #[test_case("agent",    "max_output_lines",     1 ; "agent_output_lines_too_low")]
     fn validate_rejects_invalid_sections(section: &str, field: &str, value: u64) {
         let mut config = Config {
+            decisions: DecisionsConfig::default(),
             always_yolo: false,
+            always_auto: false,
             always_fast: false,
             always_thinking: None,
             ui: UiConfig::default(),
@@ -4730,6 +4871,71 @@ mod tests {
             std::env::remove_var(PROJECT_SHADOWS);
             std::env::remove_var(PROCESS_WINS);
         }
+    }
+
+    #[test_case(false; "project_alone")]
+    #[test_case(true; "global_origin_preserved")]
+    fn decision_endpoint_environment_is_global_only(has_global: bool) {
+        const GLOBAL_ORIGIN: &str = "https://global.example.test";
+        const PROJECT_ORIGIN: &str = "https://project.example.test";
+        let dir = TempDir::new().unwrap();
+        let global = global_config_dir(dir.path());
+        fs::create_dir_all(&global).unwrap();
+        if has_global {
+            fs::write(
+                global.join(".env"),
+                format!("{}={GLOBAL_ORIGIN}", decisions::BASE_URL_ENV),
+            )
+            .unwrap();
+        }
+        let project = dir.path().join(PROJECT_DIR);
+        fs::create_dir_all(&project).unwrap();
+        fs::write(
+            project.join(".env"),
+            format!("{}={PROJECT_ORIGIN}", decisions::BASE_URL_ENV),
+        )
+        .unwrap();
+        let (vars, project_keys) = env_file_layers(dir.path(), Some(&global), true);
+        assert_eq!(
+            vars.get(decisions::BASE_URL_ENV).map(String::as_str),
+            has_global.then_some(GLOBAL_ORIGIN)
+        );
+        assert!(!project_keys.contains(decisions::BASE_URL_ENV));
+    }
+
+    #[test]
+    fn decision_credentials_cannot_come_from_project_env_even_with_custom_key_name() {
+        const KEY: &str = "TEST_CAUDRA_DECISION_PROJECT_CREDENTIAL";
+        const VALUE: &str = "project-controlled-test-value";
+        let dir = TempDir::new().unwrap();
+        let project = dir.path().join(PROJECT_DIR);
+        fs::create_dir_all(&project).unwrap();
+        fs::write(project.join(".env"), format!("{KEY}={VALUE}")).unwrap();
+        load_env_files_scoped(dir.path(), None, true);
+        assert_eq!(std::env::var(KEY).unwrap(), VALUE);
+        let config = DecisionsConfig {
+            api_key_env: KEY.into(),
+            ..DecisionsConfig::default()
+        };
+        assert_eq!(config.api_key().unwrap(), None);
+        unsafe { std::env::remove_var(KEY) };
+    }
+
+    #[test]
+    fn decision_credentials_accept_global_env_and_reject_header_injection() {
+        const KEY: &str = "TEST_CAUDRA_DECISION_GLOBAL_CREDENTIAL";
+        const VALUE: &str = "global-test-value";
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join(".env"), format!("{KEY}={VALUE}")).unwrap();
+        load_env_files_scoped(dir.path(), Some(dir.path()), false);
+        let config = DecisionsConfig {
+            api_key_env: KEY.into(),
+            ..DecisionsConfig::default()
+        };
+        assert_eq!(config.api_key().unwrap().as_deref(), Some(VALUE));
+        unsafe { std::env::set_var(KEY, "invalid\r\nheader") };
+        assert!(config.api_key().is_err());
+        unsafe { std::env::remove_var(KEY) };
     }
 
     #[test]

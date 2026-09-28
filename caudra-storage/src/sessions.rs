@@ -34,6 +34,8 @@ mod lease;
 pub mod progress;
 #[path = "sessions/sweep.rs"]
 pub mod sweep;
+#[path = "sessions/types.rs"]
+mod types;
 
 pub use database::{
     CheckpointResult, HistoryReadLimits, HistoryReadReport, HistoryRecord,
@@ -43,6 +45,7 @@ pub use database::{
 };
 pub(crate) use database::{from_i64, to_i64};
 pub use lease::SessionLease;
+pub use types::PermissionMode;
 
 const SESSION_VERSION: u32 = 1;
 const LOG_FORMAT_VERSION: u32 = 3;
@@ -378,10 +381,8 @@ pub struct SessionMeta {
     pub goal_result: Option<Box<StoredGoalResult>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub goal_continuation_limit: Option<u32>,
-    /// `None` when the user never set yolo for this session, which is what
-    /// makes `--yolo` a property of the invocation rather than of the log.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub yolo: Option<bool>,
+    pub permission_mode: Option<PermissionMode>,
     /// Why this workspace has no file revert, once something decided so. Kept
     /// on the session because the verdict is worth reporting after a restart
     /// and is not worth re-deciding by walking the tree again.
@@ -1524,8 +1525,8 @@ mod tests {
         meta_record, next_epoch, persisted_session_ids, write_full_session,
     };
     use super::{
-        HistorySnapshot, PendingConversationRevert, Session, SessionCursor, SessionDatabase,
-        SessionError, SessionMeta, StorageError, TitleSource,
+        HistorySnapshot, PendingConversationRevert, PermissionMode, Session, SessionCursor,
+        SessionDatabase, SessionError, SessionMeta, StorageError, TitleSource,
     };
     use crate::StateDir;
     use crate::id::CaudraId;
@@ -1556,6 +1557,24 @@ mod tests {
     const TITLE_PROMPT: &str = "add refresh token support";
     const FORK_TITLE: &str = "Renamed by hand (fork #1)";
     const MODE_UNCHOSEN: &str = "a new session must not pretend it picked a mode";
+
+    #[test_case(None; "absent_intent")]
+    #[test_case(Some(PermissionMode::Ask); "ask")]
+    #[test_case(Some(PermissionMode::Auto); "auto")]
+    #[test_case(Some(PermissionMode::Yolo); "yolo")]
+    fn permission_mode_metadata_roundtrips(permission_mode: Option<PermissionMode>) {
+        let meta = SessionMeta {
+            permission_mode,
+            ..Default::default()
+        };
+        let serialized = serde_json::to_value(&meta).unwrap();
+        assert_eq!(
+            serialized.get("permission_mode").is_some(),
+            meta.permission_mode.is_some()
+        );
+        let restored: SessionMeta = serde_json::from_value(serialized).unwrap();
+        assert_eq!(restored, meta);
+    }
 
     fn state_dir() -> (TempDir, StateDir) {
         let temp = TempDir::new().unwrap();
@@ -2511,7 +2530,7 @@ mod tests {
     }
 
     #[test]
-    fn session_meta_backward_compat_defaults() {
+    fn session_meta_defaults_for_absent_fields() {
         let json = r#"{"mode":"build"}"#;
         let meta: SessionMeta = serde_json::from_str(json).unwrap();
         assert!(meta.thinking.is_none());
@@ -2519,7 +2538,7 @@ mod tests {
         assert!(!meta.queued_messages_together);
         assert!(meta.queued_message_admissions.is_empty());
         assert!(meta.unsent_subagent_messages.is_empty());
-        assert!(meta.yolo.is_none());
+        assert!(meta.permission_mode.is_none());
     }
 
     /// Sessions saved before the legacy flag was removed still carry its key.
@@ -2544,8 +2563,11 @@ mod tests {
         assert_eq!(session.meta.mode, None, "{MODE_UNCHOSEN}");
     }
 
-    #[test]
-    fn session_meta_persists_through_save_load() {
+    #[test_case(None; "absent_intent")]
+    #[test_case(Some(PermissionMode::Ask); "ask")]
+    #[test_case(Some(PermissionMode::Auto); "auto")]
+    #[test_case(Some(PermissionMode::Yolo); "yolo")]
+    fn session_meta_persists_through_save_load(permission_mode: Option<PermissionMode>) {
         let (_temp, state_dir) = state_dir();
         let mut session: TestSession = Session::new("m", "/project");
         session.meta.thinking = Some(StoredThinking::Budget { tokens: 8192 });
@@ -2575,7 +2597,7 @@ mod tests {
                 paste_ranges: vec![StoredPasteRange { start: 0, end: 9 }],
             }],
         );
-        session.meta.yolo = Some(true);
+        session.meta.permission_mode = permission_mode.clone();
         session.save(&state_dir).unwrap();
 
         let loaded = TestSession::load(session.id, &state_dir).unwrap();
@@ -2594,7 +2616,7 @@ mod tests {
             loaded.meta.unsent_subagent_messages["task-1"][0].text,
             "follow up"
         );
-        assert_eq!(loaded.meta.yolo, Some(true));
+        assert_eq!(loaded.meta.permission_mode, permission_mode);
     }
 
     // -- The writer never guesses --

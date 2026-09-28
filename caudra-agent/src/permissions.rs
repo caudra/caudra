@@ -13,6 +13,7 @@ mod structured;
 pub use caudra_storage::permission_state::{
     PermissionReview, PermissionReviewResource, PermissionReviewSource,
 };
+pub use caudra_storage::sessions::PermissionMode;
 pub use command_pattern::{PatternFault, PatternGrade, grade_command_pattern};
 pub use sed_script::sed_only_prints;
 #[cfg(test)]
@@ -23,21 +24,22 @@ pub use structured::review;
 pub use structured::{
     COMMAND_EXACT_PREFIX, COMMAND_GROUP_PREFIX, COMMAND_OBSERVATION_ATTRIBUTE,
     COMMAND_OBSERVATION_BINDING_ATTRIBUTE, COMMAND_PATTERN_PREFIX, COMMAND_TEMPLATE_PREFIX,
-    COMPOSABLE_SHELL_OPTIONS, ComposedAnswerError, PermissionArgumentConstraint,
-    PermissionAuthorityProfile, PermissionCapabilityFamily, PermissionCaution,
-    PermissionExecutorKind, PermissionLifetime, PermissionOptionGroup, PermissionPresentation,
-    PermissionRequest, PermissionResource, PermissionResourceAccess, PermissionResourceConstraint,
-    PermissionResourceKind, PermissionResourcePresentation, PermissionResourceSelector,
-    PermissionRisk, PermissionRowGrant, PermissionRuleOption, PermissionRuleRecord,
-    PermissionSubject, PolicyRule, RemotePermissionIdentity, ResourceCoverage, ResourceStanding,
-    RuleOrigin, SelectedInputError, SelectedPermissionArgument, StructuredPermissionDecision,
-    StructuredPermissionEffect, StructuredPermissionRule, argument_constraint_matches,
-    canonical_json, canonical_json_sha256, escape_json_pointer_segment,
-    evaluate_structured_permission_rules, filesystem_permission_resource, json_pointer,
-    permission_rule_covers_request, permission_rule_covers_resource,
-    permission_rule_intersects_request, permission_rules_cover_request,
-    permission_rules_resource_standing, prepared_command_binding, resource_constraint_matches,
-    selected_input, selected_input_digest, selected_input_pointer, update_presentation_coverage,
+    COMPOSABLE_SHELL_OPTIONS, ComposedAnswerError, PermissionAdvisory,
+    PermissionArgumentConstraint, PermissionAuthorityProfile, PermissionCapabilityFamily,
+    PermissionCaution, PermissionExecutorKind, PermissionLifetime, PermissionOptionGroup,
+    PermissionPresentation, PermissionRequest, PermissionResource, PermissionResourceAccess,
+    PermissionResourceConstraint, PermissionResourceKind, PermissionResourcePresentation,
+    PermissionResourceSelector, PermissionRisk, PermissionRowGrant, PermissionRuleOption,
+    PermissionRuleRecord, PermissionSubject, PolicyRule, RemotePermissionIdentity,
+    ResourceCoverage, ResourceStanding, RuleOrigin, SelectedInputError, SelectedPermissionArgument,
+    StructuredPermissionDecision, StructuredPermissionEffect, StructuredPermissionRule,
+    argument_constraint_matches, canonical_json, canonical_json_sha256,
+    escape_json_pointer_segment, evaluate_structured_permission_rules,
+    filesystem_permission_resource, json_pointer, permission_rule_covers_request,
+    permission_rule_covers_resource, permission_rule_intersects_request,
+    permission_rules_cover_request, permission_rules_resource_standing, prepared_command_binding,
+    resource_constraint_matches, selected_input, selected_input_digest, selected_input_pointer,
+    update_presentation_coverage,
 };
 
 pub mod editor;
@@ -57,6 +59,7 @@ mod broker;
 use broker::{
     PendingDecision, PendingPermission, PendingRegistration, PermissionBroker, remove_pending,
 };
+mod decisions;
 mod enforce;
 pub use enforce::PermissionError;
 #[cfg(test)]
@@ -64,9 +67,9 @@ use enforce::RequestCoverage;
 mod answer;
 use answer::lifetime_name;
 pub use answer::{
-    DECISION_SOURCE_RULE, DECISION_SOURCE_USER_ABORT, DECISION_SOURCE_USER_ALWAYS,
-    DECISION_SOURCE_USER_ONCE, DECISION_SOURCE_USER_SESSION, DECISION_SOURCE_YOLO,
-    DEFAULT_DENY_GUIDANCE, PermissionAnswer,
+    DECISION_SOURCE_AUTO, DECISION_SOURCE_RULE, DECISION_SOURCE_USER_ABORT,
+    DECISION_SOURCE_USER_ALWAYS, DECISION_SOURCE_USER_ONCE, DECISION_SOURCE_USER_SESSION,
+    DECISION_SOURCE_YOLO, DEFAULT_DENY_GUIDANCE, PermissionAnswer,
 };
 mod diagnostics;
 use diagnostics::{

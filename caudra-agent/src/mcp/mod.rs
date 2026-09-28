@@ -47,8 +47,9 @@ use self::error::McpError;
 use self::http::HttpTransport;
 use self::stdio::StdioTransport;
 use self::transport::McpTransport;
+use crate::decisions::{DecisionContext, Decisions};
 use crate::permissions::{PermissionSubject, canonical_json_sha256};
-use crate::tools::deferral::SearchOutcome;
+use crate::tools::deferral::{SearchOutcome, ToolSearchRanking, rank_tool_search};
 use crate::tools::schema::sanitize_tool_input_schema;
 
 const SEPARATOR: &str = ".";
@@ -230,6 +231,15 @@ impl ToolDescriptor {
     fn wire_name(&self) -> &str {
         self.definition["name"].as_str().unwrap_or_default()
     }
+
+    fn matches_exactly(&self, query: &str) -> bool {
+        self.wire_name().eq_ignore_ascii_case(query)
+            || self.qualified_name.eq_ignore_ascii_case(query)
+            || self
+                .qualified_name
+                .split_once(SEPARATOR)
+                .is_some_and(|(_, raw)| raw.eq_ignore_ascii_case(query))
+    }
 }
 
 #[derive(Clone)]
@@ -386,6 +396,25 @@ pub struct McpRequestSnapshot {
     defer_tools: usize,
 }
 
+pub struct PreparedMcpSearch<'a> {
+    session: &'a McpSession,
+    query: &'a str,
+    index: Arc<ToolIndex>,
+    ranking: Option<ToolSearchRanking<'a>>,
+}
+
+impl PreparedMcpSearch<'_> {
+    pub fn commit(self) -> Result<SearchOutcome, String> {
+        let matches = self.session.search_matches(&self.index, self.query)?;
+        if !Arc::ptr_eq(&self.index, &self.session.handle.index.load_full()) {
+            return self.session.search_tools(self.query);
+        }
+        Ok(self
+            .session
+            .load_search_matches(self.query, matches, self.ranking))
+    }
+}
+
 impl std::ops::Deref for McpSession {
     type Target = McpHandle;
     fn deref(&self) -> &McpHandle {
@@ -457,6 +486,54 @@ impl McpSession {
     /// then name hits over description hits) and mark the top
     /// `MAX_SEARCH_LOADS` loaded; their definitions join the next request.
     pub fn search_tools(&self, query: &str) -> Result<SearchOutcome, String> {
+        let index = self.handle.index.load_full();
+        let matches = self.search_matches(&index, query)?;
+        Ok(self.load_search_matches(query, matches, None))
+    }
+
+    pub fn has_exact_match(&self, query: &str) -> bool {
+        self.handle.index.load().descriptors.iter().any(|tool| {
+            !self.is_disabled(&tool.qualified_name) && tool.matches_exactly(query.trim())
+        })
+    }
+
+    pub async fn prepare_search_tools_with_decisions<'a>(
+        &'a self,
+        query: &'a str,
+        decisions: Option<&'a Decisions>,
+        context: &DecisionContext,
+    ) -> Result<PreparedMcpSearch<'a>, String> {
+        let index = self.handle.index.load_full();
+        let matches = self.search_matches(&index, query)?;
+        let exact = index.descriptors.iter().any(|tool| {
+            !self.is_disabled(&tool.qualified_name) && tool.matches_exactly(query.trim())
+        });
+        let ranking = if exact {
+            None
+        } else {
+            rank_tool_search(
+                query,
+                matches
+                    .iter()
+                    .map(|(_, _, tool)| (tool.wire_name(), &tool.definition)),
+                decisions,
+                context,
+            )
+            .await
+        };
+        Ok(PreparedMcpSearch {
+            session: self,
+            query,
+            index,
+            ranking,
+        })
+    }
+
+    fn search_matches<'a>(
+        &self,
+        index: &'a ToolIndex,
+        query: &str,
+    ) -> Result<Vec<(bool, usize, &'a ToolDescriptor)>, String> {
         let q = query.trim().to_lowercase();
         let tokens: Vec<&str> = q
             .split(|c: char| !c.is_alphanumeric())
@@ -465,8 +542,7 @@ impl McpSession {
         if tokens.is_empty() {
             return Err(SEARCH_EMPTY_QUERY.into());
         }
-        let idx = self.handle.index.load();
-        let mut matches: Vec<(bool, usize, &ToolDescriptor)> = idx
+        let mut matches: Vec<(bool, usize, &ToolDescriptor)> = index
             .descriptors
             .iter()
             .filter(|d| !d.always_load && !self.is_disabled(&d.qualified_name))
@@ -475,10 +551,7 @@ impl McpSession {
                 let haystack = build_haystack(&d.definition);
                 // The catalog shows bare tool names, so exact match must
                 // accept both `server__tool` and `tool`.
-                let exact = name == q
-                    || d.qualified_name
-                        .split_once(SEPARATOR)
-                        .is_some_and(|(_, raw)| raw.eq_ignore_ascii_case(&q));
+                let exact = d.matches_exactly(&q);
                 let score: usize = tokens
                     .iter()
                     .map(|t| {
@@ -499,11 +572,29 @@ impl McpSession {
                 .cmp(&(a.0, a.1))
                 .then_with(|| a.2.wire_name().cmp(b.2.wire_name()))
         });
+        Ok(matches)
+    }
+
+    fn load_search_matches(
+        &self,
+        query: &str,
+        mut matches: Vec<(bool, usize, &ToolDescriptor)>,
+        ranking: Option<ToolSearchRanking<'_>>,
+    ) -> SearchOutcome {
         let mut guard = self.lock_loaded();
+        let baseline: Vec<Arc<str>> = matches
+            .iter()
+            .take(MAX_SEARCH_LOADS)
+            .filter(|(_, _, tool)| ranking.is_some() && !guard.contains(&tool.qualified_name))
+            .map(|(_, _, tool)| Arc::from(tool.wire_name()))
+            .collect();
+        if let Some(ranking) = &ranking {
+            matches[..=ranking.index()].rotate_right(1);
+        }
         let mut hits: Vec<&str> = Vec::new();
         let mut overflow: Vec<&str> = Vec::new();
         let mut loaded: Vec<Arc<str>> = Vec::new();
-        for (_, _, d) in &matches {
+        for (_, _, d) in matches {
             if hits.len() < MAX_SEARCH_LOADS {
                 if guard.insert(Arc::clone(&d.qualified_name)) {
                     loaded.push(Arc::from(d.wire_name()));
@@ -514,14 +605,18 @@ impl McpSession {
             }
         }
         drop(guard);
-        info!(query = %q, loaded = hits.len(), overflow = overflow.len(), "MCP tool search");
+        info!(
+            loaded = hits.len(),
+            overflow = overflow.len(),
+            "MCP tool search"
+        );
         if hits.is_empty() {
-            return Ok(SearchOutcome {
+            return SearchOutcome {
                 loaded,
                 message: format!(
                     "{SEARCH_NO_MATCH} '{query}'. Try other keywords or an exact name from the catalog."
                 ),
-            });
+            };
         }
         let plural = if hits.len() == 1 { "tool" } else { "tools" };
         let mut out = format!(
@@ -540,10 +635,14 @@ impl McpSession {
             }
             out.push_str(". Search an exact tool name to load it.");
         }
-        Ok(SearchOutcome {
+        let outcome = SearchOutcome {
             loaded,
             message: out,
-        })
+        };
+        if let Some(ranking) = ranking {
+            ranking.record_effect(&outcome, &baseline);
+        }
+        outcome
     }
 
     /// Invoked on every MCP dispatch: a deferred tool the model calls by
@@ -1767,12 +1866,17 @@ fn intern(name: String) -> Arc<str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tools::deferral::TOOL_SEARCH_TOOL_NAME;
+    use crate::tools::deferral::{
+        TOOL_SEARCH_TOOL_NAME,
+        tests::{PENDING_CHOICE, SearchDecisions},
+    };
     use async_lock::Mutex as AsyncMutex;
+    use caudra_config::decisions::FeatureMode;
     use caudra_providers::{Model, Role};
     use caudra_storage::sessions::SessionDatabase;
     use caudra_storage::state::project_scope;
     use config::{RawHttpFields, RawServerConfig, RawStdioFields, RawTransport};
+    use futures_lite::future;
     use std::sync::atomic::{AtomicUsize, Ordering};
     #[cfg(unix)]
     use std::time::Instant;
@@ -1789,6 +1893,8 @@ mod tests {
     const REPLACEMENT_DESCRIPTION: &str = "replacement contract";
     const REPLACEMENT_TOOL_NAME: &str = "srv.replacement";
     const TEST_MODEL_SPEC: &str = "anthropic/claude-sonnet-4-6";
+    const SEARCH_QUERY: &str = "inspect";
+    const LAST_SEARCH_CHOICE: &str = "candidate_5";
 
     fn stdio_raw(cmd: &[&str]) -> RawServerConfig {
         RawServerConfig {
@@ -2567,6 +2673,216 @@ mod tests {
             description: description.into(),
             input_schema: schema,
         }
+    }
+
+    fn decision_search_session() -> (McpManagerInner, McpSession) {
+        setup(vec![entry_with_tools(
+            "srv",
+            (0..=MAX_SEARCH_LOADS)
+                .map(|index| tool_def("srv", &format!("tool_{index}"), SEARCH_QUERY, json!({})))
+                .collect(),
+        )])
+    }
+
+    #[test]
+    fn discarded_preparation_keeps_mcp_catalog_unloaded() {
+        let fixture = SearchDecisions::new(FeatureMode::Enforce, LAST_SEARCH_CHOICE, 1.0, 1.0);
+        let (_, session) = decision_search_session();
+        let prepared = smol::block_on(session.prepare_search_tools_with_decisions(
+            SEARCH_QUERY,
+            Some(&fixture.decisions),
+            &DecisionContext::default(),
+        ))
+        .unwrap();
+        assert!(prepared.ranking.is_some());
+        assert!(session.lock_loaded().is_empty());
+        drop(prepared);
+        assert!(session.lock_loaded().is_empty());
+        let outcome = session.search_tools(SEARCH_QUERY).unwrap();
+        assert!(
+            !outcome
+                .loaded
+                .iter()
+                .any(|name| name.as_ref() == "srv__tool_5")
+        );
+    }
+
+    #[test]
+    fn cancelled_preparation_keeps_mcp_catalog_unloaded() {
+        smol::block_on(async {
+            let fixture = SearchDecisions::new(FeatureMode::Enforce, PENDING_CHOICE, 1.0, 1.0);
+            let (_, session) = decision_search_session();
+            let context = DecisionContext::default();
+            let mut pending = Box::pin(session.prepare_search_tools_with_decisions(
+                SEARCH_QUERY,
+                Some(&fixture.decisions),
+                &context,
+            ));
+            assert!(future::poll_once(&mut pending).await.is_none());
+            assert_eq!(fixture.requests.lock().unwrap().len(), 1);
+            drop(pending);
+            assert!(session.lock_loaded().is_empty());
+        });
+    }
+
+    #[test_case("candidate_0", false, false; "lexical_choice")]
+    #[test_case("candidate_1", false, false; "same_batch")]
+    #[test_case(LAST_SEARCH_CHOICE, false, true; "different_batch")]
+    #[test_case(LAST_SEARCH_CHOICE, true, false; "already_loaded_at_commit")]
+    #[test_case("none", false, false; "none_falls_back")]
+    fn mcp_commit_accounts_only_changed_new_loads(choice: &str, preload: bool, rerouted: bool) {
+        let fixture = SearchDecisions::new(FeatureMode::Enforce, choice, 1.0, 1.0);
+        let (_, session) = decision_search_session();
+        let lexical = session.fresh();
+        let prepared = smol::block_on(session.prepare_search_tools_with_decisions(
+            SEARCH_QUERY,
+            Some(&fixture.decisions),
+            &DecisionContext::default(),
+        ))
+        .unwrap();
+        assert!(session.lock_loaded().is_empty());
+        if preload {
+            for index in 0..=MAX_SEARCH_LOADS {
+                let name = format!("srv.tool_{index}");
+                session.mark_loaded(&name);
+                lexical.mark_loaded(&name);
+            }
+        }
+        let baseline = lexical.search_tools(SEARCH_QUERY).unwrap();
+        let outcome = prepared.commit().unwrap();
+        assert_eq!(outcome.rerouted_from(&baseline.loaded), rerouted);
+        if preload {
+            assert!(outcome.loaded.is_empty());
+        }
+    }
+
+    #[test]
+    fn catalog_republication_after_preparation_commits_lexical_fallback() {
+        let fixture = SearchDecisions::new(FeatureMode::Enforce, LAST_SEARCH_CHOICE, 1.0, 1.0);
+        let (mut inner, session) = decision_search_session();
+        let prepared = smol::block_on(session.prepare_search_tools_with_decisions(
+            SEARCH_QUERY,
+            Some(&fixture.decisions),
+            &DecisionContext::default(),
+        ))
+        .unwrap();
+        inner.entries[0].tools = vec![tool_def("srv", "replacement", SEARCH_QUERY, json!({}))];
+        publish(&inner, &session.handle.index, &session.handle.snapshot);
+        assert!(session.lock_loaded().is_empty());
+        let baseline = session.fresh().search_tools(SEARCH_QUERY).unwrap();
+        let outcome = prepared.commit().unwrap();
+        assert_eq!(outcome.loaded, vec![Arc::<str>::from("srv__replacement")]);
+        assert!(!outcome.rerouted_from(&baseline.loaded));
+        assert_eq!(session.lock_loaded().len(), 1);
+    }
+
+    #[test_case(FeatureMode::Enforce, true; "enforce_promotes_candidate")]
+    #[test_case(FeatureMode::Shadow, false; "shadow_keeps_predicted_tool_unloaded")]
+    #[test_case(FeatureMode::Off, false; "off_preserves_lexical")]
+    fn decision_search_only_reorders_catalog_loads(mode: FeatureMode, ranked: bool) {
+        let fixture = SearchDecisions::new(mode, LAST_SEARCH_CHOICE, 1.0, 1.0);
+        let (_, session) = decision_search_session();
+        let outcome = smol::block_on(session.prepare_search_tools_with_decisions(
+            SEARCH_QUERY,
+            Some(&fixture.decisions),
+            &DecisionContext::default(),
+        ))
+        .and_then(|prepared| prepared.commit())
+        .unwrap();
+        let last = format!("srv__tool_{MAX_SEARCH_LOADS}");
+        assert_eq!(outcome.loaded.len(), MAX_SEARCH_LOADS);
+        assert_eq!(
+            outcome.loaded.iter().any(|name| name.as_ref() == last),
+            ranked
+        );
+        assert!(session.has_tool(&format!("srv.tool_{MAX_SEARCH_LOADS}")));
+        if ranked {
+            assert_eq!(outcome.loaded[0].as_ref(), last);
+        }
+    }
+
+    #[test_case(" TOOL_5 "; "bare")]
+    #[test_case(" SRV__TOOL_5 "; "wire")]
+    #[test_case(" SRV.TOOL_5 "; "qualified")]
+    fn exact_mcp_names_bypass_decisions(query: &str) {
+        let fixture = SearchDecisions::new(FeatureMode::Enforce, "candidate_0", 1.0, 1.0);
+        let (_, session) = decision_search_session();
+        assert!(session.has_exact_match(query));
+        let outcome = smol::block_on(session.prepare_search_tools_with_decisions(
+            query,
+            Some(&fixture.decisions),
+            &DecisionContext::default(),
+        ))
+        .and_then(|prepared| prepared.commit())
+        .unwrap();
+        assert_eq!(outcome.loaded[0].as_ref(), "srv__tool_5");
+        assert!(fixture.requests.lock().unwrap().is_empty());
+    }
+
+    #[test_case("srv.tool_5"; "individual")]
+    #[test_case("srv.*"; "server")]
+    fn disabled_mcp_tools_never_enter_decision_shortlist(disabled: &str) {
+        let fixture = SearchDecisions::new(FeatureMode::Enforce, "candidate_0", 1.0, 1.0);
+        let (_, session) = decision_search_session();
+        let session = session.with_disabled_tools(&[disabled.into()]);
+        assert!(!session.has_exact_match("tool_5"));
+        let outcome = smol::block_on(session.prepare_search_tools_with_decisions(
+            SEARCH_QUERY,
+            Some(&fixture.decisions),
+            &DecisionContext::default(),
+        ))
+        .and_then(|prepared| prepared.commit())
+        .unwrap();
+        assert!(
+            !outcome
+                .loaded
+                .iter()
+                .any(|name| name.as_ref() == "srv__tool_5")
+        );
+        let requests = fixture.requests.lock().unwrap();
+        for request in requests.iter() {
+            assert!(
+                !serde_json::to_string(request)
+                    .unwrap()
+                    .contains("srv__tool_5")
+            );
+        }
+        if disabled == "srv.*" {
+            assert!(requests.is_empty());
+        }
+    }
+
+    #[test]
+    fn catalog_republication_discards_in_flight_ranking() {
+        let (mut inner, session) = decision_search_session();
+        inner.entries[0].tools = vec![tool_def("srv", "replacement", SEARCH_QUERY, json!({}))];
+        let replacement_index = ArcSwap::from_pointee(ToolIndex::default());
+        let replacement_snapshot = ArcSwap::from_pointee(McpSnapshot::default());
+        publish(&inner, &replacement_index, &replacement_snapshot);
+        let index = session.handle.index.clone();
+        let fixture = SearchDecisions::with_hook(
+            FeatureMode::Enforce,
+            LAST_SEARCH_CHOICE,
+            1.0,
+            1.0,
+            Some(Box::new(move || {
+                index.store(replacement_index.load_full());
+            })),
+        );
+        let outcome = smol::block_on(session.prepare_search_tools_with_decisions(
+            SEARCH_QUERY,
+            Some(&fixture.decisions),
+            &DecisionContext::default(),
+        ))
+        .and_then(|prepared| prepared.commit())
+        .unwrap();
+        assert_eq!(outcome.loaded, vec![Arc::<str>::from("srv__replacement")]);
+        assert!(
+            !session
+                .lock_loaded()
+                .iter()
+                .any(|name| name.as_ref().starts_with("srv.tool_"))
+        );
     }
 
     #[test_case("srv__tool-" ; "wire_name")]

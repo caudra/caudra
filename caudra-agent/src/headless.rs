@@ -7,10 +7,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
+use crate::decisions::Decisions;
 use arc_swap::{ArcSwap, ArcSwapOption};
 use async_lock::Mutex;
 #[cfg(test)]
 use caudra_config::ToolKey;
+use caudra_config::decisions::DecisionsConfig;
 use caudra_config::{ModelPolicy, SnapshotsConfig};
 use caudra_providers::Timeouts;
 use caudra_providers::model::{Model, ModelPurpose};
@@ -28,8 +30,8 @@ use caudra_storage::permission_state::mutation::{
     PermissionCommitReceipt, PermissionOwner, PermissionSnapshot, PreparedPermissionMutation,
 };
 use caudra_storage::sessions::{
-    SessionCursor, SessionDatabase, SessionError, SessionLease, StoredMode, StoredPlanTarget,
-    StoredSubagent, StoredSubagentOutcome,
+    PermissionMode, SessionCursor, SessionDatabase, SessionError, SessionLease, StoredMode,
+    StoredPlanTarget, StoredSubagent, StoredSubagentOutcome,
 };
 use caudra_storage::tool_outputs::ToolOutputStore;
 use caudra_storage::workspace_binding::StoredWorkspaceBinding;
@@ -85,6 +87,7 @@ const REMOTE_COMMAND_INDETERMINATE: &str =
     "Remote command outcome is indeterminate; it will not be retried";
 const REMOTE_COMMAND_TRUNCATED: &str = "[truncated]";
 const SESSION_DATABASE_UNAVAILABLE: &str = "session database unavailable";
+const DECISIONS_STARTUP_FAILED: &str = "Decision engine initialization failed; check decisions configuration, credentials and question overrides";
 const STALE_WORKFLOW_CONTROL: &str =
     "Workflow control was superseded by a session stop or mode change";
 
@@ -344,7 +347,7 @@ impl SessionStore {
     }
 
     fn sync_permissions(&mut self, permissions: &PermissionManager) {
-        self.session.meta.yolo = permissions.persisted_yolo();
+        self.session.meta.permission_mode = permissions.persisted_mode();
     }
 
     fn set_system_prompt_profile(&mut self, name: Option<&str>) {
@@ -751,6 +754,8 @@ pub struct HeadlessParams {
     pub model: Model,
     pub config: AgentConfig,
     pub permissions_config: PermissionsConfig,
+    pub decisions_config: DecisionsConfig,
+    pub seed_permission_mode: Option<PermissionMode>,
     pub snapshots: SnapshotsConfig,
     pub timeouts: Timeouts,
     pub prompt: String,
@@ -1276,7 +1281,10 @@ fn advertised_tool_names(
     extract_tool_names(&probe)
 }
 
-pub fn spawn(mut params: HeadlessParams) -> HeadlessHandle {
+pub fn spawn(mut params: HeadlessParams) -> Result<HeadlessHandle, InteractiveStartError> {
+    let state_dir =
+        StateDir::resolve().map_err(|error| InteractiveStartError(error.to_string()))?;
+    let decisions = initialize_decisions(params.decisions_config.clone(), &state_dir)?;
     let provider_model = params.model.clone();
     if let Err(error) = provider::adjust_model(&mut params.model, params.timeouts) {
         warn!(%error, "failed to adjust headless model before setup");
@@ -1387,6 +1395,10 @@ pub fn spawn(mut params: HeadlessParams) -> HeadlessHandle {
                 working_dir_path,
                 params.plugin_rules,
             ));
+            if let Some(mode) = params.seed_permission_mode {
+                permissions.set_seed_mode(mode);
+            }
+            permissions.set_decisions(Some(decisions));
             if let Err(error) = permissions.replace_remote_permission_asset(
                 params
                     .remote_project_context
@@ -1541,20 +1553,21 @@ pub fn spawn(mut params: HeadlessParams) -> HeadlessHandle {
         }
     });
 
-    HeadlessHandle {
+    Ok(HeadlessHandle {
         event_rx,
         tool_names,
         session_id: session_ref,
         cwd: working_dir,
         goal,
         task,
-    }
+    })
 }
 
 pub struct InteractiveParams {
     pub model: Model,
     pub config: AgentConfig,
     pub permissions_config: PermissionsConfig,
+    pub decisions_config: DecisionsConfig,
     pub snapshots: SnapshotsConfig,
     pub timeouts: Timeouts,
     pub prompt_slots: Arc<ResolvedSlots>,
@@ -1569,9 +1582,9 @@ pub struct InteractiveParams {
     pub session_lease: Arc<SessionLease>,
     pub expected_write_version: Option<i64>,
     pub initial_history: Vec<HistoryItem>,
-    pub yolo: bool,
+    pub seed_permission_mode: Option<PermissionMode>,
     pub structured_permission_rules: Vec<PermissionRuleRecord>,
-    pub session_yolo: Option<bool>,
+    pub session_permission_mode: Option<PermissionMode>,
     pub system_prompt_override: Option<String>,
     pub append_system_prompt: Option<String>,
     pub model_policy: Arc<ModelPolicy>,
@@ -1749,7 +1762,11 @@ impl InteractiveHandle {
         Ok(model)
     }
 
-    pub async fn set_mode(&self, mode: AgentMode, yolo: bool) -> Result<(), String> {
+    pub async fn set_mode(
+        &self,
+        mode: AgentMode,
+        permission_mode: PermissionMode,
+    ) -> Result<(), String> {
         self.mode_route.control_epoch.fetch_add(1, Ordering::AcqRel);
         let _admission = self.mode_route.admission.lock().await;
         self.mode_route.mode.store(Some(Arc::new(mode)));
@@ -1761,7 +1778,7 @@ impl InteractiveHandle {
             .map(BackgroundTasks::suspend)
             .transpose()?;
         drain_session_work(self.background.as_ref(), self.workflow.as_ref()).await?;
-        self.permissions.set_session_yolo(Some(yolo));
+        self.permissions.set_session_mode(Some(permission_mode));
         Ok(())
     }
 
@@ -1882,6 +1899,14 @@ impl InteractiveHandle {
 #[derive(Debug, thiserror::Error)]
 #[error("{0}")]
 pub struct InteractiveStartError(String);
+
+fn initialize_decisions(
+    config: DecisionsConfig,
+    state_dir: &StateDir,
+) -> Result<Decisions, InteractiveStartError> {
+    Decisions::new(config, state_dir)
+        .map_err(|error| InteractiveStartError(format!("{DECISIONS_STARTUP_FAILED}: {error}")))
+}
 
 pub struct PreparedInteractive {
     params: InteractiveParams,
@@ -2041,6 +2066,7 @@ async fn spawn_prepared_session(
         mut store,
         workspace_baseline,
     } = prepared;
+    let decisions = initialize_decisions(params.decisions_config.clone(), &store.dir)?;
     let workflows_available = params.workflow_mode.is_some();
     let AgentSetup {
         mut vars,
@@ -2120,14 +2146,16 @@ async fn spawn_prepared_session(
             }))
         });
 
-    let mut permissions_config = params.permissions_config;
-    permissions_config.yolo |= params.yolo;
     let permissions = Arc::new(PermissionManager::new_persistent_in(
-        permissions_config,
+        params.permissions_config,
         params.initial_wd.clone(),
         Arc::clone(&params.plugin_rules),
         state_dir.clone(),
     ));
+    if let Some(mode) = params.seed_permission_mode {
+        permissions.set_seed_mode(mode);
+    }
+    permissions.set_decisions(Some(decisions));
     if let Err(error) = permissions.replace_remote_permission_asset(
         params
             .remote_project_context
@@ -2141,7 +2169,7 @@ async fn spawn_prepared_session(
     permissions.load_structured_conversation_rules(std::mem::take(
         &mut params.structured_permission_rules,
     ));
-    permissions.set_session_yolo(params.session_yolo);
+    permissions.set_session_mode(params.session_permission_mode);
     permissions
         .attach_permission_publication(store.permission_publication().map_err(|error| {
             InteractiveStartError(format!(
@@ -2243,17 +2271,20 @@ async fn spawn_prepared_session(
             );
             // A runtime that fails to open leaves the `workflow` tool reporting
             // unavailable rather than taking the session down.
-            WorkflowRuntime::spawn(RuntimeDeps {
-                state_dir: state_dir.clone(),
-                session_id,
-                cwd: params.initial_wd.clone(),
-                user_config_dir: None,
-                remote_project_context: params.remote_project_context.clone(),
-                runner: Arc::new(SubagentTaskRunner::new(Arc::new(host))),
-                events: agent_tx.clone(),
-                mode,
-                subagent_cancels,
-            })
+            WorkflowRuntime::spawn(
+                RuntimeDeps {
+                    state_dir: state_dir.clone(),
+                    session_id,
+                    cwd: params.initial_wd.clone(),
+                    user_config_dir: None,
+                    remote_project_context: params.remote_project_context.clone(),
+                    runner: Arc::new(SubagentTaskRunner::new(Arc::new(host))),
+                    events: agent_tx.clone(),
+                    mode,
+                    subagent_cancels,
+                },
+                permissions.decisions(),
+            )
             .await
             .map_err(|error| warn!(%error, "workflow runtime unavailable for this session"))
             .ok()
@@ -3258,6 +3289,45 @@ mod tests {
     const PERMISSION_TOOL: &str = "bash";
     const PERMISSION_OPTION: &str = "allow_exact";
     const LOST_PERMISSION_ACK: &str = "permission committed but acknowledgment lost";
+
+    #[test_case(false; "passive_config")]
+    #[test_case(true; "restricted_without_endpoint")]
+    fn decision_startup_preserves_marker_only_config_and_session_isolation(restricted: bool) {
+        let temp = TempDir::new().unwrap();
+        let state = StateDir::from_path(temp.path().to_path_buf());
+        let config = DecisionsConfig {
+            auto_screening_restricted: restricted,
+            ..DecisionsConfig::default()
+        };
+        let first = initialize_decisions(config.clone(), &state).unwrap();
+        let second = initialize_decisions(config, &state).unwrap();
+        let manager = permission_manager();
+        manager.set_decisions(Some(first.clone()));
+        assert_eq!(
+            manager
+                .decisions()
+                .unwrap()
+                .config()
+                .auto_screening_restricted,
+            restricted
+        );
+        first.mark_tainted();
+        assert!(manager.decisions().unwrap().is_tainted());
+        assert!(!second.is_tainted());
+        assert!(!state.path().join("decisions.db").exists());
+    }
+
+    #[test]
+    fn invalid_decision_startup_is_an_actionable_error_not_an_absent_service() {
+        let temp = TempDir::new().unwrap();
+        let state = StateDir::from_path(temp.path().to_path_buf());
+        let config = DecisionsConfig {
+            model: String::new(),
+            ..DecisionsConfig::default()
+        };
+        let error = initialize_decisions(config, &state).err().unwrap();
+        assert!(error.to_string().contains(DECISIONS_STARTUP_FAILED));
+    }
 
     #[test_case("!pwd", Some("pwd"); "visible_command")]
     #[test_case("!! pwd", Some("pwd"); "hidden_command")]
@@ -4310,9 +4380,15 @@ mod tests {
         assert!(loaded.subagent_messages().contains_key("continuation-call"));
     }
 
-    #[test_case(false; "acknowledged")]
-    #[test_case(true; "lost_acknowledgment")]
-    fn record_turn_checkpoints_restorable_permissions(lost_ack: bool) {
+    #[test_case(false, Some(PermissionMode::Yolo); "acknowledged")]
+    #[test_case(true, Some(PermissionMode::Yolo); "lost_acknowledgment")]
+    #[test_case(false, Some(PermissionMode::Auto); "auto")]
+    #[test_case(false, Some(PermissionMode::Ask); "explicit_ask")]
+    #[test_case(false, None; "unset")]
+    fn record_turn_checkpoints_restorable_permissions(
+        lost_ack: bool,
+        mode: Option<PermissionMode>,
+    ) {
         smol::block_on(async {
             let tmp = TempDir::new().unwrap();
             let mut store = store_in(&tmp);
@@ -4341,7 +4417,7 @@ mod tests {
                 load(&tmp).meta.structured_permission_rules,
                 approved.records
             );
-            permissions.set_session_yolo(Some(true));
+            permissions.set_session_mode(mode.clone());
             store
                 .record_turn(&History::default(), MODEL_SPEC.into(), &permissions)
                 .unwrap();
@@ -4355,15 +4431,15 @@ mod tests {
                 loaded.meta.permission_generation,
                 approved.revision.generation
             );
-            assert_eq!(loaded.meta.yolo, Some(true));
+            assert_eq!(loaded.meta.permission_mode, mode);
             let restored = permission_manager();
             restored
                 .attach_permission_publication(publication.clone())
                 .unwrap();
-            restored.set_session_yolo(loaded.meta.yolo);
+            restored.set_session_mode(loaded.meta.permission_mode.clone());
             assert_eq!(restored.conversation_permission_snapshot(), Some(approved));
-            assert!(restored.is_yolo());
-            assert_eq!(restored.persisted_yolo(), Some(true));
+            assert_eq!(restored.mode(), mode.clone().unwrap_or(PermissionMode::Ask));
+            assert_eq!(restored.persisted_mode(), mode);
         });
     }
 
@@ -4626,6 +4702,7 @@ complete(#{ report: first.output });
                     ..AgentConfig::default()
                 },
                 permissions_config: PermissionsConfig::default(),
+                decisions_config: DecisionsConfig::default(),
                 snapshots: SnapshotsConfig::default(),
                 timeouts: Timeouts::default(),
                 prompt_slots: Arc::new(ResolvedSlots::default()),
@@ -4640,9 +4717,9 @@ complete(#{ report: first.output });
                 session_lease: lease,
                 expected_write_version: None,
                 initial_history: Vec::new(),
-                yolo: true,
+                seed_permission_mode: Some(PermissionMode::Yolo),
                 structured_permission_rules: store.session.meta.structured_permission_rules.clone(),
-                session_yolo: store.session.meta.yolo,
+                session_permission_mode: store.session.meta.permission_mode.clone(),
                 system_prompt_override: None,
                 append_system_prompt: None,
                 model_policy: Arc::new(ModelPolicy::default()),
@@ -5031,9 +5108,14 @@ complete(#{ report: first.output });
         });
     }
 
-    #[test_case(false; "idle_build_parent")]
-    #[test_case(true; "active_build_parent")]
-    fn acknowledged_plan_transition_drains_build_work_and_clamps_later_reports(active: bool) {
+    #[test_case(false, PermissionMode::Ask; "idle_build_parent")]
+    #[test_case(true, PermissionMode::Ask; "active_build_parent")]
+    #[test_case(false, PermissionMode::Auto; "auto_idle_build_parent")]
+    #[test_case(true, PermissionMode::Auto; "auto_active_build_parent")]
+    fn acknowledged_plan_transition_drains_build_work_and_clamps_later_reports(
+        active: bool,
+        permission_mode: PermissionMode,
+    ) {
         const CHILD: &str = "downgraded-build-child";
         const PLAN_CHILD: &str = "new-plan-child";
         const PLAN_FILE: &str = "plan.md";
@@ -5054,7 +5136,11 @@ complete(#{ report: first.output });
             let (child, _, _) = background_child(tasks, CHILD).await;
             assert_eq!(tasks.active_count(), 1);
             let plan = AgentMode::Plan(session.project.join(PLAN_FILE));
-            handle.set_mode(plan.clone(), false).await.unwrap();
+            handle
+                .set_mode(plan.clone(), permission_mode.clone())
+                .await
+                .unwrap();
+            assert_eq!(handle.permissions.mode(), permission_mode);
             if active {
                 wait_for_turn(&handle.event_rx).await;
             }
@@ -5109,7 +5195,10 @@ complete(#{ report: first.output });
             session.started.recv_async().await.unwrap();
             assert_eq!(workflow.active_count(), 1);
             handle
-                .set_mode(AgentMode::Plan(session.project.join(PLAN_FILE)), false)
+                .set_mode(
+                    AgentMode::Plan(session.project.join(PLAN_FILE)),
+                    PermissionMode::Ask,
+                )
                 .await
                 .unwrap();
             assert_eq!(workflow.active_count(), 0);
@@ -5147,7 +5236,10 @@ complete(#{ report: first.output });
                 handle.interrupt().await.unwrap();
             } else {
                 handle
-                    .set_mode(AgentMode::Plan(session.project.join(PLAN_FILE)), false)
+                    .set_mode(
+                        AgentMode::Plan(session.project.join(PLAN_FILE)),
+                        PermissionMode::Ask,
+                    )
                     .await
                     .unwrap();
             }
@@ -5230,7 +5322,9 @@ complete(#{ report: first.output });
         smol::block_on(async {
             let session = WorkflowSession::new(false);
             let handle = session.spawn(workflows).await;
-            handle.permissions.set_session_yolo(Some(false));
+            handle
+                .permissions
+                .set_session_mode(Some(PermissionMode::Ask));
             let initial = handle
                 .permissions
                 .conversation_permission_snapshot()

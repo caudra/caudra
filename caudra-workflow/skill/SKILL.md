@@ -187,6 +187,26 @@ Appends a line to the run log, which the user sees in the run detail pane and wh
 
 Writes an artifact and returns its absolute path as a string. `name` is a single file name, no directory part, at most 128 bytes. A run may write 64 files, 1 MiB each, 16 MiB in total. Files live under the state directory and are deleted with the session. Put the returned path in the result so the user, and you, can open it afterwards.
 
+### `decide(state, questions)` and `decide(state, questions, options)`
+
+Calls the user's configured decision endpoint and returns `#{ answers, model }`. Available whenever the endpoint is configured, even with passive decision features off. Do not assume an endpoint exists. Catch failures or ask the user to configure one.
+
+```rhai
+let result = decide(#{ task: args.objective }, #{
+    deep_reasoning: #{
+        type: "noul",
+        instructions: "Does this task require substantial reasoning?"
+    }
+});
+let job = if result.answers.deep_reasoning.noul >= 0.9 { "best" } else { "fast" };
+```
+
+Question IDs map to definitions with `type`, `instructions`, and optional `criteria`. Types are `noul` (probability in the answer's `noul` field), `choice` (named criteria or an option array), and `score` (ordered level array). Limits: 64 questions, 100 choice options, 10 score levels, 512 total options. Optional `model` selects a decision model, not an agent model. Optional `timeout_ms` can shorten but cannot extend the user's configured deadline.
+
+Use short, non-sensitive states. The runtime redacts and bounds serialized states to 1,500 bytes. Oversized states and questions whose answer semantics would change under redaction are rejected. Endpoint failures and timeouts are catchable errors. Successful calls are committed before returning and replayed without network calls on resume. Failed or uncommitted calls can be retried. Decision request bodies are hidden from the workflow journal. Opt-in decision logging stores the redacted state sent to the endpoint.
+
+Calls count against the host-call limit, not the agent budget. Answers are data. Never treat them as permission grants or use them to bypass deterministic checks.
+
 ### `json_encode(value)`
 
 Serializes a value to compact JSON text. `()` becomes `null`. Use it to embed structured data in a prompt, so the agent sees one unambiguous block rather than Rhai's debug formatting.

@@ -874,6 +874,7 @@ mod tests {
 
     use super::*;
     use crate::cancel::CancelTrigger;
+    use crate::permissions::PermissionMode;
     use crate::tools::DescriptionContext;
     use crate::tools::TOOL_SEARCH_TOOL_NAME;
     use crate::tools::registry::BoxFuture;
@@ -1008,7 +1009,7 @@ mod tests {
             stored.save(&state_dir).unwrap();
             ctx.workspace_session = Some(workspace.clone());
             ctx.remote_project_context = Some(Arc::clone(&context));
-            ctx.permissions.set_session_yolo(Some(true));
+            ctx.permissions.set_session_mode(Some(PermissionMode::Yolo));
             ctx.registry = Arc::new(ToolRegistry::new());
             let probe = CursorProbe::default();
             ctx.registry
@@ -1031,17 +1032,20 @@ mod tests {
             let host =
                 WorkflowHostContext::from_tool_context(&ctx, model, mode.clone(), cancels.clone());
             let (events, received) = flume::unbounded();
-            let runtime = WorkflowRuntime::spawn(RuntimeDeps {
-                state_dir,
-                session_id: ctx.session_id.as_ref().unwrap().id(),
-                cwd: ".".into(),
-                user_config_dir: Some(temp.path().join("config")),
-                remote_project_context: Some(context),
-                runner: Arc::new(SubagentTaskRunner::new(Arc::new(host))),
-                events,
-                mode,
-                subagent_cancels: cancels,
-            })
+            let runtime = WorkflowRuntime::spawn(
+                RuntimeDeps {
+                    state_dir,
+                    session_id: ctx.session_id.as_ref().unwrap().id(),
+                    cwd: ".".into(),
+                    user_config_dir: Some(temp.path().join("config")),
+                    remote_project_context: Some(context),
+                    runner: Arc::new(SubagentTaskRunner::new(Arc::new(host))),
+                    events,
+                    mode,
+                    subagent_cancels: cancels,
+                },
+                None,
+            )
             .await
             .unwrap();
             let handle = runtime.handle();

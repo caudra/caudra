@@ -78,7 +78,7 @@ use crate::{
 pub const SESSIONS_DB_FILE: &str = "caudra.sqlite";
 pub const SESSIONS_DB_LOCK_FILE: &str = "caudra.sqlite.lock";
 
-const SCHEMA_VERSION: i64 = 14;
+const SCHEMA_VERSION: i64 = 16;
 const APPLICATION_ID: i64 = i32::from_be_bytes(*b"CAUD") as i64;
 /// Pages copied per step of the pre-migration backup. The whole file is copied
 /// under the initialization lock, so this only bounds how long the backup holds
@@ -174,7 +174,7 @@ const RELOCATION_METADATA_FIELDS: [&str; 6] = [
     "plan_target",
     "plan_written",
     "structured_permission_rules",
-    "yolo",
+    "permission_mode",
     "snapshots_unavailable",
 ];
 
@@ -409,7 +409,7 @@ CREATE INDEX workflow_runs_by_session ON workflow_runs(session_id, created_at);
 CREATE TABLE workflow_calls (
     run_id       TEXT NOT NULL REFERENCES workflow_runs(run_id) ON DELETE CASCADE,
     call_key     INTEGER NOT NULL,
-    kind         TEXT NOT NULL CHECK(kind IN ('agent', 'parallel', 'scratch_file')),
+    kind         TEXT NOT NULL CHECK(kind IN ('agent', 'parallel', 'scratch_file', 'decision')),
     request_hash TEXT NOT NULL,
     request      TEXT NOT NULL CHECK(json_valid(request)),
     state        TEXT NOT NULL CHECK(state IN ('started', 'completed', 'failed')),
@@ -427,6 +427,42 @@ CREATE TABLE workflow_calls (
     ) STORED,
     PRIMARY KEY(run_id, call_key)
 ) STRICT;
+"#;
+
+const WORKFLOW_CALLS_ADD_DECISION: &str = r#"
+ALTER TABLE workflow_calls RENAME TO workflow_calls_v14;
+
+CREATE TABLE workflow_calls (
+    run_id       TEXT NOT NULL REFERENCES workflow_runs(run_id) ON DELETE CASCADE,
+    call_key     INTEGER NOT NULL,
+    kind         TEXT NOT NULL CHECK(kind IN ('agent', 'parallel', 'scratch_file', 'decision')),
+    request_hash TEXT NOT NULL,
+    request      TEXT NOT NULL CHECK(json_valid(request)),
+    state        TEXT NOT NULL CHECK(state IN ('started', 'completed', 'failed')),
+    result       TEXT CHECK(result IS NULL OR json_valid(result)),
+    error        TEXT,
+    task_id      TEXT,
+    started_at   INTEGER NOT NULL,
+    finished_at  INTEGER,
+    tokens_used  INTEGER NOT NULL DEFAULT 0,
+    duration_ms  INTEGER NOT NULL DEFAULT 0,
+    bytes        INTEGER NOT NULL GENERATED ALWAYS AS (
+        length(CAST(run_id AS BLOB)) + length(CAST(request_hash AS BLOB))
+        + length(CAST(request AS BLOB)) + coalesce(length(CAST(result AS BLOB)), 0)
+        + coalesce(length(CAST(error AS BLOB)), 0) + coalesce(length(CAST(task_id AS BLOB)), 0)
+    ) STORED,
+    PRIMARY KEY(run_id, call_key)
+) STRICT;
+
+INSERT INTO workflow_calls (
+    run_id, call_key, kind, request_hash, request, state, result, error,
+    task_id, started_at, finished_at, tokens_used, duration_ms
+)
+SELECT run_id, call_key, kind, request_hash, request, state, result, error,
+    task_id, started_at, finished_at, tokens_used, duration_ms
+FROM workflow_calls_v14;
+
+DROP TABLE workflow_calls_v14;
 "#;
 
 const WORKFLOW_RECEIPTS_TABLE: &str = "
@@ -608,6 +644,16 @@ const MIGRATIONS: &[Migration] = &[
         from: 13,
         to: 14,
         sql: JOB_OWNER_CHECKPOINTS_TABLE,
+    },
+    Migration {
+        from: 14,
+        to: 15,
+        sql: WORKFLOW_CALLS_ADD_DECISION,
+    },
+    Migration {
+        from: 15,
+        to: 16,
+        sql: crate::shell_durations::TABLES,
     },
 ];
 
@@ -859,8 +905,9 @@ CREATE TABLE pending_archives (
 /// What a fresh database gets: every migration already folded in.
 fn full_schema() -> String {
     format!(
-        "{SCHEMA}{USAGE_LEDGER_TABLE}{WORKFLOW_TABLES}{WORKFLOW_EVENTS_TABLE}{WORKFLOW_RECEIPTS_TABLE}{PERMISSION_REVISION_SCHEMA}{TOOL_USAGE_TABLES}{JOB_OWNER_CHECKPOINTS_TABLE}{}",
-        crate::background::TABLES
+        "{SCHEMA}{USAGE_LEDGER_TABLE}{WORKFLOW_TABLES}{WORKFLOW_EVENTS_TABLE}{WORKFLOW_RECEIPTS_TABLE}{PERMISSION_REVISION_SCHEMA}{TOOL_USAGE_TABLES}{JOB_OWNER_CHECKPOINTS_TABLE}{}{}",
+        crate::background::TABLES,
+        crate::shell_durations::TABLES
     )
 }
 
@@ -5897,10 +5944,15 @@ mod tests {
     use super::*;
     use crate::background::{JobPayload, ShellJobMetadata, TaskEvent, TaskRecord};
     use crate::permission_state::StructuredPermissionEffect;
-    use crate::sessions::{Session, StoredSubagentOutcome, TitleSource};
+    use crate::sessions::{PermissionMode, Session, StoredSubagentOutcome, TitleSource};
+    use crate::shell_durations::{
+        CommandDigest, DurationOutcome, DurationSource, ShellDurationKey,
+    };
     use crate::state::{WorkspaceTabs, project_scope, read_workspace_tabs, write_workspace_tabs};
     use crate::usage_ledger::BUCKET_SECONDS;
-    use crate::workflow::{WorkflowEventKind, WorkflowRunPatch, WorkflowRunRow, WorkflowUpdate};
+    use crate::workflow::{
+        WorkflowCallKind, WorkflowEventKind, WorkflowRunPatch, WorkflowRunRow, WorkflowUpdate,
+    };
     use crate::workflow_scratch::WORKFLOW_SCRATCH_DIR;
     use caudra_workspace::{
         AuthenticatedPrincipalId, AuthorityIdentity, CwdHandle, ProjectIdentity, ProjectKey,
@@ -5989,6 +6041,15 @@ mod tests {
     const CHILD_TASK: &str = "child-task";
     const OTHER_CHILD_TASK: &str = "other-child-task";
     const OWNER_CHECKPOINT_PREVIOUS_SCHEMA: i64 = 13;
+    const WORKFLOW_DECISION_PREVIOUS_SCHEMA: i64 = 14;
+    const WORKFLOW_CALL_HASH: &str = "call-hash";
+    const WORKFLOW_CALL_REQUEST: &str = r#"{"question":"évaluer"}"#;
+    const WORKFLOW_CALL_RESULT: &str = r#"{"answer":true}"#;
+    const WORKFLOW_CALL_ERROR: &str = "retained error";
+    const WORKFLOW_CALL_TASK: &str = "retained-task";
+    const INVALID_CALL_KIND: &str = "unknown_call_kind";
+    const DECISION_CALL_KEY: i64 = 4;
+    const MISSING_WORKFLOW_RUN: &str = "missing-workflow-run";
     const SHELL_INVOCATION: &str = "shell-invocation";
     const SHELL_TASK: &str = "shell-task";
     const SHELL_EVENT: &str = "shell-event";
@@ -6475,7 +6536,7 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
         database.save(&session, None).unwrap();
         database
             .connection
-            .execute_batch("DROP TABLE job_owner_checkpoints")
+            .execute_batch("DROP TABLE job_owner_checkpoints; DROP TABLE shell_durations;")
             .unwrap();
         database
             .connection
@@ -7644,8 +7705,12 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
         );
     }
 
-    #[test]
-    fn relocation_preserves_payloads_activity_and_binding_and_detaches_source_policy() {
+    #[test_case(PermissionMode::Ask; "ask")]
+    #[test_case(PermissionMode::Auto; "auto")]
+    #[test_case(PermissionMode::Yolo; "yolo")]
+    fn relocation_preserves_payloads_activity_and_binding_and_detaches_source_policy(
+        permission_mode: PermissionMode,
+    ) {
         let (_temp, state_dir) = state_dir();
         let mut database = SessionDatabase::open(&state_dir).unwrap();
         let mut session = TestSession::new(MODEL, MISSING_LEGACY_CWD);
@@ -7663,7 +7728,7 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
         session.meta.input_draft = Some(RELOCATION_DRAFT.into());
         session.meta.plan_path = Some(RELOCATION_PLAN.into());
         session.meta.plan_written = true;
-        session.meta.yolo = Some(true);
+        session.meta.permission_mode = Some(permission_mode);
         database.save(&session, None).unwrap();
         database
             .connection
@@ -7699,6 +7764,7 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
         assert_eq!(loaded.subagent_messages(), session.subagent_messages());
         assert_eq!(loaded.subagents(), session.subagents());
         assert_eq!(loaded.meta.input_draft, session.meta.input_draft);
+        assert!(loaded.meta.permission_mode.is_none());
         assert_eq!(
             after.logical_bytes + before.metadata.len(),
             before.logical_bytes + after.metadata.len()
@@ -9425,7 +9491,7 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
         let database = SessionDatabase::open(&state_dir).unwrap();
         database
             .connection
-            .execute_batch("DROP TABLE workflow_receipts; DROP TABLE job_owner_checkpoints;")
+            .execute_batch("DROP TABLE workflow_receipts; DROP TABLE job_owner_checkpoints; DROP TABLE shell_durations;")
             .unwrap();
         database
             .connection
@@ -9438,6 +9504,219 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
             !database
                 .workflow_receipt_exists(CaudraId::generate(), RUN_ID, 0)
                 .unwrap()
+        );
+    }
+
+    fn insert_workflow_call_fixture(
+        database: &SessionDatabase,
+        run_id: &str,
+        call_key: i64,
+        kind: &str,
+    ) -> Result<usize, SqliteError> {
+        database.connection.execute(
+            "INSERT INTO workflow_calls (run_id, call_key, kind, request_hash, request, state, \
+             result, error, task_id, started_at, finished_at, tokens_used, duration_ms) \
+             VALUES (?1, ?2, ?3, ?4, ?5, 'failed', ?6, ?7, ?8, 10, 20, 12, 34)",
+            params![
+                run_id,
+                call_key,
+                kind,
+                WORKFLOW_CALL_HASH,
+                WORKFLOW_CALL_REQUEST,
+                WORKFLOW_CALL_RESULT,
+                WORKFLOW_CALL_ERROR,
+                WORKFLOW_CALL_TASK,
+            ],
+        )
+    }
+
+    #[test_case(false; "fresh_schema")]
+    #[test_case(true; "migrated_schema_15")]
+    fn shell_duration_schema_preserves_workflow_decisions(migrate: bool) {
+        let (_temp, state) = state_dir();
+        let (_fresh_temp, fresh_state) = state_dir();
+        let mut database = SessionDatabase::open(&state).unwrap();
+        let mut session = TestSession::new(MODEL, CWD);
+        session.push_message(TestMessage(ARTIFACT_NAME.into()));
+        database.save(&session, None).unwrap();
+        relocation_workflow(&database, session.id, WorkflowRunStatus::Completed);
+        insert_workflow_call_fixture(
+            &database,
+            RELOCATION_RUN,
+            DECISION_CALL_KEY,
+            WorkflowCallKind::Decision.as_str(),
+        )
+        .unwrap();
+        let calls = database.load_workflow_calls(RELOCATION_RUN).unwrap();
+        if migrate {
+            database
+                .connection
+                .execute_batch("DROP TABLE shell_durations")
+                .unwrap();
+            database
+                .connection
+                .pragma_update(None, "user_version", 15)
+                .unwrap();
+        }
+        drop(database);
+        let database = SessionDatabase::open(&state).unwrap();
+        let fresh = SessionDatabase::open(&fresh_state).unwrap();
+        assert_eq!(database.stats().unwrap().schema_version, SCHEMA_VERSION);
+        assert_eq!(schema_objects(&database), schema_objects(&fresh));
+        assert_eq!(database.load_workflow_calls(RELOCATION_RUN).unwrap(), calls);
+        let loaded: TestSession = database.load(session.id).unwrap();
+        assert_eq!(loaded.messages, session.messages);
+        let key = ShellDurationKey {
+            workspace: CWD.into(),
+            family: TOOL_NAME.into(),
+            digest: CommandDigest::of_normalized(TOOL_NAME),
+        };
+        for _ in 0..3 {
+            database
+                .record_shell_duration(&key, DurationOutcome::Ok, 100)
+                .unwrap();
+        }
+        let estimate = database.shell_duration_estimate(&key).unwrap().unwrap();
+        assert_eq!(estimate.source, DurationSource::Exact);
+        assert_eq!(estimate.samples, 3);
+    }
+
+    #[test_case(false; "fresh_schema")]
+    #[test_case(true; "migrated_schema_14")]
+    fn workflow_decision_schema_preserves_calls_and_constraints(migrate: bool) {
+        let (_temp, state) = state_dir();
+        let (_fresh_temp, fresh_state) = state_dir();
+        let mut database = SessionDatabase::open(&state).unwrap();
+        if migrate {
+            let current_sql: String = database
+                .connection
+                .query_row(
+                    "SELECT sql FROM sqlite_schema WHERE name = 'workflow_calls'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let legacy_sql = current_sql.replace(", 'decision'", "");
+            assert_ne!(legacy_sql, current_sql);
+            database
+                .connection
+                .execute_batch("DROP TABLE workflow_calls; DROP TABLE shell_durations;")
+                .unwrap();
+            database.connection.execute_batch(&legacy_sql).unwrap();
+            database
+                .connection
+                .pragma_update(None, "user_version", WORKFLOW_DECISION_PREVIOUS_SCHEMA)
+                .unwrap();
+        }
+        let session = TestSession::new(MODEL, CWD);
+        database.save(&session, None).unwrap();
+        let run = relocation_workflow(&database, session.id, WorkflowRunStatus::Completed);
+        for (call_key, kind) in [
+            (2, WorkflowCallKind::Parallel),
+            (3, WorkflowCallKind::ScratchFile),
+        ] {
+            insert_workflow_call_fixture(&database, RELOCATION_RUN, call_key, kind.as_str())
+                .unwrap();
+        }
+        if migrate {
+            let error = insert_workflow_call_fixture(
+                &database,
+                RELOCATION_RUN,
+                DECISION_CALL_KEY,
+                WorkflowCallKind::Decision.as_str(),
+            )
+            .unwrap_err();
+            assert_eq!(
+                error.sqlite_extended_error_code(),
+                Some(ffi::SQLITE_CONSTRAINT_CHECK)
+            );
+        }
+        let calls = database.load_workflow_calls(RELOCATION_RUN).unwrap();
+        let events = database.load_workflow_events(RELOCATION_RUN).unwrap();
+        let bytes = database.workflow_bytes(session.id).unwrap();
+        drop(database);
+
+        let database = SessionDatabase::open(&state).unwrap();
+        let fresh = SessionDatabase::open(&fresh_state).unwrap();
+        assert_eq!(database.stats().unwrap().schema_version, SCHEMA_VERSION);
+        assert_eq!(schema_objects(&database), schema_objects(&fresh));
+        assert_eq!(database.load_workflow_calls(RELOCATION_RUN).unwrap(), calls);
+        assert_eq!(
+            database.load_workflow_run(RELOCATION_RUN).unwrap(),
+            Some(run)
+        );
+        assert_eq!(
+            database.load_workflow_events(RELOCATION_RUN).unwrap(),
+            events
+        );
+        assert_eq!(database.workflow_bytes(session.id).unwrap(), bytes);
+
+        insert_workflow_call_fixture(
+            &database,
+            RELOCATION_RUN,
+            DECISION_CALL_KEY,
+            WorkflowCallKind::Decision.as_str(),
+        )
+        .unwrap();
+        let call = database
+            .load_workflow_call(RELOCATION_RUN, DECISION_CALL_KEY as u64)
+            .unwrap()
+            .unwrap();
+        assert_eq!(call.kind, WorkflowCallKind::Decision);
+        let expected_bytes = [
+            RELOCATION_RUN,
+            WORKFLOW_CALL_HASH,
+            WORKFLOW_CALL_REQUEST,
+            WORKFLOW_CALL_RESULT,
+            WORKFLOW_CALL_ERROR,
+            WORKFLOW_CALL_TASK,
+        ]
+        .iter()
+        .map(|value| value.len() as u64)
+        .sum::<u64>();
+        assert_eq!(call.bytes, expected_bytes);
+        for (run_id, call_key, kind, code) in [
+            (
+                RELOCATION_RUN,
+                DECISION_CALL_KEY + 1,
+                INVALID_CALL_KIND,
+                ffi::SQLITE_CONSTRAINT_CHECK,
+            ),
+            (
+                RELOCATION_RUN,
+                DECISION_CALL_KEY,
+                WorkflowCallKind::Decision.as_str(),
+                ffi::SQLITE_CONSTRAINT_PRIMARYKEY,
+            ),
+            (
+                MISSING_WORKFLOW_RUN,
+                DECISION_CALL_KEY,
+                WorkflowCallKind::Decision.as_str(),
+                ffi::SQLITE_CONSTRAINT_FOREIGNKEY,
+            ),
+        ] {
+            let error =
+                insert_workflow_call_fixture(&database, run_id, call_key, kind).unwrap_err();
+            assert_eq!(error.sqlite_extended_error_code(), Some(code));
+        }
+        database
+            .connection
+            .execute(
+                "DELETE FROM workflow_runs WHERE run_id = ?1",
+                [RELOCATION_RUN],
+            )
+            .unwrap();
+        assert!(
+            database
+                .load_workflow_calls(RELOCATION_RUN)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            database
+                .load_workflow_events(RELOCATION_RUN)
+                .unwrap()
+                .is_empty()
         );
     }
 
@@ -9860,6 +10139,7 @@ CREATE TABLE subagent_history_items (
         connection
             .execute_batch(
                 &full_schema()
+                    .replace(crate::shell_durations::TABLES, "")
                     .replace(JOB_OWNER_CHECKPOINTS_TABLE, "")
                     .replace(crate::background::TABLES, "")
                     .replace(WORKFLOW_RECEIPTS_TABLE, ""),
@@ -9954,6 +10234,7 @@ CREATE TABLE subagents (
         connection
             .execute_batch(
                 &full_schema()
+                    .replace(crate::shell_durations::TABLES, "")
                     .replace(JOB_OWNER_CHECKPOINTS_TABLE, "")
                     .replace(crate::background::TABLES, "")
                     .replace(WORKFLOW_RECEIPTS_TABLE, ""),

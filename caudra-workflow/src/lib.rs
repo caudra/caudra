@@ -33,12 +33,13 @@ pub use catalog::{CatalogEntry, InvalidEntry, LaunchRequest, WorkflowCatalog};
 #[cfg(feature = "rhai")]
 pub use engine::{EngineError, RhaiEngine, RunParams, WorkflowEngine};
 pub use host::{
-    AgentRequest, AgentResult, CapabilityMode, HostError, ModelJob, UnknownCapabilityMode,
-    UnknownModelJob, WorkflowHost,
+    AgentRequest, AgentResult, CapabilityMode, DecisionRequest, DecisionResult, HostError,
+    ModelJob, UnknownCapabilityMode, UnknownModelJob, WorkflowHost,
 };
 pub use journal::{
     CallKey, CallKind, CallSignature, Journal, JournalEntry, JournalError, RequestHash,
-    agent_request_value, canonical_json, hash_request, scratch_request_value,
+    agent_request_value, canonical_json, decision_request_value, hash_request,
+    scratch_request_value,
 };
 #[cfg(feature = "rhai")]
 pub use meta::parse_meta;

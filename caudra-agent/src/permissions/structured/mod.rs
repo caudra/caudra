@@ -286,7 +286,13 @@ impl PermissionResourcePresentation {
         self.coverage.is_some()
     }
 }
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PermissionAdvisory {
+    pub flag: String,
+    pub probability: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PermissionPresentation {
     pub action: String,
     pub risk: PermissionRisk,
@@ -295,6 +301,8 @@ pub struct PermissionPresentation {
     /// Display-only, host-approved canonical project for available durable project grants.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub advisories: Vec<PermissionAdvisory>,
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PermissionRequest {

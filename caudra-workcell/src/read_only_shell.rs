@@ -258,18 +258,34 @@ fn is_read_only(analysis: &ShellCommandAnalysis, opaque: bool) -> bool {
     !opaque && !analysis.scopes.is_empty() && analysis.scopes.iter().all(scope_is_read_only)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum NotReadOnly {
+    #[error("command source differs from its normalized scope")]
+    SourceMismatch,
+    #[error("command arguments are not fully decoded")]
+    UndecodableWord,
+    #[error("executable has no deterministic read-only rule")]
+    UnknownCommand,
+    #[error("invocation is not supported by the executable's read-only rule")]
+    UnsupportedInvocation,
+}
+
 pub(crate) fn scope_is_read_only(scope: &ShellCommandScope) -> bool {
+    shell_read_only_verdict(scope).is_ok()
+}
+
+/// Classifies only the decoded command scope, not line effects or confinement.
+/// A failure means read-only is unproven, not that the command writes.
+pub(crate) fn shell_read_only_verdict(scope: &ShellCommandScope) -> Result<(), NotReadOnly> {
     if scope.source != scope.normalized {
-        return false;
+        return Err(NotReadOnly::SourceMismatch);
     }
     // Reading every flag is the whole basis for calling `git`, `rg`, and `find`
     // observers, and a word that does not mean its own text could be any of the
     // denied ones. Plan mode gates on this answer alone, so it cannot defer the
     // question to the confinement check the way the permission path does.
-    let Some(arguments) = literal_arguments(scope) else {
-        return false;
-    };
-    match scope.executable.as_str() {
+    let arguments = literal_arguments(scope).ok_or(NotReadOnly::UndecodableWord)?;
+    let read_only = match scope.executable.as_str() {
         GIT => git_is_read_only(&arguments),
         RG => !denies(&arguments, RG_DENIED_FLAGS) && no_attached_pattern_file(&arguments),
         GREP => {
@@ -289,7 +305,13 @@ pub(crate) fn scope_is_read_only(scope: &ShellCommandScope) -> bool {
         "printf" => arguments
             .first()
             .is_some_and(|format| !format.starts_with('-') || *format == "--"),
-        executable => READ_ONLY_COMMANDS.contains(&executable),
+        executable if READ_ONLY_COMMANDS.contains(&executable) => true,
+        _ => return Err(NotReadOnly::UnknownCommand),
+    };
+    if read_only {
+        Ok(())
+    } else {
+        Err(NotReadOnly::UnsupportedInvocation)
     }
 }
 
@@ -528,7 +550,11 @@ fn hides_in_cluster(argument: &str, flag: &str) -> bool {
 mod tests {
     use std::path::Path;
 
-    use super::{FIND, GIT, RG, SED, confined_read, is_read_only};
+    use super::{
+        FIND, GIT, NotReadOnly, RG, SED, confined_read, is_read_only, scope_is_read_only,
+        shell_read_only_verdict,
+    };
+    use crate::pattern_analysis::shell_facts;
     use test_case::test_case;
     use workcell::shell::bash::{BashContextAssumptions, parse_bash};
     use workcell::shell::{ShellCommandAnalysis, ShellCommandScope, ShellWord};
@@ -536,6 +562,54 @@ mod tests {
     const PROJECT: &str = "/home/dev/project";
     const DENIAL_IS_LOAD_BEARING: &str = "a denied flag must keep disqualifying its command";
     const COMMAND_SEPARATOR: &str = " && ";
+
+    #[test_case("git diff HEAD~1", Err(NotReadOnly::UndecodableWord); "unquoted_revision")]
+    #[test_case("git diff 'HEAD~1'", Ok(()); "single_quoted_revision")]
+    #[test_case("git diff \"HEAD~1\"", Ok(()); "double_quoted_revision")]
+    #[test_case("find . -name *.rs", Err(NotReadOnly::UndecodableWord); "unquoted_glob")]
+    #[test_case("find . -name '*.rs'", Ok(()); "quoted_glob")]
+    #[test_case("rg a.*b src", Err(NotReadOnly::UndecodableWord); "unquoted_pattern")]
+    #[test_case("rg 'a.*b' src", Ok(()); "quoted_pattern")]
+    #[test_case("cat $HOME", Err(NotReadOnly::UndecodableWord); "expansion")]
+    #[test_case("/bin/cat $HOME", Err(NotReadOnly::SourceMismatch); "source_mismatch_precedes_decoding")]
+    #[test_case("/bin/cat notes.md", Err(NotReadOnly::SourceMismatch); "qualified_executable")]
+    #[test_case("'cat' notes.md", Err(NotReadOnly::SourceMismatch); "quoted_executable")]
+    #[test_case("diff a b", Err(NotReadOnly::UnknownCommand); "unknown_reader")]
+    #[test_case("touch notes.md", Err(NotReadOnly::UnknownCommand); "unknown_writer")]
+    #[test_case("env git status", Err(NotReadOnly::UnknownCommand); "environment_wrapper")]
+    #[test_case("command git status", Err(NotReadOnly::UnknownCommand); "command_wrapper")]
+    #[test_case("bash -c 'git status'", Err(NotReadOnly::UnknownCommand); "shell_wrapper")]
+    #[test_case("git push origin main", Err(NotReadOnly::UnsupportedInvocation); "writing_subcommand")]
+    #[test_case("git clean -n", Err(NotReadOnly::UnsupportedInvocation); "unsupported_dry_run")]
+    #[test_case("git", Err(NotReadOnly::UnsupportedInvocation); "missing_subcommand")]
+    #[test_case("git log -n nope", Err(NotReadOnly::UnsupportedInvocation); "invalid_count_operand")]
+    #[test_case("printf", Err(NotReadOnly::UnsupportedInvocation); "missing_format")]
+    #[test_case("sed 's/a/b/' notes.md", Err(NotReadOnly::UnsupportedInvocation); "unsupported_script")]
+    #[test_case("sed -i 's/a/b/' notes.md", Err(NotReadOnly::UnsupportedInvocation); "writing_script")]
+    #[test_case("find . -delete", Err(NotReadOnly::UnsupportedInvocation); "denied_delete")]
+    #[test_case("rg --follow needle", Err(NotReadOnly::UnsupportedInvocation); "denied_nonwriting_flag")]
+    #[test_case("git status --short", Ok(()); "read_only_git")]
+    #[test_case("cat notes.md > out.txt", Ok(()); "redirect_is_not_a_scope_fact")]
+    #[test_case("cat .env", Ok(()); "protected_path_is_not_a_scope_fact")]
+    #[test_case("cat /etc/shadow", Ok(()); "confinement_is_not_a_scope_fact")]
+    fn parsed_scope_verdicts(command: &str, expected: Result<(), NotReadOnly>) {
+        let program = parse_bash(command).unwrap();
+        let contexts = program.command_contexts(Path::new(PROJECT));
+        let facts = shell_facts(&program, &contexts);
+        assert_eq!(facts.commands.len(), 1);
+        let scope = &facts.commands[0].scope;
+        assert_eq!(shell_read_only_verdict(scope), expected);
+        assert_eq!(scope_is_read_only(scope), expected.is_ok());
+    }
+
+    #[test_case(None; "unenumerated_arguments")]
+    #[test_case(Some(vec![ShellWord::Undecodable]); "undecodable_argument")]
+    fn unavailable_words_have_a_decoding_reason(arguments: Option<Vec<ShellWord>>) {
+        assert_eq!(
+            shell_read_only_verdict(&scope("pwd", arguments)),
+            Err(NotReadOnly::UndecodableWord)
+        );
+    }
 
     fn confined_reads(
         analysis: &ShellCommandAnalysis,

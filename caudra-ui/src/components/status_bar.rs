@@ -10,6 +10,7 @@ use crate::animation::spinner_frame;
 use crate::theme;
 
 use caudra_providers::format_tokens;
+use caudra_storage::sessions::PermissionMode;
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::Style;
@@ -48,6 +49,9 @@ const WORKFLOW_PHASE_SEPARATOR: &str = " \u{b7} ";
 const WORKFLOW_SUFFIX: &str = "]";
 const YOLO_LABEL: &str = " [yolo]";
 const YOLO_SHORT_LABEL: &str = " [!]";
+const AUTO_LABEL: &str = " [auto]";
+const AUTO_SHORT_LABEL: &str = " [a]";
+const DECISIONS_OFFLINE_LABEL: &str = "[decisions offline]";
 /// Says the transcript has stopped following, and clicking it starts again.
 const AUTO_SCROLL_PAUSED_LABEL: &str = "auto-scroll paused";
 /// A level narrower than this is already its own shortest unambiguous form, so
@@ -201,6 +205,7 @@ pub enum StatusBarHitTarget {
     Cwd,
     ResumeAutoScroll,
     Yolo,
+    Auto,
     Fast,
     Sandbox,
 }
@@ -231,6 +236,7 @@ impl StatusBarHitTarget {
             | Self::Cwd
             | Self::ResumeAutoScroll
             | Self::Yolo
+            | Self::Auto
             | Self::Tasks
             | Self::Shells
             | Self::Sandbox => ChatScope::Any,
@@ -314,7 +320,8 @@ pub struct StatusBarContext<'a> {
     /// Already rendered by [`workflow_chip`], so fitting the bar measures
     /// strings rather than formatting one per rung.
     pub workflows: Option<WorkflowChip>,
-    pub yolo: bool,
+    pub permission_mode: PermissionMode,
+    pub decisions_offline: bool,
     pub restoring: bool,
     pub goal: Option<&'a GoalSnapshot>,
     pub active_tasks: usize,
@@ -345,7 +352,7 @@ enum WorkflowTier {
 
 /// `[yolo]` spelled out, squeezed to `[!]`, or nothing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum YoloTier {
+enum PermissionTier {
     Named,
     Sigil,
     Hidden,
@@ -410,7 +417,7 @@ enum Reduction {
     CompactContext,
     ShortThinking,
     ShortWorkflows,
-    ShortYolo,
+    ShortPermission,
     DropTransition,
     DropSpend,
     DropContext,
@@ -418,7 +425,7 @@ enum Reduction {
     DropWorkflows,
     DropThinking,
     ChopModel,
-    DropYolo,
+    DropPermission,
 }
 
 /// The two rows of a split footer. Settings are what the user chose, which is
@@ -437,12 +444,12 @@ impl Reduction {
         match self {
             Self::LeafModel
             | Self::ShortThinking
-            | Self::ShortYolo
+            | Self::ShortPermission
             | Self::DropTransition
             | Self::DropFast
             | Self::DropThinking
             | Self::ChopModel
-            | Self::DropYolo => Band::Settings,
+            | Self::DropPermission => Band::Settings,
             Self::DropGauge
             | Self::DropGlobalSpend
             | Self::DropCompactionBorder
@@ -480,7 +487,7 @@ const LADDER: [Reduction; 16] = [
     Reduction::CompactContext,
     Reduction::ShortThinking,
     Reduction::ShortWorkflows,
-    Reduction::ShortYolo,
+    Reduction::ShortPermission,
     Reduction::DropTransition,
     Reduction::DropSpend,
     Reduction::DropContext,
@@ -488,7 +495,7 @@ const LADDER: [Reduction; 16] = [
     Reduction::DropWorkflows,
     Reduction::DropThinking,
     Reduction::ChopModel,
-    Reduction::DropYolo,
+    Reduction::DropPermission,
 ];
 
 /// The counters and prices, rendered once per frame so walking the ladder is
@@ -628,7 +635,7 @@ struct Fit {
     transition: bool,
     fast: bool,
     workflows: WorkflowTier,
-    yolo: YoloTier,
+    permission: PermissionTier,
 }
 
 impl Fit {
@@ -642,7 +649,7 @@ impl Fit {
         transition: true,
         fast: true,
         workflows: WorkflowTier::Named,
-        yolo: YoloTier::Named,
+        permission: PermissionTier::Named,
     };
 
     fn apply(&mut self, step: Reduction) {
@@ -654,7 +661,7 @@ impl Fit {
             Reduction::CompactContext => self.context = ContextTier::Percent,
             Reduction::ShortThinking => self.thinking = ThinkingTier::Short,
             Reduction::ShortWorkflows => self.workflows = WorkflowTier::Counts,
-            Reduction::ShortYolo => self.yolo = YoloTier::Sigil,
+            Reduction::ShortPermission => self.permission = PermissionTier::Sigil,
             Reduction::DropTransition => self.transition = false,
             Reduction::DropSpend => self.spend = false,
             Reduction::DropContext => self.context = ContextTier::Hidden,
@@ -662,7 +669,7 @@ impl Fit {
             Reduction::DropWorkflows => self.workflows = WorkflowTier::Hidden,
             Reduction::DropThinking => self.thinking = ThinkingTier::Hidden,
             Reduction::ChopModel => self.model = ModelTier::Chopped,
-            Reduction::DropYolo => self.yolo = YoloTier::Hidden,
+            Reduction::DropPermission => self.permission = PermissionTier::Hidden,
         }
     }
 
@@ -688,7 +695,7 @@ impl Fit {
         self.model_width(ctx, pair)
             + self.thinking_width(ctx)
             + usize::from(ctx.fast && self.fast) * FAST_LABEL.width()
-            + self.yolo_label(ctx).map_or(0, UnicodeWidthStr::width)
+            + self.permission_label(ctx).map_or(0, UnicodeWidthStr::width)
     }
 
     fn live_width(self, ctx: &StatusBarContext<'_>, spend: &SpendText) -> usize {
@@ -727,8 +734,8 @@ impl Fit {
         }
     }
 
-    fn yolo_label(self, ctx: &StatusBarContext<'_>) -> Option<&'static str> {
-        self.yolo.label().filter(|_| ctx.yolo)
+    fn permission_label(self, ctx: &StatusBarContext<'_>) -> Option<&'static str> {
+        self.permission.label(&ctx.permission_mode)
     }
 
     fn thinking_label<'a>(self, ctx: &'a StatusBarContext<'_>) -> Option<&'a str> {
@@ -784,12 +791,14 @@ impl Fit {
     }
 }
 
-impl YoloTier {
-    fn label(self) -> Option<&'static str> {
-        match self {
-            Self::Named => Some(YOLO_LABEL),
-            Self::Sigil => Some(YOLO_SHORT_LABEL),
-            Self::Hidden => None,
+impl PermissionTier {
+    fn label(self, mode: &PermissionMode) -> Option<&'static str> {
+        match (self, mode) {
+            (Self::Named, PermissionMode::Yolo) => Some(YOLO_LABEL),
+            (Self::Sigil, PermissionMode::Yolo) => Some(YOLO_SHORT_LABEL),
+            (Self::Named, PermissionMode::Auto) => Some(AUTO_LABEL),
+            (Self::Sigil, PermissionMode::Auto) => Some(AUTO_SHORT_LABEL),
+            (Self::Hidden, _) | (_, PermissionMode::Ask) => None,
         }
     }
 }
@@ -1013,6 +1022,7 @@ impl StatusBar {
         push_goal(&mut left, ctx);
         push_activity(&mut left, ctx);
         push_retry(&mut left, ctx);
+        push_decisions_status(&mut left, ctx);
         shorten_mode(&mut left, ctx, area.width, false);
         let right = match ctx.status {
             Status::Error { message, .. } => {
@@ -1082,6 +1092,7 @@ impl StatusBar {
         if let Some(flash) = self.flash_span() {
             messages.push(flash);
         }
+        push_decisions_status(&mut messages, ctx);
         let spend = SpendText::new(&ctx.stats);
         let budget = usize::from(area.width).saturating_sub(activity.width() + messages.width());
         let (fit, _) = fit_right(ctx, &spend, None, budget, Some(Band::Live));
@@ -1526,8 +1537,13 @@ fn right_side_animated<'a>(
     if !split {
         push_workflows(&mut chips, ctx, fit);
     }
-    if let Some(label) = fit.yolo_label(ctx) {
-        chips.padded(ctx, StatusBarHitTarget::Yolo, label, theme::current().error);
+    if let Some(label) = fit.permission_label(ctx) {
+        let (target, style) = if ctx.permission_mode == PermissionMode::Yolo {
+            (StatusBarHitTarget::Yolo, theme::current().error)
+        } else {
+            (StatusBarHitTarget::Auto, theme::current().tool_warning)
+        };
+        chips.padded(ctx, target, label, style);
     }
     if !split {
         push_meters(&mut chips, ctx, fit, &spend);
@@ -1663,6 +1679,15 @@ fn hoverable(ctx: &StatusBarContext<'_>, target: StatusBarHitTarget) -> bool {
     ) || clickable(ctx, target)
 }
 
+fn push_decisions_status(strip: &mut Strip, ctx: &StatusBarContext<'_>) {
+    if ctx.decisions_offline && ctx.permission_mode != PermissionMode::Yolo {
+        strip.push(Span::styled(
+            format!("{GAP}{DECISIONS_OFFLINE_LABEL}"),
+            theme::current().tool_warning,
+        ));
+    }
+}
+
 fn control_style(ctx: &StatusBarContext<'_>, target: StatusBarHitTarget) -> Style {
     if clickable(ctx, target) {
         theme::current().status_notice
@@ -1677,11 +1702,9 @@ fn control_style(ctx: &StatusBarContext<'_>, target: StatusBarHitTarget) -> Styl
 fn critical_right(ctx: &StatusBarContext<'_>) -> usize {
     GAP.width()
         + model_floor(ctx)
-        + if ctx.yolo {
-            YOLO_SHORT_LABEL.width()
-        } else {
-            0
-        }
+        + PermissionTier::Sigil
+            .label(&ctx.permission_mode)
+            .map_or(0, UnicodeWidthStr::width)
 }
 
 /// The widest rung the columns hold, with the name cut into its own slot first
@@ -2076,6 +2099,7 @@ mod tests {
     const MISSING_RESUME_HIT_MSG: &str = "a paused transcript must be resumable from the footer";
     const UNCLICKABLE_LABEL_MSG: &str = "the bar drew the resume label without a hit to click it";
     const MISSING_YOLO_HIT_MSG: &str = "a bypassed session must be switchable back from the footer";
+    const MISSING_AUTO_HIT_MSG: &str = "an auto session must be switchable back from the footer";
     const MISSING_FAST_HIT_MSG: &str = "a fast session must be switchable back from the footer";
     const UNCLICKABLE_YOLO_MSG: &str = "the bar drew the yolo chip without a hit to click it";
     const TASK_LEVEL_MISSING: &str = "a task footer must name the level that task runs at";
@@ -2160,7 +2184,8 @@ mod tests {
         compaction_border: Option<u32>,
         global_cost: Option<f64>,
         show_global: bool,
-        yolo: bool,
+        permission_mode: PermissionMode,
+        decisions_offline: bool,
         fast: bool,
         hovered: Option<StatusBarHitTarget>,
         hover_hint: Option<&'a str>,
@@ -2187,7 +2212,8 @@ mod tests {
                 compaction_border: None,
                 global_cost: None,
                 show_global: false,
-                yolo: false,
+                permission_mode: PermissionMode::Ask,
+                decisions_offline: false,
                 fast: false,
                 hovered: None,
                 hover_hint: None,
@@ -2234,7 +2260,8 @@ mod tests {
                 thinking: Some(THINKING_LEVEL.into()),
                 fast: self.fast,
                 workflows: self.workflows,
-                yolo: self.yolo,
+                permission_mode: self.permission_mode,
+                decisions_offline: self.decisions_offline,
                 restoring: false,
                 goal: self.goal,
                 active_tasks: self.active_tasks,
@@ -2343,7 +2370,7 @@ mod tests {
         render_at(Fixture {
             global_cost,
             show_global,
-            yolo,
+            permission_mode: PermissionMode::from(yolo),
             ..Default::default()
         })
         .0
@@ -2384,7 +2411,8 @@ mod tests {
             thinking: Some(LADDER_THINKING.into()),
             fast: true,
             workflows: ladder_workflows(),
-            yolo: true,
+            permission_mode: PermissionMode::Yolo,
+            decisions_offline: false,
             restoring: false,
             goal: None,
             active_tasks: 0,
@@ -2882,7 +2910,7 @@ mod tests {
             sandbox: Some(LONG_SANDBOX_NAME),
             chat_name: Some(LONG_SANDBOX_NAME),
             fast: true,
-            yolo: true,
+            permission_mode: PermissionMode::Yolo,
             ..Default::default()
         });
 
@@ -3025,7 +3053,7 @@ mod tests {
                 sandbox: Some(SANDBOX_NAME),
                 active_tasks: 1,
                 active_shells: 1,
-                yolo: true,
+                permission_mode: PermissionMode::Yolo,
                 ..Default::default()
             }
             .into_ctx();
@@ -3154,7 +3182,7 @@ mod tests {
         const LONG_NAME: &str = "a-session-name-longer-than-the-footer-can-afford";
         let (_, hits, _) = render_at(Fixture {
             chat_name: Some(LONG_NAME),
-            yolo: true,
+            permission_mode: PermissionMode::Yolo,
             ..Fixture::default()
         });
         let chat = hits
@@ -3361,7 +3389,7 @@ mod tests {
             width,
             global_cost: Some(SESSION_COST),
             show_global: true,
-            yolo: true,
+            permission_mode: PermissionMode::Yolo,
             goal: Some(&goal),
             ..Default::default()
         });
@@ -3691,7 +3719,7 @@ mod tests {
     #[test]
     fn a_bypassed_session_offers_a_yolo_control() {
         let (text, hits, _) = render_at(Fixture {
-            yolo: true,
+            permission_mode: PermissionMode::Yolo,
             ..Default::default()
         });
         let hit = hits
@@ -3709,10 +3737,118 @@ mod tests {
         let (text, hits, _) = render_at(Fixture::default());
 
         assert!(!text.contains(YOLO_LABEL.trim()));
+        assert!(!text.contains(AUTO_LABEL.trim()));
+        assert!(hits.iter().all(|hit| !matches!(
+            hit.target,
+            StatusBarHitTarget::Yolo | StatusBarHitTarget::Auto
+        )));
+    }
+
+    #[test_case(PermissionMode::Ask, SINGLE_ROW; "ask_single")]
+    #[test_case(PermissionMode::Auto, SINGLE_ROW; "auto_single")]
+    #[test_case(PermissionMode::Yolo, SINGLE_ROW; "yolo_single")]
+    #[test_case(PermissionMode::Ask, SPLIT_ROWS; "ask_split")]
+    #[test_case(PermissionMode::Auto, SPLIT_ROWS; "auto_split")]
+    #[test_case(PermissionMode::Yolo, SPLIT_ROWS; "yolo_split")]
+    fn decisions_offline_is_a_passive_warning_except_in_yolo(
+        permission_mode: PermissionMode,
+        rows: u16,
+    ) {
+        let yolo = permission_mode == PermissionMode::Yolo;
+        let ctx = Fixture {
+            permission_mode,
+            decisions_offline: true,
+            ..Default::default()
+        }
+        .into_ctx();
+        let drawn = draw(&ctx, BAR_WIDTH, rows);
+        let row = rows - 1;
+        let text = drawn.row(row);
+        if yolo {
+            assert!(!text.contains(DECISIONS_OFFLINE_LABEL));
+            return;
+        }
+        let offset = text.find(DECISIONS_OFFLINE_LABEL).unwrap();
+        let start = text[..offset].width();
+        let end = start + DECISIONS_OFFLINE_LABEL.width();
+        assert!(
+            drawn.styles[usize::from(row)][start..end]
+                .iter()
+                .all(|style| style.fg == theme::current().tool_warning.fg)
+        );
+        assert!(drawn.hits_on(row).iter().all(|hit| usize::from(hit.area.right()) <= start || usize::from(hit.area.x) >= end));
+    }
+
+    #[test_case(SINGLE_ROW; "single")]
+    #[test_case(SPLIT_ROWS; "split")]
+    fn decisions_status_is_absent_without_a_cached_failure(rows: u16) {
+        let drawn = draw(&Fixture::default().into_ctx(), BAR_WIDTH, rows);
+        assert!(
+            drawn
+                .rows
+                .iter()
+                .all(|row| !row.contains(DECISIONS_OFFLINE_LABEL))
+        );
+    }
+
+    #[test_case(true; "main_chat")]
+    #[test_case(false; "subagent_chat")]
+    fn auto_permission_mode_has_its_own_footer_control(main_chat: bool) {
+        let (text, hits, styles) = render_at(Fixture {
+            permission_mode: PermissionMode::Auto,
+            main_chat,
+            hovered: Some(StatusBarHitTarget::Auto),
+            ..Default::default()
+        });
+        let hit = hits
+            .iter()
+            .find(|hit| hit.target == StatusBarHitTarget::Auto)
+            .expect(MISSING_AUTO_HIT_MSG);
+        assert_eq!(bar_glyphs(&text, hit), AUTO_LABEL.trim());
+        assert_eq!(hit.target.scope(), ChatScope::Any);
+        assert!(hit.target.accepts_click());
+        assert!(!text.contains(YOLO_LABEL.trim()));
         assert!(
             hits.iter()
                 .all(|hit| hit.target != StatusBarHitTarget::Yolo)
         );
+        let start = usize::from(hit.area.x);
+        let end = usize::from(hit.area.right());
+        assert!(!styles[start - 1].add_modifier.contains(Modifier::REVERSED));
+        assert!(
+            styles[start..end]
+                .iter()
+                .all(|style| style.add_modifier.contains(Modifier::REVERSED))
+        );
+    }
+
+    #[test_case(3; "model_floor_only")]
+    #[test_case(8; "very_narrow")]
+    #[test_case(24; "cramped")]
+    #[test_case(60; "roomy")]
+    #[test_case(WIDE_BUDGET; "everything_fits")]
+    fn auto_permission_hit_tracks_its_label_at_every_tier(budget: usize) {
+        let ctx = Fixture {
+            permission_mode: PermissionMode::Auto,
+            ..Default::default()
+        }
+        .into_ctx();
+        let side = right_side(&ctx, LADDER_CWD, budget);
+        let text: String = side
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        match drawn_glyphs(&side, StatusBarHitTarget::Auto) {
+            Some(glyphs) => {
+                assert!([AUTO_LABEL.trim(), AUTO_SHORT_LABEL.trim()].contains(&glyphs.as_str()))
+            }
+            None => {
+                assert!(!text.contains(AUTO_LABEL.trim()));
+                assert!(!text.contains(AUTO_SHORT_LABEL.trim()));
+            }
+        }
+        assert!(drawn_glyphs(&side, StatusBarHitTarget::Yolo).is_none());
     }
 
     /// The chip keeps its warning colour, so the hover has only the reversal to
@@ -3720,7 +3856,7 @@ mod tests {
     #[test]
     fn hovering_the_yolo_control_highlights_its_chip_alone() {
         let (_, hits, styles) = render_at(Fixture {
-            yolo: true,
+            permission_mode: PermissionMode::Yolo,
             hovered: Some(StatusBarHitTarget::Yolo),
             ..Default::default()
         });
@@ -3823,7 +3959,7 @@ mod tests {
     #[test]
     fn a_subagent_footer_offers_the_yolo_control() {
         let (_, hits, _) = render_at(Fixture {
-            yolo: true,
+            permission_mode: PermissionMode::Yolo,
             main_chat: false,
             ..Default::default()
         });
@@ -4270,7 +4406,7 @@ mod tests {
             let busy = render_at(Fixture {
                 width,
                 workflows: ladder_workflows(),
-                yolo: true,
+                permission_mode: PermissionMode::Yolo,
                 ..Fixture::default()
             });
             (quiet.0.contains(MODE_LABEL) && busy.0.contains(MODE_SHORT_LABEL))

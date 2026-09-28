@@ -743,8 +743,8 @@ mod tests {
         pattern_recognition::CommandObservation,
     };
     use caudra_agent::tools::{
-        DescriptionContext, ParseError, Tool, ToolAudience, ToolFilter, ToolInvocation,
-        ToolRegistry, ToolSource,
+        DescriptionContext, ParseError, PlanModeAccess, Tool, ToolAudience, ToolFilter,
+        ToolInvocation, ToolRegistry, ToolSource,
     };
     use caudra_config::{Effect, PermissionRule, PermissionsConfig, ToolKey};
     use caudra_storage::StateDir;
@@ -753,13 +753,13 @@ mod tests {
     use serde_json::{Value, json};
     use tempfile::TempDir;
     use test_case::test_case;
-    use workcell::shell::ShellInput;
+    use workcell::shell::{PreparedShell, ShellInput};
 
     use super::{
         DISABLED, NO_TEMPLATE, PermissionEditorContext, PermissionEditorRuntime, READ_ONLY,
-        UNSUPPORTED, permission_authority_provider,
+        UNSUPPORTED, permission_authority_provider, shell_plan_access,
     };
-    use crate::WorkcellHost;
+    use crate::{WorkcellHost, pattern_analysis::shell_facts, read_only_shell};
 
     const SHELL: &str = "shell";
     const COMMAND: &str = "touch editor-sentinel";
@@ -812,6 +812,22 @@ mod tests {
 
         fn runtime(&self) -> PermissionEditorRuntime {
             self.context.current.read().unwrap().1.clone()
+        }
+
+        fn prepare_shell(&self, command: &str) -> PreparedShell {
+            let host = &self.host.inner;
+            let group = host
+                .runtime
+                .block_on(host.project_groups(self.project()))
+                .unwrap()
+                .shell;
+            host.runtime
+                .block_on(group.prepare(ShellInput {
+                    command: command.into(),
+                    timeout_sec: None,
+                    workdir: Some(self.project().to_str().unwrap().into()),
+                }))
+                .unwrap()
         }
 
         fn permissions(&self) -> PermissionManager {
@@ -1018,6 +1034,90 @@ mod tests {
         let prepared = host.runtime.block_on(group.prepare(input)).unwrap();
         assert_eq!(group.authorize_prepared(&prepared), Err(refusal));
         assert!(!fixture.project().join(SENTINEL).exists());
+    }
+
+    #[test_case("git status --short", false, true; "read_only")]
+    #[test_case("git diff HEAD~1", true, false; "unquoted_revision")]
+    #[test_case("git diff 'HEAD~1'", false, true; "quoted_revision")]
+    #[test_case("find . -name *.rs", true, false; "unquoted_glob")]
+    #[test_case("find . -name '*.rs'", false, true; "quoted_glob")]
+    #[test_case("rg a.*b src", true, false; "unquoted_regex")]
+    #[test_case("rg 'a.*b' src", false, true; "quoted_regex")]
+    #[test_case("git push origin main", false, false; "write")]
+    #[test_case("git clean -n", false, false; "unsupported_dry_run")]
+    #[test_case("touch editor-sentinel", false, false; "unknown_writer")]
+    #[test_case("diff a b", false, false; "unknown_reader")]
+    #[test_case("/bin/cat notes.md", false, false; "source_mismatch")]
+    #[test_case("env git status", true, false; "env_wrapper")]
+    #[test_case("command git status", true, false; "command_wrapper")]
+    #[test_case("bash -c 'git status'", true, false; "shell_wrapper")]
+    #[test_case("cat notes.md > editor-sentinel", true, true; "write_redirect")]
+    #[test_case("cat < notes.md", true, true; "read_redirect")]
+    #[test_case("cat notes.md 2>/dev/null", false, true; "null_redirect")]
+    #[test_case("cat .env", false, true; "protected_not_checked_by_plan_access")]
+    #[test_case("cat /etc/shadow", false, true; "confinement_not_checked_by_plan_access")]
+    #[test_case("git status && rg needle src", false, true; "read_sequence")]
+    #[test_case("git status | cat", false, true; "read_pipeline")]
+    #[test_case("git status && touch editor-sentinel", false, false; "mixed_read_write")]
+    #[test_case("cd - && cat notes.md", true, true; "unknown_cwd")]
+    fn prepared_shell_plan_access_preserves_deterministic_facts(
+        command: &str,
+        opaque: bool,
+        scopes_read_only: bool,
+    ) {
+        let fixture = Fixture::new();
+        let prepared = fixture.prepare_shell(command);
+        let program = prepared.bash_program().unwrap();
+        let contexts = prepared.bash_command_contexts().unwrap();
+        let facts = shell_facts(program, &contexts);
+        assert_eq!(facts.opaque, opaque);
+        assert!(!facts.commands.is_empty());
+        assert_eq!(
+            facts.commands.iter().all(|command| {
+                read_only_shell::shell_read_only_verdict(&command.scope).is_ok()
+            }),
+            scopes_read_only
+        );
+        assert_eq!(
+            shell_plan_access(&prepared),
+            if !opaque && scopes_read_only {
+                PlanModeAccess::ReadOnly
+            } else {
+                PlanModeAccess::Prompted
+            }
+        );
+        assert!(!fixture.project().join(SENTINEL).exists());
+    }
+
+    #[test_case("cat notes.md", vec![true]; "confined_reader")]
+    #[test_case("cat .env", vec![false]; "protected_operand")]
+    #[test_case("cat /etc/shadow", vec![false]; "outside_operand")]
+    #[test_case("cd . && cat notes.md", vec![true, true]; "known_cwd")]
+    #[test_case("cd - && cat notes.md", vec![false, false]; "unknown_cwd")]
+    fn prepared_scope_success_does_not_bypass_confinement(command: &str, confined: Vec<bool>) {
+        let fixture = Fixture::new();
+        let prepared = fixture.prepare_shell(command);
+        let program = prepared.bash_program().unwrap();
+        let contexts = prepared.bash_command_contexts().unwrap();
+        let facts = shell_facts(program, &contexts);
+        assert_eq!(
+            facts
+                .commands
+                .iter()
+                .map(|command| {
+                    assert_eq!(
+                        read_only_shell::shell_read_only_verdict(&command.scope),
+                        Ok(())
+                    );
+                    read_only_shell::confined_read(
+                        &command.scope,
+                        &command.context.unwrap().incoming,
+                        &fixture.project(),
+                    )
+                })
+                .collect::<Vec<_>>(),
+            confined
+        );
     }
 
     #[test_case(COMMAND; "mutating_command_not_executed")]

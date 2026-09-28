@@ -1,6 +1,7 @@
 use super::{PermissionAnswer, PermissionManager, PermissionRequest};
 use crate::CancelToken;
 use crate::{AgentEvent, EventSender};
+use event_listener::Event;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -14,6 +15,7 @@ pub(super) struct PermissionBroker {
     // Claim/register under this lock; evaluate policy, commit storage, and send only after release.
     pub(super) pending: Mutex<HashMap<u64, HashMap<String, PendingPermission>>>,
     pub(super) revision: AtomicU64,
+    pub(super) changed: Event,
 }
 
 impl PermissionBroker {
@@ -33,6 +35,7 @@ impl PermissionBroker {
         for sender in senders {
             let _ = sender.try_send(source_request_id.to_owned());
         }
+        self.changed.notify(usize::MAX);
     }
 }
 
@@ -199,7 +202,7 @@ mod tests {
         pending_scope_enforcement, pending_tool_enforcement, persistent_manager, remember_command,
     };
     use crate::permissions::{
-        PermissionAnswer, PermissionLifetime, PermissionManager, PermissionRequest,
+        PermissionAnswer, PermissionLifetime, PermissionManager, PermissionMode, PermissionRequest,
         PermissionRowGrant, PermissionRuleRecord,
     };
     use crate::{AgentEvent, EventSender};
@@ -1052,7 +1055,7 @@ mod tests {
             );
             received.try_recv().unwrap();
             assert!(manager.answer(CONTROLLED_REQUEST, PermissionAnswer::AllowOnce));
-            manager.set_session_yolo(Some(true));
+            manager.set_session_mode(Some(PermissionMode::Yolo));
             {
                 let mut configured = manager.configured.write().unwrap();
                 if default_deny {

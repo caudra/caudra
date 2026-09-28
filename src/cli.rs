@@ -1,6 +1,8 @@
 use std::path::PathBuf;
 
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap::{
+    Args, CommandFactory, Error as CliError, Parser, Subcommand, ValueEnum, error::ErrorKind,
+};
 use color_eyre::Result;
 use color_eyre::eyre::bail;
 
@@ -9,10 +11,12 @@ use caudra_config::is_disableable_tool;
 use caudra_config::sandbox::LeaseSeconds;
 use caudra_storage::auth::WorkcellCredentialName;
 use caudra_storage::retention::{Duration as RetentionDuration, GroupBy, KeepPolicy};
+use caudra_storage::sessions::PermissionMode;
 
 use crate::print::OutputFormat;
 
 const DEFAULT_LOG_LINES: usize = 200;
+const PERMISSION_MODE_CONFLICT: &str = "--auto cannot be used with --yolo";
 
 #[derive(Clone, ValueEnum, Default)]
 pub enum PromptVariant {
@@ -133,8 +137,17 @@ pub struct Cli {
     pub no_jit: bool,
 
     /// Skip all permission prompts (allow everything)
-    #[arg(long, alias = "dangerously-skip-permissions")]
+    #[arg(
+        long,
+        alias = "dangerously-skip-permissions",
+        global = true,
+        conflicts_with = "auto"
+    )]
     pub yolo: bool,
+
+    /// Run unmatched tool calls automatically while preserving explicit permission prompts
+    #[arg(long, global = true, conflicts_with = "yolo")]
+    pub auto: bool,
 
     /// Exit after the agent completes (for automation workflows)
     #[arg(long)]
@@ -228,6 +241,25 @@ pub struct Cli {
 }
 
 impl Cli {
+    pub fn validate(self) -> Result<Self, CliError> {
+        if self.auto && self.yolo {
+            return Err(
+                Self::command().error(ErrorKind::ArgumentConflict, PERMISSION_MODE_CONFLICT)
+            );
+        }
+        Ok(self)
+    }
+
+    pub fn permission_mode_override(&self) -> Option<PermissionMode> {
+        if self.yolo {
+            Some(PermissionMode::Yolo)
+        } else if self.auto {
+            Some(PermissionMode::Auto)
+        } else {
+            None
+        }
+    }
+
     pub fn warn_ignored_flags(&self) {
         let ignored = [
             (
@@ -369,9 +401,6 @@ pub enum Command {
         /// Model spec (provider/model-id)
         #[arg(short, long)]
         model: Option<String>,
-        /// Skip all permission prompts
-        #[arg(long)]
-        yolo: bool,
     },
     /// Show the rendered system prompt or tool definitions
     Prompt {
@@ -440,6 +469,11 @@ pub enum Command {
         #[command(subcommand)]
         action: StorageAction,
     },
+    #[command(about = "Inspect and export the opt-in decision-engine log")]
+    Decisions {
+        #[command(subcommand)]
+        action: DecisionAction,
+    },
     #[command(
         about = "Inspect permissions and discover review-only patterns without starting an agent"
     )]
@@ -453,6 +487,27 @@ pub enum Command {
         database: Option<PathBuf>,
         #[command(subcommand)]
         action: PermissionAction,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum DecisionAction {
+    #[command(about = "Show decision-engine configuration without contacting the endpoint")]
+    Status,
+    #[command(about = "Show logged decision counts, latency and labelled agreement as JSON")]
+    Stats {
+        #[arg(long)]
+        feature: Option<String>,
+    },
+    #[command(about = "Export labelled decisions as laya-evals JSONL to stdout")]
+    Export {
+        #[arg(long)]
+        feature: Option<String>,
+    },
+    #[command(about = "Delete all locally logged decisions")]
+    Purge {
+        #[arg(long, required = true)]
+        yes: bool,
     },
 }
 
@@ -1038,6 +1093,52 @@ mod tests {
     const MODEL_SPEC: &str = "openai/gpt-5";
     const PERMISSIONS_NOT_PARSED: &str = "expected permission rebind subcommand";
     const PERMISSION_DATABASE: &str = "/explicit-copy/caudra.sqlite";
+
+    #[test_case(&["caudra", "--auto"]; "root_auto")]
+    #[test_case(&["caudra", "acp", "--auto"]; "acp_auto")]
+    #[test_case(&["caudra", "--auto", "acp"]; "auto_before_acp")]
+    #[test_case(&["caudra", "-p", "--auto", "hello"]; "print_auto")]
+    fn auto_flag_is_global(args: &[&str]) {
+        let cli = Cli::try_parse_from(args).and_then(Cli::validate).unwrap();
+        assert_eq!(cli.permission_mode_override(), Some(PermissionMode::Auto));
+    }
+
+    #[test_case(&["caudra", "--auto", "--yolo"]; "root_conflict")]
+    #[test_case(&["caudra", "acp", "--auto", "--yolo"]; "acp_conflict")]
+    #[test_case(&["caudra", "--auto", "acp", "--yolo"]; "cross_scope_conflict")]
+    #[test_case(&["caudra", "--yolo", "acp", "--auto"]; "reverse_cross_scope_conflict")]
+    #[test_case(&["caudra", "--auto", "acp", "--dangerously-skip-permissions"]; "cross_scope_alias_conflict")]
+    #[test_case(&["caudra", "--auto", "--dangerously-skip-permissions"]; "alias_conflict")]
+    fn auto_and_yolo_are_mutually_exclusive(args: &[&str]) {
+        assert_eq!(
+            Cli::try_parse_from(args)
+                .and_then(Cli::validate)
+                .err()
+                .map(|error| error.kind()),
+            Some(ErrorKind::ArgumentConflict)
+        );
+    }
+
+    #[test_case("stats"; "stats")]
+    #[test_case("export"; "export")]
+    fn decision_log_filters_are_preserved(action: &str) {
+        let cli = Cli::try_parse_from(["caudra", "decisions", action, "--feature", "permission"])
+            .unwrap();
+        assert!(matches!(cli.command, Some(Command::Decisions {
+            action: DecisionAction::Stats { feature: Some(feature) }
+                | DecisionAction::Export { feature: Some(feature) },
+        }) if feature == "permission"));
+    }
+
+    #[test_case(false; "requires_confirmation")]
+    #[test_case(true; "confirmed")]
+    fn decision_log_purge_requires_confirmation(confirmed: bool) {
+        let mut args = vec!["caudra", "decisions", "purge"];
+        if confirmed {
+            args.push("--yes");
+        }
+        assert_eq!(Cli::try_parse_from(args).is_ok(), confirmed);
+    }
 
     #[test_case(&[], false; "default")]
     #[test_case(&["--no-snapshots"], true; "tui")]

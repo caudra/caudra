@@ -421,17 +421,6 @@ pub(super) fn seeded_mgr(yolo: bool) -> PermissionManager {
     )
 }
 
-/// A fork runs the same session, so it has to answer both questions the
-/// same way or a respawned agent drifts from the tab that owns it.
-pub(super) fn yolo_state(mgr: &PermissionManager) -> (bool, Option<bool>) {
-    let forked = mgr.fork();
-    assert_eq!(
-        (forked.is_yolo(), forked.persisted_yolo()),
-        (mgr.is_yolo(), mgr.persisted_yolo()),
-    );
-    (mgr.is_yolo(), mgr.persisted_yolo())
-}
-
 pub(super) const CARGO_TEST_COMMAND: &str = "cargo test";
 
 pub(super) const EMPTY_MCP_SCOPE: &str = "{}";

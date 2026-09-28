@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
-use crate::host::{AgentRequest, AgentResult};
+use crate::host::{AgentRequest, AgentResult, DecisionRequest, DecisionResult};
 
 pub const MAX_JOURNAL_ENTRIES: usize = 16_384;
 pub const MAX_JOURNAL_BYTES: usize = 64 * 1024 * 1024;
@@ -41,6 +41,7 @@ pub enum CallKind {
     Agent,
     Parallel,
     ScratchFile,
+    Decision,
 }
 
 impl CallKind {
@@ -49,6 +50,7 @@ impl CallKind {
             Self::Agent => "agent",
             Self::Parallel => "parallel",
             Self::ScratchFile => "scratch_file",
+            Self::Decision => "decision",
         }
     }
 }
@@ -100,6 +102,10 @@ pub fn canonical_json(value: &Value) -> String {
 /// The JSON the engine hashes for `agent` and `parallel` calls.
 pub fn agent_request_value(request: &AgentRequest) -> Value {
     serde_json::to_value(request).expect("AgentRequest is plain JSON data")
+}
+
+pub fn decision_request_value(request: &DecisionRequest) -> Value {
+    serde_json::to_value(request).expect("DecisionRequest is plain JSON data")
 }
 
 /// The JSON the engine hashes for `write_scratch_file` calls.
@@ -160,6 +166,14 @@ impl JournalEntry {
             CallKind::ScratchFile,
             hash_request(CallKind::ScratchFile, &scratch_request_value(name, content)),
             Value::String(path.to_owned()),
+        )
+    }
+
+    pub fn decision(request: &DecisionRequest, result: &DecisionResult) -> Self {
+        Self::new(
+            CallKind::Decision,
+            hash_request(CallKind::Decision, &decision_request_value(request)),
+            serde_json::to_value(result).expect("DecisionResult is plain JSON data"),
         )
     }
 
