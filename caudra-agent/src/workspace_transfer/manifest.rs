@@ -13,6 +13,9 @@ use crate::CancelToken;
 const FILTER_VERSION: &str = "caudra-transfer-protected-v1";
 const MAX_FILTERS: usize = 256;
 const MAX_FILTER_BYTES: usize = 512;
+/// Handed to both inventories while dotfiles are skipped, so neither lists inside a dot folder.
+const DOTFILE_PATTERN: &str = "**/.*";
+const DOTFILE_MARK: char = '.';
 const PROTECTED_NAMES: &[&str] = &[
     ".git",
     ".hg",
@@ -54,6 +57,7 @@ pub struct TransferFilters {
     excludes: GlobSet,
     digest: TransferDigest,
     respect_gitignore: bool,
+    skip_dotfiles: bool,
     patterns: Vec<String>,
 }
 
@@ -61,17 +65,20 @@ impl TransferFilters {
     pub fn new(
         profile: &TransferPolicy,
         global_excludes: &[String],
+        skip_dotfiles: bool,
     ) -> Result<Self, TransferError> {
-        if profile.delete_extraneous || profile.exclude.len() + global_excludes.len() > MAX_FILTERS
-        {
-            return Err(TransferError::Filter);
-        }
         let mut patterns = profile
             .exclude
             .iter()
             .chain(global_excludes)
             .cloned()
             .collect::<Vec<_>>();
+        if skip_dotfiles {
+            patterns.push(DOTFILE_PATTERN.to_owned());
+        }
+        if profile.delete_extraneous || patterns.len() > MAX_FILTERS {
+            return Err(TransferError::Filter);
+        }
         patterns.sort();
         patterns.dedup();
         let mut builder = GlobSetBuilder::new();
@@ -99,6 +106,7 @@ impl TransferFilters {
             excludes: builder.build().map_err(|_| TransferError::Filter)?,
             digest: digest(&(FILTER_VERSION, &patterns, profile.respect_gitignore))?,
             respect_gitignore: profile.respect_gitignore,
+            skip_dotfiles,
             patterns,
         })
     }
@@ -130,6 +138,9 @@ impl TransferFilters {
             prefix.push_str(component);
             if protected_component(component) {
                 return Some(ExclusionReason::Protected);
+            }
+            if self.skip_dotfiles && component.starts_with(DOTFILE_MARK) {
+                return Some(ExclusionReason::Dotfile);
             }
             if self.excludes.is_match(&prefix) || self.excludes.is_match(format!("{prefix}/")) {
                 return Some(ExclusionReason::Pattern);
@@ -163,6 +174,8 @@ pub enum ExclusionReason {
     Protected,
     Pattern,
     Gitignore,
+    /// Named with a leading dot while the session skips dotfiles.
+    Dotfile,
 }
 
 /// Why one side's scan is partial. `Bytes`, `Unreadable` and a file that `Changed` while hashed
@@ -576,7 +589,7 @@ impl WorkspaceTransfer {
 
 #[cfg(test)]
 mod tests {
-    use super::TransferFilters;
+    use super::{DOTFILE_PATTERN, ExclusionReason, TransferFilters};
     use caudra_config::sandbox::TransferPolicy;
     use caudra_workspace::WorkspacePath;
     use test_case::test_case;
@@ -594,8 +607,43 @@ mod tests {
             exclude: Vec::new(),
             ..TransferPolicy::default()
         };
-        let filters = TransferFilters::new(&policy, &[]).unwrap();
+        let filters = TransferFilters::new(&policy, &[], false).unwrap();
         assert!(filters.excludes(&WorkspacePath::new(name).unwrap()));
+    }
+
+    #[test_case(true, ".cache", Some(ExclusionReason::Dotfile); "dot folder")]
+    #[test_case(true, "src/.tool-versions", Some(ExclusionReason::Dotfile); "nested dotfile")]
+    #[test_case(true, ".env", Some(ExclusionReason::Protected); "protected before dotfile")]
+    #[test_case(true, "target/.fingerprint", Some(ExclusionReason::Pattern); "excluded ancestor first")]
+    #[test_case(true, "notes.d/todo", None; "inner dot")]
+    #[test_case(false, ".cache", None; "dotfiles shown")]
+    fn dotfiles_are_skipped_only_on_request(
+        skip: bool,
+        name: &str,
+        expected: Option<ExclusionReason>,
+    ) {
+        let filters = TransferFilters::new(&TransferPolicy::default(), &[], skip).unwrap();
+        assert_eq!(
+            filters.exclusion(&WorkspacePath::new(name).unwrap()),
+            expected
+        );
+    }
+
+    #[test]
+    fn skipping_dotfiles_binds_the_digest_and_reaches_the_inventory() {
+        let policy = TransferPolicy::default();
+        let shown = TransferFilters::new(&policy, &[], false).unwrap();
+        let skipped = TransferFilters::new(&policy, &[], true).unwrap();
+        assert_ne!(shown.digest(), skipped.digest());
+        for (filters, handed) in [(shown, false), (skipped, true)] {
+            assert_eq!(
+                filters
+                    .inventory_excludes()
+                    .iter()
+                    .any(|pattern| pattern == DOTFILE_PATTERN),
+                handed
+            );
+        }
     }
 
     #[test]
@@ -604,7 +652,7 @@ mod tests {
             exclude: vec!["cache/**".into(), "generated".into()],
             ..TransferPolicy::default()
         };
-        let filters = TransferFilters::new(&profile, &["global/**".into()]).unwrap();
+        let filters = TransferFilters::new(&profile, &["global/**".into()], false).unwrap();
         for name in ["cache", "cache/file", "generated/file", "global/file"] {
             assert!(
                 filters.excludes(&WorkspacePath::new(name).unwrap()),
@@ -614,13 +662,13 @@ mod tests {
         profile.exclude.reverse();
         assert_eq!(
             filters.digest(),
-            TransferFilters::new(&profile, &["global/**".into()])
+            TransferFilters::new(&profile, &["global/**".into()], false)
                 .unwrap()
                 .digest()
         );
         assert_ne!(
             filters.digest(),
-            TransferFilters::new(&profile, &[]).unwrap().digest()
+            TransferFilters::new(&profile, &[], false).unwrap().digest()
         );
     }
 }

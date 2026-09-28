@@ -97,7 +97,7 @@ pub enum TransferError {
     DirtyBuffer,
     #[error("transfer journal is invalid")]
     Journal,
-    #[error("local root identity is unavailable")]
+    #[error("local root must be an existing folder outside protected paths")]
     LocalRoot,
     #[error("publication was rejected without applying the file")]
     PublicationRejected,
@@ -1183,6 +1183,7 @@ mod tests {
     const PROTECTED: &str = ".env";
     const GENERATED: &str = "generated";
     const IGNORED: &str = "ignored";
+    const DOTFILE: &str = ".tool-versions";
     const MULTIBYTE: &str = "aé";
     const MULTIBYTE_CUT: usize = 2;
     const MULTIBYTE_PREFIX: &str = "a";
@@ -1518,7 +1519,7 @@ mod tests {
             };
             let engine = WorkspaceTransfer::new(
                 services,
-                TransferFilters::new(&TransferPolicy::default(), &[]).unwrap(),
+                TransferFilters::new(&TransferPolicy::default(), &[], false).unwrap(),
                 OrchestrationLimits::default(),
             )
             .unwrap();
@@ -3038,7 +3039,7 @@ mod tests {
             match change {
                 0 => {
                     fixture.engine.filters =
-                        TransferFilters::new(&TransferPolicy::default(), &["new/**".into()])
+                        TransferFilters::new(&TransferPolicy::default(), &["new/**".into()], false)
                             .unwrap()
                 }
                 1 => {
@@ -3499,11 +3500,12 @@ mod tests {
                     ..TransferPolicy::default()
                 },
                 &[],
+                true,
             )
             .unwrap();
             {
                 let mut state = fixture.fake.0.lock().unwrap();
-                for name in [PROTECTED, GENERATED, IGNORED, FILE] {
+                for name in [PROTECTED, GENERATED, IGNORED, FILE, DOTFILE] {
                     state.put(&Side::Local, name, AFTER, NodeKind::File);
                 }
                 state
@@ -3528,6 +3530,7 @@ mod tests {
                     (GENERATED, excluded(ExclusionReason::Pattern)),
                     (IGNORED, excluded(ExclusionReason::Gitignore)),
                     (FILE, excluded(ExclusionReason::Gitignore)),
+                    (DOTFILE, excluded(ExclusionReason::Dotfile)),
                 ])
             );
         });
@@ -3593,6 +3596,7 @@ mod tests {
                     ..TransferPolicy::default()
                 },
                 &[],
+                false,
             )
             .unwrap();
             let comparison = fixture.engine.compare(&CancelToken::none()).await.unwrap();

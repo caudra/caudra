@@ -120,6 +120,12 @@ const PARTIAL_OVERSIZED: &str = "z/y/bulk";
 const PARTIAL_OVERSIZED_FILES: usize = 4_200;
 const PARTIAL_CONTENT: &[u8] = b"partial tree bytes\n";
 const PARTIAL_LOCAL_EDIT: &[u8] = b"local edit\n";
+const DOTFILES_ROOT: &str = "dotfiles-tree";
+/// Sorts ahead of `DOTFILES_FOLDER` and outgrows Workcell's 4,096-entry inventory, the way a
+/// hidden checkout left a sandbox's `docs` unlisted.
+const DOTFILES_BULK: &str = ".bulk";
+const DOTFILES_FOLDER: &str = "docs";
+const DOTFILES_FILE: &str = "docs/guide.md";
 const PRIVATE_STATE_MODE: u32 = 0o700;
 const NATIVE_FILE: &str = "native/deep/reviewed.txt";
 const NATIVE_UPLOAD_DIRECTORY: &str = "native-empty-upload/deep/leaf";
@@ -343,7 +349,7 @@ async fn production_inventory_transfer(
                 cursor: client.root_cursor().clone(),
                 cwd: WorkspacePath::root(),
             },
-            TransferFilters::new(&TransferPolicy::default(), &[]).unwrap(),
+            TransferFilters::new(&TransferPolicy::default(), &[], false).unwrap(),
             OrchestrationLimits::default(),
             ReviewedTransferHost {
                 authorization: approval.clone(),
@@ -582,6 +588,7 @@ async fn partial_inventory_tree(client: &RemoteWorkcellClient, remote_path: &Pat
                     ..TransferPolicy::default()
                 },
                 &[],
+                false,
             )
             .unwrap(),
             OrchestrationLimits::default(),
@@ -645,6 +652,80 @@ async fn partial_inventory_tree(client: &RemoteWorkcellClient, remote_path: &Pat
     fs::remove_dir_all(remote).unwrap();
     eprintln!(
         "PASS partial inventory: nested rows without a root row, exclusion reasons, include ignored, oversized local side, previews refused"
+    );
+}
+
+async fn skipped_dotfiles_tree(client: &RemoteWorkcellClient, remote_path: &Path, fault: &Path) {
+    let local = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    fs::set_permissions(state.path(), fs::Permissions::from_mode(PRIVATE_STATE_MODE)).unwrap();
+    let remote = remote_path.join(DOTFILES_ROOT);
+    for root in [local.path(), remote.as_path()] {
+        let bulk = root.join(DOTFILES_BULK);
+        fs::create_dir_all(&bulk).unwrap();
+        for index in 0..PARTIAL_OVERSIZED_FILES {
+            fs::write(bulk.join(index.to_string()), PARTIAL_CONTENT).unwrap();
+        }
+        fs::create_dir_all(root.join(DOTFILES_FOLDER)).unwrap();
+        fs::write(root.join(DOTFILES_FILE), PARTIAL_CONTENT).unwrap();
+    }
+    let cwd = WorkspacePath::new(DOTFILES_ROOT).unwrap();
+    let resolved = client
+        .resolve_directory_cursor(client.session_binding(), client.root_cursor(), &cwd)
+        .await
+        .unwrap();
+    let host = Arc::new(TransferTestHost {
+        root: local.path().to_owned(),
+        fault: fault.to_owned(),
+        lose_response: AtomicBool::new(false),
+    });
+    for skip_dotfiles in [false, true] {
+        let engine = reviewed_workspace_transfer(
+            local.path().into(),
+            state.path().join("local-publications.json"),
+            client.clone(),
+            RemoteRootIdentity {
+                binding: client.session_binding().clone(),
+                cursor: resolved.cursor.clone(),
+                cwd: cwd.clone(),
+            },
+            TransferFilters::new(&TransferPolicy::default(), &[], skip_dotfiles).unwrap(),
+            OrchestrationLimits::default(),
+            ReviewedTransferHost {
+                authorization: host.clone(),
+                local_publication: Arc::new(FactoryLocalApproval),
+                buffers: host.clone(),
+                events: host.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        let comparison = engine.compare(&CancelToken::none()).await.unwrap();
+        let rows = comparison
+            .rows()
+            .iter()
+            .map(|row| (row.path.as_str(), (row.kind.clone(), row.excluded)))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(comparison.complete(), skip_dotfiles);
+        if skip_dotfiles {
+            assert_eq!(
+                rows,
+                BTreeMap::from([
+                    (
+                        DOTFILES_BULK,
+                        (ComparisonKind::Excluded, Some(ExclusionReason::Dotfile))
+                    ),
+                    (DOTFILES_FOLDER, (ComparisonKind::Equal, None)),
+                    (DOTFILES_FILE, (ComparisonKind::Equal, None)),
+                ])
+            );
+        } else {
+            assert!(!rows.contains_key(DOTFILES_FOLDER));
+        }
+    }
+    fs::remove_dir_all(remote).unwrap();
+    eprintln!(
+        "PASS skipped dotfiles: a hidden folder that fills the inventory starves later folders until dotfiles are skipped"
     );
 }
 
@@ -718,6 +799,7 @@ async fn native_reviewed_session(
         client.clone(),
         remote.clone(),
         &TransferPolicy::default(),
+        false,
         &StateDir::from_path(state.path().into()),
         host(),
     )
@@ -886,6 +968,7 @@ async fn native_reviewed_session(
             cwd: remote_root,
         },
         &TransferPolicy::default(),
+        false,
         &StateDir::from_path(state.path().into()),
         host(),
     )
@@ -1008,6 +1091,7 @@ fn reviewed_transfer() {
         };
         let client = connect().await.unwrap();
         partial_inventory_tree(&client, &root, &fault).await;
+        skipped_dotfiles_tree(&client, &root, &fault).await;
         let client =
             production_inventory_transfer(client, &root, &fault, &selection, &credential, &state)
                 .await;

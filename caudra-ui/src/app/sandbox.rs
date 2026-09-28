@@ -1354,6 +1354,7 @@ mod tests {
                 remote_root: WorkspacePath::root(),
                 attached_binding: Some(scope.binding.clone()),
                 include_ignored: false,
+                skip_dotfiles: false,
             }),
             scope: Box::new(scope),
         });

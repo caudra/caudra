@@ -39,8 +39,9 @@ const DIFF_WRAPS: bool = false;
 const WORKSPACE_ROOT: &str = ".";
 const ROOT_SEPARATOR: char = '/';
 const LIMIT_NOTICE: &str = "Presentation limit exceeded; choose a smaller selection or root. Nothing was truncated or approved.";
-const ROOT_NOTICE: &str =
-    "Roots need an existing absolute local folder and a workspace-relative sandbox folder";
+const LOCAL_ROOT_RELATIVE: &str = "Local root must be an absolute path";
+const SANDBOX_ROOT_OUTSIDE: &str = "Sandbox root must be a folder inside the workspace";
+const ROOT_FIX: &str = "to pick a folder";
 const DRAIN_NOTICE: &str = "Stopping; input stays locked until cleanup completes";
 const CLEANUP_NOTICE: &str = "Cleanup complete. Compare to validate the current roots again";
 const REVIEW_INCOMPLETE: &str = "Review needs a complete comparison of the current roots";
@@ -76,11 +77,25 @@ impl TransferRoots {
         }
     }
 
+    fn side(&self, side: TransferSide) -> &str {
+        match side {
+            TransferSide::Local => &self.local,
+            TransferSide::Remote => &self.remote,
+        }
+    }
+
     fn side_mut(&mut self, side: TransferSide) -> &mut String {
         match side {
             TransferSide::Local => &mut self.local,
             TransferSide::Remote => &mut self.remote,
         }
+    }
+
+    /// The first side whose root cannot be compared, and why.
+    fn problem(&self) -> Option<(TransferSide, &'static str)> {
+        TransferSide::BOTH
+            .into_iter()
+            .find_map(|side| root_problem(side, self.side(side)).map(|problem| (side, problem)))
     }
 }
 
@@ -114,6 +129,14 @@ impl TransferSide {
         match self {
             Self::Local => Self::Remote,
             Self::Remote => Self::Local,
+        }
+    }
+
+    /// The key that opens this side's root prompt.
+    fn root_key(self) -> keys::Bind {
+        match self {
+            Self::Local => keys::LOCAL_ROOT,
+            Self::Remote => keys::SANDBOX_ROOT,
         }
     }
 }
@@ -170,6 +193,8 @@ pub enum TransferExclusion {
     Protected,
     Pattern,
     Gitignore,
+    /// Named with a leading dot while dotfiles are skipped.
+    Dotfile,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -355,6 +380,7 @@ pub enum TransferAction {
         generation: u64,
         roots: TransferRoots,
         include_ignored: bool,
+        skip_dotfiles: bool,
     },
     Inspect {
         generation: u64,
@@ -485,6 +511,7 @@ pub(crate) struct TransferState {
     /// Set by the initial seed, which uploads create-only until it runs.
     seed: bool,
     include_ignored: bool,
+    skip_dotfiles: bool,
     changes_only: bool,
     tree: ComparisonTree,
     scans: [TransferScan; 2],
@@ -524,6 +551,7 @@ impl TransferState {
         self.anchor = None;
         self.seed = false;
         self.include_ignored = false;
+        self.skip_dotfiles = false;
         self.progress = None;
         self.hits = Hits::default();
         self.exit = None;
@@ -606,6 +634,7 @@ impl TransferState {
         self.anchor = None;
         self.seed = false;
         self.include_ignored = false;
+        self.skip_dotfiles = false;
         self.roots = roots;
         self.roots.normalize();
     }
@@ -725,8 +754,9 @@ impl TransferState {
 
     fn compare(&mut self) -> WorkbenchAction {
         self.roots.normalize();
-        if !valid_roots(&self.roots) {
-            self.notice = Some(Notice::Error(ROOT_NOTICE.to_owned()));
+        if let Some((side, problem)) = self.roots.problem() {
+            let fix = side.root_key().label;
+            self.notice = Some(Notice::Error(format!("{problem}; press {fix} {ROOT_FIX}")));
             return WorkbenchAction::Consumed;
         }
         if self.confirmed_roots.as_ref() == Some(&self.roots) {
@@ -744,11 +774,17 @@ impl TransferState {
             generation: self.generation,
             roots: self.roots.clone(),
             include_ignored: self.include_ignored,
+            skip_dotfiles: self.skip_dotfiles,
         })
     }
 
     fn toggle_ignored(&mut self) -> WorkbenchAction {
         self.include_ignored = !self.include_ignored;
+        self.compare()
+    }
+
+    fn toggle_dotfiles(&mut self) -> WorkbenchAction {
+        self.skip_dotfiles = !self.skip_dotfiles;
         self.compare()
     }
 
@@ -801,8 +837,10 @@ impl TransferState {
         self.prompt = Some(Prompt { side, text });
     }
 
-    /// Takes the typed root and compares under it. A root that cannot be
-    /// right keeps the prompt up with the text still in it.
+    /// Takes the typed root and compares under it. A typed root that cannot
+    /// be right keeps the prompt up with the text still in it. Only that root
+    /// is judged here: a bad root on the other side is refused by the
+    /// comparison instead, which names it.
     fn apply_prompt(&mut self) -> WorkbenchAction {
         let Some(prompt) = self.prompt.take() else {
             return WorkbenchAction::Consumed;
@@ -813,8 +851,8 @@ impl TransferState {
             TransferSide::Remote => prompt.text.trim_matches(ROOT_SEPARATOR).to_owned(),
         };
         roots.normalize();
-        if !valid_roots(&roots) {
-            self.notice = Some(Notice::Error(ROOT_NOTICE.to_owned()));
+        if let Some(problem) = root_problem(prompt.side, roots.side(prompt.side)) {
+            self.notice = Some(Notice::Error(problem.to_owned()));
             self.prompt = Some(prompt);
             return WorkbenchAction::Consumed;
         }
@@ -977,6 +1015,7 @@ impl TransferState {
     fn note_action(&mut self, folder: &str) -> WorkbenchAction {
         match self.offer(folder) {
             Some(NoteAction::IncludeIgnored) => self.toggle_ignored(),
+            Some(NoteAction::IncludeDotfiles) => self.toggle_dotfiles(),
             Some(NoteAction::CompareFolder) => self.compare_folder(folder),
             None => WorkbenchAction::Consumed,
         }
@@ -1014,6 +1053,9 @@ impl TransferState {
         if keys::INCLUDE_IGNORED.matches(key) {
             return self.toggle_ignored();
         }
+        if keys::SKIP_DOTFILES.matches(key) {
+            return self.toggle_dotfiles();
+        }
         if keys::PREVIOUS_ROOTS.matches(key) {
             return self.restore_roots();
         }
@@ -1037,10 +1079,11 @@ impl TransferState {
         if keys::CHANGES_ONLY.matches(key) {
             self.changes_only = !self.changes_only;
             self.refresh_rows(self.cursor_row().cloned());
-        } else if keys::LOCAL_ROOT.matches(key) {
-            self.edit_root(TransferSide::Local);
-        } else if keys::SANDBOX_ROOT.matches(key) {
-            self.edit_root(TransferSide::Remote);
+        } else if let Some(side) = TransferSide::BOTH
+            .into_iter()
+            .find(|side| side.root_key().matches(key))
+        {
+            self.edit_root(side);
         } else if keys::REPORT.matches(key) {
             self.open_panel(Panel::Report);
         } else if keys::FOCUS_NEXT.matches(key) || key.code == KeyCode::BackTab {
@@ -1314,13 +1357,15 @@ impl Workbench {
     }
 
     /// Brings the view up. Coming from another view starts without ignored
-    /// files, since that choice lasts only as long as the view stays up.
+    /// files and with dotfiles, since those choices last only as long as the
+    /// view stays up.
     pub fn open_transfer(&mut self) -> bool {
         if !self.transfer.available() || self.transfer.draining {
             return false;
         }
         if self.sidebar != SidebarView::Transfer {
             self.transfer.include_ignored = false;
+            self.transfer.skip_dotfiles = false;
         }
         self.open = true;
         self.sidebar = SidebarView::Transfer;
@@ -1659,8 +1704,13 @@ impl Workbench {
     }
 }
 
-fn valid_roots(roots: &TransferRoots) -> bool {
-    Path::new(&roots.local).is_absolute() && valid_relative(&roots.remote, true)
+/// Why `root` cannot be `side`'s root, if it cannot.
+fn root_problem(side: TransferSide, root: &str) -> Option<&'static str> {
+    match side {
+        TransferSide::Local if !Path::new(root).is_absolute() => Some(LOCAL_ROOT_RELATIVE),
+        TransferSide::Remote if !valid_relative(root, true) => Some(SANDBOX_ROOT_OUTSIDE),
+        _ => None,
+    }
 }
 
 fn preview_text(side: Option<&TransferPreviewSide>) -> Option<&str> {
@@ -1684,14 +1734,15 @@ mod tests {
     use super::tree::{Note, Row};
     use super::view::on_marker;
     use super::{
-        Button, DIFF_TRUNCATED, FOLDER_NOT_PAIRED, LIMIT_NOTICE, MAX_TRANSFER_ENTRIES,
-        MAX_TRANSFER_OPERATIONS, MAX_TRANSFER_PREVIEW_BYTES, MAX_TRANSFER_SELECTION, NO_HISTORY,
-        Notice, Panel, RECONCILE_OFFLINE, REVIEW_INCOMPLETE, ROOT_NOTICE, SELECTION_LIMIT,
-        TransferAction, TransferAvailability, TransferDirection, TransferEffect, TransferEntry,
-        TransferExclusion, TransferFileOutcome, TransferNodeKind, TransferOutcome,
-        TransferOutcomeEntry, TransferPhase, TransferPreview, TransferPreviewSide,
-        TransferProgress, TransferRecovery, TransferReview, TransferReviewEntry, TransferRoots,
-        TransferScan, TransferScanLimit, TransferSide, TransferSnapshot, TransferStatus,
+        Button, DIFF_TRUNCATED, FOLDER_NOT_PAIRED, LIMIT_NOTICE, LOCAL_ROOT_RELATIVE,
+        MAX_TRANSFER_ENTRIES, MAX_TRANSFER_OPERATIONS, MAX_TRANSFER_PREVIEW_BYTES,
+        MAX_TRANSFER_SELECTION, NO_HISTORY, Notice, Panel, RECONCILE_OFFLINE, REVIEW_INCOMPLETE,
+        ROOT_FIX, SANDBOX_ROOT_OUTSIDE, SELECTION_LIMIT, TransferAction, TransferAvailability,
+        TransferDirection, TransferEffect, TransferEntry, TransferExclusion, TransferFileOutcome,
+        TransferNodeKind, TransferOutcome, TransferOutcomeEntry, TransferPhase, TransferPreview,
+        TransferPreviewSide, TransferProgress, TransferRecovery, TransferReview,
+        TransferReviewEntry, TransferRoots, TransferScan, TransferScanLimit, TransferSide,
+        TransferSnapshot, TransferStatus,
     };
     use crate::{
         DocumentKey, Layout, MIN_SIDEBAR_WIDTH, SidebarView, TabLabel, Workbench, WorkbenchAction,
@@ -1711,6 +1762,7 @@ mod tests {
     const REMOTE_FOLDER_ROOT: &str = "workspace/src";
     const OTHER_ROOT: &str = "/host/other";
     const RELATIVE_ROOT: &str = "relative";
+    const ESCAPING_ROOT: &str = "../outside";
     const NESTED_SANDBOX_ROOT: &str = "/next";
     const SEPARATOR: &str = "/";
     /// The workspace root as the host prints it, and the row it once sent
@@ -1735,6 +1787,7 @@ mod tests {
     pub(super) const CHANGED_FILE: &str = "src/main.rs";
     pub(super) const EMPTY_FOLDER: &str = "empty";
     pub(super) const STAGE: &str = "stage";
+    pub(super) const DOT_FOLDER: &str = ".cache";
     /// `src/nested` and `src/nested/deep.rs` once `src` is the root.
     const INNER_FOLDER: &str = "nested";
     const INNER_FILE: &str = "nested/deep.rs";
@@ -2262,18 +2315,27 @@ mod tests {
         assert!(cursor_at(&workbench, CHANGED_FILE), "{CURSOR_LOST}");
     }
 
-    #[test]
-    fn an_ignored_folder_offers_to_include_ignored_files() {
+    #[test_case(keys::COMPARE, STAGE, TransferExclusion::Gitignore, true; "ignored")]
+    #[test_case(keys::SKIP_DOTFILES, DOT_FOLDER, TransferExclusion::Dotfile, false; "dotfile")]
+    fn a_folder_left_out_by_a_toggle_offers_to_bring_it_back(
+        start: keys::Bind,
+        name: &str,
+        reason: TransferExclusion,
+        include_ignored: bool,
+    ) {
         let mut workbench = workbench();
-        let generation = compare(
+        let action = press(&mut workbench, start);
+        let generation = answer(
             &mut workbench,
-            vec![excluded(STAGE, TransferExclusion::Gitignore)],
+            action,
+            vec![excluded(name, reason)],
+            TransferScan::default(),
         );
-        unfold(&mut workbench, &[STAGE]);
-        let note = Row::Note(STAGE.to_owned());
+        unfold(&mut workbench, &[name]);
+        let note = Row::Note(name.to_owned());
         assert_eq!(
             workbench.transfer.rows,
-            [Row::Entry(STAGE.to_owned()), note.clone()]
+            [Row::Entry(name.to_owned()), note.clone()]
         );
         point_at(&mut workbench, note);
         assert_eq!(
@@ -2281,7 +2343,8 @@ mod tests {
             WorkbenchAction::Transfer(TransferAction::Compare {
                 generation: generation.wrapping_add(1),
                 roots: roots(),
-                include_ignored: true,
+                include_ignored,
+                skip_dotfiles: false,
             })
         );
     }
@@ -2331,6 +2394,7 @@ mod tests {
                     remote: REMOTE_FOLDER_ROOT.to_owned(),
                 },
                 include_ignored: false,
+                skip_dotfiles: false,
             })
         );
         assert!(workbench.transfer.busy && workbench.transfer.pending);
@@ -2404,35 +2468,47 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn including_ignored_files_compares_again_under_a_fresh_generation() {
+    #[test_case(keys::INCLUDE_IGNORED, (true, false); "ignored")]
+    #[test_case(keys::SKIP_DOTFILES, (false, true); "dotfiles")]
+    fn a_filter_toggle_compares_again_under_a_fresh_generation(
+        toggle: keys::Bind,
+        (include_ignored, skip_dotfiles): (bool, bool),
+    ) {
         let mut workbench = workbench();
         let generation = compare(&mut workbench, project());
-        let action = press(&mut workbench, keys::INCLUDE_IGNORED);
+        let action = press(&mut workbench, toggle);
         assert_eq!(
             action,
             WorkbenchAction::Transfer(TransferAction::Compare {
                 generation: generation.wrapping_add(1),
                 roots: roots(),
-                include_ignored: true,
+                include_ignored,
+                skip_dotfiles,
             })
         );
         answer(&mut workbench, action, project(), TransferScan::default());
         assert_eq!(
-            press(&mut workbench, keys::INCLUDE_IGNORED),
+            press(&mut workbench, toggle),
             WorkbenchAction::Transfer(TransferAction::Compare {
                 generation: generation.wrapping_add(2),
                 roots: roots(),
                 include_ignored: false,
+                skip_dotfiles: false,
             })
         );
     }
 
-    #[test_case(true; "another_view")]
-    #[test_case(false; "same_view")]
-    fn including_ignored_files_lasts_while_the_view_stays_up(leave: bool) {
+    #[test_case(keys::INCLUDE_IGNORED, false, (true, false); "ignored_same_view")]
+    #[test_case(keys::INCLUDE_IGNORED, true, (false, false); "ignored_another_view")]
+    #[test_case(keys::SKIP_DOTFILES, false, (false, true); "dotfiles_same_view")]
+    #[test_case(keys::SKIP_DOTFILES, true, (false, false); "dotfiles_another_view")]
+    fn a_filter_toggle_lasts_while_the_view_stays_up(
+        toggle: keys::Bind,
+        leave: bool,
+        expected: (bool, bool),
+    ) {
         let mut workbench = workbench();
-        let action = press(&mut workbench, keys::INCLUDE_IGNORED);
+        let action = press(&mut workbench, toggle);
         let generation = answer(&mut workbench, action, project(), TransferScan::default());
         if leave {
             assert_eq!(
@@ -2444,12 +2520,14 @@ mod tests {
         }
         assert!(workbench.open_transfer());
         let WorkbenchAction::Transfer(TransferAction::Compare {
-            include_ignored, ..
+            include_ignored,
+            skip_dotfiles,
+            ..
         }) = press(&mut workbench, keys::COMPARE)
         else {
             panic!("{NO_COMPARE}");
         };
-        assert_eq!(include_ignored, !leave);
+        assert_eq!((include_ignored, skip_dotfiles), expected);
     }
 
     #[test]
@@ -2476,6 +2554,7 @@ mod tests {
                     remote: REMOTE_ROOT.to_owned(),
                 },
                 include_ignored: false,
+                skip_dotfiles: false,
             })
         );
         answer(&mut workbench, action, Vec::new(), TransferScan::default());
@@ -2485,6 +2564,7 @@ mod tests {
                 generation: generation.wrapping_add(2),
                 roots: roots(),
                 include_ignored: false,
+                skip_dotfiles: false,
             })
         );
     }
@@ -2496,9 +2576,60 @@ mod tests {
         press(&mut workbench, keys::CLEAR_ROOT);
         workbench.paste(RELATIVE_ROOT);
         assert_eq!(enter(&mut workbench), WorkbenchAction::Consumed);
-        assert_eq!(notice(&workbench), Some(ROOT_NOTICE));
+        assert_eq!(notice(&workbench), Some(LOCAL_ROOT_RELATIVE));
         assert_eq!(draft(&workbench), Some(RELATIVE_ROOT));
         assert_eq!(workbench.transfer.roots, roots(), "{DRAFT_APPLIED}");
+    }
+
+    #[test_case("", REMOTE_ROOT, keys::LOCAL_ROOT, LOCAL_ROOT_RELATIVE; "unset_local")]
+    #[test_case(RELATIVE_ROOT, REMOTE_ROOT, keys::LOCAL_ROOT, LOCAL_ROOT_RELATIVE; "relative_local")]
+    #[test_case(LOCAL_ROOT, ESCAPING_ROOT, keys::SANDBOX_ROOT, SANDBOX_ROOT_OUTSIDE; "escaping_sandbox")]
+    fn compare_names_the_root_it_refuses_and_the_key_that_edits_it(
+        local: &str,
+        remote: &str,
+        edit: keys::Bind,
+        problem: &str,
+    ) {
+        let mut workbench = workbench();
+        assert!(workbench.show_transfer(
+            TransferRoots {
+                local: local.to_owned(),
+                remote: remote.to_owned(),
+            },
+            TransferDirection::Push
+        ));
+        assert_eq!(
+            press(&mut workbench, keys::COMPARE),
+            WorkbenchAction::Consumed
+        );
+        let expected = format!("{problem}; press {} {ROOT_FIX}", edit.label);
+        assert_eq!(notice(&workbench), Some(expected.as_str()));
+    }
+
+    #[test]
+    fn a_sandbox_root_is_applied_while_the_local_root_is_refused() {
+        let mut workbench = workbench();
+        assert!(workbench.show_transfer(
+            TransferRoots {
+                local: RELATIVE_ROOT.to_owned(),
+                ..roots()
+            },
+            TransferDirection::Push
+        ));
+        press(&mut workbench, keys::SANDBOX_ROOT);
+        press(&mut workbench, keys::CLEAR_ROOT);
+        workbench.paste(NESTED_SANDBOX_ROOT);
+        assert_eq!(enter(&mut workbench), WorkbenchAction::Consumed);
+        assert_eq!(draft(&workbench), None);
+        assert_eq!(
+            workbench.transfer.roots.remote,
+            NESTED_SANDBOX_ROOT.trim_start_matches(SEPARATOR)
+        );
+        let expected = format!(
+            "{LOCAL_ROOT_RELATIVE}; press {} {ROOT_FIX}",
+            keys::LOCAL_ROOT.label
+        );
+        assert_eq!(notice(&workbench), Some(expected.as_str()));
     }
 
     #[test_case(SEPARATOR; "separator")]

@@ -30,6 +30,7 @@ const SEED_NAME: &str = "Initial seed";
 const UPLOAD_NAME: &str = "Upload";
 const DOWNLOAD_NAME: &str = "Download";
 const IGNORED_BADGE: &str = "Including ignored";
+const DOTFILES_BADGE: &str = "Skipping dotfiles";
 const CHANGES_BADGE: &str = "Changes only";
 const LOCAL_NAME: &str = "Local";
 const SANDBOX_NAME: &str = "Sandbox";
@@ -116,7 +117,10 @@ const CONFLICT_LABEL: &str = "type conflict";
 const CONFLICTS_LABEL: &str = "type conflicts";
 const BLOCKED_LABEL: &str = "never transferred";
 const INCLUDE_IGNORED_OFFER: &str = "includes ignored files";
+const INCLUDE_DOTFILES_OFFER: &str = "includes dotfiles";
 const COMPARE_FOLDER_OFFER: &str = "compares this folder";
+/// Stands in the header of a pane with no root yet.
+const ROOT_OFFER: &str = "picks a folder";
 const OUTCOMES: [TransferFileOutcome; 4] = [
     TransferFileOutcome::Confirmed,
     TransferFileOutcome::Failed,
@@ -393,6 +397,7 @@ impl TransferState {
         [
             (self.seed, SEED_NAME),
             (self.include_ignored, IGNORED_BADGE),
+            (self.skip_dotfiles, DOTFILES_BADGE),
             (self.changes_only, CHANGES_BADGE),
         ]
         .into_iter()
@@ -476,11 +481,17 @@ impl TransferState {
             false => styles.dim,
         };
         let budget = usize::from(width).saturating_sub(title.width() + TAB_GAP.width());
-        Line::from(vec![
+        let mut spans = vec![
             Span::styled(title, style),
             Span::styled(TAB_GAP, styles.background),
-            Span::styled(chrome::fit_end(&root, budget), styles.dim),
-        ])
+        ];
+        if root.is_empty() {
+            spans.push(Span::styled(side.root_key().label, styles.accent));
+            spans.push(Span::styled(format!("{TAB_GAP}{ROOT_OFFER}"), styles.dim));
+            return truncate(spans, usize::from(width));
+        }
+        spans.push(Span::styled(chrome::fit_end(&root, budget), styles.dim));
+        Line::from(spans)
     }
 
     /// One side of one row, shaped like the explorer's: the check column, the
@@ -995,6 +1006,7 @@ fn noun(count: usize, one: &'static str, many: &'static str) -> &'static str {
 fn offer_hint(action: NoteAction) -> (&'static str, &'static str) {
     match action {
         NoteAction::IncludeIgnored => (keys::INCLUDE_IGNORED.label, INCLUDE_IGNORED_OFFER),
+        NoteAction::IncludeDotfiles => (keys::SKIP_DOTFILES.label, INCLUDE_DOTFILES_OFFER),
         NoteAction::CompareFolder => (ENTER_LABEL, COMPARE_FOLDER_OFFER),
     }
 }
@@ -1269,26 +1281,27 @@ mod tests {
 
     use super::{
         ABSENT_MARK, BINARY_BADGE, CANCELLED_MARK, CHANGED_MARK, CHANGES_BADGE, CHANGES_TITLE,
-        CHECK_MARK, COMPARE_FAILED, DIFF_LEGEND, DIFFERENT_MARK, DIGEST_LABEL, DROPPED_ROW,
-        FAILED_MARK, IGNORED_BADGE, INCLUDE_IGNORED_OFFER, LOCAL_NAME, MKDIR_EFFECT, NEW_EFFECT,
-        NOT_EXECUTABLE, NOTHING_CHOSEN, ONLY_HERE_MARK, OVERWRITE_EFFECT, RECONCILE_OFFER,
-        RECOVERY_REQUIRED, REPORT_TITLE, REVIEW_TITLE, SANDBOX_NAME, SCAN_ACTION, SCAN_INCOMPLETE,
-        SEED_NAME, SELECTION_TITLE, SKIPPED_TITLE, STOPPED_LABEL, TITLE_MARK, TRUNCATED_BADGE,
-        UNKNOWN_MARK, limit_text, progress_text, size,
+        CHECK_MARK, COMPARE_FAILED, DIFF_LEGEND, DIFFERENT_MARK, DIGEST_LABEL, DOTFILES_BADGE,
+        DROPPED_ROW, FAILED_MARK, IGNORED_BADGE, INCLUDE_DOTFILES_OFFER, INCLUDE_IGNORED_OFFER,
+        LOCAL_NAME, MKDIR_EFFECT, NEW_EFFECT, NOT_EXECUTABLE, NOTHING_CHOSEN, ONLY_HERE_MARK,
+        OVERWRITE_EFFECT, RECONCILE_OFFER, RECOVERY_REQUIRED, REPORT_TITLE, REVIEW_TITLE,
+        ROOT_OFFER, SANDBOX_NAME, SCAN_ACTION, SCAN_INCOMPLETE, SEED_NAME, SELECTION_TITLE,
+        SKIPPED_TITLE, STOPPED_LABEL, TITLE_MARK, TRUNCATED_BADGE, UNKNOWN_MARK, limit_text,
+        progress_text, size,
     };
     use crate::chrome::{ELLIPSIS, VERTICAL};
     use crate::transfer::tests::{
-        CHANGED_FILE, CONTENTS, DIGEST, DOT, EMPTY_FOLDER, FILE_NAME, FOLDER, LABEL, LOCAL_ROOT,
-        NARROW, PREVIEW_DIGEST, RECOVERY, SANDBOX_DRAFT, STAGE, STOPPED, UPDATED, WIDE, answer,
-        compare, enter, excluded, file, folder, outcome, paint, partial, pending_recovery,
+        CHANGED_FILE, CONTENTS, DIGEST, DOT, DOT_FOLDER, EMPTY_FOLDER, FILE_NAME, FOLDER, LABEL,
+        LOCAL_ROOT, NARROW, PREVIEW_DIGEST, RECOVERY, SANDBOX_DRAFT, STAGE, STOPPED, UPDATED, WIDE,
+        answer, compare, enter, excluded, file, folder, outcome, paint, partial, pending_recovery,
         point_at, press, preview, project, roots, unfold, workbench,
     };
     use crate::transfer::tree::{Note, Row};
     use crate::transfer::{
         Button, DIFF_TRUNCATED, TransferAction, TransferDirection, TransferEffect, TransferEntry,
         TransferExclusion, TransferFileOutcome, TransferOutcome, TransferOutcomeEntry,
-        TransferPhase, TransferProgress, TransferReview, TransferReviewEntry, TransferScan,
-        TransferScanLimit, TransferSide, TransferStatus,
+        TransferPhase, TransferProgress, TransferReview, TransferReviewEntry, TransferRoots,
+        TransferScan, TransferScanLimit, TransferSide, TransferStatus,
     };
     use crate::{Workbench, WorkbenchAction, keys};
     use std::collections::BTreeSet;
@@ -1418,6 +1431,24 @@ mod tests {
         );
     }
 
+    #[test_case(NARROW, true; "narrow_set")]
+    #[test_case(NARROW, false; "narrow_unset")]
+    #[test_case(WIDE, false; "wide_unset")]
+    fn only_an_unset_local_root_offers_its_key_in_the_header(terminal: (u16, u16), set: bool) {
+        let mut workbench = workbench();
+        let local = if set { LOCAL_ROOT } else { "" };
+        assert!(workbench.show_transfer(
+            TransferRoots {
+                local: local.to_owned(),
+                ..roots()
+            },
+            TransferDirection::Push
+        ));
+        let offer = format!("{} {ROOT_OFFER}", keys::LOCAL_ROOT.label);
+        let screen = paint(&mut workbench, terminal);
+        assert_eq!(screen.contains(&offer), !set, "{offer}\n{screen}");
+    }
+
     #[test]
     fn a_wide_tree_shows_each_note_whole_with_what_it_offers() {
         let mut workbench = unfolded();
@@ -1433,15 +1464,45 @@ mod tests {
     }
 
     #[test]
+    fn a_skipped_dotfile_folder_says_why_and_offers_them_back() {
+        let mut workbench = workbench();
+        let action = press(&mut workbench, keys::SKIP_DOTFILES);
+        answer(
+            &mut workbench,
+            action,
+            vec![excluded(DOT_FOLDER, TransferExclusion::Dotfile)],
+            TransferScan::default(),
+        );
+        unfold(&mut workbench, &[DOT_FOLDER]);
+        let screen = paint(&mut workbench, WIDE);
+        assert_painted(
+            &screen,
+            &[
+                Note::Dotfile.badge().unwrap(),
+                Note::Dotfile.text(),
+                INCLUDE_DOTFILES_OFFER,
+            ],
+        );
+    }
+
+    #[test]
     fn the_toolbar_names_the_sandbox_every_mode_in_force_and_every_button() {
         let mut workbench = workbench();
         assert!(workbench.show_transfer(roots(), TransferDirection::Seed));
-        let action = press(&mut workbench, keys::INCLUDE_IGNORED);
-        answer(&mut workbench, action, project(), TransferScan::default());
+        for toggle in [keys::INCLUDE_IGNORED, keys::SKIP_DOTFILES] {
+            let action = press(&mut workbench, toggle);
+            answer(&mut workbench, action, project(), TransferScan::default());
+        }
         press(&mut workbench, keys::CHANGES_ONLY);
         let screen = paint(&mut workbench, WIDE);
         let title = format!("{TITLE_MARK}{LABEL}");
-        let mut expected = vec![title.as_str(), SEED_NAME, IGNORED_BADGE, CHANGES_BADGE];
+        let mut expected = vec![
+            title.as_str(),
+            SEED_NAME,
+            IGNORED_BADGE,
+            DOTFILES_BADGE,
+            CHANGES_BADGE,
+        ];
         expected.extend(Button::ALL.map(Button::label));
         assert_painted(&screen, &expected);
     }

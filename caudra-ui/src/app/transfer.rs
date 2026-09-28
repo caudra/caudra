@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::env;
 use std::path::PathBuf;
 
 use caudra_agent::AgentEvent;
@@ -61,7 +62,9 @@ impl App {
                         serde_json::to_string(binding).ok()?
                     ),
                     label: label.to_owned(),
-                    local_root: None,
+                    local_root: env::current_dir()
+                        .ok()
+                        .and_then(|cwd| cwd.into_os_string().into_string().ok()),
                     remote_root: WorkspacePath::root().to_string(),
                     directory_effects: self
                         .sandbox_live
@@ -170,6 +173,7 @@ impl App {
                 generation,
                 roots,
                 include_ignored,
+                skip_dotfiles,
             } => {
                 if generation != self.bound_workbench().transfer_generation() {
                     return Err(STALE.into());
@@ -183,6 +187,7 @@ impl App {
                     remote_root: sandbox_root(roots.remote)?,
                     attached_binding: Some(scope.binding.clone()),
                     include_ignored,
+                    skip_dotfiles,
                 };
                 if let Some(worker) = self.sandbox_live.transfer.as_mut() {
                     worker.cancel();
@@ -580,6 +585,7 @@ fn entries(rows: &[ComparisonRow]) -> Vec<TransferEntry> {
                 ExclusionReason::Protected => TransferExclusion::Protected,
                 ExclusionReason::Pattern => TransferExclusion::Pattern,
                 ExclusionReason::Gitignore => TransferExclusion::Gitignore,
+                ExclusionReason::Dotfile => TransferExclusion::Dotfile,
             }),
             unlisted: row.unlisted,
         })
@@ -832,7 +838,7 @@ mod tests {
     };
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use serde_json::json;
-    use std::{fs, sync::Arc, time::Duration};
+    use std::{env, fs, path::PathBuf, sync::Arc, time::Duration};
     use test_case::test_case;
 
     const REVISION: &str =
@@ -967,6 +973,19 @@ mod tests {
         assert_eq!(sandbox_root(roots.remote), Ok(WorkspacePath::root()));
     }
 
+    #[test]
+    fn an_attached_view_compares_from_the_working_directory() {
+        let mut app = attached();
+        assert!(app.workbench.open_transfer());
+        let WorkbenchAction::Transfer(TransferAction::Compare { roots, .. }) = app
+            .workbench
+            .handle_key(KeyEvent::new(KeyCode::F(5), KeyModifiers::NONE))
+        else {
+            panic!("{NO_COMPARE}");
+        };
+        assert_eq!(PathBuf::from(roots.local), env::current_dir().unwrap());
+    }
+
     #[test_case(false; "escape")]
     #[test_case(true; "close_chord")]
     fn lease_isolates_editor_composer_and_other_sessions_until_cleanup(close_chord: bool) {
@@ -995,6 +1014,7 @@ mod tests {
                 remote_root: WorkspacePath::root(),
                 attached_binding: Some(scope.binding.clone()),
                 include_ignored: false,
+                skip_dotfiles: false,
             }),
             scope: Box::new(scope),
         });
@@ -1194,7 +1214,9 @@ mod tests {
             .workbench
             .handle_key(KeyEvent::new(KeyCode::F(5), KeyModifiers::NONE));
         let WorkbenchAction::Transfer(TransferAction::Compare {
-            include_ignored, ..
+            include_ignored,
+            skip_dotfiles,
+            ..
         }) = action
         else {
             panic!("{NO_COMPARE}");
@@ -1212,6 +1234,7 @@ mod tests {
                         remote_root: WorkspacePath::root(),
                         attached_binding: Some(scope.binding.clone()),
                         include_ignored,
+                        skip_dotfiles,
                     }),
                     scope: Box::new(scope),
                 },

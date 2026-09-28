@@ -127,6 +127,7 @@ pub(super) fn run(args: SandboxTransferArgs, state: &StateDir) -> Result<()> {
         remote_root: WorkspacePath::new(&args.remote_root)?,
         attached_binding: None,
         include_ignored: false,
+        skip_dotfiles: false,
     };
     let paths = args
         .selected

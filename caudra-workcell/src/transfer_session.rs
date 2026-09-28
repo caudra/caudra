@@ -60,6 +60,7 @@ impl TransferSession {
         remote: RemoteWorkcellClient,
         remote_root: RemoteRootIdentity,
         policy: &TransferPolicy,
+        skip_dotfiles: bool,
         state: &StateDir,
         host: TransferSessionHost,
     ) -> Result<Self, TransferError> {
@@ -89,7 +90,7 @@ impl TransferSession {
             state_root.join(format!("transfer-{key}.local.json")),
             remote,
             remote_root,
-            TransferFilters::new(policy, &[])?,
+            TransferFilters::new(policy, &[], skip_dotfiles)?,
             OrchestrationLimits::default(),
             ReviewedTransferHost {
                 authorization: authorization.clone(),

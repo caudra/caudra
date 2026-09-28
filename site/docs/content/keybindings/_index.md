@@ -255,6 +255,7 @@ Some pickers add extra bindings on top of the defaults:
 | Workbench Transfer | `A` | Approve the review on screen, exactly as shown |
 | Workbench Transfer | `=` / `F5` | Compare the roots again |
 | Workbench Transfer | `I` | Include or leave out ignored files until Transfer closes |
+| Workbench Transfer | `.` | Skip or include dotfiles until Transfer closes |
 | Workbench Transfer | `F` | Show only what differs |
 | Workbench Transfer | `L` / `S` | Edit the local / sandbox root |
 | Workbench Transfer | `Ctrl+U` | Clear the root being edited |

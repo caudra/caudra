@@ -225,7 +225,7 @@ The walk respects `.gitignore` and skips `.git`, binaries, and files above the s
 
 After attaching to a sandbox, select `TRANSFER` or press `Ctrl+X 4`. The editor area shows local files on the left and sandbox files on the right. Your open editor tabs keep their contents and cursor positions. Local-only sessions and direct Workcell connections do not expose this view.
 
-Choose an existing absolute local directory with `L` and an existing workspace-relative sandbox directory with `S`, then Compare. Each pane header shows its root. The sandbox root is relative to the exposed Workcell workspace, not the guest filesystem. A remote conversation path is never used as a local directory automatically. Changing the root pair discards the old review and requires a fresh comparison.
+The local root starts at Caudra's current working directory and the sandbox root at the workspace. Change either with `L` or `S`, then Compare. The local root must be an existing absolute directory, and the sandbox root an existing workspace-relative directory. Each pane header shows its root, or offers `L` while no local root is set. A root that cannot be compared is named in the status bar, together with the key that edits it. The sandbox root is relative to the exposed Workcell workspace, not the guest filesystem. A remote conversation path is never used as a local directory automatically. Changing the root pair discards the old review and requires a fresh comparison.
 
 The comparison is one tree, laid out like the Explorer. Each row holds the same relative path in both panes. An entry that exists on one side only leaves a dim `·` on the other, so the rows stay aligned. Folders expand in place. Expanded folders stay open when you compare again, and the cursor returns to the same path or its nearest remaining parent.
 
@@ -239,11 +239,12 @@ Comparison checks content and executable metadata rather than choosing the newes
 | `?` | Not determined, for example on an incomplete side |
 | `● n` | Folder with n changed entries below it |
 
-Identical rows carry no mark. A folder with matching names can still contain changed or unreadable files. Ignored, protected, excluded, symlink, nested-repository, special and unsupported entries are dimmed and labelled with a word badge. An expanded folder that is empty, left out or not fully scanned ends with a note row that explains why. A partly listed folder shows the entries that were listed first.
+Identical rows carry no mark. A folder with matching names can still contain changed or unreadable files. Ignored, skipped, protected, excluded, symlink, nested-repository, special and unsupported entries are dimmed and labelled with a word badge. An expanded folder that is empty, left out or not fully scanned ends with a note row that explains why. A partly listed folder shows the entries that were listed first.
 
 | Note | Meaning |
 |------|---------|
 | Ignored by .gitignore | `I` includes ignored files |
+| Skipped as a dotfile | `.` includes dotfiles |
 | Protected | Never transferred |
 | Excluded by a transfer pattern | Matched a configured exclude |
 | Symbolic link, nested repository or special file | Never followed or transferred |
@@ -252,9 +253,9 @@ Identical rows carry no mark. A folder with matching names can still contain cha
 | Contents unknown | That side is incomplete. `Enter` compares this folder |
 | Empty folder | Can still be transferred |
 
-`I` compares again with `.gitignore` filtering turned off for this Transfer session. Protected names and configured excludes stay excluded. The choice is not saved and resets when Transfer reopens. A review made under one choice cannot be approved under the other.
+`I` compares again with `.gitignore` filtering turned off for this Transfer session. Protected names and configured excludes stay excluded. `.` compares again with dotfiles skipped: every name that starts with a dot is left out, and neither side is listed inside a skipped folder. Dotfiles are shown by default. Neither choice is saved, and both reset when Transfer reopens. A review made under one setting cannot be approved under another.
 
-Large trees can stop at a scan limit. Folders that were listed still compare by content. Entries present on one side only stay undetermined while either side is partial. When the Workcell inventory cap truncates a side, file diffs are refused too. A banner names the incomplete side. `Enter` on a "Not fully scanned" or "Contents unknown" note re-roots both sides to the folder that holds the note. That folder must exist on both sides. `Backspace` restores the previous root pair, including one changed with `L` or `S`.
+Large trees can stop at a scan limit. Folders that were listed still compare by content. Entries present on one side only stay undetermined while either side is partial. When the Workcell inventory cap truncates a side, file diffs are refused too. A banner names the incomplete side. A large dot folder, such as a tool cache or a second checkout, can use up the limit before later names are listed. `.` skips dotfiles and leaves the limit to the rest of the tree. `Enter` on a "Not fully scanned" or "Contents unknown" note re-roots both sides to the folder that holds the note. That folder must exist on both sides. `Backspace` restores the previous root pair, including one changed with `L` or `S`.
 
 Select files or folders with `Space`, then press `U` to review an upload or `D` to review a download. Without a selection, the row under the cursor is reviewed. Folder selection includes eligible descendants and empty directories. Skipped entries remain visible. Review requires a complete comparison. One review carries at most 128 paths, counting every file and new folder under a selected folder. A larger selection is refused whole rather than copying only part of it. File/directory type conflicts cannot be overwritten by a transfer.
 
@@ -274,6 +275,7 @@ Empty-directory creation requires negotiated directory-publication support. Loca
 | `A` | Approve the displayed executable review |
 | `=` / `F5` | Compare again |
 | `I` | Include or exclude ignored files for this session |
+| `.` | Skip or include dotfiles for this session |
 | `F` | Show changes only |
 | `L` / `S` | Edit the local or sandbox root |
 | `Ctrl+U` | Clear the root being edited |

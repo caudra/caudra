@@ -149,6 +149,7 @@ pub(super) fn transfer_connector(state: StateDir) -> TransferConnector {
                 client,
                 remote,
                 &policy,
+                link.skip_dotfiles,
                 &state,
                 host,
             ))?;

@@ -69,6 +69,9 @@ pub struct TransferLink {
     /// Session-only override of the profile's `respect_gitignore`; protected names and
     /// configured excludes still apply, and the filter digest binds the choice.
     pub include_ignored: bool,
+    /// Session-only: leaves out every name starting with a dot, and neither inventory lists
+    /// inside a dot folder. The filter digest binds the choice.
+    pub skip_dotfiles: bool,
 }
 
 pub type TransferConnector = Arc<

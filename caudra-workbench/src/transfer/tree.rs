@@ -56,6 +56,7 @@ pub(super) enum Note {
     Ignored,
     Protected,
     Pattern,
+    Dotfile,
     Symlink,
     Repository,
     Special,
@@ -68,6 +69,7 @@ pub(super) enum Note {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum NoteAction {
     IncludeIgnored,
+    IncludeDotfiles,
     CompareFolder,
 }
 
@@ -77,6 +79,7 @@ impl Note {
             Self::Ignored => "Ignored by .gitignore",
             Self::Protected => "Protected · never transferred",
             Self::Pattern => "Excluded by a transfer pattern",
+            Self::Dotfile => "Skipped as a dotfile",
             Self::Symlink => "Symbolic link · never followed",
             Self::Repository => "Nested repository · never transferred",
             Self::Special => "Special file · never transferred",
@@ -90,6 +93,7 @@ impl Note {
     pub(super) fn action(self) -> Option<NoteAction> {
         match self {
             Self::Ignored => Some(NoteAction::IncludeIgnored),
+            Self::Dotfile => Some(NoteAction::IncludeDotfiles),
             Self::NotScanned | Self::Unknown => Some(NoteAction::CompareFolder),
             _ => None,
         }
@@ -102,6 +106,7 @@ impl Note {
             Self::Ignored => Some("ignored"),
             Self::Protected => Some("protected"),
             Self::Pattern => Some("excluded"),
+            Self::Dotfile => Some("skipped"),
             Self::Symlink => Some("symlink"),
             Self::Repository => Some("repository"),
             Self::Special => Some("special"),
@@ -276,6 +281,7 @@ impl ComparisonTree {
             (Some(TransferExclusion::Gitignore), _) => Note::Ignored,
             (Some(TransferExclusion::Protected), _) => Note::Protected,
             (Some(TransferExclusion::Pattern), _) => Note::Pattern,
+            (Some(TransferExclusion::Dotfile), _) => Note::Dotfile,
             (None, TransferNodeKind::Symlink) => Note::Symlink,
             (None, TransferNodeKind::Repository) => Note::Repository,
             (None, TransferNodeKind::Special) => Note::Special,
@@ -483,6 +489,7 @@ mod tests {
     #[test_case(excluded(FOLDER, TransferExclusion::Gitignore), true, Note::Ignored; "gitignored")]
     #[test_case(excluded(FOLDER, TransferExclusion::Protected), true, Note::Protected; "protected")]
     #[test_case(excluded(FOLDER, TransferExclusion::Pattern), true, Note::Pattern; "pattern")]
+    #[test_case(excluded(FOLDER, TransferExclusion::Dotfile), true, Note::Dotfile; "dotfile")]
     #[test_case(folder(FOLDER, TransferStatus::Excluded), true, Note::Pattern; "excluded_without_reason")]
     #[test_case(standing_in(TransferNodeKind::Symlink), true, Note::Symlink; "symlink")]
     #[test_case(standing_in(TransferNodeKind::Repository), true, Note::Repository; "repository")]

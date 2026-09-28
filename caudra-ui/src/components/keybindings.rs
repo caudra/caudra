@@ -1716,6 +1716,12 @@ pub const KEYBINDS: &[Keybind] = &[
         platform: Platform::All,
     },
     Keybind {
+        label: KeyLabel::Single(wb::SKIP_DOTFILES.label),
+        description: "Skip or include dotfiles until Transfer closes",
+        context: KeybindContext::WorkbenchTransfer,
+        platform: Platform::All,
+    },
+    Keybind {
         label: KeyLabel::Single(wb::CHANGES_ONLY.label),
         description: "Show only what differs",
         context: KeybindContext::WorkbenchTransfer,

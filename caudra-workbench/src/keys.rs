@@ -117,6 +117,8 @@ pub const DOWNLOAD: Bind = bind!(KeyCode::Char('d'), NONE, "D");
 pub const APPROVE: Bind = bind!(KeyCode::Char('a'), NONE, "A");
 pub const COMPARE: Bind = bind!(KeyCode::Char('='), NONE, "=");
 pub const INCLUDE_IGNORED: Bind = bind!(KeyCode::Char('i'), NONE, "I");
+/// The dotfile toggle of file managers such as nnn and yazi.
+pub const SKIP_DOTFILES: Bind = bind!(KeyCode::Char('.'), NONE, ".");
 pub const CHANGES_ONLY: Bind = bind!(KeyCode::Char('f'), NONE, "F");
 pub const LOCAL_ROOT: Bind = bind!(KeyCode::Char('l'), NONE, "L");
 pub const SANDBOX_ROOT: Bind = bind!(KeyCode::Char('s'), NONE, "S");
@@ -216,6 +218,7 @@ const TRANSFER_BINDS: &[Bind] = &[
     APPROVE,
     COMPARE,
     INCLUDE_IGNORED,
+    SKIP_DOTFILES,
     CHANGES_ONLY,
     LOCAL_ROOT,
     SANDBOX_ROOT,

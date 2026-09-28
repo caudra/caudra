@@ -4487,6 +4487,7 @@ mod tests {
                     remote_root: WorkspacePath::root(),
                     attached_binding: None,
                     include_ignored: false,
+                    skip_dotfiles: false,
                 }),
             },
         ));
