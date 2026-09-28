@@ -58,6 +58,10 @@ fn runtime_resolver(
                 let registry = Arc::new(ToolRegistry::default());
                 let runtime =
                     WorkcellRuntime::initialize_session(&selection, &cwd, &storage, &registry)?;
+                if !runtime.is_remote() {
+                    super::adopt_checkout_state(&storage, &cwd);
+                    super::reconcile_worktrees(&storage, &cwd);
+                }
                 if stored.is_some() {
                     StoredWorkspaceBinding::validate_resume_identity(
                         stored.as_ref(),

@@ -41,6 +41,8 @@ const PROCESS_ONLY_ENV_VARS: &[&str] = &[
     "HERDR_PANE_ID",
     "HERDR_BIN_PATH",
     "HERDR_SOCKET_PATH",
+    "HERDR_WORKSPACE_ID",
+    "HERDR_TAB_ID",
     "WORKCELL_MCP_CODE_WORKER",
 ];
 
@@ -510,6 +512,7 @@ pub struct RawConfig {
     pub provider: ProviderFileConfig,
     pub storage: StorageFileConfig,
     pub telemetry: TelemetryConfig,
+    pub worktrees: WorktreesConfig,
     pub plugins: HashMap<String, PluginFileConfig>,
 }
 
@@ -521,6 +524,7 @@ impl RawConfig {
         self.provider.merge(overlay.provider);
         self.storage.merge(overlay.storage);
         self.telemetry.merge(overlay.telemetry);
+        self.worktrees.merge(overlay.worktrees);
         for (name, plugin) in overlay.plugins {
             let entry = self.plugins.entry(name).or_default();
             if plugin.enabled.is_some() {
@@ -558,6 +562,7 @@ impl RawConfig {
             provider: ProviderConfig::from_file(self.provider)?,
             storage: StorageConfig::from_file(self.storage),
             telemetry: self.telemetry,
+            worktrees: self.worktrees,
             permissions: PermissionsConfig::default(),
             plugins: PluginsConfig::from_plugins(self.plugins),
         };
@@ -1547,6 +1552,7 @@ pub struct Config {
     pub provider: ProviderConfig,
     pub storage: StorageConfig,
     pub telemetry: TelemetryConfig,
+    pub worktrees: WorktreesConfig,
     pub permissions: PermissionsConfig,
     pub plugins: PluginsConfig,
 }
@@ -1607,7 +1613,7 @@ pub struct UiConfig {
         default = NotificationMethod::Auto,
         ty = "string",
         default_doc = "auto",
-        desc = "Terminal notification method: auto, osc9, bell, or off"
+        desc = "Terminal notification method: auto, osc9, bell, or off. Auto is off in a Herdr pane, where Herdr shows its own notification when Caudra is blocked or finished"
     )]
     pub notifications: NotificationMethod,
 
@@ -2630,6 +2636,34 @@ impl TelemetryConfig {
             log_tool_details,
             content_max_length
         );
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WorktreeBackend {
+    /// Herdr inside a Herdr pane, git everywhere else.
+    #[default]
+    Auto,
+    Git,
+}
+
+#[derive(Deserialize, Debug, Clone, ConfigSection)]
+#[serde(default, deny_unknown_fields)]
+#[config(section = "worktrees")]
+pub struct WorktreesConfig {
+    #[config(default = None, ty = "string", default_doc = "auto",
+             desc = "What creates and removes worktrees for `/worktree`: `auto` uses Herdr inside a Herdr pane and git elsewhere, `git` always runs git")]
+    pub backend: Option<WorktreeBackend>,
+
+    #[config(default = None, ty = "string", default_doc = "<data dir>/worktrees",
+             desc = "Where git-created worktrees go, as `<directory>/<repository>/<branch>`. A leading `~/` is your home directory")]
+    pub directory: Option<String>,
+}
+
+impl WorktreesConfig {
+    fn merge(&mut self, overlay: WorktreesConfig) {
+        merge_option!(self, overlay, backend, directory);
     }
 }
 
@@ -4019,6 +4053,7 @@ mod tests {
             provider: ProviderConfig::default(),
             storage: StorageConfig::default(),
             telemetry: TelemetryConfig::default(),
+            worktrees: WorktreesConfig::default(),
             permissions: PermissionsConfig::default(),
             plugins: PluginsConfig::default(),
         };
@@ -4767,6 +4802,8 @@ mod tests {
     #[test_case("HERDR_PANE_ID", false ; "herdr_pane_id_is_process_only")]
     #[test_case("HERDR_BIN_PATH", false ; "herdr_bin_path_is_process_only")]
     #[test_case("HERDR_SOCKET_PATH", false ; "herdr_socket_path_is_process_only")]
+    #[test_case("HERDR_WORKSPACE_ID", false ; "herdr_workspace_id_is_process_only")]
+    #[test_case("HERDR_TAB_ID", false ; "herdr_tab_id_is_process_only")]
     #[test_case("WORKCELL_MCP_CODE_WORKER", false ; "workcell_worker_is_process_only")]
     #[test_case("TEST_CAUDRA_ENV_FILE_VAR", true ; "ordinary_env_file_var_is_allowed")]
     fn env_file_var_loading_policy(key: &str, expected: bool) {

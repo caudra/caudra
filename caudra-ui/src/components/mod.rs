@@ -67,6 +67,7 @@ pub(crate) mod workbench;
 pub(crate) mod workflow_card;
 pub(crate) mod workflow_catalog_picker;
 pub(crate) mod workflow_inspector;
+pub(crate) mod worktree_picker;
 
 use std::iter;
 use std::mem;
@@ -76,6 +77,7 @@ use std::time::{Duration, Instant};
 
 use caudra_agent::AgentInput;
 use caudra_agent::tools::{SHELL_TOOL_NAME, ToolEffect};
+use caudra_agent::worktree::Request as WorktreeRequest;
 use caudra_agent::{
     BufferSnapshot, CallStage, ImageSource, SubagentActivity, SubagentProgress, ToolInput,
     ToolOutput,
@@ -94,6 +96,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use crate::selection::wrap_breaks;
 use keybindings::Bind;
 use modal::FooterHits;
+use worktree_picker::WorktreeView;
 
 pub(crate) const CHEVRON: &str = "❯ ";
 const DIGIT_GROUP: usize = 3;
@@ -862,6 +865,12 @@ pub enum Action {
         request: SessionRelocation,
         donor: Option<(CaudraId, String)>,
     },
+    OpenWorktrees(WorktreeView),
+    /// Opens the checkout at the path, where this repository's other
+    /// checkouts are.
+    OpenWorktree(PathBuf),
+    InspectWorktreeRemoval(PathBuf),
+    RunWorktree(WorktreeRequest),
     ChangeRemoteWorkingDirectory(caudra_workspace::DirectoryNavigation),
     RemoteControl(String),
     ChangeModel(String),
@@ -884,6 +893,12 @@ pub enum Action {
     TrustMcpProject(String),
     RejectMcp(String),
     FocusSession(caudra_storage::id::CaudraId),
+    /// Opens a session that works in `cwd`, in another checkout of this
+    /// repository.
+    OpenSessionElsewhere {
+        id: caudra_storage::id::CaudraId,
+        cwd: PathBuf,
+    },
     DeleteSession(caudra_storage::id::CaudraId),
     SetSessionTitle {
         id: caudra_storage::id::CaudraId,

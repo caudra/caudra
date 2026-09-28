@@ -438,6 +438,7 @@ impl SessionRelocationPicker {
                 source_cwd: flow.source_cwd.clone(),
                 destination,
                 include_project_usage: flow.include_project_usage,
+                keep_plan: false,
             })
         });
         let request = match result {

@@ -14,7 +14,7 @@ use crate::{StateDir, StorageError, atomic_write_permissions};
 
 const PLANS_DIR: &str = "plans";
 const PLAN_SESSIONS_DIR: &str = "sessions";
-const MEMORIES_DIR: &str = "memories";
+pub(crate) const MEMORIES_DIR: &str = "memories";
 const MARKDOWN_EXTENSION: &str = "md";
 const PLAN_REF_PREFIX: &str = "plan-";
 const MEMORY_REF_PREFIX: &str = "memory-";

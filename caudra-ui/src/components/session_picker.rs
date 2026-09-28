@@ -1,4 +1,5 @@
-//! The `/sessions` picker: every session in this directory, live or stored.
+//! The `/sessions` picker: every session in this directory, live or stored,
+//! then those of the repository's other checkouts, one section each.
 //!
 //! Live rows come from the event loop, which is the only thing that can see
 //! sibling sessions; stored ones are read off disk when the picker opens. Row
@@ -6,6 +7,7 @@
 //! a turn never moves a row out from under the cursor.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 use caudra_grab::grab_scope;
 use caudra_storage::id::CaudraId;
@@ -13,6 +15,7 @@ use crossterm::event::{KeyCode, KeyEvent, MouseEvent};
 use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
 
+use super::status_bar::collapse_home;
 use super::{Hint, Overlay};
 use crate::components::keybindings::key;
 use crate::components::list_picker::{ListPicker, PickerAction, PickerItem};
@@ -27,6 +30,8 @@ const CURRENT_LABEL: &str = "current";
 const DELETE_FOCUSED_HINT: &str = "Cannot delete the current session";
 const RENAME_TITLE: &str = " Rename session ";
 const UNTITLED: &str = "(untitled)";
+const DETACHED_LABEL: &str = "detached";
+const SECTION_SEPARATOR: &str = " · ";
 
 /// Largest unit first, so an age reads as the coarsest one that fits.
 const AGE_UNITS: &[(u64, &str)] = &[
@@ -54,13 +59,32 @@ pub struct SessionRow {
     pub updated_at: u64,
     pub activity: Option<SessionActivity>,
     pub focused: bool,
+    /// Set for a session in another checkout of this repository.
+    pub checkout: Option<OtherCheckout>,
+}
+
+/// Where a session in another checkout of this repository works.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OtherCheckout {
+    pub root: PathBuf,
+    /// `None` when the checkout's HEAD is detached.
+    pub branch: Option<String>,
+    pub cwd: PathBuf,
 }
 
 pub enum SessionPickerAction {
     Consumed,
     Focus(CaudraId),
+    /// Open a session that works in another checkout.
+    FocusElsewhere {
+        id: CaudraId,
+        cwd: PathBuf,
+    },
     Delete(CaudraId),
-    Rename { id: CaudraId, title: String },
+    Rename {
+        id: CaudraId,
+        title: String,
+    },
     Generate(CaudraId),
     New,
     MoveCurrent,
@@ -74,6 +98,9 @@ struct SessionItem {
     detail: String,
     focused: bool,
     working: bool,
+    /// The checkout's section header and the directory the session works in,
+    /// for a session in another checkout.
+    elsewhere: Option<(String, PathBuf)>,
 }
 
 impl PickerItem for SessionItem {
@@ -83,6 +110,10 @@ impl PickerItem for SessionItem {
 
     fn detail(&self) -> Option<&str> {
         Some(&self.detail)
+    }
+
+    fn section(&self) -> Option<&str> {
+        self.elsewhere.as_ref().map(|(section, _)| section.as_str())
     }
 
     fn is_spinning(&self) -> bool {
@@ -152,10 +183,14 @@ impl SessionPicker {
         }
     }
 
-    fn rank_and_build(&mut self, mut rows: Vec<SessionRow>) -> Vec<SessionItem> {
+    /// This directory's rows keep their frozen rank; other checkouts' follow
+    /// in the order given, which already groups them by checkout.
+    fn rank_and_build(&mut self, rows: Vec<SessionRow>) -> Vec<SessionItem> {
+        let (mut here, elsewhere): (Vec<_>, Vec<_>) =
+            rows.into_iter().partition(|row| row.checkout.is_none());
         // Anything unseen is ranked as a batch, most recent first, and placed
         // above every row already on screen.
-        let mut fresh: Vec<&SessionRow> = rows
+        let mut fresh: Vec<&SessionRow> = here
             .iter()
             .filter(|row| !self.rank.contains_key(&row.id))
             .collect();
@@ -170,9 +205,10 @@ impl SessionPicker {
         }
         self.next_rank = base;
 
-        rows.sort_by_key(|row| self.rank.get(&row.id).copied().unwrap_or(0));
+        here.sort_by_key(|row| self.rank.get(&row.id).copied().unwrap_or(0));
         let now = self.now;
-        rows.into_iter()
+        here.into_iter()
+            .chain(elsewhere)
             .map(|row| SessionItem {
                 detail: detail(&row, now),
                 title: if row.title.is_empty() {
@@ -183,6 +219,9 @@ impl SessionPicker {
                 focused: row.focused,
                 working: row.activity == Some(SessionActivity::Working),
                 id: row.id,
+                elsewhere: row
+                    .checkout
+                    .map(|checkout| (section(&checkout), checkout.cwd)),
             })
             .collect()
     }
@@ -378,7 +417,10 @@ impl SessionPicker {
             PickerAction::Consumed | PickerAction::Toggle(..) => SessionPickerAction::Consumed,
             PickerAction::Select(item) => {
                 self.close();
-                SessionPickerAction::Focus(item.id)
+                match item.elsewhere {
+                    Some((_, cwd)) => SessionPickerAction::FocusElsewhere { id: item.id, cwd },
+                    None => SessionPickerAction::Focus(item.id),
+                }
             }
             PickerAction::Close => {
                 self.close();
@@ -432,6 +474,15 @@ fn confirm_hint() -> String {
     format!("Press {} again to delete this session.", key::DELETE.label)
 }
 
+/// Names another checkout by its branch and where it lives.
+fn section(checkout: &OtherCheckout) -> String {
+    format!(
+        "{}{SECTION_SEPARATOR}{}",
+        checkout.branch.as_deref().unwrap_or(DETACHED_LABEL),
+        collapse_home(&checkout.root.to_string_lossy())
+    )
+}
+
 /// The current session says so; every other row is described by how long ago
 /// it was touched, which is what tells two similar titles apart.
 fn detail(row: &SessionRow, now: u64) -> String {
@@ -457,6 +508,8 @@ fn age(seconds: u64) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use super::*;
     use crate::components::key as key_event;
     use test_case::test_case;
@@ -467,6 +520,9 @@ mod tests {
     const NOW: u64 = 1_000_000;
     const TITLE_A: &str = "refactor the parser";
     const TITLE_B: &str = "fix the tests";
+    const OTHER_ROOT: &str = "/work/app-login";
+    const OTHER_BRANCH: &str = "feature/login";
+    const OTHER_SECTION: &str = "feature/login · /work/app-login";
 
     fn char_key(c: char) -> KeyEvent {
         key_event(KeyCode::Char(c))
@@ -483,6 +539,18 @@ mod tests {
             updated_at: NOW - ago,
             activity,
             focused: false,
+            checkout: None,
+        }
+    }
+
+    fn elsewhere(raw: &str, title: &str, ago: u64) -> SessionRow {
+        SessionRow {
+            checkout: Some(OtherCheckout {
+                root: PathBuf::from(OTHER_ROOT),
+                branch: Some(OTHER_BRANCH.into()),
+                cwd: PathBuf::from(OTHER_ROOT),
+            }),
+            ..row(raw, title, ago, None)
         }
     }
 
@@ -566,6 +634,34 @@ mod tests {
             NOW,
         );
         assert_eq!(picker.selected_id(), Some(id(FIRST)));
+    }
+
+    #[test]
+    fn other_checkouts_follow_this_directory_under_their_own_section() {
+        let picker = opened(vec![
+            elsewhere(FIRST, TITLE_A, 0),
+            row(SECOND, TITLE_B, 5_000, None),
+        ]);
+
+        assert_eq!(picker.ids(), [id(SECOND), id(FIRST)]);
+        assert_eq!(picker.picker.item(0).unwrap().section(), None);
+        assert_eq!(
+            picker.picker.item(1).unwrap().section(),
+            Some(OTHER_SECTION)
+        );
+    }
+
+    #[test]
+    fn opening_another_checkouts_session_names_where_it_works() {
+        let mut picker = opened(vec![elsewhere(FIRST, TITLE_A, 0)]);
+
+        let action = picker.handle_key(key_event(KeyCode::Enter));
+
+        assert!(matches!(
+            action,
+            SessionPickerAction::FocusElsewhere { id: got, cwd }
+                if got == id(FIRST) && cwd == Path::new(OTHER_ROOT)
+        ));
     }
 
     #[test]

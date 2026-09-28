@@ -297,6 +297,12 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         scope: ChatScope::MainOnly,
     },
     BuiltinCommand {
+        name: "/worktree",
+        description: "Open, create or remove git worktrees of this repository (new [branch] | remove)",
+        max_args: 2,
+        scope: ChatScope::MainOnly,
+    },
+    BuiltinCommand {
         name: "/btw",
         description: "Ask a side question, with follow-ups (no tools, nothing enters history)",
         max_args: usize::MAX,

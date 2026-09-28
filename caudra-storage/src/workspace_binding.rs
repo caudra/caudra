@@ -128,11 +128,7 @@ impl StoredWorkspaceBinding {
             opaque_hash("local-principal", cwd.as_bytes()),
         )
         .expect("hashed local principal");
-        let project = ProjectIdentity::new(
-            authority.clone(),
-            ProjectKey::new(opaque_hash("local-project", cwd.as_bytes()))
-                .expect("hashed local project"),
-        );
+        let project = ProjectIdentity::new(authority.clone(), local_project_key(cwd));
         let binding = SessionWorkspaceBinding::new(
             SessionBindingId::new(opaque_hash("local-binding", cwd.as_bytes()))
                 .expect("hashed local binding"),
@@ -325,6 +321,11 @@ fn validate_label(label: Option<&str>) -> Result<(), WorkspaceBindingError> {
         return Err(WorkspaceBindingError::InvalidLabel);
     }
     Ok(())
+}
+
+/// The project key [`StoredWorkspaceBinding::local_from_cwd`] gives `cwd`.
+pub(crate) fn local_project_key(cwd: &str) -> ProjectKey {
+    ProjectKey::new(opaque_hash("local-project", cwd.as_bytes())).expect("hashed local project")
 }
 
 pub(crate) fn opaque_hash(purpose: &str, value: &[u8]) -> String {

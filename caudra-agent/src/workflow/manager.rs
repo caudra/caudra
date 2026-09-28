@@ -1272,6 +1272,7 @@ complete(first.output.echo);
                 source_cwd: Some(self.project.to_string_lossy().into_owned()),
                 destination: destination.to_string_lossy().into_owned(),
                 include_project_usage: true,
+                keep_plan: false,
             };
             assert_eq!(
                 database.relocate_sessions(&request).unwrap().sessions_moved,

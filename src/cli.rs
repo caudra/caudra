@@ -100,7 +100,7 @@ pub struct Cli {
     #[arg(short = 'c', long = "continue")]
     pub continue_session: bool,
 
-    /// Resume a specific session by its ID
+    /// Resume a specific session by its ID, in the directory it works in
     #[arg(short = 's', long, alias = "resume")]
     pub session: Option<String>,
 

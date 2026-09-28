@@ -2,7 +2,7 @@
 # Environment
 
 - Working directory: {cwd}
-- Platform: {platform}
+{checkout}- Platform: {platform}
 - Date: {date}
 - Model: {model}
-{scratch}</system-reminder>
+{herdr}{scratch}</system-reminder>

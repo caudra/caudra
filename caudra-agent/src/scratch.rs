@@ -94,6 +94,12 @@ pub fn environment_section() -> String {
     prompt.replace(crate::prompt::SCRATCH_DIR_SLOT, &path)
 }
 
+/// Whether tools run on this machine, which is when anything the environment
+/// block says about this machine's checkout or terminal holds for them.
+pub fn tools_run_locally() -> bool {
+    state() == Scratch::Local
+}
+
 fn local_root() -> Option<String> {
     caudra_storage::paths::scratch_root().ok().map(|root| {
         caudra_storage::paths::canonicalize_clean(&root)

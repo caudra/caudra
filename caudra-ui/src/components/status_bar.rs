@@ -508,14 +508,17 @@ struct SpendText {
     gauge: Option<Gauge>,
 }
 
+/// The share of the window `tokens` fill, in whole percent.
+pub(crate) fn context_share(tokens: u32, window: u32) -> u32 {
+    if window == 0 {
+        return 0;
+    }
+    (f64::from(tokens) / f64::from(window) * 100.0) as u32
+}
+
 impl SpendText {
     fn new(stats: &UsageStats) -> Self {
-        let share = |tokens: u32| {
-            if stats.context_window == 0 {
-                return 0;
-            }
-            (f64::from(tokens) / f64::from(stats.context_window) * 100.0) as u32
-        };
+        let share = |tokens: u32| context_share(tokens, stats.context_window);
         let pct = share(stats.context_size);
         Self {
             counts: format!(
@@ -1727,7 +1730,7 @@ fn model_fitted<'a>(ctx: &StatusBarContext<'_>, id: &'a str, budget: usize) -> C
 
 /// `anthropic/claude-opus-5` is `claude-opus-5` once the columns run out: the
 /// segment that distinguishes two models the user might be switching between.
-fn model_leaf(id: &str) -> &str {
+pub(crate) fn model_leaf(id: &str) -> &str {
     match id.rsplit_once('/') {
         Some((_, leaf)) if !leaf.is_empty() => leaf,
         _ => id,

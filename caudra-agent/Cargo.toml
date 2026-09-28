@@ -56,7 +56,8 @@ url = { workspace = true }
 getrandom = { workspace = true }
 fastrand = { workspace = true }
 tempfile = { workspace = true }
-
+wait-timeout = { workspace = true }
+shell-words = { workspace = true }
 
 [dev-dependencies]
 test-case = { workspace = true }

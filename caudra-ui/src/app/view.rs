@@ -501,6 +501,7 @@ impl App {
         render_if_open!(self.workflow_catalog_picker);
         render_if_open!(self.session_picker);
         render_if_open!(self.session_relocation_picker);
+        render_if_open!(self.worktree_picker);
         render_if_open!(self.sandbox_manager);
 
         overlay_rect
@@ -666,6 +667,11 @@ impl App {
                     .unwrap_or(&self.state.applied_model)
             });
         let activity = self.task_activity();
+        let (context_size, context_window) = self.context_usage(
+            chat,
+            effective_model.as_deref(),
+            effective_context.as_deref(),
+        );
         let ctx = StatusBarContext {
             status: &self.status,
             mode,
@@ -681,18 +687,10 @@ impl App {
             stats: UsageStats {
                 global_cost: self.state.cost,
                 global_subscription_cost: self.state.subscription_cost,
-                context_size: effective_context
-                    .as_ref()
-                    .map_or(chat.context_size, |snapshot| snapshot.used()),
+                context_size,
                 cost: chat.cost,
                 subscription_cost: chat.subscription_cost,
-                context_window: if let Some(slot) = effective_model.as_ref() {
-                    slot.model.context_window
-                } else if chat.context_window > 0 {
-                    chat.context_window
-                } else {
-                    self.state.model.context_window
-                },
+                context_window,
                 compaction_border: effective_context
                     .as_ref()
                     .and_then(|snapshot| snapshot.window.compaction_border()),

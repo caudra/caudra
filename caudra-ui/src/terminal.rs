@@ -81,8 +81,8 @@ pub(crate) struct TerminalNotifier {
 }
 
 impl TerminalNotifier {
-    pub(crate) fn new(configured: NotificationMethod) -> Option<Self> {
-        let notifier = resolve_notifier(configured, detect_osc9_support)?;
+    pub(crate) fn new(configured: NotificationMethod, herdr: bool) -> Option<Self> {
+        let notifier = resolve_notifier(configured, herdr, detect_osc9_support)?;
         Some(Self {
             notifier,
             mux: TerminalMux::detect(),
@@ -160,14 +160,18 @@ fn supports_osc9(value: &str) -> bool {
     )
 }
 
+/// Herdr raises its own toast when an agent it tracks blocks or finishes, so
+/// `auto` stays quiet in a Herdr pane rather than announcing everything twice.
 fn resolve_notifier(
     configured: NotificationMethod,
+    herdr: bool,
     auto_supports_osc9: impl FnOnce() -> bool,
 ) -> Option<ResolvedNotifier> {
     match configured {
         NotificationMethod::Off => None,
         NotificationMethod::Osc9 => Some(ResolvedNotifier::Osc9),
         NotificationMethod::Bell => Some(ResolvedNotifier::Bell),
+        NotificationMethod::Auto if herdr => None,
         NotificationMethod::Auto => Some(if auto_supports_osc9() {
             ResolvedNotifier::Osc9
         } else {
@@ -676,27 +680,29 @@ mod tests {
     // at the start and in the middle of the payload.
     const OSC52_WITH_ST: &str = "\u{1b}]52;c;SGVsbG8=\u{1b}\\";
 
-    #[test]
-    fn configured_notification_method_resolves_once() {
+    #[test_case(NotificationMethod::Osc9, false, Some(ResolvedNotifier::Osc9) ; "osc9")]
+    #[test_case(NotificationMethod::Bell, false, Some(ResolvedNotifier::Bell) ; "bell")]
+    #[test_case(NotificationMethod::Off, false, None ; "off")]
+    #[test_case(NotificationMethod::Osc9, true, Some(ResolvedNotifier::Osc9) ; "osc9_inside_herdr")]
+    #[test_case(NotificationMethod::Bell, true, Some(ResolvedNotifier::Bell) ; "bell_inside_herdr")]
+    #[test_case(NotificationMethod::Auto, true, None ; "auto_inside_herdr")]
+    fn notification_method_resolves_without_detection(
+        configured: NotificationMethod,
+        herdr: bool,
+        expected: Option<ResolvedNotifier>,
+    ) {
         assert_eq!(
-            resolve_notifier(NotificationMethod::Osc9, || panic!("auto detection ran")),
-            Some(ResolvedNotifier::Osc9)
+            resolve_notifier(configured, herdr, || panic!("auto detection ran")),
+            expected
         );
+    }
+
+    #[test_case(true, ResolvedNotifier::Osc9 ; "osc9_terminal")]
+    #[test_case(false, ResolvedNotifier::Bell ; "other_terminal")]
+    fn auto_outside_herdr_detects_the_terminal(osc9: bool, expected: ResolvedNotifier) {
         assert_eq!(
-            resolve_notifier(NotificationMethod::Bell, || panic!("auto detection ran")),
-            Some(ResolvedNotifier::Bell)
-        );
-        assert_eq!(
-            resolve_notifier(NotificationMethod::Off, || panic!("auto detection ran")),
-            None
-        );
-        assert_eq!(
-            resolve_notifier(NotificationMethod::Auto, || true),
-            Some(ResolvedNotifier::Osc9)
-        );
-        assert_eq!(
-            resolve_notifier(NotificationMethod::Auto, || false),
-            Some(ResolvedNotifier::Bell)
+            resolve_notifier(NotificationMethod::Auto, false, || osc9),
+            Some(expected)
         );
     }
 

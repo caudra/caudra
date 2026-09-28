@@ -1,7 +1,8 @@
 use std::io;
 use std::path::Path;
 
-use crate::state::{self, StateKey, project_scope};
+use crate::checkout::{self, TrustSource};
+use crate::state::{self, StateKey, StateStore, project_scope};
 use crate::{StateClass, StateDir, StorageError};
 
 const TRUST: StateKey = StateKey {
@@ -15,13 +16,33 @@ pub fn is_project_trusted(
     project: &Path,
     config_digest: &str,
 ) -> Result<bool, StorageError> {
+    Ok(project_trust_source(state_dir, project, config_digest)?.is_some())
+}
+
+/// The project's own grant, or else one for the identical config at the same
+/// place in another verified checkout of its repository.
+pub fn project_trust_source(
+    state_dir: &StateDir,
+    project: &Path,
+    config_digest: &str,
+) -> Result<Option<TrustSource>, StorageError> {
     validate_digest(config_digest)?;
-    let scope = scope(project)?;
-    let Some(stored) = state::get::<String>(state_dir, &scope, TRUST)? else {
-        return Ok(false);
-    };
-    validate_digest(&stored)?;
-    Ok(stored == config_digest)
+    let store = StateStore::open(state_dir, TRUST.class)?;
+    let source = TrustSource::find::<StorageError>(project, |candidate| {
+        let Some(stored) = store.get::<String>(&scope(candidate)?, TRUST)? else {
+            return Ok(false);
+        };
+        validate_digest(&stored)?;
+        Ok(stored == config_digest)
+    })?;
+    if let Some(TrustSource::Inherited(from)) = &source {
+        tracing::debug!(
+            project = %project.display(),
+            from = %from.display(),
+            "project permission config trusted through a sibling checkout"
+        );
+    }
+    Ok(source)
 }
 
 pub fn trust_project(
@@ -40,8 +61,13 @@ pub fn trust_project(
     })?
 }
 
+/// Revokes the grant for `project` and for its counterpart in every sibling
+/// checkout, any of which it could otherwise still inherit.
 pub fn revoke_project_trust(state_dir: &StateDir, project: &Path) -> Result<(), StorageError> {
-    state::delete(state_dir, &scope(project)?, TRUST)?;
+    let store = StateStore::open(state_dir, TRUST.class)?;
+    for path in checkout::with_siblings(project) {
+        store.delete(&scope(&path)?, TRUST)?;
+    }
     Ok(())
 }
 
@@ -103,10 +129,86 @@ fn invalid_data(message: impl Into<String>) -> StorageError {
 mod tests {
     use std::fs;
 
+    use test_case::test_case;
+
     use super::*;
+    use crate::checkout::fixture::{forged_worktree, linked_pair_with_state};
 
     const DIGEST: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
     const OTHER_DIGEST: &str = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+    const NESTED: &str = "crates/app";
+
+    #[test_case(DIGEST, true ; "identical_config")]
+    #[test_case(OTHER_DIGEST, false ; "changed_config")]
+    fn a_worktree_inherits_only_the_identical_config(digest: &str, inherited: bool) {
+        let (_temp, state_dir, main, worktree) = linked_pair_with_state();
+        trust_project(&state_dir, &main, DIGEST).unwrap();
+
+        assert_eq!(
+            project_trust_source(&state_dir, &worktree, digest).unwrap(),
+            inherited.then_some(TrustSource::Inherited(main))
+        );
+    }
+
+    #[test_case("", false ; "checkout_root")]
+    #[test_case(NESTED, true ; "same_subdirectory")]
+    fn a_subdirectory_inherits_only_from_the_same_subdirectory(granted: &str, inherited: bool) {
+        let (_temp, state_dir, main, worktree) = linked_pair_with_state();
+        fs::create_dir_all(main.join(NESTED)).unwrap();
+        fs::create_dir_all(worktree.join(NESTED)).unwrap();
+        trust_project(&state_dir, &main.join(granted), DIGEST).unwrap();
+
+        assert_eq!(
+            project_trust_source(&state_dir, &worktree.join(NESTED), DIGEST).unwrap(),
+            inherited.then(|| TrustSource::Inherited(main.join(NESTED)))
+        );
+    }
+
+    #[test]
+    fn an_exact_grant_wins_over_an_inherited_one() {
+        let (_temp, state_dir, main, worktree) = linked_pair_with_state();
+        trust_project(&state_dir, &main, DIGEST).unwrap();
+        trust_project(&state_dir, &worktree, DIGEST).unwrap();
+
+        assert_eq!(
+            project_trust_source(&state_dir, &worktree, DIGEST).unwrap(),
+            Some(TrustSource::Exact)
+        );
+    }
+
+    #[test]
+    fn a_forged_worktree_inherits_nothing() {
+        let (_temp, state_dir, main, _) = linked_pair_with_state();
+        let forged = forged_worktree(main.parent().unwrap(), &main);
+        trust_project(&state_dir, &main, DIGEST).unwrap();
+
+        assert_eq!(
+            project_trust_source(&state_dir, &forged, DIGEST).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn a_removed_worktree_stops_granting() {
+        let (_temp, state_dir, main, worktree) = linked_pair_with_state();
+        trust_project(&state_dir, &worktree, DIGEST).unwrap();
+        assert!(is_project_trusted(&state_dir, &main, DIGEST).unwrap());
+
+        fs::remove_dir_all(&worktree).unwrap();
+
+        assert!(!is_project_trusted(&state_dir, &main, DIGEST).unwrap());
+    }
+
+    #[test]
+    fn revoking_in_a_worktree_clears_the_grant_it_inherited() {
+        let (_temp, state_dir, main, worktree) = linked_pair_with_state();
+        trust_project(&state_dir, &main, DIGEST).unwrap();
+
+        revoke_project_trust(&state_dir, &worktree).unwrap();
+
+        assert!(!is_project_trusted(&state_dir, &main, DIGEST).unwrap());
+        assert!(!is_project_trusted(&state_dir, &worktree, DIGEST).unwrap());
+    }
 
     #[test]
     fn trust_is_exact_to_canonical_project_and_digest() {

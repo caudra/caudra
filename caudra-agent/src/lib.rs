@@ -3,12 +3,14 @@
 pub mod agent;
 pub mod background;
 mod background_reminder;
+pub mod bounded_process;
 pub use background_reminder::BackgroundReminderContext;
 pub mod cancel;
 pub mod child_guard;
 pub mod nudge;
 pub use child_guard::ChildGuard;
 pub mod headless;
+pub mod herdr;
 pub mod mailbox;
 pub mod mcp;
 pub use mcp::config::{McpConfigError, McpConfigErrors, McpServerInfo, McpServerStatus};
@@ -55,6 +57,7 @@ pub mod types;
 pub mod workflow;
 pub mod workspace_baseline;
 pub mod workspace_transfer;
+pub mod worktree;
 pub use stored_session::{
     StoredSession, latest_stored_session, load_stored_session, open_stored_session,
     open_stored_session_with_cursor, resolve_resume_workspace, resume_workspace_session,

@@ -6,6 +6,7 @@ use caudra_config::{
     AgentConfig, ConfigField, DEFAULT_MAX_LOG_FILES, DEFAULT_MAX_OUTPUT_LINES,
     DEFAULT_MOUSE_SCROLL_LINES, MIN_TOOL_OUTPUT_LINES, ProviderConfig, RetentionConfig,
     SnapshotsConfig, StorageConfig, TOP_LEVEL_FIELDS, TelemetryConfig, ToolOutputLines, UiConfig,
+    WorktreesConfig,
 };
 use caudra_lua::{OptionSpec, OptionType, PluginHost, PluginOptionSpecs};
 
@@ -324,6 +325,18 @@ fn write_telemetry_section(out: &mut String) {
     .unwrap();
 }
 
+fn write_worktrees_section(out: &mut String) {
+    write_section(out, "[worktrees]", WorktreesConfig::FIELDS);
+    writeln!(
+        out,
+        "Inside a Herdr pane, `auto` asks Herdr to create and remove worktrees, so each one \
+         opens as a grouped Herdr workspace. `directory` applies only to worktrees git \
+         creates. See [Worktrees](/docs/worktrees/) for what `/worktree` does with each \
+         backend.\n"
+    )
+    .unwrap();
+}
+
 fn write_steering_section(out: &mut String) {
     out.push_str(
         r###"### `agent.steering`
@@ -596,6 +609,7 @@ All fields are optional. Typos in field names cause an error right away.
     write_retention_section(&mut out);
     write_snapshots_section(&mut out);
     write_telemetry_section(&mut out);
+    write_worktrees_section(&mut out);
 
     writeln!(out, "## Plugins\n").unwrap();
     writeln!(

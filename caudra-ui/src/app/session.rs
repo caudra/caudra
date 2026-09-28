@@ -7,8 +7,9 @@ use std::time::{Duration, Instant};
 use crate::app::tasks::TaskOutcome;
 use crate::chat::{CANCELLED_TEXT, Chat, DONE_TEXT, ERROR_TEXT, history_to_display};
 use crate::components::rewind_picker::RewindEntry;
-use crate::components::session_picker::{SessionPickerAction, SessionRow};
+use crate::components::session_picker::{OtherCheckout, SessionPickerAction, SessionRow};
 use crate::components::session_relocation::SessionRelocationAction;
+use crate::components::worktree_picker::{WorktreeAction, WorktreeOverview, WorktreeView};
 use crate::components::{
     Action, DisplayMessage, DisplaySource, ForkDraft, ForkedSession, LoadedSession,
 };
@@ -34,6 +35,7 @@ use caudra_storage::sessions::{
     StoredSubagentTaskSpec,
 };
 use caudra_storage::tool_outputs::{ToolOutputId, ToolOutputRef, ToolOutputStore};
+use caudra_storage::worktrees::{self, CheckoutSessions};
 use caudra_workspace::{PreparedSnapshotOperation, SnapshotOperationPreview};
 
 use crate::AppSession;
@@ -2864,6 +2866,7 @@ fn unrevert_failure_status_value(
 /// caught up with yet.
 impl App {
     pub(super) fn sessions_browse(&mut self) -> Vec<Action> {
+        self.move_back_from_removed_worktrees();
         let rows = self.session_rows();
         // Both halves are read here, so both watches start from what the
         // picker is already showing rather than reporting their own birth as
@@ -2903,6 +2906,9 @@ impl App {
         match action {
             SessionPickerAction::Consumed | SessionPickerAction::Closed => Vec::new(),
             SessionPickerAction::Focus(id) => vec![Action::FocusSession(id)],
+            SessionPickerAction::FocusElsewhere { id, cwd } => {
+                vec![Action::OpenSessionElsewhere { id, cwd }]
+            }
             SessionPickerAction::Delete(id) => vec![Action::DeleteSession(id)],
             SessionPickerAction::Rename { id, title } => {
                 vec![Action::SetSessionTitle { id, title }]
@@ -2949,6 +2955,24 @@ impl App {
         }
     }
 
+    pub(crate) fn open_worktrees(&mut self, overview: WorktreeOverview, view: WorktreeView) {
+        self.worktree_picker.open(overview, view);
+    }
+
+    pub(crate) fn show_worktree_removal(&mut self, root: PathBuf, dirty: bool) {
+        self.worktree_picker.show_removal(root, dirty);
+    }
+
+    pub(super) fn handle_worktree_action(&mut self, action: WorktreeAction) -> Vec<Action> {
+        match action {
+            WorktreeAction::Consumed | WorktreeAction::Closed => Vec::new(),
+            WorktreeAction::Refresh => vec![Action::OpenWorktrees(WorktreeView::List)],
+            WorktreeAction::Open(root) => vec![Action::OpenWorktree(root)],
+            WorktreeAction::InspectRemoval(root) => vec![Action::InspectWorktreeRemoval(root)],
+            WorktreeAction::Run(request) => vec![Action::RunWorktree(request)],
+        }
+    }
+
     pub(super) fn rename_session(&mut self, args: &str) -> Vec<Action> {
         let title = args.trim();
         if title.is_empty() {
@@ -2959,6 +2983,27 @@ impl App {
             id: self.state.session.id,
             title: title.to_owned(),
         }]
+    }
+
+    /// Catches a worktree removed while Caudra runs, so its sessions are
+    /// listed where they now live.
+    pub(crate) fn move_back_from_removed_worktrees(&mut self) {
+        if self.workspace_baseline.is_remote() {
+            return;
+        }
+        match worktrees::reconcile(&self.storage, Path::new(&self.state.session.cwd)) {
+            Ok(moved) if moved.is_empty() => {}
+            Ok(moved) => self.flash(
+                moved
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("; "),
+            ),
+            Err(error) => {
+                tracing::warn!(%error, "failed to move sessions back from removed worktrees");
+            }
+        }
     }
 
     fn session_rows(&self) -> Vec<SessionRow> {
@@ -2978,6 +3023,11 @@ impl App {
             tracing::warn!(%error, "failed to list stored sessions");
             Vec::new()
         });
+        let elsewhere = if self.workspace_baseline.is_remote() {
+            Vec::new()
+        } else {
+            self.other_checkout_rows(&seen)
+        };
         live.iter()
             .cloned()
             .chain(
@@ -2990,8 +3040,42 @@ impl App {
                         updated_at: summary.updated_at,
                         activity: None,
                         focused: false,
+                        checkout: None,
                     }),
             )
+            .chain(elsewhere)
+            .collect()
+    }
+
+    fn other_checkout_rows(&self, seen: &HashSet<CaudraId>) -> Vec<SessionRow> {
+        worktrees::sibling_sessions(&self.storage, Path::new(&self.state.session.cwd))
+            .unwrap_or_else(|error| {
+                tracing::warn!(%error, "failed to list sessions of other checkouts");
+                Vec::new()
+            })
+            .into_iter()
+            .flat_map(
+                |CheckoutSessions {
+                     root,
+                     branch,
+                     sessions,
+                     ..
+                 }| {
+                    sessions.into_iter().map(move |session| SessionRow {
+                        id: session.id,
+                        title: session.title,
+                        updated_at: session.updated_at,
+                        activity: None,
+                        focused: false,
+                        checkout: Some(OtherCheckout {
+                            root: root.clone(),
+                            branch: branch.clone(),
+                            cwd: PathBuf::from(session.cwd),
+                        }),
+                    })
+                },
+            )
+            .filter(|row| !seen.contains(&row.id))
             .collect()
     }
 }

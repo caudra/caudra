@@ -7,6 +7,7 @@
 //! waits on every event source at once and wakes the moment a plugin action,
 //! agent event, or keypress arrives instead of sleeping in `event::poll`.
 
+use std::borrow::Cow;
 use std::collections::HashSet;
 use std::fs;
 use std::io;
@@ -24,6 +25,7 @@ use crate::sandbox::{
 };
 use caudra_agent::background::BackgroundTransition;
 use caudra_agent::command::CustomCommand;
+use caudra_agent::herdr::{HerdrEnv, resume_command_line};
 use caudra_agent::permissions::PermissionManager;
 use caudra_agent::prompt::profile::{
     BUILTIN_PROFILE_NAME, PromptProfileCatalog, SystemPromptProfile,
@@ -31,6 +33,8 @@ use caudra_agent::prompt::profile::{
 use caudra_agent::snapshots::{SESSION_SNAPSHOTS_DIR, SnapshotLimits, SnapshotStore};
 use caudra_agent::workflow::WorkflowTransition;
 use caudra_agent::workspace_baseline::WorkspaceBaseline;
+use caudra_agent::worktree::git::Git;
+use caudra_agent::worktree::{Backend, Request as WorktreeRequest, counterpart, label};
 use caudra_agent::{
     AgentConfig, AgentEvent, CancelToken, Envelope, McpCommand, McpConfigErrors, McpHandle, mcp,
 };
@@ -45,6 +49,7 @@ use caudra_providers::provider::{Provider, fetch_all_models, from_model};
 use caudra_providers::{HistoryItem, Message, Model};
 use caudra_storage::StateDir;
 use caudra_storage::StorageError;
+use caudra_storage::checkout;
 use caudra_storage::id::{CaudraId, CaudraIdParseError, SessionRef};
 use caudra_storage::remote_operation_journal::RemoteOperationJournal;
 use caudra_storage::sessions::{
@@ -54,6 +59,7 @@ use caudra_storage::sessions::{
 use caudra_storage::state::WorkspaceTabs;
 use caudra_storage::workflow::WorkflowRunStatus;
 use caudra_storage::workspace_binding::StoredWorkspaceBinding;
+use caudra_storage::worktrees;
 use caudra_workbench::WorkbenchAction;
 use caudra_workspace::WorkspaceControlCommand;
 #[cfg(not(windows))]
@@ -81,8 +87,11 @@ use crate::components::input::Submission;
 use crate::components::session_picker::{SessionActivity, SessionRow};
 use crate::components::storage_modal::{StorageFetchState, StorageReport};
 use crate::components::usage_modal::UsageFetchState;
+use crate::components::worktree_picker::{WorktreeOverview, WorktreeView};
 use crate::components::{Action, ExitRequest, ForkDraft, ForkedSession, Status};
-use crate::herdr::{HerdrObservation, HerdrReporterHandle, aggregate_observations};
+use crate::herdr::{
+    HerdrObservation, HerdrReporterHandle, HerdrResume, HerdrStatus, aggregate_observations,
+};
 use crate::input::InputReader;
 use crate::repaint::{Dirty, FrameLimiter, IDLE_POLL};
 use crate::theme;
@@ -125,6 +134,10 @@ const RELOCATION_ADMISSION_ERR: &str =
     "Session relocation is in progress; retry after the workspace restarts";
 const SANDBOX_WORK_BUSY: &str =
     "Wait for agents, queues, background tasks and shells before a sandbox action";
+const WORKTREE_REPOSITORY_ERR: &str =
+    "Worktrees need a git repository, and this session works outside one";
+const SESSION_OPEN_ELSEWHERE: &str =
+    "Another Caudra has that session open, so only its workspace was focused";
 
 /// The prompt that opened a session, which is what its title is about.
 fn opening_prompt<M: TitleSource>(messages: &[M]) -> Result<String, String> {
@@ -146,7 +159,7 @@ pub(crate) struct ShutdownReport {
     /// This generation only: `/reload` builds a new loop, so a reloaded run
     /// reports the time since the reload rather than since launch.
     pub run_time: Duration,
-    pub relocation: Option<SessionRelocationHandoff>,
+    pub relocation: Option<Handoff>,
     pub sandbox: Option<SandboxAttachment>,
     pub sandbox_control: Option<SandboxControl>,
 }
@@ -189,6 +202,7 @@ pub struct EventLoopParams {
     pub default_prompt_profile: Option<Arc<SystemPromptProfile>>,
     pub prompt_profile_override: Option<String>,
     pub herdr_reporter: Option<HerdrReporterHandle>,
+    pub worktrees: Backend,
     pub workspace_session: Option<caudra_workspace::WorkspaceSession>,
     pub remote_project_context:
         Option<Arc<caudra_agent::remote_project_context::RemoteProjectContext>>,
@@ -458,7 +472,7 @@ impl SessionRuntime {
 }
 
 fn runtime_observation(
-    blocker: Option<&'static str>,
+    blocker: Option<Cow<'static, str>>,
     app_working: bool,
     queue_empty: bool,
     queue_processing: bool,
@@ -646,6 +660,73 @@ fn check_relocation_journals(storage: &StateDir, id: CaudraId) -> Result<(), Str
         }
     }
     Ok(())
+}
+
+fn refuse_resumable_workflows(database: &SessionDatabase, id: CaudraId) -> Result<(), String> {
+    let resumable = database
+        .load_workflow_runs(id)
+        .map_err(|error| error.to_string())?
+        .iter()
+        .any(|run| {
+            matches!(
+                run.status,
+                WorkflowRunStatus::Active
+                    | WorkflowRunStatus::Paused
+                    | WorkflowRunStatus::BudgetLimited
+            )
+        });
+    if resumable {
+        return Err(format!("{RELOCATION_WORKFLOW_ERR}: {id}"));
+    }
+    Ok(())
+}
+
+/// Opens the checkout at `root` in a Herdr workspace grouped with its
+/// repository's, or focuses the one it is open in.
+fn open_in_herdr(herdr: &HerdrEnv, root: &Path) -> Result<String, String> {
+    let checkout = checkout::discover(root).ok_or(WORKTREE_REPOSITORY_ERR)?;
+    let opened = herdr
+        .cli()
+        .worktree_open(&checkout.main_root, &checkout.root)
+        .map_err(|error| error.to_string())?;
+    Ok(format!(
+        "Opened {} in Herdr",
+        label(opened.worktree.branch.as_deref(), &checkout.root)
+    ))
+}
+
+/// Resumes session `id` in the Herdr workspace of the checkout `cwd` is in:
+/// in its root pane when the workspace has just opened, else in a new pane
+/// beside the focused one. A session another Caudra has open only has its
+/// workspace focused.
+fn resume_in_herdr(
+    herdr: &HerdrEnv,
+    storage: &StateDir,
+    id: CaudraId,
+    cwd: &Path,
+) -> Result<String, String> {
+    let checkout = checkout::discover(cwd).ok_or(WORKTREE_REPOSITORY_ERR)?;
+    let cli = herdr.cli();
+    let opened = cli
+        .worktree_open(&checkout.main_root, &checkout.root)
+        .map_err(|error| error.to_string())?;
+    match SessionLease::acquire(storage, id) {
+        Ok(_) => {}
+        Err(SessionError::SessionInUse { .. }) => return Ok(SESSION_OPEN_ELSEWHERE.into()),
+        Err(error) => return Err(format!("Failed to open session: {error}")),
+    }
+    let pane = if opened.workspace.already_open {
+        cli.split_workspace(&opened.workspace.workspace_id, cwd)
+            .map_err(|error| error.to_string())?
+    } else {
+        opened.workspace.pane_id
+    };
+    cli.pane_run(&pane, &resume_command_line(&id.to_string()))
+        .map_err(|error| error.to_string())?;
+    Ok(format!(
+        "Resumed the session in {}",
+        label(opened.worktree.branch.as_deref(), &checkout.root)
+    ))
 }
 
 fn canonical_cwd(path: &Path) -> Result<PathBuf, String> {
@@ -1351,6 +1432,7 @@ pub(crate) struct EventLoop<'t> {
     title_tx: flume::Sender<GeneratedTitle>,
     ui_action_rx: flume::Receiver<UiAction>,
     herdr_reporter: Option<HerdrReporterHandle>,
+    worktrees: Backend,
     _model_fetch_task: smol::Task<()>,
     relocation: Option<PendingRelocation>,
     sandbox: Option<SandboxAttachment>,
@@ -1398,8 +1480,14 @@ impl SessionTransition {
     }
 }
 
+/// What the stopped sessions go on to once every one of them is saved.
+pub(crate) enum Handoff {
+    Relocation(SessionRelocationHandoff),
+    Worktree(WorktreeRequest),
+}
+
 struct PendingRelocation {
-    handoff: SessionRelocationHandoff,
+    handoff: Handoff,
     _workflows: Vec<SessionTransition>,
 }
 
@@ -1556,6 +1644,7 @@ impl<'t> EventLoop<'t> {
             default_prompt_profile,
             prompt_profile_override,
             herdr_reporter,
+            worktrees,
             workspace_session,
             remote_project_context: _,
             local_documents,
@@ -1613,7 +1702,8 @@ impl<'t> EventLoop<'t> {
 
         caudra_workbench::scroll::set_touch(ui_config.touch.enabled(terminal::detect_touch));
 
-        let notifier = terminal::TerminalNotifier::new(ui_config.notifications);
+        let notifier =
+            terminal::TerminalNotifier::new(ui_config.notifications, herdr_reporter.is_some());
         let mut ctx = SpawnCtx {
             storage,
             background_enabled: !exit_on_done,
@@ -1719,6 +1809,7 @@ impl<'t> EventLoop<'t> {
             title_tx,
             ui_action_rx,
             herdr_reporter,
+            worktrees,
             _model_fetch_task: bg.task,
             relocation: None,
             sandbox: None,
@@ -1729,6 +1820,17 @@ impl<'t> EventLoop<'t> {
 
     fn focused_app(&mut self) -> &mut App {
         &mut self.sessions[self.focused].app
+    }
+
+    fn herdr_resume(&self) -> HerdrResume {
+        let session = &self.sessions[self.focused].app.state.session;
+        if self.ctx.storage.is_ephemeral() {
+            HerdrResume::Never
+        } else if session.is_persisted() {
+            HerdrResume::Session(session.id)
+        } else {
+            HerdrResume::Fresh
+        }
     }
 
     pub(crate) fn run(mut self, mut initial_prompt: Option<String>) -> Result<ShutdownReport> {
@@ -2446,9 +2548,13 @@ impl<'t> EventLoop<'t> {
         dirty |= self.emit_task_changes();
         self.emit_notifications();
         if let Some(reporter) = &self.herdr_reporter {
-            reporter.observe(aggregate_observations(
-                self.sessions.iter().map(SessionRuntime::herdr_observation),
-            ));
+            reporter.observe(HerdrStatus {
+                observation: aggregate_observations(
+                    self.sessions.iter().map(SessionRuntime::herdr_observation),
+                ),
+                resume: self.herdr_resume(),
+            });
+            reporter.describe(self.sessions[self.focused].app.herdr_metadata());
         }
         // An `exit_on_done` exit waits on `QueueDrained`; a dead agent loop
         // can never send it, so fail instead of hanging forever.
@@ -2677,6 +2783,7 @@ impl<'t> EventLoop<'t> {
                 updated_at: rt.app.state.session.updated_at,
                 activity: Some(SessionStatus::of(&rt.app).activity()),
                 focused: i == self.focused,
+                checkout: None,
             })
             .collect();
         if self.ctx.live_sessions.load().as_slice() != rows {
@@ -3514,21 +3621,7 @@ impl<'t> EventLoop<'t> {
         let database =
             SessionDatabase::open_state(&self.ctx.storage).map_err(|error| error.to_string())?;
         for expected in &request.sessions {
-            if database
-                .load_workflow_runs(expected.id)
-                .map_err(|error| error.to_string())?
-                .iter()
-                .any(|run| {
-                    matches!(
-                        run.status,
-                        WorkflowRunStatus::Active
-                            | WorkflowRunStatus::Paused
-                            | WorkflowRunStatus::BudgetLimited
-                    )
-                })
-            {
-                return Err(format!("{RELOCATION_WORKFLOW_ERR}: {}", expected.id));
-            }
+            refuse_resumable_workflows(&database, expected.id)?;
         }
         for runtime in &mut self.sessions {
             runtime.app.checkpoint_now();
@@ -3554,16 +3647,17 @@ impl<'t> EventLoop<'t> {
         }
         validate_relocation_selection(&request, &current, donor.as_ref())?;
         Ok(PendingRelocation {
-            handoff: SessionRelocationHandoff {
+            handoff: Handoff::Relocation(SessionRelocationHandoff {
                 request,
                 donor,
                 leases,
-            },
+            }),
             _workflows: workflows,
         })
     }
 
-    fn change_working_directory(&mut self, idx: usize, cwd: PathBuf) {
+    /// Whether the process moved to `cwd`; a refusal is flashed.
+    fn change_working_directory(&mut self, idx: usize, cwd: PathBuf) -> bool {
         if let Some(error) = cwd_change_blocker(self.sessions.iter().map(|runtime| {
             (
                 runtime.quiescent(),
@@ -3571,7 +3665,7 @@ impl<'t> EventLoop<'t> {
             )
         })) {
             self.sessions[idx].app.flash(error.into());
-            return;
+            return false;
         }
 
         let mut transitions = Vec::new();
@@ -3580,7 +3674,7 @@ impl<'t> EventLoop<'t> {
                 Ok(transition) => transitions.push(transition),
                 Err(error) => {
                     self.sessions[idx].app.flash(error);
-                    return;
+                    return false;
                 }
             }
         }
@@ -3596,7 +3690,7 @@ impl<'t> EventLoop<'t> {
                 Ok(store) => store,
                 Err(error) => {
                     self.sessions[idx].app.flash(format!("cd: {error}"));
-                    return;
+                    return false;
                 }
             };
             match store.journal_state() {
@@ -3607,20 +3701,20 @@ impl<'t> EventLoop<'t> {
                         session_id,
                         cwd.display()
                     ));
-                    return;
+                    return false;
                 }
                 Err(error) => {
                     self.sessions[idx]
                         .app
                         .flash(format!("cd: failed to inspect workspace restore: {error}"));
-                    return;
+                    return false;
                 }
             }
         }
 
         if let Err(error) = std::env::set_current_dir(&cwd) {
             self.sessions[idx].app.flash(format!("cd: {error}"));
-            return;
+            return false;
         }
         let permissions = load_permissions(&cwd);
         self.ctx
@@ -3666,6 +3760,136 @@ impl<'t> EventLoop<'t> {
                 .app
                 .flash(format!("cd {}", cwd.display()));
         }
+        true
+    }
+
+    /// Opens a session that works in another checkout of this repository.
+    /// Inside Herdr it resumes in that checkout's workspace; otherwise this
+    /// process changes directory there first, as `/cd` would, and a session
+    /// another Caudra has open is refused before anything moves.
+    fn open_session_elsewhere(&mut self, idx: usize, id: CaudraId, cwd: &Path) {
+        if let Some(herdr) = self.worktrees.herdr() {
+            let outcome = resume_in_herdr(herdr, &self.ctx.storage, id, cwd);
+            self.sessions[idx]
+                .app
+                .flash(outcome.unwrap_or_else(|error| error));
+            return;
+        }
+        let opened = SessionLease::acquire(&self.ctx.storage, id)
+            .map_err(|error| format!("Failed to open session: {error}"))
+            .and_then(|_| cwd.canonicalize().map_err(|error| format!("cd: {error}")));
+        let cwd = match opened {
+            Ok(cwd) => cwd,
+            Err(error) => {
+                self.sessions[idx].app.flash(error);
+                return;
+            }
+        };
+        if self.change_working_directory(idx, cwd)
+            && let Err(error) = self.focus_session(id)
+        {
+            self.sessions[idx].app.flash(error);
+        }
+    }
+
+    fn open_worktrees(&mut self, idx: usize, view: WorktreeView) {
+        let overview = self
+            .relocation_available()
+            .and_then(|()| self.worktree_overview(idx));
+        match overview {
+            Ok(overview) => self.sessions[idx].app.open_worktrees(overview, view),
+            Err(error) => self.sessions[idx].app.flash(error),
+        }
+    }
+
+    /// The repository the session at `idx` works in, once the sessions left
+    /// in removed worktrees have moved back, so every count is current.
+    fn worktree_overview(&mut self, idx: usize) -> Result<WorktreeOverview, String> {
+        let app = &mut self.sessions[idx].app;
+        app.move_back_from_removed_worktrees();
+        let session = &app.state.session;
+        let cwd = canonical_cwd(Path::new(&session.cwd))?;
+        let current = checkout::discover(&cwd).ok_or(WORKTREE_REPOSITORY_ERR)?;
+        let checkouts =
+            worktrees::checkouts(&self.ctx.storage, &cwd).map_err(|error| error.to_string())?;
+        let dirty = Git::new(&current.root)
+            .is_dirty()
+            .map_err(|error| error.to_string())?;
+        Ok(WorktreeOverview {
+            session: session.id,
+            cwd,
+            current: current.root,
+            main_root: current.main_root,
+            checkouts,
+            dirty,
+            herdr: self.worktrees.herdr().is_some(),
+        })
+    }
+
+    /// Inside Herdr the checkout opens in its own workspace; otherwise every
+    /// tab moves into it, as `/cd` would take them.
+    fn open_worktree(&mut self, idx: usize, root: &Path) {
+        if let Some(herdr) = self.worktrees.herdr() {
+            let outcome = open_in_herdr(herdr, root);
+            self.sessions[idx]
+                .app
+                .flash(outcome.unwrap_or_else(|error| error));
+            return;
+        }
+        let located =
+            canonical_cwd(Path::new(&self.sessions[idx].app.state.session.cwd)).and_then(|cwd| {
+                let current = checkout::discover(&cwd).ok_or(WORKTREE_REPOSITORY_ERR)?;
+                Ok(counterpart(&cwd, &current.root, root))
+            });
+        match located {
+            Ok(destination) => {
+                self.change_working_directory(idx, destination);
+            }
+            Err(error) => self.sessions[idx].app.flash(error),
+        }
+    }
+
+    fn inspect_worktree_removal(&mut self, idx: usize, root: PathBuf) {
+        match Git::new(&root).is_dirty() {
+            Ok(dirty) => self.sessions[idx].app.show_worktree_removal(root, dirty),
+            Err(error) => self.sessions[idx].app.flash(error.to_string()),
+        }
+    }
+
+    /// Checks what `/cd` and relocation check, since the UI restarts around
+    /// every worktree change, and reserves each session's workflows until
+    /// then. A new worktree's session moves, so it must be free to.
+    fn prepare_worktree(&self, request: WorktreeRequest) -> Result<PendingRelocation, String> {
+        self.relocation_available()?;
+        if let Some(error) = cwd_change_blocker(self.sessions.iter().map(|runtime| {
+            (
+                runtime.quiescent(),
+                runtime.app.state.session.meta.pending_revert.is_some(),
+            )
+        })) {
+            return Err(error.into());
+        }
+        if self
+            .sessions
+            .iter()
+            .any(|runtime| runtime.app.workbench_blocks_workspace_change())
+        {
+            return Err(RELOCATION_WORKBENCH_ERR.into());
+        }
+        if let WorktreeRequest::Create(create) = &request {
+            check_relocation_journals(&self.ctx.storage, create.session)?;
+            let database = SessionDatabase::open_state(&self.ctx.storage)
+                .map_err(|error| error.to_string())?;
+            refuse_resumable_workflows(&database, create.session)?;
+        }
+        let mut workflows = Vec::with_capacity(self.sessions.len());
+        for runtime in &self.sessions {
+            workflows.push(SessionTransition::reserve(&runtime.handles)?);
+        }
+        Ok(PendingRelocation {
+            handoff: Handoff::Worktree(request),
+            _workflows: workflows,
+        })
     }
 
     fn respawn_agent(&mut self, idx: usize, history: Vec<HistoryItem>) {
@@ -3729,6 +3953,7 @@ impl<'t> EventLoop<'t> {
                     self.sessions[idx].app.flash(error);
                 }
             }
+            Action::OpenSessionElsewhere { id, cwd } => self.open_session_elsewhere(idx, id, &cwd),
             Action::DeleteSession(id) => match self.release_for_delete(id) {
                 Ok(lease) => self.ctx.storage_writer.delete(id, move |res| {
                     let _lease = lease;
@@ -3823,7 +4048,9 @@ impl<'t> EventLoop<'t> {
                 let actions = self.sessions[idx].app.unrevert();
                 self.dispatch(idx, actions);
             }
-            Action::ChangeWorkingDirectory(cwd) => self.change_working_directory(idx, cwd),
+            Action::ChangeWorkingDirectory(cwd) => {
+                self.change_working_directory(idx, cwd);
+            }
             Action::OpenSessionRelocation { bulk, destination } => {
                 self.open_session_relocation(idx, bulk, destination);
             }
@@ -3836,6 +4063,16 @@ impl<'t> EventLoop<'t> {
                     Err(error) => self.sessions[idx].app.flash(error),
                 }
             }
+            Action::OpenWorktrees(view) => self.open_worktrees(idx, view),
+            Action::OpenWorktree(root) => self.open_worktree(idx, &root),
+            Action::InspectWorktreeRemoval(root) => self.inspect_worktree_removal(idx, root),
+            Action::RunWorktree(request) => match self.prepare_worktree(request) {
+                Ok(pending) => {
+                    self.focused = idx;
+                    self.relocation = Some(pending);
+                }
+                Err(error) => self.sessions[idx].app.flash(error),
+            },
             Action::RemoteControl(args) => {
                 if matches!(
                     WorkspaceControlCommand::parse(&args),
@@ -4699,6 +4936,7 @@ mod tests {
                 source_cwd: Some(app.state.session.cwd.clone()),
                 destination: RELOCATION_DESTINATION.into(),
                 include_project_usage: true,
+                keep_plan: false,
             },
             &current,
             None,
@@ -4737,6 +4975,7 @@ mod tests {
             source_cwd: Some(RELOCATION_SOURCE.into()),
             destination: RELOCATION_DESTINATION.into(),
             include_project_usage: true,
+            keep_plan: false,
         };
         match change {
             "empty" => request.sessions.clear(),
@@ -5230,7 +5469,7 @@ mod tests {
     #[test]
     fn blocker_outranks_active_work() {
         assert_eq!(
-            runtime_observation(Some(HERDR_BLOCKER), true, false, true, 1, 1),
+            runtime_observation(Some(HERDR_BLOCKER.into()), true, false, true, 1, 1),
             HerdrObservation::blocked(HERDR_BLOCKER)
         );
     }

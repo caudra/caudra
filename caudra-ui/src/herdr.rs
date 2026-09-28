@@ -1,50 +1,22 @@
-use std::ffi::{OsStr, OsString};
-use std::process::{Child, Command, Stdio};
-use std::sync::{Arc, Mutex};
+use std::borrow::Cow;
+use std::io;
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use tracing::warn;
-use wait_timeout::ChildExt;
+use caudra_agent::herdr::{
+    AgentReport, AgentState, HerdrEnv, HerdrError, HerdrPane, PaneMetadata, RESUME_COMMAND,
+    command_on_path, resume_argv,
+};
+use caudra_storage::id::CaudraId;
+use tracing::{info, warn};
 
-const AGENT: &str = "caudra";
-const SOURCE: &str = "custom:caudra";
-const COMMAND_TIMEOUT: Duration = Duration::from_secs(1);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
-const HERDR_ENV: &str = "HERDR_ENV";
-const HERDR_PANE_ID: &str = "HERDR_PANE_ID";
-const HERDR_BIN_PATH: &str = "HERDR_BIN_PATH";
-const HERDR_SOCKET_PATH: &str = "HERDR_SOCKET_PATH";
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum AgentState {
-    Idle,
-    Working,
-    Blocked,
-}
-
-impl AgentState {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Idle => "idle",
-            Self::Working => "working",
-            Self::Blocked => "blocked",
-        }
-    }
-
-    fn priority(self) -> u8 {
-        match self {
-            Self::Idle => 0,
-            Self::Working => 1,
-            Self::Blocked => 2,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct HerdrObservation {
     state: AgentState,
-    message: Option<&'static str>,
+    message: Option<Cow<'static, str>>,
 }
 
 impl HerdrObservation {
@@ -62,10 +34,18 @@ impl HerdrObservation {
         }
     }
 
-    pub(crate) const fn blocked(message: &'static str) -> Self {
+    pub(crate) fn blocked(message: impl Into<Cow<'static, str>>) -> Self {
         Self {
             state: AgentState::Blocked,
-            message: Some(message),
+            message: Some(message.into()),
+        }
+    }
+
+    fn priority(&self) -> u8 {
+        match self.state {
+            AgentState::Idle => 0,
+            AgentState::Working => 1,
+            AgentState::Blocked => 2,
         }
     }
 }
@@ -76,7 +56,7 @@ pub(crate) fn aggregate_observations(
     observations
         .into_iter()
         .fold(HerdrObservation::idle(), |selected, candidate| {
-            if candidate.state.priority() > selected.state.priority() {
+            if candidate.priority() > selected.priority() {
                 candidate
             } else {
                 selected
@@ -84,94 +64,82 @@ pub(crate) fn aggregate_observations(
         })
 }
 
-#[derive(Clone)]
-struct HerdrConfig {
-    binary: OsString,
-    pane_id: OsString,
-    socket_path: OsString,
+/// What Herdr runs in this pane once it restores it after a restart.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HerdrResume {
+    /// Nothing outlives the process, as in an ephemeral run.
+    Never,
+    /// The focused session was never saved, so there is nothing to reopen and
+    /// a session handed to another pane is never resumed twice.
+    Fresh,
+    Session(CaudraId),
 }
 
-impl HerdrConfig {
-    fn from_env(get: impl Fn(&str) -> Option<OsString>) -> Option<Self> {
-        if get(HERDR_ENV).as_deref() != Some(OsStr::new("1")) {
-            return None;
+impl HerdrResume {
+    fn argv(self) -> Option<Vec<String>> {
+        match self {
+            Self::Never => None,
+            Self::Fresh => Some(resume_argv(None)),
+            Self::Session(id) => Some(resume_argv(Some(&id.to_string()))),
         }
-        Some(Self {
-            binary: get(HERDR_BIN_PATH)
-                .and_then(nonempty)
-                .unwrap_or_else(|| OsString::from("herdr")),
-            pane_id: nonempty(get(HERDR_PANE_ID)?)?,
-            socket_path: nonempty(get(HERDR_SOCKET_PATH)?)?,
-        })
     }
 }
 
-fn nonempty(value: OsString) -> Option<OsString> {
-    (!value.is_empty()).then_some(value)
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct HerdrStatus {
+    pub(crate) observation: HerdrObservation,
+    pub(crate) resume: HerdrResume,
 }
 
-#[derive(Debug, PartialEq, Eq)]
-struct CommandSpec {
-    program: OsString,
-    args: Vec<OsString>,
-    socket_path: OsString,
+/// Only the newest value is ever sent, and an unchanged one is never sent twice.
+struct Latest<T> {
+    value: Option<T>,
+    unsent: bool,
 }
 
-impl CommandSpec {
-    fn report(config: &HerdrConfig, observation: HerdrObservation, sequence: u64) -> Self {
-        let mut args = vec![
-            "pane".into(),
-            "report-agent".into(),
-            config.pane_id.clone(),
-            "--source".into(),
-            SOURCE.into(),
-            "--agent".into(),
-            AGENT.into(),
-            "--state".into(),
-            observation.state.as_str().into(),
-            "--seq".into(),
-            sequence.to_string().into(),
-        ];
-        if let Some(message) = observation.message {
-            args.extend([OsString::from("--message"), message.into()]);
-        }
+impl<T> Default for Latest<T> {
+    fn default() -> Self {
         Self {
-            program: config.binary.clone(),
-            args,
-            socket_path: config.socket_path.clone(),
-        }
-    }
-
-    fn release(config: &HerdrConfig, sequence: u64) -> Self {
-        Self {
-            program: config.binary.clone(),
-            args: vec![
-                "pane".into(),
-                "release-agent".into(),
-                config.pane_id.clone(),
-                "--source".into(),
-                SOURCE.into(),
-                "--agent".into(),
-                AGENT.into(),
-                "--seq".into(),
-                sequence.to_string().into(),
-            ],
-            socket_path: config.socket_path.clone(),
+            value: None,
+            unsent: false,
         }
     }
 }
 
-enum WorkerAction {
-    Report(HerdrObservation),
+impl<T: Clone> Latest<T> {
+    fn set(&mut self, value: T) {
+        self.value = Some(value);
+        self.unsent = true;
+    }
+
+    fn take(&mut self) -> Option<T> {
+        std::mem::take(&mut self.unsent)
+            .then(|| self.value.clone())
+            .flatten()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Farewell {
+    /// The user exited: Herdr forgets the agent and its resume command.
     Release,
+    /// The process is going away for any other reason. Herdr keeps the resume
+    /// command, and notices on its own when the shell gets the pane back.
+    Detach,
 }
 
 #[derive(Default)]
 struct Pending {
-    latest: Option<HerdrObservation>,
-    desired: Option<HerdrObservation>,
-    closing: bool,
-    released: bool,
+    status: Latest<HerdrStatus>,
+    metadata: Latest<PaneMetadata<'static>>,
+    farewell: Option<Farewell>,
+}
+
+enum WorkerAction {
+    Report(HerdrStatus),
+    Describe(PaneMetadata<'static>),
+    Release,
+    Stop,
 }
 
 struct Shared {
@@ -180,43 +148,53 @@ struct Shared {
 }
 
 impl Shared {
-    fn observe(&self, observation: HerdrObservation) {
+    fn update(&self, change: impl FnOnce(&mut Pending) -> bool) {
         let changed = {
             let mut pending = lock(&self.pending);
-            if pending.closing || pending.desired == Some(observation) {
-                false
-            } else {
-                pending.desired = Some(observation);
-                pending.latest = Some(observation);
-                true
-            }
+            pending.farewell.is_none() && change(&mut pending)
         };
         if changed {
             self.wake();
         }
     }
 
-    fn close(&self) {
-        let changed = {
-            let mut pending = lock(&self.pending);
-            let changed = !pending.closing;
-            pending.closing = true;
+    fn observe(&self, status: HerdrStatus) {
+        self.update(|pending| {
+            let changed = pending.status.value.as_ref() != Some(&status);
+            if changed {
+                pending.status.set(status);
+            }
             changed
-        };
-        if changed {
-            self.wake();
-        }
+        });
+    }
+
+    fn describe(&self, metadata: PaneMetadata<'_>) {
+        self.update(|pending| {
+            let changed = pending.metadata.value.as_ref() != Some(&metadata);
+            if changed {
+                pending.metadata.set(metadata.into_owned());
+            }
+            changed
+        });
+    }
+
+    fn close(&self, farewell: Farewell) {
+        self.update(|pending| {
+            pending.farewell = Some(farewell);
+            true
+        });
     }
 
     fn next_action(&self) -> Option<WorkerAction> {
         let mut pending = lock(&self.pending);
-        if let Some(observation) = pending.latest.take() {
-            Some(WorkerAction::Report(observation))
-        } else if pending.closing && !pending.released {
-            pending.released = true;
-            Some(WorkerAction::Release)
-        } else {
-            None
+        match pending.farewell {
+            Some(Farewell::Release) => Some(WorkerAction::Release),
+            Some(Farewell::Detach) => Some(WorkerAction::Stop),
+            None => pending
+                .status
+                .take()
+                .map(WorkerAction::Report)
+                .or_else(|| pending.metadata.take().map(WorkerAction::Describe)),
         }
     }
 
@@ -228,7 +206,7 @@ impl Shared {
     }
 }
 
-fn lock(pending: &Mutex<Pending>) -> std::sync::MutexGuard<'_, Pending> {
+fn lock(pending: &Mutex<Pending>) -> MutexGuard<'_, Pending> {
     pending.lock().unwrap_or_else(|error| error.into_inner())
 }
 
@@ -238,8 +216,12 @@ pub struct HerdrReporterHandle {
 }
 
 impl HerdrReporterHandle {
-    pub(crate) fn observe(&self, observation: HerdrObservation) {
-        self.shared.observe(observation);
+    pub(crate) fn observe(&self, status: HerdrStatus) {
+        self.shared.observe(status);
+    }
+
+    pub(crate) fn describe(&self, metadata: PaneMetadata<'_>) {
+        self.shared.describe(metadata);
     }
 }
 
@@ -251,8 +233,7 @@ pub struct HerdrReporter {
 
 impl HerdrReporter {
     pub fn from_env() -> Option<Self> {
-        let config = HerdrConfig::from_env(|name| std::env::var_os(name))?;
-        Self::start(config).map_or_else(
+        Self::start(HerdrEnv::detect()?).map_or_else(
             |error| {
                 warn!(%error, "failed to start Herdr reporter");
                 None
@@ -261,7 +242,7 @@ impl HerdrReporter {
         )
     }
 
-    fn start(config: HerdrConfig) -> std::io::Result<Self> {
+    fn start(env: HerdrEnv) -> io::Result<Self> {
         let (wake_tx, wake_rx) = flume::bounded(1);
         let (done_tx, done_rx) = flume::bounded(1);
         let shared = Arc::new(Shared {
@@ -271,7 +252,7 @@ impl HerdrReporter {
         let worker_shared = Arc::clone(&shared);
         let worker = std::thread::Builder::new()
             .name("herdr-reporter".into())
-            .spawn(move || worker_loop(config, worker_shared, wake_rx, done_tx))?;
+            .spawn(move || worker_loop(&env, &worker_shared, &wake_rx, &done_tx))?;
         Ok(Self {
             handle: HerdrReporterHandle { shared },
             done_rx,
@@ -283,15 +264,15 @@ impl HerdrReporter {
         self.handle.clone()
     }
 
-    pub fn shutdown(mut self) {
-        self.finish();
-    }
-
-    fn finish(&mut self) {
+    /// Tells Herdr the agent left the pane. Only a deliberate exit may: the
+    /// release also forgets the resume command, which is what brings the
+    /// session back after a hangup or a Herdr restart. Dropping the reporter
+    /// without this keeps it.
+    pub fn release(mut self) {
         let Some(worker) = self.worker.take() else {
             return;
         };
-        self.handle.shared.close();
+        self.handle.shared.close(Farewell::Release);
         if self.done_rx.recv_timeout(SHUTDOWN_TIMEOUT).is_err() {
             warn!("Herdr reporter did not stop within {SHUTDOWN_TIMEOUT:?}");
             return;
@@ -304,35 +285,106 @@ impl HerdrReporter {
 
 impl Drop for HerdrReporter {
     fn drop(&mut self) {
-        self.finish();
+        self.handle.shared.close(Farewell::Detach);
+    }
+}
+
+struct Worker {
+    pane: HerdrPane,
+    sequence: u64,
+    resume: bool,
+    metadata: bool,
+}
+
+impl Worker {
+    fn next_seq(&mut self) -> u64 {
+        self.sequence = self.sequence.saturating_add(1);
+        self.sequence
+    }
+
+    fn report(&mut self, status: &HerdrStatus) {
+        let resume = self.resume.then(|| status.resume.argv()).flatten();
+        let mut report = AgentReport {
+            state: status.observation.state,
+            message: status.observation.message.as_deref(),
+            resume: resume.as_deref(),
+        };
+        let seq = self.next_seq();
+        match self.pane.report_agent(&report, seq) {
+            Ok(()) => {}
+            Err(HerdrError::Unsupported(detail)) if report.resume.is_some() => {
+                warn!(%detail, "Herdr rejected the resume command, so it cannot restore this pane");
+                self.resume = false;
+                report.resume = None;
+                let seq = self.next_seq();
+                if let Err(error) = self.pane.report_agent(&report, seq) {
+                    warn!(%error, "Herdr state report failed");
+                }
+            }
+            Err(error) => warn!(%error, "Herdr state report failed"),
+        }
+    }
+
+    fn describe(&mut self, metadata: &PaneMetadata<'_>) {
+        if !self.metadata {
+            return;
+        }
+        let seq = self.next_seq();
+        match self.pane.report_metadata(metadata, seq) {
+            Ok(()) => {}
+            Err(HerdrError::Unsupported(detail)) => {
+                warn!(%detail, "Herdr rejected pane metadata; the sidebar keeps its defaults");
+                self.metadata = false;
+            }
+            Err(error) => warn!(%error, "Herdr metadata report failed"),
+        }
+    }
+
+    fn release(&mut self) {
+        let seq = self.next_seq();
+        if let Err(error) = self.pane.release_agent(seq) {
+            warn!(%error, "Herdr release failed");
+        }
     }
 }
 
 fn worker_loop(
-    config: HerdrConfig,
-    shared: Arc<Shared>,
-    wake_rx: flume::Receiver<()>,
-    done_tx: flume::Sender<()>,
+    env: &HerdrEnv,
+    shared: &Shared,
+    wake_rx: &flume::Receiver<()>,
+    done_tx: &flume::Sender<()>,
 ) {
-    let mut sequence = sequence_seed();
+    let resume = command_on_path(RESUME_COMMAND);
+    if !resume {
+        info!(
+            command = RESUME_COMMAND,
+            "command is not on PATH, so Herdr cannot restore this pane after a restart"
+        );
+    }
+    let mut worker = Worker {
+        pane: HerdrPane::new(env),
+        sequence: sequence_seed(),
+        resume,
+        metadata: true,
+    };
     while wake_rx.recv().is_ok() {
         while let Some(action) = shared.next_action() {
-            sequence = sequence.saturating_add(1);
-            let release = matches!(action, WorkerAction::Release);
-            execute(match action {
-                WorkerAction::Report(observation) => {
-                    CommandSpec::report(&config, observation, sequence)
+            match action {
+                WorkerAction::Report(status) => worker.report(&status),
+                WorkerAction::Describe(metadata) => worker.describe(&metadata),
+                WorkerAction::Release => {
+                    worker.release();
+                    let _ = done_tx.send(());
+                    return;
                 }
-                WorkerAction::Release => CommandSpec::release(&config, sequence),
-            });
-            if release {
-                let _ = done_tx.send(());
-                return;
+                WorkerAction::Stop => return,
             }
         }
     }
 }
 
+/// Herdr drops a report whose sequence is not above the last one it took from
+/// this source, and a later process in the same pane must win.
 fn sequence_seed() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -341,216 +393,119 @@ fn sequence_seed() -> u64 {
         .min(u64::MAX as u128) as u64
 }
 
-fn execute(spec: CommandSpec) {
-    let child = Command::new(&spec.program)
-        .args(&spec.args)
-        .env(HERDR_SOCKET_PATH, &spec.socket_path)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn();
-    let mut child = match child {
-        Ok(child) => child,
-        Err(error) => {
-            warn!(%error, "failed to invoke Herdr");
-            return;
-        }
-    };
-    match child.wait_timeout(COMMAND_TIMEOUT) {
-        Ok(Some(status)) if status.success() => {}
-        Ok(Some(status)) => warn!(?status, "Herdr reporter command failed"),
-        Ok(None) => {
-            warn!("Herdr reporter command timed out");
-            terminate(&mut child);
-        }
-        Err(error) => {
-            warn!(%error, "failed waiting for Herdr reporter command");
-            terminate(&mut child);
-        }
-    }
-}
-
-fn terminate(child: &mut Child) {
-    if let Err(error) = child.kill() {
-        warn!(%error, "failed to stop Herdr reporter command");
-    }
-    if let Err(error) = child.wait() {
-        warn!(%error, "failed to reap Herdr reporter command");
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use test_case::test_case;
 
-    const BLOCKER: &str = "Permission requested";
+    const BLOCKER: &str = "Permission requested: shell";
+    const TITLE: &str = "Refactor auth";
+    const MODEL: &str = "claude-opus-4-5";
 
-    fn config() -> HerdrConfig {
-        HerdrConfig {
-            binary: "/path with spaces/herdr".into(),
-            pane_id: "workspace:pane".into(),
-            socket_path: "/tmp/herdr socket".into(),
+    fn shared() -> Shared {
+        let (wake, _wake_rx) = flume::bounded(1);
+        Shared {
+            pending: Mutex::new(Pending::default()),
+            wake,
         }
     }
 
-    fn env(values: &[(&str, &str)]) -> Option<HerdrConfig> {
-        HerdrConfig::from_env(|name| {
-            values
-                .iter()
-                .find_map(|(key, value)| (*key == name).then(|| OsString::from(value)))
-        })
+    fn status(observation: HerdrObservation) -> HerdrStatus {
+        HerdrStatus {
+            observation,
+            resume: HerdrResume::Fresh,
+        }
+    }
+
+    fn metadata(context_percent: Option<u32>) -> PaneMetadata<'static> {
+        PaneMetadata {
+            title: TITLE.into(),
+            model: MODEL.into(),
+            context_percent,
+        }
     }
 
     #[test]
-    fn complete_environment_enables_reporting() {
-        let config = env(&[
-            (HERDR_ENV, "1"),
-            (HERDR_PANE_ID, "workspace:pane"),
-            (HERDR_BIN_PATH, "/path/herdr"),
-            (HERDR_SOCKET_PATH, "/tmp/herdr.sock"),
-        ])
-        .unwrap();
-
-        assert_eq!(config.binary, OsString::from("/path/herdr"));
-        assert_eq!(config.pane_id, OsString::from("workspace:pane"));
-        assert_eq!(config.socket_path, OsString::from("/tmp/herdr.sock"));
-    }
-
-    #[test]
-    fn missing_binary_path_uses_path_lookup() {
-        let config = env(&[
-            (HERDR_ENV, "1"),
-            (HERDR_PANE_ID, "workspace:pane"),
-            (HERDR_SOCKET_PATH, "/tmp/herdr.sock"),
-        ])
-        .unwrap();
-
-        assert_eq!(config.binary, OsString::from("herdr"));
-    }
-
-    #[test_case(HERDR_ENV ; "environment_marker")]
-    #[test_case(HERDR_PANE_ID ; "pane_id")]
-    #[test_case(HERDR_SOCKET_PATH ; "socket_path")]
-    fn missing_required_environment_disables_reporting(missing: &str) {
-        let values = [
-            (HERDR_ENV, "1"),
-            (HERDR_PANE_ID, "workspace:pane"),
-            (HERDR_BIN_PATH, "/path/herdr"),
-            (HERDR_SOCKET_PATH, "/tmp/herdr.sock"),
-        ];
-        let present = values
-            .into_iter()
-            .filter(|(name, _)| *name != missing)
-            .collect::<Vec<_>>();
-
-        assert!(env(&present).is_none());
-    }
-
-    #[test_case("" ; "empty")]
-    #[test_case("0" ; "zero")]
-    #[test_case("true" ; "word")]
-    fn invalid_environment_marker_disables_reporting(marker: &str) {
-        assert!(
-            env(&[
-                (HERDR_ENV, marker),
-                (HERDR_PANE_ID, "workspace:pane"),
-                (HERDR_BIN_PATH, "/path/herdr"),
-                (HERDR_SOCKET_PATH, "/tmp/herdr.sock"),
-            ])
-            .is_none()
-        );
-    }
-
-    #[test]
-    fn report_command_uses_exact_shell_free_arguments() {
-        let spec = CommandSpec::report(&config(), HerdrObservation::blocked(BLOCKER), 42);
-
-        assert_eq!(spec.program, OsString::from("/path with spaces/herdr"));
-        assert_eq!(
-            spec.args,
-            [
-                "pane",
-                "report-agent",
-                "workspace:pane",
-                "--source",
-                SOURCE,
-                "--agent",
-                AGENT,
-                "--state",
-                "blocked",
-                "--seq",
-                "42",
-                "--message",
-                BLOCKER,
-            ]
-            .map(OsString::from)
-        );
-        assert_eq!(spec.socket_path, OsString::from("/tmp/herdr socket"));
-    }
-
-    #[test]
-    fn release_command_uses_exact_shell_free_arguments() {
-        let spec = CommandSpec::release(&config(), 43);
-
-        assert_eq!(
-            spec.args,
-            [
-                "pane",
-                "release-agent",
-                "workspace:pane",
-                "--source",
-                SOURCE,
-                "--agent",
-                AGENT,
-                "--seq",
-                "43",
-            ]
-            .map(OsString::from)
-        );
-    }
-
-    #[test]
-    fn observations_coalesce_and_release_is_last() {
-        let (wake, _wake_rx) = flume::bounded(1);
-        let shared = Shared {
-            pending: Mutex::new(Pending::default()),
-            wake,
-        };
-        shared.observe(HerdrObservation::idle());
-        shared.observe(HerdrObservation::working());
-        shared.observe(HerdrObservation::blocked(BLOCKER));
-        shared.close();
+    fn status_coalesces_to_the_latest_before_metadata() {
+        let shared = shared();
+        shared.describe(metadata(Some(1)));
+        shared.observe(status(HerdrObservation::idle()));
+        shared.observe(status(HerdrObservation::working()));
+        shared.observe(status(HerdrObservation::blocked(BLOCKER)));
 
         assert!(matches!(
             shared.next_action(),
-            Some(WorkerAction::Report(HerdrObservation {
-                state: AgentState::Blocked,
-                message: Some(BLOCKER)
-            }))
+            Some(WorkerAction::Report(reported)) if reported == status(HerdrObservation::blocked(BLOCKER))
         ));
-        assert!(matches!(shared.next_action(), Some(WorkerAction::Release)));
-        assert!(shared.next_action().is_none());
-        shared.observe(HerdrObservation::idle());
+        assert!(matches!(
+            shared.next_action(),
+            Some(WorkerAction::Describe(described)) if described == metadata(Some(1))
+        ));
         assert!(shared.next_action().is_none());
     }
 
     #[test]
-    fn unchanged_observation_is_suppressed() {
-        let (wake, _wake_rx) = flume::bounded(1);
-        let shared = Shared {
-            pending: Mutex::new(Pending::default()),
-            wake,
-        };
-        shared.observe(HerdrObservation::idle());
+    fn unchanged_values_are_not_sent_twice() {
+        let shared = shared();
+        shared.observe(status(HerdrObservation::idle()));
+        shared.describe(metadata(None));
+        while shared.next_action().is_some() {}
+
+        shared.observe(status(HerdrObservation::idle()));
+        shared.describe(metadata(None));
+
+        assert!(shared.next_action().is_none());
+    }
+
+    #[test]
+    fn a_new_resume_target_is_a_change() {
+        let shared = shared();
+        shared.observe(status(HerdrObservation::idle()));
+        while shared.next_action().is_some() {}
+
+        shared.observe(HerdrStatus {
+            observation: HerdrObservation::idle(),
+            resume: HerdrResume::Session(CaudraId::generate()),
+        });
+
         assert!(matches!(
             shared.next_action(),
             Some(WorkerAction::Report(_))
         ));
+    }
 
-        shared.observe(HerdrObservation::idle());
+    #[test_case(Farewell::Release ; "release")]
+    #[test_case(Farewell::Detach ; "detach")]
+    fn the_first_farewell_wins_and_drops_pending_reports(first: Farewell) {
+        let shared = shared();
+        shared.observe(status(HerdrObservation::working()));
+        shared.close(first);
+        shared.close(Farewell::Release);
+        shared.close(Farewell::Detach);
+        shared.observe(status(HerdrObservation::idle()));
 
-        assert!(shared.next_action().is_none());
+        let action = shared.next_action();
+
+        match first {
+            Farewell::Release => assert!(matches!(action, Some(WorkerAction::Release))),
+            Farewell::Detach => assert!(matches!(action, Some(WorkerAction::Stop))),
+        }
+    }
+
+    #[test_case(HerdrResume::Never, None ; "never")]
+    #[test_case(HerdrResume::Fresh, Some(vec![RESUME_COMMAND.to_owned()]) ; "fresh")]
+    fn resume_without_a_session(resume: HerdrResume, expected: Option<Vec<String>>) {
+        assert_eq!(resume.argv(), expected);
+    }
+
+    #[test]
+    fn resume_names_the_saved_session() {
+        let id = CaudraId::generate();
+
+        assert_eq!(
+            HerdrResume::Session(id).argv(),
+            Some(resume_argv(Some(&id.to_string())))
+        );
     }
 
     #[test]
@@ -567,5 +522,71 @@ mod tests {
             aggregate_observations([HerdrObservation::idle(), HerdrObservation::working()]),
             HerdrObservation::working()
         );
+    }
+
+    #[cfg(unix)]
+    mod fake_herdr {
+        use super::*;
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::path::Path;
+        use tempfile::TempDir;
+
+        const PANE: &str = "w1:p2";
+        const SOCKET: &str = "/tmp/herdr.sock";
+        const CALLS: &str = "calls";
+        const SEPARATOR: &str = "--";
+
+        /// Records every call, one line each, and answers `--` like a Herdr
+        /// release that predates resume commands.
+        fn worker(dir: &Path) -> Worker {
+            let binary = dir.join("herdr");
+            fs::write(
+                &binary,
+                format!(
+                    "#!/bin/sh\necho \"$*\" >> '{}'\nfor arg in \"$@\"; do [ \"$arg\" = \"{SEPARATOR}\" ] && exit 2; done\nexit 0\n",
+                    dir.join(CALLS).display()
+                ),
+            )
+            .unwrap();
+            fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
+            Worker {
+                pane: HerdrPane::new(&HerdrEnv {
+                    binary: binary.into(),
+                    socket_path: SOCKET.into(),
+                    pane_id: PANE.into(),
+                    workspace_id: None,
+                }),
+                sequence: 0,
+                resume: true,
+                metadata: true,
+            }
+        }
+
+        fn calls(dir: &Path) -> Vec<Vec<String>> {
+            fs::read_to_string(dir.join(CALLS))
+                .unwrap()
+                .lines()
+                .map(|line| line.split(' ').map(str::to_owned).collect())
+                .collect()
+        }
+
+        #[test]
+        fn rejected_resume_is_dropped_and_the_state_still_reaches_herdr() {
+            let dir = TempDir::new().unwrap();
+            let mut worker = worker(dir.path());
+
+            worker.report(&status(HerdrObservation::working()));
+            worker.report(&status(HerdrObservation::idle()));
+
+            let calls = calls(dir.path());
+            let with_resume = |call: &Vec<String>| call.iter().any(|arg| arg == SEPARATOR);
+            assert_eq!(calls.len(), 3, "{calls:?}");
+            assert!(with_resume(&calls[0]));
+            assert!(!with_resume(&calls[1]) && !with_resume(&calls[2]));
+            assert!(calls[1].contains(&"working".to_owned()));
+            assert!(calls[2].contains(&"idle".to_owned()));
+            assert!(!worker.resume);
+        }
     }
 }

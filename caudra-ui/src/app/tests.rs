@@ -14967,7 +14967,7 @@ fn trusting_project_permission_config_refreshes_picker() {
     app.execute_command(cmd("/permissions"), 0);
     app.finish_permission_jobs();
     assert_eq!(
-        app.lifecycle_blocker(),
+        app.lifecycle_blocker().as_deref(),
         Some(PROJECT_PERMISSION_CONFIG_TRUST_BLOCKER)
     );
 
@@ -15036,7 +15036,7 @@ fn project_permission_config_trust_blocks_only_while_picker_is_open() {
     app.execute_command(cmd("/permissions"), 0);
     app.finish_permission_jobs();
     assert_eq!(
-        app.lifecycle_blocker(),
+        app.lifecycle_blocker().as_deref(),
         Some(PROJECT_PERMISSION_CONFIG_TRUST_BLOCKER)
     );
     app.update(Msg::Key(key(KeyCode::Esc)));
@@ -17922,6 +17922,7 @@ fn open_repeat_test_session_picker(app: &mut App) {
             updated_at: 0,
             activity: None,
             focused: true,
+            checkout: None,
         }],
         0,
     );
@@ -18817,6 +18818,28 @@ fn attention_prioritizes_permission_and_normalizes_tool() {
     assert_eq!(
         app.attention(),
         Some(Notification::PermissionRequested { tool: None })
+    );
+}
+
+#[test]
+fn lifecycle_blocker_reads_like_the_notification() {
+    let mut app = test_app();
+    app.permission_prompt.open(
+        "id".into(),
+        caudra_config::ToolKey::native("bash"),
+        vec!["execute".into()],
+        None,
+    );
+
+    assert_eq!(
+        app.lifecycle_blocker().as_deref(),
+        Some(
+            Notification::PermissionRequested {
+                tool: Some("bash".into())
+            }
+            .message()
+            .as_str()
+        )
     );
 }
 

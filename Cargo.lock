@@ -879,6 +879,7 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "sha2 0.11.0",
+ "shell-words",
  "similar",
  "smol",
  "strum 0.28.0",
@@ -889,6 +890,7 @@ dependencies = [
  "toml_edit",
  "tracing",
  "url",
+ "wait-timeout",
 ]
 
 [[package]]

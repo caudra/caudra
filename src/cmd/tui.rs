@@ -15,9 +15,11 @@ use color_eyre::eyre::{Context, bail, eyre};
 use flume::{RecvTimeoutError as PatternRecvError, Sender as ChannelSender};
 
 use caudra_agent::command::{self, CustomCommand};
+use caudra_agent::herdr::HerdrEnv;
 use caudra_agent::permissions::pattern_recognition::{PatternCandidate, RecognitionExclusion};
 use caudra_agent::prompt::profile::{PromptProfileCatalog, SystemPromptProfile};
 use caudra_agent::tools::{ToolAudience, ToolFilter, ToolRegistry};
+use caudra_agent::worktree::Backend;
 use caudra_config::sandbox::SandboxName;
 use caudra_config::{Config, RetentionConfig};
 use caudra_lua::PluginHost;
@@ -41,6 +43,7 @@ use caudra_workcell::editor_adapter::{
 };
 use caudra_workcell::{PatternObligationKind, RemoteConnectionStatus};
 
+use super::worktree::{self, Executed, Handled};
 use crate::cli::Cli;
 use crate::cmd::load_config;
 use crate::cmd::permissions::discover::{
@@ -75,6 +78,9 @@ const RELOCATION_ENV_RESTART: &str =
 const RELOCATION_USAGE_UNCHANGED: &str = "Historical project usage attribution was left unchanged";
 const RELOCATION_USAGE_EMPTY: &str =
     "No historical project usage was recorded for the source directory";
+const RELOCATION_PLANS_DETACHED: &str = "Active source plans and approvals were detached";
+const RELOCATION_APPROVALS_DETACHED: &str =
+    "Approvals were detached; plans stay attached, since both directories share project state";
 const PATTERN_LOAD_QUEUE: usize = 32;
 const PATTERN_CACHE_PROJECTS: usize = 8;
 const PATTERN_CACHE_BYTES_PER_PROJECT: usize = 256 * 1024;
@@ -726,6 +732,18 @@ struct ResolvedSessions {
     warnings: Vec<String>,
 }
 
+/// A new session for a UI generation left without a tab.
+fn fresh_tab(model_spec: &str, cwd: &Path, storage: &StateDir) -> Result<SessionTab> {
+    let session = AppSession::new(model_spec, &cwd.to_string_lossy());
+    let lease = Arc::new(SessionLease::acquire(storage, session.id)?);
+    setup::report_session_start(caudra_otel::emit::START_FRESH, Some(session.id));
+    Ok(SessionTab {
+        session,
+        lease,
+        cursor: None,
+    })
+}
+
 fn local_runtime_cwd(
     tabs: &[SessionTab],
     focused: usize,
@@ -735,6 +753,32 @@ fn local_runtime_cwd(
         Some(tab) => Ok(PathBuf::from(&tab.session.cwd)),
         None => current.context("resolve current working directory for reload"),
     }
+}
+
+/// `--session` resumes a local session where it works, whichever directory it
+/// was typed in, so config, plugins and MCP servers come from its project. A
+/// Herdr restore types it into whatever directory the pane's shell was left in.
+/// A session left in a removed worktree is moved back first, which is also
+/// what the returned messages report.
+fn resumed_session_cwd(cli: &Cli, storage: &StateDir) -> Result<(Option<PathBuf>, Vec<String>)> {
+    if cli.is_sdk_mode() || cli.print || cli.ephemeral || cli.workcell.is_set() {
+        return Ok((None, Vec::new()));
+    }
+    let Some(id) = cli
+        .session
+        .as_deref()
+        .and_then(|raw| raw.parse::<CaudraId>().ok())
+    else {
+        return Ok((None, Vec::new()));
+    };
+    let moved = caudra_storage::worktrees::reconcile_session(storage, id)
+        .map(|moved| moved.iter().map(ToString::to_string).collect())
+        .unwrap_or_else(|error| {
+            tracing::warn!(%error, session_id = %id, "could not move the resumed session back out of a removed worktree");
+            Vec::new()
+        });
+    let cwd = SessionDatabase::open_state(storage)?.local_session_cwd(id)?;
+    Ok((cwd.map(PathBuf::from).filter(|path| path.is_dir()), moved))
 }
 
 fn project_env_present(cwd: &Path) -> bool {
@@ -912,8 +956,13 @@ fn relocate_stopped_sessions(
         ),
         None => RELOCATION_USAGE_UNCHANGED.into(),
     };
+    let detached = if relocation.request.keep_plan {
+        RELOCATION_APPROVALS_DETACHED
+    } else {
+        RELOCATION_PLANS_DETACHED
+    };
     let committed = format!(
-        "Relocation committed: moved {} session(s) to {}. {usage}. Active source plans and approvals were detached. Files and old workspace snapshots were not moved",
+        "Relocation committed: moved {} session(s) to {}. {usage}. {detached}. Files and old workspace snapshots were not moved",
         result.sessions_moved, relocation.request.destination
     );
     let mut retained = Vec::new();
@@ -1231,7 +1280,17 @@ pub fn run(mut cli: Cli, tightened: Vec<PathBuf>) -> Result<ExitCode> {
         .context("load model purpose bindings")?;
     let model_registry_ms = lap();
 
-    let cwd = env::current_dir().unwrap_or_else(|_| ".".into());
+    let mut cwd = env::current_dir().unwrap_or_else(|_| ".".into());
+    let (resumed_cwd, mut moved_back) = resumed_session_cwd(&cli, &persistent_storage)?;
+    if let Some(session_cwd) = resumed_cwd {
+        env::set_current_dir(&session_cwd).wrap_err_with(|| {
+            format!(
+                "enter the resumed session's directory {}",
+                session_cwd.display()
+            )
+        })?;
+        cwd = session_cwd;
+    }
     let startup_project_env = project_env_present(&cwd);
 
     let resumed_sandbox =
@@ -1280,6 +1339,10 @@ pub fn run(mut cli: Cli, tightened: Vec<PathBuf>) -> Result<ExitCode> {
     setup::install_panic_log_hook();
     setup::warn_ignored_provider_fields();
     setup::report_startup(setup::MODE_TUI, &stack.model, &cwd);
+    if !workcell_runtime.is_remote() {
+        super::adopt_checkout_state(&storage, &cwd);
+        moved_back.extend(super::reconcile_worktrees(&storage, &cwd));
+    }
 
     if cli.is_sdk_mode() {
         let fast = stack.config.always_fast && stack.model.supports_fast();
@@ -1395,6 +1458,7 @@ pub fn run(mut cli: Cli, tightened: Vec<PathBuf>) -> Result<ExitCode> {
     let mut tabs = resolved.tabs;
     let mut focused = resolved.focused;
     let mut warnings = resolved.warnings;
+    warnings.extend(moved_back);
     if !tightened.is_empty() {
         warnings.push(format!(
             "{TIGHTENED_DIRS_WARNING}: {}",
@@ -1485,6 +1549,7 @@ pub fn run(mut cli: Cli, tightened: Vec<PathBuf>) -> Result<ExitCode> {
                 })
             })
         };
+        let worktrees = Backend::select(&stack.config.worktrees, HerdrEnv::detect());
         let outcome = caudra_ui::run(
             caudra_ui::EventLoopParams {
                 model,
@@ -1531,6 +1596,7 @@ pub fn run(mut cli: Cli, tightened: Vec<PathBuf>) -> Result<ExitCode> {
                 default_prompt_profile: stack.default_prompt_profile.clone(),
                 prompt_profile_override: cli.system_prompt_profile.clone(),
                 herdr_reporter: herdr_reporter.as_ref().map(HerdrReporter::handle),
+                worktrees: worktrees.clone(),
                 workspace_session: workcell_runtime.workspace_session().cloned(),
                 remote_project_context: workcell_runtime.remote_project_context().cloned(),
                 local_documents: workcell_runtime.local_documents().cloned(),
@@ -1545,7 +1611,7 @@ pub fn run(mut cli: Cli, tightened: Vec<PathBuf>) -> Result<ExitCode> {
             None => "run UI".into(),
         })?;
 
-        let (reloaded, f, relocation) = match outcome {
+        let (reloaded, f, relocation, mut follow_up) = match outcome {
             RunOutcome::SandboxControl {
                 tabs: stopped,
                 focused: stopped_focus,
@@ -1687,7 +1753,7 @@ pub fn run(mut cli: Cli, tightened: Vec<PathBuf>) -> Result<ExitCode> {
                     "plugin host and teardown joined"
                 );
                 if let Some(reporter) = herdr_reporter.take() {
-                    reporter.shutdown();
+                    reporter.release();
                 }
                 // Returning the code instead of exiting here keeps every guard
                 // alive to its scope end, including the ephemeral state root
@@ -1697,12 +1763,55 @@ pub fn run(mut cli: Cli, tightened: Vec<PathBuf>) -> Result<ExitCode> {
             RunOutcome::Reload {
                 tabs: reloaded,
                 focused: f,
-            } => (reloaded, f, None),
+            } => (reloaded, f, None, None),
             RunOutcome::Relocate {
                 tabs: reloaded,
                 focused: f,
                 relocation,
-            } => (reloaded, f, Some(relocation)),
+            } => (reloaded, f, Some(relocation), None),
+            RunOutcome::Worktree {
+                tabs: stopped,
+                focused: stopped_focus,
+                request,
+            } => {
+                let Executed { handled, notes } =
+                    worktree::execute(request, stopped, stopped_focus, &storage, &worktrees);
+                warnings.extend(notes);
+                match handled {
+                    Handled::Continue {
+                        tabs: kept,
+                        focused: kept_focus,
+                    } => {
+                        tabs = kept;
+                        focused = kept_focus;
+                        if tabs.is_empty() {
+                            tabs.push(fresh_tab(&stack.model.spec(), &runtime_cwd, &storage)?);
+                        }
+                        stack.commands =
+                            discover_commands(cli.no_commands || workcell_runtime.is_remote());
+                        committed_relocation = None;
+                        continue;
+                    }
+                    Handled::Relocate {
+                        tabs: moving,
+                        focused: moving_focus,
+                        handoff,
+                        follow_up,
+                    } => (moving, moving_focus, Some(handoff), Some(*follow_up)),
+                    Handled::Exit => {
+                        for warning in &warnings {
+                            eprintln!("{warning}");
+                        }
+                        drop(sweeper);
+                        drop(stack);
+                        teardown.join();
+                        if let Some(reporter) = herdr_reporter.take() {
+                            reporter.release();
+                        }
+                        return Ok(ExitCode::SUCCESS);
+                    }
+                }
+            }
         };
         let started = Instant::now();
         let restart_for_env = relocation.as_ref().is_some_and(|relocation| {
@@ -1716,7 +1825,7 @@ pub fn run(mut cli: Cli, tightened: Vec<PathBuf>) -> Result<ExitCode> {
         let relocation = match relocation {
             Some(relocation) if !relocation_moves_live_tabs(&reloaded, &relocation.request) => {
                 let original_cwd = env::current_dir().unwrap_or_else(|_| runtime_cwd.clone());
-                let (resolved, _) = relocate_stopped_sessions(
+                let (resolved, committed) = relocate_stopped_sessions(
                     reloaded,
                     f,
                     relocation,
@@ -1726,7 +1835,15 @@ pub fn run(mut cli: Cli, tightened: Vec<PathBuf>) -> Result<ExitCode> {
                 )?;
                 tabs = resolved.tabs;
                 focused = resolved.focused;
-                warnings = resolved.warnings;
+                warnings.extend(match follow_up.take() {
+                    Some(follow_up) => follow_up.finish(
+                        resolved.warnings,
+                        committed.is_some(),
+                        &worktrees,
+                        &storage,
+                    ),
+                    None => resolved.warnings,
+                });
                 stack.commands = discover_commands(cli.no_commands || workcell_runtime.is_remote());
                 committed_relocation = None;
                 continue;
@@ -1759,13 +1876,24 @@ pub fn run(mut cli: Cli, tightened: Vec<PathBuf>) -> Result<ExitCode> {
             )?;
             tabs = resolved.tabs;
             focused = resolved.focused;
-            warnings = resolved.warnings;
+            let worktree_change = follow_up.is_some();
+            warnings.extend(match follow_up {
+                Some(follow_up) => {
+                    follow_up.finish(resolved.warnings, committed.is_some(), &worktrees, &storage)
+                }
+                None => resolved.warnings,
+            });
             committed_relocation = committed;
             if restart_for_env && let Some(committed) = &committed_relocation {
                 drop(sweeper);
                 teardown.join();
                 if let Some(reporter) = herdr_reporter.take() {
-                    reporter.shutdown();
+                    reporter.release();
+                }
+                if worktree_change {
+                    for warning in &warnings {
+                        eprintln!("{warning}");
+                    }
                 }
                 eprintln!("{committed}. {RELOCATION_ENV_RESTART}.");
                 return Ok(ExitCode::SUCCESS);
@@ -1778,7 +1906,10 @@ pub fn run(mut cli: Cli, tightened: Vec<PathBuf>) -> Result<ExitCode> {
         let reload_cwd = if workcell_runtime.is_remote() {
             cwd.clone()
         } else {
-            local_runtime_cwd(&tabs, focused, env::current_dir())?
+            let local_cwd = local_runtime_cwd(&tabs, focused, env::current_dir())?;
+            super::adopt_checkout_state(&storage, &local_cwd);
+            warnings.extend(super::reconcile_worktrees(&storage, &local_cwd));
+            local_cwd
         };
         let fallback =
             (committed_relocation.is_none() && reload_cwd == runtime_cwd).then_some(last_good);
@@ -1794,14 +1925,7 @@ pub fn run(mut cli: Cli, tightened: Vec<PathBuf>) -> Result<ExitCode> {
             None => "rebuild runtime".into(),
         })?;
         if tabs.is_empty() {
-            let session = AppSession::new(&new_stack.model.spec(), &reload_cwd.to_string_lossy());
-            let lease = Arc::new(SessionLease::acquire(&storage, session.id)?);
-            setup::report_session_start(caudra_otel::emit::START_FRESH, Some(session.id));
-            tabs.push(SessionTab {
-                session,
-                lease,
-                cursor: None,
-            });
+            tabs.push(fresh_tab(&new_stack.model.spec(), &reload_cwd, &storage)?);
         }
         sweeper = RetentionSweeper::spawn(storage.clone(), new_stack.config.storage.retention);
         stack = new_stack;
@@ -2502,6 +2626,7 @@ mod tests {
                 source_cwd: bulk.then(|| source.to_string_lossy().into_owned()),
                 destination: destination.to_string_lossy().into_owned(),
                 include_project_usage: bulk,
+                keep_plan: false,
             },
             donor: None,
             leases,
@@ -2572,6 +2697,33 @@ mod tests {
         assert_eq!(
             relocation_requires_env_restart(&tabs, &handoff.request, &startup, startup_project_env),
             expected
+        );
+    }
+
+    #[test_case(&[], true, true ; "tui_adopts_the_session_directory")]
+    #[test_case(&["--print"], true, false ; "print_mode_stays")]
+    #[test_case(&["--ephemeral"], true, false ; "ephemeral_run_stays")]
+    #[test_case(&[], false, false ; "removed_directory_stays")]
+    fn session_flag_resumes_in_the_session_directory(
+        flags: &[&str],
+        directory_exists: bool,
+        adopted: bool,
+    ) {
+        use clap::Parser;
+        let temp = tempfile::tempdir().unwrap();
+        let storage = StateDir::from_path(temp.path().join("state"));
+        let project = temp.path().join("project");
+        fs::create_dir(&project).unwrap();
+        let tab = relocation_test_tab(&storage, &project);
+        if !directory_exists {
+            fs::remove_dir(&project).unwrap();
+        }
+        let id = tab.session.id.to_string();
+        let cli = Cli::parse_from(["caudra", "--session", &id].iter().chain(flags));
+
+        assert_eq!(
+            resumed_session_cwd(&cli, &storage).unwrap(),
+            (adopted.then_some(project), Vec::new())
         );
     }
 

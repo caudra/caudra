@@ -862,6 +862,10 @@ impl<'h> Agent<'h> {
             crate::prompt::ENVIRONMENT_MARKER,
             self.environment.as_deref(),
         ));
+        standing.extend(relocation_notice(
+            self.history.as_slice(),
+            self.environment.as_deref(),
+        ));
         standing.extend(standing_notice(
             self.history.as_slice(),
             crate::prompt::INSTRUCTIONS_CHANGED_MARKER,
@@ -2340,6 +2344,28 @@ fn standing_notice(history: &[Message], marker: &str, text: Option<&str>) -> Opt
     Some(Message::observation(text.to_owned()))
 }
 
+/// Names both ends of a move when `environment` puts the session in another
+/// working directory than the environment last announced. Paths from before
+/// still look valid, and in a sibling worktree they are, into the wrong
+/// checkout. Said on the one turn the environment changes, so never twice.
+fn relocation_notice(history: &[Message], environment: Option<&str>) -> Option<Message> {
+    let to = working_directory(environment?)?;
+    let from = working_directory(last_announced(history, crate::prompt::ENVIRONMENT_MARKER)?)?;
+    (from != to).then(|| {
+        Message::observation(
+            crate::prompt::RELOCATED_PROMPT
+                .replace(crate::prompt::FROM_SLOT, from)
+                .replace(crate::prompt::TO_SLOT, to),
+        )
+    })
+}
+
+fn working_directory(environment: &str) -> Option<&str> {
+    environment
+        .lines()
+        .find_map(|line| line.strip_prefix(crate::prompt::WORKING_DIRECTORY_LABEL))
+}
+
 /// The mode the transcript last told the model it was in.
 ///
 /// Derived from history rather than from a field because [`Agent`] is rebuilt
@@ -2615,6 +2641,8 @@ mod tests {
     const ENVIRONMENT_NEXT_DAY: &str =
         "<system-reminder>\n# Environment\n\n- Date: 2026-09-10\n</system-reminder>";
     const EXPECTED_ENVIRONMENT_NOTICE: &str = "a changed environment must be announced";
+    const MAIN_CWD: &str = "/work/app";
+    const WORKTREE_CWD: &str = "/data/worktrees/app/feature-login";
     const EXPECTED_USER_TURN: &str = "the fixture opens on the message the user typed";
     const EXPECTED_REQUEST: &str = "a run must send at least one message";
     const NO_PREFILL: &str = "an arrival must never leave the request ending on the assistant";
@@ -4814,6 +4842,31 @@ mod tests {
         )
         .expect(EXPECTED_ENVIRONMENT_NOTICE);
         assert_eq!(notice.user_text(), Some(ENVIRONMENT_NEXT_DAY));
+    }
+
+    fn environment_at(cwd: &str) -> String {
+        crate::agent::environment_block(&Vars::new().set("{cwd}", cwd), &default_model())
+    }
+
+    #[test_case(&[MAIN_CWD], WORKTREE_CWD, true ; "moved")]
+    #[test_case(&[MAIN_CWD], MAIN_CWD, false ; "stayed")]
+    #[test_case(&[MAIN_CWD, WORKTREE_CWD], WORKTREE_CWD, false ; "already_told")]
+    #[test_case(&[], WORKTREE_CWD, false ; "first_turn")]
+    fn a_move_is_told_once_with_both_directories(announced: &[&str], cwd: &str, told: bool) {
+        let history: Vec<_> = announced
+            .iter()
+            .map(|announced| environment_announcement(&environment_at(announced)))
+            .collect();
+
+        let notice = relocation_notice(&history, Some(&environment_at(cwd)));
+
+        assert_eq!(notice.is_some(), told);
+        if let Some(text) = notice.as_ref().and_then(Message::user_text) {
+            assert!(text.contains(crate::prompt::RELOCATED_MARKER));
+            assert!(text.contains(MAIN_CWD));
+            assert!(text.contains(WORKTREE_CWD));
+            assert!(!text.contains(crate::prompt::ENVIRONMENT_MARKER));
+        }
     }
 
     /// The compaction contract: dropping the announcement costs one re-emit

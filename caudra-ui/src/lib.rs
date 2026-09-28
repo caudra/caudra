@@ -51,6 +51,7 @@ use caudra_agent::permissions::pattern_recognition::{
     PatternCandidate, RecognitionStats, RecognizerLimits,
 };
 use caudra_agent::tools::ToolFilter;
+use caudra_agent::worktree::Request as WorktreeRequest;
 use caudra_providers::{
     HistoryItem, HistoryProjectionError, Message, Model, active_history_items, expand_message,
     resolve_history_head, transcript_history_items,
@@ -67,6 +68,8 @@ use flume::Receiver;
 use ratatui::layout::{Alignment, Rect};
 use ratatui::style::Stylize;
 use ratatui::widgets::Paragraph;
+
+use event_loop::Handoff;
 
 #[cfg(test)]
 const PATTERN_TEST_SAMPLE_LIMIT: usize = 64;
@@ -249,6 +252,14 @@ pub enum RunOutcome {
         focused: usize,
         relocation: SessionRelocationHandoff,
     },
+    /// Every session is saved and stopped for a `/worktree` change, which only
+    /// the caller can carry out: it may move this process or hand sessions to
+    /// another Herdr pane.
+    Worktree {
+        tabs: Vec<SessionTab>,
+        focused: usize,
+        request: WorktreeRequest,
+    },
     Sandbox {
         tabs: Vec<SessionTab>,
         attachment: sandbox::SandboxAttachment,
@@ -326,12 +337,22 @@ pub fn run(params: EventLoopParams, initial_prompt: Option<String>) -> Result<Ru
         );
         el.run(initial_prompt)?
     };
-    if let Some(relocation) = report.relocation {
-        return Ok(RunOutcome::Relocate {
-            tabs: report.tabs,
-            focused: report.focused,
-            relocation,
-        });
+    match report.relocation {
+        Some(Handoff::Relocation(relocation)) => {
+            return Ok(RunOutcome::Relocate {
+                tabs: report.tabs,
+                focused: report.focused,
+                relocation,
+            });
+        }
+        Some(Handoff::Worktree(request)) => {
+            return Ok(RunOutcome::Worktree {
+                tabs: report.tabs,
+                focused: report.focused,
+                request,
+            });
+        }
+        None => {}
     }
     if let Some(attachment) = report.sandbox {
         return Ok(RunOutcome::Sandbox {

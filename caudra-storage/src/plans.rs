@@ -4,7 +4,7 @@ use crate::projects::project_subdir;
 use crate::words::random_phrase;
 use crate::{StateClass, StateDir, StorageError};
 
-const PLANS_DIR: &str = "plans";
+pub(crate) const PLANS_DIR: &str = "plans";
 const SLUG_RETRIES: usize = 10;
 
 /// Plans live beside the project's other state, keyed by the enclosing

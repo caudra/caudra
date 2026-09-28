@@ -76,6 +76,15 @@ can appear while the GNU screen window has focus.
 
 Caudra sends OSC 9 directly through Zellij.
 
+## Herdr
+
+In a Herdr pane, `auto` sends no notifications. Caudra reports its state to
+Herdr, and Herdr shows its own notice when the agent finishes or waits for you,
+so a second one from Caudra would repeat it. The notice names the prompt that
+is waiting, such as `Permission requested: shell`. An explicit `osc9` or `bell`
+setting still applies. See [Worktrees](/docs/worktrees/#herdr-integration) for
+what else Caudra reports to Herdr.
+
 ## Focus on Windows
 
 This terminal focus protocol is not available on Windows. Caudra treats the

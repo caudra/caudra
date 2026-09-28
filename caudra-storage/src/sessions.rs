@@ -597,6 +597,9 @@ pub struct SessionRelocation {
     pub source_cwd: Option<String>,
     pub destination: String,
     pub include_project_usage: bool,
+    /// Source and destination share their project state, as the checkouts of
+    /// one repository do, so the plan a session works on stays attached.
+    pub keep_plan: bool,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -1045,6 +1048,12 @@ where
     pub fn persisted_write_version(&self) -> Option<i64> {
         let version = self.base_write_version.load(Ordering::Acquire);
         (version >= 0).then_some(version)
+    }
+
+    /// Whether a write of this session has committed, including one made
+    /// through a clone, so the session can be reopened by id.
+    pub fn is_persisted(&self) -> bool {
+        self.write_version.load(Ordering::Acquire) >= 0
     }
 
     pub fn workspace_binding(&self) -> Option<&StoredWorkspaceBinding> {
@@ -1569,6 +1578,18 @@ mod tests {
             mode: StoredMode::Plan,
             ..StoredSubagentTaskSpec::default()
         }
+    }
+
+    #[test]
+    fn a_commit_through_a_clone_marks_the_original_persisted() {
+        let (_temp, dir) = state_dir();
+        let session = TestSession::new("model", "/project");
+        let mut snapshot = session.clone();
+        assert!(!session.is_persisted());
+
+        snapshot.save(&dir).unwrap();
+
+        assert!(session.is_persisted());
     }
 
     #[test]

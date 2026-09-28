@@ -7,6 +7,7 @@ mod storage;
 mod subcmd;
 mod tui;
 mod workcell_runtime;
+mod worktree;
 
 use std::env;
 use std::path::Path;
@@ -15,6 +16,7 @@ use std::process::ExitCode;
 use color_eyre::Result;
 use color_eyre::eyre::Context;
 
+use caudra_agent::herdr::{HerdrEnv, herdr_skill};
 use caudra_config::Config;
 use caudra_storage::{EphemeralRoot, StateDir};
 
@@ -98,13 +100,42 @@ fn install_native_permission_rules(
     );
 }
 
+/// A linked worktree's one-time import of the notes and plans it kept before
+/// it shared its main checkout's state. A failure leaves them where they were,
+/// so it warns rather than stopping the session.
+fn adopt_checkout_state(storage: &StateDir, cwd: &Path) {
+    if let Err(error) = caudra_storage::projects::adopt_checkout_state(storage, cwd) {
+        tracing::warn!(
+            %error,
+            cwd = %cwd.display(),
+            "could not import a linked worktree's own notes and plans"
+        );
+    }
+}
+
+/// Moves sessions out of the removed worktrees of `cwd`'s repository, saying
+/// what moved. A failure leaves them for the next run, so it only warns.
+fn reconcile_worktrees(storage: &StateDir, cwd: &Path) -> Vec<String> {
+    caudra_storage::worktrees::reconcile(storage, cwd)
+        .map(|moved| moved.iter().map(ToString::to_string).collect())
+        .unwrap_or_else(|error| {
+            tracing::warn!(
+                %error,
+                cwd = %cwd.display(),
+                "could not move sessions back out of removed worktrees"
+            );
+            Vec::new()
+        })
+}
+
 /// Native tools read their options from here rather than from config
 /// directly, so `caudra-agent` stays free of a config dependency it would
 /// otherwise need only for two numbers.
 ///
 /// The `caudra-plugin-dev` skill is rendered from the live Lua API docs, so
 /// only `caudra-lua` can build it. Not installing it is how
-/// `plugins.skill.plugin_dev = false` takes effect.
+/// `plugins.skill.plugin_dev = false` takes effect. The `herdr` skill exists
+/// only inside a Herdr pane, the one place its CLI reaches a session.
 fn configure_native_tools(agent: &caudra_config::AgentConfig) {
     if agent.skill_plugin_dev {
         caudra_agent::tools::native::skill::install_builtin_skill(
@@ -115,6 +146,9 @@ fn configure_native_tools(agent: &caudra_config::AgentConfig) {
         caudra_agent::tools::native::skill::install_builtin_skill(
             caudra_agent::workflow::workflow_dev_skill(),
         );
+    }
+    if let Some(herdr) = HerdrEnv::detect() {
+        caudra_agent::tools::native::skill::install_builtin_skill(herdr_skill(herdr));
     }
     caudra_agent::tools::native::task::set_max_concurrent(agent.task_max_concurrent);
 }

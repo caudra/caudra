@@ -98,6 +98,19 @@ impl App {
             let action = self.session_relocation_picker.handle_mouse(event);
             return self.handle_session_relocation_action(action);
         }
+        if self.worktree_picker.is_open() {
+            self.clear_control_hovers();
+            self.autoscroll = None;
+            self.selection_state = None;
+            if event.kind == MouseEventKind::Down(MouseButton::Left)
+                && !self.worktree_picker.contains(at)
+            {
+                self.worktree_picker.close();
+                return Vec::new();
+            }
+            let action = self.worktree_picker.handle_mouse(event);
+            return self.handle_worktree_action(action);
+        }
         match event.kind {
             MouseEventKind::Down(MouseButton::Middle) => {
                 self.toggle_autoscroll(at);
@@ -799,6 +812,10 @@ impl App {
         }
         if self.session_relocation_picker.is_open() {
             self.session_relocation_picker.scroll(delta);
+            return;
+        }
+        if self.worktree_picker.is_open() {
+            self.worktree_picker.scroll(delta);
             return;
         }
         // The wheel is aggregated into `Msg::Scroll` before `handle_mouse` ever

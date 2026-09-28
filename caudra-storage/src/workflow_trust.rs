@@ -9,7 +9,8 @@ use std::path::{Component, Path};
 
 use sha2::{Digest, Sha256};
 
-use crate::state::{self, StateKey, project_scope};
+use crate::checkout::{self, TrustSource};
+use crate::state::{self, StateKey, StateStore, project_scope};
 use crate::{StateClass, StateDir, StorageError};
 
 const TRUST: StateKey = StateKey {
@@ -45,12 +46,36 @@ pub fn is_workflow_trusted(
     source_rel_path: &str,
     digest: &str,
 ) -> Result<bool, StorageError> {
+    Ok(workflow_trust_source(state_dir, project_root, source_rel_path, digest)?.is_some())
+}
+
+/// The project's own grant for the source, or else one for the identical
+/// source at the same path in another verified checkout of its repository.
+pub fn workflow_trust_source(
+    state_dir: &StateDir,
+    project_root: &Path,
+    source_rel_path: &str,
+    digest: &str,
+) -> Result<Option<TrustSource>, StorageError> {
     validate_digest(digest)?;
     let source = normalize_source_path(source_rel_path)?;
-    let trust = state::get::<HashMap<String, String>>(state_dir, &scope(project_root)?, TRUST)?
-        .unwrap_or_default();
-    validate(&trust)?;
-    Ok(trust.get(&source).is_some_and(|stored| stored == digest))
+    let store = StateStore::open(state_dir, TRUST.class)?;
+    let found = TrustSource::find::<StorageError>(project_root, |candidate| {
+        let trust = store
+            .get::<HashMap<String, String>>(&scope(candidate)?, TRUST)?
+            .unwrap_or_default();
+        validate(&trust)?;
+        Ok(trust.get(&source).is_some_and(|stored| stored == digest))
+    })?;
+    if let Some(TrustSource::Inherited(from)) = &found {
+        tracing::debug!(
+            project = %project_root.display(),
+            from = %from.display(),
+            source,
+            "workflow trusted through a sibling checkout"
+        );
+    }
+    Ok(found)
 }
 
 pub fn trust_workflow(
@@ -74,23 +99,27 @@ pub fn trust_workflow(
     )?
 }
 
+/// Revokes the source's grant in `project_root` and in its counterpart in
+/// every sibling checkout, any of which it could otherwise still inherit.
 pub fn revoke_workflow_trust(
     state_dir: &StateDir,
     project_root: &Path,
     source_rel_path: &str,
 ) -> Result<(), StorageError> {
     let source = normalize_source_path(source_rel_path)?;
-    let scope = scope(project_root)?;
-    state::try_update(
-        state_dir,
-        &scope,
-        TRUST,
-        |trust: &mut HashMap<String, String>| {
-            validate(trust)?;
-            trust.remove(&source);
-            Ok(())
-        },
-    )?
+    let mut store = StateStore::open(state_dir, TRUST.class)?;
+    for path in checkout::with_siblings(project_root) {
+        store.try_update(
+            &scope(&path)?,
+            TRUST,
+            |trust: &mut HashMap<String, String>| {
+                validate(trust)?;
+                trust.remove(&source);
+                Ok::<_, StorageError>(())
+            },
+        )??;
+    }
+    Ok(())
 }
 
 pub fn is_remote_workflow_trusted(
@@ -185,10 +214,12 @@ mod tests {
     use test_case::test_case;
 
     use super::*;
+    use crate::checkout::fixture::linked_pair_with_state;
 
     const SOURCE: &[u8] = b"let meta = #{ name: \"review\" };";
     const OTHER_SOURCE: &[u8] = b"let meta = #{ name: \"review\" }; ";
     const SOURCE_PATH: &str = ".caudra/workflows/review.rhai";
+    const OTHER_SOURCE_PATH: &str = ".caudra/workflows/deploy.rhai";
     const LANGUAGE_VERSION: u32 = 1;
     const ABI_VERSION: u32 = 1;
     const BYTES_ARE_EXACT: &str = "a changed byte must make the source untrusted";
@@ -295,6 +326,35 @@ mod tests {
             StorageError::Io(error) if error.kind() == io::ErrorKind::InvalidData
         ));
         assert!(is_workflow_trusted(&state_dir, &project, spelling, &digest).is_err());
+    }
+
+    #[test_case(SOURCE_PATH, SOURCE, true ; "identical_source")]
+    #[test_case("./.caudra/workflows/review.rhai", SOURCE, true ; "equivalent_spelling")]
+    #[test_case(OTHER_SOURCE_PATH, SOURCE, false ; "other_path")]
+    #[test_case(SOURCE_PATH, OTHER_SOURCE, false ; "changed_bytes")]
+    fn a_worktree_inherits_only_the_identical_source(path: &str, bytes: &[u8], inherited: bool) {
+        let (_temp, state_dir, main, worktree) = linked_pair_with_state();
+        let digest = workflow_source_digest(SOURCE, LANGUAGE_VERSION, ABI_VERSION);
+        trust_workflow(&state_dir, &main, SOURCE_PATH, &digest).unwrap();
+
+        let checked = workflow_source_digest(bytes, LANGUAGE_VERSION, ABI_VERSION);
+
+        assert_eq!(
+            workflow_trust_source(&state_dir, &worktree, path, &checked).unwrap(),
+            inherited.then_some(TrustSource::Inherited(main))
+        );
+    }
+
+    #[test]
+    fn revoking_in_a_worktree_clears_the_grant_it_inherited() {
+        let (_temp, state_dir, main, worktree) = linked_pair_with_state();
+        let digest = workflow_source_digest(SOURCE, LANGUAGE_VERSION, ABI_VERSION);
+        trust_workflow(&state_dir, &main, SOURCE_PATH, &digest).unwrap();
+
+        revoke_workflow_trust(&state_dir, &worktree, SOURCE_PATH).unwrap();
+
+        assert!(!is_workflow_trusted(&state_dir, &main, SOURCE_PATH, &digest).unwrap());
+        assert!(!is_workflow_trusted(&state_dir, &worktree, SOURCE_PATH, &digest).unwrap());
     }
 
     #[test]

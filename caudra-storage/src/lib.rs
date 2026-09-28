@@ -4,6 +4,7 @@
 
 pub mod auth;
 pub mod background;
+pub mod checkout;
 pub mod id;
 pub mod input_history;
 pub mod local_documents;
@@ -39,6 +40,7 @@ pub mod workflow_scratch;
 pub mod workflow_source;
 pub mod workflow_trust;
 pub mod workspace_binding;
+pub mod worktrees;
 
 pub use words::{
     DESCRIPTIVE_ID_ATTEMPTS, DESCRIPTIVE_ID_MAX_LEN, DescriptiveIdCandidates, random_task_id,

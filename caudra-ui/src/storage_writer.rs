@@ -1997,6 +1997,7 @@ mod tests {
                 source_cwd: Some(CWD.into()),
                 destination: RELOCATION_DESTINATION.into(),
                 include_project_usage: true,
+                keep_plan: false,
             })
             .unwrap();
 

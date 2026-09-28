@@ -29,6 +29,7 @@ pub(crate) mod view;
 mod workbench;
 pub(crate) mod workflow;
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
@@ -86,7 +87,9 @@ use crate::components::session_picker::{SessionPicker, SessionRow};
 use crate::components::session_relocation::SessionRelocationPicker;
 use crate::components::skills_modal::SkillsModal;
 use crate::components::stash_picker::StashPicker;
-use crate::components::status_bar::{StatusBar, StatusBarHit, StatusBarHitTarget};
+use crate::components::status_bar::{
+    StatusBar, StatusBarHit, StatusBarHitTarget, context_share, model_leaf,
+};
 use crate::components::storage_modal::{StorageFetchState, StorageModal};
 use crate::components::stream_modal::{StreamAction, StreamModal};
 use crate::components::system_prompt_modal::{SystemPromptAction, SystemPromptModal};
@@ -100,6 +103,7 @@ use crate::components::which_key::WhichKey;
 use crate::components::workbench::{paint_markdown, styles as workbench_styles};
 use crate::components::workflow_catalog_picker::WorkflowCatalogPicker;
 use crate::components::workflow_inspector::WorkflowInspector;
+use crate::components::worktree_picker::{WorktreePicker, WorktreeView};
 use crate::components::{
     Action, DisplayMessage, DisplayRole, DisplaySource, ExitRequest, Overlay, RetryInfo, Status,
     is_ctrl,
@@ -114,6 +118,7 @@ use arc_swap::{ArcSwap, ArcSwapOption};
 use caudra_agent::background::BackgroundTasks;
 use caudra_agent::commits::repo;
 use caudra_agent::context::{ContextKey, ContextSnapshot, ContextStore};
+use caudra_agent::herdr::PaneMetadata;
 use caudra_agent::mentions;
 use caudra_agent::permissions::{PermissionManager, PermissionPolicyError};
 use caudra_agent::prompt::profile::PromptProfileCatalog;
@@ -256,12 +261,12 @@ impl Notification {
                 .clone()
                 .unwrap_or_else(|| "Agent turn complete".into()),
             Self::PermissionRequested { tool: Some(tool) } => {
-                format!("Permission requested: {tool}")
+                format!("{PERMISSION_BLOCKER}: {tool}")
             }
-            Self::PermissionRequested { tool: None } => "Permission requested".into(),
-            Self::AuthenticationRequired => "Authentication required".into(),
-            Self::QuestionRequested => "Question requested".into(),
-            Self::PlanReady => "Plan ready".into(),
+            Self::PermissionRequested { tool: None } => PERMISSION_BLOCKER.into(),
+            Self::AuthenticationRequired => AUTH_BLOCKER.into(),
+            Self::QuestionRequested => QUESTION_BLOCKER.into(),
+            Self::PlanReady => PLAN_BLOCKER.into(),
         }
     }
 
@@ -414,6 +419,7 @@ pub struct App {
     pub(super) question_form: QuestionForm,
     pub(super) session_picker: SessionPicker,
     pub(super) session_relocation_picker: SessionRelocationPicker,
+    pub(super) worktree_picker: WorktreePicker,
     /// Published by the event loop, which is the only thing that can see
     /// sibling sessions. Polled while the picker is open.
     pub(crate) live_sessions: Arc<ArcSwap<Vec<SessionRow>>>,
@@ -667,6 +673,7 @@ impl App {
             question_form: QuestionForm::new(),
             session_picker: SessionPicker::new(),
             session_relocation_picker: SessionRelocationPicker::new(),
+            worktree_picker: WorktreePicker::new(),
             live_sessions: Arc::default(),
             live_session_watch: Watch::default(),
             stored_session_generation: 0,
@@ -1230,6 +1237,47 @@ impl App {
             })
     }
 
+    /// Tokens in use and the window they fill, counted the way the status bar
+    /// counts them for `chat`.
+    fn context_usage(
+        &self,
+        chat: &Chat,
+        effective_model: Option<&ModelSlot>,
+        snapshot: Option<&ContextSnapshot>,
+    ) -> (u32, u32) {
+        let window = match effective_model {
+            Some(slot) => slot.model.context_window,
+            None if chat.context_window > 0 => chat.context_window,
+            None => self.state.model.context_window,
+        };
+        (
+            snapshot.map_or(chat.context_size, ContextSnapshot::used),
+            window,
+        )
+    }
+
+    /// The session as Herdr's sidebar shows it: its title, the model the main
+    /// chat runs on, and how full that model's window is.
+    pub(crate) fn herdr_metadata(&self) -> PaneMetadata<'_> {
+        let chat = &self.chats[0];
+        let effective_model = self.status_main_model();
+        let snapshot = self.main_context_snapshot();
+        let (used, window) =
+            self.context_usage(chat, effective_model.as_deref(), snapshot.as_deref());
+        PaneMetadata {
+            title: Cow::Borrowed(&self.state.session.title),
+            model: match effective_model {
+                Some(slot) => Cow::Owned(model_leaf(&slot.model.spec()).to_owned()),
+                None => Cow::Borrowed(model_leaf(
+                    chat.model_id
+                        .as_deref()
+                        .unwrap_or(&self.state.session.model),
+                )),
+            },
+            context_percent: (window > 0).then(|| context_share(used, window)),
+        }
+    }
+
     fn active_subagent_can_steer(&self) -> bool {
         self.active_subagent_id()
             .is_some_and(|id| self.subagent_steers.contains_key(id))
@@ -1633,7 +1681,7 @@ impl App {
                     }
                     return vec![];
                 }
-                if self.session_relocation_picker.is_open() {
+                if self.session_relocation_picker.is_open() || self.worktree_picker.is_open() {
                     self.route_text_paste(&text);
                     return vec![];
                 }
@@ -1861,6 +1909,7 @@ impl App {
         }
         try_picker!(self.session_picker);
         try_picker!(self.session_relocation_picker);
+        try_picker!(self.worktree_picker);
         // Not modal: the palette floats over the transcript, so it claims the
         // wheel only where it actually drew.
         if self.command_palette.is_active() && self.command_palette.contains(pos) {
@@ -2357,6 +2406,11 @@ impl App {
             guard_repeat!(false);
             let action = self.session_relocation_picker.handle_key(key);
             return Some(self.handle_session_relocation_action(action));
+        }
+        if self.worktree_picker.is_open() {
+            guard_repeat!(true);
+            let action = self.worktree_picker.handle_key(key);
+            return Some(self.handle_worktree_action(action));
         }
         if self.task_picker.is_open() {
             guard_repeat!(false);
@@ -4959,6 +5013,13 @@ impl App {
                     destination: (!destination.is_empty()).then(|| destination.to_owned()),
                 }]
             }
+            "/worktree" => match WorktreeView::parse(&cmd.args) {
+                Ok(view) => vec![Action::OpenWorktrees(view)],
+                Err(usage) => {
+                    self.flash(usage.into());
+                    vec![]
+                }
+            },
             "/rename" => self.rename_session(&cmd.args),
             "/model" => {
                 self.model_picker
@@ -5377,7 +5438,7 @@ impl App {
         }
     }
 
-    fn overlays(&self) -> [&dyn Overlay; 38] {
+    fn overlays(&self) -> [&dyn Overlay; 39] {
         [
             &self.workbench,
             &self.logs_modal,
@@ -5416,11 +5477,12 @@ impl App {
             &self.question_form,
             &self.session_picker,
             &self.session_relocation_picker,
+            &self.worktree_picker,
             &self.permission_prompt,
         ]
     }
 
-    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 38] {
+    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 39] {
         [
             &mut self.workbench,
             &mut self.logs_modal,
@@ -5459,6 +5521,7 @@ impl App {
             &mut self.question_form,
             &mut self.session_picker,
             &mut self.session_relocation_picker,
+            &mut self.worktree_picker,
             &mut self.permission_prompt,
         ]
     }
@@ -5476,40 +5539,39 @@ impl App {
             || self.question_form.is_open()
     }
 
-    pub(crate) fn lifecycle_blocker(&self) -> Option<&'static str> {
+    /// Prompts read the way their notifications do, so Herdr's sidebar names
+    /// the tool waiting for permission rather than only that one is.
+    pub(crate) fn lifecycle_blocker(&self) -> Option<Cow<'static, str>> {
         if self.sandbox_network_reconciliation_pending() {
-            return Some(
+            return Some(Cow::Borrowed(
                 "Wait for saved-network reconciliation to finish before closing this session; its results must be retained",
-            );
+            ));
         }
         if crate::sandbox::transfer::active() {
-            return Some(
+            return Some(Cow::Borrowed(
                 "Close/cancel the transfer and await cleanup before changing sessions or exiting",
-            );
+            ));
         }
         if self.sandbox_manager.pending() {
-            return Some("Waiting for durable sandbox configuration acknowledgment");
+            return Some(Cow::Borrowed(
+                "Waiting for durable sandbox configuration acknowledgment",
+            ));
         }
         if self.sandbox_manager.dirty() {
-            return Some("Open /sandbox and Save or Discard the unsaved configuration draft");
+            return Some(Cow::Borrowed(
+                "Open /sandbox and Save or Discard the unsaved configuration draft",
+            ));
         }
         if self.permission_mutation_pending() {
-            return Some("Waiting for durable permission acknowledgment");
+            return Some(Cow::Borrowed(
+                "Waiting for durable permission acknowledgment",
+            ));
+        }
+        if let Some(attention) = self.attention() {
+            return Some(Cow::Owned(attention.message()));
         }
         [
-            (self.permission_prompt.is_open(), PERMISSION_BLOCKER),
-            (
-                matches!(self.pending_input, PendingInput::AuthRetry { .. }),
-                AUTH_BLOCKER,
-            ),
-            (
-                self.status != Status::Streaming && self.plan_form_active(),
-                PLAN_BLOCKER,
-            ),
-            (
-                self.float_mgr.needs_input() || self.question_form.is_open(),
-                QUESTION_BLOCKER,
-            ),
+            (self.question_form.is_open(), QUESTION_BLOCKER),
             (self.login_picker.is_open(), LOGIN_BLOCKER),
             (
                 self.mcp_picker.is_open() && self.mcp_picker.has_awaiting_trust(),
@@ -5522,7 +5584,7 @@ impl App {
             ),
         ]
         .into_iter()
-        .find_map(|(blocked, message)| blocked.then_some(message))
+        .find_map(|(blocked, message)| blocked.then_some(Cow::Borrowed(message)))
     }
 
     pub(crate) fn has_lifecycle_work(&self) -> bool {
@@ -6045,6 +6107,7 @@ impl App {
         try_picker!(self.workflow_catalog_picker);
         try_picker!(self.session_picker);
         try_picker!(self.session_relocation_picker);
+        try_picker!(self.worktree_picker);
         try_picker!(self.question_form);
         try_picker!(self.login_picker);
         if !self.is_main_chat() && !(self.active_subagent_can_steer() || self.queue_editor_active())

@@ -2,7 +2,8 @@ use std::collections::HashMap;
 use std::io;
 use std::path::Path;
 
-use crate::state::{self, StateKey, project_scope};
+use crate::checkout::{self, TrustSource};
+use crate::state::{self, StateKey, StateStore, project_scope};
 use crate::{StateClass, StateDir, StorageError};
 
 const TRUST: StateKey = StateKey {
@@ -17,13 +18,37 @@ pub fn is_project_trusted(
     server: &str,
     config_digest: &str,
 ) -> Result<bool, StorageError> {
+    Ok(project_trust_source(state_dir, project, server, config_digest)?.is_some())
+}
+
+/// The project's own grant for `server`, or else one for the identical server
+/// config at the same place in another verified checkout of its repository.
+pub fn project_trust_source(
+    state_dir: &StateDir,
+    project: &Path,
+    server: &str,
+    config_digest: &str,
+) -> Result<Option<TrustSource>, StorageError> {
     validate_digest(config_digest)?;
-    let trust = state::get::<HashMap<String, String>>(state_dir, &scope(project)?, TRUST)?
-        .unwrap_or_default();
-    validate(&trust)?;
-    Ok(trust
-        .get(server)
-        .is_some_and(|digest| digest == config_digest))
+    let store = StateStore::open(state_dir, TRUST.class)?;
+    let source = TrustSource::find::<StorageError>(project, |candidate| {
+        let trust = store
+            .get::<HashMap<String, String>>(&scope(candidate)?, TRUST)?
+            .unwrap_or_default();
+        validate(&trust)?;
+        Ok(trust
+            .get(server)
+            .is_some_and(|digest| digest == config_digest))
+    })?;
+    if let Some(TrustSource::Inherited(from)) = &source {
+        tracing::debug!(
+            project = %project.display(),
+            from = %from.display(),
+            server,
+            "MCP server trusted through a sibling checkout"
+        );
+    }
+    Ok(source)
 }
 
 pub fn trust_project(
@@ -46,22 +71,26 @@ pub fn trust_project(
     )?
 }
 
+/// Revokes the grant for `server` in `project` and in its counterpart in every
+/// sibling checkout, any of which it could otherwise still inherit.
 pub fn revoke_project_trust(
     state_dir: &StateDir,
     project: &Path,
     server: &str,
 ) -> Result<(), StorageError> {
-    let scope = scope(project)?;
-    state::try_update(
-        state_dir,
-        &scope,
-        TRUST,
-        |trust: &mut HashMap<String, String>| {
-            validate(trust)?;
-            trust.remove(server);
-            Ok(())
-        },
-    )?
+    let mut store = StateStore::open(state_dir, TRUST.class)?;
+    for path in checkout::with_siblings(project) {
+        store.try_update(
+            &scope(&path)?,
+            TRUST,
+            |trust: &mut HashMap<String, String>| {
+                validate(trust)?;
+                trust.remove(server);
+                Ok::<_, StorageError>(())
+            },
+        )??;
+    }
+    Ok(())
 }
 
 fn scope(project: &Path) -> Result<String, StorageError> {
@@ -93,10 +122,44 @@ fn validate_digest(digest: &str) -> Result<(), StorageError> {
 mod tests {
     use std::fs;
 
+    use test_case::test_case;
+
     use super::*;
+    use crate::checkout::fixture::linked_pair_with_state;
 
     const DIGEST: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
     const OTHER_DIGEST: &str = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+    const SERVER: &str = "github";
+    const OTHER_SERVER: &str = "linear";
+
+    #[test_case(SERVER, DIGEST, true ; "same_server_and_config")]
+    #[test_case(OTHER_SERVER, DIGEST, false ; "other_server")]
+    #[test_case(SERVER, OTHER_DIGEST, false ; "changed_config")]
+    fn a_worktree_inherits_only_the_same_server_config(
+        server: &str,
+        digest: &str,
+        inherited: bool,
+    ) {
+        let (_temp, state_dir, main, worktree) = linked_pair_with_state();
+        trust_project(&state_dir, &main, SERVER, DIGEST).unwrap();
+
+        assert_eq!(
+            project_trust_source(&state_dir, &worktree, server, digest).unwrap(),
+            inherited.then_some(TrustSource::Inherited(main))
+        );
+    }
+
+    #[test]
+    fn revoking_in_a_worktree_clears_only_that_server_in_every_checkout() {
+        let (_temp, state_dir, main, worktree) = linked_pair_with_state();
+        trust_project(&state_dir, &main, SERVER, DIGEST).unwrap();
+        trust_project(&state_dir, &main, OTHER_SERVER, DIGEST).unwrap();
+
+        revoke_project_trust(&state_dir, &worktree, SERVER).unwrap();
+
+        assert!(!is_project_trusted(&state_dir, &main, SERVER, DIGEST).unwrap());
+        assert!(is_project_trusted(&state_dir, &worktree, OTHER_SERVER, DIGEST).unwrap());
+    }
 
     #[test]
     fn trust_is_exact_to_project_server_and_digest() {

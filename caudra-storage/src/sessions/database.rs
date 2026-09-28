@@ -24,7 +24,7 @@ use std::num::NonZeroUsize;
 use std::ops::ControlFlow;
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
-use std::path::{Path, PathBuf, absolute};
+use std::path::{MAIN_SEPARATOR, Path, PathBuf, absolute};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use std::thread::{self, available_parallelism};
@@ -169,10 +169,14 @@ const INVALID_SQLITE_URI_PATH: &str = "SQLite URI paths must be valid UTF-8 on t
 const RELOCATION_REMOTE: &str = "remote sessions cannot be relocated";
 const RELOCATION_PENDING_REVERT: &str = "the source workspace has a pending revert or restore";
 const RELOCATION_WORKFLOW: &str = "stop active or resumable workflows before relocating";
-const RELOCATION_METADATA_FIELDS: [&str; 6] = [
-    "plan_path",
-    "plan_target",
-    "plan_written",
+/// The character after [`MAIN_SEPARATOR`], so every path below a directory
+/// sorts before `<directory>` followed by this.
+const AFTER_SEPARATOR: char = '0';
+/// Session metadata about the plan, whose file is kept in the project state a
+/// relocation may leave behind.
+const RELOCATION_PLAN_FIELDS: [&str; 3] = ["plan_path", "plan_target", "plan_written"];
+/// Session metadata about the directory a relocation leaves behind.
+const RELOCATION_WORKSPACE_FIELDS: [&str; 3] = [
     "structured_permission_rules",
     "yolo",
     "snapshots_unavailable",
@@ -2482,6 +2486,30 @@ impl SessionDatabase {
         local_session_locations_on(&self.connection, None)
     }
 
+    /// Local sessions working in `root` or anywhere below it. Matched as a
+    /// range of the index rather than with `LIKE`, which folds ASCII case and
+    /// reads `%` and `_` in a path as wildcards.
+    pub fn local_sessions_under(&self, root: &Path) -> Result<Vec<SessionLocation>, SessionError> {
+        let root = root.to_string_lossy();
+        let local = StoredWorkspaceBinding::local_from_cwd("");
+        let mut statement = self.connection.prepare(
+            "SELECT id, title, cwd, updated_at, write_version FROM sessions \
+             WHERE workspace_source IN ('', ?1) AND (cwd = ?2 OR (cwd >= ?3 AND cwd < ?4)) \
+             ORDER BY updated_at DESC, id DESC",
+        )?;
+        let mut rows = statement.query(params![
+            local.trust_anchor().as_str(),
+            root,
+            format!("{root}{MAIN_SEPARATOR}"),
+            format!("{root}{AFTER_SEPARATOR}"),
+        ])?;
+        let mut locations = Vec::new();
+        while let Some(row) = rows.next()? {
+            locations.push(session_location_from_row(row)?);
+        }
+        Ok(locations)
+    }
+
     pub fn relocate_sessions(
         &mut self,
         request: &SessionRelocation,
@@ -2591,8 +2619,13 @@ impl SessionDatabase {
                         field: "session metadata",
                         reason: "expected an object".into(),
                     })?;
-            for field in RELOCATION_METADATA_FIELDS {
-                object.remove(field);
+            let plan_fields: &[&str] = if request.keep_plan {
+                &[]
+            } else {
+                &RELOCATION_PLAN_FIELDS
+            };
+            for field in RELOCATION_WORKSPACE_FIELDS.iter().chain(plan_fields) {
+                object.remove(*field);
             }
             let metadata = serialize_json(&metadata, "session metadata", MAX_METADATA_BYTES)?;
             let changed = transaction.execute(
@@ -2745,6 +2778,20 @@ impl SessionDatabase {
             .query_row(
                 "SELECT write_version FROM sessions WHERE id = ?1",
                 params![id.as_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    /// Where a local session works. `None` for a session bound to a remote
+    /// workspace, whose cwd is not a path on this machine, or for no session.
+    pub fn local_session_cwd(&self, id: CaudraId) -> Result<Option<String>, SessionError> {
+        let local = StoredWorkspaceBinding::local_from_cwd("");
+        Ok(self
+            .connection
+            .query_row(
+                "SELECT cwd FROM sessions WHERE id = ?1 AND workspace_source IN ('', ?2)",
+                params![id.as_bytes().as_slice(), local.trust_anchor().as_str()],
                 |row| row.get(0),
             )
             .optional()?)
@@ -3649,15 +3696,19 @@ fn local_session_locations_on(
     let mut rows = statement.query(params![local.trust_anchor().as_str(), cwd])?;
     let mut locations = Vec::new();
     while let Some(row) = rows.next()? {
-        locations.push(SessionLocation {
-            id: id_from_row(row, 0)?,
-            title: row.get(1)?,
-            cwd: row.get(2)?,
-            updated_at: from_i64(row.get(3)?, "sessions.updated_at")?,
-            write_version: row.get(4)?,
-        });
+        locations.push(session_location_from_row(row)?);
     }
     Ok(locations)
+}
+
+fn session_location_from_row(row: &rusqlite::Row<'_>) -> Result<SessionLocation, SessionError> {
+    Ok(SessionLocation {
+        id: id_from_row(row, 0)?,
+        title: row.get(1)?,
+        cwd: row.get(2)?,
+        updated_at: from_i64(row.get(3)?, "sessions.updated_at")?,
+        write_version: row.get(4)?,
+    })
 }
 
 fn load_on<M, U, T>(
@@ -7139,6 +7190,7 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
             source_cwd: bulk.then(|| cwd.to_owned()),
             destination: RELOCATION_DESTINATION.into(),
             include_project_usage: bulk,
+            keep_plan: false,
         }
     }
 
@@ -7690,7 +7742,10 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
         assert_eq!(after.workspace_binding, before.workspace_binding);
         let metadata: Value = serde_json::from_str(&after.metadata).unwrap();
         assert_eq!(metadata["future_field"], RELOCATION_DRAFT);
-        for field in RELOCATION_METADATA_FIELDS {
+        for field in RELOCATION_WORKSPACE_FIELDS
+            .iter()
+            .chain(&RELOCATION_PLAN_FIELDS)
+        {
             assert!(metadata.get(field).is_none());
         }
         let loaded: TestSession = database.load(session.id).unwrap();
@@ -7703,6 +7758,28 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
             after.logical_bytes + before.metadata.len(),
             before.logical_bytes + after.metadata.len()
         );
+    }
+
+    #[test]
+    fn a_relocation_that_keeps_the_plan_detaches_only_directory_policy() {
+        let (_temp, state_dir) = state_dir();
+        let mut database = SessionDatabase::open(&state_dir).unwrap();
+        let mut session = TestSession::new(MODEL, MISSING_LEGACY_CWD);
+        session.meta.plan_path = Some(RELOCATION_PLAN.into());
+        session.meta.plan_written = true;
+        session.meta.yolo = Some(true);
+        database.save(&session, None).unwrap();
+        let request = SessionRelocation {
+            keep_plan: true,
+            ..relocation_request(&database, MISSING_LEGACY_CWD, false)
+        };
+
+        database.relocate_sessions(&request).unwrap();
+
+        let loaded: TestSession = database.load(session.id).unwrap();
+        assert_eq!(loaded.meta.plan_path.as_deref(), Some(RELOCATION_PLAN));
+        assert!(loaded.meta.plan_written);
+        assert_eq!(loaded.meta.yolo, None);
     }
 
     #[test_case(false; "explicit_current_only")]
@@ -7812,6 +7889,7 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
             source_cwd: None,
             destination: RELOCATION_DESTINATION.into(),
             include_project_usage: false,
+            keep_plan: false,
         };
         assert!(matches!(
             database.relocate_sessions(&remote_request),
@@ -8184,6 +8262,30 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
             SessionRelocationResult::default()
         );
         assert_eq!(database.local_session_locations().unwrap(), before);
+    }
+
+    #[test]
+    fn local_session_cwd_skips_remote_and_unknown_sessions() {
+        let (_temp, state_dir) = state_dir();
+        let mut database = SessionDatabase::open(&state_dir).unwrap();
+        let local = TestSession::new(MODEL, CWD);
+        let remote = TestSession::new_with_workspace(
+            MODEL,
+            REMOTE_CWD,
+            remote_binding("origin-a", "principal-a", "project", "root"),
+        );
+        database.save(&local, None).unwrap();
+        database.save(&remote, None).unwrap();
+
+        assert_eq!(
+            database.local_session_cwd(local.id).unwrap().as_deref(),
+            Some(CWD)
+        );
+        assert_eq!(database.local_session_cwd(remote.id).unwrap(), None);
+        assert_eq!(
+            database.local_session_cwd(CaudraId::generate()).unwrap(),
+            None
+        );
     }
 
     #[test]

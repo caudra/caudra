@@ -303,6 +303,8 @@ TOML supports `deny`, `ask`, and `allow`. Deny and ask rules are active from glo
 
 Project shell allows require trust before they become active. On startup, the TUI opens `/permissions` and offers to trust the project policy digest for the canonical project. The digest covers project shell allows and every project deny or ask rule. Editing any of them invalidates trust, and `/permissions` can revoke trust explicitly. Non-interactive modes leave untrusted project allows inactive. Project deny and ask rules remain active without trust because they only restrict access. Changing projects with `/cd` reloads the destination policy before further tool calls.
 
+A checkout of a git repository also accepts trust granted at the same place in a linked worktree or other checkout of that repository, as long as the digest is identical. The grant itself stays with the checkout where you made it. Revoking trust in any checkout revokes it at the same place in all of them. Project MCP servers and project workflows follow the same rule. See [Trust across checkouts](/docs/worktrees/#trust-across-checkouts).
+
 An unreadable or malformed permissions file fails closed. Caudra disables inherited allows and denies tool calls until the file is fixed.
 
 The file can start with `version = 1`, and a file without it counts as version 1. A version newer than this build reads fails closed the same way, so an older Caudra never applies rules it would misread. See [Config file versions](/docs/configuration/#config-file-versions).

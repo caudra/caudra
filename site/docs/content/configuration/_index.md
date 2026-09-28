@@ -77,7 +77,7 @@ All fields are optional. Typos in field names cause an error right away.
 | `splash_animation` | bool | `true` | - | - | Show splash animation on startup |
 | `scrollbar` | bool | `true` | - | - | Show vertical scrollbar in scrollable areas |
 | `touch` | string | `auto` | - | - | Touch-friendly pointer handling: auto, on, or off. Widens the scrollbar's hit zone so a finger can tap it, scrolls one line per wheel event instead of mouse_scroll_lines, and leaves text selection to the terminal. Auto detects Termux around Caudra itself, which SSH does not carry, so set this to on when reaching Caudra from a phone over SSH |
-| `notifications` | string | `auto` | - | - | Terminal notification method: auto, osc9, bell, or off |
+| `notifications` | string | `auto` | - | - | Terminal notification method: auto, osc9, bell, or off. Auto is off in a Herdr pane, where Herdr shows its own notification when Caudra is blocked or finished |
 | `math` | string | `unicode` | - | - | How LaTeX maths renders: unicode (approximate with Unicode) or raw (show the LaTeX source) |
 | `mermaid` | string | `unicode` | - | - | How mermaid flowcharts render: unicode (draw them with box-drawing characters) or off (leave the fence as code) |
 | `flash_duration_ms` | u64 | `1500` | - | - | Duration of flash messages (ms) |
@@ -380,6 +380,15 @@ A workspace over `max_bytes_mb` or `max_files` is refused rather than captured, 
 | `content_max_length` | integer | `10240` | `CAUDRA_OTEL_CONTENT_MAX_LENGTH` | Character cap on any logged prompt or tool input |
 
 Every field also has an environment variable, shown in the Env column, and the variable wins. See [Telemetry](/docs/telemetry/) for the full picture.
+
+### `worktrees`
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `backend` | string | `auto` | What creates and removes worktrees for `/worktree`: `auto` uses Herdr inside a Herdr pane and git elsewhere, `git` always runs git |
+| `directory` | string | `<data dir>/worktrees` | Where git-created worktrees go, as `<directory>/<repository>/<branch>`. A leading `~/` is your home directory |
+
+Inside a Herdr pane, `auto` asks Herdr to create and remove worktrees, so each one opens as a grouped Herdr workspace. `directory` applies only to worktrees git creates. See [Worktrees](/docs/worktrees/) for what `/worktree` does with each backend.
 
 ## Plugins
 

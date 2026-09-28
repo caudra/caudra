@@ -372,6 +372,7 @@ pub enum KeybindContext {
     StashPicker,
     SessionPicker,
     SessionRelocation,
+    WorktreePicker,
     WorkflowInspector,
     WorkflowCatalogPicker,
     SandboxManager,
@@ -406,6 +407,7 @@ impl KeybindContext {
             Self::StashPicker => "Stash Picker",
             Self::SessionPicker => "Session Picker",
             Self::SessionRelocation => "Session Relocation",
+            Self::WorktreePicker => "Worktree Picker",
             Self::WorkflowInspector => "Workflow Inspector",
             Self::WorkflowCatalogPicker => "Workflow Catalog",
             Self::SandboxManager => "Sandbox Manager",
@@ -430,6 +432,7 @@ impl KeybindContext {
             | Self::StashPicker
             | Self::SessionPicker
             | Self::SessionRelocation
+            | Self::WorktreePicker
             | Self::WorkflowInspector
             | Self::WorkflowCatalogPicker => Some(Self::Picker),
             Self::WorkbenchExplorer
@@ -1311,6 +1314,30 @@ pub const KEYBINDS: &[Keybind] = &[
         label: KeyLabel::Single(key::RELOCATION_USAGE.label),
         description: "Toggle the selected historical project usage row in bulk confirmation",
         context: KeybindContext::SessionRelocation,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Single(key::NEW_SESSION.label),
+        description: "New worktree",
+        context: KeybindContext::WorktreePicker,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Single(key::DELETE.label),
+        description: "Remove the selected worktree",
+        context: KeybindContext::WorktreePicker,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Single(key::RENAME_SESSION.label),
+        description: "Refresh the worktree list",
+        context: KeybindContext::WorktreePicker,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Single(key::RELOCATION_USAGE.label),
+        description: "Toggle carrying uncommitted changes into a new worktree",
+        context: KeybindContext::WorktreePicker,
         platform: Platform::All,
     },
     Keybind {

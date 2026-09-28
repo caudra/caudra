@@ -18,7 +18,9 @@ The first message comes from `--prompt`, from piped stdin, or from both. Without
 
 Caudra takes no positional argument. A bare word is read as a subcommand, so `caudra mdoels` reports an unknown subcommand and suggests `models` rather than opening a session named after the typo.
 
-When interactive Caudra starts in a Herdr pane, it automatically reports native `caudra` lifecycle state through Herdr's inherited environment and public custom-agent API. `--print` and SDK mode do not claim pane lifecycle authority.
+When interactive Caudra starts in a Herdr pane, it automatically reports native `caudra` lifecycle state through Herdr's inherited environment and public custom-agent API. `--print` and SDK mode do not claim pane lifecycle authority. The report names the prompt that blocks the agent, and the sidebar shows the focused session's title, model and context usage. Each report also carries a resume command, so Herdr can restore the pane after a restart. It is `caudra --session <id>` for the focused session once that session is saved, and a bare `caudra` before then. Herdr receives the command only when `caudra` is on `PATH`, because Herdr types it into the pane's shell. Exiting Caudra withdraws it. A hangup or a stopped Herdr server leaves it in place. See [Worktrees](/docs/worktrees/#herdr-integration).
+
+`caudra --session <id>` opens a local session in the directory it works in, wherever you run the command, so project config, plugins and MCP servers come from that directory. A session left in a removed worktree moves back to a remaining checkout first.
 
 ## Flags by run path
 

@@ -115,6 +115,10 @@ Before a whole-project rename, stop other Caudra processes using the source dire
 
 Session IDs and conversations are preserved. Active source plans and approvals are detached. Files and old workspace snapshots are not moved. If moving live tabs requires a project environment reload, Caudra exits after committing and asks you to run `caudra --continue` from the destination.
 
+### Other checkouts of a repository
+
+Checkouts of one git repository share memory notes and plans. `/sessions` lists the sessions of the repository's other checkouts below those of the current directory, one section per checkout, and opening one takes you to its checkout. A session left in a worktree that was removed moves back to a remaining checkout the next time Caudra starts in the repository or `/sessions` opens. A session moved by `/worktree`, or moved back from a removed worktree, keeps its plan. See [Worktrees](/docs/worktrees/) for `/worktree` and the rules for moving back.
+
 ## Ephemeral sessions
 
 Run `caudra --ephemeral` for a session that leaves no session record behind. Set `storage.ephemeral = true` to make this the default.

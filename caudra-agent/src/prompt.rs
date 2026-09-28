@@ -96,6 +96,17 @@ pub const STANDING_PROMPT: &str = concat!(
 /// changes when the user switches one.
 pub const ENVIRONMENT_PROMPT: &str = include_str!("prompts/environment.md");
 pub const ENVIRONMENT_MARKER: &str = "# Environment";
+/// How the environment block names the working directory, which is also how a
+/// move is noticed: the block announced last names the directory left behind.
+pub const WORKING_DIRECTORY_LABEL: &str = "- Working directory: ";
+pub const CHECKOUT_SLOT: &str = "{checkout}";
+pub const HERDR_SLOT: &str = "{herdr}";
+/// Follows an environment whose working directory differs from the last one
+/// announced, since paths from before the move still look valid.
+pub const RELOCATED_PROMPT: &str = include_str!("prompts/relocated.md");
+pub const RELOCATED_MARKER: &str = "# Working directory changed";
+pub const FROM_SLOT: &str = "{from}";
+pub const TO_SLOT: &str = "{to}";
 /// Two fragments rather than one with a substituted clause, because the claim
 /// that differs is the useful one: locally the scratch directory is where
 /// `TMPDIR` already points and a command falls into it by itself, and on a
