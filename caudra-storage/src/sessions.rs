@@ -11,8 +11,10 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::time::Duration;
 
 use caudra_workspace::PlanRef;
+use rusqlite::Error as SqliteError;
 use tracing::warn;
 
 use crate::id::CaudraId;
@@ -37,9 +39,10 @@ pub mod sweep;
 
 pub use database::{
     CheckpointResult, HistoryReadLimits, HistoryReadReport, HistoryRecord,
-    HistorySessionReadReport, LedgerEntry, SESSIONS_DB_FILE, SESSIONS_DB_LOCK_FILE, SessionCursor,
-    SessionDatabase, SessionRecreation, SessionStorageStats, ToolBucket, ToolLedgerEntry,
-    TrimReport, UsageBucket, WAL_RETENTION_LIMIT_BYTES, eager_load_limit, set_eager_load_limit,
+    HistorySessionReadReport, LedgerEntry, RuntimeRetry, SESSIONS_DB_FILE, SESSIONS_DB_LOCK_FILE,
+    SessionCursor, SessionDatabase, SessionRecreation, SessionStorageStats, ToolBucket,
+    ToolLedgerEntry, TrimReport, UsageBucket, WAL_RETENTION_LIMIT_BYTES, eager_load_limit,
+    set_eager_load_limit,
 };
 pub(crate) use database::{from_i64, to_i64};
 pub use lease::SessionLease;
@@ -86,7 +89,21 @@ pub enum SessionError {
         given_id: CaudraId,
     },
     #[error(transparent)]
-    Sqlite(#[from] rusqlite::Error),
+    Sqlite(#[from] SqliteError),
+    #[error("{operation}: storage operation cancelled")]
+    RuntimeCancelled { operation: &'static str },
+    #[error("{operation}: storage deadline exceeded")]
+    RuntimeDeadline { operation: &'static str },
+    #[error(
+        "{operation}: SQLite contention exhausted after {attempts} attempts ({elapsed:?}): {source}"
+    )]
+    RuntimeContention {
+        operation: &'static str,
+        attempts: usize,
+        elapsed: Duration,
+        #[source]
+        source: SqliteError,
+    },
     #[error("session {id} already exists")]
     AlreadyExists { id: CaudraId },
     #[error("session {id} is already open in another Caudra instance")]

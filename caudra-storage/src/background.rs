@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::time::Duration;
 
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
@@ -7,7 +8,7 @@ use serde_json::Value;
 use crate::{
     StorageError,
     id::CaudraId,
-    sessions::{SessionDatabase, SessionError},
+    sessions::{RuntimeRetry, SessionDatabase, SessionError},
     tool_outputs::ToolOutputRef,
 };
 
@@ -18,6 +19,9 @@ pub const MAX_SESSION_BYTES: usize = 64 * 1024 * 1024;
 const JOB_EVENT_FIELD: &str = "job event provenance";
 const INVALID_JOB_EVENT: &str =
     "job event does not match its recorded task, event, or owning invocation";
+const RUNTIME_IDENTITY_LOOKUP: &str = "identity lookup";
+const RUNTIME_BACKGROUND_SAVE: &str = "background record save";
+const RUNTIME_RECEIPT_LOOKUP: &str = "receipt lookup";
 pub(crate) const TABLES: &str = r#"
 CREATE TABLE background_tasks (
     session_id BLOB NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
@@ -184,6 +188,52 @@ pub fn accept_owned_job_event(
 }
 
 impl SessionDatabase {
+    pub fn task_identity_exists_runtime(
+        &self,
+        session: CaudraId,
+        task_id: &str,
+        retry: &RuntimeRetry<'_>,
+    ) -> Result<bool, SessionError> {
+        self.connection().busy_timeout(Duration::ZERO)?;
+        retry.run(RUNTIME_IDENTITY_LOOKUP, || {
+            self.task_identity_exists(session, task_id)
+        })
+    }
+
+    pub fn background_event_accepted_runtime(
+        &self,
+        session: CaudraId,
+        event_id: &str,
+        retry: &RuntimeRetry<'_>,
+    ) -> Result<bool, SessionError> {
+        self.connection().busy_timeout(Duration::ZERO)?;
+        retry.run(RUNTIME_RECEIPT_LOOKUP, || {
+            self.background_event_accepted(session, event_id)
+        })
+    }
+
+    pub fn background_accepted_events_runtime(
+        &self,
+        session: CaudraId,
+        event_ids: &[String],
+        retry: &RuntimeRetry<'_>,
+    ) -> Result<HashSet<String>, SessionError> {
+        self.connection().busy_timeout(Duration::ZERO)?;
+        retry.run(RUNTIME_RECEIPT_LOOKUP, || {
+            self.background_accepted_events(session, event_ids)
+        })
+    }
+
+    pub fn save_background_task_runtime(
+        &self,
+        session: CaudraId,
+        record: &TaskRecord,
+        retry: &RuntimeRetry<'_>,
+    ) -> Result<(), SessionError> {
+        self.connection().busy_timeout(Duration::ZERO)?;
+        self.save_background_task_inner(session, record, Some(retry))
+    }
+
     pub fn task_identity_exists(
         &self,
         session: CaudraId,
@@ -232,10 +282,31 @@ impl SessionDatabase {
         session: CaudraId,
         record: &TaskRecord,
     ) -> Result<(), SessionError> {
+        self.save_background_task_inner(session, record, None)
+    }
+
+    fn save_background_task_inner(
+        &self,
+        session: CaudraId,
+        record: &TaskRecord,
+        retry: Option<&RuntimeRetry<'_>>,
+    ) -> Result<(), SessionError> {
         let payload = serde_json::to_string(record).map_err(StorageError::from)?;
         Self::validate_len("background task", payload.len(), MAX_RECORD_BYTES)?;
-        let transaction =
-            Transaction::new_unchecked(self.connection(), TransactionBehavior::Immediate)?;
+        let begin = || {
+            Ok(Transaction::new_unchecked(
+                self.connection(),
+                TransactionBehavior::Immediate,
+            )?)
+        };
+        let transaction = if let Some(retry) = retry {
+            retry.run(RUNTIME_BACKGROUND_SAVE, begin)?
+        } else {
+            begin()?
+        };
+        if let Some(retry) = retry {
+            retry.check(RUNTIME_BACKGROUND_SAVE)?;
+        }
         let count: i64 = transaction.query_row(
             "SELECT count(*) FROM background_tasks WHERE session_id = ?1 AND invocation_id != ?2",
             params![session.as_bytes().as_slice(), record.invocation_id],
@@ -256,6 +327,9 @@ impl SessionDatabase {
             "INSERT INTO background_tasks(session_id, invocation_id, payload, bytes) VALUES (?1, ?2, ?3, ?4) ON CONFLICT(session_id, invocation_id) DO UPDATE SET payload = excluded.payload, bytes = excluded.bytes",
             params![session.as_bytes().as_slice(), record.invocation_id, payload, payload.len() as i64],
         )?;
+        if let Some(retry) = retry {
+            retry.check(RUNTIME_BACKGROUND_SAVE)?;
+        }
         transaction.commit()?;
         Ok(())
     }
@@ -319,8 +393,10 @@ pub(crate) fn protects_session(
 
 #[cfg(test)]
 mod tests {
+    use rusqlite::{ErrorCode, Transaction, TransactionBehavior};
     use serde::{Deserialize, Serialize};
     use serde_json::{Value, json};
+    use std::cell::{Cell, RefCell};
     use std::fs::{self, File, FileTimes};
     use std::slice::from_ref;
     use std::time::SystemTime;
@@ -333,7 +409,9 @@ mod tests {
     use crate::{
         StateDir,
         id::CaudraId,
-        sessions::{Session, SessionDatabase, SessionError, SessionLease, TitleSource},
+        sessions::{
+            RuntimeRetry, Session, SessionDatabase, SessionError, SessionLease, TitleSource,
+        },
         tool_outputs::{TOOL_OUTPUT_DIR, ToolOutputStore},
     };
 
@@ -388,6 +466,71 @@ mod tests {
                 suppressed: false,
             }],
         }
+    }
+
+    #[test]
+    fn runtime_save_retries_writer_acquisition_with_identical_record() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = StateDir::from_path(temp.path().to_path_buf());
+        let mut database = SessionDatabase::open(&state).unwrap();
+        let session = TestSession::new(MODEL, CWD);
+        database.save(&session, None).unwrap();
+        let opening = RuntimeRetry::new(None, &|| false);
+        let runtime = SessionDatabase::open_runtime(&state, &opening).unwrap();
+        let writer = RefCell::new(Some(
+            Transaction::new_unchecked(database.connection(), TransactionBehavior::Immediate)
+                .unwrap(),
+        ));
+        let checks = Cell::new(0);
+        let cancelled = || {
+            checks.set(checks.get() + 1);
+            if checks.get() == 2 {
+                writer.borrow_mut().take().unwrap().rollback().unwrap();
+            }
+            false
+        };
+        let retry = RuntimeRetry::new(None, &cancelled);
+        let task = record();
+        runtime
+            .save_background_task_runtime(session.id, &task, &retry)
+            .unwrap();
+        assert!(writer.borrow().is_none());
+        let records = runtime.background_tasks(session.id).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            serde_json::to_value(&records[0]).unwrap(),
+            serde_json::to_value(task).unwrap()
+        );
+    }
+
+    #[test]
+    fn runtime_save_does_not_retry_commit_failure() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = StateDir::from_path(temp.path().to_path_buf());
+        let opening = RuntimeRetry::new(None, &|| false);
+        let runtime = SessionDatabase::open_runtime(&state, &opening).unwrap();
+        runtime
+            .connection()
+            .pragma_update(None, "defer_foreign_keys", true)
+            .unwrap();
+        let checks = Cell::new(0);
+        let cancelled = || {
+            checks.set(checks.get() + 1);
+            false
+        };
+        let retry = RuntimeRetry::new(None, &cancelled);
+        let missing_session = CaudraId::generate();
+        let result = runtime.save_background_task_runtime(missing_session, &record(), &retry);
+        assert!(
+            matches!(result, Err(SessionError::Sqlite(error)) if error.sqlite_error_code() == Some(ErrorCode::ConstraintViolation))
+        );
+        assert_eq!(checks.get(), 4);
+        assert!(
+            runtime
+                .background_tasks(missing_session)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

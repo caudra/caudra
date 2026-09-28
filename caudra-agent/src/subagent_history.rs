@@ -170,19 +170,21 @@ impl SubagentHistoryStore {
         label: &str,
         mut occupied: impl FnMut(&str) -> Result<bool, String>,
     ) -> Result<SubagentHistoryLease, String> {
-        let mut state = self.lock();
         for task_id in DescriptiveIdCandidates::new(label, "task") {
+            let mut state = self.lock();
             if task_id == "main"
                 || state.active.contains(&task_id)
                 || state.records.contains_key(&task_id)
                 || state.selected_versions.contains_key(&task_id)
-                || occupied(&task_id)?
             {
                 continue;
             }
             state.active.insert(task_id.clone());
             drop(state);
-            return Ok(SubagentHistoryLease::new(self.clone(), task_id, None, None));
+            let lease = SubagentHistoryLease::new(self.clone(), task_id, None, None);
+            if !occupied(lease.task_id())? {
+                return Ok(lease);
+            }
         }
         Err(TASK_ID_EXHAUSTED.into())
     }
@@ -704,7 +706,7 @@ impl Drop for SubagentHistoryLease {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Barrier;
+    use std::sync::{Barrier, mpsc};
     use std::thread;
     use test_case::test_case;
 
@@ -817,6 +819,44 @@ mod tests {
         assert_eq!(lease.task_id(), LABEL_ID);
     }
 
+    #[test_case(false; "collision")]
+    #[test_case(true; "error")]
+    fn delayed_lookup_releases_provisional_reservation(fail: bool) {
+        let store = SubagentHistoryStore::default();
+        let (candidate_tx, candidate_rx) = mpsc::channel();
+        let (lookup_tx, lookup_rx) = mpsc::channel();
+        let lookup_store = store.clone();
+        let job = thread::spawn(move || {
+            lookup_store.reserve_generated(LABEL, |id| {
+                assert!(lookup_store.state.try_lock().unwrap().active.contains(id));
+                candidate_tx.send(id.to_owned()).unwrap();
+                lookup_rx.recv().unwrap()
+            })
+        });
+
+        assert_eq!(candidate_rx.recv().unwrap(), LABEL_ID);
+        assert!(store.is_active(LABEL_ID));
+        assert!(store.snapshot().records().is_empty());
+        let unrelated = store.reserve(TASK_ID).unwrap();
+        drop(unrelated);
+        if fail {
+            lookup_tx.send(Err(LOOKUP_ERROR.into())).unwrap();
+            assert_eq!(job.join().unwrap().unwrap_err(), LOOKUP_ERROR);
+        } else {
+            lookup_tx.send(Ok(true)).unwrap();
+            assert_eq!(candidate_rx.recv().unwrap(), SECOND_ID);
+            assert!(!store.is_active(LABEL_ID));
+            assert!(store.is_active(SECOND_ID));
+            lookup_tx.send(Ok(false)).unwrap();
+            let lease = job.join().unwrap().unwrap();
+            assert_eq!(lease.task_id(), SECOND_ID);
+            drop(lease);
+        }
+        assert_eq!(store.active_count(), 0);
+        let lease = store.reserve_generated(LABEL, |_| Ok(false)).unwrap();
+        assert_eq!(lease.task_id(), LABEL_ID);
+    }
+
     #[test]
     fn concurrent_allocators_reserve_distinct_candidates_atomically() {
         let store = SubagentHistoryStore::default();
@@ -826,8 +866,13 @@ mod tests {
                 let store = store.clone();
                 let barrier = Arc::clone(&barrier);
                 thread::spawn(move || {
-                    barrier.wait();
-                    store.reserve_generated(LABEL, |_| Ok(false)).unwrap()
+                    store
+                        .reserve_generated(LABEL, |id| {
+                            assert!(store.is_active(id));
+                            barrier.wait();
+                            Ok(false)
+                        })
+                        .unwrap()
                 })
             })
             .collect();

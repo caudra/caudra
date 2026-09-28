@@ -24,6 +24,7 @@ use caudra_providers::provider::Provider;
 use caudra_providers::{RequestOptions, Timeouts, ToolNameAliases};
 use caudra_storage::id::SessionRef;
 use caudra_storage::local_documents::LocalDocumentStore;
+use caudra_storage::sessions::RuntimeRetry;
 use caudra_storage::tool_outputs::ToolOutputStore;
 use caudra_workspace::WorkspaceSession;
 use jsonschema::Validator;
@@ -144,6 +145,18 @@ pub trait TaskRunner: Send + Sync {
         _workspace: &WorkspaceRebind,
     ) -> Result<Arc<dyn TaskRunner>, String> {
         Err("task runner does not support workspace transitions".into())
+    }
+
+    fn reserve_task_cancellable(
+        &self,
+        task_id: Option<&str>,
+        label: &str,
+        cancel: &CancelToken,
+    ) -> Result<SubagentHistoryLease, String> {
+        if cancel.is_cancelled() {
+            return Err(subagent::CANCELLED.into());
+        }
+        self.reserve_task(task_id, label)
     }
 
     fn run(&self, request: TaskRequest, cancel: CancelToken, events: EventSender)
@@ -800,6 +813,30 @@ impl SubagentTaskRunner {
 }
 
 impl TaskRunner for SubagentTaskRunner {
+    fn reserve_task_cancellable(
+        &self,
+        task_id: Option<&str>,
+        label: &str,
+        cancel: &CancelToken,
+    ) -> Result<SubagentHistoryLease, String> {
+        if cancel.is_cancelled() {
+            return Err(subagent::CANCELLED.into());
+        }
+        if task_id.is_some() {
+            return self.reserve_task(task_id, label);
+        }
+        let cancelled = || cancel.is_cancelled();
+        let retry = RuntimeRetry::new(None, &cancelled);
+        subagent::reserve_task_identity_with_retry(
+            &self.host.subagent_history,
+            label,
+            self.host.tool_output_store.as_deref(),
+            self.host.session_id.as_ref().map(SessionRef::id),
+            self.host.jobs.as_ref(),
+            &retry,
+        )
+    }
+
     fn reserve_task(
         &self,
         task_id: Option<&str>,
@@ -955,6 +992,18 @@ mod tests {
     }
 
     #[test]
+    fn cancelled_workflow_reservation_never_calls_the_runner() {
+        let (trigger, cancel) = CancelToken::new();
+        trigger.cancel();
+        assert_eq!(
+            UnsupportedRunner
+                .reserve_task_cancellable(None, LABEL, &cancel)
+                .unwrap_err(),
+            subagent::CANCELLED,
+        );
+    }
+
+    #[test]
     fn workflow_runner_reserves_shared_labels_and_preserves_replay_ids() {
         let ctx = stub_ctx_with(&AgentMode::Build, None, Some(CALL_ID));
         let model: ModelResolver = Arc::new({
@@ -968,7 +1017,9 @@ mod tests {
             Arc::new(|| AgentMode::Build),
             Arc::new(CancelMap::new()),
         )));
-        let first = runner.reserve_task(None, LABEL).unwrap();
+        let first = runner
+            .reserve_task_cancellable(None, LABEL, &CancelToken::none())
+            .unwrap();
         let second = runner.reserve_task(None, "Find/Auth").unwrap();
         assert_eq!(first.task_id(), LABEL_ID);
         assert_eq!(second.task_id(), SECOND_LABEL_ID);

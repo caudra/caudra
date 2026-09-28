@@ -16,6 +16,7 @@
 //! external. Deletes enqueue their idempotent cleanup in the same transaction as
 //! the structured delete because SQLite cannot atomically remove those files.
 
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::ffi::{OsStr, c_int};
 use std::fs::{self, File, Metadata, OpenOptions};
@@ -28,7 +29,7 @@ use std::path::{MAIN_SEPARATOR, Path, PathBuf, absolute};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use std::thread::{self, available_parallelism};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::permission_state::{
     PermissionHistoryScan, RawPermissionSession, RawPermissionSnapshot,
@@ -40,8 +41,8 @@ use rusqlite::ffi::{self, Error as SqliteErrorCode};
 use rusqlite::limits::Limit;
 use rusqlite::types::Value as SqlValue;
 use rusqlite::{
-    Connection, Error as SqliteError, MAIN_DB, OpenFlags, OptionalExtension, Transaction,
-    TransactionBehavior, params, params_from_iter,
+    Connection, Error as SqliteError, ErrorCode, MAIN_DB, OpenFlags, OptionalExtension,
+    Transaction, TransactionBehavior, params, params_from_iter,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -72,7 +73,8 @@ use crate::workflow_scratch::{remove_session as remove_scratch_session, session_
 use crate::workspace_binding::StoredWorkspaceBinding;
 use crate::{
     StateDir, StorageError, existing_state_lock, lock_session_artifacts,
-    shared_existing_state_lock, shared_state_lock, try_exclusive_existing_state_lock,
+    lock_session_artifacts_within, shared_existing_state_lock, shared_state_lock,
+    try_exclusive_existing_state_lock,
 };
 
 pub const SESSIONS_DB_FILE: &str = "caudra.sqlite";
@@ -87,6 +89,11 @@ const BACKUP_PAGES_PER_STEP: c_int = 1024;
 const INCREMENTAL_AUTO_VACUUM: i64 = 2;
 const PAGE_SIZE: i64 = 4096;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+const RUNTIME_INITIAL_BACKOFF: Duration = Duration::from_millis(10);
+const RUNTIME_MAX_BACKOFF: Duration = Duration::from_millis(100);
+const RUNTIME_MAX_ATTEMPTS: usize = 64;
+const RUNTIME_CONNECTION_SETUP: &str = "connection setup";
+const INITIALIZATION_LOCKED: &str = "session database initialization is locked";
 const WAL_AUTO_CHECKPOINT_PAGES: i64 = 1000;
 /// What `journal_size_limit` keeps. The WAL is a ring buffer that a checkpoint
 /// resets rather than shrinks, and this limit only truncates it back down to
@@ -1135,13 +1142,115 @@ struct RootRow {
     workspace_cursor_label: Option<String>,
 }
 
+pub struct RuntimeRetry<'a> {
+    started: Instant,
+    deadline: Instant,
+    cancelled: &'a dyn Fn() -> bool,
+    retries: Cell<usize>,
+}
+
+impl<'a> RuntimeRetry<'a> {
+    pub fn new(deadline: Option<Instant>, cancelled: &'a dyn Fn() -> bool) -> Self {
+        let started = Instant::now();
+        Self {
+            started,
+            deadline: deadline.map_or(started + BUSY_TIMEOUT, |deadline| {
+                deadline.min(started + BUSY_TIMEOUT)
+            }),
+            cancelled,
+            retries: Cell::new(0),
+        }
+    }
+
+    pub(crate) fn check(&self, operation: &'static str) -> Result<(), SessionError> {
+        self.check_at(operation, Instant::now())
+    }
+
+    fn check_at(&self, operation: &'static str, now: Instant) -> Result<(), SessionError> {
+        if (self.cancelled)() {
+            return Err(SessionError::RuntimeCancelled { operation });
+        }
+        if now >= self.deadline {
+            return Err(SessionError::RuntimeDeadline { operation });
+        }
+        Ok(())
+    }
+
+    pub(crate) fn run<T>(
+        &self,
+        operation: &'static str,
+        attempt: impl FnMut() -> Result<T, SessionError>,
+    ) -> Result<T, SessionError> {
+        self.run_with_clock(operation, attempt, Instant::now, thread::sleep)
+    }
+
+    fn run_with_clock<T>(
+        &self,
+        operation: &'static str,
+        mut attempt: impl FnMut() -> Result<T, SessionError>,
+        now: impl Fn() -> Instant,
+        wait: impl Fn(Duration),
+    ) -> Result<T, SessionError> {
+        let mut backoff = RUNTIME_INITIAL_BACKOFF;
+        loop {
+            self.check_at(operation, now())?;
+            match attempt() {
+                Ok(value) => {
+                    self.check_at(operation, now())?;
+                    return Ok(value);
+                }
+                Err(SessionError::Sqlite(source))
+                    if matches!(source.sqlite_error_code(), Some(ErrorCode::DatabaseBusy)) =>
+                {
+                    let attempts = self.retries.get() + 1;
+                    self.retries.set(attempts);
+                    let current = now();
+                    if (self.cancelled)() {
+                        return Err(SessionError::RuntimeCancelled { operation });
+                    }
+                    let remaining = self.deadline.saturating_duration_since(current);
+                    let extended_code = source.sqlite_error().map(|error| error.extended_code);
+                    let elapsed = current.saturating_duration_since(self.started);
+                    if attempts >= RUNTIME_MAX_ATTEMPTS || remaining <= backoff {
+                        warn!(
+                            operation,
+                            attempts,
+                            elapsed_ms = elapsed.as_millis(),
+                            primary_code = ffi::SQLITE_BUSY,
+                            extended_code,
+                            "runtime SQLite contention exhausted"
+                        );
+                        return Err(SessionError::RuntimeContention {
+                            operation,
+                            attempts,
+                            elapsed,
+                            source,
+                        });
+                    }
+                    tracing::debug!(
+                        operation,
+                        attempts,
+                        elapsed_ms = elapsed.as_millis(),
+                        primary_code = ffi::SQLITE_BUSY,
+                        extended_code,
+                        "retrying runtime SQLite contention"
+                    );
+                    wait(backoff);
+                    backoff = (backoff * 2).min(RUNTIME_MAX_BACKOFF);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+}
+
 impl SessionDatabase {
     pub fn open(state_dir: &StateDir) -> Result<Self, SessionError> {
         let migration_lock = shared_state_lock(
             &state_dir.path().join(SESSIONS_DB_LOCK_FILE),
             OWNER_FILE_MODE,
         )?;
-        let connection = open_writable_connection(state_dir, &migration_lock)?;
+        let connection = open_writable_connection(state_dir, &migration_lock, None)?;
         let mut database = Self {
             connection,
             state_dir: state_dir.clone(),
@@ -1161,11 +1270,35 @@ impl SessionDatabase {
     /// cleanup and archive reconciliation so a preference read never does
     /// filesystem maintenance on the caller's thread.
     pub fn open_state(state_dir: &StateDir) -> Result<Self, SessionError> {
-        let migration_lock = shared_state_lock(
-            &state_dir.path().join(SESSIONS_DB_LOCK_FILE),
-            OWNER_FILE_MODE,
-        )?;
-        let connection = open_writable_connection(state_dir, &migration_lock)?;
+        Self::open_state_inner(state_dir, None)
+    }
+
+    pub fn open_runtime(
+        state_dir: &StateDir,
+        retry: &RuntimeRetry<'_>,
+    ) -> Result<Self, SessionError> {
+        retry.check(RUNTIME_CONNECTION_SETUP)?;
+        Self::open_state_inner(state_dir, Some(retry))
+    }
+
+    fn open_state_inner(
+        state_dir: &StateDir,
+        retry: Option<&RuntimeRetry<'_>>,
+    ) -> Result<Self, SessionError> {
+        let lock_path = state_dir.path().join(SESSIONS_DB_LOCK_FILE);
+        let migration_lock = if retry.is_some() {
+            fs::create_dir_all(state_dir.path()).map_err(StorageError::from)?;
+            ensure_real_directory(state_dir.path(), false).map_err(StorageError::from)?;
+            create_owner_only(&lock_path)?;
+            let file = existing_state_lock(&lock_path)?;
+            file.try_lock_shared()
+                .map_err(io::Error::from)
+                .map_err(StorageError::from)?;
+            file
+        } else {
+            shared_state_lock(&lock_path, OWNER_FILE_MODE)?
+        };
+        let connection = open_writable_connection(state_dir, &migration_lock, retry)?;
         Ok(Self {
             connection,
             state_dir: state_dir.clone(),
@@ -1195,6 +1328,7 @@ impl SessionDatabase {
                 | OpenFlags::SQLITE_OPEN_NO_MUTEX
                 | OpenFlags::SQLITE_OPEN_NOFOLLOW,
         )?;
+        connection.busy_timeout(BUSY_TIMEOUT)?;
         configure_wal_retention(&connection, true)?;
         let current = open_owner_only_existing(&path)?;
         validate_existing_database_sidecars(&path)?;
@@ -1212,7 +1346,6 @@ impl SessionDatabase {
         }
         #[cfg(not(unix))]
         let _ = (&file, &current);
-        connection.busy_timeout(BUSY_TIMEOUT)?;
         connection.set_limit(Limit::SQLITE_LIMIT_LENGTH, MAX_SQLITE_VALUE_BYTES)?;
         verify_current_schema(&connection)?;
         connection.execute_batch("PRAGMA trusted_schema = OFF;")?;
@@ -1819,7 +1952,8 @@ impl SessionDatabase {
     /// Folds one call into its hourly bucket, the way [`Self::record_usage`]
     /// folds one turn.
     pub fn record_tool_call(&self, entry: &ToolLedgerEntry) -> Result<(), SessionError> {
-        let transaction = self.connection.unchecked_transaction()?;
+        let transaction =
+            Transaction::new_unchecked(&self.connection, TransactionBehavior::Immediate)?;
         merge_tool_bucket(&transaction, entry)?;
         transaction.commit()?;
         Ok(())
@@ -4247,6 +4381,7 @@ fn validate_existing_database_sidecars(path: &Path) -> Result<(), SessionError> 
 fn open_writable_connection(
     state_dir: &StateDir,
     migration_lock: &File,
+    retry: Option<&RuntimeRetry<'_>>,
 ) -> Result<Connection, SessionError> {
     fs::create_dir_all(state_dir.path()).map_err(StorageError::from)?;
     ensure_real_directory(state_dir.path(), false).map_err(StorageError::from)?;
@@ -4259,7 +4394,18 @@ fn open_writable_connection(
             | OpenFlags::SQLITE_OPEN_NO_MUTEX
             | OpenFlags::SQLITE_OPEN_NOFOLLOW,
     )?;
-    let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    connection.busy_timeout(if retry.is_some() {
+        Duration::ZERO
+    } else {
+        BUSY_TIMEOUT
+    })?;
+    let read_version =
+        || Ok(connection.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))?);
+    let version = if let Some(retry) = retry {
+        retry.run(RUNTIME_CONNECTION_SETUP, read_version)?
+    } else {
+        read_version()?
+    };
     let cutover = version > 0 && version < SCHEMA_VERSION;
     if cutover {
         migration_lock
@@ -4270,14 +4416,31 @@ fn open_writable_connection(
                 holders: describe_migration_holders(state_dir, &path),
             })?;
     }
-    configure_wal_retention(&connection, true)?;
-    connection.busy_timeout(BUSY_TIMEOUT)?;
     connection.set_limit(Limit::SQLITE_LIMIT_LENGTH, MAX_SQLITE_VALUE_BYTES)?;
-    initialize(&mut connection, state_dir)?;
+    if let Some(retry) = retry {
+        retry.run(RUNTIME_CONNECTION_SETUP, || {
+            configure_wal_retention(&connection, true)
+        })?;
+        if version == SCHEMA_VERSION {
+            retry.run(RUNTIME_CONNECTION_SETUP, || {
+                configure_current_schema(&connection)
+            })?;
+        } else {
+            retry.check(RUNTIME_CONNECTION_SETUP)?;
+            initialize(&mut connection, state_dir, true)?;
+        }
+    } else {
+        configure_wal_retention(&connection, true)?;
+        initialize(&mut connection, state_dir, false)?;
+    }
     if cutover {
         migration_lock.lock_shared().map_err(StorageError::from)?;
     }
-    configure(&connection)?;
+    if let Some(retry) = retry {
+        retry.run(RUNTIME_CONNECTION_SETUP, || configure(&connection))?;
+    } else {
+        configure(&connection)?;
+    }
     Ok(connection)
 }
 
@@ -4824,7 +4987,11 @@ fn backfill_workspace_bindings(transaction: &Transaction<'_>) -> Result<(), Sess
     Ok(())
 }
 
-fn initialize(connection: &mut Connection, state_dir: &StateDir) -> Result<(), SessionError> {
+fn initialize(
+    connection: &mut Connection,
+    state_dir: &StateDir,
+    nonblocking: bool,
+) -> Result<(), SessionError> {
     let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
     if version == SCHEMA_VERSION {
         return configure_current_schema(connection);
@@ -4833,7 +5000,16 @@ fn initialize(connection: &mut Connection, state_dir: &StateDir) -> Result<(), S
 
     // Caudra initializers serialize on the existing artifact lock, while the
     // SQLite exclusive mode below also excludes non-cooperating connections.
-    let _initialization_lock = lock_session_artifacts(state_dir)?;
+    let _initialization_lock = if nonblocking {
+        lock_session_artifacts_within(state_dir, Duration::ZERO)?.ok_or_else(|| {
+            StorageError::Io(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                INITIALIZATION_LOCKED,
+            ))
+        })?
+    } else {
+        lock_session_artifacts(state_dir)?
+    };
     let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
     if version == SCHEMA_VERSION {
         return configure_current_schema(connection);
@@ -4885,7 +5061,11 @@ fn configure_current_schema(connection: &Connection) -> Result<(), SessionError>
     // A current database needs no initialization lock; this keeps frequent state
     // opens off the write lock.
     verify_current_schema(connection)?;
-    connection.pragma_update(None, "journal_mode", "WAL")?;
+    let journal_mode: String =
+        connection.pragma_query_value(None, "journal_mode", |row| row.get(0))?;
+    if !journal_mode.eq_ignore_ascii_case("wal") {
+        connection.pragma_update(None, "journal_mode", "WAL")?;
+    }
     verify_auto_vacuum(connection)
 }
 
@@ -6064,6 +6244,295 @@ ALTER TABLE sessions DROP COLUMN workspace_source;
 ALTER TABLE sessions DROP COLUMN workspace_binding;
 "#;
 
+    fn sqlite_failure(code: c_int) -> SessionError {
+        SqliteError::SqliteFailure(SqliteErrorCode::new(code), None).into()
+    }
+
+    #[test_case(ffi::SQLITE_BUSY; "busy")]
+    #[test_case(ffi::SQLITE_BUSY_SNAPSHOT; "snapshot")]
+    #[test_case(ffi::SQLITE_BUSY_RECOVERY; "recovery")]
+    fn runtime_retry_recovers_typed_contention(code: c_int) {
+        let retry = RuntimeRetry::new(None, &|| false);
+        let clock = Cell::new(retry.started);
+        let calls = Cell::new(0);
+        let result = retry.run_with_clock(
+            RUNTIME_CONNECTION_SETUP,
+            || {
+                calls.set(calls.get() + 1);
+                if calls.get() == 1 {
+                    Err(sqlite_failure(code))
+                } else {
+                    Ok(())
+                }
+            },
+            || clock.get(),
+            |wait| clock.set(clock.get() + wait),
+        );
+        assert!(result.is_ok());
+        assert_eq!(calls.get(), 2);
+        assert_eq!(clock.get() - retry.started, RUNTIME_INITIAL_BACKOFF);
+    }
+
+    #[test_case(ffi::SQLITE_LOCKED; "locked")]
+    #[test_case(ffi::SQLITE_LOCKED_SHAREDCACHE; "shared_cache")]
+    #[test_case(ffi::SQLITE_IOERR; "io_error")]
+    #[test_case(ffi::SQLITE_CORRUPT; "corrupt")]
+    #[test_case(ffi::SQLITE_READONLY; "read_only")]
+    #[test_case(ffi::SQLITE_CONSTRAINT; "constraint")]
+    fn runtime_retry_refuses_permanent_sqlite_errors(code: c_int) {
+        let retry = RuntimeRetry::new(None, &|| false);
+        let calls = Cell::new(0);
+        let result: Result<(), _> = retry.run_with_clock(
+            RUNTIME_CONNECTION_SETUP,
+            || {
+                calls.set(calls.get() + 1);
+                Err(sqlite_failure(code))
+            },
+            || retry.started,
+            |_| unreachable!(),
+        );
+        assert!(
+            matches!(result, Err(SessionError::Sqlite(error)) if error.sqlite_error().unwrap().extended_code == code)
+        );
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test_case(None; "total_budget")]
+    #[test_case(Some(RUNTIME_MAX_BACKOFF); "caller_deadline")]
+    fn runtime_retry_bounds_elapsed_time(shorter: Option<Duration>) {
+        let mut retry = RuntimeRetry::new(None, &|| false);
+        if let Some(duration) = shorter {
+            retry.deadline = retry.started + duration;
+        }
+        let clock = Cell::new(retry.started);
+        let result: Result<(), _> = retry.run_with_clock(
+            RUNTIME_CONNECTION_SETUP,
+            || Err(sqlite_failure(ffi::SQLITE_BUSY)),
+            || clock.get(),
+            |wait| {
+                assert!(wait <= RUNTIME_MAX_BACKOFF);
+                clock.set(clock.get() + wait);
+            },
+        );
+        assert!(matches!(
+            result,
+            Err(SessionError::RuntimeContention { .. })
+        ));
+        assert!(clock.get() < retry.deadline);
+        assert!(retry.deadline - clock.get() <= RUNTIME_MAX_BACKOFF);
+        assert!(retry.retries.get() <= RUNTIME_MAX_ATTEMPTS);
+    }
+
+    #[test]
+    fn runtime_retry_counts_attempt_waits_and_shares_attempt_budget() {
+        let retry = RuntimeRetry::new(None, &|| false);
+        let clock = Cell::new(retry.started);
+        let result: Result<(), _> = retry.run_with_clock(
+            RUNTIME_CONNECTION_SETUP,
+            || {
+                clock.set(clock.get() + BUSY_TIMEOUT);
+                Err(sqlite_failure(ffi::SQLITE_BUSY))
+            },
+            || clock.get(),
+            |_| unreachable!(),
+        );
+        assert!(matches!(
+            result,
+            Err(SessionError::RuntimeContention { attempts: 1, .. })
+        ));
+
+        let result: Result<(), _> = retry.run_with_clock(
+            RUNTIME_CONNECTION_SETUP,
+            || Err(sqlite_failure(ffi::SQLITE_BUSY)),
+            || retry.started,
+            |_| {},
+        );
+        assert!(matches!(
+            result,
+            Err(SessionError::RuntimeContention {
+                attempts: RUNTIME_MAX_ATTEMPTS,
+                ..
+            })
+        ));
+    }
+
+    #[test_case(false; "before_attempt")]
+    #[test_case(true; "during_backoff")]
+    fn runtime_retry_honors_cancellation(during_backoff: bool) {
+        let cancelled = Cell::new(!during_backoff);
+        let is_cancelled = || cancelled.get();
+        let retry = RuntimeRetry::new(None, &is_cancelled);
+        let calls = Cell::new(0);
+        let result: Result<(), _> = retry.run_with_clock(
+            RUNTIME_CONNECTION_SETUP,
+            || {
+                calls.set(calls.get() + 1);
+                Err(sqlite_failure(ffi::SQLITE_BUSY))
+            },
+            || retry.started,
+            |_| cancelled.set(true),
+        );
+        assert!(matches!(result, Err(SessionError::RuntimeCancelled { .. })));
+        assert_eq!(calls.get(), usize::from(during_backoff));
+    }
+
+    #[test]
+    fn runtime_retry_refuses_expired_deadline_and_domain_errors() {
+        let retry = RuntimeRetry::new(Some(Instant::now()), &|| false);
+        let result: Result<(), _> = retry.run(RUNTIME_CONNECTION_SETUP, || unreachable!());
+        assert!(matches!(result, Err(SessionError::RuntimeDeadline { .. })));
+        let retry = RuntimeRetry::new(None, &|| false);
+        let result: Result<(), _> = retry.run_with_clock(
+            RUNTIME_CONNECTION_SETUP,
+            || Err(SessionError::WorkspaceRebindRequired),
+            || retry.started,
+            |_| unreachable!(),
+        );
+        assert!(matches!(result, Err(SessionError::WorkspaceRebindRequired)));
+    }
+
+    #[test]
+    fn runtime_open_under_writer_leaves_maintenance_pending() {
+        let (_temp, state_dir) = state_dir();
+        let mut database = SessionDatabase::open(&state_dir).unwrap();
+        let session = TestSession::new(MODEL, CWD);
+        database.save(&session, None).unwrap();
+        let removed_session = TestSession::new(MODEL, CWD);
+        database.save(&removed_session, None).unwrap();
+        let removed = removed_session.id;
+        let artifact = state_dir
+            .path()
+            .join(SESSION_SNAPSHOT_DIR)
+            .join(removed.to_string());
+        fs::create_dir_all(&artifact).unwrap();
+        fs::write(artifact.join(ARTIFACT_NAME), ARTIFACT_NAME).unwrap();
+        database.delete(removed, Some(0)).unwrap();
+        let transaction = database.connection.unchecked_transaction().unwrap();
+        transaction.execute(
+            "INSERT INTO pending_archives (session_id, expected_write_version, pending_name, byte_count) VALUES (?1, 0, ?2, 0)",
+            params![session.id.as_bytes().as_slice(), ARTIFACT_NAME],
+        ).unwrap();
+        transaction.commit().unwrap();
+        let writer =
+            Transaction::new_unchecked(&database.connection, TransactionBehavior::Immediate)
+                .unwrap();
+        let retry = RuntimeRetry::new(None, &|| false);
+        let runtime = SessionDatabase::open_runtime(&state_dir, &retry).unwrap();
+        assert!(
+            !runtime
+                .task_identity_exists_runtime(session.id, ARTIFACT_NAME, &retry)
+                .unwrap()
+        );
+        assert!(runtime.due_cleanup_jobs().unwrap() > 0);
+        let pending: i64 = runtime
+            .connection
+            .query_row("SELECT count(*) FROM pending_archives", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(pending, 1);
+        assert!(artifact.join(ARTIFACT_NAME).exists());
+        writer.rollback().unwrap();
+        drop(runtime);
+        drop(database);
+        let maintained = SessionDatabase::open(&state_dir).unwrap();
+        assert_eq!(maintained.due_cleanup_jobs().unwrap(), 0);
+        assert!(!artifact.exists());
+    }
+
+    #[test]
+    fn runtime_initialization_refuses_held_artifact_lock_without_retry() {
+        let (_temp, state_dir) = state_dir();
+        let _lock = lock_session_artifacts(&state_dir).unwrap();
+        let retry = RuntimeRetry::new(None, &|| false);
+        assert!(
+            matches!(SessionDatabase::open_runtime(&state_dir, &retry), Err(SessionError::Storage(StorageError::Io(error))) if error.kind() == io::ErrorKind::WouldBlock && error.to_string() == INITIALIZATION_LOCKED)
+        );
+        assert_eq!(retry.retries.get(), 0);
+    }
+
+    #[test]
+    fn runtime_open_does_not_retry_migration_blockers() {
+        let (_temp, state_dir) = state_dir();
+        let database = SessionDatabase::open(&state_dir).unwrap();
+        database
+            .connection
+            .pragma_update(None, "user_version", OWNER_CHECKPOINT_PREVIOUS_SCHEMA)
+            .unwrap();
+        let retry = RuntimeRetry::new(None, &|| false);
+        assert!(matches!(
+            SessionDatabase::open_runtime(&state_dir, &retry),
+            Err(SessionError::MigrationBlocked { .. })
+        ));
+        assert_eq!(retry.retries.get(), 0);
+    }
+
+    #[test]
+    fn journal_mode_transition_requires_reader_release() {
+        let (_temp, state_dir) = state_dir();
+        let database = SessionDatabase::open(&state_dir).unwrap();
+        database.connection.busy_timeout(Duration::ZERO).unwrap();
+        database
+            .connection
+            .pragma_update(None, "journal_mode", "DELETE")
+            .unwrap();
+        let reader = Connection::open(database.path()).unwrap();
+        let transaction = reader.unchecked_transaction().unwrap();
+        transaction
+            .query_row("SELECT count(*) FROM state", [], |_| Ok(()))
+            .unwrap();
+        assert!(
+            matches!(configure_current_schema(&database.connection), Err(SessionError::Sqlite(error)) if error.sqlite_error_code() == Some(ErrorCode::DatabaseBusy))
+        );
+        transaction.rollback().unwrap();
+        configure_current_schema(&database.connection).unwrap();
+        let mode: String = database
+            .connection
+            .pragma_query_value(None, "journal_mode", |row| row.get(0))
+            .unwrap();
+        assert_eq!(mode, "wal");
+    }
+
+    #[test]
+    fn immediate_transaction_prevents_stale_snapshot_upgrade() {
+        let (_temp, state_dir) = state_dir();
+        let first = SessionDatabase::open(&state_dir).unwrap();
+        let second = SessionDatabase::open_state(&state_dir).unwrap();
+        first.connection.busy_timeout(Duration::ZERO).unwrap();
+        second.connection.busy_timeout(Duration::ZERO).unwrap();
+        let stale = first.connection.unchecked_transaction().unwrap();
+        stale
+            .query_row("SELECT count(*) FROM state", [], |_| Ok(()))
+            .unwrap();
+        second
+            .connection
+            .execute(
+                "INSERT INTO state(scope, key, value, updated_at) VALUES (?1, ?1, 'null', 0)",
+                params![ARTIFACT_NAME],
+            )
+            .unwrap();
+        let failure = stale.execute("DELETE FROM state", []).unwrap_err();
+        assert_eq!(
+            failure.sqlite_error().unwrap().extended_code,
+            ffi::SQLITE_BUSY_SNAPSHOT
+        );
+        stale.rollback().unwrap();
+        let immediate =
+            Transaction::new_unchecked(&first.connection, TransactionBehavior::Immediate).unwrap();
+        immediate
+            .query_row("SELECT count(*) FROM state", [], |_| Ok(()))
+            .unwrap();
+        let failure = second
+            .connection
+            .execute("DELETE FROM state", [])
+            .unwrap_err();
+        assert_eq!(
+            failure.sqlite_error().unwrap().extended_code,
+            ffi::SQLITE_BUSY
+        );
+        immediate.execute("DELETE FROM state", []).unwrap();
+        immediate.commit().unwrap();
+    }
     #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
     struct TestMessage(String);
 

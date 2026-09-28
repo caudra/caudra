@@ -21,7 +21,10 @@ use caudra_providers::{
     CacheKey, HistoryItem, Message, ThinkingConfig, TokenUsage, add_cost, expand_message,
 };
 use caudra_storage::{
-    background::JobOwner, id::CaudraId, sessions::SessionDatabase, tool_outputs::ToolOutputStore,
+    background::JobOwner,
+    id::CaudraId,
+    sessions::{RuntimeRetry, SessionDatabase},
+    tool_outputs::ToolOutputStore,
 };
 
 use super::steering::{SharedSteering, Steering};
@@ -32,8 +35,8 @@ use crate::prompt::PromptId;
 use crate::prompt::profile::SystemPromptProfile;
 use crate::tools::native::batch::{self, MAX_BATCH_SIZE};
 use crate::tools::{
-    BuiltinDeferral, DeferredTool, DescriptionContext, FileReadTracker, LocalTools, ToolAudience,
-    ToolContext, ToolFilter, ToolLive, deferral,
+    BuiltinDeferral, Deadline, DeferredTool, DescriptionContext, FileReadTracker, LocalTools,
+    ToolAudience, ToolContext, ToolFilter, ToolLive, deferral,
 };
 use crate::{
     ActivityChild, Agent, AgentEvent, AgentInput, AgentMode, AgentParams, AgentRunParams,
@@ -48,6 +51,8 @@ pub const BUILTIN_TASK_PROFILE_DESCRIPTION: &str = "Caudra\'s built-in task prom
 pub const SESSION_CLOSED: &str = "session closed";
 pub(crate) const RESERVATION_SESSION_MISMATCH: &str =
     "task identity reservation belongs to a different session; use this session's job scope";
+const IDENTITY_CONNECTION_ERROR: &str = "task identity connection";
+const IDENTITY_LOOKUP_ERROR: &str = "task identity lookup";
 pub const CANCELLED: &str = "cancelled";
 pub(super) const TURN_LIMIT: &str = "subagent reached its maximum turn limit";
 pub(super) const TRUNCATED: &str = "subagent response was cut off at its output token limit";
@@ -824,13 +829,7 @@ pub async fn open_task(ctx: &ToolContext, opts: TaskOptions) -> Result<Subagent,
                 mode: opts.mode.unwrap_or(default_spec.mode),
                 ..SubagentTaskSpec::default()
             };
-            let lease = reserve_task_identity(
-                &ctx.subagent_history,
-                &opts.name,
-                ctx.tool_output_store.as_deref(),
-                ctx.session_id.as_ref().map(|id| id.id()),
-                ctx.job_scope().as_ref(),
-            )?;
+            let lease = reserve_task_identity_async(ctx, &opts.name).await?;
             (lease.task_id().to_owned(), lease.with_spec(spec))
         }
     };
@@ -998,7 +997,7 @@ pub async fn open_generic(ctx: &ToolContext, opts: GenericOptions) -> Result<Sub
                 .continue_task(&ids.task_id)
                 .map_err(|error| error.to_string())?,
         ),
-        None => reserve_fresh(ctx, ids.task_id.clone(), None)?,
+        None => reserve_fresh(ctx, ids.task_id.clone(), None).await?,
     };
     let model_binding = opts.model_spec.map(Binding::Exact);
     let (model, provider) = resolve_provider(ctx, model_binding.as_ref()).await?;
@@ -1085,6 +1084,52 @@ pub(crate) fn reserve_task_identity(
     session: Option<CaudraId>,
     jobs: Option<&JobScope>,
 ) -> Result<SubagentHistoryLease, String> {
+    let retry = RuntimeRetry::new(None, &|| false);
+    reserve_task_identity_with_retry(history, label, outputs, session, jobs, &retry)
+}
+
+async fn reserve_task_identity_async(
+    ctx: &ToolContext,
+    label: &str,
+) -> Result<SubagentHistoryLease, String> {
+    let history = ctx.subagent_history.clone();
+    let outputs = ctx.tool_output_store.clone();
+    let session = ctx.session_id.as_ref().map(|id| id.id());
+    let jobs = ctx.job_scope();
+    let cancel = ctx.cancel.clone();
+    let deadline = match ctx.deadline {
+        Deadline::None => None,
+        Deadline::At(instant) => Some(instant),
+    };
+    let label = label.to_owned();
+    let lease = smol::unblock(move || {
+        let cancelled = || cancel.is_cancelled();
+        let retry = RuntimeRetry::new(deadline, &cancelled);
+        reserve_task_identity_with_retry(
+            &history,
+            &label,
+            outputs.as_deref(),
+            session,
+            jobs.as_ref(),
+            &retry,
+        )
+    })
+    .await;
+    if ctx.cancel.is_cancelled() {
+        return Err(CANCELLED.into());
+    }
+    ctx.deadline.check()?;
+    lease
+}
+
+pub(crate) fn reserve_task_identity_with_retry(
+    history: &SubagentHistoryStore,
+    label: &str,
+    outputs: Option<&ToolOutputStore>,
+    session: Option<CaudraId>,
+    jobs: Option<&JobScope>,
+    retry: &RuntimeRetry<'_>,
+) -> Result<SubagentHistoryLease, String> {
     if let Some(jobs) = jobs
         && session.is_some_and(|session| session != jobs.session_id())
     {
@@ -1096,22 +1141,22 @@ pub(crate) fn reserve_task_identity(
         .or_else(|| jobs.map(JobScope::state_dir))
         .zip(session)
         .map(|(dir, session)| {
-            SessionDatabase::open(dir)
+            SessionDatabase::open_runtime(dir, retry)
                 .map(|database| (database, session))
-                .map_err(|error| error.to_string())
+                .map_err(|error| format!("{IDENTITY_CONNECTION_ERROR}: {error}"))
         })
         .transpose()?;
     history.reserve_generated(label, |id| match &database {
         Some((database, session)) => database
-            .task_identity_exists(*session, id)
-            .map_err(|error| error.to_string()),
+            .task_identity_exists_runtime(*session, id, retry)
+            .map_err(|error| format!("{IDENTITY_LOOKUP_ERROR}: {error}")),
         None => Ok(false),
     })
 }
 
 /// A tool call that ran twice under one id collides with its own history, so
 /// a taken id is answered with a fresh one rather than an error.
-fn reserve_fresh(
+async fn reserve_fresh(
     ctx: &ToolContext,
     task_id: String,
     spec: Option<SubagentTaskSpec>,
@@ -1126,14 +1171,9 @@ fn reserve_fresh(
             SubagentHistoryError::AlreadyActive { .. }
             | SubagentHistoryError::AlreadyCompleted { .. },
         ) => {
-            let lease = reserve_task_identity(
-                &ctx.subagent_history,
-                "task",
-                ctx.tool_output_store.as_deref(),
-                ctx.session_id.as_ref().map(|id| id.id()),
-                ctx.job_scope().as_ref(),
-            )?
-            .with_spec(spec.unwrap_or_else(SubagentTaskSpec::generic));
+            let lease = reserve_task_identity_async(ctx, "task")
+                .await?
+                .with_spec(spec.unwrap_or_else(SubagentTaskSpec::generic));
             Ok((lease.task_id().to_owned(), lease))
         }
         Err(error) => Err(error.to_string()),
@@ -1359,11 +1399,13 @@ mod tests {
     };
     use crate::permissions::PermissionRequest;
     use crate::tools::BATCH_TOOL_NAME;
+    use crate::tools::DEADLINE_EXCEEDED;
     use crate::tools::registry::Tool;
     use crate::tools::test_support::NamedMock;
-    use crate::{ToolDoneEvent, TurnCompleteEvent};
+    use crate::{CancelToken, ToolDoneEvent, TurnCompleteEvent};
     use caudra_config::ToolKey;
     use caudra_providers::{Billing, ContentBlock, Message, Role};
+    use caudra_storage::StateDir;
     use caudra_storage::id::SessionRef;
     use caudra_storage::usage_ledger::LedgerPurpose;
     use tempfile::TempDir;
@@ -1446,6 +1488,36 @@ mod tests {
             mcp: Some(false),
             local_tools: LocalTools::default(),
         }
+    }
+
+    #[test_case(false, false; "cancelled_without_database")]
+    #[test_case(false, true; "cancelled_with_database")]
+    #[test_case(true, false; "expired_without_database")]
+    #[test_case(true, true; "expired_with_database")]
+    fn interrupted_identity_reservation_does_not_open_a_child(expired: bool, stored: bool) {
+        smol::block_on(async {
+            let temp = TempDir::new().unwrap();
+            let mut ctx = crate::tools::test_support::stub_ctx(&AgentMode::Build);
+            if stored {
+                ctx.session_id = Some(SessionRef::generate());
+                ctx.tool_output_store = Some(Arc::new(ToolOutputStore::new(StateDir::from_path(
+                    temp.path().to_owned(),
+                ))));
+            }
+            let expected = if expired {
+                ctx.deadline = Deadline::At(Instant::now());
+                DEADLINE_EXCEEDED
+            } else {
+                let (trigger, cancel) = CancelToken::new();
+                ctx.cancel = cancel;
+                trigger.cancel();
+                CANCELLED
+            };
+            let error = open_task(&ctx, task_options(None)).await.err().unwrap();
+            assert_eq!(error, expected);
+            assert_eq!(ctx.subagent_history.active_count(), 0);
+            assert!(ctx.subagent_history.snapshot().records().is_empty());
+        });
     }
 
     #[test_case(false; "active")]

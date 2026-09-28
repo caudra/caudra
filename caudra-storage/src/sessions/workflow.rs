@@ -12,7 +12,7 @@ use std::fmt;
 use std::io;
 use std::str::FromStr;
 
-use rusqlite::{Connection, OptionalExtension, Row, params};
+use rusqlite::{Connection, OptionalExtension, Row, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 
 use crate::StorageError;
@@ -452,7 +452,8 @@ impl SessionDatabase {
     ) -> Result<u64, SessionError> {
         bounded_identifier("workflow run id", run_id)?;
         SessionDatabase::validate_len("workflow event text", text.len(), MAX_EVENT_TEXT_BYTES)?;
-        let transaction = self.connection().unchecked_transaction()?;
+        let transaction =
+            Transaction::new_unchecked(self.connection(), TransactionBehavior::Immediate)?;
         let (count, last_seq) = transaction.query_row(
             "SELECT count(*), coalesce(max(seq), -1) FROM workflow_run_events WHERE run_id = ?1",
             params![run_id],
@@ -543,7 +544,8 @@ impl SessionDatabase {
             });
         }
         let call_key = signed(start.call_key)?;
-        let transaction = self.connection().unchecked_transaction()?;
+        let transaction =
+            Transaction::new_unchecked(self.connection(), TransactionBehavior::Immediate)?;
         let existing = transaction
             .query_row(
                 "SELECT state, request_hash FROM workflow_calls \

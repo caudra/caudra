@@ -8,7 +8,7 @@ use caudra_storage::{
     background::{JobOwner, JobPayload, MAX_INVOCATIONS, ShellJobMetadata, TaskEvent, TaskRecord},
     id::CaudraId,
     now_epoch,
-    sessions::SessionDatabase,
+    sessions::{RuntimeRetry, SessionDatabase},
     tool_ledger::ToolOutcome,
     tool_outputs::ToolOutputStore,
 };
@@ -16,12 +16,13 @@ use futures_lite::FutureExt;
 use serde_json::{Value, json};
 
 use super::{
-    BackgroundTasks, CLOSED, DriverGuard, MAX_ACTIVE, MAX_ID_BYTES, MAX_REQUEST_BYTES,
+    Admission, BackgroundTasks, CLOSED, DriverGuard, MAX_ACTIVE, MAX_ID_BYTES, MAX_REQUEST_BYTES,
     MAX_RESULT_BYTES, STALE_INVOCATION, TRANSITION, bounded, deliverable,
 };
 use crate::{
     CancelToken, History, SubagentHistoryStore, TaskCard, TaskProvenance, ToolDoneEvent,
     ToolOutput, background_reminder::RuntimeSnapshot, tool_output::shell_output_label,
+    tools::Deadline,
 };
 
 const MAX_OWNER_ACTIVE: usize = 16;
@@ -108,7 +109,7 @@ impl JobScope {
             .unwrap_or_default()
     }
 
-    fn current(&self) -> Result<(), String> {
+    pub(super) fn current(&self) -> Result<(), String> {
         let state = self.tasks.lock();
         if state.generation != self.generation {
             return Err(STALE_INVOCATION.into());
@@ -223,10 +224,10 @@ impl JobScope {
                 return Err(STALE_INVOCATION.into());
             }
             smol::unblock(move || {
-                SessionDatabase::open(&dir)
-                    .and_then(|database| {
-                        database.checkpoint_job_owner(session, &invocation, &task_id, &history)
-                    })
+                let database = SessionDatabase::open_state(&dir)
+                    .map_err(|error| format!("job checkpoint connection setup: {error}"))?;
+                database
+                    .checkpoint_job_owner(session, &invocation, &task_id, &history)
                     .map_err(|error| error.to_string())
             })
             .await?;
@@ -244,6 +245,28 @@ impl JobScope {
         &self,
         metadata: ShellJobMetadata,
         history: &SubagentHistoryStore,
+        execute: F,
+    ) -> Result<TaskCard, String>
+    where
+        F: FnOnce(CancelToken, TaskProvenance) -> Fut + Send + 'static,
+        Fut: Future<Output = ToolDoneEvent> + Send + 'static,
+    {
+        self.admit_shell_cancellable(
+            metadata,
+            history,
+            &CancelToken::none(),
+            Deadline::None,
+            execute,
+        )
+        .await
+    }
+
+    pub async fn admit_shell_cancellable<F, Fut>(
+        &self,
+        metadata: ShellJobMetadata,
+        history: &SubagentHistoryStore,
+        cancel: &CancelToken,
+        deadline: Deadline,
         execute: F,
     ) -> Result<TaskCard, String>
     where
@@ -270,8 +293,14 @@ impl JobScope {
         {
             return Err("shell metadata exceeds admission byte limit".into());
         }
+        let admission = Admission {
+            scope: self.clone(),
+            cancel: cancel.clone(),
+            deadline,
+        };
+        admission.check()?;
         let gate = self.tasks.0.gate.lock_arc().await;
-        self.current()?;
+        admission.check()?;
         {
             let state = self.tasks.lock();
             if state.transition.is_some() {
@@ -314,17 +343,28 @@ impl JobScope {
         } else {
             format!("shell-{label}")
         };
+        let reservation = admission.clone();
         let lease = smol::unblock(move || {
-            let database = SessionDatabase::open(&dir).map_err(|error| error.to_string())?;
-            history.reserve_generated(&label, |id| {
+            reservation.check()?;
+            let cancelled = || reservation.is_cancelled();
+            let deadline = match reservation.deadline {
+                Deadline::None => None,
+                Deadline::At(deadline) => Some(deadline),
+            };
+            let retry = RuntimeRetry::new(deadline, &cancelled);
+            let database = SessionDatabase::open_runtime(&dir, &retry)
+                .map_err(|error| format!("shell identity connection setup: {error}"))?;
+            let lease = history.reserve_generated(&label, |id| {
                 database
-                    .task_identity_exists(session, id)
-                    .map_err(|error| error.to_string())
-            })
+                    .task_identity_exists_runtime(session, id, &retry)
+                    .map_err(|error| format!("shell identity lookup: {error}"))
+            })?;
+            reservation.check()?;
+            Ok::<_, String>(lease)
         })
         .await?;
         let task_id = lease.task_id().to_owned();
-        self.current()?;
+        admission.check()?;
         if let JobOwner::Child { invocation_id } = &self.owner {
             let state = self.tasks.lock();
             let owner = state.records.get(invocation_id);
@@ -382,7 +422,10 @@ impl JobScope {
                     task_id,
                     invocation_id: driver_id.clone(),
                 };
-                let admitted = scope.tasks.persist(record).await;
+                let admitted = scope
+                    .tasks
+                    .persist_record(record, Some(admission.clone()))
+                    .await;
                 scope.tasks.lock().admitting.remove(&driver_id);
                 if let Err(error) = admitted {
                     scope.tasks.lock().cancels.remove(&driver_id);
@@ -400,11 +443,14 @@ impl JobScope {
                     return;
                 }
                 drop(lease);
-                if scope.current().is_err() {
+                let current = admission.check();
+                if current.is_err() {
                     scope.tasks.lock().cancels.remove(&driver_id);
                 }
                 drop(gate);
-                let _ = admitted_tx.send(Ok(card));
+                if current.is_ok() {
+                    let _ = admitted_tx.send(Ok(card));
+                }
                 let result = scope
                     .run_shell(&driver_id, cancel, provenance, execute)
                     .await;
@@ -419,6 +465,9 @@ impl JobScope {
                 }
                 scope.tasks.lock().cancels.remove(&driver_id);
                 scope.tasks.0.changed.notify(usize::MAX);
+                if let Err(error) = current {
+                    let _ = admitted_tx.send(Err(error));
+                }
             });
             state.jobs.insert(invocation_id, job);
         }
@@ -618,6 +667,7 @@ mod tests {
         Arc,
         atomic::{AtomicUsize, Ordering},
     };
+    use std::time::Duration;
 
     use caudra_config::ExecutionMode;
     use caudra_providers::{ContentBlock, Message, Role};
@@ -643,9 +693,10 @@ mod tests {
             },
             task_runner::{ModelResolver, SubagentTaskRunner, TaskRunner, WorkflowHostContext},
         },
+        background::{ADMISSION_CANCELLED, tests::hold_writer},
         background_reminder::render,
-        cancel::CancelMap,
-        tools::{LocalTools, test_support::stub_ctx},
+        cancel::{CancelMap, CancelToken},
+        tools::{DEADLINE_EXCEEDED, Deadline, LocalTools, test_support::stub_ctx},
         types::BACKGROUND_EVENT_RUN_ID,
     };
 
@@ -665,6 +716,12 @@ mod tests {
     const COMPLEX_COMMAND: &str = "cargo test | cat";
     const SHELL_OUTPUT: &str = "output-shell";
     const EXISTING_OUTPUT: &str = "output-existing";
+    const SUCCEEDED: &str = "succeeded";
+    const ADMISSION_SAVE: &str = "background admission save";
+    const ADMISSION_BUDGET: Duration = Duration::from_millis(250);
+    const DEADLINE_ERROR: &str = "deadline exceeded";
+    const CONTENTION_ERROR: &str = "SQLite contention exhausted";
+    const CANCELLED: &str = "cancelled";
     const PREMATURE_ACK: &str =
         "task event must be durably saved in parent history before acknowledgment";
 
@@ -723,6 +780,249 @@ mod tests {
             }],
             ..Default::default()
         }
+    }
+
+    #[test_case(false, false; "eventual_admission")]
+    #[test_case(true, false; "stop_joins_cancelled_factory")]
+    #[test_case(false, true; "caller_cancellation_joins_cancelled_factory")]
+    fn shell_admission_busy_retry_never_replays_factory(stop: bool, cancel_caller: bool) {
+        smol::block_on(async {
+            let fixture = Fixture::new().await;
+            let scope = fixture.tasks.main_scope();
+            let (release, writer) = hold_writer(fixture.dir.clone()).await;
+            let (checked_tx, checked_rx) = flume::unbounded();
+            fixture.tasks.lock().save_checked = Some(checked_tx);
+            let factories = Arc::new(AtomicUsize::new(0));
+            let executions = Arc::new(AtomicUsize::new(0));
+            let factory_count = Arc::clone(&factories);
+            let execution_count = Arc::clone(&executions);
+            let owned = scope.clone();
+            let history = fixture.history.clone();
+            let (trigger, cancel) = CancelToken::new();
+            let caller = smol::spawn(async move {
+                owned
+                    .admit_shell_cancellable(
+                        ShellJobMetadata {
+                            command: CARGO_COMMAND.into(),
+                            ..metadata()
+                        },
+                        &history,
+                        &cancel,
+                        Deadline::None,
+                        move |cancel, _| async move {
+                            factory_count.fetch_add(1, Ordering::SeqCst);
+                            if !cancel.is_cancelled() {
+                                execution_count.fetch_add(1, Ordering::SeqCst);
+                            }
+                            done()
+                        },
+                    )
+                    .await
+            });
+            checked_rx.recv_async().await.unwrap();
+            checked_rx.recv_async().await.unwrap();
+            assert_eq!(factories.load(Ordering::SeqCst), 0);
+            assert!(fixture.tasks.list().is_empty());
+            assert!(fixture.history.is_active(CARGO_ID));
+            if stop || cancel_caller {
+                let mut stopping = Box::pin(fixture.tasks.stop());
+                if stop {
+                    assert!(poll_once(&mut stopping).await.is_none());
+                } else {
+                    trigger.cancel();
+                }
+                let error = caller.await.unwrap_err();
+                assert!(error.contains(ADMISSION_SAVE), "{error}");
+                if stop {
+                    stopping.await.unwrap();
+                }
+                assert!(fixture.tasks.list().is_empty());
+                assert_eq!(executions.load(Ordering::SeqCst), 0);
+                release.send(()).unwrap();
+                writer.await;
+            } else {
+                release.send(()).unwrap();
+                writer.await;
+                let card = caller.await.unwrap();
+                fixture.tasks.join_jobs().await.unwrap();
+                let retried = scope
+                    .admit_shell(
+                        ShellJobMetadata {
+                            command: CARGO_COMMAND.into(),
+                            ..metadata()
+                        },
+                        &fixture.history,
+                        |_, _| async { panic!("retry executed") },
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(card.task_id, CARGO_ID);
+                assert_eq!(retried.invocation_id, card.invocation_id);
+                assert_eq!(executions.load(Ordering::SeqCst), 1);
+            }
+            assert_eq!(factories.load(Ordering::SeqCst), 1);
+            assert!(!fixture.history.is_active(CARGO_ID));
+            let records = SessionDatabase::open_state(&fixture.dir)
+                .unwrap()
+                .background_tasks(fixture.session.id)
+                .unwrap();
+            assert_eq!(records.len(), usize::from(!stop && !cancel_caller));
+            fixture.tasks.shutdown().await.unwrap();
+        });
+    }
+
+    #[test_case(false; "already_expired")]
+    #[test_case(true; "expires_under_writer_contention")]
+    fn shell_admission_deadline_never_starts_execution(contended: bool) {
+        smol::block_on(async {
+            let fixture = Fixture::new().await;
+            let (release, writer) = hold_writer(fixture.dir.clone()).await;
+            let deadline = Deadline::after(if contended {
+                ADMISSION_BUDGET
+            } else {
+                Duration::ZERO
+            });
+            let error = fixture
+                .tasks
+                .main_scope()
+                .admit_shell_cancellable(
+                    metadata(),
+                    &fixture.history,
+                    &CancelToken::none(),
+                    deadline,
+                    |cancel, _| async move {
+                        assert!(cancel.is_cancelled());
+                        done()
+                    },
+                )
+                .await
+                .unwrap_err();
+            if contended {
+                assert!(
+                    error.contains(DEADLINE_ERROR) || error.contains(CONTENTION_ERROR),
+                    "{error}"
+                );
+            } else {
+                assert_eq!(error, DEADLINE_EXCEEDED);
+            }
+            assert!(fixture.tasks.list().is_empty());
+            assert_eq!(fixture.history.active_count(), 0);
+            release.send(()).unwrap();
+            writer.await;
+            fixture.tasks.shutdown().await.unwrap();
+        });
+    }
+
+    #[test_case(false; "cancel_after_commit_before_handoff")]
+    #[test_case(true; "cancel_after_successful_handoff")]
+    fn shell_caller_cancellation_obeys_admission_boundary(admitted: bool) {
+        smol::block_on(async {
+            let fixture = Fixture::new().await;
+            let (committed_tx, committed_rx) = flume::bounded(1);
+            let (resume_tx, resume_rx) = flume::bounded(1);
+            let (execute_tx, execute_rx) = flume::bounded(1);
+            let (cleanup_tx, cleanup_rx) = flume::bounded(1);
+            if !admitted {
+                fixture.tasks.lock().admission_committed = Some((committed_tx, resume_rx));
+            }
+            let (trigger, cancel) = CancelToken::new();
+            let scope = fixture.tasks.main_scope();
+            let history = fixture.history.clone();
+            let mut waiter = smol::spawn(async move {
+                scope
+                    .admit_shell_cancellable(
+                        ShellJobMetadata {
+                            command: CARGO_COMMAND.into(),
+                            ..metadata()
+                        },
+                        &history,
+                        &cancel,
+                        Deadline::None,
+                        move |cancel, _| async move {
+                            cleanup_tx.send(()).unwrap();
+                            execute_rx.recv_async().await.unwrap();
+                            assert_eq!(cancel.is_cancelled(), !admitted);
+                            done()
+                        },
+                    )
+                    .await
+            });
+            if admitted {
+                waiter.await.unwrap();
+                trigger.cancel();
+                execute_tx.send(()).unwrap();
+            } else {
+                committed_rx.recv_async().await.unwrap();
+                trigger.cancel();
+                resume_tx.send(()).unwrap();
+                cleanup_rx.recv_async().await.unwrap();
+                assert!(poll_once(&mut waiter).await.is_none());
+                execute_tx.send(()).unwrap();
+                assert_eq!(waiter.await.unwrap_err(), ADMISSION_CANCELLED);
+            }
+            fixture.tasks.join_jobs().await.unwrap();
+            assert_eq!(
+                fixture.tasks.status(CARGO_ID).unwrap().state,
+                if admitted { SUCCEEDED } else { CANCELLED }
+            );
+            assert_eq!(fixture.history.active_count(), 0);
+            fixture.tasks.shutdown().await.unwrap();
+        });
+    }
+
+    #[test_case(false; "eventual_outcome")]
+    #[test_case(true; "stop_drains_outcome")]
+    fn shell_outcome_contention_preserves_one_execution_and_output(stop: bool) {
+        smol::block_on(async {
+            let fixture = Fixture::new().await;
+            let executions = Arc::new(AtomicUsize::new(0));
+            let count = Arc::clone(&executions);
+            let (started_tx, started_rx) = flume::bounded(1);
+            let (finish_tx, finish_rx) = flume::bounded(1);
+            let card = fixture
+                .tasks
+                .main_scope()
+                .admit_shell(metadata(), &fixture.history, move |_, _| async move {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    started_tx.send(()).unwrap();
+                    finish_rx.recv_async().await.unwrap();
+                    done()
+                })
+                .await
+                .unwrap();
+            started_rx.recv_async().await.unwrap();
+            let (release, writer) = hold_writer(fixture.dir.clone()).await;
+            let (checked_tx, checked_rx) = flume::unbounded();
+            fixture.tasks.lock().save_checked = Some(checked_tx);
+            finish_tx.send(()).unwrap();
+            checked_rx.recv_async().await.unwrap();
+            checked_rx.recv_async().await.unwrap();
+            let mut stopping = Box::pin(fixture.tasks.stop());
+            if stop {
+                assert!(poll_once(&mut stopping).await.is_none());
+            }
+            release.send(()).unwrap();
+            writer.await;
+            if stop {
+                stopping.await.unwrap();
+            } else {
+                fixture.tasks.join_jobs().await.unwrap();
+            }
+            assert_eq!(executions.load(Ordering::SeqCst), 1);
+            let record = fixture.tasks.record(&card.invocation_id).unwrap();
+            let stored = SessionDatabase::open_state(&fixture.dir)
+                .unwrap()
+                .background_tasks(fixture.session.id)
+                .unwrap();
+            assert_eq!(stored.len(), 1);
+            assert_eq!(stored[0].state, SUCCEEDED);
+            assert_eq!(stored[0].events.len(), 1);
+            assert_eq!(stored[0].events[0].event_id, record.events[0].event_id);
+            assert_eq!(stored[0].output_ref, record.output_ref);
+            assert_eq!(stored[0].events[0].suppressed, stop);
+            assert_eq!(record.output_ref.unwrap().id.as_str(), SHELL_OUTPUT);
+            fixture.tasks.shutdown().await.unwrap();
+        });
     }
 
     #[test_case(false; "main")]

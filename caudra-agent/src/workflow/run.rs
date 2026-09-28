@@ -73,13 +73,19 @@ pub(super) struct Interrupt {
 pub(super) struct ActiveRun {
     pub control: Sender<Interrupt>,
     pub task: smol::Task<()>,
+    admission: CancelTrigger,
 }
 
 impl ActiveRun {
     pub async fn interrupt(self, status: RunStatus) -> Option<RunSnapshot> {
-        let Self { control, task } = self;
+        let Self {
+            control,
+            task,
+            admission,
+        } = self;
         let (reply, answer) = flume::bounded(1);
         let _ = control.send_async(Interrupt { status, reply }).await;
+        admission.cancel();
         drop(control);
         task.await;
         answer.try_recv().ok()
@@ -225,6 +231,7 @@ pub(super) fn launch(
     root: &CancelToken,
 ) -> ActiveRun {
     let (trigger, cancel) = root.child();
+    let (admission, admission_cancel) = cancel.child();
     let (commands, host_rx) = flume::unbounded();
     let (control, control_rx) = flume::unbounded();
     let host = HostAdapter {
@@ -249,6 +256,7 @@ pub(super) fn launch(
         env,
         snapshot,
         cancel,
+        admission_cancel,
         trigger: Some(trigger),
         agents_tx,
         pending: None,
@@ -261,7 +269,11 @@ pub(super) fn launch(
         driver.drive(host_rx, control_rx, agents_rx).await;
         engine.await;
     });
-    ActiveRun { control, task }
+    ActiveRun {
+        control,
+        task,
+        admission,
+    }
 }
 
 struct Driver {
@@ -272,6 +284,7 @@ struct Driver {
     /// commit moves the row past it, and that is what makes later writes stale.
     epoch: u64,
     cancel: CancelToken,
+    admission_cancel: CancelToken,
     trigger: Option<CancelTrigger>,
     agents_tx: Sender<AgentDone>,
     pending: Option<Pending>,
@@ -304,6 +317,10 @@ impl Driver {
         let mut host_rx = Some(host_rx);
         let mut control_rx = Some(control_rx);
         while !(self.engine_done && self.in_flight == 0) {
+            if let Some(interrupt) = control_rx.as_ref().and_then(|rx| rx.try_recv().ok()) {
+                self.interrupt(interrupt).await;
+                continue;
+            }
             let event = future::race(
                 future::race(
                     async { Event::Host(recv_or_pending(host_rx.as_ref()).await) },
@@ -395,7 +412,7 @@ impl Driver {
         first_key: CallKey,
         requests: &[AgentRequest],
     ) -> Result<(), HostError> {
-        if self.preempted || self.cancel.is_cancelled() {
+        if self.preempted || self.admission_cancel.is_cancelled() {
             return Err(HostError::Cancelled);
         }
         let count = u32::try_from(requests.len()).map_err(|_| HostError::BudgetExhausted)?;
@@ -440,11 +457,18 @@ impl Driver {
                         .find(|entry| entry.call_key == key.0)
                         .and_then(|entry| entry.task_id.as_deref())
                 });
-            let lease = self
-                .env
-                .runner
-                .reserve_task(previous, &label_of(key, request))
-                .map_err(HostError::Failed)?;
+            let previous = previous.map(str::to_owned);
+            let label = label_of(key, request);
+            let runner = Arc::clone(&self.env.runner);
+            let cancel = self.admission_cancel.clone();
+            let lease = smol::unblock(move || {
+                runner.reserve_task_cancellable(previous.as_deref(), &label, &cancel)
+            })
+            .await;
+            if self.admission_cancel.is_cancelled() {
+                return Err(HostError::Cancelled);
+            }
+            let lease = lease.map_err(HostError::Failed)?;
             reserved.push((key, request, lease));
         }
         self.snapshot.usage.agents_admitted = admitted;
@@ -471,7 +495,7 @@ impl Driver {
             })
             .await
             .map_err(host_failure)?;
-        if !applied {
+        if !applied || self.admission_cancel.is_cancelled() {
             return Err(HostError::Cancelled);
         }
         for (key, request, lease) in reserved {
@@ -488,6 +512,9 @@ impl Driver {
                 })
                 .await
                 .map_err(host_failure)?;
+            if self.admission_cancel.is_cancelled() {
+                return Err(HostError::Cancelled);
+            }
             self.spawn_agent(key, request, TaskIdentity::Reserved(lease));
         }
         self.publish();
@@ -989,6 +1016,8 @@ mod tests {
     use futures_lite::future::poll_once;
     use test_case::test_case;
 
+    use crate::cancel::CancelToken;
+
     use super::{ActiveRun, ModelJob, ModelPurpose, model_purpose};
 
     #[test_case(RunStatus::Paused; "pause")]
@@ -1004,10 +1033,16 @@ mod tests {
                 assert_eq!(receiver.len(), 1);
                 drop(receiver);
             });
-            let active = ActiveRun { control, task };
+            let (admission, cancel) = CancelToken::new();
+            let active = ActiveRun {
+                control,
+                task,
+                admission,
+            };
             let mut interrupt = Box::pin(active.interrupt(status));
             assert!(poll_once(&mut interrupt).await.is_none());
             assert_eq!(queued.len(), 1);
+            assert!(cancel.is_cancelled());
             drop(queued);
             release.send(()).unwrap();
             assert!(interrupt.await.is_none());

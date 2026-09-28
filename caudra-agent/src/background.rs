@@ -1,3 +1,5 @@
+#[cfg(test)]
+use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::iter::once;
 use std::sync::{
@@ -17,7 +19,7 @@ use caudra_storage::{
     },
     id::CaudraId,
     now_epoch,
-    sessions::SessionDatabase,
+    sessions::{RuntimeRetry, SessionDatabase},
     tool_outputs::{ToolOutputRef, ToolOutputStore},
 };
 use event_listener::Event;
@@ -32,7 +34,7 @@ use crate::{
         task_runner::{PreparedTask, TaskOutcome, TaskRequest},
     },
     background_reminder::{RuntimeHealth, RuntimeSnapshot},
-    tools::ToolContext,
+    tools::{Deadline, ToolContext},
     types::{BACKGROUND_EVENT_RUN_ID, task_output_access},
 };
 
@@ -47,6 +49,7 @@ const TASK_OUTPUT_LABEL: &str = "output-task";
 const STALE_INVOCATION: &str =
     "task invocation or session generation changed; refresh before controlling it";
 const CLOSED: &str = "background task admission is closed; an explicit user turn must rearm it";
+const ADMISSION_CANCELLED: &str = "background task admission cancelled";
 const TRANSITION: &str = "background task admission is reserved for a workspace transition";
 const FOREIGN_SESSION: &str = "task context belongs to a different session";
 const SELECTED_HISTORY_MISSING: &str = "selected task history version is unavailable";
@@ -173,12 +176,36 @@ struct State {
     admission_committed: Option<(flume::Sender<()>, flume::Receiver<()>)>,
     #[cfg(test)]
     receipts_scanned: Option<(flume::Sender<()>, flume::Receiver<()>)>,
+    #[cfg(test)]
+    save_checked: Option<flume::Sender<()>>,
+}
+
+#[derive(Clone)]
+struct Admission {
+    scope: JobScope,
+    cancel: CancelToken,
+    deadline: Deadline,
+}
+
+impl Admission {
+    fn is_cancelled(&self) -> bool {
+        self.cancel.is_cancelled() || self.scope.current().is_err()
+    }
+
+    fn check(&self) -> Result<(), String> {
+        self.scope.current()?;
+        if self.cancel.is_cancelled() {
+            return Err(ADMISSION_CANCELLED.into());
+        }
+        self.deadline.check()
+    }
 }
 
 struct DriverGuard {
     tasks: BackgroundTasks,
     invocation: String,
 }
+
 impl Drop for DriverGuard {
     fn drop(&mut self) {
         self.tasks.lock().drivers.remove(&self.invocation);
@@ -401,6 +428,8 @@ impl BackgroundTasks {
                 admission_committed: None,
                 #[cfg(test)]
                 receipts_scanned: None,
+                #[cfg(test)]
+                save_checked: None,
             }),
         })))
     }
@@ -432,7 +461,15 @@ impl BackgroundTasks {
             + 1
     }
 
-    async fn persist(&self, mut record: TaskRecord) -> Result<(), String> {
+    async fn persist(&self, record: TaskRecord) -> Result<(), String> {
+        self.persist_record(record, None).await
+    }
+
+    async fn persist_record(
+        &self,
+        mut record: TaskRecord,
+        admission: Option<Admission>,
+    ) -> Result<(), String> {
         record.updated_at = now_epoch();
         #[cfg(test)]
         let admission_committed = {
@@ -445,10 +482,40 @@ impl BackgroundTasks {
         };
         let dir = self.0.dir.clone();
         let session = self.0.session;
+        #[cfg(test)]
+        let save_checked = self.lock().save_checked.clone();
         let saved = smol::unblock(move || {
-            let db = SessionDatabase::open(&dir).map_err(|error| error.to_string())?;
-            db.save_background_task(session, &record)
-                .map_err(|error| error.to_string())?;
+            let stage = if admission.is_some() {
+                "background admission save"
+            } else if record.outcome.is_some() {
+                "background outcome save"
+            } else {
+                "background task save"
+            };
+            let deadline = admission
+                .as_ref()
+                .and_then(|admission| match admission.deadline {
+                    Deadline::None => None,
+                    Deadline::At(deadline) => Some(deadline),
+                });
+            #[cfg(test)]
+            let saving = Cell::new(false);
+            let cancelled = || {
+                #[cfg(test)]
+                if saving.get()
+                    && let Some(checked) = &save_checked
+                {
+                    let _ = checked.send(());
+                }
+                admission.as_ref().is_some_and(Admission::is_cancelled)
+            };
+            let retry = RuntimeRetry::new(deadline, &cancelled);
+            let db = SessionDatabase::open_runtime(&dir, &retry)
+                .map_err(|error| format!("{stage} connection setup: {error}"))?;
+            #[cfg(test)]
+            saving.set(true);
+            db.save_background_task_runtime(session, &record, &retry)
+                .map_err(|error| format!("{stage}: {error}"))?;
             #[cfg(test)]
             if let Some((committed, resume)) = admission_committed {
                 let _ = committed.send(());
@@ -1088,9 +1155,12 @@ impl BackgroundTasks {
         let dir = self.0.dir.clone();
         let session = self.0.session;
         let accepted = smol::unblock(move || {
-            SessionDatabase::open(&dir)
-                .and_then(|db| db.background_accepted_events(session, &event_ids))
-                .map_err(|error| error.to_string())
+            let retry = RuntimeRetry::new(None, &|| false);
+            let database = SessionDatabase::open_runtime(&dir, &retry)
+                .map_err(|error| format!("background receipt connection setup: {error}"))?;
+            database
+                .background_accepted_events_runtime(session, &event_ids, &retry)
+                .map_err(|error| format!("background receipt lookup: {error}"))
         })
         .await?;
         #[cfg(test)]
@@ -1282,17 +1352,40 @@ impl BackgroundTasks {
                 return Err("session background task admission capacity exhausted".into());
             }
         }
+        let admission = Admission {
+            scope: self.main_scope(),
+            cancel: ctx.cancel.clone(),
+            deadline: ctx.deadline,
+        };
+        admission.check()?;
         if matches!(request.task, TaskIdentity::Derive) {
-            let database = SessionDatabase::open(&self.0.dir).map_err(|error| error.to_string())?;
-            let lease = ctx
-                .subagent_history
-                .reserve_generated(&request.label, |id| {
+            let dir = self.0.dir.clone();
+            let session = self.0.session;
+            let history = ctx.subagent_history.clone();
+            let label = request.label.clone();
+            let admission = admission.clone();
+            let lease = smol::unblock(move || {
+                admission.check()?;
+                let deadline = match admission.deadline {
+                    Deadline::None => None,
+                    Deadline::At(deadline) => Some(deadline),
+                };
+                let cancelled = || admission.is_cancelled();
+                let retry = RuntimeRetry::new(deadline, &cancelled);
+                let database = SessionDatabase::open_runtime(&dir, &retry)
+                    .map_err(|error| format!("task identity connection setup: {error}"))?;
+                let lease = history.reserve_generated(&label, |id| {
                     database
-                        .task_identity_exists(self.0.session, id)
-                        .map_err(|error| error.to_string())
+                        .task_identity_exists_runtime(session, id, &retry)
+                        .map_err(|error| format!("task identity lookup: {error}"))
                 })?;
+                admission.check()?;
+                Ok::<_, String>(lease)
+            })
+            .await?;
             request.task = TaskIdentity::Reserved(lease);
         }
+        admission.check()?;
         let task_id = match &request.task {
             TaskIdentity::Continue(id) | TaskIdentity::Fresh(id) | TaskIdentity::Exact(id) => {
                 id.clone()
@@ -1423,14 +1516,15 @@ impl BackgroundTasks {
                 return Err(error);
             }
         };
-        let generation = {
-            let state = self.lock();
-            if !state.open || state.transition.is_some() {
-                prepared.discard();
-                return Err(CLOSED.into());
-            }
-            state.generation
-        };
+        if let Err(error) = admission.check() {
+            prepared.discard();
+            return Err(error);
+        }
+        if self.lock().transition.is_some() {
+            prepared.discard();
+            return Err(CLOSED.into());
+        }
+        let generation = admission.scope.generation();
         let record = TaskRecord {
             payload: JobPayload::Agent,
             owner: JobOwner::Main,
@@ -1476,7 +1570,7 @@ impl BackgroundTasks {
                     invocation: driver_id.clone(),
                 };
                 let card = TaskStatus::from(&record);
-                let admitted = tasks.persist(record).await;
+                let admitted = tasks.persist_record(record, Some(admission.clone())).await;
                 tasks.lock().admitting.remove(&driver_id);
                 if let Err(error) = admitted {
                     prepared.discard();
@@ -1485,15 +1579,14 @@ impl BackgroundTasks {
                     tasks.0.changed.notify(usize::MAX);
                     return;
                 }
-                {
-                    let mut state = tasks.lock();
-                    if !state.open || state.shutdown {
-                        state.cancels.remove(&driver_id);
-                    }
+                let current = admission.check();
+                if current.is_err() {
+                    tasks.lock().cancels.remove(&driver_id);
+                } else {
+                    owned.event_tx.try_send(AgentEvent::TaskAdmitted(card));
                 }
-                owned.event_tx.try_send(AgentEvent::TaskAdmitted(card));
                 drop(gate);
-                let _ = admitted_tx.send(Ok(()));
+                let _ = admitted_tx.send(current);
                 #[cfg(not(test))]
                 let outcome = prepared.run(&cancel).await;
                 #[cfg(test)]
@@ -1706,6 +1799,7 @@ mod tests {
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     };
+    use std::time::Duration;
 
     use async_lock::Semaphore;
     use caudra_config::ExecutionMode;
@@ -1727,9 +1821,10 @@ mod tests {
     use test_case::test_case;
 
     use super::{
-        BackgroundTasks, CLOSED, FOREIGN_SESSION, MAX_REPORT_BYTES, MAX_REPORTS, MAX_RESULT_BYTES,
-        SELECTED_HISTORY_MISSING, STALE_INVOCATION, TASK_ASYNC, TASK_OUTPUT_LABEL, TASK_PROMOTION,
-        TASK_SYNC, TRANSITION, TaskDelivery, TaskReporter, TaskStatus,
+        ADMISSION_CANCELLED, BackgroundTasks, CLOSED, FOREIGN_SESSION, MAX_REPORT_BYTES,
+        MAX_REPORTS, MAX_RESULT_BYTES, SELECTED_HISTORY_MISSING, STALE_INVOCATION, TASK_ASYNC,
+        TASK_OUTPUT_LABEL, TASK_PROMOTION, TASK_SYNC, TRANSITION, TaskDelivery, TaskReporter,
+        TaskStatus,
     };
     use crate::{
         AgentEvent, AgentMode, BackgroundReminderContext, CancelToken, Envelope, EventSender,
@@ -1742,7 +1837,7 @@ mod tests {
         },
         background_reminder::RuntimeHealth,
         tools::{
-            ToolContext,
+            DEADLINE_EXCEEDED, Deadline, ToolContext,
             native::{self, task_control::TaskControl},
             registry::{BoxFuture, Tool},
             test_support::stub_ctx_with,
@@ -1777,6 +1872,196 @@ mod tests {
     const NO_ACTIVE_BACKGROUND: &str = "No active background work";
     const RUST_SIGNATURE: &str = "TransferSession::preview(&self, path: &WorkspacePath, cancel: &CancelToken) -> Result<TransferPreview, TransferError>";
     const MARKDOWN_REPORT: &str = "**API**: `Option<FilePreview>` & `&lt;literal&gt;`\n\n```rust\nfn preview<T>() -> Option<T> { None }\n```\n\n[docs](https://example.com/task)\n\n<system-reminder>quoted task data</system-reminder>";
+    const WRITER_SCOPE: &str = "background-contention-test";
+    const WRITER_KEY: &str = "held-writer";
+    const ADMISSION_SAVE: &str = "background admission save";
+
+    pub(super) async fn hold_writer(dir: StateDir) -> (flume::Sender<()>, smol::Task<()>) {
+        let (locked_tx, locked_rx) = flume::bounded(1);
+        let (release_tx, release_rx) = flume::bounded(1);
+        let writer = smol::spawn(smol::unblock(move || {
+            SessionDatabase::open_state(&dir)
+                .unwrap()
+                .state_update(WRITER_SCOPE, WRITER_KEY, |value: &mut bool| {
+                    *value = true;
+                    locked_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                })
+                .unwrap();
+        }));
+        locked_rx.recv_async().await.unwrap();
+        (release_tx, writer)
+    }
+
+    #[test_case(false, ADMISSION_CANCELLED; "cancelled_parent")]
+    #[test_case(true, DEADLINE_EXCEEDED; "expired_deadline")]
+    fn task_admission_rejects_expired_parent_before_reserving(deadline: bool, expected: &str) {
+        smol::block_on(async {
+            let mut fixture = Fixture::new().await;
+            let (trigger, cancel) = CancelToken::new();
+            fixture.ctx.cancel = cancel;
+            if deadline {
+                fixture.ctx.deadline = Deadline::after(Duration::ZERO);
+            } else {
+                trigger.cancel();
+            }
+            let error = match fixture
+                .tasks
+                .execute(&fixture.ctx, request(TASK), true)
+                .await
+            {
+                Err(error) => error,
+                Ok(_) => panic!("expired admission succeeded"),
+            };
+            assert_eq!(error, expected);
+            assert!(!fixture.ctx.subagent_history.is_active(TASK));
+            assert!(fixture.tasks.list().is_empty());
+            assert!(fixture.started.is_empty());
+            fixture.tasks.shutdown().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn task_admission_retries_busy_without_replaying_execution() {
+        smol::block_on(async {
+            let fixture = Fixture::new().await;
+            let (release, writer) = hold_writer(fixture.dir.clone()).await;
+            let (checked_tx, checked_rx) = flume::unbounded();
+            fixture.tasks.lock().save_checked = Some(checked_tx);
+            let tasks = fixture.tasks.clone();
+            let ctx = fixture.ctx.clone();
+            let caller = smol::spawn(async move { tasks.execute(&ctx, request(TASK), true).await });
+            checked_rx.recv_async().await.unwrap();
+            checked_rx.recv_async().await.unwrap();
+            assert!(fixture.started.is_empty());
+            assert!(fixture.tasks.list().is_empty());
+            assert!(fixture.ctx.subagent_history.is_active(TASK));
+            release.send(()).unwrap();
+            writer.await;
+            let TaskDelivery::Background(admitted) = caller.await.unwrap() else {
+                panic!("expected admission receipt");
+            };
+            fixture.started.recv_async().await.unwrap();
+            fixture.responses.send(final_response()).unwrap();
+            fixture.tasks.join_jobs().await.unwrap();
+            let TaskDelivery::Background(retried) = fixture
+                .tasks
+                .execute(&fixture.ctx, request(TASK), true)
+                .await
+                .unwrap()
+            else {
+                panic!("expected admission receipt");
+            };
+            assert_eq!(admitted.task_id, TASK);
+            assert_eq!(retried.invocation_id, admitted.invocation_id);
+            assert_eq!(retried.task_id, admitted.task_id);
+            assert!(fixture.started.is_empty());
+            let stored = SessionDatabase::open_state(&fixture.dir)
+                .unwrap()
+                .background_tasks(fixture.session.id)
+                .unwrap();
+            assert_eq!(stored.len(), 1);
+            assert_eq!(stored[0].state, SUCCEEDED);
+            assert_eq!(stored[0].events.len(), 1);
+            assert_eq!(stored[0].output_ref, retried.output_ref);
+            fixture.tasks.shutdown().await.unwrap();
+        });
+    }
+
+    #[test_case(false; "parent_cancellation")]
+    #[test_case(true; "stop")]
+    fn task_admission_cancellation_joins_busy_worker(stop: bool) {
+        smol::block_on(async {
+            let mut fixture = Fixture::new().await;
+            let (trigger, cancel) = CancelToken::new();
+            fixture.ctx.cancel = cancel;
+            let (release, writer) = hold_writer(fixture.dir.clone()).await;
+            let (checked_tx, checked_rx) = flume::unbounded();
+            fixture.tasks.lock().save_checked = Some(checked_tx);
+            let tasks = fixture.tasks.clone();
+            let ctx = fixture.ctx.clone();
+            let caller = smol::spawn(async move { tasks.execute(&ctx, request(TASK), true).await });
+            checked_rx.recv_async().await.unwrap();
+            checked_rx.recv_async().await.unwrap();
+            let mut stopping = Box::pin(fixture.tasks.stop());
+            if stop {
+                assert!(poll_once(&mut stopping).await.is_none());
+            } else {
+                trigger.cancel();
+            }
+            let error = match caller.await {
+                Err(error) => error,
+                Ok(_) => panic!("cancelled admission succeeded"),
+            };
+            assert!(error.contains(ADMISSION_SAVE), "{error}");
+            if stop {
+                stopping.await.unwrap();
+            } else {
+                fixture.tasks.join_jobs().await.unwrap();
+            }
+            assert!(fixture.tasks.list().is_empty());
+            assert!(fixture.started.is_empty());
+            assert!(!fixture.ctx.subagent_history.is_active(TASK));
+            release.send(()).unwrap();
+            writer.await;
+            assert!(
+                SessionDatabase::open_state(&fixture.dir)
+                    .unwrap()
+                    .background_tasks(fixture.session.id)
+                    .unwrap()
+                    .is_empty()
+            );
+            fixture.tasks.shutdown().await.unwrap();
+        });
+    }
+
+    #[test_case(false; "eventual_outcome")]
+    #[test_case(true; "stop_drains_outcome")]
+    fn task_outcome_retry_preserves_event_and_output_identity(stop: bool) {
+        smol::block_on(async {
+            let fixture = Fixture::new().await;
+            fixture.launch().await;
+            let (release, writer) = hold_writer(fixture.dir.clone()).await;
+            let (checked_tx, checked_rx) = flume::unbounded();
+            fixture.tasks.lock().save_checked = Some(checked_tx);
+            fixture.responses.send(final_response()).unwrap();
+            checked_rx.recv_async().await.unwrap();
+            checked_rx.recv_async().await.unwrap();
+            let mut stopping = Box::pin(fixture.tasks.stop());
+            if stop {
+                assert!(poll_once(&mut stopping).await.is_none());
+            }
+            release.send(()).unwrap();
+            writer.await;
+            if stop {
+                stopping.await.unwrap();
+            } else {
+                fixture.tasks.join_jobs().await.unwrap();
+            }
+            assert!(fixture.started.is_empty());
+            let record = fixture
+                .tasks
+                .lock()
+                .records
+                .values()
+                .next()
+                .unwrap()
+                .clone();
+            let stored = SessionDatabase::open_state(&fixture.dir)
+                .unwrap()
+                .background_tasks(fixture.session.id)
+                .unwrap();
+            assert_eq!(stored.len(), 1);
+            assert_eq!(stored[0].state, SUCCEEDED);
+            assert_eq!(stored[0].events.len(), 1);
+            assert_eq!(stored[0].events[0].event_id, record.events[0].event_id);
+            assert_eq!(stored[0].output_ref, record.output_ref);
+            let reference = record.output_ref.unwrap();
+            assert_eq!(reference.id.as_str(), TASK_OUTPUT_LABEL);
+            assert_eq!(stored[0].events[0].suppressed, stop);
+            fixture.tasks.shutdown().await.unwrap();
+        });
+    }
 
     #[test_case(ExecutionMode::Sync, true, TASK_SYNC; "sync_refuses_admission_receipt")]
     #[test_case(ExecutionMode::Async, false, TASK_ASYNC; "async_refuses_foreground_waiter")]

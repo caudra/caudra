@@ -940,6 +940,9 @@ complete([first.output.echo, second.output.echo]);
     const UNKNOWN_KEY: u64 = 99;
     /// What `ECHO_BODY` asks its first agent for.
     const FIRST_PROMPT: &str = "hello";
+    const FIRST_AGENT_LABEL: &str = "worker-1";
+    const FIRST_PARALLEL_LABEL: &str = "worker-a";
+    const SECOND_PARALLEL_LABEL: &str = "worker-b";
     const PROMPT_IS_CARRIED: &str = "a call row must say what its agent was asked";
     const ONE_BODY_IS_ONE_CALL: &str = "a keyed body request must answer for that call alone";
     const BODY_CARRIES_THE_REQUEST: &str = "a body must carry the request the journal stored";
@@ -1173,6 +1176,45 @@ complete(first.output.echo);
                 }
                 outcome
             })
+        }
+    }
+
+    struct BlockedReservationRunner {
+        inner: Arc<FakeRunner>,
+        entered: flume::Sender<()>,
+        label: &'static str,
+    }
+
+    impl TaskRunner for BlockedReservationRunner {
+        fn reserve_task(
+            &self,
+            task_id: Option<&str>,
+            label: &str,
+        ) -> Result<SubagentHistoryLease, String> {
+            self.inner.reserve_task(task_id, label)
+        }
+
+        fn reserve_task_cancellable(
+            &self,
+            task_id: Option<&str>,
+            label: &str,
+            cancel: &CancelToken,
+        ) -> Result<SubagentHistoryLease, String> {
+            let lease = self.reserve_task(task_id, label)?;
+            if label == self.label {
+                self.entered.send(()).unwrap();
+                smol::block_on(cancel.cancelled());
+            }
+            Ok(lease)
+        }
+
+        fn run(
+            &self,
+            request: TaskRequest,
+            cancel: CancelToken,
+            events: EventSender,
+        ) -> TaskFuture<'_> {
+            self.inner.run(request, cancel, events)
         }
     }
 
@@ -1668,6 +1710,71 @@ complete(first.output.echo);
             assert_eq!(foreign.len(), 1, "{HISTORY_IS_FOREIGN}");
             assert_eq!(foreign[0].run.run_id, started.run_id);
             assert_eq!(foreign[0].session_id, fixture.session_id.to_string());
+            runtime.shutdown().await;
+        });
+    }
+
+    #[test_case(RunStatus::Paused, false; "pause_sequential")]
+    #[test_case(RunStatus::Cancelled, false; "stop_sequential")]
+    #[test_case(RunStatus::Paused, true; "pause_parallel")]
+    #[test_case(RunStatus::Cancelled, true; "stop_parallel")]
+    fn interrupt_joins_blocked_reservation_without_starting_agent(
+        interrupted: RunStatus,
+        parallel: bool,
+    ) {
+        smol::block_on(async {
+            let fixture = Fixture::new();
+            let (name, body, first_label, blocked_label) = if parallel {
+                (
+                    FANOUT,
+                    FANOUT_BODY,
+                    FIRST_PARALLEL_LABEL,
+                    SECOND_PARALLEL_LABEL,
+                )
+            } else {
+                (PAIR, PAIR_BODY, FIRST_AGENT_LABEL, FIRST_AGENT_LABEL)
+            };
+            fixture.user_workflow(name, body);
+            let (entered, waiting) = flume::bounded(1);
+            let runtime = WorkflowRuntime::spawn(RuntimeDeps {
+                state_dir: fixture.state_dir.clone(),
+                session_id: fixture.session_id,
+                cwd: fixture.project.clone(),
+                user_config_dir: Some(fixture.config.clone()),
+                remote_project_context: None,
+                runner: Arc::new(BlockedReservationRunner {
+                    inner: Arc::clone(&fixture.runner),
+                    entered,
+                    label: blocked_label,
+                }),
+                events: fixture.events_tx.clone(),
+                mode: Arc::new(|| AgentMode::Build),
+                subagent_cancels: Arc::new(CancelMap::new()),
+            })
+            .await
+            .unwrap();
+            let handle = runtime.handle();
+            let started = start(&handle, name, None).await;
+            waiting.recv_async().await.unwrap();
+            let request = match interrupted {
+                RunStatus::Paused => WorkflowRequest::Pause {
+                    run_id: started.run_id.clone(),
+                },
+                _ => WorkflowRequest::Stop {
+                    run_id: started.run_id.clone(),
+                },
+            };
+            let stopped = run(&handle, request).await;
+            assert_eq!(stopped.status, interrupted);
+            assert_eq!(stopped.execution_epoch, 1);
+            assert!(stopped.roster.is_empty());
+            assert!(fixture.runner.labels().is_empty());
+            assert!(fixture.runner.history.snapshot().records().is_empty());
+            for label in [first_label, blocked_label] {
+                let lease = fixture.runner.reserve_task(None, label).unwrap();
+                assert_eq!(lease.task_id(), label);
+                drop(lease);
+            }
             runtime.shutdown().await;
         });
     }

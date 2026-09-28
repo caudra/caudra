@@ -903,9 +903,11 @@ async fn run_inner(
                 let pending_report = Arc::new(PendingShellReport::default());
                 let owned_report = Arc::clone(&pending_report);
                 let admitted = scope
-                    .admit_shell(
+                    .admit_shell_cancellable(
                         metadata,
                         &ctx.subagent_history,
+                        &ctx.cancel,
+                        ctx.deadline,
                         move |cancel, provenance| async move {
                             let _guards = (_preparation_guards, _guards);
                             owned.cancel = cancel;
@@ -1776,6 +1778,7 @@ mod tests {
     use caudra_storage::id::SessionRef;
     use caudra_storage::sessions::SessionDatabase;
     use caudra_storage::tool_outputs::ToolOutputStore;
+    use futures_lite::future::poll_once;
     use serde_json::json;
     use tempfile::TempDir;
     use test_case::test_case;
@@ -1822,6 +1825,7 @@ mod tests {
     const NAMED_SHELL_COMMAND: &str = "cargo test private_test_name";
     const NAMED_SHELL_OUTPUT: &str = "output-cargo-test";
     const NAMED_SHELL_TASK: &str = "shell-cargo-test";
+    const ASYNC_SHELL_TIMEOUT: Duration = Duration::from_secs(121);
     static REPORTED_CALLS: LazyLock<Mutex<HashMap<String, Vec<LedgerOutcome>>>> =
         LazyLock::new(|| Mutex::new(HashMap::new()));
 
@@ -1846,6 +1850,7 @@ mod tests {
         executed: AtomicUsize,
         abandoned: AtomicUsize,
         display_root: Mutex<Option<String>>,
+        cleanup: Mutex<Option<(flume::Sender<()>, flume::Receiver<()>)>>,
     }
 
     struct ControlledShellInvocation {
@@ -1905,7 +1910,13 @@ mod tests {
         fn abandon<'a>(&'a self, _: &'a ToolContext) -> BoxFuture<'a, ()> {
             assert!(self.prepared.swap(false, Ordering::SeqCst));
             self.tool.trace.abandoned.fetch_add(1, Ordering::SeqCst);
-            Box::pin(std::future::ready(()))
+            let cleanup = self.tool.trace.cleanup.lock().unwrap().take();
+            Box::pin(async move {
+                if let Some((started, release)) = cleanup {
+                    started.send(()).unwrap();
+                    release.recv_async().await.unwrap();
+                }
+            })
         }
         fn execute<'a>(self: Box<Self>, ctx: &'a ToolContext) -> ExecFuture<'a> {
             Box::pin(async move {
@@ -2430,6 +2441,59 @@ mod tests {
             fixture.tasks.shutdown().await.unwrap();
             let reported = REPORTED_CALLS.lock().unwrap().remove(&id).unwrap();
             assert_eq!(reported, [done.accounting.outcome.unwrap()]);
+        });
+    }
+
+    #[test]
+    fn shell_postcommit_cancellation_joins_cleanup_and_reports_once() {
+        smol::block_on(async {
+            let mut fixture =
+                ShellDispatchFixture::new(Some(ASYNC_SHELL_TIMEOUT), Effect::Allow).await;
+            let (trigger, cancel) = CancelToken::new();
+            fixture.ctx.cancel = cancel;
+            let (committed_tx, committed_rx) = flume::bounded(1);
+            let (resume_tx, resume_rx) = flume::bounded(1);
+            fixture
+                .tasks
+                .pause_admission_for_test(committed_tx, resume_rx);
+            let (cleanup_tx, cleanup_rx) = flume::bounded(1);
+            let (release_tx, release_rx) = flume::bounded(1);
+            *fixture.trace.cleanup.lock().unwrap() = Some((cleanup_tx, release_rx));
+            let id = SessionRef::generate().to_string();
+            REPORTED_CALLS
+                .lock()
+                .unwrap()
+                .insert(id.clone(), Vec::new());
+            let ctx = fixture.ctx.clone();
+            let call_id = id.clone();
+            let mut dispatch = smol::spawn(async move {
+                run(
+                    &ctx.registry,
+                    None,
+                    call_id,
+                    CONTROLLED_SHELL,
+                    &json!({"command": SHELL_COMMAND}),
+                    &ctx,
+                    Emit::Silent,
+                )
+                .await
+            });
+            committed_rx.recv_async().await.unwrap();
+            trigger.cancel();
+            resume_tx.send(()).unwrap();
+            cleanup_rx.recv_async().await.unwrap();
+            assert!(poll_once(&mut dispatch).await.is_none());
+            assert!(REPORTED_CALLS.lock().unwrap()[&id].is_empty());
+            release_tx.send(()).unwrap();
+            let done = dispatch.await;
+            assert!(done.is_error);
+            assert_eq!(fixture.trace.executed.load(Ordering::SeqCst), 0);
+            assert_eq!(fixture.trace.abandoned.load(Ordering::SeqCst), 1);
+            fixture.tasks.shutdown().await.unwrap();
+            assert_eq!(
+                REPORTED_CALLS.lock().unwrap().remove(&id).unwrap(),
+                [done.accounting.outcome.unwrap()]
+            );
         });
     }
 
