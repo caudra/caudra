@@ -1,4 +1,8 @@
-use std::{path::PathBuf, sync::Arc};
+use std::{
+    collections::BTreeMap,
+    path::PathBuf,
+    sync::{Arc, Mutex, MutexGuard, PoisonError},
+};
 
 use async_trait::async_trait;
 use caudra_agent::workspace_transfer::{
@@ -103,12 +107,54 @@ impl RemoteInventorySource for RemoteWorkcellClient {
     }
 }
 
+/// One inventory snapshot indexed by parent, so a scan pages every directory from the same
+/// revision instead of refetching the recursive snapshot per directory.
+struct Listing {
+    revision: CollectionRevision,
+    complete: bool,
+    children: BTreeMap<WorkspacePath, Vec<InventoryNode>>,
+}
+
+impl Listing {
+    fn new(snapshot: &contract::TransferInventoryResponse) -> Result<Self, TransferError> {
+        let mut children = BTreeMap::<_, Vec<_>>::new();
+        for entry in &snapshot.entries {
+            let node = node(entry)?;
+            if let Some(parent) = node.path.parent() {
+                children.entry(parent).or_default().push(node);
+            }
+        }
+        Ok(Self {
+            revision: CollectionRevision::new(snapshot.revision.as_str())
+                .map_err(|_| TransferError::UnsafeInventory)?,
+            complete: snapshot.complete,
+            children,
+        })
+    }
+}
+
+#[derive(Default)]
+struct Listings {
+    local: Option<Arc<Listing>>,
+    remote: Option<Arc<Listing>>,
+}
+
+impl Listings {
+    fn side(&mut self, side: &Side) -> &mut Option<Arc<Listing>> {
+        match side {
+            Side::Local => &mut self.local,
+            Side::Remote => &mut self.remote,
+        }
+    }
+}
+
 pub struct RootedTransferInventory {
     roots: TransferRoots,
     local: Arc<LocalTransferPublisher>,
     remote: Arc<dyn RemoteInventorySource>,
     max_file_bytes: u64,
     policy: contract::TransferInventoryPolicy,
+    listings: Mutex<Listings>,
 }
 
 impl RootedTransferInventory {
@@ -131,7 +177,12 @@ impl RootedTransferInventory {
                 excludes: filters.inventory_excludes().to_vec(),
                 respect_gitignore: filters.respects_gitignore(),
             },
+            listings: Mutex::default(),
         })
+    }
+
+    fn listings(&self) -> MutexGuard<'_, Listings> {
+        self.listings.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     async fn snapshot(
@@ -195,7 +246,10 @@ impl RootedTransferInventory {
 
 #[async_trait]
 impl TransferInventory for RootedTransferInventory {
+    /// Unpins both listings, so each side's scan pages a snapshot taken when that scan starts
+    /// rather than one that aged while permission prompts were answered.
     async fn context(&self) -> Result<InventoryContext, TransferError> {
+        *self.listings() = Listings::default();
         let local = self.snapshot(&Side::Local, None).await?;
         let remote = self.snapshot(&Side::Remote, None).await?;
         Ok(InventoryContext {
@@ -217,9 +271,15 @@ impl TransferInventory for RootedTransferInventory {
         if limit == 0 {
             return Err(TransferError::Quota);
         }
-        let snapshot = self.snapshot(side, None).await?;
-        let revision = CollectionRevision::new(snapshot.revision.as_str())
-            .map_err(|_| TransferError::UnsafeInventory)?;
+        let pinned = self.listings().side(side).clone();
+        let listing = match pinned {
+            Some(listing) => listing,
+            None => {
+                let listing = Arc::new(Listing::new(&self.snapshot(side, None).await?)?);
+                *self.listings().side(side) = Some(listing.clone());
+                listing
+            }
+        };
         let offset = match continuation {
             None => 0,
             Some(token) => {
@@ -227,41 +287,40 @@ impl TransferInventory for RootedTransferInventory {
                     .as_str()
                     .rsplit_once(':')
                     .ok_or(TransferError::Stale)?;
-                if stamp != revision.as_str() {
+                if stamp != listing.revision.as_str() {
                     return Err(TransferError::Stale);
                 }
                 offset.parse::<usize>().map_err(|_| TransferError::Stale)?
             }
         };
-        let children = snapshot
-            .entries
-            .iter()
-            .map(node)
-            .collect::<Result<Vec<_>, _>>()?
-            .into_iter()
-            .filter(|node| node.path.parent().as_ref() == Some(directory))
-            .collect::<Vec<_>>();
+        let children = listing
+            .children
+            .get(directory)
+            .map_or(&[][..], Vec::as_slice);
         if offset > children.len() {
             return Err(TransferError::Stale);
         }
         let end = children.len().min(offset.saturating_add(limit as usize));
         let next = (end < children.len())
-            .then(|| ContinuationToken::new(format!("{}:{end}", revision.as_str())))
+            .then(|| ContinuationToken::new(format!("{}:{end}", listing.revision.as_str())))
             .transpose()
             .map_err(|_| TransferError::Stale)?;
         Ok(InventoryPage {
-            revision,
+            revision: listing.revision.clone(),
             entries: children[offset..end].to_vec(),
             next,
-            incomplete: !snapshot.complete,
+            incomplete: !listing.complete,
         })
     }
 
+    /// Always fresh. Also unpins the side's listing, so a listing that follows an inspection,
+    /// such as the empty-directory check before a reviewed directory publication, refetches.
     async fn inspect(
         &self,
         side: &Side,
         path: &WorkspacePath,
     ) -> Result<Inspection, TransferError> {
+        self.listings().side(side).take();
         let snapshot = self.snapshot(side, Some(path)).await?;
         if !snapshot.complete {
             return Err(TransferError::UnsafeInventory);
@@ -352,12 +411,86 @@ mod tests {
         WorkspaceCursor, WorkspaceError, WorkspacePath,
     };
     use futures_lite::io::AsyncReadExt;
-    use std::{fs, sync::Arc};
+    use std::{
+        fs,
+        path::Path,
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
     use workcell::host_contract as contract;
 
     const CONTENT: &[u8] = b"\xff\0descriptor-bound source";
     const OTHER: &[u8] = b"changed";
     const DIGEST: &str = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+    const DIRECTORIES: usize = 12;
+    const FILES_PER_DIRECTORY: usize = 3;
+    const PAGE: u32 = 2;
+    const MAX_FILE_BYTES: u64 = 1024;
+    const FOLDER: &str = "folder";
+    const CHILD: &str = "child";
+
+    struct TreeRemote(AtomicUsize);
+
+    fn tree_node(
+        path: String,
+        kind: contract::TransferNodeKind,
+        index: usize,
+    ) -> contract::TransferInventoryNode {
+        contract::TransferInventoryNode {
+            path: contract::WorkspacePath::new(path).unwrap(),
+            resource_id: contract::ResourceId::new(format!("id-{index}")).unwrap(),
+            revision: contract::Revision::new(DIGEST).unwrap(),
+            kind,
+            size_bytes: Some(0),
+            ignored: false,
+        }
+    }
+
+    fn directory_name(index: usize) -> String {
+        format!("d{index:02}")
+    }
+
+    #[async_trait]
+    impl RemoteInventorySource for TreeRemote {
+        async fn inventory(
+            &self,
+            _: &RemoteRootIdentity,
+            path: Option<&WorkspacePath>,
+            _: &contract::TransferInventoryPolicy,
+        ) -> Result<contract::TransferInventoryResponse, WorkspaceError> {
+            let fetch = self.0.fetch_add(1, Ordering::SeqCst);
+            let mut entries = Vec::new();
+            for index in 0..DIRECTORIES {
+                let name = directory_name(index);
+                entries.push(tree_node(
+                    name.clone(),
+                    contract::TransferNodeKind::Directory,
+                    entries.len(),
+                ));
+                for file in 0..FILES_PER_DIRECTORY {
+                    entries.push(tree_node(
+                        format!("{name}/f{file}"),
+                        contract::TransferNodeKind::File,
+                        entries.len(),
+                    ));
+                }
+            }
+            Ok(contract::TransferInventoryResponse {
+                version: contract::ContractVersion::V1,
+                entries,
+                revision: contract::Revision::new(format!("sha256:{fetch:064x}")).unwrap(),
+                ignore_digest: contract::Revision::new(DIGEST).unwrap(),
+                complete: true,
+                inspection: path.map(|path| contract::TransferInspection {
+                    path: contract::WorkspacePath::new(path.as_str()).unwrap(),
+                    node: None,
+                    ignored: false,
+                }),
+            })
+        }
+    }
 
     struct EmptyRemote;
     #[async_trait]
@@ -420,6 +553,27 @@ mod tests {
         }
     }
 
+    async fn rooted_inventory(
+        root: &Path,
+        remote: Arc<dyn RemoteInventorySource>,
+    ) -> RootedTransferInventory {
+        RootedTransferInventory {
+            roots: TransferRoots {
+                local: LocalRootIdentity::capture(root).unwrap(),
+                remote: remote_root(),
+            },
+            local: Arc::new(
+                LocalTransferPublisher::new(root.into(), Arc::new(EmptyRemote))
+                    .await
+                    .unwrap(),
+            ),
+            remote,
+            max_file_bytes: MAX_FILE_BYTES,
+            policy: contract::TransferInventoryPolicy::default(),
+            listings: Mutex::default(),
+        }
+    }
+
     #[test]
     fn real_local_tree_and_fake_remote_keep_absence_ignores_and_open_revisions_distinct() {
         smol::block_on(async {
@@ -427,22 +581,7 @@ mod tests {
             fs::create_dir(root.path().join("src")).unwrap();
             fs::write(root.path().join("src/file"), CONTENT).unwrap();
             fs::write(root.path().join(".gitignore"), "missing/\n").unwrap();
-            let local = Arc::new(
-                LocalTransferPublisher::new(root.path().into(), Arc::new(EmptyRemote))
-                    .await
-                    .unwrap(),
-            );
-            let roots = TransferRoots {
-                local: LocalRootIdentity::capture(root.path()).unwrap(),
-                remote: remote_root(),
-            };
-            let inventory = RootedTransferInventory {
-                roots: roots.clone(),
-                local: local.clone(),
-                remote: Arc::new(EmptyRemote),
-                max_file_bytes: 1024,
-                policy: contract::TransferInventoryPolicy::default(),
-            };
+            let inventory = rooted_inventory(root.path(), Arc::new(EmptyRemote)).await;
             let context = inventory.context().await.unwrap();
             assert!(context.safe_local_traversal && context.safe_remote_traversal);
             let missing = inventory
@@ -469,10 +608,10 @@ mod tests {
             assert!(!page.incomplete);
             assert!(page.next.is_some());
             let path = LocalTransferPath::new("src/file").unwrap();
-            let (revision, _) = local.stat(&path).await.unwrap();
+            let (revision, _) = inventory.local.stat(&path).await.unwrap();
             let relative = WorkspacePath::new(path.as_str()).unwrap();
             let mut source = inventory
-                .open_local(&roots.local, &relative, &revision.0)
+                .open_local(&inventory.roots.local, &relative, &revision.0)
                 .await
                 .unwrap()
                 .into_reader();
@@ -482,17 +621,89 @@ mod tests {
             fs::write(root.path().join(path.as_str()), OTHER).unwrap();
             assert!(
                 inventory
-                    .open_local(&roots.local, &relative, &revision.0)
+                    .open_local(&inventory.roots.local, &relative, &revision.0)
                     .await
                     .is_err()
             );
             fs::write(root.path().join("another-file"), OTHER).unwrap();
+            inventory.context().await.unwrap();
             assert!(
                 inventory
                     .list(&Side::Local, &WorkspacePath::root(), page.next, 1)
                     .await
                     .is_err()
             );
+        });
+    }
+
+    #[test]
+    fn one_listing_per_side_serves_every_directory_until_an_inspection() {
+        smol::block_on(async {
+            let root = tempfile::tempdir().unwrap();
+            let remote = Arc::new(TreeRemote(AtomicUsize::new(0)));
+            let inventory = rooted_inventory(root.path(), remote.clone()).await;
+            inventory.context().await.unwrap();
+            let fetches = || remote.0.load(Ordering::SeqCst);
+            let after_context = fetches();
+            let mut listed = 0;
+            let mut revision = None;
+            for index in 0..DIRECTORIES {
+                let directory = WorkspacePath::new(directory_name(index)).unwrap();
+                let mut continuation = None;
+                loop {
+                    let page = inventory
+                        .list(&Side::Remote, &directory, continuation, PAGE)
+                        .await
+                        .unwrap();
+                    assert!(revision.is_none_or(|revision| revision == page.revision));
+                    revision = Some(page.revision);
+                    listed += page.entries.len();
+                    let Some(next) = page.next else {
+                        break;
+                    };
+                    continuation = Some(next);
+                }
+            }
+            assert_eq!(listed, DIRECTORIES * FILES_PER_DIRECTORY);
+            assert_eq!(fetches(), after_context + 1);
+            let first = WorkspacePath::new(directory_name(0)).unwrap();
+            inventory.inspect(&Side::Remote, &first).await.unwrap();
+            let refreshed = inventory
+                .list(&Side::Remote, &first, None, PAGE)
+                .await
+                .unwrap();
+            assert_ne!(Some(refreshed.revision), revision);
+            assert_eq!(fetches(), after_context + 3);
+            inventory.context().await.unwrap();
+            inventory
+                .list(&Side::Remote, &first, None, PAGE)
+                .await
+                .unwrap();
+            assert_eq!(fetches(), after_context + 5);
+        });
+    }
+
+    #[test]
+    fn an_inspection_refreshes_the_pinned_listing_of_a_real_tree() {
+        smol::block_on(async {
+            let root = tempfile::tempdir().unwrap();
+            fs::create_dir(root.path().join(FOLDER)).unwrap();
+            let inventory = rooted_inventory(root.path(), Arc::new(EmptyRemote)).await;
+            inventory.context().await.unwrap();
+            let folder = WorkspacePath::new(FOLDER).unwrap();
+            let listed = async || {
+                inventory
+                    .list(&Side::Local, &folder, None, PAGE)
+                    .await
+                    .unwrap()
+                    .entries
+                    .len()
+            };
+            assert_eq!(listed().await, 0);
+            fs::write(root.path().join(FOLDER).join(CHILD), CONTENT).unwrap();
+            assert_eq!(listed().await, 0);
+            inventory.inspect(&Side::Local, &folder).await.unwrap();
+            assert_eq!(listed().await, 1);
         });
     }
 }

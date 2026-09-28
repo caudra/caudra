@@ -4476,6 +4476,7 @@ mod tests {
                     local_root: std::env::temp_dir(),
                     remote_root: WorkspacePath::root(),
                     attached_binding: None,
+                    include_ignored: false,
                 }),
             },
         ));

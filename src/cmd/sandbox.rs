@@ -98,11 +98,12 @@ pub(super) fn transfer_connector(state: StateDir) -> TransferConnector {
             if record.revision()? != link.instance_revision {
                 bail!("Instance changed; refresh before transferring");
             }
-            let policy = record
+            let mut policy = record
                 .launch
                 .as_ref()
                 .map(|launch| launch.configuration().transfer.value().clone())
                 .unwrap_or_else(TransferPolicy::default);
+            policy.respect_gitignore &= !link.include_ignored;
             let (client, remote, lease) = super::workcell_runtime::connect_transfer(
                 &link.name,
                 &link.instance_revision,

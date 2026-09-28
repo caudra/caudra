@@ -57,6 +57,9 @@ pub struct TransferLink {
     pub local_root: PathBuf,
     pub remote_root: WorkspacePath,
     pub attached_binding: Option<StoredWorkspaceBinding>,
+    /// Session-only override of the profile's `respect_gitignore`; protected names and
+    /// configured excludes still apply, and the filter digest binds the choice.
+    pub include_ignored: bool,
 }
 
 pub type TransferConnector = Arc<

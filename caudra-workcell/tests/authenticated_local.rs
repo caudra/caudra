@@ -19,10 +19,11 @@ use caudra_agent::{
         PermissionResourceKind, PermissionSubject, PluginRuleStore, RemotePermissionIdentity,
     },
     workspace_transfer::{
-        CleanBufferLease, ComparisonKind, FileOutcome, LocalAccess, LocalRootIdentity,
-        OrchestrationLimits, PlannedFile, PullBufferGuard, RemoteRootIdentity, TransferAction,
-        TransferAuthorization, TransferError, TransferEvent, TransferEvents, TransferFilters,
-        TransferJournal, TransferPlan, TransferRoots,
+        CleanBufferLease, ComparisonKind, ExclusionReason, FileOutcome, LocalAccess,
+        LocalRootIdentity, NodeKind, OrchestrationLimits, PlannedFile, PullBufferGuard,
+        RemoteRootIdentity, Side, TransferAction, TransferAuthorization, TransferError,
+        TransferEvent, TransferEvents, TransferFilters, TransferJournal, TransferPlan,
+        TransferRoots,
     },
 };
 use caudra_config::sandbox::TransferPolicy;
@@ -79,7 +80,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
-    os::unix::fs::PermissionsExt,
+    os::unix::fs::{PermissionsExt, symlink},
     path::Path,
     sync::atomic::{AtomicBool, Ordering},
 };
@@ -101,6 +102,24 @@ const INVENTORY_FIRST: &str = "inventory-seed/deep/first.bin";
 const INVENTORY_SECOND: &str = "inventory-seed/deep/second.bin";
 const INVENTORY_RESTART: &str = "inventory-restart/deep/file.bin";
 const INVENTORY_CONTENT: &[u8] = b"\xff\0reviewed inventory bytes";
+const PARTIAL_ROOT: &str = "partial-tree";
+const PARTIAL_GITIGNORE: &str = "stage/\n";
+const PARTIAL_LEAF: &str = "a/b/c/leaf.txt";
+const PARTIAL_NESTED: [&str; 4] = ["a", "a/b", "a/b/c", PARTIAL_LEAF];
+const PARTIAL_CHANGED: &str = "a/b/changed.txt";
+const PARTIAL_IGNORED: &str = "stage";
+const PARTIAL_IGNORED_FILE: &str = "stage/built.txt";
+const PARTIAL_PROTECTED: &str = ".caudra";
+const PARTIAL_PROTECTED_FILE: &str = ".caudra/state.txt";
+const PARTIAL_SYMLINK: &str = "link";
+const PARTIAL_REPOSITORY: &str = "vendor/repo";
+const PARTIAL_REPOSITORY_MARKER: &str = "vendor/repo/.git/HEAD";
+/// At the leaf's depth and sorted after it, so the breadth-first scan lists the leaf before
+/// this folder overflows Workcell's 4,096-entry inventory.
+const PARTIAL_OVERSIZED: &str = "z/y/bulk";
+const PARTIAL_OVERSIZED_FILES: usize = 4_200;
+const PARTIAL_CONTENT: &[u8] = b"partial tree bytes\n";
+const PARTIAL_LOCAL_EDIT: &[u8] = b"local edit\n";
 const PRIVATE_STATE_MODE: u32 = 0o700;
 const NATIVE_FILE: &str = "native/deep/reviewed.txt";
 const NATIVE_UPLOAD_DIRECTORY: &str = "native-empty-upload/deep/leaf";
@@ -511,6 +530,124 @@ async fn production_inventory_transfer(
     client
 }
 
+async fn partial_inventory_tree(client: &RemoteWorkcellClient, remote_path: &Path, fault: &Path) {
+    let local = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    fs::set_permissions(state.path(), fs::Permissions::from_mode(PRIVATE_STATE_MODE)).unwrap();
+    let remote = remote_path.join(PARTIAL_ROOT);
+    for root in [local.path(), remote.as_path()] {
+        for file in [
+            PARTIAL_LEAF,
+            PARTIAL_CHANGED,
+            PARTIAL_IGNORED_FILE,
+            PARTIAL_PROTECTED_FILE,
+            PARTIAL_REPOSITORY_MARKER,
+        ] {
+            let path = root.join(file);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, PARTIAL_CONTENT).unwrap();
+        }
+        fs::write(root.join(".gitignore"), PARTIAL_GITIGNORE).unwrap();
+        symlink(PARTIAL_NESTED[0], root.join(PARTIAL_SYMLINK)).unwrap();
+    }
+    fs::write(local.path().join(PARTIAL_CHANGED), PARTIAL_LOCAL_EDIT).unwrap();
+    let oversized = local.path().join(PARTIAL_OVERSIZED);
+    fs::create_dir_all(&oversized).unwrap();
+    for index in 0..PARTIAL_OVERSIZED_FILES {
+        fs::write(oversized.join(index.to_string()), PARTIAL_CONTENT).unwrap();
+    }
+    let cwd = WorkspacePath::new(PARTIAL_ROOT).unwrap();
+    let resolved = client
+        .resolve_directory_cursor(client.session_binding(), client.root_cursor(), &cwd)
+        .await
+        .unwrap();
+    let host = Arc::new(TransferTestHost {
+        root: local.path().to_owned(),
+        fault: fault.to_owned(),
+        lose_response: AtomicBool::new(false),
+    });
+    for respect_gitignore in [true, false] {
+        let engine = reviewed_workspace_transfer(
+            local.path().into(),
+            state.path().join("local-publications.json"),
+            client.clone(),
+            RemoteRootIdentity {
+                binding: client.session_binding().clone(),
+                cursor: resolved.cursor.clone(),
+                cwd: cwd.clone(),
+            },
+            TransferFilters::new(
+                &TransferPolicy {
+                    respect_gitignore,
+                    ..TransferPolicy::default()
+                },
+                &[],
+            )
+            .unwrap(),
+            OrchestrationLimits::default(),
+            ReviewedTransferHost {
+                authorization: host.clone(),
+                local_publication: Arc::new(FactoryLocalApproval),
+                buffers: host.clone(),
+                events: host.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        let comparison = engine.compare(&CancelToken::none()).await.unwrap();
+        assert!(comparison.rows().iter().all(|row| !row.path.is_root()));
+        let rows = comparison
+            .rows()
+            .iter()
+            .map(|row| (row.path.as_str(), row))
+            .collect::<BTreeMap<_, _>>();
+        let kind = |path: &str| (rows[path].kind.clone(), rows[path].excluded);
+        for path in PARTIAL_NESTED {
+            assert_eq!(kind(path), (ComparisonKind::Equal, None), "{path}");
+        }
+        assert_eq!(kind(PARTIAL_CHANGED), (ComparisonKind::Conflict, None));
+        assert_eq!(
+            kind(PARTIAL_PROTECTED),
+            (ComparisonKind::Excluded, Some(ExclusionReason::Protected))
+        );
+        assert!(!rows.contains_key(PARTIAL_PROTECTED_FILE));
+        for (path, node) in [
+            (PARTIAL_SYMLINK, NodeKind::Symlink),
+            (PARTIAL_REPOSITORY, NodeKind::NestedRepository),
+        ] {
+            assert_eq!(kind(path), (ComparisonKind::Unsupported, None), "{path}");
+            assert_eq!(rows[path].local_kind.as_ref(), Some(&node), "{path}");
+            assert_eq!(rows[path].remote_kind.as_ref(), Some(&node), "{path}");
+        }
+        if respect_gitignore {
+            assert_eq!(
+                kind(PARTIAL_IGNORED),
+                (ComparisonKind::Excluded, Some(ExclusionReason::Gitignore))
+            );
+            assert!(!rows.contains_key(PARTIAL_IGNORED_FILE));
+        } else {
+            assert_eq!(kind(PARTIAL_IGNORED_FILE), (ComparisonKind::Equal, None));
+        }
+        assert!(!comparison.scan(&Side::Local).complete());
+        assert!(comparison.scan(&Side::Remote).complete());
+        assert_eq!(kind(PARTIAL_OVERSIZED), (ComparisonKind::Incomplete, None));
+        assert!(matches!(
+            engine
+                .inspect_preview(
+                    &comparison,
+                    &WorkspacePath::new(PARTIAL_CHANGED).unwrap(),
+                    &CancelToken::none()
+                )
+                .await,
+            Err(TransferError::PartialInventory)
+        ));
+    }
+    fs::remove_dir_all(remote).unwrap();
+    eprintln!(
+        "PASS partial inventory: nested rows without a root row, exclusion reasons, include ignored, oversized local side, previews refused"
+    );
+}
+
 async fn native_reviewed_session(
     client: &RemoteWorkcellClient,
     remote_path: &Path,
@@ -870,6 +1007,7 @@ fn reviewed_transfer() {
             )
         };
         let client = connect().await.unwrap();
+        partial_inventory_tree(&client, &root, &fault).await;
         let client =
             production_inventory_transfer(client, &root, &fault, &selection, &credential, &state)
                 .await;

@@ -11,7 +11,10 @@ mod journal;
 mod manifest;
 
 pub use journal::{BaseEntry, JournalAudit, JournalEntry, JournalState, TransferJournal};
-pub use manifest::{Comparison, ComparisonKind, ComparisonRow, TransferFilters};
+pub use manifest::{
+    Comparison, ComparisonKind, ComparisonRow, ExclusionReason, ScanLimit, ScanState,
+    TransferFilters,
+};
 
 use async_trait::async_trait;
 use caudra_storage::{id::CaudraId, private_file::PrivateFileError};
@@ -41,13 +44,16 @@ use thiserror::Error;
 use crate::CancelToken;
 
 const MAX_ENTRIES: usize = 4096;
-const MAX_PAGES: usize = 512;
 const PAGE_SIZE: u32 = 128;
+/// Listing a folder costs a page even when it is empty, so the budget covers the root, every
+/// folder the entry budget admits, and the extra pages of full folders. Only entries bound a scan.
+const MAX_PAGES: usize = MAX_ENTRIES + 1 + MAX_ENTRIES / PAGE_SIZE as usize;
 const MAX_DEPTH: usize = 32;
 const MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_TOTAL_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_SELECTED: usize = 128;
 const PREVIEW_BYTES: usize = 4096;
+const INSPECT_BYTES: usize = 64 * 1024;
 const MAX_REVIEW_BYTES: usize = 32 * 1024;
 const IO_TIMEOUT: Duration = Duration::from_secs(30);
 const PLAN_DOMAIN: &str = "caudra-reviewed-transfer-v2";
@@ -75,6 +81,10 @@ pub enum TransferError {
     Filter,
     #[error("safe traversal or ignore evaluation is unavailable")]
     UnsafeInventory,
+    #[error(
+        "previews and reviews need a complete scan of both sides; compare a smaller folder or exclude large folders"
+    )]
+    PartialInventory,
     #[error("transfer cancelled")]
     Cancelled,
     #[error("transfer service timed out")]
@@ -231,6 +241,9 @@ pub struct Inspection {
 #[async_trait]
 pub trait TransferInventory: Send + Sync {
     async fn context(&self) -> Result<InventoryContext, TransferError>;
+    /// May page a snapshot pinned by an earlier listing of that side, so one scan reads every
+    /// directory at one revision. `context` and `inspect` unpin it: a check that needs the
+    /// current tree, such as an emptiness check, lists right after inspecting that side.
     async fn list(
         &self,
         side: &Side,
@@ -238,6 +251,7 @@ pub trait TransferInventory: Send + Sync {
         continuation: Option<ContinuationToken>,
         limit: u32,
     ) -> Result<InventoryPage, TransferError>;
+    /// Reads the current tree, and fails while that side's inventory is incomplete.
     async fn inspect(&self, side: &Side, path: &WorkspacePath)
     -> Result<Inspection, TransferError>;
     /// Open under the captured canonical root, no-follow/no-mount, and bind the descriptor to
@@ -407,7 +421,7 @@ impl TransferPlan {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub enum TransferPhase {
     Scanning,
     Staging,
@@ -426,9 +440,11 @@ pub enum FileOutcome {
     Unknown,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "kind")]
 pub enum TransferEvent {
     Phase {
+        side: Option<Side>,
         path: WorkspacePath,
         phase: TransferPhase,
     },
@@ -470,7 +486,10 @@ pub struct OrchestrationLimits {
     pub max_file_bytes: u64,
     pub max_total_bytes: u64,
     pub max_selected: usize,
+    /// Per-side prefix embedded in a reviewed plan.
     pub preview_bytes: usize,
+    /// Per-side prefix read for a read-only comparison.
+    pub inspect_bytes: usize,
     pub io_timeout: Duration,
 }
 
@@ -484,6 +503,7 @@ impl Default for OrchestrationLimits {
             max_total_bytes: MAX_TOTAL_BYTES,
             max_selected: MAX_SELECTED,
             preview_bytes: PREVIEW_BYTES,
+            inspect_bytes: INSPECT_BYTES,
             io_timeout: IO_TIMEOUT,
         }
     }
@@ -505,6 +525,8 @@ impl OrchestrationLimits {
             || self.max_selected > MAX_SELECTED
             || self.preview_bytes == 0
             || self.preview_bytes > PREVIEW_BYTES
+            || self.inspect_bytes == 0
+            || self.inspect_bytes > INSPECT_BYTES
             || self.io_timeout.is_zero()
             || self.io_timeout > IO_TIMEOUT
         {
@@ -575,6 +597,7 @@ impl WorkspaceTransfer {
 
     fn phase(&self, path: &WorkspacePath, phase: TransferPhase) {
         self.services.events.emit(TransferEvent::Phase {
+            side: None,
             path: path.clone(),
             phase,
         });
@@ -722,6 +745,7 @@ impl WorkspaceTransfer {
             {
                 return Err(TransferError::Selection);
             }
+            comparison.ensure_inspectable()?;
             let mut file = PlannedFile {
                 operation_id: operation_id()?,
                 path: path.clone(),
@@ -757,7 +781,7 @@ impl WorkspaceTransfer {
                     (Side::Remote, &comparison.remote),
                 ] {
                     let Some(entry) = manifest.entries.get(&path) else {
-                        if side == file.directory_side && manifest.complete {
+                        if side == file.directory_side && manifest.complete() {
                             if self.inspect_allowed(&side, &path, cancel).await?.is_some() {
                                 return Err(TransferError::Parent);
                             }
@@ -766,7 +790,7 @@ impl WorkspaceTransfer {
                         }
                         return Err(TransferError::Parent);
                     };
-                    let node = entry.node.as_ref().ok_or(TransferError::Parent)?;
+                    let node = &entry.node;
                     if node.kind != NodeKind::Directory || entry.blocked.is_some() {
                         return Err(TransferError::Parent);
                     }
@@ -781,15 +805,16 @@ impl WorkspaceTransfer {
             file.create_directories.reverse();
             self.validate_file(&comparison.context, &file, cancel)
                 .await?;
+            let limit = self.limits.preview_bytes;
             if let Some(stamp) = &file.local {
                 file.local_preview = Some(
-                    self.preview(&comparison.context, &Side::Local, stamp, cancel)
+                    self.preview(&comparison.context, &Side::Local, stamp, limit, cancel)
                         .await?,
                 );
             }
             if let Some(stamp) = &file.remote {
                 file.remote_preview = Some(
-                    self.preview(&comparison.context, &Side::Remote, stamp, cancel)
+                    self.preview(&comparison.context, &Side::Remote, stamp, limit, cancel)
                         .await?,
                 );
             }
@@ -901,13 +926,6 @@ impl WorkspaceTransfer {
         path: &WorkspacePath,
         cancel: &CancelToken,
     ) -> Result<TransferPreview, TransferError> {
-        self.validate_context(&comparison.context, &comparison.filter_digest, cancel)
-            .await?;
-        self.bounded(
-            cancel,
-            self.services.authorization.roots(&comparison.context.roots),
-        )
-        .await?;
         let row = comparison
             .rows
             .iter()
@@ -928,6 +946,14 @@ impl WorkspaceTransfer {
         {
             return Err(TransferError::Selection);
         }
+        comparison.ensure_inspectable()?;
+        self.validate_context(&comparison.context, &comparison.filter_digest, cancel)
+            .await?;
+        self.bounded(
+            cancel,
+            self.services.authorization.roots(&comparison.context.roots),
+        )
+        .await?;
         let mut result = TransferPreview {
             path: path.clone(),
             local: row.local.clone(),
@@ -951,8 +977,14 @@ impl WorkspaceTransfer {
                         return Err(TransferError::Stale);
                     }
                     *preview = Some(
-                        self.preview(&comparison.context, &side, stamp, cancel)
-                            .await?,
+                        self.preview(
+                            &comparison.context,
+                            &side,
+                            stamp,
+                            self.limits.inspect_bytes,
+                            cancel,
+                        )
+                        .await?,
                     );
                 }
                 _ => return Err(TransferError::Stale),
@@ -984,12 +1016,10 @@ impl WorkspaceTransfer {
         context: &InventoryContext,
         side: &Side,
         stamp: &FileStamp,
+        limit: usize,
         cancel: &CancelToken,
     ) -> Result<FilePreview, TransferError> {
-        let length = stamp
-            .content
-            .size_bytes
-            .min(self.limits.preview_bytes as u64);
+        let length = stamp.content.size_bytes.min(limit as u64);
         let (source, expected_digest) = match side {
             Side::Local => {
                 self.bounded(
@@ -1052,12 +1082,20 @@ impl WorkspaceTransfer {
         {
             return Err(WorkspaceError::TransferIntegrity.into());
         }
-        Ok(match String::from_utf8(bytes) {
-            Ok(text) if !text.contains('\0') => FilePreview::TextPrefix {
-                text,
-                truncated: length < stamp.content.size_bytes,
-            },
-            _ => FilePreview::BinarySummary {
+        let truncated = length < stamp.content.size_bytes;
+        let text = match String::from_utf8(bytes) {
+            Ok(text) => Some(text),
+            Err(error) if truncated && error.utf8_error().error_len().is_none() => {
+                let valid = error.utf8_error().valid_up_to();
+                let mut bytes = error.into_bytes();
+                bytes.truncate(valid);
+                String::from_utf8(bytes).ok()
+            }
+            Err(_) => None,
+        };
+        Ok(match text.filter(|text| !text.contains('\0')) {
+            Some(text) => FilePreview::TextPrefix { text, truncated },
+            None => FilePreview::BinarySummary {
                 content: stamp.content.clone(),
             },
         })
@@ -1085,13 +1123,13 @@ fn operation_id() -> Result<OperationId, TransferError> {
 #[cfg(all(test, unix))]
 mod tests {
     use super::{
-        CleanBufferLease, ComparisonKind, FileOutcome, FilePreview, Inspection, InventoryContext,
-        InventoryNode, InventoryPage, JournalState, LocalAccess, LocalRootIdentity, NodeKind,
-        OrchestrationLimits, PlannedDirectory, PlannedFile, PullBufferGuard, RemoteRootIdentity,
-        RollbackCoverage, Side, TransferAction, TransferAuthorization, TransferError,
-        TransferEvent, TransferEvents, TransferFilters, TransferInventory, TransferJournal,
-        TransferPhase, TransferPlan, TransferRoots, TransferServices, WorkspaceTransfer,
-        byte_digest, digest, operation_id,
+        CleanBufferLease, ComparisonKind, ExclusionReason, FileOutcome, FilePreview, INSPECT_BYTES,
+        Inspection, InventoryContext, InventoryNode, InventoryPage, JournalState, LocalAccess,
+        LocalRootIdentity, NodeKind, OrchestrationLimits, PlannedDirectory, PlannedFile,
+        PullBufferGuard, RemoteRootIdentity, RollbackCoverage, ScanLimit, Side, TransferAction,
+        TransferAuthorization, TransferError, TransferEvent, TransferEvents, TransferFilters,
+        TransferInventory, TransferJournal, TransferPhase, TransferPlan, TransferRoots,
+        TransferServices, WorkspaceTransfer, byte_digest, digest, operation_id,
     };
     use crate::{CancelToken, CancelTrigger};
     use async_trait::async_trait;
@@ -1138,6 +1176,16 @@ mod tests {
     const JOURNAL_FILE: &str = "transfers.json";
     const EMPTY_DIRECTORY: &str = "folder/empty";
     const FOLDER: &str = "folder";
+    const NESTED_SAME: &str = "folder/same";
+    const NESTED_CHANGED: &str = "folder/changed";
+    const NESTED_LOCAL: &str = "folder/local";
+    const NESTED_REMOTE: &str = "folder/remote";
+    const PROTECTED: &str = ".env";
+    const GENERATED: &str = "generated";
+    const IGNORED: &str = "ignored";
+    const MULTIBYTE: &str = "aé";
+    const MULTIBYTE_CUT: usize = 2;
+    const MULTIBYTE_PREFIX: &str = "a";
     const PRECONDITION_FAILED: &str = "precondition failed";
     const SUBJECT: &str = "subject";
     const VERSION: &str = "generation-a";
@@ -2474,7 +2522,7 @@ mod tests {
     fn inspection_is_bounded_revision_bound_and_never_prepares_publication(side: Side) {
         smol::block_on(async {
             let mut fixture = Fixture::new();
-            fixture.engine.limits.preview_bytes = BEFORE.len() - 1;
+            fixture.engine.limits.inspect_bytes = BEFORE.len() - 1;
             fixture.put(side.clone(), FILE, BEFORE);
             let comparison = fixture.engine.compare(&CancelToken::none()).await.unwrap();
             let preview = fixture
@@ -2658,6 +2706,11 @@ mod tests {
             }
             let comparison = fixture.engine.compare(&CancelToken::none()).await.unwrap();
             assert_eq!(comparison.rows()[0].kind, ComparisonKind::Unsupported);
+            assert_eq!(
+                comparison.rows()[0].remote_kind,
+                Some(NodeKind::NestedRepository)
+            );
+            assert!(comparison.complete());
             assert_eq!(fixture.fake.0.lock().unwrap().counts.stats, 0);
         });
     }
@@ -3258,9 +3311,307 @@ mod tests {
                 !comparison
                     .rows()
                     .iter()
-                    .any(|row| row.kind == ComparisonKind::LocalOnly)
+                    .any(|row| row.kind == ComparisonKind::LocalOnly || row.path.is_root())
             );
             assert!(fixture.fake.0.lock().unwrap().counts.lists <= 4);
+        });
+    }
+
+    #[test_case(Side::Local; "local_partial")]
+    #[test_case(Side::Remote; "remote_partial")]
+    fn partial_listing_keeps_nested_rows_without_a_root_row(partial: Side) {
+        smol::block_on(async {
+            let fixture = Fixture::new();
+            {
+                let mut state = fixture.fake.0.lock().unwrap();
+                for side in [Side::Local, Side::Remote] {
+                    state.put(&side, FOLDER, b"", NodeKind::Directory);
+                    state.put(&side, NESTED_SAME, BEFORE, NodeKind::File);
+                }
+                state.put(&Side::Local, NESTED_CHANGED, BEFORE, NodeKind::File);
+                state.put(&Side::Remote, NESTED_CHANGED, AFTER, NodeKind::File);
+                state.put(&Side::Local, NESTED_LOCAL, AFTER, NodeKind::File);
+                state.put(&Side::Remote, NESTED_REMOTE, AFTER, NodeKind::File);
+                state.incomplete = Some(partial.clone());
+            }
+            let comparison = fixture.engine.compare(&CancelToken::none()).await.unwrap();
+            let kinds = comparison
+                .rows()
+                .iter()
+                .map(|row| (row.path.as_str(), row.kind.clone()))
+                .collect::<BTreeMap<_, _>>();
+            assert_eq!(
+                kinds,
+                BTreeMap::from([
+                    (FOLDER, ComparisonKind::Equal),
+                    (NESTED_CHANGED, ComparisonKind::Conflict),
+                    (NESTED_LOCAL, ComparisonKind::Incomplete),
+                    (NESTED_REMOTE, ComparisonKind::Incomplete),
+                    (NESTED_SAME, ComparisonKind::Equal),
+                ])
+            );
+            assert!(!comparison.complete());
+            assert_eq!(
+                comparison.scan(&partial).limits,
+                BTreeSet::from([ScanLimit::WorkcellIncomplete])
+            );
+            let other = if partial == Side::Local {
+                Side::Remote
+            } else {
+                Side::Local
+            };
+            assert!(comparison.scan(&other).complete());
+            assert!(comparison.rows().iter().all(|row| !row.unlisted));
+            assert!(matches!(
+                fixture
+                    .engine
+                    .inspect_preview(&comparison, &path(NESTED_CHANGED), &CancelToken::none())
+                    .await,
+                Err(TransferError::PartialInventory)
+            ));
+            assert!(matches!(
+                fixture
+                    .engine
+                    .plan(
+                        &comparison,
+                        TransferAction::Push,
+                        &[path(NESTED_CHANGED)],
+                        &BTreeSet::from([path(FOLDER)]),
+                        &CancelToken::none()
+                    )
+                    .await,
+                Err(TransferError::PartialInventory)
+            ));
+        });
+    }
+
+    #[test]
+    fn unattested_traversal_marks_every_row_unsupported_without_a_root_row() {
+        smol::block_on(async {
+            let fixture = Fixture::new();
+            {
+                let mut state = fixture.fake.0.lock().unwrap();
+                state.put(&Side::Remote, FOLDER, b"", NodeKind::Directory);
+                state.put(&Side::Remote, NESTED_SAME, AFTER, NodeKind::File);
+                state.context.safe_local_traversal = false;
+            }
+            let comparison = fixture.engine.compare(&CancelToken::none()).await.unwrap();
+            assert!(comparison.scan(&Side::Local).unsupported);
+            assert_eq!(comparison.rows().len(), 2);
+            assert!(
+                comparison
+                    .rows()
+                    .iter()
+                    .all(|row| row.kind == ComparisonKind::Unsupported && !row.path.is_root())
+            );
+        });
+    }
+
+    #[test]
+    fn every_folder_within_the_entry_budget_is_listed() {
+        smol::block_on(async {
+            let fixture = Fixture::new();
+            let folders = OrchestrationLimits::default().max_entries - 1;
+            {
+                let mut state = fixture.fake.0.lock().unwrap();
+                for index in 0..folders {
+                    for side in [Side::Local, Side::Remote] {
+                        state.put(&side, &index.to_string(), b"", NodeKind::Directory);
+                    }
+                }
+            }
+            let comparison = fixture.engine.compare(&CancelToken::none()).await.unwrap();
+            for side in [Side::Local, Side::Remote] {
+                assert!(comparison.scan(&side).complete(), "{side:?}");
+            }
+            assert_eq!(comparison.rows().len(), folders);
+        });
+    }
+
+    #[test_case(ScanLimit::Depth; "depth")]
+    #[test_case(ScanLimit::Entries; "entries")]
+    fn exhausted_limits_mark_directories_unlisted(limit: ScanLimit) {
+        smol::block_on(async {
+            let mut fixture = Fixture::new();
+            {
+                let mut state = fixture.fake.0.lock().unwrap();
+                for side in [Side::Local, Side::Remote] {
+                    state.put(&side, FOLDER, b"", NodeKind::Directory);
+                    state.put(&side, NESTED_SAME, BEFORE, NodeKind::File);
+                }
+            }
+            match limit {
+                ScanLimit::Depth => fixture.engine.limits.max_depth = 1,
+                _ => fixture.engine.limits.max_entries = 1,
+            }
+            let comparison = fixture.engine.compare(&CancelToken::none()).await.unwrap();
+            let [folder] = comparison.rows() else {
+                panic!("only the unlisted folder is compared");
+            };
+            assert_eq!(folder.path, path(FOLDER));
+            assert_eq!(folder.kind, ComparisonKind::Equal);
+            assert!(folder.unlisted);
+            for side in [Side::Local, Side::Remote] {
+                assert_eq!(comparison.scan(&side).limits, BTreeSet::from([limit]));
+            }
+        });
+    }
+
+    #[test]
+    fn a_folder_without_an_ignore_decision_is_unlisted() {
+        smol::block_on(async {
+            let fixture = Fixture::new();
+            {
+                let mut state = fixture.fake.0.lock().unwrap();
+                for side in [Side::Local, Side::Remote] {
+                    state.put(&side, FOLDER, b"", NodeKind::Directory);
+                    state.put(&side, NESTED_SAME, BEFORE, NodeKind::File);
+                    state
+                        .files_mut(&side)
+                        .get_mut(&path(FOLDER))
+                        .unwrap()
+                        .node
+                        .ignored = None;
+                }
+            }
+            let comparison = fixture.engine.compare(&CancelToken::none()).await.unwrap();
+            let [folder] = comparison.rows() else {
+                panic!("the folder is never listed");
+            };
+            assert_eq!(folder.kind, ComparisonKind::Incomplete);
+            assert!(folder.unlisted);
+            for side in [Side::Local, Side::Remote] {
+                assert_eq!(
+                    comparison.scan(&side).limits,
+                    BTreeSet::from([ScanLimit::ListingFailed])
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn exclusion_reasons_are_reported_per_row() {
+        smol::block_on(async {
+            let mut fixture = Fixture::new();
+            fixture.engine.filters = TransferFilters::new(
+                &TransferPolicy {
+                    exclude: vec![GENERATED.into()],
+                    ..TransferPolicy::default()
+                },
+                &[],
+            )
+            .unwrap();
+            {
+                let mut state = fixture.fake.0.lock().unwrap();
+                for name in [PROTECTED, GENERATED, IGNORED, FILE] {
+                    state.put(&Side::Local, name, AFTER, NodeKind::File);
+                }
+                state
+                    .files_mut(&Side::Local)
+                    .get_mut(&path(IGNORED))
+                    .unwrap()
+                    .node
+                    .ignored = Some(true);
+                state.ignored_absence = Some(Side::Remote);
+            }
+            let comparison = fixture.engine.compare(&CancelToken::none()).await.unwrap();
+            let reasons = comparison
+                .rows()
+                .iter()
+                .map(|row| (row.path.as_str(), (row.kind.clone(), row.excluded)))
+                .collect::<BTreeMap<_, _>>();
+            let excluded = |reason| (ComparisonKind::Excluded, Some(reason));
+            assert_eq!(
+                reasons,
+                BTreeMap::from([
+                    (PROTECTED, excluded(ExclusionReason::Protected)),
+                    (GENERATED, excluded(ExclusionReason::Pattern)),
+                    (IGNORED, excluded(ExclusionReason::Gitignore)),
+                    (FILE, excluded(ExclusionReason::Gitignore)),
+                ])
+            );
+        });
+    }
+
+    #[test]
+    fn inspection_reads_a_larger_utf8_safe_prefix_than_review() {
+        smol::block_on(async {
+            let mut fixture = Fixture::new();
+            fixture.put(Side::Local, FILE, &vec![b'x'; INSPECT_BYTES + 1]);
+            fixture.put(Side::Remote, FILE, AFTER);
+            fixture.put(Side::Local, SECOND, MULTIBYTE.as_bytes());
+            fixture.put(Side::Remote, SECOND, BEFORE);
+            let comparison = fixture.engine.compare(&CancelToken::none()).await.unwrap();
+            let inspected = fixture
+                .engine
+                .inspect_preview(&comparison, &path(FILE), &CancelToken::none())
+                .await
+                .unwrap();
+            assert!(
+                matches!(&inspected.local_preview, Some(FilePreview::TextPrefix { text, truncated: true }) if text.len() == INSPECT_BYTES)
+            );
+            let plan = fixture.plan(TransferAction::Push, &[FILE]).await;
+            assert!(
+                matches!(&plan.review.files[0].local_preview, Some(FilePreview::TextPrefix { text, truncated: true }) if text.len() == fixture.engine.limits.preview_bytes)
+            );
+            fixture.engine.limits.inspect_bytes = MULTIBYTE_CUT;
+            let inspected = fixture
+                .engine
+                .inspect_preview(&comparison, &path(SECOND), &CancelToken::none())
+                .await
+                .unwrap();
+            assert_eq!(
+                inspected.local_preview,
+                Some(FilePreview::TextPrefix {
+                    text: MULTIBYTE_PREFIX.into(),
+                    truncated: true
+                })
+            );
+        });
+    }
+
+    #[test]
+    fn including_ignored_files_compares_them_and_invalidates_earlier_reviews() {
+        smol::block_on(async {
+            let mut fixture = Fixture::new();
+            {
+                let mut state = fixture.fake.0.lock().unwrap();
+                for name in [FILE, PROTECTED, IGNORED] {
+                    state.put(&Side::Local, name, AFTER, NodeKind::File);
+                }
+                state
+                    .files_mut(&Side::Local)
+                    .get_mut(&path(IGNORED))
+                    .unwrap()
+                    .node
+                    .ignored = Some(true);
+            }
+            let plan = fixture.plan(TransferAction::Push, &[FILE]).await;
+            fixture.engine.filters = TransferFilters::new(
+                &TransferPolicy {
+                    respect_gitignore: false,
+                    ..TransferPolicy::default()
+                },
+                &[],
+            )
+            .unwrap();
+            let comparison = fixture.engine.compare(&CancelToken::none()).await.unwrap();
+            let kinds = comparison
+                .rows()
+                .iter()
+                .map(|row| (row.path.as_str(), (row.kind.clone(), row.excluded)))
+                .collect::<BTreeMap<_, _>>();
+            assert_eq!(kinds[IGNORED], (ComparisonKind::LocalOnly, None));
+            assert_eq!(
+                kinds[PROTECTED],
+                (ComparisonKind::Excluded, Some(ExclusionReason::Protected))
+            );
+            let run = fixture
+                .engine
+                .execute(&plan, &mut fixture.journal, &CancelToken::none())
+                .await;
+            assert!(matches!(run.stopped, Some(TransferError::Stale)));
+            assert_eq!(fixture.fake.0.lock().unwrap().counts.publishes, 0);
         });
     }
 

@@ -6,7 +6,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use super::{
     FileStamp, InventoryContext, InventoryNode, NodeKind, PAGE_SIZE, Side, TransferError,
-    TransferPhase, WorkspaceTransfer, digest,
+    TransferEvent, TransferPhase, WorkspaceTransfer, digest,
 };
 use crate::CancelToken;
 
@@ -115,8 +115,12 @@ impl TransferFilters {
     }
 
     pub fn excludes(&self, path: &WorkspacePath) -> bool {
+        self.exclusion(path).is_some()
+    }
+
+    pub fn exclusion(&self, path: &WorkspacePath) -> Option<ExclusionReason> {
         if path.is_root() {
-            return false;
+            return None;
         }
         let mut prefix = String::new();
         for component in path.as_str().split('/') {
@@ -124,14 +128,14 @@ impl TransferFilters {
                 prefix.push('/');
             }
             prefix.push_str(component);
-            if protected_component(component)
-                || self.excludes.is_match(&prefix)
-                || self.excludes.is_match(format!("{prefix}/"))
-            {
-                return true;
+            if protected_component(component) {
+                return Some(ExclusionReason::Protected);
+            }
+            if self.excludes.is_match(&prefix) || self.excludes.is_match(format!("{prefix}/")) {
+                return Some(ExclusionReason::Pattern);
             }
         }
-        false
+        None
     }
 
     pub(super) fn ignored(&self, ignored: Option<bool>) -> Result<bool, TransferError> {
@@ -154,6 +158,42 @@ pub enum ComparisonKind {
     Incomplete,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum ExclusionReason {
+    Protected,
+    Pattern,
+    Gitignore,
+}
+
+/// Why one side's scan is partial. `Bytes`, `Unreadable` and a file that `Changed` while hashed
+/// leave that file undetermined, and the other limits stop folders from being listed. Any limit
+/// leaves the side partial, so entries present on the other side only stay undetermined.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+pub enum ScanLimit {
+    Entries,
+    Pages,
+    Depth,
+    Bytes,
+    /// Workcell truncated its snapshot without naming the folders it cut short, and refuses to
+    /// inspect that side until a snapshot is whole.
+    WorkcellIncomplete,
+    ListingFailed,
+    Changed,
+    Unreadable,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct ScanState {
+    pub unsupported: bool,
+    pub limits: BTreeSet<ScanLimit>,
+}
+
+impl ScanState {
+    pub fn complete(&self) -> bool {
+        !self.unsupported && self.limits.is_empty()
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ComparisonRow {
     pub path: WorkspacePath,
@@ -162,6 +202,10 @@ pub struct ComparisonRow {
     pub remote: Option<FileStamp>,
     pub local_kind: Option<NodeKind>,
     pub remote_kind: Option<NodeKind>,
+    pub excluded: Option<ExclusionReason>,
+    /// A directory that a scan limit or listing error left unlisted or partly listed on at least
+    /// one side. Its kind can still be `Equal`, and a `WorkcellIncomplete` side marks no folder.
+    pub unlisted: bool,
 }
 
 #[derive(Debug)]
@@ -184,47 +228,84 @@ impl Comparison {
         &self.rows
     }
     pub fn complete(&self) -> bool {
-        self.local.complete && self.remote.complete
+        self.local.complete() && self.remote.complete()
+    }
+    pub fn scan(&self, side: &Side) -> &ScanState {
+        match side {
+            Side::Local => &self.local.scan,
+            Side::Remote => &self.remote.scan,
+        }
+    }
+
+    /// Fails early with an actionable error where the inventory would refuse the inspection.
+    pub(super) fn ensure_inspectable(&self) -> Result<(), TransferError> {
+        if [&self.local.scan, &self.remote.scan]
+            .into_iter()
+            .any(|scan| scan.limits.contains(&ScanLimit::WorkcellIncomplete))
+        {
+            return Err(TransferError::PartialInventory);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Block {
+    Excluded(ExclusionReason),
+    Unsupported,
+    Incomplete,
+}
+
+impl Block {
+    fn kind(self) -> ComparisonKind {
+        match self {
+            Self::Excluded(_) => ComparisonKind::Excluded,
+            Self::Unsupported => ComparisonKind::Unsupported,
+            Self::Incomplete => ComparisonKind::Incomplete,
+        }
+    }
+
+    fn exclusion(self) -> Option<ExclusionReason> {
+        match self {
+            Self::Excluded(reason) => Some(reason),
+            Self::Unsupported | Self::Incomplete => None,
+        }
     }
 }
 
 #[derive(Debug, Clone)]
 pub(super) struct ManifestEntry {
-    pub node: Option<InventoryNode>,
+    pub node: InventoryNode,
     pub file: Option<FileStamp>,
-    pub blocked: Option<ComparisonKind>,
+    pub blocked: Option<Block>,
 }
 
-#[derive(Debug)]
+/// Never contains the root: a partial or unsupported side is described by `scan`.
+#[derive(Debug, Default)]
 pub(super) struct Manifest {
     pub entries: BTreeMap<WorkspacePath, ManifestEntry>,
-    pub complete: bool,
+    pub scan: ScanState,
+    unlisted: BTreeSet<WorkspacePath>,
 }
 
 impl Manifest {
-    fn block(&mut self, path: WorkspacePath, reason: ComparisonKind) {
-        if reason == ComparisonKind::Incomplete {
-            self.complete = false;
-        }
-        self.entries
-            .entry(path)
-            .or_insert(ManifestEntry {
-                node: None,
-                file: None,
-                blocked: None,
-            })
-            .blocked = Some(reason);
+    pub fn complete(&self) -> bool {
+        self.scan.complete()
     }
 
-    fn blocked(&self, path: &WorkspacePath) -> Option<ComparisonKind> {
+    fn unlist(&mut self, directory: WorkspacePath, limit: ScanLimit) {
+        self.scan.limits.insert(limit);
+        self.unlisted.insert(directory);
+    }
+
+    fn blocked(&self, path: &WorkspacePath) -> Option<Block> {
+        if self.scan.unsupported {
+            return Some(Block::Unsupported);
+        }
         let mut ancestor = Some(path.clone());
         while let Some(path) = ancestor {
-            if let Some(reason) = self
-                .entries
-                .get(&path)
-                .and_then(|entry| entry.blocked.clone())
-            {
-                return Some(reason);
+            if let Some(block) = self.entries.get(&path).and_then(|entry| entry.blocked) {
+                return Some(block);
             }
             ancestor = path.parent();
         }
@@ -247,25 +328,26 @@ impl WorkspaceTransfer {
             .chain(remote.entries.keys())
             .cloned()
             .collect::<BTreeSet<_>>();
+        let complete = local.complete() && remote.complete();
         let mut rows = Vec::with_capacity(paths.len());
         for path in paths {
             let left = local.entries.get(&path);
             let right = remote.entries.get(&path);
-            let mut kind = local.blocked(&path).or_else(|| remote.blocked(&path));
-            if kind.is_none() {
-                kind = Some(match (left, right) {
+            let (kind, excluded) = match local.blocked(&path).or_else(|| remote.blocked(&path)) {
+                Some(block) => (block.kind(), block.exclusion()),
+                None => match (left, right) {
                     (Some(left), Some(right)) => {
-                        if left.file.as_ref().map(|f| &f.content)
-                            == right.file.as_ref().map(|f| &f.content)
-                            && left.node.as_ref().map(|n| &n.kind)
-                                == right.node.as_ref().map(|n| &n.kind)
-                        {
+                        let same = left.file.as_ref().map(|file| &file.content)
+                            == right.file.as_ref().map(|file| &file.content)
+                            && left.node.kind == right.node.kind;
+                        let kind = if same {
                             ComparisonKind::Equal
                         } else {
                             ComparisonKind::Conflict
-                        }
+                        };
+                        (kind, None)
                     }
-                    _ if !local.complete || !remote.complete => ComparisonKind::Incomplete,
+                    _ if !complete => (ComparisonKind::Incomplete, None),
                     (Some(_), None) => {
                         self.absent_kind(&Side::Remote, &path, ComparisonKind::LocalOnly, cancel)
                             .await?
@@ -274,18 +356,18 @@ impl WorkspaceTransfer {
                         self.absent_kind(&Side::Local, &path, ComparisonKind::RemoteOnly, cancel)
                             .await?
                     }
-                    _ => ComparisonKind::Incomplete,
-                });
-            }
+                    (None, None) => (ComparisonKind::Incomplete, None),
+                },
+            };
             rows.push(ComparisonRow {
+                unlisted: local.unlisted.contains(&path) || remote.unlisted.contains(&path),
                 path,
-                kind: kind.unwrap_or(ComparisonKind::Incomplete),
+                kind,
                 local: left.and_then(|entry| entry.file.clone()),
                 remote: right.and_then(|entry| entry.file.clone()),
-                local_kind: left
-                    .and_then(|entry| entry.node.as_ref().map(|node| node.kind.clone())),
-                remote_kind: right
-                    .and_then(|entry| entry.node.as_ref().map(|node| node.kind.clone())),
+                local_kind: left.map(|entry| entry.node.kind.clone()),
+                remote_kind: right.map(|entry| entry.node.kind.clone()),
+                excluded,
             });
         }
         self.validate_context(&context, self.filters.digest(), cancel)
@@ -305,38 +387,36 @@ impl WorkspaceTransfer {
         path: &WorkspacePath,
         absent: ComparisonKind,
         cancel: &CancelToken,
-    ) -> Result<ComparisonKind, TransferError> {
+    ) -> Result<(ComparisonKind, Option<ExclusionReason>), TransferError> {
         match self
             .bounded(cancel, self.services.inventory.inspect(side, path))
             .await
         {
             Ok(inspection) => Ok(match self.filters.ignored(inspection.ignored) {
-                Ok(true) => ComparisonKind::Excluded,
-                Ok(false) if inspection.node.is_none() => absent,
-                _ => ComparisonKind::Incomplete,
+                Ok(true) => (ComparisonKind::Excluded, Some(ExclusionReason::Gitignore)),
+                Ok(false) if inspection.node.is_none() => (absent, None),
+                _ => (ComparisonKind::Incomplete, None),
             }),
             Err(TransferError::Cancelled) => Err(TransferError::Cancelled),
-            Err(_) => Ok(ComparisonKind::Incomplete),
+            Err(_) => Ok((ComparisonKind::Incomplete, None)),
         }
     }
 
+    /// A partial listing is still descended and hashed: entries seen on both sides compare by
+    /// content, while absence on a partial side stays undetermined.
     async fn scan(
         &self,
         context: &InventoryContext,
         side: Side,
         cancel: &CancelToken,
     ) -> Result<Manifest, TransferError> {
-        let mut manifest = Manifest {
-            entries: BTreeMap::new(),
-            complete: true,
-        };
+        let mut manifest = Manifest::default();
         let safe = match side {
             Side::Local => context.safe_local_traversal,
             Side::Remote => context.safe_remote_traversal,
         };
         if !safe {
-            manifest.complete = false;
-            manifest.block(WorkspacePath::root(), ComparisonKind::Unsupported);
+            manifest.scan.unsupported = true;
             return Ok(manifest);
         }
         let mut queue = VecDeque::from([(WorkspacePath::root(), 0)]);
@@ -344,20 +424,26 @@ impl WorkspaceTransfer {
         let mut visited = 0;
         let mut hashed = 0_u64;
         while let Some((directory, depth)) = queue.pop_front() {
-            self.phase(&directory, TransferPhase::Scanning);
+            self.services.events.emit(TransferEvent::Phase {
+                side: Some(side.clone()),
+                path: directory.clone(),
+                phase: TransferPhase::Scanning,
+            });
             if depth >= self.limits.max_depth {
-                manifest.block(directory, ComparisonKind::Incomplete);
+                manifest.unlist(directory, ScanLimit::Depth);
                 continue;
             }
             let mut continuation = None;
             let mut seen_cursors = BTreeSet::new();
             let mut revision = None;
             let mut children = BTreeMap::new();
-            let mut complete = true;
-            loop {
-                if pages >= self.limits.max_pages || visited >= self.limits.max_entries {
-                    complete = false;
-                    break;
+            let mut malformed = false;
+            let unfinished = loop {
+                if pages >= self.limits.max_pages {
+                    break Some(ScanLimit::Pages);
+                }
+                if visited >= self.limits.max_entries {
+                    break Some(ScanLimit::Entries);
                 }
                 let limit = PAGE_SIZE.min((self.limits.max_entries - visited) as u32);
                 pages += 1;
@@ -372,93 +458,114 @@ impl WorkspaceTransfer {
                 {
                     Ok(page) => page,
                     Err(TransferError::Cancelled) => return Err(TransferError::Cancelled),
-                    Err(_) => {
-                        complete = false;
-                        break;
-                    }
+                    Err(_) => break Some(ScanLimit::ListingFailed),
                 };
-                if page.entries.len() > limit as usize
-                    || revision.as_ref().is_some_and(|r| r != &page.revision)
+                if page.entries.len() > limit as usize {
+                    break Some(ScanLimit::ListingFailed);
+                }
+                if revision
+                    .as_ref()
+                    .is_some_and(|revision| revision != &page.revision)
                 {
-                    complete = false;
-                    break;
+                    break Some(ScanLimit::Changed);
                 }
                 revision = Some(page.revision);
-                complete &= !page.incomplete;
+                if page.incomplete {
+                    manifest.scan.limits.insert(ScanLimit::WorkcellIncomplete);
+                }
                 for node in page.entries {
                     visited += 1;
                     if node.path.parent().as_ref() != Some(&directory)
                         || children.contains_key(&node.path)
                     {
-                        complete = false;
+                        malformed = true;
                         continue;
                     }
                     children.insert(node.path.clone(), node);
                 }
                 match page.next {
                     Some(next) if seen_cursors.insert(next.clone()) => continuation = Some(next),
-                    Some(_) => {
-                        complete = false;
-                        break;
-                    }
-                    None => break,
+                    Some(_) => break Some(ScanLimit::ListingFailed),
+                    None => break None,
                 }
-            }
-            if !complete {
-                manifest.block(directory.clone(), ComparisonKind::Incomplete);
-            }
+            };
             if !directory.is_root()
                 && children
                     .keys()
                     .any(|path| REPOSITORY_MARKERS.contains(&path.file_name()))
             {
-                manifest.block(directory, ComparisonKind::Unsupported);
+                if let Some(entry) = manifest.entries.get_mut(&directory) {
+                    entry.node.kind = NodeKind::NestedRepository;
+                    entry.blocked = Some(Block::Unsupported);
+                }
                 continue;
             }
+            if malformed {
+                manifest.unlist(directory.clone(), ScanLimit::ListingFailed);
+            }
+            if let Some(limit) = unfinished {
+                manifest.unlist(directory.clone(), limit);
+            }
             for (path, node) in children {
+                let exclusion = match self.filters.exclusion(&path) {
+                    Some(reason) => Ok(Some(reason)),
+                    None => self
+                        .filters
+                        .ignored(node.ignored)
+                        .map(|ignored| ignored.then_some(ExclusionReason::Gitignore)),
+                };
                 let mut entry = ManifestEntry {
-                    node: Some(node.clone()),
+                    node,
                     file: None,
                     blocked: None,
                 };
-                entry.blocked = if self.filters.excludes(&path) {
-                    Some(ComparisonKind::Excluded)
-                } else {
-                    match self.filters.ignored(node.ignored) {
-                        Ok(true) => Some(ComparisonKind::Excluded),
-                        Err(_) => Some(ComparisonKind::Incomplete),
-                        Ok(false) => None,
+                let limit = match exclusion {
+                    Ok(Some(reason)) => {
+                        entry.blocked = Some(Block::Excluded(reason));
+                        None
                     }
-                };
-                if entry.blocked.is_none() {
-                    match node.kind {
-                        NodeKind::Directory if complete => {
-                            queue.push_back((path.clone(), depth + 1))
+                    Err(_) => {
+                        if entry.node.kind == NodeKind::Directory {
+                            manifest.unlisted.insert(path.clone());
                         }
-                        NodeKind::Directory => entry.blocked = Some(ComparisonKind::Incomplete),
-                        NodeKind::File => {
-                            if let Some(size) = node.size_bytes
-                                && size <= self.limits.max_file_bytes
-                                && size <= self.limits.max_total_bytes.saturating_sub(hashed)
-                                && complete
+                        Some(ScanLimit::ListingFailed)
+                    }
+                    Ok(None) => match entry.node.kind {
+                        NodeKind::Directory => {
+                            queue.push_back((path.clone(), depth + 1));
+                            None
+                        }
+                        NodeKind::File => match entry.node.size_bytes {
+                            Some(size)
+                                if size <= self.limits.max_file_bytes
+                                    && size
+                                        <= self.limits.max_total_bytes.saturating_sub(hashed) =>
                             {
                                 hashed += size;
-                                match self.stamp(context, &side, &node, cancel).await {
-                                    Ok(stamp) => entry.file = Some(stamp),
+                                match self.stamp(context, &side, &entry.node, cancel).await {
+                                    Ok(stamp) => {
+                                        entry.file = Some(stamp);
+                                        None
+                                    }
                                     Err(TransferError::Cancelled) => {
                                         return Err(TransferError::Cancelled);
                                     }
-                                    Err(_) => entry.blocked = Some(ComparisonKind::Incomplete),
+                                    Err(TransferError::Stale) => Some(ScanLimit::Changed),
+                                    Err(_) => Some(ScanLimit::Unreadable),
                                 }
-                            } else {
-                                entry.blocked = Some(ComparisonKind::Incomplete);
                             }
+                            Some(_) => Some(ScanLimit::Bytes),
+                            None => Some(ScanLimit::Unreadable),
+                        },
+                        _ => {
+                            entry.blocked = Some(Block::Unsupported);
+                            None
                         }
-                        _ => entry.blocked = Some(ComparisonKind::Unsupported),
-                    }
-                }
-                if entry.blocked == Some(ComparisonKind::Incomplete) {
-                    manifest.complete = false;
+                    },
+                };
+                if let Some(limit) = limit {
+                    manifest.scan.limits.insert(limit);
+                    entry.blocked = Some(Block::Incomplete);
                 }
                 manifest.entries.insert(path, entry);
             }

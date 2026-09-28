@@ -211,6 +211,8 @@ Selecting a remote workspace does not authorize arbitrary host writes. Compare a
 
 Attach to the sandbox, open `/workbench`, and select Transfer or press `Ctrl+X 4`. Choose both roots and Compare. The local and sandbox panes support linked or independent folder navigation, file and folder selection, change badges and read-only inspection. Upload maps to Push and Download maps to Pull. An initial-seed handoff uses create-only Seed semantics. The sandbox manager no longer contains a file-transfer mode.
 
+A large tree can stop at a scan limit, such as the Workcell inventory cap of 4,096 entries. Folders that were listed still compare by content. Entries seen on one side only stay undetermined while either side is partial, and review requires a complete comparison. When the cap truncates a side, reported as `WorkcellIncomplete`, Workcell cannot inspect that side, so file diffs are refused as well. Compare a smaller folder to review those entries or open their diffs. If one large folder is never transferred, add it to `exclude` in the profile's [transfer record](#configuration-schema). The inventory then lists that folder without walking its contents, so it no longer uses up the cap.
+
 The review lists new files, overwrites and directory effects, including selected empty directories. Text diffs use bounded prefixes and mark truncation. Binary previews report size and digest. A truncated overall review cannot be executed until you select fewer entries. Changed roots, filters, source/destination revisions or instance state require a fresh review. Unsaved Caudra editor buffers block admission, and ordinary editing remains blocked until the transfer worker closes and drains. The CLI cannot inspect buffers in other editors, so save or close them separately.
 
 ### Exact CLI commands and prompts
@@ -229,6 +231,10 @@ caudra sandbox transfer reconcile dev --local-root /home/alice/code/app --remote
 Repeat `--select` for each exact file. No file is implicitly selected, and transfer has no `--yes` flag. `--dry-run` builds a review without publishing, but read permissions still apply. Differing files are conflicts to review, not candidates for an automatic newest-mtime winner. Missing parents are explicit plan effects, not hidden directory creation.
 
 The command emits JSON lines for `permission`, `comparison`, `plan`, `progress`, and `result` events. In a terminal, answer each permission with `allow`, `deny`, or a displayed `allow_option` response. At the plan prompt, type the exact emitted `plan_id`. That is plan consent, not a blanket permission grant.
+
+A `progress` event carries a structured `detail` whose `kind` is `Phase` (with `path`, `phase` and `side`, which is null outside scanning), `Planned` (with `digest` and `files`), `Settled` (with `operation_id`, `path` and `outcome`) or `CleanupDeferred` (with `operation_id`).
+
+The `comparison` event lists one row per path below the roots and has no row for the root itself. `excluded` names why a row is excluded: `Protected`, `Pattern` or `Gitignore`. `unlisted` marks a folder that a limit or listing error left unlisted or partly listed, even when its row is `Equal`. A truncated Workcell snapshot (`WorkcellIncomplete`) marks no folder. `scan.local` and `scan.remote` report each side as `unsupported` plus a list of `limits`, such as `Entries`, `Depth`, `WorkcellIncomplete` or `ListingFailed`. `complete` is true only when both sides are supported and have no limits. While either side is partial, rows present on one side only are `Incomplete` rather than `LocalOnly` or `RemoteOnly`.
 
 Non-terminal stdin requires `--json-input`, even for Compare or Reconcile. A controller must read the emitted requests and send one JSON reply per line, using their actual IDs:
 

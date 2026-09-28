@@ -173,6 +173,7 @@ impl App {
                     remote_root: WorkspacePath::new(roots.remote)
                         .map_err(|error| error.to_string())?,
                     attached_binding: Some(scope.binding.clone()),
+                    include_ignored: false,
                 };
                 if let Some(worker) = self.sandbox_live.transfer.as_mut() {
                     worker.cancel();
@@ -820,6 +821,7 @@ mod tests {
                 local_root: root.path().into(),
                 remote_root: WorkspacePath::root(),
                 attached_binding: Some(scope.binding.clone()),
+                include_ignored: false,
             }),
             scope: Box::new(scope),
         });

@@ -1348,6 +1348,7 @@ mod tests {
                 local_root: root_b.path().into(),
                 remote_root: WorkspacePath::root(),
                 attached_binding: Some(scope.binding.clone()),
+                include_ignored: false,
             }),
             scope: Box::new(scope),
         });

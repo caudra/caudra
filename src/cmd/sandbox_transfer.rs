@@ -9,7 +9,7 @@ use caudra_agent::{
     AgentEvent, CancelToken, EventSender,
     permissions::PermissionAnswer,
     workspace_transfer::{
-        CleanBufferLease, LocalRootIdentity, PullBufferGuard, TransferAction, TransferError,
+        CleanBufferLease, LocalRootIdentity, PullBufferGuard, Side, TransferAction, TransferError,
         TransferEvent, TransferEvents,
     },
 };
@@ -42,9 +42,9 @@ enum Message {
 struct Progress(Sender<Message>);
 impl TransferEvents for Progress {
     fn emit(&self, event: TransferEvent) {
-        let _ = self.0.send(Message::Output(
-            json!({"event":"progress", "detail":format!("{event:?}")}),
-        ));
+        let _ = self
+            .0
+            .send(Message::Output(json!({"event":"progress", "detail":event})));
     }
 }
 
@@ -126,6 +126,7 @@ pub(super) fn run(args: SandboxTransferArgs, state: &StateDir) -> Result<()> {
         local_root: args.local_root.clone(),
         remote_root: WorkspacePath::new(&args.remote_root)?,
         attached_binding: None,
+        include_ignored: false,
     };
     let paths = args
         .selected
@@ -162,7 +163,8 @@ pub(super) fn run(args: SandboxTransferArgs, state: &StateDir) -> Result<()> {
                     return Ok(());
                 }
                 let comparison = connection.session.compare(&token).await?;
-                messages.send(Message::Output(json!({"event":"comparison", "context":comparison.context(), "rows":comparison.rows(), "complete":comparison.complete(), "recovery":connection.session.recovery()?})))?;
+                let scan = json!({"local":comparison.scan(&Side::Local), "remote":comparison.scan(&Side::Remote)});
+                messages.send(Message::Output(json!({"event":"comparison", "context":comparison.context(), "rows":comparison.rows(), "complete":comparison.complete(), "scan":scan, "recovery":connection.session.recovery()?})))?;
                 let action = match args.mode { SandboxTransferMode::Seed => TransferAction::Seed, SandboxTransferMode::Push => TransferAction::Push, SandboxTransferMode::Pull => TransferAction::Pull, _ => return Ok(()) };
                 let plan = connection.session.review(action, &paths, &token).await?;
                 let preview = json!({"event":"plan", "plan_id":plan.digest(), "review":plan.review(), "recovery_coverage":"None", "dry_run":args.dry_run});

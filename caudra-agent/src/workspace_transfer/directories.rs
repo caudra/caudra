@@ -508,7 +508,7 @@ impl WorkspaceTransfer {
         let source = source
             .entries
             .get(path)
-            .and_then(|entry| entry.node.clone())
+            .map(|entry| entry.node.clone())
             .ok_or(TransferError::Selection)?;
         let mut directory = PlannedDirectory {
             operation_id: operation_id()?,
@@ -526,7 +526,7 @@ impl WorkspaceTransfer {
             ] {
                 match manifest.entries.get(&path) {
                     Some(entry) if entry.blocked.is_none() => {
-                        let node = entry.node.as_ref().ok_or(TransferError::Parent)?;
+                        let node = &entry.node;
                         if node.kind != NodeKind::Directory {
                             return Err(TransferError::Parent);
                         }
@@ -536,7 +536,7 @@ impl WorkspaceTransfer {
                             identity: node.identity.clone(),
                         });
                     }
-                    None if side == *destination && manifest.complete => {
+                    None if side == *destination && manifest.complete() => {
                         directory.create_directories.push(path.clone())
                     }
                     _ => return Err(TransferError::Parent),
@@ -590,6 +590,7 @@ impl WorkspaceTransfer {
         {
             return Err(TransferError::Stale);
         }
+        // The inspection above unpinned the source side's listing, so this page is current.
         let page = self
             .bounded(
                 cancel,
