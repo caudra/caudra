@@ -8,7 +8,7 @@ use crate::components::keybindings;
 use crate::components::keybindings::KeybindContext;
 use crate::components::queue_panel;
 use crate::components::split_layout::{MIN_CHAT_ROWS, SplitLayout, carve};
-use crate::components::status_bar::{StatusBarContext, UsageStats, workflow_chip};
+use crate::components::status_bar::{self, StatusBarContext, UsageStats, workflow_chip};
 use crate::components::tools_modal::ToolsModalContext;
 use crate::components::usage_modal::UsageModalContext;
 use crate::selection::{self, SelectableZone, SelectionZone, ZoneRegistry};
@@ -77,7 +77,11 @@ impl App {
         self.render_messages(frame, &layout, render_chat);
         self.render_bottom_panel(frame, &layout);
         self.render_splits(frame, &layout);
-        let mut overlay_rect = self.render_picker_overlays(frame, layout.msg_area);
+        let above_footer = Rect {
+            height: layout.status_area.y.saturating_sub(frame.area().y),
+            ..frame.area()
+        };
+        let mut overlay_rect = self.render_picker_overlays(frame, layout.msg_area, above_footer);
         self.render_status_bar(frame, layout.status_area, render_chat);
         overlay_rect = self.render_top_modals(frame, overlay_rect);
         self.register_zones(&layout, overlay_rect);
@@ -106,8 +110,11 @@ impl App {
     fn render_workbench(&mut self, frame: &mut Frame) {
         grab_scope!("workbench", frame.area());
         let render_chat = self.active_chat;
-        let [mut body, status] = Layout::vertical([Constraint::Min(1), Constraint::Length(1)])
-            .areas(main_content_area(frame.area()));
+        let [mut body, status] = Layout::vertical([
+            Constraint::Min(1),
+            Constraint::Length(status_bar::height(frame.area().height)),
+        ])
+        .areas(main_content_area(frame.area()));
         self.zones = ZoneRegistry::new();
         self.zones.push_overlay(frame.area());
         self.render_background(frame);
@@ -124,7 +131,7 @@ impl App {
         self.render_status_bar(frame, status, render_chat);
 
         let prompt = self.render_workbench_prompt(frame, body);
-        let mut overlay_rect = self.render_picker_overlays(frame, body);
+        let mut overlay_rect = self.render_picker_overlays(frame, body, frame.area());
         overlay_rect = self.render_top_modals(frame, overlay_rect);
         for rect in [prompt, overlay_rect] {
             if rect.width > 0 {
@@ -203,8 +210,11 @@ impl App {
 
         // Carve the full-width status bar first so the split carving below only
         // ever deals with the content region above it.
-        let [content, status_area] =
-            Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(area);
+        let [content, status_area] = Layout::vertical([
+            Constraint::Min(1),
+            Constraint::Length(status_bar::height(area.height)),
+        ])
+        .areas(area);
 
         // A blocking form owns the bottom area, so drop any `below` split here
         // at the source. That keeps "the form wins bottom" in one filter
@@ -442,12 +452,14 @@ impl App {
         }
     }
 
-    fn render_picker_overlays(&mut self, frame: &mut Frame, msg_area: Rect) -> Rect {
+    /// `full` is what a picker may cover. The transcript view keeps its footer
+    /// out of it, since the footer draws last and would hide whatever a picker
+    /// put in its rows.
+    fn render_picker_overlays(&mut self, frame: &mut Frame, msg_area: Rect, full: Rect) -> Rect {
         if self.permission_prompt.is_open() {
             return Rect::default();
         }
         let mut overlay_rect = Rect::default();
-        let full = frame.area();
 
         if self.search_modal.is_open() {
             overlay_rect = self.search_modal.view(frame, msg_area);

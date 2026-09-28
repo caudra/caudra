@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::ops::Range;
 use std::path::{MAIN_SEPARATOR, Path};
 use std::time::{Duration, Instant};
 
@@ -24,6 +25,16 @@ use caudra_workflow::{RunSnapshot, RunStatus};
 const TRUNCATE_PREFIX: &str = "..";
 const HOME_ABBREVIATION: &str = "~";
 const CWD_MODEL_SEPARATOR: &str = "  ";
+/// What separates one thing the bar draws from the next.
+const GAP: &str = " ";
+/// Below this many terminal rows a line of transcript is worth more than the
+/// abbreviations a second footer row would spare.
+const SPLIT_MIN_TERMINAL_ROWS: u16 = 20;
+const SPLIT_ROWS: u16 = 2;
+const SINGLE_ROW: u16 = 1;
+/// The spinner's two columns while nothing spins, so the chips after it hold
+/// still when a turn starts or ends.
+const SPINNER_SLOT_BLANK: &str = "  ";
 const BACK_TO_MAIN_LABEL: &str = "[< Main]";
 const TASKS_LABEL: &str = "tasks";
 const SHELLS_LABEL: &str = "shell";
@@ -75,6 +86,20 @@ const NOT_BILLED_MARK: &str = "~";
 /// Joins the model a pending mode switch leaves to the one it arrives on,
 /// matching the glyph the mode label uses for the same switch.
 const MODEL_TRANSITION_ARROW: &str = "\u{2192}";
+/// Cells in the context gauge. Each fills in eighths, so the gauge resolves
+/// the window to one part in eighty.
+const GAUGE_CELLS: u8 = 10;
+const CELL_EIGHTHS: u8 = 8;
+const GAUGE_EIGHTHS: u8 = GAUGE_CELLS * CELL_EIGHTHS;
+/// A cell filled one eighth to seven eighths.
+const PARTIAL_CELLS: [char; 7] = [
+    '\u{258f}', '\u{258e}', '\u{258d}', '\u{258c}', '\u{258b}', '\u{258a}', '\u{2589}',
+];
+const FULL_CELL: char = '\u{2588}';
+const EMPTY_CELL: char = '\u{2591}';
+const GAUGE_TICK: &str = "\u{2502}";
+const GAUGE_OPEN: &str = "\u{2595}";
+const GAUGE_CLOSE: &str = "\u{258f}";
 
 /// What the bar says about the session's runs: the chip that names what is
 /// going on, and the count it falls back to when the columns run out.
@@ -145,6 +170,18 @@ fn compact_price(value: f64) -> String {
         return fixed;
     }
     fixed.trim_end_matches('0').trim_end_matches('.').to_owned()
+}
+
+/// Rows the footer takes on a terminal `terminal_rows` tall. Two once there is
+/// room, so what the next message runs with never gives up columns to what the
+/// agent is doing. It depends on nothing else, so a turn starting or a task
+/// spawning never moves the composer.
+pub fn height(terminal_rows: u16) -> u16 {
+    if terminal_rows >= SPLIT_MIN_TERMINAL_ROWS {
+        SPLIT_ROWS
+    } else {
+        SINGLE_ROW
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -353,6 +390,8 @@ impl ThinkingTier {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ContextTier {
+    /// `▕▌░░░░░░░░│▏ 12k/200k (6%/90%)`.
+    Gauge,
     /// `12k/200k (6%/90%)`.
     Counts,
     /// `6%/90%`.
@@ -364,6 +403,7 @@ enum ContextTier {
 /// it, so the bar's width falls monotonically and the search terminates.
 #[derive(Debug, Clone, Copy)]
 enum Reduction {
+    DropGauge,
     LeafModel,
     DropGlobalSpend,
     DropCompactionBorder,
@@ -381,9 +421,44 @@ enum Reduction {
     DropYolo,
 }
 
-/// A provider prefix is the first thing pressure takes: the model leaf carries
-/// the useful identity, and the recovered columns keep every other full tier.
-/// Yolo goes last because a session that skips permission prompts has to say so
+/// The two rows of a split footer. Settings are what the user chose, which is
+/// what answers the next message. The live row is what the agent is doing and
+/// what it has cost so far.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Band {
+    Settings,
+    Live,
+}
+
+impl Reduction {
+    /// The row whose chip the step shortens. Each row walks only its own
+    /// rungs, so pressure on one never costs the other a column.
+    fn band(self) -> Band {
+        match self {
+            Self::LeafModel
+            | Self::ShortThinking
+            | Self::ShortYolo
+            | Self::DropTransition
+            | Self::DropFast
+            | Self::DropThinking
+            | Self::ChopModel
+            | Self::DropYolo => Band::Settings,
+            Self::DropGauge
+            | Self::DropGlobalSpend
+            | Self::DropCompactionBorder
+            | Self::CompactContext
+            | Self::ShortWorkflows
+            | Self::DropSpend
+            | Self::DropContext
+            | Self::DropWorkflows => Band::Live,
+        }
+    }
+}
+
+/// The gauge is the first thing pressure takes, because it only draws the
+/// counter beside it a second time. A provider prefix is next: the model leaf
+/// carries the useful identity, and the recovered columns keep every other full
+/// tier. Yolo goes last because a session that skips permission prompts has to say so
 /// at any width that can hold three columns. The pending pair goes early: once
 /// the chips are already abbreviating, the model the next turn runs on is worth
 /// more than the one it is leaving.
@@ -394,7 +469,11 @@ enum Reduction {
 /// workflow phase is live state, but it is also on screen in the workflow view
 /// and its counts survive. Yolo is a warning, and `[!]` is the only rung that
 /// leaves a chip with no word at all.
-const LADDER: [Reduction; 15] = [
+///
+/// A split footer walks this same ladder once per row, skipping the rungs of
+/// the other [`Band`], so both layouts give up their chips in one order.
+const LADDER: [Reduction; 16] = [
+    Reduction::DropGauge,
     Reduction::LeafModel,
     Reduction::DropGlobalSpend,
     Reduction::DropCompactionBorder,
@@ -425,6 +504,8 @@ struct SpendText {
     over_border: bool,
     spend: Option<String>,
     global: Option<String>,
+    /// `None` without a window to measure against.
+    gauge: Option<Gauge>,
 }
 
 impl SpendText {
@@ -453,8 +534,84 @@ impl SpendText {
             global: spend(stats.global_cost, stats.global_subscription_cost)
                 .filter(|_| stats.show_global)
                 .map(|global| format!("\u{03a3}{global}")),
+            gauge: Gauge::new(stats),
         }
     }
+}
+
+/// The window as [`GAUGE_CELLS`] cells filled in eighths, with a tick in the
+/// cell auto-compaction fires at for as long as the fill has not reached it.
+struct Gauge {
+    fill: String,
+    /// The empty cells ahead of the tick, or all of them without one.
+    track: String,
+    tick: bool,
+    rest: String,
+}
+
+impl Gauge {
+    fn new(stats: &UsageStats) -> Option<Self> {
+        let window = stats.context_window;
+        if window == 0 {
+            return None;
+        }
+        let eighths = gauge_eighths(stats.context_size, window);
+        let (whole, partial) = (eighths / CELL_EIGHTHS, eighths % CELL_EIGHTHS);
+        let mut fill = cells(FULL_CELL, whole);
+        if let Some(index) = partial.checked_sub(1) {
+            fill.push(PARTIAL_CELLS[usize::from(index)]);
+        }
+        let used = whole + u8::from(partial > 0);
+        let tick = stats
+            .compaction_border
+            .map(|border| gauge_eighths(border, window) / CELL_EIGHTHS)
+            .filter(|cell| (used..GAUGE_CELLS).contains(cell));
+        let (track, rest) = match tick {
+            Some(cell) => (cell - used, GAUGE_CELLS - cell - 1),
+            None => (GAUGE_CELLS - used, 0),
+        };
+        Some(Self {
+            fill,
+            track: cells(EMPTY_CELL, track),
+            tick: tick.is_some(),
+            rest: cells(EMPTY_CELL, rest),
+        })
+    }
+
+    fn width(&self) -> usize {
+        GAUGE_OPEN.width()
+            + self.fill.width()
+            + self.track.width()
+            + usize::from(self.tick) * GAUGE_TICK.width()
+            + self.rest.width()
+            + GAUGE_CLOSE.width()
+    }
+
+    /// The fill and the tick take the counter's own style, so both turn amber
+    /// with it once the border is behind the session. The frame and the empty
+    /// cells stay dim.
+    fn spans<'a>(&self, style: Style) -> [Span<'a>; 6] {
+        let dim = theme::current().status_dim;
+        [
+            Span::styled(GAUGE_OPEN, dim),
+            Span::styled(self.fill.clone(), style),
+            Span::styled(self.track.clone(), dim),
+            Span::styled(if self.tick { GAUGE_TICK } else { "" }, style),
+            Span::styled(self.rest.clone(), dim),
+            Span::styled(GAUGE_CLOSE, dim),
+        ]
+    }
+}
+
+/// The eighths of the gauge `tokens` fill, rounded down so a sliver of a cell
+/// never reads as the cell.
+fn gauge_eighths(tokens: u32, window: u32) -> u8 {
+    let eighths = u64::from(tokens) * u64::from(GAUGE_EIGHTHS) / u64::from(window);
+    u8::try_from(eighths).map_or(GAUGE_EIGHTHS, |eighths| eighths.min(GAUGE_EIGHTHS))
+}
+
+fn cells(glyph: char, count: u8) -> String {
+    std::iter::repeat_n(glyph, usize::from(count)).collect()
 }
 
 /// Which tier each slot of the right-hand side settled on. Widths and spans
@@ -478,7 +635,7 @@ impl Fit {
     const FULL: Self = Self {
         spend: true,
         global_spend: true,
-        context: ContextTier::Counts,
+        context: ContextTier::Gauge,
         compaction_border: true,
         thinking: ThinkingTier::Full,
         model: ModelTier::Full,
@@ -490,6 +647,7 @@ impl Fit {
 
     fn apply(&mut self, step: Reduction) {
         match step {
+            Reduction::DropGauge => self.context = ContextTier::Counts,
             Reduction::LeafModel => self.model = ModelTier::Leaf,
             Reduction::DropGlobalSpend => self.global_spend = false,
             Reduction::DropCompactionBorder => self.compaction_border = false,
@@ -508,9 +666,33 @@ impl Fit {
         }
     }
 
-    /// Everything right of the cwd, which takes whatever this leaves behind.
-    fn width(self, ctx: &StatusBarContext<'_>, spend: &SpendText, pair: Option<&str>) -> usize {
-        self.model_width(ctx, pair) + self.chip_width(ctx) + self.spend_width(spend)
+    /// The columns the chips of `scope` take: every chip on a one-row bar,
+    /// else the chips of the one row of a split footer the band names.
+    fn width(
+        self,
+        ctx: &StatusBarContext<'_>,
+        spend: &SpendText,
+        pair: Option<&str>,
+        scope: Option<Band>,
+    ) -> usize {
+        match scope {
+            None => self.settings_width(ctx, pair) + self.live_width(ctx, spend),
+            Some(Band::Settings) => self.settings_width(ctx, pair),
+            Some(Band::Live) => self.live_width(ctx, spend),
+        }
+    }
+
+    /// The model and the settings beside it. The cwd takes whatever columns
+    /// this leaves.
+    fn settings_width(self, ctx: &StatusBarContext<'_>, pair: Option<&str>) -> usize {
+        self.model_width(ctx, pair)
+            + self.thinking_width(ctx)
+            + usize::from(ctx.fast && self.fast) * FAST_LABEL.width()
+            + self.yolo_label(ctx).map_or(0, UnicodeWidthStr::width)
+    }
+
+    fn live_width(self, ctx: &StatusBarContext<'_>, spend: &SpendText) -> usize {
+        self.workflow_label(ctx).map_or(0, UnicodeWidthStr::width) + self.spend_width(spend)
     }
 
     /// Clamped up to the floor so [`Reduction::ChopModel`] can never widen a
@@ -534,13 +716,6 @@ impl Fit {
             None if self.model == ModelTier::Full => ctx.model_id,
             None => model_leaf(ctx.model_id),
         }
-    }
-
-    fn chip_width(self, ctx: &StatusBarContext<'_>) -> usize {
-        self.thinking_width(ctx)
-            + usize::from(ctx.fast && self.fast) * FAST_LABEL.width()
-            + self.workflow_label(ctx).map_or(0, UnicodeWidthStr::width)
-            + self.yolo_label(ctx).map_or(0, UnicodeWidthStr::width)
     }
 
     fn workflow_label<'a>(self, ctx: &'a StatusBarContext<'_>) -> Option<&'a str> {
@@ -568,7 +743,18 @@ impl Fit {
     fn spend_width(self, spend: &SpendText) -> usize {
         self.context_text(spend)
             .map_or(0, |context| context.width())
+            + self
+                .gauge(spend)
+                .map_or(0, |gauge| gauge.width() + GAP.width())
             + self.money_text(spend).map_or(0, |money| money.width())
+    }
+
+    /// Drawn ahead of the counts, which stay as they are with or without it.
+    fn gauge(self, spend: &SpendText) -> Option<&Gauge> {
+        spend
+            .gauge
+            .as_ref()
+            .filter(|_| self.context == ContextTier::Gauge)
     }
 
     fn context_text(self, spend: &SpendText) -> Option<Cow<'_, str>> {
@@ -577,7 +763,9 @@ impl Fit {
             None => Cow::Borrowed(spend.percent.as_str()),
         };
         match self.context {
-            ContextTier::Counts => Some(Cow::Owned(format!(" {} ({share})", spend.counts))),
+            ContextTier::Gauge | ContextTier::Counts => {
+                Some(Cow::Owned(format!(" {} ({share})", spend.counts)))
+            }
             ContextTier::Percent => Some(Cow::Owned(format!(" {share}"))),
             ContextTier::Hidden => None,
         }
@@ -778,428 +966,441 @@ impl StatusBar {
                 StatusBarHitTarget::ChatName | StatusBarHitTarget::Cwd | StatusBarHitTarget::Model
             )
         }));
-        if let Some(url) = ctx.hover_hint.filter(|_| self.flash.is_none()) {
-            self.marquee.finish_frame();
-            frame.render_widget(
-                Paragraph::new(Line::from(Span::styled(
-                    format!(" {url}"),
-                    theme::current().status_notice,
-                ))),
-                area,
-            );
-            return Vec::new();
-        }
-        let mut left_spans = Vec::new();
-
-        if *ctx.status == Status::Streaming {
-            let ch = spinner_frame(self.started_at.elapsed().as_millis());
-            left_spans.push(Span::styled(format!(" {ch}"), theme::current().spinner));
-        }
-
-        if ctx.restoring {
-            let ch = spinner_frame(self.started_at.elapsed().as_millis());
-            left_spans.push(Span::styled(
-                format!(" {ch}"),
-                theme::current().status_notice,
-            ));
-        }
-
-        let mut mode_width = ctx.mode.full().width();
-        let mode_offset = left_spans.iter().map(Span::width).sum::<usize>() + " ".width();
-        left_spans.push(Span::raw(" "));
-        let mode_span = left_spans.len();
-        left_spans.push(Span::styled(
-            ctx.mode.full().clone(),
-            hover_style(
-                ctx.mode.style,
-                clickable(ctx, StatusBarHitTarget::Mode)
-                    && ctx.hovered == Some(StatusBarHitTarget::Mode),
-            ),
-        ));
-
-        let mut back_offset = (!ctx.main_chat)
-            .then(|| left_spans.iter().map(Span::width).sum::<usize>() + " ".width());
-        if !ctx.main_chat {
-            left_spans.push(Span::raw(" "));
-            left_spans.push(Span::styled(
-                BACK_TO_MAIN_LABEL,
-                hover_style(
-                    theme::current().status_notice,
-                    ctx.hovered == Some(StatusBarHitTarget::BackToMain),
-                ),
-            ));
-        }
-
-        let mut sandbox_hit = None;
-        if let Some(name) = ctx.sandbox {
-            let offset = left_spans.iter().map(Span::width).sum::<usize>() + " ".width();
-            let budget = (area.width as usize)
-                .saturating_sub(offset)
-                .saturating_sub(critical_right(ctx));
-            if let Some(label) = sandbox_label(name, budget) {
-                let width = label.width();
-                left_spans.push(Span::raw(" "));
-                left_spans.push(Span::styled(
-                    label,
-                    hover_style(
-                        control_style(ctx, StatusBarHitTarget::Sandbox),
-                        ctx.hovered == Some(StatusBarHitTarget::Sandbox),
-                    ),
-                ));
-                sandbox_hit = Some((offset, width));
-            }
-        }
-
-        let mut chat_hit = None;
-        if let Some(name) = ctx.chat_name {
-            let wrapper_width = usize::from(ctx.main_chat) * BRACKET_WIDTH;
-            let available = (area.width as usize)
-                .saturating_sub(left_spans.iter().map(Span::width).sum::<usize>())
-                .saturating_sub(critical_right(ctx))
-                .saturating_sub(1);
-            let slot_total = (area.width as usize / CHAT_NAME_WIDTH_DIVISOR)
-                .min(CHAT_NAME_MAX_WIDTH)
-                .min(available);
-            if slot_total > wrapper_width {
-                let slot_width = slot_total - wrapper_width;
-                let clipped = name.width() > slot_width;
-                let fallback = truncate_head(name, slot_width);
-                let visible = self.marquee.render(
-                    StatusBarHitTarget::ChatName,
-                    name,
-                    slot_width,
-                    fallback,
-                    ctx.hovered == Some(StatusBarHitTarget::ChatName),
-                );
-                let label = if ctx.main_chat {
-                    format!("[{visible}]")
-                } else {
-                    visible.into_owned()
-                };
-                let offset = left_spans.iter().map(Span::width).sum::<usize>() + 1;
-                left_spans.push(Span::raw(" "));
-                left_spans.push(Span::styled(label, theme::current().status_dim));
-                if clipped {
-                    chat_hit = Some((offset, slot_width + wrapper_width));
-                }
-            }
-        }
-
-        let mut resume_hit = (!ctx.auto_scroll).then(|| {
-            let offset = left_spans.iter().map(Span::width).sum::<usize>() + " ".width();
-            left_spans.push(Span::raw(" "));
-            left_spans.push(Span::styled(
-                AUTO_SCROLL_PAUSED_LABEL,
-                hover_style(
-                    theme::current().status_dim,
-                    ctx.hovered == Some(StatusBarHitTarget::ResumeAutoScroll),
-                ),
-            ));
-            (offset, AUTO_SCROLL_PAUSED_LABEL.width())
-        });
-
-        let mut goal_hit = ctx.goal.map(|goal| {
-            let label = format!(
-                "[goal · {} · {}]",
-                goal.evaluations,
-                format_goal_elapsed(goal.elapsed())
-            );
-            let offset = left_spans.iter().map(Span::width).sum::<usize>() + " ".width();
-            let width = label.width();
-            left_spans.push(Span::raw(" "));
-            left_spans.push(Span::styled(
-                label,
-                hover_style(
-                    theme::current().status_notice,
-                    clickable(ctx, StatusBarHitTarget::Goal)
-                        && ctx.hovered == Some(StatusBarHitTarget::Goal),
-                ),
-            ));
-            (offset, width)
-        });
-
-        let mut activity_hits = Vec::new();
-        for (count, label, target) in [
-            (ctx.active_tasks, TASKS_LABEL, StatusBarHitTarget::Tasks),
-            (ctx.active_shells, SHELLS_LABEL, StatusBarHitTarget::Shells),
-        ] {
-            if count == 0 {
-                continue;
-            }
-            let label = format!("[{label} · {count}]");
-            let offset = left_spans.iter().map(Span::width).sum::<usize>() + " ".width();
-            let width = label.width();
-            left_spans.push(Span::raw(" "));
-            left_spans.push(Span::styled(
-                label,
-                hover_style(theme::current().status_notice, ctx.hovered == Some(target)),
-            ));
-            activity_hits.push((target, offset, width));
-        }
-
-        let mut retry_hit = ctx.retry_info.map(|retry| {
-            let hovered = ctx.hovered == Some(StatusBarHitTarget::Retry);
-            let countdown = if hovered {
-                RETRY_NOW_LABEL.to_owned()
-            } else {
-                let secs = retry
-                    .deadline
-                    .saturating_duration_since(Instant::now())
-                    .as_secs();
-                format!(" · retrying in {secs}s (#{})", retry.attempt)
-            };
-            let offset = left_spans.iter().map(Span::width).sum::<usize>() + " ".width();
-            let width = retry.message.width() + countdown.width();
-            left_spans.push(Span::raw(" "));
-            left_spans.push(Span::styled(
-                retry.message.clone(),
-                hover_style(theme::current().status_retry_error, hovered),
-            ));
-            left_spans.push(Span::styled(
-                countdown,
-                hover_style(theme::current().status_retry_info, hovered),
-            ));
-            (offset, width)
-        });
-
-        let full_left_width = left_spans.iter().map(Span::width).sum::<usize>();
-        let full_budget = (area.width as usize).saturating_sub(full_left_width);
-        let short_saving = mode_width.saturating_sub(ctx.mode.short().width());
-        let full_rank = right_fit_rank(ctx, full_budget);
-        let short_rank = right_fit_rank(ctx, full_budget.saturating_add(short_saving));
-        if full_rank > 1 && short_rank > 0 && short_rank < full_rank {
-            left_spans[mode_span] = Span::styled(
-                ctx.mode.short().clone(),
-                hover_style(
-                    ctx.mode.style,
-                    clickable(ctx, StatusBarHitTarget::Mode)
-                        && ctx.hovered == Some(StatusBarHitTarget::Mode),
-                ),
-            );
-            mode_width = ctx.mode.short().width();
-            back_offset = back_offset.map(|offset| offset.saturating_sub(short_saving));
-            sandbox_hit =
-                sandbox_hit.map(|(offset, width)| (offset.saturating_sub(short_saving), width));
-            chat_hit = chat_hit.map(|(offset, width)| (offset.saturating_sub(short_saving), width));
-            resume_hit =
-                resume_hit.map(|(offset, width)| (offset.saturating_sub(short_saving), width));
-            goal_hit = goal_hit.map(|(offset, width)| (offset.saturating_sub(short_saving), width));
-            for (_, offset, _) in &mut activity_hits {
-                *offset = offset.saturating_sub(short_saving);
-            }
-            retry_hit =
-                retry_hit.map(|(offset, width)| (offset.saturating_sub(short_saving), width));
-        }
-
-        let mut right_spans = Vec::new();
-        let mut right_hits = Vec::new();
-
-        match ctx.status {
-            Status::Error { message: e, .. } => {
-                left_spans.push(Span::styled(format!(" {e}"), theme::current().error));
-            }
-            _ => {
-                let left_width = left_spans.iter().map(Span::width).sum::<usize>();
-                let side = right_side_animated(
-                    ctx,
-                    &self.cwd_branch,
-                    (area.width as usize).saturating_sub(left_width),
-                    Some(&mut self.marquee),
-                );
-                right_spans = side.spans;
-                right_hits = side.hits;
-            }
-        }
-
-        if let Some((ref msg, _)) = self.flash {
-            left_spans.push(Span::styled(
-                format!(" {msg}"),
-                theme::current().status_notice,
-            ));
-        }
-
-        let [left_area, right_area] = status_areas(area, &right_spans);
-
-        frame.render_widget(Paragraph::new(Line::from(left_spans)), left_area);
-        frame.render_widget(
-            Paragraph::new(Line::from(right_spans)).alignment(Alignment::Right),
-            right_area,
-        );
-
-        let mut hits = Vec::with_capacity(2);
-        push_hit(
-            &mut hits,
-            ctx,
-            left_area,
-            mode_offset,
-            mode_width,
-            StatusBarHitTarget::Mode,
-        );
-        push_hit(
-            &mut hits,
-            ctx,
-            left_area,
-            back_offset.unwrap_or_default(),
-            BACK_TO_MAIN_LABEL.width(),
-            StatusBarHitTarget::BackToMain,
-        );
-        for (target, offset, width) in right_hits {
-            push_hit(&mut hits, ctx, right_area, offset, width, target);
-        }
-        for (target, offset, width) in activity_hits {
-            push_hit(&mut hits, ctx, left_area, offset, width, target);
-        }
-        if let Some((offset, width)) = goal_hit {
-            push_hit(
-                &mut hits,
-                ctx,
-                left_area,
-                offset,
-                width,
-                StatusBarHitTarget::Goal,
-            );
-        }
-        if let Some((offset, width)) = retry_hit {
-            push_hit(
-                &mut hits,
-                ctx,
-                left_area,
-                offset,
-                width,
-                StatusBarHitTarget::Retry,
-            );
-        }
-        if let Some((offset, width)) = sandbox_hit {
-            push_hit(
-                &mut hits,
-                ctx,
-                left_area,
-                offset,
-                width,
-                StatusBarHitTarget::Sandbox,
-            );
-        }
-        if let Some((offset, width)) = chat_hit {
-            push_hit(
-                &mut hits,
-                ctx,
-                left_area,
-                offset,
-                width,
-                StatusBarHitTarget::ChatName,
-            );
-        }
-        if let Some((offset, width)) = resume_hit {
-            push_hit(
-                &mut hits,
-                ctx,
-                left_area,
-                offset,
-                width,
-                StatusBarHitTarget::ResumeAutoScroll,
-            );
+        let mut hits = Vec::new();
+        if area.height >= SPLIT_ROWS {
+            let [settings, live] = Layout::vertical([
+                Constraint::Length(SINGLE_ROW),
+                Constraint::Length(SINGLE_ROW),
+            ])
+            .areas(area);
+            self.settings_row(frame, settings, ctx, &mut hits);
+            self.live_row(frame, live, ctx, &mut hits);
+        } else {
+            self.single_row(frame, area, ctx, &mut hits);
         }
         self.marquee.finish_frame();
         hits
     }
-}
 
-/// The right-hand half of the bar, already fitted to `budget`. Hits are measured
-/// on the glyphs that were drawn, so a control cannot claim columns a shorter
-/// tier never used.
-struct RightSide<'a> {
-    spans: Vec<Span<'a>>,
-    hits: Vec<(StatusBarHitTarget, usize, usize)>,
-}
-
-/// Draws one control: the padding stays plain so a hover reverses the figure
-/// alone, and the returned hit covers exactly the glyphs that were highlighted.
-fn push_control<'a>(chips: &mut Vec<Span<'a>>, text: &str, style: Style) -> Option<(usize, usize)> {
-    let offset = chips.iter().map(Span::width).sum::<usize>();
-    let body = text.trim();
-    if body.is_empty() {
-        chips.push(Span::raw(text.to_owned()));
-        return None;
-    }
-    let lead = text.len() - text.trim_start().len();
-    let tail = lead + body.len();
-    if lead > 0 {
-        chips.push(Span::raw(text[..lead].to_owned()));
-    }
-    chips.push(Span::styled(body.to_owned(), style));
-    if tail < text.len() {
-        chips.push(Span::raw(text[tail..].to_owned()));
-    }
-    Some((offset + lead, body.width()))
-}
-
-/// Walks [`LADDER`] until the fixed chips and the model fit, then hands the cwd
-/// whatever is left. The cwd goes last because the model names what answers you
-/// and the path is usually already in the shell prompt.
-#[cfg(test)]
-fn right_side<'a>(
-    ctx: &'a StatusBarContext<'_>,
-    cwd_label: &'a str,
-    budget: usize,
-) -> RightSide<'a> {
-    right_side_animated(ctx, cwd_label, budget, None)
-}
-
-fn right_side_animated<'a>(
-    ctx: &'a StatusBarContext<'_>,
-    cwd_label: &'a str,
-    budget: usize,
-    mut marquee: Option<&mut Marquee>,
-) -> RightSide<'a> {
-    let spend = SpendText::new(&ctx.stats);
-    let pair = model_pair(ctx);
-    let pair = pair.as_deref();
-    let (fit, _) = fit_right(ctx, &spend, pair, budget);
-
-    let mut chips = Vec::new();
-    let mut chip_hits = Vec::new();
-    let mut control = |chips: &mut Vec<Span<'a>>, target, text: &str, style| {
-        let hovered = clickable(ctx, target) && ctx.hovered == Some(target);
-        if let Some(hit) = push_control(chips, text, hover_style(style, hovered)) {
-            chip_hits.push((target, hit.0, hit.1));
+    /// Every chip on one line, for a terminal too short to spare a second row.
+    /// The left side is laid out first and the right side fits whatever columns
+    /// it leaves, walking the whole ladder.
+    fn single_row(
+        &mut self,
+        frame: &mut Frame,
+        area: Rect,
+        ctx: &StatusBarContext<'_>,
+        hits: &mut Vec<StatusBarHit>,
+    ) {
+        if self.draw_hint(frame, area, ctx) {
+            return;
         }
-    };
+        let mut left = Strip::default();
+        if *ctx.status == Status::Streaming {
+            left.push(Span::styled(
+                format!("{GAP}{}", self.spinner()),
+                theme::current().spinner,
+            ));
+        }
+        if ctx.restoring {
+            left.push(Span::styled(
+                format!("{GAP}{}", self.spinner()),
+                theme::current().status_notice,
+            ));
+        }
+        self.push_settings(&mut left, ctx, area.width);
+        push_resume(&mut left, ctx);
+        push_goal(&mut left, ctx);
+        push_activity(&mut left, ctx);
+        push_retry(&mut left, ctx);
+        shorten_mode(&mut left, ctx, area.width, false);
+        let right = match ctx.status {
+            Status::Error { message, .. } => {
+                left.push(error_span(message));
+                Strip::default()
+            }
+            _ => right_side_animated(
+                ctx,
+                &self.cwd_branch,
+                right_budget(area.width, &left),
+                Some(&mut self.marquee),
+                false,
+            ),
+        };
+        if let Some(flash) = self.flash_span() {
+            left.push(flash);
+        }
+        draw_row(frame, area, ctx, left, right, hits);
+    }
 
-    if let Some(level) = fit.thinking_label(ctx) {
-        let label = format!(" [{level}]");
-        control(
-            &mut chips,
-            StatusBarHitTarget::Thinking,
-            &label,
-            control_style(ctx, StatusBarHitTarget::Thinking),
+    /// The mode, the model and the settings the next message runs with. The
+    /// live row owns the meters and the activity, so nothing here gives up a
+    /// column when a turn starts, a retry backs off, or a task spawns.
+    fn settings_row(
+        &mut self,
+        frame: &mut Frame,
+        area: Rect,
+        ctx: &StatusBarContext<'_>,
+        hits: &mut Vec<StatusBarHit>,
+    ) {
+        let mut left = Strip::default();
+        self.push_settings(&mut left, ctx, area.width);
+        shorten_mode(&mut left, ctx, area.width, true);
+        let right = right_side_animated(
+            ctx,
+            &self.cwd_branch,
+            right_budget(area.width, &left),
+            Some(&mut self.marquee),
+            true,
+        );
+        draw_row(frame, area, ctx, left, right, hits);
+    }
+
+    /// What the agent is doing and what it has cost. Messages land here too,
+    /// so an error, a backoff or a hovered link never takes a setting's
+    /// columns, and the meters fit whatever the activity and messages leave.
+    fn live_row(
+        &mut self,
+        frame: &mut Frame,
+        area: Rect,
+        ctx: &StatusBarContext<'_>,
+        hits: &mut Vec<StatusBarHit>,
+    ) {
+        if self.draw_hint(frame, area, ctx) {
+            return;
+        }
+        let mut activity = Strip::default();
+        activity.push(self.spinner_slot(ctx));
+        push_goal(&mut activity, ctx);
+        push_activity(&mut activity, ctx);
+        let mut messages = Strip::default();
+        push_resume(&mut messages, ctx);
+        push_retry(&mut messages, ctx);
+        if let Status::Error { message, .. } = ctx.status {
+            messages.push(error_span(message));
+        }
+        if let Some(flash) = self.flash_span() {
+            messages.push(flash);
+        }
+        let spend = SpendText::new(&ctx.stats);
+        let budget = usize::from(area.width).saturating_sub(activity.width() + messages.width());
+        let (fit, _) = fit_right(ctx, &spend, None, budget, Some(Band::Live));
+        push_workflows(&mut activity, ctx, fit);
+        activity.append(messages);
+        let mut meters = Strip::default();
+        push_meters(&mut meters, ctx, fit, &spend);
+        draw_row(frame, area, ctx, activity, meters, hits);
+    }
+
+    /// A hovered link takes its row whole, unless a flash is already speaking.
+    fn draw_hint(&self, frame: &mut Frame, area: Rect, ctx: &StatusBarContext<'_>) -> bool {
+        let Some(url) = ctx.hover_hint.filter(|_| self.flash.is_none()) else {
+            return false;
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                format!("{GAP}{url}"),
+                theme::current().status_notice,
+            ))),
+            area,
+        );
+        true
+    }
+
+    fn flash_span(&self) -> Option<Span<'static>> {
+        self.flash.as_ref().map(|(message, _)| {
+            Span::styled(format!("{GAP}{message}"), theme::current().status_notice)
+        })
+    }
+
+    fn spinner(&self) -> char {
+        spinner_frame(self.started_at.elapsed().as_millis())
+    }
+
+    /// The spinner's columns, held open while nothing spins so the chips after
+    /// them stay under the pointer when a turn starts or ends.
+    fn spinner_slot(&self, ctx: &StatusBarContext<'_>) -> Span<'static> {
+        let style = if *ctx.status == Status::Streaming {
+            theme::current().spinner
+        } else if ctx.restoring {
+            theme::current().status_notice
+        } else {
+            return Span::raw(SPINNER_SLOT_BLANK);
+        };
+        Span::styled(format!("{GAP}{}", self.spinner()), style)
+    }
+
+    /// The mode, the way back from a task, the sandbox and the chat name, in
+    /// the order both layouts draw them.
+    fn push_settings(&mut self, left: &mut Strip<'_>, ctx: &StatusBarContext<'_>, width: u16) {
+        left.chip(
+            ctx,
+            StatusBarHitTarget::Mode,
+            [Span::styled(ctx.mode.full().clone(), ctx.mode.style)],
+        );
+        if !ctx.main_chat {
+            left.chip(
+                ctx,
+                StatusBarHitTarget::BackToMain,
+                [Span::styled(
+                    BACK_TO_MAIN_LABEL,
+                    theme::current().status_notice,
+                )],
+            );
+        }
+        let width = usize::from(width);
+        if let Some(name) = ctx.sandbox {
+            let budget = width
+                .saturating_sub(left.width() + GAP.width())
+                .saturating_sub(critical_right(ctx));
+            if let Some(label) = sandbox_label(name, budget) {
+                left.chip(
+                    ctx,
+                    StatusBarHitTarget::Sandbox,
+                    [Span::styled(
+                        label,
+                        control_style(ctx, StatusBarHitTarget::Sandbox),
+                    )],
+                );
+            }
+        }
+        if let Some(name) = ctx.chat_name {
+            self.push_chat_name(left, ctx, name, width);
+        }
+    }
+
+    /// Bounded to a slot of its own, so a long name narrows itself rather than
+    /// the rest of the bar. A name cut short scrolls under the pointer, which
+    /// is all its hit is for.
+    fn push_chat_name(
+        &mut self,
+        left: &mut Strip<'_>,
+        ctx: &StatusBarContext<'_>,
+        name: &str,
+        width: usize,
+    ) {
+        let wrapper_width = usize::from(ctx.main_chat) * BRACKET_WIDTH;
+        let available = width
+            .saturating_sub(left.width())
+            .saturating_sub(critical_right(ctx))
+            .saturating_sub(GAP.width());
+        let slot_total = (width / CHAT_NAME_WIDTH_DIVISOR)
+            .min(CHAT_NAME_MAX_WIDTH)
+            .min(available);
+        if slot_total <= wrapper_width {
+            return;
+        }
+        let slot_width = slot_total - wrapper_width;
+        let visible = self.marquee.render(
+            StatusBarHitTarget::ChatName,
+            name,
+            slot_width,
+            truncate_head(name, slot_width),
+            ctx.hovered == Some(StatusBarHitTarget::ChatName),
+        );
+        let label = if ctx.main_chat {
+            format!("[{visible}]")
+        } else {
+            visible.into_owned()
+        };
+        let span = Span::styled(label, theme::current().status_dim);
+        if name.width() > slot_width {
+            left.chip(ctx, StatusBarHitTarget::ChatName, [span]);
+        } else {
+            left.push(Span::raw(GAP));
+            left.push(span);
+        }
+    }
+}
+
+/// One side of a row, laid out left to right. A control names the run of spans
+/// it drew rather than the columns they landed on, so respelling a span moves
+/// every hit after it along with its glyphs.
+#[derive(Default)]
+struct Strip<'a> {
+    spans: Vec<Span<'a>>,
+    controls: Vec<(StatusBarHitTarget, Range<usize>)>,
+}
+
+impl<'a> Strip<'a> {
+    fn width(&self) -> usize {
+        self.spans.iter().map(Span::width).sum()
+    }
+
+    fn push(&mut self, span: Span<'a>) {
+        self.spans.push(span);
+    }
+
+    /// Draws `spans` as one control, reversed together under the pointer.
+    fn control(
+        &mut self,
+        ctx: &StatusBarContext<'_>,
+        target: StatusBarHitTarget,
+        spans: impl IntoIterator<Item = Span<'a>>,
+    ) {
+        let hovered = clickable(ctx, target) && ctx.hovered == Some(target);
+        let start = self.spans.len();
+        self.spans.extend(spans.into_iter().map(|span| Span {
+            style: hover_style(span.style, hovered),
+            ..span
+        }));
+        self.controls.push((target, start..self.spans.len()));
+    }
+
+    /// A control a gap after whatever came before it. The gap stays plain, so
+    /// a hover reverses the label alone.
+    fn chip(
+        &mut self,
+        ctx: &StatusBarContext<'_>,
+        target: StatusBarHitTarget,
+        spans: impl IntoIterator<Item = Span<'a>>,
+    ) {
+        self.push(Span::raw(GAP));
+        self.control(ctx, target, spans);
+    }
+
+    /// A chip whose label carries its own padding, as the measured labels do.
+    fn padded(
+        &mut self,
+        ctx: &StatusBarContext<'_>,
+        target: StatusBarHitTarget,
+        text: &str,
+        style: Style,
+    ) {
+        let body = text.trim();
+        if body.is_empty() {
+            self.push(Span::raw(text.to_owned()));
+            return;
+        }
+        let lead = text.len() - text.trim_start().len();
+        let tail = lead + body.len();
+        if lead > 0 {
+            self.push(Span::raw(text[..lead].to_owned()));
+        }
+        self.control(ctx, target, [Span::styled(body.to_owned(), style)]);
+        if tail < text.len() {
+            self.push(Span::raw(text[tail..].to_owned()));
+        }
+    }
+
+    /// Swaps the text of a control's first span and keeps its style.
+    fn respell(&mut self, target: StatusBarHitTarget, text: Cow<'a, str>) {
+        if let Some((_, range)) = self.controls.iter().find(|(drawn, _)| *drawn == target) {
+            self.spans[range.start].content = text;
+        }
+    }
+
+    fn append(&mut self, other: Self) {
+        let base = self.spans.len();
+        self.spans.extend(other.spans);
+        self.controls.extend(
+            other
+                .controls
+                .into_iter()
+                .map(|(target, range)| (target, range.start + base..range.end + base)),
         );
     }
-    if ctx.fast && fit.fast {
-        control(
-            &mut chips,
-            StatusBarHitTarget::Fast,
-            FAST_LABEL,
-            control_style(ctx, StatusBarHitTarget::Fast),
+
+    /// Each control's offset and width, in columns from the strip's left edge.
+    fn hits(&self) -> impl Iterator<Item = (StatusBarHitTarget, usize, usize)> + '_ {
+        let columns = |spans: &[Span<'_>]| spans.iter().map(Span::width).sum::<usize>();
+        self.controls.iter().map(move |(target, range)| {
+            (
+                *target,
+                columns(&self.spans[..range.start]),
+                columns(&self.spans[range.clone()]),
+            )
+        })
+    }
+}
+
+fn push_resume(strip: &mut Strip<'_>, ctx: &StatusBarContext<'_>) {
+    if !ctx.auto_scroll {
+        strip.chip(
+            ctx,
+            StatusBarHitTarget::ResumeAutoScroll,
+            [Span::styled(
+                AUTO_SCROLL_PAUSED_LABEL,
+                theme::current().status_dim,
+            )],
         );
     }
+}
+
+fn push_goal(strip: &mut Strip<'_>, ctx: &StatusBarContext<'_>) {
+    if let Some(goal) = ctx.goal {
+        let label = format!(
+            "[goal · {} · {}]",
+            goal.evaluations,
+            format_goal_elapsed(goal.elapsed())
+        );
+        strip.chip(
+            ctx,
+            StatusBarHitTarget::Goal,
+            [Span::styled(label, theme::current().status_notice)],
+        );
+    }
+}
+
+fn push_activity(strip: &mut Strip<'_>, ctx: &StatusBarContext<'_>) {
+    for (count, label, target) in [
+        (ctx.active_tasks, TASKS_LABEL, StatusBarHitTarget::Tasks),
+        (ctx.active_shells, SHELLS_LABEL, StatusBarHitTarget::Shells),
+    ] {
+        if count > 0 {
+            strip.chip(
+                ctx,
+                target,
+                [Span::styled(
+                    format!("[{label} · {count}]"),
+                    theme::current().status_notice,
+                )],
+            );
+        }
+    }
+}
+
+/// The error and its countdown answer as one control, and under the pointer
+/// the countdown says what a click does instead.
+fn push_retry(strip: &mut Strip<'_>, ctx: &StatusBarContext<'_>) {
+    let Some(retry) = ctx.retry_info else {
+        return;
+    };
+    let countdown = if clickable(ctx, StatusBarHitTarget::Retry)
+        && ctx.hovered == Some(StatusBarHitTarget::Retry)
+    {
+        RETRY_NOW_LABEL.to_owned()
+    } else {
+        let secs = retry
+            .deadline
+            .saturating_duration_since(Instant::now())
+            .as_secs();
+        format!(" · retrying in {secs}s (#{})", retry.attempt)
+    };
+    strip.chip(
+        ctx,
+        StatusBarHitTarget::Retry,
+        [
+            Span::styled(retry.message.clone(), theme::current().status_retry_error),
+            Span::styled(countdown, theme::current().status_retry_info),
+        ],
+    );
+}
+
+fn push_workflows(strip: &mut Strip<'_>, ctx: &StatusBarContext<'_>, fit: Fit) {
     if let Some(label) = fit.workflow_label(ctx) {
-        control(
-            &mut chips,
+        strip.padded(
+            ctx,
             StatusBarHitTarget::Workflows,
             label,
             control_style(ctx, StatusBarHitTarget::Workflows),
         );
     }
-    if let Some(label) = fit.yolo_label(ctx) {
-        control(
-            &mut chips,
-            StatusBarHitTarget::Yolo,
-            label,
-            theme::current().error,
-        );
-    }
+}
+
+fn push_meters(strip: &mut Strip<'_>, ctx: &StatusBarContext<'_>, fit: Fit, spend: &SpendText) {
     let counters = Style::new().fg(theme::current().foreground);
-    if let Some(text) = fit.context_text(&spend) {
+    if let Some(text) = fit.context_text(spend) {
         // Past the border the next turn compacts, which is worth saying even at
         // a width that had to drop the border itself.
         let style = if spend.over_border {
@@ -1207,13 +1408,132 @@ fn right_side_animated<'a>(
         } else {
             counters
         };
-        control(&mut chips, StatusBarHitTarget::Context, &text, style);
+        match fit.gauge(spend) {
+            Some(gauge) => {
+                let counts = text.trim_start();
+                strip.push(Span::raw(text[..text.len() - counts.len()].to_owned()));
+                strip.control(
+                    ctx,
+                    StatusBarHitTarget::Context,
+                    gauge
+                        .spans(style)
+                        .into_iter()
+                        .chain([Span::styled(format!("{GAP}{counts}"), style)]),
+                );
+            }
+            None => strip.padded(ctx, StatusBarHitTarget::Context, &text, style),
+        }
     }
-    if let Some(text) = fit.money_text(&spend) {
-        control(&mut chips, StatusBarHitTarget::Usage, &text, counters);
+    if let Some(text) = fit.money_text(spend) {
+        strip.padded(ctx, StatusBarHitTarget::Usage, &text, counters);
+    }
+}
+
+fn error_span(message: &str) -> Span<'static> {
+    Span::styled(format!("{GAP}{message}"), theme::current().error)
+}
+
+/// Respells the mode short when the columns that frees win back a rung past
+/// the model leaf. The provider prefix alone is not worth a word of the mode,
+/// and a row that fits without the saving keeps the word.
+fn shorten_mode(left: &mut Strip<'_>, ctx: &StatusBarContext<'_>, width: u16, split: bool) {
+    let budget = right_budget(width, left);
+    let saving = ctx
+        .mode
+        .full()
+        .width()
+        .saturating_sub(ctx.mode.short().width());
+    let spend = SpendText::new(&ctx.stats);
+    let pair = model_pair(ctx);
+    let pair = pair.as_deref();
+    let scope = split.then_some(Band::Settings);
+    let (_, full_rank) = fit_right(ctx, &spend, pair, budget, scope);
+    let (short, short_rank) = fit_right(ctx, &spend, pair, budget.saturating_add(saving), scope);
+    if short.model != ModelTier::Full && short_rank < full_rank {
+        left.respell(StatusBarHitTarget::Mode, ctx.mode.short().clone());
+    }
+}
+
+/// The columns the right side of a row may fill. The cwd and the model carry
+/// no padding of their own, so a gap is held back or a right side that fits
+/// exactly would run into the last chip on the left.
+fn right_budget(width: u16, left: &Strip<'_>) -> usize {
+    usize::from(width).saturating_sub(left.width() + GAP.width())
+}
+
+/// Draws a row's two sides, the right one flush against the edge, and records
+/// a hit for every control that survived the clipping.
+fn draw_row(
+    frame: &mut Frame,
+    area: Rect,
+    ctx: &StatusBarContext<'_>,
+    left: Strip<'_>,
+    right: Strip<'_>,
+    hits: &mut Vec<StatusBarHit>,
+) {
+    let [left_area, right_area] = status_areas(area, right.width());
+    for (side, side_area) in [(&left, left_area), (&right, right_area)] {
+        for (target, offset, width) in side.hits() {
+            push_hit(hits, ctx, side_area, offset, width, target);
+        }
+    }
+    frame.render_widget(Paragraph::new(Line::from(left.spans)), left_area);
+    frame.render_widget(
+        Paragraph::new(Line::from(right.spans)).alignment(Alignment::Right),
+        right_area,
+    );
+}
+
+/// Walks [`LADDER`] until the fixed chips and the model fit, then hands the cwd
+/// whatever is left. The cwd goes last because the model names what answers you
+/// and the path is usually already in the shell prompt.
+#[cfg(test)]
+fn right_side<'a>(ctx: &'a StatusBarContext<'_>, cwd_label: &'a str, budget: usize) -> Strip<'a> {
+    right_side_animated(ctx, cwd_label, budget, None, false)
+}
+
+/// On a split footer the workflow chip and the meters belong to the live row,
+/// so the settings row fits and draws the rest alone.
+fn right_side_animated<'a>(
+    ctx: &'a StatusBarContext<'_>,
+    cwd_label: &'a str,
+    budget: usize,
+    mut marquee: Option<&mut Marquee>,
+    split: bool,
+) -> Strip<'a> {
+    let spend = SpendText::new(&ctx.stats);
+    let pair = model_pair(ctx);
+    let pair = pair.as_deref();
+    let (fit, _) = fit_right(ctx, &spend, pair, budget, split.then_some(Band::Settings));
+
+    let mut chips = Strip::default();
+    if let Some(level) = fit.thinking_label(ctx) {
+        chips.padded(
+            ctx,
+            StatusBarHitTarget::Thinking,
+            &format!(" [{level}]"),
+            control_style(ctx, StatusBarHitTarget::Thinking),
+        );
+    }
+    if ctx.fast && fit.fast {
+        chips.padded(
+            ctx,
+            StatusBarHitTarget::Fast,
+            FAST_LABEL,
+            control_style(ctx, StatusBarHitTarget::Fast),
+        );
+    }
+    if !split {
+        push_workflows(&mut chips, ctx, fit);
+    }
+    if let Some(label) = fit.yolo_label(ctx) {
+        chips.padded(ctx, StatusBarHitTarget::Yolo, label, theme::current().error);
+    }
+    if !split {
+        push_meters(&mut chips, ctx, fit, &spend);
     }
 
-    let residue = budget.saturating_sub(chips.iter().map(Span::width).sum::<usize>());
+    let residue = budget.saturating_sub(chips.width());
     let model_source = fit.model_id(ctx, pair);
     let model = if clickable(ctx, StatusBarHitTarget::Model)
         && residue >= model_floor(ctx)
@@ -1246,10 +1566,8 @@ fn right_side_animated<'a>(
             .saturating_sub(model.width())
             .saturating_sub(separator.width()),
     );
-    let cwd = if !cwd_static.is_empty()
-        && cwd_static != cwd_label
-        && ctx.hovered == Some(StatusBarHitTarget::Cwd)
-    {
+    let clipped = !cwd_static.is_empty() && cwd_static != cwd_label;
+    let cwd = if clipped && ctx.hovered == Some(StatusBarHitTarget::Cwd) {
         marquee
             .as_mut()
             .map_or(Cow::Borrowed(cwd_static), |marquee| {
@@ -1266,34 +1584,24 @@ fn right_side_animated<'a>(
     };
     let separator = if cwd.is_empty() { "" } else { separator };
 
-    let model_offset = cwd.width() + separator.width();
-    let model_width = model.width();
-    let cwd_width = cwd.width();
-    let mut spans = Vec::with_capacity(chips.len() + 3);
-    spans.push(Span::styled(cwd, theme::current().status_dim));
-    spans.push(Span::raw(separator));
-    spans.push(Span::styled(
-        model,
-        hover_style(
-            control_style(ctx, StatusBarHitTarget::Model),
-            clickable(ctx, StatusBarHitTarget::Model)
-                && ctx.hovered == Some(StatusBarHitTarget::Model),
-        ),
-    ));
-    spans.append(&mut chips);
-
-    let chips_at = model_offset + model_width;
-    let mut hits = Vec::new();
-    if cwd_static != cwd_label && !cwd_static.is_empty() {
-        hits.push((StatusBarHitTarget::Cwd, 0, cwd_width));
+    let mut side = Strip::default();
+    let cwd = Span::styled(cwd, theme::current().status_dim);
+    if clipped {
+        side.control(ctx, StatusBarHitTarget::Cwd, [cwd]);
+    } else {
+        side.push(cwd);
     }
-    hits.push((StatusBarHitTarget::Model, model_offset, model_width));
-    hits.extend(
-        chip_hits
-            .into_iter()
-            .map(|(target, offset, width)| (target, chips_at + offset, width)),
+    side.push(Span::raw(separator));
+    side.control(
+        ctx,
+        StatusBarHitTarget::Model,
+        [Span::styled(
+            model,
+            control_style(ctx, StatusBarHitTarget::Model),
+        )],
     );
-    RightSide { spans, hits }
+    side.append(chips);
+    side
 }
 
 /// Both sides drop the provider they share. Two providers stay because a model
@@ -1310,26 +1618,28 @@ fn model_pair(ctx: &StatusBarContext<'_>) -> Option<String> {
     })
 }
 
+/// Walks the rungs of `scope` until its chips fit `budget`, and says how many
+/// it took. `None` walks the whole ladder, for a footer that is one row.
 fn fit_right(
     ctx: &StatusBarContext<'_>,
     spend: &SpendText,
     pair: Option<&str>,
     budget: usize,
+    scope: Option<Band>,
 ) -> (Fit, usize) {
     let mut fit = Fit::FULL;
-    for (index, step) in LADDER.into_iter().enumerate() {
-        if fit.width(ctx, spend, pair) <= budget {
-            return (fit, index);
+    let mut rank = 0;
+    for step in LADDER
+        .into_iter()
+        .filter(|step| scope.is_none_or(|band| step.band() == band))
+    {
+        if fit.width(ctx, spend, pair, scope) <= budget {
+            return (fit, rank);
         }
         fit.apply(step);
+        rank += 1;
     }
-    (fit, LADDER.len())
-}
-
-fn right_fit_rank(ctx: &StatusBarContext<'_>, budget: usize) -> usize {
-    let spend = SpendText::new(&ctx.stats);
-    let pair = model_pair(ctx);
-    fit_right(ctx, &spend, pair.as_deref(), budget).1
+    (fit, rank)
 }
 
 /// Whether a control answers the pointer in the chat being drawn. Every
@@ -1362,10 +1672,11 @@ fn control_style(ctx: &StatusBarContext<'_>, target: StatusBarHitTarget) -> Styl
 }
 
 /// The columns the right-hand side keeps whatever the left side asks for: the
-/// model control's own floor, plus the yolo sigil a bypassed session has to
-/// carry at every width.
+/// gap that parts the two sides, the model control's own floor, plus the yolo
+/// sigil a bypassed session has to carry at every width.
 fn critical_right(ctx: &StatusBarContext<'_>) -> usize {
-    model_floor(ctx)
+    GAP.width()
+        + model_floor(ctx)
         + if ctx.yolo {
             YOLO_SHORT_LABEL.width()
         } else {
@@ -1446,10 +1757,10 @@ fn cwd_text(label: &str, budget: usize) -> &str {
         .unwrap_or_default()
 }
 
-fn status_areas(area: Rect, right_spans: &[Span<'_>]) -> [Rect; 2] {
+fn status_areas(area: Rect, right_width: usize) -> [Rect; 2] {
     Layout::horizontal([
         Constraint::Min(0),
-        Constraint::Length(right_spans.iter().map(|span| span.width() as u16).sum()),
+        Constraint::Length(u16::try_from(right_width).unwrap_or(u16::MAX)),
     ])
     .areas(area)
 }
@@ -1653,6 +1964,7 @@ fn spawn_branch_watcher(cwd: &str) -> Option<flume::Receiver<()>> {
 
 #[cfg(test)]
 mod tests {
+    use ratatui::buffer::Cell;
     use ratatui::style::Modifier;
     use std::fs;
 
@@ -1707,6 +2019,36 @@ mod tests {
     const COMPACTION_BORDER: u32 = 180_000;
     const COUNTS_GLYPHS: &str = "12k/200k (6%/90%)";
     const BARE_COUNTS_GLYPHS: &str = "12k/200k (6%)";
+    const GAUGE_COUNTS_GLYPHS: &str = "▕▌░░░░░░░░│▏ 12k/200k (6%/90%)";
+    /// Past [`HALF_WINDOW`], with the fill covering the cell the border is in.
+    const PAST_BORDER_SIZE: u32 = 120_000;
+    const HALF_WINDOW: u32 = 100_000;
+    const GAUGE_MISSING_MSG: &str = "a known window must draw its gauge";
+    const AMBER_FILL_MSG: &str = "past the border the fill must turn amber with the counter";
+    const DIM_FRAME_MSG: &str = "the frame and the track stay dim whatever the fill says";
+    const GAUGE_FIRST_MSG: &str = "the gauge must be the first thing pressure takes";
+    const UNKNOWN_WINDOW_MSG: &str = "a window of zero has nothing to fill and nothing to measure";
+    /// Where one row has long since abbreviated everything.
+    const SPLIT_BAR_WIDTH: u16 = 80;
+    const SETTINGS_ROW: u16 = 0;
+    const LIVE_ROW: u16 = 1;
+    const SPLIT_TIER_MSG: &str = "a split footer must keep every chip at its widest at 80 columns";
+    const LIVE_PRESSURE_MSG: &str = "activity on the live row must never cost a setting a column";
+    const SETTINGS_PRESSURE_MSG: &str = "a crowded settings row must never cost a meter a column";
+    const PRESSURE_PREMISE_MSG: &str = "the crowded row did not have to give anything up";
+    const MODEL_MOVED_MSG: &str = "a backoff moved the control that switches away from it";
+    const ERROR_MESSAGE: &str = "Stream error: overloaded_error (/continue resumes the turn)";
+    const ERROR_CUT_MSG: &str = "an error must be drawn whole, remedy included";
+    const ERROR_CROWDED_MSG: &str = "an error must leave the settings row as it was";
+    const HOVERED_URL: &str = "https://example.com/docs";
+    const HINT_MISSING_MSG: &str = "a hovered link must take the live row";
+    const HINT_SPREAD_MSG: &str = "a hovered link must leave the settings row as it was";
+    const ACTIVITY_MOVED_MSG: &str = "a turn starting moved a chip out from under the pointer";
+    const SPINNER_MISSING_MSG: &str = "a streaming turn must spin in the slot held open for it";
+    /// A chip's closing bracket against the model's opening one, or against
+    /// the cwd the test bar is drawn in.
+    const TOUCHING_SIDES: [&str; 2] = ["][", "]."];
+    const TOUCHING_MSG: &str = "a right side that fits exactly ran into the left side";
     const MONEY_GLYPHS: &str = "$0.25 \u{03a3}$1.5";
     const MISSING_HIT_MSG: &str = "the control was drawn without a hit";
     const FIGURE_HIT_MSG: &str = "a figure's hit must cover its glyphs and no padding";
@@ -1812,6 +2154,10 @@ mod tests {
     /// `BAR_WIDTH`, so each test names only what it actually exercises.
     struct Fixture<'a> {
         width: u16,
+        status: &'a Status,
+        context_size: u32,
+        context_window: u32,
+        compaction_border: Option<u32>,
         global_cost: Option<f64>,
         show_global: bool,
         yolo: bool,
@@ -1835,6 +2181,10 @@ mod tests {
         fn default() -> Self {
             Self {
                 width: BAR_WIDTH,
+                status: &Status::Idle,
+                context_size: CONTEXT_SIZE,
+                context_window: crate::components::TEST_CONTEXT_WINDOW,
+                compaction_border: None,
                 global_cost: None,
                 show_global: false,
                 yolo: false,
@@ -1856,77 +2206,137 @@ mod tests {
         }
     }
 
-    fn render_at(fixture: Fixture<'_>) -> (String, Vec<StatusBarHit>, Vec<Style>) {
-        let Fixture {
-            width,
-            global_cost,
-            show_global,
-            yolo,
-            fast,
-            hovered,
-            hover_hint,
-            goal,
-            active_tasks,
-            active_shells,
-            retry_info,
-            workflows,
-            main_chat,
-            model_id,
-            pending_model,
-            chat_name,
-            sandbox,
-            auto_scroll,
-        } = fixture;
+    impl<'a> Fixture<'a> {
+        fn into_ctx(self) -> StatusBarContext<'a> {
+            StatusBarContext {
+                status: self.status,
+                mode: ModeLabel {
+                    full: MODE_LABEL.into(),
+                    short: MODE_SHORT_LABEL.into(),
+                    style: Style::new(),
+                },
+                model_id: self.model_id,
+                pending_model: self.pending_model.map(Cow::Borrowed),
+                stats: UsageStats {
+                    global_cost: self.global_cost,
+                    show_global: self.show_global,
+                    ..usage(
+                        self.context_size,
+                        self.context_window,
+                        self.compaction_border,
+                    )
+                },
+                auto_scroll: self.auto_scroll,
+                chat_name: self.chat_name,
+                sandbox: self.sandbox,
+                main_chat: self.main_chat,
+                retry_info: self.retry_info,
+                thinking: Some(THINKING_LEVEL.into()),
+                fast: self.fast,
+                workflows: self.workflows,
+                yolo: self.yolo,
+                restoring: false,
+                goal: self.goal,
+                active_tasks: self.active_tasks,
+                active_shells: self.active_shells,
+                bash_input: false,
+                hovered: self.hovered,
+                hover_hint: self.hover_hint,
+            }
+        }
+    }
+
+    /// The chat's own price and no session total, which is what every test
+    /// that is not about the money wants.
+    fn usage(context_size: u32, context_window: u32, compaction_border: Option<u32>) -> UsageStats {
+        UsageStats {
+            global_cost: None,
+            global_subscription_cost: None,
+            context_size,
+            cost: Some(CHAT_COST),
+            subscription_cost: None,
+            context_window,
+            compaction_border,
+            show_global: false,
+        }
+    }
+
+    /// One frame of the footer: each row's glyphs and cell styles, and the
+    /// hits the frame recorded.
+    struct Drawn {
+        rows: Vec<String>,
+        styles: Vec<Vec<Style>>,
+        hits: Vec<StatusBarHit>,
+    }
+
+    impl Drawn {
+        fn row(&self, row: u16) -> &str {
+            &self.rows[usize::from(row)]
+        }
+
+        fn hits_on(&self, row: u16) -> Vec<StatusBarHit> {
+            self.hits
+                .iter()
+                .filter(|hit| hit.area.y == row)
+                .copied()
+                .collect()
+        }
+
+        fn hit(&self, target: StatusBarHitTarget) -> StatusBarHit {
+            *self
+                .hits
+                .iter()
+                .find(|hit| hit.target == target)
+                .expect(MISSING_HIT_MSG)
+        }
+
+        fn glyphs(&self, hit: StatusBarHit) -> String {
+            bar_glyphs(self.row(hit.area.y), &hit)
+        }
+
+        fn styles(&self, hit: StatusBarHit) -> &[Style] {
+            &self.styles[usize::from(hit.area.y)]
+                [usize::from(hit.area.x)..usize::from(hit.area.right())]
+        }
+    }
+
+    fn draw(ctx: &StatusBarContext<'_>, width: u16, rows: u16) -> Drawn {
         let mut bar = StatusBar::new(FLASH_TTL, ".", false);
         let mut terminal =
-            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 1)).unwrap();
-        let ctx = StatusBarContext {
-            status: &Status::Idle,
-            mode: ModeLabel {
-                full: MODE_LABEL.into(),
-                short: MODE_SHORT_LABEL.into(),
-                style: Style::new(),
-            },
-            model_id,
-            pending_model: pending_model.map(Cow::Borrowed),
-            stats: UsageStats {
-                global_cost,
-                global_subscription_cost: None,
-                context_size: CONTEXT_SIZE,
-                cost: Some(CHAT_COST),
-                subscription_cost: None,
-                context_window: crate::components::TEST_CONTEXT_WINDOW,
-                compaction_border: None,
-                show_global,
-            },
-            auto_scroll,
-            chat_name,
-            sandbox,
-            main_chat,
-            retry_info,
-            thinking: Some(THINKING_LEVEL.into()),
-            fast,
-            workflows,
-            yolo,
-            restoring: false,
-            goal,
-            active_tasks,
-            active_shells,
-            bash_input: false,
-            hovered,
-            hover_hint,
-        };
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, rows)).unwrap();
         let mut hits = Vec::new();
         terminal
             .draw(|f| {
-                hits = bar.view(f, f.area(), &ctx);
+                hits = bar.view(f, f.area(), ctx);
             })
             .unwrap();
         let buffer = terminal.backend().buffer();
-        let styles = (0..width)
-            .map(|column| buffer.cell((column, 0)).unwrap().style())
-            .collect();
-        (crate::components::buffer_text(buffer), hits, styles)
+        let cells = |row: u16| (0..width).filter_map(move |column| buffer.cell((column, row)));
+        Drawn {
+            rows: (0..rows)
+                .map(|row| cells(row).map(Cell::symbol).collect())
+                .collect(),
+            styles: (0..rows)
+                .map(|row| cells(row).map(Cell::style).collect())
+                .collect(),
+            hits,
+        }
+    }
+
+    fn render_at(fixture: Fixture<'_>) -> (String, Vec<StatusBarHit>, Vec<Style>) {
+        let width = fixture.width;
+        let Drawn {
+            mut rows,
+            mut styles,
+            hits,
+        } = draw(&fixture.into_ctx(), width, SINGLE_ROW);
+        (rows.swap_remove(0), hits, styles.swap_remove(0))
+    }
+
+    /// The fixture on a terminal tall enough to split the footer.
+    fn render_rows(fixture: Fixture<'_>) -> Drawn {
+        let width = fixture.width;
+        draw(&fixture.into_ctx(), width, SPLIT_ROWS)
     }
 
     fn render(global_cost: Option<f64>, show_global: bool, yolo: bool) -> String {
@@ -1995,34 +2405,33 @@ mod tests {
         Context,
     }
 
-    fn side_text(side: &RightSide<'_>) -> String {
+    fn side_text(side: &Strip<'_>) -> String {
         side.spans
             .iter()
             .map(|span| span.content.as_ref())
             .collect()
     }
 
-    fn side_hit(side: &RightSide<'_>, target: StatusBarHitTarget) -> Option<(usize, usize)> {
-        side.hits
-            .iter()
+    fn side_hit(side: &Strip<'_>, target: StatusBarHitTarget) -> Option<(usize, usize)> {
+        side.hits()
             .find(|(hit, _, _)| *hit == target)
-            .map(|(_, offset, width)| (*offset, *width))
+            .map(|(_, offset, width)| (offset, width))
     }
 
     /// The glyphs a hit claims, read back out of the spans it was measured on.
-    fn hit_glyphs(side: &RightSide<'_>, target: StatusBarHitTarget) -> String {
+    fn hit_glyphs(side: &Strip<'_>, target: StatusBarHitTarget) -> String {
         drawn_glyphs(side, target).expect(MISSING_HIT_MSG)
     }
 
     /// The same, for a control the bar is free to have dropped entirely.
-    fn drawn_glyphs(side: &RightSide<'_>, target: StatusBarHitTarget) -> Option<String> {
+    fn drawn_glyphs(side: &Strip<'_>, target: StatusBarHitTarget) -> Option<String> {
         let (offset, width) = side_hit(side, target)?;
         Some(side_text(side).chars().skip(offset).take(width).collect())
     }
 
     /// Reads the drawn glyphs rather than the [`Fit`], so a tier that measures
     /// one way and draws another still counts as absent.
-    fn visible_chips(side: &RightSide<'_>) -> Vec<Chip> {
+    fn visible_chips(side: &Strip<'_>) -> Vec<Chip> {
         let text = side_text(side);
         [
             Chip::Thinking,
@@ -2189,8 +2598,9 @@ mod tests {
 
     /// Both figures open a view, so each needs a target of its own measured on
     /// the glyphs alone. Padding inside a hit would hand clicks on empty
-    /// columns to a modal.
-    #[test_case(StatusBarHitTarget::Context, COUNTS_GLYPHS ; "counter_opens_context")]
+    /// columns to a modal. The gauge draws the counter a second time, so the
+    /// two are one control.
+    #[test_case(StatusBarHitTarget::Context, GAUGE_COUNTS_GLYPHS ; "gauge_and_counter_open_context")]
     #[test_case(StatusBarHitTarget::Usage, MONEY_GLYPHS    ; "money_opens_usage")]
     #[test_case(StatusBarHitTarget::Workflows, LADDER_WORKFLOW_CHIP ; "workflow_chip_opens_runs")]
     fn a_figure_is_hit_on_its_own_glyphs(target: StatusBarHitTarget, expected: &str) {
@@ -2252,20 +2662,380 @@ mod tests {
         });
     }
 
+    /// The gauge draws the counter a second time, so it goes before anything
+    /// that only one chip says, on the live row and on a one-row footer alike.
+    #[test_case(Some(Band::Live) ; "live_row")]
+    #[test_case(None             ; "one_row")]
+    fn the_gauge_is_the_first_thing_pressure_takes(scope: Option<Band>) {
+        with_ladder_ctx(|ctx| {
+            let spend = SpendText::new(&ctx.stats);
+            let full_width = Fit::FULL.width(ctx, &spend, None, scope);
+            let (fit, _) = fit_right(ctx, &spend, None, full_width - 1, scope);
+
+            assert_eq!(
+                fit,
+                Fit {
+                    context: ContextTier::Counts,
+                    ..Fit::FULL
+                },
+                "{GAUGE_FIRST_MSG}"
+            );
+        });
+    }
+
     #[test]
     fn provider_is_the_first_full_tier_to_go() {
         with_ladder_ctx(|ctx| {
             let spend = SpendText::new(&ctx.stats);
-            let full_width = Fit::FULL.width(ctx, &spend, None);
-            let (fit, reductions) = fit_right(ctx, &spend, None, full_width - 1);
+            let counts = Fit {
+                context: ContextTier::Counts,
+                ..Fit::FULL
+            };
+            let counts_width = counts.width(ctx, &spend, None, None);
+            let (fit, _) = fit_right(ctx, &spend, None, counts_width - 1, None);
 
-            assert_eq!(reductions, 1);
-            assert_eq!(fit.model, ModelTier::Leaf);
-            assert_eq!(fit.global_spend, Fit::FULL.global_spend);
-            assert_eq!(fit.context, Fit::FULL.context);
-            assert_eq!(fit.workflows, Fit::FULL.workflows);
-            assert_eq!(fit.yolo, Fit::FULL.yolo);
+            assert_eq!(
+                fit,
+                Fit {
+                    model: ModelTier::Leaf,
+                    ..counts
+                }
+            );
         });
+    }
+
+    #[test_case(0       => "▕░░░░░░░░░░▏" ; "an_empty_window")]
+    #[test_case(12_000  => "▕▌░░░░░░░░░▏" ; "a_sliver_rounds_down_to_its_eighths")]
+    #[test_case(25_000  => "▕█▎░░░░░░░░▏" ; "a_cell_and_a_quarter")]
+    #[test_case(100_000 => "▕█████░░░░░▏" ; "half_the_window")]
+    #[test_case(199_999 => "▕█████████▉▏" ; "a_token_short_of_full")]
+    #[test_case(200_000 => "▕██████████▏" ; "a_full_window")]
+    #[test_case(300_000 => "▕██████████▏" ; "an_overfull_window_stays_full")]
+    fn the_gauge_fills_in_eighths(context_size: u32) -> String {
+        gauge_glyphs(context_size, None)
+    }
+
+    /// The tick marks the cell auto-compaction fires in for as long as the
+    /// fill has not entered it.
+    #[test_case(12_000,  COMPACTION_BORDER => "▕▌░░░░░░░░│▏" ; "the_default_border")]
+    #[test_case(12_000,  20_000            => "▕▌│░░░░░░░░▏" ; "the_cell_after_the_fill")]
+    #[test_case(180_000, COMPACTION_BORDER => "▕█████████│▏" ; "a_fill_that_just_reached_it")]
+    #[test_case(12_000,  10_000            => "▕▌░░░░░░░░░▏" ; "a_border_inside_the_last_filled_cell")]
+    #[test_case(190_000, COMPACTION_BORDER => "▕█████████▌▏" ; "a_fill_past_it")]
+    fn the_gauge_marks_the_compaction_border(context_size: u32, border: u32) -> String {
+        gauge_glyphs(context_size, Some(border))
+    }
+
+    fn gauge_glyphs(context_size: u32, compaction_border: Option<u32>) -> String {
+        let stats = usage(
+            context_size,
+            crate::components::TEST_CONTEXT_WINDOW,
+            compaction_border,
+        );
+        Gauge::new(&stats)
+            .expect(GAUGE_MISSING_MSG)
+            .spans(Style::new())
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
+    }
+
+    /// The fill turns amber with the counter it draws, and the frame and the
+    /// track stay dim, so the fill is what catches the eye.
+    #[test]
+    fn a_gauge_past_the_border_turns_amber() {
+        let drawn = render_rows(Fixture {
+            context_size: PAST_BORDER_SIZE,
+            compaction_border: Some(HALF_WINDOW),
+            ..Default::default()
+        });
+        let hit = drawn.hit(StatusBarHitTarget::Context);
+        let glyphs = drawn.glyphs(hit);
+        let colour = |glyph: char| {
+            let column = glyphs
+                .chars()
+                .position(|drawn| drawn == glyph)
+                .expect(GAUGE_MISSING_MSG);
+            drawn.styles(hit)[column].fg
+        };
+        let theme = theme::current();
+
+        assert_eq!(
+            colour(FULL_CELL),
+            theme.todo_in_progress.fg,
+            "{AMBER_FILL_MSG}"
+        );
+        for dim in [EMPTY_CELL, GAUGE_OPEN.chars().next().unwrap()] {
+            assert_eq!(colour(dim), theme.status_dim.fg, "{DIM_FRAME_MSG}");
+        }
+    }
+
+    /// Without a window there is nothing to fill, and the gauge measures as
+    /// nothing too, so the ladder never budgets columns nobody draws on.
+    #[test]
+    fn an_unknown_window_draws_no_gauge() {
+        let fixture = || Fixture {
+            context_window: 0,
+            ..Default::default()
+        };
+        let ctx = fixture().into_ctx();
+        let spend = SpendText::new(&ctx.stats);
+        let counts = Fit {
+            context: ContextTier::Counts,
+            ..Fit::FULL
+        };
+
+        assert_eq!(
+            Fit::FULL.width(&ctx, &spend, None, Some(Band::Live)),
+            counts.width(&ctx, &spend, None, Some(Band::Live)),
+            "{UNKNOWN_WINDOW_MSG}"
+        );
+        let drawn = render_rows(fixture());
+        assert!(
+            !drawn.row(LIVE_ROW).contains(GAUGE_OPEN),
+            "{UNKNOWN_WINDOW_MSG}: {}",
+            drawn.row(LIVE_ROW)
+        );
+    }
+
+    /// At 80 columns a single row has shed most of its tiers. Split, each row
+    /// only has its own chips to fit, and every one of them fits whole.
+    #[test]
+    fn a_split_footer_keeps_every_chip_at_eighty_columns() {
+        with_ladder_ctx(|ctx| {
+            let drawn = draw(ctx, SPLIT_BAR_WIDTH, SPLIT_ROWS);
+            for (row, chips) in [
+                (
+                    SETTINGS_ROW,
+                    [
+                        MODE_LABEL,
+                        LADDER_MODEL_ID,
+                        FULL_THINKING_CHIP,
+                        FAST_LABEL.trim(),
+                        YOLO_LABEL.trim(),
+                    ]
+                    .as_slice(),
+                ),
+                (
+                    LIVE_ROW,
+                    [LADDER_WORKFLOW_CHIP, GAUGE_COUNTS_GLYPHS, MONEY_GLYPHS].as_slice(),
+                ),
+            ] {
+                for chip in chips {
+                    assert!(
+                        drawn.row(row).contains(chip),
+                        "{SPLIT_TIER_MSG}: {chip} missing from {}",
+                        drawn.row(row)
+                    );
+                }
+            }
+        });
+    }
+
+    /// A turn's worth of activity and a paused transcript crowd the live row
+    /// until its meters give way, and the settings row keeps every column.
+    #[test]
+    fn live_pressure_never_shortens_a_setting() {
+        let goal = active_goal();
+        let quiet = render_rows(Fixture {
+            width: SPLIT_BAR_WIDTH,
+            ..Default::default()
+        });
+        let busy = render_rows(Fixture {
+            width: SPLIT_BAR_WIDTH,
+            goal: Some(&goal),
+            active_tasks: 1,
+            active_shells: 1,
+            workflows: ladder_workflows(),
+            auto_scroll: false,
+            ..Default::default()
+        });
+
+        assert!(
+            quiet.row(LIVE_ROW).contains(GAUGE_OPEN) && !busy.row(LIVE_ROW).contains(GAUGE_OPEN),
+            "{PRESSURE_PREMISE_MSG}: {}",
+            busy.row(LIVE_ROW)
+        );
+        assert_eq!(
+            busy.row(SETTINGS_ROW),
+            quiet.row(SETTINGS_ROW),
+            "{LIVE_PRESSURE_MSG}"
+        );
+        assert_eq!(
+            busy.hits_on(SETTINGS_ROW),
+            quiet.hits_on(SETTINGS_ROW),
+            "{LIVE_PRESSURE_MSG}"
+        );
+    }
+
+    /// A long sandbox and chat name squeeze the settings row down to the
+    /// model's floor, and the live row keeps every meter it had.
+    #[test]
+    fn settings_pressure_never_compacts_a_meter() {
+        let quiet = render_rows(Fixture {
+            width: SPLIT_BAR_WIDTH,
+            ..Default::default()
+        });
+        let crowded = render_rows(Fixture {
+            width: SPLIT_BAR_WIDTH,
+            model_id: LADDER_MODEL_ID,
+            sandbox: Some(LONG_SANDBOX_NAME),
+            chat_name: Some(LONG_SANDBOX_NAME),
+            fast: true,
+            yolo: true,
+            ..Default::default()
+        });
+
+        assert!(
+            !crowded.row(SETTINGS_ROW).contains(LADDER_MODEL_ID),
+            "{PRESSURE_PREMISE_MSG}: {}",
+            crowded.row(SETTINGS_ROW)
+        );
+        assert_eq!(
+            crowded.row(LIVE_ROW),
+            quiet.row(LIVE_ROW),
+            "{SETTINGS_PRESSURE_MSG}"
+        );
+        assert_eq!(
+            crowded.hits_on(LIVE_ROW),
+            quiet.hits_on(LIVE_ROW),
+            "{SETTINGS_PRESSURE_MSG}"
+        );
+    }
+
+    /// A backoff is when switching models matters most, so the control that
+    /// does it stays exactly where it was while the countdown runs.
+    #[test]
+    fn a_retry_never_moves_the_model_control() {
+        let retry = RetryInfo {
+            attempt: RETRY_ATTEMPT,
+            message: RETRY_MESSAGE.into(),
+            deadline: Instant::now() + RETRY_REMAINING,
+        };
+        let settled = render_rows(Fixture {
+            width: SPLIT_BAR_WIDTH,
+            ..Default::default()
+        });
+        let backing_off = render_rows(Fixture {
+            width: SPLIT_BAR_WIDTH,
+            retry_info: Some(&retry),
+            ..Default::default()
+        });
+
+        assert_eq!(
+            backing_off.hit(StatusBarHitTarget::Model),
+            settled.hit(StatusBarHitTarget::Model),
+            "{MODEL_MOVED_MSG}"
+        );
+    }
+
+    /// An error ends in the remedy that clears it, so it is never cut short,
+    /// and the columns it takes come out of the live row alone.
+    #[test]
+    fn an_error_leaves_the_settings_row_whole() {
+        let status = Status::error(ERROR_MESSAGE.into());
+        let idle = render_rows(Fixture {
+            width: SPLIT_BAR_WIDTH,
+            ..Default::default()
+        });
+        let failed = render_rows(Fixture {
+            width: SPLIT_BAR_WIDTH,
+            status: &status,
+            ..Default::default()
+        });
+
+        assert!(
+            failed.row(LIVE_ROW).contains(ERROR_MESSAGE),
+            "{ERROR_CUT_MSG}: {}",
+            failed.row(LIVE_ROW)
+        );
+        assert_eq!(
+            failed.row(SETTINGS_ROW),
+            idle.row(SETTINGS_ROW),
+            "{ERROR_CROWDED_MSG}"
+        );
+        assert_eq!(
+            failed.hits_on(SETTINGS_ROW),
+            idle.hits_on(SETTINGS_ROW),
+            "{ERROR_CROWDED_MSG}"
+        );
+    }
+
+    #[test]
+    fn a_hovered_link_takes_the_live_row_only() {
+        let plain = render_rows(Fixture::default());
+        let hovering = render_rows(Fixture {
+            hover_hint: Some(HOVERED_URL),
+            ..Default::default()
+        });
+
+        assert_eq!(
+            hovering.row(LIVE_ROW).trim(),
+            HOVERED_URL,
+            "{HINT_MISSING_MSG}"
+        );
+        assert!(hovering.hits_on(LIVE_ROW).is_empty(), "{HINT_MISSING_MSG}");
+        assert_eq!(
+            hovering.row(SETTINGS_ROW),
+            plain.row(SETTINGS_ROW),
+            "{HINT_SPREAD_MSG}"
+        );
+        assert_eq!(
+            hovering.hits_on(SETTINGS_ROW),
+            plain.hits_on(SETTINGS_ROW),
+            "{HINT_SPREAD_MSG}"
+        );
+    }
+
+    /// The spinner's slot is held open while nothing spins, so a chip under
+    /// the pointer stays under it when a turn starts or ends.
+    #[test]
+    fn activity_chips_stay_put_when_a_turn_starts() {
+        let idle = render_rows(Fixture {
+            active_tasks: 1,
+            ..Default::default()
+        });
+        let streaming = render_rows(Fixture {
+            status: &Status::Streaming,
+            active_tasks: 1,
+            ..Default::default()
+        });
+
+        assert_ne!(
+            streaming.row(LIVE_ROW),
+            idle.row(LIVE_ROW),
+            "{SPINNER_MISSING_MSG}"
+        );
+        assert_eq!(
+            streaming.hit(StatusBarHitTarget::Tasks),
+            idle.hit(StatusBarHitTarget::Tasks),
+            "{ACTIVITY_MOVED_MSG}"
+        );
+    }
+
+    /// The cwd and the model carry no padding of their own, so wherever the
+    /// right side fits exactly it would run into the last chip on the left
+    /// unless the row holds a gap back for it.
+    #[test_case(SINGLE_ROW ; "one_row")]
+    #[test_case(SPLIT_ROWS ; "split")]
+    fn the_right_side_never_runs_into_the_left(rows: u16) {
+        for width in 1..=BAR_WIDTH {
+            let ctx = Fixture {
+                width,
+                sandbox: Some(SANDBOX_NAME),
+                active_tasks: 1,
+                active_shells: 1,
+                yolo: true,
+                ..Default::default()
+            }
+            .into_ctx();
+            for row in draw(&ctx, width, rows).rows {
+                assert!(
+                    TOUCHING_SIDES.iter().all(|touch| !row.contains(touch)),
+                    "{TOUCHING_MSG} at {width}: {row}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -2671,13 +3441,12 @@ mod tests {
 
     #[test]
     fn hovered_url_replaces_status_content() {
-        const URL: &str = "https://example.com/docs";
         let (text, hits, _) = render_at(Fixture {
-            hover_hint: Some(URL),
+            hover_hint: Some(HOVERED_URL),
             ..Default::default()
         });
 
-        assert!(text.trim_start().starts_with(URL));
+        assert!(text.trim_start().starts_with(HOVERED_URL));
         assert!(hits.is_empty());
     }
 
@@ -3185,10 +3954,10 @@ mod tests {
     /// bar too narrow drops it rather than crowding the mode and model controls
     /// the rest of the footer is built around.
     #[test_case(12,        None                    ; "no_room_beside_the_model")]
-    #[test_case(29,        None                    ; "too_narrow_for_the_bare_name")]
-    #[test_case(30,        Some(SANDBOX_BARE_CHIP) ; "bare_name_exactly_fits")]
-    #[test_case(38,        Some(SANDBOX_BARE_CHIP) ; "word_dropped_for_the_name")]
-    #[test_case(39,        Some(SANDBOX_CHIP)      ; "named_in_full_exactly_fits")]
+    #[test_case(30,        None                    ; "too_narrow_for_the_bare_name")]
+    #[test_case(31,        Some(SANDBOX_BARE_CHIP) ; "bare_name_exactly_fits")]
+    #[test_case(39,        Some(SANDBOX_BARE_CHIP) ; "word_dropped_for_the_name")]
+    #[test_case(40,        Some(SANDBOX_CHIP)      ; "named_in_full_exactly_fits")]
     #[test_case(BAR_WIDTH, Some(SANDBOX_CHIP)      ; "wide")]
     fn a_narrow_bar_squeezes_the_sandbox_chip_before_dropping_it(
         width: u16,

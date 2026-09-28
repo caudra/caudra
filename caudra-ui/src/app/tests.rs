@@ -13458,9 +13458,11 @@ fn relocation_custom_destination_paste_reaches_confirmation(
                 app.update(Msg::Key(kb::RELOCATION_USAGE.to_key_event()))
                     .is_empty()
             );
-            assert!(app.update(Msg::Key(key(KeyCode::Down))).is_empty());
         }
         assert!(rendered(&mut app).contains(&format!("[ ] {RELOCATION_PROJECT_USAGE}")));
+        if !mouse {
+            assert!(app.update(Msg::Key(key(KeyCode::Down))).is_empty());
+        }
     }
     let actions = if mouse {
         let (row, column) = screen_hit(&mut app, RELOCATION_CONFIRM);
@@ -18532,16 +18534,36 @@ fn non_below_split_reserves_band_and_keeps_status_aligned(dir: caudra_lua::Split
         msg_after.area() < msg_before.area(),
         "chat must shrink to make room for the split",
     );
+    let footer_rows = crate::components::status_bar::height(TEST_AREA.height);
     assert_eq!(
         status_after,
         super::view::main_content_area(Rect::new(
             TEST_AREA.x,
-            TEST_AREA.bottom() - 1,
+            TEST_AREA.bottom() - footer_rows,
             TEST_AREA.width,
-            1,
+            footer_rows,
         )),
         "status bar stays aligned to the main gutter regardless of the split",
     );
+}
+
+/// Too short to spare a transcript row for a second footer row.
+const SHORT_TERMINAL_ROWS: u16 = 12;
+const FOOTER_EDGE_MSG: &str = "the footer must sit on the terminal's bottom edge";
+
+/// Only the terminal's height picks the footer's rows, so nothing the footer
+/// shows can move the composer above it.
+#[test_case(TEST_AREA.height    => 2 ; "a_tall_terminal_splits_it")]
+#[test_case(SHORT_TERMINAL_ROWS => 1 ; "a_short_terminal_keeps_one_row")]
+fn the_footer_takes_two_rows_unless_the_terminal_is_short(rows: u16) -> u16 {
+    let area = Rect {
+        height: rows,
+        ..TEST_AREA
+    };
+    let (_msg, _bottom, status, _input, _splits) = test_app().layout_geometry(area);
+
+    assert_eq!(status.bottom(), area.bottom(), "{FOOTER_EDGE_MSG}");
+    status.height
 }
 
 #[test]
