@@ -1850,6 +1850,7 @@ mod tests {
     const PROMPT: &str = "Investigate independently and report the findings.";
     const RESULT: &str = "Verified the relevant code in src/lib.rs:1.";
     const REPORT: &str = "Important finding in src/lib.rs:1.";
+    const REPORT_TITLE: &str = "Source finding";
     const BLOCKER: &str = "Missing required authority; explicit user approval is needed.";
     const SUCCEEDED: &str = "succeeded";
     const BLOCKED: &str = "blocked";
@@ -2949,12 +2950,16 @@ mod tests {
         }
     }
 
-    fn report_response(blocked: bool) -> StreamResponse {
+    fn report_response(blocked: bool, title: Option<&str>) -> StreamResponse {
+        let mut input = json!({"message":if blocked { BLOCKER } else { REPORT },"blocked":blocked});
+        if let Some(title) = title {
+            input["title"] = title.into();
+        }
         response(
             vec![ContentBlock::ToolUse {
                 id: "report-call".into(),
                 name: "report_to_parent".into(),
-                input: json!({"message":if blocked { BLOCKER } else { REPORT },"blocked":blocked}),
+                input,
                 thought_signature: None,
             }],
             StopReason::ToolUse,
@@ -3053,9 +3058,11 @@ mod tests {
         });
     }
 
-    #[test_case(false; "intermediate_report_keeps_child_running")]
-    #[test_case(true; "blocked_report_bypasses_success_schema")]
-    fn reports_are_one_way_and_blocking_is_terminal(blocked: bool) {
+    #[test_case(false, None; "intermediate_report_keeps_child_running")]
+    #[test_case(true, None; "blocked_report_bypasses_success_schema")]
+    #[test_case(false, Some(REPORT_TITLE); "titled_report_keeps_child_running")]
+    #[test_case(true, Some(REPORT_TITLE); "titled_blocker_bypasses_success_schema")]
+    fn reports_are_one_way_and_blocking_is_terminal(blocked: bool, title: Option<&str>) {
         smol::block_on(async {
             let fixture = Fixture::new().await;
             let mut task = request(TASK);
@@ -3068,7 +3075,10 @@ mod tests {
                 .await
                 .unwrap();
             fixture.started.recv_async().await.unwrap();
-            fixture.responses.send(report_response(blocked)).unwrap();
+            fixture
+                .responses
+                .send(report_response(blocked, title))
+                .unwrap();
             if blocked {
                 fixture.settled().await;
             } else {
@@ -3092,6 +3102,7 @@ mod tests {
                 })
                 .collect::<String>();
             assert!(text.contains(if blocked { BLOCKER } else { REPORT }));
+            assert!(!text.contains(REPORT_TITLE));
             assert!(!text.contains("tool_output"));
             assert!(!text.contains(&reports[0].invocation_id));
             assert!(!text.contains(&reports[0].event_id));
@@ -3117,7 +3128,10 @@ mod tests {
         smol::block_on(async {
             let fixture = Fixture::new().await;
             fixture.launch().await;
-            fixture.responses.send(report_response(false)).unwrap();
+            fixture
+                .responses
+                .send(report_response(false, None))
+                .unwrap();
             fixture.started.recv_async().await.unwrap();
             fixture.open_receipt().await;
             assert!(fixture.tasks.has_pending());
@@ -3716,7 +3730,7 @@ mod tests {
                 .await
                 .unwrap();
             assert!(reporter.blocked.load(Ordering::Acquire));
-            fixture.responses.send(report_response(true)).unwrap();
+            fixture.responses.send(report_response(true, None)).unwrap();
             fixture.settled().await;
             assert_eq!(
                 fixture.tasks.status(&fixture.task_id()).unwrap().state,

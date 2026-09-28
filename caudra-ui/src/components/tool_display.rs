@@ -48,6 +48,9 @@ use serde_json::Value;
 use crate::render_worker::RenderWorker;
 
 const JSON_ESCAPE_CHARS: usize = 6;
+const REPORT_TOOL_NAME: &str = "report_to_parent";
+const REPORT_BLOCKED: &str = "Blocked";
+const REPORT_TITLE_MAX_CHARS: usize = 80;
 
 pub(crate) fn task_details(task: &TaskCard) -> String {
     let mut lines = Vec::new();
@@ -469,6 +472,7 @@ const BATCH: Inflection = ("Batch", "Batching", "Batched");
 const UPDATE: Inflection = ("Update", "Updating", "Updated");
 const LOAD: Inflection = ("Load", "Loading", "Loaded");
 const ASK: Inflection = ("Ask", "Asking", "Asked");
+const REPORT: Inflection = ("Report", "Reporting", "Reported");
 const VIEW: Inflection = ("View", "Viewing", "Viewed");
 const DRAW: Inflection = ("Generate image", "Generating image", "Generated image");
 /// A store reached by sub-command. The verb is the `command` argument, which
@@ -523,6 +527,12 @@ const COMPACT_TOOLS: &[(&str, CompactTool)] = &[
     tool_row("todo_write", '✓', UPDATE, &["todos"]),
     tool_row("skill", '→', LOAD, &["name"]),
     tool_row("question", '?', ASK, &["questions"]),
+    tool_row(
+        REPORT_TOOL_NAME,
+        '↑',
+        REPORT,
+        &["title", "message", "blocked"],
+    ),
     // `command` is folded by name rather than left to the containment check,
     // because the header spells the verb in a tense the argument never had.
     tool_row("memory", '▤', MEMORY, &["content", "command", "path"]),
@@ -832,6 +842,72 @@ pub(super) fn inflected_header<'a>(tool: &str, header: &'a str, tense: Tense) ->
         true => Cow::Borrowed(conjugated),
         false => Cow::Owned(format!("{conjugated} {rest}")),
     }
+}
+
+pub(super) fn report_header<'a>(
+    tool: &str,
+    header: &'a str,
+    raw_input: Option<&Value>,
+) -> Cow<'a, str> {
+    if !names_tool(REPORT_TOOL_NAME, tool) {
+        return Cow::Borrowed(header);
+    }
+    let first_line = |text: &str| {
+        text.lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty())
+            .map(|line| {
+                let mut title = escape_terminal_controls(line);
+                if let Some((cut, _)) = title.char_indices().nth(REPORT_TITLE_MAX_CHARS) {
+                    title.truncate(cut);
+                    title.push(ELLIPSIS);
+                }
+                title
+            })
+    };
+    let title = raw_input
+        .and_then(|input| input.get("title"))
+        .and_then(Value::as_str)
+        .and_then(first_line)
+        .or_else(|| report_message(tool, raw_input).and_then(first_line))
+        .or_else(|| {
+            if names_tool(REPORT_TOOL_NAME, header.trim()) {
+                None
+            } else {
+                first_line(header)
+            }
+        })
+        .unwrap_or_default();
+    let blocked = raw_input
+        .and_then(|input| input.get("blocked"))
+        .and_then(Value::as_bool);
+    Cow::Owned(match blocked {
+        Some(true) if title.is_empty() => REPORT_BLOCKED.to_owned(),
+        Some(true) => format!("{REPORT_BLOCKED}{ACTIVITY_SEPARATOR}{title}"),
+        _ => title,
+    })
+}
+
+pub(super) fn report_message<'a>(tool: &str, raw_input: Option<&'a Value>) -> Option<&'a str> {
+    if !names_tool(REPORT_TOOL_NAME, tool) {
+        return None;
+    }
+    raw_input?
+        .get("message")?
+        .as_str()
+        .filter(|message| !message.trim().is_empty())
+}
+
+pub(super) fn report_markdown(message: &str) -> String {
+    let mut markdown = String::with_capacity(message.len());
+    for character in message.replace("\r\n", "\n").chars() {
+        if character.is_control() && !matches!(character, '\n' | '\t') {
+            markdown.extend(character.escape_default());
+        } else {
+            markdown.push(character);
+        }
+    }
+    markdown
 }
 
 /// How a tool introduces itself on a one-line row. A name the table has never
@@ -2380,6 +2456,9 @@ pub fn build_tool_lines(
     if expansion.is_some() && matches!(msg.tool_output.as_deref(), Some(ToolOutput::Tasks(_))) {
         header = "";
     }
+    let report_title = report_header(tool_name, header, msg.tool_raw_input.as_deref());
+    let header = report_title.as_ref();
+    let is_report = names_tool(REPORT_TOOL_NAME, tool_name);
     let expanded = expansion.unwrap_or_default();
     // The card's own record of what is running, until a snapshot supersedes
     // it. Resolved before the header, which defers to it.
@@ -2434,7 +2513,7 @@ pub fn build_tool_lines(
             tool_name,
             shown,
             annotation,
-            msg.render_header.as_ref(),
+            msg.render_header.as_ref().filter(|_| !is_report),
             msg.tool_output.as_deref(),
             msg.tool_raw_input.as_deref(),
         );
@@ -2471,6 +2550,7 @@ pub fn build_tool_lines(
         // Nothing is drawn below the header, but the reader still needs a
         // click target whenever there is something to reveal.
         b.truncation = msg.render_snapshot.is_some()
+            || report_message(tool_name, msg.tool_raw_input.as_deref()).is_some()
             || msg.tool_input.is_some()
             || msg.tool_output.is_some()
             || msg.live_body.is_some()
@@ -2483,6 +2563,35 @@ pub fn build_tool_lines(
             msg.tool_output.clone(),
             TOOL_BODY_INDENT,
         );
+    }
+    if is_report {
+        if let Some(message) = report_message(tool_name, msg.tool_raw_input.as_deref()) {
+            let start = b.lines.len();
+            let (lines, source, links) =
+                code_view::markdown_body(&report_markdown(message), b.body_width());
+            b.lines.extend(indented(lines, TOOL_BODY_INDENT));
+            b.source.record(start, source.indented());
+            for (index, mut row) in links.rows.into_iter().enumerate() {
+                row.insert(0, None);
+                b.link_rows.push((start + index, row));
+            }
+            b.content_range = (start, b.lines.len());
+            b.push_search_text(message);
+        }
+        let resolved = resolve_output(
+            msg.tool_output.as_deref(),
+            body,
+            msg.live_output.as_deref(),
+            msg.truncated_lines,
+            RenderLimits {
+                budget: usize::MAX,
+                scroll: None,
+                ..b.limits.clone()
+            },
+            false,
+        );
+        b.push_resolved_output(&resolved);
+        return b.finish(None, None, TOOL_BODY_INDENT);
     }
     match live {
         Some(live) if draws_live_script(tool_name) => b.push_live_script(live),
@@ -2834,6 +2943,8 @@ mod tests {
     const TOL: ToolOutputLines = ToolOutputLines::DEFAULT;
     use crate::components::{DisplayRole, ToolRole};
     use crate::markdown::{TRUNCATION_PREFIX, truncate_output};
+    use crate::provenance::Provenance;
+    use crate::selection::ScreenSelection;
     use caudra_agent::tools::{
         BATCH_TOOL_NAME, FILE_GREP_TOOL_NAME, FILE_READ_TOOL_NAME, SHELL_TOOL_NAME, TASK_TOOL_NAME,
         ToolEffect,
@@ -3164,6 +3275,337 @@ mod tests {
             &test_rctx(80),
             Some(Disclosure::default()),
         ))
+    }
+
+    const REPORT_TITLE: &str = "Validation finding";
+    const REPORT_MESSAGE: &str = "\n\n# Finding\n\nThe **important** detail.\n\nLast report line.";
+    const REPORT_ACK: &str = "Report durably recorded; no reply is expected.";
+    const REPORT_ERROR: &str = "Report could not be recorded.";
+    const REPORT_COPY_MESSAGE: &str = "# Finding\n\n- **Important** detail\n\n```rust\nlet ready = true;\n```\n\nAfter the fence.";
+
+    fn report_msg(status: ToolStatus, raw_input: Option<Value>) -> DisplayMessage {
+        DisplayMessage {
+            role: DisplayRole::Tool(Box::new(ToolRole {
+                id: "report".into(),
+                effect: ToolEffect::Unknown,
+                status,
+                name: REPORT_TOOL_NAME.into(),
+            })),
+            tool_raw_input: raw_input.map(Arc::new),
+            ..bash_msg(
+                REPORT_TOOL_NAME,
+                status,
+                None,
+                match status {
+                    ToolStatus::Success => Some(ToolOutput::Plain(REPORT_ACK.into())),
+                    ToolStatus::Error => Some(ToolOutput::Plain(REPORT_ERROR.into())),
+                    ToolStatus::InProgress => None,
+                },
+            )
+        }
+    }
+
+    fn opened_report_card(
+        raw: Value,
+        batch: bool,
+        compact: bool,
+        width: u16,
+    ) -> (Vec<Line<'static>>, Option<BodySource>) {
+        if batch {
+            let output = ToolOutput::Batch {
+                entries: vec![BatchToolEntry {
+                    model_suffix: None,
+                    tool: REPORT_TOOL_NAME.into(),
+                    effect: ToolEffect::Unknown,
+                    summary: REPORT_TOOL_NAME.into(),
+                    status: BatchToolStatus::Success,
+                    input: None,
+                    raw_input: Some(raw),
+                    output: Some(ToolOutput::Plain(REPORT_ACK.into())),
+                    annotation: None,
+                }],
+                text: String::new(),
+            };
+            let content = code_view::render_tool_content(
+                None,
+                Some(&output),
+                false,
+                RenderLimits::new(true, usize::MAX, BatchViews::new([0]), TOL)
+                    .with_width(width)
+                    .with_policy(
+                        CardPolicy {
+                            compact,
+                            ..CardPolicy::default()
+                        },
+                        Arc::default(),
+                    ),
+            );
+            (content.lines, content.source)
+        } else {
+            let card = build_tool_lines(
+                &report_msg(ToolStatus::Success, Some(raw)),
+                ToolStatus::Success,
+                &RenderCtx {
+                    compact,
+                    ..test_rctx(width)
+                },
+                Some(exp(true)),
+            );
+            (card.lines, card.source)
+        }
+    }
+
+    #[test_case(false, false, 24; "standalone_narrow_lf")]
+    #[test_case(false, true, 24; "standalone_narrow_crlf")]
+    #[test_case(false, false, UNBROKEN; "standalone_wide_lf")]
+    #[test_case(false, true, UNBROKEN; "standalone_wide_crlf")]
+    #[test_case(true, false, 24; "batch_narrow_lf")]
+    #[test_case(true, true, 24; "batch_narrow_crlf")]
+    #[test_case(true, false, UNBROKEN; "batch_wide_lf")]
+    #[test_case(true, true, UNBROKEN; "batch_wide_crlf")]
+    fn report_cards_copy_markdown_source(batch: bool, crlf: bool, width: u16) {
+        let message = if crlf {
+            REPORT_COPY_MESSAGE.replace('\n', "\r\n")
+        } else {
+            REPORT_COPY_MESSAGE.to_owned()
+        };
+        for compact in [false, true] {
+            let (lines, source) = opened_report_card(
+                serde_json::json!({
+                    "title": REPORT_TITLE,
+                    "message": message,
+                }),
+                batch,
+                compact,
+                width,
+            );
+            let source = source.expect("report source provenance");
+            assert!(source.text.contains(REPORT_COPY_MESSAGE), "{}", source.text);
+            assert_eq!(source.rows.len(), lines.len());
+            for (row, line) in source.rows.iter().zip(&lines) {
+                assert_eq!(row.spans.len(), line.spans.len());
+            }
+            let selection = ScreenSelection {
+                start_row: 0,
+                start_col: 0,
+                end_row: lines.len() as u16 - 1,
+                end_col: width - 1,
+            };
+            let copied = Provenance::new(source.text.into(), source.rows)
+                .extract(&lines, width, &selection, 0, lines.len() as u16)
+                .expect("report selection uses source");
+            for fragment in [
+                "# Finding",
+                "**Important**",
+                "```rust",
+                "let ready = true;",
+                "After the fence.",
+                REPORT_ACK,
+            ] {
+                assert!(copied.contains(fragment), "{copied}");
+            }
+            assert!(!copied.contains("\\r"), "{copied}");
+            let drawn = lines.iter().map(line_text).collect::<String>();
+            assert!(!drawn.contains("```"), "{drawn}");
+            assert!(!drawn.contains("\\r"), "{drawn}");
+        }
+    }
+
+    #[test_case(false, 60; "standalone_sixty")]
+    #[test_case(false, REPORT_TITLE_MAX_CHARS; "standalone_eighty")]
+    #[test_case(true, 60; "batch_sixty")]
+    #[test_case(true, REPORT_TITLE_MAX_CHARS; "batch_eighty")]
+    fn report_cards_preserve_valid_long_titles(batch: bool, length: usize) {
+        let title = "界".repeat(length);
+        for compact in [false, true] {
+            let (lines, _) = opened_report_card(
+                serde_json::json!({
+                    "title": title,
+                    "message": REPORT_MESSAGE,
+                }),
+                batch,
+                compact,
+                UNBROKEN,
+            );
+            let header = line_text(&lines[0]);
+            assert!(header.contains(&title), "{header}");
+            assert!(!header.contains(ELLIPSIS), "{header}");
+        }
+    }
+
+    #[test_case("title"; "malformed_title")]
+    #[test_case("message"; "legacy_message")]
+    fn report_titles_still_bound_oversized_input(key: &str) {
+        let raw = serde_json::json!({key: "界".repeat(REPORT_TITLE_MAX_CHARS + 1)});
+        let header = report_header(REPORT_TOOL_NAME, REPORT_TOOL_NAME, Some(&raw));
+        assert_eq!(
+            header,
+            format!("{}{ELLIPSIS}", "界".repeat(REPORT_TITLE_MAX_CHARS))
+        );
+    }
+
+    #[test_case("first\r\nsecond", "first\nsecond"; "normalize_crlf")]
+    #[test_case("first\rsecond", "first\\rsecond"; "escape_bare_carriage_return")]
+    fn report_markdown_distinguishes_newlines_from_controls(message: &str, expected: &str) {
+        assert_eq!(report_markdown(message), expected);
+    }
+
+    #[test_case(Some(serde_json::json!({"title": REPORT_TITLE, "message": REPORT_MESSAGE, "blocked": false})), REPORT_TOOL_NAME, REPORT_TITLE; "explicit_title")]
+    #[test_case(Some(serde_json::json!({"message": REPORT_MESSAGE})), REPORT_TOOL_NAME, "# Finding"; "restored_legacy_message")]
+    #[test_case(Some(serde_json::json!({"title": " \n ", "message": REPORT_MESSAGE})), REPORT_TOOL_NAME, "# Finding"; "empty_title_falls_back")]
+    #[test_case(Some(serde_json::json!({"title": 4, "message": false})), REPORT_TOOL_NAME, ""; "malformed_input")]
+    #[test_case(Some(Value::Null), REPORT_TOOL_NAME, ""; "null_input")]
+    #[test_case(None, REPORT_TOOL_NAME, ""; "missing_input")]
+    #[test_case(None, REPORT_TITLE, REPORT_TITLE; "preserve_meaningful_header")]
+    #[test_case(Some(serde_json::json!({"blocked": true})), REPORT_TOOL_NAME, REPORT_BLOCKED; "blocked_without_message")]
+    fn report_titles_recover_persisted_input(raw: Option<Value>, header: &str, expected: &str) {
+        assert_eq!(
+            report_header(REPORT_TOOL_NAME, header, raw.as_ref()),
+            expected
+        );
+    }
+
+    #[test_case(false, ToolStatus::Success, "Reported", REPORT_ACK; "normal_success")]
+    #[test_case(true, ToolStatus::Success, "Reported", REPORT_ACK; "compact_success")]
+    #[test_case(false, ToolStatus::Error, "Report", REPORT_ERROR; "normal_error")]
+    #[test_case(true, ToolStatus::Error, "Report", REPORT_ERROR; "compact_error")]
+    #[test_case(false, ToolStatus::InProgress, "Reporting", ""; "normal_running")]
+    #[test_case(true, ToolStatus::InProgress, "Reporting", ""; "compact_running")]
+    fn report_cards_show_message_and_actual_status(
+        compact: bool,
+        status: ToolStatus,
+        label: &str,
+        acknowledgement: &str,
+    ) {
+        let msg = report_msg(
+            status,
+            Some(serde_json::json!({
+                "title": REPORT_TITLE,
+                "message": REPORT_MESSAGE,
+                "blocked": true,
+            })),
+        );
+        let rctx = RenderCtx {
+            compact,
+            ..test_rctx(UNBROKEN)
+        };
+        for expansion in [None, Some(exp(false)), Some(exp(true))] {
+            let card = build_tool_lines(&msg, status, &rctx, expansion);
+            let text = lines_text(&card);
+            assert!(
+                text.contains(&format!(
+                    "{label} {REPORT_BLOCKED}{ACTIVITY_SEPARATOR}{REPORT_TITLE}"
+                )),
+                "{text}"
+            );
+            assert!(!text.contains(REPORT_TOOL_NAME), "{text}");
+            assert!(!text.contains("message="), "{text}");
+            assert!(!text.contains("title="), "{text}");
+            assert!(!text.contains("blocked="), "{text}");
+            assert_eq!(
+                text.contains("Last report line."),
+                expansion.is_some(),
+                "{text}"
+            );
+            assert!(!text.contains("**important**"), "{text}");
+            if expansion.is_some() {
+                assert!(text.contains("important"), "{text}");
+                assert!(card.search_text.contains(REPORT_MESSAGE));
+                if !acknowledgement.is_empty() {
+                    assert_eq!(text.matches(acknowledgement).count(), 1, "{text}");
+                }
+            } else {
+                assert!(card.truncation);
+            }
+            if !matches!(status, ToolStatus::Success) {
+                assert!(!text.contains("Reported"), "{text}");
+                assert!(!text.contains(REPORT_ACK), "{text}");
+            }
+        }
+    }
+
+    #[test_case(false; "normal")]
+    #[test_case(true; "compact")]
+    fn report_cards_without_input_keep_the_result(compact: bool) {
+        let msg = report_msg(ToolStatus::Error, None);
+        let card = build_tool_lines(
+            &msg,
+            ToolStatus::Error,
+            &RenderCtx {
+                compact,
+                ..test_rctx(UNBROKEN)
+            },
+            Some(exp(true)),
+        );
+        let text = lines_text(&card);
+        assert!(text.contains(REPORT_ERROR), "{text}");
+        assert!(!text.contains(REPORT_TOOL_NAME), "{text}");
+    }
+
+    #[test_case(false; "normal")]
+    #[test_case(true; "compact")]
+    fn report_cards_restore_full_messages_over_stale_snapshots(compact: bool) {
+        let message = REPORT_MESSAGE.repeat(TOL.get(REPORT_TOOL_NAME) + 1);
+        let mut msg = report_msg(
+            ToolStatus::Success,
+            Some(serde_json::json!({
+                "title": REPORT_TITLE,
+                "message": message,
+            })),
+        );
+        let snapshot = make_snapshot(vec![vec![SnapshotSpan {
+            text: REPORT_TOOL_NAME.into(),
+            style: SpanStyle::Named("tool".into()),
+        }]]);
+        msg.render_header = Some(snapshot.clone());
+        msg.render_snapshot = Some(snapshot);
+        let card = build_tool_lines(
+            &msg,
+            ToolStatus::Success,
+            &RenderCtx {
+                compact,
+                ..test_rctx(UNBROKEN)
+            },
+            Some(exp(true)),
+        );
+        let text = lines_text(&card);
+        assert_eq!(
+            text.matches("Last report line.").count(),
+            TOL.get(REPORT_TOOL_NAME) + 1
+        );
+        assert_eq!(text.matches(REPORT_ACK).count(), 1);
+        assert!(!text.contains(REPORT_TOOL_NAME), "{text}");
+        assert!(!card.truncation);
+    }
+
+    #[test_case(false, 1; "normal_minimal")]
+    #[test_case(true, 1; "compact_minimal")]
+    #[test_case(false, 24; "normal_narrow")]
+    #[test_case(true, 24; "compact_narrow")]
+    fn report_cards_bound_titles_and_escape_controls(compact: bool, width: u16) {
+        let raw = serde_json::json!({
+            "title": format!("\u{1b}[31m{}\nsecond title line", "界".repeat(200)),
+            "message": "# Finding\n\ncontrol \u{1b}[31m\u{7} text",
+            "blocked": true,
+        });
+        let header = report_header(REPORT_TOOL_NAME, REPORT_TOOL_NAME, Some(&raw));
+        assert!(header.contains(ELLIPSIS));
+        assert!(!header.contains("second title line"));
+        let msg = report_msg(ToolStatus::Success, Some(raw));
+        for expansion in [None, Some(exp(true))] {
+            let card = build_tool_lines(
+                &msg,
+                ToolStatus::Success,
+                &RenderCtx {
+                    compact,
+                    ..test_rctx(width)
+                },
+                expansion,
+            );
+            assert!(!lines_text(&card).chars().any(char::is_control));
+            assert_eq!(card.links.rows.len(), card.lines.len());
+            assert_eq!(card.rows.len(), card.lines.len());
+        }
     }
 
     /// A note settles into a rendered document, so the body drawn while it

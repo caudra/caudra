@@ -14,6 +14,7 @@ use crate::mcp::{McpSession, UNKNOWN_MCP};
 use crate::permissions::{PermissionAuthorityProfile, RemotePermissionIdentity, canonical_json};
 use crate::task_set::TaskSet;
 use crate::tools::json_repair::RepairError;
+use crate::tools::native::report_to_parent;
 use crate::tools::registry::{
     PlanModeAccess, RegisteredTool, ToolInvocation, ToolRegistry, TrustedToolSource,
 };
@@ -1231,15 +1232,12 @@ async fn run_local_tool(
     emit: &mut Emit<'_>,
 ) -> ToolDoneEvent {
     let tool_id: Arc<str> = Arc::from(name);
-    emit_raw_start(
-        ctx,
-        emit,
-        &id,
-        &tool_id,
-        local.effect,
-        name.to_owned(),
-        input,
-    );
+    let header = if name == report_to_parent::NAME {
+        report_to_parent::header(input)
+    } else {
+        name.to_owned()
+    };
+    emit_raw_start(ctx, emit, &id, &tool_id, local.effect, header, input);
     let tool_ctx = ToolContext {
         tool_use_id: Some(id.clone()),
         ..ctx.clone()
@@ -3412,8 +3410,10 @@ mod tests {
         });
     }
 
-    #[test]
-    fn local_tool_notify_emits_tool_start_with_raw_input() {
+    #[test_case("local_echo", serde_json::json!({"path": "/a"}), "local_echo"; "ordinary_local_tool")]
+    #[test_case("report_to_parent", serde_json::json!({"title": "Writer lock identified", "message": "Detailed finding"}), "Writer lock identified"; "titled_report")]
+    #[test_case("report_to_parent", serde_json::json!({"message": "First finding\nDetails"}), "First finding"; "legacy_report")]
+    fn local_tool_notify_emits_tool_start_with_raw_input(name: &str, input: Value, summary: &str) {
         smol::block_on(async {
             let (tx, rx) = flume::unbounded::<crate::Envelope>();
             let event_tx = crate::EventSender::new(tx, 0);
@@ -3421,7 +3421,7 @@ mod tests {
                 crate::tools::test_support::stub_ctx_with(&AgentMode::Build, Some(&event_tx), None);
             let mut map = std::collections::HashMap::new();
             map.insert(
-                "local_echo".to_owned(),
+                name.to_owned(),
                 crate::tools::local_tool(|input, _ctx| {
                     let out = input.to_string();
                     Box::pin(async move { Ok(out) })
@@ -3429,12 +3429,11 @@ mod tests {
             );
             ctx.local_tools = Arc::new(map);
 
-            let input = serde_json::json!({"path": "/a"});
             let done = run(
                 ToolRegistry::global(),
                 None,
                 "t1".into(),
-                "local_echo",
+                name,
                 &input,
                 &ctx,
                 Emit::Notify,
@@ -3448,8 +3447,8 @@ mod tests {
             let AgentEvent::ToolStart(start) = envelope.event else {
                 panic!("expected ToolStart, got {:?}", envelope.event);
             };
-            assert_eq!(start.tool.as_ref(), "local_echo");
-            assert_eq!(start.summary, "local_echo");
+            assert_eq!(start.tool.as_ref(), name);
+            assert_eq!(start.summary, summary);
             assert_eq!(start.raw_input, Some(input));
         });
     }

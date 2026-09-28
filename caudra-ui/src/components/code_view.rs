@@ -16,7 +16,8 @@ use crate::theme;
 use super::tool_display::{
     ScrollTail, TREE_BRANCH, TREE_GAP, TREE_LAST, TREE_TRUNK, annotation_spans, append_annotation,
     batch_sigil_style, compact_args_for, header_spans, header_timeout, header_workdir,
-    inflected_header, names_tool, progress_lines, scroll_footer_text, title,
+    inflected_header, names_tool, progress_lines, report_header, report_markdown, report_message,
+    scroll_footer_text, title,
 };
 use super::{
     ToolProgress, environment_card, is_collapsible, memory_card, task_card, workflow_card,
@@ -1049,7 +1050,8 @@ fn render_batch(entries: &[BatchToolEntry], highlight: bool, limits: &RenderLimi
             false => (TREE_BRANCH, TREE_TRUNK),
         };
         let (sigil, label, tense) = title(&entry.tool, entry.status.into(), entry.status.stage());
-        let inflected = inflected_header(&entry.tool, &entry.summary, tense);
+        let report_title = report_header(&entry.tool, &entry.summary, entry.raw_input.as_ref());
+        let inflected = inflected_header(&entry.tool, &report_title, tense);
         // Once the body carries the script, the row keeps only what the body
         // does not say. The same trade a card's header makes, and for the same
         // reason: the body's copy is the numbered, highlighted one.
@@ -1248,6 +1250,7 @@ struct BatchCard {
 /// may be long.
 fn holds_a_body(entry: &BatchToolEntry) -> bool {
     entry.input.is_some()
+        || report_message(&entry.tool, entry.raw_input.as_ref()).is_some()
         || entry
             .output
             .as_ref()
@@ -1328,6 +1331,26 @@ fn child_body(
     live: Option<&String>,
 ) -> ChildBody {
     let output = entry.output.as_ref();
+    if let Some(message) = report_message(&entry.tool, entry.raw_input.as_ref()) {
+        let (mut lines, source, mut links) = markdown_body(&report_markdown(message), limits.width);
+        let mut trace = SourceTrace::default();
+        trace.record(0, source);
+        if let Some(output) = output {
+            let (status, source) = plain_body(&output.as_text(), limits.width);
+            trace.record(lines.len(), source);
+            links.rows.extend(LinkMap::none_for(&status).rows);
+            lines.extend(status);
+        }
+        let source = trace.finish(&lines);
+        return ChildBody {
+            rows: vec![None; lines.len()],
+            lines,
+            links,
+            source,
+            truncation: false,
+            span: None,
+        };
+    }
     if entry.status != BatchToolStatus::Error
         && let Some(ToolOutput::Markdown(text)) = output
     {
@@ -1611,7 +1634,7 @@ fn capped(mut lines: Vec<Line<'static>>, budget: usize) -> (Vec<Line<'static>>, 
 /// Breaking a paragraph here does not put a newline on the clipboard: the rows
 /// of one source line all name that line, so copy reads it back as it was
 /// written rather than as it was drawn.
-fn markdown_body(text: &str, width: u16) -> (Vec<Line<'static>>, BodySource, LinkMap) {
+pub(super) fn markdown_body(text: &str, width: u16) -> (Vec<Line<'static>>, BodySource, LinkMap) {
     let (painted, parsed) = text_to_wrapped(
         text,
         theme::current().assistant,
@@ -3424,7 +3447,7 @@ mod tests {
         ActivityChild, EnvironmentFact, GrepLine, GrepMatchGroup, ShellOutput, SubagentActivity,
         TextOutput,
     };
-    use std::time::Duration;
+    use std::{slice::from_ref, time::Duration};
     use test_case::test_case;
 
     fn plain(text: &str) -> DiffSpan {
@@ -4744,6 +4767,99 @@ mod tests {
 
     fn limits(views: BatchViews) -> RenderLimits {
         RenderLimits::new(false, PARENT_BUDGET, views, TOOL_LINES)
+    }
+
+    const REPORT_TOOL: &str = "report_to_parent";
+    const REPORT_TITLE: &str = "Validation finding";
+    const REPORT_ACK: &str = "Report durably recorded; no reply is expected.";
+    const REPORT_ERROR: &str = "Report could not be recorded.";
+    const REPORT_DETAIL: &str = "A **useful** detail.";
+
+    #[test_case(BatchToolStatus::Success, "Reported", Some(REPORT_ACK); "success")]
+    #[test_case(BatchToolStatus::Error, "Report", Some(REPORT_ERROR); "error")]
+    #[test_case(BatchToolStatus::Running, "Reporting", None; "running")]
+    #[test_case(BatchToolStatus::Pending, "Report", None; "pending")]
+    fn batch_report_cards_preserve_message_and_status(
+        status: BatchToolStatus,
+        label: &str,
+        acknowledgement: Option<&str>,
+    ) {
+        let entry = BatchToolEntry {
+            summary: REPORT_TOOL.into(),
+            status,
+            raw_input: Some(serde_json::json!({
+                "title": REPORT_TITLE,
+                "message": REPORT_DETAIL,
+                "blocked": true,
+            })),
+            output: acknowledgement.map(|text| ToolOutput::Plain(text.into())),
+            ..batch_entry(REPORT_TOOL, 0)
+        };
+        for compact in [false, true] {
+            for open in [false, true] {
+                let limits = limits(BatchViews::new(open.then_some(0)))
+                    .with_width(200)
+                    .with_policy(
+                        CardPolicy {
+                            compact,
+                            ..CardPolicy::default()
+                        },
+                        Arc::default(),
+                    );
+                let card = render_batch(from_ref(&entry), false, &limits);
+                let text = card
+                    .lines
+                    .iter()
+                    .map(|line| spans_text(&line.spans))
+                    .collect::<String>();
+                assert!(text.contains(&format!("{label} Blocked")), "{text}");
+                assert!(text.contains(REPORT_TITLE), "{text}");
+                assert!(!text.contains(REPORT_TOOL), "{text}");
+                assert!(!text.contains("message="), "{text}");
+                assert!(!text.contains("title="), "{text}");
+                assert!(!text.contains("blocked="), "{text}");
+                if open {
+                    assert!(text.contains("useful"), "{text}");
+                    assert!(!text.contains(REPORT_DETAIL), "{text}");
+                    if let Some(acknowledgement) = acknowledgement {
+                        assert_eq!(text.matches(acknowledgement).count(), 1, "{text}");
+                    }
+                } else if compact {
+                    assert!(!text.contains("useful"), "{text}");
+                    assert!(text.contains(BATCH_FOLDED_MARK), "{text}");
+                }
+                if status != BatchToolStatus::Success {
+                    assert!(!text.contains("Reported"), "{text}");
+                    assert!(!text.contains(REPORT_ACK), "{text}");
+                }
+                assert_eq!(card.rows.len(), card.lines.len());
+                assert_eq!(card.links.rows.len(), card.lines.len());
+            }
+        }
+    }
+
+    #[test_case(24; "narrow")]
+    #[test_case(200; "wide")]
+    fn batch_report_cards_recover_legacy_message(width: u16) {
+        let entry = BatchToolEntry {
+            summary: REPORT_TOOL.into(),
+            raw_input: Some(serde_json::json!({
+                "message": format!("\n\n{REPORT_TITLE}\n\n{REPORT_DETAIL}\n\u{1b}[31m"),
+            })),
+            output: Some(ToolOutput::Plain(REPORT_ACK.into())),
+            ..batch_entry(REPORT_TOOL, 0)
+        };
+        let limits = limits(BatchViews::new([0])).with_width(width);
+        let card = render_batch(&[entry], false, &limits);
+        let text = card
+            .lines
+            .iter()
+            .map(|line| spans_text(&line.spans))
+            .collect::<String>();
+        assert!(!text.contains(REPORT_TOOL), "{text}");
+        assert!(!text.chars().any(char::is_control));
+        assert_eq!(card.rows.len(), card.lines.len());
+        assert_eq!(card.links.rows.len(), card.lines.len());
     }
 
     const MARKDOWN_CHILD_TOOL: &str = "task";

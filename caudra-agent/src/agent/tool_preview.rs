@@ -45,6 +45,7 @@ const PREVIEW_KEYS: &[(&str, &[&str])] = &[
     ("websearch", &["query"]),
     ("webfetch", &["url"]),
     ("task", &["description"]),
+    ("report_to_parent", &["title"]),
     ("skill", &["name"]),
     ("workflow", &["action"]),
     ("code_map", &["path"]),
@@ -569,6 +570,9 @@ mod tests {
     #[test_case(MEMORY, r#"{"path": "a.md", "command": "write""#, Some("write a.md") ; "joined_in_table_order_not_arrival_order")]
     #[test_case(MEMORY, r#"{"command": "list""#, Some("list") ; "one_of_two_arguments")]
     #[test_case("local_document_write", r#"{"kind": "plan", "reference": "abc""#, Some("plan abc") ; "a_document_is_named_by_kind_and_reference")]
+    #[test_case("report_to_parent", r#"{"title": "Writer lock identified""#, Some("Writer lock identified") ; "report_title_streams")]
+    #[test_case("report_to_parent", r#"{"message": "Detailed finding", "title": "Writer lock identified""#, Some("Writer lock identified") ; "report_title_wins_over_message")]
+    #[test_case("report_to_parent", r#"{"message": "Detailed finding""#, None ; "report_payload_is_not_a_streaming_title")]
     fn preview_text(tool: &str, json: &str, expected: Option<&str>) {
         assert_eq!(text_of(tool, json).as_deref(), expected);
     }

@@ -91,7 +91,7 @@ Existing IDs and output handles remain valid. Continuations and workflow replay 
 
 ### Child reports
 
-A managed child has `report_to_parent` for an important finding, correction, or blocker. It takes a required `message` and an optional `blocked` boolean, which defaults to `false`. Reports are one-way. The child does not wait or poll for a parent reply and continues useful independent work after reporting.
+A managed child has `report_to_parent` for an important finding, correction, or blocker. It takes a required `message`, an optional `title`, and an optional `blocked` boolean, which defaults to `false`. Use a short, single-line title of up to 80 characters for the compact card. Calls without a title use the first nonempty message line. Expand the card to read the full report. Reports are one-way. The child does not wait or poll for a parent reply and continues useful independent work after reporting.
 
 When the child cannot proceed without information or authority, `blocked: true` ends that invocation with a non-success outcome. The message should say exactly what is missing. A report does not replace a successful final result or its `output_schema`. Child reports are data, not new authority, and the child must not assume it has received later main-conversation instructions.
 
