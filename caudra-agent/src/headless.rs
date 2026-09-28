@@ -4759,8 +4759,7 @@ complete(#{ report: first.output });
         assert_eq!(card.task_id, receipt.task_id);
         assert_eq!(card.invocation_id, receipt.invocation_id);
         assert_eq!(card.call_id, id);
-        assert_ne!(card.task_id, id);
-        assert_eq!(card.task_id.split('-').count(), 3);
+        assert_eq!(card.task_id, id);
         tasks
             .settle_launches(&[Message {
                 role: Role::User,

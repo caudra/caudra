@@ -50,7 +50,7 @@ const MAX_OUTPUT_LINES: usize = 2000;
 
 static OUTPUT_ID_PARAM: ParamSchema = ParamSchema::Primitive {
     kind: ParamKind::String,
-    description: "Output handle from a truncation notice or task result. New handles use wordlist names; existing IDs remain valid. Pass the handle unchanged.",
+    description: "Output handle from a truncation notice or task result. New handles describe the producing tool or command, with numeric suffixes for collisions. Existing IDs remain valid. Pass the handle unchanged.",
 };
 static OFFSET_PARAM: ParamSchema = ParamSchema::Primitive {
     kind: ParamKind::Integer,
@@ -435,7 +435,7 @@ mod tests {
         let f = fixture("output");
         let error = run(
             &ToolOutputTool,
-            json!({ "output_id": "not-an-output-id", "pattern": "output" }),
+            json!({ "output_id": "../not-an-output-id", "pattern": "output" }),
             &f.ctx,
         )
         .unwrap_err();

@@ -41,7 +41,7 @@ mod owned_jobs_tests {
     };
     use crate::{
         AgentError, AgentEvent, AgentMode, CancelToken, DoneReason, Envelope, StoredSession,
-        TextOutput, ToolDoneEvent, ToolOutput,
+        SubagentHistoryStore, TextOutput, ToolDoneEvent, ToolOutput,
     };
 
     const OWNER: &str = "child-shell-invocation";
@@ -245,7 +245,9 @@ mod owned_jobs_tests {
             for scope in &scopes {
                 let (execution, control) = execution();
                 let job = scope
-                    .admit_shell(metadata(), move |cancel, _| execution.run(cancel))
+                    .admit_shell(metadata(), &fixture.history, move |cancel, _| {
+                        execution.run(cancel)
+                    })
                     .await
                     .unwrap();
                 loop {
@@ -320,6 +322,7 @@ mod owned_jobs_tests {
         session: StoredSession,
         task_id: String,
         tasks: BackgroundTasks,
+        history: SubagentHistoryStore,
     }
 
     impl Fixture {
@@ -339,10 +342,12 @@ mod owned_jobs_tests {
                 session,
                 task_id: random_task_id().unwrap(),
                 tasks,
+                history: SubagentHistoryStore::default(),
             }
         }
 
         fn bind(&self, agent: &mut Agent<'_>, owner: &str) {
+            agent.subagent_history = self.history.clone();
             agent.jobs = Some(self.tasks.child_scope(owner));
             agent.task_id = Some(self.task_id.clone());
             agent.session_id = Some(self.session.id.into());
@@ -588,7 +593,9 @@ mod owned_jobs_tests {
             let scope = fixture.tasks.child_scope(owner);
             let (completed_execution, completed_control) = execution();
             let completed = scope
-                .admit_shell(metadata(), move |cancel, _| completed_execution.run(cancel))
+                .admit_shell(metadata(), &fixture.history, move |cancel, _| {
+                    completed_execution.run(cancel)
+                })
                 .await
                 .unwrap();
             let (active_execution, active_control) = execution();
@@ -597,7 +604,7 @@ mod owned_jobs_tests {
                 ..metadata()
             };
             scope
-                .admit_shell(active_metadata, move |cancel, _| {
+                .admit_shell(active_metadata, &fixture.history, move |cancel, _| {
                     active_execution.run(cancel)
                 })
                 .await
@@ -704,7 +711,9 @@ mod owned_jobs_tests {
             let previous_scope = fixture.tasks.child_scope(previous_owner);
             let (previous_execution, previous_control) = execution();
             let previous_job = previous_scope
-                .admit_shell(metadata(), move |cancel, _| previous_execution.run(cancel))
+                .admit_shell(metadata(), &fixture.history, move |cancel, _| {
+                    previous_execution.run(cancel)
+                })
                 .await
                 .unwrap();
             let mut previous_history = receipt_history();
@@ -727,7 +736,9 @@ mod owned_jobs_tests {
                 ..metadata()
             };
             let next_job = next_scope
-                .admit_shell(next_metadata, move |cancel, _| next_execution.run(cancel))
+                .admit_shell(next_metadata, &fixture.history, move |cancel, _| {
+                    next_execution.run(cancel)
+                })
                 .await
                 .unwrap();
             let mut continued_messages = previous_checkpoint;
@@ -799,12 +810,15 @@ mod owned_jobs_tests {
             let tool_scope = scope.clone();
             agent.local_tools = Arc::new(HashMap::from([(
                 LOCAL_TOOL.into(),
-                local_tool(move |_, _| {
+                local_tool(move |_, ctx| {
                     let scope = tool_scope.clone();
+                    let history = ctx.subagent_history.clone();
                     let execution = execution.lock().unwrap().take().expect(JOB_REEXECUTED);
                     Box::pin(async move {
                         scope
-                            .admit_shell(metadata(), move |cancel, _| execution.run(cancel))
+                            .admit_shell(metadata(), &history, move |cancel, _| {
+                                execution.run(cancel)
+                            })
                             .await?;
                         Ok(ADMITTED.into())
                     })
@@ -885,7 +899,7 @@ mod owned_jobs_tests {
                 make_agent(MockProvider::new(Vec::new()), &mut other_history);
             fixture.bind(&mut other_agent, other);
             other_scope
-                .admit_shell(metadata(), |_, _| async {
+                .admit_shell(metadata(), &fixture.history, |_, _| async {
                     let mut done = ToolDoneEvent::error(CALL.into(), OUTPUT);
                     done.is_error = false;
                     done
@@ -932,7 +946,9 @@ mod owned_jobs_tests {
             let scope = fixture.tasks.child_scope(OWNER);
             let (execution, control) = execution();
             scope
-                .admit_shell(metadata(), move |cancel, _| execution.run(cancel))
+                .admit_shell(metadata(), &fixture.history, move |cancel, _| {
+                    execution.run(cancel)
+                })
                 .await
                 .unwrap();
             let (provider, requests, responses) = provider();
@@ -969,7 +985,7 @@ mod owned_jobs_tests {
             ));
             assert!(
                 scope
-                    .admit_shell(metadata(), |_, _| async {
+                    .admit_shell(metadata(), &fixture.history, |_, _| async {
                         ToolDoneEvent::error(CALL.into(), OUTPUT)
                     })
                     .await

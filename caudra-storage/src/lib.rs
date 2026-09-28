@@ -40,7 +40,9 @@ pub mod workflow_source;
 pub mod workflow_trust;
 pub mod workspace_binding;
 
-pub use words::random_task_id;
+pub use words::{
+    DESCRIPTIVE_ID_ATTEMPTS, DESCRIPTIVE_ID_MAX_LEN, DescriptiveIdCandidates, random_task_id,
+};
 
 use std::env;
 use std::fs::{self, File, OpenOptions};

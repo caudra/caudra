@@ -4,9 +4,10 @@ use std::panic::AssertUnwindSafe;
 
 use caudra_providers::Message;
 use caudra_storage::{
+    StateDir,
     background::{JobOwner, JobPayload, MAX_INVOCATIONS, ShellJobMetadata, TaskEvent, TaskRecord},
     id::CaudraId,
-    now_epoch, random_task_id,
+    now_epoch,
     sessions::SessionDatabase,
     tool_ledger::ToolOutcome,
     tool_outputs::ToolOutputStore,
@@ -19,12 +20,11 @@ use super::{
     MAX_RESULT_BYTES, STALE_INVOCATION, TRANSITION, bounded, deliverable,
 };
 use crate::{
-    CancelToken, History, TaskCard, TaskProvenance, ToolDoneEvent, ToolOutput,
-    background_reminder::RuntimeSnapshot,
+    CancelToken, History, SubagentHistoryStore, TaskCard, TaskProvenance, ToolDoneEvent,
+    ToolOutput, background_reminder::RuntimeSnapshot, tool_output::shell_output_label,
 };
 
 const MAX_OWNER_ACTIVE: usize = 16;
-const ID_ATTEMPTS: usize = 64;
 const CAPACITY: &str = "session or owner shell admission capacity exhausted";
 const RETRY_MISMATCH: &str = "shell retry differs from the admitted request";
 const FOREIGN_JOB: &str = "job does not belong to this invocation";
@@ -93,6 +93,10 @@ impl JobScope {
 
     pub fn session_id(&self) -> CaudraId {
         self.tasks.session_id()
+    }
+
+    pub(crate) fn state_dir(&self) -> &StateDir {
+        &self.tasks.0.dir
     }
 
     pub fn revision(&self) -> u64 {
@@ -239,6 +243,7 @@ impl JobScope {
     pub async fn admit_shell<F, Fut>(
         &self,
         metadata: ShellJobMetadata,
+        history: &SubagentHistoryStore,
         execute: F,
     ) -> Result<TaskCard, String>
     where
@@ -302,20 +307,23 @@ impl JobScope {
         }
         let dir = self.tasks.0.dir.clone();
         let session = self.tasks.session_id();
-        let task_id = smol::unblock(move || {
+        let history = history.clone();
+        let label = shell_output_label(&metadata.command);
+        let label = if label == "shell" {
+            label
+        } else {
+            format!("shell-{label}")
+        };
+        let lease = smol::unblock(move || {
             let database = SessionDatabase::open(&dir).map_err(|error| error.to_string())?;
-            for _ in 0..ID_ATTEMPTS {
-                let id = random_task_id().map_err(|error| error.to_string())?;
-                if !database
-                    .task_identity_exists(session, &id)
-                    .map_err(|error| error.to_string())?
-                {
-                    return Ok(id);
-                }
-            }
-            Err("could not reserve a unique shell job identity".to_owned())
+            history.reserve_generated(&label, |id| {
+                database
+                    .task_identity_exists(session, id)
+                    .map_err(|error| error.to_string())
+            })
         })
         .await?;
+        let task_id = lease.task_id().to_owned();
         self.current()?;
         if let JobOwner::Child { invocation_id } = &self.owner {
             let state = self.tasks.lock();
@@ -386,10 +394,12 @@ impl JobScope {
                             format!("{error}; {cleanup}")
                         }
                     };
+                    drop(lease);
                     let _ = admitted_tx.send(Err(error));
                     scope.tasks.0.changed.notify(usize::MAX);
                     return;
                 }
+                drop(lease);
                 if scope.current().is_err() {
                     scope.tasks.lock().cancels.remove(&driver_id);
                 }
@@ -467,9 +477,15 @@ impl JobScope {
                 let dir = self.tasks.0.dir.clone();
                 let session = self.tasks.session_id();
                 let retained = terminal.clone();
+                let label = match &record.payload {
+                    JobPayload::Shell(metadata) => {
+                        format!("output-{}", shell_output_label(&metadata.command))
+                    }
+                    JobPayload::Agent => "output-shell".into(),
+                };
                 smol::unblock(move || {
                     ToolOutputStore::new(dir)
-                        .put(session, &retained)
+                        .put_named(session, &retained, &label)
                         .map_err(|error| error.to_string())
                 })
                 .await?
@@ -605,7 +621,10 @@ mod tests {
 
     use caudra_config::ExecutionMode;
     use caudra_providers::{ContentBlock, Message, Role};
-    use caudra_storage::{StateDir, background::JobKind, sessions::SessionDatabase};
+    use caudra_storage::{
+        StateDir, background::JobKind, id::CaudraId, sessions::SessionDatabase,
+        tool_outputs::ToolOutputStore,
+    };
     use futures_lite::future::poll_once;
     use serde_json::json;
     use tempfile::TempDir;
@@ -615,8 +634,19 @@ mod tests {
         BackgroundTasks, CLOSED, FOREIGN_JOB, RETRY_MISMATCH, STALE_INVOCATION, ShellJobMetadata,
     };
     use crate::{
-        AgentEvent, Envelope, History, StoredSession, SubagentInfo, TaskProvenance, ToolDoneEvent,
-        background_reminder::render, types::BACKGROUND_EVENT_RUN_ID,
+        AgentEvent, AgentMode, Envelope, History, StoredSession, SubagentHistoryStore,
+        SubagentInfo, TaskProvenance, ToolDoneEvent,
+        agent::{
+            subagent::{
+                RESERVATION_SESSION_MISMATCH, TaskIdentity, TaskOptions, open_task,
+                reserve_task_identity,
+            },
+            task_runner::{ModelResolver, SubagentTaskRunner, TaskRunner, WorkflowHostContext},
+        },
+        background_reminder::render,
+        cancel::CancelMap,
+        tools::{LocalTools, test_support::stub_ctx},
+        types::BACKGROUND_EVENT_RUN_ID,
     };
 
     const CALL: &str = "shell-call";
@@ -627,6 +657,14 @@ mod tests {
     const OUTPUT: &str = "bounded-output";
     const TIMEOUT_MS: u64 = 120_000;
     const LITERAL_OUTPUT: &str = "<html> & output > destination\n";
+    const CARGO_COMMAND: &str = "cargo test private_test_marker";
+    const CARGO_ID: &str = "shell-cargo-test";
+    const CARGO_SECOND_ID: &str = "shell-cargo-test-2";
+    const CARGO_THIRD_ID: &str = "shell-cargo-test-3";
+    const CARGO_OUTPUT: &str = "output-cargo-test";
+    const COMPLEX_COMMAND: &str = "cargo test | cat";
+    const SHELL_OUTPUT: &str = "output-shell";
+    const EXISTING_OUTPUT: &str = "output-existing";
     const PREMATURE_ACK: &str =
         "task event must be durably saved in parent history before acknowledgment";
 
@@ -635,6 +673,7 @@ mod tests {
         dir: StateDir,
         session: StoredSession,
         tasks: BackgroundTasks,
+        history: SubagentHistoryStore,
     }
 
     impl Fixture {
@@ -651,6 +690,7 @@ mod tests {
                 dir,
                 session,
                 tasks,
+                history: SubagentHistoryStore::default(),
             }
         }
     }
@@ -685,6 +725,339 @@ mod tests {
         }
     }
 
+    #[test_case(false; "main")]
+    #[test_case(true; "workflow_child")]
+    fn shell_and_task_share_active_and_durable_identity_namespace(child: bool) {
+        smol::block_on(async {
+            let fixture = Fixture::new().await;
+            let scope = if child {
+                fixture.tasks.child_scope(CHILD)
+            } else {
+                fixture.tasks.main_scope()
+            };
+            let metadata = ShellJobMetadata {
+                command: CARGO_COMMAND.into(),
+                ..metadata()
+            };
+            let task = fixture
+                .history
+                .reserve_generated(CARGO_ID, |_| Ok(false))
+                .unwrap();
+            let first = scope
+                .admit_shell(metadata.clone(), &fixture.history, |_, _| async { done() })
+                .await
+                .unwrap();
+            assert_eq!(first.task_id, CARGO_SECOND_ID);
+            assert_eq!(first.label, CARGO_COMMAND);
+            assert!(!fixture.history.is_active(CARGO_SECOND_ID));
+            assert!(fixture.history.snapshot().records().is_empty());
+            let retry = scope
+                .admit_shell(metadata.clone(), &fixture.history, |_, _| async {
+                    panic!("retry executed")
+                })
+                .await
+                .unwrap();
+            assert_eq!(retry.task_id, first.task_id);
+            assert_eq!(retry.invocation_id, first.invocation_id);
+            let next = ShellJobMetadata {
+                call_id: OTHER.into(),
+                ..metadata
+            };
+            let second = scope
+                .admit_shell(next, &fixture.history, |_, _| async { done() })
+                .await
+                .unwrap();
+            assert_eq!(second.task_id, CARGO_THIRD_ID);
+            drop(task);
+            fixture.tasks.shutdown().await.unwrap();
+            let restored = BackgroundTasks::spawn(fixture.dir.clone(), fixture.session.id)
+                .await
+                .unwrap();
+            let outputs = ToolOutputStore::new(fixture.dir.clone());
+            let task = reserve_task_identity(
+                &fixture.history,
+                CARGO_SECOND_ID,
+                Some(&outputs),
+                Some(fixture.session.id),
+                None,
+            )
+            .unwrap();
+            assert_ne!(task.task_id(), CARGO_SECOND_ID);
+            assert_eq!(
+                restored.status(CARGO_SECOND_ID).unwrap().task_id,
+                CARGO_SECOND_ID
+            );
+            restored.shutdown().await.unwrap();
+        });
+    }
+
+    #[test_case(CARGO_COMMAND, CARGO_OUTPUT, false; "recognized_short_output")]
+    #[test_case(COMPLEX_COMMAND, SHELL_OUTPUT, false; "complex_short_output")]
+    #[test_case(CARGO_COMMAND, EXISTING_OUTPUT, true; "existing_reference_is_preserved")]
+    fn shell_retained_output_uses_safe_producer_name(
+        command: &str,
+        expected: &str,
+        existing: bool,
+    ) {
+        smol::block_on(async {
+            let fixture = Fixture::new().await;
+            let outputs = ToolOutputStore::new(fixture.dir.clone());
+            let reference = existing.then(|| {
+                outputs
+                    .put_named(fixture.session.id, OUTPUT, EXISTING_OUTPUT)
+                    .unwrap()
+            });
+            let retained = reference.clone();
+            let card = fixture
+                .tasks
+                .main_scope()
+                .admit_shell(
+                    ShellJobMetadata {
+                        command: command.into(),
+                        ..metadata()
+                    },
+                    &fixture.history,
+                    move |_, _| async move {
+                        let mut result = done();
+                        result.output_ref = retained;
+                        result
+                    },
+                )
+                .await
+                .unwrap();
+            fixture.tasks.join_jobs().await.unwrap();
+            let stored = fixture
+                .tasks
+                .status(&card.task_id)
+                .unwrap()
+                .output_ref
+                .unwrap();
+            assert_eq!(stored.id.as_str(), expected);
+            if let Some(reference) = reference {
+                assert_eq!(stored, reference);
+            }
+            assert_eq!(
+                outputs.load_text(fixture.session.id, stored.id).unwrap(),
+                OUTPUT
+            );
+            fixture.tasks.shutdown().await.unwrap();
+        });
+    }
+
+    #[test_case(false; "foreground")]
+    #[test_case(true; "workflow")]
+    fn task_without_output_store_skips_durable_shell_identity(workflow: bool) {
+        smol::block_on(async {
+            let fixture = Fixture::new().await;
+            let scope = fixture.tasks.main_scope();
+            let shell = scope
+                .admit_shell(
+                    ShellJobMetadata {
+                        command: CARGO_COMMAND.into(),
+                        ..metadata()
+                    },
+                    &fixture.history,
+                    |_, _| async { done() },
+                )
+                .await
+                .unwrap();
+            fixture.tasks.join_jobs().await.unwrap();
+            assert_eq!(shell.task_id, CARGO_ID);
+            assert_eq!(fixture.history.active_count(), 0);
+            assert!(fixture.history.snapshot().records().is_empty());
+            let mut ctx = stub_ctx(&AgentMode::Build);
+            ctx.subagent_history = fixture.history.clone();
+            ctx.jobs = Some(scope);
+            ctx.session_id = Some(fixture.session.id.into());
+            ctx.tool_output_store = None;
+            if workflow {
+                let model: ModelResolver = Arc::new({
+                    let provider = Arc::clone(&ctx.provider);
+                    let model = Arc::clone(&ctx.model);
+                    move || (Arc::clone(&provider), Arc::clone(&model))
+                });
+                let host = WorkflowHostContext::from_tool_context(
+                    &ctx,
+                    model,
+                    Arc::new(|| AgentMode::Build),
+                    Arc::new(CancelMap::new()),
+                );
+                assert!(host.tool_output_store.is_none());
+                let runner = SubagentTaskRunner::new(Arc::new(host));
+                let lease = runner.reserve_task(None, CARGO_ID).unwrap();
+                assert_eq!(lease.task_id(), CARGO_SECOND_ID);
+            } else {
+                let mut task = open_task(
+                    &ctx,
+                    TaskOptions {
+                        name: CARGO_ID.into(),
+                        task_id: TaskIdentity::Derive,
+                        profile: None,
+                        mode: None,
+                        model_job: None,
+                        local_definitions: Vec::new(),
+                        local_tools: LocalTools::default(),
+                    },
+                )
+                .await
+                .unwrap();
+                assert_eq!(task.id(), CARGO_SECOND_ID);
+                task.close();
+            }
+            assert!(ctx.tool_output_store.is_none());
+            fixture.tasks.shutdown().await.unwrap();
+        });
+    }
+
+    #[test_case(false; "without_outputs")]
+    #[test_case(true; "with_outputs")]
+    fn task_reservation_rejects_foreign_job_scope(with_outputs: bool) {
+        smol::block_on(async {
+            let fixture = Fixture::new().await;
+            let scope = fixture.tasks.main_scope();
+            let outputs = with_outputs.then(|| ToolOutputStore::new(fixture.dir.clone()));
+            let error = reserve_task_identity(
+                &fixture.history,
+                CARGO_ID,
+                outputs.as_ref(),
+                Some(CaudraId::generate()),
+                Some(&scope),
+            )
+            .unwrap_err();
+            assert_eq!(error, RESERVATION_SESSION_MISMATCH);
+            assert_eq!(fixture.history.active_count(), 0);
+            fixture.tasks.shutdown().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn shell_retains_lease_until_durable_admission_finishes() {
+        smol::block_on(async {
+            let fixture = Fixture::new().await;
+            let scope = fixture.tasks.main_scope();
+            let (committed_tx, committed_rx) = flume::bounded(1);
+            let (resume_tx, resume_rx) = flume::bounded(1);
+            fixture
+                .tasks
+                .pause_admission_for_test(committed_tx, resume_rx);
+            let history = fixture.history.clone();
+            let waiter = smol::spawn(async move {
+                scope
+                    .admit_shell(
+                        ShellJobMetadata {
+                            command: CARGO_COMMAND.into(),
+                            ..metadata()
+                        },
+                        &history,
+                        |_, _| async { done() },
+                    )
+                    .await
+            });
+            committed_rx.recv_async().await.unwrap();
+            assert!(fixture.history.is_active(CARGO_ID));
+            let task = fixture
+                .history
+                .reserve_generated(CARGO_ID, |_| Ok(false))
+                .unwrap();
+            assert_eq!(task.task_id(), CARGO_SECOND_ID);
+            resume_tx.send(()).unwrap();
+            let shell = waiter.await.unwrap();
+            assert_eq!(shell.task_id, CARGO_ID);
+            assert!(!fixture.history.is_active(CARGO_ID));
+            assert!(fixture.history.snapshot().records().is_empty());
+            fixture.tasks.shutdown().await.unwrap();
+        });
+    }
+
+    #[test_case(false; "task")]
+    #[test_case(true; "shell")]
+    fn owner_checkpoint_only_identity_survives_reopening(shell: bool) {
+        smol::block_on(async {
+            let fixture = Fixture::new().await;
+            let database = SessionDatabase::open(&fixture.dir).unwrap();
+            database
+                .checkpoint_job_owner::<Message>(fixture.session.id, CHILD, CARGO_ID, &[])
+                .unwrap();
+            assert!(
+                database
+                    .background_tasks(fixture.session.id)
+                    .unwrap()
+                    .is_empty()
+            );
+            drop(database);
+            assert!(fixture.history.snapshot().records().is_empty());
+            if shell {
+                let card = fixture
+                    .tasks
+                    .main_scope()
+                    .admit_shell(
+                        ShellJobMetadata {
+                            command: CARGO_COMMAND.into(),
+                            ..metadata()
+                        },
+                        &fixture.history,
+                        |_, _| async { done() },
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(card.task_id, CARGO_SECOND_ID);
+            } else {
+                let outputs = ToolOutputStore::new(fixture.dir.clone());
+                let lease = reserve_task_identity(
+                    &fixture.history,
+                    CARGO_ID,
+                    Some(&outputs),
+                    Some(fixture.session.id),
+                    None,
+                )
+                .unwrap();
+                assert_eq!(lease.task_id(), CARGO_SECOND_ID);
+            }
+            fixture.tasks.shutdown().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn concurrent_shell_and_task_reservations_do_not_collide() {
+        smol::block_on(async {
+            let fixture = Fixture::new().await;
+            let scope = fixture.tasks.main_scope();
+            let (start, ready) = flume::bounded(2);
+            let shell_ready = ready.clone();
+            let history = fixture.history.clone();
+            let shell = smol::spawn(async move {
+                shell_ready.recv_async().await.unwrap();
+                scope
+                    .admit_shell(
+                        ShellJobMetadata {
+                            command: CARGO_COMMAND.into(),
+                            ..metadata()
+                        },
+                        &history,
+                        |_, _| async { done() },
+                    )
+                    .await
+                    .unwrap()
+            });
+            let history = fixture.history.clone();
+            let outputs = ToolOutputStore::new(fixture.dir.clone());
+            let session = fixture.session.id;
+            let task = smol::spawn(async move {
+                ready.recv_async().await.unwrap();
+                reserve_task_identity(&history, CARGO_ID, Some(&outputs), Some(session), None)
+                    .unwrap()
+            });
+            start.send(()).unwrap();
+            start.send(()).unwrap();
+            let (shell, task) = futures_lite::future::zip(shell, task).await;
+            let mut ids = [shell.task_id.as_str(), task.task_id()];
+            ids.sort_unstable();
+            assert_eq!(ids, [CARGO_ID, CARGO_SECOND_ID]);
+            assert!(fixture.history.snapshot().records().is_empty());
+            fixture.tasks.shutdown().await.unwrap();
+        });
+    }
+
     #[test_case(ExecutionMode::Sync; "task_sync_does_not_disable_shell")]
     #[test_case(ExecutionMode::Async; "task_async_does_not_change_shell")]
     fn shell_policy_independence_and_scoped_reminders(mode: ExecutionMode) {
@@ -694,14 +1067,14 @@ mod tests {
             let main = fixture.tasks.main_scope();
             let child = fixture.tasks.child_scope(CHILD);
             let main_card = main
-                .admit_shell(metadata(), |cancel, _| async move {
+                .admit_shell(metadata(), &fixture.history, |cancel, _| async move {
                     cancel.cancelled().await;
                     done()
                 })
                 .await
                 .unwrap();
             let child_card = child
-                .admit_shell(metadata(), |cancel, _| async move {
+                .admit_shell(metadata(), &fixture.history, |cancel, _| async move {
                     cancel.cancelled().await;
                     done()
                 })
@@ -709,10 +1082,12 @@ mod tests {
                 .unwrap();
             let (main_text, _, _) = render(Some(&main.reminder_snapshot()), None);
             let (child_text, _, _) = render(Some(&child.reminder_snapshot()), None);
-            assert!(main_text.contains(&main_card.task_id));
-            assert!(!main_text.contains(&child_card.task_id));
-            assert!(child_text.contains(&child_card.task_id));
-            assert!(!child_text.contains(&main_card.task_id));
+            let main_id = format!("\"{}\"", main_card.task_id);
+            let child_id = format!("\"{}\"", child_card.task_id);
+            assert!(main_text.contains(&main_id));
+            assert!(!main_text.contains(&child_id));
+            assert!(child_text.contains(&child_id));
+            assert!(!child_text.contains(&main_id));
             fixture.tasks.shutdown().await.unwrap();
         });
     }
@@ -734,7 +1109,12 @@ mod tests {
                 done()
             };
             let card = if after_admission {
-                Some(scope.admit_shell(metadata(), factory).await.unwrap())
+                Some(
+                    scope
+                        .admit_shell(metadata(), &fixture.history, factory)
+                        .await
+                        .unwrap(),
+                )
             } else {
                 None
             };
@@ -761,7 +1141,7 @@ mod tests {
                 let count = Arc::clone(&executions);
                 assert!(
                     scope
-                        .admit_shell(metadata(), move |cancel, _| async move {
+                        .admit_shell(metadata(), &fixture.history, move |cancel, _| async move {
                             if !cancel.is_cancelled() {
                                 count.fetch_add(1, Ordering::SeqCst);
                             }
@@ -791,20 +1171,24 @@ mod tests {
             let dir = fixture.dir.clone();
             let session_id = fixture.session.id;
             let card = scope
-                .admit_shell(metadata(), move |_, provenance| async move {
-                    let records = SessionDatabase::open(&dir)
-                        .unwrap()
-                        .background_tasks(session_id)
-                        .unwrap();
-                    let record = records
-                        .iter()
-                        .find(|record| record.invocation_id == provenance.invocation_id)
-                        .unwrap();
-                    assert_eq!(record.kind(), JobKind::Shell);
-                    assert!(record.history.is_null());
-                    assert!(record.spec.is_null());
-                    done()
-                })
+                .admit_shell(
+                    metadata(),
+                    &fixture.history,
+                    move |_, provenance| async move {
+                        let records = SessionDatabase::open(&dir)
+                            .unwrap()
+                            .background_tasks(session_id)
+                            .unwrap();
+                        let record = records
+                            .iter()
+                            .find(|record| record.invocation_id == provenance.invocation_id)
+                            .unwrap();
+                        assert_eq!(record.kind(), JobKind::Shell);
+                        assert!(record.history.is_null());
+                        assert!(record.spec.is_null());
+                        done()
+                    },
+                )
                 .await
                 .unwrap();
             fixture.tasks.join_jobs().await.unwrap();
@@ -879,9 +1263,10 @@ mod tests {
             let (release_tx, release_rx) = flume::bounded(1);
             let owned = scope.clone();
             let tasks = fixture.tasks.clone();
+            let history = fixture.history.clone();
             let waiter = smol::spawn(async move {
                 owned
-                    .admit_shell(metadata(), move |cancel, _| async move {
+                    .admit_shell(metadata(), &history, move |cancel, _| async move {
                         assert!(cancel.is_cancelled());
                         {
                             let _gate = tasks.0.gate.lock().await;
@@ -911,9 +1296,14 @@ mod tests {
             }
             let mut drain = Box::pin(scope.cancel_and_drain());
             assert!(poll_once(&mut drain).await.is_none());
+            if !running {
+                assert!(fixture.history.is_active("shell"));
+            }
             release_tx.send(()).unwrap();
             assert_eq!(drain.await.is_err(), running);
             assert!(fixture.tasks.lock().drivers.is_empty());
+            assert_eq!(fixture.history.active_count(), 0);
+            assert!(fixture.history.snapshot().records().is_empty());
         });
     }
 
@@ -928,7 +1318,7 @@ mod tests {
                 fixture.tasks.main_scope()
             };
             let card = scope
-                .admit_shell(metadata(), |_, _| async {
+                .admit_shell(metadata(), &fixture.history, |_, _| async {
                     let mut done = ToolDoneEvent::error(CALL.into(), LITERAL_OUTPUT);
                     done.is_error = false;
                     done
@@ -993,7 +1383,7 @@ mod tests {
             let card = fixture
                 .tasks
                 .main_scope()
-                .admit_shell(metadata(), move |_, _| {
+                .admit_shell(metadata(), &fixture.history, move |_, _| {
                     assert!(asynchronous, "factory panic");
                     async { panic!("execution panic") }
                 })
@@ -1025,9 +1415,10 @@ mod tests {
                 fixture.tasks.lock().admission_committed = Some((committed_tx, resume_rx));
             }
             let waiter_scope = scope.clone();
+            let history = fixture.history.clone();
             let waiter = smol::spawn(async move {
                 waiter_scope
-                    .admit_shell(metadata(), move |_, _| async move {
+                    .admit_shell(metadata(), &history, move |_, _| async move {
                         count.fetch_add(1, Ordering::SeqCst);
                         done()
                     })
@@ -1042,7 +1433,9 @@ mod tests {
             }
             fixture.tasks.join_jobs().await.unwrap();
             let retry = scope
-                .admit_shell(metadata(), |_, _| async { panic!("retry executed") })
+                .admit_shell(metadata(), &fixture.history, |_, _| async {
+                    panic!("retry executed")
+                })
                 .await
                 .unwrap();
             assert_eq!(retry.state, "succeeded");
@@ -1051,7 +1444,7 @@ mod tests {
             changed.command = OUTPUT.into();
             assert_eq!(
                 scope
-                    .admit_shell(changed, |_, _| async { done() })
+                    .admit_shell(changed, &fixture.history, |_, _| async { done() })
                     .await
                     .unwrap_err(),
                 RETRY_MISMATCH
@@ -1069,7 +1462,7 @@ mod tests {
             let (cancelled_tx, cancelled_rx) = flume::bounded(1);
             let (clean_tx, clean_rx) = flume::bounded(1);
             scope
-                .admit_shell(metadata(), move |cancel, _| async move {
+                .admit_shell(metadata(), &fixture.history, move |cancel, _| async move {
                     cancel.cancelled().await;
                     cancelled_tx.send(()).unwrap();
                     clean_rx.recv_async().await.unwrap();
@@ -1099,7 +1492,7 @@ mod tests {
             assert!(!scope.pending());
             assert_eq!(
                 scope
-                    .admit_shell(metadata(), |_, _| async { done() })
+                    .admit_shell(metadata(), &fixture.history, |_, _| async { done() })
                     .await
                     .unwrap_err(),
                 CLOSED
@@ -1115,7 +1508,7 @@ mod tests {
             let fixture = Fixture::new().await;
             let scope = fixture.tasks.main_scope();
             let card = scope
-                .admit_shell(metadata(), |_, _| async { done() })
+                .admit_shell(metadata(), &fixture.history, |_, _| async { done() })
                 .await
                 .unwrap();
             fixture.tasks.join_jobs().await.unwrap();
@@ -1137,7 +1530,7 @@ mod tests {
                 fixture.tasks.rearm();
                 assert_eq!(
                     scope
-                        .admit_shell(metadata(), |_, _| async { done() })
+                        .admit_shell(metadata(), &fixture.history, |_, _| async { done() })
                         .await
                         .unwrap_err(),
                     STALE_INVOCATION
@@ -1149,7 +1542,7 @@ mod tests {
                 fixture
                     .tasks
                     .main_scope()
-                    .admit_shell(metadata(), |_, _| async { done() })
+                    .admit_shell(metadata(), &fixture.history, |_, _| async { done() })
                     .await
                     .unwrap();
                 fixture.tasks.shutdown().await.unwrap();

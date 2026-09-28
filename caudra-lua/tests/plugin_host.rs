@@ -656,7 +656,7 @@ fn managed_tool_output_rejects_invalid_ids() {
     let error = exec_with_ctx(
         &reg,
         "tool_output_grep",
-        json!({ "output_id": "not-an-output-id", "pattern": "output" }),
+        json!({ "output_id": "../not-an-output-id", "pattern": "output" }),
         &ctx,
     )
     .unwrap_err();

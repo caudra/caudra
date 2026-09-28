@@ -98,13 +98,13 @@ const ERROR_OTHER: &str = "error";
 const DIFF_TIMEOUT: Duration = Duration::from_millis(100);
 
 enum DispatchResult {
-    Completed(ToolDoneEvent),
+    Completed(ToolDoneEvent, Option<String>),
     ShellAdmission(ToolDoneEvent),
 }
 
 impl From<ToolDoneEvent> for DispatchResult {
     fn from(done: ToolDoneEvent) -> Self {
-        Self::Completed(done)
+        Self::Completed(done, None)
     }
 }
 
@@ -470,9 +470,9 @@ pub async fn run(
                 .await
         }
     };
-    let (mut done, admitted) = match dispatched {
-        DispatchResult::Completed(done) => (done, false),
-        DispatchResult::ShellAdmission(done) => (done, true),
+    let (mut done, admitted, output_label) = match dispatched {
+        DispatchResult::Completed(done, label) => (done, false, label),
+        DispatchResult::ShellAdmission(done) => (done, true, None),
     };
     if let Some(Ok(repair)) = repair
         && repair.method != "unchanged"
@@ -487,7 +487,7 @@ pub async fn run(
             None => "JSON repaired".into(),
         });
     }
-    crate::tool_output::limit(&mut done, ctx).await;
+    crate::tool_output::limit_named(&mut done, ctx, output_label.as_deref()).await;
     if !ctx.cancel.is_cancelled()
         && let Some(observations) = &ctx.steering_observations
     {
@@ -827,6 +827,14 @@ async fn run_inner(
             )
             .await;
 
+        let output_label = invocation.shell_timeout().and_then(|_| {
+            invocation
+                .permission_input()
+                .unwrap_or(input)
+                .get(BASH_COMMAND_FIELD)
+                .and_then(Value::as_str)
+                .map(crate::tool_output::shell_output_label)
+        });
         if let Some(timeout) = invocation.shell_timeout() {
             let scope = ctx.job_scope();
             let background =
@@ -895,39 +903,48 @@ async fn run_inner(
                 let pending_report = Arc::new(PendingShellReport::default());
                 let owned_report = Arc::clone(&pending_report);
                 let admitted = scope
-                    .admit_shell(metadata, move |cancel, provenance| async move {
-                        let _guards = (_preparation_guards, _guards);
-                        owned.cancel = cancel;
-                        owned.event_tx = owned.event_tx.clone().with_task(provenance);
-                        let invocation = owned_invocation
-                            .lock()
-                            .unwrap_or_else(|error| error.into_inner())
-                            .take();
-                        let result = match invocation {
-                            Some(invocation) => execute_owned_shell(invocation, &owned).await,
-                            None => ToolExecResult::from(Err(SHELL_INVOCATION_LOST.into())),
-                        };
-                        let mut done = finish_invocation(
-                            owned_id,
-                            owned_tool,
-                            &source,
-                            result,
-                            started.elapsed(),
-                        );
-                        crate::tool_output::limit(&mut done, &owned).await;
-                        let took = started.elapsed();
-                        account(&mut done, &log_source, took);
-                        *owned_report
-                            .0
-                            .lock()
-                            .unwrap_or_else(|error| error.into_inner()) = Some(ShellReport {
-                            done: done.clone(),
-                            source: log_source,
-                            input: log_input,
-                            took,
-                        });
-                        done
-                    })
+                    .admit_shell(
+                        metadata,
+                        &ctx.subagent_history,
+                        move |cancel, provenance| async move {
+                            let _guards = (_preparation_guards, _guards);
+                            owned.cancel = cancel;
+                            owned.event_tx = owned.event_tx.clone().with_task(provenance);
+                            let invocation = owned_invocation
+                                .lock()
+                                .unwrap_or_else(|error| error.into_inner())
+                                .take();
+                            let result = match invocation {
+                                Some(invocation) => execute_owned_shell(invocation, &owned).await,
+                                None => ToolExecResult::from(Err(SHELL_INVOCATION_LOST.into())),
+                            };
+                            let mut done = finish_invocation(
+                                owned_id,
+                                owned_tool,
+                                &source,
+                                result,
+                                started.elapsed(),
+                            );
+                            crate::tool_output::limit_named(
+                                &mut done,
+                                &owned,
+                                output_label.as_deref(),
+                            )
+                            .await;
+                            let took = started.elapsed();
+                            account(&mut done, &log_source, took);
+                            *owned_report
+                                .0
+                                .lock()
+                                .unwrap_or_else(|error| error.into_inner()) = Some(ShellReport {
+                                done: done.clone(),
+                                source: log_source,
+                                input: log_input,
+                                took,
+                            });
+                            done
+                        },
+                    )
                     .await;
                 if admitted.is_err() {
                     pending_report
@@ -961,7 +978,10 @@ async fn run_inner(
         }
 
         let result = invocation.execute(ctx).await;
-        finish_invocation(id, tool_id, &entry.source, result, started.elapsed()).into()
+        DispatchResult::Completed(
+            finish_invocation(id, tool_id, &entry.source, result, started.elapsed()),
+            output_label,
+        )
     } else if name == TOOL_SEARCH_TOOL_NAME && searchable(mcp, ctx) {
         run_tool_search(mcp, id, input, ctx, emit).into()
     } else if mcp.is_some_and(|m| m.has_tool(mcp_lookup)) {
@@ -1799,6 +1819,9 @@ mod tests {
     const SHELL_TIMED_OUT: &str = "timed_out";
     const SHELL_CHILD_OWNER: &str = "shell-child-owner";
     const SHELL_CHILD_TASK: &str = "shell-child-task";
+    const NAMED_SHELL_COMMAND: &str = "cargo test private_test_name";
+    const NAMED_SHELL_OUTPUT: &str = "output-cargo-test";
+    const NAMED_SHELL_TASK: &str = "shell-cargo-test";
     static REPORTED_CALLS: LazyLock<Mutex<HashMap<String, Vec<LedgerOutcome>>>> =
         LazyLock::new(|| Mutex::new(HashMap::new()));
 
@@ -2129,6 +2152,60 @@ mod tests {
                     .as_ref()
                     .is_some_and(|task| task.task_id == card.task_id)
             }));
+            fixture.tasks.shutdown().await.unwrap();
+        });
+    }
+
+    #[test_case(ExecutionMode::Sync; "synchronous")]
+    #[test_case(ExecutionMode::Async; "asynchronous")]
+    fn shell_dispatch_persists_safe_command_output_labels(mode: ExecutionMode) {
+        smol::block_on(async {
+            let mut fixture =
+                ShellDispatchFixture::new(Some(Duration::from_secs(121)), Effect::Allow).await;
+            fixture.ctx.config.shell_execution = mode;
+            let text = SHELL_RESULT.repeat(1_000);
+            fixture
+                .results
+                .send(ToolExecResult::from(Ok(ToolOutput::Plain(
+                    text.clone().into(),
+                ))))
+                .unwrap();
+            let done = run(
+                &fixture.ctx.registry,
+                None,
+                SHELL_CALL.into(),
+                CONTROLLED_SHELL,
+                &json!({"command": NAMED_SHELL_COMMAND}),
+                &fixture.ctx,
+                Emit::Notify,
+            )
+            .await;
+            assert!(!done.is_error, "{}", done.output.as_text());
+            let reference = if let ToolOutput::Tasks(cards) = &done.output {
+                assert_eq!(cards[0].task_id, NAMED_SHELL_TASK);
+                fixture.settled(&cards[0]).await;
+                SessionDatabase::open(&fixture.dir)
+                    .unwrap()
+                    .background_tasks(fixture.tasks.session_id())
+                    .unwrap()
+                    .pop()
+                    .unwrap()
+                    .output_ref
+                    .unwrap()
+            } else {
+                done.output_ref.unwrap()
+            };
+            assert_eq!(reference.id.as_str(), NAMED_SHELL_OUTPUT);
+            assert_eq!(
+                fixture
+                    .ctx
+                    .tool_output_store
+                    .as_ref()
+                    .unwrap()
+                    .load_text(fixture.tasks.session_id(), reference.id)
+                    .unwrap(),
+                text
+            );
             fixture.tasks.shutdown().await.unwrap();
         });
     }

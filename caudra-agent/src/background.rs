@@ -43,6 +43,7 @@ const MAX_REPORT_BYTES: usize = 16 * 1024;
 const MAX_PENDING_BYTES: usize = 2 * 1024 * 1024;
 const MAX_BATCH_BYTES: usize = 64 * 1024;
 const MAX_RESULT_BYTES: usize = 32 * 1024;
+const TASK_OUTPUT_LABEL: &str = "output-task";
 const STALE_INVOCATION: &str =
     "task invocation or session generation changed; refresh before controlling it";
 const CLOSED: &str = "background task admission is closed; an explicit user turn must rearm it";
@@ -1283,11 +1284,13 @@ impl BackgroundTasks {
         }
         if matches!(request.task, TaskIdentity::Derive) {
             let database = SessionDatabase::open(&self.0.dir).map_err(|error| error.to_string())?;
-            let lease = ctx.subagent_history.reserve_generated(|id| {
-                database
-                    .task_identity_exists(self.0.session, id)
-                    .map_err(|error| error.to_string())
-            })?;
+            let lease = ctx
+                .subagent_history
+                .reserve_generated(&request.label, |id| {
+                    database
+                        .task_identity_exists(self.0.session, id)
+                        .map_err(|error| error.to_string())
+                })?;
             request.task = TaskIdentity::Reserved(lease);
         }
         let task_id = match &request.task {
@@ -1663,7 +1666,7 @@ fn store_outcome(
 ) -> Result<ToolOutputRef, String> {
     let serialized = serde_json::to_string_pretty(value).map_err(|error| error.to_string())?;
     ToolOutputStore::new(dir.clone())
-        .put(session, &serialized)
+        .put_named(session, &serialized, TASK_OUTPUT_LABEL)
         .map_err(|error| format!("could not persist complete task outcome: {error}"))
 }
 
@@ -1725,8 +1728,8 @@ mod tests {
 
     use super::{
         BackgroundTasks, CLOSED, FOREIGN_SESSION, MAX_REPORT_BYTES, MAX_REPORTS, MAX_RESULT_BYTES,
-        SELECTED_HISTORY_MISSING, STALE_INVOCATION, TASK_ASYNC, TASK_PROMOTION, TASK_SYNC,
-        TRANSITION, TaskDelivery, TaskReporter, TaskStatus,
+        SELECTED_HISTORY_MISSING, STALE_INVOCATION, TASK_ASYNC, TASK_OUTPUT_LABEL, TASK_PROMOTION,
+        TASK_SYNC, TRANSITION, TaskDelivery, TaskReporter, TaskStatus,
     };
     use crate::{
         AgentEvent, AgentMode, BackgroundReminderContext, CancelToken, Envelope, EventSender,
@@ -1747,6 +1750,7 @@ mod tests {
     };
 
     const TASK: &str = "background-test-task";
+    const SECOND_TASK: &str = "background-test-task-2";
     const NEXT_CALL: &str = "background-test-continuation";
     const PROMPT: &str = "Investigate independently and report the findings.";
     const RESULT: &str = "Verified the relevant code in src/lib.rs:1.";
@@ -2376,6 +2380,7 @@ mod tests {
                 assert_eq!(status.result.as_ref(), Some(&expected));
             }
             let reference = status.output_ref.clone().unwrap();
+            assert_eq!(reference.id.as_str(), TASK_OUTPUT_LABEL);
             let model = status.model_value();
             if oversized {
                 assert_eq!(model["output_ref"]["id"], reference.id.to_string());
@@ -2857,8 +2862,7 @@ mod tests {
             let fixture = Fixture::new().await;
             fixture.launch().await;
             let first = fixture.tasks.status(&fixture.task_id()).unwrap();
-            assert_ne!(first.task_id, TASK);
-            assert_eq!(first.task_id.split('-').count(), 3);
+            assert_eq!(first.task_id, TASK);
             assert_eq!(first.call_id, TASK);
             assert_ne!(first.invocation_id, first.call_id);
             assert_eq!(
@@ -2895,6 +2899,36 @@ mod tests {
             );
             assert_eq!(fixture.ctx.subagent_history.active_count(), 1);
             fixture.tasks.shutdown().await.unwrap();
+        });
+    }
+
+    #[test_case(false; "active")]
+    #[test_case(true; "durable_only_after_restore")]
+    fn repeated_descriptions_admit_new_tasks_without_resuming(reload: bool) {
+        smol::block_on(async {
+            let fixture = Fixture::new().await;
+            fixture.launch().await;
+            let mut ctx = fixture.ctx.clone();
+            let tasks = if reload {
+                fixture.responses.send(final_response()).unwrap();
+                fixture.settled().await;
+                fixture.tasks.shutdown().await.unwrap();
+                ctx.subagent_history = SubagentHistoryStore::default();
+                BackgroundTasks::spawn(fixture.dir.clone(), fixture.session.id)
+                    .await
+                    .unwrap()
+            } else {
+                fixture.tasks.clone()
+            };
+            let TaskDelivery::Background(card) =
+                tasks.execute(&ctx, request(NEXT_CALL), true).await.unwrap()
+            else {
+                panic!("expected background admission")
+            };
+            assert_eq!(card.task_id, SECOND_TASK);
+            assert_eq!(card.label, TASK);
+            fixture.started.recv_async().await.unwrap();
+            tasks.shutdown().await.unwrap();
         });
     }
 
@@ -3041,6 +3075,7 @@ mod tests {
             ctx.subagent_history = SubagentHistoryStore::default();
             let mut continuation = request(NEXT_CALL);
             continuation.task = TaskIdentity::Continue(TASK.into());
+            continuation.label = NEXT_CALL.into();
             let TaskDelivery::Background(card) =
                 recovered.execute(&ctx, continuation, true).await.unwrap()
             else {

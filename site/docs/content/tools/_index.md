@@ -128,7 +128,7 @@ Page or search managed tool output owned by the current session. Omit `pattern` 
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
-| `output_id` | string | yes |  | Output handle from a truncation notice or task result. New handles use wordlist names; existing IDs remain valid. Pass the handle unchanged. |
+| `output_id` | string | yes |  | Output handle from a truncation notice or task result. New handles describe the producing tool or command, with numeric suffixes for collisions. Existing IDs remain valid. Pass the handle unchanged. |
 | `pattern` | string | no |  | Regex to search for. Omit to read lines instead. |
 | `offset` | integer | no | 1 | Starting line, 1-indexed. |
 | `limit` | integer | no |  | Lines to return when reading, or matches when searching. Reading defaults to 200 and caps at 2000. Searching defaults to 100 and caps at 200. |

@@ -14,6 +14,34 @@ use crate::{IndexOutput, TextOutput, ToolDoneEvent, ToolOutput, ToolOutputLimits
 const PERSIST_THRESHOLD_BYTES: usize = 8 * 1024;
 const READ_LIMIT: usize = 200;
 const CLEANUP_THREAD_NAME: &str = "tool-output-reclaim";
+const MAX_COMMAND_LABEL_BYTES: usize = 4096;
+const SHELL_LABEL: &str = "shell";
+const OUTPUT_LABEL: &str = "output";
+const SHELL_LABEL_COMMANDS: &[(&str, &[&str])] = &[
+    (
+        "cargo",
+        &[
+            "build", "check", "test", "nextest", "clippy", "fmt", "run", "doc",
+        ],
+    ),
+    (
+        "git",
+        &[
+            "status", "diff", "log", "show", "fetch", "pull", "push", "add", "commit",
+        ],
+    ),
+    ("npm", &["test", "run", "install", "ci", "build"]),
+    ("pnpm", &["test", "run", "install", "build", "lint"]),
+    ("yarn", &["test", "run", "install", "build", "lint"]),
+    ("bun", &["test", "run", "install", "build"]),
+    ("go", &["build", "test", "run", "vet", "fmt"]),
+    ("just", &["check", "test", "lint", "build", "fmt"]),
+    ("make", &[]),
+    ("cmake", &[]),
+    ("ninja", &[]),
+    ("pytest", &[]),
+    ("rustc", &[]),
+];
 
 static DEFAULT_STORE: LazyLock<Option<Arc<ToolOutputStore>>> = LazyLock::new(|| {
     StateDir::resolve()
@@ -54,6 +82,36 @@ pub(crate) fn default_store() -> Option<Arc<ToolOutputStore>> {
 }
 
 pub(crate) async fn limit(done: &mut ToolDoneEvent, ctx: &ToolContext) {
+    limit_named(done, ctx, None).await;
+}
+
+pub(crate) fn shell_output_label(command: &str) -> String {
+    if command.len() > MAX_COMMAND_LABEL_BYTES
+        || !command
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b" \t-_.:/=,@%+".contains(&byte))
+    {
+        return SHELL_LABEL.into();
+    }
+    let mut words = command.split_ascii_whitespace();
+    let Some((program, subcommands)) = words.next().and_then(|program| {
+        SHELL_LABEL_COMMANDS
+            .iter()
+            .find(|(name, _)| *name == program)
+    }) else {
+        return SHELL_LABEL.into();
+    };
+    match words.next().filter(|word| subcommands.contains(word)) {
+        Some(subcommand) => format!("{program}-{subcommand}"),
+        None => (*program).into(),
+    }
+}
+
+pub(crate) async fn limit_named(
+    done: &mut ToolDoneEvent,
+    ctx: &ToolContext,
+    producer: Option<&str>,
+) {
     let limits = effective_limits(done.output_limits, &ctx.config);
     let pre_persisted = done.model_output_from_ref;
     let pre_persisted_load = if pre_persisted {
@@ -71,8 +129,14 @@ pub(crate) async fn limit(done: &mut ToolDoneEvent, ctx: &ToolContext) {
         return;
     }
 
+    let producer = producer.unwrap_or(&done.tool);
+    let label = if producer.is_empty() || producer == "unknown" {
+        OUTPUT_LABEL.to_owned()
+    } else {
+        format!("{OUTPUT_LABEL}-{producer}")
+    };
     let output_ref = if pre_persisted && done.output.instructions().is_some() {
-        let output_ref = persist(ctx, full_model_output).await;
+        let output_ref = persist(ctx, full_model_output, label).await;
         if output_ref.is_some() {
             done.output_ref = output_ref.clone();
         }
@@ -80,7 +144,7 @@ pub(crate) async fn limit(done: &mut ToolDoneEvent, ctx: &ToolContext) {
     } else if pre_persisted {
         done.output_ref.clone()
     } else {
-        let output_ref = persist(ctx, full_model_output).await;
+        let output_ref = persist(ctx, full_model_output, label).await;
         done.output_ref = output_ref.clone();
         output_ref
     };
@@ -234,14 +298,14 @@ fn effective_limits(
     }
 }
 
-async fn persist(ctx: &ToolContext, text: String) -> Option<ToolOutputRef> {
+async fn persist(ctx: &ToolContext, text: String, label: String) -> Option<ToolOutputRef> {
     let (Some(session_id), Some(store)) = (&ctx.session_id, &ctx.tool_output_store) else {
         return None;
     };
     let session_id = session_id.clone();
     let storage_session_id = session_id.id();
     let store = Arc::clone(store);
-    match smol::unblock(move || store.put(storage_session_id, &text)).await {
+    match smol::unblock(move || store.put_named(storage_session_id, &text, &label)).await {
         Ok(output_ref) => Some(output_ref),
         Err(error) => {
             warn!(%error, session_id = %session_id, "failed to persist tool output");
@@ -427,6 +491,67 @@ mod tests {
     const LARGE_BYTE_LIMIT: usize = 100_000;
     const ROSTER_LOST: &str = "an oversized batch must keep the roster its card is drawn from";
     const SHAPE_LOST: &str = "an oversized result must keep the variant its card is drawn from";
+
+    #[test_case("cargo test private_test_name --token=private", "cargo-test"; "ignores_arguments")]
+    #[test_case("git status --short", "git-status"; "known_subcommand")]
+    #[test_case("npm run private_script", "npm-run"; "ignores_script_name")]
+    #[test_case("cargo private_command", "cargo"; "unknown_subcommand")]
+    #[test_case("pytest private/path.py", "pytest"; "ignores_path")]
+    #[test_case("TOKEN=private cargo test", SHELL_LABEL; "environment")]
+    #[test_case("/private/bin/cargo test", SHELL_LABEL; "executable_path")]
+    #[test_case("private_program", SHELL_LABEL; "unknown_program")]
+    #[test_case("sudo cargo test", SHELL_LABEL; "wrapper")]
+    #[test_case("cargo test | cat", SHELL_LABEL; "pipeline")]
+    #[test_case("cargo test && cargo check", SHELL_LABEL; "compound")]
+    #[test_case("cargo test > private", SHELL_LABEL; "redirect")]
+    #[test_case("cargo test $(private)", SHELL_LABEL; "substitution")]
+    #[test_case("cargo test `private`", SHELL_LABEL; "backticks")]
+    #[test_case("cargo test 'private'", SHELL_LABEL; "quoted")]
+    #[test_case("cargo test\ncargo check", SHELL_LABEL; "multiline")]
+    #[test_case("cargo test # private", SHELL_LABEL; "comment")]
+    #[test_case("", SHELL_LABEL; "empty")]
+    fn shell_labels_use_only_fixed_command_names(command: &str, expected: &str) {
+        assert_eq!(shell_output_label(command), expected);
+    }
+
+    #[test]
+    fn shell_labels_bound_command_inspection() {
+        let command = format!("cargo test {}", "x".repeat(MAX_COMMAND_LABEL_BYTES));
+        assert_eq!(shell_output_label(&command), SHELL_LABEL);
+    }
+
+    #[test_case("file_grep", None, "output-file-grep"; "tool_name")]
+    #[test_case("shell", Some("cargo-test"), "output-cargo-test"; "shell_label")]
+    #[test_case("shell", Some(SHELL_LABEL), "output-shell"; "shell_fallback")]
+    #[test_case("unknown", None, OUTPUT_LABEL; "generic_fallback")]
+    fn persisted_outputs_use_producer_labels(tool: &str, producer: Option<&str>, expected: &str) {
+        let temp = TempDir::new().unwrap();
+        let (ctx, store, session) = stored_context(&temp, 8, 360);
+        let text = "private output content\n".repeat(100);
+        for suffix in [String::new(), "-2".into()] {
+            let mut event = done(text.clone(), false);
+            event.tool = Arc::from(tool);
+            smol::block_on(limit_named(&mut event, &ctx, producer));
+            let reference = event.output_ref.unwrap();
+            assert_eq!(reference.id.as_str(), format!("{expected}{suffix}"));
+            assert_eq!(store.load_text(session.id(), reference.id).unwrap(), text);
+        }
+    }
+
+    #[test]
+    fn producer_label_does_not_rename_a_pre_persisted_output() {
+        let temp = TempDir::new().unwrap();
+        let (ctx, store, session) = stored_context(&temp, 8, 360);
+        let text = "streamed output\n".repeat(100);
+        let reference = store
+            .put_named(session.id(), &text, "existing-label")
+            .unwrap();
+        let mut event = done(String::new(), false);
+        event.output_ref = Some(reference.clone());
+        event.model_output_from_ref = true;
+        smol::block_on(limit_named(&mut event, &ctx, Some("cargo-test")));
+        assert_eq!(event.output_ref.unwrap().id, reference.id);
+    }
 
     #[test_case("", 0 ; "empty")]
     #[test_case("x", 1 ; "unterminated")]

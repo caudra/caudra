@@ -592,9 +592,10 @@ mod tests {
         );
     }
 
-    #[test_case(false; "background_record")]
-    #[test_case(true; "historical_stream")]
-    fn task_identity_lookup_retains_completed_ids_after_reopen(stream: bool) {
+    #[test_case(false, false; "background_record")]
+    #[test_case(true, false; "historical_stream")]
+    #[test_case(false, true; "workflow_roster_only")]
+    fn task_identity_lookup_retains_completed_ids_after_reopen(stream: bool, roster: bool) {
         let temp = tempfile::tempdir().unwrap();
         let dir = StateDir::from_path(temp.path().to_path_buf());
         let mut session = TestSession::new(MODEL, CWD);
@@ -602,7 +603,15 @@ mod tests {
         {
             let db = SessionDatabase::open(&dir).unwrap();
             assert!(!db.task_identity_exists(session.id, TASK).unwrap());
-            if stream {
+            if roster {
+                db.connection().execute(
+                    "INSERT INTO workflow_runs (run_id, session_id, display_name, workflow_name, source_kind, \
+                     source_digest, language_version, abi_version, source, args, launch_mode, status, \
+                     agent_budget, usage, roster, created_at, updated_at) \
+                     VALUES (?1, ?2, ?1, ?1, 'project', ?1, 1, 1, '', '{}', 'build', 'completed', 1, '{}', ?3, 0, 0)",
+                    rusqlite::params![INVOCATION, session.id.as_bytes().as_slice(), json!([{"task_id":TASK}]).to_string()],
+                ).unwrap();
+            } else if stream {
                 db.connection()
                     .execute(
                         "INSERT INTO subagent_streams(session_id, subagent_id) VALUES (?1, ?2)",

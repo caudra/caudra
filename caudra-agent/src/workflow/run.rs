@@ -443,7 +443,7 @@ impl Driver {
             let lease = self
                 .env
                 .runner
-                .reserve_task(previous)
+                .reserve_task(previous, &label_of(key, request))
                 .map_err(HostError::Failed)?;
             reserved.push((key, request, lease));
         }

@@ -73,11 +73,21 @@ Open `/tasks` or press `Ctrl+X a` to inspect transcripts and steer running child
 
 Singular `/task` forms remain compatibility aliases. Press Enter or click an agent task to open its chat. Shell jobs show command details and bounded output rather than a child chat. The picker shows `bg` at the right of background rows, including finished tasks. Task results and reports render as Markdown, structured values as JSON, and shell output as literal text. See [task navigation](/docs/commands/#tasks) for filtering and keyboard controls.
 
-New tasks receive short `adjective-adjective-noun` IDs, separate from their description labels. Existing IDs remain valid. Use the returned `task_id` for inspection, cancellation, or later continuation.
-
 The model can inspect and cancel jobs through [`task_control`](/docs/tools/#task_control). Task `auto` also permits promotion of agent tasks. All actions except `list` require `task_id`. A later `task` call can continue a settled agent task from its saved history, but cannot resume an active or cancelling invocation. Shell jobs cannot be resumed or promoted. Run a new shell call when another command is needed.
 
 Shell results retain Workcell's output bounds and filtering. A truncated result can include a `tool_output` reference for the retained output, which is not an unlimited process log. Saved references remain usable after history reloads and forks.
+
+### Task and output IDs
+
+New task IDs come from the description or workflow label. `Implement active footer chips` becomes `implement-active-footer-chips`. Display descriptions stay unchanged. Names use lowercase ASCII letters, digits, and hyphens. Labels with no usable characters fall back to `task`.
+
+Shell jobs use a safe command label such as `shell-cargo-test`. Only recognized executable names and fixed subcommands contribute to the label. Arguments, paths, and command output do not. Unknown or complex commands fall back to `shell`.
+
+Stored output handles identify the producer, such as `output-file-grep` or `output-cargo-test`. Generic shell output uses `output-shell`, and output without a known producer uses `output`.
+
+Collisions add `-2`, `-3`, and later numeric suffixes. New IDs are at most 64 characters, including prefixes and suffixes. Shell jobs and their outputs allocate suffixes independently. Always use the returned `task_id` or output reference unchanged rather than reconstructing it from a label.
+
+Existing IDs and output handles remain valid. Continuations and workflow replay keep the original task ID even when its description changes. Reloading or copying a session preserves its saved output references.
 
 ### Child reports
 

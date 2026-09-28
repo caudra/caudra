@@ -103,7 +103,7 @@ One-shot `--print`, including `--output-format stream-json` without stream input
 Task controls use the same `control_request` envelope as workflow controls:
 
 ```json
-{"type":"control_request","request_id":"t1","request":{"subtype":"task_status","task_id":"calm-bright-heron"}}
+{"type":"control_request","request_id":"t1","request":{"subtype":"task_status","task_id":"implement-active-footer-chips"}}
 ```
 
 | Subtype | Arguments | Effect |
@@ -117,11 +117,11 @@ A successful `control_response` carries the task list or status in `response.res
 
 Status `kind` distinguishes `agent` from `shell`. Shell entries carry command metadata and have no child transcript. They support inspection and cancellation, but cannot be promoted or resumed with `task`. Child-owned command results return to that exact child invocation rather than starting a main-agent continuation.
 
-New task IDs are short `adjective-adjective-noun` phrases. Pass the returned ID unchanged. Older IDs remain valid.
+New task IDs come from the description. Shell jobs use safe command labels such as `shell-cargo-test`, falling back to `shell`. Collisions add numeric suffixes such as `-2`. Pass the returned ID unchanged. Older IDs remain valid. See [task and output IDs](/docs/sessions/#task-and-output-ids).
 
 Task status `result` is now a native JSON outcome object, replacing the JSON-encoded string. Read `result.output` directly, preserving its object, array, scalar, or string type. Do not JSON-decode `result` a second time. This corrects the SDK wire shape without rewriting saved outcomes.
 
-If an outcome exceeds the status limit, `result` is omitted, `result_truncated` is `true`, and `result_preview` contains bounded text. The preview may be incomplete JSON and is not a complete result. The full outcome is retained in the session's output store. When `output_ref` is present, pass its `id` as `output_id` to `tool_output` to read or search that outcome. New output handles use wordlist names and older IDs remain valid. Model-facing status and terminal notices include retrieval guidance when their result is incomplete. Complete short results do not prompt another fetch.
+If an outcome exceeds the status limit, `result` is omitted, `result_truncated` is `true`, and `result_preview` contains bounded text. The preview may be incomplete JSON and is not a complete result. The full outcome is retained in the session's output store. When `output_ref` is present, pass its `id` as `output_id` to `tool_output` to read or search that outcome. New output handles identify the producer, such as `output-file-grep`, with numeric suffixes for collisions. Older handles remain valid. Model-facing status and terminal notices include retrieval guidance when their result is incomplete. Complete short results do not prompt another fetch.
 
 `reports_truncated` marks shortened or omitted report text. Task lists omit result and report details to stay lightweight. Request `task_status` for details and the retained output reference.
 

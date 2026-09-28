@@ -70,6 +70,7 @@ const INVALID_INPUT_PREFIX: &str =
 const INTERRUPTED_PREFIX: &str = "sub-agent interrupted (";
 const INTERRUPTED_SUFFIX: &str = "). Partial output:\n";
 const ERROR_PREFIX: &str = "sub-agent error: ";
+const RESERVATION_UNSUPPORTED: &str = "task runner does not support identity reservation; implement reserve_task using the session's shared history and durable identity namespace";
 
 /// Process-wide cap on concurrently running subagents. Sized once from config
 /// before any tool runs; `caudra_config::DEFAULT_TASK_MAX_CONCURRENT` until
@@ -130,12 +131,12 @@ pub struct TaskOutcome {
 pub type TaskFuture<'a> = Pin<Box<dyn Future<Output = TaskOutcome> + Send + 'a>>;
 
 pub trait TaskRunner: Send + Sync {
-    fn reserve_task(&self, task_id: Option<&str>) -> Result<SubagentHistoryLease, String> {
-        let history = SubagentHistoryStore::default();
-        match task_id {
-            Some(id) => history.reserve_unconfigured(id),
-            None => history.reserve_generated(|_| Ok(false)),
-        }
+    fn reserve_task(
+        &self,
+        _task_id: Option<&str>,
+        _label: &str,
+    ) -> Result<SubagentHistoryLease, String> {
+        Err(RESERVATION_UNSUPPORTED.into())
     }
 
     fn rebind_workspace(
@@ -799,7 +800,11 @@ impl SubagentTaskRunner {
 }
 
 impl TaskRunner for SubagentTaskRunner {
-    fn reserve_task(&self, task_id: Option<&str>) -> Result<SubagentHistoryLease, String> {
+    fn reserve_task(
+        &self,
+        task_id: Option<&str>,
+        label: &str,
+    ) -> Result<SubagentHistoryLease, String> {
         let history = &self.host.subagent_history;
         match task_id {
             Some(id) if history.snapshot().records().contains_key(id) => history
@@ -808,8 +813,10 @@ impl TaskRunner for SubagentTaskRunner {
             Some(id) => history.reserve_unconfigured(id),
             None => subagent::reserve_task_identity(
                 history,
+                label,
                 self.host.tool_output_store.as_deref(),
                 self.host.session_id.as_ref().map(SessionRef::id),
+                self.host.jobs.as_ref(),
             ),
         }
     }
@@ -894,6 +901,8 @@ mod tests {
     const DEFERRED_TOOL: &str = "python_execution";
     const FRESH_ID: &str = "wf-run-1-call-7";
     const LABEL: &str = "find auth";
+    const LABEL_ID: &str = "find-auth";
+    const SECOND_LABEL_ID: &str = "find-auth-2";
     const PROMPT: &str = "search the codebase";
     const SUMMARY: &str = "found the middleware in src/auth.rs:12";
     const REQUIRED_FIELD: &str = "answer";
@@ -927,6 +936,50 @@ mod tests {
         cache_creation: 0,
         cache_read: 0,
     };
+
+    struct UnsupportedRunner;
+
+    impl TaskRunner for UnsupportedRunner {
+        fn run(&self, _: TaskRequest, _: CancelToken, _: EventSender) -> TaskFuture<'_> {
+            panic!("unsupported runner must not execute")
+        }
+    }
+
+    #[test_case(None; "generated")]
+    #[test_case(Some(FRESH_ID); "explicit")]
+    fn default_runner_requires_session_identity_reservation(task_id: Option<&str>) {
+        assert_eq!(
+            UnsupportedRunner.reserve_task(task_id, LABEL).unwrap_err(),
+            RESERVATION_UNSUPPORTED
+        );
+    }
+
+    #[test]
+    fn workflow_runner_reserves_shared_labels_and_preserves_replay_ids() {
+        let ctx = stub_ctx_with(&AgentMode::Build, None, Some(CALL_ID));
+        let model: ModelResolver = Arc::new({
+            let provider = Arc::clone(&ctx.provider);
+            let model = Arc::clone(&ctx.model);
+            move || (Arc::clone(&provider), Arc::clone(&model))
+        });
+        let runner = SubagentTaskRunner::new(Arc::new(WorkflowHostContext::from_tool_context(
+            &ctx,
+            model,
+            Arc::new(|| AgentMode::Build),
+            Arc::new(CancelMap::new()),
+        )));
+        let first = runner.reserve_task(None, LABEL).unwrap();
+        let second = runner.reserve_task(None, "Find/Auth").unwrap();
+        assert_eq!(first.task_id(), LABEL_ID);
+        assert_eq!(second.task_id(), SECOND_LABEL_ID);
+        first.complete(Vec::new());
+        let replay = runner.reserve_task(Some(LABEL_ID), PROMPT).unwrap();
+        assert_eq!(replay.task_id(), LABEL_ID);
+        let legacy = runner.reserve_task(Some(FRESH_ID), LABEL).unwrap();
+        assert_eq!(legacy.task_id(), FRESH_ID);
+        drop((second, replay, legacy));
+        assert_eq!(ctx.subagent_history.active_count(), 0);
+    }
 
     #[derive(Clone, Default)]
     struct CursorProbe {
@@ -1631,7 +1684,7 @@ mod tests {
             assert!(outcome.success && !outcome.cancelled);
             assert_eq!(outcome.output, expected);
             assert_ne!(outcome.task_id.as_deref(), Some(CALL_ID));
-            assert_eq!(outcome.task_id.as_deref().unwrap().split('-').count(), 3);
+            assert_eq!(outcome.task_id.as_deref(), Some(LABEL_ID));
             let expected_tokens = FIRST_TURN.total_input()
                 + FIRST_TURN.output
                 + SECOND_TURN.total_input()

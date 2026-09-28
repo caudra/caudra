@@ -29,8 +29,10 @@ use tempfile::NamedTempFile;
 use thiserror::Error;
 
 use crate::id::CaudraId;
-use crate::words::random_task_id;
-use crate::{StateDir, StorageError, lock_session_artifacts, sync_parent_dir};
+use crate::{
+    DESCRIPTIVE_ID_ATTEMPTS, DESCRIPTIVE_ID_MAX_LEN, DescriptiveIdCandidates, StateDir,
+    StorageError, lock_session_artifacts, sync_parent_dir,
+};
 
 pub(crate) const TOOL_OUTPUT_DIR: &str = "tool-output";
 const OUTPUT_EXTENSION: &str = "txt";
@@ -46,9 +48,8 @@ const MAX_GREP_PATTERN_CHARS: usize = 512;
 const MAX_GREP_MATCHES: usize = 200;
 const MAX_GREP_CONTEXT: usize = 5;
 const ORPHAN_GRACE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
-const ID_GENERATION_ATTEMPTS: usize = 8;
-const MAX_OUTPUT_ID_BYTES: usize = 64;
-const OUTPUT_ID_WORDS: usize = 3;
+const STAGE_CREATION_ATTEMPTS: usize = 8;
+const DEFAULT_OUTPUT_LABEL: &str = "output";
 const SCAN_BUFFER_BYTES: usize = 64 * 1024;
 #[cfg(unix)]
 const TEMP_FILE_MODE: u32 = 0o600;
@@ -61,17 +62,12 @@ const OMITTED: &str = "[...]";
 pub struct ToolOutputId(String);
 
 #[derive(Clone, Debug, PartialEq, Eq, Error)]
-#[error("invalid tool output ID: expected three lowercase words or a canonical legacy ID")]
+#[error(
+    "invalid tool output ID: expected a lowercase ASCII alphanumeric slug with single hyphens (at most {DESCRIPTIVE_ID_MAX_LEN} bytes), or a canonical legacy ID"
+)]
 pub struct ToolOutputIdParseError;
 
 impl ToolOutputId {
-    fn generate() -> Result<Self, ToolOutputError> {
-        let phrase = random_task_id().map_err(std::io::Error::other)?;
-        phrase
-            .parse()
-            .map_err(|error| std::io::Error::other(error).into())
-    }
-
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -87,20 +83,19 @@ impl FromStr for ToolOutputId {
     type Err = ToolOutputIdParseError;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        if value.is_empty() || value.len() > MAX_OUTPUT_ID_BYTES {
+        if value.is_empty() || value.len() > DESCRIPTIVE_ID_MAX_LEN {
             return Err(ToolOutputIdParseError);
         }
-        let mut words = value.split('-');
-        let readable = (0..OUTPUT_ID_WORDS).all(|_| {
-            words.next().is_some_and(|word| {
-                !word.is_empty() && word.bytes().all(|byte| byte.is_ascii_lowercase())
-            })
-        }) && words.next().is_none();
-        if readable
-            || value
-                .parse::<CaudraId>()
-                .is_ok_and(|id| id.to_string() == value)
-        {
+        let slug = value.split('-').all(|segment| {
+            !segment.is_empty()
+                && segment
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+        });
+        let legacy = value
+            .parse::<CaudraId>()
+            .is_ok_and(|id| id.to_string() == value);
+        if slug || legacy {
             Ok(Self(value.to_owned()))
         } else {
             Err(ToolOutputIdParseError)
@@ -194,7 +189,9 @@ pub enum ToolOutputError {
     PatternTooLong { char_count: usize, max_chars: usize },
     #[error("invalid grep pattern: {0}")]
     InvalidPattern(#[from] regex::Error),
-    #[error("could not generate a unique tool output ID")]
+    #[error(
+        "could not allocate a tool output ID after {DESCRIPTIVE_ID_ATTEMPTS} candidates; use a different label or remove unneeded session outputs"
+    )]
     IdCollision,
     #[error("tool output sink cannot be finished after an I/O write failure")]
     SinkWriteFailed,
@@ -305,6 +302,7 @@ pub struct ToolOutputSink {
     file: Option<StagedOutput>,
     directory: OutputDirectory,
     id: ToolOutputId,
+    candidates: DescriptiveIdCandidates,
     byte_count: usize,
     newline_count: usize,
     ends_with_newline: bool,
@@ -352,14 +350,7 @@ impl ToolOutputSink {
         Ok(())
     }
 
-    pub fn finish(self) -> Result<ToolOutputRef, ToolOutputError> {
-        self.finish_with(ToolOutputId::generate)
-    }
-
-    fn finish_with(
-        mut self,
-        mut generate: impl FnMut() -> Result<ToolOutputId, ToolOutputError>,
-    ) -> Result<ToolOutputRef, ToolOutputError> {
+    pub fn finish(mut self) -> Result<ToolOutputRef, ToolOutputError> {
         if self.write_failed {
             return Err(ToolOutputError::SinkWriteFailed);
         }
@@ -371,10 +362,7 @@ impl ToolOutputSink {
         // Cleanup and recreation use this same cross-process lock, so an old
         // generation cannot delete an output while publication is in flight.
         let _artifact_lock = lock_session_artifacts(&self.state_dir)?;
-        for attempt in 0..ID_GENERATION_ATTEMPTS {
-            if attempt > 0 {
-                self.id = generate()?;
-            }
+        loop {
             match self.directory.publish(&mut file, &output_name(&self.id)) {
                 Ok(()) => {
                     self.directory.sync()?;
@@ -388,11 +376,15 @@ impl ToolOutputSink {
                         ),
                     });
                 }
-                Err(error) if error.kind() == ErrorKind::AlreadyExists => continue,
+                Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+                    let Some(candidate) = self.candidates.next() else {
+                        return Err(ToolOutputError::IdCollision);
+                    };
+                    self.id = ToolOutputId(candidate);
+                }
                 Err(error) => return Err(error.into()),
             }
         }
-        Err(ToolOutputError::IdCollision)
     }
 
     pub fn discard(mut self) -> Result<(), ToolOutputError> {
@@ -533,7 +525,7 @@ impl OutputDirectory {
     }
 
     fn create_stage(&self) -> std::io::Result<StagedOutput> {
-        for _ in 0..ID_GENERATION_ATTEMPTS {
+        for _ in 0..STAGE_CREATION_ATTEMPTS {
             #[cfg(unix)]
             {
                 let name = format!(".{}.tmp", CaudraId::generate());
@@ -730,25 +722,35 @@ impl ToolOutputStore {
     }
 
     pub fn put(&self, session_id: CaudraId, text: &str) -> Result<ToolOutputRef, ToolOutputError> {
+        self.put_named(session_id, text, DEFAULT_OUTPUT_LABEL)
+    }
+
+    pub fn put_named(
+        &self,
+        session_id: CaudraId,
+        text: &str,
+        label: &str,
+    ) -> Result<ToolOutputRef, ToolOutputError> {
         self.ensure_size(text.len())?;
-        let mut sink = self.begin(session_id)?;
+        let mut sink = self.begin_named(session_id, label)?;
         sink.append(text)?;
         sink.finish()
     }
 
     pub fn begin(&self, session_id: CaudraId) -> Result<ToolOutputSink, ToolOutputError> {
-        self.begin_with(session_id, ToolOutputId::generate)
+        self.begin_named(session_id, DEFAULT_OUTPUT_LABEL)
     }
 
-    fn begin_with(
+    pub fn begin_named(
         &self,
         session_id: CaudraId,
-        mut generate: impl FnMut() -> Result<ToolOutputId, ToolOutputError>,
+        label: &str,
     ) -> Result<ToolOutputSink, ToolOutputError> {
         let mut directory = OutputDirectory::open(&self.state_dir, session_id, true)?;
 
-        for _ in 0..ID_GENERATION_ATTEMPTS {
-            let id = generate()?;
+        let mut candidates = DescriptiveIdCandidates::new(label, DEFAULT_OUTPUT_LABEL);
+        for candidate in candidates.by_ref() {
+            let id = ToolOutputId(candidate);
             let final_name = output_name(&id);
             if directory.contains(&final_name)? {
                 continue;
@@ -765,6 +767,7 @@ impl ToolOutputStore {
                 file: Some(file),
                 directory,
                 id,
+                candidates,
                 byte_count: 0,
                 newline_count: 0,
                 ends_with_newline: false,
@@ -2381,7 +2384,10 @@ fn remove_artifact(path: &Path, is_dir: bool) -> Result<bool, ToolOutputError> {
 
 #[cfg(test)]
 mod tests {
+    use std::env;
     use std::fs;
+    use std::io;
+    use std::process::{Command, Stdio};
     use std::sync::Barrier;
     use std::thread;
     use std::time::Duration;
@@ -2401,7 +2407,14 @@ mod tests {
     const STREAMED_TEXT: &str = "alpha\r\nβeta\n\nend\n";
     const HUGE_LINE_NEEDLE: &str = "needle-at-the-end";
     const READABLE_ID: &str = "brisk-calm-otter";
-    const RETRY_ID: &str = "bright-quiet-panda";
+    const RETRY_ID: &str = "brisk-calm-otter-2";
+    const NAMED_ID: &str = "output-cargo-test";
+    const NAMED_REF: &str = r#"{"id":"output-cargo-test-2","byte_count":19,"line_count":4}"#;
+    const GENERIC_REF: &str = r#"{"id":"output","byte_count":19,"line_count":4}"#;
+    const CHILD_ROOT_ENV: &str = "CAUDRA_OUTPUT_TEST_CHILD_ROOT";
+    const CHILD_SESSION_ENV: &str = "CAUDRA_OUTPUT_TEST_CHILD_SESSION";
+    const CHILD_TEXT_ENV: &str = "CAUDRA_OUTPUT_TEST_CHILD_TEXT";
+    const CHILD_READY: &str = "output stage ready";
     const LEGACY_ID: &str = "CNK1hV6GWoysH3KQMm5wv";
     const LEGACY_REF: &str = r#"{"id":"CNK1hV6GWoysH3KQMm5wv","byte_count":19,"line_count":4}"#;
     const READABLE_REF: &str = r#"{"id":"brisk-calm-otter","byte_count":19,"line_count":4}"#;
@@ -3278,6 +3291,13 @@ mod tests {
     #[test_case(READABLE_ID; "readable")]
     #[test_case(LEGACY_ID; "legacy")]
     #[test_case("1111111111111111"; "legacy_leading_zeros")]
+    #[test_case(MISSING_TEXT; "one_word")]
+    #[test_case("brisk-calm"; "two_words")]
+    #[test_case("brisk-calm-small-otter"; "four_words")]
+    #[test_case("brisk-calm-otter1"; "digit")]
+    #[test_case("output"; "generic")]
+    #[test_case("output-cargo-test-4096"; "prefixed_suffixed")]
+    #[test_case("42"; "numeric")]
     fn output_ids_round_trip_exact_canonical_text(raw: &str) {
         let id: ToolOutputId = raw.parse().unwrap();
         assert_eq!(id.as_str(), raw);
@@ -3288,9 +3308,6 @@ mod tests {
     }
 
     #[test_case(""; "empty")]
-    #[test_case(MISSING_TEXT; "one_word")]
-    #[test_case("brisk-calm"; "two_words")]
-    #[test_case("brisk-calm-small-otter"; "four_words")]
     #[test_case("-calm-otter"; "empty_first")]
     #[test_case("brisk--otter"; "empty_middle")]
     #[test_case("brisk-calm-"; "empty_last")]
@@ -3307,7 +3324,6 @@ mod tests {
     #[test_case("brisk/calm/otter"; "slash")]
     #[test_case("brisk\\calm\\otter"; "backslash")]
     #[test_case("brisk-calm-otter.txt"; "extension")]
-    #[test_case("brisk-calm-otter1"; "digit")]
     #[test_case(" CNK1hV6GWoysH3KQMm5wv"; "legacy_space")]
     #[test_case("1CNK1hV6GWoysH3KQMm5wv"; "legacy_extra_zero")]
     fn output_ids_reject_invalid_parse_and_deserialization(raw: &str) {
@@ -3318,7 +3334,7 @@ mod tests {
     #[test_case(0, true; "at_bound")]
     #[test_case(1, false; "above_bound")]
     fn output_ids_enforce_length_bound(extra: usize, valid: bool) {
-        let raw = format!("{}-b-c", "a".repeat(MAX_OUTPUT_ID_BYTES - 4 + extra));
+        let raw = format!("{}-b-c", "a".repeat(DESCRIPTIVE_ID_MAX_LEN - 4 + extra));
         assert_eq!(raw.parse::<ToolOutputId>().is_ok(), valid);
         assert_eq!(
             serde_json::from_value::<ToolOutputId>(Value::String(raw)).is_ok(),
@@ -3326,22 +3342,75 @@ mod tests {
         );
     }
 
-    #[test]
-    fn new_outputs_use_shared_wordlist_ids() {
+    #[test_case("Output Cargo Test", NAMED_ID; "normalized")]
+    #[test_case("cargo-test", "cargo-test"; "no_automatic_prefix")]
+    #[test_case("東京", DEFAULT_OUTPUT_LABEL; "fallback")]
+    fn new_outputs_use_descriptive_ids(label: &str, expected: &str) {
         let (_temp, store) = test_store();
         let session_id = CaudraId::generate();
-        let reference = store.put(session_id, EXACT_TEXT).unwrap();
-        let words: Vec<_> = reference.id.as_str().split('-').collect();
-        assert_eq!(words.len(), OUTPUT_ID_WORDS);
-        let adjectives = include_str!("words/adjectives.txt");
-        let nouns = include_str!("words/nouns.txt");
-        assert!(adjectives.lines().any(|word| word == words[0]));
-        assert!(adjectives.lines().any(|word| word == words[1]));
-        assert_ne!(words[0], words[1]);
-        assert!(nouns.lines().any(|word| word == words[2]));
+        let reference = store.put_named(session_id, EXACT_TEXT, label).unwrap();
+        let second = store.put_named(session_id, PAGED_TEXT, expected).unwrap();
+        assert_eq!(reference.id.as_str(), expected);
+        assert_eq!(second.id.as_str(), format!("{expected}-2"));
+        assert_eq!(store.load_text(session_id, second.id).unwrap(), PAGED_TEXT);
         assert_eq!(
             store.load_text(session_id, reference.id).unwrap(),
             EXACT_TEXT
+        );
+    }
+
+    #[test]
+    fn generic_wrappers_share_the_output_label() {
+        let (_temp, store) = test_store();
+        let session_id = CaudraId::generate();
+        let first = store.put(session_id, EXACT_TEXT).unwrap();
+        let second = store.begin(session_id).unwrap().finish().unwrap();
+        assert_eq!(first.id.as_str(), DEFAULT_OUTPUT_LABEL);
+        assert_eq!(second.id.as_str(), format!("{DEFAULT_OUTPUT_LABEL}-2"));
+    }
+
+    #[test_case(false; "creation_order")]
+    #[test_case(true; "reverse_order")]
+    fn named_sinks_allocate_in_publication_order(reverse: bool) {
+        let (_temp, store) = test_store();
+        let session_id = CaudraId::generate();
+        let mut first = store.begin_named(session_id, NAMED_ID).unwrap();
+        let mut second = store.begin_named(session_id, NAMED_ID).unwrap();
+        first.append(EXACT_TEXT).unwrap();
+        second.append(PAGED_TEXT).unwrap();
+        let (first, second, first_text, second_text) = if reverse {
+            (second, first, PAGED_TEXT, EXACT_TEXT)
+        } else {
+            (first, second, EXACT_TEXT, PAGED_TEXT)
+        };
+        let first = first.finish().unwrap();
+        let second = second.finish().unwrap();
+        assert_eq!(first.id.as_str(), NAMED_ID);
+        assert_eq!(second.id.as_str(), format!("{NAMED_ID}-2"));
+        assert_eq!(store.load_text(session_id, first.id).unwrap(), first_text);
+        assert_eq!(store.load_text(session_id, second.id).unwrap(), second_text);
+    }
+
+    #[test]
+    fn named_outputs_choose_the_first_available_gap() {
+        let (_temp, store) = test_store();
+        let session_id = CaudraId::generate();
+        let first = store.put_named(session_id, EXACT_TEXT, NAMED_ID).unwrap();
+        let gap = store.put_named(session_id, PAGED_TEXT, NAMED_ID).unwrap();
+        let third = store
+            .put_named(session_id, STREAMED_TEXT, NAMED_ID)
+            .unwrap();
+        fs::remove_file(store.output_path(session_id, gap.id.clone())).unwrap();
+        let replacement = store.put_named(session_id, GREP_TEXT, NAMED_ID).unwrap();
+        assert_eq!(replacement.id, gap.id);
+        assert_eq!(
+            store.load_text(session_id, replacement.id).unwrap(),
+            GREP_TEXT
+        );
+        assert_eq!(store.load_text(session_id, first.id).unwrap(), EXACT_TEXT);
+        assert_eq!(
+            store.load_text(session_id, third.id).unwrap(),
+            STREAMED_TEXT
         );
     }
 
@@ -3350,28 +3419,24 @@ mod tests {
     fn begin_retries_collisions_before_staging(exhaust: bool) {
         let (_temp, store) = test_store();
         let session_id = CaudraId::generate();
-        let mut first = store
-            .begin_with(session_id, || Ok(READABLE_ID.parse().unwrap()))
+        let reference = store
+            .put_named(session_id, EXACT_TEXT, READABLE_ID)
             .unwrap();
-        first.append(EXACT_TEXT).unwrap();
-        let reference = first.finish().unwrap();
-        let mut attempts = 0;
-        let result = store.begin_with(session_id, || {
-            attempts += 1;
-            Ok(if exhaust || attempts == 1 {
-                READABLE_ID
-            } else {
-                RETRY_ID
+        if exhaust {
+            for candidate in DescriptiveIdCandidates::new(READABLE_ID, DEFAULT_OUTPUT_LABEL).skip(1)
+            {
+                fs::write(
+                    store.output_path(session_id, candidate.parse().unwrap()),
+                    EXACT_TEXT,
+                )
+                .unwrap();
             }
-            .parse()
-            .unwrap())
-        });
+        }
+        let result = store.begin_named(session_id, READABLE_ID);
         if exhaust {
             assert!(matches!(result, Err(ToolOutputError::IdCollision)));
-            assert_eq!(attempts, ID_GENERATION_ATTEMPTS);
         } else {
             let sink = result.unwrap();
-            assert_eq!(attempts, 2);
             assert_eq!(sink.id.as_str(), RETRY_ID);
             assert!(!store.output_path(session_id, sink.id.clone()).exists());
             sink.discard().unwrap();
@@ -3382,7 +3447,7 @@ mod tests {
         );
         assert_eq!(
             fs::read_dir(store.session_dir(session_id)).unwrap().count(),
-            1
+            if exhaust { DESCRIPTIVE_ID_ATTEMPTS } else { 1 }
         );
     }
 
@@ -3390,29 +3455,25 @@ mod tests {
     fn finish_collision_exhaustion_preserves_winner_and_cleans_stage() {
         let (_temp, store) = test_store();
         let session_id = CaudraId::generate();
-        let mut winner = store
-            .begin_with(session_id, || Ok(READABLE_ID.parse().unwrap()))
-            .unwrap();
-        let mut loser = store
-            .begin_with(session_id, || Ok(READABLE_ID.parse().unwrap()))
-            .unwrap();
+        let mut winner = store.begin_named(session_id, READABLE_ID).unwrap();
+        let mut loser = store.begin_named(session_id, READABLE_ID).unwrap();
         winner.append(EXACT_TEXT).unwrap();
         loser.append(PAGED_TEXT).unwrap();
         let temp_path = loser.file.as_ref().unwrap().path().to_path_buf();
         let reference = winner.finish().unwrap();
-        let mut retries = 0;
-        let error = loser
-            .finish_with(|| {
-                retries += 1;
-                Ok(READABLE_ID.parse().unwrap())
-            })
-            .unwrap_err();
+        for candidate in DescriptiveIdCandidates::new(READABLE_ID, DEFAULT_OUTPUT_LABEL).skip(1) {
+            fs::write(
+                store.output_path(session_id, candidate.parse().unwrap()),
+                EXACT_TEXT,
+            )
+            .unwrap();
+        }
+        let error = loser.finish().unwrap_err();
         assert!(matches!(error, ToolOutputError::IdCollision));
-        assert_eq!(retries, ID_GENERATION_ATTEMPTS - 1);
         assert!(!temp_path.exists());
         assert_eq!(
             fs::read_dir(store.session_dir(session_id)).unwrap().count(),
-            1
+            DESCRIPTIVE_ID_ATTEMPTS
         );
         assert_eq!(
             store.load_text(session_id, reference.id).unwrap(),
@@ -3430,25 +3491,17 @@ mod tests {
                 .into_iter()
                 .map(|text| {
                     let barrier = &barrier;
-                    let store = &store;
+                    let store = ToolOutputStore::new(store.state_dir.clone());
                     scope.spawn(move || {
-                        let mut sink = store
-                            .begin_with(session_id, || Ok(READABLE_ID.parse().unwrap()))
-                            .unwrap();
+                        let mut sink = store.begin_named(session_id, READABLE_ID).unwrap();
                         sink.append(text).unwrap();
                         barrier.wait();
-                        let mut retries = 0;
-                        let reference = sink
-                            .finish_with(|| {
-                                retries += 1;
-                                Ok(RETRY_ID.parse().unwrap())
-                            })
-                            .unwrap();
+                        let reference = sink.finish().unwrap();
                         assert_eq!(
                             store.load_text(session_id, reference.id.clone()).unwrap(),
                             text
                         );
-                        (reference, retries)
+                        reference
                     })
                 })
                 .collect();
@@ -3457,8 +3510,82 @@ mod tests {
                 .map(|handle| handle.join().unwrap())
                 .collect::<Vec<_>>()
         });
-        assert_ne!(outputs[0].0.id, outputs[1].0.id);
-        assert_eq!(outputs.iter().map(|(_, retries)| retries).sum::<usize>(), 1);
+        assert_eq!(
+            outputs
+                .iter()
+                .map(|output| output.id.as_str())
+                .collect::<HashSet<_>>(),
+            HashSet::from([READABLE_ID, RETRY_ID])
+        );
+        assert_eq!(
+            fs::read_dir(store.session_dir(session_id)).unwrap().count(),
+            2
+        );
+    }
+
+    #[test]
+    fn separate_processes_publish_same_label_without_overwriting() {
+        if let Some(root) = env::var_os(CHILD_ROOT_ENV) {
+            let store = ToolOutputStore::new(StateDir::from_path(root.into()));
+            let session_id = env::var(CHILD_SESSION_ENV).unwrap().parse().unwrap();
+            let text = env::var(CHILD_TEXT_ENV).unwrap();
+            let mut sink = store.begin_named(session_id, READABLE_ID).unwrap();
+            sink.append(&text).unwrap();
+            println!("\n{CHILD_READY}");
+            io::stdout().flush().unwrap();
+            io::stdin().read_exact(&mut [0]).unwrap();
+            let reference = sink.finish().unwrap();
+            assert!([READABLE_ID, RETRY_ID].contains(&reference.id.as_str()));
+            assert_eq!(store.load_text(session_id, reference.id).unwrap(), text);
+            return;
+        }
+
+        let (_temp, store) = test_store();
+        let session_id = CaudraId::generate();
+        let mut children: Vec<_> = [EXACT_TEXT, PAGED_TEXT]
+            .into_iter()
+            .map(|text| {
+                Command::new(env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "tool_outputs::tests::separate_processes_publish_same_label_without_overwriting",
+                        "--nocapture",
+                    ])
+                    .env(CHILD_ROOT_ENV, store.state_dir.path())
+                    .env(CHILD_SESSION_ENV, session_id.to_string())
+                    .env(CHILD_TEXT_ENV, text)
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .unwrap()
+            })
+            .collect();
+        for child in &mut children {
+            let mut reader = BufReader::new(child.stdout.as_mut().unwrap());
+            loop {
+                let mut line = String::new();
+                assert_ne!(reader.read_line(&mut line).unwrap(), 0);
+                if line.trim() == CHILD_READY {
+                    break;
+                }
+            }
+        }
+        for child in &mut children {
+            child.stdin.take().unwrap().write_all(b"\n").unwrap();
+        }
+        for child in children {
+            let output = child.wait_with_output().unwrap();
+            assert!(output.status.success(), "{output:?}");
+        }
+        let contents = [READABLE_ID, RETRY_ID]
+            .into_iter()
+            .map(|id| store.load_text(session_id, id.parse().unwrap()).unwrap())
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            contents,
+            HashSet::from([EXACT_TEXT.to_owned(), PAGED_TEXT.to_owned()])
+        );
         assert_eq!(
             fs::read_dir(store.session_dir(session_id)).unwrap().count(),
             2
@@ -3472,14 +3599,12 @@ mod tests {
 
         let (_temp, store) = test_store();
         let session_id = CaudraId::generate();
-        let mut sink = store
-            .begin_with(session_id, || Ok(READABLE_ID.parse().unwrap()))
-            .unwrap();
+        let mut sink = store.begin_named(session_id, READABLE_ID).unwrap();
         sink.append(EXACT_TEXT).unwrap();
         let path = store.output_path(session_id, sink.id.clone());
         let outside = store.state_dir.path().join(MISSING_TEXT);
         symlink(&outside, &path).unwrap();
-        let reference = sink.finish_with(|| Ok(RETRY_ID.parse().unwrap())).unwrap();
+        let reference = sink.finish().unwrap();
         assert_eq!(reference.id.as_str(), RETRY_ID);
         assert_eq!(fs::read_link(path).unwrap(), outside);
         assert!(!outside.exists());
@@ -3491,6 +3616,8 @@ mod tests {
 
     #[test_case(LEGACY_REF; "legacy")]
     #[test_case(READABLE_REF; "readable")]
+    #[test_case(NAMED_REF; "named")]
+    #[test_case(GENERIC_REF; "generic")]
     fn persisted_fixtures_reload_copy_lookup_cleanup_and_accounting(fixture: &str) {
         let (_temp, store) = test_store();
         let mut session: Session<Value, Value, Value> = Session::new("model", "/project");

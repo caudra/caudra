@@ -573,7 +573,14 @@ impl UserData for LuaCtx {
                 Ok(access) => access,
                 Err(error) => return Ok(err_pair(error)),
             };
-            match store.begin(session_id) {
+            let label = this
+                .agent()
+                .and_then(|agent| agent.caller.as_ref())
+                .map_or_else(
+                    || "output".to_owned(),
+                    |caller| format!("output-{}", caller.tool),
+                );
+            match store.begin_named(session_id, &label) {
                 Ok(sink) => match ToolOutputSinkWriter::spawn(sink) {
                     Ok(sink) => Ok((
                         Some(lua.create_userdata(LuaToolOutputSink(Some(sink)))?),
@@ -809,7 +816,9 @@ mod tests {
     use caudra_agent::tools::native::batch::BatchTool;
     use caudra_agent::tools::registry::ToolSource;
     use caudra_agent::tools::test_support::{observe_tool_calls, stub_ctx_with};
+    use caudra_storage::StateDir;
     use futures::FutureExt;
+    use mlua::{AnyUserData, Lua};
     use serde_json::json;
     use test_case::test_case;
 
@@ -822,6 +831,7 @@ mod tests {
     const OBSERVATION_WINDOW: usize = 3;
     /// Arbitrary ids are rejected: `SessionRef` parses base58 or a uuid.
     const SESSION_ID: &str = "CNK1hV6GWoysH3KQMm5wu";
+    const STREAMED_OUTPUT: &str = "cargo test private_test_name\n";
 
     fn session_ref() -> SessionRef {
         SESSION_ID.parse().expect("valid session id")
@@ -1006,6 +1016,54 @@ mod tests {
                 .contains_or_insert(PathBuf::from(INSTRUCTION_PATH)),
             "handler must share the parent's set; AgentContext resets its own copy"
         );
+    }
+
+    #[test_case(Some("file_grep"), false, "output-file-grep"; "plugin_caller")]
+    #[test_case(Some("task"), true, "output-task"; "bundled_caller")]
+    #[test_case(Some("shell"), false, "output-shell"; "no_command_inference")]
+    #[test_case(None, false, "output"; "unknown_caller")]
+    fn tool_output_sink_uses_caller_label(caller: Option<&str>, bundled: bool, expected_id: &str) {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Arc::new(ToolOutputStore::new(StateDir::from_path(
+            temp.path().to_path_buf(),
+        )));
+        let mut ctx = populated_ctx();
+        ctx.tool_output_store = Some(Arc::clone(&store));
+        let lua_ctx = match caller {
+            Some(caller) => LuaCtx::handler_for_tool(&ctx, Arc::from(caller), bundled),
+            None => LuaCtx::handler(&ctx),
+        };
+        let lua = Lua::new();
+        lua.globals().set("ctx", lua_ctx).unwrap();
+        lua.globals().set("text", STREAMED_OUTPUT).unwrap();
+        let (first, second): (AnyUserData, AnyUserData) = lua
+            .load(
+                r#"
+                local first = assert(ctx:tool_output_sink())
+                local second = assert(ctx:tool_output_sink())
+                assert(first:append(text))
+                assert(second:append(text))
+                local first_ref = assert(first:finish())
+                local second_ref = assert(second:finish())
+                return first_ref, second_ref
+                "#,
+            )
+            .eval()
+            .unwrap();
+        for (output, expected) in [
+            (first, expected_id.to_owned()),
+            (second, format!("{expected_id}-2")),
+        ] {
+            let output = output.borrow::<ManagedToolOutputRef>().unwrap();
+            let reference = output.reference();
+            assert_eq!(reference.id.as_str(), expected);
+            assert_eq!(reference.byte_count, STREAMED_OUTPUT.len());
+            assert_eq!(reference.line_count, 1);
+            let stored = store
+                .load_text(session_ref().id(), reference.id.clone())
+                .unwrap();
+            assert_eq!(stored, STREAMED_OUTPUT);
+        }
     }
 
     #[test]

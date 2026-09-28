@@ -875,6 +875,7 @@ mod background_runtime {
     struct Fixture {
         app: Box<App>,
         handles: AgentHandles,
+        history: SubagentHistoryStore,
         requests: flume::Receiver<Request>,
         child: Request,
     }
@@ -904,6 +905,7 @@ mod background_runtime {
                 model: app.state.model.clone(),
                 provider: Arc::new(ControlledProvider(requests)),
             }));
+            let history = SubagentHistoryStore::default();
             let handles = AgentHandles::spawn(
                 &slot,
                 Vec::new(),
@@ -923,7 +925,7 @@ mod background_runtime {
                 McpConfigErrors::new(Default::default()),
                 Arc::new(ModelPolicy::default()),
                 app.state.goal.clone(),
-                SubagentHistoryStore::default(),
+                history.clone(),
                 None,
                 Arc::new(PromptProfileCatalog::default()),
                 Some(app.storage.clone()),
@@ -988,6 +990,7 @@ mod background_runtime {
             let mut fixture = Self {
                 app,
                 handles,
+                history,
                 requests: received,
                 child: child.expect("child request"),
             };
@@ -1681,6 +1684,7 @@ mod background_runtime {
                         timeout_ms: SHELL_TIMEOUT_MS,
                         mode: "build".into(),
                     },
+                    &fixture.history,
                     |cancel, _| async move {
                         cancel.cancelled().await;
                         ToolDoneEvent::error(SHELL_CALL.into(), SHELL_PROGRESS)
@@ -1780,6 +1784,7 @@ mod background_runtime {
                         timeout_ms: SHELL_TIMEOUT_MS,
                         mode: "build".into(),
                     },
+                    &fixture.history,
                     |cancel, _| async move {
                         cancel.cancelled().await;
                         ToolDoneEvent::error(SHELL_CALL.into(), SHELL_PROGRESS)

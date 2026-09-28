@@ -26,6 +26,7 @@ use caudra_storage::{
 
 use super::steering::{SharedSteering, Steering};
 use super::{ModelRoute, resolve_model_for_purpose};
+use crate::background::JobScope;
 use crate::cancel::{CancelMap, CancelSlot};
 use crate::prompt::PromptId;
 use crate::prompt::profile::SystemPromptProfile;
@@ -45,6 +46,8 @@ use crate::{
 pub const STRUCTURED_OUTPUT_TOOL: &str = "structured_output";
 pub const BUILTIN_TASK_PROFILE_DESCRIPTION: &str = "Caudra\'s built-in task prompt";
 pub const SESSION_CLOSED: &str = "session closed";
+pub(crate) const RESERVATION_SESSION_MISMATCH: &str =
+    "task identity reservation belongs to a different session; use this session's job scope";
 pub const CANCELLED: &str = "cancelled";
 pub(super) const TURN_LIMIT: &str = "subagent reached its maximum turn limit";
 pub(super) const TRUNCATED: &str = "subagent response was cut off at its output token limit";
@@ -823,8 +826,10 @@ pub async fn open_task(ctx: &ToolContext, opts: TaskOptions) -> Result<Subagent,
             };
             let lease = reserve_task_identity(
                 &ctx.subagent_history,
+                &opts.name,
                 ctx.tool_output_store.as_deref(),
                 ctx.session_id.as_ref().map(|id| id.id()),
+                ctx.job_scope().as_ref(),
             )?;
             (lease.task_id().to_owned(), lease.with_spec(spec))
         }
@@ -1075,18 +1080,28 @@ pub fn generated_session_id() -> String {
 
 pub(crate) fn reserve_task_identity(
     history: &SubagentHistoryStore,
+    label: &str,
     outputs: Option<&ToolOutputStore>,
     session: Option<CaudraId>,
+    jobs: Option<&JobScope>,
 ) -> Result<SubagentHistoryLease, String> {
+    if let Some(jobs) = jobs
+        && session.is_some_and(|session| session != jobs.session_id())
+    {
+        return Err(RESERVATION_SESSION_MISMATCH.into());
+    }
+    let session = session.or_else(|| jobs.map(JobScope::session_id));
     let database = outputs
+        .map(ToolOutputStore::state_dir)
+        .or_else(|| jobs.map(JobScope::state_dir))
         .zip(session)
-        .map(|(outputs, session)| {
-            SessionDatabase::open(outputs.state_dir())
+        .map(|(dir, session)| {
+            SessionDatabase::open(dir)
                 .map(|database| (database, session))
                 .map_err(|error| error.to_string())
         })
         .transpose()?;
-    history.reserve_generated(|id| match &database {
+    history.reserve_generated(label, |id| match &database {
         Some((database, session)) => database
             .task_identity_exists(*session, id)
             .map_err(|error| error.to_string()),
@@ -1113,8 +1128,10 @@ fn reserve_fresh(
         ) => {
             let lease = reserve_task_identity(
                 &ctx.subagent_history,
+                "task",
                 ctx.tool_output_store.as_deref(),
                 ctx.session_id.as_ref().map(|id| id.id()),
+                ctx.job_scope().as_ref(),
             )?
             .with_spec(spec.unwrap_or_else(SubagentTaskSpec::generic));
             Ok((lease.task_id().to_owned(), lease))
@@ -1365,6 +1382,7 @@ mod tests {
     const PROFILE_BODY: &str = "Pinned.";
     const PROFILE_MISSING: &str = "a written profile must load";
     const COLLIDING_SUBAGENT_NAME: &str = "collision";
+    const SECOND_SUBAGENT_ID: &str = "collision-2";
     const INHERITED_PROFILE: &str = "parent-default";
     const SUBAGENT_SYSTEM: &str = "system";
     const REMOTE_CWD: &str = "remote/project";
@@ -1428,6 +1446,29 @@ mod tests {
             mcp: Some(false),
             local_tools: LocalTools::default(),
         }
+    }
+
+    #[test_case(false; "active")]
+    #[test_case(true; "completed")]
+    fn repeated_task_descriptions_allocate_fresh_ids_and_continuations_keep_them(completed: bool) {
+        smol::block_on(async {
+            let ctx = crate::tools::test_support::stub_ctx(&AgentMode::Build);
+            let mut first = open_task(&ctx, task_options(None)).await.unwrap();
+            assert_eq!(first.id(), COLLIDING_SUBAGENT_NAME);
+            if completed {
+                first.close();
+            }
+            let mut second = open_task(&ctx, task_options(None)).await.unwrap();
+            assert_eq!(second.id(), SECOND_SUBAGENT_ID);
+            first.close();
+            second.close();
+            let mut options = task_options(None);
+            options.task_id = TaskIdentity::Continue(COLLIDING_SUBAGENT_NAME.into());
+            options.name = SECOND_SUBAGENT_ID.into();
+            let mut continued = open_task(&ctx, options).await.unwrap();
+            assert_eq!(continued.id(), COLLIDING_SUBAGENT_NAME);
+            continued.close();
+        });
     }
 
     #[test_case(false ; "unbound_global")]

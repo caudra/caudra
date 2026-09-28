@@ -905,9 +905,17 @@ mod tests {
 
     use super::*;
     use crate::StoredSession;
+    use crate::agent::subagent::TaskIdentity;
     use crate::agent::task_runner::{TaskFuture, TaskOutcome, TaskRequest};
+    use crate::subagent_history::{SubagentHistoryLease, SubagentHistoryStore};
 
     const MODEL: &str = "test/model";
+    const DUPLICATE_LABELS: &str = "duplicate-labels";
+    const DUPLICATE_LABELS_BODY: &str = r#"
+let first = agent("one", #{ label: "worker" });
+let second = agent("two", #{ label: "worker" });
+complete([first.output.echo, second.output.echo]);
+"#;
     const DESCRIPTION: &str = "A test workflow";
     const USER_WORKFLOWS: &str = "workflows";
     const PROJECT_WORKFLOWS: &str = ".caudra/workflows";
@@ -1065,6 +1073,7 @@ complete(first.output.echo);
     /// succeeds echoing its prompt. Every start is announced so a test can
     /// wait for an agent to be in flight without sleeping.
     struct FakeRunner {
+        history: SubagentHistoryStore,
         started: flume::Sender<String>,
         release: flume::Receiver<()>,
         calls: Mutex<Vec<(String, Option<WorkflowProvenance>)>>,
@@ -1091,6 +1100,21 @@ complete(first.output.echo);
     }
 
     impl TaskRunner for FakeRunner {
+        fn reserve_task(
+            &self,
+            task_id: Option<&str>,
+            label: &str,
+        ) -> Result<SubagentHistoryLease, String> {
+            match task_id {
+                Some(id) if self.history.snapshot().records().contains_key(id) => self
+                    .history
+                    .continue_task(id)
+                    .map_err(|error| error.to_string()),
+                Some(id) => self.history.reserve_unconfigured(id),
+                None => self.history.reserve_generated(label, |_| Ok(false)),
+            }
+        }
+
         fn run(
             &self,
             request: TaskRequest,
@@ -1098,49 +1122,56 @@ complete(first.output.echo);
             events: EventSender,
         ) -> TaskFuture<'_> {
             Box::pin(async move {
-                let label = request.label.clone();
-                self.calls
-                    .lock()
-                    .unwrap()
-                    .push((label.clone(), events.workflow().cloned()));
-                let _ = self.started.send(label.clone());
-                let task_id = Some(request.task.requested().unwrap().to_owned());
-                if label.starts_with(BLOCK_PREFIX)
-                    && cancel.race(self.release.recv_async()).await.is_err()
-                {
-                    return TaskOutcome {
+                let outcome = async {
+                    let label = request.label.clone();
+                    self.calls
+                        .lock()
+                        .unwrap()
+                        .push((label.clone(), events.workflow().cloned()));
+                    let _ = self.started.send(label.clone());
+                    let task_id = Some(request.task.requested().unwrap().to_owned());
+                    if label.starts_with(BLOCK_PREFIX)
+                        && cancel.race(self.release.recv_async()).await.is_err()
+                    {
+                        return TaskOutcome {
+                            task_id,
+                            mode: None,
+                            success: false,
+                            cancelled: true,
+                            output: Value::Null,
+                            error: Some(CANCELLED.to_owned()),
+                            tokens_used: 0,
+                            duration_ms: 0,
+                        };
+                    }
+                    if label.starts_with(FAIL_PREFIX) {
+                        return TaskOutcome {
+                            task_id: None,
+                            mode: None,
+                            success: false,
+                            cancelled: false,
+                            output: Value::Null,
+                            error: Some(FAILURE.to_owned()),
+                            tokens_used: 0,
+                            duration_ms: 0,
+                        };
+                    }
+                    TaskOutcome {
                         task_id,
                         mode: None,
-                        success: false,
-                        cancelled: true,
-                        output: Value::Null,
-                        error: Some(CANCELLED.to_owned()),
-                        tokens_used: 0,
-                        duration_ms: 0,
-                    };
-                }
-                if label.starts_with(FAIL_PREFIX) {
-                    return TaskOutcome {
-                        task_id: None,
-                        mode: None,
-                        success: false,
+                        success: true,
                         cancelled: false,
-                        output: Value::Null,
-                        error: Some(FAILURE.to_owned()),
-                        tokens_used: 0,
-                        duration_ms: 0,
-                    };
+                        output: json!({ "echo": request.prompt }),
+                        error: None,
+                        tokens_used: TOKENS_PER_AGENT,
+                        duration_ms: 1,
+                    }
                 }
-                TaskOutcome {
-                    task_id,
-                    mode: None,
-                    success: true,
-                    cancelled: false,
-                    output: json!({ "echo": request.prompt }),
-                    error: None,
-                    tokens_used: TOKENS_PER_AGENT,
-                    duration_ms: 1,
+                .await;
+                if let TaskIdentity::Reserved(lease) = request.task {
+                    lease.complete(Vec::new());
                 }
+                outcome
             })
         }
     }
@@ -1177,6 +1208,7 @@ complete(first.output.echo);
                 project: project.canonicalize().unwrap(),
                 config,
                 runner: Arc::new(FakeRunner {
+                    history: SubagentHistoryStore::default(),
                     started: started_tx,
                     release: release_rx,
                     calls: Mutex::new(Vec::new()),
@@ -1357,6 +1389,35 @@ complete(first.output.echo);
     }
 
     #[test]
+    fn repeated_workflow_labels_receive_distinct_journaled_ids() {
+        smol::block_on(async {
+            let fixture = Fixture::new();
+            fixture.user_workflow(DUPLICATE_LABELS, DUPLICATE_LABELS_BODY);
+            let runtime = fixture.spawn().await;
+            let started = start(&runtime.handle(), DUPLICATE_LABELS, None).await;
+            let done = fixture
+                .wait_for(&started.run_id, RunStatus::Completed)
+                .await;
+            let ids: Vec<_> = done
+                .roster
+                .iter()
+                .map(|entry| entry.task_id.as_deref().unwrap())
+                .collect();
+            assert_eq!(ids, ["worker", "worker-2"]);
+            let store =
+                WorkflowStore::spawn(fixture.state_dir.clone(), fixture.session_id).unwrap();
+            let calls = store.load_calls(started.run_id.clone()).await.unwrap();
+            assert_eq!(
+                calls
+                    .iter()
+                    .map(|call| call.task_id.as_deref().unwrap())
+                    .collect::<Vec<_>>(),
+                ids
+            );
+        });
+    }
+
+    #[test]
     fn a_run_completes_and_journals_every_call() {
         smol::block_on(async {
             let fixture = Fixture::new();
@@ -1417,7 +1478,7 @@ complete(first.output.echo);
             );
             assert_eq!(calls[0].task_id, done.roster[0].task_id);
             let task_id = calls[0].task_id.as_deref().unwrap();
-            assert_eq!(task_id.split('-').count(), 3);
+            assert_eq!(task_id, "worker-1");
             let result: Value = serde_json::from_str(calls[0].result.as_deref().unwrap()).unwrap();
             assert_eq!(result["agent_id"], task_id);
             let events = store.load_events(started.run_id.clone()).await.unwrap();

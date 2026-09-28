@@ -4,13 +4,13 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use crate::ToolOutput;
 use crate::tools::native::batch::child_tool_use_id;
 use caudra_providers::{HistoryItem, HistoryItemKind, Message};
+use caudra_storage::DescriptiveIdCandidates;
 pub use caudra_storage::sessions::{
     StoredMode as SubagentTaskMode, StoredSubagentTaskSpec as SubagentTaskSpec,
 };
 use thiserror::Error;
 
-const TASK_ID_ATTEMPTS: usize = 64;
-const TASK_ID_EXHAUSTED: &str = "task identity allocation exhausted after 64 attempts";
+const TASK_ID_EXHAUSTED: &str = "task identity allocation exhausted after 4096 candidates; use a different description or start a new session";
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum SubagentHistoryError {
@@ -167,23 +167,13 @@ impl SubagentHistoryStore {
 
     pub(crate) fn reserve_generated(
         &self,
-        occupied: impl FnMut(&str) -> Result<bool, String>,
-    ) -> Result<SubagentHistoryLease, String> {
-        self.reserve_generated_with(
-            || caudra_storage::random_task_id().map_err(|error| error.to_string()),
-            occupied,
-        )
-    }
-
-    fn reserve_generated_with(
-        &self,
-        mut candidate: impl FnMut() -> Result<String, String>,
+        label: &str,
         mut occupied: impl FnMut(&str) -> Result<bool, String>,
     ) -> Result<SubagentHistoryLease, String> {
-        for _ in 0..TASK_ID_ATTEMPTS {
-            let task_id = candidate()?;
-            let mut state = self.lock();
-            if state.active.contains(&task_id)
+        let mut state = self.lock();
+        for task_id in DescriptiveIdCandidates::new(label, "task") {
+            if task_id == "main"
+                || state.active.contains(&task_id)
                 || state.records.contains_key(&task_id)
                 || state.selected_versions.contains_key(&task_id)
                 || occupied(&task_id)?
@@ -725,30 +715,31 @@ mod tests {
     const PROFILE: &str = "review";
     const OTHER_PROFILE: &str = "custom";
     const PHRASE: &str = "happy-cute-tick";
-    const OTHER_PHRASE: &str = "brave-calm-fox";
     const LAUNCH: &str = "launch-call";
     const CONTINUATION: &str = "continuation-call";
     const RUNTIME: &str = "runtime-invocation-not-history";
+    const LABEL: &str = "Implement active footer chips";
+    const LABEL_ID: &str = "implement-active-footer-chips";
+    const SECOND_ID: &str = "implement-active-footer-chips-2";
+    const THIRD_ID: &str = "implement-active-footer-chips-3";
+    const LOOKUP_ERROR: &str = "persisted identity lookup failed";
 
     #[test_case(false; "active")]
     #[test_case(true; "completed")]
     fn generated_reservation_skips_live_and_completed_collisions(completed: bool) {
         let store = SubagentHistoryStore::default();
-        let occupied = store.reserve(PHRASE).unwrap();
+        let occupied = store.reserve(LABEL_ID).unwrap();
         let active = if completed {
             occupied.complete(history(FIRST_PROMPT));
             None
         } else {
             Some(occupied)
         };
-        let mut candidates = [PHRASE, OTHER_PHRASE].into_iter();
-        let lease = store
-            .reserve_generated_with(|| Ok(candidates.next().unwrap().into()), |_| Ok(false))
-            .unwrap();
-        assert_eq!(lease.task_id(), OTHER_PHRASE);
-        assert!(store.is_active(OTHER_PHRASE));
+        let lease = store.reserve_generated(LABEL, |_| Ok(false)).unwrap();
+        assert_eq!(lease.task_id(), SECOND_ID);
+        assert!(store.is_active(SECOND_ID));
         drop(lease);
-        assert!(!store.is_active(OTHER_PHRASE));
+        assert!(!store.is_active(SECOND_ID));
         drop(active);
     }
 
@@ -756,29 +747,74 @@ mod tests {
     #[test_case(true; "durable")]
     fn generated_reservation_is_bounded_and_skips_durable_ids(durable: bool) {
         let store = SubagentHistoryStore::default();
-        let occupied = (!durable).then(|| store.reserve(PHRASE).unwrap());
+        let occupied: Vec<_> = if durable {
+            Vec::new()
+        } else {
+            DescriptiveIdCandidates::new(LABEL, "task")
+                .map(|id| store.reserve(id).unwrap())
+                .collect()
+        };
         let mut attempts = 0;
         let error = store
-            .reserve_generated_with(
-                || {
-                    attempts += 1;
-                    Ok(PHRASE.into())
-                },
-                |_| Ok(durable),
-            )
+            .reserve_generated(LABEL, |_| {
+                attempts += 1;
+                Ok(durable)
+            })
             .unwrap_err();
         assert_eq!(error, TASK_ID_EXHAUSTED);
-        assert_eq!(attempts, TASK_ID_ATTEMPTS);
+        assert_eq!(
+            attempts,
+            if durable {
+                DescriptiveIdCandidates::new(LABEL, "task").count()
+            } else {
+                0
+            }
+        );
         drop(occupied);
         assert_eq!(store.active_count(), 0);
-        let mut candidates = [PHRASE, OTHER_PHRASE].into_iter();
         let lease = store
-            .reserve_generated_with(
-                || Ok(candidates.next().unwrap().into()),
-                |id| Ok(id == PHRASE),
-            )
+            .reserve_generated(LABEL, |id| Ok(id == LABEL_ID))
             .unwrap();
-        assert_eq!(lease.task_id(), OTHER_PHRASE);
+        assert_eq!(lease.task_id(), SECOND_ID);
+    }
+
+    #[test_case("MAIN", "main-2"; "reserved_main")]
+    #[test_case("!!!", "task"; "fallback")]
+    #[test_case(LABEL, LABEL_ID; "description")]
+    fn generated_reservation_normalizes_labels(label: &str, expected: &str) {
+        let store = SubagentHistoryStore::default();
+        let lease = store.reserve_generated(label, |_| Ok(false)).unwrap();
+        assert_eq!(lease.task_id(), expected);
+    }
+
+    #[test]
+    fn generated_reservation_skips_selected_versions_and_reuses_first_gap() {
+        let store = SubagentHistoryStore::seeded_with_versions(
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::from([(LABEL_ID.into(), RUNTIME.into())]),
+        );
+        let third = store.reserve(THIRD_ID).unwrap();
+        let second = store.reserve_generated(LABEL, |_| Ok(false)).unwrap();
+        assert_eq!(second.task_id(), SECOND_ID);
+        drop(second);
+        let second = store
+            .reserve_generated("IMPLEMENT-active/footer/chips", |_| Ok(false))
+            .unwrap();
+        assert_eq!(second.task_id(), SECOND_ID);
+        drop((second, third));
+    }
+
+    #[test]
+    fn generated_reservation_propagates_lookup_failure_without_leaking_lease() {
+        let store = SubagentHistoryStore::default();
+        let error = store
+            .reserve_generated(LABEL, |_| Err(LOOKUP_ERROR.into()))
+            .unwrap_err();
+        assert_eq!(error, LOOKUP_ERROR);
+        assert_eq!(store.active_count(), 0);
+        let lease = store.reserve_generated(LABEL, |_| Ok(false)).unwrap();
+        assert_eq!(lease.task_id(), LABEL_ID);
     }
 
     #[test]
@@ -790,19 +826,20 @@ mod tests {
                 let store = store.clone();
                 let barrier = Arc::clone(&barrier);
                 thread::spawn(move || {
-                    let mut candidates = [PHRASE, OTHER_PHRASE].into_iter();
                     barrier.wait();
-                    store
-                        .reserve_generated_with(
-                            || Ok(candidates.next().unwrap().into()),
-                            |_| Ok(false),
-                        )
-                        .unwrap()
+                    store.reserve_generated(LABEL, |_| Ok(false)).unwrap()
                 })
             })
             .collect();
         let leases: Vec<_> = jobs.into_iter().map(|job| job.join().unwrap()).collect();
         assert_ne!(leases[0].task_id(), leases[1].task_id());
+        assert_eq!(
+            leases
+                .iter()
+                .map(|lease| lease.task_id())
+                .collect::<HashSet<_>>(),
+            HashSet::from([LABEL_ID, SECOND_ID])
+        );
         assert_eq!(store.active_count(), 2);
         drop(leases);
         assert_eq!(store.active_count(), 0);
