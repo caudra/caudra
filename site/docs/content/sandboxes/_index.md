@@ -209,7 +209,9 @@ Selecting a remote workspace does not authorize arbitrary host writes. Compare a
 
 ### TUI transfer review
 
-Attach to the sandbox, open `/workbench`, and select Transfer or press `Ctrl+X 4`. Choose both roots and Compare. The local and sandbox panes support linked or independent folder navigation, file and folder selection, change badges and read-only inspection. Upload maps to Push and Download maps to Pull. An initial-seed handoff uses create-only Seed semantics. The sandbox manager no longer contains a file-transfer mode.
+Attach to the sandbox, open `/workbench`, and select Transfer or press `Ctrl+X 4`. Choose both roots and Compare. The local and sandbox panes show one aligned tree with change marks, file and folder selection and read-only diffs. See [Transfer](/docs/workbench/#transfer) for the layout and keys. Upload maps to Push and Download maps to Pull. An initial-seed handoff uses create-only Seed semantics. The sandbox manager no longer contains a file-transfer mode.
+
+`I` turns gitignore filtering off for the current Transfer session and compares again. Protected names and configured excludes still apply. The choice is not saved, and the filter digest binds it into the review, so a review made under one choice becomes stale under the other.
 
 A large tree can stop at a scan limit, such as the Workcell inventory cap of 4,096 entries. Folders that were listed still compare by content. Entries seen on one side only stay undetermined while either side is partial, and review requires a complete comparison. When the cap truncates a side, reported as `WorkcellIncomplete`, Workcell cannot inspect that side, so file diffs are refused as well. Compare a smaller folder to review those entries or open their diffs. If one large folder is never transferred, add it to `exclude` in the profile's [transfer record](#configuration-schema). The inventory then lists that folder without walking its contents, so it no longer uses up the cap.
 

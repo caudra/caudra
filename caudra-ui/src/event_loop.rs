@@ -123,6 +123,8 @@ const RELOCATION_WORKFLOW_ERR: &str = "Stop active or paused workflows before mo
 const RELOCATION_SHUTDOWN_ERR: &str = "Session relocation aborted before changing directories";
 const RELOCATION_ADMISSION_ERR: &str =
     "Session relocation is in progress; retry after the workspace restarts";
+const SANDBOX_WORK_BUSY: &str =
+    "Wait for agents, queues, background tasks and shells before a sandbox action";
 
 /// The prompt that opened a session, which is what its title is about.
 fn opening_prompt<M: TitleSource>(messages: &[M]) -> Result<String, String> {
@@ -2050,21 +2052,20 @@ impl<'t> EventLoop<'t> {
         self.sandbox_admission(transition, None)
     }
 
+    fn sandbox_work_idle(&self) -> Result<(), String> {
+        if self.sessions.iter().all(SessionRuntime::work_quiescent) {
+            Ok(())
+        } else {
+            Err(SANDBOX_WORK_BUSY.into())
+        }
+    }
+
     fn sandbox_admission(
         &mut self,
         transition: bool,
         transfer_owner: Option<usize>,
     ) -> Result<Vec<SessionTransition>, String> {
-        if self
-            .sessions
-            .iter()
-            .any(|runtime| !runtime.work_quiescent())
-        {
-            return Err(
-                "Wait for agents, queues, background tasks and shells before a sandbox action"
-                    .into(),
-            );
-        }
+        self.sandbox_work_idle()?;
         for (index, runtime) in self.sessions.iter().enumerate() {
             if let Some(reason) = if transfer_owner == Some(index) {
                 runtime.app.transfer_start_blocker()
@@ -2157,17 +2158,26 @@ impl<'t> EventLoop<'t> {
                     command,
                     crate::sandbox::transfer::TransferCommand::Open { .. }
                 );
+                // Reserving blocks on tasks of the global executor, whose agent dispatchers
+                // block that thread while they wait for a claim. So reserve first, then take
+                // the claims and confirm quiescence again under them.
+                let admitted = if opening {
+                    self.sandbox_admission(false, Some(index))
+                } else {
+                    Ok(Vec::new())
+                };
                 let queues: Vec<_> = self
                     .sessions
                     .iter()
                     .map(|runtime| runtime.handles.queue.clone())
                     .collect();
                 let _claims: Vec<_> = queues.iter().map(|queue| queue.lock_dispatch()).collect();
-                let admitted = if opening {
-                    self.sandbox_admission(false, Some(index))
-                } else {
-                    Ok(Vec::new())
-                };
+                let admitted = admitted.and_then(|reservations| {
+                    if opening {
+                        self.sandbox_work_idle()?;
+                    }
+                    Ok(reservations)
+                });
                 match admitted {
                     Ok(reservations) => {
                         self.sessions[index].app.start_transfer(command);

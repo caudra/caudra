@@ -858,7 +858,7 @@ impl App {
                 SidebarView::Explorer => KeybindContext::WorkbenchExplorer,
                 SidebarView::SourceControl => KeybindContext::WorkbenchSourceControl,
                 SidebarView::Search => KeybindContext::WorkbenchSearch,
-                SidebarView::Transfer => KeybindContext::Workbench,
+                SidebarView::Transfer => KeybindContext::WorkbenchTransfer,
             });
             if self.workbench.focus() == Focus::Editor && !self.workbench.transfer_input_active() {
                 contexts.push(KeybindContext::WorkbenchEditor);

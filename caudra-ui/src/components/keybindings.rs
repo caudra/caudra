@@ -380,6 +380,7 @@ pub enum KeybindContext {
     WorkbenchEditor,
     WorkbenchSourceControl,
     WorkbenchSearch,
+    WorkbenchTransfer,
 }
 
 impl KeybindContext {
@@ -413,6 +414,7 @@ impl KeybindContext {
             Self::WorkbenchEditor => "Workbench Editor",
             Self::WorkbenchSourceControl => "Workbench Source Control",
             Self::WorkbenchSearch => "Workbench Search",
+            Self::WorkbenchTransfer => "Workbench Transfer",
         }
     }
 
@@ -433,7 +435,8 @@ impl KeybindContext {
             Self::WorkbenchExplorer
             | Self::WorkbenchEditor
             | Self::WorkbenchSourceControl
-            | Self::WorkbenchSearch => Some(Self::Workbench),
+            | Self::WorkbenchSearch
+            | Self::WorkbenchTransfer => Some(Self::Workbench),
             _ => None,
         }
     }
@@ -1437,13 +1440,26 @@ pub const KEYBINDS: &[Keybind] = &[
         platform: Platform::All,
     },
     Keybind {
-        label: KeyLabel::Multi(&[
-            wb::VIEW_EXPLORER.label,
-            wb::VIEW_SOURCE_CONTROL.label,
-            wb::VIEW_SEARCH.label,
-            wb::VIEW_TRANSFER.label,
-        ]),
-        description: "Explorer / source control / search / attached sandbox transfer",
+        label: KeyLabel::Single(wb::VIEW_EXPLORER.label),
+        description: "Explorer",
+        context: KeybindContext::Workbench,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Single(wb::VIEW_SOURCE_CONTROL.label),
+        description: "Source control",
+        context: KeybindContext::Workbench,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Single(wb::VIEW_SEARCH.label),
+        description: "Search",
+        context: KeybindContext::Workbench,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Single(wb::VIEW_TRANSFER.label),
+        description: "Transfer files with the attached sandbox",
         context: KeybindContext::Workbench,
         platform: Platform::All,
     },
@@ -1631,6 +1647,120 @@ pub const KEYBINDS: &[Keybind] = &[
         label: KeyLabel::Single(wb::TOGGLE_REGEX.label),
         description: "Read the query as a regular expression",
         context: KeybindContext::WorkbenchSearch,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Multi(&["↑", "↓", wb::PREVIOUS_ROW.label, wb::NEXT_ROW.label]),
+        description: "Move through the aligned tree",
+        context: KeybindContext::WorkbenchTransfer,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Multi(&["PgUp", "PgDn", "Home", "End"]),
+        description: "Move a page at a time, or to the first or last row",
+        context: KeybindContext::WorkbenchTransfer,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Alt("→", "Enter"),
+        description: "Unfold a folder, open a file's diff, or run a note's action",
+        context: KeybindContext::WorkbenchTransfer,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Single("←"),
+        description: "Fold the folder, or step out to the one above",
+        context: KeybindContext::WorkbenchTransfer,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Single(wb::COLLAPSE_ALL.label),
+        description: "Fold the tree back to its top level",
+        context: KeybindContext::WorkbenchTransfer,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Alt(wb::FOCUS_NEXT.label, wb::FOCUS_PREV.label),
+        description: "Focus the local or the sandbox pane",
+        context: KeybindContext::WorkbenchTransfer,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Single(wb::SELECT.label),
+        description: "Choose the row, and everything under a folder",
+        context: KeybindContext::WorkbenchTransfer,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Alt(wb::UPLOAD.label, wb::DOWNLOAD.label),
+        description: "Review an upload / download of the chosen rows, or of the cursor row",
+        context: KeybindContext::WorkbenchTransfer,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Single(wb::APPROVE.label),
+        description: "Approve the review on screen, exactly as shown",
+        context: KeybindContext::WorkbenchTransfer,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Alt(wb::COMPARE.label, wb::REFRESH.label),
+        description: "Compare the roots again",
+        context: KeybindContext::WorkbenchTransfer,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Single(wb::INCLUDE_IGNORED.label),
+        description: "Include or leave out ignored files until Transfer closes",
+        context: KeybindContext::WorkbenchTransfer,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Single(wb::CHANGES_ONLY.label),
+        description: "Show only what differs",
+        context: KeybindContext::WorkbenchTransfer,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Alt(wb::LOCAL_ROOT.label, wb::SANDBOX_ROOT.label),
+        description: "Edit the local / sandbox root",
+        context: KeybindContext::WorkbenchTransfer,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Single(wb::CLEAR_ROOT.label),
+        description: "Clear the root being edited",
+        context: KeybindContext::WorkbenchTransfer,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Single(wb::PREVIOUS_ROOTS.label),
+        description: "Go back to the previous root pair",
+        context: KeybindContext::WorkbenchTransfer,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Single(wb::REPORT.label),
+        description: "Show the last transfer report",
+        context: KeybindContext::WorkbenchTransfer,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Single(wb::RECONCILE.label),
+        description: "Reconcile a publication whose outcome is unknown",
+        context: KeybindContext::WorkbenchTransfer,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Single(wb::STOP.label),
+        description: "Stop the running operation",
+        context: KeybindContext::WorkbenchTransfer,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Single(wb::CLOSE.label),
+        description: "Close the prompt or panel, then leave Transfer once cleanup ends",
+        context: KeybindContext::WorkbenchTransfer,
         platform: Platform::All,
     },
 ];

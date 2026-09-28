@@ -1,5 +1,6 @@
 use std::{
     any::Any,
+    collections::BTreeMap,
     path::PathBuf,
     sync::{
         Arc,
@@ -15,15 +16,16 @@ use caudra_agent::{
     permissions::{PermissionManager, PluginRuleStore},
     workspace_transfer::{
         CleanBufferLease, ComparisonRow, InventoryContext, LocalRootIdentity, PlanReview,
-        PullBufferGuard, TransferAction, TransferError, TransferEvent, TransferEvents,
-        TransferPreview as FileComparisonPreview,
+        PullBufferGuard, ScanState, Side, TransferAction, TransferError, TransferEvent,
+        TransferEvents, TransferPreview as FileComparisonPreview,
     },
 };
 use caudra_config::load_permissions;
 use caudra_config::sandbox::{Revision, SandboxName};
 use caudra_storage::{StateDir, id::CaudraId, workspace_binding::StoredWorkspaceBinding};
+use caudra_workbench::transfer::{TransferPhase, TransferProgress, TransferRecovery};
 use caudra_workcell::{TransferReport, TransferSession, TransferSessionHost};
-use caudra_workspace::{TransferDigest, WorkspacePath};
+use caudra_workspace::{OperationId, TransferDigest, WorkspacePath};
 use flume::{Receiver, Sender};
 use futures_lite::future;
 use smol::Timer;
@@ -31,6 +33,13 @@ use smol::Timer;
 static TRANSFER_ACTIVE: AtomicBool = AtomicBool::new(false);
 const EVENT_CAPACITY: usize = 512;
 const VALIDITY_INTERVAL: Duration = Duration::from_secs(2);
+const IDLE: TransferProgress = TransferProgress {
+    phase: TransferPhase::Scanning,
+    side: None,
+    path: None,
+    completed: 0,
+    total: 0,
+};
 
 pub fn active() -> bool {
     TRANSFER_ACTIVE.load(Ordering::Acquire)
@@ -100,7 +109,8 @@ pub(crate) enum TransferReply {
 pub(crate) struct ComparisonView {
     pub context: InventoryContext,
     pub rows: Vec<ComparisonRow>,
-    pub complete: bool,
+    pub local: ScanState,
+    pub remote: ScanState,
 }
 
 pub(crate) struct TransferPreview {
@@ -135,11 +145,13 @@ impl PullBufferGuard for TransferBuffers {
 pub(crate) struct TransferWorker {
     pub scope: TransferScope,
     pub directory_effects: bool,
-    pub recovery_required: bool,
-    pub completed: usize,
-    pub total: usize,
+    /// The journal as this worker last read it; `None` until it has.
+    pub recovery: Option<TransferRecovery>,
+    pub progress: TransferProgress,
+    /// Which path each reviewed or settled operation touched, so outcomes read as paths.
+    pub operations: BTreeMap<OperationId, WorkspacePath>,
     pub replies: Receiver<TransferReply>,
-    pub progress: Receiver<TransferEvent>,
+    pub events: Receiver<TransferEvent>,
     pub permissions: Arc<PermissionManager>,
     pub permission_events: Receiver<Envelope>,
     commands: Sender<TransferCommand>,
@@ -171,7 +183,7 @@ impl TransferWorker {
         }
         let lease = WorkspaceLease;
         let (cancel, token) = CancelToken::new();
-        let (progress_tx, progress) = flume::bounded(EVENT_CAPACITY);
+        let (progress_tx, transfer_events) = flume::bounded(EVENT_CAPACITY);
         let validity_token = token.clone();
         let host = TransferSessionHost {
             permissions: permissions.clone(),
@@ -210,7 +222,8 @@ impl TransferWorker {
                                                 Arc::new(ComparisonView {
                                                     context: comparison.context().clone(),
                                                     rows: comparison.rows().to_vec(),
-                                                    complete: comparison.complete(),
+                                                    local: comparison.scan(&Side::Local).clone(),
+                                                    remote: comparison.scan(&Side::Remote).clone(),
                                                 }),
                                                 connection.session.recovery()?,
                                                 connection.session.supports_directory_publication(),
@@ -294,11 +307,11 @@ impl TransferWorker {
         Ok(Self {
             scope,
             directory_effects: false,
-            recovery_required: false,
-            completed: 0,
-            total: 0,
+            recovery: None,
+            progress: IDLE,
+            operations: BTreeMap::new(),
             replies,
-            progress,
+            events: transfer_events,
             permissions,
             permission_events,
             commands,
@@ -307,10 +320,18 @@ impl TransferWorker {
         })
     }
 
-    pub fn send(&self, command: TransferCommand) -> Result<(), String> {
+    pub fn send(&mut self, command: TransferCommand) -> Result<(), String> {
+        let progress = restarted(&self.progress, &command);
         self.commands
             .try_send(command)
-            .map_err(|_| "Transfer is busy; wait for settlement".into())
+            .map_err(|_| "Transfer is busy; wait for settlement".to_owned())?;
+        self.progress = progress;
+        Ok(())
+    }
+
+    /// Counts afresh for `next`, the command this worker runs now.
+    pub fn restart_progress(&mut self, next: &TransferCommand) {
+        self.progress = restarted(&self.progress, next);
     }
 
     pub fn cancel(&mut self) {
@@ -329,6 +350,18 @@ impl TransferWorker {
         if let Some(join) = self.join.take() {
             join.join().unwrap();
         }
+    }
+}
+
+/// Where counting starts for `next`: at nothing, except that an execution
+/// settles the plan its review counted and so keeps that total.
+fn restarted(progress: &TransferProgress, next: &TransferCommand) -> TransferProgress {
+    TransferProgress {
+        total: match next {
+            TransferCommand::Execute(_) => progress.total,
+            _ => 0,
+        },
+        ..IDLE
     }
 }
 
@@ -352,13 +385,17 @@ impl Drop for TransferWorker {
 
 #[cfg(test)]
 mod tests {
-    use super::{CancelToken, TransferScope, TransferWorker};
+    use super::{
+        BTreeMap, CancelToken, IDLE, TransferCommand, TransferDigest, TransferPhase,
+        TransferProgress, TransferScope, TransferWorker, WorkspacePath, restarted,
+    };
     use caudra_agent::permissions::PermissionManager;
     use caudra_config::{
         PermissionsConfig,
         sandbox::{Revision, SandboxName},
     };
     use caudra_storage::{id::CaudraId, workspace_binding::StoredWorkspaceBinding};
+    use caudra_workbench::transfer::TransferSide;
     use std::{
         sync::{
             Arc,
@@ -366,9 +403,13 @@ mod tests {
         },
         thread,
     };
+    use test_case::test_case;
 
     const REVISION: &str =
         "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const FILE: &str = "src/main.rs";
+    /// How many operations the review before an execution planned.
+    const PLANNED: usize = 3;
 
     #[test]
     fn drop_requests_cancel_without_blocking_cleanup() {
@@ -387,12 +428,12 @@ mod tests {
         });
         let (commands, _) = flume::bounded(1);
         let (_, replies) = flume::unbounded();
-        let (_, progress) = flume::unbounded();
+        let (_, events) = flume::unbounded();
         let mut worker = TransferWorker {
             directory_effects: false,
-            recovery_required: false,
-            completed: 0,
-            total: 0,
+            recovery: None,
+            progress: IDLE,
+            operations: BTreeMap::new(),
             scope: TransferScope {
                 conversation: CaudraId::generate(),
                 binding: StoredWorkspaceBinding::local_from_cwd("/tmp"),
@@ -402,7 +443,7 @@ mod tests {
                 generation: 1,
             },
             replies,
-            progress,
+            events,
             permissions: Arc::new(PermissionManager::new_nonpersistent(
                 PermissionsConfig::default(),
                 std::env::temp_dir(),
@@ -421,5 +462,23 @@ mod tests {
         release.send(()).unwrap();
         finished.recv().unwrap();
         assert!(done.load(Ordering::Acquire));
+    }
+
+    #[test_case(TransferCommand::Execute(TransferDigest::new(REVISION).unwrap()), PLANNED; "execution_keeps_its_plan")]
+    #[test_case(TransferCommand::Reconcile, 0; "reconcile")]
+    #[test_case(TransferCommand::Compare, 0; "comparison_after_a_transfer")]
+    #[test_case(TransferCommand::Inspect(WorkspacePath::root()), 0; "inspection")]
+    fn each_command_counts_afresh(next: TransferCommand, total: usize) {
+        let finished = TransferProgress {
+            phase: TransferPhase::Publishing,
+            side: Some(TransferSide::Remote),
+            path: Some(FILE.to_owned()),
+            completed: PLANNED,
+            total: PLANNED,
+        };
+        assert_eq!(
+            restarted(&finished, &next),
+            TransferProgress { total, ..IDLE }
+        );
     }
 }

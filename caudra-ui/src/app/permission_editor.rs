@@ -1418,6 +1418,7 @@ pub(super) mod tests {
     use unicode_width::UnicodeWidthStr;
 
     use crate::app::Msg;
+    use crate::app::sandbox::WORKBENCH_BUSY;
     use crate::app::tests::{pattern_suggestion_candidate, remote_workspace_session, test_app};
     use crate::components::buffer_text;
     use crate::components::permission_scope::editor::{
@@ -1790,6 +1791,7 @@ pub(super) mod tests {
         assert!(!app.workbench.is_open());
         assert!(app.workbench.is_busy());
         assert!(app.sandbox_action_blocker(true).is_some());
+        assert_eq!(app.transfer_start_blocker(), Some(WORKBENCH_BUSY));
         assert!(remote.writes.lock().unwrap().is_empty());
         release.send(()).unwrap();
         settle_source_workbenches(&mut app);

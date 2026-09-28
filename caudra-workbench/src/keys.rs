@@ -107,6 +107,26 @@ pub const TOGGLE_TREE: Bind = bind!(KeyCode::Char('t'), NONE, "T");
 
 pub const COLLAPSE_ALL: Bind = bind!(KeyCode::Char('c'), NONE, "C");
 
+/// Transfer's own keys. The view takes every key while it is up, so these only
+/// have to stay clear of each other and of the leader, not of the other panes.
+pub const SELECT: Bind = bind!(KeyCode::Char(' '), NONE, "Space");
+pub const NEXT_ROW: Bind = bind!(KeyCode::Char('j'), NONE, "j");
+pub const PREVIOUS_ROW: Bind = bind!(KeyCode::Char('k'), NONE, "k");
+pub const UPLOAD: Bind = bind!(KeyCode::Char('u'), NONE, "U");
+pub const DOWNLOAD: Bind = bind!(KeyCode::Char('d'), NONE, "D");
+pub const APPROVE: Bind = bind!(KeyCode::Char('a'), NONE, "A");
+pub const COMPARE: Bind = bind!(KeyCode::Char('='), NONE, "=");
+pub const INCLUDE_IGNORED: Bind = bind!(KeyCode::Char('i'), NONE, "I");
+pub const CHANGES_ONLY: Bind = bind!(KeyCode::Char('f'), NONE, "F");
+pub const LOCAL_ROOT: Bind = bind!(KeyCode::Char('l'), NONE, "L");
+pub const SANDBOX_ROOT: Bind = bind!(KeyCode::Char('s'), NONE, "S");
+pub const PREVIOUS_ROOTS: Bind = bind!(KeyCode::Backspace, NONE, "Backspace");
+pub const REPORT: Bind = bind!(KeyCode::Char('o'), NONE, "O");
+pub const RECONCILE: Bind = bind!(KeyCode::Char('q'), NONE, "Q");
+pub const STOP: Bind = bind!(KeyCode::Char('x'), NONE, "X");
+/// The shell's own line kill, for a root prompt that holds a whole path.
+pub const CLEAR_ROOT: Bind = bind!(KeyCode::Char('u'), CTRL, "Ctrl+U");
+
 /// `Ctrl+H` is byte 0x08, indistinguishable from Backspace, so the toggle
 /// lives under the leader instead.
 pub const TOGGLE_HIDDEN: Bind = leader!(KeyCode::Char('h'), "h");
@@ -175,6 +195,37 @@ const SOURCE_CONTROL_BINDS: &[Bind] = &[STAGE_TOGGLE, OPEN_DIFF, DISCARD, TOGGLE
 #[cfg(test)]
 const EXPLORER_BINDS: &[Bind] = &[COLLAPSE_ALL];
 
+/// Every key the transfer view answers to, the shared ones it reuses included.
+/// Checked as a set of its own, with the leader in it because the view hands
+/// that one back.
+#[cfg(test)]
+const TRANSFER_BINDS: &[Bind] = &[
+    LEADER,
+    TOGGLE_SIDEBAR,
+    QUICK_OPEN,
+    CLOSE,
+    FOCUS_NEXT,
+    FOCUS_PREV,
+    REFRESH,
+    COLLAPSE_ALL,
+    SELECT,
+    NEXT_ROW,
+    PREVIOUS_ROW,
+    UPLOAD,
+    DOWNLOAD,
+    APPROVE,
+    COMPARE,
+    INCLUDE_IGNORED,
+    CHANGES_ONLY,
+    LOCAL_ROOT,
+    SANDBOX_ROOT,
+    PREVIOUS_ROOTS,
+    REPORT,
+    RECONCILE,
+    STOP,
+    CLEAR_ROOT,
+];
+
 /// Second keys of the `Ctrl+X` chords. Checked among themselves only: the
 /// prefix keeps them clear of every direct chord, whichever pane is up.
 pub const LEADER_BINDS: &[Bind] = &[
@@ -203,7 +254,7 @@ pub const LEADER_BINDS: &[Bind] = &[
 mod tests {
     use super::{
         Bind, EXPLORER_BINDS, GLOBAL_BINDS, KeyCode, KeyEvent, KeyModifiers, LEADER_BINDS,
-        LEADER_LABEL, NONE, SOURCE_CONTROL_BINDS, STAGE_TOGGLE,
+        LEADER_LABEL, NONE, SOURCE_CONTROL_BINDS, STAGE_TOGGLE, TRANSFER_BINDS,
     };
 
     const DUPLICATE: &str = "two workbench binds must not answer to the same chord";
@@ -223,7 +274,11 @@ mod tests {
     }
 
     fn every_bind() -> Vec<Bind> {
-        direct_binds().into_iter().chain(leader_binds()).collect()
+        direct_binds()
+            .into_iter()
+            .chain(leader_binds())
+            .chain(TRANSFER_BINDS.iter().copied())
+            .collect()
     }
 
     fn leader_binds() -> Vec<Bind> {
@@ -251,6 +306,11 @@ mod tests {
     #[test]
     fn no_two_leader_binds_share_a_second_key() {
         assert_no_shared_chord(&leader_binds());
+    }
+
+    #[test]
+    fn no_two_transfer_binds_share_a_chord() {
+        assert_no_shared_chord(TRANSFER_BINDS);
     }
 
     #[test]

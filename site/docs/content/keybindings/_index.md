@@ -168,7 +168,10 @@ See [Managed Sandboxes](/docs/sandboxes/#tui-manager) for instance actions and [
 | `Esc` / `Ctrl+X w` | Back to the transcript |
 | `Ctrl+B` | Show or hide the sidebar |
 | `Ctrl+X -` / `Ctrl+X =` | Narrow / widen the sidebar |
-| `Ctrl+X 1` / `Ctrl+X 2` / `Ctrl+X 3` / `Ctrl+X 4` | Explorer / source control / search / attached sandbox transfer |
+| `Ctrl+X 1` | Explorer |
+| `Ctrl+X 2` | Source control |
+| `Ctrl+X 3` | Search |
+| `Ctrl+X 4` | Transfer files with the attached sandbox |
 | `Tab` / `Shift+Tab` | Leave the sidebar for the editor |
 | `Ctrl+P` | Open a file by name |
 | `F5` | Reread the tree and the repository |
@@ -241,13 +244,32 @@ Some pickers add extra bindings on top of the defaults:
 | Workbench Search | `Ctrl+X c` | Match case |
 | Workbench Search | `Ctrl+X w` | Match whole words |
 | Workbench Search | `Ctrl+X r` | Read the query as a regular expression |
+| Workbench Transfer | `↑` / `↓` / `k` / `j` | Move through the aligned tree |
+| Workbench Transfer | `PgUp` / `PgDn` / `Home` / `End` | Move a page at a time, or to the first or last row |
+| Workbench Transfer | `→` / `Enter` | Unfold a folder, open a file's diff, or run a note's action |
+| Workbench Transfer | `←` | Fold the folder, or step out to the one above |
+| Workbench Transfer | `C` | Fold the tree back to its top level |
+| Workbench Transfer | `Tab` / `Shift+Tab` | Focus the local or the sandbox pane |
+| Workbench Transfer | `Space` | Choose the row, and everything under a folder |
+| Workbench Transfer | `U` / `D` | Review an upload / download of the chosen rows, or of the cursor row |
+| Workbench Transfer | `A` | Approve the review on screen, exactly as shown |
+| Workbench Transfer | `=` / `F5` | Compare the roots again |
+| Workbench Transfer | `I` | Include or leave out ignored files until Transfer closes |
+| Workbench Transfer | `F` | Show only what differs |
+| Workbench Transfer | `L` / `S` | Edit the local / sandbox root |
+| Workbench Transfer | `Ctrl+U` | Clear the root being edited |
+| Workbench Transfer | `Backspace` | Go back to the previous root pair |
+| Workbench Transfer | `O` | Show the last transfer report |
+| Workbench Transfer | `Q` | Reconcile a publication whose outcome is unknown |
+| Workbench Transfer | `X` | Stop the running operation |
+| Workbench Transfer | `Esc` | Close the prompt or panel, then leave Transfer once cleanup ends |
 
 ## Context Inheritance
 
 Child contexts inherit their parent's bindings and add their own.
 
 - **Pickers** is the base for: Rewind Picker, Theme Picker, Model Picker, Queue, Commands, Search, File Picker, Stash Picker, Session Picker, Session Relocation, Workflow Inspector, Workflow Catalog
-- **Workbench** is the base for: Workbench Explorer, Workbench Editor, Workbench Source Control, Workbench Search
+- **Workbench** is the base for: Workbench Explorer, Workbench Editor, Workbench Source Control, Workbench Search, Workbench Transfer
 
 ## Overriding Keybindings
 

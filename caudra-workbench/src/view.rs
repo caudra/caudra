@@ -34,7 +34,7 @@ use crate::{
     layout_sections,
 };
 
-const HINT_GAP: &str = "  ";
+pub(crate) const HINT_GAP: &str = "  ";
 const EMPTY_EDITOR_HINT: &str = "No file open";
 /// Stands where the caret's line and column would, since the rendered view has
 /// neither.
@@ -50,7 +50,7 @@ const CASE_TOGGLE: &str = "Aa";
 const WORD_TOGGLE: &str = "ab";
 const REGEX_TOGGLE: &str = ".*";
 pub(crate) const CARET: &str = "\u{2588}";
-const ENTER_LABEL: &str = "Enter";
+pub(crate) const ENTER_LABEL: &str = "Enter";
 const SUMMARY_GAP: &str = " ";
 /// The two-column rail down the left of the graph. A commit on the chain of
 /// first parents sits on the trunk, one a merge brought in hangs beside it.
@@ -71,16 +71,16 @@ const EMPTY_TREE: &str = "Nothing to show";
 const LOADING_TREE: &str = "Loading remote files…";
 const DIRTY_MARK: &str = "\u{25cf}";
 const AGENT_MARK: &str = "\u{25e6}";
-const EXPANDED_MARK: &str = "\u{25be} ";
-const COLLAPSED_MARK: &str = "\u{25b8} ";
+pub(crate) const EXPANDED_MARK: &str = "\u{25be} ";
+pub(crate) const COLLAPSED_MARK: &str = "\u{25b8} ";
 /// Trails the subject of a commit whose message says more than its subject, so
 /// the graph says which rows are worth opening.
 const BODY_MARK: &str = " \u{00b6}";
-const LEAF_INDENT: &str = "  ";
+pub(crate) const LEAF_INDENT: &str = "  ";
 const DEPTH_INDENT: usize = 2;
 /// One nesting level of the explorer, drawn as a rule rather than as air so a
 /// deep row says which folder it belongs to.
-const GUIDE: &str = "\u{2502} ";
+pub(crate) const GUIDE: &str = "\u{2502} ";
 const GUTTER_GAP: u16 = 1;
 /// The columns a diff pane needs before a second gutter of line numbers is
 /// worth what it takes away from the code.
@@ -95,7 +95,7 @@ const CONFLICT_NOTICE: &str = "Changed on disk since it was opened";
 const FIND_PROMPT: &str = "Find: ";
 const GOTO_PROMPT: &str = "Go to line: ";
 const NO_MATCHES: &str = "No results";
-const TAB_GAP: &str = " ";
+pub(crate) const TAB_GAP: &str = " ";
 const CLOSE_MARK: &str = "\u{d7}";
 /// The handle on the context menu, kept at the left of every tree row and
 /// every tab so the menu is something to reach for rather than something to
@@ -184,14 +184,8 @@ impl Workbench {
             chrome::vertical_rule(buf, separator, self.styles.border);
         }
         if self.sidebar == SidebarView::Transfer {
-            self.transfer.render(buf, panes.editor, &self.styles);
-            chrome::render_line(
-                buf,
-                panes.status,
-                Line::from(
-                    "Transfer · Ctrl+X 1/2/3/4 views · Tab local/sandbox · C cancel · Esc back",
-                ),
-            );
+            self.render_transfer(buf, panes.editor);
+            self.render_transfer_status(buf, panes.status);
             return;
         }
         self.render_editor(buf, panes.editor);
@@ -339,7 +333,7 @@ impl Workbench {
             SidebarView::Explorer => self.render_tree(buf, body),
             SidebarView::SourceControl => self.render_scm(buf, body),
             SidebarView::Search => self.render_search(buf, body, focused),
-            SidebarView::Transfer => self.transfer.render_sidebar(buf, body, &self.styles),
+            SidebarView::Transfer => self.render_transfer_sidebar(buf, body),
         }
     }
 
@@ -877,7 +871,7 @@ impl Workbench {
     /// Records the strip the bar owns and paints it. A pane whose content fits
     /// hands over no rect, which clears the slot and with it any drag that was
     /// in flight when the content shrank.
-    fn scrollbar(
+    pub(crate) fn scrollbar(
         &mut self,
         buf: &mut Surface,
         bar: Bar,
@@ -915,47 +909,27 @@ impl Workbench {
             self.render_rendered(buf, area, paint);
             return;
         }
+        let body = paint_tab(
+            buf,
+            area,
+            tab,
+            &self.styles,
+            focused,
+            self.wrap,
+            self.scrollbars,
+        );
+        self.panes.text = body.text;
+        self.text_bar(buf, body.bar, body.lines, body.first);
+    }
 
-        let lines = tab.buffer.line_count();
-        let columns = tab
-            .diff_rows()
-            .map(|rows| DiffColumns::for_pane(rows, area.width));
-        let gutter = columns.map_or_else(|| digits(lines) + GUTTER_GAP, DiffColumns::width);
-        let [numbers, text] =
-            Layout::horizontal([Constraint::Length(gutter), Constraint::Min(1)]).areas(area);
-        // Taken off the text rather than the gutter, and taken from the rect
-        // the cursor is placed against too, so a caret at the right margin
-        // cannot end up underneath the bar.
-        let (text, bar) = scroll_column(self.scrollbars, text, lines);
-        self.panes.text = text;
-
-        // Wrapping makes a row a slice of a line rather than a whole one, but
-        // the highlighter and the scrollbar still count in buffer lines, so
-        // both ends of the window are taken back to the lines they fall on.
-        let rows = tab.visible_rows(text.height as usize, text.width as usize, self.wrap);
-        let first = rows.first().map_or(0, |row| row.line);
-        let last = rows.last().map_or(0, |row| row.line + 1);
-        tab.highlight(first, last);
-        let tab = &*tab;
-        for (offset, row) in rows.iter().enumerate() {
-            chrome::render_line(
-                buf,
-                line_at(numbers, offset),
-                gutter_row(tab, *row, &self.styles, focused, gutter, columns),
-            );
-            chrome::render_line(
-                buf,
-                line_at(text, offset),
-                text_row(
-                    tab,
-                    row.line,
-                    tab.colours(row.line, first, last),
-                    &self.styles,
-                    focused,
-                    (row.start, row.span),
-                ),
-            );
-        }
+    /// Hangs the text bar beside `lines` rows of which `first` tops the pane.
+    pub(crate) fn text_bar(
+        &mut self,
+        buf: &mut Surface,
+        bar: Option<Rect>,
+        lines: usize,
+        first: usize,
+    ) {
         self.bars
             .text
             .set_hint(ScrollHint::lines(first as u32 + 1, lines as u32));
@@ -1415,7 +1389,7 @@ pub(crate) fn button_at(column: u16, header: Rect, context: usize, label: &str) 
 
 /// The hover highlight as a style rather than a whole line, for the header
 /// segments that share a row with things that are not buttons.
-fn emphasized(base: Style, hovered: bool, styles: &WorkbenchStyles) -> Style {
+pub(crate) fn emphasized(base: Style, hovered: bool, styles: &WorkbenchStyles) -> Style {
     match hovered {
         true => base.patch(styles.hover),
         false => base,
@@ -1424,7 +1398,11 @@ fn emphasized(base: Style, hovered: bool, styles: &WorkbenchStyles) -> Style {
 
 /// Paints the pointer's own highlight over a row it is resting on, keeping the
 /// colours the row already earned rather than replacing them.
-fn emphasize(line: Line<'static>, hovered: bool, styles: &WorkbenchStyles) -> Line<'static> {
+pub(crate) fn emphasize(
+    line: Line<'static>,
+    hovered: bool,
+    styles: &WorkbenchStyles,
+) -> Line<'static> {
     if !hovered {
         return line;
     }
@@ -1448,7 +1426,7 @@ fn emphasize(line: Line<'static>, hovered: bool, styles: &WorkbenchStyles) -> Li
 /// `ScrollTrack` paints itself into the last column of whatever it is handed,
 /// and it needs the pane to know how far a touch press may stray from the bar
 /// before it would land in the pane next door.
-fn scroll_column(enabled: bool, area: Rect, total: usize) -> (Rect, Option<Rect>) {
+pub(crate) fn scroll_column(enabled: bool, area: Rect, total: usize) -> (Rect, Option<Rect>) {
     if !enabled || area.width < SCROLLBAR_MIN_WIDTH || total <= area.height as usize {
         return (area, None);
     }
@@ -1464,7 +1442,7 @@ fn overwrite(buf: &mut Surface, at: (u16, u16), symbol: &str, style: Style) {
     }
 }
 
-fn placeholder(buf: &mut Surface, area: Rect, text: &str, style: Style) {
+pub(crate) fn placeholder(buf: &mut Surface, area: Rect, text: &str, style: Style) {
     chrome::render_line(
         buf,
         area,
@@ -1472,7 +1450,7 @@ fn placeholder(buf: &mut Surface, area: Rect, text: &str, style: Style) {
     );
 }
 
-fn line_at(area: Rect, offset: usize) -> Rect {
+pub(crate) fn line_at(area: Rect, offset: usize) -> Rect {
     Rect {
         y: area.y + offset as u16,
         height: 1,
@@ -1548,7 +1526,7 @@ pub(crate) fn on_menu_mark(column: u16, origin: u16) -> bool {
 
 /// A faint rule down every level the row sits under, so a name three folders
 /// deep says which one it belongs to without counting spaces.
-fn indent_guides(depth: usize) -> String {
+pub(crate) fn indent_guides(depth: usize) -> String {
     GUIDE.repeat(depth)
 }
 
@@ -1954,7 +1932,7 @@ fn hit_row(hit: &Hit, selected: bool, styles: &WorkbenchStyles, width: u16) -> L
 
 /// Cuts a painted row to the pane's width without losing the styling of the
 /// spans that survive.
-fn truncate(spans: Vec<Span<'static>>, budget: usize) -> Line<'static> {
+pub(crate) fn truncate(spans: Vec<Span<'static>>, budget: usize) -> Line<'static> {
     let mut used = 0;
     let mut kept = Vec::with_capacity(spans.len());
     for span in spans {
@@ -1975,6 +1953,73 @@ fn git_style(mark: GitMark, styles: &WorkbenchStyles) -> Style {
         GitMark::Deleted => styles.git_deleted,
         GitMark::Untracked => styles.git_untracked,
         GitMark::Conflicted => styles.git_conflicted,
+    }
+}
+
+/// Where [`paint_tab`] put a tab's text, and what its bar needs to follow it.
+pub(crate) struct TabBody {
+    pub(crate) text: Rect,
+    pub(crate) bar: Option<Rect>,
+    pub(crate) first: usize,
+    pub(crate) lines: usize,
+}
+
+/// A tab's rows in view beside their gutter, numbered, banded and coloured the
+/// way the editor shows every tab, so a diff painted anywhere else reads the
+/// same as one opened from source control.
+pub(crate) fn paint_tab(
+    buf: &mut Surface,
+    area: Rect,
+    tab: &mut Tab,
+    styles: &WorkbenchStyles,
+    focused: bool,
+    wrap: bool,
+    scrollbars: bool,
+) -> TabBody {
+    let lines = tab.buffer.line_count();
+    let columns = tab
+        .diff_rows()
+        .map(|rows| DiffColumns::for_pane(rows, area.width));
+    let gutter = columns.map_or_else(|| digits(lines) + GUTTER_GAP, DiffColumns::width);
+    let [numbers, text] =
+        Layout::horizontal([Constraint::Length(gutter), Constraint::Min(1)]).areas(area);
+    // Taken off the text rather than the gutter, and taken from the rect the
+    // cursor is placed against too, so a caret at the right margin cannot end
+    // up underneath the bar.
+    let (text, bar) = scroll_column(scrollbars, text, lines);
+
+    // Wrapping makes a row a slice of a line rather than a whole one, but the
+    // highlighter and the scrollbar still count in buffer lines, so both ends
+    // of the window are taken back to the lines they fall on.
+    let rows = tab.visible_rows(text.height as usize, text.width as usize, wrap);
+    let first = rows.first().map_or(0, |row| row.line);
+    let last = rows.last().map_or(0, |row| row.line + 1);
+    tab.highlight(first, last);
+    let tab = &*tab;
+    for (offset, row) in rows.iter().enumerate() {
+        chrome::render_line(
+            buf,
+            line_at(numbers, offset),
+            gutter_row(tab, *row, styles, focused, gutter, columns),
+        );
+        chrome::render_line(
+            buf,
+            line_at(text, offset),
+            text_row(
+                tab,
+                row.line,
+                tab.colours(row.line, first, last),
+                styles,
+                focused,
+                (row.start, row.span),
+            ),
+        );
+    }
+    TabBody {
+        text,
+        bar,
+        first,
+        lines,
     }
 }
 
@@ -2153,7 +2198,10 @@ fn status_left(
     spans
 }
 
-fn hints(pairs: &[(&'static str, &'static str)], styles: &WorkbenchStyles) -> Vec<Span<'static>> {
+pub(crate) fn hints(
+    pairs: &[(&'static str, &'static str)],
+    styles: &WorkbenchStyles,
+) -> Vec<Span<'static>> {
     let mut spans = Vec::with_capacity(pairs.len() * 3);
     for (key, label) in pairs {
         spans.push(Span::styled(HINT_GAP, styles.dim));

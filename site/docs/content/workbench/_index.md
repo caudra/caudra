@@ -225,33 +225,67 @@ The walk respects `.gitignore` and skips `.git`, binaries, and files above the s
 
 After attaching to a sandbox, select `TRANSFER` or press `Ctrl+X 4`. The editor area shows local files on the left and sandbox files on the right. Your open editor tabs keep their contents and cursor positions. Local-only sessions and direct Workcell connections do not expose this view.
 
-Choose an existing absolute local directory and an existing workspace-relative sandbox directory, then Compare. Both roots stay visible. The sandbox root is relative to the exposed Workcell workspace, not the guest filesystem. A remote conversation path is never used as a local directory automatically.
+Choose an existing absolute local directory with `L` and an existing workspace-relative sandbox directory with `S`, then Compare. Each pane header shows its root. The sandbox root is relative to the exposed Workcell workspace, not the guest filesystem. A remote conversation path is never used as a local directory automatically. Changing the root pair discards the old review and requires a fresh comparison.
 
-Linked navigation opens matching relative directories on both sides. A missing counterpart stays visible as missing. Turn linking off to compare different existing directories. Changing the root pair discards the old review and requires a fresh comparison.
+The comparison is one tree, laid out like the Explorer. Each row holds the same relative path in both panes. An entry that exists on one side only leaves a dim `·` on the other, so the rows stay aligned. Folders expand in place. Expanded folders stay open when you compare again, and the cursor returns to the same path or its nearest remaining parent.
 
-Rows distinguish identical files, local-only files, sandbox-only files, changed files, type conflicts, and excluded or incomplete entries. Comparison checks content and executable metadata rather than choosing the newest timestamp. Directory badges summarize descendants. A directory with matching names can still contain changed or unreadable files.
+Comparison checks content and executable metadata rather than choosing the newest timestamp. Marks on the right of each row:
 
-Select files or folders, choose Upload or Download, then review the exact effects before executing. Folder selection includes eligible descendants and empty directories. Skipped entries remain visible. An oversized selection requires a smaller selection or root, rather than silently copying only part of it. File/directory type conflicts cannot be overwritten by a transfer.
+| Mark | Meaning |
+|------|---------|
+| `≠` | Content differs |
+| `+` | Present only on this side |
+| `!` | File and folder type conflict |
+| `?` | Not determined, for example on an incomplete side |
+| `● n` | Folder with n changed entries below it |
+
+Identical rows carry no mark. A folder with matching names can still contain changed or unreadable files. Ignored, protected, excluded, symlink, nested-repository, special and unsupported entries are dimmed and labelled with a word badge. An expanded folder that is empty, left out or not fully scanned ends with a note row that explains why. A partly listed folder shows the entries that were listed first.
+
+| Note | Meaning |
+|------|---------|
+| Ignored by .gitignore | `I` includes ignored files |
+| Protected | Never transferred |
+| Excluded by a transfer pattern | Matched a configured exclude |
+| Symbolic link, nested repository or special file | Never followed or transferred |
+| Unsupported | Never transferred |
+| Not fully scanned | A scan limit or listing error stopped here. `Enter` compares this folder |
+| Contents unknown | That side is incomplete. `Enter` compares this folder |
+| Empty folder | Can still be transferred |
+
+`I` compares again with `.gitignore` filtering turned off for this Transfer session. Protected names and configured excludes stay excluded. The choice is not saved and resets when Transfer reopens. A review made under one choice cannot be approved under the other.
+
+Large trees can stop at a scan limit. Folders that were listed still compare by content. Entries present on one side only stay undetermined while either side is partial. When the Workcell inventory cap truncates a side, file diffs are refused too. A banner names the incomplete side. `Enter` on a "Not fully scanned" or "Contents unknown" note re-roots both sides to the folder that holds the note. That folder must exist on both sides. `Backspace` restores the previous root pair, including one changed with `L` or `S`.
+
+Select files or folders with `Space`, then press `U` to review an upload or `D` to review a download. Without a selection, the row under the cursor is reviewed. Folder selection includes eligible descendants and empty directories. Skipped entries remain visible. Review requires a complete comparison. One review carries at most 128 paths, counting every file and new folder under a selected folder. A larger selection is refused whole rather than copying only part of it. File/directory type conflicts cannot be overwritten by a transfer.
 
 Empty-directory creation requires negotiated directory-publication support. Local directory publication currently requires Linux and private staging on the same filesystem as the destination, outside the transferred tree. When that support is unavailable, file transfers remain available.
 
-Inspect shows a read-only text comparison or a binary summary. Text previews are bounded and mark truncation. Inspecting a file does not authorize copying it. The review lists new files, overwrites and directory creation, and native permissions still apply on both ends.
+`Enter` on a changed file opens a read-only diff drawn like the editor's diff tabs, with line numbers and syntax colours. `←` and `→` pan a wide diff. Each side reads at most 64 KiB, and a badge marks truncation. Binary files show size, digest and kind per side. Inspecting a file does not authorize copying it. The review lists new files, overwrites and directory creation, and native permissions still apply on both ends.
 
 | Key | Action |
 |-----|--------|
-| `Tab` / `Shift+Tab` | Switch the active pane |
-| `Enter` | Enter a folder or inspect a file |
-| `Backspace` | Navigate to the parent |
+| `↑` / `↓`, `j` / `k`, `PgUp` / `PgDn`, `Home` / `End` | Move |
+| `→` / `Enter` | Expand a folder or open a file's diff. On a note row, run its action |
+| `←` | Collapse, or go to the parent |
+| `C` | Collapse all |
+| `Tab` / `Shift+Tab` | Focus the local or sandbox pane. A narrow terminal shows one pane at a time |
 | `Space` | Select or deselect a file or folder |
-| `L` / `S` | Edit the local or sandbox root |
-| `N` | Toggle linked navigation |
-| `U` / `D` | Choose Upload or Download |
-| `=` / `F5` | Compare again |
-| `R` | Review the selection |
+| `U` / `D` | Review an upload or download of the selection, or of the row under the cursor |
 | `A` | Approve the displayed executable review |
-| `C` | Cancel the transfer connection |
-| `Q` | Reconcile recorded uncertain outcomes |
-| `Esc` | Close the current field or detail, then leave Transfer |
+| `=` / `F5` | Compare again |
+| `I` | Include or exclude ignored files for this session |
+| `F` | Show changes only |
+| `L` / `S` | Edit the local or sandbox root |
+| `Ctrl+U` | Clear the root being edited |
+| `Backspace` | Restore the previous root pair |
+| `O` | Show the last transfer report |
+| `Q` | Reconcile recorded uncertain outcomes. This needs the connection a comparison opens, so compare again if it has closed |
+| `X` | Stop the running operation |
+| `Esc` | Close the prompt or panel, then leave Transfer |
+
+The sidebar sums up the changes, what the selection would carry each way, and the last transfer report. `Ctrl+B`, `Ctrl+X -` and `Ctrl+X =` hide and resize it as in the other views. `Ctrl+P` leaves Transfer for the Explorer and opens quick open once cleanup ends.
+
+The mouse follows the Explorer. Click a row to move the cursor, click its marker or double-click a folder to expand it, and click the check column to select. Double-click a file to open its diff. Toolbar buttons run their action, and clicking a pane header edits that root. While a root is being edited, the toolbar waits for it to be confirmed or cancelled.
 
 While a transfer connection holds the editing guard, ordinary editing, saves, source-control mutations and composer submission are blocked across Caudra sessions. Save or discard dirty buffers and let active work settle before connecting. Leaving Transfer cancels its worker and waits for cleanup before returning to editing. External editors and processes are outside this guard.
 
@@ -294,4 +328,4 @@ The workbench is an editor beside an agent, not a replacement for your own. Ther
 
 ## Keys
 
-Every binding is in the [keybindings reference](/docs/keybindings/) under Workbench, Workbench Explorer, Workbench Editor, Workbench Source Control, and Workbench Search. `Ctrl+Z` suspends Caudra everywhere else, and the workbench takes it for undo while it is open.
+Every binding is in the [keybindings reference](/docs/keybindings/) under Workbench, Workbench Explorer, Workbench Editor, Workbench Source Control, Workbench Search, and Workbench Transfer. `Ctrl+Z` suspends Caudra everywhere else, and the workbench takes it for undo while it is open.

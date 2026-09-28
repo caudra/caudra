@@ -18,6 +18,8 @@ use std::time::{Duration, Instant};
 const REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 const UNSAVED_DRAFT_ERR: &str =
     "Save or discard unsaved local editor/composer drafts before changing sandbox authority";
+pub(super) const WORKBENCH_BUSY: &str =
+    "Wait for pending Workbench reads or writes before changing sandbox authority";
 
 /// The instance the footer names, or `None` when there is nothing to name.
 /// Readiness is the manager's own: the binding's sandbox record says which
@@ -163,10 +165,13 @@ impl App {
                 "Wait for the active agent, permission or restore operation before a sandbox mutation",
             );
         }
-        if !transfer && self.workbench.is_busy() {
-            return Some(
-                "Wait for pending Workbench reads or writes before changing sandbox authority",
-            );
+        let workbench_busy = if transfer {
+            self.workbench.backend_busy()
+        } else {
+            self.workbench.is_busy()
+        };
+        if workbench_busy {
+            return Some(WORKBENCH_BUSY);
         }
         if (if transfer {
             self.workbench.blocks_transfer_start()

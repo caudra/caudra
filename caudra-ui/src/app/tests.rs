@@ -20230,8 +20230,9 @@ const LEADER_TRAPPED_MSG: &str =
     "the leader must arm over an open workbench, or its chords are unreachable";
 const OVERLAY_HIDDEN: &str = "an overlay opened over the workbench must be drawn over it";
 /// A chord description no transcript context offers, so seeing it proves the
-/// panel is both drawn and scoped to the workbench.
-const WORKBENCH_CHORD_DESC: &str = "Close the active tab";
+/// panel is both drawn and scoped to the workbench. One of the first chords
+/// listed, because a narrow screen fits one column of eight.
+const WORKBENCH_CHORD_DESC: &str = "Narrow / widen the sidebar";
 const PROMPT_UNANSWERABLE: &str =
     "the prompt must answer before the workbench, or the session hangs on it";
 

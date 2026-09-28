@@ -3,8 +3,10 @@ use std::path::PathBuf;
 
 use caudra_agent::AgentEvent;
 use caudra_agent::workspace_transfer::{
-    ComparisonKind, FileOutcome, FilePreview, JournalEntry, NodeKind, PlanReview,
-    TransferAction as Direction, TransferEvent, TransferRoots as EngineRoots,
+    ComparisonKind, ComparisonRow, ExclusionReason, FileOutcome, FilePreview, FileStamp,
+    JournalEntry, NodeKind, PlanReview, ScanLimit, ScanState, Side, TransferAction as Direction,
+    TransferEvent, TransferPhase as Phase, TransferPreview as FileComparisonPreview,
+    TransferRoots as EngineRoots,
 };
 use caudra_config::sandbox::persistence::SandboxStore;
 use caudra_sandbox::Controller;
@@ -12,10 +14,13 @@ use caudra_workbench::{
     WorkbenchAction,
     transfer::{
         TransferAction, TransferAvailability, TransferDirection, TransferEffect, TransferEntry,
-        TransferNodeKind, TransferOutcome, TransferPreview, TransferProgress, TransferReview,
-        TransferReviewEntry, TransferRoots, TransferSnapshot, TransferStatus,
+        TransferExclusion, TransferFileOutcome, TransferNodeKind, TransferOutcome,
+        TransferOutcomeEntry, TransferPhase, TransferPreview, TransferPreviewSide,
+        TransferProgress, TransferRecovery, TransferReview, TransferReviewEntry, TransferRoots,
+        TransferScan, TransferScanLimit, TransferSide, TransferSnapshot, TransferStatus,
     },
 };
+use caudra_workcell::TransferReport;
 use caudra_workspace::{OperationId, TransferDigest, WorkspacePath};
 use crossterm::event::{KeyEvent, KeyEventKind};
 
@@ -35,6 +40,7 @@ use crate::sandbox::{
 const STALE: &str = "Attachment or transfer roots changed; compare again";
 const CONNECT: &str = "Compare explicit roots before requesting another operation";
 const NO_ROLLBACK: &str = "No rollback or whole-tree atomicity. Unknown outcomes are queried, never replayed. Metadata: content and executable bit only.";
+const OUTCOMES_UNAVAILABLE: &str = "Outcomes unavailable; query only, never replay";
 
 impl App {
     pub(super) fn workbench_leader(&mut self, event: KeyEvent) -> WorkbenchAction {
@@ -160,7 +166,11 @@ impl App {
             return Ok(());
         }
         let (scope, command) = match action {
-            TransferAction::Compare { generation, roots } => {
+            TransferAction::Compare {
+                generation,
+                roots,
+                include_ignored,
+            } => {
                 if generation != self.bound_workbench().transfer_generation() {
                     return Err(STALE.into());
                 }
@@ -170,10 +180,9 @@ impl App {
                     instance_revision: scope.instance_revision.clone(),
                     configuration_revision: scope.configuration_revision.clone(),
                     local_root: PathBuf::from(roots.local),
-                    remote_root: WorkspacePath::new(roots.remote)
-                        .map_err(|error| error.to_string())?,
+                    remote_root: sandbox_root(roots.remote)?,
                     attached_binding: Some(scope.binding.clone()),
-                    include_ignored: false,
+                    include_ignored,
                 };
                 if let Some(worker) = self.sandbox_live.transfer.as_mut() {
                     worker.cancel();
@@ -242,18 +251,22 @@ impl App {
         Ok(())
     }
 
+    /// Ends a request that never reached a worker.
     pub(crate) fn transfer_failed(&mut self, message: String) {
+        self.end_transfer(message, None);
+    }
+
+    /// Ends the request in flight with `message`. `recovery` is the journal as
+    /// the worker last read it, and `None` for a request no worker ran, which
+    /// leaves the view's recovery and last report alone.
+    fn end_transfer(&mut self, message: String, recovery: Option<TransferRecovery>) {
         let generation = self.bound_workbench().transfer_generation();
-        let recovery_required = self
-            .sandbox_live
-            .transfer
-            .as_ref()
-            .is_some_and(|worker| worker.recovery_required);
         self.bound_workbench_mut().receive_transfer_outcome(
             generation,
             TransferOutcome {
-                entries: vec![message],
-                recovery_required,
+                stopped: Some(message),
+                recovery,
+                ..TransferOutcome::default()
             },
         );
         if self.sandbox_live.transfer.is_none() {
@@ -285,7 +298,7 @@ impl App {
             command => self
                 .sandbox_live
                 .transfer
-                .as_ref()
+                .as_mut()
                 .ok_or_else(|| CONNECT.to_owned())
                 .and_then(|worker| worker.send(command)),
         };
@@ -316,8 +329,8 @@ impl App {
         let generation = worker.scope.generation;
         let settled = worker.settled();
         let replies: Vec<_> = worker.replies.try_iter().collect();
-        let progress: Vec<_> = worker.progress.try_iter().collect();
-        let mut dirty = Dirty::from(!replies.is_empty() || !progress.is_empty());
+        let events: Vec<_> = worker.events.try_iter().collect();
+        let mut dirty = Dirty::from(!replies.is_empty() || !events.is_empty());
         for envelope in worker.permission_events.try_iter() {
             match envelope.event {
                 AgentEvent::PermissionRequest(request)
@@ -336,125 +349,94 @@ impl App {
             }
             dirty = Dirty::YES;
         }
+        // Events were sent before any reply collected with them, so a settlement is recorded
+        // before the report that counts it.
+        if current {
+            for event in events {
+                let Some(worker) = self.sandbox_live.transfer.as_mut() else {
+                    break;
+                };
+                if advance(&mut worker.progress, &mut worker.operations, event) {
+                    let progress = worker.progress.clone();
+                    self.bound_workbench_mut()
+                        .receive_transfer_progress(generation, progress);
+                }
+            }
+        }
         for reply in replies {
             if !current {
                 continue;
             }
             match reply {
                 TransferReply::Compared(comparison, recovery, directory_effects) => {
+                    let recovery = recovery_summary(recovery);
                     if let Some(worker) = self.sandbox_live.transfer.as_mut() {
                         worker.directory_effects = directory_effects;
+                        worker.recovery = Some(recovery.clone());
                     }
                     self.sync_transfer_availability();
                     self.bound_workbench_mut()
                         .receive_transfer_snapshot(generation, snapshot(&comparison));
-                    let (entries, required) = recovery_summary(recovery);
-                    if let Some(worker) = self.sandbox_live.transfer.as_mut() {
-                        worker.recovery_required = required;
-                    }
                     self.bound_workbench_mut()
-                        .receive_transfer_recovery(generation, entries, required);
+                        .receive_transfer_recovery(generation, recovery);
                 }
                 TransferReply::Reviewed(plan) => {
+                    if let Some(worker) = self.sandbox_live.transfer.as_mut() {
+                        worker.operations.extend(operations(&plan.review));
+                    }
                     self.bound_workbench_mut()
                         .receive_transfer_review(generation, review(&plan.digest, &plan.review));
                 }
-                TransferReply::Inspected(preview) => {
-                    let (local, local_truncated) = preview_text(preview.local_preview.as_ref());
-                    let (remote, remote_truncated) = preview_text(preview.remote_preview.as_ref());
-                    self.bound_workbench_mut().receive_transfer_preview(
-                        generation,
-                        TransferPreview {
-                            path: preview.path.to_string(),
-                            local,
-                            remote,
-                            truncated: local_truncated || remote_truncated,
-                            summary: format!(
-                                "Local {}: {:?}\nSandbox {}: {:?}",
-                                preview_kind(preview.local_preview.as_ref()),
-                                preview.local.as_ref().map(|file| &file.content),
-                                preview_kind(preview.remote_preview.as_ref()),
-                                preview.remote.as_ref().map(|file| &file.content)
-                            ),
-                        },
-                    );
+                TransferReply::Inspected(inspected) => {
+                    self.bound_workbench_mut()
+                        .receive_transfer_preview(generation, preview(&inspected));
                 }
                 TransferReply::Finished(report) => {
-                    let (mut entries, mut recovery_required) =
-                        recovery_summary(report.recovery.clone());
-                    entries.insert(
-                        0,
-                        format!(
-                            "Result {} · {}",
-                            report.result_id,
-                            report.stopped.as_deref().unwrap_or("settled")
-                        ),
-                    );
-                    match serde_json::from_value::<BTreeMap<OperationId, FileOutcome>>(
-                        report.outcomes.clone(),
-                    ) {
-                        Ok(outcomes) => {
-                            for (id, outcome) in outcomes {
-                                recovery_required |= outcome == FileOutcome::Unknown;
-                                entries.push(format!("{}: {outcome:?}", id.as_str()));
-                            }
-                        }
-                        Err(error) => {
-                            recovery_required = true;
-                            entries.push(format!("Outcomes unavailable: {error}; never replay"));
-                        }
-                    }
-                    recovery_required |= report
-                        .cleanup_deferred
-                        .as_array()
-                        .is_none_or(|entries| !entries.is_empty());
-                    if let Some(worker) = self.sandbox_live.transfer.as_mut() {
-                        worker.recovery_required = recovery_required;
-                    }
-                    self.bound_workbench_mut().receive_transfer_outcome(
-                        generation,
-                        TransferOutcome {
-                            entries,
-                            recovery_required,
-                        },
-                    );
+                    let Some(worker) = self.sandbox_live.transfer.as_mut() else {
+                        continue;
+                    };
+                    let outcome = outcome(&report, &worker.operations);
+                    worker.recovery = outcome.recovery.clone();
+                    worker.restart_progress(&TransferCommand::Compare);
+                    self.bound_workbench_mut()
+                        .receive_transfer_outcome(generation, outcome);
                     self.bound_workbench_mut().refresh_after_transfer();
                 }
-                TransferReply::Failed(message) => self.transfer_failed(message),
+                TransferReply::Failed(message) => {
+                    let recovery = self
+                        .sandbox_live
+                        .transfer
+                        .as_ref()
+                        .and_then(|worker| worker.recovery.clone());
+                    self.end_transfer(message, recovery);
+                }
                 TransferReply::Closed => {}
             }
         }
-        if current {
-            for event in progress {
-                let Some(worker) = self.sandbox_live.transfer.as_mut() else {
-                    break;
-                };
-                match &event {
-                    TransferEvent::Planned { files, .. } => {
-                        worker.total = *files;
-                        worker.completed = 0;
-                    }
-                    TransferEvent::Settled { .. } => worker.completed += 1,
-                    _ => {}
-                }
-                let progress = TransferProgress {
-                    message: format!("{event:?}"),
-                    completed: worker.completed,
-                    total: worker.total,
-                };
-                self.bound_workbench_mut()
-                    .receive_transfer_progress(generation, progress);
-            }
-        }
         if settled {
-            self.sandbox_live.transfer = None;
-            let current_generation = self.bound_workbench().transfer_generation();
-            self.bound_workbench_mut()
-                .set_transfer_connection(current_generation, false, false);
-            self.sync_transfer_availability();
+            self.settle_transfer();
             dirty = Dirty::YES;
         }
         dirty
+    }
+
+    /// Lets go of a worker that finished. One replaced by a comparison still
+    /// queued leaves the view waiting on that comparison instead of idle.
+    fn settle_transfer(&mut self) {
+        self.sandbox_live.transfer = None;
+        let replaced = matches!(
+            self.sandbox_live.transfer_queued,
+            Some((_, TransferCommand::Open { .. }))
+        );
+        let generation = self.bound_workbench().transfer_generation();
+        if replaced {
+            self.bound_workbench_mut()
+                .release_transfer_worker(generation);
+        } else {
+            self.bound_workbench_mut()
+                .set_transfer_connection(generation, false, false);
+        }
+        self.sync_transfer_availability();
     }
 
     pub(super) fn transfer_input(&mut self, msg: Msg) -> Vec<Action> {
@@ -527,6 +509,14 @@ fn engine_direction(direction: TransferDirection) -> Direction {
     }
 }
 
+/// The view names the sandbox workspace itself with an empty root.
+fn sandbox_root(root: String) -> Result<WorkspacePath, String> {
+    if root.is_empty() {
+        return Ok(WorkspacePath::root());
+    }
+    WorkspacePath::new(root).map_err(|error| error.to_string())
+}
+
 fn roots(roots: &EngineRoots) -> TransferRoots {
     TransferRoots {
         local: roots.local.canonical_path().to_string_lossy().into_owned(),
@@ -534,48 +524,182 @@ fn roots(roots: &EngineRoots) -> TransferRoots {
     }
 }
 
-fn node(kind: Option<&NodeKind>) -> Option<TransferNodeKind> {
+fn node(kind: &NodeKind) -> TransferNodeKind {
     match kind {
-        Some(NodeKind::File) => Some(TransferNodeKind::File),
-        Some(NodeKind::Directory) => Some(TransferNodeKind::Directory),
-        _ => None,
+        NodeKind::File => TransferNodeKind::File,
+        NodeKind::Directory => TransferNodeKind::Directory,
+        NodeKind::Symlink => TransferNodeKind::Symlink,
+        NodeKind::NestedRepository => TransferNodeKind::Repository,
+        NodeKind::Mount | NodeKind::Special => TransferNodeKind::Special,
+    }
+}
+
+fn side(side: &Side) -> TransferSide {
+    match side {
+        Side::Local => TransferSide::Local,
+        Side::Remote => TransferSide::Remote,
     }
 }
 
 fn snapshot(comparison: &ComparisonView) -> TransferSnapshot {
     TransferSnapshot {
         roots: roots(&comparison.context.roots),
-        entries: comparison
-            .rows
+        entries: entries(&comparison.rows),
+        local: scan(&comparison.local),
+        remote: scan(&comparison.remote),
+    }
+}
+
+/// The root is the pair being compared rather than an entry in it, and each side's scan
+/// already says how far that side got, so a root row never reaches the tree.
+fn entries(rows: &[ComparisonRow]) -> Vec<TransferEntry> {
+    rows.iter()
+        .filter(|row| !row.path.is_root())
+        .map(|row| TransferEntry {
+            path: row.path.to_string(),
+            local: row.local_kind.as_ref().map(node),
+            remote: row.remote_kind.as_ref().map(node),
+            status: match row.kind {
+                ComparisonKind::Equal => TransferStatus::Equal,
+                ComparisonKind::LocalOnly => TransferStatus::LocalOnly,
+                ComparisonKind::RemoteOnly => TransferStatus::RemoteOnly,
+                ComparisonKind::Conflict if row.local_kind != row.remote_kind => {
+                    TransferStatus::TypeConflict
+                }
+                ComparisonKind::Conflict => TransferStatus::Different,
+                ComparisonKind::Excluded => TransferStatus::Excluded,
+                ComparisonKind::Unsupported => TransferStatus::Unsupported,
+                ComparisonKind::Incomplete => TransferStatus::Incomplete,
+            },
+            local_bytes: row.local.as_ref().map_or(0, |file| file.content.size_bytes),
+            remote_bytes: row
+                .remote
+                .as_ref()
+                .map_or(0, |file| file.content.size_bytes),
+            excluded: row.excluded.as_ref().map(|reason| match reason {
+                ExclusionReason::Protected => TransferExclusion::Protected,
+                ExclusionReason::Pattern => TransferExclusion::Pattern,
+                ExclusionReason::Gitignore => TransferExclusion::Gitignore,
+            }),
+            unlisted: row.unlisted,
+        })
+        .collect()
+}
+
+fn scan(state: &ScanState) -> TransferScan {
+    TransferScan {
+        unsupported: state.unsupported,
+        limits: state
+            .limits
             .iter()
-            .map(|row| TransferEntry {
-                path: row.path.to_string(),
-                local: node(row.local_kind.as_ref()),
-                remote: node(row.remote_kind.as_ref()),
-                status: match row.kind {
-                    ComparisonKind::Equal => TransferStatus::Equal,
-                    ComparisonKind::LocalOnly => TransferStatus::LocalOnly,
-                    ComparisonKind::RemoteOnly => TransferStatus::RemoteOnly,
-                    ComparisonKind::Conflict if row.local_kind != row.remote_kind => {
-                        TransferStatus::TypeConflict
-                    }
-                    ComparisonKind::Conflict => TransferStatus::Different,
-                    ComparisonKind::Excluded => TransferStatus::Excluded,
-                    ComparisonKind::Unsupported => TransferStatus::Unsupported,
-                    ComparisonKind::Incomplete => TransferStatus::Incomplete,
-                },
-                bytes: row
-                    .local
-                    .as_ref()
-                    .or(row.remote.as_ref())
-                    .map_or(0, |file| file.content.size_bytes),
+            .map(|limit| match limit {
+                ScanLimit::Entries => TransferScanLimit::Entries,
+                ScanLimit::Pages => TransferScanLimit::Pages,
+                ScanLimit::Depth => TransferScanLimit::Depth,
+                ScanLimit::Bytes => TransferScanLimit::Bytes,
+                ScanLimit::WorkcellIncomplete => TransferScanLimit::WorkcellIncomplete,
+                ScanLimit::ListingFailed => TransferScanLimit::ListingFailed,
+                ScanLimit::Changed => TransferScanLimit::Changed,
+                ScanLimit::Unreadable => TransferScanLimit::Unreadable,
             })
             .collect(),
-        complete: comparison.complete,
-        notice: Some(format!(
-            "Content comparison; complete={}. {NO_ROLLBACK}",
-            comparison.complete
-        )),
+    }
+}
+
+/// Folds one engine event into the running progress, and says whether it changed what the
+/// view shows. A settlement also records which path its operation touched.
+fn advance(
+    progress: &mut TransferProgress,
+    operations: &mut BTreeMap<OperationId, WorkspacePath>,
+    event: TransferEvent,
+) -> bool {
+    match event {
+        TransferEvent::Phase {
+            side: phase_side,
+            path,
+            phase,
+        } => {
+            progress.phase = match phase {
+                Phase::Scanning => TransferPhase::Scanning,
+                Phase::Staging => TransferPhase::Staging,
+                Phase::Sealing => TransferPhase::Sealing,
+                Phase::Preparing => TransferPhase::Preparing,
+                Phase::Reviewing => TransferPhase::Reviewing,
+                Phase::Publishing => TransferPhase::Publishing,
+                Phase::Reconciling => TransferPhase::Reconciling,
+            };
+            progress.side = phase_side.as_ref().map(side);
+            progress.path = (!path.is_root()).then(|| path.to_string());
+        }
+        TransferEvent::Planned { files, .. } => {
+            progress.completed = 0;
+            progress.total = files;
+        }
+        TransferEvent::Settled {
+            operation_id, path, ..
+        } => {
+            progress.completed += 1;
+            progress.path = Some(path.to_string());
+            operations.insert(operation_id, path);
+        }
+        TransferEvent::CleanupDeferred { .. } => return false,
+    }
+    true
+}
+
+fn operations(review: &PlanReview) -> impl Iterator<Item = (OperationId, WorkspacePath)> + '_ {
+    let files = review
+        .files
+        .iter()
+        .map(|file| (&file.operation_id, &file.path));
+    let directories = review
+        .directories
+        .iter()
+        .map(|directory| (&directory.operation_id, &directory.path));
+    files
+        .chain(directories)
+        .map(|(id, path)| (id.clone(), path.clone()))
+}
+
+fn outcome(
+    report: &TransferReport,
+    operations: &BTreeMap<OperationId, WorkspacePath>,
+) -> TransferOutcome {
+    let mut recovery = recovery_summary(report.recovery.clone());
+    let mut entries = Vec::new();
+    match serde_json::from_value::<BTreeMap<OperationId, FileOutcome>>(report.outcomes.clone()) {
+        Ok(outcomes) => {
+            for (id, outcome) in outcomes {
+                recovery.required |= outcome == FileOutcome::Unknown;
+                entries.push(TransferOutcomeEntry {
+                    path: operations
+                        .get(&id)
+                        .map_or_else(|| id.as_str().to_owned(), ToString::to_string),
+                    outcome: match outcome {
+                        FileOutcome::Confirmed => TransferFileOutcome::Confirmed,
+                        FileOutcome::Failed => TransferFileOutcome::Failed,
+                        FileOutcome::Cancelled => TransferFileOutcome::Cancelled,
+                        FileOutcome::Unknown => TransferFileOutcome::Unknown,
+                    },
+                });
+            }
+        }
+        Err(error) => {
+            recovery.required = true;
+            recovery
+                .lines
+                .push(format!("{OUTCOMES_UNAVAILABLE}: {error}"));
+        }
+    }
+    entries.sort_by(|left, right| left.path.cmp(&right.path));
+    recovery.required |= report
+        .cleanup_deferred
+        .as_array()
+        .is_none_or(|deferred| !deferred.is_empty());
+    TransferOutcome {
+        entries,
+        stopped: report.stopped.clone(),
+        recovery: Some(recovery),
     }
 }
 
@@ -621,28 +745,40 @@ fn review(digest: &TransferDigest, review: &PlanReview) -> TransferReview {
     }
 }
 
-fn preview_text(preview: Option<&FilePreview>) -> (Option<String>, bool) {
-    match preview {
+fn preview(inspected: &FileComparisonPreview) -> TransferPreview {
+    TransferPreview {
+        path: inspected.path.to_string(),
+        local: preview_side(inspected.local.as_ref(), inspected.local_preview.as_ref()),
+        remote: preview_side(inspected.remote.as_ref(), inspected.remote_preview.as_ref()),
+    }
+}
+
+fn preview_side(
+    stamp: Option<&FileStamp>,
+    preview: Option<&FilePreview>,
+) -> Option<TransferPreviewSide> {
+    let stamp = stamp?;
+    let (text, truncated) = match preview {
         Some(FilePreview::TextPrefix { text, truncated }) => (Some(text.clone()), *truncated),
         _ => (None, false),
-    }
+    };
+    Some(TransferPreviewSide {
+        kind: node(&stamp.node.kind),
+        bytes: stamp.content.size_bytes,
+        digest: stamp.content.digest.as_str().to_owned(),
+        text,
+        binary: matches!(preview, Some(FilePreview::BinarySummary { .. })),
+        truncated,
+    })
 }
 
-fn preview_kind(preview: Option<&FilePreview>) -> &'static str {
-    match preview {
-        Some(FilePreview::TextPrefix { .. }) => "bounded text",
-        Some(FilePreview::BinarySummary { .. }) => "binary",
-        None => "absent",
-    }
-}
-
-fn recovery_summary(recovery: serde_json::Value) -> (Vec<String>, bool) {
+fn recovery_summary(recovery: serde_json::Value) -> TransferRecovery {
     match serde_json::from_value::<Vec<JournalEntry>>(recovery) {
         Ok(records) => {
             let required = records
                 .iter()
                 .any(|entry| entry.state.blocks() || entry.cleanup_pending);
-            let entries = records
+            let lines = records
                 .iter()
                 .filter(|entry| entry.state.blocks() || entry.cleanup_pending)
                 .map(|entry| {
@@ -655,20 +791,26 @@ fn recovery_summary(recovery: serde_json::Value) -> (Vec<String>, bool) {
                     )
                 })
                 .collect();
-            (entries, required)
+            TransferRecovery { lines, required }
         }
-        Err(error) => (
-            vec![format!(
+        Err(error) => TransferRecovery {
+            lines: vec![format!(
                 "Recovery records unavailable: {error}; query only, never replay"
             )],
-            true,
-        ),
+            required: true,
+        },
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{App, TransferCommand, TransferLink, TransferScope, recovery_summary};
+    use super::{
+        App, BTreeMap, ComparisonKind, ComparisonRow, FileOutcome, FileStamp, NodeKind,
+        OperationId, Phase, Side, TransferAction, TransferCommand, TransferDigest, TransferEvent,
+        TransferFileOutcome, TransferLink, TransferOutcomeEntry, TransferPhase, TransferProgress,
+        TransferReport, TransferScope, TransferSide, advance, entries, outcome, recovery_summary,
+        sandbox_root,
+    };
     use crate::agent::shared_queue::{QueueItem, queue};
     use crate::{
         AppSession,
@@ -678,13 +820,16 @@ mod tests {
         },
         components::{Overlay, keybindings::key},
     };
+    use caudra_agent::workspace_transfer::{InventoryNode, OrchestrationLimits};
     use caudra_config::sandbox::{Revision, SandboxName};
     use caudra_storage::{id::CaudraId, workspace_binding::StoredWorkspaceBinding};
     use caudra_workbench::{
         DocumentKey, TabLabel, WorkbenchAction,
-        transfer::{TransferDirection, TransferRoots},
+        transfer::{MAX_TRANSFER_SELECTION, TransferDirection, TransferRoots},
     };
-    use caudra_workspace::WorkspacePath;
+    use caudra_workspace::{
+        ResourceId, ResourceRevision, TransferContent, TransferMode, WorkspacePath,
+    };
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use serde_json::json;
     use std::{fs, sync::Arc, time::Duration};
@@ -696,6 +841,13 @@ mod tests {
     const CHANGED: &str = "must not be applied";
     const STOPPED: &str = "test worker stopped";
     const TIMEOUT: Duration = Duration::from_secs(10);
+    const FOLDER: &str = "src";
+    const FILE: &str = "src/main.rs";
+    const OPERATION: &str = "op-1";
+    const UNMAPPED: &str = "op-2";
+    const LOCAL_BYTES: u64 = 3;
+    const REMOTE_BYTES: u64 = 5;
+    const NO_COMPARE: &str = "the key must ask the host for a comparison";
 
     fn attached() -> App {
         let mut app = test_app();
@@ -794,6 +946,27 @@ mod tests {
         assert!(other.transfer_start_blocker().is_some());
     }
 
+    #[test_case(WorkspacePath::root().to_string(); "offered_workspace_root")]
+    #[test_case(String::new(); "typed_workspace_root")]
+    fn a_root_comparison_names_the_sandbox_workspace(offered: String) {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = attached();
+        assert!(app.workbench.show_transfer(
+            TransferRoots {
+                local: root.path().to_string_lossy().into_owned(),
+                remote: offered,
+            },
+            TransferDirection::Push
+        ));
+        let WorkbenchAction::Transfer(TransferAction::Compare { roots, .. }) = app
+            .workbench
+            .handle_key(KeyEvent::new(KeyCode::F(5), KeyModifiers::NONE))
+        else {
+            panic!("{NO_COMPARE}");
+        };
+        assert_eq!(sandbox_root(roots.remote), Ok(WorkspacePath::root()));
+    }
+
     #[test_case(false; "escape")]
     #[test_case(true; "close_chord")]
     fn lease_isolates_editor_composer_and_other_sessions_until_cleanup(close_chord: bool) {
@@ -859,6 +1032,193 @@ mod tests {
     #[test_case(json!([]), false; "empty")]
     #[test_case(json!({"unavailable":"journal unreadable", "replay_forbidden":true}), true; "unavailable")]
     fn recovery_fails_closed_without_substring_guessing(value: serde_json::Value, required: bool) {
-        assert_eq!(recovery_summary(value).1, required);
+        assert_eq!(recovery_summary(value).required, required);
+    }
+
+    #[test]
+    fn a_root_row_is_never_forwarded() {
+        let row = |path| ComparisonRow {
+            path,
+            kind: ComparisonKind::Equal,
+            local: None,
+            remote: None,
+            local_kind: Some(NodeKind::Directory),
+            remote_kind: Some(NodeKind::Directory),
+            excluded: None,
+            unlisted: true,
+        };
+        let forwarded = entries(&[
+            row(WorkspacePath::root()),
+            row(WorkspacePath::new(FOLDER).unwrap()),
+        ]);
+        let paths: Vec<_> = forwarded.iter().map(|entry| entry.path.as_str()).collect();
+        assert_eq!(paths, [FOLDER]);
+        assert!(forwarded[0].unlisted);
+    }
+
+    #[test]
+    fn engine_events_become_structured_progress_that_names_settled_paths() {
+        let mut progress = TransferProgress {
+            phase: TransferPhase::Staging,
+            side: None,
+            path: None,
+            completed: 0,
+            total: 0,
+        };
+        let mut operations = BTreeMap::new();
+        let id = OperationId::new(OPERATION).unwrap();
+        let file = WorkspacePath::new(FILE).unwrap();
+        let events = [
+            TransferEvent::Phase {
+                side: Some(Side::Remote),
+                path: WorkspacePath::root(),
+                phase: Phase::Scanning,
+            },
+            TransferEvent::Planned {
+                digest: TransferDigest::new(REVISION).unwrap(),
+                files: 2,
+            },
+            TransferEvent::Settled {
+                operation_id: id.clone(),
+                path: file.clone(),
+                outcome: FileOutcome::Confirmed,
+            },
+        ];
+        for event in events {
+            assert!(advance(&mut progress, &mut operations, event));
+        }
+        assert_eq!(progress.phase, TransferPhase::Scanning);
+        assert_eq!(progress.side, Some(TransferSide::Remote));
+        assert_eq!((progress.completed, progress.total), (1, 2));
+        assert_eq!(progress.path.as_deref(), Some(FILE));
+        assert_eq!(operations.get(&id), Some(&file));
+        assert!(!advance(
+            &mut progress,
+            &mut operations,
+            TransferEvent::CleanupDeferred { operation_id: id }
+        ));
+    }
+
+    #[test]
+    fn outcomes_name_paths_and_an_unknown_one_requires_recovery() {
+        let report = TransferReport {
+            result_id: String::new(),
+            plan_id: None,
+            outcomes: json!({ OPERATION: "Confirmed", UNMAPPED: "Unknown" }),
+            stopped: None,
+            cleanup_deferred: json!([]),
+            recovery: json!([]),
+            audit: json!(null),
+        };
+        let operations = BTreeMap::from([(
+            OperationId::new(OPERATION).unwrap(),
+            WorkspacePath::new(FILE).unwrap(),
+        )]);
+        let reported = outcome(&report, &operations);
+        assert_eq!(
+            reported.entries,
+            [
+                TransferOutcomeEntry {
+                    path: UNMAPPED.into(),
+                    outcome: TransferFileOutcome::Unknown,
+                },
+                TransferOutcomeEntry {
+                    path: FILE.into(),
+                    outcome: TransferFileOutcome::Confirmed,
+                },
+            ]
+        );
+        assert!(reported.recovery.is_some_and(|recovery| recovery.required));
+    }
+
+    #[test]
+    fn each_side_keeps_its_own_size() {
+        let stamp = |size| FileStamp {
+            node: InventoryNode {
+                path: WorkspacePath::new(FILE).unwrap(),
+                identity: ResourceId::new(FILE).unwrap(),
+                revision: ResourceRevision::new(REVISION).unwrap(),
+                kind: NodeKind::File,
+                size_bytes: Some(size),
+                ignored: Some(false),
+            },
+            revision: ResourceRevision::new(REVISION).unwrap(),
+            content: TransferContent {
+                digest: TransferDigest::new(REVISION).unwrap(),
+                size_bytes: size,
+                mode: TransferMode::Regular,
+            },
+        };
+        let forwarded = entries(&[ComparisonRow {
+            path: WorkspacePath::new(FILE).unwrap(),
+            kind: ComparisonKind::Conflict,
+            local: Some(stamp(LOCAL_BYTES)),
+            remote: Some(stamp(REMOTE_BYTES)),
+            local_kind: Some(NodeKind::File),
+            remote_kind: Some(NodeKind::File),
+            excluded: None,
+            unlisted: false,
+        }]);
+        assert_eq!(
+            (forwarded[0].local_bytes, forwarded[0].remote_bytes),
+            (LOCAL_BYTES, REMOTE_BYTES)
+        );
+    }
+
+    #[test]
+    fn the_view_refuses_a_selection_the_engine_would() {
+        assert_eq!(
+            MAX_TRANSFER_SELECTION,
+            OrchestrationLimits::default().max_selected
+        );
+    }
+
+    #[test_case(true; "replaced_by_a_queued_comparison")]
+    #[test_case(false; "last_worker")]
+    fn a_settled_worker_frees_the_view_unless_a_comparison_replaces_it(replaced: bool) {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = attached();
+        assert!(app.workbench.show_transfer(
+            TransferRoots {
+                local: root.path().to_string_lossy().into_owned(),
+                remote: String::new()
+            },
+            TransferDirection::Push
+        ));
+        let generation = app.workbench.transfer_generation();
+        assert!(
+            app.workbench
+                .set_transfer_connection(generation, true, false)
+        );
+        let action = app
+            .workbench
+            .handle_key(KeyEvent::new(KeyCode::F(5), KeyModifiers::NONE));
+        let WorkbenchAction::Transfer(TransferAction::Compare {
+            include_ignored, ..
+        }) = action
+        else {
+            panic!("{NO_COMPARE}");
+        };
+        if replaced {
+            let scope = scope(&app);
+            app.sandbox_live.transfer_queued = Some((
+                scope.clone(),
+                TransferCommand::Open {
+                    link: Box::new(TransferLink {
+                        name: scope.name.clone(),
+                        instance_revision: scope.instance_revision.clone(),
+                        configuration_revision: scope.configuration_revision.clone(),
+                        local_root: root.path().into(),
+                        remote_root: WorkspacePath::root(),
+                        attached_binding: Some(scope.binding.clone()),
+                        include_ignored,
+                    }),
+                    scope: Box::new(scope),
+                },
+            ));
+        }
+        app.settle_transfer();
+        assert_eq!(app.workbench.is_busy(), replaced);
+        assert_eq!(app.transfer_start_blocker(), None);
     }
 }

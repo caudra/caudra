@@ -985,6 +985,7 @@ impl Workbench {
         self.styles = styles;
         self.theme_generation += 1;
         self.editor.set_theme_generation(self.theme_generation);
+        self.transfer.set_theme_generation(self.theme_generation);
     }
 
     pub fn set_scrollbars(&mut self, scrollbars: bool) {
@@ -1003,7 +1004,7 @@ impl Workbench {
         self.transfer.connection_active() || self.backend_busy()
     }
 
-    fn backend_busy(&self) -> bool {
+    pub fn backend_busy(&self) -> bool {
         !self.remote_pending.is_empty()
             || !self.pending_save.is_empty()
             || !self.pending_open.is_empty()
@@ -1832,12 +1833,7 @@ impl Workbench {
             return self.transfer_switch(*view);
         }
         if self.transfer_input_active() {
-            let clicks = if event.kind == MouseEventKind::Down(MouseButton::Left) {
-                self.clicks.press((event.column, event.row), Instant::now())
-            } else {
-                0
-            };
-            return self.transfer.mouse(event, clicks);
+            return self.transfer_mouse(event);
         }
         let at = (event.column, event.row);
         // The panel is anchored to a cell, so what could move the cell out from
@@ -2912,13 +2908,7 @@ impl Workbench {
             return Some(WorkbenchAction::Consumed);
         }
         if keys::QUICK_OPEN.matches(key) {
-            self.palette.set_priority(self.other_tabs());
-            if self.remote_backend.is_some() {
-                self.palette
-                    .open_remote(self.remote_entries.values().cloned().collect());
-            } else {
-                self.palette.open(&self.root, self.show_hidden);
-            }
+            self.quick_open();
             return Some(WorkbenchAction::Consumed);
         }
         if keys::REFRESH.matches(key) {
@@ -2950,6 +2940,16 @@ impl Workbench {
         self.clipboard_key(key).or_else(|| self.buffer_key(key))
     }
 
+    fn quick_open(&mut self) {
+        self.palette.set_priority(self.other_tabs());
+        if self.remote_backend.is_some() {
+            self.palette
+                .open_remote(self.remote_entries.values().cloned().collect());
+        } else {
+            self.palette.open(&self.root, self.show_hidden);
+        }
+    }
+
     /// The key that followed `Ctrl+X`. The host owns the prefix and the pending
     /// state, so this only has to answer for the second half, and hands back
     /// `Passthrough` when the chord belongs to the transcript instead.
@@ -2970,6 +2970,15 @@ impl Workbench {
                     self.cancel_remote_search();
                 }
                 return self.transfer_switch(view);
+            }
+        }
+        for (bind, step) in [
+            (keys::SHRINK_SIDEBAR, -SIDEBAR_STEP),
+            (keys::GROW_SIDEBAR, SIDEBAR_STEP),
+        ] {
+            if bind.matches(key) {
+                self.set_sidebar_width(self.sidebar_width.saturating_add_signed(step));
+                return WorkbenchAction::Consumed;
             }
         }
         if self.transfer_input_active() {
@@ -3007,15 +3016,6 @@ impl Workbench {
         if self.markdown.is_some() && keys::TOGGLE_RENDERED.matches(key) {
             self.toggle_rendered();
             return WorkbenchAction::Consumed;
-        }
-        for (bind, step) in [
-            (keys::SHRINK_SIDEBAR, -SIDEBAR_STEP),
-            (keys::GROW_SIDEBAR, SIDEBAR_STEP),
-        ] {
-            if bind.matches(key) {
-                self.set_sidebar_width(self.sidebar_width.saturating_add_signed(step));
-                return WorkbenchAction::Consumed;
-            }
         }
         let claimed = self.focus == Focus::Sidebar
             && match self.sidebar {
