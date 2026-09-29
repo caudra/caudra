@@ -401,17 +401,18 @@ Connection settings and thresholds are global-only. Projects may set individual 
 
 | Field | Type | Default | Meaning |
 |-------|------|---------|---------|
-| `endpoint` | string | `nil` | Full request URL. HTTPS required except for numeric loopback HTTP. No credentials, query, or fragment. |
+| `endpoint` | string | `nil` | Full request URL. HTTPS required except for numeric loopback HTTP or explicit `allow_http` consent. No credentials, query, fragment, whitespace, or control characters. |
 | `model` | string | `"jev-latest"` | Decision model identifier, nonblank and without control characters. |
 | `api_key_env` | string | `"TYPESAFE_API_KEY"` | Environment variable containing the optional credential, never the credential itself. Project environment values are excluded. |
 | `allow_remote` | boolean | `false` | Explicit global consent to send decision context to a non-loopback endpoint. |
+| `allow_http` | boolean | `false` | Global-only opt-in for non-loopback HTTP. Also requires `allow_remote = true`. Use only with transport protection you control, such as a trusted encrypted tunnel. |
 | `timeout_ms` | integer | `400` | Positive decision-request deadline in milliseconds, separate from shell execution timeouts. |
 | `log` | boolean | `false` | Retain bounded decision records in the separate local `decisions.db`. |
 | `log_retention_days` | integer | `90` | Positive retention period for decision records. |
 | `features` | table | all `"off"` | Per-feature modes below. |
 | `thresholds` | table | defaults below | Probability thresholds, all finite and within 0–1 inclusive. |
 
-`TYPESAFE_BASE_URL` replaces only the origin of an explicitly configured endpoint, preserving its path. It must be an origin without a path and passes the same endpoint and remote-opt-in checks. The variable alone never activates the engine. Requests ignore ambient proxies and do not follow redirects. `localhost` is a DNS name, not numeric loopback for this policy.
+`TYPESAFE_BASE_URL` replaces only the origin of an explicitly configured endpoint, preserving its path. It must be an origin without a path and passes the same endpoint and both transport opt-in checks. The variable alone never activates the engine. Requests ignore ambient proxies and do not follow redirects. `localhost` is a DNS name, not numeric loopback for this policy. Private and CGNAT addresses receive no automatic HTTP exemption. These settings do not change Workcell transport policy.
 
 Redaction is best effort. Decision context can include commands, task text, tool output, and candidate descriptions. Review what you send and any exports before sharing them. See [decision advice and logging](/docs/permissions/#decision-engine-advice).
 

@@ -1325,6 +1325,8 @@ mod tests {
 
     #[test_case("endpoint = 'https://project.example.test/v1/systemone'", "endpoint")]
     #[test_case("allow_remote = true", "allow_remote")]
+    #[test_case("allow_http = true", "allow_http")]
+    #[test_case("allow_http = false", "allow_http")]
     #[test_case("api_key_env = 'PROJECT_KEY'", "api_key_env")]
     #[test_case("log = true", "log")]
     #[test_case("log_retention_days = 999", "log_retention_days")]
@@ -1359,7 +1361,7 @@ mod tests {
 
     #[test]
     fn decision_setup_global_enablement_and_project_restrictions() {
-        const GLOBAL: &str = "caudra.setup({ decisions = { log = true, features = { permission_advice = 'advise', auto_screening = 'enforce' } } })";
+        const GLOBAL: &str = "caudra.setup({ decisions = { endpoint = 'http://100.64.0.3:8000/predict', allow_remote = true, allow_http = true, log = true, features = { permission_advice = 'advise', auto_screening = 'enforce' } } })";
         const PROJECT: &str = "caudra.setup({ decisions = { log = false, log_retention_days = 7, features = { permission_advice = 'off' } } })";
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("init.lua");
@@ -1382,6 +1384,12 @@ mod tests {
         )
         .unwrap();
         let config = merged.unwrap().into_config(false).unwrap().decisions;
+        assert!(config.allow_remote);
+        assert!(config.allow_http);
+        assert_eq!(
+            config.endpoint.as_ref().map(|endpoint| endpoint.as_str()),
+            Some("http://100.64.0.3:8000/predict")
+        );
         assert_eq!(config.features.permission_advice, FeatureMode::Off);
         assert_eq!(config.features.auto_screening, FeatureMode::Enforce);
         assert!(!config.log);

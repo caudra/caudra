@@ -494,10 +494,11 @@ fn write_decisions_section(out: &mut String) {
          prompting for eligible Auto calls.\n\n\
          | Field | Type | Default | Meaning |\n\
          |-------|------|---------|---------|\n\
-         | `endpoint` | string | `nil` | Full request URL. HTTPS required except for numeric loopback HTTP. No credentials, query, or fragment. |\n\
+         | `endpoint` | string | `nil` | Full request URL. HTTPS required except for numeric loopback HTTP or explicit `allow_http` consent. No credentials, query, fragment, whitespace, or control characters. |\n\
          | `model` | string | `\"{model}\"` | Decision model identifier, nonblank and without control characters. |\n\
          | `api_key_env` | string | `\"{api_key_env}\"` | Environment variable containing the optional credential, never the credential itself. Project environment values are excluded. |\n\
          | `allow_remote` | boolean | `{allow_remote}` | Explicit global consent to send decision context to a non-loopback endpoint. |\n\
+         | `allow_http` | boolean | `{allow_http}` | Global-only opt-in for non-loopback HTTP. Also requires `allow_remote = true`. Use only with transport protection you control, such as a trusted encrypted tunnel. |\n\
          | `timeout_ms` | integer | `{timeout_ms}` | Positive decision-request deadline in milliseconds, separate from shell execution timeouts. |\n\
          | `log` | boolean | `{log}` | Retain bounded decision records in the separate local `decisions.db`. |\n\
          | `log_retention_days` | integer | `{retention}` | Positive retention period for decision records. |\n\
@@ -505,9 +506,10 @@ fn write_decisions_section(out: &mut String) {
          | `thresholds` | table | defaults below | Probability thresholds, all finite and within 0–1 inclusive. |\n\n\
          `TYPESAFE_BASE_URL` replaces only the origin of an explicitly configured endpoint, \
          preserving its path. It must be an origin without a path and passes the same endpoint \
-         and remote-opt-in checks. The variable alone never activates the engine. \
+         and both transport opt-in checks. The variable alone never activates the engine. \
          Requests ignore ambient proxies and do not follow redirects. `localhost` is a DNS name, \
-         not numeric loopback for this policy.\n\n\
+         not numeric loopback for this policy. Private and CGNAT addresses receive no automatic HTTP exemption. \
+         These settings do not change Workcell transport policy.\n\n\
          Redaction is best effort. Decision context can include commands, task text, tool output, \
          and candidate descriptions. Review what you send and any exports before sharing them. \
          See [decision advice and logging](/docs/permissions/#decision-engine-advice).\n\n\
@@ -521,6 +523,7 @@ fn write_decisions_section(out: &mut String) {
         model = config.model,
         api_key_env = config.api_key_env,
         allow_remote = config.allow_remote,
+        allow_http = config.allow_http,
         timeout_ms = config.timeout_ms,
         log = config.log,
         retention = config.log_retention_days,
@@ -918,6 +921,15 @@ mod tests {
     const HEADING: &str = "### `agent.steering`";
     const PROMPT_ROW: &str = "| `prompt` | string | `nil` |";
     const RULE_COUNT: usize = 8;
+
+    #[test_case("allow_remote", DecisionsConfig::default().allow_remote)]
+    #[test_case("allow_http", DecisionsConfig::default().allow_http)]
+    fn decision_reference_covers_transport_defaults(field: &str, default: bool) {
+        let mut reference = String::new();
+        write_decisions_section(&mut reference);
+        let prefix = format!("| `{field}` | boolean | `{default}` |");
+        assert!(reference.lines().any(|line| line.starts_with(&prefix)));
+    }
 
     #[test_case("off")]
     #[test_case("shadow")]

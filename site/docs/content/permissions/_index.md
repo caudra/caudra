@@ -456,6 +456,8 @@ Decision features are opt-in and configured in user-global `caudra.setup()` sett
 
 Decision requests connect directly to the configured endpoint. They ignore ambient proxy variables and do not follow HTTP redirects, so project environment settings cannot redirect a loopback request.
 
+HTTPS is required except for numeric loopback HTTP. A user-global `allow_http = true` permits non-loopback HTTP only together with `allow_remote = true`. Use this opt-in only when you control the transport protection, such as an encrypted tunnel. Private and CGNAT addresses do not prove that a tunnel exists. Projects cannot set either opt-in, and Workcell transport rules remain unchanged.
+
 ```lua
 caudra.setup({
   decisions = {
