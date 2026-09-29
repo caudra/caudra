@@ -5,6 +5,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::animation::live_elapsed;
 use crate::highlight::{fallback_span, highlight_line};
 use crate::markdown::{
     LinkMap, expand_notice, should_truncate, text_to_wrapped, truncation_notice,
@@ -1360,7 +1361,7 @@ fn child_elapsed(entry: &BatchToolEntry, started: Option<&Instant>) -> Option<Du
     if entry.status == BatchToolStatus::Running {
         return started
             .filter(|_| names_tool(SHELL_TOOL_NAME, &entry.tool))
-            .map(|started| started.elapsed());
+            .map(|started| live_elapsed(*started));
     }
     match entry.output.as_ref() {
         Some(ToolOutput::Shell(output)) => Some(Duration::from_millis(output.duration_ms)),
@@ -3668,6 +3669,7 @@ fn merge_syntax_with_diff(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::animation::test_clock::FrozenClock;
     use crate::components::tool_display::{AWAITING_APPROVAL, WRITING_COMMAND};
     use crate::markdown::{EXPAND_AFFORDANCE, TRUNCATION_PREFIX};
     use caudra_agent::tools::{
@@ -6072,6 +6074,7 @@ mod tests {
     /// down one child stepped back out a level.
     #[test]
     fn a_settled_child_carries_its_tally_on_its_own_row() {
+        let _clock = FrozenClock::at(Duration::ZERO);
         let entries = [batch_entry(SHELL_CHILD, 1), batch_entry(SHELL_CHILD, 1)];
         let mut limits = limits(BatchViews::new([0]));
         let mut progress = batching_report(Vec::new());
@@ -6394,6 +6397,7 @@ mod tests {
     /// belongs to.
     #[test]
     fn a_batching_child_draws_its_roster_as_a_third_level() {
+        let _clock = FrozenClock::at(Duration::ZERO);
         let entries = [
             batch_entry(TASK_TOOL_NAME, 0),
             batch_entry(TASK_TOOL_NAME, 1),
@@ -6446,8 +6450,10 @@ mod tests {
         yet, so its roster is still free to grow";
 
     /// The card a dispatched child's batch report draws, with its children in
-    /// `states`.
+    /// `states`. The clock is held because the child's row carries its tally,
+    /// and two rosters drawn a render apart must not differ by the time between.
     fn nested_roster(states: [BatchToolStatus; ROSTER_CALLS.len()]) -> Vec<String> {
+        let _clock = FrozenClock::at(Duration::ZERO);
         let children = ROSTER_CALLS
             .iter()
             .zip(states)
@@ -6679,18 +6685,18 @@ mod tests {
         }
     }
 
-    /// Back-dated far enough that the tenths are stable however slow the host
-    /// is, and a magnitude the settled formatter spells differently.
-    const CHILD_RAN_FOR: Duration = Duration::from_millis(1_201);
+    /// What the held clock reads for a running child: far enough from the
+    /// measured time that a row drawing the wrong one of the two cannot pass.
+    const CHILD_RAN_FOR: Duration = Duration::from_millis(1_200);
     const CHILD_LIVE_CLOCK: &str = " · 1.2s";
     const CHILD_MEASURED_MS: u64 = 10;
     const CHILD_MEASURED_CLOCK: &str = " · 10ms";
     const CHILD_TIMEOUT_MS: u64 = 120_000;
     const CHILD_CLOCK_MSG: &str = "a child row keeps the clock its standalone card would";
 
-    fn started(index: usize, ago: Duration) -> RenderLimits {
+    fn started(index: usize) -> RenderLimits {
         RenderLimits {
-            started: Arc::new(HashMap::from([(index, Instant::now() - ago)])),
+            started: Arc::new(HashMap::from([(index, Instant::now())])),
             ..limits(BatchViews::default())
         }
     }
@@ -6722,11 +6728,8 @@ mod tests {
 
     #[test]
     fn a_running_shell_child_counts_up() {
-        let card = render_batch(
-            &[shell_child(BatchToolStatus::Running)],
-            false,
-            &started(0, CHILD_RAN_FOR),
-        );
+        let _clock = FrozenClock::at(CHILD_RAN_FOR);
+        let card = render_batch(&[shell_child(BatchToolStatus::Running)], false, &started(0));
         let row = line_text(&card.lines[0]);
 
         assert!(row.ends_with(CHILD_LIVE_CLOCK), "{CHILD_CLOCK_MSG}: {row}");
@@ -6736,11 +6739,12 @@ mod tests {
     /// with, exactly as a standalone card's header does.
     #[test]
     fn a_settled_shell_child_reports_the_commands_own_time() {
+        let _clock = FrozenClock::at(CHILD_RAN_FOR);
         let entry = BatchToolEntry {
             output: Some(shell_child_output(CHILD_MEASURED_MS)),
             ..shell_child(BatchToolStatus::Success)
         };
-        let card = render_batch(&[entry], false, &started(0, CHILD_RAN_FOR));
+        let card = render_batch(&[entry], false, &started(0));
         let row = line_text(&card.lines[0]);
 
         assert!(
@@ -6757,7 +6761,7 @@ mod tests {
             status: BatchToolStatus::Running,
             ..batch_entry(GREP_CHILD, 0)
         };
-        let card = render_batch(&[entry], false, &started(0, CHILD_RAN_FOR));
+        let card = render_batch(&[entry], false, &started(0));
 
         assert!(!line_text(&card.lines[0]).contains(CHILD_ACTIVITY_SEPARATOR));
     }

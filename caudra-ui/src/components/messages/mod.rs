@@ -27,7 +27,7 @@ use super::{
     memory_card, review, task_card, workflow_card,
     workflow_card::CardHit,
 };
-use crate::animation::spinner_str;
+use crate::animation::{live_elapsed, spinner_str};
 use crate::chat::batch_child_id;
 use crate::components::commit_popup::CommitIndex;
 use crate::components::keybindings::key;
@@ -4573,7 +4573,7 @@ impl MessagesPanel {
                         Some(message) => message.thinking_duration.map(format_settled_duration),
                         None => self
                             .thinking_started
-                            .map(|started| format_live_duration(started.elapsed())),
+                            .map(|started| format_live_duration(live_elapsed(started))),
                     };
                     let mut metadata = format!("View: {}", if open { "open" } else { "collapsed" });
                     if let Some(duration) = duration {
@@ -5120,7 +5120,7 @@ impl MessagesPanel {
         let mut msg =
             DisplayMessage::new(DisplayRole::Thinking, self.streaming_thinking.take_all());
         msg.body_open = self.streaming_reasoning_open.take();
-        msg.thinking_duration = started.map(|started| started.elapsed());
+        msg.thinking_duration = started.map(live_elapsed);
         // Where the reader left the live window is theirs, not the stream's, so
         // the settled block opens on the same rows with the wheel still armed.
         self.rekey_window(
@@ -5143,7 +5143,7 @@ impl MessagesPanel {
     fn build_streaming_collapsed_lines(&self) -> Vec<Line<'static>> {
         thought_line(
             reasoning_summary(self.streaming_thinking.buffer()).title,
-            self.thinking_started.map(|started| started.elapsed()),
+            self.thinking_started.map(live_elapsed),
             false,
         )
     }
@@ -5155,7 +5155,7 @@ impl MessagesPanel {
         let summary = self.streaming_reasoning();
         let header = thought_line(
             summary.title,
-            self.thinking_started.map(|started| started.elapsed()),
+            self.thinking_started.map(live_elapsed),
             false,
         );
         let content = &self.streaming_thinking;

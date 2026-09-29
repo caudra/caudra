@@ -1,6 +1,6 @@
 use super::segment;
 use super::*;
-use crate::animation::test_clock::FrozenSpinner;
+use crate::animation::test_clock::{FrozenClock, FrozenSpinner};
 use crate::chat::{DONE_TEXT, ERROR_TEXT};
 use crate::components::code_view::{BatchViews, RenderLimits, ScrollSpan, render_tool_content};
 use crate::components::prompt_progress::PROMPT_PROGRESS_LABEL;
@@ -4536,19 +4536,23 @@ fn streaming_reasoning_panel() -> MessagesPanel {
     )
 }
 
+const THINKING_RAN_FOR: Duration = Duration::from_millis(1_200);
+const THINKING_LIVE_HEADER: &str = "Thinking · 1.2s";
+
 #[test]
 fn streaming_reasoning_shows_a_spinner_and_tenths_timer() {
+    let _clock = FrozenClock::at(THINKING_RAN_FOR);
     let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
     panel.thinking_delta("working");
-    panel.thinking_started = Some(Instant::now() - Duration::from_millis(1_201));
+    // The body is drawn now rather than counted, so the typewriter revealing
+    // it is real work and asks for the faster cadence of the two. Asked before
+    // the first frame, because a frame slow enough finishes a reveal this short.
+    assert_eq!(panel.cadence(), Cadence::SMOOTH);
 
     let text = buffer_text(&render(&mut panel, 80, 5));
 
     assert!(SPINNER_GLYPHS.chars().any(|glyph| text.contains(glyph)));
-    assert!(text.contains("Thinking · 1.2s"));
-    // The body is drawn now rather than counted, so the typewriter revealing
-    // it is real work and asks for the faster cadence of the two.
-    assert_eq!(panel.cadence(), Cadence::SMOOTH);
+    assert!(text.contains(THINKING_LIVE_HEADER), "{text}");
 }
 
 /// A collapsed block reveals nothing, so believing its typewriter would pin
@@ -6642,8 +6646,8 @@ fn thought_durations_are_formatted_by_magnitude(duration: Duration, expected: &s
     assert_eq!(text, expected);
 }
 
-/// Back-dated far enough that the tenths are stable however slow the host is.
-const SHELL_RAN_FOR: Duration = Duration::from_millis(1_201);
+/// What the held clock reads once a running call has ticked.
+const SHELL_RAN_FOR: Duration = Duration::from_millis(1_200);
 const SHELL_LIVE_CLOCK: &str = "· 1.2s";
 /// What `shell_done` reports as the command's own time.
 const SHELL_MEASURED_CLOCK: &str = "· 10ms";
@@ -6659,6 +6663,7 @@ const SHELL_MEASURED_CLOCK: &str = "· 10ms";
 /// so a panel test cannot tell the two apart.
 #[test]
 fn a_running_shell_child_ticks_inside_a_batch() {
+    let _clock = FrozenClock::at(Duration::ZERO);
     let mut panel = panel_with_tools(&[(TOOL_ID, BATCH_TOOL)]);
     let mut event = start(TOOL_ID, BATCH_TOOL);
     event.output = Some(ToolOutput::Batch {
@@ -6669,9 +6674,7 @@ fn a_running_shell_child_ticks_inside_a_batch() {
     panel.batch_progress(TOOL_ID, 0, running_child(SHELL_TOOL_NAME));
     render(&mut panel, 80, 20);
 
-    let started = panel.batch_child_started[TOOL_ID][&0];
-    Arc::make_mut(panel.batch_child_started.get_mut(TOOL_ID).unwrap())
-        .insert(0, started - SHELL_RAN_FOR);
+    let _ticked = FrozenClock::at(SHELL_RAN_FOR);
     let text = buffer_text(&render(&mut panel, 80, 20));
 
     assert!(text.contains(SHELL_LIVE_CLOCK), "{text}");
@@ -6703,11 +6706,12 @@ fn a_settled_shell_child_drops_its_wall_clock() {
 /// the clock-driven refresh knows to rebuild it.
 #[test]
 fn a_running_shell_card_ticks_after_its_segment_is_cached() {
+    let _clock = FrozenClock::at(Duration::ZERO);
     let mut panel = panel_with_tools(&[("t1", SHELL_TOOL_NAME)]);
     assert!(panel.messages[0].tool_started.is_some());
     render(&mut panel, 80, 20);
 
-    panel.messages[0].tool_started = Some(Instant::now() - SHELL_RAN_FOR);
+    let _ticked = FrozenClock::at(SHELL_RAN_FOR);
     let text = buffer_text(&render(&mut panel, 80, 20));
 
     assert!(text.contains(SHELL_LIVE_CLOCK), "{text}");
@@ -6715,8 +6719,8 @@ fn a_running_shell_card_ticks_after_its_segment_is_cached() {
 
 #[test]
 fn a_settled_shell_card_swaps_the_live_clock_for_the_measured_one() {
+    let _clock = FrozenClock::at(SHELL_RAN_FOR);
     let mut panel = panel_with_tools(&[("t1", SHELL_TOOL_NAME)]);
-    panel.messages[0].tool_started = Some(Instant::now() - SHELL_RAN_FOR);
     render(&mut panel, 80, 20);
 
     panel.tool_done(shell_done("t1", false));
@@ -7649,7 +7653,8 @@ fn a_child_at_its_edge_gives_the_rest_of_the_wheel_back() {
 /// untouched window has to hand the whole burst back.
 #[test]
 fn an_unarmed_window_leaves_the_wheel_to_the_transcript() {
-    let _clock = FrozenSpinner::at(0);
+    let _spinner = FrozenSpinner::at(0);
+    let _clock = FrozenClock::at(Duration::ZERO);
     let mut panel = panel_with_running_shell();
     panel.set_batch_child_output("t1", 0, &shell_stream());
     let terminal = render(&mut panel, 80, 24);

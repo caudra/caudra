@@ -94,6 +94,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+use crate::animation::live_elapsed;
 use crate::selection::wrap_breaks;
 use keybindings::Bind;
 use modal::FooterHits;
@@ -1098,7 +1099,7 @@ impl ToolProgress {
     }
 
     pub fn elapsed(&self) -> Duration {
-        self.report.elapsed + self.since.map_or(Duration::ZERO, |since| since.elapsed())
+        self.report.elapsed + self.since.map_or(Duration::ZERO, live_elapsed)
     }
 }
 

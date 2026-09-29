@@ -1,6 +1,6 @@
 use std::time::{Duration, Instant};
 
-use crate::animation::spinner_str;
+use crate::animation::{live_elapsed, spinner_str};
 use crate::components::ModalScroll;
 use crate::components::Overlay;
 use crate::components::modal::{ESC_LABEL, FooterHits, FooterLine, Modal};
@@ -198,7 +198,7 @@ impl Exchange {
     }
 
     fn settle(&mut self, outcome: ExchangeOutcome) {
-        self.settled = Some(self.started_at.elapsed());
+        self.settled = Some(live_elapsed(self.started_at));
         self.outcome = outcome;
     }
 
@@ -674,7 +674,7 @@ impl StreamModal {
     /// by the clock alone.
     fn draw_status(&mut self, frame: &mut Frame, area: Rect) {
         let theme = theme::current();
-        let Some(elapsed) = self.exchanges.last().map(|e| e.started_at.elapsed()) else {
+        let Some(elapsed) = self.exchanges.last().map(|e| live_elapsed(e.started_at)) else {
             return;
         };
         grab_scope!("stream_modal_status", area);
@@ -765,6 +765,7 @@ impl Overlay for StreamModal {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::animation::test_clock::FrozenClock;
     use crate::components::key as key_ev;
     use crate::components::prompt_progress::PROMPT_PROGRESS_LABEL;
     use caudra_agent::CancelToken;
@@ -1301,6 +1302,7 @@ mod tests {
 
     #[test]
     fn the_status_row_carries_the_wait_and_leaves_when_the_answer_lands() {
+        let _clock = FrozenClock::at(Duration::ZERO);
         let mut m = StreamModal::new(0);
         let (tx, _cancel) = open_modal(&mut m, HEADER, StreamFooter::Close);
         let mut terminal = Terminal::new(TestBackend::new(WIDTH, HEIGHT)).unwrap();

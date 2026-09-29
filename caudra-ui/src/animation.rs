@@ -22,12 +22,23 @@ pub fn spinner_str(elapsed_ms: u128) -> &'static str {
     SPINNER_STRS[(elapsed_ms / SPINNER_FRAME_MS) as usize % SPINNER_STRS.len()]
 }
 
+/// How long a clock that counts while it is drawn has been running. Read
+/// through here rather than off the `Instant`, so a test can hold it at one
+/// reading however long its render takes.
+pub fn live_elapsed(started: Instant) -> Duration {
+    let elapsed = started.elapsed();
+    #[cfg(test)]
+    let elapsed = test_clock::running(elapsed);
+    elapsed
+}
+
 #[cfg(test)]
 pub(crate) mod test_clock {
-    use std::{cell::Cell, marker::PhantomData, rc::Rc};
+    use std::{cell::Cell, marker::PhantomData, rc::Rc, time::Duration};
 
     thread_local! {
         static ELAPSED: Cell<Option<u128>> = const { Cell::new(None) };
+        static RUNNING: Cell<Option<Duration>> = const { Cell::new(None) };
     }
 
     pub(crate) struct FrozenSpinner {
@@ -52,6 +63,32 @@ pub(crate) mod test_clock {
 
     pub(super) fn elapsed(real: u128) -> u128 {
         ELAPSED.get().unwrap_or(real)
+    }
+
+    /// Every live clock on this thread reads exactly `elapsed` until this is
+    /// dropped, whenever it was started.
+    pub(crate) struct FrozenClock {
+        previous: Option<Duration>,
+        thread: PhantomData<Rc<()>>,
+    }
+
+    impl FrozenClock {
+        pub(crate) fn at(elapsed: Duration) -> Self {
+            Self {
+                previous: RUNNING.replace(Some(elapsed)),
+                thread: PhantomData,
+            }
+        }
+    }
+
+    impl Drop for FrozenClock {
+        fn drop(&mut self) {
+            RUNNING.set(self.previous);
+        }
+    }
+
+    pub(super) fn running(real: Duration) -> Duration {
+        RUNNING.get().unwrap_or(real)
     }
 }
 
@@ -239,6 +276,24 @@ mod tests {
             assert_eq!(spinner_frame(SPINNER_FRAME_MS), SPINNER_FRAMES[0]);
         }
         assert_eq!(spinner_frame(SPINNER_FRAME_MS), SPINNER_FRAMES[1]);
+    }
+
+    /// `Duration::MAX` is a reading no real clock can reach, so seeing it
+    /// proves the guard is in force and not seeing it proves it was released.
+    #[test]
+    fn frozen_clock_holds_live_clocks_and_restores_time() {
+        use super::test_clock::FrozenClock;
+
+        let started = Instant::now();
+        {
+            let _clock = FrozenClock::at(Duration::MAX);
+            {
+                let _inner = FrozenClock::at(Duration::ZERO);
+                assert_eq!(live_elapsed(started), Duration::ZERO);
+            }
+            assert_eq!(live_elapsed(started), Duration::MAX);
+        }
+        assert_ne!(live_elapsed(started), Duration::MAX);
     }
 
     #[test]

@@ -2,7 +2,7 @@ use super::{DisplayMessage, ToolProgress, ToolStatus, escape_terminal_controls, 
 
 use super::code_view;
 use super::status_bar::collapse_home;
-use crate::animation::{spinner_frame, spinner_str};
+use crate::animation::{live_elapsed, spinner_frame, spinner_str};
 use crate::chat::batch_child_id;
 use crate::theme;
 use caudra_config::{ClockFormat, ToolOutputLines};
@@ -2537,7 +2537,7 @@ pub(super) fn shell_elapsed(msg: &DisplayMessage, status: ToolStatus) -> Option<
         return msg
             .tool_started
             .filter(|_| names_tool(SHELL_TOOL_NAME, msg.role.tool_name().unwrap_or_default()))
-            .map(|started| started.elapsed());
+            .map(live_elapsed);
     }
     match msg.tool_output.as_deref() {
         Some(ToolOutput::Shell(output)) => Some(Duration::from_millis(output.duration_ms)),
@@ -3081,6 +3081,7 @@ mod tests {
     use super::*;
 
     const TOL: ToolOutputLines = ToolOutputLines::DEFAULT;
+    use crate::animation::test_clock::{FrozenClock, FrozenSpinner};
     use crate::components::{DisplayRole, ToolRole};
     use crate::markdown::{TRUNCATION_PREFIX, truncate_output};
     use crate::provenance::Provenance;
@@ -3997,6 +3998,7 @@ mod tests {
     /// keeps, so the two frames draw the same card.
     #[test]
     fn a_generation_draws_one_prompt_from_the_first_token_to_the_call() {
+        let _clock = FrozenSpinner::at(0);
         let open = |msg| {
             lines_text(&build_tool_lines(
                 &msg,
@@ -5798,23 +5800,24 @@ mod tests {
         assert!(!tl.truncation);
     }
 
-    /// Back-dated far enough that the tenths are stable however slow the test
-    /// host is, and a magnitude the settled formatter spells differently.
-    const SHELL_RAN_FOR: Duration = Duration::from_millis(1_201);
+    /// What the held clock reads for a running call: far enough from the
+    /// measured time that a header drawing the wrong one of the two cannot pass.
+    const SHELL_RAN_FOR: Duration = Duration::from_millis(1_200);
     const LIVE_CLOCK: &str = " · 1.2s";
     /// What `shell_output()` reports as the command's own time.
     const MEASURED_CLOCK: &str = " · 10ms";
 
-    fn running_shell(started: Option<Duration>) -> DisplayMessage {
+    fn running_shell(started: bool) -> DisplayMessage {
         let mut msg = bash_msg("cargo test", ToolStatus::InProgress, None, None);
-        msg.tool_started = started.map(|ago| Instant::now() - ago);
+        msg.tool_started = started.then(Instant::now);
         msg
     }
 
     #[test_case(test_rctx(80)    ; "expanded")]
     #[test_case(compact_rctx(80) ; "compact")]
     fn a_running_shell_header_carries_a_live_clock(rctx: RenderCtx<'static>) {
-        let msg = running_shell(Some(SHELL_RAN_FOR));
+        let _clock = FrozenClock::at(SHELL_RAN_FOR);
+        let msg = running_shell(true);
         let tl = build_tool_lines(&msg, ToolStatus::InProgress, &rctx, None);
 
         assert!(
@@ -5826,13 +5829,14 @@ mod tests {
 
     #[test]
     fn a_settled_shell_header_reports_the_commands_own_time() {
+        let _clock = FrozenClock::at(SHELL_RAN_FOR);
         let mut msg = bash_msg(
             "cargo test",
             ToolStatus::Success,
             None,
             Some(shell_output(false)),
         );
-        msg.tool_started = Some(Instant::now() - SHELL_RAN_FOR);
+        msg.tool_started = Some(Instant::now());
         let tl = build_tool_lines(&msg, ToolStatus::Success, &test_rctx(80), None);
 
         let header = line_text(&tl.lines[0]);
@@ -5845,7 +5849,7 @@ mod tests {
 
     #[test]
     fn an_unstarted_shell_card_draws_no_clock() {
-        let msg = running_shell(None);
+        let msg = running_shell(false);
         let tl = build_tool_lines(&msg, ToolStatus::InProgress, &test_rctx(80), None);
 
         assert!(!line_text(&tl.lines[0]).contains(DURATION_SEPARATOR));
@@ -5934,7 +5938,7 @@ mod tests {
     /// so only `shell` gets a clock.
     #[test]
     fn a_non_shell_tool_draws_no_clock() {
-        let mut msg = running_shell(Some(SHELL_RAN_FOR));
+        let mut msg = running_shell(true);
         if let DisplayRole::Tool(tool) = &mut msg.role {
             tool.name = FILE_READ_TOOL_NAME.into();
         }
