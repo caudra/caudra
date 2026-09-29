@@ -61,7 +61,7 @@ impl FilesystemCore {
 
 fn enforce_preparation_peak(bytes: usize, maximum: usize) -> Result<(), FilesystemError> {
     if bytes > maximum {
-        return Err(FilesystemError::message(format!(
+        return Err(FilesystemError::invalid(format!(
             "File write preparation exceeds maximum retained size of {maximum} bytes"
         )));
     }

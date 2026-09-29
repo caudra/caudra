@@ -6,6 +6,7 @@ mod pdf_response;
 
 use std::time::Duration;
 
+use http::StatusCode;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use workcell_source_icons::SourceIconError;
@@ -28,7 +29,34 @@ pub enum WebfetchError {
     #[error("Tool invocation was aborted.")]
     Aborted,
     #[error("{0}")]
+    TimedOut(String),
+    /// Network safety rules or the outbound proxy refused the target.
+    #[error("{0}")]
+    Denied(String),
+    #[error("{0}")]
+    NotFound(String),
+    #[error("{0}")]
     Operation(String),
+}
+
+impl WebfetchError {
+    /// The symbolic token a caller branches on, so it never has to parse the
+    /// message to tell a refused target from a slow or broken one.
+    #[must_use]
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::InvalidInput(_) => "invalid_input",
+            Self::Aborted => "cancelled",
+            Self::TimedOut(_) => "timed_out",
+            Self::Denied(_) => "web_request_denied",
+            Self::NotFound(_) => "not_found",
+            Self::Operation(_) => "operation_failed",
+        }
+    }
+
+    fn timed_out(timeout_seconds: u64) -> Self {
+        Self::TimedOut(format!("Request timed out after {timeout_seconds} seconds"))
+    }
 }
 
 pub(crate) struct WebfetchExecution {
@@ -48,7 +76,7 @@ pub(crate) async fn execute(
     input
         .policy
         .validate_url(&input.url)
-        .map_err(|error| WebfetchError::Operation(input::policy_message(error)))?;
+        .map_err(input::policy_error)?;
     let response = dependencies
         .http
         .execute(WebHttpRequest {
@@ -69,13 +97,17 @@ pub(crate) async fn execute(
     input
         .policy
         .validate_url(&response.final_url)
-        .map_err(|error| WebfetchError::Operation(input::policy_message(error)))?;
+        .map_err(input::policy_error)?;
     if !response.status.is_success() {
-        return Err(WebfetchError::Operation(format!(
+        let message = format!(
             "webfetch returned {} {}",
             response.status.as_u16(),
             response.status.canonical_reason().unwrap_or_default()
-        )));
+        );
+        return Err(match response.status {
+            StatusCode::NOT_FOUND | StatusCode::GONE => WebfetchError::NotFound(message),
+            _ => WebfetchError::Operation(message),
+        });
     }
 
     let content_type = content::normalized_content_type(&response.headers);
@@ -171,13 +203,11 @@ pub(crate) async fn execute(
 fn map_http_error(error: WebHttpError, timeout: u64) -> WebfetchError {
     match error {
         WebHttpError::Cancelled => WebfetchError::Aborted,
-        WebHttpError::Timeout => {
-            WebfetchError::Operation(format!("Request timed out after {timeout} seconds"))
-        }
+        WebHttpError::Timeout => WebfetchError::timed_out(timeout),
         WebHttpError::Rejected(message) => {
-            WebfetchError::Operation(format!("URL is blocked by network safety rules: {message}"))
+            WebfetchError::Denied(format!("URL is blocked by network safety rules: {message}"))
         }
-        WebHttpError::ProxyRejected => WebfetchError::Operation(
+        WebHttpError::ProxyRejected => WebfetchError::Denied(
             "The outbound proxy refused this request; the target is not permitted.".to_owned(),
         ),
         WebHttpError::RedirectRejected | WebHttpError::RequestFailed => {

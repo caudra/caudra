@@ -45,7 +45,7 @@ pub use workcell_mcp_files::{
 #[cfg(feature = "shell")]
 pub use workcell_mcp_shell as shell;
 #[cfg(feature = "shell")]
-pub use workcell_mcp_shell::{PreparedShell, ShellToolGroup};
+pub use workcell_mcp_shell::{PreparedShell, ShellPreparationError, ShellToolGroup};
 #[cfg(feature = "web")]
 pub use workcell_mcp_web as web;
 #[cfg(feature = "web")]

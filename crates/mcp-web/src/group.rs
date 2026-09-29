@@ -223,6 +223,17 @@ pub enum WebOperationError {
     Webfetch(#[from] WebfetchError),
 }
 
+impl WebOperationError {
+    #[must_use]
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::GroupMismatch => "invalid_operation",
+            Self::Websearch(_) => "operation_failed",
+            Self::Webfetch(error) => error.code(),
+        }
+    }
+}
+
 pub const STALE_WEBSEARCH_CONFIGURATION_ERROR: &str =
     "Prepared websearch is stale because the search configuration revision changed";
 

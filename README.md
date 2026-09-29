@@ -430,6 +430,9 @@ descriptor reports `exactPreparation: true`: execution consumes the typed prepar
 resource, working-directory, content, configuration, catalog, or policy changes that invalidate it.
 Websearch preparation reports the provider connection separately from a search resource whose opaque
 ID and bounded display text bind the exact normalized query used by embedded permission checks.
+A failed file, index, code-graph, or web execution reports its cause as `structuredContent.error.code`
+beside the message, so a client can tell a refused, missing, cancelled, or timed-out target apart
+without parsing prose. A failed shell, Python, or execution-environment run carries only text.
 
 The same negotiated extension exposes versioned workspace methods for directory resolution, stat,
 deterministically ordered list and traversal, bounded text ranges, and deterministic text search:
@@ -1027,7 +1030,7 @@ workcell = { git = "https://github.com/tensorninja/workcell-mcp", default-featur
 | `files` | `FileToolGroup`, `PreparedFilePatch`, filesystem schemas and bounded operations |
 | `files-index` | `files` plus `file_index`, its typed output, and the feature-gated parser bundle |
 | `web` | `WebToolGroup`, `PreparedWebsearch`, `PreparedWebfetch`, extraction and provider lowering |
-| `shell` | `ShellToolGroup`, `PreparedShell`, scope analysis, progress streaming, and `output_filter` |
+| `shell` | `ShellToolGroup`, `PreparedShell`, `ShellPreparationError`, scope analysis, progress streaming, and `output_filter` |
 | `code` | `CodeToolGroup`, isolated interpreter execution (the `python_execution` tool) |
 | `code-bundled` | `code` plus verified extraction of a build-time embedded Monty worker |
 | `code-graph` | `CodeGraphToolGroup` and the five `code_*` tools over a confined source tree |

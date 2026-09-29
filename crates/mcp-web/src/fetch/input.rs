@@ -43,9 +43,7 @@ pub(crate) fn normalize_input(
         url.set_scheme("https")
             .map_err(|()| WebfetchError::InvalidInput(format!("Invalid URL: {original}")))?;
     }
-    policy
-        .validate_url(&url)
-        .map_err(|error| WebfetchError::InvalidInput(policy_message(error)))?;
+    policy.validate_url(&url).map_err(policy_error)?;
     let timeout_seconds = input
         .timeout
         .unwrap_or(DEFAULT_TIMEOUT_SECONDS)
@@ -69,10 +67,12 @@ pub(crate) fn normalize_input(
     })
 }
 
-pub(super) fn policy_message(error: UrlPolicyError) -> String {
+pub(super) fn policy_error(error: UrlPolicyError) -> WebfetchError {
     match error {
-        UrlPolicyError::UnsupportedScheme => "URL must use http or https".to_owned(),
-        UrlPolicyError::InvalidUrl(_) => "Invalid URL".to_owned(),
-        other => format!("URL is blocked by network safety rules: {other}"),
+        UrlPolicyError::UnsupportedScheme => {
+            WebfetchError::InvalidInput("URL must use http or https".to_owned())
+        }
+        UrlPolicyError::InvalidUrl(_) => WebfetchError::InvalidInput("Invalid URL".to_owned()),
+        other => WebfetchError::Denied(format!("URL is blocked by network safety rules: {other}")),
     }
 }

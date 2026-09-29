@@ -16,11 +16,19 @@ use workcell_mcp_web::{
     NativePdfExtractor, OperatorConfiguredPolicy, PdfExtraction, PdfExtractionError, PdfExtractor,
     PreparedWebOperation, STALE_WEBSEARCH_CONFIGURATION_ERROR, SerpApiEngine, UrlPolicy,
     WebHttpError, WebHttpRequestKind, WebOperationError, WebOperationExecution, WebToolGroup,
-    WebfetchFormat, WebfetchInput, WebfetchPdfMode, WebsearchBackend, WebsearchConfigurationIssue,
-    WebsearchConfigurationSource, WebsearchExecutionConfiguration, WebsearchInput, catalog, specs,
+    WebfetchError, WebfetchFormat, WebfetchInput, WebfetchPdfMode, WebsearchBackend,
+    WebsearchConfigurationIssue, WebsearchConfigurationSource, WebsearchExecutionConfiguration,
+    WebsearchInput, catalog, specs,
 };
 
 use support::*;
+
+const INVALID_INPUT_CODE: &str = "invalid_input";
+const CANCELLED_CODE: &str = "cancelled";
+const TIMED_OUT_CODE: &str = "timed_out";
+const WEB_REQUEST_DENIED_CODE: &str = "web_request_denied";
+const NOT_FOUND_CODE: &str = "not_found";
+const OPERATION_FAILED_CODE: &str = "operation_failed";
 
 #[test]
 fn catalog_is_backend_specific_and_ordered() {
@@ -364,8 +372,9 @@ async fn exact_prepared_webfetch_preserves_cancellation_without_network_io() {
 
     assert!(matches!(
         error,
-        WebOperationError::Webfetch(workcell_mcp_web::WebfetchError::Aborted)
+        WebOperationError::Webfetch(WebfetchError::Aborted)
     ));
+    assert_eq!(error.code(), CANCELLED_CODE);
     assert!(http.requests().is_empty());
 }
 
@@ -1309,6 +1318,71 @@ async fn webfetch_normalizes_urls_and_rejects_private_initial_and_redirect_targe
     assert_eq!(result.is_error, Some(true));
     assert!(text(&result).contains("blocked by network safety rules"));
     assert!(!text(&result).contains("secret metadata"));
+}
+
+async fn webfetch_error(group: &WebToolGroup, url: &str) -> WebfetchError {
+    group
+        .webfetch(
+            WebfetchInput {
+                url: url.into(),
+                format: WebfetchFormat::Text,
+                pdf_mode: WebfetchPdfMode::Extract,
+                timeout: None,
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .expect_err("webfetch must fail")
+}
+
+#[tokio::test]
+async fn webfetch_failures_carry_the_code_of_their_cause() {
+    let http = Arc::new(FakeHttp::with_responses(vec![
+        Ok(response(
+            "https://example.test/missing",
+            StatusCode::NOT_FOUND,
+            Some("text/plain"),
+            Bytes::new(),
+        )),
+        Ok(response(
+            "https://example.test/removed",
+            StatusCode::GONE,
+            Some("text/plain"),
+            Bytes::new(),
+        )),
+        Ok(response(
+            "https://example.test/broken",
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Some("text/plain"),
+            Bytes::new(),
+        )),
+        Ok(response(
+            "http://169.254.169.254/latest/meta-data",
+            StatusCode::OK,
+            Some("text/plain"),
+            Bytes::new(),
+        )),
+        Err(WebHttpError::Timeout),
+        Err(WebHttpError::ProxyRejected),
+    ]));
+    let group = WebToolGroup::with_dependencies(
+        WebsearchExecutionConfiguration::unconfigured(),
+        dependencies(http.clone(), Arc::new(FakeIcons::default()), default_pdf()),
+    );
+
+    for (url, code) in [
+        ("https://example.test/missing", NOT_FOUND_CODE),
+        ("https://example.test/removed", NOT_FOUND_CODE),
+        ("https://example.test/broken", OPERATION_FAILED_CODE),
+        ("https://example.test/redirected", WEB_REQUEST_DENIED_CODE),
+        ("https://example.test/slow", TIMED_OUT_CODE),
+        ("https://example.test/proxied", WEB_REQUEST_DENIED_CODE),
+        ("https://127.0.0.1/private", WEB_REQUEST_DENIED_CODE),
+        ("ftp://example.test/file", INVALID_INPUT_CODE),
+    ] {
+        assert_eq!(webfetch_error(&group, url).await.code(), code, "{url}");
+    }
+    assert_eq!(http.requests().len(), 6);
 }
 
 #[tokio::test]

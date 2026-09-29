@@ -155,9 +155,7 @@ fn parse_error() -> WebfetchError {
 fn blocking_error(error: BlockingError, timeout_seconds: u64) -> WebfetchError {
     match error {
         BlockingError::Cancelled => WebfetchError::Aborted,
-        BlockingError::TimedOut => {
-            WebfetchError::Operation(format!("Request timed out after {timeout_seconds} seconds"))
-        }
+        BlockingError::TimedOut => WebfetchError::timed_out(timeout_seconds),
         BlockingError::Panicked => parse_error(),
     }
 }

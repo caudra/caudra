@@ -129,10 +129,10 @@ fn detect(path: &Path) -> Result<Language, FilesystemError> {
         return Ok(language);
     }
     match path.extension().and_then(|value| value.to_str()) {
-        Some(extension) => Err(FilesystemError::message(format!(
+        Some(extension) => Err(FilesystemError::invalid(format!(
             "Unsupported file type: .{extension}. Use file_read instead."
         ))),
-        None => Err(FilesystemError::message(
+        None => Err(FilesystemError::invalid(
             "Unsupported file type: (no extension). Use file_read instead.",
         )),
     }
@@ -192,7 +192,7 @@ impl FilesystemCore {
         } else if metadata.is_file() {
             FileResourceAccess::Read
         } else {
-            return Err(FilesystemError::message(format!(
+            return Err(FilesystemError::invalid(format!(
                 "Path is not a regular file or directory: {}",
                 resource.requested_path
             )));
@@ -217,7 +217,7 @@ impl FilesystemCore {
             return self.index_directory(&path, limits, token).await;
         }
         if !metadata.is_file() {
-            return Err(FilesystemError::message(format!(
+            return Err(FilesystemError::invalid(format!(
                 "Path is not a regular file or directory: {}",
                 path.to_string_lossy()
             )));
@@ -235,7 +235,7 @@ impl FilesystemCore {
         let bytes = read_bounded(path, limits.max_source_bytes, token).await?;
         reject_binary(path, &bytes)?;
         let source = str::from_utf8(&bytes).map_err(|_| {
-            FilesystemError::message(format!(
+            FilesystemError::invalid(format!(
                 "Index requires strict UTF-8 text: {}",
                 path.to_string_lossy()
             ))

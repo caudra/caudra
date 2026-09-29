@@ -80,7 +80,7 @@ enum FastPath {
 impl GlobMatcher {
     pub(crate) fn new(pattern: &str, limits: &FilesystemLimits) -> Result<Self, FilesystemError> {
         if pattern.len() > limits.max_glob_bytes {
-            return Err(FilesystemError::message(format!(
+            return Err(FilesystemError::invalid(format!(
                 "glob pattern exceeds maximum size of {} bytes",
                 limits.max_glob_bytes
             )));
@@ -249,16 +249,16 @@ fn expand_bounded(
 ) -> Result<(), FilesystemError> {
     let Some((start, end)) = first_brace_group(pattern) else {
         if output.len() == limits.max_glob_alternatives {
-            return Err(FilesystemError::message(format!(
+            return Err(FilesystemError::invalid(format!(
                 "glob pattern exceeds maximum of {} alternatives",
                 limits.max_glob_alternatives
             )));
         }
         *generated_bytes = generated_bytes
             .checked_add(pattern.len())
-            .ok_or_else(|| FilesystemError::message("glob expansion is too large"))?;
+            .ok_or_else(|| FilesystemError::invalid("glob expansion is too large"))?;
         if *generated_bytes > limits.max_glob_generated_bytes {
-            return Err(FilesystemError::message(format!(
+            return Err(FilesystemError::invalid(format!(
                 "glob expansion exceeds maximum size of {} bytes",
                 limits.max_glob_generated_bytes
             )));
@@ -267,7 +267,7 @@ fn expand_bounded(
         return Ok(());
     };
     if depth == limits.max_glob_brace_depth {
-        return Err(FilesystemError::message(format!(
+        return Err(FilesystemError::invalid(format!(
             "glob pattern exceeds maximum brace depth of {}",
             limits.max_glob_brace_depth
         )));
@@ -279,9 +279,9 @@ fn expand_bounded(
             .len()
             .checked_add(part.len())
             .and_then(|size| size.checked_add(after.len()))
-            .ok_or_else(|| FilesystemError::message("glob expansion is too large"))?;
+            .ok_or_else(|| FilesystemError::invalid("glob expansion is too large"))?;
         if estimated > limits.max_glob_generated_bytes {
-            return Err(FilesystemError::message("glob expansion is too large"));
+            return Err(FilesystemError::invalid("glob expansion is too large"));
         }
         let mut alternative = String::with_capacity(estimated);
         alternative.push_str(before);

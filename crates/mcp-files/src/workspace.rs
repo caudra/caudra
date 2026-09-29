@@ -1250,7 +1250,7 @@ fn prepared_workspace_parts_bytes(
 
 fn enforce_preparation_bytes(bytes: usize, maximum: usize) -> Result<(), WorkspaceError> {
     if bytes > maximum {
-        return Err(FilesystemError::message(format!(
+        return Err(FilesystemError::invalid(format!(
             "Prepared workspace mutation exceeds maximum retained size of {maximum} bytes"
         ))
         .into());

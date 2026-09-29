@@ -70,8 +70,8 @@ use workcell_mcp_shell::{
     mcp_progress_sink,
 };
 use workcell_mcp_web::{
-    PreparedWebOperation, ProxyConfiguration, WebOperationExecution, WebToolGroup, WebfetchInput,
-    WebsearchExecutionConfiguration, WebsearchInput,
+    PreparedWebOperation, ProxyConfiguration, WebOperationExecution, WebToolGroup, WebfetchError,
+    WebfetchInput, WebsearchExecutionConfiguration, WebsearchInput,
 };
 use workcell_tool_contract::{CatalogRevision, ToolManifest, ToolSpec};
 use workcell_workspace_scm::{ScmError, ScmGroup};
@@ -119,7 +119,6 @@ const CODE_GRAPH_INVALID_CODE: &str = "code_graph_invalid";
 const CODE_GRAPH_INTERNAL_CODE: &str = "code_graph_internal";
 const CANCELLED_CODE: &str = "cancelled";
 const WEB_PREPARATION_FAILED_CODE: &str = "web_preparation_failed";
-const SHELL_PREPARATION_FAILED_CODE: &str = "shell_preparation_failed";
 const SHELL_COMMAND_REFUSED_CODE: &str = "shell_command_refused";
 const PYTHON_PREPARATION_FAILED_CODE: &str = "python_preparation_failed";
 const PREPARATION_INTERNAL_CODE: &str = "preparation_internal_error";
@@ -1558,15 +1557,7 @@ impl WorkcellServer {
             )
         };
         let files_failed = |error: FilesystemError| failed(error.code(), &error);
-        let graph_failed = |error: CodeGraphError| {
-            let code = match &error {
-                CodeGraphError::Denied(_) => CODE_GRAPH_DENIED_CODE,
-                CodeGraphError::Invalid(_) => CODE_GRAPH_INVALID_CODE,
-                CodeGraphError::Aborted => CANCELLED_CODE,
-                CodeGraphError::Internal(_) => CODE_GRAPH_INTERNAL_CODE,
-            };
-            failed(code, &error)
-        };
+        let graph_failed = |error: CodeGraphError| failed(code_graph_error_code(&error), &error);
         let token = CancellationToken::new();
         let (operation, kind, mutating, resources) = match name {
             "file_read" => {
@@ -1803,7 +1794,14 @@ impl WorkcellServer {
                     .as_ref()
                     .ok_or_else(unavailable)?
                     .prepare_webfetch_operation(input)
-                    .map_err(|error| failed(WEB_PREPARATION_FAILED_CODE, &error))?;
+                    .map_err(|error| {
+                        let code = if matches!(error, WebfetchError::Denied(_)) {
+                            error.code()
+                        } else {
+                            WEB_PREPARATION_FAILED_CODE
+                        };
+                        failed(code, &error)
+                    })?;
                 let PreparedWebOperation::Webfetch(prepared) = prepared else {
                     return Err(remote_invalid());
                 };
@@ -1821,7 +1819,7 @@ impl WorkcellServer {
                 let prepared = shell
                     .prepare(input)
                     .await
-                    .map_err(|error| failed(SHELL_PREPARATION_FAILED_CODE, &error))?;
+                    .map_err(|error| failed(error.code(), &error))?;
                 shell
                     .authorize_prepared(&prepared)
                     .map_err(|error| failed(SHELL_COMMAND_REFUSED_CODE, &error))?;
@@ -3342,7 +3340,7 @@ where
             })?;
             typed_tool_result(&output, FileModelText::model_text(&output).into_owned())
         }
-        Err(error) => Ok(tool_error_result(error)),
+        Err(error) => operation_error_result(error.code(), error.to_string()),
     }
 }
 
@@ -3356,7 +3354,7 @@ fn file_index_result(
             let model_text = output.model_text().to_owned();
             typed_tool_result(&output, model_text)
         }
-        Err(error) => Ok(tool_error_result(error)),
+        Err(error) => operation_error_result(error.code(), error.to_string()),
     }
 }
 
@@ -3371,7 +3369,7 @@ where
             let output = workcell_mcp_code_graph::fit(output);
             typed_tool_result(&output, GraphModelText::model_text(&output).into_owned())
         }
-        Err(error) => Ok(tool_error_result(error)),
+        Err(error) => operation_error_result(code_graph_error_code(&error), error.to_string()),
     }
 }
 
@@ -3389,7 +3387,16 @@ where
         Ok(Err(refusal)) => {
             typed_tool_result(&refusal, GraphModelText::model_text(&refusal).into_owned())
         }
-        Err(error) => Ok(tool_error_result(error)),
+        Err(error) => operation_error_result(code_graph_error_code(&error), error.to_string()),
+    }
+}
+
+fn code_graph_error_code(error: &CodeGraphError) -> &'static str {
+    match error {
+        CodeGraphError::Denied(_) => CODE_GRAPH_DENIED_CODE,
+        CodeGraphError::Invalid(_) => CODE_GRAPH_INVALID_CODE,
+        CodeGraphError::Aborted => CANCELLED_CODE,
+        CodeGraphError::Internal(_) => CODE_GRAPH_INTERNAL_CODE,
     }
 }
 
@@ -3403,7 +3410,7 @@ fn web_result(
         Ok(WebOperationExecution::Webfetch(execution)) => {
             typed_tool_result(&execution.output, execution.model_text)
         }
-        Err(error) => Ok(tool_error_result(error)),
+        Err(error) => operation_error_result(error.code(), error.to_string()),
     }
 }
 
@@ -3723,6 +3730,10 @@ mod tests {
 
     const PATH_OUTSIDE_ROOT_CODE: &str = "path_outside_root";
     const NOT_FOUND_CODE: &str = "not_found";
+    const INVALID_INPUT_CODE: &str = "invalid_input";
+    const OPERATION_FAILED_CODE: &str = "operation_failed";
+    const WEB_REQUEST_DENIED_CODE: &str = "web_request_denied";
+    const SHELL_PREPARATION_FAILED_CODE: &str = "shell_preparation_failed";
     const CAPTURE_TEST_TIMEOUT: Duration = Duration::from_secs(10);
 
     #[test]
@@ -5014,6 +5025,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_failed_remote_search_index_graph_or_web_execution_carries_its_code() {
+        let root = tempfile::tempdir().unwrap();
+        tokio::fs::create_dir(root.path().join("scope"))
+            .await
+            .unwrap();
+        tokio::fs::write(root.path().join("scope/lib.rs"), "fn scoped() {}\n")
+            .await
+            .unwrap();
+        tokio::fs::write(root.path().join("binary.rs"), b"fn scoped() {}\n\0")
+            .await
+            .unwrap();
+        let server = WorkcellServer::configured(
+            Some(root.path()),
+            &[ToolGroup::Files, ToolGroup::CodeGraph, ToolGroup::Web],
+            ServerBehavior::default(),
+            test_tools(),
+        )
+        .await
+        .unwrap()
+        .with_remote_host(remote_configuration())
+        .await
+        .unwrap();
+        let grep = stored_operation(
+            &server,
+            "file_grep",
+            json!({"pattern": "scoped", "path": "scope"}),
+        )
+        .await;
+        let index = stored_operation(&server, "file_index", json!({"path": "binary.rs"})).await;
+        let graph = stored_operation(&server, "code_map", json!({"path": "scope"})).await;
+        let refs = stored_operation(
+            &server,
+            "code_refs",
+            json!({"symbol": "scoped", "path": "scope"}),
+        )
+        .await;
+        let search = stored_operation(&server, "websearch", json!({"query": "stored query"})).await;
+        let fetch = stored_operation(
+            &server,
+            "webfetch",
+            json!({"url": "https://example.com/exact"}),
+        )
+        .await;
+        tokio::fs::rename(root.path().join("scope"), root.path().join("moved"))
+            .await
+            .unwrap();
+        server.web.as_ref().unwrap().clear_configuration();
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
+
+        for (operation, cancellation, code) in [
+            (grep, CancellationToken::new(), NOT_FOUND_CODE),
+            (index, CancellationToken::new(), INVALID_INPUT_CODE),
+            (graph, CancellationToken::new(), CODE_GRAPH_INVALID_CODE),
+            (refs, CancellationToken::new(), CODE_GRAPH_INVALID_CODE),
+            (search, CancellationToken::new(), OPERATION_FAILED_CODE),
+            (fetch, cancelled, CANCELLED_CODE),
+        ] {
+            let result = server
+                .execute_prepared_operation(operation, cancellation, None)
+                .await;
+            assert_eq!(result_error_code(&result), Some(code));
+        }
+    }
+
+    #[tokio::test]
     async fn remote_python_execution_consumes_the_stored_snippet() {
         let Some(worker) = test_worker() else {
             eprintln!("skipping: no monty worker; run make code-worker");
@@ -5236,6 +5313,43 @@ mod tests {
             )
             .await,
             NOT_FOUND_CODE
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_shell_or_webfetch_preparation_carries_its_own_reason() {
+        for (workdir, code) in [("..", PATH_OUTSIDE_ROOT_CODE), ("absent", NOT_FOUND_CODE)] {
+            assert_eq!(
+                preparation_refusal(
+                    &[ToolGroup::Shell],
+                    "shell",
+                    json!({"command": "true", "workdir": workdir})
+                )
+                .await,
+                code
+            );
+        }
+        assert_eq!(
+            preparation_refusal(&[ToolGroup::Shell], "shell", json!({"command": " "})).await,
+            SHELL_PREPARATION_FAILED_CODE
+        );
+        assert_eq!(
+            preparation_refusal(
+                &[ToolGroup::Web],
+                "webfetch",
+                json!({"url": "https://127.0.0.1/private"})
+            )
+            .await,
+            WEB_REQUEST_DENIED_CODE
+        );
+        assert_eq!(
+            preparation_refusal(
+                &[ToolGroup::Web],
+                "webfetch",
+                json!({"url": "ftp://example.com/file"})
+            )
+            .await,
+            WEB_PREPARATION_FAILED_CODE
         );
     }
 

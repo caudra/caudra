@@ -26,7 +26,7 @@ impl FilesystemCore {
     ) -> Result<(String, crate::text::FileVersion, FileEditOutput), FilesystemError> {
         check_cancelled(token)?;
         if input.old_string == input.new_string {
-            return Err(FilesystemError::message(
+            return Err(FilesystemError::invalid(
                 "No changes to apply: strings are identical",
             ));
         }
@@ -49,7 +49,7 @@ impl FilesystemCore {
             .saturating_add(new_content.capacity())
             .saturating_add(line_index_retained_bytes(&[old_content, &new_content]));
         if preparation_peak > maximum_retained_bytes {
-            return Err(FilesystemError::message(format!(
+            return Err(FilesystemError::invalid(format!(
                 "File edit preparation exceeds maximum retained size of {maximum_retained_bytes} bytes"
             )));
         }
@@ -90,7 +90,7 @@ fn replace_exact(
     replace_all: bool,
 ) -> Result<String, FilesystemError> {
     let Some(first) = content.find(old_string) else {
-        return Err(FilesystemError::message(
+        return Err(FilesystemError::invalid(
             "Could not find oldString in the file",
         ));
     };
@@ -98,7 +98,7 @@ fn replace_exact(
         return Ok(content.replace(old_string, new_string));
     }
     if content.rfind(old_string) != Some(first) {
-        return Err(FilesystemError::message(
+        return Err(FilesystemError::invalid(
             "Found multiple matches for oldString; provide more context or set replaceAll",
         ));
     }

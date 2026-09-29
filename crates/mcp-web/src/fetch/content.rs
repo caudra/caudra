@@ -31,7 +31,7 @@ pub(super) async fn format(
         return Err(WebfetchError::Aborted);
     }
     if Instant::now() >= deadline {
-        return Err(timeout_error(timeout_seconds));
+        return Err(WebfetchError::timed_out(timeout_seconds));
     }
     if !is_html(content_type) {
         return Ok(FormattedContent {
@@ -143,14 +143,10 @@ fn parse_error() -> WebfetchError {
     WebfetchError::Operation("Failed to parse HTML content.".to_owned())
 }
 
-fn timeout_error(timeout_seconds: u64) -> WebfetchError {
-    WebfetchError::Operation(format!("Request timed out after {timeout_seconds} seconds"))
-}
-
 fn blocking_error(error: BlockingError, timeout_seconds: u64) -> WebfetchError {
     match error {
         BlockingError::Cancelled => WebfetchError::Aborted,
-        BlockingError::TimedOut => timeout_error(timeout_seconds),
+        BlockingError::TimedOut => WebfetchError::timed_out(timeout_seconds),
         BlockingError::Panicked => parse_error(),
     }
 }

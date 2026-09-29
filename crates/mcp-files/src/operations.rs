@@ -65,7 +65,7 @@ impl FilesystemCore {
             .await
             .map_err(|_| FilesystemError::message("directory is unavailable"))?;
         if !metadata.is_dir() {
-            return Err(FilesystemError::message("path is not a directory"));
+            return Err(FilesystemError::invalid("path is not a directory"));
         }
         let relative_path = self.policy.relative(&path)?;
         Ok((path, relative_path))

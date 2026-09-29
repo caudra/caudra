@@ -5,12 +5,19 @@
 //! this is validation, not a command sandbox.
 
 use std::{
+    io,
     mem::size_of,
     path::{Component, Path, PathBuf},
 };
 
+use crate::ShellPreparationError;
+
 pub const STALE_WORKDIR_ERROR: &str =
     "Prepared shell workdir is stale because its path or directory identity changed";
+const MISSING_WORKDIR_ERROR: &str = "Invalid arguments: workdir must be an existing directory";
+const UNINSPECTABLE_WORKDIR_ERROR: &str = "Invalid arguments: workdir cannot be inspected";
+const CONFINED_WORKDIR_ERROR: &str =
+    "Invalid arguments: workdir must be a directory inside the configured root";
 
 #[derive(Debug)]
 pub(crate) struct WorkdirBinding {
@@ -60,7 +67,10 @@ pub(crate) async fn canonicalize(path: &Path) -> std::io::Result<PathBuf> {
         .map_err(std::io::Error::other)?
 }
 
-pub(crate) async fn resolve(root: &Path, requested: &str) -> Result<WorkdirBinding, String> {
+pub(crate) async fn resolve(
+    root: &Path,
+    requested: &str,
+) -> Result<WorkdirBinding, ShellPreparationError> {
     let requested = if requested.is_empty() { "." } else { requested };
     let path = Path::new(requested);
     let lexical = normalize(if path.is_absolute() {
@@ -69,32 +79,34 @@ pub(crate) async fn resolve(root: &Path, requested: &str) -> Result<WorkdirBindi
         root.join(path)
     });
     if !inside(&lexical, root) {
-        return Err("Invalid arguments: workdir escapes the configured root".into());
+        return Err(ShellPreparationError::OutsideRoot(
+            "Invalid arguments: workdir escapes the configured root".into(),
+        ));
     }
     // Check again after canonicalization: the lexical check catches `..`, while this check catches
     // symlinks whose target leaves the configured root.
-    let canonical = canonicalize(&lexical)
-        .await
-        .map_err(|_| "Invalid arguments: workdir must be an existing directory".to_owned())?;
-    if !inside(&canonical, root)
-        || !tokio::fs::metadata(&canonical)
-            .await
-            .map_err(|_| "Invalid arguments: workdir cannot be inspected".to_owned())?
-            .is_dir()
-    {
-        return Err(
-            "Invalid arguments: workdir must be a directory inside the configured root".into(),
-        );
+    let canonical = canonicalize(&lexical).await.map_err(missing_workdir)?;
+    if !inside(&canonical, root) {
+        return Err(ShellPreparationError::OutsideRoot(
+            CONFINED_WORKDIR_ERROR.into(),
+        ));
+    }
+    if !inspect_directory(&canonical).await? {
+        return Err(ShellPreparationError::Invalid(
+            CONFINED_WORKDIR_ERROR.into(),
+        ));
     }
     let relative = canonical
         .strip_prefix(root)
-        .map_err(|_| "Invalid workdir".to_owned())?;
+        .map_err(|_| ShellPreparationError::Invalid("Invalid workdir".to_owned()))?;
     let relative = if relative.as_os_str().is_empty() {
         ".".to_owned()
     } else {
         relative.to_string_lossy().replace('\\', "/")
     };
-    let identity = identity(&canonical).await?;
+    let identity = identity(&canonical)
+        .await
+        .map_err(ShellPreparationError::Invalid)?;
     Ok(WorkdirBinding {
         canonical,
         requested: lexical,
@@ -108,7 +120,7 @@ pub(crate) async fn resolve(root: &Path, requested: &str) -> Result<WorkdirBindi
 pub(crate) async fn resolve_unconfined(
     base_cwd: &Path,
     requested: &str,
-) -> Result<WorkdirBinding, String> {
+) -> Result<WorkdirBinding, ShellPreparationError> {
     let requested = if requested.is_empty() { "." } else { requested };
     let path = Path::new(requested);
     let lexical = normalize(if path.is_absolute() {
@@ -116,15 +128,11 @@ pub(crate) async fn resolve_unconfined(
     } else {
         base_cwd.join(path)
     });
-    let canonical = canonicalize(&lexical)
-        .await
-        .map_err(|_| "Invalid arguments: workdir must be an existing directory".to_owned())?;
-    if !tokio::fs::metadata(&canonical)
-        .await
-        .map_err(|_| "Invalid arguments: workdir cannot be inspected".to_owned())?
-        .is_dir()
-    {
-        return Err("Invalid arguments: workdir must be a directory".into());
+    let canonical = canonicalize(&lexical).await.map_err(missing_workdir)?;
+    if !inspect_directory(&canonical).await? {
+        return Err(ShellPreparationError::Invalid(
+            "Invalid arguments: workdir must be a directory".into(),
+        ));
     }
     let relative = canonical.strip_prefix(base_cwd).map_or_else(
         |_| canonical.to_string_lossy().replace('\\', "/"),
@@ -136,7 +144,9 @@ pub(crate) async fn resolve_unconfined(
             }
         },
     );
-    let identity = identity(&canonical).await?;
+    let identity = identity(&canonical)
+        .await
+        .map_err(ShellPreparationError::Invalid)?;
     Ok(WorkdirBinding {
         canonical,
         requested: lexical,
@@ -145,6 +155,21 @@ pub(crate) async fn resolve_unconfined(
         identity,
         confined: false,
     })
+}
+
+fn missing_workdir(error: io::Error) -> ShellPreparationError {
+    if error.kind() == io::ErrorKind::NotFound {
+        ShellPreparationError::NotFound(MISSING_WORKDIR_ERROR.into())
+    } else {
+        ShellPreparationError::Invalid(MISSING_WORKDIR_ERROR.into())
+    }
+}
+
+async fn inspect_directory(path: &Path) -> Result<bool, ShellPreparationError> {
+    tokio::fs::metadata(path)
+        .await
+        .map(|metadata| metadata.is_dir())
+        .map_err(|_| ShellPreparationError::Invalid(UNINSPECTABLE_WORKDIR_ERROR.into()))
 }
 
 pub(crate) async fn revalidate(binding: &WorkdirBinding) -> Result<(), String> {

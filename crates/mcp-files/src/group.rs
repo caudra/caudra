@@ -153,7 +153,7 @@ impl FileToolGroup {
         let offset = input.offset.unwrap_or(1);
         let limit = input.limit.unwrap_or(self.core.limits.max_read_lines);
         if limit > self.core.limits.max_read_lines {
-            return Err(FilesystemError::message(format!(
+            return Err(FilesystemError::invalid(format!(
                 "limit must be an integer between 0 and {}",
                 self.core.limits.max_read_lines
             )));
@@ -165,7 +165,7 @@ impl FileToolGroup {
         } else if metadata.is_file() {
             FileResourceAccess::Read
         } else {
-            return Err(FilesystemError::message(format!(
+            return Err(FilesystemError::invalid(format!(
                 "Path is not a regular file: {}",
                 input.file_path
             )));
@@ -237,7 +237,7 @@ impl FileToolGroup {
         let path = self.core.policy.resolve(requested_path).await?;
         let metadata = inspect_existing(&path, requested_path).await?;
         if !metadata.is_dir() {
-            return Err(FilesystemError::message(format!(
+            return Err(FilesystemError::invalid(format!(
                 "glob path must be a directory: {requested_path}"
             )));
         }
@@ -306,7 +306,7 @@ impl FileToolGroup {
         } else if metadata.is_dir() {
             FileResourceAccess::Traverse
         } else {
-            return Err(FilesystemError::message(format!(
+            return Err(FilesystemError::invalid(format!(
                 "Path is not a regular file or directory: {requested_path}"
             )));
         };
@@ -573,7 +573,7 @@ impl FileToolGroup {
         } else if metadata.is_file() {
             FileResourceAccess::Read
         } else {
-            return Err(FilesystemError::message(format!(
+            return Err(FilesystemError::invalid(format!(
                 "Path is not a regular file or directory: {}",
                 input.path
             )));
@@ -687,7 +687,7 @@ impl FileToolGroup {
         )?;
         let hunks = parse_patch(&input.patch_text)?;
         if hunks.len() > self.core.limits.max_patch_files {
-            return Err(FilesystemError::message(format!(
+            return Err(FilesystemError::invalid(format!(
                 "Patch exceeds maximum of {} file sections",
                 self.core.limits.max_patch_files
             )));
@@ -743,7 +743,7 @@ impl FileToolGroup {
         } else if metadata.is_file() {
             FileResourceAccess::Read
         } else {
-            return Err(FilesystemError::message(format!(
+            return Err(FilesystemError::invalid(format!(
                 "Path is not a regular file or directory: {}",
                 input.path
             )));
@@ -818,7 +818,7 @@ impl FileToolGroup {
             relative_paths,
         };
         if prepared.retained_bytes() > maximum_retained_bytes {
-            return Err(FilesystemError::message(format!(
+            return Err(FilesystemError::invalid(format!(
                 "Patch plan exceeds maximum retained size of {maximum_retained_bytes} bytes"
             )));
         }
@@ -1253,7 +1253,7 @@ fn tool_error(error: impl ToString) -> Result<CallToolResult, rmcp::ErrorData> {
 
 fn nonempty(value: &str, name: &str) -> Result<(), FilesystemError> {
     if value.is_empty() {
-        Err(FilesystemError::message(format!(
+        Err(FilesystemError::invalid(format!(
             "Invalid arguments: {name} must not be empty"
         )))
     } else {
@@ -1269,7 +1269,7 @@ fn validate_read(mut input: FileReadInput) -> Result<FileReadInput, FilesystemEr
         input.file_path = ".".to_owned();
     }
     if input.offset == Some(0) {
-        return Err(FilesystemError::message(
+        return Err(FilesystemError::invalid(
             "Invalid arguments: offset must be at least 1",
         ));
     }
@@ -1280,7 +1280,7 @@ fn validate_read(mut input: FileReadInput) -> Result<FileReadInput, FilesystemEr
             .limit
             .is_some_and(|value| value as u64 > MAX_SAFE_INTEGER)
     {
-        return Err(FilesystemError::message(
+        return Err(FilesystemError::invalid(
             "Invalid arguments: numeric values must be safe integers",
         ));
     }

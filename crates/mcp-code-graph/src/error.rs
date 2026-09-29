@@ -48,6 +48,7 @@ impl From<FilesystemError> for CodeGraphError {
                 Self::Denied(message)
             }
             FilesystemError::Operation(message)
+            | FilesystemError::Invalid(message)
             | FilesystemError::NotFound(message)
             | FilesystemError::Stale(message) => Self::Invalid(message),
             // The context string is the action and path the filesystem crate already chose to

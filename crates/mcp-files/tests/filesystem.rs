@@ -18,6 +18,8 @@ const STALE_PUBLICATION: &str = "changed before publication";
 const FOREIGN_FILE_GROUP: &str = "different file tool group";
 const DIRECTORY_REPLACEMENT_CONTENT: &str = "directory grants must not expose this content";
 const DIRECTORY_LISTING_LIMIT: usize = 1;
+const INVALID_INPUT_CODE: &str = "invalid_input";
+const INVALID_OPERATION_CODE: &str = "invalid_operation";
 
 struct Fixture {
     _temporary: TempDir,
@@ -1394,6 +1396,68 @@ async fn exact_edit_requires_unique_match_unless_replace_all_is_set() {
         fs::read_to_string(fixture.root.join("repeat.txt")).unwrap(),
         "new\nnew\n"
     );
+}
+
+#[tokio::test]
+async fn a_refusal_caused_by_the_request_is_coded_apart_from_a_failed_operation() {
+    let fixture = fixture();
+    let files = FileToolGroup::new(&fixture.root, true, None)
+        .await
+        .expect("tool group");
+    let unmatched_edit = files
+        .file_edit(
+            FileEditInput {
+                file_path: "notes.txt".into(),
+                old_string: "absent".into(),
+                new_string: "present".into(),
+                replace_all: None,
+            },
+            &token(),
+        )
+        .await
+        .expect_err("an unmatched edit must be refused");
+    let malformed_patch = files
+        .file_apply_patch(
+            FileApplyPatchInput {
+                patch_text: "not a patch".into(),
+            },
+            &token(),
+        )
+        .await
+        .expect_err("a patch without markers must be refused");
+    let unsupported_regex = files
+        .file_grep(
+            FileGrepInput {
+                pattern: "(?=a)a".into(),
+                ..Default::default()
+            },
+            &token(),
+        )
+        .await
+        .expect_err("look-around must be refused");
+    for refusal in [unmatched_edit, malformed_patch, unsupported_regex] {
+        assert_eq!(refusal.code(), INVALID_INPUT_CODE, "{refusal}");
+    }
+
+    let directory = files
+        .prepare_read(
+            FileReadInput {
+                file_path: ".".into(),
+                offset: None,
+                limit: None,
+            },
+            &token(),
+        )
+        .await
+        .expect("prepared directory read");
+    let foreign = FileToolGroup::new(&fixture.root, true, None)
+        .await
+        .expect("foreign tool group");
+    let misrouted = foreign
+        .execute_prepared_directory_read(directory, &token())
+        .await
+        .expect_err("a foreign group must refuse the prepared read");
+    assert_eq!(misrouted.code(), INVALID_OPERATION_CODE);
 }
 
 #[tokio::test]

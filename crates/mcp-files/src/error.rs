@@ -8,6 +8,12 @@ pub enum FilesystemError {
     ProtectedPath(String),
     #[error("{0}")]
     Operation(String),
+    /// The request itself was refused before any effect: a malformed argument, a
+    /// target of the wrong kind, or a size over a configured bound. Distinct from
+    /// `Operation` because a caller that has to read prose to learn that retrying
+    /// unchanged fails the same way cannot branch on it.
+    #[error("{0}")]
+    Invalid(String),
     /// The path does not exist. Distinct from `Operation` because a caller that
     /// has to read prose to learn a file is simply absent cannot branch on it.
     #[error("{0}")]
@@ -36,6 +42,7 @@ impl FilesystemError {
             Self::RootEscape(_) => "path_outside_root",
             Self::ProtectedPath(_) => "protected_path",
             Self::Operation(_) => "invalid_operation",
+            Self::Invalid(_) => "invalid_input",
             Self::NotFound(_) => "not_found",
             Self::Stale(_) => "stale_resource",
             Self::Aborted => "cancelled",
@@ -49,6 +56,10 @@ impl FilesystemError {
 
     pub(crate) fn message(message: impl Into<String>) -> Self {
         Self::Operation(message.into())
+    }
+
+    pub(crate) fn invalid(message: impl Into<String>) -> Self {
+        Self::Invalid(message.into())
     }
 
     pub(crate) fn not_found(message: impl Into<String>) -> Self {

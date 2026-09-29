@@ -60,7 +60,7 @@ impl RootPathPolicy {
 
     pub(crate) async fn resolve(&self, requested: &str) -> Result<PathBuf, FilesystemError> {
         if requested.is_empty() {
-            return Err(FilesystemError::message("path is required"));
+            return Err(FilesystemError::invalid("path is required"));
         }
         let requested_path = Path::new(requested);
         let lexical = if requested_path.is_absolute() {

@@ -21,8 +21,8 @@ impl ParseFailure {
         match self {
             Self::Cancelled => FilesystemError::Aborted,
             Self::Deadline => FilesystemError::message("Index parser deadline exceeded"),
-            Self::NodeLimit => FilesystemError::message("Index post-parse node limit exceeded"),
-            Self::DepthLimit => FilesystemError::message("Index post-parse depth limit exceeded"),
+            Self::NodeLimit => FilesystemError::invalid("Index post-parse node limit exceeded"),
+            Self::DepthLimit => FilesystemError::invalid("Index post-parse depth limit exceeded"),
             Self::Parser => FilesystemError::message("Index parser failed"),
         }
     }

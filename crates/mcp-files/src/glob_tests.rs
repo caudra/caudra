@@ -102,7 +102,7 @@ fn rejects_expansion_before_exponential_allocation() {
     };
     let error = GlobMatcher::new("{a,b}{a,b}{a,b}{a,b}", &limits)
         .expect_err("sixteen alternatives must be rejected");
-    assert!(matches!(error, FilesystemError::Operation(_)));
+    assert!(matches!(error, FilesystemError::Invalid(_)));
     assert!(error.to_string().contains("maximum of 8 alternatives"));
 
     for (limits, pattern, expected) in [

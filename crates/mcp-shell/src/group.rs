@@ -75,6 +75,29 @@ impl fmt::Display for ShellBuildError {
 }
 impl std::error::Error for ShellBuildError {}
 
+/// A shell request refused before any process started, typed by cause so a caller never has to
+/// parse the message to tell a workdir outside the root from one that does not exist.
+#[derive(Debug, thiserror::Error)]
+pub enum ShellPreparationError {
+    #[error("{0}")]
+    Invalid(String),
+    #[error("{0}")]
+    OutsideRoot(String),
+    #[error("{0}")]
+    NotFound(String),
+}
+
+impl ShellPreparationError {
+    #[must_use]
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::Invalid(_) => "shell_preparation_failed",
+            Self::OutsideRoot(_) => "path_outside_root",
+            Self::NotFound(_) => "not_found",
+        }
+    }
+}
+
 impl ShellToolGroup {
     pub async fn new(root: impl AsRef<Path>) -> Result<Self, ShellBuildError> {
         Self::with_policy(root, ShellPermissionPolicy::restricted()).await
@@ -197,7 +220,7 @@ impl ShellToolGroup {
         };
         let prepared = match self.prepare(input).await {
             Ok(prepared) => prepared,
-            Err(error) => return Some(Ok(tool_error(error))),
+            Err(error) => return Some(Ok(tool_error(error.to_string()))),
         };
         if let Err(error) = self.authorize_prepared(&prepared) {
             return Some(Ok(tool_error(error)));
@@ -215,9 +238,9 @@ impl ShellToolGroup {
     }
 
     /// Validate, inspect, and apply immutable policy without starting a process.
-    pub async fn prepare(&self, input: ShellInput) -> Result<PreparedShell, String> {
-        validate_command(&input.command)?;
-        let timeout_ms = input.timeout_ms()?;
+    pub async fn prepare(&self, input: ShellInput) -> Result<PreparedShell, ShellPreparationError> {
+        validate_command(&input.command).map_err(ShellPreparationError::Invalid)?;
+        let timeout_ms = input.timeout_ms().map_err(ShellPreparationError::Invalid)?;
         self.bind(input.command, timeout_ms, input.workdir.as_deref())
             .await
     }
@@ -234,7 +257,8 @@ impl ShellToolGroup {
         let timeout_ms = direct_timeout_ms(options.timeout_ms)?;
         let prepared = self
             .bind(command, timeout_ms, Some(&relative_workdir))
-            .await?;
+            .await
+            .map_err(|error| error.to_string())?;
         self.authorize_prepared(&prepared)?;
         Ok(prepared)
     }
@@ -244,7 +268,7 @@ impl ShellToolGroup {
         command: String,
         timeout_ms: u64,
         requested_workdir: Option<&str>,
-    ) -> Result<PreparedShell, String> {
+    ) -> Result<PreparedShell, ShellPreparationError> {
         let requested_workdir = requested_workdir.unwrap_or(".");
         let workdir = if self.confined {
             workdir::resolve(&self.root, requested_workdir).await?
@@ -576,7 +600,10 @@ impl ShellToolGroup {
         cancellation: CancellationToken,
         progress: Option<Arc<dyn ShellProgressSink>>,
     ) -> Result<Option<ShellExecution>, String> {
-        let prepared = self.prepare(input).await?;
+        let prepared = self
+            .prepare(input)
+            .await
+            .map_err(|error| error.to_string())?;
         self.authorize_prepared(&prepared)?;
         self.execute_prepared(prepared, cancellation, progress)
             .await
@@ -731,6 +758,9 @@ mod tests {
     const CARGO_TEST_STDERR: &str = "warning: future incompatibility\n";
     const PREPARED_TIMEOUT_SECS: u64 = 321;
     const HOURS_LONG_TIMEOUT_SECS: u64 = 10_800;
+    const SHELL_PREPARATION_FAILED_CODE: &str = "shell_preparation_failed";
+    const PATH_OUTSIDE_ROOT_CODE: &str = "path_outside_root";
+    const NOT_FOUND_CODE: &str = "not_found";
 
     async fn group_for_render(output_filter: bool) -> (tempfile::TempDir, ShellToolGroup) {
         let root = tempfile::tempdir().unwrap();
@@ -1089,7 +1119,8 @@ mod tests {
                     workdir: None,
                 })
                 .await
-                .unwrap_err();
+                .unwrap_err()
+                .to_string();
             assert!(
                 error.contains(&format!("timeoutSec is {requested} seconds")),
                 "{error}"
@@ -1189,6 +1220,36 @@ mod tests {
                 .is_none()
         );
         assert!(!marker.exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_refused_workdir_carries_the_code_of_its_cause() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("file.txt"), "").unwrap();
+        symlink(outside.path(), root.path().join("escape")).unwrap();
+        let group = ShellToolGroup::with_policy(root.path(), ShellPermissionPolicy::yolo())
+            .await
+            .unwrap();
+        for (workdir, code) in [
+            ("..", PATH_OUTSIDE_ROOT_CODE),
+            ("escape", PATH_OUTSIDE_ROOT_CODE),
+            ("missing", NOT_FOUND_CODE),
+            ("file.txt", SHELL_PREPARATION_FAILED_CODE),
+        ] {
+            let error = group
+                .prepare(ShellInput {
+                    command: "printf refused".into(),
+                    timeout_sec: None,
+                    workdir: Some(workdir.into()),
+                })
+                .await
+                .unwrap_err();
+            assert_eq!(error.code(), code, "{workdir}: {error}");
+        }
     }
 
     #[cfg(unix)]

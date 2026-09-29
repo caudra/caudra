@@ -44,7 +44,7 @@ impl FilesystemCore {
         check_cancelled(token)?;
         let metadata = fs::metadata(&requested).await.map_err(|error| {
             if error.kind() == std::io::ErrorKind::NotFound {
-                FilesystemError::message("Prepared grep path is no longer available")
+                FilesystemError::not_found("Prepared grep path is no longer available")
             } else {
                 FilesystemError::io_path("Cannot inspect", &requested, error)
             }
@@ -178,17 +178,17 @@ pub(crate) fn compile_linear_regex(
     maximum: usize,
 ) -> Result<Regex, FilesystemError> {
     if js_length(pattern) > maximum {
-        return Err(FilesystemError::message(format!(
+        return Err(FilesystemError::invalid(format!(
             "grep regex exceeds maximum length of {maximum}"
         )));
     }
     if contains_unsupported_ecmascript_construct(pattern) {
-        return Err(FilesystemError::message(
+        return Err(FilesystemError::invalid(
             "Unsupported grep regex construct: look-around and backreferences are not available in linear-time mode",
         ));
     }
     Regex::new(pattern)
-        .map_err(|error| FilesystemError::message(format!("Invalid grep regex: {error}")))
+        .map_err(|error| FilesystemError::invalid(format!("Invalid grep regex: {error}")))
 }
 
 fn contains_unsupported_ecmascript_construct(pattern: &str) -> bool {

@@ -77,7 +77,7 @@ pub(crate) async fn read_bounded(
         .map_err(|error| FilesystemError::io_path("Cannot read", path, error))?;
     check_cancelled(token)?;
     if bytes.len() > maximum {
-        return Err(FilesystemError::message(format!(
+        return Err(FilesystemError::invalid(format!(
             "File exceeds maximum size of {maximum} bytes: {}",
             path.to_string_lossy()
         )));
@@ -87,7 +87,7 @@ pub(crate) async fn read_bounded(
 
 pub(crate) fn reject_binary(path: &Path, bytes: &[u8]) -> Result<(), FilesystemError> {
     if is_binary_content(bytes) {
-        return Err(FilesystemError::message(format!(
+        return Err(FilesystemError::invalid(format!(
             "Cannot operate on binary file: {}",
             path.to_string_lossy()
         )));
@@ -199,7 +199,7 @@ pub(crate) fn enforce_bytes(
     maximum: usize,
 ) -> Result<(), FilesystemError> {
     if value.len() > maximum {
-        return Err(FilesystemError::message(format!(
+        return Err(FilesystemError::invalid(format!(
             "{label} exceeds maximum size of {maximum} bytes"
         )));
     }

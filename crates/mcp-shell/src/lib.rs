@@ -20,7 +20,7 @@ mod workdir;
 #[cfg(feature = "mcp")]
 pub use catalog::catalog;
 pub use catalog::specs;
-pub use group::{ShellBuildError, ShellToolGroup};
+pub use group::{ShellBuildError, ShellPreparationError, ShellToolGroup};
 pub use permission::{
     ShellPermissionPolicy, ShellPermissionPolicyError, ShellPermissionPolicySummary,
 };

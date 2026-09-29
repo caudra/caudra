@@ -42,12 +42,12 @@ pub(crate) fn parse_patch(patch_text: &str) -> Result<Vec<PatchHunk>, Filesystem
         .position(|line| line.trim() == "*** Begin Patch");
     let end = lines.iter().position(|line| line.trim() == "*** End Patch");
     let (Some(begin), Some(end)) = (begin, end) else {
-        return Err(FilesystemError::message(
+        return Err(FilesystemError::invalid(
             "Invalid patch format: missing Begin/End markers",
         ));
     };
     if begin >= end {
-        return Err(FilesystemError::message(
+        return Err(FilesystemError::invalid(
             "Invalid patch format: missing Begin/End markers",
         ));
     }
@@ -63,7 +63,7 @@ pub(crate) fn parse_patch(patch_text: &str) -> Result<Vec<PatchHunk>, Filesystem
             while index < end && !lines[index].starts_with("***") {
                 let content_line = lines[index];
                 let Some(content_line) = content_line.strip_prefix('+') else {
-                    return Err(FilesystemError::message("Add File lines must start with +"));
+                    return Err(FilesystemError::invalid("Add File lines must start with +"));
                 };
                 content.push(content_line);
                 index += 1;
@@ -97,7 +97,7 @@ pub(crate) fn parse_patch(patch_text: &str) -> Result<Vec<PatchHunk>, Filesystem
             while index < end && !lines[index].starts_with("***") {
                 let marker = lines[index];
                 let Some(marker_body) = marker.strip_prefix("@@") else {
-                    return Err(FilesystemError::message(format!(
+                    return Err(FilesystemError::invalid(format!(
                         "Expected patch chunk, received: {marker}"
                     )));
                 };
@@ -127,7 +127,7 @@ pub(crate) fn parse_patch(patch_text: &str) -> Result<Vec<PatchHunk>, Filesystem
                     } else if let Some(value) = change.strip_prefix('+') {
                         new_lines.push(value.to_owned());
                     } else {
-                        return Err(FilesystemError::message(format!(
+                        return Err(FilesystemError::invalid(format!(
                             "Invalid patch line: {change}"
                         )));
                     }
@@ -141,7 +141,7 @@ pub(crate) fn parse_patch(patch_text: &str) -> Result<Vec<PatchHunk>, Filesystem
                 });
             }
             if chunks.is_empty() {
-                return Err(FilesystemError::message(format!(
+                return Err(FilesystemError::invalid(format!(
                     "Update File has no chunks: {path}"
                 )));
             }
@@ -153,14 +153,14 @@ pub(crate) fn parse_patch(patch_text: &str) -> Result<Vec<PatchHunk>, Filesystem
             continue;
         }
         if !line.trim().is_empty() {
-            return Err(FilesystemError::message(format!(
+            return Err(FilesystemError::invalid(format!(
                 "Invalid patch section: {line}"
             )));
         }
         index += 1;
     }
     if hunks.is_empty() {
-        return Err(FilesystemError::message(
+        return Err(FilesystemError::invalid(
             "Patch must contain at least one file section",
         ));
     }
@@ -184,7 +184,7 @@ pub(crate) fn apply_update_chunks(
         if let Some(context) = &chunk.context {
             let Some(context_index) = seek(&lines, std::slice::from_ref(context), cursor, false)
             else {
-                return Err(FilesystemError::message(format!(
+                return Err(FilesystemError::invalid(format!(
                     "Failed to find context '{context}' in {file_path}"
                 )));
             };
@@ -195,7 +195,7 @@ pub(crate) fn apply_update_chunks(
             continue;
         }
         let Some(found) = seek(&lines, &chunk.old_lines, cursor, chunk.end_of_file) else {
-            return Err(FilesystemError::message(format!(
+            return Err(FilesystemError::invalid(format!(
                 "Failed to find expected lines in {file_path}:\n{}",
                 chunk.old_lines.join("\n")
             )));
@@ -284,7 +284,7 @@ impl Comparison {
 fn required_header_path(line: &str, prefix: &str) -> Result<String, FilesystemError> {
     let value = line[prefix.len()..].trim();
     if value.is_empty() {
-        return Err(FilesystemError::message(format!(
+        return Err(FilesystemError::invalid(format!(
             "{prefix} requires a path"
         )));
     }

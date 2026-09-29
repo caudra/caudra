@@ -87,7 +87,7 @@ impl FilesystemCore {
     ) -> Result<Vec<PlannedChange>, FilesystemError> {
         let hunks = parse_patch(patch_text)?;
         if hunks.len() > self.limits.max_patch_files {
-            return Err(FilesystemError::message(format!(
+            return Err(FilesystemError::invalid(format!(
                 "Patch exceeds maximum of {} file sections",
                 self.limits.max_patch_files
             )));
@@ -100,14 +100,14 @@ impl FilesystemCore {
             let hunk_path = hunk.path().to_owned();
             let file_path = self.policy.resolve(&hunk_path).await?;
             if !used.insert(file_path.clone()) {
-                return Err(FilesystemError::message(format!(
+                return Err(FilesystemError::invalid(format!(
                     "Patch references a path more than once: {hunk_path}"
                 )));
             }
             match hunk {
                 PatchHunk::Add { contents, .. } => {
                     if exists(&file_path).await {
-                        return Err(FilesystemError::message(format!(
+                        return Err(FilesystemError::invalid(format!(
                             "Cannot add existing file: {hunk_path}"
                         )));
                     }
@@ -201,12 +201,12 @@ impl FilesystemCore {
                     };
                     if let Some((requested_move, target)) = &move_path {
                         if used.contains(target) {
-                            return Err(FilesystemError::message(format!(
+                            return Err(FilesystemError::invalid(format!(
                                 "Patch target conflicts with another path: {requested_move}"
                             )));
                         }
                         if exists(target).await {
-                            return Err(FilesystemError::message(format!(
+                            return Err(FilesystemError::invalid(format!(
                                 "Cannot move over existing file: {requested_move}"
                             )));
                         }
@@ -283,7 +283,7 @@ fn fit(
         // Every preview is already gone and the receipt still does not fit, so
         // no representable result exists. The caller learns that before any
         // file is published rather than after.
-        return Err(FilesystemError::message(format!(
+        return Err(FilesystemError::invalid(format!(
             "Patch result exceeds maximum size of {limit} bytes"
         )));
     }
@@ -357,7 +357,7 @@ impl PatchPlanBudget {
             .and_then(|value| value.checked_add(diff_bytes))
             .unwrap_or(usize::MAX);
         if measured > self.maximum_bytes {
-            return Err(FilesystemError::message(format!(
+            return Err(FilesystemError::invalid(format!(
                 "Patch plan exceeds maximum content budget of {} bytes",
                 self.maximum_bytes
             )));
@@ -411,7 +411,7 @@ fn patch_preview_peak(changes: &[PlannedChange]) -> usize {
 
 fn enforce_patch_bytes(bytes: usize, maximum: usize) -> Result<(), FilesystemError> {
     if bytes > maximum {
-        return Err(FilesystemError::message(format!(
+        return Err(FilesystemError::invalid(format!(
             "Patch plan exceeds maximum retained size of {maximum} bytes"
         )));
     }

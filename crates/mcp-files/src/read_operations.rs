@@ -41,7 +41,7 @@ impl FilesystemCore {
         let metadata = match fs::metadata(&file_path).await {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Err(FilesystemError::message(format!(
+                return Err(FilesystemError::not_found(format!(
                     "File not found: {}",
                     requested_path
                 )));
@@ -55,7 +55,7 @@ impl FilesystemCore {
             }
         };
         if !metadata.is_file() {
-            return Err(FilesystemError::message(format!(
+            return Err(FilesystemError::invalid(format!(
                 "Path is not a regular file: {}",
                 requested_path
             )));
