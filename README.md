@@ -1070,6 +1070,13 @@ rather than lines, so a host that displays those chunks renders them itself with
 one still being drawn, and `redraws` reports how many frames were absorbed. The capture already
 arrives rendered, and `ShellOutput::{stdout,stderr}_redraws_collapsed` say by how much.
 
+A shell child starts from the fixed environment allowlist described under [`shell`](#shell). A host
+whose own environment carries context its commands need, such as the terminal pane it runs in, adds
+names with `ShellToolGroup::with_inherited_environment`. Names that decide which Bash runs or how it
+starts, among them every `BASH*` name, `ENV`, `SHELLOPTS`, `CDPATH`, and `PWD`, are dropped even when
+listed, because `PreparedShell::bash_command_contexts` assumes Bash started without them. `NO_COLOR`
+and `CLICOLOR` keep Workcell's values.
+
 ### Confinement is a host decision
 
 `FileToolGroup::new` and `ShellToolGroup::with_policy` confine to a root, exactly as the standalone
@@ -1466,8 +1473,9 @@ through the same confined resolver the filesystem tools use and never opens a pa
   or allowed programs.
 - The child receives a cleaned allowlist of environment variables rather than the complete Workcell
   environment. The allowlist covers `PATH`, home, locale, temporary-directory, and the conventional
-  proxy variables, so a credentialed proxy URL is readable by any admitted command. Standard input is
-  closed; stdout and stderr are captured separately.
+  proxy variables, so a credentialed proxy URL is readable by any admitted command. An embedding host
+  can add names with `ShellToolGroup::with_inherited_environment`. Standard input is closed; stdout and
+  stderr are captured separately.
 - With an MCP progress token, decoded stdout and stderr chunks are sent as ordered
   `notifications/progress` messages before the final result. Without a token, output is still drained
   safely and only bounded tails are returned.

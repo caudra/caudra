@@ -25,8 +25,26 @@ use crate::bash::BashContextAssumptions;
 const TERMINATION_GRACE: Duration = Duration::from_secs(3);
 #[cfg(unix)]
 const BASH_ARGUMENTS: [&str; 3] = ["--noprofile", "--norc", "-c"];
-#[cfg(unix)]
 const BASH_EXECUTABLE_ENV: &str = "WORKCELL_BASH_EXECUTABLE";
+/// Bash gives variables under this prefix special meaning, `BASH_ENV` and exported functions among
+/// them.
+const BASH_VARIABLE_PREFIX: &str = "BASH";
+/// Names that decide which Bash runs or how it starts. A host that lists one for forwarding does not
+/// get it, because the policy's startup assumptions hold only in their absence.
+const STARTUP_VARIABLES: &[&str] = &[
+    BASH_EXECUTABLE_ENV,
+    "ENV",
+    "SHELLOPTS",
+    "POSIXLY_CORRECT",
+    "CDPATH",
+    "PWD",
+    "OLDPWD",
+    "PROMPT_COMMAND",
+    "PS4",
+    "IFS",
+    "GLOBIGNORE",
+    "EXECIGNORE",
+];
 #[cfg(unix)]
 const DEFAULT_BASH_EXECUTABLES: &[&str] = &["/bin/bash", "/usr/bin/bash"];
 const MAX_LAUNCHER_PATH_BYTES: usize = 4096;
@@ -202,28 +220,44 @@ pub(crate) fn retained_launcher_bytes(launcher: &SharedShellLauncher) -> usize {
 }
 
 #[cfg(unix)]
-pub(crate) fn platform_command(launcher: &ShellLauncher, script: &str) -> Command {
+pub(crate) fn platform_command(
+    launcher: &ShellLauncher,
+    script: &str,
+    inherited: &[&str],
+) -> Command {
     let mut command = Command::new(&launcher.executable);
     command.args(BASH_ARGUMENTS).arg(script);
-    clean_environment(&mut command);
+    clean_environment(&mut command, inherited);
     // A dedicated group lets cancellation target descendants that inherited the shell's group.
     command.as_std_mut().process_group(0);
     command
 }
 #[cfg(windows)]
-pub(crate) fn platform_command(launcher: &ShellLauncher, script: &str) -> Command {
+pub(crate) fn platform_command(
+    launcher: &ShellLauncher,
+    script: &str,
+    inherited: &[&str],
+) -> Command {
     let mut command = Command::new(&launcher.executable);
     command.arg("/D").arg("/S").arg("/C").arg(script);
-    clean_environment(&mut command);
+    clean_environment(&mut command, inherited);
     command
 }
 
-fn clean_environment(command: &mut Command) {
-    clean_environment_with(command, |name: &str| std::env::var_os(name));
+fn clean_environment(command: &mut Command, inherited: &[&str]) {
+    clean_environment_with(command, inherited, |name: &str| std::env::var_os(name));
 }
 
-fn clean_environment_with(command: &mut Command, read: impl Fn(&str) -> Option<OsString>) {
+fn clean_environment_with(
+    command: &mut Command,
+    inherited: &[&str],
+    read: impl Fn(&str) -> Option<OsString>,
+) {
     command.env_clear();
+    let listed = inherited
+        .iter()
+        .copied()
+        .filter(|name| !decides_bash_startup(name));
     for name in [
         "PATH",
         "HOME",
@@ -251,12 +285,16 @@ fn clean_environment_with(command: &mut Command, read: impl Fn(&str) -> Option<O
         "all_proxy",
         "NO_PROXY",
         "no_proxy",
-    ] {
+    ]
+    .into_iter()
+    .chain(listed)
+    {
         if let Some(value) = read(name) {
             command.env(name, value);
         }
     }
-    // Set, not forwarded. `env_clear` already dropped any inherited `NO_COLOR`,
+    // Set, not forwarded, and after every forwarded name so a listed one cannot
+    // replace it. `env_clear` already dropped any inherited `NO_COLOR`,
     // `FORCE_COLOR`, and `CLICOLOR_FORCE`, so this establishes a default for an
     // environment that has none rather than overriding an operator's choice.
     // Not conditioned on the output filter: this describes the environment a
@@ -265,6 +303,10 @@ fn clean_environment_with(command: &mut Command, read: impl Fn(&str) -> Option<O
     // `--color=always` still wins, which is the intended behaviour.
     command.env("NO_COLOR", "1");
     command.env("CLICOLOR", "0");
+}
+
+fn decides_bash_startup(name: &str) -> bool {
+    name.starts_with(BASH_VARIABLE_PREFIX) || STARTUP_VARIABLES.contains(&name)
 }
 
 pub(crate) async fn terminate_and_reap(
@@ -384,12 +426,16 @@ mod tests {
         ("OLDPWD", "/outside"),
         ("PROMPT_COMMAND", "cd /"),
         ("PS4", "$(cd /)"),
+        ("POSIXLY_CORRECT", "1"),
+        ("IFS", "/"),
+        ("GLOBIGNORE", "*"),
+        ("EXECIGNORE", "*"),
     ];
 
     #[tokio::test]
     async fn startup_trust_matches_the_actual_platform_launcher() {
         let launcher = ShellLauncher::from_host().await.unwrap();
-        let command = platform_command(&launcher, LAUNCH_CANARY);
+        let command = platform_command(&launcher, LAUNCH_CANARY, &[]);
         let arguments: Vec<_> = command.as_std().get_args().collect();
         assert_eq!(launcher.bash_startup_assumptions().is_some(), cfg!(unix));
         assert_eq!(
@@ -431,20 +477,45 @@ mod tests {
 
     #[test]
     fn startup_files_options_functions_and_directory_variables_are_not_inherited() {
-        let inherited = child_environment(STARTUP_ENVIRONMENT);
+        let inherited = child_environment(STARTUP_ENVIRONMENT, &[]);
         for (forbidden, _) in STARTUP_ENVIRONMENT {
             assert!(inherited.iter().all(|(name, _)| name != forbidden));
         }
     }
 
+    #[test]
+    fn startup_variables_stay_dropped_even_when_a_host_lists_them() {
+        let listed: Vec<&str> = STARTUP_ENVIRONMENT.iter().map(|(name, _)| *name).collect();
+        let inherited = child_environment(STARTUP_ENVIRONMENT, &listed);
+        for (forbidden, _) in STARTUP_ENVIRONMENT {
+            assert!(
+                inherited.iter().all(|(name, _)| name != forbidden),
+                "{forbidden} must not reach the child"
+            );
+        }
+    }
+
+    #[test]
+    fn host_listed_variables_reach_the_child() {
+        const LISTED: (&str, &str) = ("HOST_PANE_ID", "w1:p2");
+        const UNLISTED: (&str, &str) = ("HOST_SESSION_TOKEN", "session-secret-canary");
+        let inherited = child_environment(&[LISTED, UNLISTED], &[LISTED.0]);
+        assert!(
+            inherited
+                .iter()
+                .any(|(name, value)| name == LISTED.0 && value == LISTED.1)
+        );
+        assert!(inherited.iter().all(|(name, _)| name != UNLISTED.0));
+    }
+
     /// Resolve the child environment from a fixture instead of the real process environment, which
     /// cannot be mutated from a test without `unsafe` under edition 2024.
-    fn child_environment(fixture: &[(&str, &str)]) -> Vec<(String, String)> {
+    fn child_environment(fixture: &[(&str, &str)], listed: &[&str]) -> Vec<(String, String)> {
         let mut command = Command::new("ignored");
         for (name, value) in fixture {
             command.env(name, value);
         }
-        clean_environment_with(&mut command, |name| {
+        clean_environment_with(&mut command, listed, |name| {
             fixture
                 .iter()
                 .find(|(candidate, _)| *candidate == name)
@@ -466,12 +537,15 @@ mod tests {
 
     #[test]
     fn child_environment_drops_runtime_and_provider_secrets() {
-        let inherited = child_environment(&[
-            ("PATH", "/usr/bin"),
-            ("WORKCELL_PRIVATE_SECRET", "private-secret-canary"),
-            ("WORKCELL_RUNTIME_SERVICE_TOKEN", "service-secret-canary"),
-            ("EXA_API_KEY", "web-secret-canary"),
-        ]);
+        let inherited = child_environment(
+            &[
+                ("PATH", "/usr/bin"),
+                ("WORKCELL_PRIVATE_SECRET", "private-secret-canary"),
+                ("WORKCELL_RUNTIME_SERVICE_TOKEN", "service-secret-canary"),
+                ("EXA_API_KEY", "web-secret-canary"),
+            ],
+            &[],
+        );
         for forbidden in [
             "WORKCELL_PRIVATE_SECRET",
             "WORKCELL_RUNTIME_SERVICE_TOKEN",
@@ -494,7 +568,7 @@ mod tests {
             ("ALL_PROXY", "http://proxy.internal:3128"),
             ("NO_PROXY", "localhost,127.0.0.1,10.0.0.0/8"),
         ];
-        let inherited = child_environment(&fixture);
+        let inherited = child_environment(&fixture, &[]);
         for (name, value) in fixture {
             assert!(
                 inherited
@@ -509,8 +583,12 @@ mod tests {
     fn child_environment_defaults_to_no_colour() {
         // Preventing the bytes is cheaper than deleting them afterwards, and it
         // is the only lever that works on a tool the escape strip would have to
-        // rewrite. A value inherited from the parent must not defeat it.
-        let inherited = child_environment(&[("NO_COLOR", ""), ("CLICOLOR", "1")]);
+        // rewrite. A value inherited from the parent must not defeat it, even
+        // one a host lists.
+        let inherited = child_environment(
+            &[("NO_COLOR", ""), ("CLICOLOR", "1")],
+            &["NO_COLOR", "CLICOLOR"],
+        );
         for (name, expected) in [("NO_COLOR", "1"), ("CLICOLOR", "0")] {
             assert!(
                 inherited

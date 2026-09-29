@@ -456,6 +456,12 @@ for hosts that authorize paths and commands themselves:
   Permission policy stays fail-closed unless the host supplies its own, and deny rules still reject a
   request before any command runs.
 
+`ShellToolGroup::with_inherited_environment` forwards the host variables it names to every command,
+unchanged, so any admitted command can read them. Names that decide which Bash runs or how it starts,
+including every `BASH*` name, `ENV`, `SHELLOPTS`, `POSIXLY_CORRECT`, `CDPATH`, `PWD`, `PS4`, and
+`WORKCELL_BASH_EXECUTABLE`, are dropped even when listed, because the command-context analysis a host
+authorizes against assumes Bash started without them.
+
 Prepared operations exist so that authorization can happen before any effect. `prepare_apply_patch`,
 `ShellToolGroup::prepare`, and the web `prepare_*` methods disclose every path, command scope, query,
 or URL a call would touch without reading, writing, or executing anything. A host that commits a

@@ -64,6 +64,7 @@ pub struct ShellToolGroup {
     policy: ShellPermissionPolicy,
     confined: bool,
     output_filter: bool,
+    inherited_environment: &'static [&'static str],
     launcher: SharedShellLauncher,
 }
 #[derive(Debug)]
@@ -152,6 +153,7 @@ impl ShellToolGroup {
             policy,
             confined,
             output_filter: true,
+            inherited_environment: &[],
             launcher: Arc::new(ShellLauncher::from_host().await),
         })
     }
@@ -165,6 +167,17 @@ impl ShellToolGroup {
     #[must_use]
     pub const fn with_output_filter(mut self, enabled: bool) -> Self {
         self.output_filter = enabled;
+        self
+    }
+
+    /// Forwards the named host variables to every command this group executes, on top of the
+    /// fixed allowlist, for a host whose own environment carries context its commands need.
+    ///
+    /// Names that decide which Bash runs or how it starts are dropped even when listed, because the
+    /// policy's startup assumptions hold only in their absence.
+    #[must_use]
+    pub const fn with_inherited_environment(mut self, names: &'static [&'static str]) -> Self {
+        self.inherited_environment = names;
         self
     }
 
@@ -313,7 +326,7 @@ impl ShellToolGroup {
         // all per-execution resources inside the global concurrency budget.
         let _permit = tokio::select! {permit=concurrency().clone().acquire_owned()=>permit.map_err(|_|"Shell concurrency gate is unavailable".to_owned())?,()=cancellation.cancelled()=>return Ok(None)};
         let started = Instant::now();
-        let mut command = platform_command(launcher, &command_text);
+        let mut command = platform_command(launcher, &command_text, self.inherited_environment);
         command
             .current_dir(workdir.canonical())
             .stdin(Stdio::null())
