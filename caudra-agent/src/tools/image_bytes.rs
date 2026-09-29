@@ -22,6 +22,7 @@ use crate::permissions::{
     PermissionResource, PermissionResourceAccess, PermissionResourceKind, RemotePermissionIdentity,
     canonical_json_sha256,
 };
+use crate::tools::{ToolError, ToolFailure};
 
 /// Anthropic rejects images over 5MB base64; 3MB raw is ~4MB encoded, which
 /// leaves headroom. Also keeps generation request bodies small.
@@ -88,39 +89,47 @@ pub(crate) struct RemoteImageResource {
     pub size_bytes: u64,
 }
 
+/// A file the call named that no provider would take, however often it retries.
+fn invalid(message: String) -> ToolError {
+    ToolError::new(ToolFailure::InvalidInput, message)
+}
+
 /// Read, validate, and shrink `path` until a provider will accept it.
-pub(crate) fn prepare(path: &str) -> Result<PreparedImage, String> {
-    let meta = std::fs::metadata(path).map_err(|_| format!("error: path not found: {path}"))?;
+pub(crate) fn prepare(path: &str) -> Result<PreparedImage, ToolError> {
+    let meta = std::fs::metadata(path).map_err(|error| {
+        ToolError::new((&error).into(), format!("error: path not found: {path}"))
+    })?;
     if meta.is_dir() {
-        return Err(format!("error: {path} is a directory"));
+        return Err(invalid(format!("error: {path} is a directory")));
     }
     if meta.len() > MAX_INPUT_BYTES {
-        return Err(format!(
+        return Err(invalid(format!(
             "{path} is too large to view ({}; limit {})",
             format_size(meta.len()),
             format_size(MAX_INPUT_BYTES)
-        ));
+        )));
     }
 
-    let bytes = std::fs::read(path).map_err(|e| format!("cannot read {path}: {e}"))?;
+    let bytes = std::fs::read(path)
+        .map_err(|e| ToolError::new((&e).into(), format!("cannot read {path}: {e}")))?;
     prepare_bytes(path, &bytes)
 }
 
-pub(crate) fn prepare_bytes(path: &str, bytes: &[u8]) -> Result<PreparedImage, String> {
+pub(crate) fn prepare_bytes(path: &str, bytes: &[u8]) -> Result<PreparedImage, ToolError> {
     if bytes.len() as u64 > MAX_INPUT_BYTES {
-        return Err(format!(
+        return Err(invalid(format!(
             "{path} is too large to view ({}; limit {})",
             format_size(bytes.len() as u64),
             format_size(MAX_INPUT_BYTES)
-        ));
+        )));
     }
     let (format, width, height) =
-        probe(bytes).map_err(|e| format!("{path} is not an image {e}"))?;
+        probe(bytes).map_err(|e| invalid(format!("{path} is not an image {e}")))?;
     let source_media = media_type(format).ok_or_else(|| {
-        format!(
+        invalid(format!(
             "unsupported image format {}: only png, jpeg, gif, and webp can be viewed",
             format_name(format)
-        )
+        ))
     })?;
 
     // Decode fully even on the pass-through path: a corrupt file shipped
@@ -162,11 +171,11 @@ pub(crate) fn prepare_bytes(path: &str, bytes: &[u8]) -> Result<PreparedImage, S
         encoded = encode(&decoded, out_format)?;
     }
     if encoded.len() as u64 > MAX_RAW_BYTES {
-        return Err(format!(
+        return Err(invalid(format!(
             "{path} is too large to view ({} after downscaling; limit {})",
             format_size(encoded.len() as u64),
             format_size(MAX_RAW_BYTES)
-        ));
+        )));
     }
 
     let mut note = if resized {
@@ -194,7 +203,7 @@ pub(crate) fn prepare_bytes(path: &str, bytes: &[u8]) -> Result<PreparedImage, S
 pub(crate) async fn resolve_remote(
     session: &WorkspaceSession,
     path: &WorkspacePath,
-) -> Result<RemoteImageResource, String> {
+) -> Result<RemoteImageResource, ToolError> {
     let service = session
         .workspace()
         .services()
@@ -204,13 +213,20 @@ pub(crate) async fn resolve_remote(
     let resource = service
         .resolve(session.binding(), session.cursor(), path)
         .await
-        .map_err(|error| format!("cannot resolve remote image {path}: {error}"))?;
+        .map_err(|error| {
+            ToolError::new(
+                (&error).into(),
+                format!("cannot resolve remote image {path}: {error}"),
+            )
+        })?;
     let resolved_path = resource
         .path
         .clone()
         .ok_or_else(|| format!("remote image {path} returned no path"))?;
     if resource.kind != ResourceKind::File || resource.project != *session.binding().project() {
-        return Err(format!("remote image {resolved_path} is not a file"));
+        return Err(invalid(format!(
+            "remote image {resolved_path} is not a file"
+        )));
     }
     let resource_id = resource.scope.resource_id().clone();
     let stat = service
@@ -220,7 +236,12 @@ pub(crate) async fn resolve_remote(
             &ResourceSelector::Id(resource_id.clone()),
         )
         .await
-        .map_err(|error| format!("cannot inspect remote image {resolved_path}: {error}"))?;
+        .map_err(|error| {
+            ToolError::new(
+                (&error).into(),
+                format!("cannot inspect remote image {resolved_path}: {error}"),
+            )
+        })?;
     if stat.kind != ResourceKind::File
         || stat.project != resource.project
         || stat.path.as_ref() != Some(&resolved_path)
@@ -228,9 +249,9 @@ pub(crate) async fn resolve_remote(
         || stat.revision != resource.revision
         || stat.size_bytes != resource.size_bytes
     {
-        return Err(format!(
-            "remote image {resolved_path} changed while it was being resolved"
-        ));
+        return Err(
+            format!("remote image {resolved_path} changed while it was being resolved").into(),
+        );
     }
     let revision = stat
         .revision
@@ -239,11 +260,11 @@ pub(crate) async fn resolve_remote(
         .size_bytes
         .ok_or_else(|| format!("remote image {resolved_path} has no size"))?;
     if size_bytes > MAX_INPUT_BYTES {
-        return Err(format!(
+        return Err(invalid(format!(
             "{resolved_path} is too large to view ({}; limit {})",
             format_size(size_bytes),
             format_size(MAX_INPUT_BYTES)
-        ));
+        )));
     }
     Ok(RemoteImageResource {
         path: resolved_path,
@@ -257,7 +278,7 @@ pub(crate) async fn resolve_remote(
 pub(crate) async fn read_remote(
     session: &WorkspaceSession,
     resource: &RemoteImageResource,
-) -> Result<PreparedImage, String> {
+) -> Result<PreparedImage, ToolError> {
     let service = session
         .workspace()
         .services()
@@ -277,7 +298,12 @@ pub(crate) async fn read_remote(
             },
         )
         .await
-        .map_err(|error| format!("cannot read remote image {}: {error}", resource.path))?;
+        .map_err(|error| {
+            ToolError::new(
+                (&error).into(),
+                format!("cannot read remote image {}: {error}", resource.path),
+            )
+        })?;
     if content.resource_id != resource.resource_id
         || content.revision != resource.revision
         || content.range.start != 0
@@ -290,7 +316,8 @@ pub(crate) async fn read_remote(
         return Err(format!(
             "remote image {} returned a stale or incomplete byte range",
             resource.path
-        ));
+        )
+        .into());
     }
     prepare_bytes(resource.path.as_str(), &content.bytes)
 }
@@ -438,6 +465,9 @@ mod tests {
 
     const NOT_AN_IMAGE: &str = "is not an image";
     const TOO_LARGE: &str = "too large to view";
+    const TEXT_NAME: &str = "notes.txt";
+    const MISSING_NAME: &str = "missing.png";
+    const DIRECTORY_NAME: &str = "";
     const UNSUPPORTED: &str = "unsupported image format";
 
     #[test_case(750, 1, 1 ; "one_token_per_pixels_per_token")]
@@ -494,7 +524,17 @@ mod tests {
     fn non_image_bytes_are_rejected() {
         let dir = tempfile::tempdir().unwrap();
         let path = write(&dir, "notes.txt", b"just text");
-        assert!(prepare(&path).unwrap_err().contains(NOT_AN_IMAGE));
+        assert!(prepare(&path).unwrap_err().message.contains(NOT_AN_IMAGE));
+    }
+
+    #[test_case(MISSING_NAME, ToolFailure::NotFound; "missing_path")]
+    #[test_case(TEXT_NAME, ToolFailure::InvalidInput; "not_an_image")]
+    #[test_case(DIRECTORY_NAME, ToolFailure::InvalidInput; "directory")]
+    fn a_refused_image_says_why(name: &str, failure: ToolFailure) {
+        let dir = tempfile::tempdir().unwrap();
+        write(&dir, TEXT_NAME, b"just text");
+        let path = dir.path().join(name).to_string_lossy().into_owned();
+        assert_eq!(prepare(&path).unwrap_err().failure, failure);
     }
 
     #[test_case(ImageFormat::Png, Some(ImageMediaType::Png) ; "png")]
@@ -526,7 +566,12 @@ mod tests {
     fn directories_are_rejected() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().to_string_lossy().into_owned();
-        assert!(prepare(&path).unwrap_err().contains("is a directory"));
+        assert!(
+            prepare(&path)
+                .unwrap_err()
+                .message
+                .contains("is a directory")
+        );
     }
 
     #[test]
@@ -553,7 +598,7 @@ mod tests {
         let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
         file.set_len(MAX_INPUT_BYTES + 1).unwrap();
         drop(file);
-        assert!(prepare(&path).unwrap_err().contains(TOO_LARGE));
+        assert!(prepare(&path).unwrap_err().message.contains(TOO_LARGE));
     }
 
     #[test_case(1023, "1KB" ; "rounds_partial_kb_up")]

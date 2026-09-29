@@ -22,8 +22,7 @@ use super::{
 };
 use crate::{
     CancelToken, History, SubagentHistoryStore, TaskCard, TaskProvenance, ToolDoneEvent,
-    ToolOutput, background_reminder::RuntimeSnapshot, tool_output::shell_output_label,
-    tools::Deadline,
+    background_reminder::RuntimeSnapshot, tool_output::shell_output_label, tools::Deadline,
 };
 
 const MAX_OWNER_ACTIVE: usize = 16;
@@ -654,16 +653,10 @@ impl JobScope {
     }
 }
 
-/// A command that ran reports how it ended, so words it printed never decide
-/// its state. The accounting bucket, which is matched from text, only speaks
-/// for a result that carries no process facts, such as a refused remote call.
+/// The outcome is the one the result's producer typed, so words a command
+/// printed never decide its state.
 fn shell_job_state(cancelled: bool, done: &ToolDoneEvent) -> &'static str {
-    let outcome = match &done.output {
-        ToolOutput::Shell(shell) if shell.timed_out => Some(ToolOutcome::Timeout),
-        ToolOutput::Shell(_) => None,
-        _ => done.accounting.outcome,
-    };
-    match (cancelled, outcome) {
+    match (cancelled, done.accounting.outcome) {
         (true, _) | (_, Some(ToolOutcome::Cancelled)) => "cancelled",
         (_, Some(ToolOutcome::Timeout)) => "timed_out",
         _ if done.is_error => "failed",

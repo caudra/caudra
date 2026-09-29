@@ -255,7 +255,7 @@ async fn remote_image(
             String::new(),
             vec![prepared.source],
         ),
-        Err(error) => note(mention, &error),
+        Err(error) => note(mention, &error.message),
     }
 }
 
@@ -276,7 +276,7 @@ fn image(mention: &Mention, root: &Path, vision: bool) -> Message {
             String::new(),
             vec![prepared.source],
         ),
-        Err(error) => note(mention, &error),
+        Err(error) => note(mention, &error.message),
     }
 }
 

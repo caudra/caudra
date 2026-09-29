@@ -9,8 +9,8 @@ use crate::{
     tools::{
         DescriptionContext, ToolAudience, ToolContext,
         registry::{
-            ExecFuture, HeaderFuture, HeaderResult, ParseError, Tool, ToolExecResult,
-            ToolInvocation,
+            ExecFuture, HeaderFuture, HeaderResult, ParseError, Tool, ToolError, ToolExecResult,
+            ToolFailure, ToolInvocation,
         },
     },
 };
@@ -105,7 +105,7 @@ impl ToolInvocation for ControlCall {
                             .as_ref()
                             .is_some_and(|jobs| *jobs.owner() != JobOwner::Main))
                 {
-                    return Err(PROMOTION_DENIED.into());
+                    return Err(ToolError::new(ToolFailure::Denied, PROMOTION_DENIED));
                 }
                 let id = self.task_id.as_deref().unwrap_or_default();
                 if self.action != "background"
@@ -113,8 +113,11 @@ impl ToolInvocation for ControlCall {
                 {
                     let cards = match self.action.as_str() {
                         "list" => jobs.list(),
-                        "status" => vec![jobs.status(id)?],
-                        _ => vec![jobs.cancel(id).await?],
+                        "status" => vec![jobs.status(id).map_err(invisible)?],
+                        _ => {
+                            jobs.status(id).map_err(invisible)?;
+                            vec![jobs.cancel(id).await?]
+                        }
                     };
                     return Ok(ToolOutput::Tasks(cards));
                 }
@@ -124,23 +127,36 @@ impl ToolInvocation for ControlCall {
                     .ok_or("task controls require a supported session")?;
                 let cards = match self.action.as_str() {
                     "list" => tasks.list(),
-                    "status" => vec![tasks.status(id)?],
-                    "cancel" => vec![tasks.cancel(id).await?],
-                    _ => vec![tasks.promote(id).await?],
+                    "status" => vec![tasks.status(id).map_err(invisible)?],
+                    action => {
+                        tasks.status(id).map_err(invisible)?;
+                        vec![match action {
+                            "cancel" => tasks.cancel(id).await?,
+                            _ => tasks.promote(id).await?,
+                        }]
+                    }
                 };
                 Ok(ToolOutput::Tasks(cards))
             }
             .await;
-            ToolExecResult::from(result)
+            match result {
+                Ok(output) => ToolExecResult::from(Ok(output)),
+                Err(error) => ToolExecResult::failed(error.failure, error.message),
+            }
         })
     }
+}
+
+/// A job this owner cannot see reads as one that does not exist.
+fn invisible(message: String) -> ToolError {
+    ToolError::new(ToolFailure::NotFound, message)
 }
 
 #[cfg(test)]
 mod tests {
     use super::{DESCRIPTION, PROMOTION_DENIED, TaskControl, configure_execution};
     use crate::AgentMode;
-    use crate::tools::registry::Tool;
+    use crate::tools::registry::{Tool, ToolFailure};
     use crate::tools::test_support::stub_ctx;
     use caudra_config::ExecutionMode;
     use serde_json::json;
@@ -182,7 +198,7 @@ mod tests {
                 .parse(&json!({"action":"background", "task_id":"unknown"}))
                 .unwrap();
             let result = call.execute(&ctx).await;
-            assert!(result.is_error);
+            assert_eq!(result.failure, Some(ToolFailure::Denied));
             assert_eq!(result.output.err().as_deref(), Some(PROMOTION_DENIED));
         });
     }

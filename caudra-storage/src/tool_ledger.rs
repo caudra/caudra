@@ -33,9 +33,9 @@ const P95: f64 = 0.95;
 const VARINT_CONTINUE: u8 = 0x80;
 const VARINT_PAYLOAD_BITS: u32 = 7;
 
-/// How a call ended. `Ok` plus the low-cardinality classes the agent already
-/// buckets failures into, so the storage grain stays bounded at seven rows per
-/// key and an error rate can be read as a reason.
+/// How a call ended. `Ok` plus the low-cardinality classes a failing tool
+/// states for itself, so the storage grain stays bounded at seven rows per key
+/// and an error rate can be read as a reason.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolOutcome {

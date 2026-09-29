@@ -12,8 +12,8 @@ use caudra_agent::tools::registry::{RegisteredTool, ToolRegistry};
 use caudra_agent::tools::schema::{ParamSchema, to_json_schema, try_from_json, validate};
 use caudra_agent::tools::{
     BoxFuture, Deadline, DescriptionContext, ExecFuture, HeaderFuture, HeaderResult, ParseError,
-    PermissionScopes, ToolAudience, ToolContext, ToolEffect, ToolExecResult, ToolFilter,
-    ToolInvocation, ToolSource, is_tool_enabled, timeout_annotation,
+    PermissionScopes, ToolAudience, ToolContext, ToolEffect, ToolExecResult, ToolFailure,
+    ToolFilter, ToolInvocation, ToolSource, is_tool_enabled, timeout_annotation,
 };
 use caudra_agent::{
     AgentEvent, BufferSnapshot, ImageMediaType, ImageSource, InstructionBlock, SharedBuf,
@@ -45,6 +45,7 @@ use crate::runtime::{
 const TOOL_NAME_MAX: usize = 64;
 const TOOL_HANDLER_RETURN_ERR: &str =
     "tool handler must return string or {output=string, is_error?=bool}";
+const LUA_THREAD_DISCONNECTED_ERR: &str = "lua thread disconnected";
 const TIMEOUT_PARSE_ERR: &str = "register_tool: 'timeout' must be a positive number, 0, or false";
 const NARGS_ERR: &str = r#"register_command: 'nargs' must be 0, 1, "?", "*", or "+""#;
 const PERMISSION_RULE_KEYS: &[&str] = &["tool", "scope", "effect"];
@@ -421,12 +422,12 @@ impl ToolInvocation for LuaToolInvocation {
             let effective_secs: Option<u64> = match tool_timeout {
                 Some(d) => match deadline.cap_timeout(d.as_secs()) {
                     Ok(s) => Some(s),
-                    Err(e) => return Err(e).into(),
+                    Err(e) => return ToolExecResult::failed(ToolFailure::Timeout, e),
                 },
                 None => match deadline {
                     Deadline::At(_) => match deadline.cap_timeout(u64::MAX) {
                         Ok(s) => Some(s),
-                        Err(e) => return Err(e).into(),
+                        Err(e) => return ToolExecResult::failed(ToolFailure::Timeout, e),
                     },
                     Deadline::None => None,
                 },
@@ -456,7 +457,7 @@ impl ToolInvocation for LuaToolInvocation {
                 .await
                 .is_err()
             {
-                return Err("lua thread disconnected".to_string()).into();
+                return ToolExecResult::failed(ToolFailure::Other, LUA_THREAD_DISCONNECTED_ERR);
             }
 
             let recv = async { Some(reply_rx.recv_async().await) };
@@ -472,14 +473,18 @@ impl ToolInvocation for LuaToolInvocation {
             };
 
             match result {
-                None => Err(format!(
-                    "plugin {} tool {} exceeded timeout ({}s)",
-                    plugin,
-                    tool,
-                    effective_secs.unwrap_or(0)
-                ))
-                .into(),
-                Some(Err(_)) => Err("lua thread disconnected".to_string()).into(),
+                None => ToolExecResult::failed(
+                    ToolFailure::Timeout,
+                    format!(
+                        "plugin {} tool {} exceeded timeout ({}s)",
+                        plugin,
+                        tool,
+                        effective_secs.unwrap_or(0)
+                    ),
+                ),
+                Some(Err(_)) => {
+                    ToolExecResult::failed(ToolFailure::Other, LUA_THREAD_DISCONNECTED_ERR)
+                }
                 Some(Ok(reply)) => {
                     if let Some(ref id) = ctx.tool_use_id {
                         if let Some(live_buf) = reply.live_buf {
@@ -533,6 +538,7 @@ impl ToolInvocation for LuaToolInvocation {
                             }
                         }),
                         is_error,
+                        failure: is_error.then_some(reply.failure),
                         annotation: reply.annotation,
                         written_path: reply.written_path,
                         written_paths: Vec::new(),
@@ -1561,6 +1567,10 @@ pub(crate) struct DiffPayload {
 
 pub(crate) struct ToolCallReply {
     pub result: ToolCallResult,
+    /// Why `result` is an error. The host places what it knows, a tool it
+    /// cannot find or a task cancelled or out of time; anything else is
+    /// [`ToolFailure::Other`], whatever the plugin's words say.
+    pub failure: ToolFailure,
     pub snapshot: Option<BufferSnapshot>,
     pub header: Option<BufferSnapshot>,
     pub live_buf: Option<Arc<SharedBuf>>,
@@ -1631,6 +1641,7 @@ impl ToolCallReply {
         };
         Self {
             result,
+            failure: ToolFailure::Other,
             snapshot,
             header,
             live_buf,
@@ -1668,6 +1679,7 @@ impl ToolCallReply {
     pub fn plain(result: ToolCallResult) -> Self {
         Self {
             result,
+            failure: ToolFailure::Other,
             snapshot: None,
             header: None,
             live_buf: None,
@@ -1687,6 +1699,13 @@ impl ToolCallReply {
 
     pub fn err(msg: impl Into<String>) -> Self {
         Self::plain(Err(msg.into()))
+    }
+
+    pub fn failed(failure: ToolFailure, msg: impl Into<String>) -> Self {
+        Self {
+            failure,
+            ..Self::err(msg)
+        }
     }
 }
 

@@ -26,7 +26,7 @@ use crate::tools::image_bytes::{
 };
 use crate::tools::registry::{
     ExecFuture, HeaderFuture, HeaderResult, ParseError, PermissionIntent, PermissionScopes,
-    PlanModeAccess, Tool, ToolExecResult, ToolInvocation,
+    PlanModeAccess, Tool, ToolError, ToolExecResult, ToolFailure, ToolInvocation,
 };
 use crate::tools::schema::{ParamKind, ParamSchema, Property, to_json_schema, validate};
 use crate::tools::{
@@ -238,20 +238,12 @@ impl ToolInvocation for ImageGenerateCall {
     fn preflight<'a>(
         &'a self,
         ctx: &'a ToolContext,
-    ) -> BoxFuture<'a, Result<Option<PermissionIntent>, String>> {
+    ) -> BoxFuture<'a, Result<Option<PermissionIntent>, ToolError>> {
         Box::pin(async move {
             let Some(session) = ctx.workspace_session.as_ref() else {
                 return Ok(None);
             };
-            let out = WorkspacePath::new(self.raw_out.clone())
-                .map_err(|error| format!("invalid remote output path: {error}"))?;
-            let mut references = Vec::with_capacity(self.raw_references.len());
-            for raw in &self.raw_references {
-                let path = WorkspacePath::new(raw.clone())
-                    .map_err(|error| format!("invalid remote reference path: {error}"))?;
-                references.push(resolve_remote(session, &path).await?);
-            }
-            let plan = RemoteGeneratePlan { out, references };
+            let plan = self.resolve_remote_plan(session).await?;
             let intent = remote_generate_intent(session, &plan);
             *self.remote.lock().await = Some(plan);
             Ok(Some(intent))
@@ -269,14 +261,14 @@ impl ToolInvocation for ImageGenerateCall {
                     .with_written_path(Some(path))
                     .with_remote_written_paths(),
                 Ok((output, None)) => ToolExecResult::from(Ok(output)),
-                Err(message) => ToolExecResult::from(Err(message)),
+                Err(error) => ToolExecResult::failed(error.failure, error.message),
             }
         })
     }
 }
 
 impl ImageGenerateCall {
-    async fn run(self, ctx: &ToolContext) -> Result<(ToolOutput, Option<String>), String> {
+    async fn run(self, ctx: &ToolContext) -> Result<(ToolOutput, Option<String>), ToolError> {
         let remote_plan = if let Some(session) = ctx.workspace_session.as_ref() {
             Some(match self.remote.lock().await.clone() {
                 Some(plan) => plan,
@@ -320,6 +312,7 @@ impl ImageGenerateCall {
                 smol::unblock(move || save(&requested, &bytes))
                     .await
                     .map(|output| (output, None))
+                    .map_err(ToolError::from)
             }
         }
     }
@@ -327,20 +320,28 @@ impl ImageGenerateCall {
     async fn resolve_remote_plan(
         &self,
         session: &WorkspaceSession,
-    ) -> Result<RemoteGeneratePlan, String> {
-        let out = WorkspacePath::new(self.raw_out.clone())
-            .map_err(|error| format!("invalid remote output path: {error}"))?;
+    ) -> Result<RemoteGeneratePlan, ToolError> {
+        let out = WorkspacePath::new(self.raw_out.clone()).map_err(|error| {
+            ToolError::new(
+                ToolFailure::InvalidInput,
+                format!("invalid remote output path: {error}"),
+            )
+        })?;
         let mut references = Vec::with_capacity(self.raw_references.len());
         for raw in &self.raw_references {
-            let path = WorkspacePath::new(raw.clone())
-                .map_err(|error| format!("invalid remote reference path: {error}"))?;
+            let path = WorkspacePath::new(raw.clone()).map_err(|error| {
+                ToolError::new(
+                    ToolFailure::InvalidInput,
+                    format!("invalid remote reference path: {error}"),
+                )
+            })?;
             references.push(resolve_remote(session, &path).await?);
         }
         Ok(RemoteGeneratePlan { out, references })
     }
 }
 
-fn read_references(paths: &[String]) -> Result<Vec<ImageSource>, String> {
+fn read_references(paths: &[String]) -> Result<Vec<ImageSource>, ToolError> {
     paths
         .iter()
         .map(|path| prepare(path).map(|image| image.source))
@@ -350,7 +351,7 @@ fn read_references(paths: &[String]) -> Result<Vec<ImageSource>, String> {
 async fn read_remote_references(
     session: &WorkspaceSession,
     resources: &[RemoteImageResource],
-) -> Result<Vec<ImageSource>, String> {
+) -> Result<Vec<ImageSource>, ToolError> {
     let mut references = Vec::with_capacity(resources.len());
     for resource in resources {
         references.push(read_remote(session, resource).await?.source);
@@ -461,7 +462,9 @@ async fn save_remote(
             .revision
             .as_ref()
             .ok_or_else(|| "remote image write returned no revision".to_owned())?;
-        let resource = resolve_remote(session, &candidate).await?;
+        let resource = resolve_remote(session, &candidate)
+            .await
+            .map_err(|error| error.message)?;
         if &resource.revision != mutation_revision || resource.size_bytes != bytes.len() as u64 {
             return Err("remote image write could not be verified".to_owned());
         }
@@ -1008,7 +1011,8 @@ mod tests {
 
         let error = read_references(&[path]).unwrap_err();
 
-        assert!(error.contains("is not an image"), "{error}");
+        assert_eq!(error.failure, ToolFailure::InvalidInput);
+        assert!(error.message.contains("is not an image"), "{error}");
     }
 
     #[test]

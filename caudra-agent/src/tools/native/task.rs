@@ -20,7 +20,8 @@ use crate::prompt::task_execution_guidance;
 use crate::subagent_history::SubagentTaskMode;
 use crate::tools::native::task_control;
 use crate::tools::registry::{
-    ExecFuture, HeaderFuture, HeaderResult, ParseError, Tool, ToolExecResult, ToolInvocation,
+    ExecFuture, HeaderFuture, HeaderResult, ParseError, Tool, ToolExecResult, ToolFailure,
+    ToolInvocation,
 };
 use crate::tools::schema::{ParamKind, ParamSchema, Property, to_json_schema, validate};
 use crate::tools::{DescriptionContext, ToolAudience, ToolContext};
@@ -255,13 +256,17 @@ impl ToolInvocation for TaskCall {
 
     fn execute<'a>(self: Box<Self>, ctx: &'a ToolContext) -> ExecFuture<'a> {
         Box::pin(async move {
-            let background = match resolve_task_background(
-                &ctx.config,
-                ctx.background.is_some(),
-                self.background,
-            ) {
+            let supported = ctx.background.is_some();
+            let background = match resolve_task_background(&ctx.config, supported, self.background)
+            {
                 Ok(background) => background,
-                Err(message) => return error(message.into()),
+                Err(message) => {
+                    let failure = match effective_task_execution(&ctx.config, supported) {
+                        Some(_) => ToolFailure::InvalidInput,
+                        None => ToolFailure::Denied,
+                    };
+                    return error(failure, message.into());
+                }
             };
             let request = TaskRequest {
                 prompt: self.prompt,
@@ -293,7 +298,7 @@ impl ToolInvocation for TaskCall {
                         result
                     }
                     Ok(crate::background::TaskDelivery::Background(status)) => receipt(*status),
-                    Err(message) => error(message),
+                    Err(message) => error(ctx.refusal_failure(), message),
                 }
             } else {
                 render(run_task(ctx, request).await)
@@ -308,8 +313,12 @@ impl ToolInvocation for TaskCall {
 /// and a caller that wanted a command run has no other way to learn it was
 /// handed a read-only agent.
 fn render(outcome: TaskOutcome) -> ToolExecResult {
+    let failure = match outcome.cancelled {
+        true => ToolFailure::Cancelled,
+        false => ToolFailure::Other,
+    };
     let result = match (outcome.error, outcome.output) {
-        (Some(message), _) => error(message),
+        (Some(message), _) => error(failure, message),
         (None, Value::String(text)) => markdown(text),
         (None, structured) => structured_json(structured),
     };
@@ -362,11 +371,8 @@ fn structured_json(structured: Value) -> ToolExecResult {
         .with_model_output(Some(compact))
 }
 
-fn error(message: String) -> ToolExecResult {
-    ToolExecResult {
-        is_error: true,
-        ..ToolExecResult::from(Ok(ToolOutput::Plain(message.into())))
-    }
+fn error(failure: ToolFailure, message: String) -> ToolExecResult {
+    ToolExecResult::from(Ok(ToolOutput::Plain(message.into()))).with_failure(failure)
 }
 
 #[cfg(test)]
@@ -497,12 +503,13 @@ mod tests {
         );
     }
 
-    #[test_case(ExecutionMode::Sync, Some(true); "sync_rejects_launch")]
-    #[test_case(ExecutionMode::Async, Some(false); "async_rejects_wait")]
-    #[test_case(ExecutionMode::Async, None; "async_requires_session")]
+    #[test_case(ExecutionMode::Sync, Some(true), ToolFailure::InvalidInput; "sync_rejects_launch")]
+    #[test_case(ExecutionMode::Async, Some(false), ToolFailure::Denied; "async_rejects_wait")]
+    #[test_case(ExecutionMode::Async, None, ToolFailure::Denied; "async_requires_session")]
     fn contradictory_or_unsupported_calls_never_admit(
         mode: ExecutionMode,
         requested: Option<bool>,
+        expected: ToolFailure,
     ) {
         smol::block_on(async {
             let mut input = minimal();
@@ -512,7 +519,7 @@ mod tests {
             let mut ctx = crate::tools::test_support::stub_ctx(&crate::AgentMode::Build);
             ctx.config.task_execution = mode;
             let result = parse(input).unwrap().execute(&ctx).await;
-            assert!(result.is_error);
+            assert_eq!(result.failure, Some(expected));
             assert!(ctx.subagent_history.snapshot().records().is_empty());
         });
     }
@@ -726,6 +733,16 @@ mod tests {
         let result = render(outcome(Some(TASK_ID), Ok(Value::String(SUMMARY.into()))));
         assert!(!result.is_error);
         assert_eq!(text_of(&result), SUMMARY);
+    }
+
+    #[test_case(false, ToolFailure::Other; "failed")]
+    #[test_case(true, ToolFailure::Cancelled; "cancelled")]
+    fn a_failed_task_states_why(cancelled: bool, expected: ToolFailure) {
+        let result = render(TaskOutcome {
+            cancelled,
+            ..outcome(Some(TASK_ID), Err(BOOM))
+        });
+        assert_eq!(result.failure, Some(expected));
     }
 
     #[test]

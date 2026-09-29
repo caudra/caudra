@@ -1,14 +1,16 @@
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 
-use caudra_storage::local_documents::{DocumentRevision, LocalDocumentStore, PatchEdit};
+use caudra_storage::local_documents::{
+    DocumentRevision, LocalDocumentError, LocalDocumentStore, PatchEdit,
+};
 use caudra_workspace::{LocalDocumentRef, MemoryRef, PlanRef};
 use serde_json::{Value, json};
 
 use crate::permissions::{PermissionResource, PermissionResourceKind, PermissionRisk};
 use crate::tools::registry::{
     ExecFuture, HeaderFuture, HeaderResult, ParseError, PermissionIntent, PermissionScopes,
-    PlanModeAccess, Tool, ToolExecResult, ToolInvocation,
+    PlanModeAccess, Tool, ToolError, ToolExecResult, ToolFailure, ToolInvocation,
 };
 use crate::tools::{
     DescriptionContext, LOCAL_DOCUMENT_APPLY_PATCH_TOOL_NAME, LOCAL_DOCUMENT_READ_TOOL_NAME,
@@ -183,7 +185,7 @@ impl ToolInvocation for LocalDocumentCall {
     fn preflight<'a>(
         &'a self,
         ctx: &'a ToolContext,
-    ) -> crate::tools::registry::BoxFuture<'a, Result<Option<PermissionIntent>, String>> {
+    ) -> crate::tools::registry::BoxFuture<'a, Result<Option<PermissionIntent>, ToolError>> {
         Box::pin(async move {
             scoped_store(ctx)?;
             if matches!(self.operation, Operation::Read) {
@@ -245,13 +247,30 @@ impl ToolInvocation for LocalDocumentCall {
                     });
                     result
                 }
-                Err(error) => ToolExecResult::from(Err(error)),
+                Err(error) => ToolExecResult::failed(error.failure, error.message),
             }
         })
     }
 }
 
-pub(super) fn scoped_store(ctx: &ToolContext) -> Result<&LocalDocumentStore, String> {
+/// A reference the store cannot place is refused as not yours rather than as
+/// missing, so that refusal stays [`ToolFailure::Other`].
+impl From<LocalDocumentError> for ToolError {
+    fn from(error: LocalDocumentError) -> Self {
+        let failure = match &error {
+            LocalDocumentError::InvalidReference
+            | LocalDocumentError::InvalidMemoryName
+            | LocalDocumentError::TooLarge
+            | LocalDocumentError::PatchConflict => ToolFailure::InvalidInput,
+            LocalDocumentError::Symlink => ToolFailure::Denied,
+            LocalDocumentError::Io(error) => ToolFailure::from(error),
+            _ => ToolFailure::Other,
+        };
+        Self::new(failure, error.to_string())
+    }
+}
+
+pub(super) fn scoped_store(ctx: &ToolContext) -> Result<&LocalDocumentStore, ToolError> {
     let workspace = ctx
         .workspace_session
         .as_ref()
@@ -260,24 +279,20 @@ pub(super) fn scoped_store(ctx: &ToolContext) -> Result<&LocalDocumentStore, Str
         .local_documents
         .as_ref()
         .ok_or_else(|| "local document store is unavailable".to_owned())?;
-    store
-        .validate_binding(workspace.binding())
-        .map_err(|error| error.to_string())?;
+    store.validate_binding(workspace.binding())?;
     Ok(store)
 }
 
 fn execute(
     call: &LocalDocumentCall,
     ctx: &ToolContext,
-) -> Result<(String, DocumentRevision), String> {
+) -> Result<(String, DocumentRevision), ToolError> {
     let store = scoped_store(ctx)?;
     let project = store.project_key();
     let session_id = ctx.session_id.as_ref().map(|session| session.as_str());
     match &call.operation {
         Operation::Read => {
-            let document = store
-                .read(project, session_id, &call.reference)
-                .map_err(|error| error.to_string())?;
+            let document = store.read(project, session_id, &call.reference)?;
             Ok((
                 format!(
                     "kind: {}\nreference: {}\nrevision: {}\n\n{}",
@@ -290,15 +305,12 @@ fn execute(
             ))
         }
         Operation::Write { content } => {
-            let revision = store
-                .write(project, session_id, &call.reference, content)
-                .map_err(|error| error.to_string())?;
+            let revision = store.write(project, session_id, &call.reference, content)?;
             Ok((WRITE_RECEIPT.to_owned(), revision))
         }
         Operation::Patch { revision, edits } => {
-            let revision = store
-                .apply_patch(project, session_id, &call.reference, revision, edits)
-                .map_err(|error| error.to_string())?;
+            let revision =
+                store.apply_patch(project, session_id, &call.reference, revision, edits)?;
             Ok((PATCH_RECEIPT.to_owned(), revision))
         }
     }

@@ -22,7 +22,10 @@ use caudra_agent::mcp::config::{McpServerStatus, RawHttpFields, RawStdioFields, 
 use caudra_agent::mcp::{self, McpHandle};
 use caudra_agent::permissions::{PermissionAnswer, PermissionRequest as CaudraPermissionRequest};
 use caudra_agent::prompt::profile::{BUILTIN_PROFILE_NAME, SystemPromptProfile};
-use caudra_agent::tools::{LocalToolFn, LocalTools, QUESTION_TOOL_NAME, ToolRegistry, local_tool};
+use caudra_agent::tools::{
+    LocalToolFn, LocalTools, QUESTION_TOOL_NAME, ToolEffect, ToolError, ToolFailure, ToolRegistry,
+    typed_local_tool,
+};
 use caudra_agent::types::AgentEvent;
 use caudra_agent::{
     AgentInput, AgentMode, Envelope, History, ImageMediaType, ImageSource, open_stored_session,
@@ -685,7 +688,7 @@ fn question_tool(
     pending: PendingState,
     via_permission: bool,
 ) -> LocalToolFn {
-    local_tool(move |input, ctx| {
+    typed_local_tool(ToolEffect::Unknown, move |input, ctx| {
         let out_tx = out_tx.clone();
         let pending = Arc::clone(&pending);
         Box::pin(async move {
@@ -699,17 +702,15 @@ fn question_tool(
             // the elicitation rejected or dropped.
             let tool_call_id = ctx.tool_use_id.filter(|id| !id.is_empty());
             let request = if via_permission {
-                AgentRequest::RequestPermissionRequest(elicitation::question_permission_request(
-                    &session_id,
-                    tool_call_id,
-                    &input,
-                )?)
+                AgentRequest::RequestPermissionRequest(
+                    elicitation::question_permission_request(&session_id, tool_call_id, &input)
+                        .map_err(unaskable)?,
+                )
             } else {
-                AgentRequest::CreateElicitationRequest(elicitation::form_request(
-                    &session_id,
-                    tool_call_id,
-                    &input,
-                )?)
+                AgentRequest::CreateElicitationRequest(
+                    elicitation::form_request(&session_id, tool_call_id, &input)
+                        .map_err(unaskable)?,
+                )
             };
             let rx = ctx.user_response_rx.as_ref().ok_or("no answer channel")?;
 
@@ -731,6 +732,11 @@ fn question_tool(
             })
         })
     })
+}
+
+/// Questions this client cannot render are the model's to rephrase.
+fn unaskable(message: String) -> ToolError {
+    ToolError::new(ToolFailure::InvalidInput, message)
 }
 
 /// Servers the client injects on `session/new` and `session/load`. A transport we

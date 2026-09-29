@@ -2,7 +2,7 @@ use serde_json::{Value, json};
 
 use crate::{
     background::TaskReporter,
-    tools::{LocalToolFn, ToolEffect, audited_local_tool},
+    tools::{LocalToolFn, ToolEffect, ToolError, ToolFailure, typed_local_tool},
 };
 
 pub(crate) const NAME: &str = "report_to_parent";
@@ -57,26 +57,28 @@ pub(crate) fn tool(reporter: TaskReporter) -> (Value, LocalToolFn) {
             "required":["message"]
         }
     });
-    let handler = audited_local_tool(ToolEffect::ReadOnly, move |input, ctx| {
+    let handler = typed_local_tool(ToolEffect::ReadOnly, move |input, ctx| {
         let reporter = reporter.clone();
         Box::pin(async move {
-            let object = input.as_object().ok_or("report input must be an object")?;
+            let object = input
+                .as_object()
+                .ok_or_else(|| invalid("report input must be an object"))?;
             if object
                 .keys()
                 .any(|key| key != "title" && key != "message" && key != "blocked")
             {
-                return Err("unknown report field".into());
+                return Err(invalid("unknown report field"));
             }
-            title(&input)?;
+            title(&input).map_err(invalid)?;
             let message = input
                 .get("message")
                 .and_then(Value::as_str)
-                .ok_or("message is required")?
+                .ok_or_else(|| invalid("message is required"))?
                 .to_owned();
             let blocked = match input.get("blocked") {
                 None => false,
                 Some(Value::Bool(blocked)) => *blocked,
-                _ => return Err("blocked must be a boolean".into()),
+                _ => return Err(invalid("blocked must be a boolean")),
             };
             reporter
                 .report(
@@ -86,9 +88,14 @@ pub(crate) fn tool(reporter: TaskReporter) -> (Value, LocalToolFn) {
                     blocked,
                 )
                 .await
+                .map_err(ToolError::from)
         })
     });
     (definition, handler)
+}
+
+fn invalid(message: &'static str) -> ToolError {
+    ToolError::new(ToolFailure::InvalidInput, message)
 }
 
 #[cfg(test)]

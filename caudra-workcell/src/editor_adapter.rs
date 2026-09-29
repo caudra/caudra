@@ -516,6 +516,7 @@ async fn prepare_example(
                 Some(&raw),
                 ShellNativeRedirect::Off,
             )
+            .map_err(|error| error.message)
         }
         Input::FileRead(input) => {
             let token = CancellationToken::new();
@@ -549,7 +550,9 @@ async fn prepare_example(
                 .inspect_glob(&input)
                 .await
                 .map_err(|error| error.to_string())?;
-            let (group, path) = confined_traversal_group(groups.files, &resource).await?;
+            let (group, path) = confined_traversal_group(groups.files, &resource)
+                .await
+                .map_err(|error| error.to_string())?;
             input.path = Some(path);
             Ok(file_prepared(
                 vec![resource],
@@ -565,7 +568,9 @@ async fn prepare_example(
                 .inspect_grep(&input)
                 .await
                 .map_err(|error| error.to_string())?;
-            let (group, path) = confined_traversal_group(groups.files, &resource).await?;
+            let (group, path) = confined_traversal_group(groups.files, &resource)
+                .await
+                .map_err(|error| error.to_string())?;
             input.path = Some(path);
             Ok(file_prepared(
                 vec![resource],

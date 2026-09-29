@@ -189,7 +189,10 @@ a permission prompt includes the wait for your answer.
 
 `error_type` is a coarse bucket (`timeout`, `not_found`, `permission_denied`,
 `invalid_input`, `cancelled`, `error`) rather than the raw message, so it
-stays useful as a group-by.
+stays useful as a group-by. The failing tool picks the bucket from what
+actually happened, and its output text plays no part. A `shell` command that
+prints "not found" and exits non-zero is `error`, and a stopped one is
+`cancelled`. A failure the tool cannot place is `error`.
 
 `error` follows the same idea. A provider's error body often just echoes your
 request back, so an HTTP failure reports `API error (429)` plus the status

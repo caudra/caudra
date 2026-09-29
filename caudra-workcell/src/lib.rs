@@ -49,10 +49,11 @@ use caudra_agent::permissions::{
     filesystem_permission_resource, prepared_command_binding, shell_permission_scope,
 };
 use caudra_agent::tools::{
-    BoxFuture, DescriptionContext, ExecFuture, HeaderFuture, HeaderResult, LockKey,
-    PYTHON_EXECUTION_TOOL_NAME, ParseError, PermissionIntent, PermissionScopes, PlanModeAccess,
-    RegistryError, SHELL_TOOL_NAME, Tool, ToolAudience, ToolContext, ToolEffect, ToolExecResult,
-    ToolInvocation, ToolLive, ToolRegistry, ToolSource, expand_tilde, stale_read_message,
+    BoxFuture, DEADLINE_EXCEEDED, DescriptionContext, ExecFuture, HeaderFuture, HeaderResult,
+    LockKey, PYTHON_EXECUTION_TOOL_NAME, ParseError, PermissionIntent, PermissionScopes,
+    PlanModeAccess, RegistryError, SHELL_TOOL_NAME, Tool, ToolAudience, ToolContext, ToolEffect,
+    ToolError, ToolExecResult, ToolFailure, ToolInvocation, ToolLive, ToolRegistry, ToolSource,
+    expand_tilde, stale_read_message,
 };
 use caudra_agent::{
     AgentEvent, CodeGraphRow, CodeGraphSource, EnvironmentCommand, EnvironmentFact, GrepFileEntry,
@@ -69,7 +70,7 @@ use caudra_storage::permission_state::{
 };
 use caudra_workspace::{
     OperationError, OperationProgressKind, OperationState, OperationStatus, PreparedToolCall,
-    ToolPrepareRequest,
+    ToolPrepareRequest, WorkspaceError,
 };
 use futures_lite::future;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -80,9 +81,10 @@ use tokio_util::sync::CancellationToken;
 use workcell::code::bundled_worker_available;
 use workcell::code::{CodeConfiguration, CodeExecution, CodeInput, Outcome, WorkerSource};
 use workcell::code_graph::{
-    CodeContextInput, CodeExpandInput, CodeGraphLimits, CodeGraphToolGroup, CodeImpactInput,
-    CodeMapInput, CodeRefsInput, GraphProgress, GraphProgressSink, ModelText as CodeGraphModelText,
-    RankedSymbol, ReachedSymbol, SelectorRefusal, SymbolRef, crawl_filesystem_limits, fit,
+    CodeContextInput, CodeExpandInput, CodeGraphError, CodeGraphLimits, CodeGraphToolGroup,
+    CodeImpactInput, CodeMapInput, CodeRefsInput, GraphProgress, GraphProgressSink,
+    ModelText as CodeGraphModelText, RankedSymbol, ReachedSymbol, SelectorRefusal, SymbolRef,
+    crawl_filesystem_limits, fit,
 };
 use workcell::environment::{
     ExecutionEnvironmentError, ExecutionEnvironmentResult, ToolGroupDisclosure,
@@ -91,7 +93,7 @@ use workcell::files::{
     FileApplyPatchInput, FileApplyPatchOutput, FileDiff, FileEditInput, FileEditOutput,
     FileGlobInput, FileGlobOutput, FileGrepInput, FileGrepOutput, FileReadInput, FileReadOutput,
     FileResource, FileResourceAccess, FileToolGroup, FileWriteInput, FileWriteOutput,
-    IndexDirectoryEntryKind, IndexExecutionConfiguration, IndexInput, IndexLimits,
+    FilesystemError, IndexDirectoryEntryKind, IndexExecutionConfiguration, IndexInput, IndexLimits,
     IndexLineSemantic, IndexOutput as WorkcellIndexOutput, ModelText, PreparedFilePatch,
     PreparedFileRead,
 };
@@ -103,7 +105,7 @@ use workcell::shell::{
 };
 use workcell::web::{
     PreparedWebfetch, PreparedWebsearch, ProxyConfiguration, WebExecution, WebToolGroup,
-    WebfetchInput, WebfetchOutput, WebsearchExecutionConfiguration, WebsearchInput,
+    WebfetchError, WebfetchInput, WebfetchOutput, WebsearchExecutionConfiguration, WebsearchInput,
     WebsearchOutput,
 };
 use workcell::{CodeToolGroup, ExecutionEnvironment};
@@ -135,6 +137,19 @@ pub const NATIVE_TOOL_NAMES: &[&str] = &[
 ];
 const CODE_WORKER_UNAVAILABLE: &str =
     "Workcell python_execution is unavailable: no code worker path was supplied";
+const SHELL_CANCELLED: &str = "Shell execution cancelled";
+const CODE_CANCELLED: &str = "Code execution cancelled";
+/// Every way a snippet can end, so a remote result's outcome is read by the
+/// names Workcell itself serializes rather than by a copy of them.
+const CODE_OUTCOMES: [Outcome; 5] = [
+    Outcome::Completed,
+    Outcome::Exception,
+    Outcome::Rejected,
+    Outcome::Limited,
+    Outcome::Unavailable,
+];
+const CODE_OUTCOME_FIELD: &str = "outcome";
+const CODE_TIMED_OUT_FIELD: &str = "timedOut";
 const PROGRESS_MAX_BYTES: usize = 64 * 1024;
 const PROGRESS_TRUNCATED: &str = "[earlier output truncated]\n";
 const BYTES_PER_MIB: usize = 1024 * 1024;
@@ -159,6 +174,7 @@ const REMOTE_RECONCILE_TIMEOUT: Duration = Duration::from_secs(10);
 const REMOTE_RECONCILE_MAX_POLLS: usize = 4;
 const REMOTE_DEADLINE_BEFORE_DISPATCH: &str =
     "Remote Workcell execution deadline expired before dispatch";
+const REMOTE_CONTEXT_UNAVAILABLE: &str = "Remote Workcell workspace context is unavailable";
 /// A preparation lives on the server's own timer, so a call that waits behind
 /// review can outlive it. Renewing before dispatch keeps a legitimate call
 /// alive; the renewed intent still has to be the one that was reviewed.
@@ -288,13 +304,19 @@ impl HostInner {
         Ok(groups)
     }
 
-    async fn run<T, F, Fut>(&self, ctx: &ToolContext, operation: F) -> Result<T, String>
+    /// Fails only for reasons of its own: the caller's deadline, or a runtime
+    /// task that never returned. A cancelled caller still gets the operation's
+    /// result, because the operation is what knows how it stopped.
+    async fn run<T, F, Fut>(&self, ctx: &ToolContext, operation: F) -> Result<T, ToolError>
     where
         T: Send + 'static,
         F: FnOnce(CancellationToken) -> Fut,
         Fut: Future<Output = T> + Send + 'static,
     {
-        let deadline = ctx.deadline.remaining()?;
+        let deadline = ctx
+            .deadline
+            .remaining()
+            .map_err(|message| ToolError::new(ToolFailure::Timeout, message))?;
         let cancellation = CancellationToken::new();
         if ctx.cancel.is_cancelled() {
             cancellation.cancel();
@@ -304,14 +326,14 @@ impl HostInner {
         let mut task = Box::pin(self.runtime.spawn(async move {
             tokio::pin!(operation);
             let Some(deadline) = deadline else {
-                return Ok(operation.await);
+                return Some(operation.await);
             };
             tokio::select! {
-                output = &mut operation => Ok(output),
+                output = &mut operation => Some(output),
                 () = tokio::time::sleep(deadline) => {
                     operation_cancellation.cancel();
                     let _ = operation.await;
-                    Err(caudra_agent::tools::DEADLINE_EXCEEDED.to_owned())
+                    None
                 }
             }
         }));
@@ -329,7 +351,14 @@ impl HostInner {
             Completion::Done(result) => result,
             Completion::Cancelled => task.await,
         };
-        result.map_err(|error| format!("Workcell runtime task failed: {error}"))?
+        match result {
+            Ok(Some(output)) => Ok(output),
+            Ok(None) => Err(ToolError::new(ToolFailure::Timeout, DEADLINE_EXCEEDED)),
+            Err(error) => Err(ToolError::new(
+                ToolFailure::Other,
+                format!("Workcell runtime task failed: {error}"),
+            )),
+        }
     }
 }
 
@@ -990,7 +1019,7 @@ struct WorkcellInvocation {
 }
 
 impl WorkcellInvocation {
-    async fn prepare(&self, ctx: &ToolContext) -> Result<PermissionIntent, String> {
+    async fn prepare(&self, ctx: &ToolContext) -> Result<PermissionIntent, ToolError> {
         if let Some(prepared) = self
             .prepared
             .lock()
@@ -1013,9 +1042,9 @@ impl WorkcellInvocation {
                             .files
                             .prepare_read(inspection_input.clone(), &token)
                             .await
-                            .map_err(|e| e.to_string())?;
+                            .map_err(filesystem_error)?;
                         if read.resource().access != FileResourceAccess::Traverse {
-                            return Ok::<_, String>((groups.files, read));
+                            return Ok::<_, ToolError>((groups.files, read));
                         }
                         let group = FileToolGroup::new(
                             &read.resource().path,
@@ -1023,7 +1052,7 @@ impl WorkcellInvocation {
                             Some(*groups.files.limits()),
                         )
                         .await
-                        .map_err(|error| error.to_string())?;
+                        .map_err(filesystem_error)?;
                         let read = group
                             .prepare_read(
                                 FileReadInput {
@@ -1033,7 +1062,7 @@ impl WorkcellInvocation {
                                 &token,
                             )
                             .await
-                            .map_err(|error| error.to_string())?;
+                            .map_err(filesystem_error)?;
                         Ok((group, read))
                     })
                     .await??;
@@ -1051,10 +1080,12 @@ impl WorkcellInvocation {
                             .files
                             .inspect_glob(&inspection_input)
                             .await
-                            .map_err(|e| e.to_string())?;
+                            .map_err(filesystem_error)?;
                         let (group, search_path) =
-                            confined_traversal_group(groups.files, &resource).await?;
-                        Ok::<_, String>((group, resource, search_path))
+                            confined_traversal_group(groups.files, &resource)
+                                .await
+                                .map_err(filesystem_error)?;
+                        Ok::<_, ToolError>((group, resource, search_path))
                     })
                     .await??;
                 let mut authorized = input.clone();
@@ -1079,10 +1110,12 @@ impl WorkcellInvocation {
                             .files
                             .inspect_grep(&inspection_input)
                             .await
-                            .map_err(|e| e.to_string())?;
+                            .map_err(filesystem_error)?;
                         let (group, search_path) =
-                            confined_traversal_group(groups.files, &resource).await?;
-                        Ok::<_, String>((group, resource, search_path))
+                            confined_traversal_group(groups.files, &resource)
+                                .await
+                                .map_err(filesystem_error)?;
+                        Ok::<_, ToolError>((group, resource, search_path))
                     })
                     .await??;
                 let mut authorized = input.clone();
@@ -1107,8 +1140,8 @@ impl WorkcellInvocation {
                             .files
                             .inspect_write(&inspection_input)
                             .await
-                            .map_err(|e| e.to_string())?;
-                        Ok::<_, String>((groups.files, resource))
+                            .map_err(filesystem_error)?;
+                        Ok::<_, ToolError>((groups.files, resource))
                     })
                     .await??;
                 let mut authorized = input.clone();
@@ -1133,8 +1166,8 @@ impl WorkcellInvocation {
                             .files
                             .inspect_edit(&inspection_input)
                             .await
-                            .map_err(|e| e.to_string())?;
-                        Ok::<_, String>((groups.files, resource))
+                            .map_err(filesystem_error)?;
+                        Ok::<_, ToolError>((groups.files, resource))
                     })
                     .await??;
                 let mut authorized = input.clone();
@@ -1159,8 +1192,8 @@ impl WorkcellInvocation {
                             .files
                             .prepare_apply_patch(patch_input, &token)
                             .await
-                            .map_err(|e| e.to_string())?;
-                        Ok::<_, String>((groups.files, patch))
+                            .map_err(filesystem_error)?;
+                        Ok::<_, ToolError>((groups.files, patch))
                     })
                     .await?;
                 // Planning is where Workcell matches context, so a patch built
@@ -1172,7 +1205,10 @@ impl WorkcellInvocation {
                             .into_iter()
                             .map(|path| project.join(path))
                             .collect::<Vec<_>>();
-                        return Err(with_stale_notice(error, stale_notice(ctx, &targets)));
+                        return Err(ToolError::new(
+                            error.failure,
+                            with_stale_notice(error.message, stale_notice(ctx, &targets)),
+                        ));
                     }
                 };
                 let resources = patch.resources().to_vec();
@@ -1191,14 +1227,18 @@ impl WorkcellInvocation {
                             .files
                             .inspect_index(&inspection_input)
                             .await
-                            .map_err(|error| error.to_string())?;
-                        Ok::<_, String>((groups.files, resource))
+                            .map_err(filesystem_error)?;
+                        Ok::<_, ToolError>((groups.files, resource))
                     })
                     .await??;
                 index_prepared(resource, &project, group)
             }
             Input::Websearch(input) => {
-                let prepared = self.host.web.prepare_websearch(input.clone())?;
+                let prepared = self
+                    .host
+                    .web
+                    .prepare_websearch(input.clone())
+                    .map_err(invalid_input)?;
                 let intent = editor_adapter::web_intent(
                     PermissionResourceKind::Query,
                     prepared.permission_query.clone(),
@@ -1215,7 +1255,7 @@ impl WorkcellInvocation {
                     .host
                     .web
                     .prepare_webfetch(input.clone())
-                    .map_err(|error| error.to_string())?;
+                    .map_err(webfetch_error)?;
                 let intent = editor_adapter::web_intent(
                     PermissionResourceKind::Url,
                     prepared.permission_url.clone(),
@@ -1237,8 +1277,8 @@ impl WorkcellInvocation {
                     .run(ctx, move |_| async move {
                         let groups = host.project_groups(cwd).await?;
                         let group = groups.shell.with_output_filter(output_filter);
-                        let prepared = group.prepare(input).await?;
-                        Ok::<_, String>((group, prepared))
+                        let prepared = group.prepare(input).await.map_err(invalid_input)?;
+                        Ok::<_, ToolError>((group, prepared))
                     })
                     .await??;
                 shell_prepared(
@@ -1295,7 +1335,7 @@ impl WorkcellInvocation {
                 let environment = self
                     .host
                     .run(ctx, move |_| async move {
-                        Ok::<_, String>(host.project_groups(project).await?.environment)
+                        Ok::<_, ToolError>(host.project_groups(project).await?.environment)
                     })
                     .await??;
                 let mut prepared = exact_custom_prepared(
@@ -1309,7 +1349,10 @@ impl WorkcellInvocation {
             }
         };
         if let Some(missing) = missing_read_target(&prepared.intent) {
-            return Err(format!("{MISSING_READ_TARGET}: {missing}"));
+            return Err(ToolError::new(
+                ToolFailure::NotFound,
+                format!("{MISSING_READ_TARGET}: {missing}"),
+            ));
         }
         let intent = prepared.intent.clone();
         *self
@@ -1323,22 +1366,27 @@ impl WorkcellInvocation {
         &self,
         ctx: &ToolContext,
         project: PathBuf,
-    ) -> Result<Arc<CodeGraphToolGroup>, String> {
+    ) -> Result<Arc<CodeGraphToolGroup>, ToolError> {
         let host = Arc::clone(&self.host);
         self.host
             .run(ctx, move |_| async move {
-                Ok::<_, String>(host.project_groups(project).await?.code_graph)
+                Ok::<_, ToolError>(host.project_groups(project).await?.code_graph)
             })
             .await?
     }
 
-    async fn take_prepared(&self, ctx: &ToolContext) -> Result<PreparedInvocation, String> {
+    async fn take_prepared(&self, ctx: &ToolContext) -> Result<PreparedInvocation, ToolError> {
         self.prepare(ctx).await?;
         self.prepared
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .take()
-            .ok_or_else(|| "Workcell invocation preparation was already consumed".into())
+            .ok_or_else(|| {
+                ToolError::new(
+                    ToolFailure::Other,
+                    "Workcell invocation preparation was already consumed",
+                )
+            })
     }
 
     fn prepared_targets(&self, select: impl Fn(&PreparedInvocation) -> &[PathBuf]) -> Vec<PathBuf> {
@@ -1449,7 +1497,7 @@ fn input_start_input(input: &Input) -> Option<ToolInput> {
 }
 
 impl RemoteWorkcellInvocation {
-    async fn prepare(&self, ctx: &ToolContext) -> Result<PermissionIntent, String> {
+    async fn prepare(&self, ctx: &ToolContext) -> Result<PermissionIntent, ToolError> {
         let mut state = self.prepared.lock().await;
         if let Some(call) = &state.call {
             return Ok(self.permission_intent(call));
@@ -1457,7 +1505,7 @@ impl RemoteWorkcellInvocation {
         let session = ctx
             .workspace_session
             .as_ref()
-            .ok_or_else(|| "Remote Workcell workspace context is unavailable".to_owned())?;
+            .ok_or_else(|| ToolError::new(ToolFailure::Other, REMOTE_CONTEXT_UNAVAILABLE))?;
         let call = self
             .client
             .prepare_canonical_tool(
@@ -1469,7 +1517,7 @@ impl RemoteWorkcellInvocation {
                 },
             )
             .await
-            .map_err(|error| error.to_string())?;
+            .map_err(workspace_error)?;
         let intent = self.permission_intent(&call);
         state.call = Some(call);
         Ok(intent)
@@ -1623,7 +1671,7 @@ impl RemoteWorkcellInvocation {
         let mut progress = RemoteProgress::new(ctx);
         let session = match ctx.workspace_session.as_ref() {
             Some(session) => session,
-            None => return Err("Remote Workcell workspace context is unavailable".into()).into(),
+            None => return Err(REMOTE_CONTEXT_UNAVAILABLE.to_owned()).into(),
         };
         if session.binding() != &call.binding || session.cursor() != &call.cursor {
             let _ = self
@@ -1641,13 +1689,13 @@ impl RemoteWorkcellInvocation {
         let deadline = Instant::now() + timeout;
         // A stopped call must not prepare on the host again to renew itself.
         if timeout.is_zero() {
-            return Err(REMOTE_DEADLINE_BEFORE_DISPATCH.into()).into();
+            return ToolExecResult::failed(ToolFailure::Timeout, REMOTE_DEADLINE_BEFORE_DISPATCH);
         }
         if let Err(cancelled) = ctx.cancel.race(future::ready(())).await {
-            return Err(cancelled).into();
+            return ToolExecResult::failed(ToolFailure::Cancelled, cancelled);
         }
         if let Err(error) = self.renew_lapsing_preparation(&mut call, cleanup).await {
-            return Err(error).into();
+            return failed(error);
         }
         let executed = race_remote_execution(
             ctx,
@@ -1664,11 +1712,16 @@ impl RemoteWorkcellInvocation {
             Ok(Some(Ok(status))) => status,
             Ok(Some(Err(RemoteToolExecutionError::BeforeDispatch(error)))) => {
                 cleanup.execution_started = false;
-                return Err(error.to_string()).into();
+                return failed(workspace_error(error));
             }
-            Err(error) if !cleanup.execution_started => return Err(error).into(),
+            Err(cancelled) if !cleanup.execution_started => {
+                return ToolExecResult::failed(ToolFailure::Cancelled, cancelled);
+            }
             Ok(None) if !cleanup.execution_started => {
-                return Err(REMOTE_DEADLINE_BEFORE_DISPATCH.into()).into();
+                return ToolExecResult::failed(
+                    ToolFailure::Timeout,
+                    REMOTE_DEADLINE_BEFORE_DISPATCH,
+                );
             }
             _ => match self.reconcile(&call, &mut progress).await {
                 Some(status) => status,
@@ -1733,8 +1786,7 @@ impl RemoteWorkcellInvocation {
                     };
                 }
                 OperationState::Failed { error, .. } => {
-                    return ToolExecResult::from(Err(remote_failure_message(&self.input, error)))
-                        .with_annotation(Some("remote Workcell failure".into()));
+                    return remote_failure_result(&self.input, error);
                 }
                 OperationState::Cancelled {
                     side_effects_possible,
@@ -1744,10 +1796,11 @@ impl RemoteWorkcellInvocation {
                     } else {
                         "Remote Workcell execution cancelled"
                     };
-                    return ToolExecResult::from(Err(message.into())).with_annotation(
-                        side_effects_possible
-                            .then(|| "remote outcome may include mutations".into()),
-                    );
+                    return ToolExecResult::failed(remote_cancellation(ctx, deadline), message)
+                        .with_annotation(
+                            side_effects_possible
+                                .then(|| "remote outcome may include mutations".into()),
+                        );
                 }
                 OperationState::Forgotten | OperationState::NeverSeen => {
                     return indeterminate_result(&call.prepared, REMOTE_FORGOTTEN);
@@ -1766,7 +1819,7 @@ impl RemoteWorkcellInvocation {
         &self,
         call: &mut RemotePreparedToolCall,
         cleanup: &mut RemoteExecutionCleanup,
-    ) -> Result<(), String> {
+    ) -> Result<(), ToolError> {
         if !call.expires_within(REMOTE_PREPARATION_RENEWAL) {
             return Ok(());
         }
@@ -1778,13 +1831,18 @@ impl RemoteWorkcellInvocation {
             .client
             .prepare_canonical_tool(&call.binding, &call.cursor, &request)
             .await
-            .map_err(|error| format!("{REMOTE_PREPARATION_LAPSED}: {error}"))?;
+            .map_err(|error| {
+                ToolError::new(
+                    ToolFailure::from(&error),
+                    format!("{REMOTE_PREPARATION_LAPSED}: {error}"),
+                )
+            })?;
         if renewed.intent != call.intent {
             let _ = self
                 .client
                 .release_canonical_tool(&renewed.binding, &renewed.cursor, &renewed.prepared)
                 .await;
-            return Err(REMOTE_PREPARATION_CHANGED.into());
+            return Err(REMOTE_PREPARATION_CHANGED.to_owned().into());
         }
         let lapsed = std::mem::replace(call, renewed);
         cleanup.call = Some(call.clone());
@@ -1898,6 +1956,23 @@ fn remote_failure_message(input: &Input, error: OperationError) -> String {
         stale_read_message(paths.join(", "))
     } else {
         error.message
+    }
+}
+
+fn remote_failure_result(input: &Input, error: OperationError) -> ToolExecResult {
+    let failure = ToolFailure::from_code(error.code.as_str());
+    ToolExecResult::failed(failure, remote_failure_message(input, error))
+        .with_annotation(Some("remote Workcell failure".into()))
+}
+
+/// A host reports only that an operation was cancelled. Caudra cancels one
+/// for its caller or once its own deadline has passed, and only local state
+/// can tell which.
+fn remote_cancellation(ctx: &ToolContext, deadline: Instant) -> ToolFailure {
+    if !ctx.cancel.is_cancelled() && Instant::now() >= deadline {
+        ToolFailure::Timeout
+    } else {
+        ToolFailure::Cancelled
     }
 }
 
@@ -2112,7 +2187,7 @@ impl ToolInvocation for RemoteWorkcellInvocation {
     fn preflight<'a>(
         &'a self,
         ctx: &'a ToolContext,
-    ) -> BoxFuture<'a, Result<Option<PermissionIntent>, String>> {
+    ) -> BoxFuture<'a, Result<Option<PermissionIntent>, ToolError>> {
         Box::pin(async move { self.prepare(ctx).await.map(Some) })
     }
 
@@ -2307,13 +2382,10 @@ fn remote_result(
         ToolKind::Index => deserialize_remote(&structured_content)
             .map(|output| remote_index_result(output, &model_output)),
         ToolKind::Shell => remote_shell_result(&structured_content, model_output.clone()),
-        ToolKind::Code => Ok(text_result(
+        ToolKind::Code => Ok(remote_code_result(
             &structured_content,
             model_output.clone(),
-            false,
-            model_output.clone(),
-        )
-        .with_error(is_error || structured_content["outcome"] != "completed")),
+        )),
         ToolKind::Websearch => Ok(text_result(
             &structured_content,
             model_output.clone(),
@@ -2340,10 +2412,13 @@ fn remote_result(
             .map(|output| ToolExecResult::from(Ok::<_, String>(output))),
     };
     match parsed {
-        Ok(result) => result
-            .with_error(is_error)
-            .with_model_output(Some(model_output))
-            .with_remote_written_paths(),
+        Ok(result) => {
+            let is_error = is_error || result.is_error;
+            result
+                .with_error(is_error)
+                .with_model_output(Some(model_output))
+                .with_remote_written_paths()
+        }
         Err(error) => Err(format!("invalid remote Workcell result: {error}")).into(),
     }
 }
@@ -2458,7 +2533,6 @@ fn remote_shell_result(
     model_output: String,
 ) -> Result<ToolExecResult, serde_json::Error> {
     let output: RemoteShellOutput = deserialize_remote(value)?;
-    let is_error = output.exit_code != Some(0) || output.timed_out || output.output_limit_exceeded;
     let output = AgentShellOutput {
         model_text: model_output.clone(),
         relative_workdir: output.relative_workdir,
@@ -2481,11 +2555,18 @@ fn remote_shell_result(
         stderr_redraws_collapsed: output.stderr_redraws_collapsed,
         filter: None,
     };
-    Ok(
-        ToolExecResult::from(Ok::<_, String>(ToolOutput::Shell(output)))
-            .with_model_output(Some(model_output))
-            .with_error(is_error),
-    )
+    Ok(shell_exec_result(output, model_output))
+}
+
+fn remote_code_result(value: &Value, model_output: String) -> ToolExecResult {
+    let result = text_result(value, model_output.clone(), false, model_output);
+    let outcome = CODE_OUTCOMES.into_iter().find(|outcome| {
+        serde_json::to_value(outcome).is_ok_and(|name| name == value[CODE_OUTCOME_FIELD])
+    });
+    match outcome {
+        Some(outcome) => code_outcome_result(result, outcome, value[CODE_TIMED_OUT_FIELD] == true),
+        None => result.with_failure(ToolFailure::Other),
+    }
 }
 
 #[derive(Deserialize)]
@@ -2724,7 +2805,7 @@ impl ToolInvocation for WorkcellInvocation {
     fn preflight<'a>(
         &'a self,
         ctx: &'a ToolContext,
-    ) -> BoxFuture<'a, Result<Option<PermissionIntent>, String>> {
+    ) -> BoxFuture<'a, Result<Option<PermissionIntent>, ToolError>> {
         Box::pin(async move { self.prepare(ctx).await.map(Some) })
     }
 
@@ -2736,7 +2817,7 @@ impl ToolInvocation for WorkcellInvocation {
         Box::pin(async move {
             let prepared = match self.take_prepared(ctx).await {
                 Ok(prepared) => prepared,
-                Err(error) => return Err(error).into(),
+                Err(error) => return failed(error),
             };
             self.execute_prepared(ctx, prepared).await
         })
@@ -2759,8 +2840,8 @@ impl WorkcellInvocation {
                     .await
                 {
                     Ok(Ok(output)) => file_read_result(output),
-                    Ok(Err(error)) => Err(error.to_string()).into(),
-                    Err(error) => Err(error).into(),
+                    Ok(Err(error)) => failed(filesystem_error(error)),
+                    Err(error) => failed(error),
                 }
             }
             (Input::FileRead(_), PreparedExecution::FileRead(group, read)) => {
@@ -2777,8 +2858,8 @@ impl WorkcellInvocation {
                         }
                         file_read_result(output)
                     }
-                    Ok(Err(error)) => Err(error.to_string()).into(),
-                    Err(error) => Err(error).into(),
+                    Ok(Err(error)) => failed(filesystem_error(error)),
+                    Err(error) => failed(error),
                 }
             }
             (Input::FileGlob(_), PreparedExecution::File(group, Input::FileGlob(input))) => {
@@ -2790,8 +2871,8 @@ impl WorkcellInvocation {
                     .await
                 {
                     Ok(Ok(output)) => file_glob_result(output),
-                    Ok(Err(error)) => Err(error.to_string()).into(),
-                    Err(error) => Err(error).into(),
+                    Ok(Err(error)) => failed(filesystem_error(error)),
+                    Err(error) => failed(error),
                 }
             }
             (Input::FileGrep(_), PreparedExecution::File(group, Input::FileGrep(input))) => {
@@ -2811,8 +2892,8 @@ impl WorkcellInvocation {
                         }
                         file_grep_result(output)
                     }
-                    Ok(Err(error)) => Err(error.to_string()).into(),
-                    Err(error) => Err(error).into(),
+                    Ok(Err(error)) => failed(filesystem_error(error)),
+                    Err(error) => failed(error),
                 }
             }
             (
@@ -2836,8 +2917,8 @@ impl WorkcellInvocation {
                         }
                         file_write_result(output, content)
                     }
-                    Ok(Err(error)) => Err(error.to_string()).into(),
-                    Err(error) => Err(error).into(),
+                    Ok(Err(error)) => failed(filesystem_error(error)),
+                    Err(error) => failed(error),
                 }
             }
             (Input::FileEdit(original), PreparedExecution::File(group, Input::FileEdit(input))) => {
@@ -2861,8 +2942,11 @@ impl WorkcellInvocation {
                         }
                         file_edit_result(output, old_string, new_string, replace_all)
                     }
-                    Ok(Err(error)) => Err(with_stale_notice(error.to_string(), stale)).into(),
-                    Err(error) => Err(error).into(),
+                    Ok(Err(error)) => ToolExecResult::failed(
+                        ToolFailure::from_code(error.code()),
+                        with_stale_notice(error.to_string(), stale),
+                    ),
+                    Err(error) => failed(error),
                 }
             }
             // No stale check: the patch only reaches execution once Workcell has
@@ -2872,10 +2956,13 @@ impl WorkcellInvocation {
                 let result = self
                     .host
                     .run(ctx, move |token| async move {
-                        group.execute_prepared_patch(patch, &token).await
+                        group
+                            .execute_prepared_patch(patch, &token)
+                            .await
+                            .map_err(filesystem_error)
                     })
                     .await
-                    .and_then(|result| result.map_err(|error| error.to_string()));
+                    .flatten();
                 match result {
                     Ok(output) => {
                         if output.applied {
@@ -2885,7 +2972,7 @@ impl WorkcellInvocation {
                         }
                         file_patch_result(output)
                     }
-                    Err(error) => Err(error).into(),
+                    Err(error) => failed(error),
                 }
             }
             (Input::Index(_), PreparedExecution::Index(group, resource)) => {
@@ -2916,8 +3003,8 @@ impl WorkcellInvocation {
                         }
                         index_result(output, max_model_output_bytes)
                     }
-                    Ok(Err(error)) => Err(error.to_string()).into(),
-                    Err(error) => Err(error).into(),
+                    Ok(Err(error)) => failed(filesystem_error(error)),
+                    Err(error) => failed(error),
                 }
             }
             (Input::Websearch(_), PreparedExecution::Websearch(prepared)) => {
@@ -2925,13 +3012,26 @@ impl WorkcellInvocation {
                     .host
                     .run(ctx, {
                         let web = self.host.web.clone();
-                        move |token| async move { web.execute_websearch(prepared, token).await }
+                        // A search reports being stopped only in prose, so the
+                        // token it was handed is what places the failure.
+                        move |token| async move {
+                            web.execute_websearch(prepared, token.clone())
+                                .await
+                                .map_err(|message| {
+                                    let failure = if token.is_cancelled() {
+                                        ToolFailure::Cancelled
+                                    } else {
+                                        ToolFailure::Other
+                                    };
+                                    ToolError::new(failure, message)
+                                })
+                        }
                     })
                     .await
+                    .flatten()
                 {
-                    Ok(Ok(execution)) => websearch_result(execution),
-                    Ok(Err(error)) => Err(error).into(),
-                    Err(error) => Err(error).into(),
+                    Ok(execution) => websearch_result(execution),
+                    Err(error) => failed(error),
                 }
             }
             (Input::Webfetch(_), PreparedExecution::Webfetch(prepared)) => {
@@ -2939,13 +3039,17 @@ impl WorkcellInvocation {
                     .host
                     .run(ctx, {
                         let web = self.host.web.clone();
-                        move |token| async move { web.execute_webfetch(prepared, token).await }
+                        move |token| async move {
+                            web.execute_webfetch(prepared, token)
+                                .await
+                                .map_err(webfetch_error)
+                        }
                     })
                     .await
+                    .flatten()
                 {
-                    Ok(Ok(execution)) => webfetch_result(execution),
-                    Ok(Err(error)) => Err(error.to_string()).into(),
-                    Err(error) => Err(error).into(),
+                    Ok(execution) => webfetch_result(execution),
+                    Err(error) => failed(error),
                 }
             }
             (Input::Shell(_), PreparedExecution::Shell(group, prepared)) => {
@@ -2961,14 +3065,14 @@ impl WorkcellInvocation {
                     .await
                 {
                     Ok(Ok(Some(execution))) => shell_result(execution),
-                    Ok(Ok(None)) => Err("Shell execution cancelled".into()).into(),
-                    Ok(Err(error)) => Err(error).into(),
-                    Err(error) => Err(error).into(),
+                    Ok(Ok(None)) => ToolExecResult::failed(ToolFailure::Cancelled, SHELL_CANCELLED),
+                    Ok(Err(error)) => ToolExecResult::failed(ToolFailure::Other, error),
+                    Err(error) => failed(error),
                 }
             }
             (Input::Code(input), PreparedExecution::None) => {
                 let Some(code) = self.host.code.clone() else {
-                    return Err(CODE_WORKER_UNAVAILABLE.into()).into();
+                    return ToolExecResult::failed(ToolFailure::Other, CODE_WORKER_UNAVAILABLE);
                 };
                 let input = input.clone();
                 match self
@@ -2980,9 +3084,9 @@ impl WorkcellInvocation {
                     .await
                 {
                     Ok(Ok(Some(execution))) => code_result(execution),
-                    Ok(Ok(None)) => Err("Code execution cancelled".into()).into(),
-                    Ok(Err(error)) => Err(error).into(),
-                    Err(error) => Err(error).into(),
+                    Ok(Ok(None)) => ToolExecResult::failed(ToolFailure::Cancelled, CODE_CANCELLED),
+                    Ok(Err(error)) => failed(invalid_input(error)),
+                    Err(error) => failed(error),
                 }
             }
             (Input::CodeMap(input), PreparedExecution::CodeGraph(group)) => {
@@ -3007,8 +3111,8 @@ impl WorkcellInvocation {
                             annotation,
                         )
                     }
-                    Ok(Err(error)) => Err(error.to_string()).into(),
-                    Err(error) => Err(error).into(),
+                    Ok(Err(error)) => failed(code_graph_error(error)),
+                    Err(error) => failed(error),
                 }
             }
             (Input::CodeContext(input), PreparedExecution::CodeGraph(group)) => {
@@ -3044,8 +3148,8 @@ impl WorkcellInvocation {
                             annotation,
                         )
                     }
-                    Ok(Err(error)) => Err(error.to_string()).into(),
-                    Err(error) => Err(error).into(),
+                    Ok(Err(error)) => failed(code_graph_error(error)),
+                    Err(error) => failed(error),
                 }
             }
             (Input::CodeRefs(input), PreparedExecution::CodeGraph(group)) => {
@@ -3074,8 +3178,8 @@ impl WorkcellInvocation {
                         )
                     }
                     Ok(Ok(Err(refusal))) => selector_refusal_result(&refusal),
-                    Ok(Err(error)) => Err(error.to_string()).into(),
-                    Err(error) => Err(error).into(),
+                    Ok(Err(error)) => failed(code_graph_error(error)),
+                    Err(error) => failed(error),
                 }
             }
             (Input::CodeImpact(input), PreparedExecution::CodeGraph(group)) => {
@@ -3111,8 +3215,8 @@ impl WorkcellInvocation {
                         )
                     }
                     Ok(Ok(Err(refusal))) => selector_refusal_result(&refusal),
-                    Ok(Err(error)) => Err(error.to_string()).into(),
-                    Err(error) => Err(error).into(),
+                    Ok(Err(error)) => failed(code_graph_error(error)),
+                    Err(error) => failed(error),
                 }
             }
             (Input::CodeExpand(input), PreparedExecution::CodeGraph(group)) => {
@@ -3156,8 +3260,8 @@ impl WorkcellInvocation {
                         )
                     }
                     Ok(Ok(Err(refusal))) => selector_refusal_result(&refusal),
-                    Ok(Err(error)) => Err(error.to_string()).into(),
-                    Err(error) => Err(error).into(),
+                    Ok(Err(error)) => failed(code_graph_error(error)),
+                    Err(error) => failed(error),
                 }
             }
             (Input::Environment, PreparedExecution::Environment(environment)) => {
@@ -3176,8 +3280,8 @@ impl WorkcellInvocation {
                     .await
                 {
                     Ok(Ok(result)) => environment_result(result),
-                    Ok(Err(error)) => Err(environment_error(error)).into(),
-                    Err(error) => Err(error).into(),
+                    Ok(Err(error)) => failed(environment_error(error)),
+                    Err(error) => failed(error),
                 }
             }
             _ => Err("Workcell invocation preparation did not match its typed input".into()).into(),
@@ -3201,10 +3305,47 @@ fn with_stale_notice(error: String, notice: Option<String>) -> String {
     }
 }
 
+fn failed(error: ToolError) -> ToolExecResult {
+    ToolExecResult::failed(error.failure, error.message)
+}
+
+fn invalid_input(message: String) -> ToolError {
+    ToolError::new(ToolFailure::InvalidInput, message)
+}
+
+/// Workcell's own symbolic code, the one a remote host refuses with, so a
+/// local and a remote failure land in the same bucket.
+fn filesystem_error(error: FilesystemError) -> ToolError {
+    ToolError::new(ToolFailure::from_code(error.code()), error.to_string())
+}
+
+fn webfetch_error(error: WebfetchError) -> ToolError {
+    let failure = match &error {
+        WebfetchError::InvalidInput(_) => ToolFailure::InvalidInput,
+        WebfetchError::Aborted => ToolFailure::Cancelled,
+        WebfetchError::Operation(_) => ToolFailure::Other,
+    };
+    ToolError::new(failure, error.to_string())
+}
+
+fn code_graph_error(error: CodeGraphError) -> ToolError {
+    let failure = match &error {
+        CodeGraphError::Denied(_) => ToolFailure::Denied,
+        CodeGraphError::Invalid(_) => ToolFailure::InvalidInput,
+        CodeGraphError::Aborted => ToolFailure::Cancelled,
+        CodeGraphError::Internal(_) => ToolFailure::Other,
+    };
+    ToolError::new(failure, error.to_string())
+}
+
+fn workspace_error(error: WorkspaceError) -> ToolError {
+    ToolError::new(ToolFailure::from(&error), error.to_string())
+}
+
 async fn confined_traversal_group(
     unconfined: FileToolGroup,
     resource: &FileResource,
-) -> Result<(FileToolGroup, String), String> {
+) -> Result<(FileToolGroup, String), FilesystemError> {
     let is_directory = tokio::fs::metadata(&resource.path)
         .await
         .is_ok_and(|metadata| metadata.is_dir());
@@ -3212,9 +3353,7 @@ async fn confined_traversal_group(
         return Ok((unconfined, resource.path.to_string_lossy().into_owned()));
     }
     let limits = *unconfined.limits();
-    let confined = FileToolGroup::new(&resource.path, false, Some(limits))
-        .await
-        .map_err(|error| error.to_string())?;
+    let confined = FileToolGroup::new(&resource.path, false, Some(limits)).await?;
     Ok((confined, ".".into()))
 }
 
@@ -3517,7 +3656,7 @@ fn shell_prepared(
     project: &Path,
     raw_input: Option<&Value>,
     redirect: ShellNativeRedirect,
-) -> Result<PreparedInvocation, String> {
+) -> Result<PreparedInvocation, ToolError> {
     let raw_input = raw_input
         .filter(|input| input.get("command").and_then(Value::as_str) == Some(shell.command()));
     let mut opaque = true;
@@ -3545,7 +3684,10 @@ fn shell_prepared(
                 "shell command duplicates a native tool"
             );
             if enforced {
-                return Err(native_redirect::refusal(&natives));
+                return Err(ToolError::new(
+                    ToolFailure::Denied,
+                    native_redirect::refusal(&natives),
+                ));
             }
         }
         for command in &facts.commands {
@@ -4054,7 +4196,6 @@ fn shell_result_parts(
     mut model_text: String,
     filter: Option<WorkcellShellFilterInfo>,
 ) -> ToolExecResult {
-    let is_error = output.exit_code != Some(0) || output.timed_out || output.output_limit_exceeded;
     model_text.push_str("\n\n");
     model_text.push_str(&shell_status(&output));
     let output = AgentShellOutput {
@@ -4083,9 +4224,22 @@ fn shell_result_parts(
             filtered_utf8_bytes: filter.filtered_utf8_bytes,
         }),
     };
-    ToolExecResult::from(Ok::<_, String>(ToolOutput::Shell(output)))
-        .with_model_output(Some(model_text))
-        .with_error(is_error)
+    shell_exec_result(output, model_text)
+}
+
+/// A command that ran and failed on its own states no reason. Only Workcell's
+/// own time limit makes it a timeout, whatever the command printed.
+fn shell_exec_result(output: AgentShellOutput, model_output: String) -> ToolExecResult {
+    let timed_out = output.timed_out;
+    let is_error = output.exit_code != Some(0) || timed_out || output.output_limit_exceeded;
+    let result = ToolExecResult::from(Ok::<_, String>(ToolOutput::Shell(output)))
+        .with_model_output(Some(model_output))
+        .with_error(is_error);
+    if timed_out {
+        result.with_failure(ToolFailure::Timeout)
+    } else {
+        result
+    }
 }
 
 fn shell_status(output: &WorkcellShellOutput) -> String {
@@ -4223,14 +4377,30 @@ fn shown_of(shown: usize, total: usize, unit: &str) -> String {
 }
 
 fn code_result(execution: CodeExecution) -> ToolExecResult {
-    let is_error = execution.output.outcome != Outcome::Completed;
-    text_result(
+    let (outcome, timed_out) = (execution.output.outcome, execution.output.timed_out);
+    let result = text_result(
         &execution.output,
         execution.model_text.clone(),
         false,
         execution.model_text,
-    )
-    .with_error(is_error)
+    );
+    code_outcome_result(result, outcome, timed_out)
+}
+
+/// A snippet's failure is placed by the outcome Workcell typed. A spent budget
+/// is a timeout only when time was the budget.
+fn code_outcome_result(
+    result: ToolExecResult,
+    outcome: Outcome,
+    timed_out: bool,
+) -> ToolExecResult {
+    let failure = match outcome {
+        Outcome::Completed => return result,
+        Outcome::Rejected => ToolFailure::InvalidInput,
+        Outcome::Limited if timed_out => ToolFailure::Timeout,
+        Outcome::Exception | Outcome::Limited | Outcome::Unavailable => ToolFailure::Other,
+    };
+    result.with_failure(failure)
 }
 
 /// The host as a card rather than as its record. Workcell's `model_text` is the
@@ -4491,8 +4661,13 @@ fn enabled_tool_groups(groups: &EnvironmentGroups) -> Vec<&'static str> {
     .collect()
 }
 
-fn environment_error(error: ExecutionEnvironmentError) -> String {
-    error.to_string()
+fn environment_error(error: ExecutionEnvironmentError) -> ToolError {
+    let failure = match error {
+        ExecutionEnvironmentError::Unavailable => ToolFailure::Other,
+        ExecutionEnvironmentError::Cancelled => ToolFailure::Cancelled,
+        ExecutionEnvironmentError::TimedOut => ToolFailure::Timeout,
+    };
+    ToolError::new(failure, error.to_string())
 }
 
 /// The live tail of a running command, rendered as a terminal would show it.
@@ -4636,7 +4811,7 @@ mod tests {
     };
     use caudra_agent::template::Vars;
     use caudra_agent::tools::execution::configure_tools;
-    use caudra_agent::tools::{FileReadTracker, STALE_READ_MSG, interpreter_ctx};
+    use caudra_agent::tools::{Deadline, FileReadTracker, STALE_READ_MSG, interpreter_ctx};
     use caudra_agent::{
         AgentMode, ContentBlock, Envelope, EventSender, History, Mention, Message, StoredSession,
         TaskCard, ToolFilter,
@@ -4662,14 +4837,15 @@ mod tests {
     use smol::lock::Mutex as AsyncMutex;
     use smol::net::TcpListener;
     use std::any::TypeId;
+    use std::io::ErrorKind;
     use std::ops::RangeInclusive;
     use std::slice;
     use std::sync::Arc;
     use tempfile::TempDir;
     use test_case::test_case;
     use workcell::code::{
-        DEFAULT_TIMEOUT_MS as CODE_DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS as CODE_MAX_TIMEOUT_MS,
-        MAX_TIMEOUT_SECS as CODE_MAX_TIMEOUT_SECS,
+        CodeOutput, DEFAULT_TIMEOUT_MS as CODE_DEFAULT_TIMEOUT_MS,
+        MAX_TIMEOUT_MS as CODE_MAX_TIMEOUT_MS, MAX_TIMEOUT_SECS as CODE_MAX_TIMEOUT_SECS,
     };
     use workcell::environment::{
         CommandDescriptor, ContainerDescriptor, DeclaredPackageManager,
@@ -4695,7 +4871,6 @@ mod tests {
     const EXPECT_SAME_AS_BATCHED: &str =
         "a call reads the same whether it was made directly or inside a batch";
     const FILTERABLE_MAKEFILE: &str = "all:\n\t@echo \"make[1]: Entering directory '/x'\"\n\t@echo \"real build line\"\n\t@echo \"make[1]: Leaving directory '/x'\"\n";
-    const SHELL_CANCELLED: &str = "Shell execution cancelled";
     const LOCKFILE: &str = "package-lock.json";
     const BROWSE_CONTENT_SENTINEL: &str = "content_not_authorized_by_a_names_only_grant";
     const PATTERN_PACKAGES: [&str; 3] = ["alpha", "beta", "gamma"];
@@ -4710,6 +4885,11 @@ mod tests {
     /// rendering that ever approached that would have stopped being one.
     const ENVIRONMENT_MAX_MODEL_LINES: usize = 40;
     const REMOTE_ENVIRONMENT_MODEL_TEXT: &str = "authoritative remote environment text";
+    /// Output that names every failure class, so a result is proven to be
+    /// placed by Workcell's flags rather than by what the command printed.
+    const MISLEADING_OUTPUT: &str = "cancelled: not found, permission denied, timeout exceeded";
+    const RUN_DEADLINE: Duration = Duration::from_millis(50);
+    const FAILING_EXIT_CODE: i32 = 1;
     const INVALID_REMOTE_RESULT: &str = "invalid remote Workcell result:";
     const EMBEDDED_SHELL_CALL: &str = "embedded-shell-call";
     const EMBEDDED_SHELL_READY: &[u8] = b"ready\n";
@@ -5051,8 +5231,13 @@ mod tests {
             prepared: Mutex::new(None),
         };
         let timeout = invocation.shell_timeout();
-        let result = smol::block_on(invocation.preflight(&ctx));
-        assert_eq!(result.is_ok(), timeout.is_some());
+        let failure = smol::block_on(invocation.preflight(&ctx))
+            .err()
+            .map(|error| error.failure);
+        assert_eq!(
+            failure,
+            timeout.is_none().then_some(ToolFailure::InvalidInput)
+        );
         assert_eq!(invocation.shell_timeout(), timeout);
         assert_eq!(invocation.permission_input(), Some(&input));
         if let Some(timeout) = timeout {
@@ -6149,7 +6334,7 @@ mod tests {
     fn shell_redirect_preflight(
         command: &str,
         redirect: ShellNativeRedirect,
-    ) -> Result<(), String> {
+    ) -> Result<(), ToolError> {
         let root = TempDir::new().expect("tempdir");
         let (_host, registry) = host_and_registry(root.path());
         let mut ctx = context(root.path(), Arc::clone(&registry), CancelToken::none());
@@ -6178,7 +6363,11 @@ mod tests {
         let error = shell_redirect_preflight(DUPLICATING_COMMAND, ShellNativeRedirect::Enforce)
             .expect_err("enforcement must refuse");
 
-        assert!(error.contains("file_grep"), "{error:?} must name the tool");
+        assert!(
+            error.message.contains("file_grep"),
+            "{error:?} must name the tool"
+        );
+        assert_eq!(error.failure, ToolFailure::Denied);
     }
 
     /// The trap enforcement has to avoid: a flag the native tool cannot express
@@ -7191,6 +7380,99 @@ mod tests {
             failure.output.as_ref().unwrap(),
             ToolOutput::Shell(output) if output.filter.is_none()
         ));
+    }
+
+    /// Workcell's flags place a command's failure, never its output. A host
+    /// returns a finished command as a success whatever its exit, so the remote
+    /// result keeps the command's own status over the envelope's.
+    #[test_case(0, false, false => (false, None) ; "a_clean_exit")]
+    #[test_case(FAILING_EXIT_CODE, false, false => (true, None) ; "a_failed_command_states_no_reason")]
+    #[test_case(0, false, true => (true, None) ; "an_exceeded_output_limit_states_no_reason")]
+    #[test_case(FAILING_EXIT_CODE, true, false => (true, Some(ToolFailure::Timeout)) ; "a_timed_out_command")]
+    fn a_command_fails_by_its_flags_locally_and_remotely(
+        exit_code: i32,
+        timed_out: bool,
+        output_limit_exceeded: bool,
+    ) -> (bool, Option<ToolFailure>) {
+        let mut output = shell_output(exit_code);
+        output.stdout = MISLEADING_OUTPUT.into();
+        output.timed_out = timed_out;
+        output.output_limit_exceeded = output_limit_exceeded;
+        let remote = remote_result(
+            ToolKind::Shell,
+            &Input::parse(ToolKind::Shell, json!({"command": DEADLINE_COMMAND}))
+                .expect("valid input"),
+            RemoteToolResultEnvelope {
+                structured_content: serde_json::to_value(&output).expect("structured output"),
+                model_output: MISLEADING_OUTPUT.into(),
+                is_error: false,
+            },
+        );
+        let local = shell_result_parts(output, MISLEADING_OUTPUT.into(), None);
+
+        assert_eq!(
+            (remote.is_error, remote.failure),
+            (local.is_error, local.failure)
+        );
+        (local.is_error, local.failure)
+    }
+
+    fn code_output(outcome: Outcome, timed_out: bool) -> CodeOutput {
+        CodeOutput {
+            version: 1,
+            kind: "code",
+            outcome,
+            timeout_ms: CODE_DEFAULT_TIMEOUT_MS,
+            duration_ms: 10,
+            type_checked: true,
+            result: Value::Null,
+            result_repr: None,
+            stdout: MISLEADING_OUTPUT.into(),
+            stderr: String::new(),
+            stdout_truncated: false,
+            stderr_truncated: false,
+            stdout_utf8_bytes: 0,
+            stderr_utf8_bytes: 0,
+            exception: None,
+            diagnostic: None,
+            timed_out,
+            memory_exceeded: false,
+            suspension_limit_exceeded: false,
+        }
+    }
+
+    /// The outcome Workcell typed places a snippet's failure, and reads the
+    /// same whether the worker ran here or on a remote host.
+    #[test_case(Outcome::Completed, false => (false, None) ; "completed")]
+    #[test_case(Outcome::Rejected, false => (true, Some(ToolFailure::InvalidInput)) ; "rejected_before_running")]
+    #[test_case(Outcome::Exception, false => (true, Some(ToolFailure::Other)) ; "raised")]
+    #[test_case(Outcome::Limited, true => (true, Some(ToolFailure::Timeout)) ; "out_of_time")]
+    #[test_case(Outcome::Limited, false => (true, Some(ToolFailure::Other)) ; "out_of_another_budget")]
+    #[test_case(Outcome::Unavailable, false => (true, Some(ToolFailure::Other)) ; "unavailable")]
+    fn a_snippet_fails_by_its_outcome_locally_and_remotely(
+        outcome: Outcome,
+        timed_out: bool,
+    ) -> (bool, Option<ToolFailure>) {
+        let remote = remote_result(
+            ToolKind::Code,
+            &Input::parse(ToolKind::Code, json!({"code": DEADLINE_CODE})).expect("valid input"),
+            RemoteToolResultEnvelope {
+                structured_content: serde_json::to_value(code_output(outcome, timed_out))
+                    .expect("structured output"),
+                model_output: MISLEADING_OUTPUT.into(),
+                is_error: false,
+            },
+        );
+        let local = code_result(CodeExecution {
+            output: code_output(outcome, timed_out),
+            model_text: MISLEADING_OUTPUT.into(),
+        });
+
+        assert_eq!(
+            (remote.is_error, remote.failure),
+            (local.is_error, local.failure)
+        );
+        (local.is_error, local.failure)
     }
 
     #[test]
@@ -8727,6 +9009,59 @@ mod tests {
         assert_eq!(remote_failure_message(&input, error), expected);
     }
 
+    /// A host refuses with Workcell's own code, so a file failure lands in the
+    /// same bucket whether the tool ran here or on the host.
+    #[test_case(FilesystemError::RootEscape(HOST_REFUSAL.into()), ToolFailure::Denied ; "outside_the_root")]
+    #[test_case(FilesystemError::ProtectedPath(HOST_REFUSAL.into()), ToolFailure::Denied ; "a_protected_path")]
+    #[test_case(FilesystemError::NotFound(HOST_REFUSAL.into()), ToolFailure::NotFound ; "a_missing_path")]
+    #[test_case(FilesystemError::Io { context: HOST_REFUSAL.into(), source: ErrorKind::PermissionDenied.into() }, ToolFailure::Denied ; "a_permission_error")]
+    #[test_case(FilesystemError::Aborted, ToolFailure::Cancelled ; "an_aborted_operation")]
+    #[test_case(FilesystemError::Stale(HOST_REFUSAL.into()), ToolFailure::Other ; "a_stale_resource")]
+    fn a_file_failure_lands_in_one_bucket_locally_and_remotely(
+        error: FilesystemError,
+        failure: ToolFailure,
+    ) {
+        let input = Input::parse(
+            ToolKind::FileRead,
+            json!({"filePath": REMOTE_RELATIVE_TARGET}),
+        )
+        .expect("valid input");
+        let remote = remote_failure_result(
+            &input,
+            OperationError {
+                code: OperationId::new(error.code()).unwrap(),
+                message: HOST_REFUSAL.to_owned(),
+            },
+        );
+
+        assert_eq!(remote.failure, Some(failure));
+        assert_eq!(filesystem_error(error).failure, failure);
+    }
+
+    /// A host reports only that an operation was cancelled, so it is a timeout
+    /// exactly when Caudra's own deadline passed and its caller did not cancel.
+    #[test_case(false, true => ToolFailure::Timeout ; "past_the_deadline")]
+    #[test_case(false, false => ToolFailure::Cancelled ; "before_the_deadline")]
+    #[test_case(true, true => ToolFailure::Cancelled ; "a_caller_that_cancelled_wins")]
+    fn a_remote_cancellation_is_a_timeout_only_past_the_deadline(
+        cancelled: bool,
+        expired: bool,
+    ) -> ToolFailure {
+        let root = TempDir::new().unwrap();
+        let (trigger, cancel) = CancelToken::new();
+        let ctx = context(root.path(), Arc::new(ToolRegistry::new()), cancel);
+        if cancelled {
+            trigger.cancel();
+        }
+        let now = Instant::now();
+        let deadline = if expired {
+            now
+        } else {
+            now + REMOTE_EXECUTION_TIMEOUT
+        };
+        remote_cancellation(&ctx, deadline)
+    }
+
     /// Workcell records every successful `file_read` against the tracker it is
     /// handed, `offset` or not, so the only thing standing between a 20-line
     /// mention and a later edit passing its staleness check on the whole file
@@ -8844,7 +9179,7 @@ mod tests {
         let root = TempDir::new().expect("tempdir");
         let (_host, registry) = host_and_registry(root.path());
         let mut ctx = context(root.path(), Arc::clone(&registry), CancelToken::none());
-        ctx.deadline = caudra_agent::tools::Deadline::after(std::time::Duration::ZERO);
+        ctx.deadline = Deadline::after(Duration::ZERO);
         let invocation = registry
             .get("file_read")
             .expect("registered file read")
@@ -8852,10 +9187,28 @@ mod tests {
             .parse(&json!({"filePath": "missing.txt"}))
             .expect("valid read input");
 
-        assert_eq!(
-            smol::block_on(invocation.preflight(&ctx)).unwrap_err(),
-            caudra_agent::tools::DEADLINE_EXCEEDED
-        );
+        let error = smol::block_on(invocation.preflight(&ctx)).unwrap_err();
+        assert_eq!(error.message, DEADLINE_EXCEEDED);
+        assert_eq!(error.failure, ToolFailure::Timeout);
+    }
+
+    /// An operation stopped by the caller's deadline reports the deadline, not
+    /// whatever the stopped operation returned on its way out.
+    #[test]
+    fn a_deadline_reached_mid_operation_is_a_timeout() {
+        let root = TempDir::new().expect("tempdir");
+        let (host, registry) = host_and_registry(root.path());
+        let mut ctx = context(root.path(), registry, CancelToken::none());
+        ctx.deadline = Deadline::after(RUN_DEADLINE);
+
+        let error = smol::block_on(
+            host.inner
+                .run(&ctx, |token| async move { token.cancelled().await }),
+        )
+        .expect_err("only the deadline ends the operation");
+
+        assert_eq!(error.message, DEADLINE_EXCEEDED);
+        assert_eq!(error.failure, ToolFailure::Timeout);
     }
 
     #[cfg(unix)]
@@ -9555,11 +9908,11 @@ mod tests {
             smol::block_on(invocation.preflight(&ctx)).expect_err("unmatched context fails");
 
         assert!(
-            error.contains(PATCH_MISS_MSG),
+            error.message.contains(PATCH_MISS_MSG),
             "{EXPECT_CAUSE_KEPT}: {error}"
         );
         assert!(
-            error.contains(STALE_READ_MSG),
+            error.message.contains(STALE_READ_MSG),
             "{EXPECT_STALE_NOTICE}: {error}"
         );
     }
@@ -9576,11 +9929,11 @@ mod tests {
             smol::block_on(invocation.preflight(&ctx)).expect_err("unmatched context fails");
 
         assert!(
-            error.contains(PATCH_MISS_MSG),
+            error.message.contains(PATCH_MISS_MSG),
             "{EXPECT_CAUSE_KEPT}: {error}"
         );
         assert!(
-            !error.contains(STALE_READ_MSG),
+            !error.message.contains(STALE_READ_MSG),
             "{EXPECT_NO_STALE_NOTICE}: {error}"
         );
     }
@@ -9646,6 +9999,7 @@ mod tests {
 
         let result = smol::block_on(invocation.execute(&ctx));
         assert!(result.is_error);
+        assert_eq!(result.failure, Some(ToolFailure::Cancelled));
         assert_eq!(result.output.expect_err(SHELL_CANCELLED), SHELL_CANCELLED);
     }
 
@@ -9759,7 +10113,7 @@ mod tests {
     const MISSING_NAME: &str = "does-not-exist.txt";
     const PRESENT_NAME: &str = "present.txt";
 
-    fn preflight_error(root: &Path, tool: &str, input: Value) -> Result<(), String> {
+    fn preflight_error(root: &Path, tool: &str, input: Value) -> Result<(), ToolError> {
         let (_host, registry) = host_and_registry(root);
         let ctx = context(root, Arc::clone(&registry), CancelToken::none());
         let invocation = registry
@@ -9792,9 +10146,10 @@ mod tests {
         let error = preflight_error(root.path(), tool, input).expect_err("preflight must refuse");
 
         assert!(
-            error.contains(MISSING_NAME),
+            error.message.contains(MISSING_NAME),
             "the refusal must name the absent path, got {error:?}"
         );
+        assert_eq!(error.failure, ToolFailure::NotFound);
     }
 
     #[test]
@@ -9809,7 +10164,7 @@ mod tests {
         .expect_err("preflight must refuse");
 
         assert!(
-            error.contains(MISSING_READ_TARGET),
+            error.message.contains(MISSING_READ_TARGET),
             "expected our own refusal, got {error:?}"
         );
     }

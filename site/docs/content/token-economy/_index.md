@@ -189,7 +189,7 @@ Token figures carry a `~` because they are estimates. Caudra measures them with 
 
 The percentiles are approximate for a different reason. A sum survives being merged across hours and projects while a percentile does not, so Caudra records the shape of each tool's durations as a small log-scale histogram rather than keeping every sample. Each figure names the top of the bucket a call landed in, which makes it an upper bound within roughly 12% of the real duration.
 
-Tools that failed get a `Failures` block under the table naming the classes behind the rate: `cancelled`, `timed out`, `denied`, `not found`, `bad input`, and `failed` for the rest. A rate of 40% reads differently once you know it was `denied` every time.
+Tools that failed get a `Failures` block under the table naming the classes behind the rate: `cancelled`, `timed out`, `denied`, `not found`, `bad input`, and `failed` for the rest. A rate of 40% reads differently once you know it was `denied` every time. Each class is stated by the tool that failed rather than read from its output, so a command that fails on its own is `failed` whatever it printed.
 
 Recorded activity lives in its own ledger, the same way spend does. Session counters go when the session goes. The project and global ledger holds one row per hour, tool, source, outcome, and project, so deleting a transcript leaves the record of what ran behind, and `caudra storage usage --prune-older-than` trims both ledgers in one pass.
 

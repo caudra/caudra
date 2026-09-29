@@ -23,7 +23,8 @@ use caudra_agent::permissions::{
 use caudra_agent::prompt::{PromptId, ResolvedSlots, Slot, SlotEntry};
 use caudra_agent::tools::{
     DOOM_LOOP_MESSAGE, HeaderResult, PLAN_WRITE_RESTRICTED, PermissionScopes,
-    READ_ONLY_TOOL_RESTRICTED, RegistryError, Tool, ToolEffect, ToolLive, ToolRegistry, ToolSource,
+    READ_ONLY_TOOL_RESTRICTED, RegistryError, Tool, ToolEffect, ToolFailure, ToolLive,
+    ToolRegistry, ToolSource,
 };
 use caudra_agent::{BufferSnapshot, SharedBuf, SnapshotLine, SnapshotSpan, SpanStyle};
 use include_dir::Dir;
@@ -367,6 +368,15 @@ pub struct LiveCtx {
 enum KillReason {
     Cancelled,
     Deadline,
+}
+
+impl From<KillReason> for ToolFailure {
+    fn from(reason: KillReason) -> Self {
+        match reason {
+            KillReason::Cancelled => Self::Cancelled,
+            KillReason::Deadline => Self::Timeout,
+        }
+    }
 }
 
 /// Lua is single-threaded so this Mutex never contends, but
@@ -2641,10 +2651,13 @@ async fn run_tool_call(
     let handler: Function = {
         let plugins_ref = plugins.borrow();
         let Some(keys) = plugins_ref.get(&*plugin) else {
-            return ToolCallReply::err(format!("plugin not loaded: {plugin}"));
+            return ToolCallReply::failed(
+                ToolFailure::NotFound,
+                format!("plugin not loaded: {plugin}"),
+            );
         };
         let Some(tool_keys) = keys.get(&*tool) else {
-            return ToolCallReply::err(format!("tool not found: {tool}"));
+            return ToolCallReply::failed(ToolFailure::NotFound, format!("tool not found: {tool}"));
         };
         if tool_keys.contract != contract {
             return ToolCallReply::err("plugin implementation changed during permission review");
@@ -2740,6 +2753,13 @@ async fn run_tool_call(
     // `tool.rs` timeout is the absolute backstop; the dispatch loop
     // and watchdog interrupt enforce the per-plugin deadline from TaskCell.
     let reply = call_future.await;
+    // A task doomed by the time it answers failed for that reason, whoever
+    // worded the reply: a cancel hook, the handler, or the host.
+    let kill = lock_cell(&handle).doomed(Instant::now());
+    let reply = ToolCallReply {
+        failure: kill.map_or(reply.failure, ToolFailure::from),
+        ..reply
+    };
     if let Some(id) = &live_id {
         live_tasks.borrow_mut().remove(id);
         // Best-effort cache: any tool with a root buf can serve clicks.

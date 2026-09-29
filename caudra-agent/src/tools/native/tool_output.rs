@@ -13,7 +13,8 @@ use std::sync::Arc;
 use serde_json::Value;
 
 use crate::tools::registry::{
-    ExecFuture, HeaderFuture, HeaderResult, ParseError, Tool, ToolExecResult, ToolInvocation,
+    ExecFuture, HeaderFuture, HeaderResult, ParseError, Tool, ToolError, ToolExecResult,
+    ToolFailure, ToolInvocation,
 };
 use crate::tools::schema::{ParamKind, ParamSchema, Property, to_json_schema, validate};
 use crate::tools::{DescriptionContext, ToolAudience, ToolContext};
@@ -21,7 +22,7 @@ use crate::types::ToolOutput;
 use caudra_providers::{estimate_tokens, token_label};
 use caudra_storage::id::CaudraId;
 use caudra_storage::tool_outputs::{
-    ToolOutputGrepResult, ToolOutputId, ToolOutputReadResult, ToolOutputStore,
+    ToolOutputError, ToolOutputGrepResult, ToolOutputId, ToolOutputReadResult, ToolOutputStore,
 };
 
 pub const DESCRIPTION: &str = "Page or search managed tool output owned by the current session. \
@@ -163,17 +164,12 @@ impl ToolInvocation for ReadCall {
     }
 
     fn execute<'a>(self: Box<Self>, ctx: &'a ToolContext) -> ExecFuture<'a> {
-        Box::pin(async move {
-            match self.run(ctx).await {
-                Ok(text) => ToolExecResult::from(Ok(ToolOutput::Plain(text.into()))),
-                Err(error) => ToolExecResult::from(Err(format!("error: {error}"))),
-            }
-        })
+        Box::pin(async move { page_result(self.run(ctx).await) })
     }
 }
 
 impl ReadCall {
-    async fn run(&self, ctx: &ToolContext) -> Result<String, String> {
+    async fn run(&self, ctx: &ToolContext) -> Result<String, ToolError> {
         let (session, store) = access(ctx)?;
         let id = parse_id(&self.output_id)?;
         let (offset, limit) = (
@@ -183,7 +179,7 @@ impl ReadCall {
         let byte_offset = self.byte_offset;
         let result =
             smol::unblock(move || store.read_at(session, id, offset, limit, byte_offset)).await;
-        let result = result.map_err(|e| e.to_string())?;
+        let result = result.map_err(store_error)?;
         Ok(format_read(&self.output_id, &result, self.limit))
     }
 }
@@ -203,17 +199,12 @@ impl ToolInvocation for GrepCall {
     }
 
     fn execute<'a>(self: Box<Self>, ctx: &'a ToolContext) -> ExecFuture<'a> {
-        Box::pin(async move {
-            match self.run(ctx).await {
-                Ok(text) => ToolExecResult::from(Ok(ToolOutput::Plain(text.into()))),
-                Err(error) => ToolExecResult::from(Err(format!("error: {error}"))),
-            }
-        })
+        Box::pin(async move { page_result(self.run(ctx).await) })
     }
 }
 
 impl GrepCall {
-    async fn run(&self, ctx: &ToolContext) -> Result<String, String> {
+    async fn run(&self, ctx: &ToolContext) -> Result<String, ToolError> {
         let (session, store) = access(ctx)?;
         let id = parse_id(&self.output_id)?;
         let (offset, limit) = (
@@ -228,8 +219,15 @@ impl GrepCall {
         let result =
             smol::unblock(move || store.grep(session, id, &pattern, offset, limit, before, after))
                 .await;
-        let result = result.map_err(|e| e.to_string())?;
+        let result = result.map_err(store_error)?;
         Ok(format_grep(self, &result))
+    }
+}
+
+fn page_result(page: Result<String, ToolError>) -> ToolExecResult {
+    match page {
+        Ok(text) => ToolExecResult::from(Ok(ToolOutput::Plain(text.into()))),
+        Err(error) => ToolExecResult::failed(error.failure, format!("error: {error}")),
     }
 }
 
@@ -239,15 +237,35 @@ fn access(ctx: &ToolContext) -> Result<(CaudraId, Arc<ToolOutputStore>), String>
     Ok((session.id(), Arc::clone(store)))
 }
 
-fn parse_id(raw: &str) -> Result<ToolOutputId, String> {
-    raw.parse::<ToolOutputId>()
-        .map_err(|e| format!("invalid tool output ID: {e}"))
+fn parse_id(raw: &str) -> Result<ToolOutputId, ToolError> {
+    raw.parse::<ToolOutputId>().map_err(|e| {
+        ToolError::new(
+            ToolFailure::InvalidInput,
+            format!("invalid tool output ID: {e}"),
+        )
+    })
 }
 
-fn positive(value: usize, name: &str) -> Result<usize, String> {
-    (value > 0)
-        .then_some(value)
-        .ok_or_else(|| format!("{name} must be at least 1"))
+fn positive(value: usize, name: &str) -> Result<usize, ToolError> {
+    (value > 0).then_some(value).ok_or_else(|| {
+        ToolError::new(
+            ToolFailure::InvalidInput,
+            format!("{name} must be at least 1"),
+        )
+    })
+}
+
+fn store_error(error: ToolOutputError) -> ToolError {
+    let failure = match error {
+        ToolOutputError::NotFound { .. } => ToolFailure::NotFound,
+        ToolOutputError::InvalidOffset
+        | ToolOutputError::InvalidByteOffset { .. }
+        | ToolOutputError::InvalidLimit
+        | ToolOutputError::PatternTooLong { .. }
+        | ToolOutputError::InvalidPattern(_) => ToolFailure::InvalidInput,
+        _ => ToolFailure::Other,
+    };
+    ToolError::new(failure, error.to_string())
 }
 
 fn required_str(input: &Value, key: &str) -> Result<String, ParseError> {
@@ -377,6 +395,7 @@ mod tests {
     use caudra_storage::StateDir;
     use caudra_storage::id::SessionRef;
     use serde_json::json;
+    use test_case::test_case;
 
     const SESSION: &str = "CNK1hV6GWoysH3KQMm5wv";
     const OTHER_SESSION: &str = "CNK1hV6GWoysH3KQMm5ww";
@@ -448,6 +467,28 @@ mod tests {
         f.ctx.session_id = Some(OTHER_SESSION.parse().unwrap());
         let error = run(&ToolOutputTool, json!({ "output_id": f.output_id }), &f.ctx).unwrap_err();
         assert!(error.contains("does not exist for session"), "got: {error}");
+    }
+
+    #[test_case(Some(OTHER_SESSION), None, None, ToolFailure::NotFound ; "another_sessions_output")]
+    #[test_case(Some(SESSION), Some("../not-an-output-id"), None, ToolFailure::InvalidInput ; "malformed_id")]
+    #[test_case(Some(SESSION), None, Some("("), ToolFailure::InvalidInput ; "unparsable_pattern")]
+    #[test_case(None, None, None, ToolFailure::Other ; "no_session")]
+    fn a_refused_call_states_why(
+        session: Option<&str>,
+        output_id: Option<&str>,
+        pattern: Option<&str>,
+        expected: ToolFailure,
+    ) {
+        let mut f = fixture("output");
+        f.ctx.session_id = session.map(|session| session.parse().unwrap());
+        let mut input = json!({ "output_id": output_id.unwrap_or(&f.output_id) });
+        if let Some(pattern) = pattern {
+            input["pattern"] = json!(pattern);
+        }
+        let invocation = ToolOutputTool.parse(&input).unwrap();
+        let result = smol::block_on(invocation.execute(&f.ctx));
+        assert!(result.is_error);
+        assert_eq!(result.failure, Some(expected));
     }
 
     #[test]

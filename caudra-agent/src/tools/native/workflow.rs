@@ -14,7 +14,8 @@ use caudra_workflow::{
 use serde_json::Value;
 
 use crate::tools::registry::{
-    ExecFuture, HeaderFuture, HeaderResult, ParseError, Tool, ToolExecResult, ToolInvocation,
+    ExecFuture, HeaderFuture, HeaderResult, ParseError, Tool, ToolExecResult, ToolFailure,
+    ToolInvocation,
 };
 use crate::tools::schema::{ParamKind, ParamSchema, Property, to_json_schema, validate};
 use crate::tools::{DescriptionContext, ToolAudience, ToolContext};
@@ -222,7 +223,7 @@ impl ToolInvocation for WorkflowCall {
     fn execute<'a>(self: Box<Self>, ctx: &'a ToolContext) -> ExecFuture<'a> {
         Box::pin(async move {
             let Some(handle) = ctx.workflow.as_ref() else {
-                return error(UNAVAILABLE.to_owned());
+                return error(ToolFailure::Other, UNAVAILABLE.to_owned());
             };
             render(handle, self.request).await
         })
@@ -265,10 +266,28 @@ async fn render(handle: &WorkflowHandle, request: WorkflowRequest) -> ToolExecRe
         Ok(WorkflowResponse::History(entries)) => plain(render_history(&entries)),
         Ok(WorkflowResponse::Trusted { name }) => plain(format!("{name} is now trusted.")),
         Ok(WorkflowResponse::Acked(_) | WorkflowResponse::Ack) => plain(String::new()),
-        Err(WorkflowError::TrustRequired { name, digest, path }) => error(format!(
-            "workflow {name:?} at {path} is not trusted (digest {digest}). {TRUST_HINT}"
-        )),
-        Err(failure) => error(failure.to_string()),
+        Err(WorkflowError::TrustRequired { name, digest, path }) => error(
+            ToolFailure::Denied,
+            format!("workflow {name:?} at {path} is not trusted (digest {digest}). {TRUST_HINT}"),
+        ),
+        Err(failure) => error(failure_of(&failure), failure.to_string()),
+    }
+}
+
+fn failure_of(error: &WorkflowError) -> ToolFailure {
+    match error {
+        WorkflowError::UnknownWorkflow { .. } | WorkflowError::UnknownRun { .. } => {
+            ToolFailure::NotFound
+        }
+        WorkflowError::TrustRequired { .. } => ToolFailure::Denied,
+        WorkflowError::Invalid { .. }
+        | WorkflowError::Ambiguous { .. }
+        | WorkflowError::Budget { .. }
+        | WorkflowError::InvalidTransition { .. } => ToolFailure::InvalidInput,
+        WorkflowError::Unavailable
+        | WorkflowError::TooManyRuns { .. }
+        | WorkflowError::Storage(_)
+        | WorkflowError::Internal(_) => ToolFailure::Other,
     }
 }
 
@@ -510,11 +529,8 @@ fn plain(text: String) -> ToolExecResult {
     ToolExecResult::from(Ok(ToolOutput::Plain(text.into())))
 }
 
-fn error(message: String) -> ToolExecResult {
-    ToolExecResult {
-        is_error: true,
-        ..ToolExecResult::from(Ok(ToolOutput::Plain(message.into())))
-    }
+fn error(failure: ToolFailure, message: String) -> ToolExecResult {
+    ToolExecResult::from(Ok(ToolOutput::Plain(message.into()))).with_failure(failure)
 }
 
 #[cfg(test)]

@@ -48,7 +48,7 @@ use crate::template::Vars;
 use crate::tools::registry::ToolRegistry;
 use crate::tools::{
     Deadline, FileReadTracker, LocalToolFn, LocalTools, PathLocks, ToolAudience, ToolContext,
-    ToolEffect, ToolFilter,
+    ToolEffect, ToolError, ToolFailure, ToolFilter,
 };
 use crate::types::WorkflowProvenance;
 use crate::workflow::WorkspaceRebind;
@@ -527,8 +527,9 @@ fn structured_output_tool(
     let captured = Arc::clone(captured);
     let report_ready = Arc::clone(report_ready);
     let handler: LocalToolFn =
-        crate::tools::audited_local_tool(ToolEffect::ReadOnly, move |input, ctx| {
-            let result = record(&validator, &captured, input);
+        crate::tools::typed_local_tool(ToolEffect::ReadOnly, move |input, ctx| {
+            let result = record(&validator, &captured, input)
+                .map_err(|errors| ToolError::new(ToolFailure::InvalidInput, errors));
             if result.is_ok() {
                 report_ready.store(true, Ordering::Release);
             } else {

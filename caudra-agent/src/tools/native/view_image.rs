@@ -18,7 +18,7 @@ use crate::tools::image_bytes::{
 };
 use crate::tools::registry::{
     ExecFuture, HeaderFuture, HeaderResult, ParseError, PermissionIntent, PermissionScopes, Tool,
-    ToolExecResult, ToolInvocation,
+    ToolError, ToolExecResult, ToolFailure, ToolInvocation,
 };
 use crate::tools::schema::{ParamKind, ParamSchema, Property, to_json_schema, validate};
 use crate::tools::{
@@ -102,14 +102,12 @@ impl ToolInvocation for ViewImageCall {
     fn preflight<'a>(
         &'a self,
         ctx: &'a ToolContext,
-    ) -> BoxFuture<'a, Result<Option<PermissionIntent>, String>> {
+    ) -> BoxFuture<'a, Result<Option<PermissionIntent>, ToolError>> {
         Box::pin(async move {
             let Some(session) = ctx.workspace_session.as_ref() else {
                 return Ok(None);
             };
-            let path = WorkspacePath::new(self.raw_path.clone())
-                .map_err(|error| format!("invalid remote image path: {error}"))?;
-            let resource = resolve_remote(session, &path).await?;
+            let resource = resolve_remote(session, &remote_path(&self.raw_path)?).await?;
             let intent = remote_read_intent(session, &resource);
             *self.remote.lock().await = Some(resource);
             Ok(Some(intent))
@@ -127,21 +125,17 @@ impl ToolInvocation for ViewImageCall {
             };
             match result {
                 Ok(output) => ToolExecResult::from(Ok(output)),
-                Err(message) => ToolExecResult::from(Err(message)),
+                Err(error) => ToolExecResult::failed(error.failure, error.message),
             }
         })
     }
 }
 
 impl ViewImageCall {
-    async fn load_remote(&self, session: &WorkspaceSession) -> Result<ToolOutput, String> {
+    async fn load_remote(&self, session: &WorkspaceSession) -> Result<ToolOutput, ToolError> {
         let resource = match self.remote.lock().await.clone() {
             Some(resource) => resource,
-            None => {
-                let path = WorkspacePath::new(self.raw_path.clone())
-                    .map_err(|error| format!("invalid remote image path: {error}"))?;
-                resolve_remote(session, &path).await?
-            }
+            None => resolve_remote(session, &remote_path(&self.raw_path)?).await?,
         };
         let image = read_remote(session, &resource).await?;
         Ok(ToolOutput::Image {
@@ -175,7 +169,16 @@ fn remote_read_intent(
     .with_authority(PermissionAuthorityProfile::RemoteResource)
 }
 
-fn load(path: &str) -> Result<ToolOutput, String> {
+fn remote_path(raw: &str) -> Result<WorkspacePath, ToolError> {
+    WorkspacePath::new(raw.to_owned()).map_err(|error| {
+        ToolError::new(
+            ToolFailure::InvalidInput,
+            format!("invalid remote image path: {error}"),
+        )
+    })
+}
+
+fn load(path: &str) -> Result<ToolOutput, ToolError> {
     let image = prepare(path)?;
     Ok(ToolOutput::Image {
         text: caption(path, image.bytes, image.width, image.height, &image.note),
@@ -451,7 +454,7 @@ mod tests {
     fn failures_from_the_shared_pipeline_reach_the_caller() {
         let dir = tempfile::tempdir().unwrap();
         let path = write(&dir, "notes.txt", b"just text");
-        assert!(load(&path).unwrap_err().contains("is not an image"));
+        assert!(load(&path).unwrap_err().message.contains("is not an image"));
     }
 
     #[test]
@@ -490,7 +493,10 @@ mod tests {
                 let resource = resolve_remote(&session, &path).await.unwrap();
                 read_remote(&session, &resource).await.unwrap_err()
             });
-            assert!(error.contains("stale or incomplete byte range"), "{error}");
+            assert!(
+                error.message.contains("stale or incomplete byte range"),
+                "{error}"
+            );
         }
     }
 
@@ -503,7 +509,7 @@ mod tests {
         ))
         .unwrap_err();
 
-        assert!(error.contains("too large to view"), "{error}");
+        assert!(error.message.contains("too large to view"), "{error}");
         assert_eq!(service.reads.load(Ordering::SeqCst), 0);
     }
 
@@ -522,7 +528,10 @@ mod tests {
             read_remote(&session, &resource).await.unwrap_err()
         });
 
-        assert!(error.contains("image too large to decode"), "{error}");
+        assert!(
+            error.message.contains("image too large to decode"),
+            "{error}"
+        );
     }
 
     #[test]

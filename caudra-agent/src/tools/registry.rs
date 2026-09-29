@@ -4,6 +4,7 @@
 use std::any::Any;
 use std::borrow::Cow;
 use std::future::Future;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -13,7 +14,9 @@ use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use bitflags::bitflags;
+use caudra_storage::tool_ledger::ToolOutcome;
 use caudra_storage::tool_outputs::ToolOutputRef;
+use caudra_workspace::{TransportErrorKind, WorkspaceError};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -27,6 +30,22 @@ use crate::{BufferSnapshot, ToolInput, ToolOutput, ToolOutputLimits};
 use super::deferral::DeferredTool;
 use super::{DescriptionContext, LockKey, ToolContext};
 
+const CANCELLED_CODE: &str = "cancelled";
+const NOT_FOUND_CODE: &str = "not_found";
+const DENIED_CODES: &[&str] = &[
+    "path_outside_root",
+    "protected_path",
+    "filesystem_permission_denied",
+    "code_graph_denied",
+    "shell_command_refused",
+];
+const INVALID_INPUT_CODES: &[&str] = &[
+    "invalid_arguments",
+    "code_graph_invalid",
+    "shell_preparation_failed",
+    "web_preparation_failed",
+    "python_preparation_failed",
+];
 const EXAMPLES_HEADER: &str = "Examples:";
 const EXAMPLE_CODE_KEY: &str = "code";
 const EXAMPLE_FENCE_OPEN: &str = "\n```\n";
@@ -195,9 +214,117 @@ impl ToolEffect {
 
 pub type ParseError = super::schema::ToolInputError;
 
+/// Why a call failed, stated by whoever produced the failure so accounting
+/// never has to read the text. A failure its producer cannot place is
+/// [`ToolFailure::Other`]. Low-cardinality on purpose: a raw message would give
+/// the collector a new attribute value on every call, and the ledger keeps one
+/// row per class.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolFailure {
+    /// Stopped by the user, its owner, or a turn that ended first.
+    Cancelled,
+    /// Ran out of time, whether its own limit or the turn's deadline.
+    Timeout,
+    /// Refused by permissions, policy, or the user before it could run.
+    Denied,
+    /// The tool, file, or resource it named does not exist.
+    NotFound,
+    /// Its arguments were malformed or rejected before any effect.
+    InvalidInput,
+    /// Anything else, including a command that ran and failed on its own.
+    Other,
+}
+
+impl ToolFailure {
+    /// Places a symbolic refusal code: the vocabulary a remote workspace
+    /// authority refuses with, which Workcell's filesystem errors share. A code
+    /// that covers causes from more than one bucket stays [`Self::Other`].
+    pub fn from_code(code: &str) -> Self {
+        match code {
+            CANCELLED_CODE => Self::Cancelled,
+            NOT_FOUND_CODE => Self::NotFound,
+            code if DENIED_CODES.contains(&code) => Self::Denied,
+            code if INVALID_INPUT_CODES.contains(&code) => Self::InvalidInput,
+            _ => Self::Other,
+        }
+    }
+}
+
+impl From<&io::Error> for ToolFailure {
+    fn from(error: &io::Error) -> Self {
+        match error.kind() {
+            io::ErrorKind::NotFound => Self::NotFound,
+            io::ErrorKind::PermissionDenied => Self::Denied,
+            _ => Self::Other,
+        }
+    }
+}
+
+impl From<&WorkspaceError> for ToolFailure {
+    fn from(error: &WorkspaceError) -> Self {
+        match error {
+            WorkspaceError::Cancelled => Self::Cancelled,
+            WorkspaceError::Transport {
+                kind: TransportErrorKind::Timeout,
+            } => Self::Timeout,
+            WorkspaceError::PermissionDenied | WorkspaceError::PolicyDenied => Self::Denied,
+            WorkspaceError::LimitExceeded { .. } => Self::InvalidInput,
+            WorkspaceError::Refused { symbolic, .. } => Self::from_code(symbolic),
+            _ => Self::Other,
+        }
+    }
+}
+
+/// A message with its typed reason, for the channels that fail a call before
+/// any [`ToolExecResult`] exists. A bare message converts as
+/// [`ToolFailure::Other`].
+#[derive(Debug, thiserror::Error)]
+#[error("{message}")]
+pub struct ToolError {
+    pub failure: ToolFailure,
+    pub message: String,
+}
+
+impl ToolError {
+    pub fn new(failure: ToolFailure, message: impl Into<String>) -> Self {
+        Self {
+            failure,
+            message: message.into(),
+        }
+    }
+}
+
+impl From<String> for ToolError {
+    fn from(message: String) -> Self {
+        Self::new(ToolFailure::Other, message)
+    }
+}
+
+impl From<&str> for ToolError {
+    fn from(message: &str) -> Self {
+        Self::new(ToolFailure::Other, message)
+    }
+}
+
+impl From<ToolFailure> for ToolOutcome {
+    fn from(failure: ToolFailure) -> Self {
+        match failure {
+            ToolFailure::Cancelled => Self::Cancelled,
+            ToolFailure::Timeout => Self::Timeout,
+            ToolFailure::Denied => Self::Denied,
+            ToolFailure::NotFound => Self::NotFound,
+            ToolFailure::InvalidInput => Self::InvalidInput,
+            ToolFailure::Other => Self::Other,
+        }
+    }
+}
+
 pub struct ToolExecResult {
     pub output: Result<ToolOutput, String>,
     pub is_error: bool,
+    /// Why the call failed, when its producer knows. Read only when the call
+    /// is an error, and an unstated failure counts as [`ToolFailure::Other`].
+    pub failure: Option<ToolFailure>,
     pub annotation: Option<String>,
     pub written_path: Option<String>,
     pub written_paths: Vec<String>,
@@ -215,6 +342,7 @@ impl From<Result<ToolOutput, String>> for ToolExecResult {
         Self {
             output,
             is_error,
+            failure: None,
             annotation: None,
             written_path: None,
             written_paths: Vec::new(),
@@ -270,6 +398,16 @@ impl ToolExecResult {
     pub fn with_error(mut self, is_error: bool) -> Self {
         self.is_error = is_error;
         self
+    }
+
+    pub fn with_failure(mut self, failure: ToolFailure) -> Self {
+        self.is_error = true;
+        self.failure = Some(failure);
+        self
+    }
+
+    pub fn failed(failure: ToolFailure, message: impl Into<String>) -> Self {
+        Self::from(Err(message.into())).with_failure(failure)
     }
 }
 
@@ -493,7 +631,7 @@ pub trait ToolInvocation: Send + Sync {
     fn preflight<'a>(
         &'a self,
         _ctx: &'a ToolContext,
-    ) -> BoxFuture<'a, Result<Option<PermissionIntent>, String>> {
+    ) -> BoxFuture<'a, Result<Option<PermissionIntent>, ToolError>> {
         Box::pin(std::future::ready(Ok(None)))
     }
     fn permission_intent<'a>(

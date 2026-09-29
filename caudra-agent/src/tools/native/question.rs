@@ -12,7 +12,8 @@ use serde_json::Value;
 
 use crate::AgentEvent;
 use crate::tools::registry::{
-    ExecFuture, HeaderFuture, HeaderResult, ParseError, Tool, ToolExecResult, ToolInvocation,
+    ExecFuture, HeaderFuture, HeaderResult, ParseError, Tool, ToolExecResult, ToolFailure,
+    ToolInvocation,
 };
 use crate::tools::schema::{ParamKind, ParamSchema, Property, to_json_schema, validate};
 use crate::tools::{DescriptionContext, ToolAudience, ToolContext};
@@ -172,7 +173,7 @@ impl ToolInvocation for QuestionCall {
     fn execute<'a>(self: Box<Self>, ctx: &'a ToolContext) -> ExecFuture<'a> {
         Box::pin(async move {
             let Some(rx) = ctx.user_response_rx.as_ref() else {
-                return error(NO_UI.to_owned());
+                return error(ToolFailure::Other, NO_UI);
             };
             // The channel is shared with re-authentication, so the lock is
             // taken before the ask goes out: nothing else may consume the
@@ -190,7 +191,7 @@ impl ToolInvocation for QuestionCall {
                 Ok(Ok(raw)) => raw,
                 // A cancel and a dropped channel are both "no answer is
                 // coming"; the run is ending either way.
-                _ => return error(CANCELLED.to_owned()),
+                _ => return error(ToolFailure::Cancelled, CANCELLED),
             };
             self.report(&raw)
         })
@@ -262,17 +263,19 @@ fn format_answers(questions: &[AskedQuestion], answers: &[Answer]) -> String {
         .join("\n")
 }
 
-fn error(message: String) -> ToolExecResult {
-    ToolExecResult {
-        is_error: true,
-        ..ToolExecResult::from(Ok(ToolOutput::Plain(message.into())))
-    }
+fn error(failure: ToolFailure, message: &'static str) -> ToolExecResult {
+    ToolExecResult::from(Ok(ToolOutput::Plain(message.into()))).with_failure(failure)
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
+    use crate::AgentMode;
+    use crate::tools::test_support::stub_ctx;
     use serde_json::json;
+    use test_case::test_case;
 
     const PICK: &str = "Pick one";
     const HEADER: &str = "Choice";
@@ -424,6 +427,19 @@ mod tests {
             DISMISSED,
             "the model is told the form was dismissed"
         );
+    }
+
+    #[test_case(false, ToolFailure::Other ; "without_a_front_end")]
+    #[test_case(true, ToolFailure::Cancelled ; "when_the_answer_channel_closes")]
+    fn an_unanswered_question_states_why(interactive: bool, expected: ToolFailure) {
+        let mut ctx = stub_ctx(&AgentMode::Build);
+        let (_, response_rx) = flume::unbounded::<String>();
+        ctx.user_response_rx = interactive.then(|| Arc::new(async_lock::Mutex::new(response_rx)));
+        let call = Box::new(QuestionCall {
+            questions: vec![question(HEADER, false)],
+        });
+        let result = smol::block_on(call.execute(&ctx));
+        assert_eq!(result.failure, Some(expected));
     }
 
     #[test]

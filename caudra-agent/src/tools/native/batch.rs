@@ -16,7 +16,8 @@ use serde_json::{Map, Value};
 use crate::agent::speculative::{Peeked, with_live};
 use crate::agent::tool_dispatch::{self, Emit};
 use crate::tools::registry::{
-    ExecFuture, HeaderFuture, HeaderResult, ParseError, Tool, ToolExecResult, ToolInvocation,
+    ExecFuture, HeaderFuture, HeaderResult, ParseError, Tool, ToolExecResult, ToolFailure,
+    ToolInvocation,
 };
 use crate::tools::schema::{ParamSchema, Property, to_json_schema, validate};
 use crate::tools::{DescriptionContext, ToolAudience, ToolContext, ToolEffect};
@@ -419,6 +420,7 @@ impl BatchCall {
         let text = render_llm(&entries);
         ToolExecResult {
             is_error: cancelled,
+            failure: cancelled.then_some(ToolFailure::Cancelled),
             ..ToolExecResult::from(Ok(ToolOutput::Batch { entries, text }))
         }
     }
@@ -627,7 +629,9 @@ mod tests {
     use crate::AgentMode;
     use crate::agent::speculative::{REVISED_INPUT, SpeculativeRuns};
     use crate::agent::tool_dispatch::{ResponseObservations, ToolOutcome};
-    use crate::tools::registry::{BoxFuture, PermissionIntent, ToolRegistry, ToolSource};
+    use crate::tools::registry::{
+        BoxFuture, PermissionIntent, ToolError, ToolRegistry, ToolSource,
+    };
     use crate::tools::test_support::{stub_ctx, stub_ctx_with};
     use crate::tools::{LockKey, STALE_READ_MSG};
     use futures_lite::future;
@@ -1762,7 +1766,7 @@ mod tests {
         fn preflight<'a>(
             &'a self,
             _ctx: &'a ToolContext,
-        ) -> BoxFuture<'a, Result<Option<PermissionIntent>, String>> {
+        ) -> BoxFuture<'a, Result<Option<PermissionIntent>, ToolError>> {
             Box::pin(async move {
                 let depth = self.gauge.inside.fetch_add(1, Ordering::SeqCst) + 1;
                 self.gauge.peak.fetch_max(depth, Ordering::SeqCst);

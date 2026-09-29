@@ -11,6 +11,7 @@ pub mod paths;
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::fs;
+use std::io;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
@@ -24,7 +25,7 @@ use crate::permissions::{PermissionResource, PermissionResourceKind, PermissionR
 use crate::tools::native::local_document::scoped_store;
 use crate::tools::registry::{
     ExecFuture, HeaderFuture, HeaderResult, ParseError, PermissionIntent, PermissionScopes, Tool,
-    ToolEffect, ToolExecResult, ToolInvocation,
+    ToolEffect, ToolError, ToolExecResult, ToolFailure, ToolInvocation,
 };
 use crate::tools::schema::{ParamKind, ParamSchema, Property, to_json_schema, validate};
 use crate::tools::{DescriptionContext, ToolContext};
@@ -414,26 +415,26 @@ struct MemoryCall {
 impl MemoryCall {
     /// Rejects combinations the schema cannot express: which of `path`,
     /// `tags`, and `content` a command needs depends on the command.
-    fn validate(&self) -> Result<(), String> {
+    fn validate(&self) -> Result<(), ToolError> {
         let has_path = self.path.is_some();
         let has_tags = !self.tags.is_empty();
         match self.command {
             Command::Read if has_path && has_tags => {
-                Err("provide 'path' or 'tags', not both".into())
+                Err(invalid("provide 'path' or 'tags', not both"))
             }
             Command::Read if !has_path && !has_tags => {
-                Err("'path' or 'tags' is required for read".into())
+                Err(invalid("'path' or 'tags' is required for read"))
             }
-            Command::Write if !has_path => Err("'path' is required for write".into()),
+            Command::Write if !has_path => Err(invalid("'path' is required for write")),
             Command::Write if self.content.is_none() => {
-                Err("'content' is required for write".into())
+                Err(invalid("'content' is required for write"))
             }
-            Command::Delete if !has_path => Err("'path' is required for delete".into()),
+            Command::Delete if !has_path => Err(invalid("'path' is required for delete")),
             _ => Ok(()),
         }
     }
 
-    fn run(&self, dir: &Path, cache: &Mutex<notes::TagCache>) -> Result<Answer, String> {
+    fn run(&self, dir: &Path, cache: &Mutex<notes::TagCache>) -> Result<Answer, ToolError> {
         match self.command {
             Command::List => Ok(Answer::Browse(self.list(dir, cache))),
             Command::Read if !self.tags.is_empty() => {
@@ -502,8 +503,8 @@ impl MemoryCall {
         &self,
         dir: &Path,
         cache: &Mutex<notes::TagCache>,
-    ) -> Result<MemoryOutput, String> {
-        let (wanted, warning) = notes::tags_for_filter(&self.tags)?;
+    ) -> Result<MemoryOutput, ToolError> {
+        let (wanted, warning) = notes::tags_for_filter(&self.tags).map_err(invalid)?;
         let (found, mut read_warnings) = scan(dir, cache);
         let mut read = Vec::new();
         for note in found
@@ -529,9 +530,9 @@ impl MemoryCall {
         })
     }
 
-    fn read_by_path(&self, dir: &Path) -> Result<MemoryOutput, String> {
+    fn read_by_path(&self, dir: &Path) -> Result<MemoryOutput, ToolError> {
         let path = self.resolved(dir)?;
-        let content = fs::read_to_string(&path).map_err(|error| format!("read error: {error}"))?;
+        let content = fs::read_to_string(&path).map_err(|error| io_error("read", &error))?;
         let name = self.path.clone().unwrap_or_default();
         Ok(MemoryOutput::Notes {
             directory: Some(dir.display().to_string()),
@@ -540,21 +541,21 @@ impl MemoryCall {
         })
     }
 
-    fn write(&self, dir: &Path) -> Result<String, String> {
+    fn write(&self, dir: &Path) -> Result<String, ToolError> {
         let path = self.resolved(dir)?;
         let content = self.content.clone().unwrap_or_default();
         if let Some(error) = notes::write_size_error(&content) {
-            return Err(error);
+            return Err(invalid(error));
         }
-        let (tags, note) = notes::tags_for_write(&self.tags)?;
+        let (tags, note) = notes::tags_for_write(&self.tags).map_err(invalid)?;
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(|error| format!("write error: {error}"))?;
+            fs::create_dir_all(parent).map_err(|error| io_error("write", &error))?;
         }
         fs::write(
             &path,
             format!("{}{content}", notes::encode_frontmatter(&tags)),
         )
-        .map_err(|error| format!("write error: {error}"))?;
+        .map_err(|error| io_error("write", &error))?;
         let listed = if tags.is_empty() {
             "none".to_owned()
         } else {
@@ -567,25 +568,40 @@ impl MemoryCall {
         ))
     }
 
-    fn delete(&self, dir: &Path) -> Result<String, String> {
+    fn delete(&self, dir: &Path) -> Result<String, ToolError> {
         let path = self.resolved(dir)?;
         let name = self.path.clone().unwrap_or_default();
         if !path.exists() {
-            return Err(format!("'{name}' does not exist"));
+            return Err(missing(&name));
         }
-        fs::remove_file(&path).map_err(|error| format!("delete error: {error}"))?;
+        fs::remove_file(&path).map_err(|error| io_error("delete", &error))?;
         Ok(format!("deleted {name}"))
     }
 
-    fn resolved(&self, dir: &Path) -> Result<PathBuf, String> {
-        paths::safe_resolve(dir, self.path.as_deref().unwrap_or_default())
+    fn resolved(&self, dir: &Path) -> Result<PathBuf, ToolError> {
+        paths::safe_resolve(dir, self.path.as_deref().unwrap_or_default()).map_err(invalid)
     }
 
-    fn run_all(&self, cache: &Mutex<notes::TagCache>) -> Result<Answer, String> {
+    fn run_all(&self, cache: &Mutex<notes::TagCache>) -> Result<Answer, ToolError> {
         self.validate()?;
-        let dir = self.dir.clone().ok_or(STATE_DIR_UNRESOLVED)?;
+        let dir = self
+            .dir
+            .clone()
+            .ok_or_else(|| STATE_DIR_UNRESOLVED.to_owned())?;
         self.run(&dir, cache)
     }
+}
+
+fn invalid(message: impl Into<String>) -> ToolError {
+    ToolError::new(ToolFailure::InvalidInput, message)
+}
+
+fn missing(name: &str) -> ToolError {
+    ToolError::new(ToolFailure::NotFound, format!("'{name}' does not exist"))
+}
+
+fn io_error(action: &str, error: &io::Error) -> ToolError {
+    ToolError::new(ToolFailure::from(error), format!("{action} error: {error}"))
 }
 
 /// What a command answered with. The two browsing commands return something a
@@ -674,7 +690,7 @@ impl ToolInvocation for MemoryCall {
     fn preflight<'a>(
         &'a self,
         ctx: &'a ToolContext,
-    ) -> crate::tools::registry::BoxFuture<'a, Result<Option<PermissionIntent>, String>> {
+    ) -> crate::tools::registry::BoxFuture<'a, Result<Option<PermissionIntent>, ToolError>> {
         Box::pin(async move {
             if ctx.workspace_session.is_none() {
                 return Ok(None);
@@ -709,7 +725,9 @@ impl ToolInvocation for MemoryCall {
         Box::pin(async move {
             let answer = match self.run_for_context(ctx) {
                 Ok(answer) => answer,
-                Err(error) => return ToolExecResult::from(Err(format!("error: {error}"))),
+                Err(error) => {
+                    return ToolExecResult::failed(error.failure, format!("error: {error}"));
+                }
             };
             let receipt = match answer {
                 // A browse is drawn from its structure, and the model reads the
@@ -767,16 +785,14 @@ impl MemoryCall {
         )
     }
 
-    fn run_for_context(&self, ctx: &ToolContext) -> Result<Answer, String> {
+    fn run_for_context(&self, ctx: &ToolContext) -> Result<Answer, ToolError> {
         if ctx.workspace_session.is_none() {
             return self.run_all(&TAG_CACHE);
         }
         self.validate()?;
         let store = scoped_store(ctx)?;
         let project = store.project_key();
-        let documents = store
-            .list_memories(project)
-            .map_err(|error| error.to_string())?;
+        let documents = store.list_memories(project)?;
         match self.command {
             Command::List => Ok(Answer::Browse(self.remote_list(&documents))),
             Command::Read if !self.tags.is_empty() => {
@@ -830,8 +846,8 @@ impl MemoryCall {
         }
     }
 
-    fn remote_read_by_tag(&self, documents: &[LocalDocument]) -> Result<MemoryOutput, String> {
-        let (wanted, warning) = notes::tags_for_filter(&self.tags)?;
+    fn remote_read_by_tag(&self, documents: &[LocalDocument]) -> Result<MemoryOutput, ToolError> {
+        let (wanted, warning) = notes::tags_for_filter(&self.tags).map_err(invalid)?;
         let read: Vec<MemoryNote> = documents
             .iter()
             .map(remote_note)
@@ -848,12 +864,12 @@ impl MemoryCall {
         })
     }
 
-    fn remote_read_by_path(&self, documents: &[LocalDocument]) -> Result<MemoryOutput, String> {
+    fn remote_read_by_path(&self, documents: &[LocalDocument]) -> Result<MemoryOutput, ToolError> {
         let name = self.path.as_deref().unwrap_or_default();
         let document = documents
             .iter()
             .find(|document| document.name.as_deref() == Some(name))
-            .ok_or_else(|| format!("'{name}' does not exist"))?;
+            .ok_or_else(|| missing(name))?;
         Ok(MemoryOutput::Notes {
             directory: None,
             notes: Vec::from([remote_note(document)]),
@@ -865,16 +881,15 @@ impl MemoryCall {
         &self,
         store: &LocalDocumentStore,
         project: &caudra_workspace::ProjectKey,
-    ) -> Result<String, String> {
+    ) -> Result<String, ToolError> {
         let content = self.content.as_deref().unwrap_or_default();
         if let Some(error) = notes::write_size_error(content) {
-            return Err(error);
+            return Err(invalid(error));
         }
-        let (tags, note) = notes::tags_for_write(&self.tags)?;
+        let (tags, note) = notes::tags_for_write(&self.tags).map_err(invalid)?;
         let body = format!("{}{content}", notes::encode_frontmatter(&tags));
-        let reference = store
-            .write_memory(project, self.path.as_deref().unwrap_or_default(), &body)
-            .map_err(|error| error.to_string())?;
+        let reference =
+            store.write_memory(project, self.path.as_deref().unwrap_or_default(), &body)?;
         let suffix = note.map_or(String::new(), |note| format!("; {note}"));
         Ok(format!("wrote memory_ref {}{suffix}", reference.as_str()))
     }
@@ -883,10 +898,8 @@ impl MemoryCall {
         &self,
         store: &LocalDocumentStore,
         project: &caudra_workspace::ProjectKey,
-    ) -> Result<String, String> {
-        let reference = store
-            .delete_memory(project, self.path.as_deref().unwrap_or_default())
-            .map_err(|error| error.to_string())?;
+    ) -> Result<String, ToolError> {
+        let reference = store.delete_memory(project, self.path.as_deref().unwrap_or_default())?;
         Ok(format!("deleted memory_ref {}", reference.as_str()))
     }
 }
@@ -983,9 +996,10 @@ mod tests {
 
     fn run(input: Value, dir: &Path) -> Result<String, String> {
         let call = call_in(input, dir);
-        call.validate()?;
+        call.validate().map_err(|error| error.message)?;
         call.run(dir, &Mutex::new(notes::TagCache::default()))
             .map(text)
+            .map_err(|error| error.message)
     }
 
     fn browse(input: Value, dir: &Path) -> MemoryOutput {
@@ -1176,7 +1190,8 @@ mod tests {
         let error = call_in(input, Path::new("/memories"))
             .validate()
             .unwrap_err();
-        assert!(error.contains(expected), "{error}");
+        assert_eq!(error.failure, ToolFailure::InvalidInput);
+        assert!(error.message.contains(expected), "{error}");
     }
 
     #[test]
@@ -1220,6 +1235,7 @@ mod tests {
         call_in(input, dir)
             .run_all(&Mutex::new(notes::TagCache::default()))
             .map(text)
+            .map_err(|error| error.message)
     }
 
     #[test]
@@ -1255,6 +1271,17 @@ mod tests {
             ToolOutput::Markdown(text) => text.text,
             other => panic!("{BODY_MSG}, got {other:?}"),
         }
+    }
+
+    #[test_case(json!({ "command": "read", "path": "missing.md" }), ToolFailure::NotFound ; "reading_a_missing_note")]
+    #[test_case(json!({ "command": "delete", "path": "missing.md" }), ToolFailure::NotFound ; "deleting_a_missing_note")]
+    #[test_case(json!({ "command": "write", "path": "../escape.md", "content": "x" }), ToolFailure::InvalidInput ; "writing_outside_the_notes")]
+    #[test_case(json!({ "command": "read", "path": "a.md", "tags": ["ui"] }), ToolFailure::InvalidInput ; "reading_by_path_and_tag")]
+    fn a_refused_command_states_why(input: Value, expected: ToolFailure) {
+        let temp = tempfile::tempdir().unwrap();
+        let result = execute_in(input, temp.path());
+        assert!(result.is_error);
+        assert_eq!(result.failure, Some(expected));
     }
 
     /// A write's reply is a receipt, so rendering it is rendering nothing. The

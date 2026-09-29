@@ -25,7 +25,7 @@ use strum::Display;
 
 use crate::agent::{GoalResult, GoalVerdict};
 use crate::permissions::PermissionRequest;
-use crate::tools::ToolEffect;
+use crate::tools::{ToolEffect, ToolFailure};
 
 pub const NO_FILES_FOUND: &str = "No files found";
 pub const INDEX_TRUNCATED: &str = "[truncated]";
@@ -1688,8 +1688,9 @@ pub struct ToolDoneEvent {
     /// What the call cost in wall clock, how it ended, where the tool came
     /// from, and how much of the context window its result took. Filled once,
     /// after bounding, so telemetry and the durable ledger cannot disagree.
-    /// Skipped by serde: this is host accounting, not part of any transcript or
-    /// protocol.
+    /// Only why a call failed is known sooner, and its producer states it
+    /// through [`Self::with_failure`]. Skipped by serde: this is host
+    /// accounting, not part of any transcript or protocol.
     #[serde(skip)]
     pub accounting: ToolAccounting,
 }
@@ -1752,6 +1753,12 @@ impl ToolDoneEvent {
 
     pub fn model_suffix(&self) -> Option<&str> {
         self.model_suffix.as_deref()
+    }
+
+    pub fn with_failure(mut self, failure: ToolFailure) -> Self {
+        self.is_error = true;
+        self.accounting.outcome = Some(failure.into());
+        self
     }
 
     pub fn with_model_suffix(mut self, model_suffix: Option<String>) -> Self {

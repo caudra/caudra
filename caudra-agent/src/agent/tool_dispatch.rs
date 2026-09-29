@@ -12,7 +12,9 @@ use tracing::{Instrument, debug, error, info_span, warn};
 use crate::background::ShellJobMetadata;
 use crate::decisions::{DecisionContext, DecisionFeature, shell_duration::ShellDurationPlan};
 use crate::mcp::{McpSession, UNKNOWN_MCP};
-use crate::permissions::{PermissionAuthorityProfile, RemotePermissionIdentity, canonical_json};
+use crate::permissions::{
+    PermissionAuthorityProfile, PermissionError, RemotePermissionIdentity, canonical_json,
+};
 use crate::task_set::TaskSet;
 use crate::tools::json_repair::RepairError;
 use crate::tools::native::report_to_parent;
@@ -20,9 +22,9 @@ use crate::tools::registry::{
     PlanModeAccess, RegisteredTool, ToolInvocation, ToolRegistry, TrustedToolSource,
 };
 use crate::tools::{
-    DOOM_LOOP_GUIDANCE, LocalToolEntry, LockKey, READ_ONLY_CALL_GUIDANCE,
-    READ_ONLY_TOOL_RESTRICTED, TOOL_SEARCH_TOOL_NAME, ToolContext, ToolEffect, ToolExecResult,
-    ToolSource,
+    DOOM_LOOP_GUIDANCE, LocalToolEntry, LockKey, PLAN_WRITE_RESTRICTED, READ_ONLY_CALL_GUIDANCE,
+    READ_ONLY_TOOL_RESTRICTED, TOOL_SEARCH_TOOL_NAME, ToolContext, ToolEffect, ToolError,
+    ToolExecResult, ToolFailure, ToolSource,
 };
 use crate::{
     AgentError, AgentEvent, AgentMode, LuaToolProvenance, ToolAccounting, ToolDoneEvent,
@@ -450,7 +452,9 @@ pub async fn run(
         None
     };
     let dispatched = match refusal {
-        Some(message) => ToolDoneEvent::error(id, message).into(),
+        Some(message) => ToolDoneEvent::error(id, message)
+            .with_failure(ToolFailure::InvalidInput)
+            .into(),
         None if invalid.is_some() && !matches!(repair, Some(Ok(_))) => {
             ctx.mark_tool_result_repairable();
             let mut message = format!("{canonical} {INVALID_INPUT_MESSAGE}");
@@ -461,7 +465,8 @@ pub async fn run(
             if let Some(Err(error)) = &repair {
                 message.push_str(&format!("\n{error}"));
             }
-            let mut done = ToolDoneEvent::error(id, message);
+            let mut done =
+                ToolDoneEvent::error(id, message).with_failure(ToolFailure::InvalidInput);
             done.tool = Arc::from(canonical);
             done.into()
         }
@@ -638,7 +643,7 @@ async fn run_inner(
         .unwrap_or_else(|| Arc::from(UNKNOWN_MCP));
     let started = Instant::now();
 
-    let done_error = |msg: String| {
+    let done_error = |failure: ToolFailure, msg: String| {
         let mut output = ToolOutput::Plain(msg.into());
         if let Some(entry) = &entry {
             set_lua_provenance(&mut output, &entry.source, false);
@@ -659,13 +664,17 @@ async fn run_inner(
             model_output_from_ref: false,
             accounting: ToolAccounting::default(),
         }
+        .with_failure(failure)
         .into()
     };
 
     // Before the read-only gate: a tool the config turned off should say so
     // even when the mode would have refused it for another reason.
     if entry.is_none() && local.is_none() && mcp.is_some_and(|mcp| mcp.is_disabled(mcp_lookup)) {
-        return done_error(format!("tool {mcp_lookup} {TOOL_DISABLED_SUFFIX}"));
+        return done_error(
+            ToolFailure::Denied,
+            format!("tool {mcp_lookup} {TOOL_DISABLED_SUFFIX}"),
+        );
     }
 
     if ctx.policy().is_read_only() {
@@ -681,12 +690,18 @@ async fn run_inner(
         };
         if !allowed {
             warn!(tool = %name, "blocked tool in strict read-only mode");
-            return done_error(format!("{READ_ONLY_TOOL_RESTRICTED}: {name}"));
+            return done_error(
+                ToolFailure::Denied,
+                format!("{READ_ONLY_TOOL_RESTRICTED}: {name}"),
+            );
         }
     }
 
     if (local.is_some() || entry.is_some()) && !ctx.tool_filter.matches(name) {
-        return done_error(format!("tool {name} {TOOL_DISABLED_SUFFIX}"));
+        return done_error(
+            ToolFailure::Denied,
+            format!("tool {name} {TOOL_DISABLED_SUFFIX}"),
+        );
     }
     if let Some(local) = local {
         return run_local_tool(local, id, name, input, ctx, emit)
@@ -696,9 +711,10 @@ async fn run_inner(
 
     if let Some(ref entry) = entry {
         if !entry.tool.audience().contains(ctx.audience) {
-            return done_error(format!(
-                "tool {name} is unavailable to the current agent audience"
-            ));
+            return done_error(
+                ToolFailure::Denied,
+                format!("tool {name} is unavailable to the current agent audience"),
+            );
         }
         // Guessing a deferred tool's name right is as good as searching for
         // it: keep it declared so the model is not told to look for what it
@@ -739,7 +755,7 @@ async fn run_inner(
                         "tool input parse failed"
                     );
                     ctx.mark_tool_result_repairable();
-                    return done_error(e.to_string());
+                    return done_error(ToolFailure::InvalidInput, e.to_string());
                 }
             };
 
@@ -754,7 +770,7 @@ async fn run_inner(
                 .await;
             let mut prepared_intent = match invocation.preflight(ctx).await {
                 Ok(intent) => intent,
-                Err(error) => return done_error(error),
+                Err(error) => return done_error(error.failure, error.message),
             };
             if ShellDurationPlan::discard_stale(&mut duration_plan, ctx) {
                 invocation.abandon(ctx).await;
@@ -794,10 +810,13 @@ async fn run_inner(
             if ctx.policy().is_read_only() && !entry.is_safe_in_read_only_with(call_effect) {
                 warn!(tool = %name, effect = call_effect.as_str(), "blocked tool in strict read-only mode");
                 invocation.abandon(ctx).await;
-                return done_error(format!(
-                    "{READ_ONLY_TOOL_RESTRICTED}: {name}. This call is {}, and {READ_ONLY_CALL_GUIDANCE}.",
-                    call_effect.as_str()
-                ));
+                return done_error(
+                    ToolFailure::Denied,
+                    format!(
+                        "{READ_ONLY_TOOL_RESTRICTED}: {name}. This call is {}, and {READ_ONLY_CALL_GUIDANCE}.",
+                        call_effect.as_str()
+                    ),
+                );
             }
 
             let planning = ctx.mode.is_planning();
@@ -805,7 +824,7 @@ async fn run_inner(
             if planning && plan_access == PlanModeAccess::Refused {
                 warn!(tool = %name, "blocked tool in plan mode");
                 invocation.abandon(ctx).await;
-                return done_error(crate::tools::PLAN_WRITE_RESTRICTED.into());
+                return done_error(ToolFailure::Denied, PLAN_WRITE_RESTRICTED.into());
             }
             // A plan-mode grant must not outlive the plan, and no authority from
             // before the plan may quietly cover this call. Both are containment,
@@ -828,12 +847,12 @@ async fn run_inner(
             {
                 warn!(tool = %name, "blocked non-plan local document write in remote plan mode");
                 invocation.abandon(ctx).await;
-                return done_error(crate::tools::PLAN_WRITE_RESTRICTED.into());
+                return done_error(ToolFailure::Denied, PLAN_WRITE_RESTRICTED.into());
             }
             if planning && !call_effect.is_safe_in_read_only() && !entry.source.is_trusted() {
                 warn!(tool = %name, "blocked untrusted effect in plan mode");
                 invocation.abandon(ctx).await;
-                return done_error(crate::tools::PLAN_WRITE_RESTRICTED.into());
+                return done_error(ToolFailure::Denied, PLAN_WRITE_RESTRICTED.into());
             }
             // A call that named no target cannot be checked against the plan file,
             // unless it already accounted for itself above.
@@ -845,7 +864,7 @@ async fn run_inner(
             {
                 warn!(tool = %name, "blocked unscoped effect in plan mode");
                 invocation.abandon(ctx).await;
-                return done_error(crate::tools::PLAN_WRITE_RESTRICTED.into());
+                return done_error(ToolFailure::Denied, PLAN_WRITE_RESTRICTED.into());
             }
 
             for target in &mutation_targets {
@@ -861,17 +880,17 @@ async fn run_inner(
                             "blocked write in plan mode"
                         );
                         invocation.abandon(ctx).await;
-                        return done_error(crate::tools::PLAN_WRITE_RESTRICTED.into());
+                        return done_error(ToolFailure::Denied, PLAN_WRITE_RESTRICTED.into());
                     }
                     if let Some(reason) = ctx.permissions.boundary_block_reason(target) {
                         invocation.abandon(ctx).await;
-                        return done_error(reason);
+                        return done_error(ToolFailure::Denied, reason);
                     }
                 }
             }
 
             if !remote_plan_target
-                && let Err(e) = enforce_permission(
+                && let Err(refusal) = enforce_permission(
                     invocation.as_ref(),
                     prepared_intent.as_ref(),
                     entry,
@@ -883,7 +902,7 @@ async fn run_inner(
                 .await
             {
                 invocation.abandon(ctx).await;
-                return done_error(e);
+                return done_error(refusal.failure, refusal.message);
             }
 
             let header_result = invocation.start_header().await;
@@ -918,11 +937,11 @@ async fn run_inner(
             if !remote_plan_target && let Err(message) = ensure_revert_point(ctx, call_effect).await
             {
                 invocation.abandon(ctx).await;
-                return done_error(message);
+                return done_error(ToolFailure::Other, message);
             }
             if let Err(message) = ctx.deadline.remaining() {
                 invocation.abandon(ctx).await;
-                return done_error(message);
+                return done_error(ToolFailure::Timeout, message);
             }
 
             // Taken after the permission verdict, so a prompt never blocks a
@@ -967,7 +986,7 @@ async fn run_inner(
                     Ok(background) => background,
                     Err(message) => {
                         invocation.abandon(ctx).await;
-                        return done_error(message.into());
+                        return done_error(ToolFailure::Denied, message.into());
                     }
                 };
                 if background && let Some(scope) = scope {
@@ -977,15 +996,15 @@ async fn run_inner(
                         .and_then(Value::as_str)
                     else {
                         invocation.abandon(ctx).await;
-                        return done_error(SHELL_METADATA_INVALID.into());
+                        return done_error(ToolFailure::Other, SHELL_METADATA_INVALID.into());
                     };
                     if ctx.cancel.is_cancelled() {
                         invocation.abandon(ctx).await;
-                        return done_error(ERROR_CANCELLED.into());
+                        return done_error(ToolFailure::Cancelled, ERROR_CANCELLED.into());
                     }
                     if let Err(message) = ctx.deadline.remaining() {
                         invocation.abandon(ctx).await;
-                        return done_error(message);
+                        return done_error(ToolFailure::Timeout, message);
                     }
                     let metadata = ShellJobMetadata {
                         call_id: id.clone(),
@@ -1118,7 +1137,7 @@ async fn run_inner(
                             }
                             DispatchResult::ShellAdmission(done)
                         }
-                        Err(message) => done_error(message),
+                        Err(message) => done_error(ctx.refusal_failure(), message),
                     };
                 }
             }
@@ -1137,7 +1156,7 @@ async fn run_inner(
                     Ok(tracked) => Some(tracked),
                     Err(message) => {
                         invocation.abandon(ctx).await;
-                        return done_error(message);
+                        return done_error(ctx.refusal_failure(), message);
                     }
                 },
                 None => None,
@@ -1173,7 +1192,7 @@ async fn run_inner(
             input,
         );
         if let Err(message) = ensure_revert_point(ctx, ToolEffect::Unknown).await {
-            return done_error(message);
+            return done_error(ToolFailure::Other, message);
         }
         execute_mcp_tool(ctx, &id, tool_id, mcp_lookup, input)
             .await
@@ -1181,7 +1200,7 @@ async fn run_inner(
     } else {
         let msg = format!("{UNKNOWN_TOOL_PREFIX}: {mcp_lookup}");
         warn!(tool = %mcp_lookup, "unknown tool");
-        done_error(msg)
+        done_error(ToolFailure::NotFound, msg)
     }
 }
 
@@ -1197,7 +1216,7 @@ async fn execute_owned_shell(
     };
     if let Some(message) = refusal {
         invocation.abandon(ctx).await;
-        return ToolExecResult::from(Err(message));
+        return ToolExecResult::failed(ctx.refusal_failure(), message);
     }
     let observation = duration_plan.map(ShellDurationPlan::begin);
     let result = invocation.execute(ctx).await;
@@ -1240,7 +1259,10 @@ fn finish_invocation(
                 model_suffix: result.model_suffix,
                 model_output: result.model_output,
                 model_output_from_ref: result.model_output_from_ref,
-                accounting: ToolAccounting::default(),
+                accounting: ToolAccounting {
+                    outcome: result.failure.map(LedgerOutcome::from),
+                    ..ToolAccounting::default()
+                },
             }
         }
         Err(message) => {
@@ -1260,6 +1282,7 @@ fn finish_invocation(
             done.output_ref = result.output_ref;
             done.model_output = result.model_output;
             done.model_output_from_ref = result.model_output_from_ref;
+            done.accounting.outcome = result.failure.map(LedgerOutcome::from);
             done
         }
     }
@@ -1439,7 +1462,10 @@ async fn run_tool_search(
         model_suffix: None,
         model_output: None,
         model_output_from_ref: false,
-        accounting: ToolAccounting::default(),
+        accounting: ToolAccounting {
+            outcome: is_error.then_some(LedgerOutcome::InvalidInput),
+            ..ToolAccounting::default()
+        },
     }
 }
 
@@ -1462,13 +1488,13 @@ async fn run_local_tool(
         tool_use_id: Some(id.clone()),
         ..ctx.clone()
     };
-    let (output, is_error) = match ensure_revert_point(ctx, local.effect).await {
-        Err(message) => (message, true),
+    let (output, failure) = match ensure_revert_point(ctx, local.effect).await {
+        Err(message) => (message, Some(ToolFailure::Other)),
         Ok(()) => match local.call(input.clone(), tool_ctx).await {
-            Ok(output) => (output, false),
-            Err(e) => {
-                warn!(tool = %name, error = %e, "local tool failed");
-                (e, true)
+            Ok(output) => (output, None),
+            Err(error) => {
+                warn!(tool = %name, error = %error, "local tool failed");
+                (error.message, Some(error.failure))
             }
         },
     };
@@ -1482,7 +1508,7 @@ async fn run_local_tool(
         id,
         tool: tool_id,
         output,
-        is_error,
+        is_error: failure.is_some(),
         annotation: None,
         written_path: None,
         written_paths: Vec::new(),
@@ -1492,7 +1518,10 @@ async fn run_local_tool(
         model_suffix: None,
         model_output: None,
         model_output_from_ref: false,
-        accounting: ToolAccounting::default(),
+        accounting: ToolAccounting {
+            outcome: failure.map(LedgerOutcome::from),
+            ..ToolAccounting::default()
+        },
     }
 }
 
@@ -1535,10 +1564,11 @@ async fn enforce_permission(
     input: &Value,
     ctx: &ToolContext,
     id: &str,
-) -> Result<(), String> {
+) -> Result<(), ToolError> {
     if name.contains('.') {
-        return Err(format!(
-            "enforce_permission called with dotted name: {name}"
+        return Err(ToolError::new(
+            ToolFailure::Other,
+            format!("enforce_permission called with dotted name: {name}"),
         ));
     }
     let input = inv.permission_input().unwrap_or(input);
@@ -1547,10 +1577,12 @@ async fn enforce_permission(
         && prepared_intent
             .is_some_and(|intent| intent.authority == PermissionAuthorityProfile::RemoteResource)
     {
-        let workspace = ctx
-            .workspace_session
-            .as_ref()
-            .ok_or_else(|| "remote permission intent has no workspace identity".to_owned())?;
+        let workspace = ctx.workspace_session.as_ref().ok_or_else(|| {
+            ToolError::new(
+                ToolFailure::Other,
+                "remote permission intent has no workspace identity",
+            )
+        })?;
         Some(RemotePermissionIdentity::from_binding(workspace.binding()))
     } else {
         None
@@ -1585,7 +1617,7 @@ async fn enforce_permission(
                 include_builtin_allows,
             )
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|error| permission_refusal(ctx, &error))?;
     } else {
         let scopes = inv.permission_scopes().await.unwrap_or_else(|| {
             crate::tools::PermissionScopes::single(crate::permissions::canonical_json(input))
@@ -1604,9 +1636,19 @@ async fn enforce_permission(
                 include_builtin_allows,
             )
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|error| permission_refusal(ctx, &error))?;
     }
     Ok(())
+}
+
+/// A prompt abandoned because the turn was cancelled surfaces as a denial, so
+/// the cancellation token, not the message, says which it was.
+fn permission_refusal(ctx: &ToolContext, error: &PermissionError) -> ToolError {
+    let failure = match ctx.cancel.is_cancelled() {
+        true => ToolFailure::Cancelled,
+        false => ToolFailure::Denied,
+    };
+    ToolError::new(failure, error.to_string())
 }
 
 async fn execute_mcp_tool(
@@ -1616,11 +1658,11 @@ async fn execute_mcp_tool(
     tool_name: &str,
     input: &Value,
 ) -> ToolDoneEvent {
-    let done = |output: String, is_error: bool| ToolDoneEvent {
+    let done = |output: String| ToolDoneEvent {
         id: id.to_owned(),
         tool: Arc::clone(&tool_id),
         output: ToolOutput::Plain(output.into()),
-        is_error,
+        is_error: false,
         annotation: None,
         written_path: None,
         written_paths: Vec::new(),
@@ -1634,27 +1676,30 @@ async fn execute_mcp_tool(
     };
 
     if ctx.policy().is_read_only() {
-        return done(format!("{READ_ONLY_TOOL_RESTRICTED}: {tool_name}"), true);
+        return done(format!("{READ_ONLY_TOOL_RESTRICTED}: {tool_name}"))
+            .with_failure(ToolFailure::Denied);
     }
 
     if ctx.mode.is_planning() {
-        return done(MCP_BLOCKED_IN_PLAN.into(), true);
+        return done(MCP_BLOCKED_IN_PLAN.into()).with_failure(ToolFailure::Denied);
     }
 
     let perm_tool = match ToolKey::parse(tool_name) {
         Ok(k) => k,
         Err(e) => {
-            return done(format!("invalid MCP tool key '{tool_name}': {e}"), true);
+            return done(format!("invalid MCP tool key '{tool_name}': {e}"))
+                .with_failure(ToolFailure::Other);
         }
     };
     let perm_scope = canonical_json(input);
     let perm_scopes = crate::tools::PermissionScopes::single(perm_scope);
     let Some(mcp) = &ctx.mcp else {
-        return done(format!("MCP manager not available for {tool_name}"), true);
+        return done(format!("MCP manager not available for {tool_name}"))
+            .with_failure(ToolFailure::Other);
     };
     let binding = match mcp.bind_tool(tool_name) {
         Ok(binding) => binding,
-        Err(error) => return done(error.to_string(), true),
+        Err(error) => return done(error.to_string()).with_failure(error.failure()),
     };
 
     if let Err(e) = ctx
@@ -1676,7 +1721,8 @@ async fn execute_mcp_tool(
         )
         .await
     {
-        return done(e.to_string(), true);
+        let refusal = permission_refusal(ctx, &e);
+        return done(refusal.message).with_failure(refusal.failure);
     }
 
     // A permitted call to a deferred tool counts as loading it, so its full
@@ -1685,8 +1731,8 @@ async fn execute_mcp_tool(
         announce_loads(ctx, vec![Arc::from(tool_name)]);
     }
     match binding.call(input).await {
-        Ok(text) => done(text, false),
-        Err(e) => done(e.to_string(), true),
+        Ok(text) => done(text),
+        Err(e) => done(e.to_string()).with_failure(e.failure()),
     }
 }
 
@@ -1841,26 +1887,6 @@ fn tool_source(registry: &ToolRegistry, ctx: &ToolContext, name: &str) -> Cow<'s
     }
 }
 
-/// Low-cardinality buckets, because a raw error message would give the
-/// collector a new attribute value on every call, and because the ledger keeps
-/// one row per class.
-fn classify_error(text: &str) -> LedgerOutcome {
-    let text = text.to_ascii_lowercase();
-    if text.contains("cancel") {
-        LedgerOutcome::Cancelled
-    } else if text.contains("timed out") || text.contains("timeout") {
-        LedgerOutcome::Timeout
-    } else if text.contains("permission denied") || text.contains("not allowed") {
-        LedgerOutcome::Denied
-    } else if text.contains("no such file") || text.contains("not found") {
-        LedgerOutcome::NotFound
-    } else if text.contains("invalid") || text.contains("expected") {
-        LedgerOutcome::InvalidInput
-    } else {
-        LedgerOutcome::Other
-    }
-}
-
 /// The attribute value collectors already index on. Kept apart from
 /// [`LedgerOutcome::storage_name`] so renaming a storage value can never
 /// silently rewrite a dashboard's history.
@@ -1932,9 +1958,12 @@ fn git_activity(name: &str, input: &Value) {
 /// The token estimate runs on `composed_model_output`, which is the exact text
 /// the model will read and which [`crate::tool_output::limit`] has already
 /// bounded, so this counts what the context window is actually charged.
+///
+/// The outcome is whatever the failure's producer stated, never a reading of
+/// the text: a command that printed "timeout" and exited 1 failed on its own.
 fn account(done: &mut ToolDoneEvent, source: &str, took: Duration) {
     let outcome = match done.is_error {
-        true => classify_error(&done.output.as_text()),
+        true => done.accounting.outcome.unwrap_or(LedgerOutcome::Other),
         false => LedgerOutcome::Ok,
     };
     done.accounting = ToolAccounting {
@@ -2151,7 +2180,7 @@ mod tests {
         fn preflight<'a>(
             &'a self,
             _: &'a ToolContext,
-        ) -> BoxFuture<'a, Result<Option<PermissionIntent>, String>> {
+        ) -> BoxFuture<'a, Result<Option<PermissionIntent>, ToolError>> {
             self.prepared.store(true, Ordering::SeqCst);
             self.tool.trace.prepared.fetch_add(1, Ordering::SeqCst);
             *self.tool.trace.prepared_input.lock().unwrap() = Some(self.input.clone());
@@ -2799,6 +2828,7 @@ mod tests {
             let expected = serde_json::to_value(&output).unwrap();
             let mut result = ToolExecResult::from(Ok(output));
             result.is_error = state != SHELL_SUCCEEDED;
+            result.failure = timed_out.then_some(ToolFailure::Timeout);
             fixture.results.send(result).unwrap();
             let terminal = fixture.settled(card).await;
             assert_eq!(terminal.state, state);
@@ -3348,7 +3378,8 @@ mod tests {
             .insert(id.clone(), Vec::new());
         let mut waiter = Some(Arc::new(PendingShellReport::default()));
         let worker = Arc::clone(waiter.as_ref().unwrap());
-        let mut done = ToolDoneEvent::error(id.clone(), ERROR_CANCELLED);
+        let mut done =
+            ToolDoneEvent::error(id.clone(), ERROR_CANCELLED).with_failure(ToolFailure::Cancelled);
         account(&mut done, SOURCE_NATIVE, Duration::ZERO);
         if waiter_first {
             drop(waiter.take());
@@ -3940,6 +3971,43 @@ mod tests {
             .await;
             assert!(done.is_error);
             assert_eq!(done.output.as_text(), "nope");
+        });
+    }
+
+    const LOCAL_TOOL: &str = "stated_local";
+    const LOCAL_FAILURE: &str = "cancelled: timed out, permission denied, not found";
+
+    #[test_case(None, LedgerOutcome::Other; "unstated")]
+    #[test_case(Some(ToolFailure::InvalidInput), LedgerOutcome::InvalidInput; "stated")]
+    fn a_local_tool_failure_is_accounted_as_its_handler_states(
+        failure: Option<ToolFailure>,
+        expected: LedgerOutcome,
+    ) {
+        smol::block_on(async {
+            let mut ctx = crate::tools::test_support::stub_ctx(&AgentMode::Build);
+            let tool = match failure {
+                Some(failure) => {
+                    crate::tools::typed_local_tool(ToolEffect::ReadOnly, move |_, _| {
+                        Box::pin(async move { Err(ToolError::new(failure, LOCAL_FAILURE)) })
+                    })
+                }
+                None => crate::tools::local_tool(|_, _| {
+                    Box::pin(async { Err(LOCAL_FAILURE.to_owned()) })
+                }),
+            };
+            ctx.local_tools = Arc::new(HashMap::from([(LOCAL_TOOL.to_owned(), tool)]));
+            let done = run(
+                ToolRegistry::global(),
+                None,
+                "t1".into(),
+                LOCAL_TOOL,
+                &json!({}),
+                &ctx,
+                Emit::Silent,
+            )
+            .await;
+            assert_eq!(done.output.as_text(), LOCAL_FAILURE);
+            assert_eq!(done.accounting.outcome, Some(expected));
         });
     }
 
@@ -4737,7 +4805,7 @@ mod tests {
         fn preflight<'a>(
             &'a self,
             _ctx: &'a ToolContext,
-        ) -> BoxFuture<'a, Result<Option<PermissionIntent>, String>> {
+        ) -> BoxFuture<'a, Result<Option<PermissionIntent>, ToolError>> {
             self.preflighted.store(true, Ordering::SeqCst);
             Box::pin(std::future::ready(Ok(None)))
         }
@@ -5735,20 +5803,36 @@ mod telemetry_tests {
     const BEFORE: &str = "a\nb\nc\n";
     const AFTER: &str = "a\nB\nc\nd\n";
     const CALL_ID: &str = "call-1";
+    const FAILURE_TEXT: &str = "no such file or directory";
 
-    #[test_case("operation was cancelled", LedgerOutcome::Cancelled, ERROR_CANCELLED; "cancelled")]
-    #[test_case("command timed out after 120s", LedgerOutcome::Timeout, ERROR_TIMEOUT; "timed_out")]
-    #[test_case("permission denied: bash", LedgerOutcome::Denied, ERROR_DENIED; "denied")]
-    #[test_case("no such file or directory", LedgerOutcome::NotFound, ERROR_NOT_FOUND; "missing_file")]
-    #[test_case("invalid input: expected a string", LedgerOutcome::InvalidInput, ERROR_INVALID_INPUT; "invalid")]
-    #[test_case("boom", LedgerOutcome::Other, ERROR_OTHER; "fallback")]
-    fn errors_bucket_into_low_cardinality_types(
-        text: &str,
+    #[test_case(ToolFailure::Cancelled, LedgerOutcome::Cancelled, ERROR_CANCELLED; "cancelled")]
+    #[test_case(ToolFailure::Timeout, LedgerOutcome::Timeout, ERROR_TIMEOUT; "timeout")]
+    #[test_case(ToolFailure::Denied, LedgerOutcome::Denied, ERROR_DENIED; "denied")]
+    #[test_case(ToolFailure::NotFound, LedgerOutcome::NotFound, ERROR_NOT_FOUND; "not_found")]
+    #[test_case(ToolFailure::InvalidInput, LedgerOutcome::InvalidInput, ERROR_INVALID_INPUT; "invalid_input")]
+    #[test_case(ToolFailure::Other, LedgerOutcome::Other, ERROR_OTHER; "other")]
+    fn a_stated_failure_is_the_accounted_outcome(
+        failure: ToolFailure,
         outcome: LedgerOutcome,
         attribute: &str,
     ) {
-        assert_eq!(classify_error(text), outcome);
+        let mut done = ToolDoneEvent::error(CALL_ID.into(), FAILURE_TEXT).with_failure(failure);
+        account(&mut done, SOURCE_NATIVE, Duration::ZERO);
+
+        assert_eq!(done.accounting.outcome, Some(outcome));
         assert_eq!(error_type(outcome), Some(attribute));
+    }
+
+    #[test_case("operation was cancelled"; "cancelled")]
+    #[test_case("command timed out after 120s"; "timed_out")]
+    #[test_case("permission denied: bash"; "denied")]
+    #[test_case("no such file or directory"; "missing_file")]
+    #[test_case("invalid input: expected a string"; "invalid")]
+    fn an_unstated_failure_is_other_whatever_its_text_says(text: &str) {
+        let mut done = ToolDoneEvent::error(CALL_ID.into(), text);
+        account(&mut done, SOURCE_NATIVE, Duration::ZERO);
+
+        assert_eq!(done.accounting.outcome, Some(LedgerOutcome::Other));
     }
 
     #[test]
@@ -5758,7 +5842,8 @@ mod telemetry_tests {
 
     #[test]
     fn accounting_records_the_outcome_and_what_the_result_costs_the_window() {
-        let mut done = ToolDoneEvent::error(CALL_ID.into(), "no such file or directory");
+        let mut done =
+            ToolDoneEvent::error(CALL_ID.into(), FAILURE_TEXT).with_failure(ToolFailure::NotFound);
         account(&mut done, SOURCE_NATIVE, Duration::from_millis(42));
 
         assert_eq!(done.accounting.duration_ms, 42);

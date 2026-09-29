@@ -17,8 +17,8 @@ use arc_swap::ArcSwap;
 use serde_json::Value;
 
 use crate::tools::registry::{
-    ExecFuture, HeaderFuture, HeaderResult, ParseError, RegisteredTool, Tool, ToolExecResult,
-    ToolInvocation, ToolRegistry,
+    ExecFuture, HeaderFuture, HeaderResult, ParseError, RegisteredTool, Tool, ToolError,
+    ToolExecResult, ToolFailure, ToolInvocation, ToolRegistry,
 };
 use crate::tools::schema::{ParamKind, ParamSchema, Property, to_json_schema, validate};
 use crate::tools::{DescriptionContext, SKILL_TOOL_NAME, ToolContext, relative_path};
@@ -265,9 +265,10 @@ pub fn load(registry: &ToolRegistry, name: &str) -> Result<String, String> {
             dirs: tool.dirs.clone(),
             remote_skills: tool.remote_skills.clone(),
         }
-        .load();
+        .load()
+        .map_err(|error| error.message);
     }
-    load_from(name, &[], &installed_builtins())
+    load_from(name, &[], &installed_builtins()).map_err(|error| error.message)
 }
 
 impl Tool for SkillTool {
@@ -324,14 +325,14 @@ impl ToolInvocation for SkillCall {
             }
             match smol::unblock(move || self.load()).await {
                 Ok(text) => ToolExecResult::from(Ok(ToolOutput::Markdown(text.into()))),
-                Err(message) => ToolExecResult::from(Err(message)),
+                Err(error) => ToolExecResult::failed(error.failure, error.message),
             }
         })
     }
 }
 
 impl SkillCall {
-    fn load(&self) -> Result<String, String> {
+    fn load(&self) -> Result<String, ToolError> {
         if let Some(skill) = self
             .remote_skills
             .iter()
@@ -352,10 +353,13 @@ fn load_from(
     name: &str,
     dirs: &[SkillDirCandidate],
     builtins: &[Arc<BuiltinSkill>],
-) -> Result<String, String> {
+) -> Result<String, ToolError> {
     let discovered = discover(dirs, builtins);
     let Some(skill) = discovered.get(name) else {
-        return Err(format!("{NOT_FOUND}{name}{}", skill_list(&discovered)));
+        return Err(ToolError::new(
+            ToolFailure::NotFound,
+            format!("{NOT_FOUND}{name}{}", skill_list(&discovered)),
+        ));
     };
     let (content, location) = read_skill(skill, builtins)?;
     Ok(format!("{location}\n{}", numbered(&content)))
@@ -644,7 +648,7 @@ mod tests {
         let loaded = call(&remote, SHARED_SKILL).unwrap();
         assert!(loaded.contains(expected));
         assert!(!loaded.contains(LOCAL_BODY));
-        let error = call(&remote, LOCAL_ONLY_SKILL).unwrap_err();
+        let error = call(&remote, LOCAL_ONLY_SKILL).unwrap_err().message;
         assert!(error.starts_with(NOT_FOUND));
         assert!(!error.contains(LOCAL_BODY));
         assert!(!remote.catalog().description.contains(LOCAL_ONLY_SKILL));
@@ -732,6 +736,8 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let root = skill_dir(&temp, "deploy", "---\ndescription: ship it\n---\nbody\n");
         let error = load_from("nope", &[root], &[]).unwrap_err();
+        assert_eq!(error.failure, ToolFailure::NotFound);
+        let error = error.message;
         assert!(error.starts_with(NOT_FOUND), "{error}");
         assert!(error.contains("- deploy: ship it"), "{error}");
     }
@@ -782,7 +788,7 @@ mod tests {
     #[test]
     fn an_uninstalled_builtin_is_simply_absent() {
         assert!(discover(&[], &[]).is_empty());
-        let error = load_from(BUILTIN_NAME, &[], &[]).unwrap_err();
+        let error = load_from(BUILTIN_NAME, &[], &[]).unwrap_err().message;
         assert!(error.starts_with(NOT_FOUND), "{error}");
     }
 

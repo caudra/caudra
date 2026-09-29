@@ -32,7 +32,8 @@ pub use path_locks::{LockKey, PathGuards, PathLocks};
 pub use registry::{
     BoxFuture, ExecFuture, HeaderFuture, HeaderResult, ParseError, PermissionIntent,
     PermissionScopes, PlanModeAccess, RegisteredTool, RegistryError, Tool, ToolAudience,
-    ToolDefinitions, ToolEffect, ToolExecResult, ToolInvocation, ToolRegistry, ToolSource,
+    ToolDefinitions, ToolEffect, ToolError, ToolExecResult, ToolFailure, ToolInvocation,
+    ToolRegistry, ToolSource,
 };
 pub use report::{ToolReport, ToolState, builtin_report};
 
@@ -355,7 +356,7 @@ pub const PLAN_WRITE_RESTRICTED: &str = "write restricted to plan file in plan m
 pub const READ_ONLY_TOOL_RESTRICTED: &str = "tool is not available in strict read-only mode";
 /// Appended when the tool is listed but this one call is refused, so the model
 /// narrows the call instead of concluding the tool is gone. The prefix above
-/// stays first: the Lua runtime and telemetry both match on it.
+/// stays first: the Lua runtime matches on it.
 pub const READ_ONLY_CALL_GUIDANCE: &str =
     "this agent may only make calls that change nothing and read nothing outside the project";
 pub const DOOM_LOOP_MESSAGE: &str = "You have called this tool with identical input 3 times in a row. You are stuck in a loop. Break out and try a different approach.";
@@ -429,7 +430,8 @@ pub fn timeout_annotation(timeout: Duration) -> String {
 }
 
 pub type LocalToolResult = BoxFuture<'static, Result<String, String>>;
-type LocalToolHandler = Arc<dyn Fn(Value, ToolContext) -> LocalToolResult + Send + Sync>;
+pub type TypedLocalToolResult = BoxFuture<'static, Result<String, ToolError>>;
+type LocalToolHandler = Arc<dyn Fn(Value, ToolContext) -> TypedLocalToolResult + Send + Sync>;
 
 #[derive(Clone)]
 pub struct LocalToolEntry {
@@ -438,7 +440,7 @@ pub struct LocalToolEntry {
 }
 
 impl LocalToolEntry {
-    pub fn call(&self, input: Value, ctx: ToolContext) -> LocalToolResult {
+    pub fn call(&self, input: Value, ctx: ToolContext) -> TypedLocalToolResult {
         (self.handler)(input, ctx)
     }
 }
@@ -455,9 +457,21 @@ where
     audited_local_tool(ToolEffect::Unknown, f)
 }
 
+/// A failure from this handler is accounted as [`ToolFailure::Other`]; use
+/// [`typed_local_tool`] when the handler knows why it failed.
 pub fn audited_local_tool<F>(effect: ToolEffect, f: F) -> LocalToolEntry
 where
     F: Fn(Value, ToolContext) -> LocalToolResult + Send + Sync + 'static,
+{
+    typed_local_tool(effect, move |input, ctx| {
+        let call = f(input, ctx);
+        Box::pin(async move { call.await.map_err(ToolError::from) })
+    })
+}
+
+pub fn typed_local_tool<F>(effect: ToolEffect, f: F) -> LocalToolEntry
+where
+    F: Fn(Value, ToolContext) -> TypedLocalToolResult + Send + Sync + 'static,
 {
     LocalToolEntry {
         handler: Arc::new(f),
@@ -549,6 +563,18 @@ pub struct ToolContext {
 }
 
 impl ToolContext {
+    /// Why a call was refused before it ran, read from its own cancellation and
+    /// deadline rather than from the refusal's text.
+    pub fn refusal_failure(&self) -> ToolFailure {
+        if self.cancel.is_cancelled() {
+            ToolFailure::Cancelled
+        } else if self.deadline.check().is_err() {
+            ToolFailure::Timeout
+        } else {
+            ToolFailure::Other
+        }
+    }
+
     pub fn job_scope(&self) -> Option<JobScope> {
         self.jobs
             .clone()

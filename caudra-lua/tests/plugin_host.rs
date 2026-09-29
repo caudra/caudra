@@ -2,14 +2,15 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use caudra_agent::tools::{
-    DescriptionContext, ExecFuture, HeaderFuture, HeaderResult, ParseError, PermissionScopes,
-    QUESTION_TOOL_NAME, Tool, ToolAudience, ToolContext, ToolExecResult, ToolInvocation, ToolLive,
-    ToolRegistry, ToolSource, timeout_annotation,
+    DEADLINE_EXCEEDED, Deadline, DescriptionContext, ExecFuture, HeaderFuture, HeaderResult,
+    ParseError, PermissionScopes, QUESTION_TOOL_NAME, Tool, ToolAudience, ToolContext,
+    ToolExecResult, ToolFailure, ToolInvocation, ToolLive, ToolRegistry, ToolSource,
+    test_support::stub_ctx, timeout_annotation,
 };
-use caudra_agent::{ToolOutput, ToolOutputLimits};
+use caudra_agent::{AgentMode, CancelToken, ToolOutput, ToolOutputLimits};
 use caudra_config::{
     AlwaysThinking, Effect, PermissionRule, PermissionsConfig, PluginsConfig, ToolKey,
     ToolOutputLines, TouchMode,
@@ -274,6 +275,80 @@ const TIMED_OUT_SUBSTR: &str = "timed out";
 const ALREADY_CALLED_ERR: &str = "already called";
 const UNKNOWN_FIELD_ERR: &str = "unknown field";
 const PERMISSION_DENIED_MSG: &str = "permission denied";
+const TIMEOUT_WORDS: &str = "timeout";
+const CANCELLED_WORDS: &str = "cancelled";
+const PLUGIN_NOT_LOADED_ERR: &str = "plugin not loaded";
+const TOOL_NOT_FOUND_ERR: &str = "tool not found";
+const EMPTY_PLUGIN_SRC: &str = "";
+const PROBE_PLUGIN_NAME: &str = "failure_probe";
+const PROBE_RETURNS: &str = "probe_returns";
+const PROBE_REPORTS: &str = "probe_reports";
+const PROBE_RAISES: &str = "probe_raises";
+const PROBE_MALFORMED: &str = "probe_malformed";
+const PROBE_KILLED: &str = "probe_killed";
+const PROBE_PARKS: &str = "probe_parks";
+const PROBE_ANSWERS_LATE: &str = "probe_answers_late";
+const PROBE_MESSAGE: &str = "probe message";
+/// Each tool ends the way its name says, in its `message` where it has words.
+const FAILURE_PROBE_PLUGIN: &str = r#"
+local schema = {
+    type = "object",
+    properties = { message = { type = "string" } },
+    required = { "message" },
+}
+caudra.api.register_tool({
+    name = "probe_returns",
+    description = "returns its message",
+    schema = schema,
+    handler = function(input) return input.message end,
+})
+caudra.api.register_tool({
+    name = "probe_reports",
+    description = "reports its message as an error",
+    schema = schema,
+    handler = function(input) return { llm_output = input.message, is_error = true } end,
+})
+caudra.api.register_tool({
+    name = "probe_raises",
+    description = "raises its message",
+    schema = schema,
+    handler = function(input) error(input.message, 0) end,
+})
+caudra.api.register_tool({
+    name = "probe_malformed",
+    description = "returns what no handler may",
+    schema = schema,
+    handler = function() return 42 end,
+})
+caudra.api.register_tool({
+    name = "probe_killed",
+    description = "spins past a deadline that lapses at once",
+    schema = schema,
+    handler = function(_, ctx)
+        ctx:set_deadline(0)
+        while true do end
+    end,
+})
+caudra.api.register_tool({
+    name = "probe_parks",
+    description = "waits on a job past a deadline that lapses at once",
+    schema = schema,
+    handler = function(_, ctx)
+        ctx:set_deadline(0)
+        caudra.fn.jobstart("sleep 30")
+        return nil
+    end,
+})
+caudra.api.register_tool({
+    name = "probe_answers_late",
+    description = "reports its message past a deadline that lapses at once",
+    schema = schema,
+    handler = function(input, ctx)
+        ctx:set_deadline(0)
+        return { llm_output = input.message, is_error = true }
+    end,
+})
+"#;
 
 #[test]
 fn stdlib_globals_accessible() {
@@ -1690,6 +1765,7 @@ caudra.api.register_tool({{
     let result = smol::block_on(async { inv.execute(&ctx).await });
 
     assert!(result.output.is_err(), "expected error from timed-out loop");
+    assert_eq!(result.failure, Some(ToolFailure::Timeout));
 
     let ok = exec_tool(&reg, "noop_after_loop", serde_json::json!({}));
     assert!(ok.is_ok(), "VM poisoned after interrupt: {ok:?}");
@@ -1803,6 +1879,99 @@ fn handler_lua_error_surfaces_as_tool_error() {
 
     let err = exec_tool(&reg, "thrower", serde_json::json!({})).unwrap_err();
     assert!(err.contains("intentional kaboom"), "got: {err}");
+}
+
+fn failure_probe_host() -> (Arc<ToolRegistry>, PluginHost) {
+    let reg = fresh_registry();
+    let host = PluginHost::new(Arc::clone(&reg)).unwrap();
+    host.load_source(PROBE_PLUGIN_NAME, FAILURE_PROBE_PLUGIN)
+        .unwrap();
+    (reg, host)
+}
+
+fn run_failure_probe(tool: &str, message: &str, ctx: &ToolContext) -> ToolExecResult {
+    let (reg, _host) = failure_probe_host();
+    exec_result_with_ctx(&reg, tool, json!({ "message": message }), ctx)
+}
+
+/// Only the host can place a failure: whatever a plugin raises, reports, or
+/// returns malformed is `Other`, however its words read.
+#[test_case::test_case(PROBE_RETURNS, PROBE_MESSAGE, None ; "success")]
+#[test_case::test_case(PROBE_REPORTS, PROBE_MESSAGE, Some(ToolFailure::Other) ; "reported_error")]
+#[test_case::test_case(PROBE_MALFORMED, PROBE_MESSAGE, Some(ToolFailure::Other) ; "malformed_return")]
+#[test_case::test_case(PROBE_RAISES, TIMEOUT_WORDS, Some(ToolFailure::Other) ; "raised_timeout_words")]
+#[test_case::test_case(PROBE_RAISES, CANCELLED_WORDS, Some(ToolFailure::Other) ; "raised_cancelled_words")]
+#[test_case::test_case(PROBE_RAISES, TOOL_NOT_FOUND_ERR, Some(ToolFailure::Other) ; "raised_not_found_words")]
+#[test_case::test_case(PROBE_RAISES, PERMISSION_DENIED_MSG, Some(ToolFailure::Other) ; "raised_permission_denied_words")]
+fn lua_tool_failure_kind_ignores_the_message(
+    tool: &str,
+    message: &str,
+    expected: Option<ToolFailure>,
+) {
+    let ctx = stub_ctx(&AgentMode::Build);
+
+    let result = run_failure_probe(tool, message, &ctx);
+
+    assert_eq!(result.is_error, expected.is_some());
+    assert_eq!(result.failure, expected);
+}
+
+/// Whether the host kills the handler, gives up on its jobs, or the handler
+/// answers on its own, a doomed task fails for why it was doomed, and a
+/// cancel outranks the lapsed deadline.
+#[test_case::test_case(PROBE_KILLED, true, ToolFailure::Cancelled ; "killed_after_cancel")]
+#[test_case::test_case(PROBE_KILLED, false, ToolFailure::Timeout ; "killed_after_deadline")]
+#[test_case::test_case(PROBE_PARKS, true, ToolFailure::Cancelled ; "parked_after_cancel")]
+#[test_case::test_case(PROBE_PARKS, false, ToolFailure::Timeout ; "parked_after_deadline")]
+#[test_case::test_case(PROBE_ANSWERS_LATE, true, ToolFailure::Cancelled ; "answered_after_cancel")]
+#[test_case::test_case(PROBE_ANSWERS_LATE, false, ToolFailure::Timeout ; "answered_after_deadline")]
+fn doomed_lua_tool_fails_for_why_it_was_doomed(tool: &str, cancelled: bool, expected: ToolFailure) {
+    let mut ctx = stub_ctx(&AgentMode::Build);
+    if cancelled {
+        let (trigger, token) = CancelToken::new();
+        trigger.cancel();
+        ctx.cancel = token;
+    }
+
+    let result = run_failure_probe(tool, PROBE_MESSAGE, &ctx);
+
+    assert_eq!(result.failure, Some(expected));
+}
+
+/// An invocation parsed before its plugin changed reaches a host that no
+/// longer has what it names.
+#[test_case::test_case(None, PLUGIN_NOT_LOADED_ERR ; "plugin_unloaded")]
+#[test_case::test_case(Some(EMPTY_PLUGIN_SRC), TOOL_NOT_FOUND_ERR ; "tool_dropped_by_reload")]
+fn stale_lua_invocation_fails_as_not_found(reload: Option<&str>, expected_err: &str) {
+    let (reg, host) = failure_probe_host();
+    let invocation = reg
+        .get(PROBE_RETURNS)
+        .unwrap()
+        .tool
+        .parse(&json!({ "message": PROBE_MESSAGE }))
+        .unwrap();
+    match reload {
+        Some(source) => host.load_source(PROBE_PLUGIN_NAME, source).unwrap(),
+        None => host.unload(PROBE_PLUGIN_NAME).unwrap(),
+    }
+    let ctx = stub_ctx(&AgentMode::Build);
+
+    let result = smol::block_on(invocation.execute(&ctx));
+
+    assert_eq!(result.failure, Some(ToolFailure::NotFound));
+    let err = result.output.unwrap_err();
+    assert!(err.contains(expected_err), "got: {err}");
+}
+
+#[test]
+fn lapsed_turn_deadline_fails_a_lua_tool_as_timeout() {
+    let mut ctx = stub_ctx(&AgentMode::Build);
+    ctx.deadline = Deadline::At(Instant::now());
+
+    let result = run_failure_probe(PROBE_RETURNS, PROBE_MESSAGE, &ctx);
+
+    assert_eq!(result.failure, Some(ToolFailure::Timeout));
+    assert_eq!(result.output.unwrap_err(), DEADLINE_EXCEEDED);
 }
 
 #[test]
@@ -3761,18 +3930,21 @@ caudra.api.register_tool({
 /// A handler parked in an await runs no Lua when its deadline lapses, so the
 /// host is what ends it, by raising inside the await. Its cancel hooks still
 /// get that last slice, and the reply they finish with beats the generic
-/// timeout error. The handler that already returned nil takes a different
-/// road out, unit tested in `runtime.rs`.
+/// timeout error, though the failure stays the timeout's. The handler that
+/// already returned nil takes a different road out, unit tested in
+/// `runtime.rs`.
 #[test]
 fn parked_handler_reports_its_hook_finish_reply_on_deadline() {
     let reg = fresh_registry();
     let host = PluginHost::new(Arc::clone(&reg)).unwrap();
     host.load_source("parked_deadline_plugin", PARKED_DEADLINE_PLUGIN)
         .unwrap();
+    let ctx = stub_ctx(&AgentMode::Build);
 
-    let result = exec_tool(&reg, "parked_deadline", json!({}));
+    let result = exec_result_with_ctx(&reg, "parked_deadline", json!({}), &ctx);
 
-    assert_eq!(result, Err(PARKED_DEADLINE_REPLY.to_owned()));
+    assert_eq!(result.output.unwrap_err(), PARKED_DEADLINE_REPLY);
+    assert_eq!(result.failure, Some(ToolFailure::Timeout));
     drop(host);
 }
 
