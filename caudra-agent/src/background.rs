@@ -2087,7 +2087,7 @@ mod tests {
     use std::time::Duration;
 
     use async_lock::Semaphore;
-    use caudra_config::ExecutionMode;
+    use caudra_config::{ExecutionMode, FeatureFlags};
     use caudra_providers::{
         AgentError, CacheKey, ContentBlock, Message, ModelInfo, ProviderEvent, RequestOptions,
         Role, StandingReminderKind, StopReason, StreamResponse, TaskEventOrigin, TokenUsage,
@@ -3021,7 +3021,7 @@ mod tests {
             fixture.ctx.session_id = Some(fixture.session.id.into());
             fixture.ctx.tool_output_store = Some(store);
             let read = json!({"output_id": reference.id, "pattern": FULL_OUTCOME_TAIL});
-            native::register(&fixture.ctx.registry).unwrap();
+            native::register(&fixture.ctx.registry, FeatureFlags::all()).unwrap();
             let tool = fixture.ctx.registry.get("tool_output").unwrap().tool;
             let retrieved = tool.parse(&read).unwrap().execute(&fixture.ctx).await;
             assert!(!retrieved.is_error);

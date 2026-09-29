@@ -7,7 +7,6 @@ use std::sync::Arc;
 use caudra_agent::snapshots::{SnapshotStore, StoreEntry, collect_garbage};
 use caudra_agent::tools::ToolRegistry;
 use caudra_config::{RetentionConfig, load_env_files};
-use caudra_lua::PluginHost;
 use caudra_providers::{format_hit_rate, format_tokens_u64};
 use caudra_storage::StateDir;
 use caudra_storage::id::CaudraId;
@@ -26,7 +25,7 @@ use jiff::tz::TimeZone;
 use jiff::{Timestamp, Zoned};
 use serde::Serialize;
 
-use crate::cli::{KeepPolicyArgs, PolicyScopeArgs, StorageAction, UsageGrouping};
+use crate::cli::{Cli, KeepPolicyArgs, PolicyScopeArgs, StorageAction, UsageGrouping};
 
 const ID_WIDTH: usize = 22;
 const ACTIVITY_WIDTH: usize = 16;
@@ -105,7 +104,7 @@ struct PruneDocument<'a> {
     snapshot_garbage_bytes: Option<u64>,
 }
 
-pub fn run(action: StorageAction, no_plugins: bool, no_jit: bool) -> Result<()> {
+pub fn run(action: StorageAction, cli: &Cli) -> Result<()> {
     let state_dir = StateDir::resolve().context("resolve state directory")?;
     match action {
         StorageAction::Path => {
@@ -208,7 +207,7 @@ pub fn run(action: StorageAction, no_plugins: bool, no_jit: bool) -> Result<()> 
                 prune: false,
             };
             if ids.is_empty() {
-                let retention = load_retention(no_plugins, no_jit)?;
+                let retention = load_retention(cli)?;
                 let policy = effective_policy(&policy, &scope, retention.trim)?;
                 let group_by = scope.group_by.unwrap_or(retention.group_by);
                 let plan = sweep::plan(
@@ -258,7 +257,7 @@ pub fn run(action: StorageAction, no_plugins: bool, no_jit: bool) -> Result<()> 
                 prune,
             };
             if ids.is_empty() {
-                let retention = load_retention(no_plugins, no_jit)?;
+                let retention = load_retention(cli)?;
                 let policy = effective_policy(&policy, &scope, retention.forget)?;
                 let group_by = scope.group_by.unwrap_or(retention.group_by);
                 forget_by_policy(&mut database, &state_dir, policy, group_by, &scope, options)?;
@@ -446,15 +445,11 @@ fn apply_by_ids(
     Ok(())
 }
 
-fn load_retention(no_plugins: bool, no_jit: bool) -> Result<RetentionConfig> {
+fn load_retention(cli: &Cli) -> Result<RetentionConfig> {
     let cwd = env::current_dir().unwrap_or_else(|_| ".".into());
     load_env_files(&cwd);
-    let host = PluginHost::with_jit(Arc::clone(ToolRegistry::global_arc()), !no_jit)
-        .context("initialize lua plugin host")?;
-    let config = host
-        .load_init_files_or_skip(no_plugins, &cwd)
-        .context("load init.lua files")?
-        .unwrap_or_default()
+    let host = super::cli_plugin_host(cli, Arc::clone(ToolRegistry::global_arc()))?;
+    let config = super::load_settings(&host, &cli.startup, &cwd, false)?
         .into_config(false)
         .context("invalid config")?;
     Ok(config.storage.retention)

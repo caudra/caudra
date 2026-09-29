@@ -49,7 +49,7 @@ use crate::app::workbench::StoredDocument;
 use crate::chat::Chat;
 use crate::chat::{CANCELLED_TEXT, ChatEventResult, DONE_TEXT, ERROR_TEXT};
 use crate::clipboard::{ClipboardState, CopyResult};
-use crate::components::command::{CommandAction, CommandPalette, ParsedCommand};
+use crate::components::command::{CommandAction, CommandPalette, ParsedCommand, disabled_feature};
 use crate::components::command_modal::{CommandModal, CommandModalAction};
 use crate::components::commit_popup::{CommitAction, CommitIndex, CommitPopup};
 use crate::components::context_modal::ContextModal;
@@ -135,7 +135,10 @@ use caudra_agent::{
     SharedHistory, SteeringQueue, SubagentInfo, project_for_inspection,
 };
 use caudra_config::decisions::{DecisionsConfig, FeatureMode};
-use caudra_config::{ModelPolicy, PermissionsConfig, SnapshotsConfig, UiConfig};
+use caudra_config::{
+    Feature, FeatureDisabled, FeatureFlags, ModelPolicy, PermissionsConfig, SnapshotsConfig,
+    UiConfig,
+};
 use caudra_lua::{
     BuiltinAction, EventHandle, HintReader, HintSnapshot, KeymapReader, LuaCommandReader, WinView,
 };
@@ -542,6 +545,9 @@ pub struct App {
     merged_history: Option<MergedHistory>,
     pub(crate) shell: shell::ShellState,
     pub(crate) ui_config: UiConfig,
+    /// The experiments this process started with, which decide what the UI
+    /// offers and what an explicit request may open.
+    pub(crate) features: FeatureFlags,
     pub(crate) permissions: Arc<PermissionManager>,
     pub(crate) conversation_permissions: ConversationPermissions,
     pub(crate) permission_authority_factory: Option<crate::PermissionAuthorityFactory>,
@@ -607,6 +613,7 @@ impl App {
         model_policy: Arc<ModelPolicy>,
         prompt_profiles: Arc<PromptProfileCatalog>,
         workspace_session: Option<caudra_workspace::WorkspaceSession>,
+        features: FeatureFlags,
     ) -> Self {
         scrollbar::set_enabled(ui_config.scrollbar);
         let state = SessionState::from_session(session, model, &storage, &model_policy);
@@ -636,6 +643,7 @@ impl App {
                 custom_commands,
                 mcp_reader.clone(),
                 lua_command_reader,
+                features,
             ),
             no_commands: false,
             command_modal: CommandModal::new(),
@@ -775,6 +783,7 @@ impl App {
             merged_history: None,
             shell: shell::ShellState::default(),
             ui_config,
+            features,
             permissions,
             conversation_permissions: ConversationPermissions::Detached,
             permission_authority_factory: None,
@@ -3502,6 +3511,9 @@ impl App {
 
     fn intercept_inspection_submission(&mut self, text: &str) -> bool {
         let (token, args) = text.split_once(char::is_whitespace).unwrap_or((text, ""));
+        if self.refuse_disabled_command(token) {
+            return true;
+        }
         if token.eq_ignore_ascii_case("/decisions") {
             self.execute_decisions(args);
             return true;
@@ -4965,9 +4977,13 @@ impl App {
         let (name, args) = trimmed
             .split_once(char::is_whitespace)
             .unwrap_or((trimmed, ""));
+        let requested = format!("/{}", name.trim_start_matches('/'));
+        if let Some(feature) = disabled_feature(&requested, self.features) {
+            return Err(FeatureDisabled(feature).to_string());
+        }
         let resolved = self
             .command_palette
-            .resolve(&format!("/{}", name.trim_start_matches('/')))
+            .resolve(&requested)
             .ok_or_else(|| format!("unknown command '{name}'"))?;
         if self.command_is_out_of_scope(&resolved) {
             return Err(MAIN_ONLY_CMD_MSG.to_string());
@@ -4988,11 +5004,31 @@ impl App {
         !self.is_main_chat() && self.command_palette.is_main_only(name)
     }
 
+    /// A built-in whose experiment is off is hidden, but typing its exact
+    /// name still earns the key that turns it on rather than a prompt.
+    fn refuse_disabled_command(&mut self, name: &str) -> bool {
+        disabled_feature(name, self.features).is_some_and(|feature| self.refuse(feature))
+    }
+
+    /// Every way into an experiment's surface, from a shortcut to a footer
+    /// chip, asks here first.
+    pub(crate) fn refuse_disabled(&mut self, feature: Feature) -> bool {
+        !self.features.enabled(feature) && self.refuse(feature)
+    }
+
+    fn refuse(&mut self, feature: Feature) -> bool {
+        self.flash(FeatureDisabled(feature).to_string());
+        true
+    }
+
     /// {depth} is the `caudra.api.run_command` hop count, forwarded to a Lua
     /// handler so an alias cycle keeps counting. 0 when the user typed it.
     fn execute_command(&mut self, cmd: ParsedCommand, depth: u8) -> Vec<Action> {
         if self.command_is_out_of_scope(&cmd.name) {
             self.flash(MAIN_ONLY_CMD_MSG.into());
+            return vec![];
+        }
+        if self.refuse_disabled_command(&cmd.name) {
             return vec![];
         }
         match cmd.name.as_str() {
@@ -5122,9 +5158,16 @@ impl App {
                 vec![]
             }
             "/cd" => self.cmd_cd(&cmd.args),
-            "/remote" => {
-                vec![Action::RemoteControl(cmd.args)]
-            }
+            "/remote" => match self
+                .features
+                .require_source(self.state.session.workspace_binding())
+            {
+                Ok(()) => vec![Action::RemoteControl(cmd.args)],
+                Err(disabled) => {
+                    self.flash(disabled.to_string());
+                    vec![]
+                }
+            },
             "/sandbox" => {
                 self.open_sandbox(&cmd.args);
                 vec![]

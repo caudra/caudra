@@ -12,6 +12,7 @@ use caudra_agent::{
     AgentConfig, CancelToken, CancelTrigger, ToolAccounting, ToolDoneEvent, ToolInput, ToolOutput,
     ToolStartEvent, WorkspaceBaseline,
 };
+use caudra_config::FeatureFlags;
 use caudra_providers::Message;
 use caudra_workspace::{
     CommandText, DirectoryNavigation, ExecRequest, OperationProgressKind, OperationState,
@@ -227,6 +228,7 @@ pub(crate) fn spawn_remote_cd(
     workspace: WorkspaceSession,
     stored_binding: caudra_storage::workspace_binding::StoredWorkspaceBinding,
     path: DirectoryNavigation,
+    features: FeatureFlags,
     tx: flume::Sender<ShellEvent>,
 ) {
     smol::spawn(async move {
@@ -254,10 +256,11 @@ pub(crate) fn spawn_remote_cd(
             let binding = stored_binding
                 .with_cursor(workspace.cursor().clone())
                 .map_err(|_| "cd: remote workspace identity changed".to_owned())?;
-            let context =
-                caudra_agent::remote_project_context::load_remote_project_context(&workspace)
-                    .await
-                    .map_err(|_| "cd: remote project context could not be refreshed".to_owned())?;
+            let context = caudra_agent::remote_project_context::load_remote_project_context(
+                &workspace, features,
+            )
+            .await
+            .map_err(|_| "cd: remote project context could not be refreshed".to_owned())?;
             Ok(RemoteDirectoryChange {
                 workspace,
                 binding,

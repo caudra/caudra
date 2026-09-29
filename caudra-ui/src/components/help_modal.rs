@@ -7,6 +7,7 @@ use crate::components::scrollbar::{Scrollbar, ScrollbarMouse};
 use crate::components::{ModalScroll, bar_area};
 use crate::theme;
 
+use caudra_config::FeatureFlags;
 use caudra_grab::grab_scope;
 use crossterm::event::{KeyCode, KeyEvent, MouseEvent};
 use ratatui::Frame;
@@ -156,7 +157,7 @@ impl HelpModal {
         true
     }
 
-    pub fn view(&mut self, frame: &mut Frame, area: Rect) -> Rect {
+    pub fn view(&mut self, frame: &mut Frame, area: Rect, features: FeatureFlags) -> Rect {
         if !self.open {
             return Rect::default();
         }
@@ -167,7 +168,7 @@ impl HelpModal {
 
         let key_col_width = KEYBINDS
             .iter()
-            .filter(|kb| kb.platform.is_visible())
+            .filter(|kb| kb.is_visible(features))
             .map(|kb| kb.label.display_width())
             .max()
             .unwrap_or(0)
@@ -175,7 +176,7 @@ impl HelpModal {
 
         let mut first = true;
         for ctx in all_contexts() {
-            if ctx.parent().is_some() {
+            if ctx.parent().is_some() || ctx.feature().is_some_and(|f| !features.enabled(f)) {
                 continue;
             }
             if !first {
@@ -190,7 +191,7 @@ impl HelpModal {
 
             for kb in KEYBINDS
                 .iter()
-                .filter(|kb| kb.context == ctx && kb.platform.is_visible())
+                .filter(|kb| kb.context == ctx && kb.is_visible(features))
             {
                 let mut spans = key_spans(kb.label, key_col_width, PREFIX_TOP);
                 spans.push(Span::styled(kb.description, theme.keybind_desc));
@@ -203,7 +204,7 @@ impl HelpModal {
                 }
                 let child_binds: Vec<_> = KEYBINDS
                     .iter()
-                    .filter(|kb| kb.context == child && kb.platform.is_visible())
+                    .filter(|kb| kb.context == child && kb.is_visible(features))
                     .collect();
                 if child_binds.is_empty() {
                     continue;
@@ -362,7 +363,7 @@ mod tests {
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
         terminal
             .draw(|f| {
-                modal.view(f, f.area());
+                modal.view(f, f.area(), FeatureFlags::all());
             })
             .unwrap();
         crate::components::buffer_text(terminal.backend().buffer())

@@ -60,7 +60,7 @@ use crate::workspace_baseline::BaselineGate;
 use crate::{
     AgentConfig, AgentMode, EventSender, SharedBuf, SubagentHistoryStore, SubagentProgress,
 };
-use caudra_config::{ModelPolicy, ToolOutputLines};
+use caudra_config::{Feature, FeatureFlags, ModelPolicy, ToolOutputLines};
 use caudra_providers::Model;
 use caudra_providers::RequestOptions;
 use caudra_providers::provider::Provider;
@@ -267,6 +267,7 @@ impl ToolFilter {
             )
         };
         let mut exclude: Vec<&str> = extra_exclude.to_vec();
+        exclude.extend(feature_exclusions(config.features));
         exclude.extend(capability_exclusions(model));
         exclude.extend(credential_exclusions());
         exclude.extend(config.disabled_tools.iter().map(|s| s.as_str()));
@@ -288,6 +289,16 @@ pub fn capability_exclusions(model: &Model) -> &'static [&'static str] {
         (true, false) => &[FILE_APPLY_PATCH_TOOL_NAME],
         (false, true) => &[VIEW_IMAGE_TOOL_NAME, FILE_EDIT_TOOL_NAME],
         (false, false) => &[VIEW_IMAGE_TOOL_NAME, FILE_APPLY_PATCH_TOOL_NAME],
+    }
+}
+
+/// A tool whose experiment is off leaves every catalog, even one an allowlist
+/// asks for by name: only the global caudra.toml can turn it on.
+pub fn feature_exclusions(features: FeatureFlags) -> &'static [&'static str] {
+    if features.enabled(Feature::Workflows) {
+        &[]
+    } else {
+        &[WORKFLOW_TOOL_NAME]
     }
 }
 
@@ -1100,6 +1111,24 @@ mod tests {
             !subscribed,
             "a tool that can only fail must not be advertised"
         );
+    }
+
+    #[test_case(Vec::new(), FeatureFlags::NONE, false ; "off_by_default")]
+    #[test_case(vec![WORKFLOW_TOOL_NAME.into()], FeatureFlags::NONE, false ; "allowlist_cannot_turn_it_on")]
+    #[test_case(Vec::new(), FeatureFlags::NONE.with(Feature::Workflows), true ; "experiment_on")]
+    fn workflow_follows_its_experiment(
+        allowed_tools: Vec<String>,
+        features: FeatureFlags,
+        offered: bool,
+    ) {
+        let model = Model::from_spec("anthropic/claude-opus-4-8").unwrap();
+        let config = AgentConfig {
+            allowed_tools,
+            features,
+            ..Default::default()
+        };
+        let filter = ToolFilter::from_config(&config, &model, &[]);
+        assert_eq!(filter.matches(WORKFLOW_TOOL_NAME), offered);
     }
 
     #[test]

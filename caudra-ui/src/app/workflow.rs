@@ -9,6 +9,7 @@ use std::borrow::Cow;
 use std::collections::HashSet;
 
 use caudra_agent::workflow::WorkflowHandle;
+use caudra_config::Feature;
 use caudra_providers::{Message, WorkflowEventOrigin};
 use caudra_workflow::{
     LaunchRequest, LogLine, MAX_AGENT_BUDGET, MAX_RUN_LOG_ENTRIES, RunSnapshot, RunStatus,
@@ -492,6 +493,9 @@ impl WorkflowDelivery {
 
 impl App {
     pub(super) fn workflows_browse(&mut self) -> Vec<Action> {
+        if self.refuse_disabled(Feature::Workflows) {
+            return Vec::new();
+        }
         if !self.workflow.available() {
             self.flash(UNAVAILABLE_MSG.into());
             return Vec::new();
@@ -504,6 +508,9 @@ impl App {
 
     pub(super) fn execute_workflow(&mut self, args: &str) -> Vec<Action> {
         let args = args.trim();
+        if self.refuse_disabled(Feature::Workflows) {
+            return Vec::new();
+        }
         if !self.workflow.available() {
             self.flash(UNAVAILABLE_MSG.into());
             return Vec::new();
@@ -589,6 +596,9 @@ impl App {
     /// mirror does not hold: earlier sessions' runs once, and the selected
     /// run's detail whenever the selection or the run moves.
     pub(super) fn open_workflow_inspector(&mut self, preferred: Option<&str>) {
+        if self.refuse_disabled(Feature::Workflows) {
+            return;
+        }
         if !self.workflow.available() {
             self.flash(UNAVAILABLE_MSG.into());
             return;
@@ -953,6 +963,7 @@ mod tests {
         AgentEvent, AgentMode, CancelMap, CancelToken, Envelope, EventSender, HistorySnapshot,
         SubagentActivity, SubagentInfo, SubagentProgress,
     };
+    use caudra_config::FeatureFlags;
     use caudra_workflow::{
         AgentRosterEntry, CatalogEntry, RosterState, RunDetail, RunHistoryEntry, RunUsage,
         SourceKind, WorkflowCatalog,
@@ -1158,6 +1169,7 @@ mod tests {
                 events: flume::unbounded().0,
                 mode: Arc::new(AgentMode::default),
                 subagent_cancels: Arc::new(CancelMap::default()),
+                features: FeatureFlags::NONE.with(Feature::Workflows),
             },
             None,
         ))

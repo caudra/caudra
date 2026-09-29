@@ -9,6 +9,7 @@ use caudra_agent::workspace_transfer::{
     TransferEvent, TransferPhase as Phase, TransferPreview as FileComparisonPreview,
     TransferRoots as EngineRoots,
 };
+use caudra_config::Feature;
 use caudra_config::sandbox::persistence::SandboxStore;
 use caudra_sandbox::Controller;
 use caudra_workbench::{
@@ -153,6 +154,9 @@ impl App {
     }
 
     fn queue_transfer_action(&mut self, action: TransferAction) -> Result<(), String> {
+        self.features
+            .require(Feature::Sandboxes)
+            .map_err(|disabled| disabled.to_string())?;
         if let TransferAction::Cancel { generation } = action {
             if generation != self.bound_workbench().transfer_generation() {
                 return Err(STALE.into());

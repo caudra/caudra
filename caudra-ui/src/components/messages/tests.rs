@@ -3621,7 +3621,8 @@ fn handle_click_returns_nothing_when_no_segment_at_row() {
 
 #[test]
 fn handle_click_on_done_tool_records_click_row() {
-    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    let (eh, _probe) = caudra_lua::test_support::probed_event_handle();
+    let mut panel = MessagesPanel::new(UiConfig::default(), eh);
     panel.tool_start(start("t1", SHELL_TOOL_NAME));
     panel.tool_done(ToolDoneEvent {
         id: "t1".into(),
@@ -3652,7 +3653,8 @@ fn handle_click_on_done_tool_records_click_row() {
 
 #[test]
 fn handle_click_on_running_tool_forwards_live_without_recording() {
-    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    let (eh, _probe) = caudra_lua::test_support::probed_event_handle();
+    let mut panel = MessagesPanel::new(UiConfig::default(), eh);
     panel.tool_start(start("t1", SHELL_TOOL_NAME));
     panel.tool_snapshot(
         "t1",
@@ -3662,6 +3664,27 @@ fn handle_click_on_running_tool_forwards_live_without_recording() {
     render(&mut panel, 80, 24);
     let area = Rect::new(0, 0, 80, 24);
     assert!(panel.handle_click(area.y, area));
+    assert!(panel.lua_clicks.is_empty());
+}
+
+/// A transcript restored without Lua keeps its rendered snapshot but no
+/// longer answers clicks, so none is recorded for a replay nothing runs.
+#[test_case(true; "done")]
+#[test_case(false; "running")]
+fn a_snapshot_is_passive_without_a_lua_runtime(done: bool) {
+    let mut panel = if done {
+        bash_tool_with_snapshot("t1")
+    } else {
+        let mut panel =
+            MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+        panel.tool_start(start("t1", SHELL_TOOL_NAME));
+        panel.tool_snapshot("t1", rendered_snapshot(), None);
+        panel
+    };
+    panel.set_restore_channel(Some(test_event_sender()));
+    render(&mut panel, 80, 24);
+    let area = Rect::new(0, 0, 80, 24);
+    assert!(!panel.handle_click(area.y, area));
     assert!(panel.lua_clicks.is_empty());
 }
 
@@ -4081,7 +4104,9 @@ fn rendered_snapshot() -> BufferSnapshot {
 
 #[test]
 fn rebake_walk_requests_without_stamping_displayed_generation() {
+    let (eh, _probe) = caudra_lua::test_support::probed_event_handle();
     let mut panel = bash_tool_with_snapshot("t1");
+    panel.lua_event_handle = eh;
     panel.find_tool_msg_mut("t1").unwrap().tool_raw_input =
         Some(Arc::new(serde_json::json!({ "command": "echo" })));
     panel.push(DisplayMessage::new(DisplayRole::Assistant, "plain".into()));
@@ -4126,7 +4151,7 @@ fn test_event_sender() -> caudra_agent::EventSender {
 const RAW_INPUT_SET_MSG: &str = "tool_raw_input must be set from event payload";
 const HEADER_GEN_MSG: &str = "header snapshot must stamp the provided generation";
 const LIVE_PANEL_GEN_MSG: &str = "live snapshot (None gen) must stamp with panel theme_generation";
-const REBAKE_NOOP_MSG: &str = "rebake without channel must be a no-op (no requested gen)";
+const REBAKE_NOOP_MSG: &str = "a rebake nothing can answer must be a no-op (no requested gen)";
 
 #[test_case(false ; "fresh_start")]
 #[test_case(true  ; "upgrade_from_pending")]
@@ -4177,11 +4202,15 @@ fn live_snapshot_uses_panel_generation() {
     );
 }
 
-#[test]
-fn rebake_without_channel_is_noop() {
+#[test_case(false; "without_channel")]
+#[test_case(true; "without_lua_runtime")]
+fn rebake_without_a_receiver_is_noop(channel: bool) {
     let mut panel = bash_tool_with_snapshot("t1");
     panel.find_tool_msg_mut("t1").unwrap().tool_raw_input =
         Some(Arc::new(serde_json::json!({"command": "echo"})));
+    if channel {
+        panel.set_restore_channel(Some(test_event_sender()));
+    }
     let baked_gen = panel.snapshot_gen_of("t1").unwrap();
 
     panel.rebake_stale_snapshots(baked_gen + 1);

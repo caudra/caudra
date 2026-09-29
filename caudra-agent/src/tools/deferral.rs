@@ -648,6 +648,7 @@ pub(crate) mod tests {
     };
     use async_trait::async_trait;
     use caudra_config::decisions::DecisionsConfig;
+    use caudra_config::{Feature, FeatureFlags};
     use caudra_decision::{
         AnswerMetadata, ChoiceAnswer, DecisionEngine, DecisionError, DecisionRequest,
         DecisionResponse, Usage,
@@ -684,6 +685,7 @@ pub(crate) mod tests {
     const TEST_ENDPOINT: &str = "http://127.0.0.1:1/v1/systemone";
     const TEST_TIMEOUT_MS: u64 = 5_000;
     const SEARCH_REDACTED: &str = "[redacted]";
+    const WORKFLOWS_ON: FeatureFlags = FeatureFlags::NONE.with(Feature::Workflows);
 
     struct SearchEngine {
         requests: Arc<Mutex<Vec<DecisionRequest>>>,
@@ -1242,7 +1244,10 @@ pub(crate) mod tests {
     #[test_case(true ; "another_tool_pending")]
     fn workflow_loads_independently_and_updates_the_catalog(other_pending: bool) {
         let mut definitions = workflow_definitions(
-            &AgentConfig::default(),
+            &AgentConfig {
+                features: WORKFLOWS_ON,
+                ..Default::default()
+            },
             BuiltinDeferral::Lazy,
             ToolAudience::MAIN,
         );
@@ -1285,6 +1290,7 @@ pub(crate) mod tests {
             } else {
                 Vec::new()
             },
+            features: WORKFLOWS_ON,
             ..Default::default()
         };
         let definitions = workflow_definitions(&config, deferral, ToolAudience::MAIN);
@@ -1296,14 +1302,16 @@ pub(crate) mod tests {
         assert_eq!(names(&tools), [WORKFLOW_TOOL_NAME]);
     }
 
-    #[test_case(ToolAudience::MAIN, true, false ; "disabled")]
-    #[test_case(ToolAudience::MAIN, false, true ; "filtered_out")]
-    #[test_case(ToolAudience::GENERAL_SUB, false, false ; "general_subagent")]
-    #[test_case(ToolAudience::RESEARCH_SUB, false, false ; "research_subagent")]
+    #[test_case(ToolAudience::MAIN, true, false, WORKFLOWS_ON ; "disabled")]
+    #[test_case(ToolAudience::MAIN, false, true, WORKFLOWS_ON ; "filtered_out")]
+    #[test_case(ToolAudience::GENERAL_SUB, false, false, WORKFLOWS_ON ; "general_subagent")]
+    #[test_case(ToolAudience::RESEARCH_SUB, false, false, WORKFLOWS_ON ; "research_subagent")]
+    #[test_case(ToolAudience::MAIN, false, false, FeatureFlags::NONE ; "experiment_off")]
     fn excluded_workflow_does_not_create_a_catalog(
         audience: ToolAudience,
         disabled: bool,
         filtered: bool,
+        features: FeatureFlags,
     ) {
         let config = AgentConfig {
             disabled_tools: if disabled {
@@ -1316,6 +1324,7 @@ pub(crate) mod tests {
             } else {
                 Vec::new()
             },
+            features,
             ..Default::default()
         };
         let definitions = workflow_definitions(&config, BuiltinDeferral::Lazy, audience);

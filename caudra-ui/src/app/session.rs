@@ -2076,6 +2076,9 @@ impl App {
         if self.permission_mutation_pending() {
             return Err(PERMISSION_WORKER_BUSY.into());
         }
+        self.features
+            .require_source(session.workspace_binding())
+            .map_err(|disabled| disabled.to_string())?;
         if self.workspace_session.is_none() {
             caudra_storage::workspace_binding::StoredWorkspaceBinding::validate_resume(
                 session.workspace_binding(),

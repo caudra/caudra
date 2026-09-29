@@ -31,8 +31,8 @@ use caudra_agent::{
 };
 use caudra_config::decisions::DecisionsConfig;
 use caudra_config::{
-    ExecutionMode, ModelPolicy, SnapshotsConfig, effective_shell_execution,
-    effective_task_execution,
+    ExecutionMode, Feature, FeatureDisabled, ModelPolicy, SnapshotsConfig,
+    effective_shell_execution, effective_task_execution,
 };
 use caudra_providers::model::Model;
 use caudra_providers::{
@@ -63,6 +63,7 @@ use tracing::warn;
 
 use crate::cli::Cli;
 
+pub(crate) const AUTO_PERMISSION_MODE: &str = "auto";
 const WORKFLOW_SYSTEM_SUBTYPE: &str = "workflow";
 const TASK_CONTROLS: &[&str] = &["task_list", "task_status", "task_cancel", "task_promote"];
 const STALE_TASK_INVOCATION: &str = "Task invocation is no longer current";
@@ -150,7 +151,7 @@ impl PermissionMode {
     fn parse(s: &str) -> Option<Self> {
         match s {
             "default" => Some(Self::Default),
-            "auto" => Some(Self::Auto),
+            AUTO_PERMISSION_MODE => Some(Self::Auto),
             "acceptEdits" => Some(Self::AcceptEdits),
             "plan" => Some(Self::Plan),
             "bypassPermissions" => Some(Self::BypassPermissions),
@@ -161,7 +162,7 @@ impl PermissionMode {
     fn as_str(self) -> &'static str {
         match self {
             Self::Default => "default",
-            Self::Auto => "auto",
+            Self::Auto => AUTO_PERMISSION_MODE,
             Self::AcceptEdits => "acceptEdits",
             Self::Plan => "plan",
             Self::BypassPermissions => "bypassPermissions",
@@ -1838,6 +1839,12 @@ fn handle_control_request(
         "set_permission_mode" => {
             let mode_str = cr.request.extra.get("mode").and_then(Value::as_str);
             match mode_str.and_then(PermissionMode::parse) {
+                Some(PermissionMode::Auto) if !handle.permissions.decision_engine() => writer
+                    .emit_control_response(
+                        &cr.request_id,
+                        None,
+                        Some(FeatureDisabled(Feature::DecisionEngine).to_string()),
+                    ),
                 Some(mode) => {
                     let execution_mode = mode.preserve_plan(shared.lock().unwrap().permission_mode);
                     let agent_mode = shared

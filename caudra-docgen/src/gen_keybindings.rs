@@ -1,3 +1,4 @@
+use caudra_config::Feature;
 use caudra_ui::keybindings::{
     ALT_SEP, KEYBINDS, KeyLabel, Keybind, KeybindContext, LEADER_PREFIX, Platform, all_contexts,
 };
@@ -31,10 +32,27 @@ fn label_str(label: KeyLabel) -> String {
 }
 
 fn description_str(kb: &Keybind) -> String {
-    match kb.platform {
+    let description = match kb.platform {
         Platform::All => kb.description.to_string(),
         Platform::UnixOnly => format!("{} (Unix only)", kb.description),
+    };
+    match kb
+        .feature()
+        .filter(|&feature| kb.context.feature() != Some(feature))
+    {
+        Some(feature) => format!("{description} (needs `{feature}`)"),
+        None => description,
     }
+}
+
+fn experiment_note(ctx: KeybindContext) -> Option<String> {
+    ctx.feature().map(|feature| {
+        format!(
+            "These keys exist only with `{} = true` under `[experimental]`. See \
+             [Experimental features](/docs/configuration/#experimental-features).\n\n",
+            feature.key()
+        )
+    })
 }
 
 fn write_table_2col(out: &mut String, rows: &[(String, String)]) {
@@ -46,6 +64,9 @@ fn write_table_2col(out: &mut String, rows: &[(String, String)]) {
 
 fn write_section(out: &mut String, ctx: KeybindContext) {
     out.push_str(&format!("\n## {}\n\n", ctx.label()));
+    if let Some(note) = experiment_note(ctx) {
+        out.push_str(&note);
+    }
 
     let rows: Vec<_> = KEYBINDS
         .iter()
@@ -148,13 +169,31 @@ fn write_context_specific(out: &mut String) {
     out.push_str("Some pickers add extra bindings on top of the defaults:\n\n");
     out.push_str("| Context | Key | Action |\n|---------|-----|--------|\n");
 
+    let mut experimental: Vec<(KeybindContext, Feature)> = Vec::new();
     for kb in &child_binds {
         let key = label_str(kb.label);
         out.push_str(&format!(
             "| {} | {key} | {} |\n",
             kb.context.label(),
-            kb.description
+            description_str(kb)
         ));
+        if let Some(feature) = kb.context.feature()
+            && !experimental.iter().any(|(ctx, _)| *ctx == kb.context)
+        {
+            experimental.push((kb.context, feature));
+        }
+    }
+
+    if experimental.is_empty() {
+        return;
+    }
+    out.push_str(
+        "\nSome of these contexts belong to an \
+         [experimental feature](/docs/configuration/#experimental-features) and exist only \
+         while its switch is on:\n\n",
+    );
+    for (ctx, feature) in experimental {
+        out.push_str(&format!("- {}: `{}`\n", ctx.label(), feature.key()));
     }
 }
 
@@ -209,7 +248,8 @@ pub fn generate() -> String {
 fn write_overrides(out: &mut String) {
     out.push_str("\n## Overriding Keybindings\n\n");
     out.push_str(
-        "Plugins and `init.lua` can rebind keys at runtime with \
+        "With [Lua plugins](/docs/configuration/#experimental-features) turned \
+         on, plugins and `init.lua` can rebind keys at runtime with \
          `caudra.keymap.set` and `caudra.keymap.del`. The tables above are the \
          built-in defaults. An override on the same key wins, unless a \
          modal or overlay is open (help, plan form, permission prompt).\n\n",
@@ -237,15 +277,14 @@ fn write_overrides(out: &mut String) {
     out.push_str("### Recovering from a bad keymap\n\n");
     out.push_str(
         "If an override leaves Caudra stuck (a rebound `Ctrl+C`, a modal \
-         that won't close, a plugin that throws on load), boot without \
-         user `init.lua`:\n\n",
+         that will not close, a plugin that throws on load), boot without Lua:\n\n",
     );
     out.push_str("```bash\ncaudra --no-plugins\n```\n\n");
     out.push_str(
-        "Skips user `init.lua` files (global and project). The Lua host \
-         stays up and every built-in tool is native, so tools still work. \
-         `permissions.toml`, custom commands, and env files load as \
-         usual.\n\n",
+        "This run skips every plugin and both `init.lua` files and starts \
+         no Lua host, even with `lua_plugins` on. Every built-in tool is \
+         native, so tools still work. `caudra.toml`, `permissions.toml`, \
+         custom commands, and env files load as usual.\n\n",
     );
     out.push_str(
         "The default keymap lives in Rust, not Lua, so `--no-plugins` \

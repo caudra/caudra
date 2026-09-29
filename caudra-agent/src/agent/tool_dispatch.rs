@@ -2291,6 +2291,7 @@ mod tests {
                         scope: None,
                         effect: permission,
                     }],
+                    decision_engine: true,
                     ..Default::default()
                 },
                 root.path().to_owned(),

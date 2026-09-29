@@ -911,6 +911,7 @@ mod tests {
     use std::sync::Mutex;
 
     use caudra_config::steering::SteeringModelConfig;
+    use caudra_config::{Feature, FeatureFlags};
     use caudra_providers::{
         AgentError, CacheKey, ContentBlock, Message, ProviderEvent, Role, StopReason,
         StreamResponse, TokenUsage,
@@ -1089,9 +1090,12 @@ mod tests {
             let temp = tempfile::tempdir().unwrap();
             let (workspace, service) =
                 crate::stored_session::tests::remote_workspace("runner", CURSOR_WORKFLOW);
-            let context = crate::remote_project_context::load_remote_project_context(&workspace)
-                .await
-                .unwrap();
+            let context = crate::remote_project_context::load_remote_project_context(
+                &workspace,
+                FeatureFlags::all(),
+            )
+            .await
+            .unwrap();
             let provider = Arc::new(ScriptedProvider::new(vec![
                 response(
                     vec![ContentBlock::tool_use("probe", CURSOR_PROBE, json!({}))],
@@ -1149,6 +1153,7 @@ mod tests {
                     events,
                     mode,
                     subagent_cancels: cancels,
+                    features: FeatureFlags::NONE.with(Feature::Workflows),
                 },
                 None,
             )
@@ -1172,9 +1177,12 @@ mod tests {
             service
                 .revision
                 .store(2, std::sync::atomic::Ordering::SeqCst);
-            let context = crate::remote_project_context::load_remote_project_context(&nested)
-                .await
-                .unwrap();
+            let context = crate::remote_project_context::load_remote_project_context(
+                &nested,
+                FeatureFlags::all(),
+            )
+            .await
+            .unwrap();
             let transition = handle.suspend().await.unwrap();
             transition
                 .rebind(WorkspaceRebind {

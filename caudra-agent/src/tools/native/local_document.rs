@@ -401,6 +401,7 @@ fn reference_label(reference: &LocalDocumentRef) -> String {
 mod tests {
     use std::sync::Arc;
 
+    use caudra_config::FeatureFlags;
     use caudra_storage::StateDir;
     use caudra_storage::id::SessionRef;
     use caudra_storage::local_documents::LocalDocumentStore;
@@ -490,7 +491,8 @@ mod tests {
             .create_plan(workspace.binding().project().key(), session_id.as_str())
             .expect("create plan");
         let registry = Arc::new(ToolRegistry::new());
-        crate::tools::native::register(&registry).expect("register native tools");
+        crate::tools::native::register(&registry, FeatureFlags::all())
+            .expect("register native tools");
         let mut ctx = stub_ctx(&AgentMode::RemotePlan(plan.clone()));
         ctx.registry = Arc::clone(&registry);
         ctx.session_id = Some(session_id);
@@ -664,7 +666,7 @@ mod tests {
                 .write_memory(store.project_key(), "note.md", PLAN)
                 .expect("note");
             let registry = Arc::new(ToolRegistry::new());
-            crate::tools::native::register(&registry).expect("register");
+            crate::tools::native::register(&registry, FeatureFlags::all()).expect("register");
             let mut ctx = stub_ctx(&AgentMode::Build);
             ctx.registry = Arc::clone(&registry);
             ctx.workspace_session = Some(workspace_for_principal("other"));
@@ -734,7 +736,8 @@ mod tests {
                 .write_memory(workspace.binding().project().key(), "note.md", "note")
                 .expect("write memory");
             let registry = Arc::new(ToolRegistry::new());
-            crate::tools::native::register(&registry).expect("register native tools");
+            crate::tools::native::register(&registry, FeatureFlags::all())
+                .expect("register native tools");
             let mut ctx = stub_ctx(&AgentMode::RemotePlan(plan));
             ctx.registry = Arc::clone(&registry);
             ctx.session_id = Some(session_id);

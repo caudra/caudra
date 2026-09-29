@@ -13,6 +13,8 @@ Use compatible client and server builds. A matching version label alone does not
 
 This guide covers direct Workcell connections, where you provision the host and manage its process, credentials, TLS and storage. For optional e2b-libvirt lifecycle management, profiles, the template catalog and reviewed file transfers, use [Managed Sandboxes](/docs/sandboxes/). A failed remote connection never switches execution to the local checkout.
 
+Direct Workcell connections are experimental and off by default. Turn them on with `remote_workcell = true` under `[experimental]` in the global `caudra.toml`, then restart Caudra. See [Experimental features](/docs/configuration/#experimental-features). The switch covers the `--workcell-*` selectors, `caudra auth workcell`, and `caudra remote` or `/remote` in a direct session. Managed sandboxes have their own switch and work without this one.
+
 ## Prepare the server
 
 Use a matching Workcell build with a working Python execution worker. A generic MCP endpoint or a read-only Workcell server is insufficient. Caudra requires the full first-party catalog with matching schemas, contract and result versions, annotations, and presentation metadata.
@@ -82,7 +84,7 @@ caudra auth workcell set dev
 
 Use the hidden prompt, or `caudra auth workcell set dev --stdin` with a secret source piped into stdin. Do not put the token in an endpoint URL or command argument. Credentials are stored under the client's persistent state directory in owner-only files, without OS-keyring encryption. `caudra auth workcell list` lists names and timestamps. `caudra auth workcell delete dev` removes the saved credential.
 
-Create `workcell.toml` in the local user configuration directory, alongside global `init.lua`. On Linux the default is `~/.config/caudra/workcell.toml`. See [platform configuration paths](/docs/configuration/#directory-layout).
+Create `workcell.toml` in the local user configuration directory, alongside the global `caudra.toml`. On Linux the default is `~/.config/caudra/workcell.toml`. See [platform configuration paths](/docs/configuration/#directory-layout).
 
 ```toml
 version = 1
@@ -132,7 +134,7 @@ Remote selection applies to workspace tools and workspace UI operations. Explici
 
 ## Project context and trust
 
-Caudra fetches remote project assets through a bounded, revision-checked manifest. It does not execute remote `init.lua`, source remote environment files, or load remote MCP configuration. The client checkout's project configuration is also excluded. Global client configuration and its environment file remain local inputs.
+Caudra fetches remote project assets through a bounded, revision-checked manifest. It does not read a remote `.caudra/caudra.toml`, execute remote `init.lua`, source remote environment files, or load remote MCP configuration. The client checkout's project configuration is also excluded. Global client configuration and its environment file remain local inputs.
 
 Supported remote assets are:
 
@@ -141,7 +143,7 @@ Supported remote assets are:
 | Instructions | `AGENTS.md`, `AGENTS.local.md`, `CLAUDE.md`, `COPILOT.md`, `.cursorrules`, `.windsurfrules`, `.clinerules`, `CONVENTIONS.md`, `GEMINI.md`, and `CODING_AGENT.md`, plus `.github/copilot-instructions.md` and `.caudra/instructions`. Directory scope determines applicability |
 | Skills       | One-level `<name>/SKILL.md` under `.caudra/skills`, `.claude/skills`, `.opencode/skills`, or `.agents/skills`                                                                                                                                                                 |
 | Commands     | Immediate Markdown files under `.caudra/commands`, `.claude/commands`, or `.opencode/commands`. They are prompt templates, not client shell scripts                                                                                                                           |
-| Workflows    | `.caudra/workflows/*.rhai`. Scripts require client approval before execution                                                                                                                                                                                                  |
+| Workflows    | `.caudra/workflows/*.rhai`, loaded only while `experimental.workflows` is on. Scripts require client approval before execution                                                                                                                                                |
 | Permissions  | The exact `.caudra/permissions.toml` file. Restrictive rules apply immediately. Allows require review                                                                                                                                                                         |
 
 Skill and command directories use the order shown above, selecting the highest-priority remote tier. Project entries override same-named global entries. Instructions and skill text are model context, not permission grants.
@@ -176,6 +178,8 @@ caudra --workcell-profile dev --session SESSION_ID
 ```
 
 Stored bindings include the endpoint origin, server ID, workspace ID, workspace generation, resource namespace, authenticated principal, and root project. They also retain cursor scope for cwd restoration and validation. A profile name or matching path alone is insufficient. Local-to-remote resume, a different authority, or a replaced workspace generation is rejected instead of silently rebinding history. Reconnect to the original identity or start a new session.
+
+Resuming a direct remote session also needs `experimental.remote_workcell`, whether through `--continue`, `--session`, the session picker, the SDK, or ACP. Without it, resume fails with an error and never falls back to local execution. The session data stays intact.
 
 An ordinary server restart preserves durable identity but changes the process instance. Caudra must refresh volatile handles and reconcile pending operations. Reusing a generation after a workspace reset defeats this distinction, so generation management is the operator's responsibility.
 
@@ -222,6 +226,8 @@ Use the recovery controller without asking the model to repeat the command:
 4. Inspect the remote files and process state before considering another mutation or acknowledgement.
 
 ### Recovery commands
+
+`/remote` and `caudra remote` are available when `experimental.sandboxes` or `experimental.remote_workcell` is on. Each checks the session's actual source, so a direct session needs `remote_workcell` and a sandbox session needs `sandboxes`.
 
 | TUI command | Effect |
 |-------------|--------|

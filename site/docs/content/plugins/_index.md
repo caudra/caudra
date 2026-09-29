@@ -7,6 +7,8 @@ group = "Guides"
 
 # Writing caudra plugins
 
+Lua plugins are experimental and off by default. Turn them on with `lua_plugins = true` under `[experimental]` in the global `caudra.toml`, then restart Caudra. `--no-plugins` turns Lua off again for one run. See [Experimental features](/docs/configuration/#experimental-features).
+
 Caudra plugins are plain Lua files (Luau) that run inside caudra. A plugin can
 register tools the LLM calls, slash commands, keymaps, prompt hints, and
 custom UI. Everything lives under the global `caudra` table. The full API

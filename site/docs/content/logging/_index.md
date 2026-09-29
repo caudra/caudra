@@ -86,13 +86,12 @@ kept as written and treated as an error, so a level filter never hides it.
 
 ## Level
 
-The default level is `info`. Set `storage.log_level` in your config to
+The default level is `info`. Set `storage.log_level` in `caudra.toml` to
 `trace`, `debug`, `info`, `warn`, or `error`.
 
-```lua
-storage = {
-    log_level = "debug",
-}
+```toml
+[storage]
+log_level = "debug"
 ```
 
 `RUST_LOG` overrides the config for one run, and takes the full
@@ -130,5 +129,6 @@ outruns the disk, the newest records are dropped and a warning records how many,
 which keeps a slow disk from slowing a run. Caudra flushes the queue on a clean
 exit and on a panic, so the record that explains a crash reaches the file.
 
-Plugins write to the same file through `caudra.log.info|warn|error`. See
+Lua plugins write to the same file through `caudra.log.info|warn|error`. They
+run only when `experimental.lua_plugins` is on. See
 [Plugins](/docs/plugins/#development-loop).

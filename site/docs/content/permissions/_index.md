@@ -434,11 +434,15 @@ The builtin read-only classifier is conservative about mutation flags, executabl
 
 ## Plugin rules
 
+Plugin rules apply only while Lua plugins run, which needs `experimental.lua_plugins`. See [Experimental features](/docs/configuration/#experimental-features).
+
 Bundled plugins can declare trusted host policy for resources they own. Builtin allows apply only to implementations marked as bundled by the loader. User plugins do not inherit native or bundled trust. Global user plugins need a valid `plugin.toml` before they can register allow policy. Project plugins can register deny rules only. Remembered Lua decisions bind to the plugin name, tool name, entry source, required Lua modules, description, and schema. A reload during review cannot switch the approved handler generation.
 
 Lua plugin API capabilities remain separate. `plugin.toml` controls whether plugin code may call filesystem, network, process, and environment APIs. Tool-call permissions control whether the agent may invoke a registered tool.
 
 ## Auto mode
+
+Auto mode is experimental and belongs to the decision engine. Turn it on with `decision_engine = true` under `[experimental]` in the global `caudra.toml`, then restart Caudra. See [Experimental features](/docs/configuration/#experimental-features).
 
 `/auto` toggles between Ask and Auto. `--auto` selects Auto at startup. The status bar shows `[auto]`, or `[a]` in a narrow terminal. Clicking the chip returns to Ask. `--auto` and `--yolo` are mutually exclusive.
 
@@ -446,30 +450,31 @@ Auto skips prompts only when no rule covers the call and the tool's default is P
 
 An explicit mode choice is saved with the root conversation. A command-line mode overrides the restored choice. Global `always_auto = true` supplies the default when neither exists. Global YOLO settings take precedence if both defaults are enabled. Projects cannot set `always_auto` or `always_yolo`.
 
-Auto works without a decision engine. With enforced engine screening, a flagged call, engine error, or timeout takes the ordinary prompt path. Without a channel for answering that prompt, the call is denied. Disabling globally required screening in project configuration also restores prompting for eligible calls.
+While the switch is off, `/auto`, `--auto`, SDK `--permission-mode auto`, and an SDK `set_permission_mode` request for `auto` fail with an error, and the mode does not change. With `always_auto = true`, sessions start in Ask and Caudra shows a notice. A session saved in Auto also starts in Ask. The saved choice is kept, so turning the switch on later brings Auto back. Ask, Plan, and YOLO are unaffected.
+
+With the switch on, Auto works without a configured decision endpoint. With enforced engine screening, a flagged call, engine error, or timeout takes the ordinary prompt path. Without a channel for answering that prompt, the call is denied. Disabling globally required screening in project configuration also restores prompting for eligible calls.
 
 Auto is not a security boundary. An engine miss can let an eligible call run. Engine predictions never grant read-only access or weaken deterministic permission rules.
 
 ### Decision engine advice
 
-Decision features are opt-in and configured in user-global `caudra.setup()` settings. A project may disable a feature or logging and shorten retention, but cannot redirect the endpoint, change thresholds, or enable a feature. Non-loopback endpoints require `allow_remote = true` because decision context leaves the machine. See the [configuration reference](/docs/configuration/#decisions) for fields, defaults, and supported modes.
+The decision engine needs the same `experimental.decision_engine` switch, and so do `caudra decisions` and `/decisions`. While the switch is off, `[decisions]` settings have no effect, and existing decision logs and shell duration history stay untouched. Turning the switch on enables nothing by itself. The engine still needs its endpoint and a mode for each feature, and Auto still has to be selected.
+
+Decision features are opt-in and configured in the `[decisions]` table of the global `caudra.toml`. A project may disable a feature or logging and shorten retention, but cannot redirect the endpoint, change thresholds, or enable a feature. Non-loopback endpoints require `allow_remote = true` because decision context leaves the machine. See the [configuration reference](/docs/configuration/#decisions) for fields, defaults, and supported modes.
 
 Decision requests connect directly to the configured endpoint. They ignore ambient proxy variables and do not follow HTTP redirects, so project environment settings cannot redirect a loopback request.
 
 HTTPS is required except for numeric loopback HTTP. A user-global `allow_http = true` permits non-loopback HTTP only together with `allow_remote = true`. Use this opt-in only when you control the transport protection, such as an encrypted tunnel. Private and CGNAT addresses do not prove that a tunnel exists. Projects cannot set either opt-in, and Workcell transport rules remain unchanged.
 
-```lua
-caudra.setup({
-  decisions = {
-    endpoint = "http://127.0.0.1:8000/v1/systemone",
-    timeout_ms = 400,
-    log = false,
-    features = {
-      permission_advice = "shadow",
-      auto_screening = "shadow",
-    },
-  },
-})
+```toml
+[decisions]
+endpoint = "http://127.0.0.1:8000/v1/systemone"
+timeout_ms = 400
+log = false
+
+[decisions.features]
+permission_advice = "shadow"
+auto_screening = "shadow"
 ```
 
 Every feature defaults to `off`. `permission_advice = "shadow"` evaluates predictions without changing a prompt. Retaining them requires `log = true`. `"advise"` can add warnings to an already visible prompt without delaying the user's answer. `auto_screening = "shadow"` leaves Auto's deterministic baseline unchanged. `"enforce"` can turn an eligible Auto call into a prompt.

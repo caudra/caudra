@@ -3691,6 +3691,11 @@ impl MessagesPanel {
         }
 
         if self.has_snapshot(tool_id) {
+            // Without a runtime the snapshot is passive history: a click
+            // would record replays nothing can ever answer.
+            if self.lua_event_handle.is_disconnected() {
+                return false;
+            }
             let buf_row = seg.source_line_at(rel, width).map_or(0, |l| seg.buf_row(l));
             if self.tool_in_progress(tool_id) {
                 self.lua_event_handle
@@ -4791,6 +4796,9 @@ impl MessagesPanel {
         let Some(tx) = self.restore_event_tx.clone() else {
             return;
         };
+        if self.lua_event_handle.is_disconnected() {
+            return;
+        }
         let eh = &self.lua_event_handle;
         self.rebake_requested.retain(|_, g| *g >= current_gen);
         let tol = self.tool_output_lines;

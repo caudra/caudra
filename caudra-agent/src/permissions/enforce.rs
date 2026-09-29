@@ -1017,6 +1017,7 @@ mod tests {
         let manager = mgr_with(
             PermissionsConfig {
                 default,
+                decision_engine: true,
                 ..Default::default()
             },
             PathBuf::from(SHELL_WORKDIR),

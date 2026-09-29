@@ -1,6 +1,8 @@
 use caudra_agent::template::Vars;
-use caudra_agent::tools::{DescriptionContext, ToolAudience, ToolFilter, ToolRegistry, ToolSource};
-use caudra_config::PluginsConfig;
+use caudra_agent::tools::{
+    DescriptionContext, ToolAudience, ToolFilter, ToolRegistry, ToolSource, feature_exclusions,
+};
+use caudra_config::{Feature, FeatureFlags, PluginsConfig};
 use regex::Regex;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
@@ -89,10 +91,9 @@ fn write_disabling_section(out: &mut String) {
          an MCP tool as `server.tool`, or a whole MCP server as `server.*`. An unknown name fails \
          at startup with the list of valid names. A project list extends the global one, so a \
          project can restrict further and cannot re-enable what the global config turned off.\n\n\
-         ```lua\n\
-         caudra.setup({{\n    \
-             agent = {{ disabled_tools = {{ \"shell\", \"file_write\", \"github.*\" }} }},\n\
-         }})\n\
+         ```toml\n\
+         [agent]\n\
+         disabled_tools = [\"shell\", \"file_write\", \"github.*\"]\n\
          ```\n\n\
          `--disallowed-tools` does the same for one run and accepts the same names. \
          `plugins.<name>.enabled = false` still works and maps to the tools that plugin was \
@@ -264,6 +265,13 @@ fn write_param_table(out: &mut String, params: &[Param]) {
     }
 }
 
+/// The experiment that keeps `name` out of every catalog while it is off.
+fn experiment(name: &str) -> Option<Feature> {
+    Feature::ALL
+        .into_iter()
+        .find(|&feature| feature_exclusions(FeatureFlags::all().without(feature)).contains(&name))
+}
+
 fn write_tool_entry(out: &mut String, name: &str, info: &ToolInfo, opt_in: &HashSet<String>) {
     let description = info
         .def
@@ -273,6 +281,7 @@ fn write_tool_entry(out: &mut String, name: &str, info: &ToolInfo, opt_in: &Hash
     let schema = info.def.get("input_schema").cloned().unwrap_or(Value::Null);
     let params = extract_params(&schema);
     let summary = first_paragraph(description);
+    let experiment = experiment(name);
 
     writeln!(out).unwrap();
     let mut badges = String::new();
@@ -282,6 +291,9 @@ fn write_tool_entry(out: &mut String, name: &str, info: &ToolInfo, opt_in: &Hash
     if opt_in.contains(name) {
         badges.push_str(" <span class=\"badge badge-optin\">opt-in</span>");
     }
+    if experiment.is_some() {
+        badges.push_str(" <span class=\"badge\">experimental</span>");
+    }
     if caudra_config::is_deferred_builtin(name) {
         badges.push_str(" <span class=\"badge\">on demand</span>");
     }
@@ -289,6 +301,15 @@ fn write_tool_entry(out: &mut String, name: &str, info: &ToolInfo, opt_in: &Hash
     writeln!(out).unwrap();
     writeln!(out, "{summary}").unwrap();
     writeln!(out).unwrap();
+    if let Some(feature) = experiment {
+        writeln!(
+            out,
+            "Experimental and off by default. Turn it on with `{} = true` under `[experimental]` in the global `caudra.toml`. See [Experimental features](/docs/configuration/#experimental-features).",
+            feature.key()
+        )
+        .unwrap();
+        writeln!(out).unwrap();
+    }
     if name == "task" {
         writeln!(
             out,
@@ -409,7 +430,8 @@ fn load_registry_with_builtins() -> (Arc<ToolRegistry>, HashSet<String>) {
     workcell
         .register_documented_tools(&registry)
         .expect("Workcell tools");
-    caudra_agent::tools::native::register(&registry).expect("native Caudra tools");
+    caudra_agent::tools::native::register(&registry, FeatureFlags::all())
+        .expect("native Caudra tools");
     let mut host = PluginHost::new(Arc::clone(&registry)).expect("plugin host");
 
     host.load_production_builtins(&PluginsConfig::from_plugins(HashMap::new()))

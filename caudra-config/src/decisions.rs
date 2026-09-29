@@ -69,10 +69,14 @@ macro_rules! features {
                 $(if overlay.$field.as_ref().is_some_and(|mode| *mode != FeatureMode::Off) {
                     return Err(DecisionsConfigError::ProjectOverride(concat!("features.", stringify!($field))));
                 })+
+                self.overlay(overlay);
+                Ok(())
+            }
+
+            fn overlay(&mut self, overlay: Self) {
                 $(if overlay.$field.is_some() {
                     self.$field = overlay.$field;
                 })+
-                Ok(())
             }
         }
 
@@ -216,6 +220,30 @@ impl Default for DecisionsConfig {
 }
 
 impl RawDecisionsConfig {
+    /// A layer with the same authority replaces whatever it names; restriction
+    /// provenance from earlier layers is never cleared.
+    pub(crate) fn overlay(&mut self, overlay: Self) {
+        macro_rules! replace {
+            ($($field:ident),+) => {
+                $(if overlay.$field.is_some() { self.$field = overlay.$field; })+
+            };
+        }
+        replace!(
+            endpoint,
+            model,
+            api_key_env,
+            allow_remote,
+            allow_http,
+            timeout_ms,
+            log,
+            log_retention_days,
+            thresholds
+        );
+        self.features.overlay(overlay.features);
+        self.project_error = self.project_error.take().or(overlay.project_error);
+        self.auto_screening_restricted |= overlay.auto_screening_restricted;
+    }
+
     pub(crate) fn restrict(&mut self, overlay: Self) {
         if self.project_error.is_some() {
             return;

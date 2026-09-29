@@ -54,8 +54,8 @@ use caudra_agent::{
 use caudra_config::decisions::DecisionFeatures;
 use caudra_config::sandbox::SandboxName;
 use caudra_config::{
-    Effect, PermissionReviewCandidate, PermissionReviewKind, PermissionRule, PermissionSource,
-    PermissionsConfig, ToolKey, UiConfig,
+    Effect, FeatureFlags, PermissionReviewCandidate, PermissionReviewKind, PermissionRule,
+    PermissionSource, PermissionsConfig, ToolKey, UiConfig,
 };
 use caudra_lua::test_support::{HintWriterHandle, hint_writer_pair};
 use caudra_lua::{BuiltinAction, HintReader, KeymapReader, LuaCommandInfo, LuaCommandReader};
@@ -374,6 +374,7 @@ fn build_app_with_lua(
         Arc::new(PermissionManager::new_nonpersistent(
             PermissionsConfig {
                 rules: vec![],
+                decision_engine: true,
                 ..Default::default()
             },
             PathBuf::from("/tmp"),
@@ -384,6 +385,7 @@ fn build_app_with_lua(
         Arc::new(caudra_config::ModelPolicy::default()),
         Arc::new(caudra_agent::prompt::profile::PromptProfileCatalog::default()),
         None,
+        FeatureFlags::all(),
     )
 }
 
@@ -777,7 +779,7 @@ mod background_runtime {
         SubagentInfo, TaskProvenance,
     };
     use caudra_agent::{BatchToolStatus, SubagentActivity, ToolDoneEvent, ToolOutput};
-    use caudra_config::ModelPolicy;
+    use caudra_config::{Feature, FeatureFlags, ModelPolicy};
     use caudra_lua::EventHandle;
     use caudra_providers::provider::{BoxFuture, Provider};
     use caudra_providers::{
@@ -895,7 +897,9 @@ mod background_runtime {
         }
 
         async fn after_final_with_reminders(show_reminders: bool) -> Self {
-            REGISTER.call_once(|| native::register(ToolRegistry::global()).unwrap());
+            REGISTER.call_once(|| {
+                native::register(ToolRegistry::global(), FeatureFlags::all()).unwrap()
+            });
             let mut app = Box::new(test_app());
             app.ui_config.show_reminders = show_reminders;
             app.chats[0] = Chat::new(
@@ -923,6 +927,7 @@ mod background_runtime {
                 AgentConfig {
                     generate_titles: false,
                     compaction_requirements: false,
+                    features: FeatureFlags::NONE.with(Feature::Workflows),
                     ..Default::default()
                 },
                 app.ui_config.tool_output_lines,
@@ -4624,6 +4629,79 @@ fn main_only_commands_still_run_from_the_main_composer() {
     assert!(actions.iter().any(|a| matches!(a, Action::Compact)));
 }
 
+#[test_case("/workflow", Feature::Workflows; "workflow")]
+#[test_case("/workflows", Feature::Workflows; "workflows")]
+#[test_case("/deep-research", Feature::Workflows; "workflow_shortcut")]
+#[test_case("/sandbox", Feature::Sandboxes; "sandbox")]
+#[test_case("/decisions", Feature::DecisionEngine; "decisions")]
+#[test_case("/auto", Feature::DecisionEngine; "auto")]
+fn a_command_whose_experiment_is_off_names_the_switch(command: &str, feature: Feature) {
+    let mut app = test_app();
+    app.features = FeatureFlags::all().without(feature);
+    let expected = FeatureDisabled(feature).to_string();
+
+    assert!(app.execute_command(cmd(command), 0).is_empty());
+    assert_eq!(app.status_bar.flash_text(), Some(expected.as_str()));
+    assert_eq!(app.run_cmdline(command, 0).err(), Some(expected));
+    assert!(!app.sandbox_manager.is_open());
+    assert_eq!(app.permissions.mode(), PermissionMode::Ask);
+}
+
+#[test]
+fn a_typed_hidden_command_names_the_switch_instead_of_prompting() {
+    let mut app = test_app();
+    app.features = FeatureFlags::NONE;
+
+    let actions = type_and_submit(&mut app, "/sandbox");
+
+    let expected = FeatureDisabled(Feature::Sandboxes).to_string();
+    assert_eq!(app.status_bar.flash_text(), Some(expected.as_str()));
+    assert!(actions.is_empty());
+    assert!(app.state.session.messages().is_empty());
+}
+
+fn remote_binding(sandbox: bool) -> StoredWorkspaceBinding {
+    let workspace = remote_workspace_session();
+    let binding = StoredWorkspaceBinding::new_with_cursor(
+        workspace.binding().clone(),
+        workspace.cursor().clone(),
+        None,
+    )
+    .unwrap();
+    if sandbox {
+        binding.with_sandbox_record(CaudraId::generate()).unwrap()
+    } else {
+        binding
+    }
+}
+
+#[test_case(true, Feature::Sandboxes; "managed_sandbox")]
+#[test_case(false, Feature::RemoteWorkcell; "direct_remote")]
+fn remote_control_follows_the_session_source(sandbox: bool, feature: Feature) {
+    let mut app = test_app();
+    app.state.session = Arc::new(AppSession::new_with_workspace(
+        "test",
+        ".",
+        remote_binding(sandbox),
+    ));
+    let other = if sandbox {
+        Feature::RemoteWorkcell
+    } else {
+        Feature::Sandboxes
+    };
+    app.features = FeatureFlags::NONE.with(other);
+
+    assert!(app.execute_command(cmd("/remote"), 0).is_empty());
+    let expected = FeatureDisabled(feature).to_string();
+    assert_eq!(app.status_bar.flash_text(), Some(expected.as_str()));
+
+    app.features = FeatureFlags::NONE.with(feature);
+    assert!(matches!(
+        app.execute_command(cmd("/remote"), 0).as_slice(),
+        [Action::RemoteControl(_)]
+    ));
+}
+
 #[test]
 fn run_cmdline_reports_main_only_commands_in_a_task_view() {
     let (mut app, _steer_tx) = focused_task_composer();
@@ -4658,6 +4736,7 @@ fn with_custom_command(app: &mut App, name: &str, content: &str) {
         }]),
         McpSnapshotReader::empty(),
         LuaCommandReader::empty(),
+        FeatureFlags::all(),
     );
 }
 
@@ -10766,7 +10845,10 @@ fn remote_cd_persistence_failure_preserves_live_state() {
     let old_session = Arc::clone(&app.state.session);
     let old_baseline = Arc::clone(&app.workspace_baseline);
     let old_context = smol::block_on(
-        caudra_agent::remote_project_context::load_remote_project_context(&workspace),
+        caudra_agent::remote_project_context::load_remote_project_context(
+            &workspace,
+            FeatureFlags::all(),
+        ),
     )
     .unwrap();
     app.remote_project_context = Some(Arc::clone(&old_context));

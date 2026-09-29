@@ -23,7 +23,7 @@ use caudra_agent::{
     AgentConfig, AgentMode, AgentParams, BaselineGate, CancelMap, Envelope, McpHandle,
     SubagentHistoryStore, ToolOutputLines, agent,
 };
-use caudra_config::ModelPolicy;
+use caudra_config::{Feature, ModelPolicy};
 use caudra_lua::EventHandle;
 use caudra_providers::{CacheKey, Timeouts};
 use caudra_storage::StateDir;
@@ -106,9 +106,12 @@ pub(crate) struct WorkflowSession {
 }
 
 impl WorkflowSession {
-    /// `None` when the runtime cannot open its store: the session then runs
-    /// without workflows rather than not at all.
+    /// `None` when workflows are off or the runtime cannot open its store: the
+    /// session then runs without workflows rather than not at all.
     pub(crate) fn spawn(spawn: WorkflowSpawn<'_>) -> Option<Self> {
+        if !spawn.config.features.enabled(Feature::Workflows) {
+            return None;
+        }
         let cwd = match &spawn.workspace_session {
             Some(workspace) => match smol::block_on(caudra_agent::workspace_logical_cwd(workspace))
             {
@@ -212,6 +215,7 @@ impl WorkflowSession {
             events: spawn.events,
             mode: mode_resolver,
             subagent_cancels,
+            features: spawn.config.features,
         }, spawn.permissions.decisions()))
         .map_err(|error| {
             warn!(%error, session_id = %spawn.session_id, "workflow runtime unavailable for this session")

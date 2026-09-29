@@ -386,7 +386,7 @@ mod tests {
     use crate::{AgentEvent, CancelToken, EventSender};
     use async_trait::async_trait;
     use caudra_config::decisions::{DecisionsConfig, FeatureMode};
-    use caudra_config::{Effect, ToolKey};
+    use caudra_config::{Effect, PermissionsConfig, ToolKey};
     use caudra_decision::{
         Answer, AnswerMetadata, DecisionEngine, DecisionError, DecisionRequest, DecisionResponse,
         NoulAnswer, Usage,
@@ -583,6 +583,31 @@ mod tests {
                 allowed
             );
             assert_eq!(service.calls.load(Ordering::Relaxed), 0);
+        });
+    }
+
+    #[test_case(Some(PermissionMode::Auto); "stored_auto")]
+    #[test_case(None; "seeded_auto")]
+    fn auto_without_the_experiment_prompts_like_ask(stored: Option<PermissionMode>) {
+        smol::block_on(async {
+            let service = service(
+                Behavior::Probability(0.0),
+                FeatureMode::Enforce,
+                FeatureMode::Off,
+                false,
+            );
+            let manager = mgr_with(PermissionsConfig::default(), PathBuf::from(SHELL_WORKDIR));
+            manager.set_seed_mode(PermissionMode::Auto);
+            manager.set_session_mode(stored.clone());
+            manager.set_decisions(Some(service.decisions));
+            assert!(manager.decisions().is_none());
+            assert!(
+                enforce_shell_without_prompt(&manager, &[FIRST_COMMAND], false)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(service.calls.load(Ordering::Relaxed), 0);
+            assert_eq!(manager.persisted_mode(), stored);
         });
     }
 

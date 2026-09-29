@@ -13,6 +13,7 @@ use caudra_agent::{
         TransferEvent, TransferEvents,
     },
 };
+use caudra_config::FeatureFlags;
 use caudra_config::sandbox::{SandboxName, persistence::SandboxStore};
 use caudra_sandbox::Controller;
 use caudra_storage::StateDir;
@@ -102,7 +103,11 @@ fn answer(reply: &Value, id: &str, json_input: bool) -> PermissionAnswer {
         .unwrap_or(PermissionAnswer::Deny)
 }
 
-pub(super) fn run(args: SandboxTransferArgs, state: &StateDir) -> Result<()> {
+pub(super) fn run(
+    args: SandboxTransferArgs,
+    state: &StateDir,
+    features: FeatureFlags,
+) -> Result<()> {
     if !io::stdin().is_terminal() && !args.json_input {
         bail!(HEADLESS_REQUIRED);
     }
@@ -153,7 +158,7 @@ pub(super) fn run(args: SandboxTransferArgs, state: &StateDir) -> Result<()> {
             }
         }),
     };
-    let connector = super::sandbox::transfer_connector(state.clone());
+    let connector = super::sandbox::transfer_connector(state.clone(), features);
     let worker = thread::Builder::new().name("transfer-cli".into()).spawn(move || {
         let work = || -> Result<()> {
             let mut connection = connector(link, host).map_err(|error| eyre!(error))?;

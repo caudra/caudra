@@ -1,3 +1,4 @@
+use caudra_config::{Feature, FeatureFlags};
 use caudra_workbench::keys as wb;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::fmt::Write;
@@ -420,6 +421,16 @@ impl KeybindContext {
         }
     }
 
+    /// The experiment a whole context belongs to: help leaves it out while
+    /// that experiment is off.
+    pub const fn feature(self) -> Option<Feature> {
+        match self {
+            Self::WorkflowInspector | Self::WorkflowCatalogPicker => Some(Feature::Workflows),
+            Self::SandboxManager | Self::WorkbenchTransfer => Some(Feature::Sandboxes),
+            _ => None,
+        }
+    }
+
     pub const fn parent(self) -> Option<KeybindContext> {
         match self {
             Self::RewindPicker
@@ -515,10 +526,10 @@ fn leader_suffix(label: &'static str) -> Option<&'static str> {
 /// Every chord the leader still reaches from `contexts`, read back out of
 /// [`KEYBINDS`] so the panel, the help modal and the generated docs cannot
 /// describe the same key differently.
-pub fn leader_chords(contexts: &[KeybindContext]) -> Vec<LeaderChord> {
+pub fn leader_chords(contexts: &[KeybindContext], features: FeatureFlags) -> Vec<LeaderChord> {
     KEYBINDS
         .iter()
-        .filter(|kb| kb.platform.is_visible() && contexts.contains(&kb.context))
+        .filter(|kb| kb.is_visible(features) && contexts.contains(&kb.context))
         .filter_map(|kb| {
             let key = kb.label.parts().find_map(leader_suffix)?;
             Some(LeaderChord {
@@ -545,6 +556,42 @@ pub struct Keybind {
     pub description: &'static str,
     pub context: KeybindContext,
     pub platform: Platform,
+}
+
+/// Chords in a shared context that still open one experiment's surface.
+const FEATURE_CHORDS: &[(KeybindContext, &str, Feature)] = &[
+    (
+        KeybindContext::General,
+        leader::WORKFLOWS.label,
+        Feature::Workflows,
+    ),
+    (
+        KeybindContext::Workbench,
+        wb::VIEW_TRANSFER.label,
+        Feature::Sandboxes,
+    ),
+];
+
+impl Keybind {
+    /// Whether help and the leader panel list this binding: it runs on this
+    /// platform and needs no experiment this process left off.
+    pub fn is_visible(&self, features: FeatureFlags) -> bool {
+        self.platform.is_visible()
+            && self
+                .feature()
+                .is_none_or(|feature| features.enabled(feature))
+    }
+
+    pub fn feature(&self) -> Option<Feature> {
+        self.context.feature().or_else(|| {
+            FEATURE_CHORDS
+                .iter()
+                .find(|(context, label, _)| {
+                    *context == self.context && self.label.parts().any(|part| part == *label)
+                })
+                .map(|&(_, _, feature)| feature)
+        })
+    }
 }
 
 pub const KEYBINDS: &[Keybind] = &[
@@ -1973,7 +2020,7 @@ mod tests {
     fn no_two_chords_in_one_context_share_a_second_key() {
         for ctx in all_contexts() {
             let mut seen: Vec<&str> = Vec::new();
-            for chord in leader_chords(&[ctx]) {
+            for chord in leader_chords(&[ctx], FeatureFlags::all()) {
                 assert!(
                     !seen.contains(&chord.key),
                     "{CHORD_COLLISION}: {LEADER_PREFIX} {} in {ctx:?}",
@@ -1981,6 +2028,41 @@ mod tests {
                 );
                 seen.push(chord.key);
             }
+        }
+    }
+
+    #[test_case(KeybindContext::General, leader::WORKFLOWS.label, Feature::Workflows; "workflow_chord")]
+    #[test_case(KeybindContext::Workbench, wb::VIEW_TRANSFER.label, Feature::Sandboxes; "transfer_view")]
+    fn a_binding_that_opens_an_experiment_hides_with_it(
+        context: KeybindContext,
+        label: &str,
+        feature: Feature,
+    ) {
+        let binding = KEYBINDS
+            .iter()
+            .find(|kb| kb.context == context && kb.label.parts().any(|part| part == label))
+            .unwrap();
+        assert!(binding.is_visible(FeatureFlags::NONE.with(feature)));
+        assert!(!binding.is_visible(FeatureFlags::all().without(feature)));
+    }
+
+    #[test]
+    fn the_leader_panel_drops_a_chord_whose_experiment_is_off() {
+        let workflows = leader_suffix(leader::WORKFLOWS.label).unwrap();
+        let keys = |features| {
+            leader_chords(&[KeybindContext::General], features)
+                .into_iter()
+                .map(|chord| chord.key)
+                .collect::<Vec<_>>()
+        };
+        assert!(keys(FeatureFlags::all()).contains(&workflows));
+        assert!(!keys(FeatureFlags::NONE).contains(&workflows));
+    }
+
+    #[test]
+    fn an_experiment_context_is_hidden_while_its_experiment_is_off() {
+        for kb in KEYBINDS.iter().filter(|kb| kb.context.feature().is_some()) {
+            assert!(!kb.is_visible(FeatureFlags::NONE), "{}", kb.description);
         }
     }
 

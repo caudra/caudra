@@ -870,6 +870,9 @@ def main():
                         (config / "permissions.toml").write_text(
                             'default = "allow"\n[file_index]\nallow = ["*"]\n'
                         )
+                        (config / "caudra.toml").write_text(
+                            "[experimental]\nsandboxes = true\nremote_workcell = true\n"
+                        )
 
                     def run_cli(arguments, stdin=""):
                         with child(

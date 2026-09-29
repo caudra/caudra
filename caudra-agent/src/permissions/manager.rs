@@ -203,11 +203,18 @@ pub struct PermissionManager {
 struct PermissionModeState {
     seed: PermissionMode,
     stored: Option<PermissionMode>,
+    /// Without the decision engine a seeded or stored Auto acts as Ask,
+    /// whatever supplied it, and the stored choice survives for a process
+    /// that has the engine again.
+    decision_engine: bool,
 }
 
 impl PermissionModeState {
     fn mode(&self) -> PermissionMode {
-        self.stored.as_ref().unwrap_or(&self.seed).clone()
+        match self.stored.as_ref().unwrap_or(&self.seed) {
+            PermissionMode::Auto if !self.decision_engine => PermissionMode::Ask,
+            mode => mode.clone(),
+        }
     }
 }
 
@@ -303,6 +310,7 @@ impl PermissionManager {
         policy_context_error: Option<String>,
     ) -> Self {
         let seed = PermissionMode::from(config.yolo);
+        let decision_engine = config.decision_engine;
         let configured = configured_policy(config, None);
         let builtin_rules = builtin_rules(&cwd);
 
@@ -352,7 +360,11 @@ impl PermissionManager {
             external_generation: Mutex::new(None),
             broker,
             configured: RwLock::new(configured),
-            permission_mode: Mutex::new(PermissionModeState { seed, stored: None }),
+            permission_mode: Mutex::new(PermissionModeState {
+                seed,
+                stored: None,
+                decision_engine,
+            }),
             decisions: Arc::default(),
             project: Mutex::new(ProjectContext {
                 cwd,
@@ -526,7 +538,10 @@ impl PermissionManager {
             .clone()
     }
 
+    /// Ignores a service while the decision engine is off, so no caller can
+    /// attach one the startup policy refused.
     pub fn set_decisions(&self, decisions: Option<Decisions>) {
+        let decisions = decisions.filter(|_| self.decision_engine());
         let _mutation = self
             .broker
             .mutation_gate
@@ -569,8 +584,14 @@ impl PermissionManager {
         })
     }
 
+    /// Refused, leaving the mode alone, while the decision engine is off.
     pub fn toggle_auto(&self) -> bool {
-        self.toggle_mode(PermissionMode::Auto)
+        self.decision_engine() && self.toggle_mode(PermissionMode::Auto)
+    }
+
+    /// Whether the decision engine experiment is on, which Auto needs.
+    pub fn decision_engine(&self) -> bool {
+        self.permission_mode().decision_engine
     }
 
     pub fn toggle_yolo(&self) -> bool {
@@ -1206,6 +1227,19 @@ mod tests {
         assert_eq!(fork.mode(), seed);
         assert_eq!(fork.persisted_mode(), None);
         assert_eq!(manager.persisted_mode(), stored);
+    }
+
+    #[test_case(None; "seeded_auto")]
+    #[test_case(Some(PermissionMode::Auto); "stored_auto")]
+    fn unavailable_auto_acts_as_ask_and_keeps_its_intent(stored: Option<PermissionMode>) {
+        let manager = mgr_with(PermissionsConfig::default(), PathBuf::from("/tmp"));
+        manager.set_seed_mode(PermissionMode::Auto);
+        manager.set_session_mode(stored.clone());
+        assert_eq!(manager.mode(), PermissionMode::Ask);
+        assert!(!manager.toggle_auto());
+        assert_eq!(manager.persisted_mode(), stored);
+        assert_eq!(manager.fork().mode(), PermissionMode::Ask);
+        assert_eq!(manager.fork_session().mode(), PermissionMode::Ask);
     }
 
     #[test_case(PermissionMode::Ask; "from_ask")]

@@ -108,18 +108,15 @@ Task profiles support overlay and custom layouts. For a custom task prompt, dire
 
 The effective profile and mode are stored with task history. A continuation uses the stored values when they are omitted and rejects conflicting values. Legacy task histories bind both values on their first successful continuation.
 
-The task API no longer accepts `subagent_type`, `model`, or `model_tier`. Replace `subagent_type = "research"` with `mode = "plan"` and `subagent_type = "general"` with `mode = "build"`. Move model selection into profile frontmatter and remove `plugins.task.allow_model` from `init.lua`.
+The task API no longer accepts `subagent_type`, `model`, or `model_tier`. Replace `subagent_type = "research"` with `mode = "plan"` and `subagent_type = "general"` with `mode = "build"`. Move model selection into profile frontmatter and remove `plugins.task.allow_model` from your `caudra.toml` or `init.lua`.
 
 ## Select a profile
 
-Set the default in `init.lua`:
+Set the default in `caudra.toml`:
 
-```lua
-caudra.setup({
-  agent = {
-    system_prompt_profile = "review",
-  },
-})
+```toml
+[agent]
+system_prompt_profile = "review"
 ```
 
 Use `builtin` to clear a default inherited from another config file.

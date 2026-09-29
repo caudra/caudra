@@ -22,7 +22,7 @@ use caudra_agent::prompt::profile::{PromptProfileCatalog, SystemPromptProfile};
 use caudra_agent::tools::{ToolAudience, ToolFilter, ToolRegistry};
 use caudra_agent::worktree::Backend;
 use caudra_config::sandbox::SandboxName;
-use caudra_config::{Config, RetentionConfig};
+use caudra_config::{Config, Feature, RetentionConfig};
 use caudra_lua::PluginHost;
 use caudra_providers::model::Model;
 use caudra_storage::id::CaudraId;
@@ -606,8 +606,7 @@ fn build_stack(
 ) -> Result<(Stack, Vec<String>)> {
     let mut warnings = Vec::new();
 
-    let mut plugin_host = PluginHost::with_jit(Arc::clone(ToolRegistry::global_arc()), !cli.no_jit)
-        .context("initialize lua plugin host")?;
+    let mut plugin_host = super::cli_plugin_host(cli, Arc::clone(ToolRegistry::global_arc()))?;
 
     let (fallback_config, fallback_model) = match fallback {
         Some((config, model, profiles, selected)) => {
@@ -633,6 +632,16 @@ fn build_stack(
     });
     let (config, prompt_profiles, default_prompt_profile) =
         config_or_fallback(loaded, fallback_config, &mut warnings)?;
+    let notices = super::settings_notices(cli, cwd, remote)
+        .into_iter()
+        .chain(super::auto_notice(&config));
+    if cli.print {
+        for notice in notices {
+            eprintln!("warning: {notice}");
+        }
+    } else {
+        warnings.extend(notices);
+    }
     super::configure_native_tools(&config.agent);
     super::install_native_permission_rules(&plugin_host.plugin_rules(), cwd);
 
@@ -1304,6 +1313,7 @@ pub fn run(mut cli: Cli, tightened: Vec<PathBuf>) -> Result<ExitCode> {
         &cwd,
         &persistent_storage,
         ToolRegistry::global(),
+        cli.startup.features,
     )?);
     if let Some(binding) = &resumed_sandbox {
         StoredWorkspaceBinding::validate_resume_identity(
@@ -1322,7 +1332,7 @@ pub fn run(mut cli: Cli, tightened: Vec<PathBuf>) -> Result<ExitCode> {
     let mut initial_seed = None;
     let workcell_runtime_ms = lap();
 
-    let (mut stack, _) = build_stack(
+    let (mut stack, stack_warnings) = build_stack(
         &cli,
         &cwd,
         &persistent_storage,
@@ -1363,6 +1373,7 @@ pub fn run(mut cli: Cli, tightened: Vec<PathBuf>) -> Result<ExitCode> {
             .event_handle()
             .collect_prompt_slots(&stack.config.agent);
         let timeouts = stack.timeouts();
+        let features = cli.startup.features;
         crate::sdk_mode::run(crate::sdk_mode::SdkParams {
             cli,
             model: stack.model,
@@ -1390,7 +1401,12 @@ pub fn run(mut cli: Cli, tightened: Vec<PathBuf>) -> Result<ExitCode> {
             }),
         })
         .context("run sdk mode")?;
-        super::sandbox::remember_session_source(&storage, &cwd, workcell_runtime.stored_binding())?;
+        super::sandbox::remember_session_source(
+            &storage,
+            &cwd,
+            workcell_runtime.stored_binding(),
+            features,
+        )?;
         return Ok(ExitCode::SUCCESS);
     }
 
@@ -1452,7 +1468,12 @@ pub fn run(mut cli: Cli, tightened: Vec<PathBuf>) -> Result<ExitCode> {
         workcell_runtime.stored_binding(),
     )?;
     let resolve_sessions_ms = lap();
-    super::sandbox::remember_session_source(&storage, &cwd, workcell_runtime.stored_binding())?;
+    super::sandbox::remember_session_source(
+        &storage,
+        &cwd,
+        workcell_runtime.stored_binding(),
+        cli.startup.features,
+    )?;
     tracing::info!(
         state_dir_ms,
         model_registry_ms,
@@ -1471,6 +1492,7 @@ pub fn run(mut cli: Cli, tightened: Vec<PathBuf>) -> Result<ExitCode> {
         tabs[focused].session.meta.permission_mode = Some(mode.clone());
     }
     let mut warnings = resolved.warnings;
+    warnings.extend(stack_warnings);
     warnings.extend(moved_back);
     if !tightened.is_empty() {
         warnings.push(format!(
@@ -1486,6 +1508,7 @@ pub fn run(mut cli: Cli, tightened: Vec<PathBuf>) -> Result<ExitCode> {
     let mut herdr_reporter = HerdrReporter::from_env();
     let mut sweeper = RetentionSweeper::spawn(storage.clone(), stack.config.storage.retention);
     let mut committed_relocation: Option<String> = None;
+    let sandboxes = cli.startup.features.enabled(Feature::Sandboxes);
 
     loop {
         let runtime_cwd = if workcell_runtime.is_remote() {
@@ -1527,10 +1550,12 @@ pub fn run(mut cli: Cli, tightened: Vec<PathBuf>) -> Result<ExitCode> {
                 .clone()
                 .unwrap_or_else(|| super::permission_mode_seed(&stack.config)),
         );
-        permissions.set_decisions(Some(
-            Decisions::new(stack.config.decisions.clone(), &storage)
-                .context("initialize decision engine; check decisions configuration, credentials and question overrides")?,
-        ));
+        if stack.config.permissions.decision_engine {
+            permissions.set_decisions(Some(
+                Decisions::new(stack.config.decisions.clone(), &storage)
+                    .context("initialize decision engine; check decisions configuration, credentials and question overrides")?,
+            ));
+        }
         permissions
             .replace_remote_permission_asset(
                 workcell_runtime
@@ -1593,11 +1618,16 @@ pub fn run(mut cli: Cli, tightened: Vec<PathBuf>) -> Result<ExitCode> {
                     .as_ref()
                     .map(|worker| Arc::clone(&worker.loader)),
                 permission_authority_factory: Some(permission_authority_factory),
-                sandbox_connector: Some(super::sandbox::connector(
-                    storage.clone(),
-                    runtime_cwd.clone(),
-                )),
-                transfer_connector: Some(super::sandbox::transfer_connector(storage.clone())),
+                sandbox_connector: sandboxes.then(|| {
+                    super::sandbox::connector(
+                        storage.clone(),
+                        runtime_cwd.clone(),
+                        cli.startup.features,
+                    )
+                }),
+                transfer_connector: sandboxes.then(|| {
+                    super::sandbox::transfer_connector(storage.clone(), cli.startup.features)
+                }),
                 initial_seed: initial_seed.take(),
                 sandbox_readiness: Some({
                     let runtime = Arc::clone(&workcell_runtime);
@@ -1639,6 +1669,7 @@ pub fn run(mut cli: Cli, tightened: Vec<PathBuf>) -> Result<ExitCode> {
                 focused: stopped_focus,
                 control,
             } => {
+                cli.startup.features.require(Feature::Sandboxes)?;
                 let reconnect = control.reconnects();
                 let name = control.name.clone();
                 let action = control.action_label();
@@ -1680,6 +1711,7 @@ pub fn run(mut cli: Cli, tightened: Vec<PathBuf>) -> Result<ExitCode> {
                                 &storage,
                                 &registry,
                                 Some(&record.revision()?),
+                                cli.startup.features,
                             )?,
                         )
                     },
@@ -1724,6 +1756,7 @@ pub fn run(mut cli: Cli, tightened: Vec<PathBuf>) -> Result<ExitCode> {
                 tabs: stopped,
                 attachment,
             } => {
+                cli.startup.features.require(Feature::Sandboxes)?;
                 let prepared = attachment.runtime.downcast::<super::sandbox::PreparedSandbox>().map_err(|_| eyre!("Sandbox transition returned an incompatible runtime; source sessions were preserved"))?;
                 StoredWorkspaceBinding::validate_resume_identity(
                     Some(&attachment.binding),
@@ -1748,7 +1781,12 @@ pub fn run(mut cli: Cli, tightened: Vec<PathBuf>) -> Result<ExitCode> {
                     &storage,
                     &attachment.binding,
                 )?;
-                super::sandbox::remember_session_source(&storage, &cwd, Some(&attachment.binding))?;
+                super::sandbox::remember_session_source(
+                    &storage,
+                    &cwd,
+                    Some(&attachment.binding),
+                    cli.startup.features,
+                )?;
                 tabs = resolved.tabs;
                 focused = resolved.focused;
                 warnings = new_warnings;
@@ -1992,7 +2030,6 @@ mod tests {
     use std::fs;
     #[cfg(unix)]
     use std::os::unix::fs::symlink;
-    use std::path::PathBuf;
     use std::slice;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use test_case::test_case;
@@ -3741,99 +3778,6 @@ mod tests {
         assert!(warnings.is_empty());
     }
 
-    /// `--no-plugins` keeps the Lua host live but skips user `init.lua`, so
-    /// a broken project `init.lua` must not be executed in that mode.
-    #[test]
-    fn no_plugins_skips_broken_init_lua_but_keeps_host_alive() {
-        use caudra_agent::tools::ToolRegistry;
-        use clap::Parser;
-        use tempfile::tempdir;
-
-        let dir = tempdir().expect("tempdir");
-        let caudra_dir: PathBuf = dir.path().join(".caudra");
-        fs::create_dir_all(&caudra_dir).expect("mkdir .caudra");
-        fs::write(
-            caudra_dir.join("init.lua"),
-            "error('broken init lua must not run')",
-        )
-        .expect("write init.lua");
-
-        let cli = Cli::parse_from(["caudra", "--no-plugins"]);
-        assert!(cli.no_plugins);
-
-        let mut plugin_host = PluginHost::with_jit(Arc::new(ToolRegistry::new()), true)
-            .expect("live host boots under --no-plugins");
-
-        let config = load_config(&plugin_host, &cli, dir.path(), false)
-            .expect("no-plugins must skip the broken init.lua and still load defaults");
-        assert!(
-            !config.plugins.names.is_empty(),
-            "default builtin plugins must still be enabled under --no-plugins"
-        );
-
-        plugin_host
-            .load_production_builtins(&config.plugins)
-            .expect("builtins load on the live host under --no-plugins");
-
-        plugin_host.begin_shutdown();
-    }
-
-    /// Negative control for the test above: without `--no-plugins`, the
-    /// same broken `init.lua` must surface as an error so the skip path
-    /// cannot silently regress into a tautology.
-    #[test]
-    fn broken_init_lua_errors_without_no_plugins() {
-        use caudra_agent::tools::ToolRegistry;
-        use clap::Parser;
-        use tempfile::tempdir;
-
-        let dir = tempdir().expect("tempdir");
-        let caudra_dir: PathBuf = dir.path().join(".caudra");
-        fs::create_dir_all(&caudra_dir).expect("mkdir .caudra");
-        fs::write(
-            caudra_dir.join("init.lua"),
-            "error('broken init lua must not run')",
-        )
-        .expect("write init.lua");
-
-        let cli = Cli::parse_from(["caudra"]);
-        assert!(!cli.no_plugins);
-
-        let mut plugin_host =
-            PluginHost::with_jit(Arc::new(ToolRegistry::new()), true).expect("live host boots");
-
-        match load_config(&plugin_host, &cli, dir.path(), false) {
-            Err(_) => {}
-            Ok(_) => panic!("broken init.lua must error without --no-plugins"),
-        }
-
-        plugin_host.begin_shutdown();
-    }
-
-    #[test]
-    fn remote_config_does_not_execute_project_init_lua() {
-        use caudra_agent::tools::ToolRegistry;
-        use clap::Parser;
-        use tempfile::tempdir;
-
-        let dir = tempdir().expect("tempdir");
-        let caudra_dir = dir.path().join(".caudra");
-        fs::create_dir_all(&caudra_dir).expect("mkdir .caudra");
-        fs::write(
-            caudra_dir.join("init.lua"),
-            "error('remote project config canary executed')",
-        )
-        .expect("write init.lua");
-        let cli = Cli::parse_from(["caudra"]);
-        let mut plugin_host =
-            PluginHost::with_jit(Arc::new(ToolRegistry::new()), true).expect("live host boots");
-
-        load_config(&plugin_host, &cli, dir.path(), true)
-            .expect("remote startup must skip project init.lua");
-
-        plugin_host.begin_shutdown();
-    }
-
     #[test_case(false, false; "local_default")]
     #[test_case(false, true; "local_disabled")]
     #[test_case(true, false; "remote_default")]
@@ -3844,10 +3788,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut cli = Cli::parse_from(["caudra", "--no-plugins"]);
         cli.no_snapshots = disabled;
-        let mut host = PluginHost::with_jit(Arc::new(ToolRegistry::new()), true).unwrap();
-        let config = load_config(&host, &cli, dir.path(), remote).unwrap();
+        let config = load_config(&PluginHost::disabled(), &cli, dir.path(), remote).unwrap();
         assert_eq!(config.storage.snapshots.enabled, !disabled);
-        host.begin_shutdown();
     }
 
     #[test_case(0; "zero_turns")]
@@ -3869,8 +3811,7 @@ mod tests {
             "--disallowed-tools",
             "shell",
         ]);
-        let mut host = PluginHost::with_jit(Arc::new(ToolRegistry::new()), true).unwrap();
-        let config = load_config(&host, &cli, dir.path(), true).unwrap();
+        let config = load_config(&PluginHost::disabled(), &cli, dir.path(), true).unwrap();
         assert_eq!(config.agent.max_turns, cli.max_turns);
         assert!(config.permissions.yolo);
         assert_eq!(config.agent.allowed_tools, ["file_index"]);
@@ -3881,6 +3822,5 @@ mod tests {
                 .iter()
                 .any(|tool| tool == "shell")
         );
-        host.begin_shutdown();
     }
 }

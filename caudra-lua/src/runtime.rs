@@ -98,6 +98,7 @@ const RESTORE_SPAWN_ROUNDS: usize = 8;
 /// Keeps a buggy plugin's restore task from freezing the lua loop.
 const RESTORE_ASYNC_DEADLINE: Duration = Duration::from_secs(10);
 static NEXT_TASK_ID: AtomicU64 = AtomicU64::new(1);
+static SPAWNED_RUNTIMES: AtomicU64 = AtomicU64::new(0);
 /// Hard cap on one whole restore item. The watchdog interrupt only lands
 /// while Lua runs, so a restore parked on a never-resolving await would otherwise
 /// hold its gate slot forever and deadlock `gate.drain()` in the dispatcher.
@@ -2797,6 +2798,13 @@ pub(crate) struct LuaThread {
     pub ui_action_rx: flume::Receiver<UiAction>,
 }
 
+/// How many Lua runtimes this process has started, so a test can prove a path
+/// that should run no Lua never booted a VM.
+#[doc(hidden)]
+pub fn spawned_runtimes() -> u64 {
+    SPAWNED_RUNTIMES.load(Ordering::Relaxed)
+}
+
 /// Lua lives on its own OS thread (no Send needed). `smol::block_on`
 /// drives async, load/clear requests wait for in-flight tools.
 pub fn spawn(
@@ -2805,6 +2813,7 @@ pub fn spawn(
     jit: bool,
     plugin_rules: Arc<PluginRuleStore>,
 ) -> Result<LuaThread, PluginError> {
+    SPAWNED_RUNTIMES.fetch_add(1, Ordering::Relaxed);
     let (tx, rx) = flume::unbounded::<Request>();
     let (prio_tx, prio_rx) = flume::unbounded::<Request>();
     let tx_clone = tx.clone();

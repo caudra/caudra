@@ -18,6 +18,7 @@ use caudra_storage::workspace_binding::StoredWorkspaceBinding;
 use super::workcell_runtime::WorkcellRuntime;
 use crate::cli::{Cli, WorkcellSelectorArgs};
 use crate::setup;
+use crate::startup::Startup;
 
 struct SessionResources {
     plugin_host: Option<PluginHost>,
@@ -44,7 +45,8 @@ impl Drop for SessionResources {
 fn runtime_resolver(
     storage: StateDir,
     selection: WorkcellSelectorArgs,
-    no_plugins: bool,
+    startup: Startup,
+    runs_lua: bool,
     no_jit: bool,
     no_snapshots: bool,
 ) -> AcpRuntimeResolver {
@@ -52,12 +54,18 @@ fn runtime_resolver(
         move |cwd: PathBuf, stored: Option<StoredWorkspaceBinding>| {
             let resolve = || -> Result<AcpRuntime> {
                 let mut selection = selection.clone();
+                startup.features.require_source(stored.as_ref())?;
                 if let Some(binding) = &stored {
                     super::sandbox::recover_binding_source(&mut selection, &storage, binding)?;
                 }
                 let registry = Arc::new(ToolRegistry::default());
-                let runtime =
-                    WorkcellRuntime::initialize_session(&selection, &cwd, &storage, &registry)?;
+                let runtime = WorkcellRuntime::initialize_session(
+                    &selection,
+                    &cwd,
+                    &storage,
+                    &registry,
+                    startup.features,
+                )?;
                 if !runtime.is_remote() {
                     super::adopt_checkout_state(&storage, &cwd);
                     super::reconcile_worktrees(&storage, &cwd);
@@ -68,19 +76,17 @@ fn runtime_resolver(
                         runtime.stored_binding(),
                     )?;
                 }
-                let mut plugin_host = PluginHost::with_jit(Arc::clone(&registry), !no_jit)?;
-                let raw = if runtime.is_remote() {
-                    plugin_host.load_global_init_file_or_skip(no_plugins)
-                } else {
-                    plugin_host.load_init_files_or_skip(no_plugins, &cwd)
-                }?;
-                let mut config = raw.unwrap_or_default().into_config(false)?;
+                let mut plugin_host = super::plugin_host(runs_lua, no_jit, Arc::clone(&registry))?;
+                let mut config =
+                    super::load_settings(&plugin_host, &startup, &cwd, runtime.is_remote())?
+                        .into_config(false)?;
                 config.storage.snapshots.enabled &= !no_snapshots;
                 config.permissions = if runtime.is_remote() {
                     caudra_config::load_global_permissions()
                 } else {
                     load_permissions(&cwd)
                 };
+                super::apply_startup_policy(&mut config, startup.features);
                 config.permissions.yolo |= config.always_yolo;
                 config.validate()?;
                 super::configure_native_tools(&config.agent);
@@ -142,18 +148,12 @@ pub fn run(model_arg: Option<&str>, cli: &Cli) -> Result<()> {
     let cwd = env::current_dir().unwrap_or_else(|_| ".".into());
     caudra_config::load_global_env_file();
 
-    let mut plugin_host = PluginHost::with_jit(Arc::new(ToolRegistry::default()), !cli.no_jit)
-        .context("initialize lua plugin host")?;
-
-    let raw_config = plugin_host
-        .load_global_init_file_or_skip(cli.no_plugins)
-        .context("load init.lua files")?;
-
-    let mut config = raw_config
-        .unwrap_or_default()
+    let mut plugin_host = super::cli_plugin_host(cli, Arc::new(ToolRegistry::default()))?;
+    let mut config = super::load_settings(&plugin_host, &cli.startup, &cwd, true)?
         .into_config(false)
         .context("invalid config")?;
     config.permissions = caudra_config::load_global_permissions();
+    super::apply_startup_policy(&mut config, cli.startup.features);
 
     if cli.yolo || config.always_yolo {
         config.permissions.yolo = true;
@@ -212,7 +212,8 @@ pub fn run(model_arg: Option<&str>, cli: &Cli) -> Result<()> {
         runtime_resolver: runtime_resolver(
             storage,
             cli.workcell.clone(),
-            cli.no_plugins,
+            cli.startup.clone(),
+            cli.runs_lua(),
             cli.no_jit,
             cli.no_snapshots,
         ),

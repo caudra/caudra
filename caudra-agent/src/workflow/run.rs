@@ -9,6 +9,7 @@ use crate::background_reminder::RuntimeHealth;
 use arc_swap::ArcSwap;
 use std::sync::Arc;
 
+use caudra_config::{Feature, FeatureFlags};
 use caudra_decision::DecisionError;
 use caudra_providers::ModelPurpose;
 use caudra_storage::workflow::{
@@ -55,6 +56,7 @@ const DECISION_REJECTED: &str = "workflow decision request was rejected";
 pub(super) struct RunEnv {
     pub store: WorkflowStore,
     pub decisions: Option<Decisions>,
+    pub features: FeatureFlags,
     pub runner: Arc<dyn TaskRunner>,
     pub events: Sender<Envelope>,
     pub mode: ModeResolver,
@@ -463,6 +465,10 @@ impl Driver {
             return Err(HostError::Cancelled);
         }
         request.validate()?;
+        self.env
+            .features
+            .require(Feature::DecisionEngine)
+            .map_err(|disabled| HostError::Failed(disabled.to_string()))?;
         let decisions = self
             .env
             .decisions

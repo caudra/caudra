@@ -1,6 +1,7 @@
 use caudra_agent::tools::ToolRegistry;
 use caudra_config::sandbox::TransferPolicy;
 use caudra_config::sandbox::{SandboxName, SandboxProvider, persistence::SandboxStore};
+use caudra_config::{Feature, FeatureFlags};
 use caudra_sandbox::{
     Controller, LifecycleAction, Ownership, Store, generate_api_key, local_admin,
 };
@@ -35,6 +36,8 @@ use std::sync::Arc;
 use super::workcell_runtime::WorkcellRuntime;
 use crate::cli::{Cli, SandboxAction, SandboxAuthAction, WorkcellSelectorArgs};
 
+const LAST_SESSION_IN_SANDBOX: &str =
+    "the most recent session here ran in a managed sandbox; use --session to resume a local one";
 const MIN_API_KEY_BYTES: usize = 32;
 const LAST_SANDBOX: StateKey = StateKey {
     name: "sandbox.last_source",
@@ -46,7 +49,11 @@ pub(super) struct PreparedSandbox {
     pub registry: ToolRegistry,
 }
 
-pub(super) fn connector(storage: StateDir, cwd: PathBuf) -> SandboxConnector {
+pub(super) fn connector(
+    storage: StateDir,
+    cwd: PathBuf,
+    features: FeatureFlags,
+) -> SandboxConnector {
     Arc::new(move |name, revision| {
         let prepare = || -> Result<SandboxAttachment> {
             let registry = ToolRegistry::default();
@@ -57,6 +64,7 @@ pub(super) fn connector(storage: StateDir, cwd: PathBuf) -> SandboxConnector {
                 &storage,
                 &registry,
                 Some(&revision),
+                features,
             )?;
             let binding = runtime.stored_binding().cloned().ok_or_else(|| {
                 color_eyre::eyre::eyre!("Sandbox did not supply a workspace binding")
@@ -86,7 +94,7 @@ fn print_json(value: &impl Serialize) -> Result<()> {
     Ok(())
 }
 
-pub(super) fn transfer_connector(state: StateDir) -> TransferConnector {
+pub(super) fn transfer_connector(state: StateDir, features: FeatureFlags) -> TransferConnector {
     Arc::new(move |link, mut host| {
         let open = || -> Result<TransferConnection> {
             let loaded = SandboxStore::user_global()?.load()?;
@@ -109,6 +117,7 @@ pub(super) fn transfer_connector(state: StateDir) -> TransferConnector {
                 &link.instance_revision,
                 &link.remote_root,
                 &state,
+                features,
             )?;
             if let Some(attached) = &link.attached_binding {
                 let binding = attached.binding();
@@ -174,10 +183,12 @@ fn provider(name: &str) -> Result<SandboxProvider> {
         .ok_or_else(|| color_eyre::eyre::eyre!("saved sandbox provider is missing"))
 }
 
-pub fn run(action: SandboxAction, state: &StateDir) -> Result<()> {
+pub fn run(action: SandboxAction, state: &StateDir, features: FeatureFlags) -> Result<()> {
     let controller = Controller::new(state)?;
     match action {
-        SandboxAction::Transfer(args) => return super::sandbox_transfer::run(args, state),
+        SandboxAction::Transfer(args) => {
+            return super::sandbox_transfer::run(args, state, features);
+        }
         SandboxAction::AcknowledgeFailure { name, yes } => {
             let name = SandboxName::parse(&name)?;
             let record = controller.store().get(&name)?;
@@ -270,7 +281,7 @@ pub fn run(action: SandboxAction, state: &StateDir) -> Result<()> {
             smol::block_on(controller.wait_ready(&name)).wrap_err(
                 "sandbox is not ready; its create operation and any retained disk remain saved",
             )?;
-            verify(&name, state).wrap_err("daemon creation completed but Workcell attachment failed; sandbox record was retained")?;
+            verify(&name, state, features).wrap_err("daemon creation completed but Workcell attachment failed; sandbox record was retained")?;
             print_json(&controller.store().get(&name)?)?;
         }
         SandboxAction::List {
@@ -298,7 +309,7 @@ pub fn run(action: SandboxAction, state: &StateDir) -> Result<()> {
                     WorkspacePath::new(cwd)?,
                 ))?;
             }
-            verify(&name, state)?;
+            verify(&name, state, features)?;
             print_json(&controller.store().get(&name)?)?;
         }
         SandboxAction::Resume {
@@ -309,7 +320,7 @@ pub fn run(action: SandboxAction, state: &StateDir) -> Result<()> {
             confirm(yes, "Cold-boot resume this saved sandbox?")?;
             let name = SandboxName::parse(&name)?;
             smol::block_on(controller.action(&name, LifecycleAction::Resume { lease_seconds }))?;
-            verify(&name, state)?;
+            verify(&name, state, features)?;
             print_json(&controller.store().get(&name)?)?;
         }
         SandboxAction::Pause { name } => print_json(&smol::block_on(
@@ -351,10 +362,11 @@ fn read_json_file<T: DeserializeOwned>(path: &Path) -> Result<T> {
         .map_err(|_| color_eyre::eyre::eyre!("invalid strict sandbox request JSON"))
 }
 
-fn verify(name: &SandboxName, state: &StateDir) -> Result<()> {
+fn verify(name: &SandboxName, state: &StateDir, features: FeatureFlags) -> Result<()> {
     let cwd = std::env::current_dir()?;
     let registry = ToolRegistry::default();
-    let _runtime = WorkcellRuntime::initialize_sandbox(name, false, &cwd, state, &registry)?;
+    let _runtime =
+        WorkcellRuntime::initialize_sandbox(name, false, &cwd, state, &registry, features)?;
     Ok(())
 }
 
@@ -439,12 +451,16 @@ pub fn recover_session_source(
     if cli.is_sdk_mode() && cli.fork_session {
         return Ok(None);
     }
+    let features = cli.startup.features;
     let Some(session_id) = cli.session.as_deref() else {
         if cli.continue_session
             && !cli.workcell.is_set()
             && let Some(record_id) =
                 state::get::<CaudraId>(state, &state::project_scope(cwd), LAST_SANDBOX)?
         {
+            features
+                .require(Feature::Sandboxes)
+                .wrap_err(LAST_SESSION_IN_SANDBOX)?;
             let record = Store::open(state)?.by_id(record_id)?;
             select_saved_source(&mut cli.workcell, &record.name)?;
             return record.workcell_binding.map(Some).ok_or_else(|| {
@@ -456,6 +472,7 @@ pub fn recover_session_source(
         return Ok(None);
     };
     let session = crate::setup::load_session(session_id.parse()?, state)?;
+    features.require_source(session.workspace_binding())?;
     let Some(binding) = session.workspace_binding() else {
         return Ok(None);
     };
@@ -486,12 +503,15 @@ pub(super) fn recover_binding_source(
     Ok(())
 }
 
+/// Inert while sandboxes are off, so a local launch cannot erase the pointer
+/// `--continue` follows back into a sandbox once they are on again.
 pub fn remember_session_source(
     state: &StateDir,
     cwd: &Path,
     binding: Option<&StoredWorkspaceBinding>,
+    features: FeatureFlags,
 ) -> Result<()> {
-    if state.is_ephemeral() {
+    if state.is_ephemeral() || !features.enabled(Feature::Sandboxes) {
         return Ok(());
     }
     let scope = state::project_scope(cwd);

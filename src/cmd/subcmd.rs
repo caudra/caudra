@@ -20,7 +20,6 @@ use caudra_config::providers::{
     resolve_login_url, slugify,
 };
 use caudra_config::{Config, DefaultEffect, ModelPolicy, PermissionsConfig, ToolKey};
-use caudra_lua::PluginHost;
 use caudra_providers::model_registry::{self, Binding};
 use caudra_providers::provider::fetch_all_models;
 use caudra_providers::{
@@ -821,11 +820,13 @@ pub fn models(cli: &Cli, jobs: bool) -> Result<()> {
         &cwd,
         &storage,
         ToolRegistry::global(),
+        cli.startup.features,
     )?;
 
-    let host = PluginHost::with_jit(Arc::clone(ToolRegistry::global_arc()), !cli.no_jit)
-        .context("initialize lua plugin host")?;
-    let config = load_effective_config(&host, cli.no_plugins, &cwd, runtime.is_remote())?;
+    let host = super::cli_plugin_host(cli, Arc::clone(ToolRegistry::global_arc()))?;
+    let config = super::load_settings(&host, &cli.startup, &cwd, runtime.is_remote())?
+        .into_config(false)
+        .context("invalid config")?;
     if jobs {
         return print_model_jobs(cli.model.as_deref(), &config);
     }
@@ -845,23 +846,6 @@ pub fn models(cli: &Cli, jobs: bool) -> Result<()> {
     Ok(())
 }
 
-fn load_effective_config(
-    host: &PluginHost,
-    no_plugins: bool,
-    cwd: &Path,
-    remote: bool,
-) -> Result<Config> {
-    let raw = if remote {
-        host.load_global_init_file_or_skip(no_plugins)
-    } else {
-        host.load_init_files_or_skip(no_plugins, cwd)
-    };
-    raw.context("load init.lua files")?
-        .unwrap_or_default()
-        .into_config(false)
-        .context("invalid config")
-}
-
 pub fn index(cli: &Cli, path: &str) -> Result<()> {
     let cwd = env::current_dir().unwrap_or_else(|_| ".".into());
     let storage = StateDir::resolve().context("resolve data directory")?;
@@ -870,10 +854,10 @@ pub fn index(cli: &Cli, path: &str) -> Result<()> {
         &cwd,
         &storage,
         ToolRegistry::global(),
+        cli.startup.features,
     )?;
 
-    let mut host = PluginHost::with_jit(Arc::clone(ToolRegistry::global_arc()), !cli.no_jit)
-        .context("initialize lua plugin host")?;
+    let mut host = super::cli_plugin_host(cli, Arc::clone(ToolRegistry::global_arc()))?;
 
     let config = super::load_config(&host, cli, &cwd, runtime.is_remote())?;
     super::configure_native_tools(&config.agent);
@@ -917,7 +901,8 @@ pub fn remote_control(cli: &Cli, args: &[String]) -> Result<()> {
         bail!("Select a remote Workcell profile or endpoint for remote control");
     }
     let storage = StateDir::resolve().context("resolve data directory")?;
-    let workspace = super::workcell_runtime::connect_control(&cli.workcell, &storage)?;
+    let workspace =
+        super::workcell_runtime::connect_control(&cli.workcell, &storage, cli.startup.features)?;
     let output = smol::block_on(caudra_workspace::execute_workspace_control(
         &workspace.workspace,
         &args,
@@ -1148,11 +1133,11 @@ pub fn tools(cli: &Cli, enabled_only: bool, json: bool, names: bool, schemas: bo
         &cwd,
         &storage,
         ToolRegistry::global(),
+        cli.startup.features,
     )?;
 
     let reg = ToolRegistry::global_arc();
-    let mut host =
-        PluginHost::with_jit(Arc::clone(reg), !cli.no_jit).context("initialize lua plugin host")?;
+    let mut host = super::cli_plugin_host(cli, Arc::clone(reg))?;
     let config = super::load_config(&host, cli, &cwd, runtime.is_remote())?;
     super::configure_native_tools(&config.agent);
     super::install_native_permission_rules(&host.plugin_rules(), &cwd);
@@ -1248,11 +1233,11 @@ pub fn skills(cli: &Cli, name: Option<&str>, names: bool, json: bool, dirs: bool
         &cwd,
         &storage,
         ToolRegistry::global(),
+        cli.startup.features,
     )?;
 
     let reg = ToolRegistry::global_arc();
-    let mut host =
-        PluginHost::with_jit(Arc::clone(reg), !cli.no_jit).context("initialize lua plugin host")?;
+    let mut host = super::cli_plugin_host(cli, Arc::clone(reg))?;
     let config = super::load_config(&host, cli, &cwd, runtime.is_remote())?;
     super::configure_native_tools(&config.agent);
     host.load_production_builtins(&config.plugins)
@@ -1340,18 +1325,12 @@ fn print_skill_dirs(candidates: &[SkillDirCandidate]) {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 pub fn prompt(
+    cli: &Cli,
     variant: &crate::cli::PromptVariant,
     plan: bool,
     tools: bool,
     names: bool,
-    no_plugins: bool,
-    no_jit: bool,
-    no_rtk: bool,
-    model_arg: Option<&str>,
-    profile_arg: Option<&str>,
-    workcell: &crate::cli::WorkcellSelectorArgs,
 ) -> Result<()> {
     use crate::cli::PromptVariant;
     use caudra_agent::agent::{build_system_prompt, environment_block, load_instruction_text};
@@ -1367,10 +1346,11 @@ pub fn prompt(
     let cwd = env::current_dir().unwrap_or_else(|_| ".".into());
     let storage = StateDir::resolve().context("resolve data directory")?;
     let runtime = super::workcell_runtime::WorkcellRuntime::initialize(
-        workcell,
+        &cli.workcell,
         &cwd,
         &storage,
         ToolRegistry::global(),
+        cli.startup.features,
     )?;
 
     let vars = if runtime.is_remote() {
@@ -1381,18 +1361,11 @@ pub fn prompt(
         template::env_vars()
     };
     let reg = ToolRegistry::global_arc();
-    let mut host =
-        PluginHost::with_jit(Arc::clone(reg), !no_jit).context("initialize lua plugin host")?;
-    let raw_config = if runtime.is_remote() {
-        host.load_global_init_file_or_skip(no_plugins)
-    } else {
-        host.load_init_files_or_skip(no_plugins, &cwd)
-    }
-    .context("load init.lua files")?;
-    let config = raw_config
-        .unwrap_or_default()
-        .into_config(no_rtk)
+    let mut host = super::cli_plugin_host(cli, Arc::clone(reg))?;
+    let mut config = super::load_settings(&host, &cli.startup, &cwd, runtime.is_remote())?
+        .into_config(cli.no_rtk)
         .context("invalid config")?;
+    config.agent.features = cli.startup.features;
     super::configure_native_tools(&config.agent);
     super::install_native_permission_rules(&host.plugin_rules(), &cwd);
     host.load_production_builtins(&config.plugins)
@@ -1406,12 +1379,19 @@ pub fn prompt(
     };
     let slots = host.event_handle().collect_prompt_slots(&config.agent);
     let prompt_profiles = caudra_agent::prompt::profile::PromptProfileCatalog::discover_user();
-    let profile_name = profile_arg.or(config.agent.system_prompt_profile.as_deref());
+    let profile_name = cli
+        .system_prompt_profile
+        .as_deref()
+        .or(config.agent.system_prompt_profile.as_deref());
     let system_prompt_profile = prompt_profiles
         .resolve(profile_name)
         .context("resolve system prompt profile")?;
-    let mut model =
-        crate::setup::resolve_model(model_arg, &config.provider, &storage, StoredMode::Build)?;
+    let mut model = crate::setup::resolve_model(
+        cli.model.as_deref(),
+        &config.provider,
+        &storage,
+        StoredMode::Build,
+    )?;
     caudra_providers::provider::adjust_model(&mut model, caudra_providers::Timeouts::default())?;
     let filter = ToolFilter::from_config(&config.agent, &model, &[]);
 

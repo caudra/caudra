@@ -39,7 +39,7 @@ use caudra_agent::{
     AgentConfig, AgentEvent, CancelToken, Envelope, McpCommand, McpConfigErrors, McpHandle, mcp,
 };
 use caudra_config::sandbox::SandboxName;
-use caudra_config::{ModelPolicy, SnapshotsConfig, UiConfig, load_permissions};
+use caudra_config::{Feature, ModelPolicy, SnapshotsConfig, UiConfig, load_permissions};
 use caudra_lua::{
     EventHandle, HintReader, KeymapReader, LuaCommandReader, ModelRequest, SessionRequest,
     TaskRequest, UiAction, UiReply,
@@ -1135,7 +1135,10 @@ impl SpawnCtx {
             .as_ref()
             .map(|workspace| {
                 smol::block_on(
-                    caudra_agent::remote_project_context::load_remote_project_context(workspace),
+                    caudra_agent::remote_project_context::load_remote_project_context(
+                        workspace,
+                        self.config.features,
+                    ),
                 )
                 .map_err(|error| error.to_string())
             })
@@ -1284,6 +1287,7 @@ impl SpawnCtx {
             Arc::clone(&self.model_policy),
             Arc::clone(&self.prompt_profiles),
             workspace_session.clone(),
+            self.config.features,
         );
         app.local_documents = self.local_documents.clone();
         app.sandbox_live.connector = self.sandbox_connector.clone();
@@ -2227,6 +2231,13 @@ impl<'t> EventLoop<'t> {
     }
 
     fn poll_sandbox_actions(&mut self) -> Dirty {
+        if let Err(disabled) = self.ctx.config.features.require(Feature::Sandboxes) {
+            return Dirty::any(
+                self.sessions
+                    .iter_mut()
+                    .map(|runtime| runtime.app.refuse_sandbox_work(&disabled)),
+            );
+        }
         self.release_settled_sandbox_reservations();
         let mut dirty = Dirty::NO;
         for index in 0..self.sessions.len() {
@@ -4131,7 +4142,13 @@ impl<'t> EventLoop<'t> {
                         .flash("cd: session workspace binding is unavailable".into());
                     return;
                 };
-                spawn_remote_cd(workspace, binding, path, runtime.shell_tx.clone());
+                spawn_remote_cd(
+                    workspace,
+                    binding,
+                    path,
+                    self.ctx.config.features,
+                    runtime.shell_tx.clone(),
+                );
             }
             Action::ChangeModel(spec) => {
                 if let Err(e) = self.change_model(&spec) {
@@ -4688,8 +4705,8 @@ mod tests {
         ConflictPolicy, JournalState, PathOutcomeKind, RestoreTarget, SnapshotKey, workspace_key,
     };
     use caudra_agent::{DoneReason, McpSnapshotReader};
-    use caudra_config::PermissionsConfig;
     use caudra_config::sandbox::Revision;
+    use caudra_config::{FeatureFlags, PermissionsConfig};
     use caudra_providers::{ImageMediaType, ImageSource, TokenUsage};
     use caudra_storage::sessions::{
         PendingConversationRevert, PendingRestoreKind, PendingRestoreOperation, PendingRestorePhase,
@@ -4813,6 +4830,7 @@ mod tests {
             Arc::new(ModelPolicy::default()),
             Arc::new(PromptProfileCatalog::default()),
             None,
+            FeatureFlags::all(),
         )
     }
 

@@ -10,6 +10,7 @@ use caudra_agent::permissions::{
     PluginRuleStore, VerifiedLocalSourceLocator, canonical_json_sha256,
 };
 use caudra_agent::tools::ToolRegistry;
+use caudra_config::config_file::{global_init_lua_path, project_init_lua_path};
 use caudra_config::{AgentConfig, PluginsConfig, RawConfig};
 use include_dir::{Dir, include_dir};
 
@@ -168,13 +169,16 @@ static BUNDLED_DIRS: LazyLock<&'static [&'static Dir<'static>]> = LazyLock::new(
 });
 
 pub struct PluginHost {
-    inner: LuaThread,
+    /// `None` when Lua is off for the whole process: no VM, thread, or
+    /// watchdog exists, executable requests are refused, and everything else
+    /// answers inertly.
+    lua: Option<LuaThread>,
     plugin_rules: Arc<PluginRuleStore>,
 }
 
 impl Drop for PluginHost {
     fn drop(&mut self) {
-        let Some(handle) = self.inner.join.take() else {
+        let Some(handle) = self.lua.as_mut().and_then(|lua| lua.join.take()) else {
             return;
         };
         // Start the shutdown first, or the join below waits for all
@@ -204,9 +208,27 @@ impl PluginHost {
         let plugin_rules = Arc::new(PluginRuleStore::default());
         let lua = runtime::spawn(registry, *BUNDLED_DIRS, jit, Arc::clone(&plugin_rules))?;
         Ok(Self {
-            inner: lua,
+            lua: Some(lua),
             plugin_rules,
         })
+    }
+
+    /// The host of a process that runs no Lua, because
+    /// `experimental.lua_plugins` is off or `--no-plugins` forced it off. The
+    /// permission-rule store still serves native rules.
+    pub fn disabled() -> Self {
+        Self {
+            lua: None,
+            plugin_rules: Arc::default(),
+        }
+    }
+
+    pub fn is_enabled(&self) -> bool {
+        self.lua.is_some()
+    }
+
+    fn lua(&self) -> Result<&LuaThread, PluginError> {
+        self.lua.as_ref().ok_or(PluginError::Disabled)
     }
 
     /// The store that `caudra.api.register_permission_rule` writes into. Hand
@@ -224,19 +246,31 @@ impl PluginHost {
     /// makes every later host call fail right at the send; `&mut self`
     /// rules out a call racing the swap. `Drop` still joins the thread.
     pub fn begin_shutdown(&mut self) {
-        self.inner.shutdown.store(true, Ordering::Release);
-        let _ = self.inner.prio_tx.send(Request::Shutdown);
-        self.inner.tx = flume::unbounded().0;
-        self.inner.prio_tx = flume::unbounded().0;
+        let Some(lua) = &mut self.lua else {
+            return;
+        };
+        lua.shutdown.store(true, Ordering::Release);
+        let _ = lua.prio_tx.send(Request::Shutdown);
+        lua.tx = flume::unbounded().0;
+        lua.prio_tx = flume::unbounded().0;
     }
 
+    /// A disabled host has nothing to stop; a live one that already lost its
+    /// thread reports [`PluginError::HostDead`].
     pub fn shutdown_checked(&mut self) -> Result<(), PluginError> {
         self.shutdown_checked_with_timeout(SHUTDOWN_TIMEOUT)
     }
 
     fn shutdown_checked_with_timeout(&mut self, timeout: Duration) -> Result<(), PluginError> {
+        if self.lua.is_none() {
+            return Ok(());
+        }
         self.begin_shutdown();
-        let handle = self.inner.join.take().ok_or(PluginError::HostDead)?;
+        let handle = self
+            .lua
+            .as_mut()
+            .and_then(|lua| lua.join.take())
+            .ok_or(PluginError::HostDead)?;
         let (done_tx, done_rx) = flume::bounded(1);
         thread::spawn(move || {
             let _ = done_tx.send(handle.join().is_err());
@@ -259,69 +293,37 @@ impl PluginHost {
         Ok(host)
     }
 
-    pub fn load_init_files(&self, cwd: &Path) -> Result<Option<RawConfig>, PluginError> {
-        let mut merged: Option<RawConfig> = None;
-
-        if let Some(global_dir) = caudra_config::global_config_dir() {
-            self.run_init_file(
-                &global_dir.join("init.lua"),
-                "global/init.lua",
-                PermissionRulePolicy::Trusted,
-                &mut merged,
-            )?;
-        }
+    /// Runs the global `init.lua` in `config_dir`, if there is one. It is
+    /// trusted, and its settings rank with the global `caudra.toml`.
+    pub fn run_global_init(&self, config_dir: &Path) -> Result<Option<RawConfig>, PluginError> {
         self.run_init_file(
-            &cwd.join(".caudra/init.lua"),
+            &global_init_lua_path(config_dir),
+            "global/init.lua",
+            PermissionRulePolicy::Trusted,
+        )
+    }
+
+    /// Runs `.caudra/init.lua` under `cwd`, if there is one. It may only add
+    /// deny rules, and its settings apply as a project layer.
+    pub fn run_project_init(&self, cwd: &Path) -> Result<Option<RawConfig>, PluginError> {
+        self.run_init_file(
+            &project_init_lua_path(cwd),
             "project/init.lua",
             PermissionRulePolicy::DenyOnly,
-            &mut merged,
-        )?;
-
-        Ok(merged)
+        )
     }
 
-    /// `--no-plugins` recovery path: skip every user `init.lua` while the
-    /// host and builtin plugins stay live. Centralized so every entry point
-    /// (TUI, index, acp, prompt) honors the flag identically.
-    pub fn load_init_files_or_skip(
-        &self,
-        no_plugins: bool,
-        cwd: &Path,
-    ) -> Result<Option<RawConfig>, PluginError> {
-        if no_plugins {
-            return Ok(None);
-        }
-        self.load_init_files(cwd)
-    }
-
-    pub fn load_global_init_file_or_skip(
-        &self,
-        no_plugins: bool,
-    ) -> Result<Option<RawConfig>, PluginError> {
-        if no_plugins {
-            return Ok(None);
-        }
-        let mut merged = None;
-        if let Some(global_dir) = caudra_config::global_config_dir() {
-            self.run_init_file(
-                &global_dir.join("init.lua"),
-                "global/init.lua",
-                PermissionRulePolicy::Trusted,
-                &mut merged,
-            )?;
-        }
-        Ok(merged)
-    }
-
+    /// Refuses before touching the file, so a disabled host never reads a
+    /// script it would not run.
     fn run_init_file(
         &self,
         path: &Path,
         label: &str,
         rule_policy: PermissionRulePolicy,
-        merged: &mut Option<RawConfig>,
-    ) -> Result<(), PluginError> {
+    ) -> Result<Option<RawConfig>, PluginError> {
+        self.lua()?;
         if !path.is_file() {
-            return Ok(());
+            return Ok(None);
         }
         let source_path = fs::canonicalize(path).map_err(|e| PluginError::Io {
             path: path.to_path_buf(),
@@ -333,40 +335,38 @@ impl PluginHost {
         })?;
         let plugin_dir = path.parent().map(Path::to_path_buf);
         let local_source = loaded_entrypoint(&source_path, &source);
-        if let Some(raw) = self.send_run_init_lua_with_policy(
+        self.send_run_init_lua_with_policy(
             source,
             label.to_owned(),
             plugin_dir,
             rule_policy,
             local_source,
-        )? {
-            match merged {
-                Some(existing) => existing.merge(raw),
-                None if matches!(rule_policy, PermissionRulePolicy::DenyOnly) => {
-                    let mut restricted = RawConfig::default();
-                    restricted.merge(raw);
-                    *merged = Some(restricted);
-                }
-                None => *merged = Some(raw),
-            }
-        }
-        Ok(())
+        )
     }
 
     pub fn load_builtins(&mut self, config: &PluginsConfig) -> Result<(), PluginError> {
-        let result = self.send_builtin_loads(config, None);
-        // Armed even when a load failed, so a caller that only warns about the
-        // error is not left interpreting for the rest of the session.
-        let _ = self.inner.tx.send(Request::WarmJit);
-        result
+        self.load_builtins_from(config, None)
     }
 
+    /// Production runs no Lua built-in on a disabled host, so there is
+    /// nothing to load rather than anything to refuse.
     pub fn load_production_builtins(&mut self, config: &PluginsConfig) -> Result<(), PluginError> {
-        let result =
-            self.send_builtin_loads(config, Some(caudra_config::ACTIVE_DEFAULT_LUA_PLUGINS));
+        if !self.is_enabled() {
+            return Ok(());
+        }
+        self.load_builtins_from(config, Some(caudra_config::ACTIVE_DEFAULT_LUA_PLUGINS))
+    }
+
+    fn load_builtins_from(
+        &self,
+        config: &PluginsConfig,
+        allowlist: Option<&[&str]>,
+    ) -> Result<(), PluginError> {
+        let lua = self.lua()?;
+        let result = self.send_builtin_loads(config, allowlist);
         // Armed even when a load failed, so a caller that only warns about the
         // error is not left interpreting for the rest of the session.
-        let _ = self.inner.tx.send(Request::WarmJit);
+        let _ = lua.tx.send(Request::WarmJit);
         result
     }
 
@@ -460,7 +460,7 @@ impl PluginHost {
         local_source: Option<VerifiedLocalSourceLocator>,
     ) -> Result<(), PluginError> {
         let (reply_tx, reply_rx) = flume::bounded(1);
-        self.inner
+        self.lua()?
             .tx
             .send(Request::LoadSource {
                 name,
@@ -481,7 +481,7 @@ impl PluginHost {
     /// keyed by plugin name. Used by docgen.
     pub fn plugin_options(&self) -> Result<PluginOptionSpecs, PluginError> {
         let (reply_tx, reply_rx) = flume::bounded(1);
-        self.inner
+        self.lua()?
             .tx
             .send(Request::CollectPluginOptions { reply: reply_tx })
             .map_err(|_| PluginError::HostDead)?;
@@ -512,7 +512,7 @@ impl PluginHost {
         local_source: Option<VerifiedLocalSourceLocator>,
     ) -> Result<Option<RawConfig>, PluginError> {
         let (reply_tx, reply_rx) = flume::bounded(1);
-        self.inner
+        self.lua()?
             .tx
             .send(Request::RunInitLua {
                 source,
@@ -528,7 +528,7 @@ impl PluginHost {
 
     pub fn unload(&self, plugin: &str) -> Result<(), PluginError> {
         let (reply_tx, reply_rx) = flume::bounded(1);
-        self.inner
+        self.lua()?
             .tx
             .send(Request::ClearPlugin {
                 plugin: Arc::from(plugin),
@@ -580,6 +580,7 @@ impl PluginHost {
     }
 
     pub fn load_plugin_file(&self, path: &Path) -> Result<(), PluginError> {
+        self.lua()?;
         let source_path = fs::canonicalize(path).map_err(|e| PluginError::Io {
             path: path.to_path_buf(),
             source: e,
@@ -612,26 +613,38 @@ impl PluginHost {
     }
 
     pub fn event_handle(&self) -> EventHandle {
-        EventHandle {
-            tx: self.inner.tx.clone(),
-            prio_tx: self.inner.prio_tx.clone(),
-        }
+        self.lua
+            .as_ref()
+            .map_or_else(EventHandle::inert, |lua| EventHandle {
+                tx: lua.tx.clone(),
+                prio_tx: lua.prio_tx.clone(),
+            })
     }
 
     pub fn command_reader(&self) -> LuaCommandReader {
-        self.inner.command_reader.clone()
+        self.lua
+            .as_ref()
+            .map_or_else(LuaCommandReader::empty, |lua| lua.command_reader.clone())
     }
 
     pub fn keymap_reader(&self) -> KeymapReader {
-        self.inner.keymap_reader.clone()
+        self.lua
+            .as_ref()
+            .map_or_else(KeymapReader::empty, |lua| lua.keymap_reader.clone())
     }
 
     pub fn hint_reader(&self) -> HintReader {
-        self.inner.hint_reader.clone()
+        self.lua
+            .as_ref()
+            .map_or_else(HintReader::empty, |lua| lua.hint_reader.clone())
     }
 
+    /// Already disconnected on a disabled host, so a consumer's disconnect
+    /// check drops it instead of polling a channel nobody writes.
     pub fn ui_action_rx(&self) -> flume::Receiver<UiAction> {
-        self.inner.ui_action_rx.clone()
+        self.lua
+            .as_ref()
+            .map_or_else(|| flume::unbounded().1, |lua| lua.ui_action_rx.clone())
     }
 }
 
@@ -660,9 +673,15 @@ impl EventHandle {
         }
     }
 
+    /// A handle no runtime drains, for a process without Lua: every request
+    /// settles at once with its default, so nothing ever waits on one.
+    pub fn inert() -> Self {
+        Self::from_tx(flume::unbounded().0)
+    }
+
     #[doc(hidden)]
     pub fn disconnected_for_test() -> Self {
-        Self::from_tx(flume::unbounded().0)
+        Self::inert()
     }
 
     /// True when no runtime is draining requests. Production handles stay
@@ -788,8 +807,15 @@ impl EventHandle {
         });
     }
 
+    /// Clears `flag` once every restore queued before it has landed. With no
+    /// runtime to deliver the barrier to there is nothing to wait for, so it
+    /// clears at once rather than leaving the caller restoring forever.
     pub fn send_restore_complete(&self, flag: Arc<AtomicBool>) {
-        let _ = self.tx.send(Request::RestoreComplete { flag });
+        if let Err(flume::SendError(Request::RestoreComplete { flag })) =
+            self.tx.send(Request::RestoreComplete { flag })
+        {
+            flag.store(false, Ordering::Relaxed);
+        }
     }
 
     /// Blocks until every restore item queued so far has finished; restores
@@ -850,7 +876,7 @@ mod tests {
             host.plugin_rules(),
         );
         if init {
-            host.run_init_file(&path, LABEL, PermissionRulePolicy::DenyOnly, &mut None)
+            host.run_init_file(&path, LABEL, PermissionRulePolicy::DenyOnly)
                 .unwrap();
         } else {
             host.load_plugin_file(&path).unwrap();
@@ -988,8 +1014,9 @@ mod tests {
         let mut host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
         let events = host.event_handle();
         host.shutdown_checked().unwrap();
-        assert!(host.inner.shutdown.load(Ordering::Acquire));
-        assert!(host.inner.join.is_none());
+        let lua = host.lua.as_ref().unwrap();
+        assert!(lua.shutdown.load(Ordering::Acquire));
+        assert!(lua.join.is_none());
         assert!(events.is_disconnected());
         assert!(matches!(
             host.load_source("late", "return {}"),
@@ -1010,7 +1037,7 @@ mod tests {
         let (release_tx, release_rx) = flume::bounded(1);
         let stopped = Arc::new(AtomicBool::new(false));
         let thread_stopped = Arc::clone(&stopped);
-        host.inner.join = Some(thread::spawn(move || {
+        host.lua.as_mut().unwrap().join = Some(thread::spawn(move || {
             release_rx.recv().unwrap();
             assert!(!panics, "{PANIC_MESSAGE}");
             thread_stopped.store(true, Ordering::Release);
@@ -1036,7 +1063,7 @@ mod tests {
         host.shutdown_checked().unwrap();
         let (release_tx, release_rx) = flume::bounded(1);
         let (stopped_tx, stopped_rx) = flume::bounded(1);
-        host.inner.join = Some(thread::spawn(move || {
+        host.lua.as_mut().unwrap().join = Some(thread::spawn(move || {
             if release_rx.recv().is_ok() {
                 let _ = stopped_tx.send(());
             }
@@ -1291,13 +1318,11 @@ mod tests {
         }
     }
 
-    /// `load_init_files_or_skip` is the single seam every entry point
-    /// (TUI, index, acp, prompt) uses to honor `--no-plugins`. Verify both
-    /// halves: the flag skips a broken init.lua, and absence runs it (so
-    /// the skip path is not a tautology that hides a regression in the
-    /// unconditional loader).
+    /// Both halves, so the refusal cannot hide a loader that never runs
+    /// anything: a live host surfaces the broken script's error, a disabled
+    /// one refuses without evaluating it.
     #[test]
-    fn load_init_files_or_skip_respects_flag() {
+    fn disabled_host_refuses_init_files_a_live_host_runs() {
         let dir = tempfile::tempdir().unwrap();
         fs::create_dir_all(dir.path().join(".caudra")).unwrap();
         fs::write(
@@ -1305,22 +1330,84 @@ mod tests {
             "error('broken init lua must not run')",
         )
         .unwrap();
+        fs::write(
+            dir.path().join("init.lua"),
+            "error('broken init lua must not run')",
+        )
+        .unwrap();
 
-        let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        let disabled = PluginHost::disabled();
+        assert!(!disabled.is_enabled());
+        assert!(matches!(
+            disabled.run_project_init(dir.path()),
+            Err(PluginError::Disabled)
+        ));
+        assert!(matches!(
+            disabled.run_global_init(dir.path()),
+            Err(PluginError::Disabled)
+        ));
+        assert!(matches!(
+            disabled.load_plugin_file(&dir.path().join("init.lua")),
+            Err(PluginError::Disabled)
+        ));
 
-        let skipped = host
-            .load_init_files_or_skip(true, dir.path())
-            .expect("no-plugins skips broken init.lua");
-        assert!(
-            skipped.is_none(),
-            "--no-plugins must skip user init.lua entirely"
-        );
+        let live = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        assert!(matches!(
+            live.run_project_init(dir.path()),
+            Err(PluginError::Lua { .. })
+        ));
+    }
 
-        let ran = host.load_init_files_or_skip(false, dir.path());
-        assert!(
-            ran.is_err(),
-            "without --no-plugins the broken init.lua must surface as an error"
-        );
+    #[test]
+    fn disabled_host_answers_inertly_and_shuts_down_cleanly() {
+        let mut host = PluginHost::disabled();
+        let handle = host.event_handle();
+        assert!(handle.is_disconnected());
+        let slots = handle.collect_prompt_slots(&AgentConfig::default());
+        assert!(contents(&slots, PromptId::System, Slot::ToolUsage).is_empty());
+        assert!(!handle.run_keybind_callback(1));
+        let restoring = Arc::new(AtomicBool::new(true));
+        handle.send_restore_complete(Arc::clone(&restoring));
+        assert!(!restoring.load(Ordering::Relaxed));
+        assert!(host.ui_action_rx().is_disconnected());
+        assert!(host.command_reader().load().commands.is_empty());
+        let plugins = PluginsConfig::from_plugins(HashMap::new());
+        assert!(host.load_production_builtins(&plugins).is_ok());
+        assert!(matches!(
+            host.load_builtins(&plugins),
+            Err(PluginError::Disabled)
+        ));
+        host.begin_shutdown();
+        assert!(host.shutdown_checked().is_ok());
+    }
+
+    #[test]
+    fn live_host_without_its_thread_reports_host_dead() {
+        let mut host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
+        host.shutdown_checked().unwrap();
+        assert!(matches!(
+            host.shutdown_checked(),
+            Err(PluginError::HostDead)
+        ));
+    }
+
+    /// Layers one script the way config loading does: a trusted script
+    /// overlays with global authority, a project one only restricts.
+    fn run_layer(
+        host: &PluginHost,
+        path: &Path,
+        label: &str,
+        rule_policy: PermissionRulePolicy,
+        merged: &mut Option<RawConfig>,
+    ) -> Result<(), PluginError> {
+        if let Some(raw) = host.run_init_file(path, label, rule_policy)? {
+            let base = merged.get_or_insert_with(RawConfig::default);
+            match rule_policy {
+                PermissionRulePolicy::Trusted => base.merge_global(raw),
+                PermissionRulePolicy::DenyOnly => base.merge(raw),
+            }
+        }
+        Ok(())
     }
 
     #[test_case("endpoint = 'https://project.example.test/v1/systemone'", "endpoint")]
@@ -1346,7 +1433,8 @@ mod tests {
         .unwrap();
         let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
         for mut merged in [None, Some(RawConfig::default())] {
-            host.run_init_file(
+            run_layer(
+                &host,
                 &path,
                 "project/init.lua",
                 PermissionRulePolicy::DenyOnly,
@@ -1368,7 +1456,8 @@ mod tests {
         let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
         let mut merged = None;
         fs::write(&path, GLOBAL).unwrap();
-        host.run_init_file(
+        run_layer(
+            &host,
             &path,
             "global/init.lua",
             PermissionRulePolicy::Trusted,
@@ -1376,7 +1465,8 @@ mod tests {
         )
         .unwrap();
         fs::write(&path, PROJECT).unwrap();
-        host.run_init_file(
+        run_layer(
+            &host,
             &path,
             "project/init.lua",
             PermissionRulePolicy::DenyOnly,
@@ -1406,7 +1496,8 @@ mod tests {
         fs::write(&path, format!("caudra.setup({{ {field} = {value} }})")).unwrap();
         let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
         for mut merged in [None, Some(RawConfig::default())] {
-            host.run_init_file(
+            run_layer(
+                &host,
                 &path,
                 "project/init.lua",
                 PermissionRulePolicy::DenyOnly,
@@ -1418,7 +1509,8 @@ mod tests {
             );
         }
         let mut global = None;
-        host.run_init_file(
+        run_layer(
+            &host,
             &path,
             "global/init.lua",
             PermissionRulePolicy::Trusted,
@@ -1445,7 +1537,8 @@ mod tests {
         let host = PluginHost::new(Arc::new(ToolRegistry::new())).unwrap();
         let mut merged = None;
         fs::write(&path, GLOBAL).unwrap();
-        host.run_init_file(
+        run_layer(
+            &host,
             &path,
             "global/init.lua",
             PermissionRulePolicy::Trusted,
@@ -1457,7 +1550,8 @@ mod tests {
             format!("caudra.setup({{ decisions = {{ features = {{ {feature} = 'off' }} }} }})"),
         )
         .unwrap();
-        host.run_init_file(
+        run_layer(
+            &host,
             &path,
             "project/init.lua",
             PermissionRulePolicy::DenyOnly,

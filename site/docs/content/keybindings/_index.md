@@ -41,7 +41,7 @@ Holding `Alt` while turning the wheel scrolls four times as far. A middle-click 
 | `Ctrl+O` / `Ctrl+X o` | Open the plan in the workbench |
 | `Ctrl+X t` | Toggle plan / todo panel |
 | `Ctrl+X a` | Open tasks |
-| `Ctrl+X k` | Open the workflow inspector |
+| `Ctrl+X k` | Open the workflow inspector (needs `experimental.workflows`) |
 | `Ctrl+X l` | Browse sessions |
 | `Ctrl+X n` | Start a new session |
 | `Ctrl+X v` | Toggle compact / expanded transcript |
@@ -138,6 +138,8 @@ Holding `Alt` while turning the wheel scrolls four times as far. A middle-click 
 
 ## Sandbox Manager
 
+These keys exist only with `sandboxes = true` under `[experimental]`. See [Experimental features](/docs/configuration/#experimental-features).
+
 | Key | Action |
 |-----|--------|
 | `Ctrl+S` | Validate and save sandbox defaults; export preview saves as a new file |
@@ -171,7 +173,7 @@ See [Managed Sandboxes](/docs/sandboxes/#tui-manager) for instance actions and [
 | `Ctrl+X 1` | Explorer |
 | `Ctrl+X 2` | Source control |
 | `Ctrl+X 3` | Search |
-| `Ctrl+X 4` | Transfer files with the attached sandbox |
+| `Ctrl+X 4` | Transfer files with the attached sandbox (needs `experimental.sandboxes`) |
 | `Tab` / `Shift+Tab` | Leave the sidebar for the editor |
 | `Ctrl+P` | Open a file by name |
 | `F5` | Reread the tree and the repository |
@@ -269,6 +271,12 @@ Some pickers add extra bindings on top of the defaults:
 | Workbench Transfer | `X` | Stop the running operation |
 | Workbench Transfer | `Esc` | Close the prompt or panel, then leave Transfer once cleanup ends |
 
+Some of these contexts belong to an [experimental feature](/docs/configuration/#experimental-features) and exist only while its switch is on:
+
+- Workflow Inspector: `workflows`
+- Workflow Catalog: `workflows`
+- Workbench Transfer: `sandboxes`
+
 ## Context Inheritance
 
 Child contexts inherit their parent's bindings and add their own.
@@ -278,7 +286,7 @@ Child contexts inherit their parent's bindings and add their own.
 
 ## Overriding Keybindings
 
-Plugins and `init.lua` can rebind keys at runtime with `caudra.keymap.set` and `caudra.keymap.del`. The tables above are the built-in defaults. An override on the same key wins, unless a modal or overlay is open (help, plan form, permission prompt).
+With [Lua plugins](/docs/configuration/#experimental-features) turned on, plugins and `init.lua` can rebind keys at runtime with `caudra.keymap.set` and `caudra.keymap.del`. The tables above are the built-in defaults. An override on the same key wins, unless a modal or overlay is open (help, plan form, permission prompt).
 
 Precedence, high to low:
 
@@ -293,13 +301,13 @@ The `/help` modal and the splash show default labels, not live overrides, but pr
 
 ### Recovering from a bad keymap
 
-If an override leaves Caudra stuck (a rebound `Ctrl+C`, a modal that won't close, a plugin that throws on load), boot without user `init.lua`:
+If an override leaves Caudra stuck (a rebound `Ctrl+C`, a modal that will not close, a plugin that throws on load), boot without Lua:
 
 ```bash
 caudra --no-plugins
 ```
 
-Skips user `init.lua` files (global and project). The Lua host stays up and every built-in tool is native, so tools still work. `permissions.toml`, custom commands, and env files load as usual.
+This run skips every plugin and both `init.lua` files and starts no Lua host, even with `lua_plugins` on. Every built-in tool is native, so tools still work. `caudra.toml`, `permissions.toml`, custom commands, and env files load as usual.
 
 The default keymap lives in Rust, not Lua, so `--no-plugins` never drops it.
 

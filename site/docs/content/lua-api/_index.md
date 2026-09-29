@@ -7,6 +7,8 @@ group = "Reference"
 
 # Lua API
 
+Lua plugins are experimental and off by default. Turn them on with `lua_plugins = true` under `[experimental]` in the global `caudra.toml`, then restart Caudra. `--no-plugins` turns Lua off again for one run. See [Experimental features](/docs/configuration/#experimental-features).
+
 Caudra plugins are plain Lua files. Everything a plugin can touch lives under
 one global table: `caudra`. This reference documents every module, function,
 and method. It is generated straight from the source code by `caudra-docgen`.

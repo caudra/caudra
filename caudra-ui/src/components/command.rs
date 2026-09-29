@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use caudra_agent::command::CustomCommand;
 use caudra_agent::{McpPromptInfo, McpSnapshotReader};
+use caudra_config::{Feature, FeatureFlags};
 use caudra_grab::grab_scope;
 use caudra_lua::{LuaCommandInfo, LuaCommandReader};
 use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
@@ -77,6 +78,29 @@ pub struct BuiltinCommand {
     pub description: &'static str,
     pub max_args: usize,
     pub scope: ChatScope,
+    /// Experiments any one of which makes the command available; empty for a
+    /// command that always is.
+    pub features: &'static [Feature],
+}
+
+impl BuiltinCommand {
+    pub fn available(&self, features: FeatureFlags) -> bool {
+        self.features.is_empty()
+            || self
+                .features
+                .iter()
+                .any(|&feature| features.enabled(feature))
+    }
+}
+
+/// The experiment that keeps the built-in command `name` out of this
+/// process, so an explicit request can say how to turn it on.
+pub fn disabled_feature(name: &str, features: FeatureFlags) -> Option<Feature> {
+    BUILTIN_COMMANDS
+        .iter()
+        .find(|command| command.name.eq_ignore_ascii_case(name))
+        .filter(|command| !command.available(features))
+        .and_then(|command| command.features.first().copied())
 }
 
 pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
@@ -85,312 +109,364 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         description: "Summarize and compact conversation history",
         max_args: 0,
         scope: ChatScope::MainOnly,
+        features: &[],
     },
     BuiltinCommand {
         name: "/continue",
         description: "Resume an interrupted turn without adding a message",
         max_args: 0,
         scope: ChatScope::MainOnly,
+        features: &[],
     },
     BuiltinCommand {
         name: "/new",
         description: "Start a new session",
         max_args: 0,
         scope: ChatScope::Any,
+        features: &[],
     },
     BuiltinCommand {
         name: "/help",
         description: "Show keybindings",
         max_args: 0,
         scope: ChatScope::Any,
+        features: &[],
     },
     BuiltinCommand {
         name: "/usage",
         description: "Show token usage breakdown",
         max_args: 0,
         scope: ChatScope::Any,
+        features: &[],
     },
     BuiltinCommand {
         name: "/context",
         description: "Inspect active context window usage",
         max_args: 1,
         scope: ChatScope::Any,
+        features: &[],
     },
     BuiltinCommand {
         name: "/storage",
         description: "Inspect what the state directory holds",
         max_args: 1,
         scope: ChatScope::Any,
+        features: &[],
     },
     BuiltinCommand {
         name: "/logs",
         description: "Browse the structured log",
         max_args: 0,
         scope: ChatScope::Any,
+        features: &[],
     },
     BuiltinCommand {
         name: "/tools",
         description: "Show which tools the model can reach",
         max_args: 0,
         scope: ChatScope::Any,
+        features: &[],
     },
     BuiltinCommand {
         name: "/skills",
         description: "Show the skills the model can load and where they come from",
         max_args: 0,
         scope: ChatScope::Any,
+        features: &[],
     },
     BuiltinCommand {
         name: "/queue",
         description: "Inspect and edit queued prompts",
         max_args: 0,
         scope: ChatScope::Any,
+        features: &[],
     },
     BuiltinCommand {
         name: "/stash",
         description: "Park the current prompt draft for later",
         max_args: 0,
         scope: ChatScope::Any,
+        features: &[],
     },
     BuiltinCommand {
         name: "/stash-pop",
         description: "Restore the most recently stashed prompt",
         max_args: 0,
         scope: ChatScope::Any,
+        features: &[],
     },
     BuiltinCommand {
         name: "/stash-list",
         description: "Browse stashed prompts",
         max_args: 0,
         scope: ChatScope::Any,
+        features: &[],
     },
     BuiltinCommand {
         name: "/memory",
         description: "View, edit, and delete memory files",
         max_args: 0,
         scope: ChatScope::Any,
+        features: &[],
     },
     BuiltinCommand {
         name: "/tasks",
         description: "Browse tasks and steer running subagents",
         max_args: usize::MAX,
         scope: ChatScope::Any,
+        features: &[],
     },
     BuiltinCommand {
         name: "/shells",
         description: "Browse shell commands and stop running ones",
         max_args: 0,
         scope: ChatScope::Any,
+        features: &[],
     },
     BuiltinCommand {
         name: "/workflows",
         description: "Browse, trust, and launch workflows",
         max_args: 0,
         scope: ChatScope::MainOnly,
+        features: &[Feature::Workflows],
     },
     BuiltinCommand {
         name: "/workflow",
         description: "Start a workflow, or list, pause, resume, and stop runs",
         max_args: usize::MAX,
         scope: ChatScope::MainOnly,
+        features: &[Feature::Workflows],
     },
     BuiltinCommand {
         name: "/deep-research",
         description: "Research a question with the deep-research workflow",
         max_args: usize::MAX,
         scope: ChatScope::MainOnly,
+        features: &[Feature::Workflows],
     },
     BuiltinCommand {
         name: "/review-changes",
         description: "Review a change from independent angles with the review-changes workflow",
         max_args: usize::MAX,
         scope: ChatScope::MainOnly,
+        features: &[Feature::Workflows],
     },
     BuiltinCommand {
         name: "/root-cause",
         description: "Diagnose a failure with the root-cause workflow",
         max_args: usize::MAX,
         scope: ChatScope::MainOnly,
+        features: &[Feature::Workflows],
     },
     BuiltinCommand {
         name: "/sessions",
         description: "Browse and switch sessions",
         max_args: 0,
         scope: ChatScope::Any,
+        features: &[],
     },
     BuiltinCommand {
         name: "/rename",
         description: "Rename the current session",
         max_args: usize::MAX,
         scope: ChatScope::Any,
+        features: &[],
     },
     BuiltinCommand {
         name: "/model",
         description: "Switch chat model or assign job models",
         max_args: 0,
         scope: ChatScope::MainOnly,
+        features: &[],
     },
     BuiltinCommand {
         name: "/system-prompt",
         description: "Inspect the system prompt and switch profile",
         max_args: 0,
         scope: ChatScope::MainOnly,
+        features: &[],
     },
     BuiltinCommand {
         name: "/projection",
         description: "Inspect the conversation as the provider receives it",
         max_args: 0,
         scope: ChatScope::MainOnly,
+        features: &[],
     },
     BuiltinCommand {
         name: "/review",
         description: "Review the last reply passage by passage",
         max_args: 0,
         scope: ChatScope::Any,
+        features: &[],
     },
     BuiltinCommand {
         name: "/theme",
         description: "Switch color theme",
         max_args: 0,
         scope: ChatScope::Any,
+        features: &[],
     },
     BuiltinCommand {
         name: "/view",
         description: "Cycle transcript: auto / compact / expanded",
         max_args: 0,
         scope: ChatScope::Any,
+        features: &[],
     },
     BuiltinCommand {
         name: "/mcp",
         description: "Configure MCP servers",
         max_args: 0,
         scope: ChatScope::Any,
+        features: &[],
     },
     BuiltinCommand {
         name: "/permissions",
         description: "Inspect active conversation permission rules",
         max_args: 0,
         scope: ChatScope::Any,
+        features: &[],
     },
     BuiltinCommand {
         name: "/login",
         description: "Authenticate with an LLM provider",
         max_args: 0,
         scope: ChatScope::Any,
+        features: &[],
     },
     BuiltinCommand {
         name: "/cd",
         description: "Change working directory",
         max_args: 1,
         scope: ChatScope::Any,
+        features: &[],
     },
     BuiltinCommand {
         name: "/move-session",
         description: "Move the current session; retain its counters and lifetime project attribution (optional directory)",
         max_args: 1,
         scope: ChatScope::MainOnly,
+        features: &[],
     },
     BuiltinCommand {
         name: "/migrate-sessions",
         description: "Migrate sessions with one exact stored cwd; historical project usage included by default (optional destination directory)",
         max_args: 1,
         scope: ChatScope::MainOnly,
+        features: &[],
     },
     BuiltinCommand {
         name: "/worktree",
         description: "Open, create or remove git worktrees of this repository (new [branch] | remove)",
         max_args: 2,
         scope: ChatScope::MainOnly,
+        features: &[],
     },
     BuiltinCommand {
         name: "/btw",
         description: "Ask a side question, with follow-ups (no tools, nothing enters history)",
         max_args: usize::MAX,
         scope: ChatScope::MainOnly,
+        features: &[],
     },
     BuiltinCommand {
         name: "/extract",
         description: "List the requirements the session has gathered so far (Extract model, copyable, no history pollution)",
         max_args: 0,
         scope: ChatScope::MainOnly,
+        features: &[],
     },
     BuiltinCommand {
         name: "/goal",
         description: "Work until a completion condition is met",
         max_args: usize::MAX,
         scope: ChatScope::MainOnly,
+        features: &[],
     },
     BuiltinCommand {
         name: "/goal-clear",
         description: "Stop the active completion goal",
         max_args: 0,
         scope: ChatScope::MainOnly,
+        features: &[],
     },
     BuiltinCommand {
         name: "/goal-model",
         description: "Assign the completion goal model",
         max_args: 0,
         scope: ChatScope::MainOnly,
+        features: &[],
     },
     BuiltinCommand {
         name: "/auto",
         description: "Toggle Auto permissions (skip unmatched prompts, keep safeguards)",
         max_args: 0,
         scope: ChatScope::Any,
+        features: &[Feature::DecisionEngine],
     },
     BuiltinCommand {
         name: "/decisions",
         description: "Show decision engine configuration and cached status",
         max_args: 0,
         scope: ChatScope::Any,
+        features: &[Feature::DecisionEngine],
     },
     BuiltinCommand {
         name: "/yolo",
         description: "Toggle YOLO mode (skip all permission prompts)",
         max_args: 0,
         scope: ChatScope::Any,
+        features: &[],
     },
     BuiltinCommand {
         name: "/thinking",
         description: "Set reasoning (off, adaptive/provider default, effort, or token budget)",
         max_args: 1,
         scope: ChatScope::Any,
+        features: &[],
     },
     BuiltinCommand {
         name: "/fast",
         description: "Toggle fast mode (models that sell a fast tier)",
         max_args: 0,
         scope: ChatScope::Any,
+        features: &[],
     },
     BuiltinCommand {
         name: "/exit",
         description: "Exit the application",
         max_args: 0,
         scope: ChatScope::Any,
+        features: &[],
     },
     BuiltinCommand {
         name: "/reload",
         description: "Reload plugins and config",
         max_args: 0,
         scope: ChatScope::Any,
+        features: &[],
     },
     BuiltinCommand {
         name: "/workbench",
         description: "Open the file explorer, editor and source control view",
         max_args: 0,
         scope: ChatScope::Any,
+        features: &[],
     },
     BuiltinCommand {
         name: "/remote",
         description: "Remote status, pending operations, reconnect, reconcile or explicit acknowledgement",
         max_args: 3,
         scope: ChatScope::MainOnly,
+        features: &[Feature::RemoteWorkcell, Feature::Sandboxes],
     },
     BuiltinCommand {
         name: "/sandbox",
         description: "Manage live sandboxes, profiles, images and providers; explicit reviewed actions, Doctor and recovery",
         max_args: 1,
         scope: ChatScope::Any,
+        features: &[Feature::Sandboxes],
     },
 ];
 
@@ -461,6 +537,7 @@ pub struct CommandPalette {
     lua_reader: LuaCommandReader,
     lua_commands: Vec<LuaCommandInfo>,
     lua_generation: u64,
+    features: FeatureFlags,
     nucleo: Nucleo<CommandItem>,
     matcher: Matcher,
     current_arg_count: usize,
@@ -483,6 +560,7 @@ impl CommandPalette {
         custom_commands: Arc<[CustomCommand]>,
         mcp_reader: McpSnapshotReader,
         lua_reader: LuaCommandReader,
+        features: FeatureFlags,
     ) -> Self {
         let snap = mcp_reader.load();
         let mcp_generation = snap.generation;
@@ -492,7 +570,7 @@ impl CommandPalette {
         let lua_generation = lua_snap.generation;
         let lua_commands = lua_snap.commands.clone();
 
-        let nucleo = Self::build_nucleo(&custom_commands, &prompts, &lua_commands);
+        let nucleo = Self::build_nucleo(features, &custom_commands, &prompts, &lua_commands);
         Self {
             selected: 0,
             filtered: Vec::new(),
@@ -503,6 +581,7 @@ impl CommandPalette {
             lua_reader,
             lua_commands,
             lua_generation,
+            features,
             nucleo,
             matcher: Matcher::new(Config::DEFAULT),
             current_arg_count: 0,
@@ -517,23 +596,33 @@ impl CommandPalette {
 
     pub(crate) fn set_custom_commands(&mut self, commands: Arc<[CustomCommand]>) {
         self.custom = commands;
-        self.nucleo = Self::build_nucleo(&self.custom, &self.mcp_prompts, &self.lua_commands);
+        self.nucleo = Self::build_nucleo(
+            self.features,
+            &self.custom,
+            &self.mcp_prompts,
+            &self.lua_commands,
+        );
         self.filtered.clear();
         self.selected = 0;
     }
 
     /// Every command the palette knows, in display order. The one place that
-    /// enumerates the four sources: matching and name lookup both read it.
+    /// enumerates the four sources: matching and name lookup both read it, so
+    /// a built-in whose experiment is off is neither suggested nor resolved.
     fn items<'a>(
+        features: FeatureFlags,
         custom_commands: &'a [CustomCommand],
         mcp_prompts: &'a [McpPromptInfo],
         lua_commands: &'a [LuaCommandInfo],
     ) -> impl Iterator<Item = CommandItem> + 'a {
-        let builtins = BUILTIN_COMMANDS.iter().map(|cmd| CommandItem {
-            name: cmd.name.to_string(),
-            max_args: cmd.max_args,
-            command_type: CommandType::Builtin(cmd),
-        });
+        let builtins = BUILTIN_COMMANDS
+            .iter()
+            .filter(move |cmd| cmd.available(features))
+            .map(|cmd| CommandItem {
+                name: cmd.name.to_string(),
+                max_args: cmd.max_args,
+                command_type: CommandType::Builtin(cmd),
+            });
         let custom = custom_commands
             .iter()
             .enumerate()
@@ -560,6 +649,7 @@ impl CommandPalette {
     }
 
     fn build_nucleo(
+        features: FeatureFlags,
         custom_commands: &[CustomCommand],
         mcp_prompts: &[McpPromptInfo],
         lua_commands: &[LuaCommandInfo],
@@ -567,7 +657,7 @@ impl CommandPalette {
         let nucleo = Nucleo::new(Config::DEFAULT, Arc::new(|| {}), None, 1);
         let injector = nucleo.injector();
 
-        for item in Self::items(custom_commands, mcp_prompts, lua_commands) {
+        for item in Self::items(features, custom_commands, mcp_prompts, lua_commands) {
             injector.push(item, |item, cols| {
                 cols[0] = Utf32String::from(item.name.as_str());
             });
@@ -692,22 +782,32 @@ impl CommandPalette {
         self.mcp_prompts = mcp_snap.prompts.clone();
         self.lua_generation = lua_snap.generation;
         self.lua_commands = lua_snap.commands.clone();
-        self.nucleo = Self::build_nucleo(&self.custom, &self.mcp_prompts, &self.lua_commands);
+        self.nucleo = Self::build_nucleo(
+            self.features,
+            &self.custom,
+            &self.mcp_prompts,
+            &self.lua_commands,
+        );
     }
 
     /// Every command as a modal picker row, grouped by source. {task_focused}
     /// only decides styling: refusal stays with the one dispatcher.
     pub fn rows(&mut self, task_focused: bool) -> Vec<CommandRow> {
         self.refresh_sources();
-        Self::items(&self.custom, &self.mcp_prompts, &self.lua_commands)
-            .map(|item| CommandRow {
-                description: self.describe(&item.command_type).to_string(),
-                section: Self::section_of(&item.command_type),
-                disabled: task_focused && Self::scope_of(&item.command_type) == ChatScope::MainOnly,
-                name: item.name,
-                max_args: item.max_args,
-            })
-            .collect()
+        Self::items(
+            self.features,
+            &self.custom,
+            &self.mcp_prompts,
+            &self.lua_commands,
+        )
+        .map(|item| CommandRow {
+            description: self.describe(&item.command_type).to_string(),
+            section: Self::section_of(&item.command_type),
+            disabled: task_focused && Self::scope_of(&item.command_type) == ChatScope::MainOnly,
+            name: item.name,
+            max_args: item.max_args,
+        })
+        .collect()
     }
 
     fn section_of(command_type: &CommandType) -> &'static str {
@@ -733,9 +833,14 @@ impl CommandPalette {
     /// The styling question the palettes ask, and the refusal question
     /// [`crate::app::App`] asks, answered from one table.
     pub fn is_main_only(&self, name: &str) -> bool {
-        Self::items(&self.custom, &self.mcp_prompts, &self.lua_commands)
-            .find(|item| item.name == name)
-            .is_some_and(|item| Self::scope_of(&item.command_type) == ChatScope::MainOnly)
+        Self::items(
+            self.features,
+            &self.custom,
+            &self.mcp_prompts,
+            &self.lua_commands,
+        )
+        .find(|item| item.name == name)
+        .is_some_and(|item| Self::scope_of(&item.command_type) == ChatScope::MainOnly)
     }
 
     fn describe(&self, command_type: &CommandType) -> &str {
@@ -974,9 +1079,14 @@ impl CommandPalette {
     /// typing, but never fuzzy: an alias names one command on purpose, and a
     /// typo should report itself instead of running the closest neighbor.
     pub fn resolve(&self, name: &str) -> Option<String> {
-        Self::items(&self.custom, &self.mcp_prompts, &self.lua_commands)
-            .map(|item| item.name)
-            .find(|n| n.eq_ignore_ascii_case(name))
+        Self::items(
+            self.features,
+            &self.custom,
+            &self.mcp_prompts,
+            &self.lua_commands,
+        )
+        .map(|item| item.name)
+        .find(|n| n.eq_ignore_ascii_case(name))
     }
 
     pub fn find_custom_command(&self, display_name: &str) -> Option<&CustomCommand> {
@@ -1109,9 +1219,62 @@ mod tests {
     }
 
     fn synced(input: &str) -> CommandPalette {
-        let mut p = CommandPalette::new(Arc::from([]), empty_snapshot(), LuaCommandReader::empty());
+        synced_with(input, FeatureFlags::all())
+    }
+
+    fn synced_with(input: &str, features: FeatureFlags) -> CommandPalette {
+        let mut p = CommandPalette::new(
+            Arc::from([]),
+            empty_snapshot(),
+            LuaCommandReader::empty(),
+            features,
+        );
         p.sync(input, false);
         p
+    }
+
+    #[test_case("/workflow", Feature::Workflows; "workflow")]
+    #[test_case("/deep-research", Feature::Workflows; "workflow_shortcut")]
+    #[test_case("/sandbox", Feature::Sandboxes; "sandbox")]
+    #[test_case("/decisions", Feature::DecisionEngine; "decisions")]
+    #[test_case("/auto", Feature::DecisionEngine; "auto")]
+    fn a_command_is_absent_until_its_experiment_is_on(name: &str, feature: Feature) {
+        let mut off = synced_with(name, FeatureFlags::all().without(feature));
+        assert!(off.rows(false).iter().all(|row| row.name != name));
+        assert_eq!(off.resolve(name), None);
+        assert!(off.confirm(name).is_none_or(|command| command.name != name));
+        assert_eq!(
+            disabled_feature(name, FeatureFlags::all().without(feature)),
+            Some(feature)
+        );
+
+        let mut on = synced_with(name, FeatureFlags::NONE.with(feature));
+        assert!(on.rows(false).iter().any(|row| row.name == name));
+        assert_eq!(on.resolve(name).as_deref(), Some(name));
+        assert_eq!(
+            disabled_feature(name, FeatureFlags::NONE.with(feature)),
+            None
+        );
+    }
+
+    #[test_case(FeatureFlags::NONE => false; "neither")]
+    #[test_case(FeatureFlags::NONE.with(Feature::Sandboxes) => true; "managed_sandboxes")]
+    #[test_case(FeatureFlags::NONE.with(Feature::RemoteWorkcell) => true; "direct_remote")]
+    fn remote_follows_either_remote_experiment(features: FeatureFlags) -> bool {
+        const REMOTE: &str = "/remote";
+        synced_with(REMOTE, features).resolve(REMOTE).is_some()
+    }
+
+    #[test]
+    fn ordinary_commands_need_no_experiment() {
+        const MEMORY: &str = "/memory";
+        assert_eq!(disabled_feature(MEMORY, FeatureFlags::NONE), None);
+        assert_eq!(
+            synced_with(MEMORY, FeatureFlags::NONE)
+                .resolve(MEMORY)
+                .as_deref(),
+            Some(MEMORY)
+        );
     }
 
     #[test_case("/move-session"; "current")]
@@ -1191,8 +1354,12 @@ mod tests {
     }
 
     fn palette_for_scope(task_focused: bool) -> CommandPalette {
-        let mut palette =
-            CommandPalette::new(Arc::from([]), empty_snapshot(), LuaCommandReader::empty());
+        let mut palette = CommandPalette::new(
+            Arc::from([]),
+            empty_snapshot(),
+            LuaCommandReader::empty(),
+            FeatureFlags::all(),
+        );
         palette.sync("/", task_focused);
         // Off the first row, so both commands under test are styled as
         // ordinary rows rather than as the selection.
@@ -1210,7 +1377,12 @@ mod tests {
     }
 
     fn synced_with_custom(input: &str, custom: Arc<[CustomCommand]>) -> CommandPalette {
-        let mut p = CommandPalette::new(custom, empty_snapshot(), LuaCommandReader::empty());
+        let mut p = CommandPalette::new(
+            custom,
+            empty_snapshot(),
+            LuaCommandReader::empty(),
+            FeatureFlags::all(),
+        );
         p.sync(input, false);
         p
     }
@@ -1413,7 +1585,12 @@ mod tests {
 
     #[test]
     fn confirm_when_inactive_returns_none() {
-        let p = CommandPalette::new(Arc::from([]), empty_snapshot(), LuaCommandReader::empty());
+        let p = CommandPalette::new(
+            Arc::from([]),
+            empty_snapshot(),
+            LuaCommandReader::empty(),
+            FeatureFlags::all(),
+        );
         assert!(p.confirm("").is_none());
     }
 
@@ -1469,7 +1646,12 @@ mod tests {
     #[test_case("/proj", "/projection", "" ; "proj_opens_projection")]
     #[test_case("/btw hello world", "/btw", "hello world" ; "btw_multi_word")]
     fn confirm_parses_args(input: &str, expected_name: &str, expected_args: &str) {
-        let mut p = CommandPalette::new(Arc::from([]), empty_snapshot(), LuaCommandReader::empty());
+        let mut p = CommandPalette::new(
+            Arc::from([]),
+            empty_snapshot(),
+            LuaCommandReader::empty(),
+            FeatureFlags::all(),
+        );
         p.sync(input, false);
         let cmd = p.confirm(input).unwrap();
         assert_eq!(cmd.name, expected_name);
@@ -1479,7 +1661,12 @@ mod tests {
     #[test]
     fn confirm_custom_command() {
         let custom = sample_custom();
-        let mut p = CommandPalette::new(custom, empty_snapshot(), LuaCommandReader::empty());
+        let mut p = CommandPalette::new(
+            custom,
+            empty_snapshot(),
+            LuaCommandReader::empty(),
+            FeatureFlags::all(),
+        );
         p.sync("/project:review", false);
         assert!(p.is_active());
         let cmd = p.confirm("/project:review some-file.rs").unwrap();
@@ -1490,7 +1677,12 @@ mod tests {
     #[test]
     fn find_custom_command_lookup() {
         let custom = sample_custom();
-        let p = CommandPalette::new(custom, empty_snapshot(), LuaCommandReader::empty());
+        let p = CommandPalette::new(
+            custom,
+            empty_snapshot(),
+            LuaCommandReader::empty(),
+            FeatureFlags::all(),
+        );
         let found = p.find_custom_command("/project:review");
         assert!(found.is_some());
         assert_eq!(found.unwrap().content, "Review $ARGUMENTS");
@@ -1524,7 +1716,12 @@ mod tests {
     }
 
     fn synced_with_prompts(input: &str) -> CommandPalette {
-        let mut p = CommandPalette::new(Arc::from([]), sample_prompts(), LuaCommandReader::empty());
+        let mut p = CommandPalette::new(
+            Arc::from([]),
+            sample_prompts(),
+            LuaCommandReader::empty(),
+            FeatureFlags::all(),
+        );
         p.sync(input, false);
         p
     }
@@ -1582,7 +1779,12 @@ mod tests {
     #[test]
     fn mcp_update_clears_old_prompts() {
         let reader = sample_prompts();
-        let mut p = CommandPalette::new(Arc::from([]), reader, LuaCommandReader::empty());
+        let mut p = CommandPalette::new(
+            Arc::from([]),
+            reader,
+            LuaCommandReader::empty(),
+            FeatureFlags::all(),
+        );
 
         p.sync("/", false);
         let initial_count = p
@@ -1674,7 +1876,8 @@ mod tests {
             plugin: Arc::from("deploy_plugin"),
             max_args,
         }]);
-        let mut p = CommandPalette::new(Arc::from([]), empty_snapshot(), reader);
+        let mut p =
+            CommandPalette::new(Arc::from([]), empty_snapshot(), reader, FeatureFlags::all());
         p.sync(input, false);
         p
     }
@@ -1702,7 +1905,12 @@ mod tests {
     }
 
     fn synced_with_lua(input: &str) -> CommandPalette {
-        let mut p = CommandPalette::new(Arc::from([]), empty_snapshot(), sample_lua_commands());
+        let mut p = CommandPalette::new(
+            Arc::from([]),
+            empty_snapshot(),
+            sample_lua_commands(),
+            FeatureFlags::all(),
+        );
         p.sync(input, false);
         p
     }
@@ -1740,7 +1948,12 @@ mod tests {
 
     #[test]
     fn confirm_lua_command_parses_args() {
-        let mut p = CommandPalette::new(Arc::from([]), empty_snapshot(), sample_lua_commands());
+        let mut p = CommandPalette::new(
+            Arc::from([]),
+            empty_snapshot(),
+            sample_lua_commands(),
+            FeatureFlags::all(),
+        );
         p.sync("/memory", false);
         let cmd = p.confirm("/memory some-arg").unwrap();
         assert_eq!(cmd.name, "/memory");
@@ -1756,7 +1969,8 @@ mod tests {
             plugin: Arc::from("p"),
             max_args: 0,
         }]);
-        let mut p = CommandPalette::new(Arc::from([]), empty_snapshot(), reader);
+        let mut p =
+            CommandPalette::new(Arc::from([]), empty_snapshot(), reader, FeatureFlags::all());
         p.sync("/", false);
         let initial_lua = p
             .filtered

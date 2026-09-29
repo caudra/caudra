@@ -11,6 +11,8 @@ Use a managed sandbox when Caudra should create or attach to an e2b-libvirt VM a
 
 The terminal UI, model connections, credentials and conversation state stay on the client. Workspace tools run in the selected sandbox. Client-local extensions remain client-local. The same [remote identity and project-trust rules](/docs/remote-workspaces/#project-context-and-trust) apply, with no fallback to local execution if attachment fails.
 
+Managed sandboxes are experimental and off by default. Turn them on with `sandboxes = true` under `[experimental]` in the global `caudra.toml`, then restart Caudra. See [Experimental features](/docs/configuration/#experimental-features). Sandboxes reach Workcell over the same transport as a [remote workspace](/docs/remote-workspaces/) and still work with `experimental.remote_workcell` off. While the switch is off, `caudra sandbox`, `caudra auth sandbox`, `--sandbox`, `--sandbox-resume`, the `/sandbox` manager, and the workbench Transfer view are unavailable, and so are `caudra remote` and `/remote` for sandbox sessions. Turning the switch off never stops or deletes anything. A running sandbox keeps running and keeps billing, so pause or delete it before you turn the switch off.
+
 ## Compatibility and release status
 
 Caudra pins its Workcell dependency in `Cargo.toml`. Reviewed transfers require compatible remote contracts, and empty-directory publication requires its additional negotiated capability. Matching version labels alone do not establish compatibility. There is no raw-transfer fallback.
@@ -58,11 +60,11 @@ caudra --sandbox dev --sandbox-resume --session SESSION_ID
 
 `--session` restores the saved sandbox source before resolving Workcell. `--continue` can recover the last saved sandbox source for the client directory. It is a resume preference, not an automatic sandbox default for fresh runs. A paused VM requires explicit approval through `--sandbox-resume` or a separate `sandbox resume` command. Conversation resume and cold-boot VM resume are different operations.
 
-Caudra validates the original authority, principal, workspace generation and cursor. Missing records, changed identity or an unavailable provider stop resume. No new VM is substituted under old history. SDK `--fork-session` is a history-only fork and does not implicitly recover the source sandbox. See [Sessions](/docs/sessions/) for transcript and snapshot behavior.
+Caudra validates the original authority, principal, workspace generation and cursor. Missing records, changed identity or an unavailable provider stop resume. No new VM is substituted under old history. Resuming a sandbox session also needs `experimental.sandboxes`. Without it, resume fails with an error, never falls back to local execution, and leaves the session intact. SDK `--fork-session` is a history-only fork and does not implicitly recover the source sandbox. See [Sessions](/docs/sessions/) for transcript and snapshot behavior.
 
 ## Configuration schema
 
-Managed configuration lives in user-global `sandboxes.toml`, beside `init.lua` and `workcell.toml`. It is separate from model-provider `providers.toml` and direct Workcell endpoint profiles. The default Linux path is `~/.config/caudra/sandboxes.toml`. [Debug builds and namespaces](/docs/configuration/#directory-layout) can select a different directory.
+Managed configuration lives in user-global `sandboxes.toml`, beside `caudra.toml` and `workcell.toml`. It is separate from model-provider `providers.toml` and direct Workcell endpoint profiles. The default Linux path is `~/.config/caudra/sandboxes.toml`. [Debug builds and namespaces](/docs/configuration/#directory-layout) can select a different directory.
 
 The file uses `version = 1` and `[sandbox.providers.NAME]`, `[sandbox.networks.NAME]`, `[sandbox.transfers.NAME]`, and `[sandbox.profiles.NAME]`. Unknown fields, unsupported versions and dangling references are rejected. The file must be a user-owned regular file with no group/other access or symlink components. Saves check the previous file revision rather than overwriting concurrent edits.
 

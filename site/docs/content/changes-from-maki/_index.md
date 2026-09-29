@@ -83,6 +83,12 @@ Maki provided the native Rust TUI, Lua plugin system, provider integrations, MCP
 
 **Why:** Users with an existing Claude subscription can authenticate without manually handling an API key and can see the account limits that affect an active session.
 
+## Declarative settings and opt-in experiments
+
+**What changed:** Settings live in a plain `caudra.toml` instead of a Lua `init.lua` script. Workflows, managed sandboxes, direct remote Workcell connections, Lua plugins, and the decision engine are [experimental features](/docs/configuration/#experimental-features). Each stays off until the `[experimental]` table of the global `caudra.toml` turns it on. A feature that is off adds no tools, commands, or startup work.
+
+**Why:** Settings should load without running code, so a default install starts no Lua runtime. Keeping experiments off by default limits a new install to the stable features. Only the user's global file can turn one on, so a repository cannot opt its users into an experiment.
+
 ## Independent release identity
 
 **What changed:** Caudra starts a separate `0.1.0` release line with its own executable, crates, configuration paths, Lua namespace, telemetry namespace, repository, installers, site, and visual identity. The rename is a hard break without runtime Maki aliases.

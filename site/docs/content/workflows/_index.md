@@ -11,6 +11,8 @@ A workflow is a script that runs a plan of subagents and keeps the results. It i
 
 Caudra ships three workflows and discovers the ones you write. Runs are durable. A run that pauses, fails, or is stopped can resume from its journal instead of starting over.
 
+Workflows are experimental and off by default. Turn them on with `workflows = true` under `[experimental]` in the global `caudra.toml`, then restart Caudra. See [Experimental features](/docs/configuration/#experimental-features). While they are off, Caudra offers no `workflow` tool, workflow commands, status chip, or inspector, and it does not open workflow storage, discover scripts, or resume runs. Saved runs stay on disk.
+
 ## What ships
 
 | Workflow | Use it for | Phases |
@@ -162,7 +164,7 @@ Everything after the metadata is ordinary Rhai with these host functions:
 | `pause(kind, message)` | Suspends the run in a resumable state |
 | `complete()`, `complete(value)` | Ends the run with `value` as its result |
 | `write_scratch_file(name, content)` | Writes an artifact and returns its path |
-| `decide(state, questions)`, `decide(state, questions, opts)` | Calls the configured decision endpoint. Returns `#{ answers, model }` |
+| `decide(state, questions)`, `decide(state, questions, opts)` | Calls the configured decision endpoint. Needs `experimental.decision_engine`. Returns `#{ answers, model }` |
 | `json_encode(value)` | Serializes a value to JSON text |
 | `budget()` | Returns `#{ issued, limit, remaining }` for the run's agent budget |
 | `args` | The launch arguments, or `()` when none were given |
@@ -193,7 +195,7 @@ Precedence runs from most specific configuration to least. A `subagent_model` pi
 
 ### Typed decisions
 
-`decide()` uses the endpoint in your global [`decisions` configuration](/docs/configuration/#decisions). It is available even when passive decision features are off, including in YOLO. Non-loopback endpoints require `allow_remote = true`. Calls go directly to that endpoint without ambient proxies or HTTP redirects.
+`decide()` uses the endpoint in your global [`decisions` configuration](/docs/configuration/#decisions) and needs `experimental.decision_engine` as well as `experimental.workflows`. With the engine switch on, it is available even when passive decision features are off, including in YOLO. Non-loopback endpoints require `allow_remote = true`. Calls go directly to that endpoint without ambient proxies or HTTP redirects.
 
 ```rhai
 let result = decide(
@@ -213,6 +215,8 @@ Questions are keyed by ID. Supported types are `noul`, `choice`, and `score`. A 
 The optional third argument accepts `model` and `timeout_ms`. A positive timeout is capped at the configured decision deadline. States are redacted and bounded to 1,500 serialized bytes, with depth and node limits. Oversized states are rejected rather than silently shortened. Dynamic question descriptions are also redacted. A question is rejected if redaction would change an answer label or question ID. Redaction is best effort, so keep credentials and sensitive material out of both states and questions.
 
 Endpoint errors and timeouts are catchable Rhai errors. A successful result is saved before the script continues and replayed on resume without another endpoint call. Calls that failed or were interrupted before their result was committed can run again. The workflow journal omits the decision request body. The separate opt-in decision log stores the redacted state that was sent, questions, and answers. Workflow effects remain `none` there, even if the script acts on an answer.
+
+While the engine switch is off, a new `decide()` call raises a catchable error before anything reaches the journal. A decision the run already recorded still replays as its saved value, so resuming an older run works.
 
 Decision calls count against the host-call limit, not the agent budget. Their answers are data for the script. They do not grant permissions or change an agent's execution mode.
 

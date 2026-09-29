@@ -13,6 +13,8 @@ For remote sessions, transcripts stay on the client and workspace snapshots stay
 
 Managed sandbox sessions retain their sandbox source. `caudra --session ID` resolves it before validating the remote workspace, and a paused VM requires explicit resume approval. See [sandbox conversation and VM resume](/docs/sandboxes/#resume-a-conversation-or-vm). Saving or deleting conversation history does not delete the VM or extend its disk-retention deadline.
 
+Resuming a session bound to a managed sandbox needs `experimental.sandboxes`, and one bound to a direct remote workspace needs `experimental.remote_workcell`. The rule covers `--continue`, `--session`, the session picker, the SDK, and ACP. Without the switch, resume fails with an error and never falls back to local execution. The session data stays intact, so the session resumes once the switch is on. See [Experimental features](/docs/configuration/#experimental-features).
+
 ## Active sessions
 
 One Caudra runtime can own a session ID at a time. Opening that session from
@@ -223,17 +225,12 @@ The policy is evaluated per working directory by default, so one busy project ca
 
 Both policies start empty, so Caudra keeps every session until you ask it to do otherwise:
 
-```lua
-caudra.setup({
-    storage = {
-        retention = {
-            group_by = "directory",
-            sweep_interval_hours = 24,
-            trim = {},
-            forget = {},
-        },
-    },
-})
+```toml
+[storage.retention]
+group_by = "directory"
+sweep_interval_hours = 24
+trim = {}
+forget = {}
 ```
 
 To keep the twenty most recently active sessions of every directory in full and strip the artifacts of anything older than ninety days, set `trim = { keep_last = 20, keep_within = "90d" }`. To delete sessions after two years, set `forget = { keep_within = "2y" }`. Set `sweep_interval_hours = 0` to run retention only through the CLI.
@@ -284,10 +281,11 @@ Snapshots from releases before the Git format are not migrated. A session's old 
 
 Run `caudra --no-snapshots` to disable automatic snapshots for one process. The flag applies to local and remote workspaces, including TUI, `--print`, SDK, and ACP sessions. It skips session-start, pre-mutation, run-completion, cancellation, and final captures, including when resuming a session with old snapshots.
 
-For a persistent setting, merge this into `caudra.setup()` in your `init.lua`:
+For a persistent setting, add this to your `caudra.toml`:
 
-```lua
-caudra.setup({ storage = { snapshots = { enabled = false } } })
+```toml
+[storage.snapshots]
+enabled = false
 ```
 
 `--no-snapshots` overrides the configured value without saving it. Remote sessions read this setting from the client user configuration, not from the remote project.

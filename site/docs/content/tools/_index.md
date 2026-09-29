@@ -17,10 +17,9 @@ Remote Workcell selection replaces the first-party execution backend. Startup re
 
 `agent.disabled_tools` withholds a tool from the model. Entries are built-in tool names, an MCP tool as `server.tool`, or a whole MCP server as `server.*`. An unknown name fails at startup with the list of valid names. A project list extends the global one, so a project can restrict further and cannot re-enable what the global config turned off.
 
-```lua
-caudra.setup({
-    agent = { disabled_tools = { "shell", "file_write", "github.*" } },
-})
+```toml
+[agent]
+disabled_tools = ["shell", "file_write", "github.*"]
 ```
 
 `--disallowed-tools` does the same for one run and accepts the same names. `plugins.<name>.enabled = false` still works and maps to the tools that plugin was replaced by, so `plugins.bash` turns off `shell`.
@@ -313,9 +312,11 @@ Inspect or control jobs visible to this owner. Actions: list, status, cancel. Li
 | `before` | object | no | History cursor returned as next by list. |
 | `limit` | integer | no |  |
 
-### `workflow` <span class="badge">on demand</span> {#workflow}
+### `workflow` <span class="badge">experimental</span> <span class="badge">on demand</span> {#workflow}
 
 Run durable, multi-agent workflows: scripted plans that launch subagents in phases, keep a journal, and can be paused and resumed.
+
+Experimental and off by default. Turn it on with `workflows = true` under `[experimental]` in the global `caudra.toml`. See [Experimental features](/docs/configuration/#experimental-features).
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|

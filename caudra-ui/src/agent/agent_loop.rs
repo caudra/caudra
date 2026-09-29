@@ -734,19 +734,21 @@ impl AgentLoop {
 
     async fn read_instructions(&mut self) -> Result<Instructions, AgentError> {
         if let Some(workspace) = &self.workspace_session {
-            let context =
-                match caudra_agent::remote_project_context::load_remote_project_context(workspace)
-                    .await
-                {
-                    Ok(context) => context,
-                    Err(error) => {
-                        self.permissions.invalidate_remote_permission_asset();
-                        return Err(AgentError::Tool {
-                            tool: "remote_project_context".into(),
-                            message: format!("Remote project context unavailable: {error}"),
-                        });
-                    }
-                };
+            let context = match caudra_agent::remote_project_context::load_remote_project_context(
+                workspace,
+                self.config.features,
+            )
+            .await
+            {
+                Ok(context) => context,
+                Err(error) => {
+                    self.permissions.invalidate_remote_permission_asset();
+                    return Err(AgentError::Tool {
+                        tool: "remote_project_context".into(),
+                        message: format!("Remote project context unavailable: {error}"),
+                    });
+                }
+            };
             let changed = self
                 .remote_project_context
                 .as_ref()

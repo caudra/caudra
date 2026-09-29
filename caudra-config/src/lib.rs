@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::{self, Write};
 use std::fs;
+use std::mem;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -47,14 +48,17 @@ const PROCESS_ONLY_ENV_VARS: &[&str] = &[
 ];
 static PROJECT_ENV_KEYS: Mutex<Option<HashSet<String>>> = Mutex::new(None);
 
+pub mod config_file;
 pub mod config_version;
 pub mod decisions;
+pub mod experimental;
 pub mod providers;
 pub mod sandbox;
 pub mod steering;
 pub mod workcell;
 
 pub use decisions::{DecisionsConfig, FeatureMode};
+pub use experimental::{Feature, FeatureDisabled, FeatureFlags};
 pub use steering::SteeringConfig;
 
 pub const DEFAULT_MAX_OUTPUT_BYTES: usize = 50 * 1024;
@@ -409,7 +413,7 @@ pub const TOP_LEVEL_FIELDS: &[ConfigField] = &[
         default: ConfigValue::Bool(false),
         min: None,
         env: None,
-        description: "Start every session with Auto permission mode (preserve required prompts and screen unmatched calls); global config only",
+        description: "Start every session with Auto permission mode (preserve required prompts and screen unmatched calls); global config only. Needs `experimental.decision_engine`, otherwise sessions start in Ask",
     },
     ConfigField {
         name: "always_fast",
@@ -537,13 +541,30 @@ pub struct RawConfig {
 }
 
 impl RawConfig {
-    pub fn merge(&mut self, overlay: RawConfig) {
+    /// Applies a project layer: global-only settings are refused and the
+    /// decision engine may only be tightened.
+    pub fn merge(&mut self, mut overlay: RawConfig) {
         self.project_permission_mode_override = self
             .project_permission_mode_override
             .or(overlay.project_permission_mode_override)
             .or(overlay.always_yolo.map(|_| "always_yolo"))
             .or(overlay.always_auto.map(|_| "always_auto"));
-        self.decisions.restrict(overlay.decisions);
+        self.decisions.restrict(mem::take(&mut overlay.decisions));
+        self.merge_shared(overlay);
+    }
+
+    /// Applies a layer with the same authority, such as the global `init.lua`
+    /// over the global `caudra.toml`: every setting it names wins.
+    pub fn merge_global(&mut self, mut overlay: RawConfig) {
+        self.project_permission_mode_override = self
+            .project_permission_mode_override
+            .or(overlay.project_permission_mode_override);
+        merge_option!(self, overlay, always_yolo, always_auto);
+        self.decisions.overlay(mem::take(&mut overlay.decisions));
+        self.merge_shared(overlay);
+    }
+
+    fn merge_shared(&mut self, overlay: RawConfig) {
         merge_option!(self, overlay, always_fast, always_thinking);
         self.ui.merge(overlay.ui);
         self.agent.merge(overlay.agent);
@@ -1560,6 +1581,9 @@ pub struct PermissionsConfig {
     pub review_candidates: Vec<PermissionReviewCandidate>,
     pub loaded_sources: Vec<LoadedPermissionSource>,
     pub yolo: bool,
+    /// The decision engine experiment. Without it no decision service
+    /// attaches and a seeded or stored Auto acts as Ask.
+    pub decision_engine: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -2103,6 +2127,12 @@ pub struct AgentConfig {
 
     #[config(skip, default = DEFAULT_SKILL_WORKFLOW_DEV)]
     pub skill_workflow_dev: bool,
+
+    /// The process's startup snapshot of `[experimental]`; never read from a
+    /// settings layer, so neither a project nor `init.lua` can opt in.
+    #[config(skip, default = "FeatureFlags::NONE")]
+    #[serde(skip)]
+    pub features: FeatureFlags,
 }
 
 impl AgentConfig {
@@ -2155,6 +2185,7 @@ impl AgentConfig {
             task_max_concurrent,
             skill_plugin_dev,
             skill_workflow_dev,
+            features: FeatureFlags::NONE,
         }
     }
 }
@@ -3089,6 +3120,7 @@ fn build_permissions(
         review_candidates,
         loaded_sources,
         yolo: false,
+        decision_engine: false,
     }
 }
 

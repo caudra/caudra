@@ -7,58 +7,117 @@ group = "Getting Started"
 
 # Configuration
 
-Settings go in `init.lua`, a Lua script that calls `caudra.setup()`. Same language as plugins.
+Settings go in `caudra.toml`. It has two places, and both are optional:
 
-Two places, both optional:
+- **Global**: `~/.config/caudra/caudra.toml`
+- **Project**: `.caudra/caudra.toml` (relative to your working directory)
 
-- **Global**: `~/.config/caudra/init.lua`
-- **Project**: `.caudra/init.lua` (relative to your working directory)
+When both exist, project settings override global ones field by field. A few settings are global-only, and their descriptions say so. `/reload` reads both files again, except for the [experimental switches](#experimental-features), which apply from startup.
 
-When both exist, project settings override global ones. Neither file is required.
+Settings apply in this order, and each layer overrides the ones before it:
 
-Remote sessions load only the client's global executable configuration. They do not load either checkout's project `init.lua`, project environment files, or project MCP configuration. Remote project context uses a bounded declarative asset manifest instead. See [Remote Workspaces](/docs/remote-workspaces/#project-context-and-trust).
+1. Built-in defaults
+2. Global `caudra.toml`
+3. Global `init.lua`, only with Lua plugins turned on
+4. Project `.caudra/caudra.toml`
+5. Project `.caudra/init.lua`, only with Lua plugins turned on
+6. Command-line flags
 
-Remote endpoint profiles live in a separate user `workcell.toml`, with `version = 1` and tables named `[workcell.profiles.NAME]`. They are not `caudra.setup()` settings. See [profile configuration](/docs/remote-workspaces/#configure-a-profile) for the exact fields and credential rules.
+Remote sessions load only the client's global configuration. They skip both project layers, project environment files, and project MCP configuration. Remote project context uses a bounded declarative asset manifest instead. See [Remote Workspaces](/docs/remote-workspaces/#project-context-and-trust).
+
+Remote endpoint profiles live in a separate user `workcell.toml`, with `version = 1` and tables named `[workcell.profiles.NAME]`. They are not `caudra.toml` settings. See [profile configuration](/docs/remote-workspaces/#configure-a-profile) for the exact fields and credential rules.
 
 Managed sandbox providers, profiles, network policies and transfer defaults live in user-global `sandboxes.toml`, also with `version = 1`. They are separate from direct Workcell and model-provider profiles. See [Managed Sandboxes](/docs/sandboxes/#configuration-schema) for the schema, TUI editor and release status. Saving these defaults does not create a VM or change a running instance.
 
 ## Example
 
+```toml
+[ui]
+splash_animation = true
+mouse_scroll_lines = 5
+theme = "tokyonight"
+
+[ui.tool_output_lines]
+bash = 8
+read = 5
+
+[agent]
+max_output_lines = 3000
+
+[provider]
+default_model = "anthropic/claude-sonnet-4-6"
+allowed_models = ["anthropic/*", "openai/gpt-5"]
+excluded_models = ["*/*-preview"]
+
+[storage]
+max_log_files = 5
+
+[plugins.bash]
+timeout_secs = 180
+
+[plugins.index]
+max_file_size_mb = 4
+```
+
+All fields are optional. A file may start with `version = 1`, and a file without it counts as version 1. Typos in field names and values of the wrong type cause an error right away, with the file and line.
+
+`provider.allowed_models` is a list of glob patterns for qualified `provider/model-id` specs. `*` also matches `/`, so `opencode/*` includes nested model IDs. When the list is empty or omitted, every model is allowed. `provider.excluded_models` removes matching models after that, so exclusions always win. A project list replaces the matching global list. Omit it to inherit, or use `[]` to clear it. The policy applies to selectors, CLI and API model changes, delegation, and `caudra models`.
+
+## Experimental features
+
+Some features are experimental and stay off until you turn them on. Each one has its own switch in the `[experimental]` table of the global `caudra.toml`:
+
+```toml
+[experimental]
+workflows = true
+decision_engine = true
+```
+
+| Key | Default | Turns on |
+|-----|---------|----------|
+| `workflows` | `false` | [Workflows](/docs/workflows/): the `workflow` tool, the workflow commands and inspector, and the `caudra-workflow-dev` skill. |
+| `sandboxes` | `false` | [Managed sandboxes](/docs/sandboxes/): `caudra sandbox`, `caudra auth sandbox`, `--sandbox`, `/sandbox`, and the workbench Transfer view. Sandboxes bring their own connection to Workcell and do not need `remote_workcell`. |
+| `remote_workcell` | `false` | Direct [remote Workcell](/docs/remote-workspaces/) connections: the `--workcell-*` flags and `caudra auth workcell`. |
+| `lua_plugins` | `false` | Every use of Lua: [plugins](/docs/plugins/), the [Lua API](/docs/lua-api/), global and project `init.lua`, and the `caudra-plugin-dev` skill. `--no-plugins` still turns Lua off for one run. |
+| `decision_engine` | `false` | The [decision engine](#decisions), [Auto mode](/docs/permissions/#auto-mode), `caudra decisions`, and workflow [`decide()` calls](/docs/workflows/#typed-decisions). |
+
+Each switch is independent, so turning one on never turns on another. A missing file, table, or key leaves a switch off, and an unknown key is an error. `caudra remote` and `/remote` work when either `sandboxes` or `remote_workcell` is on, and each session checks the switch for its own source.
+
+Only the global file may hold `[experimental]`. Caudra rejects a project `.caudra/caudra.toml` that contains the table, even an empty one, so a repository cannot opt you in. Lua, tool allowlists, and saved sessions cannot turn a feature on either.
+
+Caudra reads the switches once at startup and keeps them until it exits. `/reload`, session switches, and ACP sessions all use the startup values. When the table changes on disk, Caudra shows a notice asking for a restart.
+
+A feature that is off is hidden and does no work. Its tools, commands, shortcuts, help entries, and status chips are gone, and startup skips it. Asking for it directly, such as typing its command or passing its flag, fails with a message that names the switch. A saved session attached to a sandbox or a remote workspace does not resume while its switch is off, and it never falls back to local execution. Turning a feature off keeps its data and leaves external resources alone, so a running sandbox keeps running until you stop it.
+
+With `decision_engine` off, `always_auto = true` and sessions saved in Auto start in Ask. Caudra keeps the saved choice, so Auto returns once the switch is on again.
+
+## Migrating from Lua settings
+
+Earlier releases read settings from `init.lua` through `caudra.setup()`. Caudra now runs `init.lua` only when `lua_plugins` is on. With Lua off, Caudra shows one notice that names each `init.lua` it skipped. It does not read, run, or change those files.
+
+To migrate, move the table you passed to `caudra.setup()` into the `caudra.toml` of the same scope. Keys and values stay the same. Top-level values come first, and each nested table becomes a TOML table:
+
 ```lua
 caudra.setup({
-    ui = {
-        splash_animation = true,
-        mouse_scroll_lines = 5,
-        theme = "tokyonight",
-        tool_output_lines = {
-            bash = 8,
-            read = 5,
-        },
-    },
-    agent = {
-        max_output_lines = 3000,
-    },
-    provider = {
-        default_model = "anthropic/claude-sonnet-4-6",
-        allowed_models = { "anthropic/*", "openai/gpt-5" },
-        excluded_models = { "*/*-preview" },
-    },
-
-    storage = {
-        max_log_files = 5,
-    },
-    plugins = {
-        bash = { timeout_secs = 180 },
-        index = { max_file_size_mb = 4 },
-    },
+    always_fast = true,
+    ui = { theme = "tokyonight" },
+    agent = { disabled_tools = { "websearch" } },
 })
 ```
 
-All fields are optional. Typos in field names cause an error right away.
+```toml
+always_fast = true
 
-`provider.allowed_models` is a list of glob patterns for qualified `provider/model-id` specs. `*` also matches `/`, so `opencode/*` includes nested model IDs. When the list is empty or omitted, every model is allowed. `provider.excluded_models` removes matching models after that, so exclusions always win. A project list replaces the matching global list; omit it to inherit or use `{}` to clear it. The policy applies to selectors, CLI and API model changes, delegation, and `caudra models`.
+[ui]
+theme = "tokyonight"
 
-`caudra.setup()` can only be called once per init.lua.
+[agent]
+disabled_tools = ["websearch"]
+```
+
+Lists become arrays, and deeper tables become dotted headers such as `[agent.steering.rules.repetition]`. Quote a key that holds other characters, as in `[agent.steering.models."openai/gpt-5"]`. Leave out any key you set to `nil`.
+
+To keep using `init.lua`, set `lua_plugins = true` under `[experimental]`. Its `caudra.setup()` values then apply on top of the `caudra.toml` of the same scope, in the order shown [above](#configuration).
 
 ## Full Reference
 
@@ -67,7 +126,7 @@ All fields are optional. Typos in field names cause an error right away.
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `always_yolo` | bool | `false` | Start every session with YOLO mode (skip permission prompts, deny rules still apply); global config only |
-| `always_auto` | bool | `false` | Start every session with Auto permission mode (preserve required prompts and screen unmatched calls); global config only |
+| `always_auto` | bool | `false` | Start every session with Auto permission mode (preserve required prompts and screen unmatched calls); global config only. Needs `experimental.decision_engine`, otherwise sessions start in Ask |
 | `always_fast` | bool | `false` | Start every session with fast mode, on the models that sell a fast tier (ignored otherwise) |
 | `always_thinking` | bool \| string | `false` | Start every session with extended thinking (true/"adaptive", "off", an effort level ("minimal" to "max"), or a token budget) |
 
@@ -112,8 +171,10 @@ Caudra asks again every ten minutes, and also when the terminal regains focus or
 
 Light half to use in place of the one from the pairing table, or to give a theme that has no pair. `ui.theme` becomes the dark half:
 
-```lua
-caudra.setup({ ui = { theme = "tokyonight", theme_light = "catppuccin_latte" } })
+```toml
+[ui]
+theme = "tokyonight"
+theme_light = "catppuccin_latte"
 ```
 
 Leave `ui.theme` unset to pair the light theme with whatever you last picked from `/theme`.
@@ -171,7 +232,7 @@ The `bash`, `python_execution`, and `task` entries apply only when `ui.scroll_ca
 
 ### `agent.steering`
 
-Automatic steering repairs unusable model output and can add bounded guidance about repeated behavior. All eight rules are enabled by default. Configure overrides inside `agent` in `caudra.setup()`. All fields are optional.
+Automatic steering repairs unusable model output and can add bounded guidance about repeated behavior. All eight rules are enabled by default. Configure overrides in the `[agent.steering]` table. All fields are optional.
 
 | Field | Type | Default | Limits and meaning |
 |-------|------|---------|--------------------|
@@ -210,7 +271,7 @@ Each table at `agent.steering.rules.<rule>` accepts these common fields:
 | Field | Type | Default | Limits and meaning |
 |-------|------|---------|--------------------|
 | `enabled` | boolean | `true` | Explicit `false` disables this rule. |
-| `prompt` | string | `nil` | Use built-in guidance when omitted. Custom text must be nonblank and at most 16,384 UTF-8 bytes. |
+| `prompt` | string | unset | Use built-in guidance when omitted. Custom text must be nonblank and at most 16,384 UTF-8 bytes. |
 
 Custom prompts replace guidance only. They are literal user-configured text, without template expansion or executable expressions. They do not change triggers, budgets, enforcement, or factual tool-failure information. A custom prompt cannot authorize a tool or turn a rejected call into an executed one.
 
@@ -251,34 +312,24 @@ Tool-planning guidance asks the model to reconsider its tool choices and identif
 
 This example disables repetition guidance globally, then enables it with a higher threshold for one exact model and adjusts that model's tool-planning guidance:
 
-```lua
-caudra.setup({
-    agent = {
-        steering = {
-            rules = {
-                repetition = { enabled = false },
-            },
-            models = {
-                ["openai/gpt-5"] = {
-                    rules = {
-                        repetition = { enabled = true, text_repeats = 4 },
-                        tool_planning = {
-                            after_calls = 8,
-                            prompt = "Reassess your recent tool choices. Choose a different useful action if these calls are not helping.",
-                        },
-                    },
-                },
-            },
-        },
-    },
-})
+```toml
+[agent.steering.rules.repetition]
+enabled = false
+
+[agent.steering.models."openai/gpt-5".rules.repetition]
+enabled = true
+text_repeats = 4
+
+[agent.steering.models."openai/gpt-5".rules.tool_planning]
+after_calls = 8
+prompt = "Reassess your recent tool choices. Choose a different useful action if these calls are not helping."
 ```
 
 Model entries accept `enabled`, `max_recoveries`, `max_advisories`, `max_stalled_turns`, and `rules` with the same types and limits as the global fields. They cannot contain another `models` table. Omitted fields inherit through the resolution order below.
 
 Keys are case-sensitive exact IDs, at most 512 UTF-8 bytes each. Use a nonempty provider and model suffix separated by `/`. Additional slashes inside the suffix are allowed, but every segment must be nonempty. Whitespace, control characters, `*`, `?`, `[`, `]`, `{`, `}`, and backslashes are rejected. Matching requires no authentication or model discovery. There are no glob overrides, provider-wide layers, capability guesses from model names, or Lua detector callbacks.
 
-Global and project Lua settings merge field by field, with project values taking precedence. Model maps merge by exact key and rules merge by rule name and field. Omission inherits. Explicit `false` and `0` survive merging. An empty table does not clear inherited entries. Disable an inherited model policy or rule with `enabled = false`.
+Global and project settings merge field by field, with project values taking precedence. Model maps merge by exact key and rules merge by rule name and field. Omission inherits. Explicit `false` and `0` survive merging. An empty table does not clear inherited entries. Disable an inherited model policy or rule with `enabled = false`.
 
 After merging, resolve against the effective routed model for Chat, Plan, or a delegated task:
 
@@ -327,7 +378,7 @@ Disabling the master switch or setting `rules.truncation.enabled = false` stops 
 | `input_history_size` | usize | `100` | - | 10 | Number of input history entries to retain |
 | `ephemeral` | bool | `false` | - | - | Store session data in a temporary directory removed when Caudra exits |
 
-### `storage.retention`
+### `[storage.retention]`
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
@@ -338,7 +389,7 @@ Disabling the master switch or setting `rules.truncation.enabled = false` stops 
 
 `trim` and `forget` are keep policies in `restic forget` terms: `keep_last`, `keep_hourly`, `keep_daily`, `keep_weekly`, `keep_monthly`, `keep_yearly` take a count, and `keep_within` plus `keep_within_hourly` through `keep_within_yearly` take a duration such as `"90d"` or `"2y5m7d3h"`. A session is kept when any rule matches. An empty `forget` policy disables automatic deletion. See [Sessions](/docs/sessions/#retention) for what each tier keeps and how the sweep runs.
 
-### `storage.snapshots`
+### `[storage.snapshots]`
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
@@ -349,7 +400,7 @@ Disabling the master switch or setting `rules.truncation.enabled = false` stops 
 
 A workspace over `max_bytes_mb` or `max_files` is refused rather than captured, and individual files over `max_file_bytes_mb` are skipped while the rest of the tree is still captured. A refusal costs file revert and lets the tool call proceed. See [Sessions](/docs/sessions/#limits) for what a capture covers.
 
-### `telemetry`
+### `[telemetry]`
 
 | Field | Type | Default | Env | Description |
 |-------|------|---------|-----|-------------|
@@ -386,7 +437,7 @@ A workspace over `max_bytes_mb` or `max_files` is refused rather than captured, 
 
 Every field also has an environment variable, shown in the Env column, and the variable wins. See [Telemetry](/docs/telemetry/) for the full picture.
 
-### `worktrees`
+### `[worktrees]`
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
@@ -397,13 +448,13 @@ Inside a Herdr pane, `auto` asks Herdr to create and remove worktrees, so each o
 
 ### `decisions`
 
-Configure the optional typed decision engine inside `caudra.setup()`. No endpoint, passive feature, or decision logging is enabled by default. Explicit workflow [`decide()` calls](/docs/workflows/#typed-decisions) need an endpoint but do not need a passive feature enabled. Shell duration history can work without an endpoint.
+Configure the optional typed decision engine in the `[decisions]` table. The engine is experimental and needs `decision_engine = true` under [`[experimental]`](#experimental-features). Without that switch Caudra still validates this table and starts no engine. It then sends no decision requests, reads no engine credentials, and leaves decision logs and shell duration history untouched. No endpoint, passive feature, or decision logging is enabled by default. Explicit workflow [`decide()` calls](/docs/workflows/#typed-decisions) need an endpoint but do not need a passive feature enabled. Shell duration history can work without an endpoint.
 
 Connection settings and thresholds are global-only. Projects may set individual features to `"off"`, set `log = false`, or keep or shorten inherited log retention. Other project overrides are errors, even when they repeat a global value. Disabling globally required Auto screening or its active content screening restores prompting for eligible Auto calls.
 
 | Field | Type | Default | Meaning |
 |-------|------|---------|---------|
-| `endpoint` | string | `nil` | Full request URL. HTTPS required except for numeric loopback HTTP or explicit `allow_http` consent. No credentials, query, fragment, whitespace, or control characters. |
+| `endpoint` | string | unset | Full request URL. HTTPS required except for numeric loopback HTTP or explicit `allow_http` consent. No credentials, query, fragment, whitespace, or control characters. |
 | `model` | string | `"jev-latest"` | Decision model identifier, nonblank and without control characters. |
 | `api_key_env` | string | `"TYPESAFE_API_KEY"` | Environment variable containing the optional credential, never the credential itself. Project environment values are excluded. |
 | `allow_remote` | boolean | `false` | Explicit global consent to send decision context to a non-loopback endpoint. |
@@ -448,7 +499,7 @@ Flag thresholds trigger at or above the configured value. Goal prescreening uses
 | `shell_heavy` | `0.9` | Probability for a heavy-command prior and confidence required for a duration choice. |
 | `routing_confidence` | `0.9` | Confidence required for tool search, skill suggestions, and subagent routing. Tool-search choice probability must also meet it. |
 | `goal_skip_below` | `0.05` | Skip an evaluator at or below this completion probability, within the continuation budget. |
-| `shell_writes` | `nil` | Optional project-write warning threshold. Omission leaves the warning disabled. No built-in enforcement threshold. |
+| `shell_writes` | unset | Optional project-write warning threshold. Omission leaves the warning disabled. No built-in enforcement threshold. |
 
 #### Shell duration
 
@@ -472,15 +523,14 @@ Each feature checks its own options at startup. A typo, a wrong type, or an unkn
 
 The edit plugin's extra tools are options too: `plugins.edit = { multiedit = false, insert_lines = true }`.
 
-This table is for bundled plugins only. Your own plugins go in `~/.config/caudra/lua/`, see [Plugins](/docs/plugins/).
+This table is for bundled plugins only, and it works without Lua. Your own plugins go in `~/.config/caudra/lua/` and need `lua_plugins` turned on. See [Plugins](/docs/plugins/).
 
-```lua
-caudra.setup({
-    plugins = {
-        bash = { timeout_secs = 180 },
-        websearch = { enabled = false },
-    },
-})
+```toml
+[plugins.bash]
+timeout_secs = 180
+
+[plugins.websearch]
+enabled = false
 ```
 
 ### `plugins.index`
@@ -497,8 +547,8 @@ caudra.setup({
 
 | Field | Type | Default | Min | Description |
 |-------|------|---------|-----|-------------|
-| `plugin_dev` | boolean | `false` | - | Offer the builtin caudra-plugin-dev skill for writing caudra plugins. |
-| `workflow_dev` | boolean | `true` | - | Offer the builtin caudra-workflow-dev skill for writing and running workflows. |
+| `plugin_dev` | boolean | `false` | - | Offer the builtin caudra-plugin-dev skill for writing caudra plugins. Needs `experimental.lua_plugins`. |
+| `workflow_dev` | boolean | `true` | - | Offer the builtin caudra-workflow-dev skill for writing and running workflows. Needs `experimental.workflows`. |
 
 ### `plugins.task`
 
@@ -525,7 +575,7 @@ Caudra follows platform directory conventions. On Linux and macOS that is XDG. O
 | Cache | `~/.cache/caudra/` | `%LOCALAPPDATA%\caudra\` |
 | Scratch | `$TMPDIR/caudra/` | `%TEMP%\caudra\` |
 
-Config holds `init.lua`, `permissions.toml`, `mcp.toml`, `providers.toml`, `workcell.toml`, `sandboxes.toml`, and `commands/`. State holds sessions, auth tokens, memories, plans, model-job bindings, sandbox lifecycle records and transfer recovery journals. The install script puts the binary under `%LOCALAPPDATA%\caudra` on Windows; that is separate from these runtime dirs.
+Config holds `caudra.toml`, `init.lua`, `permissions.toml`, `mcp.toml`, `providers.toml`, `workcell.toml`, `sandboxes.toml`, and `commands/`. State holds sessions, auth tokens, memories, plans, model-job bindings, sandbox lifecycle records and transfer recovery journals. The install script puts the binary under `%LOCALAPPDATA%\caudra` on Windows; that is separate from these runtime dirs.
 
 Scratch holds work that belongs outside your project, such as a file the model writes while thinking or a temporary a command leaves behind. Each project gets its own subdirectory, named by the project directory plus a three-word phrase derived from its path, as in `caudra-heroic-easy-grouse`. Two checkouts sharing a name get different phrases, so they cannot overwrite each other. The phrase is derived rather than drawn at random, so a project returns to the same directory on every run. Caudra creates it at startup and points `TMPDIR`, `TMP`, and `TEMP` at it, so every command Caudra runs puts its own temporary files there instead of the shared temp root. The model is told the path, and writing anywhere under the scratch root needs no approval. Paths beside the root still ask.
 
@@ -543,6 +593,7 @@ Each TOML config file takes a top-level `version`, and every format is at versio
 
 | File | `version` | Newer than this build reads |
 |------|-----------|-----------------------------|
+| `caudra.toml` | Optional | Caudra stops with an error |
 | `permissions.toml` | Optional | Fails closed. Tool calls are denied until the file is fixed |
 | `mcp.toml` | Optional | Servers from that file do not start, and Caudra shows the error |
 | `providers.toml` | Optional | Caudra stops with an error |
@@ -550,7 +601,7 @@ Each TOML config file takes a top-level `version`, and every format is at versio
 | `workcell.toml` | Required | Rejected with an error |
 | `sandboxes.toml` | Required | Rejected with an error |
 
-Caudra writes `version = 1` whenever it saves `providers.toml`. `init.lua` has no version because it is a script. To share one `init.lua` across releases, branch on [`caudra.version()`](/docs/lua-api/#caudra-version).
+Caudra writes `version = 1` whenever it saves `providers.toml`. `init.lua`, which runs only with Lua plugins turned on, has no version because it is a script. To share one `init.lua` across releases, branch on [`caudra.version()`](/docs/lua-api/#caudra-version).
 
 ## Personal Instructions
 

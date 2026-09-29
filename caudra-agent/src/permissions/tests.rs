@@ -31,9 +31,12 @@ pub(super) const SHELL_WORKDIR: &str = "/tmp";
 
 pub(super) const LEGACY_REQUEST_ID: &str = "legacy-request";
 
+/// The decision engine experiment is on; the tests that need it off build
+/// their config without it.
 pub(super) fn make_config(rules: Vec<PermissionRule>) -> PermissionsConfig {
     PermissionsConfig {
         rules,
+        decision_engine: true,
         ..Default::default()
     }
 }
@@ -266,7 +269,7 @@ pub(super) fn mgr_with(config: PermissionsConfig, cwd: PathBuf) -> PermissionMan
 }
 
 pub(super) fn default_mgr() -> PermissionManager {
-    mgr_with(PermissionsConfig::default(), PathBuf::from("/tmp"))
+    mgr_with(make_config(Vec::new()), PathBuf::from("/tmp"))
 }
 
 pub(super) const CONFINED_COMMAND: &str = "git status --short";
@@ -415,7 +418,7 @@ pub(super) fn seeded_mgr(yolo: bool) -> PermissionManager {
     mgr_with(
         PermissionsConfig {
             yolo,
-            ..Default::default()
+            ..make_config(Vec::new())
         },
         PathBuf::from("/tmp"),
     )
@@ -458,7 +461,7 @@ pub(super) const PLUGIN_EDIT_PATH: &str = "/x/f";
 
 pub(super) fn persistent_manager(state_dir: StateDir, project: &Path) -> Arc<PermissionManager> {
     Arc::new(PermissionManager::new_persistent_in(
-        PermissionsConfig::default(),
+        make_config(Vec::new()),
         project.to_path_buf(),
         Arc::default(),
         state_dir,

@@ -1,19 +1,21 @@
 use std::path::PathBuf;
 
 use clap::{
-    Args, CommandFactory, Error as CliError, Parser, Subcommand, ValueEnum, error::ErrorKind,
+    Args, Command as ClapCommand, CommandFactory, Error as CliError, FromArgMatches, Parser,
+    Subcommand, ValueEnum, error::ErrorKind,
 };
 use color_eyre::Result;
 use color_eyre::eyre::bail;
 
 use caudra_agent::tools::all_builtin_tool_names;
-use caudra_config::is_disableable_tool;
 use caudra_config::sandbox::LeaseSeconds;
+use caudra_config::{Feature, FeatureDisabled, FeatureFlags, is_disableable_tool};
 use caudra_storage::auth::WorkcellCredentialName;
 use caudra_storage::retention::{Duration as RetentionDuration, GroupBy, KeepPolicy};
 use caudra_storage::sessions::PermissionMode;
 
 use crate::print::OutputFormat;
+use crate::startup::Startup;
 
 const DEFAULT_LOG_LINES: usize = 200;
 const PERMISSION_MODE_CONFLICT: &str = "--auto cannot be used with --yolo";
@@ -238,9 +240,50 @@ pub struct Cli {
     pub thinking: Option<String>,
     #[arg(long, hide = true)]
     pub thinking_display: Option<String>,
+
+    /// Never parsed from arguments: `dispatch` fills it from the global
+    /// caudra.toml read before parsing.
+    #[arg(skip)]
+    pub startup: Startup,
 }
 
 impl Cli {
+    /// Parses the process arguments against a tree whose help lists only
+    /// what `features` turns on. Hidden commands still parse, so running one
+    /// names the switch it needs instead of calling it unknown.
+    pub fn parse_for(features: FeatureFlags) -> Result<Self, CliError> {
+        let mut matches = Self::command_for(features).try_get_matches()?;
+        Self::from_arg_matches_mut(&mut matches)
+            .map_err(|error| error.format(&mut Self::command_for(features)))?
+            .validate()
+    }
+
+    pub fn command_for(features: FeatureFlags) -> ClapCommand {
+        let off = |feature| !features.enabled(feature);
+        let sandboxes_off = off(Feature::Sandboxes);
+        let direct_off = off(Feature::RemoteWorkcell);
+        Self::command()
+            .mut_arg("sandbox", |arg| arg.hide(sandboxes_off))
+            .mut_arg("sandbox_resume", |arg| arg.hide(sandboxes_off))
+            .mut_arg("profile", |arg| arg.hide(direct_off))
+            .mut_arg("endpoint", |arg| arg.hide(direct_off))
+            .mut_arg("cwd", |arg| arg.hide(direct_off))
+            .mut_arg("credential_ref", |arg| arg.hide(direct_off))
+            .mut_arg("auto", |arg| arg.hide(off(Feature::DecisionEngine)))
+            .mut_arg("no_jit", |arg| arg.hide(off(Feature::LuaPlugins)))
+            .mut_subcommand("sandbox", |command| command.hide(sandboxes_off))
+            .mut_subcommand("remote", |command| {
+                command.hide(sandboxes_off && direct_off)
+            })
+            .mut_subcommand("decisions", |command| {
+                command.hide(off(Feature::DecisionEngine))
+            })
+            .mut_subcommand("auth", |auth| {
+                auth.mut_subcommand("sandbox", |command| command.hide(sandboxes_off))
+                    .mut_subcommand("workcell", |command| command.hide(direct_off))
+            })
+    }
+
     pub fn validate(self) -> Result<Self, CliError> {
         if self.auto && self.yolo {
             return Err(
@@ -291,6 +334,12 @@ impl Cli {
 
     pub fn is_sdk_mode(&self) -> bool {
         self.print && matches!(self.input_format, InputFormat::StreamJson)
+    }
+
+    /// Lua runs only when the global caudra.toml opts in, and `--no-plugins`
+    /// still forces it off.
+    pub fn runs_lua(&self) -> bool {
+        !self.no_plugins && self.startup.features.enabled(Feature::LuaPlugins)
     }
 }
 
@@ -346,11 +395,28 @@ pub struct WorkcellSelectorArgs {
 
 impl WorkcellSelectorArgs {
     pub fn is_set(&self) -> bool {
-        self.sandbox.is_some()
-            || self.profile.is_some()
+        self.sandbox.is_some() || self.is_direct()
+    }
+
+    /// A selector that connects to a Workcell endpoint without a managed
+    /// sandbox in between.
+    pub fn is_direct(&self) -> bool {
+        self.profile.is_some()
             || self.endpoint.is_some()
             || self.cwd.is_some()
             || self.credential_ref.is_some()
+    }
+
+    /// Refuses a selector whose experiment is off, before anything reads its
+    /// profiles, credentials, or network.
+    pub fn require_features(&self, features: FeatureFlags) -> Result<(), FeatureDisabled> {
+        if self.sandbox.is_some() || self.sandbox_resume {
+            features.require(Feature::Sandboxes)?;
+        }
+        if self.is_direct() {
+            features.require(Feature::RemoteWorkcell)?;
+        }
+        Ok(())
     }
 }
 
@@ -488,6 +554,31 @@ pub enum Command {
         #[command(subcommand)]
         action: PermissionAction,
     },
+}
+
+impl Command {
+    /// Commands that never read settings, so a broken global caudra.toml
+    /// cannot stop an update, a rollback, or a look at the logs.
+    pub fn runs_without_config(&self) -> bool {
+        matches!(
+            self,
+            Self::Update { .. } | Self::Rollback | Self::Logs { .. }
+        )
+    }
+
+    pub fn loads_settings(&self) -> bool {
+        matches!(
+            self,
+            Self::Index { .. }
+                | Self::Models { .. }
+                | Self::Acp { .. }
+                | Self::Prompt { .. }
+                | Self::Tools { .. }
+                | Self::Skills { .. }
+                | Self::Storage { .. }
+                | Self::Decisions { .. }
+        )
+    }
 }
 
 #[derive(Subcommand)]
@@ -1097,7 +1188,7 @@ mod tests {
     #[test_case(&["caudra", "--auto"]; "root_auto")]
     #[test_case(&["caudra", "acp", "--auto"]; "acp_auto")]
     #[test_case(&["caudra", "--auto", "acp"]; "auto_before_acp")]
-    #[test_case(&["caudra", "-p", "--auto", "hello"]; "print_auto")]
+    #[test_case(&["caudra", "-p", "--auto", "--prompt", "hello"]; "print_auto")]
     fn auto_flag_is_global(args: &[&str]) {
         let cli = Cli::try_parse_from(args).and_then(Cli::validate).unwrap();
         assert_eq!(cli.permission_mode_override(), Some(PermissionMode::Auto));

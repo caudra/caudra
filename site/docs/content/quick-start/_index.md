@@ -105,16 +105,15 @@ Type what you want done, press Enter, watch it work. Worth knowing on day one:
 
 ## Default model (optional)
 
-```lua
--- ~/.config/caudra/init.lua
-caudra.setup({
-    provider = {
-        default_model = "anthropic/claude-sonnet-4-6",
-    },
-})
+```toml
+# ~/.config/caudra/caudra.toml
+[provider]
+default_model = "anthropic/claude-sonnet-4-6"
 ```
 
 Without it, Caudra remembers the last model you used in each mode. Pick a strong model while planning and a cheaper one for building, and `Tab` moves between them with you.
+
+Settings live in `caudra.toml` (Windows: `%APPDATA%\caudra\caudra.toml`) and need no Lua. Workflows, managed sandboxes, direct remote Workcell connections, Lua plugins, and the decision engine are experimental and stay off until you turn them on in the global file. See [Experimental features](/docs/configuration/#experimental-features).
 
 ## Teach it your project
 
@@ -122,7 +121,7 @@ Caudra loads `AGENTS.md` (or `CLAUDE.md`, `.cursorrules`, and friends) from your
 
 ```
 .caudra/
-├── init.lua           # overrides global config
+├── caudra.toml        # overrides global settings
 ├── permissions.toml   # restrictive project permission policy
 ├── mcp.toml           # MCP server config
 ├── commands/          # custom slash commands (.md files)

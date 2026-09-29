@@ -29,14 +29,11 @@ history.
 
 ## Configuration
 
-Set `ui.notifications` in `~/.config/caudra/init.lua`:
+Set `ui.notifications` in `~/.config/caudra/caudra.toml`:
 
-```lua
-caudra.setup({
-  ui = {
-    notifications = "auto",
-  },
-})
+```toml
+[ui]
+notifications = "auto"
 ```
 
 | Value | Behavior |

@@ -189,7 +189,7 @@ Writes an artifact and returns its absolute path as a string. `name` is a single
 
 ### `decide(state, questions)` and `decide(state, questions, options)`
 
-Calls the user's configured decision endpoint and returns `#{ answers, model }`. Available whenever the endpoint is configured, even with passive decision features off. Do not assume an endpoint exists. Catch failures or ask the user to configure one.
+Calls the user's configured decision endpoint and returns `#{ answers, model }`. Available when the decision engine experiment is on (`experimental.decision_engine` in the global `caudra.toml`) and an endpoint is configured, even with passive decision features off. Do not assume either exists. Catch failures or ask the user to turn the engine on and configure an endpoint. A call that already completed in a resumed run replays its recorded answer without the engine.
 
 ```rhai
 let result = decide(#{ task: args.objective }, #{

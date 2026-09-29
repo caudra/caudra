@@ -6,10 +6,10 @@ use caudra_agent::tools::{RegistryError, ToolRegistry};
 use caudra_agent::workspace_transfer::RemoteRootIdentity;
 use caudra_config::sandbox::{Revision, SandboxName};
 use caudra_config::{
-    load_env_files, load_global_env_file,
+    Feature, FeatureDisabled, FeatureFlags, load_env_files, load_global_env_file,
     workcell::{
-        RemoteWorkcellSelection, WorkcellProfileError, WorkcellSelection, WorkcellSelectionError,
-        WorkcellSourceRef, load_workcell_profiles, select_workcell,
+        RemoteWorkcellSelection, WorkcellProfileError, WorkcellProfiles, WorkcellSelection,
+        WorkcellSelectionError, WorkcellSourceRef, load_workcell_profiles, select_workcell,
     },
 };
 use caudra_sandbox::{Controller as SandboxController, ResumePolicy, RuntimeLease};
@@ -65,6 +65,8 @@ pub struct WorkcellDisplay {
 
 #[derive(Debug, Error)]
 pub enum WorkcellRuntimeError {
+    #[error(transparent)]
+    Feature(#[from] FeatureDisabled),
     #[error(transparent)]
     Sandbox(#[from] caudra_sandbox::Error),
     #[error(
@@ -126,8 +128,9 @@ impl WorkcellRuntime {
         client_cwd: &Path,
         storage: &StateDir,
         registry: &ToolRegistry,
+        features: FeatureFlags,
     ) -> Result<Self, WorkcellRuntimeError> {
-        Self::initialize_environment(args, client_cwd, storage, registry, true)
+        Self::initialize_environment(args, client_cwd, storage, registry, true, features)
     }
 
     pub(super) fn initialize_session(
@@ -135,17 +138,22 @@ impl WorkcellRuntime {
         client_cwd: &Path,
         storage: &StateDir,
         registry: &ToolRegistry,
+        features: FeatureFlags,
     ) -> Result<Self, WorkcellRuntimeError> {
-        Self::initialize_environment(args, client_cwd, storage, registry, false)
+        Self::initialize_environment(args, client_cwd, storage, registry, false, features)
     }
 
+    /// A selector whose experiment is off is refused before anything reads
+    /// its profiles, credentials, journals, or network.
     fn initialize_environment(
         args: &WorkcellSelectorArgs,
         client_cwd: &Path,
         storage: &StateDir,
         registry: &ToolRegistry,
         load_environment: bool,
+        features: FeatureFlags,
     ) -> Result<Self, WorkcellRuntimeError> {
+        args.require_features(features)?;
         if let Some(name) = &args.sandbox {
             let name = SandboxName::parse(name).map_err(caudra_sandbox::Error::from)?;
             return Self::initialize_sandbox(
@@ -154,6 +162,7 @@ impl WorkcellRuntime {
                 client_cwd,
                 storage,
                 registry,
+                features,
             );
         }
         if args.sandbox_resume {
@@ -168,7 +177,7 @@ impl WorkcellRuntime {
             }
         }
 
-        Self::initialize_selection(selection, client_cwd, storage, registry)
+        Self::initialize_selection(selection, client_cwd, storage, registry, features)
     }
 
     fn initialize_selection(
@@ -176,12 +185,15 @@ impl WorkcellRuntime {
         client_cwd: &Path,
         storage: &StateDir,
         registry: &ToolRegistry,
+        features: FeatureFlags,
     ) -> Result<Self, WorkcellRuntimeError> {
         match selection {
-            WorkcellSelection::Embedded => Self::embedded(client_cwd, registry),
+            WorkcellSelection::Embedded => Self::embedded(client_cwd, registry, features),
             WorkcellSelection::Remote(selection) => {
-                let client = connect_remote(&selection, storage)?;
-                Self::initialize_remote(*selection, client, client_cwd, storage, registry, None)
+                let client = connect_remote(&selection, storage, features)?;
+                Self::initialize_remote(
+                    *selection, client, client_cwd, storage, registry, None, features,
+                )
             }
         }
     }
@@ -192,8 +204,11 @@ impl WorkcellRuntime {
         client_cwd: &Path,
         storage: &StateDir,
         registry: &ToolRegistry,
+        features: FeatureFlags,
     ) -> Result<Self, WorkcellRuntimeError> {
-        Self::initialize_sandbox_reviewed(name, resume, client_cwd, storage, registry, None)
+        Self::initialize_sandbox_reviewed(
+            name, resume, client_cwd, storage, registry, None, features,
+        )
     }
 
     pub fn initialize_sandbox_reviewed(
@@ -203,13 +218,14 @@ impl WorkcellRuntime {
         storage: &StateDir,
         registry: &ToolRegistry,
         revision: Option<&Revision>,
+        features: FeatureFlags,
     ) -> Result<Self, WorkcellRuntimeError> {
         let SandboxConnection {
             selection,
             client,
             binding,
             lease,
-        } = connect_sandbox(name, resume, storage, revision)?;
+        } = connect_sandbox(name, resume, storage, revision, features)?;
         let mut runtime = Self::initialize_remote(
             selection,
             client,
@@ -217,11 +233,14 @@ impl WorkcellRuntime {
             storage,
             registry,
             Some((binding, lease)),
+            features,
         )?;
         runtime.display.label = format!("sandbox '{name}'");
         Ok(runtime)
     }
 
+    /// Shared by direct and managed connections, so it checks neither
+    /// experiment: each entry point checked its own before connecting.
     fn initialize_remote(
         selection: RemoteWorkcellSelection,
         client: RemoteWorkcellClient,
@@ -229,6 +248,7 @@ impl WorkcellRuntime {
         storage: &StateDir,
         registry: &ToolRegistry,
         sandbox: Option<(StoredWorkspaceBinding, RuntimeLease)>,
+        features: FeatureFlags,
     ) -> Result<Self, WorkcellRuntimeError> {
         let workspace = client
             .workspace_handle()
@@ -248,7 +268,10 @@ impl WorkcellRuntime {
             workspace_session.binding(),
         ));
         let remote_project_context = smol::block_on(
-            caudra_agent::remote_project_context::load_remote_project_context(&workspace_session),
+            caudra_agent::remote_project_context::load_remote_project_context(
+                &workspace_session,
+                features,
+            ),
         )
         .map_err(WorkcellRuntimeError::ProjectContext)?;
         // A host that will not make a scratch directory costs the model a path,
@@ -292,8 +315,12 @@ impl WorkcellRuntime {
         }
         host.register_with_generic_mcp_endpoints(registry, http_endpoints(&global_mcp))
             .map_err(WorkcellRuntimeError::RemoteRegistration)?;
-        caudra_agent::tools::native::register_remote(registry, remote_project_context.skills())
-            .map_err(WorkcellRuntimeError::Registry)?;
+        caudra_agent::tools::native::register_remote(
+            registry,
+            remote_project_context.skills(),
+            features,
+        )
+        .map_err(WorkcellRuntimeError::Registry)?;
         Ok(Self {
             backend: WorkcellBackend::Remote(host),
             workspace_session: Some(workspace_session),
@@ -306,13 +333,18 @@ impl WorkcellRuntime {
         .ready())
     }
 
-    fn embedded(client_cwd: &Path, registry: &ToolRegistry) -> Result<Self, WorkcellRuntimeError> {
+    fn embedded(
+        client_cwd: &Path,
+        registry: &ToolRegistry,
+        features: FeatureFlags,
+    ) -> Result<Self, WorkcellRuntimeError> {
         let worker = std::env::var_os(WORKCELL_CODE_WORKER_ENV).map(PathBuf::from);
         let host = WorkcellHost::new_production(client_cwd, worker.as_deref())
             .map_err(WorkcellRuntimeError::Embedded)?;
         host.register(registry)
             .map_err(WorkcellRuntimeError::Registry)?;
-        caudra_agent::tools::native::register(registry).map_err(WorkcellRuntimeError::Registry)?;
+        caudra_agent::tools::native::register(registry, features)
+            .map_err(WorkcellRuntimeError::Registry)?;
         for warning in host.warnings() {
             eprintln!("warning: {warning}");
         }
@@ -387,10 +419,18 @@ impl WorkcellRuntime {
     }
 }
 
+/// Reads `workcell.toml` only for a named profile, so a broken profile file
+/// cannot stop a local session or a direct endpoint.
 fn resolve_selection(
     args: &WorkcellSelectorArgs,
 ) -> Result<WorkcellSelection, WorkcellRuntimeError> {
-    let profiles = load_workcell_profiles().map_err(WorkcellRuntimeError::Profiles)?;
+    if !args.is_direct() {
+        return Ok(WorkcellSelection::Embedded);
+    }
+    let profiles = match args.profile {
+        Some(_) => load_workcell_profiles().map_err(WorkcellRuntimeError::Profiles)?,
+        None => WorkcellProfiles::default(),
+    };
     select_workcell(
         &profiles,
         args.profile.as_deref(),
@@ -448,10 +488,14 @@ fn ephemeral_credential(token: String) -> Result<NamedBearerCredential, Workcell
     Ok(NamedBearerCredential::new(name, credential))
 }
 
+/// A direct connection only; a sandbox reaches the shared transport through
+/// `connect_sandbox` under its own experiment.
 fn connect_remote(
     selection: &RemoteWorkcellSelection,
     storage: &StateDir,
+    features: FeatureFlags,
 ) -> Result<RemoteWorkcellClient, WorkcellRuntimeError> {
+    features.require(Feature::RemoteWorkcell)?;
     let credential = resolve_credential(selection, storage)?;
     connect_remote_with_credential(selection, storage, credential)
 }
@@ -487,7 +531,9 @@ fn connect_sandbox(
     resume: bool,
     storage: &StateDir,
     revision: Option<&Revision>,
+    features: FeatureFlags,
 ) -> Result<SandboxConnection, WorkcellRuntimeError> {
+    features.require(Feature::Sandboxes)?;
     if revision.is_none() {
         load_global_env_file();
     }
@@ -527,8 +573,9 @@ pub(super) fn connect_transfer(
     revision: &Revision,
     root: &WorkspacePath,
     state: &StateDir,
+    features: FeatureFlags,
 ) -> Result<(RemoteWorkcellClient, RemoteRootIdentity, RuntimeLease), WorkcellRuntimeError> {
-    let connected = connect_sandbox(name, false, state, Some(revision))?;
+    let connected = connect_sandbox(name, false, state, Some(revision), features)?;
     let base = &connected.selection.cwd;
     let parents = if base.is_root() {
         0
@@ -560,17 +607,19 @@ pub(super) fn connect_transfer(
 pub fn connect_control(
     args: &WorkcellSelectorArgs,
     storage: &StateDir,
+    features: FeatureFlags,
 ) -> Result<ControlConnection, WorkcellRuntimeError> {
+    args.require_features(features)?;
     let (client, lifecycle) = if let Some(name) = &args.sandbox {
         let name = SandboxName::parse(name).map_err(caudra_sandbox::Error::from)?;
-        let connected = connect_sandbox(&name, args.sandbox_resume, storage, None)?;
+        let connected = connect_sandbox(&name, args.sandbox_resume, storage, None, features)?;
         (connected.client, Some(connected.lease))
     } else {
         let WorkcellSelection::Remote(selection) = resolve_selection(args)? else {
             return Err(WorkcellRuntimeError::RemoteRequired);
         };
         load_global_env_file();
-        (connect_remote(&selection, storage)?, None)
+        (connect_remote(&selection, storage, features)?, None)
     };
     let workspace = WorkspaceSession::new(
         client
@@ -616,6 +665,7 @@ mod tests {
     use crate::cli::WorkcellSelectorArgs;
     use caudra_agent::tools::{ToolRegistry, ToolSource};
     use caudra_config::workcell::{WorkcellProfiles, select_workcell};
+    use caudra_config::{Feature, FeatureDisabled, FeatureFlags};
     use caudra_storage::StateDir;
 
     use super::{
@@ -647,6 +697,7 @@ mod tests {
                 &storage,
                 &registry,
                 load_environment,
+                FeatureFlags::all(),
             ),
             Err(WorkcellRuntimeError::SandboxSelectionRequired)
         ));
@@ -665,11 +716,98 @@ mod tests {
             sandbox: Some("does-not-exist".into()),
             ..Default::default()
         };
-        assert!(WorkcellRuntime::initialize(&args, root.path(), &storage, &registry).is_err());
+        assert!(
+            WorkcellRuntime::initialize(
+                &args,
+                root.path(),
+                &storage,
+                &registry,
+                FeatureFlags::all()
+            )
+            .is_err()
+        );
         for name in caudra_workcell::NATIVE_TOOL_NAMES {
             assert!(registry.get(name).is_none());
         }
         assert!(!storage.path().join("sandboxes/instances.json").exists());
+    }
+
+    #[test_case::test_case(Some("box"), None, Feature::Sandboxes; "sandbox")]
+    #[test_case::test_case(None, Some(SECRET_ENDPOINT), Feature::RemoteWorkcell; "direct_endpoint")]
+    fn disabled_selectors_are_refused_before_any_backend(
+        sandbox: Option<&str>,
+        endpoint: Option<&str>,
+        feature: Feature,
+    ) {
+        let root = tempfile::tempdir().unwrap();
+        let storage = StateDir::from_path(root.path().join("state"));
+        let registry = ToolRegistry::new();
+        let args = WorkcellSelectorArgs {
+            sandbox: sandbox.map(Into::into),
+            endpoint: endpoint.map(Into::into),
+            cwd: endpoint.map(|_| "project".into()),
+            ..Default::default()
+        };
+        let error = WorkcellRuntime::initialize(
+            &args,
+            root.path(),
+            &storage,
+            &registry,
+            FeatureFlags::all().without(feature),
+        )
+        .err()
+        .expect("a disabled selector must fail");
+        assert!(matches!(
+            error,
+            WorkcellRuntimeError::Feature(FeatureDisabled(disabled)) if disabled == feature
+        ));
+        assert!(
+            registry
+                .get(caudra_workcell::NATIVE_TOOL_NAMES[0])
+                .is_none()
+        );
+        assert!(!storage.path().exists());
+    }
+
+    #[test]
+    fn managed_sandboxes_do_not_need_direct_remote() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = StateDir::from_path(root.path().join("state"));
+        let args = WorkcellSelectorArgs {
+            sandbox: Some("does-not-exist".into()),
+            ..Default::default()
+        };
+        let error = WorkcellRuntime::initialize(
+            &args,
+            root.path(),
+            &storage,
+            &ToolRegistry::new(),
+            FeatureFlags::NONE.with(Feature::Sandboxes),
+        )
+        .err()
+        .expect("a missing sandbox must fail");
+        assert!(
+            !matches!(error, WorkcellRuntimeError::Feature(_)),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn embedded_runtime_registers_workflow_only_when_it_is_on() {
+        let root = tempfile::tempdir().unwrap();
+        for (features, registered) in [
+            (FeatureFlags::NONE, false),
+            (FeatureFlags::NONE.with(Feature::Workflows), true),
+        ] {
+            let registry = ToolRegistry::new();
+            WorkcellRuntime::embedded(root.path(), &registry, features).unwrap();
+            assert_eq!(
+                registry
+                    .get(caudra_agent::tools::WORKFLOW_TOOL_NAME)
+                    .is_some(),
+                registered
+            );
+        }
     }
 
     #[test]
@@ -693,7 +831,8 @@ mod tests {
     fn embedded_default_preserves_registration_and_context() {
         let root = tempfile::tempdir().expect("tempdir");
         let registry = ToolRegistry::new();
-        let runtime = WorkcellRuntime::embedded(root.path(), &registry).expect("embedded runtime");
+        let runtime = WorkcellRuntime::embedded(root.path(), &registry, FeatureFlags::all())
+            .expect("embedded runtime");
 
         assert!(!runtime.is_remote());
         assert_eq!(runtime.display().origin, WorkcellOrigin::Embedded);
@@ -725,10 +864,15 @@ mod tests {
         )
         .expect("valid remote selection");
 
-        let error =
-            WorkcellRuntime::initialize_selection(selection, root.path(), &storage, &registry)
-                .err()
-                .expect("missing credential must fail");
+        let error = WorkcellRuntime::initialize_selection(
+            selection,
+            root.path(),
+            &storage,
+            &registry,
+            FeatureFlags::all(),
+        )
+        .err()
+        .expect("missing credential must fail");
 
         assert!(matches!(
             &error,
@@ -757,10 +901,15 @@ mod tests {
         )
         .expect("valid loopback selection");
 
-        let error =
-            WorkcellRuntime::initialize_selection(selection, root.path(), &storage, &registry)
-                .err()
-                .expect("unavailable journal must fail");
+        let error = WorkcellRuntime::initialize_selection(
+            selection,
+            root.path(),
+            &storage,
+            &registry,
+            FeatureFlags::all(),
+        )
+        .err()
+        .expect("unavailable journal must fail");
 
         assert!(matches!(error, WorkcellRuntimeError::RemoteJournal(_)));
         for name in caudra_workcell::NATIVE_TOOL_NAMES {
@@ -796,10 +945,15 @@ mod tests {
         )
         .expect("valid loopback selection");
 
-        let error =
-            WorkcellRuntime::initialize_selection(selection, root.path(), &storage, &registry)
-                .err()
-                .expect("invalid handshake must fail");
+        let error = WorkcellRuntime::initialize_selection(
+            selection,
+            root.path(),
+            &storage,
+            &registry,
+            FeatureFlags::all(),
+        )
+        .err()
+        .expect("invalid handshake must fail");
         server.join().expect("test server");
 
         assert!(matches!(error, WorkcellRuntimeError::Connection(_)));

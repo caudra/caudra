@@ -9,6 +9,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 
 use arc_swap::ArcSwap;
+use caudra_config::{Feature, FeatureFlags};
 use caudra_storage::StateDir;
 use caudra_storage::id::CaudraId;
 use caudra_storage::paths::config_dir;
@@ -80,6 +81,7 @@ pub struct RuntimeDeps {
     /// shared by every run of the session, so per-run cancellation goes
     /// through the run's own root token; `cancel_all` fires only at shutdown.
     pub subagent_cancels: Arc<CancelMap<String>>,
+    pub features: FeatureFlags,
 }
 
 pub struct WorkflowRuntime {
@@ -94,10 +96,15 @@ pub struct WorkflowRuntime {
 impl WorkflowRuntime {
     /// Opens the store, marks every run the previous process left active as
     /// interrupted, publishes the session's history, and starts serving.
+    /// Refuses before touching the store or the user scope while the
+    /// experiment is off, whichever caller forgot to check.
     pub async fn spawn(
         deps: RuntimeDeps,
         decisions: Option<Decisions>,
     ) -> Result<Self, WorkflowError> {
+        if !deps.features.enabled(Feature::Workflows) {
+            return Err(WorkflowError::Unavailable);
+        }
         let store = WorkflowStore::spawn(deps.state_dir.clone(), deps.session_id)?;
         let interrupted = store.interrupt_active().await?;
         if interrupted > 0 {
@@ -131,6 +138,7 @@ impl WorkflowRuntime {
             env: RunEnv {
                 store,
                 decisions,
+                features: deps.features,
                 runner: deps.runner,
                 events: deps.events,
                 mode: deps.mode,
@@ -1057,6 +1065,14 @@ try {
 } catch (error) { result = "caught"; }
 complete(result);
 "#;
+    const DECISION_ERROR_BODY: &str = r#"
+let result = "not caught";
+try {
+    decide(#{ command: "ls" }, #{ ready: #{ type: "noul", instructions: "Is it ready?" } });
+} catch (error) { result = error; }
+complete(result);
+"#;
+    const DECISION_ENGINE_KEY: &str = "experimental.decision_engine";
     const DECISION_DEADLINE_BODY: &str = r#"
 let result = "not caught";
 try {
@@ -1136,9 +1152,10 @@ complete(result);
         (decisions, engine, entered, ended)
     }
 
-    #[test_case(false; "resume")]
-    #[test_case(true; "restart_without_service")]
-    fn workflow_decision_is_committed_before_reply_and_replayed(restart: bool) {
+    #[test_case(None; "resume")]
+    #[test_case(Some(false); "restart_without_service")]
+    #[test_case(Some(true); "restart_without_engine")]
+    fn workflow_decision_is_committed_before_reply_and_replayed(restart: Option<bool>) {
         smol::block_on(async {
             let fixture = Fixture::new();
             fixture.user_workflow(DECIDING, DECIDING_BODY);
@@ -1174,9 +1191,13 @@ complete(result);
             )
             .await;
             assert_eq!(paused.status, RunStatus::Paused);
-            if restart {
+            if let Some(engine_off) = restart {
                 runtime.shutdown().await;
-                runtime = fixture.spawn().await;
+                runtime = if engine_off {
+                    fixture.spawn_without_engine().await
+                } else {
+                    fixture.spawn().await
+                };
             }
             let handle = runtime.handle();
             resume(&handle, &started.run_id, None).await.unwrap();
@@ -1225,6 +1246,33 @@ complete(result);
             } else {
                 assert!(call.is_none());
             }
+            runtime.shutdown().await;
+        });
+    }
+
+    #[test]
+    fn disabled_engine_fails_a_new_decision_before_journaling_it() {
+        smol::block_on(async {
+            let fixture = Fixture::new();
+            fixture.user_workflow(DECIDING, DECISION_ERROR_BODY);
+            let runtime = fixture.spawn_without_engine().await;
+            let started = start(&runtime.handle(), DECIDING, Some(0)).await;
+            let completed = fixture
+                .wait_for(&started.run_id, RunStatus::Completed)
+                .await;
+            let error = completed.result.unwrap();
+            assert!(
+                error.as_str().unwrap().contains(DECISION_ENGINE_KEY),
+                "{error}"
+            );
+            assert!(
+                runtime
+                    .store
+                    .load_call(started.run_id, FIRST_KEY)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
             runtime.shutdown().await;
         });
     }
@@ -1645,6 +1693,25 @@ complete(result);
             session_id: CaudraId,
             decisions: Option<Decisions>,
         ) -> WorkflowRuntime {
+            self.spawn_with(session_id, decisions, FeatureFlags::all())
+                .await
+        }
+
+        async fn spawn_without_engine(&self) -> WorkflowRuntime {
+            self.spawn_with(
+                self.session_id,
+                None,
+                FeatureFlags::all().without(Feature::DecisionEngine),
+            )
+            .await
+        }
+
+        async fn spawn_with(
+            &self,
+            session_id: CaudraId,
+            decisions: Option<Decisions>,
+            features: FeatureFlags,
+        ) -> WorkflowRuntime {
             WorkflowRuntime::spawn(
                 RuntimeDeps {
                     state_dir: self.state_dir.clone(),
@@ -1656,6 +1723,7 @@ complete(result);
                     events: self.events_tx.clone(),
                     mode: Arc::new(|| AgentMode::Build),
                     subagent_cancels: Arc::new(CancelMap::new()),
+                    features,
                 },
                 decisions,
             )
@@ -2074,6 +2142,7 @@ complete(result);
                     events: fixture.events_tx.clone(),
                     mode: Arc::new(|| AgentMode::Build),
                     subagent_cancels: Arc::new(CancelMap::new()),
+                    features: FeatureFlags::all(),
                 },
                 None,
             )
@@ -3125,6 +3194,31 @@ complete(result);
             assert!(report.contains(PHASE), "{report}");
             assert_eq!(fixture.runner.labels().len(), 0);
             runtime.shutdown().await;
+        });
+    }
+
+    #[test]
+    fn disabled_runtime_refuses_before_touching_the_user_scope() {
+        smol::block_on(async {
+            let fixture = Fixture::new();
+            let refused = WorkflowRuntime::spawn(
+                RuntimeDeps {
+                    state_dir: fixture.state_dir.clone(),
+                    session_id: fixture.session_id,
+                    cwd: fixture.project.clone(),
+                    user_config_dir: Some(fixture.config.clone()),
+                    remote_project_context: None,
+                    runner: Arc::clone(&fixture.runner) as Arc<dyn TaskRunner>,
+                    events: fixture.events_tx.clone(),
+                    mode: Arc::new(|| AgentMode::Build),
+                    subagent_cancels: Arc::new(CancelMap::new()),
+                    features: FeatureFlags::all().without(Feature::Workflows),
+                },
+                None,
+            )
+            .await;
+            assert!(matches!(refused, Err(WorkflowError::Unavailable)));
+            assert!(!fixture.config.join(USER_WORKFLOWS).exists());
         });
     }
 }

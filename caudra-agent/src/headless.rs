@@ -13,7 +13,7 @@ use async_lock::Mutex;
 #[cfg(test)]
 use caudra_config::ToolKey;
 use caudra_config::decisions::DecisionsConfig;
-use caudra_config::{ModelPolicy, SnapshotsConfig};
+use caudra_config::{Feature, FeatureFlags, ModelPolicy, SnapshotsConfig};
 use caudra_providers::Timeouts;
 use caudra_providers::model::{Model, ModelPurpose};
 use caudra_providers::provider::{self, Provider};
@@ -1301,7 +1301,11 @@ fn advertised_tool_names(
 pub fn spawn(mut params: HeadlessParams) -> Result<HeadlessHandle, InteractiveStartError> {
     let state_dir =
         StateDir::resolve().map_err(|error| InteractiveStartError(error.to_string()))?;
-    let decisions = initialize_decisions(params.decisions_config.clone(), &state_dir)?;
+    let decisions = initialize_decisions(
+        params.decisions_config.clone(),
+        &state_dir,
+        params.config.features,
+    )?;
     let provider_model = params.model.clone();
     if let Err(error) = provider::adjust_model(&mut params.model, params.timeouts) {
         warn!(%error, "failed to adjust headless model before setup");
@@ -1415,7 +1419,7 @@ pub fn spawn(mut params: HeadlessParams) -> Result<HeadlessHandle, InteractiveSt
             if let Some(mode) = params.seed_permission_mode {
                 permissions.set_seed_mode(mode);
             }
-            permissions.set_decisions(Some(decisions));
+            permissions.set_decisions(decisions);
             if let Err(error) = permissions.replace_remote_permission_asset(
                 params
                     .remote_project_context
@@ -1694,6 +1698,7 @@ struct RemoteWorkspaceState {
     session: WorkspaceSession,
     binding: StoredWorkspaceBinding,
     cwd: String,
+    features: FeatureFlags,
 }
 
 struct WorkspaceChangeRequest {
@@ -1846,11 +1851,11 @@ impl InteractiveHandle {
             .remote_workspace
             .as_ref()
             .ok_or_else(|| "cd: remote workspace is unavailable".to_owned())?;
-        let (workspace, stored_binding) = {
+        let (workspace, stored_binding, features) = {
             let state = state
                 .lock()
                 .map_err(|_| "cd: remote workspace state is unavailable".to_owned())?;
-            (state.session.clone(), state.binding.clone())
+            (state.session.clone(), state.binding.clone(), state.features)
         };
         let path = DirectoryNavigation::new(path)
             .map_err(|_| "cd: invalid remote workspace path".to_owned())?;
@@ -1877,7 +1882,9 @@ impl InteractiveHandle {
             .with_cursor(workspace.cursor().clone())
             .map_err(|_| "cd: remote workspace identity changed".to_owned())?;
         let context =
-            match crate::remote_project_context::load_remote_project_context(&workspace).await {
+            match crate::remote_project_context::load_remote_project_context(&workspace, features)
+                .await
+            {
                 Ok(context) => context,
                 Err(_) => {
                     return Err("cd: remote project context could not be refreshed".to_owned());
@@ -1917,11 +1924,18 @@ impl InteractiveHandle {
 #[error("{0}")]
 pub struct InteractiveStartError(String);
 
+/// `None` while the decision engine is off, before anything engine-specific
+/// is read, so no endpoint, credential, or question file can switch it on.
 fn initialize_decisions(
     config: DecisionsConfig,
     state_dir: &StateDir,
-) -> Result<Decisions, InteractiveStartError> {
+    features: FeatureFlags,
+) -> Result<Option<Decisions>, InteractiveStartError> {
+    if !features.enabled(Feature::DecisionEngine) {
+        return Ok(None);
+    }
     Decisions::new(config, state_dir)
+        .map(Some)
         .map_err(|error| InteractiveStartError(format!("{DECISIONS_STARTUP_FAILED}: {error}")))
 }
 
@@ -1991,9 +2005,12 @@ pub async fn prepare_interactive(
             environment.cwd = session.cwd.clone();
         }
         params.remote_project_context = Some(
-            crate::remote_project_context::load_remote_project_context(&workspace)
-                .await
-                .map_err(|error| InteractiveStartError(error.to_string()))?,
+            crate::remote_project_context::load_remote_project_context(
+                &workspace,
+                params.config.features,
+            )
+            .await
+            .map_err(|error| InteractiveStartError(error.to_string()))?,
         );
         params.workspace_session = Some(workspace);
         params.workspace_binding = session.workspace_binding().cloned();
@@ -2083,7 +2100,14 @@ async fn spawn_prepared_session(
         mut store,
         workspace_baseline,
     } = prepared;
-    let decisions = initialize_decisions(params.decisions_config.clone(), &store.dir)?;
+    let decisions = initialize_decisions(
+        params.decisions_config.clone(),
+        &store.dir,
+        params.config.features,
+    )?;
+    if !params.config.features.enabled(Feature::Workflows) {
+        params.workflow_mode = None;
+    }
     let workflows_available = params.workflow_mode.is_some();
     let AgentSetup {
         mut vars,
@@ -2160,6 +2184,7 @@ async fn spawn_prepared_session(
                 session,
                 binding,
                 cwd: params.initial_wd.to_string_lossy().into_owned(),
+                features: params.config.features,
             }))
         });
 
@@ -2172,7 +2197,7 @@ async fn spawn_prepared_session(
     if let Some(mode) = params.seed_permission_mode {
         permissions.set_seed_mode(mode);
     }
-    permissions.set_decisions(Some(decisions));
+    permissions.set_decisions(decisions);
     if let Err(error) = permissions.replace_remote_permission_asset(
         params
             .remote_project_context
@@ -2299,6 +2324,7 @@ async fn spawn_prepared_session(
                     events: agent_tx.clone(),
                     mode,
                     subagent_cancels,
+                    features: params.config.features,
                 },
                 permissions.decisions(),
             )
@@ -2721,8 +2747,11 @@ async fn spawn_prepared_session(
                 let error_tx = event_tx.clone();
 
                 if let Some(workspace) = &params.workspace_session {
-                    match crate::remote_project_context::load_remote_project_context(workspace)
-                        .await
+                    match crate::remote_project_context::load_remote_project_context(
+                        workspace,
+                        params.config.features,
+                    )
+                    .await
                     {
                         Ok(context) => {
                             let changed =
@@ -3313,6 +3342,7 @@ mod tests {
     const REVISED_TODO_CALL: &str = "todo-2";
     const FIRST_TODO: &str = "draft the schema";
     const REVISED_TODO: &str = "backfill the rows";
+    const ENGINE_ON: FeatureFlags = FeatureFlags::NONE.with(Feature::DecisionEngine);
 
     #[test_case(false; "passive_config")]
     #[test_case(true; "restricted_without_endpoint")]
@@ -3323,8 +3353,12 @@ mod tests {
             auto_screening_restricted: restricted,
             ..DecisionsConfig::default()
         };
-        let first = initialize_decisions(config.clone(), &state).unwrap();
-        let second = initialize_decisions(config, &state).unwrap();
+        let first = initialize_decisions(config.clone(), &state, ENGINE_ON)
+            .unwrap()
+            .unwrap();
+        let second = initialize_decisions(config, &state, ENGINE_ON)
+            .unwrap()
+            .unwrap();
         let manager = permission_manager();
         manager.set_decisions(Some(first.clone()));
         assert_eq!(
@@ -3349,8 +3383,26 @@ mod tests {
             model: String::new(),
             ..DecisionsConfig::default()
         };
-        let error = initialize_decisions(config, &state).err().unwrap();
+        let error = initialize_decisions(config, &state, ENGINE_ON)
+            .err()
+            .unwrap();
         assert!(error.to_string().contains(DECISIONS_STARTUP_FAILED));
+    }
+
+    #[test]
+    fn disabled_engine_reads_no_decision_config() {
+        let temp = TempDir::new().unwrap();
+        let state = StateDir::from_path(temp.path().to_path_buf());
+        let unusable = DecisionsConfig {
+            model: String::new(),
+            ..DecisionsConfig::default()
+        };
+        assert!(
+            initialize_decisions(unusable, &state, FeatureFlags::NONE)
+                .unwrap()
+                .is_none()
+        );
+        assert!(!state.path().join("decisions.db").exists());
     }
 
     #[test_case("!pwd", Some("pwd"); "visible_command")]
@@ -3450,7 +3502,10 @@ mod tests {
 
     fn permission_manager() -> PermissionManager {
         PermissionManager::new_nonpersistent(
-            PermissionsConfig::default(),
+            PermissionsConfig {
+                decision_engine: true,
+                ..PermissionsConfig::default()
+            },
             PathBuf::from(CWD),
             Arc::default(),
         )
@@ -4714,6 +4769,7 @@ complete(#{ report: first.output });
         project: PathBuf,
         provider: Arc<ScriptedProvider>,
         started: flume::Receiver<()>,
+        features: FeatureFlags,
     }
 
     impl WorkflowSession {
@@ -4740,6 +4796,7 @@ complete(#{ report: first.output });
                     systems: std::sync::Mutex::new(Vec::new()),
                 }),
                 started,
+                features: FeatureFlags::all(),
                 _temp: temp,
             }
         }
@@ -4777,9 +4834,12 @@ complete(#{ report: first.output });
             };
             let context = match &workspace {
                 Some(workspace) => Some(
-                    crate::remote_project_context::load_remote_project_context(workspace)
-                        .await
-                        .unwrap(),
+                    crate::remote_project_context::load_remote_project_context(
+                        workspace,
+                        FeatureFlags::all(),
+                    )
+                    .await
+                    .unwrap(),
                 ),
                 None => None,
             };
@@ -4797,9 +4857,13 @@ complete(#{ report: first.output });
                 model: Model::from_spec(MODEL_SPEC).unwrap(),
                 config: AgentConfig {
                     generate_titles: false,
+                    features: self.features,
                     ..AgentConfig::default()
                 },
-                permissions_config: PermissionsConfig::default(),
+                permissions_config: PermissionsConfig {
+                    decision_engine: self.features.enabled(Feature::DecisionEngine),
+                    ..PermissionsConfig::default()
+                },
                 decisions_config: DecisionsConfig::default(),
                 snapshots: SnapshotsConfig::default(),
                 timeouts: Timeouts::default(),
@@ -5997,11 +6061,16 @@ complete(#{ report: first.output });
         });
     }
 
-    #[test]
-    fn a_session_without_workflow_mode_attaches_no_runtime() {
+    #[test_case(false, FeatureFlags::all(); "without_workflow_mode")]
+    #[test_case(true, FeatureFlags::all().without(Feature::Workflows); "with_workflows_off")]
+    fn a_session_without_workflows_attaches_no_runtime(
+        workflow_mode: bool,
+        features: FeatureFlags,
+    ) {
         smol::block_on(async {
-            let session = WorkflowSession::new(false);
-            let handle = session.spawn(false).await;
+            let mut session = WorkflowSession::new(false);
+            session.features = features;
+            let handle = session.spawn(workflow_mode).await;
             assert!(handle.workflow.is_none());
             let InteractiveHandle { input_tx, task, .. } = handle;
             drop(input_tx);

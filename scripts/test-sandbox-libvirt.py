@@ -511,6 +511,7 @@ on_exit = "detach"
             (directory / "sandboxes.toml").write_text(config)
             (directory / "sandboxes.toml").chmod(0o600)
             (directory / "permissions.toml").write_text('default = "prompt"\n')
+            (directory / "caudra.toml").write_text("[experimental]\nsandboxes = true\n")
         self.cli(["auth", "sandbox", "set", "fixture", "--stdin"], stdin=self.key)
 
     def rpc(self, method, params=None):

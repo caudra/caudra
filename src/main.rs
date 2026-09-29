@@ -8,15 +8,17 @@ mod print;
 mod progress;
 mod sdk_mode;
 mod setup;
+mod startup;
 mod update;
 
 use std::process::ExitCode;
 use std::time::Duration;
 
-use clap::Parser;
+use caudra_config::FeatureFlags;
 use clap::error::ErrorKind;
 
 use cli::Cli;
+use startup::Startup;
 
 /// How long a final telemetry export may take before caudra stops waiting.
 const TELEMETRY_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
@@ -33,12 +35,19 @@ const PROMPT_HINT: &str = "tip: to open a session with a message, use `caudra --
 /// `process::exit` deeper in the tree would skip them.
 fn main() -> ExitCode {
     color_eyre::install().ok();
-    let cli = match Cli::try_parse().and_then(Cli::validate) {
+    // Read before parsing, so help lists only the experiments this process
+    // turned on. A file that cannot be read shows none of them; dispatch then
+    // reports why.
+    let startup = Startup::load();
+    let features = startup
+        .as_ref()
+        .map_or(FeatureFlags::NONE, |startup| startup.features);
+    let cli = match Cli::parse_for(features) {
         Ok(cli) => cli,
         Err(err) => return report_parse_error(&err),
     };
     progress::install();
-    let result = cmd::dispatch(cli);
+    let result = cmd::dispatch(cli, startup);
     // Detached export tasks die with the process, so drain them once every
     // command has released its resources.
     caudra_otel::shutdown(TELEMETRY_SHUTDOWN_TIMEOUT);

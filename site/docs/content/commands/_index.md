@@ -13,60 +13,62 @@ Type `/` in the input box to open the command palette.
 
 Commands marked Main only act on the main session's turn or history. They stay listed while a task transcript is open, drawn dimmed, and report their scope rather than running. See [Tasks](#tasks).
 
-| Command | Description | Scope |
-|---------|-------------|-------|
-| `/compact` | Summarize and compact conversation history | Main only |
-| `/continue` | Resume an interrupted turn without adding a message | Main only |
-| `/new` | Start a new session |  |
-| `/help` | Show keybindings |  |
-| `/usage` | Show token usage breakdown |  |
-| `/context` | Inspect active context window usage |  |
-| `/storage` | Inspect what the state directory holds |  |
-| `/logs` | Browse the structured log |  |
-| `/tools` | Show which tools the model can reach |  |
-| `/skills` | Show the skills the model can load and where they come from |  |
-| `/queue` | Inspect and edit queued prompts |  |
-| `/stash` | Park the current prompt draft for later |  |
-| `/stash-pop` | Restore the most recently stashed prompt |  |
-| `/stash-list` | Browse stashed prompts |  |
-| `/memory` | View, edit, and delete memory files |  |
-| `/tasks` | Browse tasks and steer running subagents |  |
-| `/shells` | Browse shell commands and stop running ones |  |
-| `/workflows` | Browse, trust, and launch workflows | Main only |
-| `/workflow` | Start a workflow, or list, pause, resume, and stop runs | Main only |
-| `/deep-research` | Research a question with the deep-research workflow | Main only |
-| `/review-changes` | Review a change from independent angles with the review-changes workflow | Main only |
-| `/root-cause` | Diagnose a failure with the root-cause workflow | Main only |
-| `/sessions` | Browse and switch sessions |  |
-| `/rename` | Rename the current session |  |
-| `/model` | Switch chat model or assign job models | Main only |
-| `/system-prompt` | Inspect the system prompt and switch profile | Main only |
-| `/projection` | Inspect the conversation as the provider receives it | Main only |
-| `/review` | Review the last reply passage by passage |  |
-| `/theme` | Switch color theme |  |
-| `/view` | Cycle transcript: auto / compact / expanded |  |
-| `/mcp` | Configure MCP servers |  |
-| `/permissions` | Inspect active conversation permission rules |  |
-| `/login` | Authenticate with an LLM provider |  |
-| `/cd` | Change working directory |  |
-| `/move-session` | Move the current session; retain its counters and lifetime project attribution (optional directory) | Main only |
-| `/migrate-sessions` | Migrate sessions with one exact stored cwd; historical project usage included by default (optional destination directory) | Main only |
-| `/worktree` | Open, create or remove git worktrees of this repository (new [branch] \| remove) | Main only |
-| `/btw` | Ask a side question, with follow-ups (no tools, nothing enters history) | Main only |
-| `/extract` | List the requirements the session has gathered so far (Extract model, copyable, no history pollution) | Main only |
-| `/goal` | Work until a completion condition is met | Main only |
-| `/goal-clear` | Stop the active completion goal | Main only |
-| `/goal-model` | Assign the completion goal model | Main only |
-| `/auto` | Toggle Auto permissions (skip unmatched prompts, keep safeguards) |  |
-| `/decisions` | Show decision engine configuration and cached status |  |
-| `/yolo` | Toggle YOLO mode (skip all permission prompts) |  |
-| `/thinking` | Set reasoning (off, adaptive/provider default, effort, or token budget) |  |
-| `/fast` | Toggle fast mode (models that sell a fast tier) |  |
-| `/exit` | Exit the application |  |
-| `/reload` | Reload plugins and config |  |
-| `/workbench` | Open the file explorer, editor and source control view |  |
-| `/remote` | Remote status, pending operations, reconnect, reconcile or explicit acknowledgement | Main only |
-| `/sandbox` | Manage live sandboxes, profiles, images and providers; explicit reviewed actions, Doctor and recovery |  |
+A command with an Experiment entry exists only while that switch is on under `[experimental]` in the global `caudra.toml`. Typing it while the switch is off names the switch instead. See [Experimental features](/docs/configuration/#experimental-features).
+
+| Command | Description | Scope | Experiment |
+|---------|-------------|-------|------------|
+| `/compact` | Summarize and compact conversation history | Main only |  |
+| `/continue` | Resume an interrupted turn without adding a message | Main only |  |
+| `/new` | Start a new session |  |  |
+| `/help` | Show keybindings |  |  |
+| `/usage` | Show token usage breakdown |  |  |
+| `/context` | Inspect active context window usage |  |  |
+| `/storage` | Inspect what the state directory holds |  |  |
+| `/logs` | Browse the structured log |  |  |
+| `/tools` | Show which tools the model can reach |  |  |
+| `/skills` | Show the skills the model can load and where they come from |  |  |
+| `/queue` | Inspect and edit queued prompts |  |  |
+| `/stash` | Park the current prompt draft for later |  |  |
+| `/stash-pop` | Restore the most recently stashed prompt |  |  |
+| `/stash-list` | Browse stashed prompts |  |  |
+| `/memory` | View, edit, and delete memory files |  |  |
+| `/tasks` | Browse tasks and steer running subagents |  |  |
+| `/shells` | Browse shell commands and stop running ones |  |  |
+| `/workflows` | Browse, trust, and launch workflows | Main only | `workflows` |
+| `/workflow` | Start a workflow, or list, pause, resume, and stop runs | Main only | `workflows` |
+| `/deep-research` | Research a question with the deep-research workflow | Main only | `workflows` |
+| `/review-changes` | Review a change from independent angles with the review-changes workflow | Main only | `workflows` |
+| `/root-cause` | Diagnose a failure with the root-cause workflow | Main only | `workflows` |
+| `/sessions` | Browse and switch sessions |  |  |
+| `/rename` | Rename the current session |  |  |
+| `/model` | Switch chat model or assign job models | Main only |  |
+| `/system-prompt` | Inspect the system prompt and switch profile | Main only |  |
+| `/projection` | Inspect the conversation as the provider receives it | Main only |  |
+| `/review` | Review the last reply passage by passage |  |  |
+| `/theme` | Switch color theme |  |  |
+| `/view` | Cycle transcript: auto / compact / expanded |  |  |
+| `/mcp` | Configure MCP servers |  |  |
+| `/permissions` | Inspect active conversation permission rules |  |  |
+| `/login` | Authenticate with an LLM provider |  |  |
+| `/cd` | Change working directory |  |  |
+| `/move-session` | Move the current session; retain its counters and lifetime project attribution (optional directory) | Main only |  |
+| `/migrate-sessions` | Migrate sessions with one exact stored cwd; historical project usage included by default (optional destination directory) | Main only |  |
+| `/worktree` | Open, create or remove git worktrees of this repository (new [branch] \| remove) | Main only |  |
+| `/btw` | Ask a side question, with follow-ups (no tools, nothing enters history) | Main only |  |
+| `/extract` | List the requirements the session has gathered so far (Extract model, copyable, no history pollution) | Main only |  |
+| `/goal` | Work until a completion condition is met | Main only |  |
+| `/goal-clear` | Stop the active completion goal | Main only |  |
+| `/goal-model` | Assign the completion goal model | Main only |  |
+| `/auto` | Toggle Auto permissions (skip unmatched prompts, keep safeguards) |  | `decision_engine` |
+| `/decisions` | Show decision engine configuration and cached status |  | `decision_engine` |
+| `/yolo` | Toggle YOLO mode (skip all permission prompts) |  |  |
+| `/thinking` | Set reasoning (off, adaptive/provider default, effort, or token budget) |  |  |
+| `/fast` | Toggle fast mode (models that sell a fast tier) |  |  |
+| `/exit` | Exit the application |  |  |
+| `/reload` | Reload plugins and config |  |  |
+| `/workbench` | Open the file explorer, editor and source control view |  |  |
+| `/remote` | Remote status, pending operations, reconnect, reconcile or explicit acknowledgement | Main only | `remote_workcell` or `sandboxes` |
+| `/sandbox` | Manage live sandboxes, profiles, images and providers; explicit reviewed actions, Doctor and recovery |  | `sandboxes` |
 
 ## Resuming after an interruption
 
@@ -125,6 +127,8 @@ Press Enter or click a row to see its owner, working directory, timeout, elapsed
 Finished commands stay listed after a reload. See [shell history](/docs/sessions/#shell-history) for what a session keeps and how commands cut short by a crash appear.
 
 ## Workflows
+
+Workflows are experimental. The commands here exist only with `workflows = true` under [`[experimental]`](/docs/configuration/#experimental-features).
 
 A workflow is a script that launches subagents in phases, keeps a journal, and can be paused and resumed. Each session runs one workflow runtime. Runs continue after a normal main-turn completion. `Esc Esc` stops the main turn, background tasks, and workflows, and suppresses automatic completion turns. A run belongs to the session that started it and stays with that session when you switch to another.
 
@@ -219,7 +223,7 @@ Extract is a [model job](/docs/providers/#model-jobs) and follows Fast unless bo
 - **`/fast`**: fast mode, a premium tier that answers quicker for more per token. Anthropic Opus sells one, and so does every GPT-6 and GPT-5.6 model. Ignored on a model without one, and unavailable on a subscription. Config: `always_fast = true`.
 - **`/view`**: cycle the transcript through auto, compact, and expanded. Auto is the default: every card falls back to a single row except the newest one, which stays open until a newer card replaces it. Expanded gives each call its own card. In auto and expanded only calls that changed nothing can be hidden, so writes and edits stay open, though you can still click one shut. Compact is the one mode that answers for every tool: every call folds to a single row, writes and edits included, and a click opens the one you want. `batch` is the single exception there, because its body is the list of the calls it made and folded it would say nothing at all. Its children fold instead, each to its own row. Tools named in `ui.always_collapsed` stay a single row in every mode until you click them, which suits the lookups whose first line is already the answer. A server-qualified name matches too, so `file_read` also covers `mcp_File_read`. An open card shows as much of its body as `ui.tool_output_lines` allows for that tool, clicking shows all of it, and clicking again puts it back. A card you opened yourself stays open as the transcript grows. `shell`, `python_execution`, and `task` are drawn differently: their body is a fixed window of `ui.scroll_card_lines` rows that follows the newest output, with a footer reporting how much sits above and below. Click inside a window to give it the wheel, or drag the bar in its last column. While the call is still running the footer names the edge it is pinned to, scrolling up pauses it and says so, and clicking that footer sends it back to the tail. Once the call has answered there is no tail left to follow, so the footer reports only how much sits either side. A write is never windowed, and a write that created a file is never abridged either, since its body is that file. Anything drawn as a diff — an edit, a patch, an overwrite — is drawn whole until it runs long, because a diff is already only the part that changed, so `ui.tool_output_lines` bounds one only where it is raised past that point. Outside compact, `task` and `batch` keep their child rows throughout, and each child answers the same question its own card would: a child that changed something draws its body the way its own card would draw it, and every other child folds to its row until you click it. Nesting goes one body deep. A batch inside a subagent keeps a row per child, with its status and its clock, but folds its bodies away until you open one, so work arriving at the bottom of a tree cannot keep resizing everything above it. The choice is remembered across restarts.
 - **Plan / build**: not a slash command. Press `Tab` in the input to toggle plan mode (plan-file writes only). Caudra opens in plan mode, and a resumed session reopens in the mode it was left in. A toggle reaches the agent with your next message, so until you send one the status bar shows the pending switch as `[PLAN→BUILD]`. It abbreviates this to `[P→B]` when those columns preserve more useful footer detail. Each mode remembers the model it was last used with, so the toggle asks for that one too and the bar names the pair as `[claude-opus-5→claude-sonnet-5]`, keeping the provider only when the two differ there. Binding the Plan job in `/model` decides what a plan run uses on its own, and turns the swap off.
-- **`/reload`**: rebuild plugins and config without leaving the app.
+- **`/reload`**: read `caudra.toml` again and rebuild plugins without leaving the app. The `[experimental]` switches apply from startup, so changing them needs a restart.
 - **`/btw`**: a side question over the conversation so far, with follow-ups in the same thread. The answer streams into a modal that reports elapsed time while it waits, and how much of the prompt has been prefilled when the provider says. Type under it and press `Enter` or click `Send a follow-up` to ask the next question, which is queued if the previous answer is still streaming; `Ctrl+Y` copies the answer, `Ctrl+C` stops it without losing the thread, and `Esc` or `Close` closes. No tool runs, nothing enters history, and a marker in the transcript shows where the thread's view of the conversation ends.
 - **`/extract`**: list every requirement the session has gathered so far. See [Requirements](#requirements).
 - **`/memory`**: open the memory file picker. `Enter` opens a note in the [workbench](/docs/workbench/#plans-memory-notes-and-prompt-drafts) to read or edit, and a note can be deleted from the list. See the `memory` tool under [Tools](/docs/tools/).
@@ -263,7 +267,7 @@ For example, `/project:review main.rs` replaces `$ARGUMENTS` with `main.rs`.
 
 ## Aliasing commands
 
-Prefer a different name for a command? `caudra.api.run_command` runs any slash command exactly as typing it would, so an alias is a one-line handler in your `init.lua` instead of a reimplementation.
+Prefer a different name for a command? With [Lua plugins](/docs/configuration/#experimental-features) turned on, `caudra.api.run_command` runs any slash command exactly as typing it would, so an alias is a one-line handler in your `init.lua` instead of a reimplementation.
 
 ```lua
 -- ~/.config/caudra/init.lua

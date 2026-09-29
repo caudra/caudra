@@ -2,19 +2,35 @@ use std::fmt::Write;
 use std::sync::Arc;
 
 use caudra_agent::tools::ToolRegistry;
+use caudra_config::config_file::CONFIG_VERSION;
 use caudra_config::{
     AgentConfig, ConfigField, DEFAULT_MAX_LOG_FILES, DEFAULT_MAX_OUTPUT_LINES,
-    DEFAULT_MOUSE_SCROLL_LINES, DecisionsConfig, MIN_TOOL_OUTPUT_LINES, ProviderConfig,
-    RetentionConfig, SnapshotsConfig, StorageConfig, TOP_LEVEL_FIELDS, TelemetryConfig,
-    ToolOutputLines, UiConfig, WorktreesConfig,
+    DEFAULT_MOUSE_SCROLL_LINES, DecisionsConfig, Feature, FeatureFlags, MIN_TOOL_OUTPUT_LINES,
+    ProviderConfig, RetentionConfig, SnapshotsConfig, StorageConfig, TOP_LEVEL_FIELDS,
+    TelemetryConfig, ToolOutputLines, UiConfig, WorktreesConfig,
 };
 use caudra_lua::{OptionSpec, OptionType, PluginHost, PluginOptionSpecs};
+use serde_json::Value;
 
 const PLUGIN_DEV_DESC: &str =
     "Offer the builtin caudra-plugin-dev skill for writing caudra plugins.";
 const WORKFLOW_DEV_DESC: &str =
     "Offer the builtin caudra-workflow-dev skill for writing and running workflows.";
 const MAX_CONCURRENT_DESC: &str = "Max concurrently running subagents.";
+/// A default the reference shows for a setting that has none.
+const UNSET: &str = "unset";
+
+fn needs(description: &str, feature: Feature) -> String {
+    format!("{description} Needs `{feature}`.")
+}
+
+fn format_default(value: &Value) -> String {
+    if value.is_null() {
+        UNSET.into()
+    } else {
+        format!("`{value}`")
+    }
+}
 
 type ExtraColumn = (&'static str, fn(&ConfigField) -> String);
 
@@ -64,18 +80,117 @@ fn escape_pipes(ty: &str) -> String {
     ty.replace('|', "\\|")
 }
 
-fn lua_section_name(heading: &str) -> String {
-    heading
-        .trim_start_matches('[')
-        .trim_end_matches(']')
-        .to_string()
-}
-
-fn write_section(out: &mut String, heading: &str, fields: &[ConfigField]) {
-    let lua_name = lua_section_name(heading);
-    writeln!(out, "### `{lua_name}`\n").unwrap();
+fn write_section(out: &mut String, table: &str, fields: &[ConfigField]) {
+    writeln!(out, "### `{table}`\n").unwrap();
     write_table(out, fields);
     writeln!(out).unwrap();
+}
+
+fn experiment_scope(feature: Feature) -> &'static str {
+    match feature {
+        Feature::Workflows => {
+            "[Workflows](/docs/workflows/): the `workflow` tool, the workflow commands and \
+             inspector, and the `caudra-workflow-dev` skill."
+        }
+        Feature::Sandboxes => {
+            "[Managed sandboxes](/docs/sandboxes/): `caudra sandbox`, `caudra auth sandbox`, \
+             `--sandbox`, `/sandbox`, and the workbench Transfer view. Sandboxes bring their own \
+             connection to Workcell and do not need `remote_workcell`."
+        }
+        Feature::RemoteWorkcell => {
+            "Direct [remote Workcell](/docs/remote-workspaces/) connections: the `--workcell-*` \
+             flags and `caudra auth workcell`."
+        }
+        Feature::LuaPlugins => {
+            "Every use of Lua: [plugins](/docs/plugins/), the [Lua API](/docs/lua-api/), global \
+             and project `init.lua`, and the `caudra-plugin-dev` skill. `--no-plugins` still \
+             turns Lua off for one run."
+        }
+        Feature::DecisionEngine => {
+            "The [decision engine](#decisions), [Auto mode](/docs/permissions/#auto-mode), \
+             `caudra decisions`, and workflow [`decide()` calls](/docs/workflows/#typed-decisions)."
+        }
+    }
+}
+
+fn write_experimental_section(out: &mut String) {
+    out.push_str(
+        "## Experimental features\n\n\
+         Some features are experimental and stay off until you turn them on. Each one has its \
+         own switch in the `[experimental]` table of the global `caudra.toml`:\n\n\
+         ```toml\n\
+         [experimental]\n\
+         workflows = true\n\
+         decision_engine = true\n\
+         ```\n\n\
+         | Key | Default | Turns on |\n\
+         |-----|---------|----------|\n",
+    );
+    for feature in Feature::ALL {
+        writeln!(
+            out,
+            "| `{key}` | `{default}` | {scope} |",
+            key = feature.key(),
+            default = FeatureFlags::default().enabled(feature),
+            scope = experiment_scope(feature),
+        )
+        .unwrap();
+    }
+    out.push_str(
+        "\nEach switch is independent, so turning one on never turns on another. A missing file, \
+         table, or key leaves a switch off, and an unknown key is an error. `caudra remote` and \
+         `/remote` work when either `sandboxes` or `remote_workcell` is on, and each session \
+         checks the switch for its own source.\n\n\
+         Only the global file may hold `[experimental]`. Caudra rejects a project \
+         `.caudra/caudra.toml` that contains the table, even an empty one, so a repository cannot \
+         opt you in. Lua, tool allowlists, and saved sessions cannot turn a feature on either.\n\n\
+         Caudra reads the switches once at startup and keeps them until it exits. `/reload`, \
+         session switches, and ACP sessions all use the startup values. When the table changes on \
+         disk, Caudra shows a notice asking for a restart.\n\n\
+         A feature that is off is hidden and does no work. Its tools, commands, shortcuts, help \
+         entries, and status chips are gone, and startup skips it. Asking for it directly, such \
+         as typing its command or passing its flag, fails with a message that names the switch. \
+         A saved session attached to a sandbox or a remote workspace does not resume while its \
+         switch is off, and it never falls back to local execution. Turning a feature off keeps \
+         its data and leaves external resources alone, so a running sandbox keeps running until \
+         you stop it.\n\n\
+         With `decision_engine` off, `always_auto = true` and sessions saved in Auto start in \
+         Ask. Caudra keeps the saved choice, so Auto returns once the switch is on again.\n\n",
+    );
+}
+
+fn write_migration_section(out: &mut String) {
+    out.push_str(
+        r#"## Migrating from Lua settings
+
+Earlier releases read settings from `init.lua` through `caudra.setup()`. Caudra now runs `init.lua` only when `lua_plugins` is on. With Lua off, Caudra shows one notice that names each `init.lua` it skipped. It does not read, run, or change those files.
+
+To migrate, move the table you passed to `caudra.setup()` into the `caudra.toml` of the same scope. Keys and values stay the same. Top-level values come first, and each nested table becomes a TOML table:
+
+```lua
+caudra.setup({
+    always_fast = true,
+    ui = { theme = "tokyonight" },
+    agent = { disabled_tools = { "websearch" } },
+})
+```
+
+```toml
+always_fast = true
+
+[ui]
+theme = "tokyonight"
+
+[agent]
+disabled_tools = ["websearch"]
+```
+
+Lists become arrays, and deeper tables become dotted headers such as `[agent.steering.rules.repetition]`. Quote a key that holds other characters, as in `[agent.steering.models."openai/gpt-5"]`. Leave out any key you set to `nil`.
+
+To keep using `init.lua`, set `lua_plugins = true` under `[experimental]`. Its `caudra.setup()` values then apply on top of the `caudra.toml` of the same scope, in the order shown [above](#configuration).
+
+"#,
+    );
 }
 
 /// These tables outlived the Lua plugins they were written for: the tool is
@@ -169,14 +284,14 @@ fn collect_plugin_options() -> PluginOptionSpecs {
                 ty: OptionType::Boolean,
                 default: Some(serde_json::json!(caudra_config::DEFAULT_SKILL_PLUGIN_DEV)),
                 min: None,
-                desc: PLUGIN_DEV_DESC.into(),
+                desc: needs(PLUGIN_DEV_DESC, Feature::LuaPlugins),
             },
             OptionSpec {
                 name: "workflow_dev".into(),
                 ty: OptionType::Boolean,
                 default: Some(serde_json::json!(caudra_config::DEFAULT_SKILL_WORKFLOW_DEV)),
                 min: None,
-                desc: WORKFLOW_DEV_DESC.into(),
+                desc: needs(WORKFLOW_DEV_DESC, Feature::Workflows),
             },
         ],
     );
@@ -254,8 +369,7 @@ fn write_theme_section(out: &mut String) {
     .unwrap();
     writeln!(
         out,
-        "```lua\ncaudra.setup({{ ui = {{ theme = \"tokyonight\", theme_light = \
-         \"catppuccin_latte\" }} }})\n```\n"
+        "```toml\n[ui]\ntheme = \"tokyonight\"\ntheme_light = \"catppuccin_latte\"\n```\n"
     )
     .unwrap();
     writeln!(
@@ -341,7 +455,7 @@ fn write_steering_section(out: &mut String) {
     out.push_str(
         r###"### `agent.steering`
 
-Automatic steering repairs unusable model output and can add bounded guidance about repeated behavior. All eight rules are enabled by default. Configure overrides inside `agent` in `caudra.setup()`. All fields are optional.
+Automatic steering repairs unusable model output and can add bounded guidance about repeated behavior. All eight rules are enabled by default. Configure overrides in the `[agent.steering]` table. All fields are optional.
 
 | Field | Type | Default | Limits and meaning |
 |-------|------|---------|--------------------|
@@ -380,7 +494,7 @@ Each table at `agent.steering.rules.<rule>` accepts these common fields:
 | Field | Type | Default | Limits and meaning |
 |-------|------|---------|--------------------|
 | `enabled` | boolean | `true` | Explicit `false` disables this rule. |
-| `prompt` | string | `nil` | Use built-in guidance when omitted. Custom text must be nonblank and at most 16,384 UTF-8 bytes. |
+| `prompt` | string | unset | Use built-in guidance when omitted. Custom text must be nonblank and at most 16,384 UTF-8 bytes. |
 
 Custom prompts replace guidance only. They are literal user-configured text, without template expansion or executable expressions. They do not change triggers, budgets, enforcement, or factual tool-failure information. A custom prompt cannot authorize a tool or turn a rejected call into an executed one.
 
@@ -421,34 +535,24 @@ Tool-planning guidance asks the model to reconsider its tool choices and identif
 
 This example disables repetition guidance globally, then enables it with a higher threshold for one exact model and adjusts that model's tool-planning guidance:
 
-```lua
-caudra.setup({
-    agent = {
-        steering = {
-            rules = {
-                repetition = { enabled = false },
-            },
-            models = {
-                ["openai/gpt-5"] = {
-                    rules = {
-                        repetition = { enabled = true, text_repeats = 4 },
-                        tool_planning = {
-                            after_calls = 8,
-                            prompt = "Reassess your recent tool choices. Choose a different useful action if these calls are not helping.",
-                        },
-                    },
-                },
-            },
-        },
-    },
-})
+```toml
+[agent.steering.rules.repetition]
+enabled = false
+
+[agent.steering.models."openai/gpt-5".rules.repetition]
+enabled = true
+text_repeats = 4
+
+[agent.steering.models."openai/gpt-5".rules.tool_planning]
+after_calls = 8
+prompt = "Reassess your recent tool choices. Choose a different useful action if these calls are not helping."
 ```
 
 Model entries accept `enabled`, `max_recoveries`, `max_advisories`, `max_stalled_turns`, and `rules` with the same types and limits as the global fields. They cannot contain another `models` table. Omitted fields inherit through the resolution order below.
 
 Keys are case-sensitive exact IDs, at most 512 UTF-8 bytes each. Use a nonempty provider and model suffix separated by `/`. Additional slashes inside the suffix are allowed, but every segment must be nonempty. Whitespace, control characters, `*`, `?`, `[`, `]`, `{`, `}`, and backslashes are rejected. Matching requires no authentication or model discovery. There are no glob overrides, provider-wide layers, capability guesses from model names, or Lua detector callbacks.
 
-Global and project Lua settings merge field by field, with project values taking precedence. Model maps merge by exact key and rules merge by rule name and field. Omission inherits. Explicit `false` and `0` survive merging. An empty table does not clear inherited entries. Disable an inherited model policy or rule with `enabled = false`.
+Global and project settings merge field by field, with project values taking precedence. Model maps merge by exact key and rules merge by rule name and field. Omission inherits. Explicit `false` and `0` survive merging. An empty table does not clear inherited entries. Disable an inherited model policy or rule with `enabled = false`.
 
 After merging, resolve against the effective routed model for Chat, Plan, or a delegated task:
 
@@ -485,7 +589,11 @@ fn write_decisions_section(out: &mut String) {
     writeln!(
         out,
         "### `decisions`\n\n\
-         Configure the optional typed decision engine inside `caudra.setup()`. \
+         Configure the optional typed decision engine in the `[decisions]` table. \
+         The engine is experimental and needs `decision_engine = true` under \
+         [`[experimental]`](#experimental-features). Without that switch Caudra still validates \
+         this table and starts no engine. It then sends no decision requests, reads no engine \
+         credentials, and leaves decision logs and shell duration history untouched. \
          No endpoint, passive feature, or decision logging is enabled by default. \
          Explicit workflow [`decide()` calls](/docs/workflows/#typed-decisions) need an endpoint \
          but do not need a passive feature enabled. Shell duration history can work without an endpoint.\n\n\
@@ -496,7 +604,7 @@ fn write_decisions_section(out: &mut String) {
          prompting for eligible Auto calls.\n\n\
          | Field | Type | Default | Meaning |\n\
          |-------|------|---------|---------|\n\
-         | `endpoint` | string | `nil` | Full request URL. HTTPS required except for numeric loopback HTTP or explicit `allow_http` consent. No credentials, query, fragment, whitespace, or control characters. |\n\
+         | `endpoint` | string | {UNSET} | Full request URL. HTTPS required except for numeric loopback HTTP or explicit `allow_http` consent. No credentials, query, fragment, whitespace, or control characters. |\n\
          | `model` | string | `\"{model}\"` | Decision model identifier, nonblank and without control characters. |\n\
          | `api_key_env` | string | `\"{api_key_env}\"` | Environment variable containing the optional credential, never the credential itself. Project environment values are excluded. |\n\
          | `allow_remote` | boolean | `{allow_remote}` | Explicit global consent to send decision context to a non-loopback endpoint. |\n\
@@ -630,13 +738,8 @@ fn write_decisions_section(out: &mut String) {
             "Optional project-write warning threshold. Omission leaves the warning disabled. No built-in enforcement threshold.",
         ),
     ] {
-        let value = &thresholds[name];
-        let default = if value.is_null() {
-            "nil".into()
-        } else {
-            value.to_string()
-        };
-        writeln!(out, "| `{name}` | `{default}` | {meaning} |").unwrap();
+        let default = format_default(&thresholds[name]);
+        writeln!(out, "| `{name}` | {default} | {meaning} |").unwrap();
     }
     out.push_str(
         "\n#### Shell duration\n\n\
@@ -716,81 +819,86 @@ group = \"Getting Started\"
 
 # Configuration
 
-Settings go in `init.lua`, a Lua script that calls `caudra.setup()`. Same language as plugins.
+Settings go in `caudra.toml`. It has two places, and both are optional:
 
-Two places, both optional:
+- **Global**: `~/.config/caudra/caudra.toml`
+- **Project**: `.caudra/caudra.toml` (relative to your working directory)
 
-- **Global**: `~/.config/caudra/init.lua`
-- **Project**: `.caudra/init.lua` (relative to your working directory)
+When both exist, project settings override global ones field by field. A few settings are global-only, and their descriptions say so. `/reload` reads both files again, except for the [experimental switches](#experimental-features), which apply from startup.
 
-When both exist, project settings override global ones. Neither file is required.
+Settings apply in this order, and each layer overrides the ones before it:
 
-Remote sessions load only the client's global executable configuration. They do not load either checkout's project `init.lua`, project environment files, or project MCP configuration. Remote project context uses a bounded declarative asset manifest instead. See [Remote Workspaces](/docs/remote-workspaces/#project-context-and-trust).
+1. Built-in defaults
+2. Global `caudra.toml`
+3. Global `init.lua`, only with Lua plugins turned on
+4. Project `.caudra/caudra.toml`
+5. Project `.caudra/init.lua`, only with Lua plugins turned on
+6. Command-line flags
 
-Remote endpoint profiles live in a separate user `workcell.toml`, with `version = 1` and tables named `[workcell.profiles.NAME]`. They are not `caudra.setup()` settings. See [profile configuration](/docs/remote-workspaces/#configure-a-profile) for the exact fields and credential rules.
+Remote sessions load only the client's global configuration. They skip both project layers, project environment files, and project MCP configuration. Remote project context uses a bounded declarative asset manifest instead. See [Remote Workspaces](/docs/remote-workspaces/#project-context-and-trust).
+
+Remote endpoint profiles live in a separate user `workcell.toml`, with `version = 1` and tables named `[workcell.profiles.NAME]`. They are not `caudra.toml` settings. See [profile configuration](/docs/remote-workspaces/#configure-a-profile) for the exact fields and credential rules.
 
 Managed sandbox providers, profiles, network policies and transfer defaults live in user-global `sandboxes.toml`, also with `version = 1`. They are separate from direct Workcell and model-provider profiles. See [Managed Sandboxes](/docs/sandboxes/#configuration-schema) for the schema, TUI editor and release status. Saving these defaults does not create a VM or change a running instance.
 
 ## Example
 
-```lua
-caudra.setup({{
-    ui = {{
-        splash_animation = true,
-        mouse_scroll_lines = {mouse_scroll},
-        theme = \"tokyonight\",
-        tool_output_lines = {{
-            bash = {tol_bash},
-            read = {tol_read},
-        }},
-    }},
-    agent = {{
-        max_output_lines = {max_output_lines},
-    }},
-    provider = {{
-        default_model = \"anthropic/claude-sonnet-4-6\",
-        allowed_models = {{ \"anthropic/*\", \"openai/gpt-5\" }},
-        excluded_models = {{ \"*/*-preview\" }},
-    }},
+```toml
+[ui]
+splash_animation = true
+mouse_scroll_lines = {mouse_scroll}
+theme = \"tokyonight\"
 
-    storage = {{
-        max_log_files = {max_log_files},
-    }},
-    plugins = {{
-        bash = {{ timeout_secs = 180 }},
-        index = {{ max_file_size_mb = 4 }},
-    }},
-}})
+[ui.tool_output_lines]
+bash = {tol_bash}
+read = {tol_read}
+
+[agent]
+max_output_lines = {max_output_lines}
+
+[provider]
+default_model = \"anthropic/claude-sonnet-4-6\"
+allowed_models = [\"anthropic/*\", \"openai/gpt-5\"]
+excluded_models = [\"*/*-preview\"]
+
+[storage]
+max_log_files = {max_log_files}
+
+[plugins.bash]
+timeout_secs = 180
+
+[plugins.index]
+max_file_size_mb = 4
 ```
 
-All fields are optional. Typos in field names cause an error right away.
+All fields are optional. A file may start with `version = {version}`, and a file without it counts as version {version}. Typos in field names and values of the wrong type cause an error right away, with the file and line.
 
-`provider.allowed_models` is a list of glob patterns for qualified `provider/model-id` specs. `*` also matches `/`, so `opencode/*` includes nested model IDs. When the list is empty or omitted, every model is allowed. `provider.excluded_models` removes matching models after that, so exclusions always win. A project list replaces the matching global list; omit it to inherit or use `{{}}` to clear it. The policy applies to selectors, CLI and API model changes, delegation, and `caudra models`.
-
-`caudra.setup()` can only be called once per init.lua.
-
-## Full Reference
+`provider.allowed_models` is a list of glob patterns for qualified `provider/model-id` specs. `*` also matches `/`, so `opencode/*` includes nested model IDs. When the list is empty or omitted, every model is allowed. `provider.excluded_models` removes matching models after that, so exclusions always win. A project list replaces the matching global list. Omit it to inherit, or use `[]` to clear it. The policy applies to selectors, CLI and API model changes, delegation, and `caudra models`.
 ",
         mouse_scroll = DEFAULT_MOUSE_SCROLL_LINES + 2,
         tol_bash = ToolOutputLines::DEFAULT.bash + 3,
         tol_read = ToolOutputLines::DEFAULT.read + 2,
         max_output_lines = DEFAULT_MAX_OUTPUT_LINES + 1000,
         max_log_files = DEFAULT_MAX_LOG_FILES / 2,
+        version = CONFIG_VERSION,
     )
     .unwrap();
+    write_experimental_section(&mut out);
+    write_migration_section(&mut out);
 
+    writeln!(out, "## Full Reference\n").unwrap();
     writeln!(out, "### Top-level\n").unwrap();
     write_table(&mut out, TOP_LEVEL_FIELDS);
     writeln!(out).unwrap();
 
-    write_section(&mut out, "[ui]", UiConfig::FIELDS);
+    write_section(&mut out, "ui", UiConfig::FIELDS);
     write_theme_section(&mut out);
     write_update_check_section(&mut out);
     write_tool_output_section(&mut out);
-    write_section(&mut out, "[agent]", AgentConfig::FIELDS);
+    write_section(&mut out, "agent", AgentConfig::FIELDS);
     write_steering_section(&mut out);
-    write_section(&mut out, "[provider]", ProviderConfig::FIELDS);
-    write_section(&mut out, "[storage]", StorageConfig::FIELDS);
+    write_section(&mut out, "provider", ProviderConfig::FIELDS);
+    write_section(&mut out, "storage", StorageConfig::FIELDS);
     write_retention_section(&mut out);
     write_snapshots_section(&mut out);
     write_telemetry_section(&mut out);
@@ -814,20 +922,20 @@ All fields are optional. Typos in field names cause an error right away.
          [Disabling tools](/docs/tools/#disabling-tools).\n\n\
          The edit plugin's extra tools are options too: \
          `plugins.edit = {{ multiedit = false, insert_lines = true }}`.\n\n\
-         This table is for bundled plugins only. Your own plugins go in \
-         `~/.config/caudra/lua/`, see [Plugins](/docs/plugins/).\n"
+         This table is for bundled plugins only, and it works without Lua. Your own plugins go \
+         in `~/.config/caudra/lua/` and need `lua_plugins` turned on. See \
+         [Plugins](/docs/plugins/).\n"
     )
     .unwrap();
     writeln!(
         out,
         "\
-```lua
-caudra.setup({{
-    plugins = {{
-        bash = {{ timeout_secs = 180 }},
-        websearch = {{ enabled = false }},
-    }},
-}})
+```toml
+[plugins.bash]
+timeout_secs = 180
+
+[plugins.websearch]
+enabled = false
 ```\n"
     )
     .unwrap();
@@ -858,7 +966,7 @@ Caudra follows platform directory conventions. On Linux and macOS that is XDG. O
 | Cache | `~/.cache/caudra/` | `%LOCALAPPDATA%\\caudra\\` |
 | Scratch | `$TMPDIR/caudra/` | `%TEMP%\\caudra\\` |
 
-Config holds `init.lua`, `permissions.toml`, `mcp.toml`, `providers.toml`, `workcell.toml`, `sandboxes.toml`, and `commands/`. State holds sessions, auth tokens, memories, plans, model-job bindings, sandbox lifecycle records and transfer recovery journals. The install script puts the binary under `%LOCALAPPDATA%\\caudra` on Windows; that is separate from these runtime dirs.
+Config holds `caudra.toml`, `init.lua`, `permissions.toml`, `mcp.toml`, `providers.toml`, `workcell.toml`, `sandboxes.toml`, and `commands/`. State holds sessions, auth tokens, memories, plans, model-job bindings, sandbox lifecycle records and transfer recovery journals. The install script puts the binary under `%LOCALAPPDATA%\\caudra` on Windows; that is separate from these runtime dirs.
 
 Scratch holds work that belongs outside your project, such as a file the model writes while thinking or a temporary a command leaves behind. Each project gets its own subdirectory, named by the project directory plus a three-word phrase derived from its path, as in `caudra-heroic-easy-grouse`. Two checkouts sharing a name get different phrases, so they cannot overwrite each other. The phrase is derived rather than drawn at random, so a project returns to the same directory on every run. Caudra creates it at startup and points `TMPDIR`, `TMP`, and `TEMP` at it, so every command Caudra runs puts its own temporary files there instead of the shared temp root. The model is told the path, and writing anywhere under the scratch root needs no approval. Paths beside the root still ask.
 
@@ -876,6 +984,7 @@ Each TOML config file takes a top-level `version`, and every format is at versio
 
 | File | `version` | Newer than this build reads |
 |------|-----------|-----------------------------|
+| `caudra.toml` | Optional | Caudra stops with an error |
 | `permissions.toml` | Optional | Fails closed. Tool calls are denied until the file is fixed |
 | `mcp.toml` | Optional | Servers from that file do not start, and Caudra shows the error |
 | `providers.toml` | Optional | Caudra stops with an error |
@@ -883,7 +992,7 @@ Each TOML config file takes a top-level `version`, and every format is at versio
 | `workcell.toml` | Required | Rejected with an error |
 | `sandboxes.toml` | Required | Rejected with an error |
 
-Caudra writes `version = 1` whenever it saves `providers.toml`. `init.lua` has no version because it is a script. To share one `init.lua` across releases, branch on [`caudra.version()`](/docs/lua-api/#caudra-version).
+Caudra writes `version = 1` whenever it saves `providers.toml`. `init.lua`, which runs only with Lua plugins turned on, has no version because it is a script. To share one `init.lua` across releases, branch on [`caudra.version()`](/docs/lua-api/#caudra-version).
 
 ## Personal Instructions
 
@@ -911,18 +1020,53 @@ Related pages: [Skills](/docs/skills/), [CLI](/docs/cli/), [Providers](/docs/pro
 
 #[cfg(test)]
 mod tests {
+    use caudra_config::config_file::GlobalConfigFile;
     use caudra_config::{
-        AgentConfig, DecisionsConfig, SteeringConfig, decisions::RawDecisionsConfig,
+        AgentConfig, DecisionsConfig, Feature, SteeringConfig, decisions::RawDecisionsConfig,
     };
     use serde_json::{Value, json};
     use test_case::test_case;
 
-    use super::{write_decisions_section, write_steering_section};
+    use super::{
+        UNSET, generate, write_decisions_section, write_experimental_section,
+        write_steering_section,
+    };
 
     const MODEL: &str = "provider/model";
     const HEADING: &str = "### `agent.steering`";
-    const PROMPT_ROW: &str = "| `prompt` | string | `nil` |";
+    const PROMPT_ROW: &str = "| `prompt` | string | unset |";
     const RULE_COUNT: usize = 8;
+    const TOML_FENCE: &str = "```toml\n";
+    const FENCE_END: &str = "```";
+
+    #[test]
+    fn experimental_reference_lists_every_switch_off() {
+        let mut reference = String::new();
+        write_experimental_section(&mut reference);
+        for feature in Feature::ALL {
+            let row = format!("| `{}` | `false` |", feature.key());
+            assert!(
+                reference.lines().any(|line| line.starts_with(&row)),
+                "{row}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_toml_example_is_a_valid_global_config() {
+        let page = generate();
+        let examples: Vec<&str> = page
+            .split(TOML_FENCE)
+            .skip(1)
+            .filter_map(|rest| rest.split_once(FENCE_END).map(|(body, _)| body))
+            .collect();
+        assert!(!examples.is_empty());
+        for example in examples {
+            if let Err(error) = GlobalConfigFile::parse(example) {
+                panic!("{error}\n{example}");
+            }
+        }
+    }
 
     #[test_case("allow_remote", DecisionsConfig::default().allow_remote)]
     #[test_case("allow_http", DecisionsConfig::default().allow_http)]
@@ -968,11 +1112,11 @@ mod tests {
         write_decisions_section(&mut reference);
         for (field, value) in defaults.as_object().unwrap() {
             let default = if value.is_null() {
-                "nil".into()
+                UNSET.into()
             } else {
-                value.to_string()
+                format!("`{value}`")
             };
-            let prefix = format!("| `{field}` | `{default}` |");
+            let prefix = format!("| `{field}` | {default} |");
             assert!(
                 reference.lines().any(|line| line.starts_with(&prefix)),
                 "{field}"

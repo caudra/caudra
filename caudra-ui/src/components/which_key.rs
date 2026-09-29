@@ -116,6 +116,7 @@ fn cell_width(chord: &LeaderChord) -> usize {
 mod tests {
     use super::*;
     use crate::components::keybindings::{KeybindContext, leader_chords};
+    use caudra_config::FeatureFlags;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
@@ -143,7 +144,7 @@ mod tests {
     #[test]
     fn a_disarmed_panel_paints_nothing() {
         let which_key = WhichKey::new(IMMEDIATE);
-        let chords = leader_chords(&[KeybindContext::General]);
+        let chords = leader_chords(&[KeybindContext::General], FeatureFlags::all());
         assert!(
             !render(&which_key, &chords).contains("tasks"),
             "{NOT_ARMED}"
@@ -162,7 +163,7 @@ mod tests {
     fn an_armed_panel_lists_its_chords() {
         let mut which_key = WhichKey::new(IMMEDIATE);
         which_key.arm();
-        let chords = leader_chords(&[KeybindContext::General]);
+        let chords = leader_chords(&[KeybindContext::General], FeatureFlags::all());
         let painted = render(&which_key, &chords);
         assert!(painted.contains("Open tasks"), "{MISSING_CHORD}");
     }

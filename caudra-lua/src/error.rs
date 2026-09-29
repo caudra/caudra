@@ -25,6 +25,8 @@ pub enum PluginError {
     UnknownPlugin { plugin: String },
     #[error("plugin host is not running")]
     HostDead,
+    #[error("Lua is turned off for this process")]
+    Disabled,
     #[error("lua thread did not stop within the shutdown timeout")]
     ShutdownTimeout,
     #[error("lua thread panicked on shutdown")]

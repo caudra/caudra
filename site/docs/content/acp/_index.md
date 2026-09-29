@@ -56,6 +56,6 @@ caudra acp --yolo
 caudra --no-jit acp
 ```
 
-`caudra acp` only takes `-m` / `--model` and `--yolo` as subcommand flags. Global flags like `--no-jit` must come before the subcommand (`caudra --no-jit acp`, not `caudra acp --no-jit`).
+`caudra acp` only takes `-m` / `--model` and `--yolo` as subcommand flags. Other flags go before the subcommand, as in `caudra --no-jit acp`. [`caudra acp`](/docs/cli/#caudra-acp) lists the ones that also work after it. `--no-jit` has an effect only when `experimental.lua_plugins` is on.
 
 Plan mode in ACP uses the same state-directory plan files as the TUI (`…/projects/<project-id>/plans/<slug>.md`) rather than the SDK's `./plan.md`.

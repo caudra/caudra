@@ -11,6 +11,7 @@ use crate::sandbox::{
 };
 use crate::sandbox::{SandboxSnapshot, SandboxSnapshotRequest, SandboxWorkers, start_store_effect};
 use caudra_config::sandbox::SandboxName;
+use caudra_config::{Feature, FeatureDisabled};
 use flume::TryRecvError;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -50,6 +51,9 @@ pub(crate) fn attached_sandbox_instance<'a>(
 
 impl App {
     pub(super) fn open_sandbox(&mut self, args: &str) {
+        if self.refuse_disabled(Feature::Sandboxes) {
+            return;
+        }
         if args.trim() == "reconcile-network" {
             if self
                 .sandbox_live
@@ -114,6 +118,9 @@ impl App {
     }
 
     pub(super) fn handle_sandbox_action(&mut self, action: SandboxAction) {
+        if self.refuse_disabled(Feature::Sandboxes) {
+            return;
+        }
         match action {
             SandboxAction::None => {}
             SandboxAction::Copy(text) => self.copy_to_clipboard(&text),
@@ -145,6 +152,20 @@ impl App {
 
     pub(crate) fn sandbox_failed(&mut self, message: String) {
         self.sandbox_manager.live_failed(message);
+    }
+
+    /// Drops queued sandbox work in a process that left the experiment off,
+    /// so nothing queued ahead of a check reaches a controller or a worker.
+    pub(crate) fn refuse_sandbox_work(&mut self, disabled: &FeatureDisabled) -> Dirty {
+        let live = self.sandbox_live.queued.take().is_some();
+        let transfer = self.sandbox_live.transfer_queued.take().is_some();
+        if live {
+            self.sandbox_failed(disabled.to_string());
+        }
+        if transfer {
+            self.transfer_failed(disabled.to_string());
+        }
+        Dirty::from(live || transfer)
     }
 
     pub(crate) fn sandbox_action_blocker(&self, transition: bool) -> Option<&'static str> {

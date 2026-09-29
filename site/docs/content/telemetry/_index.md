@@ -38,18 +38,15 @@ Two signals:
 
 ## Quick start
 
-Run a collector on the usual ports, then in `init.lua`:
+Run a collector on the usual ports, then in `caudra.toml`:
 
-```lua
-caudra.setup({
-    telemetry = {
-        enabled = true,
-        metrics_exporter = "otlp",
-        logs_exporter = "otlp",
-        protocol = "grpc",
-        endpoint = "http://localhost:4317",
-    },
-})
+```toml
+[telemetry]
+enabled = true
+metrics_exporter = "otlp"
+logs_exporter = "otlp"
+protocol = "grpc"
+endpoint = "http://localhost:4317"
 ```
 
 For HTTP instead of gRPC, set `protocol = "http/protobuf"` and
@@ -79,23 +76,25 @@ the log file.
 
 ## Configuration
 
-Every setting lives in the `telemetry` table of `init.lua` and also has a
+Every setting lives in the `[telemetry]` table of `caudra.toml` and also has a
 matching environment variable. **The environment variable wins.** The full
 list of keys, their variables, types and defaults is in the generated
 [Configuration](/docs/configuration/#telemetry) reference.
 
-```lua
-caudra.setup({
-    telemetry = {
-        enabled = true,
-        metrics_exporter = "otlp",
-        logs_exporter = "otlp",
-        protocol = "grpc",
-        endpoint = "http://localhost:4317",
-        headers = { ["x-api-key"] = "secret" },
-        resource_attributes = { team = "core", env = "dev" },
-    },
-})
+```toml
+[telemetry]
+enabled = true
+metrics_exporter = "otlp"
+logs_exporter = "otlp"
+protocol = "grpc"
+endpoint = "http://localhost:4317"
+
+[telemetry.headers]
+"x-api-key" = "secret"
+
+[telemetry.resource_attributes]
+team = "core"
+env = "dev"
 ```
 
 All durations are in milliseconds and floored at 100ms, so a zero cannot make
@@ -105,11 +104,12 @@ a comma-separated mix, and a repeat is ignored. Protocols are `grpc`,
 
 One setting exists only in the environment: `OTEL_SDK_DISABLED=true` turns
 telemetry off no matter what anything else says, so you can disable it across
-a whole team without editing anyone's `init.lua`.
+a whole team without editing anyone's `caudra.toml`.
 
 Per-signal settings like `metrics_endpoint` override the generic one, but only
-within the same source: the environment always beats `init.lua`, so a generic
-endpoint set in the environment overrides a `metrics_endpoint` written in Lua.
+within the same source: the environment always beats the config file, so a
+generic endpoint set in the environment overrides a `metrics_endpoint` written
+in `caudra.toml`.
 Headers merge instead: a
 per-signal header replaces the generic one with the same key and the rest
 stay. That is a deliberate departure from the spec, where per-signal headers

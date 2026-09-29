@@ -517,7 +517,7 @@ impl App {
         if r.width > 0 {
             overlay_rect = r;
         }
-        let r = self.help_modal.view(frame, full);
+        let r = self.help_modal.view(frame, full, self.features);
         if r.width > 0 {
             overlay_rect = r;
         }
@@ -611,7 +611,7 @@ impl App {
             overlay_rect = r;
         }
         // Last, so a pending chord's list sits over whatever it was armed on.
-        let chords = keybindings::leader_chords(&self.leader_contexts());
+        let chords = keybindings::leader_chords(&self.leader_contexts(), self.features);
         let r = self.which_key.view(frame, full, &chords);
         if r.width > 0 {
             overlay_rect = r;

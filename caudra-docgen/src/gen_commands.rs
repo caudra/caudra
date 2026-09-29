@@ -1,6 +1,6 @@
 use std::fmt::Write;
 
-use caudra_ui::{BUILTIN_COMMANDS, ChatScope};
+use caudra_ui::{BUILTIN_COMMANDS, BuiltinCommand, ChatScope};
 
 const MAIN_ONLY_MARK: &str = "Main only";
 
@@ -12,7 +12,7 @@ See [Providers](/docs/providers/#model-jobs) for the jobs, picker controls, assi
 
 const ALIASING: &str = r#"## Aliasing commands
 
-Prefer a different name for a command? `caudra.api.run_command` runs any slash command exactly as typing it would, so an alias is a one-line handler in your `init.lua` instead of a reimplementation.
+Prefer a different name for a command? With [Lua plugins](/docs/configuration/#experimental-features) turned on, `caudra.api.run_command` runs any slash command exactly as typing it would, so an alias is a one-line handler in your `init.lua` instead of a reimplementation.
 
 ```lua
 -- ~/.config/caudra/init.lua
@@ -155,6 +155,8 @@ Finished commands stay listed after a reload. See [shell history](/docs/sessions
 
 const WORKFLOWS: &str = r#"## Workflows
 
+Workflows are experimental. The commands here exist only with `workflows = true` under [`[experimental]`](/docs/configuration/#experimental-features).
+
 A workflow is a script that launches subagents in phases, keeps a journal, and can be paused and resumed. Each session runs one workflow runtime. Runs continue after a normal main-turn completion. `Esc Esc` stops the main turn, background tasks, and workflows, and suppresses automatic completion turns. A run belongs to the session that started it and stays with that session when you switch to another.
 
 New workflow run IDs use three words from the plan-name word lists, such as `neat-wanted-cowbird`. A collision adds a numeric suffix. Existing run IDs remain valid, and resuming a run keeps its original ID.
@@ -171,15 +173,22 @@ A run that finishes, fails, pauses, or runs out of budget leaves a notice. When 
 
 Closing Caudra interrupts every active run, and an interrupted run is over. Pause a run you mean to pick up later: resuming a paused run replays its journal and continues from the last committed phase, and work an agent had started but not committed runs again. The model reaches the same runtime through the [`workflow` tool](/docs/tools/#workflow)."#;
 
-fn write_row(out: &mut String, name: &str, description: &str, scope: ChatScope) {
-    let scope = match scope {
+fn write_row(out: &mut String, command: &BuiltinCommand) {
+    let scope = match command.scope {
         ChatScope::Any => "",
         ChatScope::MainOnly => MAIN_ONLY_MARK,
     };
+    let experiments = command
+        .features
+        .iter()
+        .map(|feature| format!("`{}`", feature.key()))
+        .collect::<Vec<_>>()
+        .join(" or ");
     writeln!(
         out,
-        "| `{name}` | {} | {scope} |",
-        description.replace('|', "\\|")
+        "| `{name}` | {description} | {scope} | {experiments} |",
+        name = command.name,
+        description = command.description.replace('|', "\\|"),
     )
     .unwrap();
 }
@@ -210,10 +219,16 @@ pub fn generate() -> String {
     )
     .unwrap();
     writeln!(out).unwrap();
-    writeln!(out, "| Command | Description | Scope |").unwrap();
-    writeln!(out, "|---------|-------------|-------|").unwrap();
+    writeln!(
+        out,
+        "A command with an Experiment entry exists only while that switch is on under `[experimental]` in the global `caudra.toml`. Typing it while the switch is off names the switch instead. See [Experimental features](/docs/configuration/#experimental-features)."
+    )
+    .unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "| Command | Description | Scope | Experiment |").unwrap();
+    writeln!(out, "|---------|-------------|-------|------------|").unwrap();
     for cmd in BUILTIN_COMMANDS {
-        write_row(&mut out, cmd.name, cmd.description, cmd.scope);
+        write_row(&mut out, cmd);
     }
 
     writeln!(out).unwrap();
@@ -285,7 +300,7 @@ pub fn generate() -> String {
     .unwrap();
     writeln!(
         out,
-        "- **`/reload`**: rebuild plugins and config without leaving the app."
+        "- **`/reload`**: read `caudra.toml` again and rebuild plugins without leaving the app. The `[experimental]` switches apply from startup, so changing them needs a restart."
     )
     .unwrap();
     writeln!(

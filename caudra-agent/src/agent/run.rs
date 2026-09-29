@@ -4659,6 +4659,7 @@ mod tests {
                     caudra_config::PermissionsConfig {
                         default: caudra_config::DefaultEffect::Allow,
                         rules: vec![],
+                        decision_engine: true,
                         ..Default::default()
                     },
                     std::path::PathBuf::from("/tmp"),

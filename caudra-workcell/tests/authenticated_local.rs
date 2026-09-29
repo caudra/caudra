@@ -30,7 +30,9 @@ use caudra_config::sandbox::TransferPolicy;
 use caudra_config::workcell::{
     ExpectedWorkcellId, RemoteWorkcellSelection, WorkcellEndpoint, WorkcellSourceRef,
 };
-use caudra_config::{Effect, PermissionRule, PermissionsConfig, SnapshotsConfig, ToolKey};
+use caudra_config::{
+    Effect, FeatureFlags, PermissionRule, PermissionsConfig, SnapshotsConfig, ToolKey,
+};
 use caudra_storage::{
     StateDir,
     auth::{WorkcellCredential, WorkcellCredentialName, WorkcellCredentialRef},
@@ -2581,7 +2583,7 @@ async fn remote_image_bytes(client: &RemoteWorkcellClient, root: &Path) {
         .save_with_format(root.join(EDITOR_IMAGE), ImageFormat::Png)
         .unwrap();
     let registry = Arc::new(ToolRegistry::new());
-    caudra_agent::tools::native::register(&registry).unwrap();
+    caudra_agent::tools::native::register(&registry, FeatureFlags::all()).unwrap();
     let permissions = Arc::new(PermissionManager::new_nonpersistent(
         PermissionsConfig {
             yolo: true,
@@ -3583,9 +3585,12 @@ fn authenticated_local() {
             cursor.clone(),
         )
         .unwrap();
-        let context = caudra_agent::remote_project_context::load_remote_project_context(&session)
-            .await
-            .unwrap();
+        let context = caudra_agent::remote_project_context::load_remote_project_context(
+            &session,
+            FeatureFlags::all(),
+        )
+        .await
+        .unwrap();
         assert_eq!(context.skills().len(), 1);
         assert!(context.skipped().is_empty(), "{:?}", context.skipped());
         // The overlay layers on top of the ranked file rather than displacing

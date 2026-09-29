@@ -80,6 +80,8 @@ Inbound messages (`user`, `control_request`, `control_response`, `control_cancel
 
 SDK-only flags (`--system-prompt`, `--max-turns`, `--session-id`, `--fork-session`, `--permission-mode`, `--include-partial-messages`, ...) are listed in the [CLI flag matrix](/docs/cli/#flags-by-run-path).
 
+Auto mode needs `experimental.decision_engine`. Without it, `--permission-mode auto` stops Caudra with an error, and a `set_permission_mode` control request for `auto` returns that error and leaves the mode unchanged. See [SDK permission modes](/docs/cli/#permission-modes-sdk).
+
 Two caveats:
 
 - One-shot `--print` always starts a **new** session in **build** mode, unlike the TUI, which opens in plan mode. Plan mode and session resume need the SDK path (or the TUI).
@@ -131,7 +133,7 @@ The `interrupt` control stops the parent and all session tasks, shell jobs, and 
 
 ### Workflows
 
-A stream-json session runs a workflow runtime beside the agent. Scripts under `.caudra/workflows/<name>.rhai` in the project can be started, watched, paused, and resumed from the wire, and the model can reach the same runtime through the [`workflow` tool](/docs/tools/#workflow). Runs outlive individual turns and keep a journal. Pause a run before closing the session if you intend to resume it later.
+Workflows are [experimental](/docs/configuration/#experimental-features) and need `experimental.workflows`. With it on, a stream-json session runs a workflow runtime beside the agent. Scripts under `.caudra/workflows/<name>.rhai` in the project can be started, watched, paused, and resumed from the wire, and the model can reach the same runtime through the [`workflow` tool](/docs/tools/#workflow). Runs outlive individual turns and keep a journal. Pause a run before closing the session if you intend to resume it later.
 
 The `init` message says whether the runtime is attached and which controls it answers:
 
@@ -141,7 +143,7 @@ The `init` message says whether the runtime is attached and which controls it an
                       "workflow_pause","workflow_resume","workflow_stop","workflow_trust","workflow_ack"],...}
 ```
 
-When the runtime failed to start, `workflows` is `false`, `workflow_controls` is empty, and every workflow control answers with the `unavailable` error. One-shot `--print` and the [ACP server](/docs/acp/) attach no runtime.
+When `experimental.workflows` is off or the runtime failed to start, `workflows` is `false`, `workflow_controls` is empty, and every workflow control answers with the `unavailable` error. One-shot `--print` and the [ACP server](/docs/acp/) attach no runtime.
 
 #### Controls
 

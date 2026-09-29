@@ -16,7 +16,7 @@ The docs are sorted by what you came here to do:
   </div>
   <div class="card-grid">
     <a class="card" href="/docs/quick-start/"><span class="card-title">Quick Start</span><span class="card-desc">Install, connect a provider, first session.</span></a>
-    <a class="card" href="/docs/configuration/"><span class="card-title">Configuration</span><span class="card-desc">init.lua settings, separate profile files, and directory layout.</span></a>
+    <a class="card" href="/docs/configuration/"><span class="card-title">Configuration</span><span class="card-desc">caudra.toml settings, experimental features, separate profile files, and directory layout.</span></a>
   </div>
 </div>
 
@@ -27,15 +27,15 @@ The docs are sorted by what you came here to do:
   </div>
   <div class="card-grid">
     <a class="card" href="/docs/skills/"><span class="card-title">Skills</span><span class="card-desc">Write Markdown playbooks the agent loads on demand.</span></a>
-    <a class="card" href="/docs/remote-workspaces/"><span class="card-title">Remote Workspaces</span><span class="card-desc">Connect to Workcell with explicit workspace identity and remote execution.</span></a>
-    <a class="card" href="/docs/sandboxes/"><span class="card-title">Managed Sandboxes</span><span class="card-desc">Manage VM profiles, images, network policy and reviewed file transfers.</span></a>
+    <a class="card" href="/docs/remote-workspaces/"><span class="card-title">Remote Workspaces</span><span class="card-desc">Connect to Workcell with explicit workspace identity and remote execution (experimental).</span></a>
+    <a class="card" href="/docs/sandboxes/"><span class="card-title">Managed Sandboxes</span><span class="card-desc">Manage VM profiles, images, network policy and reviewed file transfers (experimental).</span></a>
     <a class="card" href="/docs/sessions/"><span class="card-title">Sessions</span><span class="card-desc">Fork conversation points and restore chat or workspace state.</span></a>
     <a class="card" href="/docs/worktrees/"><span class="card-title">Worktrees</span><span class="card-desc">Create, open and remove git worktrees, with or without Herdr.</span></a>
     <a class="card" href="/docs/review/"><span class="card-title">Review</span><span class="card-desc">Mark passages of a reply and send notes on them back.</span></a>
     <a class="card" href="/docs/workbench/"><span class="card-title">Workbench</span><span class="card-desc">File explorer, editor, source control, and search beside the transcript.</span></a>
     <a class="card" href="/docs/system-prompts/"><span class="card-title">System Prompts</span><span class="card-desc">Create named prompt profiles without copying Caudra's dynamic prompt.</span></a>
-    <a class="card" href="/docs/plugins/"><span class="card-title">Plugins</span><span class="card-desc">Add your own tools and commands in Lua, or let the agent write them.</span></a>
-    <a class="card" href="/docs/workflows/"><span class="card-title">Workflows</span><span class="card-desc">Durable multi-agent scripts that pause, resume, and report back.</span></a>
+    <a class="card" href="/docs/plugins/"><span class="card-title">Plugins</span><span class="card-desc">Add your own tools and commands in Lua, or let the agent write them (experimental).</span></a>
+    <a class="card" href="/docs/workflows/"><span class="card-title">Workflows</span><span class="card-desc">Durable multi-agent scripts that pause, resume, and report back (experimental).</span></a>
     <a class="card" href="/docs/headless/"><span class="card-title">Headless Mode</span><span class="card-desc">--print for scripts and CI. Drop-in Claude Code compatible.</span></a>
     <a class="card" href="/docs/acp/"><span class="card-title">ACP</span><span class="card-desc">Drive Caudra from your editor, like Zed, over the Agent Client Protocol.</span></a>
   </div>
@@ -67,7 +67,7 @@ The docs are sorted by what you came here to do:
     <a class="card" href="/docs/mcp/"><span class="card-title">MCP</span><span class="card-desc">External tool servers over stdio or HTTP.</span></a>
     <a class="card" href="/docs/commands/"><span class="card-title">Commands</span><span class="card-desc">The / palette, sessions, toggles, custom commands.</span></a>
     <a class="card" href="/docs/keybindings/"><span class="card-title">Keybindings</span><span class="card-desc">Defaults, precedence, rebinding from Lua.</span></a>
-    <a class="card" href="/docs/lua-api/"><span class="card-title">Lua API</span><span class="card-desc">The plugin surface, mirrored from Neovim.</span></a>
+    <a class="card" href="/docs/lua-api/"><span class="card-title">Lua API</span><span class="card-desc">The plugin surface, mirrored from Neovim (experimental).</span></a>
     <a class="card" href="/docs/cli/"><span class="card-title">CLI</span><span class="card-desc">Flags and subcommands (auth, models, acp, prompt, ...).</span></a>
     <a class="card" href="/docs/logging/"><span class="card-title">Logging</span><span class="card-desc">The structured log every run writes, and the two ways to read it.</span></a>
     <a class="card" href="/docs/telemetry/"><span class="card-title">Telemetry</span><span class="card-desc">Opt-in OpenTelemetry metrics and events, to a collector you run.</span></a>

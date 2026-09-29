@@ -77,25 +77,25 @@ caudra skills --dirs          # candidate directories: selected, superseded, or 
 
 ## The builtins
 
-Caudra ships two skills. Each is a normal entry in the `skill` tool's list, and a `SKILL.md` of the same name in any of your directories replaces it.
+Caudra ships two skills. Each is a normal entry in the `skill` tool's list, and a `SKILL.md` of the same name in any of your directories replaces it. Each builtin also needs its [experimental feature](/docs/configuration/#experimental-features). Your own Markdown skills need no experimental switch.
 
 ### caudra-workflow-dev
 
-On by default. It is the complete authoring guide for [workflows](/docs/workflows/): where a script goes and which scope to choose, the `meta` header rules, every host function with its result shape and failure modes, the parts of Rhai that trip people up, how replay and resume constrain a script, prompt patterns for untrusted agent output, three complete worked scripts, and a table of common errors with their fixes. With it loaded, "write me a workflow that reviews a branch with three readers and verifies their findings" produces a file the agent can validate and start in the same session. The examples in the guide are compiled and smoke-run by Caudra's own test suite, so they cannot drift from the engine.
+It needs `experimental.workflows`. With workflows on, it is on by default. It is the complete authoring guide for [workflows](/docs/workflows/): where a script goes and which scope to choose, the `meta` header rules, every host function with its result shape and failure modes, the parts of Rhai that trip people up, how replay and resume constrain a script, prompt patterns for untrusted agent output, three complete worked scripts, and a table of common errors with their fixes. With it loaded, "write me a workflow that reviews a branch with three readers and verifies their findings" produces a file the agent can validate and start in the same session. The examples in the guide are compiled and smoke-run by Caudra's own test suite, so they cannot drift from the engine.
 
 The agent writes to the project directory when the plan belongs to the repository and to your user directory when it is personal. A project script still needs your approval in `/workflows` before it can start. The agent cannot grant that.
 
 ### caudra-plugin-dev
 
-Off by default. It teaches the agent how to write caudra Lua plugins, and on load it writes the full Lua API reference to a file in the state dir, so the agent can read it in pieces instead of swallowing it whole. It carries the same guide you can read in [Plugins](/docs/plugins/), so "write me a plugin that ..." is usually enough.
+It needs `experimental.lua_plugins`. With Lua on, it is still off by default. It teaches the agent how to write caudra Lua plugins, and on load it writes the full Lua API reference to a file in the state dir, so the agent can read it in pieces instead of swallowing it whole. It carries the same guide you can read in [Plugins](/docs/plugins/), so "write me a plugin that ..." is usually enough.
 
 Both are switches under `plugins.skill`:
 
-```lua
--- ~/.config/caudra/init.lua
-caudra.setup({
-    plugins = {
-        skill = { plugin_dev = true, workflow_dev = false },
-    },
-})
+```toml
+# ~/.config/caudra/caudra.toml
+[plugins.skill]
+plugin_dev = true
+workflow_dev = false
 ```
+
+A switch has no effect while its experimental feature is off.

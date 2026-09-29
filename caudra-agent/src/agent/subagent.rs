@@ -1587,7 +1587,7 @@ mod tests {
     use crate::tools::registry::Tool;
     use crate::tools::test_support::NamedMock;
     use crate::{CancelToken, ToolDoneEvent, TurnCompleteEvent};
-    use caudra_config::ToolKey;
+    use caudra_config::{PermissionsConfig, ToolKey};
     use caudra_providers::{Billing, ContentBlock, Message, Role};
     use caudra_storage::id::SessionRef;
     use caudra_storage::usage_ledger::LedgerPurpose;
@@ -1690,7 +1690,10 @@ mod tests {
         crate::tools::test_support::stub_ctx_with_permissions(
             &AgentMode::Build,
             Arc::new(PermissionManager::new_nonpersistent(
-                caudra_config::PermissionsConfig::default(),
+                PermissionsConfig {
+                    decision_engine: true,
+                    ..Default::default()
+                },
                 Path::new("/tmp").to_path_buf(),
                 Arc::default(),
             )),

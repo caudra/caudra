@@ -35,7 +35,7 @@ Caudra modifications are maintained by [Thorsten Born](https://thorstenborn.com)
 
 ### Extensible by design
 
-Caudra has a Neovim-style Lua API. Built-in and user plugins can add tools, commands, keymaps, and UI. See the [built-in plugins](https://github.com/caudra/caudra/tree/main/plugins) and [Lua API reference](https://caudra.ai/docs/lua-api/).
+Settings live in a plain `caudra.toml` and need no Lua. For deeper changes, Caudra has a Neovim-style Lua API where plugins can add tools, commands, keymaps, and UI. The Lua API is experimental and opt-in: turn it on with `lua_plugins = true` under `[experimental]` in the global `caudra.toml`, as described in [Experimental features](https://caudra.ai/docs/configuration/#experimental-features). See the [example plugins](https://github.com/caudra/caudra/tree/main/plugins) and the [Lua API reference](https://caudra.ai/docs/lua-api/).
 
 ## Providers
 

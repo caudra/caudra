@@ -1,8 +1,8 @@
 use std::{env, io, sync::Arc};
 
 use caudra_agent::tools::ToolRegistry;
+use caudra_config::Feature;
 use caudra_config::decisions::{DecisionThresholds, DecisionsConfig};
-use caudra_lua::PluginHost;
 use caudra_storage::{
     StateDir,
     decision_log::{DecisionLog, StatsThresholds},
@@ -16,6 +16,7 @@ use serde_json::json;
 use crate::cli::{Cli, DecisionAction};
 
 pub(super) fn run(action: DecisionAction, cli: &Cli) -> Result<()> {
+    cli.startup.features.require(Feature::DecisionEngine)?;
     if cli.workcell.is_set() || cli.ephemeral {
         bail!("decision log administration requires local persistent storage");
     }
@@ -79,8 +80,7 @@ pub(super) fn run(action: DecisionAction, cli: &Cli) -> Result<()> {
 }
 
 fn configuration(cli: &Cli) -> Result<DecisionsConfig> {
-    let host = PluginHost::with_jit(Arc::clone(ToolRegistry::global_arc()), !cli.no_jit)
-        .context("initialize config host")?;
+    let host = super::cli_plugin_host(cli, Arc::clone(ToolRegistry::global_arc()))?;
     let cwd = env::current_dir().context("resolve working directory")?;
     Ok(super::load_config(&host, cli, &cwd, false)?.decisions)
 }

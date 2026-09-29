@@ -223,7 +223,7 @@ The walk respects `.gitignore` and skips `.git`, binaries, and files above the s
 
 ## Transfer
 
-After attaching to a sandbox, select `TRANSFER` or press `Ctrl+X 4`. The editor area shows local files on the left and sandbox files on the right. Your open editor tabs keep their contents and cursor positions. Local-only sessions and direct Workcell connections do not expose this view.
+After attaching to a sandbox, select `TRANSFER` or press `Ctrl+X 4`. The editor area shows local files on the left and sandbox files on the right. Your open editor tabs keep their contents and cursor positions. Local-only sessions and direct Workcell connections do not expose this view. It belongs to [managed sandboxes](/docs/sandboxes/), so it needs `experimental.sandboxes`.
 
 The local root starts at Caudra's current working directory and the sandbox root at the workspace. Change either with `L` or `S`, then Compare. The local root must be an existing absolute directory, and the sandbox root an existing workspace-relative directory. Each pane header shows its root, or offers `L` while no local root is set. A root that cannot be compared is named in the status bar, together with the key that edits it. The sandbox root is relative to the exposed Workcell workspace, not the guest filesystem. A remote conversation path is never used as a local directory automatically. Changing the root pair discards the old review and requires a fresh comparison.
 

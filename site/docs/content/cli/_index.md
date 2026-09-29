@@ -22,9 +22,11 @@ When interactive Caudra starts in a Herdr pane, it automatically reports native 
 
 `caudra --session <id>` opens a local session in the directory it works in, wherever you run the command, so project config, plugins and MCP servers come from that directory. A session left in a removed worktree moves back to a remaining checkout first.
 
+Some flags and subcommands belong to [experimental features](/docs/configuration/#experimental-features), which stay off until the global `caudra.toml` turns them on. While a feature is off, `--help` does not list them. Using one anyway stops Caudra with an error that names the `experimental.*` key to set. The exception is `--no-jit`, which has no effect without Lua. `caudra update`, `caudra rollback`, and `caudra logs` do not read settings, so a broken `caudra.toml` cannot stop them.
+
 ## caudra decisions
 
-Decision log administration does not start an agent:
+Decision log administration needs `experimental.decision_engine` and does not start an agent:
 
 ```bash
 caudra decisions status
@@ -46,6 +48,7 @@ Labels are partial evidence, not a complete evaluation dataset. Tool-search actu
 | `--prompt` | yes | yes | no (messages arrive on the wire) |
 | `-m` / `--model` | yes | yes | yes |
 | `--yolo` | yes | yes | yes (or `--permission-mode bypassPermissions`) |
+| `--auto` | yes | yes | yes (or `--permission-mode auto`) |
 | `--no-plugins` / `--no-commands` / `--no-jit` | yes | yes | yes |
 | `--allowed-tools` / `--disallowed-tools` | yes | yes | yes |
 | `--system-prompt-profile` | yes | yes | yes |
@@ -78,9 +81,10 @@ Labels are partial evidence, not a complete evaluation dataset. Tool-search actu
 | `--output-format <text\|json\|stream-json>` | Output shape for `--print` (default `text`) |
 | `--input-format <text\|stream-json>` | With `--print`, `stream-json` enters SDK mode |
 | `--no-commands` | Skip custom commands from every user and project command directory |
-| `--no-plugins` | Skip user `init.lua` (global and project). The Lua host stays up and every built-in tool is native, so nothing else is lost |
-| `--no-jit` | Run plugin Lua on the interpreter with full debug info |
+| `--no-plugins` | Turn Lua off for this process, even when `experimental.lua_plugins` is on. No Lua runtime starts, so no `init.lua` or Lua plugin runs. `caudra.toml`, `permissions.toml`, custom commands, and env files load as usual. Use it to recover from a broken `init.lua` or keymap override |
+| `--no-jit` | Run plugin Lua on the interpreter with full debug info. Hidden, and without effect, while `experimental.lua_plugins` is off |
 | `--yolo` | Skip permission prompts on gated tools (alias: `--dangerously-skip-permissions`). Deny rules still apply |
+| `--auto` | Start in [Auto mode](/docs/permissions/#auto-mode). Needs `experimental.decision_engine`. Cannot be combined with `--yolo` |
 | `--exit-on-done` | Exit when the agent finishes (TUI automation wrappers) |
 | `--allowed-tools <LIST>` | Comma-separated allow list (PascalCase or snake_case) |
 | `--disallowed-tools <LIST>` | Comma-separated deny list |
@@ -90,10 +94,12 @@ Labels are partial evidence, not a complete evaluation dataset. Tool-search actu
 | `--max-turns <N>` | Cap agent turns (SDK) |
 | `--system-prompt <TEXT>` | Replace the system prompt (SDK only) |
 | `--append-system-prompt <TEXT>` | Append to the built-in system prompt (SDK only) |
-| `--permission-mode <MODE>` | SDK: `default`, `acceptEdits`, `plan`, or `bypassPermissions` |
+| `--permission-mode <MODE>` | SDK: `default`, `auto`, `acceptEdits`, `plan`, or `bypassPermissions` |
 | `--include-partial-messages` | Stream partial deltas in SDK mode |
 
 ### Remote Workcell selection
+
+Direct Workcell connections are experimental. These flags need `experimental.remote_workcell`.
 
 ```bash
 caudra --workcell-profile dev
@@ -115,6 +121,8 @@ These flags are global. A Workcell profile cannot be combined with any direct se
 
 ### Managed sandbox selection
 
+Managed sandboxes are experimental. These flags need `experimental.sandboxes`, and they work without `experimental.remote_workcell`.
+
 | Flag | Description |
 |------|-------------|
 | `--sandbox <NAME>` | Attach the exact saved sandbox. Never creates a VM implicitly. Conflicts with the `--workcell-*` selectors |
@@ -133,11 +141,14 @@ These selectors also work with ACP. `--session ID` restores a saved sandbox sour
 | Mode | Effect |
 |------|--------|
 | `default` | Normal permission prompts |
+| `auto` | Same as `--auto` for the SDK path. Needs `experimental.decision_engine` |
 | `acceptEdits` | Accepted for Claude Code compatibility; currently same as `default` |
 | `plan` | Agent mode plan with plan file `./plan.md` under cwd |
 | `bypassPermissions` | Same as `--yolo` for the SDK path |
 
 If both `--yolo` and `--permission-mode` are set, the explicit mode wins. Unknown mode names warn and fall back to `default`.
+
+While `experimental.decision_engine` is off, `--permission-mode auto` stops Caudra with an error. A `set_permission_mode` control request for `auto` returns the same error and leaves the mode unchanged.
 
 Several other Claude Code flags are accepted and ignored so existing scripts keep parsing. Caudra prints a warning when you pass one of them.
 
@@ -292,6 +303,8 @@ Unlike CLI `rebind`, the TUI manager's Copy action leaves all source rules activ
 
 ### `caudra sandbox`
 
+Managed sandbox administration needs `experimental.sandboxes`:
+
 ```bash
 caudra sandbox doctor --provider local --local
 caudra sandbox create dev --profile rust
@@ -313,7 +326,7 @@ caudra --workcell-profile dev remote reconcile
 caudra --workcell-profile dev remote acknowledge OPERATION_ID --accept-possible-effects
 ```
 
-A remote selector is required. With no action, `remote` shows status. Pending operations never block tool calls. Acknowledgement clears an operation from the pending report and accepts that it may have had effects or may still be running. It does not cancel, undo, or resend the operation. See [recovery commands](/docs/remote-workspaces/#recovery-commands) for the TUI and SDK forms and the inspection steps to take first.
+A remote selector is required. `remote` is available when `experimental.sandboxes` or `experimental.remote_workcell` is on, and the selector needs its own feature: `--sandbox` needs `sandboxes`, and the `--workcell-*` selectors need `remote_workcell`. With no action, `remote` shows status. Pending operations never block tool calls. Acknowledgement clears an operation from the pending report and accepts that it may have had effects or may still be running. It does not cancel, undo, or resend the operation. See [recovery commands](/docs/remote-workspaces/#recovery-commands) for the TUI and SDK forms and the inspection steps to take first.
 
 ### `caudra auth`
 
@@ -336,9 +349,9 @@ Anthropic OAuth is experimental. The command explains the Anthropic terms limita
 
 The TUI `/login` command offers the same method choice for Anthropic and OpenAI. `status` distinguishes saved OAuth, saved API keys, environment credentials, configured endpoints, and missing credentials.
 
-`auth workcell set` reads a bearer token from a hidden terminal prompt, or from stdin with `--stdin`. It stores or replaces a named credential, referenced as `credential:NAME`. `list` shows names and update times without bearer values. Credentials are stored in owner-only local files, without OS-keyring encryption. They are separate from provider login and MCP OAuth credentials.
+`auth workcell set` reads a bearer token from a hidden terminal prompt, or from stdin with `--stdin`. It stores or replaces a named credential, referenced as `credential:NAME`. `list` shows names and update times without bearer values. Credentials are stored in owner-only local files, without OS-keyring encryption. They are separate from provider login and MCP OAuth credentials. `auth workcell` needs `experimental.remote_workcell`.
 
-`auth sandbox` manages lifecycle keys in a separate purpose store, referenced as `sandbox-api:NAME`. `generate` saves a new 256-bit key without printing it. `set` uses a hidden prompt or bounded stdin, and `list` omits secret values. Deleting a credential does not delete sandbox resources. See [sandbox configuration](/docs/sandboxes/#configuration-schema).
+`auth sandbox` needs `experimental.sandboxes` and manages lifecycle keys in a separate purpose store, referenced as `sandbox-api:NAME`. `generate` saves a new 256-bit key without printing it. `set` uses a hidden prompt or bounded stdin, and `list` omits secret values. Deleting a credential does not delete sandbox resources. See [sandbox configuration](/docs/sandboxes/#configuration-schema).
 
 ### `caudra models`
 
@@ -390,7 +403,7 @@ Starts an [ACP](/docs/acp/) server on stdio for editors like Zed. Subcommand fla
 caudra index path/to/file.rs
 ```
 
-Runs the native `file_index` tool and prints its compact file skeleton or directory listing. It honors `plugins.index.enabled` and `plugins.index.max_file_size_mb`. `--no-plugins` skips user `init.lua`, so default index settings apply.
+Runs the native `file_index` tool and prints its compact file skeleton or directory listing. It honors `plugins.index.enabled` and `plugins.index.max_file_size_mb`. `--no-plugins` skips only Lua, so these settings still apply from `caudra.toml`.
 
 ### `caudra prompt`
 
@@ -432,7 +445,7 @@ caudra skills --json          # full records
 caudra skills --dirs          # candidate directories: selected, superseded, or missing
 ```
 
-Applies the same directory precedence a real run does, including the builtin `caudra-workflow-dev` and `caudra-plugin-dev` skills when their `plugins.skill` switches are on. `--dirs` answers why a skill is missing: a directory reads `superseded` when a higher-priority one exists, and `missing` when nothing is there. See [Skills](/docs/skills/#where-skills-live).
+Applies the same directory precedence a real run does, including the builtin `caudra-workflow-dev` and `caudra-plugin-dev` skills when their `plugins.skill` switches and their experimental features are on. `--dirs` answers why a skill is missing: a directory reads `superseded` when a higher-priority one exists, and `missing` when nothing is there. See [Skills](/docs/skills/#where-skills-live).
 
 ### `caudra logs`
 

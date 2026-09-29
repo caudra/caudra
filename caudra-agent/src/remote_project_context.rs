@@ -3,7 +3,8 @@ use std::sync::{Arc, LazyLock, Mutex};
 
 use caudra_config::config_version::{ConfigVersion, ConfigVersionError};
 use caudra_config::{
-    DefaultEffect, Effect, PERMISSIONS_VERSION, PermissionRule, PermissionsConfig, ToolKey,
+    DefaultEffect, Effect, Feature, FeatureFlags, PERMISSIONS_VERSION, PermissionRule,
+    PermissionsConfig, ToolKey,
 };
 use caudra_workflow::meta::MAX_SOURCE_BYTES;
 use caudra_workflow::{WORKFLOW_ABI_VERSION, WORKFLOW_LANGUAGE_VERSION, WorkflowMeta, parse_meta};
@@ -297,6 +298,7 @@ struct ContextKey {
     project: ProjectIdentity,
     cwd: caudra_workspace::CwdHandle,
     revision: CollectionRevision,
+    workflows: bool,
 }
 
 #[derive(Default)]
@@ -310,10 +312,14 @@ impl RemoteProjectContextLoader {
         Self::default()
     }
 
+    /// Workflow assets are neither read nor parsed while that experiment is
+    /// off, so a broken one cannot fail the session.
     pub async fn load(
         &self,
         session: &WorkspaceSession,
+        features: FeatureFlags,
     ) -> Result<Arc<RemoteProjectContext>, RemoteProjectContextError> {
+        let workflows = features.enabled(Feature::Workflows);
         let _guard = self.gate.lock().await;
         let service = session
             .workspace()
@@ -332,6 +338,7 @@ impl RemoteProjectContextLoader {
             project: session.binding().project().clone(),
             cwd: session.cursor().cwd_handle().clone(),
             revision: manifest.revision.clone(),
+            workflows,
         };
         if let Some(cached) = self
             .cache
@@ -347,6 +354,9 @@ impl RemoteProjectContextLoader {
         let mut declared_bytes = 0u64;
         let mut admitted = Vec::new();
         for asset in manifest.assets {
+            if asset.kind == ProjectAssetKind::Workflow && !workflows {
+                continue;
+            }
             // Skipping an asset costs context; loading one whose declaration
             // Caudra cannot account for costs more. A permission policy is the
             // exception, because a session that quietly runs without the
@@ -414,8 +424,9 @@ impl RemoteProjectContextLoader {
 
 pub async fn load_remote_project_context(
     session: &WorkspaceSession,
+    features: FeatureFlags,
 ) -> Result<Arc<RemoteProjectContext>, RemoteProjectContextError> {
-    REMOTE_CONTEXT_LOADER.load(session).await
+    REMOTE_CONTEXT_LOADER.load(session, features).await
 }
 
 struct ContextBuilder {
@@ -986,10 +997,10 @@ pub(crate) mod tests {
                     )
                 })
                 .collect();
-            smol::block_on(
-                RemoteProjectContextLoader::new()
-                    .load(&session(Self::new(assets), "instruction-fixture")),
-            )
+            smol::block_on(RemoteProjectContextLoader::new().load(
+                &session(Self::new(assets), "instruction-fixture"),
+                FeatureFlags::all(),
+            ))
             .unwrap()
         }
 
@@ -1170,7 +1181,8 @@ pub(crate) mod tests {
                 "x",
             )]);
             let context = smol::block_on(
-                RemoteProjectContextLoader::new().load(&session(Arc::clone(&service), "alice")),
+                RemoteProjectContextLoader::new()
+                    .load(&session(Arc::clone(&service), "alice"), FeatureFlags::all()),
             )
             .unwrap();
             assert_eq!(context.skipped(), [WorkspacePath::new(path).unwrap()]);
@@ -1206,7 +1218,8 @@ pub(crate) mod tests {
             ),
         ]);
         let context = smol::block_on(
-            RemoteProjectContextLoader::new().load(&session(Arc::clone(&service), "alice")),
+            RemoteProjectContextLoader::new()
+                .load(&session(Arc::clone(&service), "alice"), FeatureFlags::all()),
         )
         .unwrap();
 
@@ -1245,7 +1258,8 @@ pub(crate) mod tests {
         service.state.lock().unwrap().manifest.unreadable = unreadable.clone();
 
         let context = smol::block_on(
-            RemoteProjectContextLoader::new().load(&session(Arc::clone(&service), "alice")),
+            RemoteProjectContextLoader::new()
+                .load(&session(Arc::clone(&service), "alice"), FeatureFlags::all()),
         )
         .unwrap();
 
@@ -1278,7 +1292,8 @@ pub(crate) mod tests {
         )]);
 
         let error = smol::block_on(
-            RemoteProjectContextLoader::new().load(&session(Arc::clone(&service), "alice")),
+            RemoteProjectContextLoader::new()
+                .load(&session(Arc::clone(&service), "alice"), FeatureFlags::all()),
         )
         .unwrap_err();
 
@@ -1299,8 +1314,8 @@ pub(crate) mod tests {
         let session = session(Arc::clone(&service), "alice");
         let loader = RemoteProjectContextLoader::new();
 
-        let initial = smol::block_on(loader.load(&session)).unwrap();
-        let cached = smol::block_on(loader.load(&session)).unwrap();
+        let initial = smol::block_on(loader.load(&session, FeatureFlags::all())).unwrap();
+        let cached = smol::block_on(loader.load(&session, FeatureFlags::all())).unwrap();
         assert!(Arc::ptr_eq(&initial, &cached));
         assert_eq!(service.reads.load(Ordering::Relaxed), 1);
 
@@ -1312,7 +1327,7 @@ pub(crate) mod tests {
             NESTED_RULE.len() as u64,
         );
         service.replace(second, NESTED_RULE, "manifest-2");
-        let refreshed = smol::block_on(loader.load(&session)).unwrap();
+        let refreshed = smol::block_on(loader.load(&session, FeatureFlags::all())).unwrap();
         assert_eq!(refreshed.instructions()[0].content, NESTED_RULE);
         assert_eq!(service.reads.load(Ordering::Relaxed), 2);
     }
@@ -1329,8 +1344,10 @@ pub(crate) mod tests {
         let service = AssetService::new(vec![(instruction, ROOT_RULE)]);
         let loader = RemoteProjectContextLoader::new();
 
-        smol::block_on(loader.load(&session(Arc::clone(&service), "alice"))).unwrap();
-        smol::block_on(loader.load(&session(Arc::clone(&service), "bob"))).unwrap();
+        smol::block_on(loader.load(&session(Arc::clone(&service), "alice"), FeatureFlags::all()))
+            .unwrap();
+        smol::block_on(loader.load(&session(Arc::clone(&service), "bob"), FeatureFlags::all()))
+            .unwrap();
 
         assert_eq!(service.reads.load(Ordering::Relaxed), 2);
     }
@@ -1348,7 +1365,8 @@ pub(crate) mod tests {
             ROOT_RULE,
         )]);
         let context = smol::block_on(
-            RemoteProjectContextLoader::new().load(&session(Arc::clone(&service), "alice")),
+            RemoteProjectContextLoader::new()
+                .load(&session(Arc::clone(&service), "alice"), FeatureFlags::all()),
         )
         .unwrap();
         assert!(context.instructions().is_empty());
@@ -1386,7 +1404,8 @@ pub(crate) mod tests {
         }
 
         let error = smol::block_on(
-            RemoteProjectContextLoader::new().load(&session(Arc::clone(&service), "alice")),
+            RemoteProjectContextLoader::new()
+                .load(&session(Arc::clone(&service), "alice"), FeatureFlags::all()),
         )
         .unwrap_err();
 
@@ -1413,7 +1432,8 @@ pub(crate) mod tests {
         ));
 
         let error = smol::block_on(
-            RemoteProjectContextLoader::new().load(&session(Arc::clone(&service), "alice")),
+            RemoteProjectContextLoader::new()
+                .load(&session(Arc::clone(&service), "alice"), FeatureFlags::all()),
         )
         .unwrap_err();
 
@@ -1430,10 +1450,10 @@ pub(crate) mod tests {
             ProjectAssetTrust::Declarative,
             ROOT_RULE.len() as u64,
         );
-        let context = smol::block_on(RemoteProjectContextLoader::new().load(&session(
-            AssetService::new(vec![(instruction, ROOT_RULE)]),
-            "alice",
-        )))
+        let context = smol::block_on(RemoteProjectContextLoader::new().load(
+            &session(AssetService::new(vec![(instruction, ROOT_RULE)]), "alice"),
+            FeatureFlags::all(),
+        ))
         .unwrap();
         let label = context.instructions()[0].source.source_label();
 
@@ -1479,9 +1499,10 @@ pub(crate) mod tests {
                 SHADOWED_RULE,
             ),
         ]);
-        let context =
-            smol::block_on(RemoteProjectContextLoader::new().load(&session(service, "alice")))
-                .unwrap();
+        let context = smol::block_on(
+            RemoteProjectContextLoader::new().load(&session(service, "alice"), FeatureFlags::all()),
+        )
+        .unwrap();
 
         let root = context.applicable_instructions(&WorkspacePath::new("README.md").unwrap());
         let nested = context.applicable_instructions(&WorkspacePath::new("src/lib.rs").unwrap());
@@ -1512,9 +1533,10 @@ pub(crate) mod tests {
             instruction("AGENTS.local.md", "overlay", PERSONAL_RULE),
             instruction("src/AGENTS.local.md", "nested-overlay", NESTED_RULE),
         ]);
-        let context =
-            smol::block_on(RemoteProjectContextLoader::new().load(&session(service, "alice")))
-                .unwrap();
+        let context = smol::block_on(
+            RemoteProjectContextLoader::new().load(&session(service, "alice"), FeatureFlags::all()),
+        )
+        .unwrap();
 
         let root = context.applicable_instructions(&WorkspacePath::new("README.md").unwrap());
         assert_eq!(
@@ -1564,9 +1586,11 @@ pub(crate) mod tests {
                     ROOT_RULE,
                 ),
             ]);
-            let context =
-                smol::block_on(RemoteProjectContextLoader::new().load(&session(service, "alice")))
-                    .unwrap();
+            let context = smol::block_on(
+                RemoteProjectContextLoader::new()
+                    .load(&session(service, "alice"), FeatureFlags::all()),
+            )
+            .unwrap();
 
             let applicable = context.applicable_instructions(&WorkspacePath::root());
             assert_eq!(applicable.len(), 1, "{better} beside {worse}");
@@ -1644,9 +1668,10 @@ pub(crate) mod tests {
                 "---\nname: review\n---\nnew skill",
             ),
         ]);
-        let context =
-            smol::block_on(RemoteProjectContextLoader::new().load(&session(service, "alice")))
-                .unwrap();
+        let context = smol::block_on(
+            RemoteProjectContextLoader::new().load(&session(service, "alice"), FeatureFlags::all()),
+        )
+        .unwrap();
         assert_eq!(context.commands().len(), 1);
         assert_eq!(context.commands()[0].content, "new command");
         assert_eq!(context.skills().len(), 1);
@@ -1686,10 +1711,13 @@ pub(crate) mod tests {
             source.len() as u64,
         );
 
-        let error = smol::block_on(RemoteProjectContextLoader::new().load(&session(
-            AssetService::new(vec![(permission_asset, source.as_str())]),
-            "alice",
-        )))
+        let error = smol::block_on(RemoteProjectContextLoader::new().load(
+            &session(
+                AssetService::new(vec![(permission_asset, source.as_str())]),
+                "alice",
+            ),
+            FeatureFlags::all(),
+        ))
         .unwrap_err();
 
         assert_eq!(
@@ -1714,10 +1742,10 @@ pub(crate) mod tests {
             ProjectAssetTrust::MixedReviewRequired,
             source.len() as u64,
         );
-        let context = smol::block_on(RemoteProjectContextLoader::new().load(&session(
-            AssetService::new(vec![(permission_asset, source)]),
-            "alice",
-        )))
+        let context = smol::block_on(RemoteProjectContextLoader::new().load(
+            &session(AssetService::new(vec![(permission_asset, source)]), "alice"),
+            FeatureFlags::all(),
+        ))
         .unwrap();
         let temp = tempfile::tempdir().unwrap();
         let state = caudra_storage::StateDir::from_path(temp.path().join("state"));
@@ -1749,6 +1777,29 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn workflow_assets_are_not_read_while_workflows_are_off() {
+        let broken = "not a workflow";
+        let workflow_asset = asset(
+            ".caudra/workflows/review.rhai",
+            "workflow-1",
+            ProjectAssetKind::Workflow,
+            ProjectAssetTrust::ClientApprovalRequired,
+            broken.len() as u64,
+        );
+        let service = AssetService::new(vec![(workflow_asset, broken)]);
+        let loader = RemoteProjectContextLoader::new();
+        let off = FeatureFlags::all().without(Feature::Workflows);
+        let context =
+            smol::block_on(loader.load(&session(Arc::clone(&service), "alice"), off)).unwrap();
+        assert!(context.workflows().is_empty());
+        assert!(context.skipped().is_empty());
+        assert_eq!(service.reads.load(Ordering::Relaxed), 0);
+        assert!(
+            smol::block_on(loader.load(&session(service, "alice"), FeatureFlags::all())).is_err()
+        );
+    }
+
+    #[test]
     fn workflow_trust_isolated_by_digest_revision_and_principal() {
         let source = "let meta = #{ name: \"review\", description: \"review\" };";
         let workflow_asset = asset(
@@ -1760,11 +1811,14 @@ pub(crate) mod tests {
         );
         let service = AssetService::new(vec![(workflow_asset, source)]);
         let alice = smol::block_on(
-            RemoteProjectContextLoader::new().load(&session(Arc::clone(&service), "alice")),
+            RemoteProjectContextLoader::new()
+                .load(&session(Arc::clone(&service), "alice"), FeatureFlags::all()),
         )
         .unwrap();
-        let bob = smol::block_on(RemoteProjectContextLoader::new().load(&session(service, "bob")))
-            .unwrap();
+        let bob = smol::block_on(
+            RemoteProjectContextLoader::new().load(&session(service, "bob"), FeatureFlags::all()),
+        )
+        .unwrap();
         let state = tempfile::tempdir().unwrap();
         let state = caudra_storage::StateDir::from_path(state.path().to_path_buf());
         let workflow = &alice.workflows()[0];

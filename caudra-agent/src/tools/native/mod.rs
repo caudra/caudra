@@ -25,6 +25,7 @@ pub mod workflow;
 
 use std::sync::Arc;
 
+use caudra_config::{Feature, FeatureFlags};
 use serde_json::json;
 
 use super::registry::{RegistryError, Tool, ToolEffect, ToolRegistry, ToolSource};
@@ -58,23 +59,25 @@ pub fn review_contracts() -> Vec<(String, String)> {
     .collect()
 }
 
-pub fn register(registry: &ToolRegistry) -> Result<(), RegistryError> {
-    registry.register_many_audited(entries())
-}
-
-fn entries() -> Vec<(Arc<dyn Tool>, ToolSource, ToolEffect)> {
-    entries_with_skill(skill::SkillTool::default())
+/// A tool whose experiment is off is never registered, so no catalog, allowlist,
+/// or batch can reach it.
+pub fn register(registry: &ToolRegistry, features: FeatureFlags) -> Result<(), RegistryError> {
+    registry.register_many_audited(entries(skill::SkillTool::default(), features))
 }
 
 pub fn register_remote(
     registry: &ToolRegistry,
     skills: &[RemoteSkill],
+    features: FeatureFlags,
 ) -> Result<(), RegistryError> {
-    registry.register_many_audited(entries_with_skill(skill::SkillTool::remote(skills)))
+    registry.register_many_audited(entries(skill::SkillTool::remote(skills), features))
 }
 
-fn entries_with_skill(skill: skill::SkillTool) -> Vec<(Arc<dyn Tool>, ToolSource, ToolEffect)> {
-    vec![
+fn entries(
+    skill: skill::SkillTool,
+    features: FeatureFlags,
+) -> Vec<(Arc<dyn Tool>, ToolSource, ToolEffect)> {
+    let mut entries = vec![
         entry(
             tool_output::ToolOutputTool,
             ToolEffect::ReadOnly,
@@ -132,12 +135,15 @@ fn entries_with_skill(skill: skill::SkillTool) -> Vec<(Arc<dyn Tool>, ToolSource
             ToolEffect::ReadOnly,
             view_image::DESCRIPTION,
         ),
-        entry(
+    ];
+    if features.enabled(Feature::Workflows) {
+        entries.push(entry(
             workflow::WorkflowTool,
             ToolEffect::Orchestrator,
             workflow::DESCRIPTION,
-        ),
-    ]
+        ));
+    }
+    entries
 }
 
 /// `description` is passed separately because a tool may augment its live
@@ -183,9 +189,13 @@ mod tests {
     const NAME_DRIFT: &str = "CAUDRA_NATIVE_TOOL_NAMES must list exactly what `entries` registers; \
          it drives tool classification, prompt filters, and permission defaults";
 
+    fn every_entry() -> Vec<(Arc<dyn Tool>, ToolSource, ToolEffect)> {
+        entries(skill::SkillTool::default(), FeatureFlags::all())
+    }
+
     #[test]
     fn registered_names_match_the_declared_list() {
-        let registered = entries();
+        let registered = every_entry();
         let mut registered: Vec<&str> = registered.iter().map(|(t, ..)| t.name()).collect();
         registered.sort_unstable();
         let mut declared = caudra_config::CAUDRA_NATIVE_TOOL_NAMES.to_vec();
@@ -195,7 +205,7 @@ mod tests {
 
     #[test]
     fn every_native_tool_registers_under_a_unique_name() {
-        let registered = entries();
+        let registered = every_entry();
         let mut names: Vec<&str> = registered.iter().map(|(t, ..)| t.name()).collect();
         names.sort_unstable();
         let unique = names.len();
@@ -209,19 +219,32 @@ mod tests {
             ToolSource::Native { contract, .. } => contract.to_string(),
             other => panic!("native tools must register as native, got {other:?}"),
         };
-        let first: Vec<String> = entries().iter().map(|(_, s, _)| contract(s)).collect();
-        let second: Vec<String> = entries().iter().map(|(_, s, _)| contract(s)).collect();
+        let first: Vec<String> = every_entry().iter().map(|(_, s, _)| contract(s)).collect();
+        let second: Vec<String> = every_entry().iter().map(|(_, s, _)| contract(s)).collect();
         assert_eq!(first, second);
     }
 
     #[test]
     fn descriptions_are_non_empty() {
-        for (tool, ..) in entries() {
+        for (tool, ..) in every_entry() {
             assert!(
                 !static_description(tool.as_ref()).trim().is_empty(),
                 "{} has no description",
                 tool.name()
             );
         }
+    }
+
+    #[test]
+    fn workflow_registers_only_when_its_experiment_is_on() {
+        let registers_workflow = |features| {
+            entries(skill::SkillTool::default(), features)
+                .iter()
+                .any(|(tool, ..)| tool.name() == crate::tools::WORKFLOW_TOOL_NAME)
+        };
+        assert!(!registers_workflow(FeatureFlags::NONE));
+        assert!(registers_workflow(
+            FeatureFlags::NONE.with(Feature::Workflows)
+        ));
     }
 }
