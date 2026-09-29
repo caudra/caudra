@@ -1673,7 +1673,7 @@ mod background_runtime {
     #[test_case(true, false; "child_owned_shell_in_child_chat")]
     #[test_case(false, true; "stale_main_shell")]
     #[test_case(true, true; "stale_child_shell")]
-    fn activity_shell_click_selects_live_details_without_switching_chat(child: bool, stale: bool) {
+    fn activity_shell_click_opens_shell_modal_without_switching_chat(child: bool, stale: bool) {
         smol::block_on(bounded(async {
             let mut fixture = Fixture::after_final().await;
             let runtime = fixture.handles.background.as_ref().unwrap().clone();
@@ -1733,26 +1733,36 @@ mod background_runtime {
                         .is_empty()
                 );
             }
-            assert!(fixture.app.task_picker.is_open());
+            assert!(fixture.app.shell_modal.is_open());
+            assert!(!fixture.app.task_picker.is_open());
             assert_eq!(fixture.app.status_hover, None);
             assert_eq!(fixture.app.active_chat, index);
             assert_eq!(fixture.app.chats.len(), chats);
             assert_eq!(fixture.app.status, Status::Idle);
-            if stale {
-                assert_ne!(
-                    fixture.app.task_picker.selected_id().as_deref(),
-                    Some(card.task_id.as_str())
-                );
-            } else {
-                assert_eq!(
-                    fixture.app.task_picker.selected_id().as_deref(),
-                    Some(card.task_id.as_str())
-                );
-                assert!(super::rendered_wide(&mut fixture.app, 140).contains(SHELL_COMMAND));
+            assert_eq!(
+                fixture.app.shell_modal.selected_id().as_deref(),
+                Some(card.task_id.as_str())
+            );
+            assert!(super::rendered_wide(&mut fixture.app, 140).contains(SHELL_COMMAND));
+            if !stale {
                 assert!(runtime.status(&card.task_id).unwrap().active());
+                fixture.app.update(Msg::Key(KeyEvent::new(
+                    KeyCode::Char('k'),
+                    KeyModifiers::CONTROL,
+                )));
+                fixture.app.flush_task_controls().await;
+                assert!(matches!(
+                    runtime.status(&card.task_id).unwrap().state.as_str(),
+                    "cancelling" | "cancelled"
+                ));
+                assert!(
+                    runtime.status(&owner.task_id).unwrap().active(),
+                    "stopping a shell leaves its owner running"
+                );
+                assert!(fixture.app.shell_modal.is_open());
                 runtime.stop().await.unwrap();
             }
-            fixture.app.task_picker.close();
+            fixture.app.shell_modal.close();
             assert_eq!(fixture.app.task_activity(), TaskActivity::default());
             super::rendered(&mut fixture.app);
             assert!(fixture.app.status_hits.iter().all(|hit| {
@@ -1897,7 +1907,12 @@ mod background_runtime {
                 .app
                 .execute_task_control(&format!("status {}", card.task_id));
             fixture.app.update(Msg::Key(key(KeyCode::Enter)));
-            assert!(fixture.app.task_picker.is_open());
+            assert!(fixture.app.shell_modal.is_open());
+            assert!(!fixture.app.task_picker.is_open());
+            assert_eq!(
+                fixture.app.shell_modal.selected_id().as_deref(),
+                Some(card.task_id.as_str())
+            );
             assert_eq!(fixture.app.active_chat, index);
             assert_eq!(fixture.app.chats.len(), chats);
             assert_eq!(fixture.app.status, Status::Idle);
@@ -2838,6 +2853,43 @@ fn task_commands_open_local_picker_without_transcript(command: &str) {
     assert!(actions.is_empty());
     assert!(app.task_picker.is_open());
     assert_eq!(app.chats[0].message_count(), before);
+}
+
+const ONE_MODAL: &str = "opening Tasks or Shell must close the other";
+
+/// `/shells` needs no running command, and the two modals never stack. Shell
+/// taking over from a previewing task picker returns to the chat the picker
+/// was opened from, and an outside press leaves Shell without moving it.
+#[test]
+fn shell_and_task_modals_replace_each_other_over_the_same_chat() {
+    let mut app = app_with_subagent();
+    let before = app.chats[0].message_count();
+    assert!(type_and_submit(&mut app, "/shells").is_empty());
+    assert!(app.shell_modal.is_open());
+    assert_eq!(app.chats[0].message_count(), before);
+    let _ = rendered(&mut app);
+    let (column, row) = OUTSIDE_MODAL;
+    app.update(mouse_event(
+        MouseEventKind::Down(MouseButton::Left),
+        column,
+        row,
+    ));
+    assert!(!app.shell_modal.is_open(), "{LEFT_STANDING}");
+    assert_eq!(app.active_chat, 0);
+
+    app.focus_task(TASK_ID).unwrap();
+    app.tasks_browse();
+    let _ = rendered(&mut app);
+    app.update(Msg::Key(key(KeyCode::Up)));
+    assert_eq!(app.active_chat, 0, "the preview should have moved to Main");
+    app.shells_browse();
+    assert!(app.shell_modal.is_open());
+    assert!(!app.task_picker.is_open(), "{ONE_MODAL}");
+    assert_eq!(app.active_chat, 1, "{ORIGIN_RESTORED}");
+
+    app.tasks_browse();
+    assert!(app.task_picker.is_open());
+    assert!(!app.shell_modal.is_open(), "{ONE_MODAL}");
 }
 
 #[test_case("/tasks status"; "missing_id")]

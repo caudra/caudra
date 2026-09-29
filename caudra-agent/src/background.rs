@@ -20,6 +20,7 @@ use caudra_storage::{
     id::CaudraId,
     now_epoch,
     sessions::{RuntimeRetry, SessionDatabase},
+    shell_history::MAX_SHELL_EXECUTIONS,
     tool_outputs::{ToolOutputRef, ToolOutputStore},
 };
 use event_listener::Event;
@@ -61,8 +62,10 @@ const DELIVERY_CUE: &str = "<system-reminder>\n# Background task delivery\nNew t
 
 pub type TaskStatus = TaskCard;
 mod jobs;
+mod shells;
 pub use caudra_storage::background::ShellJobMetadata;
 pub use jobs::JobScope;
+pub use shells::{ShellExecutions, ShellLive, ShellOutputView, ShellSnapshot, ShellView};
 
 impl From<&TaskRecord> for TaskStatus {
     fn from(record: &TaskRecord) -> Self {
@@ -148,6 +151,7 @@ struct Inner {
     gate: Arc<AsyncMutex<()>>,
     drain_gate: AsyncMutex<()>,
     changed: Event,
+    shells: ShellExecutions,
 }
 
 struct State {
@@ -359,7 +363,7 @@ impl TaskReporter {
 impl BackgroundTasks {
     pub async fn spawn(dir: StateDir, session: CaudraId) -> Result<Self, String> {
         let load_dir = dir.clone();
-        let records = smol::unblock(move || -> Result<_, String> {
+        let (records, shells) = smol::unblock(move || -> Result<_, String> {
             let db = SessionDatabase::open(&load_dir).map_err(|error| error.to_string())?;
             let mut records = db
                 .background_tasks(session)
@@ -384,7 +388,12 @@ impl BackgroundTasks {
                 db.save_background_task(session, record)
                     .map_err(|error| error.to_string())?;
             }
-            Ok(records)
+            db.interrupt_shell_executions(session, shells::SHELL_INTERRUPTED)
+                .map_err(|error| error.to_string())?;
+            let shells = db
+                .shell_executions(session, None, MAX_SHELL_EXECUTIONS)
+                .map_err(|error| error.to_string())?;
+            Ok((records, shells))
         })
         .await?;
         let generation = records
@@ -394,6 +403,7 @@ impl BackgroundTasks {
             .unwrap_or_default()
             + 1;
         Ok(Self(Arc::new(Inner {
+            shells: ShellExecutions::restore(dir.clone(), session, shells),
             dir,
             session,
             gate: Arc::new(AsyncMutex::new(())),
@@ -595,6 +605,10 @@ impl BackgroundTasks {
 
     pub fn session_id(&self) -> CaudraId {
         self.0.session
+    }
+
+    pub fn shells(&self) -> &ShellExecutions {
+        &self.0.shells
     }
 
     pub fn generation(&self) -> u64 {
@@ -835,6 +849,7 @@ impl BackgroundTasks {
         for (_, job) in jobs {
             job.await;
         }
+        self.0.shells.shutdown().await;
         result
     }
 

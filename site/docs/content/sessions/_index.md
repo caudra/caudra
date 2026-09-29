@@ -70,12 +70,21 @@ Open `/tasks` or press `Ctrl+X a` to inspect transcripts and steer running child
 | `/tasks status <id>` | Open the picker with that task selected and its details visible |
 | `/tasks background <id>` | Promote an agent task without restarting it, in task `auto` mode |
 | `/tasks cancel <id>` | Cancel that invocation, showing cancelling until it settles |
+| `/shells` | Open the shell modal to inspect or stop shell commands |
 
-Singular `/task` forms remain compatibility aliases. Press Enter or click an agent task to open its chat. Shell jobs show command details and bounded output rather than a child chat. The picker shows `bg` at the right of background rows, including finished tasks. Task results and reports render as Markdown, structured values as JSON, and shell output as literal text. See [task navigation](/docs/commands/#tasks) for filtering and keyboard controls.
+Singular `/task` forms remain compatibility aliases. The task picker lists subagents and workflow agents. Press Enter or click an agent task to open its chat. A workflow agent without a transcript opens its run in the workflow inspector. The picker shows `bg` at the right of background rows, including finished tasks. Task results and reports render as Markdown and structured values as JSON. See [task navigation](/docs/commands/#tasks) for filtering and keyboard controls.
+
+The shell modal lists `shell` calls from the main agent, subagents, and workflow agents, in the foreground or the background. Output appears as literal text. `Ctrl+K` stops only the selected command, and its owner continues with a cancelled result. `/tasks status <id>` with a shell ID opens this modal. The footer shows `[tasks · N]` for running agents and `[shell · N]` for running commands, and each chip disappears at zero. See [shell commands](/docs/commands/#shell-commands) for navigation and controls.
 
 The model can inspect and cancel jobs through [`task_control`](/docs/tools/#task_control). Task `auto` also permits promotion of agent tasks. All actions except `list` require `task_id`. A later `task` call can continue a settled agent task from its saved history, but cannot resume an active or cancelling invocation. Shell jobs cannot be resumed or promoted. Run a new shell call when another command is needed.
 
 Shell results retain Workcell's output bounds and filtering. A truncated result can include a `tool_output` reference for the retained output, which is not an unlimited process log. Saved references remain usable after history reloads and forks.
+
+### Shell history
+
+Foreground `shell` calls are saved with the session, including calls from subagents and workflow agents. Caudra records each command before it starts and again when it settles. If that first record cannot be written, the call fails without running the command. Each session keeps its 200 most recent finished commands, with up to 64 KiB of output each. Longer output keeps the end of each stream. Background shell jobs keep their records with the session's background tasks.
+
+Closing a session cancels its running commands and waits for them to settle. After a crash, a command that was still running shows as `interrupted` on reload, because its outcome is unknown. Restoring history never runs a command again or reconnects to one. Forking a session does not copy its shell history, and deleting a session deletes it.
 
 ### Task and output IDs
 
@@ -101,7 +110,7 @@ Subagents and workflow agents can own asynchronous shell jobs, even when their p
 
 Stopping all session tasks and workflows cancels owned work and suppresses automatic continuation, including late reports and completion notices. A new user turn re-enables continuation. See [Stop and replace](/docs/queue/#stop-and-replace) for TUI controls.
 
-Switching TUI tabs leaves the owning session open. Closing a session cancels and drains its children and shell jobs before saving and releasing it. Background work is session-owned, not a daemon or a promise to keep executing after exit. Crash recovery marks unfinished work interrupted without replaying commands or other effects.
+Switching TUI tabs leaves the owning session open. Closing a session cancels and drains its children and shell commands before saving and releasing it. Background work is session-owned, not a daemon or a promise to keep executing after exit. Crash recovery marks unfinished work interrupted without replaying commands or other effects.
 
 ## Moving sessions to another directory
 

@@ -48,7 +48,7 @@ use ignore::WalkBuilder;
 use serde_json::Value;
 
 use crate::agent::LoadedInstructions;
-use crate::background::JobScope;
+use crate::background::{JobScope, ShellLive};
 use crate::cancel::{CancelMap, CancelToken};
 use crate::context::ContextPublisher;
 use crate::mcp::McpSession;
@@ -534,6 +534,9 @@ pub struct ToolContext {
     /// Never inherited: `to_tool_context` clears it, and each caller sets
     /// it for its own call only.
     pub live_sink: Option<flume::Sender<ToolLive>>,
+    /// Where the executor of a tracked shell attaches its live output. Set by
+    /// dispatch for that one execution only, whether or not a sink watches it.
+    pub shell_live: Option<ShellLive>,
     pub model_policy: Arc<ModelPolicy>,
     /// The session's workflow runtime. Only the main agent holds one: an
     /// agent a workflow launched must not launch workflows of its own.
@@ -810,6 +813,7 @@ pub fn interpreter_ctx(
         workflow: None,
         background: None,
         jobs: None,
+        shell_live: None,
     }
 }
 

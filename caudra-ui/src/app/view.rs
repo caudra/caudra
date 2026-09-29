@@ -497,6 +497,7 @@ impl App {
         render_if_open!(self.stash_picker);
         render_if_open!(self.memory_picker);
         render_if_open!(self.task_picker);
+        render_if_open!(self.shell_modal);
         render_if_open!(self.workflow_inspector);
         render_if_open!(self.workflow_catalog_picker);
         render_if_open!(self.session_picker);

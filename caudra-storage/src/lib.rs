@@ -26,6 +26,7 @@ pub mod retention;
 pub mod sandbox_auth;
 pub mod sessions;
 pub mod shell_durations;
+pub mod shell_history;
 pub mod state;
 pub mod theme;
 pub mod thinking;

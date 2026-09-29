@@ -1,7 +1,8 @@
-//! The `/tasks` picker: the subagents of the focused session, running first.
+//! The `/tasks` picker: the agents of the focused session, running first.
+//! Shell commands have a modal of their own.
 //!
 //! There is no task state here. The app owns the chats, so every open and
-//! every refresh rebuilds the rows from [`crate::app::App::tasks`], and
+//! every refresh rebuilds the rows from [`crate::app::App::picker_tasks`], and
 //! previewing is a real focus with a restore on cancel.
 
 use caudra_agent::TaskCard;
@@ -54,6 +55,12 @@ pub enum TaskPickerAction {
     Preview(String),
     /// Committed: keep the previewed task and close.
     Opened(String),
+    /// Committed to a workflow agent with no chat here. The app puts the
+    /// origin back and opens the run in the workflow inspector.
+    Inspect {
+        run_id: String,
+        origin: Option<String>,
+    },
     Control {
         task: Box<TaskCard>,
         promote: bool,
@@ -71,6 +78,8 @@ pub struct TaskItem {
     running: bool,
     search: String,
     runtime: Option<TaskCard>,
+    /// The run of a workflow agent listed without a chat.
+    workflow: Option<String>,
 }
 
 impl PickerItem for TaskItem {
@@ -283,9 +292,7 @@ impl TaskPicker {
                     )
                 },
             );
-            let shell = runtime.is_some_and(|task| task.kind == JobKind::Shell);
-            let room = area.height.saturating_sub(LIST_ROOM) / 2;
-            let rows = if shell { room } else { DETAIL_ROWS.min(room) } as usize;
+            let rows = DETAIL_ROWS.min(area.height.saturating_sub(LIST_ROOM) / 2) as usize;
             let width = Modal::inner_width(area.width, WIDTH_PERCENT);
             let facts = text
                 .lines()
@@ -295,7 +302,6 @@ impl TaskPicker {
                 .collect::<Vec<_>>();
             let mut lines = WrappedRows::new(facts, 0, width).lines();
             if let Some(task) = runtime {
-                lines.extend(task_card::shell_facts(task, width));
                 lines.extend(task_card::details(task, width).0);
             }
             if rows > 0 && lines.len() > rows {
@@ -313,12 +319,6 @@ impl TaskPicker {
             .selected_item()
             .and_then(|item| item.runtime.as_ref());
         self.picker.set_footer_builder(match task {
-            Some(task)
-                if task.kind == JobKind::Shell && task.active() && task.state != "cancelling" =>
-            {
-                shell_running_footer
-            }
-            Some(task) if task.kind == JobKind::Shell => shell_footer,
             Some(task) if task.active() && task.state != "cancelling" && self.can_promote(task) => {
                 foreground_footer
             }
@@ -333,10 +333,15 @@ impl TaskPicker {
     }
 
     /// Emitted whenever the cursor lands somewhere new, which is what makes
-    /// arrowing through the list preview each transcript.
+    /// arrowing through the list preview each transcript. A workflow row has
+    /// no transcript here, so the one behind it stays.
     fn preview(&mut self) -> TaskPickerAction {
-        match self.selected_id() {
-            Some(id) if self.previewed.as_deref() != Some(id.as_str()) => {
+        match self.picker.selected_item() {
+            Some(item)
+                if item.workflow.is_none()
+                    && self.previewed.as_deref() != Some(item.id.as_str()) =>
+            {
+                let id = item.id.clone();
                 self.previewed = Some(id.clone());
                 TaskPickerAction::Preview(id)
             }
@@ -348,15 +353,12 @@ impl TaskPicker {
         match action {
             PickerAction::Consumed | PickerAction::Toggle(..) => self.preview(),
             PickerAction::Select(item) => {
-                if item
-                    .runtime
-                    .as_ref()
-                    .is_some_and(|task| task.kind == JobKind::Shell)
-                {
-                    return TaskPickerAction::Preview(item.id);
-                }
+                let origin = self.origin.take();
                 self.close();
-                TaskPickerAction::Opened(item.id)
+                match item.workflow {
+                    Some(run_id) => TaskPickerAction::Inspect { run_id, origin },
+                    None => TaskPickerAction::Opened(item.id),
+                }
             }
             PickerAction::Close => {
                 let origin = self.origin.take();
@@ -401,22 +403,10 @@ fn background_footer() -> Vec<Hint> {
     hints
 }
 
-fn shell_footer() -> Vec<Hint> {
-    vec![
-        Hint::bind(key::ENTER, "details"),
-        Hint::bind(key::ESC, "cancel"),
-    ]
-}
-
-fn shell_running_footer() -> Vec<Hint> {
-    let mut hints = shell_footer();
-    hints.push(Hint::bind(CANCEL, "stop command"));
-    hints
-}
-
 /// The main chat comes first and has no status. The subagents follow, running
 /// ones above finished ones so a long job never gets buried under the ones
-/// that already returned. Within a section, chat order.
+/// that already returned. Within a section, chat order. A workflow agent
+/// without a chat shows its roster state.
 fn build_items(tasks: Vec<TaskInfo>) -> Vec<TaskItem> {
     let (mut main, mut running, mut finished) = (Vec::new(), Vec::new(), Vec::new());
     for mut task in tasks {
@@ -443,10 +433,14 @@ fn build_items(tasks: Vec<TaskInfo>) -> Vec<TaskItem> {
             search: format!("{} {}", task.name, task.id),
             id,
             name: task.name,
-            suffix,
+            suffix: task
+                .workflow
+                .as_ref()
+                .map_or(suffix, |workflow| Some(workflow.state)),
             section: None,
             running: status == Some(TaskStatus::Working),
             runtime: task.runtime,
+            workflow: task.workflow.map(|workflow| workflow.run_id),
         });
     }
     for (heading, bucket) in [
@@ -464,6 +458,7 @@ fn build_items(tasks: Vec<TaskInfo>) -> Vec<TaskItem> {
 mod tests {
     use super::*;
     use crate::animation::test_clock::FrozenSpinner;
+    use crate::app::tasks::WorkflowTask;
     use crate::components::key as key_event;
     use caudra_storage::tool_outputs::ToolOutputRef;
     use crossterm::event::{KeyCode, MouseButton, MouseEventKind};
@@ -482,6 +477,7 @@ mod tests {
     const OTHER_LABEL: &str = "Other investigation";
     const CLICK_ROW_MISSING: &str = "the completed task has a visible list row";
     const OUTPUT_ID: &str = "calm-blue-wren";
+    const RUN_ID: &str = "run-build";
 
     fn click_tasks(hydrated: bool, background: bool, state: &str) -> Vec<TaskInfo> {
         let mut target = runtime_task(state, background);
@@ -821,16 +817,32 @@ mod tests {
         ));
     }
 
-    #[test_case("running"; "active")]
-    #[test_case("succeeded"; "settled")]
-    fn shell_selection_requests_details_not_chat(state: &str) {
-        let mut item = runtime_task(state, true);
-        item.runtime.as_mut().unwrap().kind = JobKind::Shell;
+    #[test_case(TaskStatus::Working, "running"; "running_agent")]
+    #[test_case(TaskStatus::Error, "failed"; "failed_agent")]
+    fn workflow_rows_inspect_their_run_without_previewing(status: TaskStatus, state: &'static str) {
+        let mut agent = task(RUNNING_ID, LABEL, Some(status), false);
+        agent.workflow = Some(WorkflowTask {
+            run_id: RUN_ID.into(),
+            state,
+        });
         let mut picker = TaskPicker::new();
-        picker.open(vec![item]);
-        assert!(
-            matches!(picker.handle_key(key_event(KeyCode::Enter)), TaskPickerAction::Preview(id) if id == RUNNING_ID)
-        );
+        picker.open(vec![task(MAIN_ID, "Main", None, true), agent]);
+        assert!(matches!(
+            picker.handle_key(key_event(KeyCode::Down)),
+            TaskPickerAction::Consumed
+        ));
+        let row = picker.picker.selected_item().unwrap();
+        assert_eq!(row.detail(), Some(state));
+        assert_eq!(row.is_spinning(), status == TaskStatus::Working);
+        assert!(matches!(
+            picker.handle_key(CANCEL.to_key_event()),
+            TaskPickerAction::Consumed
+        ));
+        assert!(matches!(
+            picker.handle_key(key_event(KeyCode::Enter)),
+            TaskPickerAction::Inspect { run_id, origin: Some(origin) } if run_id == RUN_ID && origin == MAIN_ID
+        ));
+        assert!(!picker.is_open());
     }
 
     #[test_case("succeeded"; "terminal")]
@@ -874,6 +886,7 @@ mod tests {
             status,
             focused,
             runtime: None,
+            workflow: None,
         }
     }
 

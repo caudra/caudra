@@ -1,6 +1,7 @@
 use std::fmt;
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
+use std::sync::Arc;
 
 use caudra_providers::Message;
 use caudra_storage::{
@@ -17,7 +18,7 @@ use serde_json::{Value, json};
 
 use super::{
     Admission, BackgroundTasks, CLOSED, DriverGuard, MAX_ACTIVE, MAX_ID_BYTES, MAX_REQUEST_BYTES,
-    MAX_RESULT_BYTES, STALE_INVOCATION, TRANSITION, bounded, deliverable,
+    MAX_RESULT_BYTES, STALE_INVOCATION, TRANSITION, bounded, deliverable, shells::ShellExecutions,
 };
 use crate::{
     CancelToken, History, SubagentHistoryStore, TaskCard, TaskProvenance, ToolDoneEvent,
@@ -37,6 +38,7 @@ pub struct JobScope {
     tasks: BackgroundTasks,
     owner: JobOwner,
     generation: u64,
+    task_id: Option<Arc<str>>,
 }
 
 impl fmt::Debug for JobScope {
@@ -45,6 +47,7 @@ impl fmt::Debug for JobScope {
             .debug_struct("JobScope")
             .field("owner", &self.owner)
             .field("generation", &self.generation)
+            .field("task_id", &self.task_id)
             .finish_non_exhaustive()
     }
 }
@@ -55,6 +58,7 @@ impl BackgroundTasks {
             tasks: self.clone(),
             owner: JobOwner::Main,
             generation: self.generation(),
+            task_id: None,
         }
     }
 
@@ -65,6 +69,7 @@ impl BackgroundTasks {
                 invocation_id: invocation_id.into(),
             },
             generation: self.generation(),
+            task_id: None,
         }
     }
 }
@@ -77,11 +82,26 @@ impl JobScope {
                 invocation_id: invocation_id.into(),
             },
             generation: self.generation,
+            task_id: None,
         }
+    }
+
+    /// Names the task this scope's owner runs, for history that outlives it.
+    pub fn for_task(mut self, task_id: impl Into<Arc<str>>) -> Self {
+        self.task_id = Some(task_id.into());
+        self
     }
 
     pub fn owner(&self) -> &JobOwner {
         &self.owner
+    }
+
+    pub fn task_id(&self) -> Option<&str> {
+        self.task_id.as_deref()
+    }
+
+    pub fn shells(&self) -> &ShellExecutions {
+        self.tasks.shells()
     }
 
     pub(crate) fn reminder_snapshot(&self) -> RuntimeSnapshot {
@@ -506,19 +526,7 @@ impl JobScope {
         let done = execute_shell(execute, cancel.clone(), provenance).await?;
         let _gate = self.tasks.0.gate.lock().await;
         let mut record = self.tasks.record(invocation)?;
-        record.state =
-            if cancel.is_cancelled() || done.accounting.outcome == Some(ToolOutcome::Cancelled) {
-                "cancelled"
-            } else if done.accounting.outcome == Some(ToolOutcome::Timeout)
-                || matches!(&done.output, ToolOutput::Shell(shell) if shell.timed_out)
-            {
-                "timed_out"
-            } else if done.is_error {
-                "failed"
-            } else {
-                "succeeded"
-            }
-            .into();
+        record.state = shell_job_state(cancel.is_cancelled(), &done).into();
         let terminal = done.composed_model_output();
         let reference = match done.output_ref {
             Some(reference) => reference,
@@ -643,6 +651,23 @@ impl JobScope {
         failure
             .or_else(|| self.tasks.lock().failure.clone())
             .map_or(Ok(()), Err)
+    }
+}
+
+/// A command that ran reports how it ended, so words it printed never decide
+/// its state. The accounting bucket, which is matched from text, only speaks
+/// for a result that carries no process facts, such as a refused remote call.
+fn shell_job_state(cancelled: bool, done: &ToolDoneEvent) -> &'static str {
+    let outcome = match &done.output {
+        ToolOutput::Shell(shell) if shell.timed_out => Some(ToolOutcome::Timeout),
+        ToolOutput::Shell(_) => None,
+        _ => done.accounting.outcome,
+    };
+    match (cancelled, outcome) {
+        (true, _) | (_, Some(ToolOutcome::Cancelled)) => "cancelled",
+        (_, Some(ToolOutcome::Timeout)) => "timed_out",
+        _ if done.is_error => "failed",
+        _ => "succeeded",
     }
 }
 

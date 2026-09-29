@@ -793,6 +793,7 @@ impl WorkflowHostContext {
             workflow: None,
             background: None,
             jobs: self.jobs.clone(),
+            shell_live: None,
             steering_observations: None,
             steering_order: Vec::new(),
             speculative: None,

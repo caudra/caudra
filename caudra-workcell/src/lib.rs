@@ -2037,6 +2037,10 @@ impl ToolInvocation for RemoteWorkcellInvocation {
         self.input.shell_timeout()
     }
 
+    fn runs_remotely(&self) -> bool {
+        true
+    }
+
     fn start_header(&self) -> HeaderFuture {
         HeaderFuture::Ready(HeaderResult::plain(input_header(&self.input)))
     }
@@ -2165,9 +2169,13 @@ struct RemoteProgress {
 
 impl RemoteProgress {
     fn new(ctx: &ToolContext) -> Self {
+        let buffer = Arc::new(SharedBuf::new());
+        if let Some(live) = &ctx.shell_live {
+            live.attach(&buffer);
+        }
         Self {
             sink: ctx.live_sink.clone(),
-            buffer: Arc::new(SharedBuf::new()),
+            buffer,
             buffer_published: false,
             next_sequence: None,
             reported_gap: None,
@@ -4577,7 +4585,10 @@ impl NativeProgressSink {
         }
     }
 
-    fn publish_live_buf(&self, _ctx: &ToolContext) {
+    fn publish_live_buf(&self, ctx: &ToolContext) {
+        if let Some(live) = &ctx.shell_live {
+            live.attach(&self.body);
+        }
         if let Some(sink) = &self.live_sink {
             let _ = sink.try_send(ToolLive::Buf(Arc::clone(&self.body)));
         }
@@ -4612,7 +4623,7 @@ mod tests {
     use super::*;
     use caudra_agent::agent::mention_preamble;
     use caudra_agent::agent::tool_dispatch::{self, Emit};
-    use caudra_agent::background::{BackgroundTasks, JobScope};
+    use caudra_agent::background::{BackgroundTasks, JobScope, ShellLive};
     use caudra_agent::cancel::CancelToken;
     use caudra_agent::permissions::pattern_recognition::{CommandObservation, ShellEffectStatus};
     use caudra_agent::permissions::{
@@ -4712,6 +4723,7 @@ mod tests {
         "task event must be durably saved in parent history before acknowledgment";
     const SHELL_SUCCEEDED: &str = "succeeded";
     const SHELL_CANCELLED_STATE: &str = "cancelled";
+    const OBSERVED_ROW: &str = "observed without a transcript";
 
     async fn bounded_shell_test<T>(operation: impl Future<Output = T>) -> T {
         future::race(operation, async {
@@ -7484,6 +7496,71 @@ mod tests {
             .last()
             .expect("a running command publishes output");
         assert_eq!(last.lines().collect::<Vec<_>>(), ["setup done", "100%"]);
+    }
+
+    fn observed_rows(live: &ShellLive) -> Vec<String> {
+        live.lines()
+            .expect("the executor attaches its buffer")
+            .iter()
+            .map(|line| line.spans.iter().map(|span| span.text.as_str()).collect())
+            .collect()
+    }
+
+    #[test]
+    fn a_tracked_local_shell_publishes_rows_without_a_transcript_sink() {
+        let root = TempDir::new().expect("tempdir");
+        let (_host, registry) = host_and_registry(root.path());
+        let mut ctx = context(root.path(), Arc::clone(&registry), CancelToken::none());
+        let live = ShellLive::default();
+        ctx.shell_live = Some(live.clone());
+        let invocation = registry
+            .get("shell")
+            .expect("registered shell")
+            .tool
+            .parse(&json!({"command": format!("printf '{OBSERVED_ROW}\\n'")}))
+            .expect("valid shell input");
+
+        smol::block_on(invocation.preflight(&ctx)).expect("shell preflight");
+        smol::block_on(invocation.execute(&ctx));
+
+        assert!(ctx.live_sink.is_none());
+        assert_eq!(observed_rows(&live), [OBSERVED_ROW]);
+    }
+
+    #[test]
+    fn a_tracked_remote_shell_publishes_rows_without_a_transcript_sink() {
+        let root = TempDir::new().unwrap();
+        let mut ctx = context(
+            root.path(),
+            Arc::new(ToolRegistry::new()),
+            CancelToken::none(),
+        );
+        let live = ShellLive::default();
+        ctx.shell_live = Some(live.clone());
+        let execution_id = OperationId::new("execution").unwrap();
+        let status = OperationStatus {
+            handle: OperationHandle {
+                preparation_id: OperationId::new("preparation").unwrap(),
+                invocation_id: Some(OperationId::new("invocation").unwrap()),
+                execution_id: Some(execution_id.clone()),
+                expires_at_unix_ms: Some(1),
+            },
+            state: OperationState::Running,
+            progress: vec![OperationProgress {
+                execution_id,
+                sequence: 1,
+                kind: OperationProgressKind::Stdout,
+                chunk: OBSERVED_ROW.into(),
+            }],
+            progress_metadata: SequenceMetadata {
+                first_retained_sequence: Some(1),
+                next_sequence: 2,
+                gap_before_first: false,
+            },
+        };
+
+        assert!(RemoteProgress::new(&ctx).publish(&status));
+        assert_eq!(observed_rows(&live), [OBSERVED_ROW]);
     }
 
     #[test]

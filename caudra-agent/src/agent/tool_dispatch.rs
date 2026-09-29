@@ -1028,6 +1028,7 @@ async fn run_inner(
                     let pending_report = Arc::new(PendingShellReport::default());
                     let owned_report = Arc::clone(&pending_report);
                     let owned_duration = duration_plan.clone();
+                    let shells = scope.shells().clone();
                     let admitted = scope
                         .admit_shell_cancellable(
                             metadata,
@@ -1036,7 +1037,9 @@ async fn run_inner(
                             ctx.deadline,
                             move |cancel, provenance| async move {
                                 let _guards = (_preparation_guards, _guards);
+                                let observed = shells.observe_job(&provenance.invocation_id);
                                 owned.cancel = cancel;
+                                owned.shell_live = Some(observed.live());
                                 owned.event_tx = owned.event_tx.clone().with_task(provenance);
                                 let invocation = owned_invocation
                                     .lock()
@@ -1120,12 +1123,38 @@ async fn run_inner(
                 }
             }
 
+            let tracked = match invocation.shell_timeout().zip(ctx.job_scope()) {
+                Some((timeout, scope)) => match scope
+                    .track_shell(
+                        ctx,
+                        &id,
+                        invocation.permission_input().unwrap_or(input),
+                        timeout,
+                        invocation.runs_remotely(),
+                    )
+                    .await
+                {
+                    Ok(tracked) => Some(tracked),
+                    Err(message) => {
+                        invocation.abandon(ctx).await;
+                        return done_error(message);
+                    }
+                },
+                None => None,
+            };
+            let tracked_ctx = tracked.as_ref().map(|tracked| tracked.context(ctx));
+            let execution_ctx = tracked_ctx.as_ref().unwrap_or(ctx);
             let observation = duration_plan.clone().map(ShellDurationPlan::begin);
-            let result = invocation.execute(ctx).await;
+            let result = invocation.execute(execution_ctx).await;
             if let Some(observation) = observation {
-                observation.finish(&result, ctx.cancel.is_cancelled()).await;
+                observation
+                    .finish(&result, execution_ctx.cancel.is_cancelled())
+                    .await;
             }
             let mut done = finish_invocation(id, tool_id, &entry.source, result, started.elapsed());
+            if let Some(tracked) = tracked {
+                tracked.finish(&done);
+            }
             if let Some(plan) = &duration_plan {
                 plan.advise(&mut done, ctx);
             }
@@ -1971,6 +2000,7 @@ mod tests {
     use caudra_storage::id::{CaudraId, SessionRef};
     use caudra_storage::sessions::SessionDatabase;
     use caudra_storage::shell_durations::{DurationOutcome, ShellDurationKey, ShellDurations};
+    use caudra_storage::shell_history::ShellExecutionState;
     use caudra_storage::tool_outputs::ToolOutputStore;
     use futures_lite::future::poll_once;
     use serde_json::json;
@@ -2011,6 +2041,7 @@ mod tests {
     const SHELL_ROOT: &str = "controlled-shell-root";
     const SHELL_COMMAND: &str = "controlled command";
     const SHELL_RESULT: &str = "controlled terminal output";
+    const SHELL_RESULT_NAMING_OUTCOMES: &str = "FAIL retry_after_timeout::cancelling";
     const SHELL_INDETERMINATE: &str =
         "Remote Workcell outcome is indeterminate; do not retry automatically";
     const SHELL_RUNNING: &str = "running";
@@ -2705,14 +2736,17 @@ mod tests {
         })
     }
 
-    #[test_case(Some(0), None, false, SHELL_SUCCEEDED; "success")]
-    #[test_case(Some(7), None, false, SHELL_FAILED; "nonzero_exit")]
-    #[test_case(None, Some(15), false, SHELL_FAILED; "signal")]
-    #[test_case(None, Some(9), true, SHELL_TIMED_OUT; "timeout")]
+    #[test_case(Some(0), None, false, SHELL_RESULT, SHELL_SUCCEEDED; "success")]
+    #[test_case(Some(7), None, false, SHELL_RESULT, SHELL_FAILED; "nonzero_exit")]
+    #[test_case(Some(7), None, false, SHELL_RESULT_NAMING_OUTCOMES, SHELL_FAILED; "nonzero_exit_printing_outcome_words")]
+    #[test_case(None, Some(15), false, SHELL_RESULT, SHELL_FAILED; "signal")]
+    #[test_case(None, Some(9), true, SHELL_RESULT, SHELL_TIMED_OUT; "timeout")]
+    #[test_case(None, Some(9), true, SHELL_RESULT_NAMING_OUTCOMES, SHELL_TIMED_OUT; "timeout_printing_outcome_words")]
     fn shell_admission_precedes_completion_and_preserves_owned_result(
         exit_code: Option<i32>,
         signal: Option<i32>,
         timed_out: bool,
+        printed: &str,
         state: &str,
     ) {
         smol::block_on(async {
@@ -2758,7 +2792,10 @@ mod tests {
                     .is_none()
             );
             cancel.cancel();
-            let output = shell_result(exit_code, signal, timed_out);
+            let mut output = shell_result(exit_code, signal, timed_out);
+            if let ToolOutput::Shell(shell) = &mut output {
+                shell.model_text = printed.into();
+            }
             let expected = serde_json::to_value(&output).unwrap();
             let mut result = ToolExecResult::from(Ok(output));
             result.is_error = state != SHELL_SUCCEEDED;
@@ -2889,6 +2926,78 @@ mod tests {
                 assert_eq!(matches!(done.output, ToolOutput::Tasks(_)), background);
                 assert_eq!(done.accounting.outcome.is_none(), background);
             }
+            fixture.tasks.shutdown().await.unwrap();
+        });
+    }
+
+    #[test_case(false; "completes")]
+    #[test_case(true; "stopped")]
+    fn foreground_shell_is_tracked_once_and_stops_alone(stop: bool) {
+        smol::block_on(async {
+            let mut fixture =
+                ShellDispatchFixture::new(Some(Duration::from_secs(121)), Effect::Allow).await;
+            fixture.ctx.config.shell_execution = ExecutionMode::Sync;
+            let shells = fixture.tasks.shells().clone();
+            let observe = async {
+                assert!(!fixture.started.recv_async().await.unwrap());
+                let snapshot = shells.snapshot();
+                let record = &snapshot.executions[0].record;
+                assert_eq!(snapshot.active_count(), 1);
+                assert_eq!(record.state, ShellExecutionState::Running);
+                assert_eq!(record.call_id, SHELL_CALL);
+                assert_eq!(record.command, SHELL_COMMAND);
+                if stop {
+                    shells.cancel(&record.execution_id).unwrap();
+                } else {
+                    fixture
+                        .results
+                        .send(ToolExecResult::from(Ok(shell_result(Some(0), None, false))))
+                        .unwrap();
+                }
+            };
+            let (done, ()) = futures_lite::future::zip(fixture.dispatch(), observe).await;
+            assert_eq!(done.is_error, stop, "{}", done.output.as_text());
+            assert!(!fixture.ctx.cancel.is_cancelled());
+            assert!(fixture.tasks.list().is_empty());
+            assert_eq!(fixture.trace.executed.load(Ordering::SeqCst), 1);
+            let snapshot = shells.snapshot();
+            assert_eq!(snapshot.executions.len(), 1);
+            assert_eq!(
+                snapshot.executions[0].record.state,
+                if stop {
+                    ShellExecutionState::Cancelled
+                } else {
+                    ShellExecutionState::Succeeded
+                }
+            );
+            assert!(snapshot.jobs.is_empty());
+            fixture.tasks.shutdown().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn asynchronous_shell_is_observed_as_its_job_and_never_tracked() {
+        smol::block_on(async {
+            let mut fixture =
+                ShellDispatchFixture::new(Some(Duration::from_secs(121)), Effect::Allow).await;
+            fixture.ctx.config.shell_execution = ExecutionMode::Async;
+            let done = fixture.dispatch().await;
+            let ToolOutput::Tasks(cards) = done.output else {
+                panic!("expected shell admission");
+            };
+            assert!(fixture.started.recv_async().await.unwrap());
+            let shells = fixture.tasks.shells();
+            let snapshot = shells.snapshot();
+            assert!(snapshot.executions.is_empty());
+            assert!(snapshot.jobs.contains_key(&cards[0].invocation_id));
+            fixture
+                .results
+                .send(ToolExecResult::from(Ok(shell_result(Some(0), None, false))))
+                .unwrap();
+            fixture.settled(&cards[0]).await;
+            let snapshot = shells.snapshot();
+            assert!(snapshot.executions.is_empty());
+            assert!(snapshot.jobs.is_empty());
             fixture.tasks.shutdown().await.unwrap();
         });
     }

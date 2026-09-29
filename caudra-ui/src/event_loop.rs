@@ -2793,9 +2793,10 @@ impl<'t> EventLoop<'t> {
         if self.last_focused == Some(id) {
             return;
         }
-        // The picker only ever lists the focused session, so a session switch
-        // closes it rather than leaving ids from elsewhere on screen.
+        // The pickers only ever list the focused session, so a session switch
+        // closes them rather than leaving ids from elsewhere on screen.
         self.focused_app().task_picker.close();
+        self.focused_app().shell_modal.close();
         self.focused_app().request_pattern_suggestions();
         let mut data = json!({ "session_id": id });
         if let Some(previous) = self.last_focused {

@@ -2297,6 +2297,7 @@ impl<'h> Agent<'h> {
             workflow: self.workflow.clone(),
             background: self.background.clone(),
             jobs: self.jobs.clone(),
+            shell_live: None,
             speculative: None,
         }
     }

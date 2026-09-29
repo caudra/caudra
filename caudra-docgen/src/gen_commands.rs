@@ -131,9 +131,9 @@ const TASKS: &str = r#"## Tasks
 
 Each `task` subagent has a separate transcript. Open the task picker with `/tasks` or `Ctrl+X a`, click the task count above the input, or click a task call in the main chat. Click `[< Main]` in a task's status bar to return. The picker also lists Main and supports previewing every transcript.
 
-`/tasks list` opens or refreshes the picker. `/tasks status <task_id>` opens it with that task selected and its details visible. Press Enter or click an agent row to open its chat. Shell jobs show command details and bounded output instead of a transcript. Escape restores the original focus. Inspection stays local and does not send a model prompt or add transcript messages.
+`/tasks list` opens or refreshes the picker. `/tasks status <task_id>` opens it with that task selected and its details visible. Press Enter or click an agent row to open its chat. Workflow agents are listed too, and one without a transcript opens its run in the workflow inspector. Escape restores the original focus. Inspection stays local and does not send a model prompt or add transcript messages. Shell commands have their own modal, described in [Shell commands](#shell-commands). `/tasks status` with a shell ID opens that modal instead.
 
-`/tasks background <task_id>` lets a foreground agent task continue asynchronously without restarting it when `agent.task_execution = "auto"`. `/tasks cancel <task_id>` cancels that invocation. The picker offers `Ctrl+B` to promote and `Ctrl+K` to cancel an eligible selected task. Shell jobs cannot be promoted or resumed. Ordinary letters filter the list. Main and finished tasks have no execution controls. Singular `/task` forms remain compatibility aliases. See [background tasks](/docs/sessions/#background-tasks) for execution policies, delivery, and shutdown behavior.
+`/tasks background <task_id>` lets a foreground agent task continue asynchronously without restarting it when `agent.task_execution = "auto"`. `/tasks cancel <task_id>` cancels that invocation. The picker offers `Ctrl+B` to promote and `Ctrl+K` to cancel an eligible selected task. Ordinary letters filter the list. Main and finished tasks have no execution controls. Singular `/task` forms remain compatibility aliases. See [background tasks](/docs/sessions/#background-tasks) for execution policies, delivery, and shutdown behavior.
 
 Background rows show a right-aligned `bg` indicator beside the state or spinner, including after completion. New task IDs come from the description, such as `implement-active-footer-chips`, with `-2`, `-3`, and later suffixes for collisions. Display labels stay unchanged. Shell jobs use safe command labels such as `shell-cargo-test`, falling back to `shell`. Use the returned ID unchanged. Older IDs remain valid for inspection, control, and continuation. See [task and output IDs](/docs/sessions/#task-and-output-ids) for naming and compatibility.
 
@@ -142,6 +142,16 @@ An input box appears while the focused task is running. Press Enter to queue gui
 That input box is a full composer. Typing `/` opens the palette, `Ctrl+S` inserts a file path, `Ctrl+X e` edits the draft in the [workbench](/docs/workbench/#plans-memory-notes-and-prompt-drafts), and `Ctrl+V` attaches an image to the guidance. A custom `/project:` or `/user:` command expands its template and steers the focused task rather than the main session.
 
 Commands that reach the main session's turn or history have no task equivalent, so `/compact`, `/continue`, `/model`, `/system-prompt`, `/projection`, `/btw`, `/extract`, the `/goal` family, the workflow commands, and MCP prompts are drawn dimmed and report their scope when run. Return to Main to use them. `/context`, `/tools`, `/skills`, `/queue`, `/review`, and the stash commands already follow the focused transcript."#;
+
+const SHELLS: &str = r#"## Shell commands
+
+`/shells` opens the shell modal. It lists the `shell` calls that the main agent, subagents, and workflow agents made in this session, in the foreground or the background. Running commands come first, oldest first, and finished ones follow, newest first. Background rows show the same `bg` indicator as tasks. Click the shell count above the input to open the modal on the oldest running command. Commands you run with `!` or `!!` are not listed.
+
+Press Enter or click a row to see its owner, working directory, timeout, elapsed time, exit status, and output. Output appears as the command wrote it, with terminal control sequences escaped and no Markdown rendering. Output of a running command updates in place. Ordinary letters filter the list. Escape leaves the details, and a second Escape closes the modal without stopping anything.
+
+`Ctrl+K` stops the selected running command, from the list or its details. Only that call is cancelled. The row shows `cancelling` until the command settles. Its owner receives an ordinary cancelled result, and the rest of its work continues. Background shell jobs also accept `/tasks cancel <task_id>`. Shell jobs cannot be promoted or resumed.
+
+Finished commands stay listed after a reload. See [shell history](/docs/sessions/#shell-history) for what a session keeps and how commands cut short by a crash appear."#;
 
 const WORKFLOWS: &str = r#"## Workflows
 
@@ -224,6 +234,9 @@ pub fn generate() -> String {
 
     writeln!(out).unwrap();
     writeln!(out, "{TASKS}").unwrap();
+
+    writeln!(out).unwrap();
+    writeln!(out, "{SHELLS}").unwrap();
 
     writeln!(out).unwrap();
     writeln!(out, "{WORKFLOWS}").unwrap();

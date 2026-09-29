@@ -269,6 +269,14 @@ impl App {
             ) {
                 return actions;
             }
+        } else if self.shell_modal.is_open() {
+            if let Some(actions) = self.route_overlay_mouse(
+                event,
+                |app, event| app.shell_modal.handle_mouse(event),
+                |app, action| app.handle_shell_modal_action(action),
+            ) {
+                return actions;
+            }
         } else if self.memory_picker.is_open() {
             if let Some(actions) = self.route_overlay_mouse(
                 event,
@@ -1290,6 +1298,7 @@ impl App {
             let action = self.task_picker.cancel();
             self.handle_task_picker_action(action)
         });
+        dismiss!(self.shell_modal);
         dismiss!(self.session_picker);
 
         None

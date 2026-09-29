@@ -49,7 +49,7 @@ pub(crate) fn details(task: &TaskCard, width: u16) -> (Vec<Line<'static>>, LinkM
     }
 }
 
-pub(crate) fn shell_facts(task: &TaskCard, width: u16) -> Vec<Line<'static>> {
+fn shell_facts(task: &TaskCard, width: u16) -> Vec<Line<'static>> {
     let Some(shell) = &task.shell else {
         return Vec::new();
     };
@@ -252,7 +252,7 @@ pub(crate) fn render(
     (lines, rows, truncated, links)
 }
 
-fn fact(label: &str, value: &str, style: Style) -> Line<'static> {
+pub(crate) fn fact(label: &str, value: &str, style: Style) -> Line<'static> {
     Line::from(vec![
         Span::styled(
             format!("{INDENT}{label:<LABEL_WIDTH$}  "),
@@ -262,7 +262,7 @@ fn fact(label: &str, value: &str, style: Style) -> Line<'static> {
     ])
 }
 
-fn status_style(state: &str) -> Style {
+pub(crate) fn status_style(state: &str) -> Style {
     let t = theme::current();
     match state {
         "completed" | "succeeded" => t.tool_success,

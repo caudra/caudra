@@ -945,7 +945,8 @@ mod tests {
         SubagentActivity, SubagentInfo, SubagentProgress,
     };
     use caudra_workflow::{
-        CatalogEntry, RunDetail, RunHistoryEntry, RunUsage, SourceKind, WorkflowCatalog,
+        AgentRosterEntry, CatalogEntry, RosterState, RunDetail, RunHistoryEntry, RunUsage,
+        SourceKind, WorkflowCatalog,
     };
     use crossterm::event::{KeyCode, MouseEventKind};
     use test_case::test_case;
@@ -1683,6 +1684,41 @@ mod tests {
 
         assert!(app.workflow_inspector.is_open());
         assert_eq!(app.status_hover, None);
+        assert_eq!(app.workflow.sent, inspector_requests());
+    }
+
+    /// A workflow agent with no chat still counts on the tasks chip, so the
+    /// picker the chip opens lists it, and choosing it opens its run instead
+    /// of a transcript that is not there.
+    #[test_case(RosterState::Running, 1; "running_agent")]
+    #[test_case(RosterState::Completed, 0; "finished_agent")]
+    fn a_roster_agent_without_a_chat_is_a_task_that_opens_its_run(
+        state: RosterState,
+        active: usize,
+    ) {
+        let mut app = scripted_app();
+        let mut active_run = run(RunStatus::Active);
+        active_run.roster.push(AgentRosterEntry {
+            call_key: 1,
+            label: AGENT_LABEL.into(),
+            phase: None,
+            task_id: Some(TASK_ID.into()),
+            state,
+            tokens_used: 0,
+            duration_ms: 0,
+        });
+        app.workflow.apply(active_run);
+        assert_eq!(app.task_activity().agents, active);
+        assert!(app.task_hint_text().is_some());
+
+        workflow_command(&mut app, "/tasks", "");
+        assert!(app.task_picker.select(TASK_ID));
+        app.update(Msg::Key(key(KeyCode::Enter)));
+
+        assert!(!app.task_picker.is_open());
+        assert_eq!(app.active_chat, 0);
+        assert_eq!(app.chats.len(), 1);
+        assert!(app.workflow_inspector.is_open());
         assert_eq!(app.workflow.sent, inspector_requests());
     }
 

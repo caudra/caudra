@@ -422,6 +422,11 @@ pub trait ToolInvocation: Send + Sync {
     fn shell_timeout(&self) -> Option<Duration> {
         None
     }
+    /// Whether the effect happens on a remote host, where a cancelled call
+    /// cannot confirm that the process it started is gone.
+    fn runs_remotely(&self) -> bool {
+        false
+    }
     fn start_annotation(&self) -> Option<String> {
         None
     }

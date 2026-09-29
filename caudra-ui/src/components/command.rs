@@ -183,6 +183,12 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         scope: ChatScope::Any,
     },
     BuiltinCommand {
+        name: "/shells",
+        description: "Browse shell commands and stop running ones",
+        max_args: 0,
+        scope: ChatScope::Any,
+    },
+    BuiltinCommand {
         name: "/workflows",
         description: "Browse, trust, and launch workflows",
         max_args: 0,

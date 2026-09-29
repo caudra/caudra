@@ -1511,6 +1511,7 @@ fn build(
                 } else {
                     scope.child_scope(ids.parent_tool_use_id.clone())
                 }
+                .for_task(resolved.task_id.as_str())
             }),
             task_id: Some(resolved.task_id.clone()),
         },

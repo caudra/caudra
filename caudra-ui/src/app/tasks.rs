@@ -1,26 +1,28 @@
 //! A task is an agent chat or a supervised shell job. The main chat
 //! goes by [`MAIN_TASK_ID`] and carries no status, since its work is the
-//! session's own and `caudra.session.live()` already reports that.
+//! session's own and `caudra.session.live()` already reports that. The
+//! `/tasks` picker lists agents only; shell commands have their own modal.
 //!
 //! Both `caudra.task.list()` and the `TaskStatusChanged` autocmd serialize the
 //! types below, so the two can never spell a status differently.
 
-use caudra_agent::background::BackgroundTasks;
+use caudra_agent::background::{BackgroundTasks, ShellSnapshot};
 use caudra_agent::types::BACKGROUND_EVENT_RUN_ID;
 use caudra_agent::{AgentEvent, Envelope, SubagentInfo, TaskCard, TaskProvenance};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use caudra_config::ExecutionMode;
 use caudra_providers::project_messages;
 use caudra_storage::background::{JobKind, JobOwner};
 use caudra_storage::id::CaudraId;
-use caudra_workflow::{RosterState, RunSnapshot, RunStatus};
+use caudra_workflow::{AgentRosterEntry, RosterState, RunSnapshot, RunStatus};
 use serde::Serialize;
 
 use crate::app::App;
 use crate::app::background_delivery::{DeliveryJob, DeliveryKey};
 
+use crate::components::shell_modal;
 use crate::components::task_picker::TaskPickerAction;
 use crate::components::{Action, DisplayRole};
 use crate::repaint::Dirty;
@@ -99,6 +101,17 @@ pub(crate) struct TaskInfo {
     pub(crate) focused: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) runtime: Option<TaskCard>,
+    /// Set only on the picker's rows for workflow agents without a chat.
+    #[serde(skip)]
+    pub(crate) workflow: Option<WorkflowTask>,
+}
+
+/// A workflow agent the picker lists without a chat: the run that opens in
+/// the workflow inspector, and the roster state shown in place of a card's.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct WorkflowTask {
+    pub(crate) run_id: String,
+    pub(crate) state: &'static str,
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -108,42 +121,70 @@ pub(super) struct TaskActivity {
 }
 
 impl TaskActivity {
+    /// Agents are counted once each, trusting the runtime over a workflow
+    /// roster over a chat, the same order the `/tasks` rows use. Shells are
+    /// counted as the Shell modal lists them.
     fn new<'a>(
         runtime: &[TaskCard],
+        shells: Option<&ShellSnapshot>,
         workflows: &[RunSnapshot],
         chats: impl Iterator<Item = TaskState<'a>>,
     ) -> Self {
         let mut tasks: HashMap<_, _> = runtime
             .iter()
-            .map(|task| (task.task_id.as_str(), (task.kind.clone(), task.active())))
+            .filter(|task| task.kind == JobKind::Agent)
+            .map(|task| (task.task_id.as_str(), task.active()))
             .collect();
-        for run in workflows {
-            for agent in &run.roster {
-                if let Some(id) = agent.task_id.as_deref() {
-                    tasks.entry(id).or_insert((
-                        JobKind::Agent,
-                        run.status == RunStatus::Active
-                            && matches!(agent.state, RosterState::Pending | RosterState::Running),
-                    ));
-                }
-            }
+        for (run, agent, id) in roster_agents(workflows) {
+            tasks
+                .entry(id)
+                .or_insert(roster_status(run, agent) == TaskStatus::Working);
         }
         for chat in chats {
             tasks
                 .entry(chat.id.as_ref())
-                .or_insert((JobKind::Agent, chat.status == TaskStatus::Working));
+                .or_insert(chat.status == TaskStatus::Working);
         }
-        let mut activity = Self::default();
-        for (id, (kind, active)) in tasks {
-            if !active || id == MAIN_TASK_ID {
-                continue;
-            }
-            match kind {
-                JobKind::Agent => activity.agents += 1,
-                JobKind::Shell => activity.shells += 1,
-            }
+        Self {
+            agents: tasks
+                .into_iter()
+                .filter(|&(id, active)| active && id != MAIN_TASK_ID)
+                .count(),
+            shells: shell_modal::active_count(shells, runtime),
         }
-        activity
+    }
+}
+
+/// Every workflow agent with a task id, newest run first.
+fn roster_agents(
+    workflows: &[RunSnapshot],
+) -> impl Iterator<Item = (&RunSnapshot, &AgentRosterEntry, &str)> {
+    workflows.iter().flat_map(|run| {
+        run.roster
+            .iter()
+            .filter_map(move |agent| Some((run, agent, agent.task_id.as_deref()?)))
+    })
+}
+
+/// Only an active run keeps its agents working: a paused or stopped one has
+/// nothing running under it, whatever its roster last said.
+fn roster_status(run: &RunSnapshot, agent: &AgentRosterEntry) -> TaskStatus {
+    match agent.state {
+        RosterState::Pending | RosterState::Running if run.status == RunStatus::Active => {
+            TaskStatus::Working
+        }
+        RosterState::Completed => TaskStatus::Done,
+        _ => TaskStatus::Error,
+    }
+}
+
+/// The roster state, or the run's when the run stopped under a live agent.
+fn roster_state(run: &RunSnapshot, agent: &AgentRosterEntry) -> &'static str {
+    match agent.state {
+        RosterState::Pending | RosterState::Running if run.status != RunStatus::Active => {
+            run.status.as_str()
+        }
+        state => state.as_str(),
     }
 }
 
@@ -156,7 +197,21 @@ impl App {
         let _ = self.poll_task_controls();
     }
 
-    fn start_task_control(&mut self, task: TaskCard, promote: bool) {
+    /// What `modal` has selected. A closed modal selects nothing, so a reply
+    /// to a control issued from it cannot land once it is gone.
+    fn control_selection(&self, modal: ControlModal) -> Option<String> {
+        match modal {
+            ControlModal::Tasks => self.task_picker.selected_id(),
+            ControlModal::Shells => self.shell_modal.selected_id(),
+        }
+    }
+
+    pub(super) fn start_task_control(
+        &mut self,
+        task: TaskCard,
+        promote: bool,
+        modal: ControlModal,
+    ) {
         let Some(runtime) = self.background.clone() else {
             self.flash(TASK_UNAVAILABLE.into());
             return;
@@ -175,7 +230,7 @@ impl App {
             .task_id()
             .map_or(MAIN_TASK_ID, |id| id.as_ref())
             .to_owned();
-        let selection = self.task_picker.selected_id();
+        let selection = self.control_selection(modal);
         let sender = self.task_controls.sender.clone();
         self.task_controls.jobs.push(smol::spawn(async move {
             if fence.epoch() != epoch {
@@ -195,6 +250,7 @@ impl App {
                 generation,
                 epoch,
                 focus,
+                modal,
                 selection,
                 task,
                 result,
@@ -212,7 +268,7 @@ impl App {
                     .task_id()
                     .map_or(MAIN_TASK_ID, |id| id.as_ref())
                     != reply.focus
-                || self.task_picker.selected_id() != reply.selection
+                || self.control_selection(reply.modal) != reply.selection
                 || self.background.as_ref().is_none_or(|runtime| {
                     runtime.generation() != reply.generation
                         || !runtime
@@ -224,6 +280,7 @@ impl App {
             }
             if let Err(error) = reply.result {
                 self.flash(error);
+                dirty = Dirty::YES;
             }
             dirty |= self.refresh_task_picker();
         }
@@ -333,11 +390,13 @@ impl App {
         match (operation, target, words.next()) {
             ("list", None, None) => return self.tasks_browse(),
             ("status", Some(id), None) => {
-                self.tasks_browse();
-                if !self.task_picker.select(id) {
-                    self.flash(format!("{UNKNOWN_TASK_ERR}{id}"));
+                if !self.show_shell(id) {
+                    self.tasks_browse();
+                    if !self.task_picker.select(id) {
+                        self.flash(format!("{UNKNOWN_TASK_ERR}{id}"));
+                    }
+                    let _ = self.refresh_task_picker();
                 }
-                let _ = self.refresh_task_picker();
             }
             ("background" | "cancel", Some(id), None) => {
                 match self
@@ -346,7 +405,11 @@ impl App {
                     .ok_or_else(|| TASK_UNAVAILABLE.to_owned())
                     .and_then(|runtime| runtime.status(id))
                 {
-                    Ok(task) => self.start_task_control(task, operation == "background"),
+                    Ok(task) => self.start_task_control(
+                        task,
+                        operation == "background",
+                        ControlModal::Tasks,
+                    ),
                     Err(error) => self.flash(error),
                 }
             }
@@ -424,6 +487,7 @@ impl App {
             .unwrap_or_default();
         TaskActivity::new(
             &runtime,
+            self.shell_snapshot.get(),
             self.workflow.runs(),
             self.chats.iter().filter_map(|chat| {
                 Some(TaskState {
@@ -435,7 +499,8 @@ impl App {
         )
     }
 
-    pub(crate) fn tasks(&self) -> Vec<TaskInfo> {
+    /// The runtime's cards, the picker's selected one in full detail.
+    fn runtime_tasks(&self) -> Vec<TaskCard> {
         let mut runtime = self
             .background
             .as_ref()
@@ -448,31 +513,36 @@ impl App {
         {
             *task = detail;
         }
-        let mut tasks: Vec<_> = self
-            .chats
+        runtime
+    }
+
+    /// Every chat, the main one first, with its runtime card if it has one.
+    fn chat_tasks(&self, runtime: &[TaskCard]) -> Vec<TaskInfo> {
+        self.chats
             .iter()
             .enumerate()
             .map(|(idx, chat)| {
                 let task_id = chat.task_id();
+                let card =
+                    task_id.and_then(|id| runtime.iter().find(|task| task.task_id == id.as_ref()));
                 TaskInfo {
                     id: task_id.map_or_else(|| Arc::from(MAIN_TASK_ID), Arc::clone),
                     name: chat.name.clone(),
-                    status: task_id.map(|id| {
-                        runtime
-                            .iter()
-                            .find(|task| task.task_id == id.as_ref())
-                            .map_or_else(|| chat.task_status(), runtime_status)
-                    }),
+                    status: task_id
+                        .map(|_| card.map_or_else(|| chat.task_status(), runtime_status)),
                     focused: idx == self.active_chat,
-                    runtime: task_id.and_then(|id| {
-                        runtime
-                            .iter()
-                            .find(|task| task.task_id == id.as_ref())
-                            .cloned()
-                    }),
+                    runtime: card.cloned(),
+                    workflow: None,
                 }
             })
-            .collect();
+            .collect()
+    }
+
+    /// What `caudra.task.list()` reports: every chat, then every background
+    /// shell job.
+    pub(crate) fn tasks(&self) -> Vec<TaskInfo> {
+        let runtime = self.runtime_tasks();
+        let mut tasks = self.chat_tasks(&runtime);
         tasks.extend(
             runtime
                 .into_iter()
@@ -483,23 +553,49 @@ impl App {
                     status: Some(runtime_status(&task)),
                     focused: false,
                     runtime: Some(task),
+                    workflow: None,
                 }),
         );
         tasks
     }
 
+    /// The `/tasks` rows: every chat, then every workflow agent no chat here
+    /// stands for. A chat without a runtime card takes its status from the
+    /// roster first, as [`TaskActivity`] counts it.
+    pub(crate) fn picker_tasks(&self) -> Vec<TaskInfo> {
+        let runtime = self.runtime_tasks();
+        let mut tasks = self.chat_tasks(&runtime);
+        let mut seen = HashSet::new();
+        for (run, agent, id) in roster_agents(self.workflow.runs()) {
+            if !seen.insert(id) {
+                continue;
+            }
+            let status = roster_status(run, agent);
+            match tasks.iter_mut().find(|task| &*task.id == id) {
+                Some(task) if task.runtime.is_none() => task.status = Some(status),
+                Some(_) => {}
+                None => tasks.push(TaskInfo {
+                    id: Arc::from(id),
+                    name: agent.label.clone(),
+                    status: Some(status),
+                    focused: false,
+                    runtime: None,
+                    workflow: Some(WorkflowTask {
+                        run_id: run.run_id.clone(),
+                        state: roster_state(run, agent),
+                    }),
+                }),
+            }
+        }
+        tasks
+    }
+
     /// The only writer of `active_chat` outside the chat cycling keys. Tasks
     /// are looked up by id, never by position and never through `chat_index`,
-    /// a routing cache wiped at the end of every turn.
+    /// a routing cache wiped at the end of every turn. A shell command opens
+    /// in the Shell modal instead.
     pub(crate) fn focus_task(&mut self, id: &str) -> Result<(), String> {
-        if self.background.as_ref().is_some_and(|runtime| {
-            runtime
-                .status(id)
-                .is_ok_and(|task| task.kind == JobKind::Shell)
-        }) {
-            self.tasks_browse();
-            self.task_picker.select(id);
-            let _ = self.refresh_task_picker();
+        if self.show_shell(id) {
             return Ok(());
         }
         self.leave_active_chat();
@@ -533,11 +629,20 @@ pub(super) struct TaskInteractions {
     pub(super) permissions: HashMap<String, Arc<TaskProvenance>>,
 }
 
+/// The modal a control was issued from. Its reply is fenced on that modal's
+/// own selection, so a stop from one never lands on the other.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ControlModal {
+    Tasks,
+    Shells,
+}
+
 struct TaskControlReply {
     session: CaudraId,
     generation: u64,
     epoch: u64,
     focus: String,
+    modal: ControlModal,
     selection: Option<String>,
     task: TaskCard,
     result: Result<TaskCard, String>,
@@ -586,10 +691,11 @@ pub(super) fn task_response_current(
 }
 
 /// The `/tasks` picker's side of the conversation. The picker holds no task
-/// state: it is opened from [`App::tasks`] and refreshed from it whenever a
-/// status changes, so it can never disagree with the chats it lists.
+/// state: it is opened from [`App::picker_tasks`] and refreshed from it
+/// whenever a status changes, so it can never disagree with the chats it lists.
 impl App {
     pub(super) fn tasks_browse(&mut self) -> Vec<Action> {
+        self.shell_modal.close();
         self.task_picker.set_promotion_enabled(
             self.background
                 .as_ref()
@@ -599,23 +705,9 @@ impl App {
         if self.task_picker.is_open() {
             let _ = self.refresh_task_picker();
         } else {
-            self.task_picker.open(self.tasks());
+            self.task_picker.open(self.picker_tasks());
         }
         Vec::new()
-    }
-
-    pub(super) fn shells_browse(&mut self) -> Vec<Action> {
-        let actions = self.tasks_browse();
-        if let Some(task) = self.background.as_ref().and_then(|runtime| {
-            runtime
-                .list()
-                .into_iter()
-                .find(|task| task.kind == JobKind::Shell && task.active())
-        }) {
-            self.task_picker.select(&task.task_id);
-            let _ = self.refresh_task_picker();
-        }
-        actions
     }
 
     /// Keeps an open picker in step with the chats behind it.
@@ -628,7 +720,7 @@ impl App {
                 .as_ref()
                 .is_some_and(|runtime| runtime.task_execution() == ExecutionMode::Auto),
         );
-        let tasks = self.tasks();
+        let tasks = self.picker_tasks();
         Dirty::from(self.task_picker.refresh(tasks))
     }
 
@@ -704,7 +796,9 @@ impl App {
         match action {
             TaskPickerAction::Consumed => {}
             TaskPickerAction::Opened(id) => self.preview_task(&id),
-            TaskPickerAction::Control { task, promote } => self.start_task_control(*task, promote),
+            TaskPickerAction::Control { task, promote } => {
+                self.start_task_control(*task, promote, ControlModal::Tasks);
+            }
             // Previewing is a real focus, so the transcript behind the float is
             // the one the app already draws.
             TaskPickerAction::Preview(id) => self.preview_task(&id),
@@ -713,22 +807,29 @@ impl App {
                     self.preview_task(&id);
                 }
             }
+            TaskPickerAction::Inspect { run_id, origin } => {
+                if let Some(id) = origin {
+                    self.preview_task(&id);
+                }
+                self.open_workflow_inspector(Some(&run_id));
+            }
         }
         Vec::new()
     }
 
     /// Opening a subagent puts its transcript where the main chat was, so the
     /// composer's top row advertises the picker as the way back out to every
-    /// other task.
+    /// other task. Shell commands are not tasks and stay out of the count.
     pub(crate) fn task_hint_text(&self) -> Option<String> {
-        let count = self.chats.len().saturating_sub(1)
-            + self.background.as_ref().map_or(0, |runtime| {
-                runtime
-                    .list()
-                    .iter()
-                    .filter(|task| task.kind == JobKind::Shell)
-                    .count()
-            });
+        let mut roster_only: HashSet<_> = roster_agents(self.workflow.runs())
+            .map(|(_, _, id)| id)
+            .collect();
+        for chat in &self.chats {
+            if let Some(id) = chat.task_id() {
+                roster_only.remove(id.as_ref());
+            }
+        }
+        let count = self.chats.len().saturating_sub(1) + roster_only.len();
         if count == 0 {
             return None;
         }
@@ -806,7 +907,7 @@ mod tests {
             activity_card(OTHER_ID, status, JobKind::Shell),
         ];
         assert_eq!(
-            TaskActivity::new(&cards, &[], std::iter::empty()),
+            TaskActivity::new(&cards, None, &[], std::iter::empty()),
             TaskActivity {
                 agents: usize::from(active),
                 shells: usize::from(active),
@@ -822,7 +923,7 @@ mod tests {
         let cards = [activity_card(TASK_ID, status, JobKind::Agent)];
         let chats = [state(&id, chat_status), state(&id, chat_status)];
         assert_eq!(
-            TaskActivity::new(&cards, &[], chats.into_iter()),
+            TaskActivity::new(&cards, None, &[], chats.into_iter()),
             TaskActivity { agents, shells: 0 }
         );
     }
@@ -846,14 +947,14 @@ mod tests {
             state(&finished, TaskStatus::Error),
         ];
         assert_eq!(
-            TaskActivity::new(&cards, &[], chats.into_iter()),
+            TaskActivity::new(&cards, None, &[], chats.into_iter()),
             TaskActivity {
                 agents: 1,
                 shells: 2
             }
         );
         assert_eq!(
-            TaskActivity::new(&[], &[], std::iter::empty()),
+            TaskActivity::new(&[], None, &[], std::iter::empty()),
             TaskActivity::default()
         );
     }
@@ -878,6 +979,7 @@ mod tests {
         let count = |run: &RunSnapshot, runtime: &[TaskCard]| {
             TaskActivity::new(
                 runtime,
+                None,
                 std::slice::from_ref(run),
                 [state(&id, TaskStatus::Working)].into_iter(),
             )
@@ -899,7 +1001,7 @@ mod tests {
         run.status = RunStatus::Active;
         run.roster.clear();
         assert_eq!(
-            TaskActivity::new(&[], &[run], std::iter::empty()),
+            TaskActivity::new(&[], None, &[run], std::iter::empty()),
             TaskActivity::default()
         );
     }

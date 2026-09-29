@@ -80,7 +80,7 @@ use crate::{
 pub const SESSIONS_DB_FILE: &str = "caudra.sqlite";
 pub const SESSIONS_DB_LOCK_FILE: &str = "caudra.sqlite.lock";
 
-const SCHEMA_VERSION: i64 = 16;
+const SCHEMA_VERSION: i64 = 17;
 const APPLICATION_ID: i64 = i32::from_be_bytes(*b"CAUD") as i64;
 /// Pages copied per step of the pre-migration backup. The whole file is copied
 /// under the initialization lock, so this only bounds how long the backup holds
@@ -667,6 +667,11 @@ const MIGRATIONS: &[Migration] = &[
         to: 16,
         sql: crate::shell_durations::TABLES,
     },
+    Migration {
+        from: 16,
+        to: 17,
+        sql: crate::shell_history::TABLES,
+    },
 ];
 
 const JOB_OWNER_CHECKPOINTS_TABLE: &str = r#"
@@ -917,9 +922,10 @@ CREATE TABLE pending_archives (
 /// What a fresh database gets: every migration already folded in.
 fn full_schema() -> String {
     format!(
-        "{SCHEMA}{USAGE_LEDGER_TABLE}{WORKFLOW_TABLES}{WORKFLOW_EVENTS_TABLE}{WORKFLOW_RECEIPTS_TABLE}{PERMISSION_REVISION_SCHEMA}{TOOL_USAGE_TABLES}{JOB_OWNER_CHECKPOINTS_TABLE}{}{}",
+        "{SCHEMA}{USAGE_LEDGER_TABLE}{WORKFLOW_TABLES}{WORKFLOW_EVENTS_TABLE}{WORKFLOW_RECEIPTS_TABLE}{PERMISSION_REVISION_SCHEMA}{TOOL_USAGE_TABLES}{JOB_OWNER_CHECKPOINTS_TABLE}{}{}{}",
         crate::background::TABLES,
-        crate::shell_durations::TABLES
+        crate::shell_durations::TABLES,
+        crate::shell_history::TABLES
     )
 }
 
@@ -2041,11 +2047,12 @@ impl SessionDatabase {
     pub fn session_facts(&self, cwd: Option<&str>) -> Result<Vec<SessionFacts>, SessionError> {
         let mut statement = self.connection.prepare(&format!(
             "SELECT id, title, cwd, created_at, updated_at, last_opened_at, pinned, trimmed_at,\
-                    logical_bytes + {SESSION_WORKFLOW_BYTES} + {SESSION_OWNER_CHECKPOINT_BYTES} + {}, \
+                    logical_bytes + {SESSION_WORKFLOW_BYTES} + {SESSION_OWNER_CHECKPOINT_BYTES} + {} + {}, \
                     json_extract(metadata, '$.pending_revert') IS NOT NULL \
              FROM sessions WHERE ?1 IS NULL OR cwd = ?1 \
              ORDER BY max(updated_at, coalesce(last_opened_at, 0)) DESC, id DESC",
-            crate::background::SESSION_BYTES
+            crate::background::SESSION_BYTES,
+            crate::shell_history::SESSION_BYTES
         ))?;
         let mut rows = statement.query(params![cwd])?;
         let mut facts = Vec::new();
@@ -6181,6 +6188,7 @@ mod tests {
     use crate::shell_durations::{
         CommandDigest, DurationOutcome, DurationSource, ShellDurationKey,
     };
+    use crate::shell_history::MAX_SHELL_EXECUTIONS;
     use crate::state::{WorkspaceTabs, project_scope, read_workspace_tabs, write_workspace_tabs};
     use crate::usage_ledger::BUCKET_SECONDS;
     use crate::workflow::{
@@ -7058,7 +7066,9 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
         database.save(&session, None).unwrap();
         database
             .connection
-            .execute_batch("DROP TABLE job_owner_checkpoints; DROP TABLE shell_durations;")
+            .execute_batch(
+                "DROP TABLE job_owner_checkpoints; DROP TABLE shell_durations; DROP TABLE shell_executions;",
+            )
             .unwrap();
         database
             .connection
@@ -10064,7 +10074,7 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
         let database = SessionDatabase::open(&state_dir).unwrap();
         database
             .connection
-            .execute_batch("DROP TABLE workflow_receipts; DROP TABLE job_owner_checkpoints; DROP TABLE shell_durations;")
+            .execute_batch("DROP TABLE workflow_receipts; DROP TABLE job_owner_checkpoints; DROP TABLE shell_durations; DROP TABLE shell_executions;")
             .unwrap();
         database
             .connection
@@ -10124,7 +10134,7 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
         if migrate {
             database
                 .connection
-                .execute_batch("DROP TABLE shell_durations")
+                .execute_batch("DROP TABLE shell_durations; DROP TABLE shell_executions;")
                 .unwrap();
             database
                 .connection
@@ -10154,6 +10164,38 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
         assert_eq!(estimate.samples, 3);
     }
 
+    #[test]
+    fn schema_sixteen_adds_an_empty_shell_history() {
+        const PREVIOUS_SCHEMA: i64 = 16;
+        let (_temp, state) = state_dir();
+        let (_fresh_temp, fresh_state) = state_dir();
+        let mut database = SessionDatabase::open(&state).unwrap();
+        let mut session = TestSession::new(MODEL, CWD);
+        session.push_message(TestMessage(ARTIFACT_NAME.into()));
+        database.save(&session, None).unwrap();
+        database
+            .connection
+            .execute_batch("DROP TABLE shell_executions")
+            .unwrap();
+        database
+            .connection
+            .pragma_update(None, "user_version", PREVIOUS_SCHEMA)
+            .unwrap();
+        drop(database);
+        let database = SessionDatabase::open(&state).unwrap();
+        let fresh = SessionDatabase::open(&fresh_state).unwrap();
+        assert_eq!(database.stats().unwrap().schema_version, SCHEMA_VERSION);
+        assert_eq!(schema_objects(&database), schema_objects(&fresh));
+        let loaded: TestSession = database.load(session.id).unwrap();
+        assert_eq!(loaded.messages, session.messages);
+        assert!(
+            database
+                .shell_executions(session.id, None, MAX_SHELL_EXECUTIONS)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
     #[test_case(false; "fresh_schema")]
     #[test_case(true; "migrated_schema_14")]
     fn workflow_decision_schema_preserves_calls_and_constraints(migrate: bool) {
@@ -10173,7 +10215,9 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
             assert_ne!(legacy_sql, current_sql);
             database
                 .connection
-                .execute_batch("DROP TABLE workflow_calls; DROP TABLE shell_durations;")
+                .execute_batch(
+                    "DROP TABLE workflow_calls; DROP TABLE shell_durations; DROP TABLE shell_executions;",
+                )
                 .unwrap();
             database.connection.execute_batch(&legacy_sql).unwrap();
             database
@@ -10712,6 +10756,7 @@ CREATE TABLE subagent_history_items (
         connection
             .execute_batch(
                 &full_schema()
+                    .replace(crate::shell_history::TABLES, "")
                     .replace(crate::shell_durations::TABLES, "")
                     .replace(JOB_OWNER_CHECKPOINTS_TABLE, "")
                     .replace(crate::background::TABLES, "")
@@ -10807,6 +10852,7 @@ CREATE TABLE subagents (
         connection
             .execute_batch(
                 &full_schema()
+                    .replace(crate::shell_history::TABLES, "")
                     .replace(crate::shell_durations::TABLES, "")
                     .replace(JOB_OWNER_CHECKPOINTS_TABLE, "")
                     .replace(crate::background::TABLES, "")

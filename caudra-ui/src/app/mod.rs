@@ -20,6 +20,7 @@ mod sandbox;
 mod session;
 pub(crate) mod session_state;
 pub(crate) mod shell;
+mod shells;
 mod stash;
 pub(crate) mod tasks;
 #[cfg(test)]
@@ -85,6 +86,7 @@ use crate::components::scrollbar;
 use crate::components::search_modal::{SearchAction, SearchModal};
 use crate::components::session_picker::{SessionPicker, SessionRow};
 use crate::components::session_relocation::SessionRelocationPicker;
+use crate::components::shell_modal::ShellModal;
 use crate::components::skills_modal::SkillsModal;
 use crate::components::stash_picker::StashPicker;
 use crate::components::status_bar::{
@@ -115,7 +117,7 @@ use crate::sandbox::{SandboxWorkers, StoreReply};
 use crate::selection::{SelectionState, SelectionZone, ZoneRegistry};
 use crate::{AppSession, PatternDiscoveryMode, PatternDiscoveryOutcome, PatternSuggestionLoader};
 use arc_swap::{ArcSwap, ArcSwapOption};
-use caudra_agent::background::BackgroundTasks;
+use caudra_agent::background::{BackgroundTasks, ShellSnapshot};
 use caudra_agent::commits::repo;
 use caudra_agent::context::{ContextKey, ContextSnapshot, ContextStore};
 use caudra_agent::decisions::DecisionStatus;
@@ -417,6 +419,7 @@ pub struct App {
     permission_config_trust_deferred: bool,
     pub(super) memory_picker: MemoryPicker,
     pub(super) task_picker: TaskPicker,
+    pub(super) shell_modal: ShellModal,
     pub(super) workflow_inspector: WorkflowInspector,
     /// The run a transcript was opened from, so reopening the inspector
     /// returns to it rather than to whichever run is newest.
@@ -473,6 +476,9 @@ pub struct App {
     pub exit_request: ExitRequest,
     pub(crate) exit_on_done: bool,
     pub(crate) background: Option<BackgroundTasks>,
+    /// The foreground shell tracker's last snapshot, polled every tick for the
+    /// footer chip and the `/shells` modal.
+    shell_snapshot: Watch<ShellSnapshot>,
     task_interactions: tasks::TaskInteractions,
     task_controls: tasks::TaskControls,
     pub(crate) background_claims: Vec<Message>,
@@ -673,6 +679,7 @@ impl App {
             permission_config_trust_deferred: false,
             memory_picker: MemoryPicker::new(),
             task_picker: TaskPicker::new(),
+            shell_modal: ShellModal::new(),
             workflow_inspector: WorkflowInspector::new(),
             workflow_return: None,
             workflow_catalog_picker: WorkflowCatalogPicker::new(),
@@ -715,6 +722,7 @@ impl App {
             exit_request: ExitRequest::None,
             exit_on_done: false,
             background: None,
+            shell_snapshot: Watch::default(),
             task_interactions: tasks::TaskInteractions::default(),
             task_controls: tasks::TaskControls::default(),
             background_claims: Vec::new(),
@@ -1913,6 +1921,12 @@ impl App {
             }
             return None;
         }
+        if self.shell_modal.is_open() {
+            if self.shell_modal.contains(pos) {
+                self.shell_modal.scroll(delta);
+            }
+            return None;
+        }
         try_picker!(self.session_picker);
         try_picker!(self.session_relocation_picker);
         try_picker!(self.worktree_picker);
@@ -2422,6 +2436,11 @@ impl App {
             guard_repeat!(false);
             let action = self.task_picker.handle_key(key);
             return Some(self.handle_task_picker_action(action));
+        }
+        if self.shell_modal.is_open() {
+            guard_repeat!(false);
+            let action = self.shell_modal.handle_key(key);
+            return Some(self.handle_shell_modal_action(action));
         }
         if self.memory_picker.is_open() {
             guard_repeat!(false);
@@ -5033,6 +5052,7 @@ impl App {
             "/stash-list" => self.run_builtin(BuiltinAction::StashList),
             "/memory" => self.memory_browse(),
             "/tasks" | "/task" => self.execute_task_control(&cmd.args),
+            "/shells" => self.shells_browse(),
             "/workflows" => self.workflows_browse(),
             "/workflow" => self.execute_workflow(&cmd.args),
             "/deep-research" => {
@@ -5486,7 +5506,7 @@ impl App {
         }
     }
 
-    fn overlays(&self) -> [&dyn Overlay; 39] {
+    fn overlays(&self) -> [&dyn Overlay; 40] {
         [
             &self.workbench,
             &self.logs_modal,
@@ -5520,6 +5540,7 @@ impl App {
             &self.stash_picker,
             &self.memory_picker,
             &self.task_picker,
+            &self.shell_modal,
             &self.workflow_inspector,
             &self.workflow_catalog_picker,
             &self.question_form,
@@ -5530,7 +5551,7 @@ impl App {
         ]
     }
 
-    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 39] {
+    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 40] {
         [
             &mut self.workbench,
             &mut self.logs_modal,
@@ -5564,6 +5585,7 @@ impl App {
             &mut self.stash_picker,
             &mut self.memory_picker,
             &mut self.task_picker,
+            &mut self.shell_modal,
             &mut self.workflow_inspector,
             &mut self.workflow_catalog_picker,
             &mut self.question_form,
@@ -5746,6 +5768,7 @@ impl App {
             | self.refresh_session_picker()
             | self.poll_workflow_replies()
             | self.poll_task_controls()
+            | self.poll_shells()
             | self.tick_workbench()
             | self.poll_commit_index()
             | self.thinking_picker.tick()
@@ -6148,6 +6171,7 @@ impl App {
         try_picker!(self.stash_picker);
         try_picker!(self.memory_picker);
         try_picker!(self.task_picker);
+        try_picker!(self.shell_modal);
         if let Some(action) = self.workflow_inspector.handle_paste(text) {
             self.handle_workflow_inspector_action(action);
             return;
