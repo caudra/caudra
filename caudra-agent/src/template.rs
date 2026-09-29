@@ -5,8 +5,7 @@ use std::path::Path;
 use caudra_storage::checkout::{self, Checkout};
 use jiff::Timestamp;
 
-use crate::herdr::HerdrEnv;
-use crate::prompt::{CHECKOUT_SLOT, HERDR_SLOT};
+use crate::prompt::CHECKOUT_SLOT;
 
 const DETACHED_HEAD: &str = "detached HEAD";
 
@@ -15,20 +14,16 @@ pub fn env_vars() -> Vars {
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|_| ".".into());
     let date = Timestamp::now().strftime("%Y-%m-%d").to_string();
-    let (checkout, herdr) = if crate::scratch::tools_run_locally() {
-        (
-            checkout_section(Path::new(&cwd)),
-            herdr_section(HerdrEnv::detect()),
-        )
+    let checkout = if crate::scratch::tools_run_locally() {
+        checkout_section(Path::new(&cwd))
     } else {
-        Default::default()
+        String::new()
     };
     Vars::new()
         .set("{cwd}", cwd)
         .set("{platform}", env::consts::OS)
         .set("{date}", date)
         .set(CHECKOUT_SLOT, checkout)
-        .set(HERDR_SLOT, herdr)
         .set("{scratch}", crate::scratch::environment_section())
         .set(
             "{task_system_prompt_profiles}",
@@ -51,12 +46,6 @@ fn checkout_section(cwd: &Path) -> String {
         "- Git worktree: {head}, linked to {}\n",
         checkout.main_root.display()
     )
-}
-
-fn herdr_section(herdr: Option<HerdrEnv>) -> String {
-    herdr.map_or_else(String::new, |herdr| {
-        format!("- Herdr: pane {}\n", herdr.pane_id)
-    })
 }
 
 #[derive(Clone, Default)]
@@ -98,9 +87,6 @@ mod tests {
 
     const BRANCH: &str = "feature/login";
     const LINKED: &str = "linked";
-    const PANE: &str = "w1:p2";
-    const HERDR_BINARY: &str = "herdr";
-    const HERDR_SOCKET: &str = "/tmp/herdr.sock";
 
     fn format_date(ts: Timestamp) -> String {
         ts.strftime("%Y-%m-%d").to_string()
@@ -175,21 +161,5 @@ mod tests {
         );
 
         assert!(checkout_section(&worktree).contains(DETACHED_HEAD));
-    }
-
-    #[test_case(Some(PANE) ; "inside_herdr")]
-    #[test_case(None ; "outside_herdr")]
-    fn only_a_herdr_pane_is_named(pane: Option<&str>) {
-        let herdr = pane.map(|pane| HerdrEnv {
-            binary: HERDR_BINARY.into(),
-            socket_path: HERDR_SOCKET.into(),
-            pane_id: pane.into(),
-            workspace_id: None,
-        });
-
-        let section = herdr_section(herdr);
-
-        assert_eq!(section.contains(PANE), pane.is_some());
-        assert_eq!(section.is_empty(), pane.is_none());
     }
 }

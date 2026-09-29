@@ -100,7 +100,6 @@ pub const ENVIRONMENT_MARKER: &str = "# Environment";
 /// move is noticed: the block announced last names the directory left behind.
 pub const WORKING_DIRECTORY_LABEL: &str = "- Working directory: ";
 pub const CHECKOUT_SLOT: &str = "{checkout}";
-pub const HERDR_SLOT: &str = "{herdr}";
 /// Follows an environment whose working directory differs from the last one
 /// announced, since paths from before the move still look valid.
 pub const RELOCATED_PROMPT: &str = include_str!("prompts/relocated.md");

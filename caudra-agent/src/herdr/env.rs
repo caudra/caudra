@@ -8,6 +8,18 @@ const HERDR_PANE_ID: &str = "HERDR_PANE_ID";
 const HERDR_BIN_PATH: &str = "HERDR_BIN_PATH";
 pub(super) const HERDR_SOCKET_PATH: &str = "HERDR_SOCKET_PATH";
 const HERDR_WORKSPACE_ID: &str = "HERDR_WORKSPACE_ID";
+const HERDR_TAB_ID: &str = "HERDR_TAB_ID";
+/// What Herdr exports to every process in its pane. Shell commands receive it
+/// too, so the model's `herdr` calls see the pane the way any other process in
+/// it would.
+pub const PANE_ENVIRONMENT: &[&str] = &[
+    HERDR_ENV,
+    HERDR_PANE_ID,
+    HERDR_TAB_ID,
+    HERDR_WORKSPACE_ID,
+    HERDR_SOCKET_PATH,
+    HERDR_BIN_PATH,
+];
 const ENABLED_MARKER: &str = "1";
 const DEFAULT_BINARY: &str = "herdr";
 const PATH: &str = "PATH";

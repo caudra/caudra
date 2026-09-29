@@ -14,5 +14,5 @@ pub use api::{
     resume_argv, resume_command_line,
 };
 pub use cli::{HerdrCli, HerdrError};
-pub use env::{HerdrEnv, command_on_path};
+pub use env::{HerdrEnv, PANE_ENVIRONMENT, command_on_path};
 pub use skill::herdr_skill;

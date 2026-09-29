@@ -5,4 +5,4 @@
 {checkout}- Platform: {platform}
 - Date: {date}
 - Model: {model}
-{herdr}{scratch}</system-reminder>
+{scratch}</system-reminder>

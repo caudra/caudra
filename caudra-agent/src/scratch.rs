@@ -95,7 +95,7 @@ pub fn environment_section() -> String {
 }
 
 /// Whether tools run on this machine, which is when anything the environment
-/// block says about this machine's checkout or terminal holds for them.
+/// block says about this machine's checkout holds for them.
 pub fn tools_run_locally() -> bool {
     state() == Scratch::Local
 }

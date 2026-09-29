@@ -87,11 +87,11 @@ Grants stay on the exact path where you made them. Revoking trust in any checkou
 
 ## What the model sees
 
-In a linked worktree, the environment block the model receives names the branch and the main checkout, for example `- Git worktree: branch feature/login, linked to /work/app`. Inside Herdr, it also names the pane, as in `- Herdr: pane w1:p2`. Both lines are left out when tools run on a [remote workspace](/docs/remote-workspaces/).
+In a linked worktree, the environment block the model receives names the branch and the main checkout, for example `- Git worktree: branch feature/login, linked to /work/app`. The line is left out when tools run on a [remote workspace](/docs/remote-workspaces/).
 
 When a session moves to another directory, the model is told the old and the new working directory once, together with the new environment. Paths from earlier in the conversation would otherwise still look valid, and in another checkout they point at the wrong files.
 
-Inside Herdr, the `herdr` skill is available through the [`skill` tool](/docs/skills/). Its content is what `herdr --skill` prints, so it matches the installed Herdr release. A skill named `herdr` on disk takes precedence. Suggested permission patterns for `herdr` keep three words, so approving `herdr pane read w1:p2` offers `herdr pane read *` rather than a rule for one pane.
+Inside Herdr, the `herdr` skill is available through the [`skill` tool](/docs/skills/). Its content is what `herdr --skill` prints, so it matches the installed Herdr release. A skill named `herdr` on disk takes precedence. Shell commands get the variables Herdr sets in the pane, such as `HERDR_ENV` and `HERDR_PANE_ID`, so the skill's own Herdr check passes and its examples address this pane. Commands on a remote workspace do not get them. Suggested permission patterns for `herdr` keep three words, so approving `herdr pane read w1:p2` offers `herdr pane read *` rather than a rule for one pane.
 
 ## Herdr integration
 

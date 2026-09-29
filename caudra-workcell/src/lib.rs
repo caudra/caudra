@@ -40,6 +40,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use caudra_agent::herdr::PANE_ENVIRONMENT;
 use caudra_agent::patch;
 use caudra_agent::permissions::pattern_recognition::ObservationProvenance;
 use caudra_agent::permissions::{
@@ -252,6 +253,13 @@ async fn code_graph_group(cwd: &Path) -> Result<Arc<CodeGraphToolGroup>, String>
     )))
 }
 
+async fn shell_group(cwd: &Path) -> Result<ShellToolGroup, String> {
+    ShellToolGroup::new_unconfined(cwd)
+        .await
+        .map(|group| group.with_inherited_environment(PANE_ENVIRONMENT))
+        .map_err(|error| error.to_string())
+}
+
 struct HostInner {
     runtime: Runtime,
     projects: tokio::sync::Mutex<HashMap<PathBuf, ProjectGroups>>,
@@ -289,9 +297,7 @@ impl HostInner {
         let files = FileToolGroup::new_unconfined(&cwd, ALLOW_WRITE, None)
             .await
             .map_err(|error| error.to_string())?;
-        let shell = ShellToolGroup::new_unconfined(&cwd)
-            .await
-            .map_err(|error| error.to_string())?;
+        let shell = shell_group(&cwd).await?;
         let code_graph = code_graph_group(&cwd).await?;
         let environment = Arc::new(ExecutionEnvironment::new(Some(&cwd)).await);
         let groups = ProjectGroups {
@@ -397,7 +403,7 @@ impl WorkcellHost {
             .unwrap_or_else(|_| project_cwd.as_ref().to_path_buf());
         let (files, shell, code_graph, environment, code_result) = runtime.block_on(async {
             let files = FileToolGroup::new_unconfined(&project_cwd, ALLOW_WRITE, None).await;
-            let shell = ShellToolGroup::new_unconfined(&project_cwd).await;
+            let shell = shell_group(&project_cwd).await;
             let code_graph = code_graph_group(&project_cwd).await;
             let environment = ExecutionEnvironment::new(Some(&project_cwd)).await;
             let code = if let Some(worker) = worker_source {
@@ -414,7 +420,7 @@ impl WorkcellHost {
             (files, shell, code_graph, environment, code)
         });
         let files = files.map_err(|error| HostError::Files(error.to_string()))?;
-        let shell = shell.map_err(|error| HostError::Shell(error.to_string()))?;
+        let shell = shell.map_err(HostError::Shell)?;
         let code_graph = code_graph.map_err(HostError::Files)?;
         let mut warnings = Vec::new();
         let code = match code_result {
@@ -4854,6 +4860,7 @@ mod tests {
     use std::fs;
     use std::io::ErrorKind;
     use std::ops::RangeInclusive;
+    use std::process::Command;
     use std::slice;
     use std::sync::Arc;
     use tempfile::TempDir;
@@ -4920,6 +4927,11 @@ mod tests {
     const SHELL_CANCELLED_STATE: &str = "cancelled";
     const OBSERVED_ROW: &str = "observed without a transcript";
     const LEADING_CD_COMMAND: &str = "cd ../workcell-mcp && grep -rn --include=*.rs -E";
+    /// Names the child test a parent re-runs this binary for.
+    const CHILD_TEST_ENV: &str = "CAUDRA_WORKCELL_CHILD_TEST";
+    const HERDR_PANE_CHILD: &str = "tests::herdr_pane_environment_child";
+    const HERDR_PANE_CHILD_PASSED: &str = "the herdr pane environment reached the command";
+    const PANE_CANARY_SUFFIX: &str = "-canary";
 
     async fn bounded_shell_test<T>(operation: impl Future<Output = T>) -> T {
         future::race(operation, async {
@@ -7792,6 +7804,62 @@ mod tests {
         assert!(output.filter.is_none());
         assert_eq!(output.stdout, "3/3\n");
         assert_eq!(output.redraws_collapsed(), 2);
+    }
+
+    fn pane_canary(name: &str) -> String {
+        format!("{name}{PANE_CANARY_SUFFIX}")
+    }
+
+    /// The `herdr` skill stops unless a command sees `HERDR_ENV`, and it
+    /// addresses the pane through the other variables. Setting them in this
+    /// process takes `unsafe`, so a copy of this binary runs the command.
+    #[test]
+    fn shell_commands_see_the_herdr_pane_they_run_in() {
+        let child = Command::new(std::env::current_exe().expect("test binary"))
+            .args(["--exact", HERDR_PANE_CHILD, "--nocapture"])
+            .env(CHILD_TEST_ENV, HERDR_PANE_CHILD)
+            .envs(
+                PANE_ENVIRONMENT
+                    .iter()
+                    .map(|&name| (name, pane_canary(name))),
+            )
+            .output()
+            .expect("child test process");
+        let stdout = String::from_utf8_lossy(&child.stdout);
+
+        assert!(
+            child.status.success() && stdout.contains(HERDR_PANE_CHILD_PASSED),
+            "{stdout}{}",
+            String::from_utf8_lossy(&child.stderr)
+        );
+    }
+
+    #[test]
+    fn herdr_pane_environment_child() {
+        if std::env::var(CHILD_TEST_ENV).as_deref() != Ok(HERDR_PANE_CHILD) {
+            return;
+        }
+        let root = TempDir::new().expect("tempdir");
+        let (_host, registry) = host_and_registry(root.path());
+        let ctx = context(root.path(), Arc::clone(&registry), CancelToken::none());
+        let invocation = registry
+            .get("shell")
+            .expect("registered shell")
+            .tool
+            .parse(&json!({"command": format!("printenv {}", PANE_ENVIRONMENT.join(" "))}))
+            .expect("valid shell input");
+        smol::block_on(invocation.preflight(&ctx)).expect("shell preflight");
+        let ToolOutput::Shell(output) = smol::block_on(invocation.execute(&ctx)).output.unwrap()
+        else {
+            panic!("expected typed shell output");
+        };
+
+        let expected: Vec<String> = PANE_ENVIRONMENT
+            .iter()
+            .map(|&name| pane_canary(name))
+            .collect();
+        assert_eq!(output.stdout.lines().collect::<Vec<_>>(), expected);
+        println!("{HERDR_PANE_CHILD_PASSED}");
     }
 
     fn progress_chunk(stream: ShellStream, text: &str) -> ShellProgressChunk {
