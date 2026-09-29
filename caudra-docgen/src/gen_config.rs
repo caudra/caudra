@@ -363,9 +363,11 @@ Automatic steering repairs unusable model output and can add bounded guidance ab
 | `missing_task_report` | `true` | Request a missing task summary or required structured report, up to 2 corrections. |
 | `abandoned_turn` | `true` | Continue a turn that ended by announcing work the response never performed, up to 2 continuations per episode. Spending the allowance accepts the text rather than failing the turn. |
 | `repetition` | `true` | Advise on short exact tool cycles, including normalized native batch leaf calls, or repeated normalized assistant text. |
-| `tool_planning` | `true` | Advise after repeated narrow tool choice across responses, with repeated-call/cycle or repeated-error evidence. Successful reads of different files alone are insufficient. |
+| `tool_planning` | `true` | Advise after consecutive failed tool attempts across responses, including attempts with different tools or inputs. Any successful tool result ends the failure episode. Repeating a successful call is insufficient. |
 
 Recovery and advisory budgets are separate. Advisory rules allow at most 4 total injections per invocation, with a default cooldown of 3 completed model responses for each rule.
+
+Tool-planning evidence starts after the last response containing any successful tool result, including results outside the retained batch window. A background admission ends the failure episode without proving that the background work succeeded. Later terminal outcomes do not retroactively change that admission into a failed attempt.
 
 An empty-response episode lives in the transcript tail, so it survives a restore and a new invocation. A message typed into a stall is answered, but it does not refill the budget: only a response carrying a tool call or visible text ends the episode. `max_stalled_turns` bounds the turns that interleaved rules spend between them, independently of any single rule's allowance.
 
@@ -401,8 +403,8 @@ The remaining fields are integers. All ranges are inclusive. Set `enabled = fals
 | `repetition.text_window` | `8` | 1–4096 | Recent completed assistant responses retained for text repetition. |
 | `repetition.text_repeats` | `3` | 2–1024 | Matching nontrivial normalized assistant responses needed for an advisory. |
 | `repetition.cooldown` | `3` | 1–1024 | Completed model responses between this rule's advisories. |
-| `tool_planning.after_calls` | `6` | 1–1024 | Uses of the same canonical tool, with repetition or error evidence. |
-| `tool_planning.after_responses` | `3` | 1–1024 | Completed model responses across which those tool uses must occur. |
+| `tool_planning.after_calls` | `6` | 1–1024 | Number of most recent leaf tool calls that must all have failed since the last response containing a successful result. |
+| `tool_planning.after_responses` | `3` | 1–1024 | Distinct completed model responses represented by those failed calls. |
 | `tool_planning.cooldown` | `3` | 1–1024 | Completed model responses between this rule's advisories. |
 
 Validation also requires:

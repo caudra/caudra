@@ -169,6 +169,7 @@ struct ObservationState {
     facts: BTreeMap<Vec<usize>, ToolObservation>,
     attempts: usize,
     repairable: usize,
+    successful: usize,
 }
 
 struct ObservationAttempt {
@@ -186,6 +187,7 @@ impl ResponseObservations {
                 facts: BTreeMap::new(),
                 attempts: 0,
                 repairable: 0,
+                successful: 0,
             })),
             attempt: None,
         }
@@ -275,6 +277,8 @@ impl ResponseObservations {
         let mut state = self.lock();
         state.repairable -= usize::from(attempt.outcome == ToolOutcome::Repairable);
         state.repairable += usize::from(outcome == ToolOutcome::Repairable);
+        state.successful -= usize::from(attempt.outcome == ToolOutcome::Success);
+        state.successful += usize::from(outcome == ToolOutcome::Success);
         if let Some(fact) = state.facts.get_mut(&attempt.order) {
             fact.outcome = outcome.clone();
         }
@@ -291,9 +295,14 @@ impl ResponseObservations {
             let mut state = self.lock();
             state.attempts -= 1;
             state.repairable -= usize::from(attempt.outcome == ToolOutcome::Repairable);
+            state.successful -= usize::from(attempt.outcome == ToolOutcome::Success);
             state.facts.remove(&attempt.order);
             attempt.expanded = true;
         }
+    }
+
+    pub(crate) fn has_success(&self) -> bool {
+        self.lock().successful > 0
     }
 
     pub(crate) fn take(&self) -> (Vec<ToolObservation>, bool) {
@@ -302,6 +311,7 @@ impl ResponseObservations {
         let facts = std::mem::take(&mut state.facts).into_values().collect();
         state.attempts = 0;
         state.repairable = 0;
+        state.successful = 0;
         (facts, all_repairable)
     }
 }
@@ -2783,7 +2793,8 @@ mod tests {
                 ShellDispatchFixture::new(Some(Duration::from_secs(121)), Effect::Allow).await;
             let (cancel, token) = CancelToken::new();
             fixture.ctx.cancel = token;
-            fixture.ctx.steering_observations = Some(ResponseObservations::new(1));
+            let observations = ResponseObservations::new(1);
+            fixture.ctx.steering_observations = Some(observations.clone());
             fixture.ctx.steering_order = vec![0];
             fixture.ctx.live_sink = Some(flume::unbounded().0);
             fixture.ctx.user_response_rx =
@@ -2791,6 +2802,10 @@ mod tests {
             let done = fixture.dispatch().await;
             assert!(!done.is_error, "{}", done.output.as_text());
             assert!(done.accounting.outcome.is_none());
+            assert!(observations.has_success());
+            let (facts, all_repairable) = observations.take();
+            assert_eq!(facts[0].outcome, ToolOutcome::Success);
+            assert!(!all_repairable);
             let ToolOutput::Tasks(cards) = done.output else {
                 panic!("expected shell admission");
             };
@@ -2832,6 +2847,7 @@ mod tests {
             fixture.results.send(result).unwrap();
             let terminal = fixture.settled(card).await;
             assert_eq!(terminal.state, state);
+            assert!(!observations.has_success());
             let _guards = locks.await;
             let record = SessionDatabase::open(&fixture.dir)
                 .unwrap()
@@ -3605,7 +3621,9 @@ mod tests {
             }
             slots[index].finish(index < OBSERVATION_WINDOW);
         }
+        assert!(observations.has_success());
         let (facts, all_repairable) = observations.take();
+        assert!(!observations.has_success());
         assert_eq!(
             facts
                 .iter()
@@ -3641,6 +3659,7 @@ mod tests {
             }
             parents[index].finish(false);
         }
+        assert!(!observations.has_success());
         let (facts, all_repairable) = observations.take();
         assert_eq!(
             facts
@@ -3663,6 +3682,75 @@ mod tests {
         unsettled.mark_repairable();
         assert!(!observations.take().1);
         assert_eq!(ResponseObservations::new(limit).take(), (Vec::new(), false));
+    }
+
+    #[test_case(0, false; "zero_capacity")]
+    #[test_case(1, false; "omitted_success")]
+    #[test_case(1, true; "evicted_success")]
+    fn observations_retain_success_outside_the_window(limit: usize, success_first: bool) {
+        let observations = ResponseObservations::new(limit);
+        assert!(!observations.has_success());
+        for successful in [success_first, !success_first] {
+            let slot =
+                observations.reserve(vec![usize::from(successful)], OBSERVED_TOOL, &Value::Null);
+            slot.mark_repairable();
+            slot.finish(!successful);
+        }
+        assert!(observations.has_success());
+        let (facts, all_repairable) = observations.take();
+        assert_eq!(facts.len(), limit);
+        assert!(
+            facts
+                .iter()
+                .all(|fact| fact.outcome == ToolOutcome::Repairable)
+        );
+        assert!(!all_repairable);
+        assert!(!observations.has_success());
+
+        let next = observations.reserve(vec![0], OBSERVED_TOOL, &Value::Null);
+        next.mark_repairable();
+        next.finish(true);
+        assert!(!observations.has_success());
+        assert!(observations.take().1);
+    }
+
+    #[test_case(false; "finish_after_expansion")]
+    #[test_case(true; "finish_before_expansion")]
+    fn expanded_parent_success_does_not_count(finish_before_expansion: bool) {
+        let observations = ResponseObservations::new(OBSERVATION_WINDOW);
+        let parent = observations.reserve(vec![0], BATCH_TOOL_NAME, &Value::Null);
+        if finish_before_expansion {
+            parent.finish(false);
+            parent.finish(false);
+            assert!(observations.has_success());
+        }
+        parent.expand();
+        parent.expand();
+        parent.finish(false);
+        let child = observations.reserve(vec![0, 0], OBSERVED_TOOL, &Value::Null);
+        child.mark_repairable();
+        child.finish(true);
+        assert!(!observations.has_success());
+        let (facts, all_repairable) = observations.take();
+        assert_eq!(facts.len(), 1);
+        assert_eq!(facts[0].name, OBSERVED_TOOL);
+        assert!(all_repairable);
+    }
+
+    #[test_case(false; "ordinary_failure")]
+    #[test_case(true; "repairable_failure")]
+    fn observations_update_success_without_double_counting(repairable: bool) {
+        let observations = ResponseObservations::new(OBSERVATION_WINDOW);
+        let slot = observations.reserve(vec![0], OBSERVED_TOOL, &Value::Null);
+        if repairable {
+            slot.mark_repairable();
+        }
+        slot.finish(false);
+        slot.finish(false);
+        assert!(observations.has_success());
+        slot.finish(true);
+        assert!(!observations.has_success());
+        assert_eq!(observations.take().1, repairable);
     }
 
     #[test_case(&[0, 1], false; "earlier_root_first")]
@@ -3699,6 +3787,7 @@ mod tests {
                 slot.finish(repairable);
             }
         }
+        assert!(observations.has_success());
         let (facts, all_repairable) = observations.take();
         assert_eq!(
             facts

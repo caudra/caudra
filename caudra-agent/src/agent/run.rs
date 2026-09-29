@@ -1491,7 +1491,7 @@ impl<'h> Agent<'h> {
             && self.tools.as_array().is_some_and(|tools| !tools.is_empty())
             && steering::visible_text(&response.message)
                 .is_some_and(|text| steering::abandons_turn(&text));
-        let (observations, all_repairable) = if has_tools {
+        let (observations, all_repairable, successful) = if has_tools {
             self.response_text = None;
             self.process_tool_calls(response, repair_state).await?
         } else {
@@ -1504,7 +1504,7 @@ impl<'h> Agent<'h> {
                 response.message.padding = true;
             }
             self.push_assistant_message(response.message);
-            (Vec::new(), false)
+            (Vec::new(), false, false)
         };
         self.continuing_response = false;
         if let Some(error) = &interrupted {
@@ -1512,6 +1512,7 @@ impl<'h> Agent<'h> {
         }
         steering::lock(&self.steering).observe(Observed {
             calls: observations,
+            successful,
             protocol,
             productive: has_tools || !empty,
             abandoned,
@@ -2209,7 +2210,7 @@ impl<'h> Agent<'h> {
         &mut self,
         response: StreamResponse,
         repair_state: Arc<RepairState>,
-    ) -> Result<(Vec<ToolObservation>, bool), AgentError> {
+    ) -> Result<(Vec<ToolObservation>, bool, bool), AgentError> {
         let tool_uses = response
             .message
             .tool_uses()
@@ -2258,7 +2259,9 @@ impl<'h> Agent<'h> {
                     message,
                 })?;
         }
-        Ok(observations.take())
+        let successful = observations.has_success();
+        let (calls, all_repairable) = observations.take();
+        Ok((calls, all_repairable, successful))
     }
 
     fn drain_repair_usage(&mut self, state: &RepairState) {
@@ -3104,7 +3107,7 @@ mod tests {
     use crate::remote_project_context::{RemoteAssetIdentity, RemoteSkill};
     use crate::tools::native::todo_write::TodoWrite;
     use crate::tools::registry::ToolSource;
-    use crate::tools::{TODOWRITE_TOOL_NAME, ToolEffect};
+    use crate::tools::{TODOWRITE_TOOL_NAME, ToolEffect, local_tool};
     use crate::types::{TodoPriority, TodoStatus};
     use crate::{Envelope, QueueItemId};
 
@@ -3607,6 +3610,9 @@ mod tests {
     const OUTPUT_TOKENS: u32 = 7;
     const TEST_TOOL: &str = "test_tool";
     const TEST_TOOL_RESULT: &str = "completed";
+    const TEST_TOOL_ERROR: &str = "test command failed";
+    const TEST_EDIT_TOOL: &str = "test_edit";
+    const STEERING_PLANNING: &str = "tool_planning";
     const VISIBLE_RESPONSE: &str = "response";
     const STEERING_CUSTOM: &str = "Custom runtime guidance.";
     const INVALID_TOOL: &str = "invalid_tool";
@@ -6655,6 +6661,68 @@ mod tests {
             );
             assert_eq!(agent.num_turns, 1);
             assert_eq!(steering::lock(&agent.steering).responses(), 2);
+        });
+    }
+
+    #[test_case(false, true; "successful_edit_non_eager")]
+    #[test_case(true, true; "successful_edit_eager")]
+    #[test_case(false, false; "failed_edit_non_eager")]
+    #[test_case(true, false; "failed_edit_eager")]
+    fn successful_edit_breaks_tool_planning_failure_episode(eager: bool, edit_succeeds: bool) {
+        smol::block_on(async {
+            let responses = vec![
+                tool_use_response(TEST_TOOL, json!({})),
+                tool_use_response(TEST_EDIT_TOOL, json!({})),
+                tool_use_response(TEST_TOOL, json!({})),
+                text_response(StopReason::EndTurn),
+            ];
+            let mut history = History::default();
+            let (mut agent, _events) = make_agent(MockProvider::new(responses), &mut history);
+            agent.config.eager_tool_dispatch = eager;
+            agent.tools = json!([
+                {"name": TEST_TOOL, "input_schema": {"type": "object"}},
+                {"name": TEST_EDIT_TOOL, "input_schema": {"type": "object"}},
+            ]);
+            let config = Arc::make_mut(&mut agent.config.steering);
+            config.rules.tool_planning.after_calls = Some(2);
+            config.rules.tool_planning.after_responses = Some(2);
+            let edits = Arc::new(AtomicUsize::new(0));
+            let executed = Arc::clone(&edits);
+            let mut edit = local_tool(move |_, _| {
+                executed.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async move {
+                    if edit_succeeds {
+                        Ok(TEST_TOOL_RESULT.into())
+                    } else {
+                        Err(TEST_TOOL_ERROR.into())
+                    }
+                })
+            });
+            edit.effect = ToolEffect::Mutating;
+            agent.local_tools = Arc::new(HashMap::from([
+                (
+                    TEST_TOOL.into(),
+                    local_tool(|_, _| Box::pin(async { Err(TEST_TOOL_ERROR.into()) })),
+                ),
+                (TEST_EDIT_TOOL.into(), edit),
+            ]));
+
+            assert_eq!(
+                agent.run(default_input()).await.unwrap(),
+                DoneReason::EndTurn
+            );
+            assert_eq!(edits.load(Ordering::SeqCst), 1);
+            assert_eq!(agent.num_turns, 4);
+            assert_eq!(
+                agent
+                    .history
+                    .as_slice()
+                    .iter()
+                    .filter_map(|message| message.steering.as_ref())
+                    .filter(|origin| origin.rule == STEERING_PLANNING)
+                    .count(),
+                usize::from(!edit_succeeds)
+            );
         });
     }
 

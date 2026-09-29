@@ -25,7 +25,7 @@ const ABANDONED_FACT: &str =
     "The turn ended on a statement of intent. The work it announced was not performed.";
 const ABANDONED_PROMPT: &str = "Carry out what you said you would do now, using tool calls. Do not restate the plan. When the work is done, end with the report the task asked for.";
 const REPETITION_PROMPT: &str = "Recent responses repeat the same text or tool-call pattern. Reconsider the next useful action and change approach if this repetition is not helping. Legitimate verification or polling may continue.";
-const PLANNING_PROMPT: &str = "Recent responses repeatedly use the same tool with repeated calls or errors. Reassess your tool choices and choose a useful next action; change approach if these calls are not helping.";
+const PLANNING_PROMPT: &str = "Several consecutive tool attempts returned errors. Review those errors before retrying. If you have corrected the inputs or changed the relevant state, continue; otherwise consider a different approach.";
 const HISTORY_SCAN_LIMIT: usize = 16_384;
 const TEXT_BYTES_LIMIT: usize = 8_192;
 const MIN_REPEATED_TEXT_CHARS: usize = 32;
@@ -100,6 +100,7 @@ pub(crate) struct Steering {
     responses: u64,
     stalled: u32,
     calls: VecDeque<(u64, ToolObservation)>,
+    planning_since: u64,
     model: Option<String>,
 }
 
@@ -120,6 +121,7 @@ pub(super) enum Recovery {
 /// What one response did, as the budgets need to see it.
 pub(super) struct Observed {
     pub calls: Vec<ToolObservation>,
+    pub successful: bool,
     pub protocol: bool,
     /// Carried a tool call or visible text, so the turn moved the task.
     pub productive: bool,
@@ -157,6 +159,7 @@ impl Steering {
             responses: 0,
             stalled: 0,
             calls: VecDeque::new(),
+            planning_since: 0,
             model: None,
         }
     }
@@ -232,6 +235,9 @@ impl Steering {
 
     pub(super) fn observe(&mut self, observed: Observed) {
         self.responses = self.responses.saturating_add(1);
+        if observed.successful {
+            self.planning_since = self.responses;
+        }
         if !observed.protocol {
             self.protocols = 0;
         }
@@ -475,9 +481,15 @@ impl Steering {
                     .unwrap_or(REPETITION_PROMPT),
             ))
         } else if rules.tool_planning.enabled
-            && self.needs_planning()
             && cooldown_ready(&history, PLANNING_RULE, rules.tool_planning.cooldown)
+            && let Some((failed_calls, failed_responses)) = self.planning_episode()
         {
+            info!(
+                rule = PLANNING_RULE,
+                failed_calls,
+                failed_responses,
+                "consecutive tool failures warrant reviewing the errors"
+            );
             Some((
                 PLANNING_RULE,
                 rules
@@ -526,33 +538,32 @@ impl Steering {
         })
     }
 
-    fn needs_planning(&self) -> bool {
-        let Some((response, latest)) = self.calls.back() else {
-            return false;
-        };
+    fn planning_episode(&self) -> Option<(usize, usize)> {
+        let (response, _) = self.calls.back()?;
         if *response != self.responses {
-            return false;
+            return None;
         }
-        let calls: Vec<_> = self
-            .calls
-            .iter()
-            .filter(|(_, call)| call.name == latest.name)
-            .collect();
-        let mut responses: Vec<_> = calls.iter().map(|(response, _)| *response).collect();
-        responses.dedup();
-        let repeated = calls
-            .iter()
-            .filter(|(_, call)| same_call(call, latest))
-            .count()
-            >= MIN_CYCLE;
-        let errors = calls
-            .iter()
-            .filter(|(_, call)| call.outcome != ToolOutcome::Success)
-            .count()
-            >= MIN_CYCLE;
-        calls.len() >= self.policy.rules.tool_planning.after_calls
-            && responses.len() >= self.policy.rules.tool_planning.after_responses
-            && (repeated || errors)
+        let policy = &self.policy.rules.tool_planning;
+        let mut calls = 0;
+        let mut responses = 0;
+        let mut previous_response = None;
+        for (response, _) in
+            self.calls
+                .iter()
+                .rev()
+                .take(policy.after_calls)
+                .take_while(|(response, call)| {
+                    *response > self.planning_since && call.outcome != ToolOutcome::Success
+                })
+        {
+            calls += 1;
+            if previous_response != Some(response) {
+                responses += 1;
+                previous_response = Some(response);
+            }
+        }
+        (calls >= policy.after_calls && responses >= policy.after_responses)
+            .then_some((calls, responses))
     }
 }
 
@@ -709,7 +720,7 @@ mod tests {
 
     use super::{
         ABANDONED_FACT, ABANDONED_RULE, EMPTY_IDLE, EMPTY_RULE, Intervention, Observed,
-        PLANNING_RULE, PROTOCOL_FACT, PROTOCOL_RULE, REPETITION_RULE, REPORT_RULE,
+        PLANNING_PROMPT, PLANNING_RULE, PROTOCOL_FACT, PROTOCOL_RULE, REPETITION_RULE, REPORT_RULE,
         REPORT_STRUCTURED, REPORT_SUMMARY, Recovery, RecoveryAction, Steering, TEXT_BYTES_LIMIT,
         TRUNCATION_FACT, TRUNCATION_PROMPT, TRUNCATION_RULE, abandons_turn, eligible_response,
         normalized_message,
@@ -725,6 +736,34 @@ mod tests {
     const EXPECTED_CONTINUE: &str = "a charged recovery continues";
     const OTHER_MODEL: &str = "other-model";
     const TRUNCATION_ATTEMPTS: u32 = 3;
+    const SHELL_TOOL: &str = "shell";
+    const PATCH_TOOL: &str = "file_apply_patch";
+    const READ_TOOL: &str = "file_read";
+    const GREP_TOOL: &str = "file_grep";
+    const EDIT_TEST_TRACE: &[(&str, u64, bool)] = &[
+        (SHELL_TOOL, 1, true),
+        (PATCH_TOOL, 2, true),
+        (PATCH_TOOL, 3, true),
+        (READ_TOOL, 4, true),
+        (GREP_TOOL, 5, true),
+        (SHELL_TOOL, 6, true),
+        ("todo_write", 7, true),
+        (SHELL_TOOL, 8, false),
+        ("task", 9, true),
+        (PATCH_TOOL, 10, true),
+        (PATCH_TOOL, 11, true),
+        (SHELL_TOOL, 12, true),
+        (SHELL_TOOL, 13, true),
+        (READ_TOOL, 14, true),
+        (READ_TOOL, 15, true),
+        (READ_TOOL, 16, true),
+        (READ_TOOL, 17, true),
+        (READ_TOOL, 18, true),
+        (GREP_TOOL, 19, true),
+        (READ_TOOL, 20, true),
+        (PATCH_TOOL, 21, true),
+        (SHELL_TOOL, 12, true),
+    ];
     const ABANDONED_ATTEMPTS: u32 = 2;
 
     fn default_state() -> Steering {
@@ -742,6 +781,9 @@ mod tests {
     fn observe_calls(state: &mut Steering, calls: Vec<ToolObservation>) {
         let productive = !calls.is_empty();
         state.observe(Observed {
+            successful: calls
+                .iter()
+                .any(|call| call.outcome == ToolOutcome::Success),
             calls,
             protocol: false,
             productive,
@@ -1014,6 +1056,7 @@ mod tests {
         for _ in 0..2 {
             state.observe(Observed {
                 calls: Vec::new(),
+                successful: false,
                 protocol: true,
                 productive: false,
                 abandoned: false,
@@ -1061,10 +1104,16 @@ mod tests {
         assert!(!state.has_cycle());
     }
 
-    #[test_case(false, false, false; "different_successful_reads")]
-    #[test_case(true, false, true; "repeated_calls")]
-    #[test_case(false, true, true; "repeated_errors")]
-    fn planning_requires_evidence_across_responses(repeat: bool, errors: bool, expected: bool) {
+    #[test_case(false, ToolOutcome::Success, false; "different_successful_reads")]
+    #[test_case(true, ToolOutcome::Success, false; "repeated_successes")]
+    #[test_case(false, ToolOutcome::Failure, true; "changed_inputs_still_fail")]
+    #[test_case(true, ToolOutcome::Failure, true; "repeated_failures")]
+    #[test_case(false, ToolOutcome::Repairable, true; "changed_inputs_still_invalid")]
+    fn planning_requires_evidence_across_responses(
+        repeat: bool,
+        outcome: ToolOutcome,
+        expected: bool,
+    ) {
         let mut state = default_state();
         state.policy.rules.repetition.enabled = false;
         let model = Model::from_spec(MODEL).unwrap();
@@ -1075,17 +1124,13 @@ mod tests {
                     .map(|index| {
                         call(
                             if repeat { 0 } else { response * 2 + index },
-                            if errors {
-                                ToolOutcome::Failure
-                            } else {
-                                ToolOutcome::Success
-                            },
+                            outcome.clone(),
                         )
                     })
                     .collect(),
             );
         }
-        assert_eq!(state.needs_planning(), expected);
+        assert_eq!(state.planning_episode().is_some(), expected);
         let advisory = state.advisory(&[], &model, true);
         assert_eq!(
             advisory
@@ -1094,6 +1139,164 @@ mod tests {
                 .map(|origin| origin.rule.as_str()),
             expected.then_some(PLANNING_RULE)
         );
+    }
+
+    #[test]
+    fn planning_leaves_interleaved_edit_test_retries_alone() {
+        let mut state = default_state();
+        let model = Model::from_spec(MODEL).unwrap();
+        for &(name, fingerprint, successful) in EDIT_TEST_TRACE {
+            observe_calls(
+                &mut state,
+                vec![ToolObservation {
+                    name: name.into(),
+                    fingerprint,
+                    outcome: if successful {
+                        ToolOutcome::Success
+                    } else {
+                        ToolOutcome::Failure
+                    },
+                }],
+            );
+            assert!(state.advisory(&[], &model, true).is_none());
+        }
+    }
+
+    #[test_case(&[2, 2, 1], false; "below_call_threshold")]
+    #[test_case(&[2, 2, 2], true; "both_thresholds_met")]
+    #[test_case(&[6], false; "one_large_batch")]
+    #[test_case(&[1, 5], false; "two_responses")]
+    #[test_case(&[1, 1, 4], true; "uneven_batches")]
+    #[test_case(&[1, 1, 6], false; "older_responses_outside_planning_window")]
+    fn planning_counts_recent_failed_calls_and_responses(batches: &[usize], expected: bool) {
+        let mut state = default_state();
+        state.policy.rules.repetition.enabled = false;
+        let model = Model::from_spec(MODEL).unwrap();
+        let mut fingerprint = 0;
+        for &count in batches {
+            observe_calls(
+                &mut state,
+                (0..count)
+                    .map(|_| {
+                        fingerprint += 1;
+                        call(fingerprint, ToolOutcome::Failure)
+                    })
+                    .collect(),
+            );
+        }
+        assert_eq!(state.advisory(&[], &model, true).is_some(), expected);
+    }
+
+    #[test_case(SHELL_TOOL; "successful_shell_result_or_admission")]
+    #[test_case(PATCH_TOOL; "successful_edit")]
+    #[test_case(READ_TOOL; "successful_read")]
+    fn planning_success_breaks_failure_episode(name: &str) {
+        let mut state = default_state();
+        let model = Model::from_spec(MODEL).unwrap();
+        for fingerprint in 0..4 {
+            observe_calls(&mut state, vec![call(fingerprint, ToolOutcome::Failure)]);
+        }
+        observe_calls(
+            &mut state,
+            vec![ToolObservation {
+                name: name.into(),
+                fingerprint: 4,
+                outcome: ToolOutcome::Success,
+            }],
+        );
+        for fingerprint in 5..7 {
+            observe_calls(&mut state, vec![call(fingerprint, ToolOutcome::Failure)]);
+        }
+        assert!(state.advisory(&[], &model, true).is_none());
+        for fingerprint in 7..11 {
+            observe_calls(&mut state, vec![call(fingerprint, ToolOutcome::Failure)]);
+        }
+        assert_eq!(
+            state
+                .advisory(&[], &model, true)
+                .unwrap()
+                .steering
+                .unwrap()
+                .rule,
+            PLANNING_RULE
+        );
+    }
+
+    #[test]
+    fn planning_success_outside_retained_facts_breaks_episode() {
+        let mut state = default_state();
+        let model = Model::from_spec(MODEL).unwrap();
+        for fingerprint in 0..4 {
+            observe_calls(&mut state, vec![call(fingerprint, ToolOutcome::Failure)]);
+        }
+        state.observe(Observed {
+            calls: vec![call(4, ToolOutcome::Failure)],
+            successful: true,
+            protocol: false,
+            productive: true,
+            abandoned: false,
+        });
+        for fingerprint in 5..10 {
+            observe_calls(&mut state, vec![call(fingerprint, ToolOutcome::Failure)]);
+            assert!(state.advisory(&[], &model, true).is_none());
+        }
+        observe_calls(&mut state, vec![call(10, ToolOutcome::Failure)]);
+        assert_eq!(
+            state
+                .advisory(&[], &model, true)
+                .unwrap()
+                .steering
+                .unwrap()
+                .rule,
+            PLANNING_RULE
+        );
+    }
+
+    #[test]
+    fn planning_requires_a_failure_in_the_latest_response() {
+        let mut state = default_state();
+        let model = Model::from_spec(MODEL).unwrap();
+        for fingerprint in 0..6 {
+            observe_calls(&mut state, vec![call(fingerprint, ToolOutcome::Failure)]);
+        }
+        assert!(state.planning_episode().is_some());
+        observe_calls(&mut state, Vec::new());
+        assert!(state.advisory(&[], &model, true).is_none());
+    }
+
+    #[test_case(false; "default_prompt")]
+    #[test_case(true; "custom_prompt")]
+    fn planning_preserves_prompt_budget_cooldown_and_disable(custom: bool) {
+        let mut state = default_state();
+        let model = Model::from_spec(MODEL).unwrap();
+        state.policy.rules.repetition.enabled = false;
+        state.policy.max_advisories = 2;
+        if custom {
+            state.policy.rules.tool_planning.prompt = Some(CUSTOM.into());
+        }
+        for fingerprint in 0..6 {
+            let mut observation = call(fingerprint, ToolOutcome::Failure);
+            observation.name = if fingerprint % 2 == 0 {
+                SHELL_TOOL
+            } else {
+                READ_TOOL
+            }
+            .into();
+            observe_calls(&mut state, vec![observation]);
+        }
+        state.policy.rules.tool_planning.enabled = false;
+        assert!(state.advisory(&[], &model, true).is_none());
+        state.policy.rules.tool_planning.enabled = true;
+        let message = state.advisory(&[], &model, true).unwrap();
+        assert_eq!(
+            message.first_text_content(),
+            Some(if custom { CUSTOM } else { PLANNING_PROMPT })
+        );
+        let mut history = vec![message];
+        assert!(state.advisory(&history, &model, true).is_none());
+        history.extend((0..state.policy.rules.tool_planning.cooldown).map(|_| assistant(TEXT)));
+        assert!(state.advisory(&history, &model, true).is_some());
+        assert!(state.advisory(&[], &model, true).is_none());
     }
 
     #[test_case(0, false; "no_responses")]
@@ -1329,6 +1532,7 @@ mod tests {
         ));
         state.observe(Observed {
             calls: Vec::new(),
+            successful: false,
             protocol: false,
             productive: true,
             abandoned: !clean,
