@@ -3387,11 +3387,12 @@ pub fn render_tool_content(
     let mut trace = SourceTrace::default();
     let mut output_source: Option<BodySource> = None;
     let mut output_links = LinkMap::default();
-    if let Some((language, code)) = input.map(|i| match i {
+    let drawn_script = input.map(|i| match i {
         ToolInput::Script { language, code } | ToolInput::Code { language, code } => {
             (language, code)
         }
-    }) {
+    });
+    if let Some((language, code)) = drawn_script {
         let code_lines: Vec<String> = code
             .trim_end_matches('\n')
             .lines()
@@ -3534,8 +3535,12 @@ pub fn render_tool_content(
             (card_lines, false)
         }
         Some(ToolOutput::Tasks(tasks)) => {
-            let (lines, rows, truncated, links) =
-                task_card::render(tasks, limits.bounded_budget(), limits.width);
+            let (lines, rows, truncated, links) = task_card::render(
+                tasks,
+                drawn_script.map(|(_, code)| code.as_str()),
+                limits.bounded_budget(),
+                limits.width,
+            );
             output_rows = rows;
             output_links = links;
             (lines, truncated)

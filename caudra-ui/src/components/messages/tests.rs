@@ -4,6 +4,7 @@ use crate::animation::test_clock::{FrozenClock, FrozenSpinner};
 use crate::chat::{DONE_TEXT, ERROR_TEXT};
 use crate::components::code_view::{BatchViews, RenderLimits, ScrollSpan, render_tool_content};
 use crate::components::prompt_progress::PROMPT_PROGRESS_LABEL;
+use crate::components::task_card::COMMAND_LABEL;
 use crate::components::tool_display::{
     AWAITING_APPROVAL, FOLLOWING, NOTICE_PREFIX, PAUSED, WRITING_PROMPT, scroll_footer_text,
     task_details,
@@ -22,6 +23,7 @@ use caudra_agent::{
     ShellFilterInfo, ShellOutput, SkillOutput, SnapshotLine, SnapshotSpan, SpanStyle,
     SubagentActivity, SubagentProgress, ToolAccounting, ToolInput, ToolOutput,
 };
+use caudra_storage::background::ShellJobMetadata;
 use caudra_storage::id::CaudraId;
 use caudra_storage::tool_outputs::ToolOutputRef;
 use caudra_workbench::scroll::SCROLLBAR_THUMB;
@@ -56,6 +58,11 @@ const BLOCKED_STATE: &str = "blocked";
 const TASK_BADGE: &str = "[background]";
 const TASK_MODE: &str = "build";
 const TASK_SUCCESS: &str = "All checks passed.";
+const JOB_ID: &str = "shell-cargo-nextest";
+const JOB_COMMAND: &str = "cargo nextest run -p caudra-ui";
+const JOB_TIMEOUT_MS: u64 = 1_200_000;
+const TASK_CONTROL_TOOL: &str = "task_control";
+const ONE_COMMAND_MSG: &str = "a background shell job shows its command once";
 
 fn live_task_card(call: &str, state: &str) -> TaskCard {
     serde_json::from_value(serde_json::json!({
@@ -9689,6 +9696,123 @@ fn background_shell_highlights_preserve_task_body(view: ViewMode, closed: bool, 
     }
 }
 
+fn shell_job(call: &str) -> TaskCard {
+    let mut card = live_task_card(call, LIVE_STATE);
+    card.kind = JobKind::Shell;
+    card.task_id = JOB_ID.into();
+    card.label = JOB_COMMAND.into();
+    card.shell = Some(Box::new(ShellJobMetadata {
+        call_id: call.into(),
+        root_call_id: TOOL_ID.into(),
+        command: JOB_COMMAND.into(),
+        workdir: ".".into(),
+        timeout_ms: JOB_TIMEOUT_MS,
+        mode: TASK_MODE.into(),
+    }));
+    card
+}
+
+fn job_input(script: bool) -> ToolInput {
+    let (language, code) = ("bash".into(), JOB_COMMAND.into());
+    if script {
+        ToolInput::Script { language, code }
+    } else {
+        ToolInput::Code { language, code }
+    }
+}
+
+/// The reported case: an opened card drew the command as its script, then again
+/// as the job's heading and as its `Command` row.
+#[test_case(ViewMode::Auto, false, false, STREAM_HIGHLIGHT_WIDTH; "auto_code")]
+#[test_case(ViewMode::Expanded, true, false, STREAM_HIGHLIGHT_WIDTH; "expanded_script")]
+#[test_case(ViewMode::Compact, false, false, STREAM_HIGHLIGHT_WIDTH; "compact_opened")]
+#[test_case(ViewMode::Auto, true, false, STREAM_HIGHLIGHT_NARROW_WIDTH; "narrow_auto_script")]
+#[test_case(ViewMode::Auto, false, true, STREAM_HIGHLIGHT_WIDTH; "auto_closed")]
+fn a_background_shell_card_shows_its_command_once(
+    view: ViewMode,
+    script: bool,
+    closed: bool,
+    width: u16,
+) {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.set_view(view);
+    panel.tool_start(ToolStartEvent {
+        summary: JOB_COMMAND.into(),
+        input: Some(job_input(script)),
+        ..start(TOOL_ID, SHELL_TOOL_NAME)
+    });
+    panel.tool_done(ToolDoneEvent {
+        tool: SHELL_TOOL_NAME.into(),
+        output: ToolOutput::Tasks(vec![shell_job(TOOL_ID)]),
+        ..done(TOOL_ID)
+    });
+    render(&mut panel, width, STREAM_HIGHLIGHT_HEIGHT);
+    if closed {
+        panel.close_tool_card(TOOL_ID);
+    } else if view == ViewMode::Compact {
+        assert!(panel.toggle_expansion(TOOL_ID));
+    }
+    let shown = visible_text(&render(&mut panel, width, STREAM_HIGHLIGHT_HEIGHT));
+    assert_eq!(
+        shown.matches(JOB_COMMAND).count(),
+        1,
+        "{ONE_COMMAND_MSG}: {shown}"
+    );
+    assert_eq!(
+        shown.matches(JOB_ID).count(),
+        usize::from(!closed),
+        "{shown}"
+    );
+    assert!(!shown.contains(COMMAND_LABEL), "{ONE_COMMAND_MSG}: {shown}");
+}
+
+#[test]
+fn an_open_background_shell_child_shows_its_command_once() {
+    let mut panel = panel_with_child(BatchToolEntry {
+        summary: JOB_COMMAND.into(),
+        input: Some(job_input(false)),
+        output: Some(ToolOutput::Tasks(vec![shell_job(&format!("{TOOL_ID}:0"))])),
+        ..batch_child(SHELL_TOOL_NAME, "x")
+    });
+    let shown = visible_text(&render(
+        &mut panel,
+        STREAM_HIGHLIGHT_WIDTH,
+        STREAM_HIGHLIGHT_HEIGHT,
+    ));
+    assert_eq!(
+        shown.matches(JOB_COMMAND).count(),
+        1,
+        "{ONE_COMMAND_MSG}: {shown}"
+    );
+    assert_eq!(shown.matches(JOB_ID).count(), 1, "{shown}");
+    assert!(!shown.contains(COMMAND_LABEL), "{ONE_COMMAND_MSG}: {shown}");
+}
+
+/// A card with no script of its own is the one place the job still names it.
+#[test]
+fn a_task_control_shell_job_names_its_command_once() {
+    let mut panel = panel_with_tools(&[(TOOL_ID, TASK_CONTROL_TOOL)]);
+    panel.set_view(ViewMode::Expanded);
+    panel.tool_done(ToolDoneEvent {
+        tool: TASK_CONTROL_TOOL.into(),
+        output: ToolOutput::Tasks(vec![shell_job(TOOL_ID)]),
+        ..done(TOOL_ID)
+    });
+    let shown = visible_text(&render(
+        &mut panel,
+        STREAM_HIGHLIGHT_WIDTH,
+        STREAM_HIGHLIGHT_HEIGHT,
+    ));
+    assert_eq!(
+        shown.matches(JOB_COMMAND).count(),
+        1,
+        "{ONE_COMMAND_MSG}: {shown}"
+    );
+    let row = shown.lines().find(|row| row.contains(JOB_COMMAND)).unwrap();
+    assert!(row.contains(COMMAND_LABEL), "{shown}");
+    assert_eq!(shown.matches(JOB_ID).count(), 1, "{shown}");
+}
+
 #[test_case(false; "code_input")]
 #[test_case(true; "script_input")]
 fn streaming_shell_reuses_command_highlights(script: bool) {
@@ -9849,20 +9973,12 @@ fn script_token_styles(panel: &MessagesPanel, tool_id: &str) -> Vec<Style> {
         .collect()
 }
 
-/// A batch whose one child is a shell call carrying `script` and answering
-/// with `output`.
-fn panel_with_script_child(script: &str, output: ToolOutput) -> MessagesPanel {
+/// An expanded batch whose only child, `child`, is open.
+fn panel_with_child(child: BatchToolEntry) -> MessagesPanel {
     let mut panel = panel_with_tools(&[(TOOL_ID, BATCH_TOOL)]);
     let mut ev = start(TOOL_ID, BATCH_TOOL);
     ev.output = Some(ToolOutput::Batch {
-        entries: vec![caudra_agent::BatchToolEntry {
-            input: Some(ToolInput::Script {
-                language: "bash".into(),
-                code: script.into(),
-            }),
-            output: Some(output),
-            ..batch_child(SHELL_TOOL_NAME, "x")
-        }],
+        entries: vec![child],
         text: String::new(),
     });
     panel.tool_start(ev);
@@ -9871,6 +9987,19 @@ fn panel_with_script_child(script: &str, output: ToolOutput) -> MessagesPanel {
         .batch_views
         .insert(TOOL_ID.into(), BatchViews::new([0]));
     panel
+}
+
+/// A batch whose one child is a shell call carrying `script` and answering
+/// with `output`.
+fn panel_with_script_child(script: &str, output: ToolOutput) -> MessagesPanel {
+    panel_with_child(BatchToolEntry {
+        input: Some(ToolInput::Script {
+            language: "bash".into(),
+            code: script.into(),
+        }),
+        output: Some(output),
+        ..batch_child(SHELL_TOOL_NAME, "x")
+    })
 }
 
 fn shell_child_output() -> ToolOutput {

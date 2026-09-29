@@ -22,6 +22,7 @@ const LABEL_WIDTH: usize = 8;
 const SEPARATOR: &str = " · ";
 const BACKGROUND_BADGE: &str = " [background]";
 const OPEN_CHAT: &str = " · open chat";
+pub(crate) const COMMAND_LABEL: &str = "Command";
 
 pub(crate) fn is_shell_delivery(origin: &TaskEventOrigin, text: &str) -> bool {
     text.starts_with(&format!("Shell {}:", origin.task_id))
@@ -49,18 +50,28 @@ pub(crate) fn details(task: &TaskCard, width: u16) -> (Vec<Line<'static>>, LinkM
     }
 }
 
-fn shell_facts(task: &TaskCard, width: u16) -> Vec<Line<'static>> {
-    let Some(shell) = &task.shell else {
+/// A job's facts, naming its command only where `script`, the code the card
+/// holding this job already drew, is not that same command. A receipt saved
+/// without metadata still carries its command as the label.
+fn shell_facts(task: &TaskCard, script: Option<&str>) -> Vec<Line<'static>> {
+    if task.kind != JobKind::Shell {
         return Vec::new();
-    };
+    }
     let t = theme::current();
-    let owner = match task.owner {
-        JobOwner::Main => "main chat",
-        JobOwner::Child { .. } => "agent task",
-    };
-    WrappedRows::new(
-        vec![
-            fact("Command", &shell.command, t.tool),
+    let command = task
+        .shell
+        .as_ref()
+        .map_or(task.label.as_str(), |shell| shell.command.as_str());
+    let mut facts = Vec::new();
+    if !repeats_script(command, script) {
+        facts.push(fact(COMMAND_LABEL, command, t.tool));
+    }
+    if let Some(shell) = &task.shell {
+        let owner = match task.owner {
+            JobOwner::Main => "main chat",
+            JobOwner::Child { .. } => "agent task",
+        };
+        facts.extend([
             fact("Owner", owner, t.tool),
             fact("Workdir", &shell.workdir, t.tool),
             fact(
@@ -68,11 +79,13 @@ fn shell_facts(task: &TaskCard, width: u16) -> Vec<Line<'static>> {
                 &format_settled_duration(Duration::from_millis(shell.timeout_ms)),
                 t.tool,
             ),
-        ],
-        0,
-        width,
-    )
-    .lines()
+        ]);
+    }
+    facts
+}
+
+fn repeats_script(command: &str, script: Option<&str>) -> bool {
+    script.is_some_and(|script| script.trim_end() == command.trim_end())
 }
 
 pub(crate) fn markdown_body(text: &str, width: u16) -> (Vec<Line<'static>>, LinkMap) {
@@ -141,8 +154,11 @@ pub(crate) fn delivery(
     (lines, links)
 }
 
+/// `script` is the code the card holding these jobs already drew, which a
+/// shell job whose command it is does not repeat.
 pub(crate) fn render(
     tasks: &[TaskCard],
+    script: Option<&str>,
     budget: usize,
     width: u16,
 ) -> (Vec<Line<'static>>, Vec<Option<RowTarget>>, bool, LinkMap) {
@@ -162,8 +178,12 @@ pub(crate) fn render(
             lines.push(Line::default());
             rows.push(None);
         }
+        let title = match task.kind {
+            JobKind::Agent => &task.label,
+            JobKind::Shell => &task.task_id,
+        };
         let mut heading = vec![
-            Span::styled(escape_terminal_controls(&task.label), t.tool_prefix),
+            Span::styled(escape_terminal_controls(title), t.tool_prefix),
             Span::styled(SEPARATOR, t.tool_dim),
             Span::styled(
                 escape_terminal_controls(&task.state),
@@ -174,21 +194,13 @@ pub(crate) fn render(
             heading.push(Span::styled(BACKGROUND_BADGE, t.accent));
         }
         let mut identity = WrappedRows::new(vec![Line::from(heading)], 0, width).lines();
-        let mut task_line = fact(
-            if task.kind == JobKind::Shell {
-                "Shell"
-            } else {
-                "Task"
-            },
-            &task.task_id,
-            t.tool,
-        );
         if task.kind == JobKind::Agent {
+            let mut task_line = fact("Task", &task.task_id, t.tool);
             task_line.spans.push(Span::styled(OPEN_CHAT, t.accent));
+            identity.extend(WrappedRows::new(vec![task_line], 1, width).lines());
         }
-        identity.extend(WrappedRows::new(vec![task_line], 1, width).lines());
         identity.extend(WrappedRows::new(vec![fact("Mode", &task.mode, t.tool)], 1, width).lines());
-        let mut body = shell_facts(task, width);
+        let mut body = shell_facts(task, script);
         if let Some(result) = &task.result {
             if let Some(duration) = result.get("duration_ms").and_then(|value| value.as_u64()) {
                 body.push(fact(
@@ -362,7 +374,7 @@ pub(crate) fn has_active(output: &ToolOutput) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{delivery, markdown_body, render};
+    use super::{BACKGROUND_BADGE, COMMAND_LABEL, OPEN_CHAT, delivery, markdown_body, render};
     use crate::chat::history_to_display;
     use crate::components::{DisplayRole, code_view::RowTarget};
     use caudra_agent::{History, TaskCard};
@@ -379,6 +391,12 @@ mod tests {
     const INLINE_TYPE: &str = "Option<FilePreview>";
     const CODE: &str = "fn preview<T>() -> Option<T> { None }";
     const LITERAL_ENTITIES: &str = "&lt;literal&gt;";
+    const SHELL_ID: &str = "shell-4";
+    const SHELL_COMMAND: &str = "cargo nextest run -p caudra-ui --no-fail-fast";
+    const COMMAND_WORD: &str = "nextest";
+    const OTHER_SCRIPT: &str = "printf other";
+    const RUNNING: &str = "running";
+    const TIMEOUT_MS: u64 = 1_200_000;
 
     fn text(lines: &[Line<'_>]) -> String {
         lines
@@ -424,9 +442,9 @@ mod tests {
     #[test_case(80; "wide")]
     fn task_budget_counts_markdown_rows_and_preserves_targets(width: u16) {
         let task = task(json!(MARKDOWN));
-        let (all, _, _, _) = render(slice::from_ref(&task), usize::MAX, width);
+        let (all, _, _, _) = render(slice::from_ref(&task), None, usize::MAX, width);
         let budget = all.len() - 2;
-        let (lines, targets, truncated, links) = render(&[task], budget, width);
+        let (lines, targets, truncated, links) = render(&[task], None, budget, width);
         assert!(truncated);
         assert_eq!(lines.len(), budget);
         assert!(links.is_aligned(&lines));
@@ -444,7 +462,7 @@ mod tests {
             task.result = None;
             task.reports = vec!["**report**".into()];
         }
-        let (lines, _, _, _) = render(slice::from_ref(&task), usize::MAX, 80);
+        let (lines, _, _, _) = render(slice::from_ref(&task), None, usize::MAX, 80);
         let shown = text(&lines);
         if structured {
             assert!(shown.contains(LITERAL));
@@ -574,7 +592,7 @@ mod tests {
                 100,
             )
         } else {
-            let (lines, targets, _, links) = render(&[card], usize::MAX, 100);
+            let (lines, targets, _, links) = render(&[card], None, usize::MAX, 100);
             assert!(targets.iter().all(Option::is_none));
             assert!(text(&lines).contains("Workdir"));
             assert!(text(&lines).contains("Timeout"));
@@ -584,5 +602,72 @@ mod tests {
         assert!(!text(&lines).contains("open chat"));
         assert!(links.is_aligned(&lines));
         assert!(links.rows.iter().flatten().all(Option::is_none));
+    }
+
+    fn shell_job(metadata: bool) -> TaskCard {
+        let mut card = task(json!(""));
+        card.kind = JobKind::Shell;
+        card.task_id = SHELL_ID.into();
+        card.label = SHELL_COMMAND.into();
+        card.state = RUNNING.into();
+        card.background = true;
+        card.result = None;
+        card.shell = metadata.then(|| {
+            Box::new(ShellJobMetadata {
+                call_id: card.call_id.clone(),
+                root_call_id: card.root_call_id.clone(),
+                command: SHELL_COMMAND.into(),
+                workdir: ".".into(),
+                timeout_ms: TIMEOUT_MS,
+                mode: card.mode.clone(),
+            })
+        });
+        card
+    }
+
+    #[test_case(32, true, Some(SHELL_COMMAND), false; "narrow_script_is_the_command")]
+    #[test_case(120, true, Some(SHELL_COMMAND), false; "wide_script_is_the_command")]
+    #[test_case(32, true, None, true; "narrow_without_script")]
+    #[test_case(120, true, None, true; "wide_without_script")]
+    #[test_case(120, true, Some(OTHER_SCRIPT), true; "different_script")]
+    #[test_case(120, false, Some(SHELL_COMMAND), false; "label_fallback_script_is_the_command")]
+    #[test_case(120, false, None, true; "label_fallback_without_script")]
+    fn shell_job_is_headed_by_its_id_and_names_its_command_once(
+        width: u16,
+        metadata: bool,
+        script: Option<&str>,
+        named: bool,
+    ) {
+        let (lines, _, _, links) = render(&[shell_job(metadata)], script, usize::MAX, width);
+        let shown = text(&lines);
+        assert_eq!(
+            shown.matches(COMMAND_LABEL).count(),
+            usize::from(named),
+            "{shown}"
+        );
+        assert_eq!(
+            shown.matches(COMMAND_WORD).count(),
+            usize::from(named),
+            "{shown}"
+        );
+        let heading = lines[0].to_string();
+        for identity in [SHELL_ID, RUNNING, BACKGROUND_BADGE.trim()] {
+            assert!(heading.contains(identity), "{shown}");
+            assert_eq!(shown.matches(identity).count(), 1, "{shown}");
+        }
+        assert!(links.is_aligned(&lines));
+    }
+
+    #[test_case(false; "without_script")]
+    #[test_case(true; "script_matching_label")]
+    fn agent_task_keeps_its_label_heading_and_chat_row(script: bool) {
+        let task = task(json!(""));
+        let script = script.then_some(task.label.as_str());
+        let (lines, _, _, _) = render(slice::from_ref(&task), script, usize::MAX, 80);
+        let shown = text(&lines);
+        assert!(lines[0].to_string().starts_with(&task.label), "{shown}");
+        assert_eq!(shown.matches(&task.task_id).count(), 1, "{shown}");
+        assert!(shown.contains(OPEN_CHAT), "{shown}");
+        assert!(!shown.contains(COMMAND_LABEL), "{shown}");
     }
 }
