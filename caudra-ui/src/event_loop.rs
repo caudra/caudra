@@ -443,6 +443,14 @@ impl SessionRuntime {
             && self.app.shell.active_ids().is_empty()
     }
 
+    fn shutdown_quiescent(&self) -> bool {
+        SessionStatus::of(&self.app) == SessionStatus::Idle
+            && self.handles.active_background_tasks() == 0
+            && self.app.shell.active_ids().is_empty()
+            && self.handles.agent_rx.is_empty()
+            && self.shell_rx.is_empty()
+    }
+
     fn delivery_idle(&self) -> bool {
         !self.handles.queue.has_priority_input() && !self.handles.queue.is_processing()
     }
@@ -4466,16 +4474,6 @@ impl<'t> EventLoop<'t> {
         drained
     }
 
-    fn shutdown_quiescent(&self) -> bool {
-        self.sessions.iter().all(|runtime| {
-            SessionStatus::of(&runtime.app) == SessionStatus::Idle
-                && runtime.handles.active_background_tasks() == 0
-                && runtime.app.shell.active_ids().is_empty()
-                && runtime.handles.agent_rx.is_empty()
-                && runtime.shell_rx.is_empty()
-        })
-    }
-
     fn shutdown(mut self) -> Result<ShutdownReport> {
         let started = Instant::now();
         let relocating =
@@ -4503,14 +4501,29 @@ impl<'t> EventLoop<'t> {
         let deadline = Instant::now() + AGENT_SHUTDOWN_TIMEOUT;
         loop {
             self.drain_shutdown_envelopes();
-            if self.shutdown_quiescent() {
+            if self.sessions.iter().all(SessionRuntime::shutdown_quiescent) {
                 break;
             }
             if Instant::now() >= deadline {
                 if relocating {
                     relocation_error = Some("agents did not become idle".to_owned());
                 }
-                warn!("agents did not quiesce within {AGENT_SHUTDOWN_TIMEOUT:?}, forcing shutdown");
+                for runtime in self
+                    .sessions
+                    .iter()
+                    .filter(|runtime| !runtime.shutdown_quiescent())
+                {
+                    warn!(
+                        session_id = %runtime.id(),
+                        status = SessionStatus::of(&runtime.app).as_str(),
+                        work = ?runtime.app.session_work(),
+                        background_tasks = runtime.handles.active_background_tasks(),
+                        shells = runtime.app.shell.active_ids().len(),
+                        pending_events = runtime.handles.agent_rx.len() + runtime.shell_rx.len(),
+                        timeout = ?AGENT_SHUTDOWN_TIMEOUT,
+                        "session did not quiesce, forcing shutdown"
+                    );
+                }
                 break;
             }
             std::thread::sleep(Duration::from_millis(5));
@@ -4536,7 +4549,7 @@ impl<'t> EventLoop<'t> {
             deadline.saturating_duration_since(Instant::now()),
         );
         if relocating && !agents_joined {
-            relocation_error = Some("agents did not finish".to_owned());
+            relocation_error.get_or_insert_with(|| "agents did not finish".to_owned());
         }
         let join_agents_ms = lap();
 
@@ -4770,6 +4783,28 @@ mod tests {
         let next = crate::agent::reserve_background_transition(&tasks).unwrap();
         drop(next);
         smol::block_on(tasks.shutdown()).unwrap();
+    }
+
+    #[test_case(false; "held")]
+    #[test_case(true; "after_runtime_shutdown")]
+    fn workspace_reservation_leaves_session_idle(shut_down: bool) {
+        let mut app = test_app();
+        let tasks = smol::block_on(BackgroundTasks::spawn(
+            app.storage.clone(),
+            app.state.session.id,
+        ))
+        .unwrap();
+        app.background = Some(tasks.clone());
+        let reservation = crate::agent::reserve_background_transition(&tasks).unwrap();
+        if shut_down {
+            smol::block_on(tasks.shutdown()).unwrap();
+        }
+        assert!(SessionStatus::of(&app) == SessionStatus::Idle);
+        assert!(!app.has_session_work());
+        drop(reservation);
+        if !shut_down {
+            smol::block_on(tasks.shutdown()).unwrap();
+        }
     }
 
     const OBSERVATION: &str = "failed";

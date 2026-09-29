@@ -53,6 +53,9 @@ impl BackgroundTasks {
             .map(TaskCard::from)
     }
 
+    /// A held workspace transition is left out: it is its holder's admission
+    /// lock, taken only once every job has joined, and the holder waits for
+    /// the session to go idle before releasing it.
     pub fn work(&self) -> SessionWork {
         let state = self.lock();
         SessionWork {
@@ -60,7 +63,6 @@ impl BackgroundTasks {
             settling: !state.admitting.is_empty()
                 || !state.drivers.is_empty()
                 || state.pending_stops > 0
-                || state.transition.is_some()
                 || !state.claims.is_empty()
                 || self.0.shells.pending()
                 || (state.open

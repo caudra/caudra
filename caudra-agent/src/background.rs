@@ -4112,6 +4112,24 @@ mod tests {
         });
     }
 
+    #[test_case(false; "held")]
+    #[test_case(true; "after_shutdown")]
+    fn workspace_transition_is_not_session_work(shut_down: bool) {
+        smol::block_on(async {
+            let fixture = Fixture::new().await;
+            let transition = fixture.tasks.suspend().unwrap();
+            transition.drain().await.unwrap();
+            if shut_down {
+                fixture.tasks.shutdown().await.unwrap();
+            }
+            assert!(!fixture.tasks.work().pending());
+            drop(transition);
+            if !shut_down {
+                fixture.tasks.shutdown().await.unwrap();
+            }
+        });
+    }
+
     #[test_case(true, Some(TASK); "loaded_selection")]
     #[test_case(false, Some(TASK); "recover_exact_missing_selection")]
     #[test_case(false, Some(MISSING_VERSION); "missing_selection_refuses_latest")]

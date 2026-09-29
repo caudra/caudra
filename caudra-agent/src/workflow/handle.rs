@@ -209,13 +209,14 @@ impl WorkflowHandle {
             .count()
     }
 
+    /// `Stopping` alone is not work: a suspended runtime has already joined
+    /// its runs, and one shutting down keeps each run active until it ends.
     pub(crate) fn work(&self) -> SessionWork {
         let state = self.state.load();
         let health = self.health.load();
         SessionWork {
             running: state.runs.iter().any(|run| run.status == RunStatus::Active),
-            settling: **health == RuntimeHealth::Stopping
-                || state.runs.iter().any(|run| run.outbox_pending),
+            settling: state.runs.iter().any(|run| run.outbox_pending),
             unavailable: **health == RuntimeHealth::Unavailable
                 || (self.requests.is_disconnected() && **health != RuntimeHealth::Closed),
         }

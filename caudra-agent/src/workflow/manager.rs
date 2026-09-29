@@ -1420,6 +1420,20 @@ complete(result);
         });
     }
 
+    #[test]
+    fn suspended_runtime_is_not_session_work() {
+        smol::block_on(async {
+            let fixture = Fixture::new();
+            let runtime = fixture.spawn().await;
+            let handle = runtime.handle();
+            let transition = handle.suspend().await.unwrap();
+            assert_eq!(handle.reminder_snapshot().health, RuntimeHealth::Stopping);
+            assert!(!handle.work().pending());
+            drop(transition);
+            runtime.shutdown().await;
+        });
+    }
+
     /// Answers each agent by its label: `block-*` parks until released or
     /// cancelled, `fail-*` fails without opening a session, anything else
     /// succeeds echoing its prompt. Every start is announced so a test can
