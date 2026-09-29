@@ -163,6 +163,10 @@ rule!(ToolPlanningConfig, ToolPlanningPolicy, {
     cooldown: u32 = 3, 1..=MAX_COUNT,
         "Completed model responses between this rule's advisories.";
 });
+rule!(RelativePathsConfig, RelativePathsPolicy, {
+    min_saved_chars: usize = 12, 1..=MAX_COUNT,
+        "Characters a relative form must save over its absolute path before the path is suggested.";
+});
 
 /// One `[agent.steering.rules.<name>]` table. Every rule also takes
 /// [`SteeringRule::COMMON_FIELDS`].
@@ -269,6 +273,8 @@ rules! {
         "Advise on short exact tool cycles, including normalized native batch leaf calls, or repeated normalized assistant text.";
     tool_planning: ToolPlanningConfig => ToolPlanningPolicy,
         "Advise after consecutive failed tool attempts across responses, including attempts with different tools or inputs. Any successful tool result ends the failure episode. Repeating a successful call is insufficient.";
+    relative_paths: RelativePathsConfig => RelativePathsPolicy,
+        "Suggest up to two shorter relative forms when file, patch, code-graph, or shell `workdir` paths spell out the working directory or its parent. The hint appears once per context.";
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -514,7 +520,7 @@ mod tests {
     const INVALID_FIELD: &str = "rules.repetition.text_window";
     const INVALID_MESSAGE: &str = "must be between 3 and 4096, got 2";
     const UNKNOWN_FIELD: &str = "unknown field";
-    const RULES: [&str; 8] = [
+    const RULES: [&str; 9] = [
         "truncation",
         "empty_response",
         "repeated_tool_call",
@@ -523,6 +529,7 @@ mod tests {
         "abandoned_turn",
         "repetition",
         "tool_planning",
+        "relative_paths",
     ];
 
     fn config(value: Value) -> SteeringConfig {
@@ -555,7 +562,8 @@ mod tests {
                     "tool_planning": {
                         "enabled": true, "prompt": null, "after_calls": 6,
                         "after_responses": 3, "cooldown": 3
-                    }
+                    },
+                    "relative_paths": {"enabled": true, "prompt": null, "min_saved_chars": 12}
                 }
             })
         );
@@ -572,7 +580,8 @@ mod tests {
             "rules": {
                 "repetition": {"enabled": global},
                 "tool_planning": {"enabled": false, "after_responses": 4},
-                "empty_response": {"max_idle": 5, "prompt": GLOBAL_PROMPT}
+                "empty_response": {"max_idle": 5, "prompt": GLOBAL_PROMPT},
+                "relative_paths": {"enabled": global, "min_saved_chars": 20}
             },
             "models": {(MODEL): {
                 "enabled": true,
@@ -580,7 +589,8 @@ mod tests {
                 "rules": {
                     "repetition": {"enabled": model},
                     "tool_planning": {"after_responses": 6},
-                    "empty_response": {"prompt": PROMPT}
+                    "empty_response": {"prompt": PROMPT},
+                    "relative_paths": {"min_saved_chars": 30}
                 }
             }}
         }));
@@ -594,11 +604,14 @@ mod tests {
         assert_eq!(policy.rules.tool_planning.after_responses, 6);
         assert_eq!(policy.rules.empty_response.max_idle, 5);
         assert_eq!(policy.rules.empty_response.prompt.as_deref(), Some(PROMPT));
+        assert_eq!(policy.rules.relative_paths.enabled, global);
+        assert_eq!(policy.rules.relative_paths.min_saved_chars, 30);
         let unmatched = config.resolve(OTHER_MODEL);
         assert_eq!(unmatched.rules.repetition.enabled, global);
         assert!(!unmatched.enabled);
         assert_eq!(unmatched.max_recoveries, 7);
         assert_eq!(unmatched.rules.tool_planning.after_responses, 4);
+        assert_eq!(unmatched.rules.relative_paths.min_saved_chars, 20);
         assert_eq!(
             unmatched.rules.empty_response.prompt.as_deref(),
             Some(GLOBAL_PROMPT)
@@ -723,6 +736,8 @@ mod tests {
     #[test_case(r#"{"rules":{"truncation":{"max_attempts":1.5}}}"#; "fractional_attempts")]
     #[test_case(r#"{"rules":{"truncation":{"max_attempts":4294967296}}}"#; "overflow_attempts")]
     #[test_case(r#"{"rules":{"truncation":{"max_idle":3}}}"#; "wrong_truncation_parameter")]
+    #[test_case(r#"{"rules":{"relative_paths":{"threshold":12}}}"#; "wrong_relative_paths_parameter")]
+    #[test_case(r#"{"rules":{"relative_paths":{"min_saved_chars":-1}}}"#; "negative_saved_chars")]
     fn rejects_invalid_schema(raw: &str) {
         assert!(serde_json::from_str::<SteeringConfig>(raw).is_err());
         assert!(
@@ -786,6 +801,8 @@ mod tests {
     #[test_case("tool_planning", "cooldown", 0; "planning_cooldown_zero")]
     #[test_case("tool_planning", "after_calls", MAX_COUNT + 1; "oversized_count")]
     #[test_case("tool_planning", "after_responses", 0; "planning_zero_responses")]
+    #[test_case("relative_paths", "min_saved_chars", 0; "relative_paths_zero")]
+    #[test_case("relative_paths", "min_saved_chars", MAX_COUNT + 1; "relative_paths_too_large")]
     fn rejects_invalid_rule_ranges(rule: &str, field: &str, value: usize) {
         for model_override in [false, true] {
             let invalid = json!({"enabled": false, "rules": {(rule): {(field): value}}});

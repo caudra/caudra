@@ -376,8 +376,8 @@ fn write_steering_section(out: &mut String) {
     out.push_str(
         "### `agent.steering`\n\n\
          Automatic steering repairs unusable model output and can add bounded guidance about \
-         repeated behavior. Every rule is enabled by default. Configure overrides in the \
-         `[agent.steering]` table. All fields are optional.\n\n",
+         repeated behavior or needlessly long tool paths. Every rule is enabled by default. \
+         Configure overrides in the `[agent.steering]` table. All fields are optional.\n\n",
     );
     write_table(out, SteeringConfig::FIELDS);
     out.push_str(
@@ -390,9 +390,11 @@ fn write_steering_section(out: &mut String) {
     }
     out.push_str(
         r###"
-Recovery and advisory budgets are separate. Advisory rules allow at most 4 total injections per invocation, with a default cooldown of 3 completed model responses for each rule.
+Recovery and advisory budgets are separate. Advisory rules allow at most 4 total injections per invocation. Repetition and tool-planning advisories each wait a default cooldown of 3 completed model responses.
 
 Tool-planning evidence starts after the last response containing any successful tool result, including results outside the retained batch window. A background admission ends the failure episode without proving that the background work succeeded. Later terminal outcomes do not retroactively change that admission into a failed attempt.
+
+Relative-path evidence is the latest response only, and the hint yields to repetition and tool-planning advisories. While an earlier hint remains in context, even across user turns, no new hint is added. Once compaction removes it, another hint appears only if a later response uses absolute paths again. A suggestion climbs at most one directory with `../`. Local sessions get suggestions only when the working directory the model sees is the canonical project path. Remote workspaces, sandboxes, and code-graph scopes get suggestions inside the working directory only. Paths with backticks, angle brackets, control characters, or invisible Unicode formatting characters are never quoted. Caudra never rewrites the paths a model sends.
 
 An empty-response episode lives in the transcript tail, so it survives a restore and a new invocation. A message typed into a stall is answered, but it does not refill the budget: only a response carrying a tool call or visible text ends the episode. `max_stalled_turns` bounds the turns that interleaved rules spend between them, independently of any single rule's allowance.
 
@@ -480,7 +482,7 @@ Charge one recovery for a completed-response-to-next-request transition caused b
 
 A mixed batch with useful successful siblings proceeds normally. It is not replayed or charged once per child. Transport and authentication retries, ordinary tool execution failures, permission denials, normal successful tool progress, explicit goal evaluation, and manual steering are separate from model-format recovery. The recovery budget does not bound every possible agent loop. Outer turn limits and cancellation still apply.
 
-At most one supplemental steering message is added per request. Recovery takes priority, then repetition and tool planning. Advisory exhaustion only suppresses hints. Recovery exhaustion with an unmet output contract reports a failure and retains partial output, except for `abandoned_turn`, which stops intervening and lets the turn end. A valid captured structured task report remains usable after an empty tail, but cancellation, transport/permission failures, and hard outer-limit failures do not become success.
+At most one supplemental steering message is added per request. Recovery takes priority, then repetition, tool planning, and relative paths. Advisory exhaustion only suppresses hints. Recovery exhaustion with an unmet output contract reports a failure and retains partial output, except for `abandoned_turn`, which stops intervening and lets the turn end. A valid captured structured task report remains usable after an empty tail, but cancellation, transport/permission failures, and hard outer-limit failures do not become success.
 
 `abandoned_turn` reads the tail of a response that called no tool and would otherwise end the turn. It fires on a text stopping at a bare colon, or on a last sentence that opens on an intent to act. It does not fire on a question, an offer, a completion, or a promise deferred behind another event, and code spans and quoted prose are removed before any of that is matched. Tool-looking prose is not executed here either; the rule only decides whether to ask for one more response.
 
@@ -855,7 +857,7 @@ mod tests {
     const MODEL: &str = "provider/model";
     const HEADING: &str = "### `agent.steering`";
     const PROMPT_ROW: &str = "| `prompt` | string | unset |";
-    const RULE_COUNT: usize = 8;
+    const RULE_COUNT: usize = 9;
     const TOML_FENCE: &str = "```toml\n";
     const FENCE_END: &str = "```";
 

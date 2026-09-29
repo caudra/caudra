@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 use tracing::{Instrument, debug, error, info_span, warn};
 
+use super::relative_paths::{MAX_SUGGESTIONS, PathBase, PathSuggestion};
 use crate::background::ShellJobMetadata;
 use crate::decisions::{DecisionContext, DecisionFeature, shell_duration::ShellDurationPlan};
 use crate::mcp::{McpSession, UNKNOWN_MCP};
@@ -170,6 +171,31 @@ struct ObservationState {
     attempts: usize,
     repairable: usize,
     successful: usize,
+    paths: Option<PathBase>,
+    suggestions: Vec<((Vec<usize>, usize), PathSuggestion)>,
+}
+
+impl ObservationState {
+    /// Keeps the earliest distinct suggestions by leaf and argument order, so
+    /// the order calls finish in cannot change which examples a hint cites.
+    fn suggest_paths(&mut self, order: &[usize], name: &str, input: &Value) {
+        let Some(base) = &self.paths else { return };
+        for (index, suggestion) in base.suggestions(name, input).into_iter().enumerate() {
+            let key = (order.to_vec(), index);
+            match self
+                .suggestions
+                .iter_mut()
+                .find(|(_, existing)| *existing == suggestion)
+            {
+                Some((existing_key, _)) if key < *existing_key => *existing_key = key,
+                Some(_) => {}
+                None => self.suggestions.push((key, suggestion)),
+            }
+            self.suggestions
+                .sort_by(|(left, _), (right, _)| left.cmp(right));
+            self.suggestions.truncate(MAX_SUGGESTIONS);
+        }
+    }
 }
 
 struct ObservationAttempt {
@@ -188,9 +214,17 @@ impl ResponseObservations {
                 attempts: 0,
                 repairable: 0,
                 successful: 0,
+                paths: None,
+                suggestions: Vec::new(),
             })),
             attempt: None,
         }
+    }
+
+    /// Also collect shorter spellings of absolute paths the calls name.
+    pub(crate) fn with_paths(self, base: Option<PathBase>) -> Self {
+        self.lock().paths = base;
+        self
     }
 
     fn lock(&self) -> MutexGuard<'_, ObservationState> {
@@ -205,6 +239,7 @@ impl ResponseObservations {
     fn reserve(&self, order: Vec<usize>, name: &str, input: &Value) -> Self {
         let mut state = self.lock();
         state.attempts += 1;
+        state.suggest_paths(&order, name, input);
         if state.limit > 0
             && (state.facts.len() < state.limit
                 || state
@@ -305,6 +340,14 @@ impl ResponseObservations {
         self.lock().successful > 0
     }
 
+    pub(crate) fn path_suggestions(&self) -> Vec<PathSuggestion> {
+        self.lock()
+            .suggestions
+            .iter()
+            .map(|(_, suggestion)| suggestion.clone())
+            .collect()
+    }
+
     pub(crate) fn take(&self) -> (Vec<ToolObservation>, bool) {
         let mut state = self.lock();
         let all_repairable = state.attempts > 0 && state.attempts == state.repairable;
@@ -312,6 +355,7 @@ impl ResponseObservations {
         state.attempts = 0;
         state.repairable = 0;
         state.successful = 0;
+        state.suggestions.clear();
         (facts, all_repairable)
     }
 }
@@ -2067,6 +2111,9 @@ mod tests {
     const OBSERVED_TOOL: &str = "observed";
     const OBSERVED_ERROR: &str = "invalid JSON permission denied";
     const OBSERVATION_WINDOW: usize = 3;
+    const PATH_CWD: &str = "/home/ubuntu/workspace/caudra";
+    const READ_TOOL: &str = "file_read";
+    const PATCH_TOOL: &str = "file_apply_patch";
     const REPEAT_GUIDANCE: &str = "Inspect the previous result before choosing another tool.";
     const MODEL_REPEAT_GUIDANCE: &str = "Use a different query for this model.";
     const REPEAT_TWO_PREFIX: &str =
@@ -3736,6 +3783,57 @@ mod tests {
         assert_eq!(facts.len(), 1);
         assert_eq!(facts[0].name, OBSERVED_TOOL);
         assert!(all_repairable);
+    }
+
+    fn read_input(file: &str) -> Value {
+        json!({"filePath": format!("{PATH_CWD}/{file}")})
+    }
+
+    fn relatives(observations: &ResponseObservations) -> Vec<String> {
+        observations
+            .path_suggestions()
+            .into_iter()
+            .map(|suggestion| suggestion.relative)
+            .collect()
+    }
+
+    /// Batch children reserve as they are reached, so the examples a hint
+    /// cites come from leaf order, not from the order calls happen to start.
+    #[test_case(&[0, 1, 2, 3]; "input_order")]
+    #[test_case(&[3, 2, 1, 0]; "reverse_order")]
+    #[test_case(&[2, 0, 3, 1]; "shuffled_order")]
+    fn path_suggestions_keep_the_earliest_distinct_leaves(order: &[usize]) {
+        const FILES: [&str; 4] = ["a.rs", "b.rs", "a.rs", "c.rs"];
+        let observations =
+            ResponseObservations::new(0).with_paths(PathBase::new(PATH_CWD, true, 1));
+        let parent = observations.reserve(vec![0], BATCH_TOOL_NAME, &Value::Null);
+        parent.expand();
+        for &index in order {
+            observations.reserve(vec![0, index], READ_TOOL, &read_input(FILES[index]));
+        }
+        assert_eq!(relatives(&observations), ["a.rs", "b.rs"]);
+        observations.take();
+        assert!(observations.path_suggestions().is_empty());
+    }
+
+    #[test]
+    fn path_suggestions_follow_argument_order_within_a_call() {
+        let patch = format!(
+            "*** Begin Patch\n*** Delete File: {PATH_CWD}/z.rs\n*** Delete File: {PATH_CWD}/y.rs\n*** Delete File: {PATH_CWD}/x.rs\n*** End Patch"
+        );
+        let observations =
+            ResponseObservations::new(0).with_paths(PathBase::new(PATH_CWD, true, 1));
+        observations.reserve(vec![1], READ_TOOL, &read_input("a.rs"));
+        observations.reserve(vec![0], PATCH_TOOL, &json!({"patchText": patch}));
+        assert_eq!(relatives(&observations), ["z.rs", "y.rs"]);
+    }
+
+    #[test]
+    fn path_suggestions_need_a_base() {
+        let observations = ResponseObservations::new(OBSERVATION_WINDOW).with_paths(None);
+        observations.reserve(vec![0], READ_TOOL, &read_input("a.rs"));
+        assert!(observations.path_suggestions().is_empty());
+        assert_eq!(observations.take().0.len(), 1);
     }
 
     #[test_case(false; "ordinary_failure")]

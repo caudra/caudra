@@ -5,6 +5,7 @@ mod history;
 mod instructions;
 pub mod mention_preamble;
 mod provider_projection;
+pub(crate) mod relative_paths;
 pub mod requirements;
 mod run;
 pub mod side_model;

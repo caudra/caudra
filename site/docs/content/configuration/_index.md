@@ -236,7 +236,7 @@ The `bash`, `python_execution`, and `task` entries apply only when `ui.scroll_ca
 
 ### `agent.steering`
 
-Automatic steering repairs unusable model output and can add bounded guidance about repeated behavior. Every rule is enabled by default. Configure overrides in the `[agent.steering]` table. All fields are optional.
+Automatic steering repairs unusable model output and can add bounded guidance about repeated behavior or needlessly long tool paths. Every rule is enabled by default. Configure overrides in the `[agent.steering]` table. All fields are optional.
 
 | Field | Type | Default | Min | Max | Description |
 |-------|------|---------|-----|-----|-------------|
@@ -259,10 +259,13 @@ Automatic steering repairs unusable model output and can add bounded guidance ab
 | `abandoned_turn` | Continue a turn that ended by announcing work the response never performed, up to 2 continuations per episode. Spending the allowance accepts the text rather than failing the turn. |
 | `repetition` | Advise on short exact tool cycles, including normalized native batch leaf calls, or repeated normalized assistant text. |
 | `tool_planning` | Advise after consecutive failed tool attempts across responses, including attempts with different tools or inputs. Any successful tool result ends the failure episode. Repeating a successful call is insufficient. |
+| `relative_paths` | Suggest up to two shorter relative forms when file, patch, code-graph, or shell `workdir` paths spell out the working directory or its parent. The hint appears once per context. |
 
-Recovery and advisory budgets are separate. Advisory rules allow at most 4 total injections per invocation, with a default cooldown of 3 completed model responses for each rule.
+Recovery and advisory budgets are separate. Advisory rules allow at most 4 total injections per invocation. Repetition and tool-planning advisories each wait a default cooldown of 3 completed model responses.
 
 Tool-planning evidence starts after the last response containing any successful tool result, including results outside the retained batch window. A background admission ends the failure episode without proving that the background work succeeded. Later terminal outcomes do not retroactively change that admission into a failed attempt.
+
+Relative-path evidence is the latest response only, and the hint yields to repetition and tool-planning advisories. While an earlier hint remains in context, even across user turns, no new hint is added. Once compaction removes it, another hint appears only if a later response uses absolute paths again. A suggestion climbs at most one directory with `../`. Local sessions get suggestions only when the working directory the model sees is the canonical project path. Remote workspaces, sandboxes, and code-graph scopes get suggestions inside the working directory only. Paths with backticks, angle brackets, control characters, or invisible Unicode formatting characters are never quoted. Caudra never rewrites the paths a model sends.
 
 An empty-response episode lives in the transcript tail, so it survives a restore and a new invocation. A message typed into a stall is answered, but it does not refill the budget: only a response carrying a tool call or visible text ends the episode. `max_stalled_turns` bounds the turns that interleaved rules spend between them, independently of any single rule's allowance.
 
@@ -301,6 +304,7 @@ The remaining fields are integers. All ranges are inclusive. Set `enabled = fals
 | `tool_planning.after_calls` | `6` | 1–1024 | Number of most recent leaf tool calls that must all have failed since the last response containing a successful result. |
 | `tool_planning.after_responses` | `3` | 1–1024 | Distinct completed model responses represented by those failed calls. |
 | `tool_planning.cooldown` | `3` | 1–1024 | Completed model responses between this rule's advisories. |
+| `relative_paths.min_saved_chars` | `12` | 1–1024 | Characters a relative form must save over its absolute path before the path is suggested. |
 
 Validation also requires:
 
@@ -351,7 +355,7 @@ Charge one recovery for a completed-response-to-next-request transition caused b
 
 A mixed batch with useful successful siblings proceeds normally. It is not replayed or charged once per child. Transport and authentication retries, ordinary tool execution failures, permission denials, normal successful tool progress, explicit goal evaluation, and manual steering are separate from model-format recovery. The recovery budget does not bound every possible agent loop. Outer turn limits and cancellation still apply.
 
-At most one supplemental steering message is added per request. Recovery takes priority, then repetition and tool planning. Advisory exhaustion only suppresses hints. Recovery exhaustion with an unmet output contract reports a failure and retains partial output, except for `abandoned_turn`, which stops intervening and lets the turn end. A valid captured structured task report remains usable after an empty tail, but cancellation, transport/permission failures, and hard outer-limit failures do not become success.
+At most one supplemental steering message is added per request. Recovery takes priority, then repetition, tool planning, and relative paths. Advisory exhaustion only suppresses hints. Recovery exhaustion with an unmet output contract reports a failure and retains partial output, except for `abandoned_turn`, which stops intervening and lets the turn end. A valid captured structured task report remains usable after an empty tail, but cancellation, transport/permission failures, and hard outer-limit failures do not become success.
 
 `abandoned_turn` reads the tail of a response that called no tool and would otherwise end the turn. It fires on a text stopping at a bare colon, or on a last sentence that opens on an intent to act. It does not fire on a question, an offer, a completion, or a promise deferred behind another event, and code spans and quoted prose are removed before any of that is matched. Tool-looking prose is not executed here either; the rule only decides whether to ask for one more response.
 

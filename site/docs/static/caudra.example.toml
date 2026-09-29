@@ -541,6 +541,25 @@ version = 1
 # Type: integer, 1 to 1024.
 # cooldown = 3
 
+[agent.steering.rules.relative_paths]
+# Suggest up to two shorter relative forms when file, patch, code-graph, or
+# shell `workdir` paths spell out the working directory or its parent. The hint
+# appears once per context.
+
+# Explicit `false` disables this rule.
+# Type: boolean.
+# enabled = true
+
+# Use built-in guidance when omitted. Custom text must be nonblank and at most
+# 16,384 UTF-8 bytes.
+# Type: string. Default: unset.
+# prompt = <string>
+
+# Characters a relative form must save over its absolute path before the path
+# is suggested.
+# Type: integer, 1 to 1024.
+# min_saved_chars = 12
+
 [provider]
 
 # Default model identifier (e.g. `anthropic/claude-sonnet-4-6`).

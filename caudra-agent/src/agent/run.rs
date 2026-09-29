@@ -1,7 +1,7 @@
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::slice;
 use std::sync::{
     Arc, Mutex,
@@ -31,13 +31,14 @@ use super::history::{CANCEL_MARKER, History, sanitize_cancelled_history, sanitiz
 use super::instructions::LoadedInstructions;
 use super::mention_preamble;
 use super::provider_projection;
+use super::relative_paths::PathBase;
 use super::speculative::SpeculativeRuns;
 use super::steering::{
     self, NO_PROGRESS_RULE, Observed, Recovery, RecoveryAction, SharedSteering, Steering,
 };
 use super::streaming::{StreamError, stream_with_retry};
 use super::title;
-use super::tool_dispatch::{self, RecentCalls, ResponseObservations, ToolObservation};
+use super::tool_dispatch::{self, RecentCalls, ResponseObservations};
 use crate::background::{BackgroundTasks, JobScope, SessionWork};
 use crate::cancel::{CancelMap, CancelToken};
 use crate::context::{
@@ -84,6 +85,7 @@ const GOAL_PRESCREEN_CONTINUATION: &str =
 const GOAL_PRESCREEN_TAIL_CHARS: usize = 600;
 const GOAL_PRESCREEN_TOOL_OUTCOMES: usize = 4;
 const OWNED_JOB_IDENTITY_MISSING: &str = "owned shell work has no task identity";
+const CWD_VAR: &str = "{cwd}";
 /// Multiplied by the attempt, so a stall that keeps stalling waits longer
 /// each time instead of billing a full cached prefix every couple of seconds.
 const STALL_BACKOFF: Duration = Duration::from_secs(2);
@@ -1332,9 +1334,7 @@ impl<'h> Agent<'h> {
         self.speculative = self.config.eager_tool_dispatch.then(|| {
             let ctx = ToolContext {
                 json_repair: Arc::clone(&repair_state),
-                steering_observations: Some(ResponseObservations::new(
-                    steering::lock(&self.steering).observation_window(),
-                )),
+                steering_observations: Some(self.response_observations()),
                 ..self.tool_context()
             };
             Arc::new(
@@ -1491,7 +1491,7 @@ impl<'h> Agent<'h> {
             && self.tools.as_array().is_some_and(|tools| !tools.is_empty())
             && steering::visible_text(&response.message)
                 .is_some_and(|text| steering::abandons_turn(&text));
-        let (observations, all_repairable, successful) = if has_tools {
+        let (observed, all_repairable) = if has_tools {
             self.response_text = None;
             self.process_tool_calls(response, repair_state).await?
         } else {
@@ -1504,18 +1504,17 @@ impl<'h> Agent<'h> {
                 response.message.padding = true;
             }
             self.push_assistant_message(response.message);
-            (Vec::new(), false, false)
+            (Observed::default(), false)
         };
         self.continuing_response = false;
         if let Some(error) = &interrupted {
             self.push_injected(Message::observation(format!("The provider stream stopped after tool admission ({}). Admitted calls were settled and their actual outcomes are recorded above. Calls not admitted were not executed. Do not replay successful calls; consider possible effects of failed calls before continuing.", error.kind())));
         }
         steering::lock(&self.steering).observe(Observed {
-            calls: observations,
-            successful,
             protocol,
             productive: has_tools || !empty,
             abandoned,
+            ..observed
         });
         if self.cancel.is_cancelled() {
             return Err(AgentError::Cancelled);
@@ -2206,11 +2205,12 @@ impl<'h> Agent<'h> {
         }
     }
 
+    /// The tool facts of one response, and whether every call was repairable.
     async fn process_tool_calls(
         &mut self,
         response: StreamResponse,
         repair_state: Arc<RepairState>,
-    ) -> Result<(Vec<ToolObservation>, bool, bool), AgentError> {
+    ) -> Result<(Observed, bool), AgentError> {
         let tool_uses = response
             .message
             .tool_uses()
@@ -2220,9 +2220,7 @@ impl<'h> Agent<'h> {
             .speculative
             .as_ref()
             .and_then(|runs| runs.observations())
-            .unwrap_or_else(|| {
-                ResponseObservations::new(steering::lock(&self.steering).observation_window())
-            });
+            .unwrap_or_else(|| self.response_observations());
         self.tool_name_aliases = response.tool_name_aliases.clone();
         let ctx = ToolContext {
             steering_observations: Some(observations.clone()),
@@ -2260,8 +2258,35 @@ impl<'h> Agent<'h> {
                 })?;
         }
         let successful = observations.has_success();
+        let paths = observations.path_suggestions();
         let (calls, all_repairable) = observations.take();
-        Ok((calls, all_repairable, successful))
+        Ok((
+            Observed {
+                calls,
+                successful,
+                paths,
+                ..Observed::default()
+            },
+            all_repairable,
+        ))
+    }
+
+    fn response_observations(&self) -> ResponseObservations {
+        let window = steering::lock(&self.steering).observation_window();
+        ResponseObservations::new(window).with_paths(self.path_base())
+    }
+
+    /// Local tools resolve relative paths against the canonical project, so a
+    /// `{cwd}` naming it any other way, even through a symlink, gets no hints.
+    /// Remote and sandbox roots may confine tools, so hints stay inside them.
+    fn path_base(&self) -> Option<PathBase> {
+        let min_saved_chars = steering::lock(&self.steering).path_hint_threshold()?;
+        let cwd = self.task_environment.apply(CWD_VAR);
+        let local = self.workspace_session.is_none() && self.host_cwd.is_none();
+        if local && self.permissions.project_cwd() != Path::new(cwd.as_ref()) {
+            return None;
+        }
+        PathBase::new(&cwd, local, min_saved_chars)
     }
 
     fn drain_repair_usage(&mut self, state: &RepairState) {
@@ -3613,6 +3638,10 @@ mod tests {
     const TEST_TOOL_ERROR: &str = "test command failed";
     const TEST_EDIT_TOOL: &str = "test_edit";
     const STEERING_PLANNING: &str = "tool_planning";
+    const STEERING_RELATIVE_PATHS: &str = "relative_paths";
+    const READ_TOOL: &str = "file_read";
+    const FIRST_FILE: &str = "src/first.rs";
+    const SECOND_FILE: &str = "src/second.rs";
     const VISIBLE_RESPONSE: &str = "response";
     const STEERING_CUSTOM: &str = "Custom runtime guidance.";
     const INVALID_TOOL: &str = "invalid_tool";
@@ -6724,6 +6753,67 @@ mod tests {
                     .count(),
                 usize::from(!edit_succeeds)
             );
+        });
+    }
+
+    /// End to end, including the eager path: the hint rides the request after
+    /// the first absolute path, and stays single while it is in context.
+    #[test_case(false, false; "absolute_paths")]
+    #[test_case(true, false; "absolute_paths_eager")]
+    #[test_case(false, true; "relative_paths")]
+    fn absolute_tool_paths_get_one_relative_path_hint(eager: bool, relative: bool) {
+        smol::block_on(async {
+            let project = tempfile::tempdir().unwrap();
+            let cwd = std::fs::canonicalize(project.path())
+                .unwrap()
+                .display()
+                .to_string();
+            let path = |file: &str| {
+                if relative {
+                    file.to_owned()
+                } else {
+                    format!("{cwd}/{file}")
+                }
+            };
+            let responses = vec![
+                tool_use_response(READ_TOOL, json!({"filePath": path(FIRST_FILE)})),
+                tool_use_response(READ_TOOL, json!({"filePath": path(SECOND_FILE)})),
+                text_response(StopReason::EndTurn),
+            ];
+            let mut history = History::default();
+            let (mut agent, _events) = make_agent(MockProvider::new(responses), &mut history);
+            agent.config.eager_tool_dispatch = eager;
+            agent.permissions.set_project(project.path());
+            agent.task_environment = agent.task_environment.clone().set(CWD_VAR, cwd.clone());
+            agent.tools = json!([{"name": READ_TOOL, "input_schema": {"type": "object"}}]);
+            agent.local_tools = Arc::new(HashMap::from([(
+                READ_TOOL.into(),
+                local_tool(|_, _| Box::pin(async { Ok(TEST_TOOL_RESULT.into()) })),
+            )]));
+
+            assert_eq!(
+                agent.run(default_input()).await.unwrap(),
+                DoneReason::EndTurn
+            );
+            let hints: Vec<_> = agent
+                .history
+                .as_slice()
+                .iter()
+                .filter(|message| {
+                    message
+                        .steering
+                        .as_ref()
+                        .is_some_and(|origin| origin.rule == STEERING_RELATIVE_PATHS)
+                })
+                .collect();
+            assert_eq!(hints.len(), usize::from(!relative));
+            if let Some(hint) = hints.first() {
+                assert!(
+                    hint.first_text_content()
+                        .unwrap()
+                        .contains(&format!("`{}` → `{FIRST_FILE}`", path(FIRST_FILE)))
+                );
+            }
         });
     }
 

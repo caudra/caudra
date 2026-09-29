@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 
@@ -9,6 +10,7 @@ use regex::Regex;
 use tracing::info;
 
 use super::history::is_user_turn;
+use super::relative_paths::PathSuggestion;
 use super::tool_dispatch::{ToolObservation, ToolOutcome};
 use crate::AgentError;
 
@@ -26,6 +28,9 @@ const ABANDONED_FACT: &str =
 const ABANDONED_PROMPT: &str = "Carry out what you said you would do now, using tool calls. Do not restate the plan. When the work is done, end with the report the task asked for.";
 const REPETITION_PROMPT: &str = "Recent responses repeat the same text or tool-call pattern. Reconsider the next useful action and change approach if this repetition is not helping. Legitimate verification or polling may continue.";
 const PLANNING_PROMPT: &str = "Several consecutive tool attempts returned errors. Review those errors before retrying. If you have corrected the inputs or changed the relevant state, continue; otherwise consider a different approach.";
+const RELATIVE_PATHS_FACT: &str = "<system-reminder>\n# Relative paths\n\nTool paths resolve against the working directory. Shorter forms of absolute paths from your last response:";
+const RELATIVE_PATHS_PROMPT: &str = "Prefer relative paths like these to save tokens. Keep absolute paths for locations more than one directory above the working directory.";
+const REMINDER_CLOSE: &str = "</system-reminder>";
 const HISTORY_SCAN_LIMIT: usize = 16_384;
 const TEXT_BYTES_LIMIT: usize = 8_192;
 const MIN_REPEATED_TEXT_CHARS: usize = 32;
@@ -41,6 +46,7 @@ const TRUNCATION_RULE: &str = "truncation";
 const TOOL_REPAIR_RULE: &str = "tool_repair";
 const REPETITION_RULE: &str = "repetition";
 const PLANNING_RULE: &str = "tool_planning";
+const RELATIVE_PATHS_RULE: &str = "relative_paths";
 pub(super) const NO_PROGRESS_RULE: &str = "no_progress";
 
 /// Code spans and quoted prose carry other people's sentences. Matching inside
@@ -101,6 +107,8 @@ pub(crate) struct Steering {
     stalled: u32,
     calls: VecDeque<(u64, ToolObservation)>,
     planning_since: u64,
+    /// From the latest response only, so older evidence cannot raise a hint.
+    latest_paths: Vec<PathSuggestion>,
     model: Option<String>,
 }
 
@@ -119,6 +127,7 @@ pub(super) enum Recovery {
 }
 
 /// What one response did, as the budgets need to see it.
+#[derive(Default)]
 pub(super) struct Observed {
     pub calls: Vec<ToolObservation>,
     pub successful: bool,
@@ -127,6 +136,7 @@ pub(super) struct Observed {
     pub productive: bool,
     /// Announced work instead of doing it, per [`abandons_turn`].
     pub abandoned: bool,
+    pub paths: Vec<PathSuggestion>,
 }
 
 pub(super) enum RecoveryAction {
@@ -160,6 +170,7 @@ impl Steering {
             stalled: 0,
             calls: VecDeque::new(),
             planning_since: 0,
+            latest_paths: Vec::new(),
             model: None,
         }
     }
@@ -187,8 +198,17 @@ impl Steering {
         }
     }
 
+    /// The saving a relative-path suggestion needs, or `None` while no hint
+    /// could be shown, so paths are not examined for nothing.
+    pub(super) fn path_hint_threshold(&self) -> Option<usize> {
+        let rule = &self.policy.rules.relative_paths;
+        (self.policy.enabled && rule.enabled && self.advisories < self.policy.max_advisories)
+            .then_some(rule.min_saved_chars)
+    }
+
     pub(super) fn reset_patterns(&mut self) {
         self.calls.clear();
+        self.latest_paths.clear();
     }
 
     /// A run that has produced neither a tool call nor visible text for this
@@ -249,6 +269,7 @@ impl Steering {
         } else {
             self.stalled.saturating_add(1)
         };
+        self.latest_paths = observed.paths;
         if !self.policy.enabled {
             return;
         }
@@ -428,7 +449,7 @@ impl Steering {
 
     pub(super) fn advisory(
         &mut self,
-        history: &[Message],
+        transcript: &[Message],
         model: &Model,
         has_tools: bool,
     ) -> Option<Message> {
@@ -436,7 +457,9 @@ impl Steering {
         if !self.policy.enabled
             || self.advisories >= self.policy.max_advisories
             || !has_tools
-            || !(rules.repetition.enabled || rules.tool_planning.enabled)
+            || !(rules.repetition.enabled
+                || rules.tool_planning.enabled
+                || rules.relative_paths.enabled)
         {
             return None;
         }
@@ -446,7 +469,7 @@ impl Steering {
         // expected response, not a stall worth steering. Synthetic input also
         // cuts off the retained tail behind a compaction continuation, including
         // when a fresh Agent reads it.
-        let history: Vec<_> = history
+        let history: Vec<_> = transcript
             .iter()
             .rev()
             .take(HISTORY_SCAN_LIMIT)
@@ -474,11 +497,13 @@ impl Steering {
         {
             Some((
                 REPETITION_RULE,
-                rules
-                    .repetition
-                    .prompt
-                    .as_deref()
-                    .unwrap_or(REPETITION_PROMPT),
+                Cow::Borrowed(
+                    rules
+                        .repetition
+                        .prompt
+                        .as_deref()
+                        .unwrap_or(REPETITION_PROMPT),
+                ),
             ))
         } else if rules.tool_planning.enabled
             && cooldown_ready(&history, PLANNING_RULE, rules.tool_planning.cooldown)
@@ -492,11 +517,38 @@ impl Steering {
             );
             Some((
                 PLANNING_RULE,
-                rules
-                    .tool_planning
-                    .prompt
-                    .as_deref()
-                    .unwrap_or(PLANNING_PROMPT),
+                Cow::Borrowed(
+                    rules
+                        .tool_planning
+                        .prompt
+                        .as_deref()
+                        .unwrap_or(PLANNING_PROMPT),
+                ),
+            ))
+        } else if rules.relative_paths.enabled
+            && !self.latest_paths.is_empty()
+            && !in_context(transcript, RELATIVE_PATHS_RULE)
+        {
+            info!(
+                rule = RELATIVE_PATHS_RULE,
+                examples = self.latest_paths.len(),
+                saved_chars = self
+                    .latest_paths
+                    .iter()
+                    .map(PathSuggestion::saved_chars)
+                    .sum::<usize>(),
+                "absolute tool paths spell out the working directory"
+            );
+            Some((
+                RELATIVE_PATHS_RULE,
+                Cow::Owned(relative_paths_hint(
+                    &self.latest_paths,
+                    rules
+                        .relative_paths
+                        .prompt
+                        .as_deref()
+                        .unwrap_or(RELATIVE_PATHS_PROMPT),
+                )),
             ))
         } else {
             None
@@ -510,7 +562,7 @@ impl Steering {
             responses = self.responses
         );
         Some(Message::steering(
-            prompt.to_owned(),
+            prompt.into_owned(),
             rule,
             SteeringKind::Advisory,
         ))
@@ -695,6 +747,31 @@ fn normalize_text(text: &str) -> Option<String> {
     (text.chars().count() >= MIN_REPEATED_TEXT_CHARS).then_some(text)
 }
 
+/// Whether an advisory from `rule` is still before the model: sent since the
+/// latest compaction, which is what takes it out of context. Later user turns
+/// leave it there, so unlike cooldowns this looks past request boundaries.
+fn in_context(transcript: &[Message], rule: &str) -> bool {
+    transcript
+        .iter()
+        .rev()
+        .take(HISTORY_SCAN_LIMIT)
+        .take_while(|message| !message.is_compaction_summary)
+        .any(|message| {
+            message
+                .steering
+                .as_ref()
+                .is_some_and(|origin| origin.rule == rule)
+        })
+}
+
+fn relative_paths_hint(paths: &[PathSuggestion], prompt: &str) -> String {
+    let examples: String = paths
+        .iter()
+        .map(|path| format!("- `{}` → `{}`\n", path.absolute, path.relative))
+        .collect();
+    format!("{RELATIVE_PATHS_FACT}\n{examples}\n{prompt}\n{REMINDER_CLOSE}")
+}
+
 fn cooldown_ready(history: &[&Message], rule: &str, cooldown: u32) -> bool {
     let mut responses = 0;
     for message in history {
@@ -716,16 +793,19 @@ fn cooldown_ready(history: &[&Message], rule: &str, cooldown: u32) -> bool {
 mod tests {
     use caudra_config::steering::SteeringConfig;
     use caudra_providers::{ContentBlock, Message, Model, ReasoningSource, Role, SteeringKind};
+    use serde_json::{Value, json};
     use test_case::test_case;
 
     use super::{
         ABANDONED_FACT, ABANDONED_RULE, EMPTY_IDLE, EMPTY_RULE, Intervention, Observed,
-        PLANNING_PROMPT, PLANNING_RULE, PROTOCOL_FACT, PROTOCOL_RULE, REPETITION_RULE, REPORT_RULE,
+        PLANNING_PROMPT, PLANNING_RULE, PROTOCOL_FACT, PROTOCOL_RULE, RELATIVE_PATHS_FACT,
+        RELATIVE_PATHS_PROMPT, RELATIVE_PATHS_RULE, REMINDER_CLOSE, REPETITION_RULE, REPORT_RULE,
         REPORT_STRUCTURED, REPORT_SUMMARY, Recovery, RecoveryAction, Steering, TEXT_BYTES_LIMIT,
         TRUNCATION_FACT, TRUNCATION_PROMPT, TRUNCATION_RULE, abandons_turn, eligible_response,
         normalized_message,
     };
     use crate::AgentError;
+    use crate::agent::relative_paths::PathSuggestion;
     use crate::agent::tool_dispatch::{ToolObservation, ToolOutcome};
 
     const MODEL: &str = "anthropic/claude-sonnet-4-6";
@@ -765,6 +845,10 @@ mod tests {
         (SHELL_TOOL, 12, true),
     ];
     const ABANDONED_ATTEMPTS: u32 = 2;
+    const PATH_DIR: &str = "/home/ubuntu/workspace/caudra/src";
+    const DEFAULT_MIN_SAVED_CHARS: usize = 12;
+    const CUSTOM_MIN_SAVED_CHARS: usize = 30;
+    const REMINDER_OPEN: &str = "<system-reminder>";
 
     fn default_state() -> Steering {
         Steering::new(SteeringConfig::default().resolve(MODEL))
@@ -788,6 +872,7 @@ mod tests {
             protocol: false,
             productive,
             abandoned: false,
+            paths: Vec::new(),
         });
     }
 
@@ -797,6 +882,28 @@ mod tests {
             fingerprint,
             outcome,
         }
+    }
+
+    fn suggestion(index: usize) -> PathSuggestion {
+        PathSuggestion {
+            absolute: format!("{PATH_DIR}/file{index}.rs"),
+            relative: format!("src/file{index}.rs"),
+        }
+    }
+
+    fn observe_paths(state: &mut Steering, paths: Vec<PathSuggestion>) {
+        state.observe(Observed {
+            productive: true,
+            paths,
+            ..Observed::default()
+        });
+    }
+
+    fn advised_rule(state: &mut Steering, history: &[Message]) -> Option<String> {
+        state
+            .advisory(history, &Model::from_spec(MODEL).unwrap(), true)
+            .and_then(|message| message.steering)
+            .map(|origin| origin.rule)
     }
 
     #[test_case(false, false, 2; "idle")]
@@ -1060,6 +1167,7 @@ mod tests {
                 protocol: true,
                 productive: false,
                 abandoned: false,
+                paths: Vec::new(),
             });
             let RecoveryAction::Continue(Intervention {
                 message: Some(message),
@@ -1235,6 +1343,7 @@ mod tests {
             protocol: false,
             productive: true,
             abandoned: false,
+            paths: Vec::new(),
         });
         for fingerprint in 5..10 {
             observe_calls(&mut state, vec![call(fingerprint, ToolOutcome::Failure)]);
@@ -1536,6 +1645,7 @@ mod tests {
             protocol: false,
             productive: true,
             abandoned: !clean,
+            paths: Vec::new(),
         });
         assert_eq!(state.abandons, expected);
     }
@@ -1548,5 +1658,137 @@ mod tests {
             state.recover(Recovery::Abandoned).unwrap(),
             RecoveryAction::Disabled
         ));
+    }
+
+    /// A custom prompt replaces the guidance, never the facts it follows.
+    #[test_case(None; "default_prompt")]
+    #[test_case(Some(CUSTOM); "custom_prompt")]
+    fn relative_paths_hint_cites_the_latest_paths(custom: Option<&str>) {
+        let mut state = default_state();
+        state.policy.rules.relative_paths.prompt = custom.map(str::to_owned);
+        observe_paths(&mut state, vec![suggestion(0), suggestion(1)]);
+        let message = state
+            .advisory(&[], &Model::from_spec(MODEL).unwrap(), true)
+            .unwrap();
+        let origin = message.steering.as_ref().unwrap();
+        assert_eq!(origin.rule, RELATIVE_PATHS_RULE);
+        assert_eq!(origin.kind, SteeringKind::Advisory);
+        let text = message.first_text_content().unwrap();
+        assert_eq!(
+            text,
+            format!(
+                "{RELATIVE_PATHS_FACT}\n- `{PATH_DIR}/file0.rs` → `src/file0.rs`\n- `{PATH_DIR}/file1.rs` → `src/file1.rs`\n\n{}\n{REMINDER_CLOSE}",
+                custom.unwrap_or(RELATIVE_PATHS_PROMPT)
+            )
+        );
+        assert!(text.starts_with(REMINDER_OPEN));
+        assert_eq!(text.matches(REMINDER_OPEN).count(), 1);
+        assert_eq!(text.matches(REMINDER_CLOSE).count(), 1);
+    }
+
+    /// The hint stays silent while an earlier one is still before the model,
+    /// across user turns, and after compaction returns only for new paths.
+    #[test_case(false; "compaction_removes_the_hint")]
+    #[test_case(true; "retained_tail_keeps_the_hint")]
+    fn relative_paths_hint_is_shown_once_per_context(retained: bool) {
+        let mut state = default_state();
+        observe_paths(&mut state, vec![suggestion(0)]);
+        let hint = state
+            .advisory(&[], &Model::from_spec(MODEL).unwrap(), true)
+            .unwrap();
+        let mut history = vec![hint.clone()];
+        for message in [
+            assistant(TEXT),
+            Message::user(PROMPT.into()),
+            assistant(TEXT),
+        ] {
+            history.push(message);
+            observe_paths(&mut state, vec![suggestion(1)]);
+            assert_eq!(advised_rule(&mut state, &history), None);
+        }
+        history.push(Message {
+            is_compaction_summary: true,
+            ..assistant(TEXT)
+        });
+        if retained {
+            history.push(hint);
+        }
+        state.reset_patterns();
+        assert_eq!(advised_rule(&mut state, &history), None);
+        observe_paths(&mut state, vec![suggestion(1)]);
+        assert_eq!(
+            advised_rule(&mut state, &history).as_deref(),
+            (!retained).then_some(RELATIVE_PATHS_RULE)
+        );
+    }
+
+    #[test]
+    fn relative_paths_need_evidence_from_the_latest_response() {
+        let mut state = default_state();
+        observe_paths(&mut state, vec![suggestion(0)]);
+        observe_paths(&mut state, Vec::new());
+        assert_eq!(advised_rule(&mut state, &[]), None);
+    }
+
+    #[test_case(json!({}), Some(DEFAULT_MIN_SAVED_CHARS); "defaults")]
+    #[test_case(json!({"rules": {"relative_paths": {"min_saved_chars": CUSTOM_MIN_SAVED_CHARS}}}), Some(CUSTOM_MIN_SAVED_CHARS); "custom_threshold")]
+    #[test_case(json!({"rules": {"relative_paths": {"enabled": false}}}), None; "rule_disabled")]
+    #[test_case(json!({"enabled": false}), None; "master_switch")]
+    #[test_case(json!({"models": {(MODEL): {"rules": {"relative_paths": {"enabled": false}}}}}), None; "model_disabled")]
+    #[test_case(json!({"max_advisories": 0}), None; "no_advisory_budget")]
+    fn relative_paths_follow_configuration(config: Value, threshold: Option<usize>) {
+        let config: SteeringConfig = serde_json::from_value(config).unwrap();
+        let mut state = Steering::new(config.resolve(MODEL));
+        assert_eq!(state.path_hint_threshold(), threshold);
+        observe_paths(&mut state, vec![suggestion(0)]);
+        assert_eq!(advised_rule(&mut state, &[]).is_some(), threshold.is_some());
+    }
+
+    /// Paths are the cheapest thing to fix, so they wait for any advisory
+    /// about behavior, and for the budget that advisory leaves.
+    #[test_case(true, true; "after_repetition")]
+    #[test_case(false, true; "after_tool_planning")]
+    #[test_case(false, false; "budget_spent")]
+    fn relative_paths_yield_to_other_advisories(repetition: bool, budget_left: bool) {
+        let mut state = default_state();
+        state.policy.max_advisories = 1 + u32::from(budget_left);
+        let mut history = if repetition {
+            vec![assistant(TEXT); 3]
+        } else {
+            Vec::new()
+        };
+        if !repetition {
+            for fingerprint in 0..5 {
+                observe_calls(&mut state, vec![call(fingerprint, ToolOutcome::Failure)]);
+            }
+        }
+        state.observe(Observed {
+            calls: if repetition {
+                Vec::new()
+            } else {
+                vec![call(5, ToolOutcome::Failure)]
+            },
+            productive: true,
+            paths: vec![suggestion(0)],
+            ..Observed::default()
+        });
+        let first = state
+            .advisory(&history, &Model::from_spec(MODEL).unwrap(), true)
+            .unwrap();
+        assert_eq!(
+            first.steering.as_ref().unwrap().rule,
+            if repetition {
+                REPETITION_RULE
+            } else {
+                PLANNING_RULE
+            }
+        );
+        history.push(first);
+        observe_paths(&mut state, vec![suggestion(1)]);
+        assert_eq!(state.path_hint_threshold().is_some(), budget_left);
+        assert_eq!(
+            advised_rule(&mut state, &history).as_deref(),
+            budget_left.then_some(RELATIVE_PATHS_RULE)
+        );
     }
 }
