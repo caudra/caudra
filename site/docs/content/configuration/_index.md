@@ -61,6 +61,8 @@ max_file_size_mb = 4
 
 All fields are optional. A file may start with `version = 1`, and a file without it counts as version 1. Typos in field names and values of the wrong type cause an error right away, with the file and line.
 
+For every setting in one file, with its type, default, and description, run [`caudra config example`](/docs/cli/#caudra-config) or download [caudra.example.toml](/docs/caudra.example.toml).
+
 `provider.allowed_models` is a list of glob patterns for qualified `provider/model-id` specs. `*` also matches `/`, so `opencode/*` includes nested model IDs. When the list is empty or omitted, every model is allowed. `provider.excluded_models` removes matching models after that, so exclusions always win. A project list replaces the matching global list. Omit it to inherit, or use `[]` to clear it. The policy applies to selectors, CLI and API model changes, delegation, and `caudra models`.
 
 ## Experimental features
@@ -128,7 +130,7 @@ To keep using `init.lua`, set `lua_plugins = true` under `[experimental]`. Its `
 | `always_yolo` | bool | `false` | Start every session with YOLO mode (skip permission prompts, deny rules still apply); global config only |
 | `always_auto` | bool | `false` | Start every session with Auto permission mode (preserve required prompts and screen unmatched calls); global config only. Needs `experimental.decision_engine`, otherwise sessions start in Ask |
 | `always_fast` | bool | `false` | Start every session with fast mode, on the models that sell a fast tier (ignored otherwise) |
-| `always_thinking` | bool \| string | `false` | Start every session with extended thinking (true/"adaptive", "off", an effort level ("minimal" to "max"), or a token budget) |
+| `always_thinking` | bool \| string | unset | Start every session with extended thinking (true/"adaptive", "off", an effort level ("minimal" to "max"), or a token budget) |
 
 ### `ui`
 
@@ -152,6 +154,8 @@ To keep using `init.lua`, set `lua_plugins = true` under `[experimental]`. Its `
 | `show_reminders` | bool | `true` | - | - | Show the messages Caudra writes into the conversation on your behalf: standing reminders, goal check-ins, nudges, and continuations. Each is one dim row that expands on click to the exact text the model was sent. Turn this off to keep the transcript to the conversation alone |
 | `clock_format` | String | `system` | - | - | Clock format for timestamps: "12h", "24h", or "system" (follow the OS preference, 24h when unknown) |
 | `update_check` | bool | `false` | `CAUDRA_ENABLE_UPDATE_CHECK` | - | Ask GitHub for the latest release on startup and show it in the splash. Off by default, so Caudra makes no such request unless you turn this on |
+| `theme` | string | unset | - | - | Name of the color theme to load at startup, overriding the theme you last picked with `/theme`. Unset keeps your last pick |
+| `theme_light` | string | unset | - | - | Light theme to pair with `theme`, in place of the one from the pairing table or for a theme that has no pair. `theme` becomes the dark half |
 
 ### `ui.theme`
 
@@ -210,9 +214,9 @@ The `bash`, `python_execution`, and `task` entries apply only when `ui.scroll_ca
 | `system_prompt_profile` | String | `builtin` | - | Default user system prompt profile from the system-prompts config directory |
 | `max_output_bytes` | usize | `51200` | 1024 | Host-enforced default max tool-result size (bytes) |
 | `max_output_lines` | usize | `2000` | 10 | Host-enforced default max tool-result lines |
-| `compaction_buffer` | u32 \| string | `20%, or 10% when the model's window excludes output` | - | Context reserved for compaction: token count or percent of the context window (e.g. "20%") |
-| `compaction_instructions` | String | `none` | - | Extra instructions appended to the compaction summary prompt |
-| `post_compaction_instructions` | String | `none` | - | Extra instructions the agent receives after any compaction (e.g. re-read plan.md) |
+| `compaction_buffer` | u32 \| string | 20%, or 10% when the model's window excludes output | - | Context reserved for compaction: token count or percent of the context window (e.g. "20%") |
+| `compaction_instructions` | String | unset | - | Extra instructions appended to the compaction summary prompt |
+| `post_compaction_instructions` | String | unset | - | Extra instructions the agent receives after any compaction (e.g. re-read plan.md) |
 | `compaction_requirements` | bool | `true` | - | Append a `# User requirements` section to every compaction summary: what the user asked for, constrained, and decided, read from their own messages and answered questions across every earlier compaction, and extracted by the Extract model so the conversation model never sees the request |
 | `background_reminder_turns` | u32 | `0` | - | Committed main-agent response groups between unchanged active background-work reminders; 0 disables periodic refresh only, not state-change or post-compaction reminders |
 | `todo_reminder` | bool | `true` | - | Before the main agent hands control back with pending or in-progress todos, remind it once per user turn, repeating the full todo list, to verify the work and update the list |
@@ -232,29 +236,29 @@ The `bash`, `python_execution`, and `task` entries apply only when `ui.scroll_ca
 
 ### `agent.steering`
 
-Automatic steering repairs unusable model output and can add bounded guidance about repeated behavior. All eight rules are enabled by default. Configure overrides in the `[agent.steering]` table. All fields are optional.
+Automatic steering repairs unusable model output and can add bounded guidance about repeated behavior. Every rule is enabled by default. Configure overrides in the `[agent.steering]` table. All fields are optional.
 
-| Field | Type | Default | Limits and meaning |
-|-------|------|---------|--------------------|
-| `enabled` | boolean | `true` | Master switch for automatic steering, including truncation recovery and repeat-policy blocking. |
-| `max_recoveries` | integer | `32` | 0–1024 corrective continuations per externally initiated invocation. Zero prevents optional recovery continuations. |
-| `max_advisories` | integer | `4` | 0–1024 advisory injections per invocation. Zero suppresses advisories. |
-| `max_stalled_turns` | integer | `5` | 0–1024 consecutive turns carrying neither a tool call nor visible text before the run ends, whichever rule intervened. Zero disables the backstop. |
-| `rules` | table | `{}` | Overrides by rule name, listed below. Omission uses built-in defaults. |
-| `models` | table | `{}` | Up to 256 exact `provider/model-id` keys, each with its own overrides. |
+| Field | Type | Default | Min | Max | Description |
+|-------|------|---------|-----|-----|-------------|
+| `enabled` | boolean | `true` | - | - | Master switch for automatic steering, including truncation recovery and repeat-policy blocking. |
+| `max_recoveries` | integer | `32` | 0 | 1024 | Corrective continuations per externally initiated invocation. Zero prevents optional recovery continuations. |
+| `max_advisories` | integer | `4` | 0 | 1024 | Advisory injections per invocation. Zero suppresses advisories. |
+| `max_stalled_turns` | integer | `5` | 0 | 1024 | Consecutive turns carrying neither a tool call nor visible text before the run ends, whichever rule intervened. Zero disables the backstop. |
+| `rules` | table | `{}` | - | - | Overrides by rule name, listed below. Omission uses built-in defaults. |
+| `models` | table | `{}` | - | - | Up to 256 exact `provider/model-id` keys, each with its own overrides. |
 
 #### Rules
 
-| Rule in `rules` | Enabled by default | Behavior |
-|-----------------|--------------------|----------|
-| `truncation` | `true` | Continue output cut off by the response token limit, up to 3 corrective requests per externally initiated invocation. |
-| `empty_response` | `true` | Continue after empty output, with separate per-episode limits after recent tools and while idle. |
-| `repeated_tool_call` | `true` | Refuse the third consecutive identical top-level tool name/input before execution. Native batch children do not acquire this hard blocker. |
-| `protocol_mismatch` | `true` | Correct an explicit provider tool-use indication with no actual tool calls, up to 2 continuations per episode. |
-| `missing_task_report` | `true` | Request a missing task summary or required structured report, up to 2 corrections. |
-| `abandoned_turn` | `true` | Continue a turn that ended by announcing work the response never performed, up to 2 continuations per episode. Spending the allowance accepts the text rather than failing the turn. |
-| `repetition` | `true` | Advise on short exact tool cycles, including normalized native batch leaf calls, or repeated normalized assistant text. |
-| `tool_planning` | `true` | Advise after consecutive failed tool attempts across responses, including attempts with different tools or inputs. Any successful tool result ends the failure episode. Repeating a successful call is insufficient. |
+| Rule in `rules` | Behavior |
+|-----------------|----------|
+| `truncation` | Continue output cut off by the response token limit, up to 3 corrective requests per externally initiated invocation. |
+| `empty_response` | Continue after empty output, with separate per-episode limits after recent tools and while idle. |
+| `repeated_tool_call` | Refuse the third consecutive identical top-level tool name/input before execution. Native batch children do not acquire this hard blocker. |
+| `protocol_mismatch` | Correct an explicit provider tool-use indication with no actual tool calls, up to 2 continuations per episode. |
+| `missing_task_report` | Request a missing task summary or required structured report, up to 2 corrections. |
+| `abandoned_turn` | Continue a turn that ended by announcing work the response never performed, up to 2 continuations per episode. Spending the allowance accepts the text rather than failing the turn. |
+| `repetition` | Advise on short exact tool cycles, including normalized native batch leaf calls, or repeated normalized assistant text. |
+| `tool_planning` | Advise after consecutive failed tool attempts across responses, including attempts with different tools or inputs. Any successful tool result ends the failure episode. Repeating a successful call is insufficient. |
 
 Recovery and advisory budgets are separate. Advisory rules allow at most 4 total injections per invocation, with a default cooldown of 3 completed model responses for each rule.
 
@@ -268,8 +272,8 @@ Advisories only accompany an independently scheduled next request. They never re
 
 Each table at `agent.steering.rules.<rule>` accepts these common fields:
 
-| Field | Type | Default | Limits and meaning |
-|-------|------|---------|--------------------|
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
 | `enabled` | boolean | `true` | Explicit `false` disables this rule. |
 | `prompt` | string | unset | Use built-in guidance when omitted. Custom text must be nonblank and at most 16,384 UTF-8 bytes. |
 
@@ -361,7 +365,7 @@ Disabling the master switch or setting `rules.truncation.enabled = false` stops 
 
 | Field | Type | Default | Min | Description |
 |-------|------|---------|-----|-------------|
-| `default_model` | String | `none` | - | Default model identifier (e.g. `anthropic/claude-sonnet-4-6`) |
+| `default_model` | String | unset | - | Default model identifier (e.g. `anthropic/claude-sonnet-4-6`) |
 | `allowed_models` | string[] | `[]` | - | Glob patterns for permitted qualified model specs; empty permits all models |
 | `excluded_models` | string[] | `[]` | - | Glob patterns for excluded qualified model specs; exclusions take precedence |
 | `connect_timeout_secs` | u64 | `10` | 1 | HTTP connect timeout (seconds) |
@@ -407,19 +411,19 @@ A workspace over `max_bytes_mb` or `max_files` is refused rather than captured, 
 | `enabled` | bool | `false` | `CAUDRA_ENABLE_TELEMETRY` | Master switch |
 | `metrics_exporter` | string | `none` | `OTEL_METRICS_EXPORTER` | Where metrics go: `otlp`, `console`, `none`, or a comma-separated mix |
 | `logs_exporter` | string | `none` | `OTEL_LOGS_EXPORTER` | Where events go: `otlp`, `console`, `none`, or a comma-separated mix |
-| `protocol` | string | `-` | `OTEL_EXPORTER_OTLP_PROTOCOL` | OTLP protocol: `grpc`, `http/protobuf`, or `http/json`. Required when an exporter is `otlp` |
-| `endpoint` | string | `-` | `OTEL_EXPORTER_OTLP_ENDPOINT` | Collector endpoint. HTTP appends `/v1/metrics` and `/v1/logs` |
+| `protocol` | string | unset | `OTEL_EXPORTER_OTLP_PROTOCOL` | OTLP protocol: `grpc`, `http/protobuf`, or `http/json`. Required when an exporter is `otlp` |
+| `endpoint` | string | unset | `OTEL_EXPORTER_OTLP_ENDPOINT` | Collector endpoint. HTTP appends `/v1/metrics` and `/v1/logs` |
 | `headers` | table | `{}` | `OTEL_EXPORTER_OTLP_HEADERS` | Extra headers sent with every export |
 | `timeout_ms` | integer | `10000` | `OTEL_EXPORTER_OTLP_TIMEOUT` | Per-export request timeout (ms) |
 | `compression` | string | `none` | `OTEL_EXPORTER_OTLP_COMPRESSION` | Payload compression: `gzip` or `none` |
-| `metrics_protocol` | string | `-` | `OTEL_EXPORTER_OTLP_METRICS_PROTOCOL` | Metrics-only protocol override |
-| `metrics_endpoint` | string | `-` | `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` | Metrics-only endpoint, used verbatim with no path appended |
+| `metrics_protocol` | string | unset | `OTEL_EXPORTER_OTLP_METRICS_PROTOCOL` | Metrics-only protocol override |
+| `metrics_endpoint` | string | unset | `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` | Metrics-only endpoint, used verbatim with no path appended |
 | `metrics_headers` | table | `{}` | `OTEL_EXPORTER_OTLP_METRICS_HEADERS` | Metrics-only headers, merged over `headers` |
-| `metrics_timeout_ms` | integer | `-` | `OTEL_EXPORTER_OTLP_METRICS_TIMEOUT` | Metrics-only request timeout (ms) |
-| `logs_protocol` | string | `-` | `OTEL_EXPORTER_OTLP_LOGS_PROTOCOL` | Logs-only protocol override |
-| `logs_endpoint` | string | `-` | `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT` | Logs-only endpoint, used verbatim with no path appended |
+| `metrics_timeout_ms` | integer | unset | `OTEL_EXPORTER_OTLP_METRICS_TIMEOUT` | Metrics-only request timeout (ms) |
+| `logs_protocol` | string | unset | `OTEL_EXPORTER_OTLP_LOGS_PROTOCOL` | Logs-only protocol override |
+| `logs_endpoint` | string | unset | `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT` | Logs-only endpoint, used verbatim with no path appended |
 | `logs_headers` | table | `{}` | `OTEL_EXPORTER_OTLP_LOGS_HEADERS` | Logs-only headers, merged over `headers` |
-| `logs_timeout_ms` | integer | `-` | `OTEL_EXPORTER_OTLP_LOGS_TIMEOUT` | Logs-only request timeout (ms) |
+| `logs_timeout_ms` | integer | unset | `OTEL_EXPORTER_OTLP_LOGS_TIMEOUT` | Logs-only request timeout (ms) |
 | `metrics_interval_ms` | integer | `60000` | `OTEL_METRIC_EXPORT_INTERVAL` | How often metrics are exported (ms) |
 | `metrics_export_timeout_ms` | integer | `30000` | `OTEL_METRIC_EXPORT_TIMEOUT` | Deadline for one metrics export, retries included (ms) |
 | `logs_interval_ms` | integer | `5000` | `OTEL_LOGS_EXPORT_INTERVAL`, `OTEL_BLRP_SCHEDULE_DELAY` | How often queued events are flushed (ms) |
@@ -452,18 +456,18 @@ Configure the optional typed decision engine in the `[decisions]` table. The eng
 
 Connection settings and thresholds are global-only. Projects may set individual features to `"off"`, set `log = false`, or keep or shorten inherited log retention. Other project overrides are errors, even when they repeat a global value. Disabling globally required Auto screening or its active content screening restores prompting for eligible Auto calls.
 
-| Field | Type | Default | Meaning |
-|-------|------|---------|---------|
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
 | `endpoint` | string | unset | Full request URL. HTTPS required except for numeric loopback HTTP or explicit `allow_http` consent. No credentials, query, fragment, whitespace, or control characters. |
-| `model` | string | `"jev-latest"` | Decision model identifier, nonblank and without control characters. |
-| `api_key_env` | string | `"TYPESAFE_API_KEY"` | Environment variable containing the optional credential, never the credential itself. Project environment values are excluded. |
+| `model` | string | `jev-latest` | Decision model identifier, nonblank and without control characters. |
+| `api_key_env` | string | `TYPESAFE_API_KEY` | Environment variable containing the optional credential, never the credential itself. Project environment values are excluded. |
 | `allow_remote` | boolean | `false` | Explicit global consent to send decision context to a non-loopback endpoint. |
 | `allow_http` | boolean | `false` | Global-only opt-in for non-loopback HTTP. Also requires `allow_remote = true`. Use only with transport protection you control, such as a trusted encrypted tunnel. |
 | `timeout_ms` | integer | `400` | Positive decision-request deadline in milliseconds, separate from shell execution timeouts. |
 | `log` | boolean | `false` | Retain bounded decision records in the separate local `decisions.db`. |
 | `log_retention_days` | integer | `90` | Positive retention period for decision records. |
-| `features` | table | all `"off"` | Per-feature modes below. |
-| `thresholds` | table | defaults below | Probability thresholds, all finite and within 0–1 inclusive. |
+| `features` | table | `{}` | Per-feature modes below. |
+| `thresholds` | table | `{}` | Probability thresholds, all finite and within 0–1 inclusive. |
 
 `TYPESAFE_BASE_URL` replaces only the origin of an explicitly configured endpoint, preserving its path. It must be an origin without a path and passes the same endpoint and both transport opt-in checks. The variable alone never activates the engine. Requests ignore ambient proxies and do not follow redirects. `localhost` is a DNS name, not numeric loopback for this policy. Private and CGNAT addresses receive no automatic HTTP exemption. These settings do not change Workcell transport policy.
 
@@ -475,31 +479,31 @@ Redaction is best effort. Decision context can include commands, task text, tool
 
 | Feature | Default | Supported modes | Behavior beyond shadow |
 |---------|---------|-----------------|------------------------|
-| `permission_advice` | `"off"` | `off`, `shadow`, `advise` | Add warnings to an existing permission prompt without delaying the answer. |
-| `auto_screening` | `"off"` | `off`, `shadow`, `enforce` | Escalate an eligible Auto call to a prompt on a flag or engine failure. No answer channel means denial. |
-| `shell_effect` | `"off"` | `off`, `shadow`, `advise` | Warn about possible project writes during Plan review only when `shell_writes` is configured. Never establish read-only authority. |
-| `content_screening` | `"off"` | `off`, `shadow`, `advise` | Add caution to flagged web/MCP output and tighten upload/credential Auto screening for the session. Content remains available. |
-| `shell_duration` | `"off"` | `off`, `shadow`, `advise`, `enforce` | Advise with local shell estimates. Enforce may fill an omitted timeout and select delivery at admission. Explicit timeouts stay unchanged. See [shell duration](#shell-duration). |
-| `tool_search` | `"off"` | `off`, `shadow`, `enforce` | Rerank the existing lexical tool shortlist. This neither loads arbitrary names nor grants execution permission. |
-| `skill_suggestions` | `"off"` | `off`, `shadow`, `advise` | Suggest a shortlisted skill. The agent still chooses whether to load it. |
-| `goal_prescreen` | `"off"` | `off`, `shadow`, `enforce` | Skip an unlikely-to-pass goal evaluation within the continuation budget and continue work. Only the normal evaluator can certify completion. |
-| `subagent_routing` | `"off"` | `off`, `shadow`, `enforce` | Choose a model job for a new unpinned subagent from its task label, not its full prompt. Explicit jobs, profile pins, and continuations keep their routing. |
+| `permission_advice` | `off` | `off`, `shadow`, `advise` | Add warnings to an existing permission prompt without delaying the answer. |
+| `auto_screening` | `off` | `off`, `shadow`, `enforce` | Escalate an eligible Auto call to a prompt on a flag or engine failure. No answer channel means denial. |
+| `shell_effect` | `off` | `off`, `shadow`, `advise` | Warn about possible project writes during Plan review only when `shell_writes` is configured. Never establish read-only authority. |
+| `content_screening` | `off` | `off`, `shadow`, `advise` | Add caution to flagged web/MCP output and tighten upload/credential Auto screening for the session. Content remains available. |
+| `shell_duration` | `off` | `off`, `shadow`, `advise`, `enforce` | Advise with local shell estimates. Enforce may fill an omitted timeout and select delivery at admission. Explicit timeouts stay unchanged. See [shell duration](#shell-duration). |
+| `tool_search` | `off` | `off`, `shadow`, `enforce` | Rerank the existing lexical tool shortlist. This neither loads arbitrary names nor grants execution permission. |
+| `skill_suggestions` | `off` | `off`, `shadow`, `advise` | Suggest a shortlisted skill. The agent still chooses whether to load it. |
+| `goal_prescreen` | `off` | `off`, `shadow`, `enforce` | Skip an unlikely-to-pass goal evaluation within the continuation budget and continue work. Only the normal evaluator can certify completion. |
+| `subagent_routing` | `off` | `off`, `shadow`, `enforce` | Choose a model job for a new unpinned subagent from its task label, not its full prompt. Explicit jobs, profile pins, and continuations keep their routing. |
 
 #### `decisions.thresholds`
 
 Flag thresholds trigger at or above the configured value. Goal prescreening uses an at-or-below comparison. Content screening requires both signals in a sampled chunk. After content is flagged, Auto uses 75% of `auto_flag` for upload and credential flags.
 
-| Field | Default | Meaning |
-|-------|---------|---------|
-| `permission_flag` | `0.85` | Probability for a permission warning. |
-| `auto_flag` | `0.85` | Probability for escalating an eligible Auto call. |
-| `content_injection` | `0.9` | Probability that sampled content attempts instruction injection. |
-| `content_addressed_to_agent` | `0.9` | Probability that sampled content addresses the agent. |
-| `shell_endless` | `0.9` | Probability that a shell command runs until stopped. |
-| `shell_heavy` | `0.9` | Probability for a heavy-command prior and confidence required for a duration choice. |
-| `routing_confidence` | `0.9` | Confidence required for tool search, skill suggestions, and subagent routing. Tool-search choice probability must also meet it. |
-| `goal_skip_below` | `0.05` | Skip an evaluator at or below this completion probability, within the continuation budget. |
-| `shell_writes` | unset | Optional project-write warning threshold. Omission leaves the warning disabled. No built-in enforcement threshold. |
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `permission_flag` | float | `0.85` | Probability for a permission warning. |
+| `auto_flag` | float | `0.85` | Probability for escalating an eligible Auto call. |
+| `content_injection` | float | `0.9` | Probability that sampled content attempts instruction injection. |
+| `content_addressed_to_agent` | float | `0.9` | Probability that sampled content addresses the agent. |
+| `shell_endless` | float | `0.9` | Probability that a shell command runs until stopped. |
+| `shell_heavy` | float | `0.9` | Probability for a heavy-command prior and confidence required for a duration choice. |
+| `routing_confidence` | float | `0.9` | Confidence required for tool search, skill suggestions, and subagent routing. Tool-search choice probability must also meet it. |
+| `goal_skip_below` | float | `0.05` | Skip an evaluator at or below this completion probability, within the continuation budget. |
+| `shell_writes` | float | unset | Optional project-write warning threshold. Omission leaves the warning disabled. No built-in enforcement threshold. |
 
 #### Shell duration
 
@@ -537,18 +541,18 @@ enabled = false
 
 `file_index` executes as a native Workcell tool, and this table keeps the `plugins.index` key it was configured under. The file-size limit accepts 1 through 16 MiB to bound parser memory and work.
 
-| Field | Type | Default | Min | Description |
-|-------|------|---------|-----|-------------|
-| `max_file_size_mb` | integer | `2` | 1 | Refuse to index files larger than this many MiB (maximum 16). |
+| Field | Type | Default | Min | Max | Description |
+|-------|------|---------|-----|-----|-------------|
+| `max_file_size_mb` | integer | `2` | 1 | 16 | Refuse to index files larger than this many MiB. |
 
 ### `plugins.skill`
 
 `skill` executes as a native Caudra tool. This table keeps its existing configuration key.
 
-| Field | Type | Default | Min | Description |
-|-------|------|---------|-----|-------------|
-| `plugin_dev` | boolean | `false` | - | Offer the builtin caudra-plugin-dev skill for writing caudra plugins. Needs `experimental.lua_plugins`. |
-| `workflow_dev` | boolean | `true` | - | Offer the builtin caudra-workflow-dev skill for writing and running workflows. Needs `experimental.workflows`. |
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `plugin_dev` | boolean | `false` | Offer the builtin caudra-plugin-dev skill for writing caudra plugins. Needs `experimental.lua_plugins`. |
+| `workflow_dev` | boolean | `true` | Offer the builtin caudra-workflow-dev skill for writing and running workflows. Needs `experimental.workflows`. |
 
 ### `plugins.task`
 

@@ -51,6 +51,7 @@ struct FieldAttrs {
     skip: bool,
     default: Option<Expr>,
     default_doc: Option<LitStr>,
+    default_varies: Option<LitStr>,
     min: Option<Expr>,
     desc: Option<String>,
     env: Option<String>,
@@ -101,6 +102,7 @@ fn parse_field_attrs(field: &syn::Field) -> syn::Result<FieldAttrs> {
         skip: false,
         default: None,
         default_doc: None,
+        default_varies: None,
         min: None,
         desc: None,
         env: None,
@@ -129,6 +131,11 @@ fn parse_field_attrs(field: &syn::Field) -> syn::Result<FieldAttrs> {
                 "default_doc" => {
                     if let ConfigAttrValue::Str(lit) = item.value {
                         attrs.default_doc = Some(lit);
+                    }
+                }
+                "default_varies" => {
+                    if let ConfigAttrValue::Str(lit) = item.value {
+                        attrs.default_varies = Some(lit);
                     }
                 }
                 "min" => {
@@ -174,7 +181,14 @@ fn parse_field_attrs(field: &syn::Field) -> syn::Result<FieldAttrs> {
     Ok(attrs)
 }
 
+fn is_none(expr: &Expr) -> bool {
+    matches!(expr, Expr::Path(path) if path.path.is_ident("None"))
+}
+
 fn config_value_expr(ty_name: &str, default: &Option<Expr>) -> TokenStream2 {
+    if default.as_ref().is_some_and(is_none) {
+        return quote! { ConfigValue::Unset };
+    }
     match ty_name {
         "bool" => {
             let val = default.as_ref().expect("bool field requires default");
@@ -184,8 +198,33 @@ fn config_value_expr(ty_name: &str, default: &Option<Expr>) -> TokenStream2 {
             let val = default.as_ref().expect("numeric field requires default");
             quote! { ConfigValue::U64(#val as u64) }
         }
-        "String" => quote! { ConfigValue::Str("none") },
+        "String" => quote! { ConfigValue::Unset },
         other => panic!("unsupported config type: {other}"),
+    }
+}
+
+/// `default_doc` spells the default as the user writes it, so the declared
+/// type decides whether it is a boolean, a number, a string, or raw TOML.
+fn documented_value(ty_name: &str, doc: &LitStr) -> syn::Result<TokenStream2> {
+    let text = doc.value();
+    let mismatch = |expected: &str| {
+        syn::Error::new(
+            doc.span(),
+            format!("default_doc of a {ty_name} field must be {expected}"),
+        )
+    };
+    match ty_name {
+        "bool" => {
+            let value: bool = text.parse().map_err(|_| mismatch("true or false"))?;
+            Ok(quote! { ConfigValue::Bool(#value) })
+        }
+        "u32" | "u64" | "usize" | "integer" => {
+            let value: u64 = text.parse().map_err(|_| mismatch("an unsigned integer"))?;
+            Ok(quote! { ConfigValue::U64(#value) })
+        }
+        "string" | "String" => Ok(quote! { ConfigValue::Str(#doc) }),
+        "string[]" | "table" => Ok(quote! { ConfigValue::Toml(#doc) }),
+        _ => Err(mismatch("stated with default_varies instead")),
     }
 }
 
@@ -237,9 +276,16 @@ fn derive_impl(input: &DeriveInput) -> syn::Result<TokenStream2> {
         let ty_string = type_to_name(ty);
         let ty_name = attrs.ty_override.as_deref().unwrap_or(&ty_string);
         let desc = attrs.desc.as_deref().unwrap_or("");
-        let default_expr = match &attrs.default_doc {
-            Some(doc) => quote! { ConfigValue::Str(#doc) },
-            None => config_value_expr(ty_name, &attrs.default),
+        let default_expr = match (&attrs.default_doc, &attrs.default_varies) {
+            (Some(doc), None) => documented_value(ty_name, doc)?,
+            (None, Some(text)) => quote! { ConfigValue::Varies(#text) },
+            (None, None) => config_value_expr(ty_name, &attrs.default),
+            (Some(doc), Some(_)) => {
+                return Err(syn::Error::new(
+                    doc.span(),
+                    "set default_doc or default_varies, not both",
+                ));
+            }
         };
         let min_expr = match &attrs.min {
             Some(m) => quote! { Some(#m as u64) },
@@ -256,6 +302,7 @@ fn derive_impl(input: &DeriveInput) -> syn::Result<TokenStream2> {
                 ty: #ty_name,
                 default: #default_expr,
                 min: #min_expr,
+                max: None,
                 env: #env_expr,
                 description: #desc,
             }

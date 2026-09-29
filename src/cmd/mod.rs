@@ -11,6 +11,7 @@ mod workcell_runtime;
 mod worktree;
 
 use std::env;
+use std::io::{self, Write};
 use std::path::Path;
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -28,7 +29,9 @@ use caudra_lua::PluginHost;
 use caudra_storage::sessions::PermissionMode;
 use caudra_storage::{EphemeralRoot, StateDir};
 
-use crate::cli::{AuthAction, Cli, Command, McpAction, WorkcellAuthAction, normalize_tool_name};
+use crate::cli::{
+    AuthAction, Cli, Command, ConfigAction, McpAction, WorkcellAuthAction, normalize_tool_name,
+};
 use crate::sdk_mode::AUTO_PERMISSION_MODE;
 use crate::startup::Startup;
 use crate::update;
@@ -36,7 +39,7 @@ use crate::update;
 /// The three names Workcell's shell forwards from this process into every
 /// command it runs. Windows reads the last two, Unix the first.
 const TEMP_DIR_VARS: [&str; 3] = ["TMPDIR", "TMP", "TEMP"];
-const INIT_LUA_SKIPPED: &str = "init.lua not loaded, because Lua plugins are experimental and turned off; move its settings to caudra.toml, or set `experimental.lua_plugins = true` in the global caudra.toml and restart Caudra";
+const INIT_LUA_SKIPPED: &str = "init.lua not loaded, because Lua plugins are experimental and turned off; move its settings to caudra.toml (`caudra config example` lists them all), or set `experimental.lua_plugins = true` in the global caudra.toml and restart Caudra";
 const FEATURES_CHANGED: &str =
     "the [experimental] table in the global caudra.toml changed; restart Caudra to apply it";
 const AUTO_NEEDS_ENGINE: &str = "always_auto is set, but Auto mode is experimental and turned off, so sessions start in Ask; set `experimental.decision_engine = true` in the global caudra.toml and restart Caudra to use it";
@@ -441,6 +444,11 @@ pub fn dispatch(mut cli: Cli, startup: Result<Startup, ConfigFileError>) -> Resu
             dirs,
         }) => {
             subcmd::skills(&cli, name.as_deref(), names, json, dirs)?;
+        }
+        Some(Command::Config {
+            action: ConfigAction::Example,
+        }) => {
+            io::stdout().write_all(caudra_config::example_toml().as_bytes())?;
         }
         Some(Command::Logs {
             follow,

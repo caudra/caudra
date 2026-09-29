@@ -515,6 +515,11 @@ pub enum Command {
         #[arg(long, conflicts_with_all = ["names", "json"])]
         dirs: bool,
     },
+    /// Show the settings caudra.toml accepts
+    Config {
+        #[command(subcommand)]
+        action: ConfigAction,
+    },
     /// Print the structured log
     Logs {
         /// Keep printing new records as they arrive
@@ -558,11 +563,12 @@ pub enum Command {
 
 impl Command {
     /// Commands that never read settings, so a broken global caudra.toml
-    /// cannot stop an update, a rollback, or a look at the logs.
+    /// cannot stop an update, a rollback, a look at the logs, or the settings
+    /// reference that helps fix it.
     pub fn runs_without_config(&self) -> bool {
         matches!(
             self,
-            Self::Update { .. } | Self::Rollback | Self::Logs { .. }
+            Self::Update { .. } | Self::Rollback | Self::Logs { .. } | Self::Config { .. }
         )
     }
 
@@ -579,6 +585,12 @@ impl Command {
                 | Self::Decisions { .. }
         )
     }
+}
+
+#[derive(Subcommand)]
+pub enum ConfigAction {
+    /// Print every caudra.toml setting, commented out and set to its default
+    Example,
 }
 
 #[derive(Subcommand)]
@@ -1451,6 +1463,19 @@ mod tests {
     #[test]
     fn the_logs_subcommand_rejects_an_unknown_level() {
         assert!(Cli::try_parse_from(["caudra", "logs", "--level", "chatty"]).is_err());
+    }
+
+    #[test_case(&["caudra", "config", "example"], true ; "config_example")]
+    #[test_case(&["caudra", "logs"], true ; "logs")]
+    #[test_case(&["caudra", "rollback"], true ; "rollback")]
+    #[test_case(&["caudra", "models"], false ; "models")]
+    #[test_case(&["caudra", "tools"], false ; "tools")]
+    fn only_settings_free_commands_run_without_config(args: &[&str], expected: bool) {
+        let cli = Cli::try_parse_from(args).unwrap();
+        assert_eq!(
+            cli.command.as_ref().map(Command::runs_without_config),
+            Some(expected)
+        );
     }
 
     #[test_case(&["caudra", "models"], false, None ; "plain_listing")]

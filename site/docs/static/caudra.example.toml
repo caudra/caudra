@@ -1,0 +1,952 @@
+# Every caudra.toml setting with its default. Each one is commented out, so
+# this file changes nothing until you edit it. `caudra config example` prints
+# it.
+#
+# To change a setting, copy its line into your caudra.toml under the same
+# [table] header, remove the "#", and set your value. A value in angle
+# brackets, such as <string>, marks a setting that has no default. The global
+# file is ~/.config/caudra/caudra.toml, or %APPDATA%\caudra\caudra.toml on
+# Windows. A project .caudra/caudra.toml takes the same settings, except
+# [experimental] and the ones marked global-only.
+#
+# Full reference: https://caudra.ai/docs/configuration/
+
+version = 1
+
+# Start every session with YOLO mode (skip permission prompts, deny rules still
+# apply); global config only.
+# Type: bool.
+# always_yolo = false
+
+# Start every session with Auto permission mode (preserve required prompts and
+# screen unmatched calls); global config only. Needs
+# `experimental.decision_engine`, otherwise sessions start in Ask.
+# Type: bool.
+# always_auto = false
+
+# Start every session with fast mode, on the models that sell a fast tier
+# (ignored otherwise).
+# Type: bool.
+# always_fast = false
+
+# Start every session with extended thinking (true/"adaptive", "off", an effort
+# level ("minimal" to "max"), or a token budget).
+# Type: bool | string. Default: unset.
+# always_thinking = <bool | string>
+
+[experimental]
+# Experimental features stay off until you turn them on, and each switch is
+# independent. Only the global caudra.toml may hold this table. Caudra reads it
+# once at startup, so a change needs a restart.
+
+# Turn on workflows.
+# Type: bool.
+# workflows = false
+
+# Turn on managed sandboxes.
+# Type: bool.
+# sandboxes = false
+
+# Turn on direct remote Workcell connections.
+# Type: bool.
+# remote_workcell = false
+
+# Turn on Lua plugins and init.lua.
+# Type: bool.
+# lua_plugins = false
+
+# Turn on the decision engine and Auto mode.
+# Type: bool.
+# decision_engine = false
+
+[ui]
+
+# Show splash animation on startup.
+# Type: bool.
+# splash_animation = true
+
+# Show vertical scrollbar in scrollable areas.
+# Type: bool.
+# scrollbar = true
+
+# Touch-friendly pointer handling: auto, on, or off. Widens the scrollbar's hit
+# zone so a finger can tap it, scrolls one line per wheel event instead of
+# mouse_scroll_lines, and leaves text selection to the terminal. Auto detects
+# Termux around Caudra itself, which SSH does not carry, so set this to on when
+# reaching Caudra from a phone over SSH.
+# Type: string.
+# touch = "auto"
+
+# Terminal notification method: auto, osc9, bell, or off. Auto is off in a
+# Herdr pane, where Herdr shows its own notification when Caudra is blocked or
+# finished.
+# Type: string.
+# notifications = "auto"
+
+# How LaTeX maths renders: unicode (approximate with Unicode) or raw (show the
+# LaTeX source).
+# Type: string.
+# math = "unicode"
+
+# How mermaid flowcharts render: unicode (draw them with box-drawing
+# characters) or off (leave the fence as code).
+# Type: string.
+# mermaid = "unicode"
+
+# Duration of flash messages (ms).
+# Type: u64.
+# flash_duration_ms = 1500
+
+# How long Ctrl+X waits before listing the chords it can still reach (ms). 0
+# shows the list at once.
+# Type: u64.
+# which_key_delay_ms = 250
+
+# Typewriter effect speed (ms/char).
+# Type: u64.
+# typewriter_ms_per_char = 4
+
+# Lines per mouse wheel scroll.
+# Type: u32, at least 1.
+# mouse_scroll_lines = 3
+
+# Rows of body a shell, python_execution or task card draws. The window follows
+# new output while it sits at the bottom and pauses when scrolled up. Click
+# inside a window to give it the wheel, which passes back to the transcript at
+# either edge, and drag the bar in its last column to move it directly. `0`
+# turns scrolling off, restoring the `ui.tool_output_lines` budget for those
+# tools. A write is never windowed: it is drawn whole at any setting, as the
+# file it created or as the diff of what it replaced.
+# Type: u32.
+# scroll_card_lines = 10
+
+# Tools whose card never opens on its own: the call stays a single row in every
+# view mode until you click it. A server-qualified name still matches, so
+# `file_read` also covers `mcp_File_read`. Set to `[]` to opt out.
+# Type: string[].
+# always_collapsed = ["file_read", "file_glob", "file_grep", "file_index", "webfetch"]
+
+# Maximum visible input lines.
+# Type: u32, at least 1.
+# max_input_lines = 20
+
+# Show full model reasoning live and persisted. Turn this off to start every
+# reasoning block collapsed behind a Thinking or Thought header that can be
+# clicked to expand.
+# Type: bool.
+# show_thinking = true
+
+# Rows of body an open reasoning block draws. The window follows the reasoning
+# while it streams and pauses when scrolled up, and a footer reports how much
+# sits above and below. Click inside a window to give it the wheel, which
+# passes back to the transcript at either edge, and drag the bar in its last
+# column to move it directly. Click the footer to follow again. A finished
+# block rests on its last rows until you move it. `0` draws every block whole.
+# Type: u32.
+# thinking_lines = 10
+
+# Show the messages Caudra writes into the conversation on your behalf:
+# standing reminders, goal check-ins, nudges, and continuations. Each is one
+# dim row that expands on click to the exact text the model was sent. Turn this
+# off to keep the transcript to the conversation alone.
+# Type: bool.
+# show_reminders = true
+
+# Clock format for timestamps: "12h", "24h", or "system" (follow the OS
+# preference, 24h when unknown).
+# Type: String.
+# clock_format = "system"
+
+# Ask GitHub for the latest release on startup and show it in the splash. Off
+# by default, so Caudra makes no such request unless you turn this on.
+# Type: bool. Env: CAUDRA_ENABLE_UPDATE_CHECK.
+# update_check = false
+
+# Name of the color theme to load at startup, overriding the theme you last
+# picked with `/theme`. Unset keeps your last pick.
+# Type: string. Default: unset.
+# theme = <string>
+
+# Light theme to pair with `theme`, in place of the one from the pairing table
+# or for a theme that has no pair. `theme` becomes the dark half.
+# Type: string. Default: unset.
+# theme_light = <string>
+
+[ui.tool_output_lines]
+# Rows of output an open tool card shows before it holds the rest back. `other`
+# covers every tool that no other key names.
+
+# Rows for `shell`.
+# Type: usize, at least 1.
+# bash = 5
+
+# Rows for `python_execution`.
+# Type: usize, at least 1.
+# python_execution = 5
+
+# Rows for `task`, `task_control`.
+# Type: usize, at least 1.
+# task = 12
+
+# Rows for `file_index`, `code_map`, `code_context`, `code_refs`,
+# `code_impact`, `code_expand`.
+# Type: usize, at least 1.
+# index = 3
+
+# Rows for `file_grep`, `file_glob`.
+# Type: usize, at least 1.
+# grep = 3
+
+# Rows for `file_read`, `local_document_read`.
+# Type: usize, at least 1.
+# read = 3
+
+# Rows for `file_write`, `file_edit`, `file_apply_patch`, `image_generate`,
+# `local_document_apply_patch`, `local_document_write`, `memory`.
+# Type: usize, at least 1.
+# write = 7
+
+# Rows for `webfetch`, `websearch`.
+# Type: usize, at least 1.
+# web = 3
+
+# Rows for `batch`, `execution_environment`, `question`, `skill`, `todo_write`,
+# `tool_output`, `view_image`, `workflow`.
+# Type: usize, at least 1.
+# other = 3
+
+[agent]
+
+# Default user system prompt profile from the system-prompts config directory.
+# Type: String.
+# system_prompt_profile = "builtin"
+
+# Host-enforced default max tool-result size (bytes).
+# Type: usize, at least 1024.
+# max_output_bytes = 51200
+
+# Host-enforced default max tool-result lines.
+# Type: usize, at least 10.
+# max_output_lines = 2000
+
+# Context reserved for compaction: token count or percent of the context window
+# (e.g. "20%").
+# Type: u32 | string. Default: 20%, or 10% when the model's window excludes
+# output.
+# compaction_buffer = <u32 | string>
+
+# Extra instructions appended to the compaction summary prompt.
+# Type: String. Default: unset.
+# compaction_instructions = <String>
+
+# Extra instructions the agent receives after any compaction (e.g. re-read
+# plan.md).
+# Type: String. Default: unset.
+# post_compaction_instructions = <String>
+
+# Append a `# User requirements` section to every compaction summary: what the
+# user asked for, constrained, and decided, read from their own messages and
+# answered questions across every earlier compaction, and extracted by the
+# Extract model so the conversation model never sees the request.
+# Type: bool.
+# compaction_requirements = true
+
+# Committed main-agent response groups between unchanged active background-work
+# reminders; 0 disables periodic refresh only, not state-change or
+# post-compaction reminders.
+# Type: u32.
+# background_reminder_turns = 0
+
+# Before the main agent hands control back with pending or in-progress todos,
+# remind it once per user turn, repeating the full todo list, to verify the
+# work and update the list.
+# Type: bool.
+# todo_reminder = true
+
+# Task delivery: sync waits for the completed result, auto lets the model
+# choose, async returns an admission receipt.
+# Type: string.
+# task_execution = "auto"
+
+# Shell delivery: sync waits for termination, auto routes by requested timeout,
+# async returns an admission receipt.
+# Type: string.
+# shell_execution = "auto"
+
+# Requested shell timeout above which auto delivery returns an admission
+# receipt; independent of the enforced execution deadline.
+# Type: u64, at least 1.
+# shell_async_threshold_secs = 120
+
+# Name a new session by summarizing its first prompt with the Title model.
+# Type: bool.
+# generate_titles = true
+
+# Block a write to a file that changed on disk since it was read, and point a
+# failed edit or patch at the change.
+# Type: bool.
+# stale_read_check = true
+
+# Repair malformed tool JSON syntax locally, with one bounded isolated model
+# fallback; independent of eager dispatch.
+# Type: bool.
+# tool_json_repair = true
+
+# Start tools and batch children as soon as their complete arguments arrive,
+# instead of waiting for the whole message.
+# Type: bool.
+# eager_tool_dispatch = true
+
+# Filter completed model-facing shell output with built-in rules.
+# Type: bool.
+# shell_output_filter = true
+
+# Refuse shell commands with a leading literal `cd ... &&` in favor of the
+# shell `workdir` parameter. Set to `false` to disable this nudge independently
+# of `shell_native_redirect`.
+# Type: bool.
+# shell_workdir_redirect = true
+
+# What happens when a shell command only re-implements a native tool, such as
+# bare `rg` or `cat`: `enforce` refuses it and names the tool to call instead,
+# `annotate` only logs the finding, `off` disables the check. A command using
+# any flag the native tool cannot express is never affected.
+# Type: string.
+# shell_native_redirect = "enforce"
+
+# When the on-demand built-in tools start outside the request array: `auto`
+# defers them for a small model or one with no supply metadata and declares
+# them upfront for a known non-small model, `always` defers for every model,
+# `never` declares them upfront.
+# Type: string.
+# defer_builtin_tools = "auto"
+
+# GPT Image 2.5 model behind `image_generate`: `sunburst` is the most capable
+# and the better editor, `flare` is faster at the same price.
+# Type: string.
+# image_model = "sunburst"
+
+# Tools to withhold from the model: built-in names, `server.tool`, or
+# `server.*` for a whole MCP server. A project list extends the global one.
+# Type: string[].
+# disabled_tools = []
+
+[agent.steering]
+# Automatic steering repairs unusable model output and can add bounded guidance
+# about repeated behavior. Each rule has its own table below.
+
+# Master switch for automatic steering, including truncation recovery and
+# repeat-policy blocking.
+# Type: boolean.
+# enabled = true
+
+# Corrective continuations per externally initiated invocation. Zero prevents
+# optional recovery continuations.
+# Type: integer, 0 to 1024.
+# max_recoveries = 32
+
+# Advisory injections per invocation. Zero suppresses advisories.
+# Type: integer, 0 to 1024.
+# max_advisories = 4
+
+# Consecutive turns carrying neither a tool call nor visible text before the
+# run ends, whichever rule intervened. Zero disables the backstop.
+# Type: integer, 0 to 1024.
+# max_stalled_turns = 5
+
+# Up to 256 exact `provider/model-id` keys, each with its own overrides.
+# Type: table.
+# models = {}
+
+[agent.steering.rules.truncation]
+# Continue output cut off by the response token limit, up to 3 corrective
+# requests per externally initiated invocation.
+
+# Explicit `false` disables this rule.
+# Type: boolean.
+# enabled = true
+
+# Use built-in guidance when omitted. Custom text must be nonblank and at most
+# 16,384 UTF-8 bytes.
+# Type: string. Default: unset.
+# prompt = <string>
+
+# Actual truncation-correction requests per externally initiated invocation,
+# shared across truncation episodes.
+# Type: integer, 1 to 1024.
+# max_attempts = 3
+
+[agent.steering.rules.empty_response]
+# Continue after empty output, with separate per-episode limits after recent
+# tools and while idle.
+
+# Explicit `false` disables this rule.
+# Type: boolean.
+# enabled = true
+
+# Use built-in guidance when omitted. Custom text must be nonblank and at most
+# 16,384 UTF-8 bytes.
+# Type: string. Default: unset.
+# prompt = <string>
+
+# Empty-output continuations per episode after recent tool results.
+# Type: integer, 1 to 1024.
+# max_after_tools = 3
+
+# Empty-output continuations per episode without recent tool results.
+# Type: integer, 1 to 1024.
+# max_idle = 2
+
+# Continuations per episode after a response that carried no content at all.
+# Clamped by the limit above; repeating an unchanged request is not a retry.
+# Type: integer, 1 to 1024.
+# max_barren = 1
+
+# Non-padding history messages inspected for recent tool results.
+# Type: integer, 1 to 4096.
+# recent_tool_window = 5
+
+[agent.steering.rules.repeated_tool_call]
+# Refuse the third consecutive identical top-level tool name/input before
+# execution. Native batch children do not acquire this hard blocker.
+
+# Explicit `false` disables this rule.
+# Type: boolean.
+# enabled = true
+
+# Use built-in guidance when omitted. Custom text must be nonblank and at most
+# 16,384 UTF-8 bytes.
+# Type: string. Default: unset.
+# prompt = <string>
+
+# Consecutive identical top-level calls. Refuse the call reaching this
+# threshold.
+# Type: integer, 2 to 1024.
+# threshold = 3
+
+[agent.steering.rules.protocol_mismatch]
+# Correct an explicit provider tool-use indication with no actual tool calls,
+# up to 2 continuations per episode.
+
+# Explicit `false` disables this rule.
+# Type: boolean.
+# enabled = true
+
+# Use built-in guidance when omitted. Custom text must be nonblank and at most
+# 16,384 UTF-8 bytes.
+# Type: string. Default: unset.
+# prompt = <string>
+
+# Protocol corrective continuations per episode.
+# Type: integer, 1 to 1024.
+# max_attempts = 2
+
+[agent.steering.rules.missing_task_report]
+# Request a missing task summary or required structured report, up to 2
+# corrections.
+
+# Explicit `false` disables this rule.
+# Type: boolean.
+# enabled = true
+
+# Use built-in guidance when omitted. Custom text must be nonblank and at most
+# 16,384 UTF-8 bytes.
+# Type: string. Default: unset.
+# prompt = <string>
+
+# Additional report-correction prompts per task invocation.
+# Type: integer, 1 to 1024.
+# max_attempts = 2
+
+[agent.steering.rules.abandoned_turn]
+# Continue a turn that ended by announcing work the response never performed,
+# up to 2 continuations per episode. Spending the allowance accepts the text
+# rather than failing the turn.
+
+# Explicit `false` disables this rule.
+# Type: boolean.
+# enabled = true
+
+# Use built-in guidance when omitted. Custom text must be nonblank and at most
+# 16,384 UTF-8 bytes.
+# Type: string. Default: unset.
+# prompt = <string>
+
+# Continuations per episode after a turn that announced work instead of doing
+# it.
+# Type: integer, 1 to 1024.
+# max_attempts = 2
+
+[agent.steering.rules.repetition]
+# Advise on short exact tool cycles, including normalized native batch leaf
+# calls, or repeated normalized assistant text.
+
+# Explicit `false` disables this rule.
+# Type: boolean.
+# enabled = true
+
+# Use built-in guidance when omitted. Custom text must be nonblank and at most
+# 16,384 UTF-8 bytes.
+# Type: string. Default: unset.
+# prompt = <string>
+
+# Recent normalized leaf tool calls retained for cycle detection.
+# Type: integer, 1 to 4096.
+# window = 24
+
+# Exact repetitions of a tool cycle needed for an advisory.
+# Type: integer, 2 to 1024.
+# cycle_repeats = 3
+
+# Maximum cycle length in leaf calls. Candidate cycle lengths start at 2.
+# Type: integer, 2 to 1024.
+# max_cycle = 4
+
+# Recent completed assistant responses retained for text repetition.
+# Type: integer, 1 to 4096.
+# text_window = 8
+
+# Matching nontrivial normalized assistant responses needed for an advisory.
+# Type: integer, 2 to 1024.
+# text_repeats = 3
+
+# Completed model responses between this rule's advisories.
+# Type: integer, 1 to 1024.
+# cooldown = 3
+
+[agent.steering.rules.tool_planning]
+# Advise after consecutive failed tool attempts across responses, including
+# attempts with different tools or inputs. Any successful tool result ends the
+# failure episode. Repeating a successful call is insufficient.
+
+# Explicit `false` disables this rule.
+# Type: boolean.
+# enabled = true
+
+# Use built-in guidance when omitted. Custom text must be nonblank and at most
+# 16,384 UTF-8 bytes.
+# Type: string. Default: unset.
+# prompt = <string>
+
+# Number of most recent leaf tool calls that must all have failed since the
+# last response containing a successful result.
+# Type: integer, 1 to 1024.
+# after_calls = 6
+
+# Distinct completed model responses represented by those failed calls.
+# Type: integer, 1 to 1024.
+# after_responses = 3
+
+# Completed model responses between this rule's advisories.
+# Type: integer, 1 to 1024.
+# cooldown = 3
+
+[provider]
+
+# Default model identifier (e.g. `anthropic/claude-sonnet-4-6`).
+# Type: String. Default: unset.
+# default_model = <String>
+
+# Glob patterns for permitted qualified model specs; empty permits all models.
+# Type: string[].
+# allowed_models = []
+
+# Glob patterns for excluded qualified model specs; exclusions take precedence.
+# Type: string[].
+# excluded_models = []
+
+# HTTP connect timeout (seconds).
+# Type: u64, at least 1.
+# connect_timeout_secs = 10
+
+# Longest the server may send nothing before the request is abandoned
+# (seconds).
+# Type: u64, at least 10.
+# stream_timeout_secs = 300
+
+[storage]
+
+# Max total log size (MB).
+# Type: u64, at least 1.
+# max_log_bytes_mb = 200
+
+# Max number of log files to keep.
+# Type: u32, at least 1.
+# max_log_files = 10
+
+# Largest session Caudra will hydrate when opening one (MB), counted in
+# uncompressed payload bytes rather than disk or memory. A session past this
+# refuses to load; trim it or raise this.
+# Type: u64, at least 64. Env: CAUDRA_MAX_EAGER_LOAD_MB.
+# max_eager_load_mb = 1024
+
+# Minimum severity written to the log file: trace, debug, info, warn, or error.
+# RUST_LOG overrides it.
+# Type: string.
+# log_level = "info"
+
+# Number of input history entries to retain.
+# Type: usize, at least 10.
+# input_history_size = 100
+
+# Store session data in a temporary directory removed when Caudra exits.
+# Type: bool.
+# ephemeral = false
+
+[storage.retention]
+# `trim` and `forget` take keep policies in `restic forget` terms, such as
+# `{ keep_last = 50, keep_within = "90d" }`. A session is kept when any rule
+# matches.
+
+# Evaluate policies per working directory (`directory`) or across every session
+# (`none`).
+# Type: string.
+# group_by = "directory"
+
+# Hours between background sweeps. A sweep reclaims freed space, and applies
+# `trim` and `forget` when they are set. `0` disables the sweep;
+# `caudra storage` commands still work.
+# Type: u64.
+# sweep_interval_hours = 24
+
+# Sessions outside this policy lose snapshots, tool output files, archives, and
+# large rich outputs but stay resumable. Empty means never trim automatically.
+# Type: table.
+# trim = {}
+
+# Sessions outside this policy are deleted. Empty means never delete
+# automatically.
+# Type: table.
+# forget = {}
+
+[storage.snapshots]
+
+# Capture automatic workspace snapshots locally and remotely, including
+# session-start and final captures. `false` disables capture and file revert
+# without deleting existing snapshots or bypassing restore recovery.
+# `--no-snapshots` overrides this for one run.
+# Type: bool.
+# enabled = true
+
+# Largest working tree a capture will take, and the retention target for the
+# compressed object store each workspace shares across its sessions. A
+# workspace above it loses file revert rather than paying for a snapshot the
+# store cannot keep.
+# Type: u64.
+# max_bytes_mb = 512
+
+# Most files a capture will take, counted after ignore rules.
+# Type: u64.
+# max_files = 50000
+
+# Largest single file a capture will take. A bigger one is left out of the
+# snapshot and left alone on disk, so it cannot be reverted.
+# Type: u64.
+# max_file_bytes_mb = 100
+
+[telemetry]
+# Each setting that names an environment variable gives way to it.
+
+# Master switch.
+# Type: bool. Env: CAUDRA_ENABLE_TELEMETRY.
+# enabled = false
+
+# Where metrics go: `otlp`, `console`, `none`, or a comma-separated mix.
+# Type: string. Env: OTEL_METRICS_EXPORTER.
+# metrics_exporter = "none"
+
+# Where events go: `otlp`, `console`, `none`, or a comma-separated mix.
+# Type: string. Env: OTEL_LOGS_EXPORTER.
+# logs_exporter = "none"
+
+# OTLP protocol: `grpc`, `http/protobuf`, or `http/json`. Required when an
+# exporter is `otlp`.
+# Type: string. Default: unset. Env: OTEL_EXPORTER_OTLP_PROTOCOL.
+# protocol = <string>
+
+# Collector endpoint. HTTP appends `/v1/metrics` and `/v1/logs`.
+# Type: string. Default: unset. Env: OTEL_EXPORTER_OTLP_ENDPOINT.
+# endpoint = <string>
+
+# Extra headers sent with every export.
+# Type: table. Env: OTEL_EXPORTER_OTLP_HEADERS.
+# headers = {}
+
+# Per-export request timeout (ms).
+# Type: integer. Env: OTEL_EXPORTER_OTLP_TIMEOUT.
+# timeout_ms = 10000
+
+# Payload compression: `gzip` or `none`.
+# Type: string. Env: OTEL_EXPORTER_OTLP_COMPRESSION.
+# compression = "none"
+
+# Metrics-only protocol override.
+# Type: string. Default: unset. Env: OTEL_EXPORTER_OTLP_METRICS_PROTOCOL.
+# metrics_protocol = <string>
+
+# Metrics-only endpoint, used verbatim with no path appended.
+# Type: string. Default: unset. Env: OTEL_EXPORTER_OTLP_METRICS_ENDPOINT.
+# metrics_endpoint = <string>
+
+# Metrics-only headers, merged over `headers`.
+# Type: table. Env: OTEL_EXPORTER_OTLP_METRICS_HEADERS.
+# metrics_headers = {}
+
+# Metrics-only request timeout (ms).
+# Type: integer. Default: unset. Env: OTEL_EXPORTER_OTLP_METRICS_TIMEOUT.
+# metrics_timeout_ms = <integer>
+
+# Logs-only protocol override.
+# Type: string. Default: unset. Env: OTEL_EXPORTER_OTLP_LOGS_PROTOCOL.
+# logs_protocol = <string>
+
+# Logs-only endpoint, used verbatim with no path appended.
+# Type: string. Default: unset. Env: OTEL_EXPORTER_OTLP_LOGS_ENDPOINT.
+# logs_endpoint = <string>
+
+# Logs-only headers, merged over `headers`.
+# Type: table. Env: OTEL_EXPORTER_OTLP_LOGS_HEADERS.
+# logs_headers = {}
+
+# Logs-only request timeout (ms).
+# Type: integer. Default: unset. Env: OTEL_EXPORTER_OTLP_LOGS_TIMEOUT.
+# logs_timeout_ms = <integer>
+
+# How often metrics are exported (ms).
+# Type: integer. Env: OTEL_METRIC_EXPORT_INTERVAL.
+# metrics_interval_ms = 60000
+
+# Deadline for one metrics export, retries included (ms).
+# Type: integer. Env: OTEL_METRIC_EXPORT_TIMEOUT.
+# metrics_export_timeout_ms = 30000
+
+# How often queued events are flushed (ms).
+# Type: integer. Env: OTEL_LOGS_EXPORT_INTERVAL, OTEL_BLRP_SCHEDULE_DELAY.
+# logs_interval_ms = 5000
+
+# Event queue capacity. Events are dropped and counted when it is full.
+# Type: integer. Env: OTEL_BLRP_MAX_QUEUE_SIZE.
+# logs_max_queue_size = 2048
+
+# Maximum events per export request.
+# Type: integer. Env: OTEL_BLRP_MAX_EXPORT_BATCH_SIZE.
+# logs_max_export_batch_size = 512
+
+# Deadline for one events export, retries included (ms).
+# Type: integer. Env: OTEL_BLRP_EXPORT_TIMEOUT.
+# logs_export_timeout_ms = 30000
+
+# Metric temporality: `delta` or `cumulative`.
+# Type: string. Env: OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE.
+# metrics_temporality = "delta"
+
+# `service.name` on the exported resource.
+# Type: string. Env: OTEL_SERVICE_NAME.
+# service_name = "caudra"
+
+# Extra resource attributes, your place for team or environment labels.
+# Type: table. Env: OTEL_RESOURCE_ATTRIBUTES.
+# resource_attributes = {}
+
+# Attach `session.id` to metrics. Turn off to keep metric cardinality low.
+# Type: bool. Env: OTEL_METRICS_INCLUDE_SESSION_ID.
+# metrics_include_session_id = true
+
+# Attach `app.version` to metrics.
+# Type: bool. Env: OTEL_METRICS_INCLUDE_VERSION.
+# metrics_include_version = false
+
+# Include prompt text in `caudra.user_prompt` events. Off by default.
+# Type: bool. Env: OTEL_LOG_USER_PROMPTS.
+# log_user_prompts = false
+
+# Include tool input in `caudra.tool_result` events. Off by default.
+# Type: bool. Env: OTEL_LOG_TOOL_DETAILS.
+# log_tool_details = false
+
+# Character cap on any logged prompt or tool input.
+# Type: integer. Env: CAUDRA_OTEL_CONTENT_MAX_LENGTH.
+# content_max_length = 10240
+
+[worktrees]
+
+# What creates and removes worktrees for `/worktree`: `auto` uses Herdr inside
+# a Herdr pane and git elsewhere, `git` always runs git.
+# Type: string.
+# backend = "auto"
+
+# Where git-created worktrees go, as `<directory>/<repository>/<branch>`. A
+# leading `~/` is your home directory.
+# Type: string. Default: `<data dir>/worktrees`.
+# directory = <string>
+
+[decisions]
+# The typed decision engine. It needs `decision_engine = true` under
+# [experimental]. Connection settings and thresholds are global-only.
+
+# Full request URL. HTTPS required except for numeric loopback HTTP or explicit
+# `allow_http` consent. No credentials, query, fragment, whitespace, or control
+# characters.
+# Type: string. Default: unset.
+# endpoint = <string>
+
+# Decision model identifier, nonblank and without control characters.
+# Type: string.
+# model = "jev-latest"
+
+# Environment variable containing the optional credential, never the credential
+# itself. Project environment values are excluded.
+# Type: string.
+# api_key_env = "TYPESAFE_API_KEY"
+
+# Explicit global consent to send decision context to a non-loopback endpoint.
+# Type: boolean.
+# allow_remote = false
+
+# Global-only opt-in for non-loopback HTTP. Also requires
+# `allow_remote = true`. Use only with transport protection you control, such
+# as a trusted encrypted tunnel.
+# Type: boolean.
+# allow_http = false
+
+# Positive decision-request deadline in milliseconds, separate from shell
+# execution timeouts.
+# Type: integer.
+# timeout_ms = 400
+
+# Retain bounded decision records in the separate local `decisions.db`.
+# Type: boolean.
+# log = false
+
+# Positive retention period for decision records.
+# Type: integer.
+# log_retention_days = 90
+
+[decisions.features]
+# `off` turns a feature off, `shadow` collects predictions without applying
+# them, `advise` adds caution or suggestions, and `enforce` applies the
+# feature's own behavior. Each feature lists the modes it takes.
+
+# Add warnings to an existing permission prompt without delaying the answer.
+# Modes: off, shadow, advise.
+# Type: string.
+# permission_advice = "off"
+
+# Escalate an eligible Auto call to a prompt on a flag or engine failure. No
+# answer channel means denial. Modes: off, shadow, enforce.
+# Type: string.
+# auto_screening = "off"
+
+# Warn about possible project writes during Plan review only when
+# `shell_writes` is configured. Never establish read-only authority. Modes:
+# off, shadow, advise.
+# Type: string.
+# shell_effect = "off"
+
+# Add caution to flagged web/MCP output and tighten upload/credential Auto
+# screening for the session. Content remains available. Modes: off, shadow,
+# advise.
+# Type: string.
+# content_screening = "off"
+
+# Advise with local shell estimates. Enforce may fill an omitted timeout and
+# select delivery at admission. Explicit timeouts stay unchanged. Modes: off,
+# shadow, advise, enforce.
+# Type: string.
+# shell_duration = "off"
+
+# Rerank the existing lexical tool shortlist. This neither loads arbitrary
+# names nor grants execution permission. Modes: off, shadow, enforce.
+# Type: string.
+# tool_search = "off"
+
+# Suggest a shortlisted skill. The agent still chooses whether to load it.
+# Modes: off, shadow, advise.
+# Type: string.
+# skill_suggestions = "off"
+
+# Skip an unlikely-to-pass goal evaluation within the continuation budget and
+# continue work. Only the normal evaluator can certify completion. Modes: off,
+# shadow, enforce.
+# Type: string.
+# goal_prescreen = "off"
+
+# Choose a model job for a new unpinned subagent from its task label, not its
+# full prompt. Explicit jobs, profile pins, and continuations keep their
+# routing. Modes: off, shadow, enforce.
+# Type: string.
+# subagent_routing = "off"
+
+[decisions.thresholds]
+# Probabilities between 0 and 1. Flags trigger at or above their threshold, and
+# goal prescreening skips at or below its own.
+
+# Probability for a permission warning.
+# Type: float.
+# permission_flag = 0.85
+
+# Probability for escalating an eligible Auto call.
+# Type: float.
+# auto_flag = 0.85
+
+# Probability that sampled content attempts instruction injection.
+# Type: float.
+# content_injection = 0.9
+
+# Probability that sampled content addresses the agent.
+# Type: float.
+# content_addressed_to_agent = 0.9
+
+# Probability that a shell command runs until stopped.
+# Type: float.
+# shell_endless = 0.9
+
+# Probability for a heavy-command prior and confidence required for a duration
+# choice.
+# Type: float.
+# shell_heavy = 0.9
+
+# Confidence required for tool search, skill suggestions, and subagent routing.
+# Tool-search choice probability must also meet it.
+# Type: float.
+# routing_confidence = 0.9
+
+# Skip an evaluator at or below this completion probability, within the
+# continuation budget.
+# Type: float.
+# goal_skip_below = 0.05
+
+# Optional project-write warning threshold. Omission leaves the warning
+# disabled. No built-in enforcement threshold.
+# Type: float. Default: unset.
+# shell_writes = <float>
+
+[plugins]
+# Bundled tools are on by default. Turn one off with `enabled = false` in its
+# own table, such as [plugins.websearch]. Names: bash, batch, edit, glob, grep,
+# index, list, memory, question, read, sessions, skill, task, todo_write,
+# tool_output, view_image, webfetch, websearch, write.
+
+[plugins.index]
+
+# Refuse to index files larger than this many MiB.
+# Type: integer, 1 to 16.
+# max_file_size_mb = 2
+
+[plugins.skill]
+
+# Offer the builtin caudra-plugin-dev skill for writing caudra plugins. Needs
+# `experimental.lua_plugins`.
+# Type: boolean.
+# plugin_dev = false
+
+# Offer the builtin caudra-workflow-dev skill for writing and running
+# workflows. Needs `experimental.workflows`.
+# Type: boolean.
+# workflow_dev = true
+
+[plugins.task]
+
+# Max concurrently running subagents.
+# Type: integer, at least 1.
+# max_concurrent = 8

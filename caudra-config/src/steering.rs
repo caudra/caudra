@@ -5,8 +5,9 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::ConfigError;
+use crate::{ConfigError, ConfigField, ConfigValue};
 
+const DEFAULT_ENABLED: bool = true;
 const DEFAULT_MAX_RECOVERIES: u32 = 32;
 const DEFAULT_MAX_ADVISORIES: u32 = 4;
 /// Longer than any single rule's episode, so a stalling rule still ends on its
@@ -38,7 +39,7 @@ macro_rules! merge_fields {
 
 macro_rules! rule {
     ($config:ident, $policy:ident, {
-        $($field:ident: $ty:ty = $default:literal, $min:literal..=$max:ident);+ $(;)?
+        $($field:ident: $ty:ty = $default:literal, $min:literal..=$max:ident, $description:literal);+ $(;)?
     }) => {
         #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
         #[serde(default, deny_unknown_fields)]
@@ -71,7 +72,7 @@ macro_rules! rule {
         impl Default for $policy {
             fn default() -> Self {
                 Self {
-                    enabled: true,
+                    enabled: DEFAULT_ENABLED,
                     prompt: None,
                     $($field: $default,)+
                 }
@@ -79,6 +80,16 @@ macro_rules! rule {
         }
 
         impl $policy {
+            const FIELDS: &[ConfigField] = &[$(ConfigField {
+                name: stringify!($field),
+                ty: "integer",
+                default: ConfigValue::U64($default),
+                min: Some($min),
+                max: Some($max as u64),
+                env: None,
+                description: $description,
+            }),+];
+
             fn validate(&self, path: &str) -> Result<(), ConfigError> {
                 if let Some(prompt) = &self.prompt
                     && (prompt.trim().is_empty() || prompt.len() > MAX_PROMPT_BYTES)
@@ -101,42 +112,91 @@ macro_rules! rule {
 }
 
 rule!(TruncationConfig, TruncationPolicy, {
-    max_attempts: u32 = 3, 1..=MAX_COUNT;
+    max_attempts: u32 = 3, 1..=MAX_COUNT,
+        "Actual truncation-correction requests per externally initiated invocation, shared across truncation episodes.";
 });
 rule!(EmptyResponseConfig, EmptyResponsePolicy, {
-    max_after_tools: u32 = 3, 1..=MAX_COUNT;
-    max_idle: u32 = 2, 1..=MAX_COUNT;
-    max_barren: u32 = 1, 1..=MAX_COUNT;
-    recent_tool_window: usize = 5, 1..=MAX_WINDOW;
+    max_after_tools: u32 = 3, 1..=MAX_COUNT,
+        "Empty-output continuations per episode after recent tool results.";
+    max_idle: u32 = 2, 1..=MAX_COUNT,
+        "Empty-output continuations per episode without recent tool results.";
+    max_barren: u32 = 1, 1..=MAX_COUNT,
+        "Continuations per episode after a response that carried no content at all. Clamped by the limit above; repeating an unchanged request is not a retry.";
+    recent_tool_window: usize = 5, 1..=MAX_WINDOW,
+        "Non-padding history messages inspected for recent tool results.";
 });
 rule!(RepeatedToolCallConfig, RepeatedToolCallPolicy, {
-    threshold: usize = 3, 2..=MAX_COUNT;
+    threshold: usize = 3, 2..=MAX_COUNT,
+        "Consecutive identical top-level calls. Refuse the call reaching this threshold.";
 });
 rule!(ProtocolMismatchConfig, ProtocolMismatchPolicy, {
-    max_attempts: u32 = 2, 1..=MAX_COUNT;
+    max_attempts: u32 = 2, 1..=MAX_COUNT,
+        "Protocol corrective continuations per episode.";
 });
 rule!(MissingTaskReportConfig, MissingTaskReportPolicy, {
-    max_attempts: u32 = 2, 1..=MAX_COUNT;
+    max_attempts: u32 = 2, 1..=MAX_COUNT,
+        "Additional report-correction prompts per task invocation.";
 });
 rule!(AbandonedTurnConfig, AbandonedTurnPolicy, {
-    max_attempts: u32 = 2, 1..=MAX_COUNT;
+    max_attempts: u32 = 2, 1..=MAX_COUNT,
+        "Continuations per episode after a turn that announced work instead of doing it.";
 });
 rule!(RepetitionConfig, RepetitionPolicy, {
-    window: usize = 24, 1..=MAX_WINDOW;
-    cycle_repeats: usize = 3, 2..=MAX_COUNT;
-    max_cycle: usize = 4, 2..=MAX_COUNT;
-    text_window: usize = 8, 1..=MAX_WINDOW;
-    text_repeats: usize = 3, 2..=MAX_COUNT;
-    cooldown: u32 = 3, 1..=MAX_COUNT;
+    window: usize = 24, 1..=MAX_WINDOW,
+        "Recent normalized leaf tool calls retained for cycle detection.";
+    cycle_repeats: usize = 3, 2..=MAX_COUNT,
+        "Exact repetitions of a tool cycle needed for an advisory.";
+    max_cycle: usize = 4, 2..=MAX_COUNT,
+        "Maximum cycle length in leaf calls. Candidate cycle lengths start at 2.";
+    text_window: usize = 8, 1..=MAX_WINDOW,
+        "Recent completed assistant responses retained for text repetition.";
+    text_repeats: usize = 3, 2..=MAX_COUNT,
+        "Matching nontrivial normalized assistant responses needed for an advisory.";
+    cooldown: u32 = 3, 1..=MAX_COUNT,
+        "Completed model responses between this rule's advisories.";
 });
 rule!(ToolPlanningConfig, ToolPlanningPolicy, {
-    after_calls: usize = 6, 1..=MAX_COUNT;
-    after_responses: usize = 3, 1..=MAX_COUNT;
-    cooldown: u32 = 3, 1..=MAX_COUNT;
+    after_calls: usize = 6, 1..=MAX_COUNT,
+        "Number of most recent leaf tool calls that must all have failed since the last response containing a successful result.";
+    after_responses: usize = 3, 1..=MAX_COUNT,
+        "Distinct completed model responses represented by those failed calls.";
+    cooldown: u32 = 3, 1..=MAX_COUNT,
+        "Completed model responses between this rule's advisories.";
 });
 
+/// One `[agent.steering.rules.<name>]` table. Every rule also takes
+/// [`SteeringRule::COMMON_FIELDS`].
+pub struct SteeringRule {
+    pub name: &'static str,
+    pub description: &'static str,
+    pub fields: &'static [ConfigField],
+}
+
+impl SteeringRule {
+    pub const COMMON_FIELDS: &[ConfigField] = &[
+        ConfigField {
+            name: "enabled",
+            ty: "boolean",
+            default: ConfigValue::Bool(DEFAULT_ENABLED),
+            min: None,
+            max: None,
+            env: None,
+            description: "Explicit `false` disables this rule.",
+        },
+        ConfigField {
+            name: "prompt",
+            ty: "string",
+            default: ConfigValue::Unset,
+            min: None,
+            max: None,
+            env: None,
+            description: "Use built-in guidance when omitted. Custom text must be nonblank and at most 16,384 UTF-8 bytes.",
+        },
+    ];
+}
+
 macro_rules! rules {
-    ($($field:ident: $config:ident => $policy:ident),+ $(,)?) => {
+    ($($field:ident: $config:ident => $policy:ident, $description:literal);+ $(;)?) => {
         #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
         #[serde(default, deny_unknown_fields)]
         pub struct SteeringRulesConfig {
@@ -144,6 +204,12 @@ macro_rules! rules {
         }
 
         impl SteeringRulesConfig {
+            pub const RULES: &[SteeringRule] = &[$(SteeringRule {
+                name: stringify!($field),
+                description: $description,
+                fields: $policy::FIELDS,
+            }),+];
+
             fn merge(&mut self, overlay: Self) {
                 $(self.$field.merge(overlay.$field);)+
             }
@@ -188,13 +254,21 @@ macro_rules! rules {
 
 rules! {
     truncation: TruncationConfig => TruncationPolicy,
+        "Continue output cut off by the response token limit, up to 3 corrective requests per externally initiated invocation.";
     empty_response: EmptyResponseConfig => EmptyResponsePolicy,
+        "Continue after empty output, with separate per-episode limits after recent tools and while idle.";
     repeated_tool_call: RepeatedToolCallConfig => RepeatedToolCallPolicy,
+        "Refuse the third consecutive identical top-level tool name/input before execution. Native batch children do not acquire this hard blocker.";
     protocol_mismatch: ProtocolMismatchConfig => ProtocolMismatchPolicy,
+        "Correct an explicit provider tool-use indication with no actual tool calls, up to 2 continuations per episode.";
     missing_task_report: MissingTaskReportConfig => MissingTaskReportPolicy,
+        "Request a missing task summary or required structured report, up to 2 corrections.";
     abandoned_turn: AbandonedTurnConfig => AbandonedTurnPolicy,
+        "Continue a turn that ended by announcing work the response never performed, up to 2 continuations per episode. Spending the allowance accepts the text rather than failing the turn.";
     repetition: RepetitionConfig => RepetitionPolicy,
+        "Advise on short exact tool cycles, including normalized native batch leaf calls, or repeated normalized assistant text.";
     tool_planning: ToolPlanningConfig => ToolPlanningPolicy,
+        "Advise after consecutive failed tool attempts across responses, including attempts with different tools or inputs. Any successful tool result ends the failure episode. Repeating a successful call is insufficient.";
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -242,6 +316,63 @@ impl SteeringModelConfig {
 }
 
 impl SteeringConfig {
+    pub const FIELDS: &[ConfigField] = &[
+        ConfigField {
+            name: "enabled",
+            ty: "boolean",
+            default: ConfigValue::Bool(DEFAULT_ENABLED),
+            min: None,
+            max: None,
+            env: None,
+            description: "Master switch for automatic steering, including truncation recovery and repeat-policy blocking.",
+        },
+        ConfigField {
+            name: "max_recoveries",
+            ty: "integer",
+            default: ConfigValue::U64(DEFAULT_MAX_RECOVERIES as u64),
+            min: Some(0),
+            max: Some(MAX_COUNT as u64),
+            env: None,
+            description: "Corrective continuations per externally initiated invocation. Zero prevents optional recovery continuations.",
+        },
+        ConfigField {
+            name: "max_advisories",
+            ty: "integer",
+            default: ConfigValue::U64(DEFAULT_MAX_ADVISORIES as u64),
+            min: Some(0),
+            max: Some(MAX_COUNT as u64),
+            env: None,
+            description: "Advisory injections per invocation. Zero suppresses advisories.",
+        },
+        ConfigField {
+            name: "max_stalled_turns",
+            ty: "integer",
+            default: ConfigValue::U64(DEFAULT_MAX_STALLED_TURNS as u64),
+            min: Some(0),
+            max: Some(MAX_COUNT as u64),
+            env: None,
+            description: "Consecutive turns carrying neither a tool call nor visible text before the run ends, whichever rule intervened. Zero disables the backstop.",
+        },
+        ConfigField {
+            name: "rules",
+            ty: "table",
+            default: ConfigValue::Toml("{}"),
+            min: None,
+            max: None,
+            env: None,
+            description: "Overrides by rule name, listed below. Omission uses built-in defaults.",
+        },
+        ConfigField {
+            name: "models",
+            ty: "table",
+            default: ConfigValue::Toml("{}"),
+            min: None,
+            max: None,
+            env: None,
+            description: "Up to 256 exact `provider/model-id` keys, each with its own overrides.",
+        },
+    ];
+
     /// Later layers replace explicit fields, while rules and exact model entries merge
     /// field by field so omitted settings continue to inherit.
     pub fn merge(&mut self, overlay: Self) {
@@ -267,7 +398,7 @@ impl SteeringConfig {
 
     fn resolve_override(&self, model: Option<&SteeringModelConfig>) -> SteeringPolicy {
         let mut policy = SteeringPolicy {
-            enabled: true,
+            enabled: DEFAULT_ENABLED,
             max_recoveries: DEFAULT_MAX_RECOVERIES,
             max_advisories: DEFAULT_MAX_ADVISORIES,
             max_stalled_turns: DEFAULT_MAX_STALLED_TURNS,

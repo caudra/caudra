@@ -23,6 +23,7 @@ const PROJECT_DIR: &str = ".caudra";
 const PERMISSIONS_FILE: &str = "permissions.toml";
 pub const PERMISSIONS_VERSION: u32 = 1;
 const SHELL_PERMISSION_TOOLS: &[&str] = &["bash", "shell"];
+const UNSET_DEFAULT: &str = "unset";
 /// Tools whose card never opens on its own. A truncated prefix of one of
 /// these bodies carries nothing: a read and a fetch are windows into a
 /// document, and a glob, a grep and an index are ordered by path or by source
@@ -57,7 +58,10 @@ pub mod sandbox;
 pub mod steering;
 pub mod workcell;
 
+mod example;
+
 pub use decisions::{DecisionsConfig, FeatureMode};
+pub use example::example_toml;
 pub use experimental::{Feature, FeatureDisabled, FeatureFlags};
 pub use steering::SteeringConfig;
 
@@ -127,8 +131,10 @@ pub const DEFAULT_SKILL_WORKFLOW_DEV: bool = true;
 const SKILL_PLUGIN_DEV_FIELD: &str = "plugin_dev";
 const SKILL_WORKFLOW_DEV_FIELD: &str = "workflow_dev";
 const SKILL_FIELDS: [&str; 2] = [SKILL_PLUGIN_DEV_FIELD, SKILL_WORKFLOW_DEV_FIELD];
+const TASK_MAX_CONCURRENT_FIELD: &str = "max_concurrent";
 pub const DEFAULT_TASK_MAX_CONCURRENT: usize = 8;
 pub const MIN_TASK_MAX_CONCURRENT: usize = 1;
+const INDEX_MAX_FILE_SIZE_FIELD: &str = "max_file_size_mb";
 pub const DEFAULT_INDEX_MAX_FILE_SIZE_MB: usize = 2;
 pub const MIN_INDEX_MAX_FILE_SIZE_MB: usize = 1;
 /// Workcell briefly holds the input bytes and parser-owned source together,
@@ -174,6 +180,58 @@ const LEGACY_PLUGIN_TOOLS: &[(&str, &[&str])] = &[
 /// tools are internal companions. Disabling them is a no-op, so their names
 /// stay out of the resolved list instead of sitting in it matching nothing.
 const TOOLLESS_PLUGINS: &[&str] = &["list", "sessions", "tool_output"];
+
+/// Options that native tools still read from the `plugins.<name>` table their
+/// Lua plugin was configured under, besides `enabled`.
+pub const NATIVE_PLUGIN_OPTIONS: &[(&str, &[ConfigField])] = &[
+    (
+        "index",
+        &[ConfigField {
+            name: INDEX_MAX_FILE_SIZE_FIELD,
+            ty: "integer",
+            default: ConfigValue::U64(DEFAULT_INDEX_MAX_FILE_SIZE_MB as u64),
+            min: Some(MIN_INDEX_MAX_FILE_SIZE_MB as u64),
+            max: Some(MAX_INDEX_MAX_FILE_SIZE_MB as u64),
+            env: None,
+            description: "Refuse to index files larger than this many MiB.",
+        }],
+    ),
+    (
+        "skill",
+        &[
+            ConfigField {
+                name: SKILL_PLUGIN_DEV_FIELD,
+                ty: "boolean",
+                default: ConfigValue::Bool(DEFAULT_SKILL_PLUGIN_DEV),
+                min: None,
+                max: None,
+                env: None,
+                description: "Offer the builtin caudra-plugin-dev skill for writing caudra plugins. Needs `experimental.lua_plugins`.",
+            },
+            ConfigField {
+                name: SKILL_WORKFLOW_DEV_FIELD,
+                ty: "boolean",
+                default: ConfigValue::Bool(DEFAULT_SKILL_WORKFLOW_DEV),
+                min: None,
+                max: None,
+                env: None,
+                description: "Offer the builtin caudra-workflow-dev skill for writing and running workflows. Needs `experimental.workflows`.",
+            },
+        ],
+    ),
+    (
+        "task",
+        &[ConfigField {
+            name: TASK_MAX_CONCURRENT_FIELD,
+            ty: "integer",
+            default: ConfigValue::U64(DEFAULT_TASK_MAX_CONCURRENT as u64),
+            min: Some(MIN_TASK_MAX_CONCURRENT as u64),
+            max: None,
+            env: None,
+            description: "Max concurrently running subagents.",
+        }],
+    ),
+];
 
 /// Which of [`DEFAULT_BUILTINS`] production still loads from Lua. Empty: every
 /// built-in is native now. The sources stay in the tree as Lua-API coverage
@@ -375,15 +433,35 @@ pub const FILE_WRITE_TOOLS: &[&str] = &[
 pub enum ConfigValue {
     Bool(bool),
     U64(u64),
+    F64(f64),
+    /// A string, quoted when written as TOML.
     Str(&'static str),
+    /// A value already spelled as TOML, such as an array or an inline table.
+    Toml(&'static str),
+    /// No value until one is set.
+    Unset,
+    /// A default that depends on where Caudra runs, so only prose can state it.
+    Varies(&'static str),
 }
 
 impl ConfigValue {
     pub fn format_default(&self) -> String {
         match self {
-            Self::Bool(b) => if *b { "true" } else { "false" }.to_string(),
-            Self::U64(v) => v.to_string(),
-            Self::Str(s) => (*s).to_string(),
+            Self::Bool(value) => value.to_string(),
+            Self::U64(value) => value.to_string(),
+            Self::F64(value) => value.to_string(),
+            Self::Str(text) | Self::Toml(text) | Self::Varies(text) => (*text).to_string(),
+            Self::Unset => UNSET_DEFAULT.to_string(),
+        }
+    }
+
+    /// The default as a TOML value, or `None` when no value states it.
+    pub fn toml(&self) -> Option<String> {
+        match self {
+            Self::Bool(_) | Self::U64(_) | Self::Toml(_) => Some(self.format_default()),
+            Self::F64(value) => Some(format!("{value:?}")),
+            Self::Str(text) => Some(toml::Value::from(*text).to_string()),
+            Self::Unset | Self::Varies(_) => None,
         }
     }
 }
@@ -394,6 +472,7 @@ pub struct ConfigField {
     pub ty: &'static str,
     pub default: ConfigValue,
     pub min: Option<u64>,
+    pub max: Option<u64>,
     pub env: Option<&'static str>,
     pub description: &'static str,
 }
@@ -404,6 +483,7 @@ pub const TOP_LEVEL_FIELDS: &[ConfigField] = &[
         ty: "bool",
         default: ConfigValue::Bool(false),
         min: None,
+        max: None,
         env: None,
         description: "Start every session with YOLO mode (skip permission prompts, deny rules still apply); global config only",
     },
@@ -412,6 +492,7 @@ pub const TOP_LEVEL_FIELDS: &[ConfigField] = &[
         ty: "bool",
         default: ConfigValue::Bool(false),
         min: None,
+        max: None,
         env: None,
         description: "Start every session with Auto permission mode (preserve required prompts and screen unmatched calls); global config only. Needs `experimental.decision_engine`, otherwise sessions start in Ask",
     },
@@ -420,14 +501,16 @@ pub const TOP_LEVEL_FIELDS: &[ConfigField] = &[
         ty: "bool",
         default: ConfigValue::Bool(false),
         min: None,
+        max: None,
         env: None,
         description: "Start every session with fast mode, on the models that sell a fast tier (ignored otherwise)",
     },
     ConfigField {
         name: "always_thinking",
         ty: "bool | string",
-        default: ConfigValue::Bool(false),
+        default: ConfigValue::Unset,
         min: None,
+        max: None,
         env: None,
         description: "Start every session with extended thinking (true/\"adaptive\", \"off\", an effort level (\"minimal\" to \"max\"), or a token budget)",
     },
@@ -689,16 +772,15 @@ impl RawConfig {
     }
 
     fn index_max_file_size_mb(&self) -> Result<usize, ConfigError> {
-        const FIELD: &str = "max_file_size_mb";
         let invalid = |message: String| ConfigError::InvalidNativeToolOption {
             plugin: "index",
-            field: FIELD.into(),
+            field: INDEX_MAX_FILE_SIZE_FIELD.into(),
             message,
         };
-        let Some(opts) = self.native_tool_opts("index", &[FIELD])? else {
+        let Some(opts) = self.native_tool_opts("index", &[INDEX_MAX_FILE_SIZE_FIELD])? else {
             return Ok(DEFAULT_INDEX_MAX_FILE_SIZE_MB);
         };
-        let Some(value) = opts.get(FIELD) else {
+        let Some(value) = opts.get(INDEX_MAX_FILE_SIZE_FIELD) else {
             return Ok(DEFAULT_INDEX_MAX_FILE_SIZE_MB);
         };
         let value = value
@@ -718,16 +800,15 @@ impl RawConfig {
     }
 
     fn task_max_concurrent(&self) -> Result<usize, ConfigError> {
-        const FIELD: &str = "max_concurrent";
-        let Some(opts) = self.native_tool_opts("task", &[FIELD])? else {
+        let Some(opts) = self.native_tool_opts("task", &[TASK_MAX_CONCURRENT_FIELD])? else {
             return Ok(DEFAULT_TASK_MAX_CONCURRENT);
         };
-        let Some(value) = opts.get(FIELD) else {
+        let Some(value) = opts.get(TASK_MAX_CONCURRENT_FIELD) else {
             return Ok(DEFAULT_TASK_MAX_CONCURRENT);
         };
         let invalid = |message: String| ConfigError::InvalidNativeToolOption {
             plugin: "task",
-            field: FIELD.into(),
+            field: TASK_MAX_CONCURRENT_FIELD.into(),
             message,
         };
         let value = value
@@ -1758,10 +1839,18 @@ pub struct UiConfig {
     )]
     pub update_check: bool,
 
-    #[config(skip, default = "None")]
+    #[config(
+        ty = "string",
+        default = "None",
+        desc = "Name of the color theme to load at startup, overriding the theme you last picked with `/theme`. Unset keeps your last pick"
+    )]
     pub theme: Option<String>,
 
-    #[config(skip, default = "None")]
+    #[config(
+        ty = "string",
+        default = "None",
+        desc = "Light theme to pair with `theme`, in place of the one from the pairing table or for a theme that has no pair. `theme` becomes the dark half"
+    )]
     pub theme_light: Option<String>,
 
     #[config(skip, default = "ToolOutputLines::default()")]
@@ -1993,7 +2082,7 @@ pub struct AgentConfig {
     #[config(
         default = "None",
         ty = "u32 | string",
-        default_doc = "20%, or 10% when the model's window excludes output",
+        default_varies = "20%, or 10% when the model's window excludes output",
         desc = "Context reserved for compaction: token count or percent of the context window (e.g. \"20%\")"
     )]
     pub compaction_buffer: Option<CompactionBuffer>,
@@ -2417,6 +2506,7 @@ impl SnapshotsConfig {
             ty: "bool",
             default: ConfigValue::Bool(DEFAULT_SNAPSHOTS_ENABLED),
             min: None,
+            max: None,
             env: None,
             description: "Capture automatic workspace snapshots locally and remotely, including session-start and final captures. `false` disables capture and file revert without deleting existing snapshots or bypassing restore recovery. `--no-snapshots` overrides this for one run",
         },
@@ -2425,6 +2515,7 @@ impl SnapshotsConfig {
             ty: "u64",
             default: ConfigValue::U64(DEFAULT_SNAPSHOT_MAX_BYTES_MB),
             min: None,
+            max: None,
             env: None,
             description: "Largest working tree a capture will take, and the retention target for the compressed object store each workspace shares across its sessions. A workspace above it loses file revert rather than paying for a snapshot the store cannot keep",
         },
@@ -2433,6 +2524,7 @@ impl SnapshotsConfig {
             ty: "u64",
             default: ConfigValue::U64(DEFAULT_SNAPSHOT_MAX_FILES),
             min: None,
+            max: None,
             env: None,
             description: "Most files a capture will take, counted after ignore rules",
         },
@@ -2441,6 +2533,7 @@ impl SnapshotsConfig {
             ty: "u64",
             default: ConfigValue::U64(DEFAULT_SNAPSHOT_MAX_FILE_BYTES_MB),
             min: None,
+            max: None,
             env: None,
             description: "Largest single file a capture will take. A bigger one is left out of the snapshot and left alone on disk, so it cannot be reverted",
         },
@@ -2479,6 +2572,7 @@ impl RetentionConfig {
             ty: "string",
             default: ConfigValue::Str("directory"),
             min: None,
+            max: None,
             env: None,
             description: "Evaluate policies per working directory (`directory`) or across every session (`none`)",
         },
@@ -2487,22 +2581,25 @@ impl RetentionConfig {
             ty: "u64",
             default: ConfigValue::U64(DEFAULT_RETENTION_SWEEP_INTERVAL_HOURS),
             min: None,
+            max: None,
             env: None,
             description: "Hours between background sweeps. A sweep reclaims freed space, and applies `trim` and `forget` when they are set. `0` disables the sweep; `caudra storage` commands still work",
         },
         ConfigField {
             name: "trim",
             ty: "table",
-            default: ConfigValue::Str("{}"),
+            default: ConfigValue::Toml("{}"),
             min: None,
+            max: None,
             env: None,
             description: "Sessions outside this policy lose snapshots, tool output files, archives, and large rich outputs but stay resumable. Empty means never trim automatically",
         },
         ConfigField {
             name: "forget",
             ty: "table",
-            default: ConfigValue::Str("{}"),
+            default: ConfigValue::Toml("{}"),
             min: None,
+            max: None,
             env: None,
             description: "Sessions outside this policy are deleted. Empty means never delete automatically",
         },
@@ -2550,12 +2647,12 @@ pub struct TelemetryConfig {
              desc = "Where events go: `otlp`, `console`, `none`, or a comma-separated mix")]
     pub logs_exporter: Option<String>,
 
-    #[config(default = None, ty = "string", default_doc = "-",
+    #[config(default = None, ty = "string",
              env = "OTEL_EXPORTER_OTLP_PROTOCOL",
              desc = "OTLP protocol: `grpc`, `http/protobuf`, or `http/json`. Required when an exporter is `otlp`")]
     pub protocol: Option<String>,
 
-    #[config(default = None, ty = "string", default_doc = "-",
+    #[config(default = None, ty = "string",
              env = "OTEL_EXPORTER_OTLP_ENDPOINT",
              desc = "Collector endpoint. HTTP appends `/v1/metrics` and `/v1/logs`")]
     pub endpoint: Option<String>,
@@ -2575,12 +2672,12 @@ pub struct TelemetryConfig {
              desc = "Payload compression: `gzip` or `none`")]
     pub compression: Option<String>,
 
-    #[config(default = None, ty = "string", default_doc = "-",
+    #[config(default = None, ty = "string",
              env = "OTEL_EXPORTER_OTLP_METRICS_PROTOCOL",
              desc = "Metrics-only protocol override")]
     pub metrics_protocol: Option<String>,
 
-    #[config(default = None, ty = "string", default_doc = "-",
+    #[config(default = None, ty = "string",
              env = "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT",
              desc = "Metrics-only endpoint, used verbatim with no path appended")]
     pub metrics_endpoint: Option<String>,
@@ -2590,17 +2687,17 @@ pub struct TelemetryConfig {
              desc = "Metrics-only headers, merged over `headers`")]
     pub metrics_headers: Option<BTreeMap<String, String>>,
 
-    #[config(default = None, ty = "integer", default_doc = "-",
+    #[config(default = None, ty = "integer",
              env = "OTEL_EXPORTER_OTLP_METRICS_TIMEOUT",
              desc = "Metrics-only request timeout (ms)")]
     pub metrics_timeout_ms: Option<u64>,
 
-    #[config(default = None, ty = "string", default_doc = "-",
+    #[config(default = None, ty = "string",
              env = "OTEL_EXPORTER_OTLP_LOGS_PROTOCOL",
              desc = "Logs-only protocol override")]
     pub logs_protocol: Option<String>,
 
-    #[config(default = None, ty = "string", default_doc = "-",
+    #[config(default = None, ty = "string",
              env = "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT",
              desc = "Logs-only endpoint, used verbatim with no path appended")]
     pub logs_endpoint: Option<String>,
@@ -2610,7 +2707,7 @@ pub struct TelemetryConfig {
              desc = "Logs-only headers, merged over `headers`")]
     pub logs_headers: Option<BTreeMap<String, String>>,
 
-    #[config(default = None, ty = "integer", default_doc = "-",
+    #[config(default = None, ty = "integer",
              env = "OTEL_EXPORTER_OTLP_LOGS_TIMEOUT",
              desc = "Logs-only request timeout (ms)")]
     pub logs_timeout_ms: Option<u64>,
@@ -2742,7 +2839,7 @@ pub struct WorktreesConfig {
              desc = "What creates and removes worktrees for `/worktree`: `auto` uses Herdr inside a Herdr pane and git elsewhere, `git` always runs git")]
     pub backend: Option<WorktreeBackend>,
 
-    #[config(default = None, ty = "string", default_doc = "<data dir>/worktrees",
+    #[config(default = None, ty = "string", default_varies = "`<data dir>/worktrees`",
              desc = "Where git-created worktrees go, as `<directory>/<repository>/<branch>`. A leading `~/` is your home directory")]
     pub directory: Option<String>,
 }

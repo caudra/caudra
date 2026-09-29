@@ -12,6 +12,7 @@ use std::process::ExitCode;
 use std::thread;
 
 const CONTENT_DIR: &str = "site/docs/content";
+const STATIC_DIR: &str = "site/docs/static";
 
 type Page = (&'static str, fn() -> String);
 
@@ -60,10 +61,15 @@ fn check_file(path: &Path, expected: &str) -> bool {
 fn main() -> ExitCode {
     let check = std::env::args().any(|a| a == "--check");
 
-    let outputs = thread::scope(|scope| {
+    let pages = thread::scope(|scope| {
         let running = PAGES.map(|(section, generate)| (page_path(section), scope.spawn(generate)));
         running.map(|(path, page)| (path, page.join().unwrap()))
     });
+    let config_example = (
+        Path::new(STATIC_DIR).join(gen_config::CONFIG_EXAMPLE_FILE),
+        caudra_config::example_toml(),
+    );
+    let outputs: Vec<(PathBuf, String)> = pages.into_iter().chain([config_example]).collect();
 
     if check {
         let mismatches = outputs

@@ -5,6 +5,7 @@ use thiserror::Error;
 use url::Url;
 
 use crate::workcell::{WorkcellEndpoint, WorkcellEndpointError};
+use crate::{ConfigField, ConfigValue};
 
 pub const BASE_URL_ENV: &str = "TYPESAFE_BASE_URL";
 const DEFAULT_MODEL: &str = "jev-latest";
@@ -26,6 +27,25 @@ pub enum FeatureMode {
     Enforce,
 }
 
+impl FeatureMode {
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Shadow => "shadow",
+            Self::Advise => "advise",
+            Self::Enforce => "enforce",
+        }
+    }
+}
+
+/// One `[decisions.features]` key and the modes it accepts.
+pub struct DecisionFeature {
+    pub name: &'static str,
+    pub modes: &'static [FeatureMode],
+    /// What the feature does beyond `shadow`.
+    pub description: &'static str,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum DecisionsConfigError {
     #[error("invalid config: decisions.{field}: {message}")]
@@ -44,7 +64,7 @@ fn invalid(field: &'static str, message: &'static str) -> DecisionsConfigError {
 }
 
 macro_rules! features {
-    ($($field:ident: [$($mode:ident),+]),+ $(,)?) => {
+    ($($field:ident: [$($mode:ident),+], $description:literal);+ $(;)?) => {
         #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
         pub struct DecisionFeatures {
             $(pub $field: FeatureMode,)+
@@ -81,6 +101,12 @@ macro_rules! features {
         }
 
         impl DecisionFeatures {
+            pub const ALL: &[DecisionFeature] = &[$(DecisionFeature {
+                name: stringify!($field),
+                modes: &[FeatureMode::Off, FeatureMode::Shadow $(, FeatureMode::$mode)+],
+                description: $description,
+            }),+];
+
             pub fn validate(&self) -> Result<(), DecisionsConfigError> {
                 $(if !matches!(self.$field, FeatureMode::Off | FeatureMode::Shadow $(| FeatureMode::$mode)+) {
                     return Err(invalid(concat!("features.", stringify!($field)), "unsupported feature mode"));
@@ -97,14 +123,23 @@ macro_rules! features {
 
 features! {
     permission_advice: [Advise],
+        "Add warnings to an existing permission prompt without delaying the answer.";
     auto_screening: [Enforce],
+        "Escalate an eligible Auto call to a prompt on a flag or engine failure. No answer channel means denial.";
     shell_effect: [Advise],
+        "Warn about possible project writes during Plan review only when `shell_writes` is configured. Never establish read-only authority.";
     content_screening: [Advise],
+        "Add caution to flagged web/MCP output and tighten upload/credential Auto screening for the session. Content remains available.";
     shell_duration: [Advise, Enforce],
+        "Advise with local shell estimates. Enforce may fill an omitted timeout and select delivery at admission. Explicit timeouts stay unchanged.";
     tool_search: [Enforce],
+        "Rerank the existing lexical tool shortlist. This neither loads arbitrary names nor grants execution permission.";
     skill_suggestions: [Advise],
+        "Suggest a shortlisted skill. The agent still chooses whether to load it.";
     goal_prescreen: [Enforce],
+        "Skip an unlikely-to-pass goal evaluation within the continuation budget and continue work. Only the normal evaluator can certify completion.";
     subagent_routing: [Enforce],
+        "Choose a model job for a new unpinned subagent from its task label, not its full prompt. Explicit jobs, profile pins, and continuations keep their routing.";
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -138,6 +173,90 @@ impl Default for DecisionThresholds {
 }
 
 impl DecisionThresholds {
+    pub const FIELDS: &[ConfigField] = &[
+        ConfigField {
+            name: "permission_flag",
+            ty: "float",
+            default: ConfigValue::F64(DEFAULT_FLAG_THRESHOLD),
+            min: None,
+            max: None,
+            env: None,
+            description: "Probability for a permission warning.",
+        },
+        ConfigField {
+            name: "auto_flag",
+            ty: "float",
+            default: ConfigValue::F64(DEFAULT_FLAG_THRESHOLD),
+            min: None,
+            max: None,
+            env: None,
+            description: "Probability for escalating an eligible Auto call.",
+        },
+        ConfigField {
+            name: "content_injection",
+            ty: "float",
+            default: ConfigValue::F64(DEFAULT_CONFIDENCE_THRESHOLD),
+            min: None,
+            max: None,
+            env: None,
+            description: "Probability that sampled content attempts instruction injection.",
+        },
+        ConfigField {
+            name: "content_addressed_to_agent",
+            ty: "float",
+            default: ConfigValue::F64(DEFAULT_CONFIDENCE_THRESHOLD),
+            min: None,
+            max: None,
+            env: None,
+            description: "Probability that sampled content addresses the agent.",
+        },
+        ConfigField {
+            name: "shell_endless",
+            ty: "float",
+            default: ConfigValue::F64(DEFAULT_CONFIDENCE_THRESHOLD),
+            min: None,
+            max: None,
+            env: None,
+            description: "Probability that a shell command runs until stopped.",
+        },
+        ConfigField {
+            name: "shell_heavy",
+            ty: "float",
+            default: ConfigValue::F64(DEFAULT_CONFIDENCE_THRESHOLD),
+            min: None,
+            max: None,
+            env: None,
+            description: "Probability for a heavy-command prior and confidence required for a duration choice.",
+        },
+        ConfigField {
+            name: "routing_confidence",
+            ty: "float",
+            default: ConfigValue::F64(DEFAULT_CONFIDENCE_THRESHOLD),
+            min: None,
+            max: None,
+            env: None,
+            description: "Confidence required for tool search, skill suggestions, and subagent routing. Tool-search choice probability must also meet it.",
+        },
+        ConfigField {
+            name: "goal_skip_below",
+            ty: "float",
+            default: ConfigValue::F64(DEFAULT_GOAL_SKIP_BELOW),
+            min: None,
+            max: None,
+            env: None,
+            description: "Skip an evaluator at or below this completion probability, within the continuation budget.",
+        },
+        ConfigField {
+            name: "shell_writes",
+            ty: "float",
+            default: ConfigValue::Unset,
+            min: None,
+            max: None,
+            env: None,
+            description: "Optional project-write warning threshold. Omission leaves the warning disabled. No built-in enforcement threshold.",
+        },
+    ];
+
     fn validate(&self) -> Result<(), DecisionsConfigError> {
         for (field, value) in [
             ("thresholds.permission_flag", Some(self.permission_flag)),
@@ -355,6 +474,99 @@ impl RawDecisionsConfig {
 }
 
 impl DecisionsConfig {
+    pub const FIELDS: &[ConfigField] = &[
+        ConfigField {
+            name: "endpoint",
+            ty: "string",
+            default: ConfigValue::Unset,
+            min: None,
+            max: None,
+            env: None,
+            description: "Full request URL. HTTPS required except for numeric loopback HTTP or explicit `allow_http` consent. No credentials, query, fragment, whitespace, or control characters.",
+        },
+        ConfigField {
+            name: "model",
+            ty: "string",
+            default: ConfigValue::Str(DEFAULT_MODEL),
+            min: None,
+            max: None,
+            env: None,
+            description: "Decision model identifier, nonblank and without control characters.",
+        },
+        ConfigField {
+            name: "api_key_env",
+            ty: "string",
+            default: ConfigValue::Str(DEFAULT_API_KEY_ENV),
+            min: None,
+            max: None,
+            env: None,
+            description: "Environment variable containing the optional credential, never the credential itself. Project environment values are excluded.",
+        },
+        ConfigField {
+            name: "allow_remote",
+            ty: "boolean",
+            default: ConfigValue::Bool(false),
+            min: None,
+            max: None,
+            env: None,
+            description: "Explicit global consent to send decision context to a non-loopback endpoint.",
+        },
+        ConfigField {
+            name: "allow_http",
+            ty: "boolean",
+            default: ConfigValue::Bool(false),
+            min: None,
+            max: None,
+            env: None,
+            description: "Global-only opt-in for non-loopback HTTP. Also requires `allow_remote = true`. Use only with transport protection you control, such as a trusted encrypted tunnel.",
+        },
+        ConfigField {
+            name: "timeout_ms",
+            ty: "integer",
+            default: ConfigValue::U64(DEFAULT_TIMEOUT_MS),
+            min: None,
+            max: None,
+            env: None,
+            description: "Positive decision-request deadline in milliseconds, separate from shell execution timeouts.",
+        },
+        ConfigField {
+            name: "log",
+            ty: "boolean",
+            default: ConfigValue::Bool(false),
+            min: None,
+            max: None,
+            env: None,
+            description: "Retain bounded decision records in the separate local `decisions.db`.",
+        },
+        ConfigField {
+            name: "log_retention_days",
+            ty: "integer",
+            default: ConfigValue::U64(DEFAULT_LOG_RETENTION_DAYS as u64),
+            min: None,
+            max: None,
+            env: None,
+            description: "Positive retention period for decision records.",
+        },
+        ConfigField {
+            name: "features",
+            ty: "table",
+            default: ConfigValue::Toml("{}"),
+            min: None,
+            max: None,
+            env: None,
+            description: "Per-feature modes below.",
+        },
+        ConfigField {
+            name: "thresholds",
+            ty: "table",
+            default: ConfigValue::Toml("{}"),
+            min: None,
+            max: None,
+            env: None,
+            description: "Probability thresholds, all finite and within 0–1 inclusive.",
+        },
+    ];
+
     pub fn validate(&self) -> Result<(), DecisionsConfigError> {
         if let Some(endpoint) = &self.endpoint {
             parse_endpoint(endpoint.as_str(), self.allow_remote, self.allow_http)?;
@@ -499,6 +711,14 @@ mod tests {
                 toml::from_str(&format!("[features]\n{feature} = '{mode}'")).unwrap();
             assert_eq!(raw.resolve(None).is_ok(), allowed, "{feature}: {mode}");
         }
+    }
+
+    #[test_case(FeatureMode::Off)]
+    #[test_case(FeatureMode::Shadow)]
+    #[test_case(FeatureMode::Advise)]
+    #[test_case(FeatureMode::Enforce)]
+    fn feature_mode_names_match_their_config_spelling(mode: FeatureMode) {
+        assert_eq!(serde_json::to_value(&mode).unwrap(), mode.as_str());
     }
 
     #[test_case("http://127.0.0.1:8000/v1/systemone", false, true; "numeric_loopback")]

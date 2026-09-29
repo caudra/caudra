@@ -22,7 +22,7 @@ When interactive Caudra starts in a Herdr pane, it automatically reports native 
 
 `caudra --session <id>` opens a local session in the directory it works in, wherever you run the command, so project config, plugins and MCP servers come from that directory. A session left in a removed worktree moves back to a remaining checkout first.
 
-Some flags and subcommands belong to [experimental features](/docs/configuration/#experimental-features), which stay off until the global `caudra.toml` turns them on. While a feature is off, `--help` does not list them. Using one anyway stops Caudra with an error that names the `experimental.*` key to set. The exception is `--no-jit`, which has no effect without Lua. `caudra update`, `caudra rollback`, and `caudra logs` do not read settings, so a broken `caudra.toml` cannot stop them.
+Some flags and subcommands belong to [experimental features](/docs/configuration/#experimental-features), which stay off until the global `caudra.toml` turns them on. While a feature is off, `--help` does not list them. Using one anyway stops Caudra with an error that names the `experimental.*` key to set. The exception is `--no-jit`, which has no effect without Lua. `caudra update`, `caudra rollback`, `caudra logs`, and `caudra config` do not read settings, so a broken `caudra.toml` cannot stop them.
 
 ## caudra decisions
 
@@ -446,6 +446,15 @@ caudra skills --dirs          # candidate directories: selected, superseded, or 
 ```
 
 Applies the same directory precedence a real run does, including the builtin `caudra-workflow-dev` and `caudra-plugin-dev` skills when their `plugins.skill` switches and their experimental features are on. `--dirs` answers why a skill is missing: a directory reads `superseded` when a higher-priority one exists, and `missing` when nothing is there. See [Skills](/docs/skills/#where-skills-live).
+
+### `caudra config`
+
+```bash
+caudra config example                         # every caudra.toml setting, commented out
+caudra config example > caudra.example.toml   # keep a copy to read or diff
+```
+
+Prints every `caudra.toml` setting with its type, default, allowed range, environment variable, and description. Each setting is commented out, so the whole output is a valid config that changes nothing. To change a setting, copy its line into your `caudra.toml` under the same table and remove the `#`. It does not need your settings, so it works even when `caudra.toml` has an error. The same text is available as [caudra.example.toml](/docs/caudra.example.toml). See [Configuration](/docs/configuration/).
 
 ### `caudra logs`
 

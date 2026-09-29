@@ -1,34 +1,32 @@
 use std::fmt::Write;
-use std::sync::Arc;
 
-use caudra_agent::tools::ToolRegistry;
 use caudra_config::config_file::CONFIG_VERSION;
+use caudra_config::decisions::{DecisionFeatures, DecisionThresholds, FeatureMode};
+use caudra_config::steering::{SteeringRule, SteeringRulesConfig};
 use caudra_config::{
-    AgentConfig, ConfigField, DEFAULT_MAX_LOG_FILES, DEFAULT_MAX_OUTPUT_LINES,
+    AgentConfig, ConfigField, ConfigValue, DEFAULT_MAX_LOG_FILES, DEFAULT_MAX_OUTPUT_LINES,
     DEFAULT_MOUSE_SCROLL_LINES, DecisionsConfig, Feature, FeatureFlags, MIN_TOOL_OUTPUT_LINES,
-    ProviderConfig, RetentionConfig, SnapshotsConfig, StorageConfig, TOP_LEVEL_FIELDS,
-    TelemetryConfig, ToolOutputLines, UiConfig, WorktreesConfig,
+    NATIVE_PLUGIN_OPTIONS, ProviderConfig, RetentionConfig, SnapshotsConfig, SteeringConfig,
+    StorageConfig, TOP_LEVEL_FIELDS, TelemetryConfig, ToolOutputLines, UiConfig, WorktreesConfig,
 };
-use caudra_lua::{OptionSpec, OptionType, PluginHost, PluginOptionSpecs};
-use serde_json::Value;
 
-const PLUGIN_DEV_DESC: &str =
-    "Offer the builtin caudra-plugin-dev skill for writing caudra plugins.";
-const WORKFLOW_DEV_DESC: &str =
-    "Offer the builtin caudra-workflow-dev skill for writing and running workflows.";
-const MAX_CONCURRENT_DESC: &str = "Max concurrently running subagents.";
-/// A default the reference shows for a setting that has none.
-const UNSET: &str = "unset";
+pub const CONFIG_EXAMPLE_FILE: &str = "caudra.example.toml";
+/// The one feature with a section of its own further down the page.
+const SHELL_DURATION_FEATURE: &str = "shell_duration";
+const SHELL_DURATION_LINK: &str = " See [shell duration](#shell-duration).";
 
-fn needs(description: &str, feature: Feature) -> String {
-    format!("{description} Needs `{feature}`.")
+/// Shown bare, since the text is prose rather than a value to copy.
+fn default_cell(value: &ConfigValue) -> String {
+    match value {
+        ConfigValue::Unset | ConfigValue::Varies(_) => value.format_default(),
+        _ => format!("`{}`", value.format_default()),
+    }
 }
 
-fn format_default(value: &Value) -> String {
-    if value.is_null() {
-        UNSET.into()
-    } else {
-        format!("`{value}`")
+fn range_cell(field: &ConfigField) -> String {
+    match (field.min, field.max) {
+        (Some(min), Some(max)) => format!("{min}–{max}"),
+        _ => "-".into(),
     }
 }
 
@@ -51,6 +49,11 @@ fn write_table(out: &mut String, fields: &[ConfigField]) {
             f.min.map_or("-".to_string(), |v| v.to_string())
         }));
     }
+    if fields.iter().any(|f| f.max.is_some()) {
+        extras.push(("Max", |f: &ConfigField| {
+            f.max.map_or("-".to_string(), |v| v.to_string())
+        }));
+    }
 
     let header: String = extras
         .iter()
@@ -66,10 +69,10 @@ fn write_table(out: &mut String, fields: &[ConfigField]) {
             .collect();
         writeln!(
             out,
-            "| `{name}` | {ty} | `{default}` |{cells} {desc} |",
+            "| `{name}` | {ty} | {default} |{cells} {desc} |",
             name = f.name,
             ty = escape_pipes(f.ty),
-            default = f.default.format_default(),
+            default = default_cell(&f.default),
             desc = f.description,
         )
         .unwrap();
@@ -209,97 +212,15 @@ fn native_tool_note(plugin: &str) -> Option<String> {
     }
 }
 
-fn write_plugin_options(out: &mut String, specs: &PluginOptionSpecs) {
-    for (plugin, options) in specs {
+fn write_plugin_options(out: &mut String) {
+    for (plugin, fields) in NATIVE_PLUGIN_OPTIONS {
         writeln!(out, "### `plugins.{plugin}`\n").unwrap();
         if let Some(note) = native_tool_note(plugin) {
             writeln!(out, "{note}\n").unwrap();
         }
-        writeln!(out, "| Field | Type | Default | Min | Description |").unwrap();
-        writeln!(out, "|-------|------|---------|-----|-------------|").unwrap();
-        for o in options {
-            let default = o
-                .default
-                .as_ref()
-                .map_or("-".to_string(), |d| format!("`{d}`"));
-            let min = o.min.map_or("-".to_string(), |m| m.to_string());
-            writeln!(
-                out,
-                "| `{name}` | {ty} | {default} | {min} | {desc} |",
-                name = o.name,
-                ty = o.ty,
-                desc = o.desc,
-            )
-            .unwrap();
-        }
+        write_table(out, fields);
         writeln!(out).unwrap();
     }
-}
-
-fn collect_plugin_options() -> PluginOptionSpecs {
-    let registry = Arc::new(ToolRegistry::new());
-    let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
-    let workcell = caudra_workcell::WorkcellHost::new(cwd, None).expect("Workcell host");
-    workcell
-        .register_documented_tools(&registry)
-        .expect("Workcell tools");
-    let mut host = PluginHost::new(registry).expect("plugin host");
-    host.load_production_builtins(&caudra_config::PluginsConfig::from_plugins(
-        std::collections::HashMap::new(),
-    ))
-    .expect("loading builtins");
-    let mut specs = host.plugin_options().expect("collecting plugin options");
-    specs.insert(
-        "index".into(),
-        vec![OptionSpec {
-            name: "max_file_size_mb".into(),
-            ty: OptionType::Integer,
-            default: Some(serde_json::json!(
-                caudra_config::DEFAULT_INDEX_MAX_FILE_SIZE_MB
-            )),
-            min: Some(caudra_config::MIN_INDEX_MAX_FILE_SIZE_MB as f64),
-            desc: format!(
-                "Refuse to index files larger than this many MiB (maximum {}).",
-                caudra_config::MAX_INDEX_MAX_FILE_SIZE_MB
-            ),
-        }],
-    );
-    specs.insert(
-        "task".into(),
-        vec![OptionSpec {
-            name: "max_concurrent".into(),
-            ty: OptionType::Integer,
-            default: Some(serde_json::json!(
-                caudra_config::DEFAULT_TASK_MAX_CONCURRENT
-            )),
-            min: Some(caudra_config::MIN_TASK_MAX_CONCURRENT as f64),
-            desc: MAX_CONCURRENT_DESC.into(),
-        }],
-    );
-    specs.insert(
-        "skill".into(),
-        vec![
-            OptionSpec {
-                name: "plugin_dev".into(),
-                ty: OptionType::Boolean,
-                default: Some(serde_json::json!(caudra_config::DEFAULT_SKILL_PLUGIN_DEV)),
-                min: None,
-                desc: needs(PLUGIN_DEV_DESC, Feature::LuaPlugins),
-            },
-            OptionSpec {
-                name: "workflow_dev".into(),
-                ty: OptionType::Boolean,
-                default: Some(serde_json::json!(caudra_config::DEFAULT_SKILL_WORKFLOW_DEV)),
-                min: None,
-                desc: needs(WORKFLOW_DEV_DESC, Feature::Workflows),
-            },
-        ],
-    );
-    assert!(
-        !specs.is_empty(),
-        "no plugin declared options; the plugins reference would be empty"
-    );
-    specs
 }
 
 fn write_theme_section(out: &mut String) {
@@ -453,32 +374,22 @@ fn write_worktrees_section(out: &mut String) {
 
 fn write_steering_section(out: &mut String) {
     out.push_str(
-        r###"### `agent.steering`
-
-Automatic steering repairs unusable model output and can add bounded guidance about repeated behavior. All eight rules are enabled by default. Configure overrides in the `[agent.steering]` table. All fields are optional.
-
-| Field | Type | Default | Limits and meaning |
-|-------|------|---------|--------------------|
-| `enabled` | boolean | `true` | Master switch for automatic steering, including truncation recovery and repeat-policy blocking. |
-| `max_recoveries` | integer | `32` | 0–1024 corrective continuations per externally initiated invocation. Zero prevents optional recovery continuations. |
-| `max_advisories` | integer | `4` | 0–1024 advisory injections per invocation. Zero suppresses advisories. |
-| `max_stalled_turns` | integer | `5` | 0–1024 consecutive turns carrying neither a tool call nor visible text before the run ends, whichever rule intervened. Zero disables the backstop. |
-| `rules` | table | `{}` | Overrides by rule name, listed below. Omission uses built-in defaults. |
-| `models` | table | `{}` | Up to 256 exact `provider/model-id` keys, each with its own overrides. |
-
-#### Rules
-
-| Rule in `rules` | Enabled by default | Behavior |
-|-----------------|--------------------|----------|
-| `truncation` | `true` | Continue output cut off by the response token limit, up to 3 corrective requests per externally initiated invocation. |
-| `empty_response` | `true` | Continue after empty output, with separate per-episode limits after recent tools and while idle. |
-| `repeated_tool_call` | `true` | Refuse the third consecutive identical top-level tool name/input before execution. Native batch children do not acquire this hard blocker. |
-| `protocol_mismatch` | `true` | Correct an explicit provider tool-use indication with no actual tool calls, up to 2 continuations per episode. |
-| `missing_task_report` | `true` | Request a missing task summary or required structured report, up to 2 corrections. |
-| `abandoned_turn` | `true` | Continue a turn that ended by announcing work the response never performed, up to 2 continuations per episode. Spending the allowance accepts the text rather than failing the turn. |
-| `repetition` | `true` | Advise on short exact tool cycles, including normalized native batch leaf calls, or repeated normalized assistant text. |
-| `tool_planning` | `true` | Advise after consecutive failed tool attempts across responses, including attempts with different tools or inputs. Any successful tool result ends the failure episode. Repeating a successful call is insufficient. |
-
+        "### `agent.steering`\n\n\
+         Automatic steering repairs unusable model output and can add bounded guidance about \
+         repeated behavior. Every rule is enabled by default. Configure overrides in the \
+         `[agent.steering]` table. All fields are optional.\n\n",
+    );
+    write_table(out, SteeringConfig::FIELDS);
+    out.push_str(
+        "\n#### Rules\n\n\
+         | Rule in `rules` | Behavior |\n\
+         |-----------------|----------|\n",
+    );
+    for rule in SteeringRulesConfig::RULES {
+        writeln!(out, "| `{}` | {} |", rule.name, rule.description).unwrap();
+    }
+    out.push_str(
+        r###"
 Recovery and advisory budgets are separate. Advisory rules allow at most 4 total injections per invocation, with a default cooldown of 3 completed model responses for each rule.
 
 Tool-planning evidence starts after the last response containing any successful tool result, including results outside the retained batch window. A background admission ends the failure episode without proving that the background work succeeded. Later terminal outcomes do not retroactively change that admission into a failed attempt.
@@ -491,36 +402,35 @@ Advisories only accompany an independently scheduled next request. They never re
 
 Each table at `agent.steering.rules.<rule>` accepts these common fields:
 
-| Field | Type | Default | Limits and meaning |
-|-------|------|---------|--------------------|
-| `enabled` | boolean | `true` | Explicit `false` disables this rule. |
-| `prompt` | string | unset | Use built-in guidance when omitted. Custom text must be nonblank and at most 16,384 UTF-8 bytes. |
-
+"###,
+    );
+    write_table(out, SteeringRule::COMMON_FIELDS);
+    out.push_str(
+        r###"
 Custom prompts replace guidance only. They are literal user-configured text, without template expansion or executable expressions. They do not change triggers, budgets, enforcement, or factual tool-failure information. A custom prompt cannot authorize a tool or turn a rejected call into an executed one.
 
 The remaining fields are integers. All ranges are inclusive. Set `enabled = false` to disable a rule rather than setting a positive threshold to zero.
 
 | Field under `rules` | Default | Range | Unit and meaning |
 |---------------------|---------|-------|------------------|
-| `truncation.max_attempts` | `3` | 1–1024 | Actual truncation-correction requests per externally initiated invocation, shared across truncation episodes. |
-| `empty_response.max_after_tools` | `3` | 1–1024 | Empty-output continuations per episode after recent tool results. |
-| `empty_response.max_idle` | `2` | 1–1024 | Empty-output continuations per episode without recent tool results. |
-| `empty_response.max_barren` | `1` | 1–1024 | Continuations per episode after a response that carried no content at all. Clamped by the limit above; repeating an unchanged request is not a retry. |
-| `empty_response.recent_tool_window` | `5` | 1–4096 | Non-padding history messages inspected for recent tool results. |
-| `repeated_tool_call.threshold` | `3` | 2–1024 | Consecutive identical top-level calls. Refuse the call reaching this threshold. |
-| `protocol_mismatch.max_attempts` | `2` | 1–1024 | Protocol corrective continuations per episode. |
-| `missing_task_report.max_attempts` | `2` | 1–1024 | Additional report-correction prompts per task invocation. |
-| `abandoned_turn.max_attempts` | `2` | 1–1024 | Continuations per episode after a turn that announced work instead of doing it. |
-| `repetition.window` | `24` | 1–4096 | Recent normalized leaf tool calls retained for cycle detection. |
-| `repetition.cycle_repeats` | `3` | 2–1024 | Exact repetitions of a tool cycle needed for an advisory. |
-| `repetition.max_cycle` | `4` | 2–1024 | Maximum cycle length in leaf calls. Candidate cycle lengths start at 2. |
-| `repetition.text_window` | `8` | 1–4096 | Recent completed assistant responses retained for text repetition. |
-| `repetition.text_repeats` | `3` | 2–1024 | Matching nontrivial normalized assistant responses needed for an advisory. |
-| `repetition.cooldown` | `3` | 1–1024 | Completed model responses between this rule's advisories. |
-| `tool_planning.after_calls` | `6` | 1–1024 | Number of most recent leaf tool calls that must all have failed since the last response containing a successful result. |
-| `tool_planning.after_responses` | `3` | 1–1024 | Distinct completed model responses represented by those failed calls. |
-| `tool_planning.cooldown` | `3` | 1–1024 | Completed model responses between this rule's advisories. |
-
+"###,
+    );
+    for rule in SteeringRulesConfig::RULES {
+        for field in rule.fields {
+            writeln!(
+                out,
+                "| `{}.{}` | {} | {} | {} |",
+                rule.name,
+                field.name,
+                default_cell(&field.default),
+                range_cell(field),
+                field.description,
+            )
+            .unwrap();
+        }
+    }
+    out.push_str(
+        r###"
 Validation also requires:
 
 - `repetition.window >= repetition.max_cycle * repetition.cycle_repeats`.
@@ -585,9 +495,7 @@ Disabling the master switch or setting `rules.truncation.enabled = false` stops 
 }
 
 fn write_decisions_section(out: &mut String) {
-    let config = DecisionsConfig::default();
-    writeln!(
-        out,
+    out.push_str(
         "### `decisions`\n\n\
          Configure the optional typed decision engine in the `[decisions]` table. \
          The engine is experimental and needs `decision_engine = true` under \
@@ -601,20 +509,11 @@ fn write_decisions_section(out: &mut String) {
          to `\"off\"`, set `log = false`, or keep or shorten inherited log retention. \
          Other project overrides are errors, even when they repeat a global value. \
          Disabling globally required Auto screening or its active content screening restores \
-         prompting for eligible Auto calls.\n\n\
-         | Field | Type | Default | Meaning |\n\
-         |-------|------|---------|---------|\n\
-         | `endpoint` | string | {UNSET} | Full request URL. HTTPS required except for numeric loopback HTTP or explicit `allow_http` consent. No credentials, query, fragment, whitespace, or control characters. |\n\
-         | `model` | string | `\"{model}\"` | Decision model identifier, nonblank and without control characters. |\n\
-         | `api_key_env` | string | `\"{api_key_env}\"` | Environment variable containing the optional credential, never the credential itself. Project environment values are excluded. |\n\
-         | `allow_remote` | boolean | `{allow_remote}` | Explicit global consent to send decision context to a non-loopback endpoint. |\n\
-         | `allow_http` | boolean | `{allow_http}` | Global-only opt-in for non-loopback HTTP. Also requires `allow_remote = true`. Use only with transport protection you control, such as a trusted encrypted tunnel. |\n\
-         | `timeout_ms` | integer | `{timeout_ms}` | Positive decision-request deadline in milliseconds, separate from shell execution timeouts. |\n\
-         | `log` | boolean | `{log}` | Retain bounded decision records in the separate local `decisions.db`. |\n\
-         | `log_retention_days` | integer | `{retention}` | Positive retention period for decision records. |\n\
-         | `features` | table | all `\"off\"` | Per-feature modes below. |\n\
-         | `thresholds` | table | defaults below | Probability thresholds, all finite and within 0–1 inclusive. |\n\n\
-         `TYPESAFE_BASE_URL` replaces only the origin of an explicitly configured endpoint, \
+         prompting for eligible Auto calls.\n\n",
+    );
+    write_table(out, DecisionsConfig::FIELDS);
+    out.push_str(
+        "\n`TYPESAFE_BASE_URL` replaces only the origin of an explicitly configured endpoint, \
          preserving its path. It must be an origin without a path and passes the same endpoint \
          and both transport opt-in checks. The variable alone never activates the engine. \
          Requests ignore ambient proxies and do not follow redirects. `localhost` is a DNS name, \
@@ -629,68 +528,26 @@ fn write_decisions_section(out: &mut String) {
          listed below, never permission grants or relaxed executor restrictions. \
          Unsupported modes are configuration errors. Passive features are suppressed in YOLO.\n\n\
          | Feature | Default | Supported modes | Behavior beyond shadow |\n\
-         |---------|---------|-----------------|------------------------|",
-        model = config.model,
-        api_key_env = config.api_key_env,
-        allow_remote = config.allow_remote,
-        allow_http = config.allow_http,
-        timeout_ms = config.timeout_ms,
-        log = config.log,
-        retention = config.log_retention_days,
-    )
-    .unwrap();
-    let features = serde_json::to_value(&config.features).unwrap();
-    for (name, modes, behavior) in [
-        (
-            "permission_advice",
-            "`off`, `shadow`, `advise`",
-            "Add warnings to an existing permission prompt without delaying the answer.",
-        ),
-        (
-            "auto_screening",
-            "`off`, `shadow`, `enforce`",
-            "Escalate an eligible Auto call to a prompt on a flag or engine failure. No answer channel means denial.",
-        ),
-        (
-            "shell_effect",
-            "`off`, `shadow`, `advise`",
-            "Warn about possible project writes during Plan review only when `shell_writes` is configured. Never establish read-only authority.",
-        ),
-        (
-            "content_screening",
-            "`off`, `shadow`, `advise`",
-            "Add caution to flagged web/MCP output and tighten upload/credential Auto screening for the session. Content remains available.",
-        ),
-        (
-            "shell_duration",
-            "`off`, `shadow`, `advise`, `enforce`",
-            "Advise with local shell estimates. Enforce may fill an omitted timeout and select delivery at admission. Explicit timeouts stay unchanged. See [shell duration](#shell-duration).",
-        ),
-        (
-            "tool_search",
-            "`off`, `shadow`, `enforce`",
-            "Rerank the existing lexical tool shortlist. This neither loads arbitrary names nor grants execution permission.",
-        ),
-        (
-            "skill_suggestions",
-            "`off`, `shadow`, `advise`",
-            "Suggest a shortlisted skill. The agent still chooses whether to load it.",
-        ),
-        (
-            "goal_prescreen",
-            "`off`, `shadow`, `enforce`",
-            "Skip an unlikely-to-pass goal evaluation within the continuation budget and continue work. Only the normal evaluator can certify completion.",
-        ),
-        (
-            "subagent_routing",
-            "`off`, `shadow`, `enforce`",
-            "Choose a model job for a new unpinned subagent from its task label, not its full prompt. Explicit jobs, profile pins, and continuations keep their routing.",
-        ),
-    ] {
+         |---------|---------|-----------------|------------------------|\n",
+    );
+    for feature in DecisionFeatures::ALL {
+        let modes: Vec<String> = feature
+            .modes
+            .iter()
+            .map(|mode| format!("`{}`", mode.as_str()))
+            .collect();
+        let see_also = if feature.name == SHELL_DURATION_FEATURE {
+            SHELL_DURATION_LINK
+        } else {
+            ""
+        };
         writeln!(
             out,
-            "| `{name}` | `{}` | {modes} | {behavior} |",
-            features[name]
+            "| `{}` | `{}` | {} | {}{see_also} |",
+            feature.name,
+            FeatureMode::default().as_str(),
+            modes.join(", "),
+            feature.description,
         )
         .unwrap();
     }
@@ -698,49 +555,9 @@ fn write_decisions_section(out: &mut String) {
         "\n#### `decisions.thresholds`\n\n\
          Flag thresholds trigger at or above the configured value. Goal prescreening uses an \
          at-or-below comparison. Content screening requires both signals in a sampled chunk. \
-         After content is flagged, Auto uses 75% of `auto_flag` for upload and credential flags.\n\n\
-         | Field | Default | Meaning |\n\
-         |-------|---------|---------|\n",
+         After content is flagged, Auto uses 75% of `auto_flag` for upload and credential flags.\n\n",
     );
-    let thresholds = serde_json::to_value(&config.thresholds).unwrap();
-    for (name, meaning) in [
-        ("permission_flag", "Probability for a permission warning."),
-        (
-            "auto_flag",
-            "Probability for escalating an eligible Auto call.",
-        ),
-        (
-            "content_injection",
-            "Probability that sampled content attempts instruction injection.",
-        ),
-        (
-            "content_addressed_to_agent",
-            "Probability that sampled content addresses the agent.",
-        ),
-        (
-            "shell_endless",
-            "Probability that a shell command runs until stopped.",
-        ),
-        (
-            "shell_heavy",
-            "Probability for a heavy-command prior and confidence required for a duration choice.",
-        ),
-        (
-            "routing_confidence",
-            "Confidence required for tool search, skill suggestions, and subagent routing. Tool-search choice probability must also meet it.",
-        ),
-        (
-            "goal_skip_below",
-            "Skip an evaluator at or below this completion probability, within the continuation budget.",
-        ),
-        (
-            "shell_writes",
-            "Optional project-write warning threshold. Omission leaves the warning disabled. No built-in enforcement threshold.",
-        ),
-    ] {
-        let default = format_default(&thresholds[name]);
-        writeln!(out, "| `{name}` | {default} | {meaning} |").unwrap();
-    }
+    write_table(out, DecisionThresholds::FIELDS);
     out.push_str(
         "\n#### Shell duration\n\n\
          `shell_duration` applies only to eligible local native shell calls, not remote workspaces \
@@ -873,6 +690,8 @@ max_file_size_mb = 4
 
 All fields are optional. A file may start with `version = {version}`, and a file without it counts as version {version}. Typos in field names and values of the wrong type cause an error right away, with the file and line.
 
+For every setting in one file, with its type, default, and description, run [`caudra config example`](/docs/cli/#caudra-config) or download [{example_file}](/docs/{example_file}).
+
 `provider.allowed_models` is a list of glob patterns for qualified `provider/model-id` specs. `*` also matches `/`, so `opencode/*` includes nested model IDs. When the list is empty or omitted, every model is allowed. `provider.excluded_models` removes matching models after that, so exclusions always win. A project list replaces the matching global list. Omit it to inherit, or use `[]` to clear it. The policy applies to selectors, CLI and API model changes, delegation, and `caudra models`.
 ",
         mouse_scroll = DEFAULT_MOUSE_SCROLL_LINES + 2,
@@ -881,6 +700,7 @@ All fields are optional. A file may start with `version = {version}`, and a file
         max_output_lines = DEFAULT_MAX_OUTPUT_LINES + 1000,
         max_log_files = DEFAULT_MAX_LOG_FILES / 2,
         version = CONFIG_VERSION,
+        example_file = CONFIG_EXAMPLE_FILE,
     )
     .unwrap();
     write_experimental_section(&mut out);
@@ -940,7 +760,7 @@ enabled = false
     )
     .unwrap();
 
-    write_plugin_options(&mut out, &collect_plugin_options());
+    write_plugin_options(&mut out);
 
     writeln!(out, "## Validation\n").unwrap();
     writeln!(
@@ -1022,14 +842,14 @@ Related pages: [Skills](/docs/skills/), [CLI](/docs/cli/), [Providers](/docs/pro
 mod tests {
     use caudra_config::config_file::GlobalConfigFile;
     use caudra_config::{
-        AgentConfig, DecisionsConfig, Feature, SteeringConfig, decisions::RawDecisionsConfig,
+        AgentConfig, ConfigValue, DecisionsConfig, Feature, SteeringConfig,
+        decisions::RawDecisionsConfig,
     };
     use serde_json::{Value, json};
     use test_case::test_case;
 
     use super::{
-        UNSET, generate, write_decisions_section, write_experimental_section,
-        write_steering_section,
+        generate, write_decisions_section, write_experimental_section, write_steering_section,
     };
 
     const MODEL: &str = "provider/model";
@@ -1092,7 +912,7 @@ mod tests {
                 .unwrap();
             assert_eq!(
                 row.split('|').nth(2).unwrap().trim(),
-                format!("`{default}`")
+                format!("`{}`", default.as_str().unwrap())
             );
             let documented = row
                 .split('|')
@@ -1112,11 +932,11 @@ mod tests {
         write_decisions_section(&mut reference);
         for (field, value) in defaults.as_object().unwrap() {
             let default = if value.is_null() {
-                UNSET.into()
+                ConfigValue::Unset.format_default()
             } else {
                 format!("`{value}`")
             };
-            let prefix = format!("| `{field}` | {default} |");
+            let prefix = format!("| `{field}` | float | {default} |");
             assert!(
                 reference.lines().any(|line| line.starts_with(&prefix)),
                 "{field}"
@@ -1159,13 +979,10 @@ mod tests {
         let rules = policy["rules"].as_object().unwrap();
         assert_eq!(rules.len(), RULE_COUNT);
         for (rule, fields) in rules {
-            let row = reference
-                .lines()
-                .find(|line| line.starts_with(&format!("| `{rule}` |")))
-                .unwrap();
-            assert_eq!(
-                row.split('|').nth(2).unwrap().trim(),
-                format!("`{}`", fields["enabled"])
+            assert!(
+                reference
+                    .lines()
+                    .any(|line| line.starts_with(&format!("| `{rule}` |")))
             );
             for (field, value) in fields.as_object().unwrap() {
                 match field.as_str() {
