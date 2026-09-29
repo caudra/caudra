@@ -14,13 +14,13 @@ use caudra_agent::tools::{
     BATCH_TOOL_NAME, FILE_APPLY_PATCH_TOOL_NAME, FILE_EDIT_TOOL_NAME, FILE_GLOB_TOOL_NAME,
     FILE_GREP_TOOL_NAME, FILE_INDEX_TOOL_NAME, FILE_READ_TOOL_NAME, FILE_WRITE_TOOL_NAME,
     IMAGE_GENERATE_TOOL_NAME, MEMORY_TOOL_NAME, PYTHON_EXECUTION_TOOL_NAME, QUESTION_TOOL_NAME,
-    SHELL_TOOL_NAME, TASK_TOOL_NAME, TODOWRITE_TOOL_NAME, TOOL_OUTPUT_TOOL_NAME, ToolEffect,
-    VIEW_IMAGE_TOOL_NAME,
+    SHELL_TOOL_NAME, SKILL_TOOL_NAME, TASK_TOOL_NAME, TODOWRITE_TOOL_NAME, TOOL_OUTPUT_TOOL_NAME,
+    ToolEffect, VIEW_IMAGE_TOOL_NAME,
 };
 use caudra_agent::{
     ActivityChild, CodeGraphRow, GrepFileEntry, GrepMatchGroup, NO_FILES_FOUND, SearchCap,
-    ShellFilterInfo, ShellOutput, SnapshotLine, SnapshotSpan, SpanStyle, SubagentActivity,
-    SubagentProgress, ToolAccounting, ToolInput, ToolOutput,
+    ShellFilterInfo, ShellOutput, SkillOutput, SnapshotLine, SnapshotSpan, SpanStyle,
+    SubagentActivity, SubagentProgress, ToolAccounting, ToolInput, ToolOutput,
 };
 use caudra_storage::id::CaudraId;
 use caudra_storage::tool_outputs::ToolOutputRef;
@@ -2564,6 +2564,31 @@ fn open_tool_copies_its_visible_body() {
     assert!(copied.contains("## Tool: `code_map`"), "{copied}");
     assert!(copied.contains("Status: success | View: open"), "{copied}");
     assert!(copied.contains("hidden tool output"), "{copied}");
+}
+
+/// A skill copies as the document its card drew, and the location above it is
+/// a path rather than code, so nothing in the copy is fenced.
+#[test]
+fn an_open_skill_copies_its_document_under_an_unfenced_location() {
+    const LOCATION: &str = "builtin:herdr";
+    const DOCUMENT: &str = "# Herdr\n\nDrive panes.";
+    const FENCE: &str = "```";
+    let mut panel = panel_with_tools(&[("t1", SKILL_TOOL_NAME)]);
+    panel.tool_done(ToolDoneEvent {
+        tool: SKILL_TOOL_NAME.into(),
+        output: ToolOutput::Skill(SkillOutput {
+            location: LOCATION.into(),
+            body: DOCUMENT.into(),
+        }),
+        ..done("t1")
+    });
+    panel.set_view(ViewMode::Expanded);
+
+    let copied = extract_entire_document(&mut panel);
+
+    assert!(copied.contains(LOCATION), "{copied}");
+    assert!(copied.contains(DOCUMENT), "{copied}");
+    assert!(!copied.contains(FENCE), "{copied}");
 }
 
 #[test]

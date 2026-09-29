@@ -31,7 +31,7 @@ use caudra_agent::types::{TodoItem, TodoStatus};
 use caudra_agent::{
     BatchToolEntry, BatchToolStatus, CodeGraphRow, CodeGraphSource, GrepFileEntry, INDEX_TRUNCATED,
     IndexDirectoryEntryKind, IndexLine, IndexLineSemantic, IndexOutput, IndexSourceRange,
-    InstructionBlock, PatchedFile, SearchCap, SubagentProgress, ToolInput, ToolOutput,
+    InstructionBlock, PatchedFile, SearchCap, SkillOutput, SubagentProgress, ToolInput, ToolOutput,
     format_live_duration, format_settled_duration,
 };
 use caudra_config::ToolOutputLines;
@@ -1453,19 +1453,7 @@ fn child_body(
             );
             with_script(entry, highlight, limits, body)
         }
-        None => {
-            let content =
-                render_tool_content(entry.input.as_ref(), output, highlight, limits.clone());
-            ChildBody {
-                highlights: content.highlights,
-                links: content.links,
-                lines: content.lines,
-                rows: content.rows,
-                source: content.source,
-                truncation: content.truncation,
-                span: None,
-            }
-        }
+        None => render_tool_content(entry.input.as_ref(), output, highlight, limits.clone()).into(),
     }
 }
 
@@ -1550,6 +1538,63 @@ impl ChildBody {
     }
 }
 
+impl From<ToolContent> for ChildBody {
+    fn from(content: ToolContent) -> Self {
+        Self {
+            highlights: content.highlights,
+            links: content.links,
+            lines: content.lines,
+            rows: content.rows,
+            source: content.source,
+            truncation: content.truncation,
+            span: None,
+        }
+    }
+}
+
+/// `body` drawn under `top`, with everything that has to stay parallel to the
+/// lines moved down with it. `gap` sets a blank row between the two when both
+/// have rows to separate.
+fn stacked(top: ChildBody, body: ChildBody, gap: bool) -> ChildBody {
+    let mut lines = top.lines;
+    if gap && !lines.is_empty() && !body.lines.is_empty() {
+        lines.push(Line::default());
+    }
+    let shift = lines.len();
+    let mut highlights = top.highlights;
+    highlights.extend(body.highlights.into_iter().map(|mut region| {
+        region.shift(shift);
+        region
+    }));
+    let mut links = top.links;
+    links
+        .rows
+        .extend(LinkMap::none_for(&lines[links.rows.len()..]).rows);
+    links.rows.extend(body.links.rows);
+    let mut rows = top.rows;
+    rows.resize(shift, None);
+    rows.extend(body.rows);
+    lines.extend(body.lines);
+    // The two halves were painted from different texts, so their ranges are
+    // rebased onto the one the card ends up holding rather than spliced.
+    let mut trace = SourceTrace::default();
+    for (start, source) in [(0, top.source), (shift, body.source)] {
+        match source {
+            Some(source) => trace.record(start, source),
+            None => trace.abandon(),
+        }
+    }
+    ChildBody {
+        highlights,
+        source: trace.finish(&lines),
+        links,
+        lines,
+        rows,
+        truncation: top.truncation || body.truncation,
+        span: body.span.map(|span| span.shift_lines(shift)),
+    }
+}
+
 /// Whether an opened child's body prints its summary row again. A shell or
 /// python call's summary is its script's first line, so the row and the script
 /// say the same thing.
@@ -1587,43 +1632,30 @@ fn with_script(
         return body;
     }
     let script = render_tool_content(entry.input.as_ref(), None, highlight, limits.clone());
-    let mut lines = script.lines;
-    if !lines.is_empty() && !body.lines.is_empty() {
-        lines.push(Line::default());
+    stacked(script.into(), body, true)
+}
+
+/// A loaded skill: the place it was loaded from, then its instructions drawn
+/// as the document they are rather than as the numbered text the model reads.
+///
+/// The place stands outside the budget, so an abridged card still opens on the
+/// start of the skill instead of spending one of its rows on where it lives.
+fn skill_body(skill: &SkillOutput, limits: &RenderLimits) -> ChildBody {
+    let (lines, source, links) = markdown_body(&skill.body, limits.width);
+    let mut document = ChildBody::traced(lines, source);
+    document.links = links;
+    let (mut location, mut source) = plain_body(&skill.location, limits.width);
+    // A location is not code, so a copy reaching past it must not fence it.
+    source.code.clear();
+    let style = theme::current().tool_dim;
+    for span in location.iter_mut().flat_map(|line| line.spans.iter_mut()) {
+        span.style = style;
     }
-    let shift = lines.len();
-    let mut highlights = script.highlights;
-    highlights.extend(body.highlights.into_iter().map(|mut region| {
-        region.shift(shift);
-        region
-    }));
-    let mut links = script.links;
-    links
-        .rows
-        .extend(LinkMap::none_for(&lines[links.rows.len()..]).rows);
-    links.rows.extend(body.links.rows);
-    let mut rows = script.rows;
-    rows.resize(shift, None);
-    rows.extend(body.rows);
-    lines.extend(body.lines);
-    // The two halves were painted from different texts, so their ranges are
-    // rebased onto the one the card ends up holding rather than spliced.
-    let mut trace = SourceTrace::default();
-    for (start, source) in [(0, script.source), (shift, body.source)] {
-        match source {
-            Some(source) => trace.record(start, source),
-            None => trace.abandon(),
-        }
-    }
-    ChildBody {
-        highlights,
-        source: trace.finish(&lines),
-        links,
-        lines,
-        rows,
-        truncation: body.truncation,
-        span: body.span.map(|span| span.shift_lines(shift)),
-    }
+    stacked(
+        ChildBody::traced(location, source),
+        document.capped(limits.budget),
+        false,
+    )
 }
 
 /// Holds a child to its window when it scrolls and to its budget otherwise.
@@ -3464,6 +3496,12 @@ pub fn render_tool_content(
             output_rows = rows;
             (card_lines, truncated)
         }
+        Some(ToolOutput::Skill(skill)) => {
+            let body = skill_body(skill, &limits);
+            output_links = body.links;
+            output_source = body.source;
+            (body.lines, body.truncation)
+        }
         Some(ToolOutput::Instructions { blocks }) => {
             let mut instruction_lines = Vec::new();
             let trunc = render_instructions(
@@ -3673,7 +3711,7 @@ mod tests {
     use crate::components::tool_display::{AWAITING_APPROVAL, WRITING_COMMAND};
     use crate::markdown::{EXPAND_AFFORDANCE, TRUNCATION_PREFIX};
     use caudra_agent::tools::{
-        BATCH_TOOL_NAME, FILE_GREP_TOOL_NAME, FILE_READ_TOOL_NAME, ToolEffect,
+        BATCH_TOOL_NAME, FILE_GREP_TOOL_NAME, FILE_READ_TOOL_NAME, SKILL_TOOL_NAME, ToolEffect,
     };
     use caudra_agent::types::QuestionOption;
     use caudra_agent::{
@@ -5284,6 +5322,35 @@ mod tests {
     fn all_indented(body: &[(String, LineProvenance)]) -> bool {
         let indent = format!("{TREE_GAP}{BATCH_BODY_PAD}");
         body.iter().all(|(text, _)| text.starts_with(&indent))
+    }
+
+    const SKILL_LOCATION: &str = "builtin:herdr";
+    const SKILL_HEADING: &str = "Herdr";
+    const SKILL_PROSE: &str = "Drive panes.";
+
+    /// A child that loaded a skill draws what the skill's own card draws: the
+    /// file it came from, then the document rather than the numbered text the
+    /// model reads.
+    #[test]
+    fn a_skill_child_draws_its_document_under_its_location() {
+        let entry = BatchToolEntry {
+            output: Some(ToolOutput::Skill(SkillOutput {
+                location: SKILL_LOCATION.into(),
+                body: format!("# {SKILL_HEADING}\n\n{SKILL_PROSE}"),
+            })),
+            ..batch_entry(SKILL_TOOL_NAME, 0)
+        };
+        let card = render_batch(from_ref(&entry), false, &limits(BatchViews::new([0])));
+
+        let body = lone_child_body(&card);
+        let rows: Vec<&str> = body.iter().map(|(text, _)| text.trim()).collect();
+        assert_eq!(
+            rows.iter().take(2).copied().collect::<Vec<_>>(),
+            [SKILL_LOCATION, SKILL_HEADING],
+            "{rows:#?}"
+        );
+        assert!(rows.contains(&SKILL_PROSE), "{rows:#?}");
+        assert!(all_indented(&body), "{CHILD_INDENT_MSG}: {rows:#?}");
     }
 
     #[test]
@@ -7435,6 +7502,13 @@ mod tests {
         }
     }
 
+    fn skill_output() -> ToolOutput {
+        ToolOutput::Skill(SkillOutput {
+            location: LONG.to_owned(),
+            body: format!("# {LONG}\n\n{LONG}"),
+        })
+    }
+
     /// A child whose body is structured rather than prose. Prose is broken to
     /// the child's own width before it is indented, so it is the structured
     /// renderers that reach the card's break still carrying a full-width row.
@@ -7464,6 +7538,7 @@ mod tests {
     #[test_case(environment_output() ; "environment")]
     #[test_case(read_code_output() ; "read_code")]
     #[test_case(code_graph_output() ; "code_graph")]
+    #[test_case(skill_output() ; "skill")]
     #[test_case(ToolOutput::Plain(text_output(LONG)) ; "plain")]
     #[test_case(ToolOutput::Markdown(text_output(LONG)) ; "markdown")]
     fn no_row_outgrows_the_card_it_is_drawn_in(output: ToolOutput) {

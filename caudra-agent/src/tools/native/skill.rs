@@ -22,7 +22,7 @@ use crate::tools::registry::{
 };
 use crate::tools::schema::{ParamKind, ParamSchema, Property, to_json_schema, validate};
 use crate::tools::{DescriptionContext, SKILL_TOOL_NAME, ToolContext, relative_path};
-use crate::types::ToolOutput;
+use crate::types::{SkillOutput, ToolOutput};
 
 pub const DESCRIPTION: &str =
     "Load a skill that provides instructions and workflows for specific tasks.";
@@ -256,19 +256,21 @@ pub fn directories(registry: &ToolRegistry) -> Vec<SkillDirCandidate> {
 /// The body exactly as the model receives it, for `caudra skills <name>`.
 pub fn load(registry: &ToolRegistry, name: &str) -> Result<String, String> {
     let registered = registry.get(SKILL_TOOL_NAME);
-    if let Some(tool) = registered
+    let loaded = match registered
         .as_ref()
         .and_then(RegisteredTool::downcast_ref::<SkillTool>)
     {
-        return SkillCall {
+        Some(tool) => SkillCall {
             name: name.into(),
             dirs: tool.dirs.clone(),
             remote_skills: tool.remote_skills.clone(),
         }
-        .load()
-        .map_err(|error| error.message);
-    }
-    load_from(name, &[], &installed_builtins()).map_err(|error| error.message)
+        .load(),
+        None => load_from(name, &[], &installed_builtins()),
+    };
+    loaded
+        .map(|skill| skill.model_text())
+        .map_err(|error| error.message)
 }
 
 impl Tool for SkillTool {
@@ -324,7 +326,7 @@ impl ToolInvocation for SkillCall {
                 );
             }
             match smol::unblock(move || self.load()).await {
-                Ok(text) => ToolExecResult::from(Ok(ToolOutput::Markdown(text.into()))),
+                Ok(skill) => ToolExecResult::from(Ok(ToolOutput::Skill(skill))),
                 Err(error) => ToolExecResult::failed(error.failure, error.message),
             }
         })
@@ -332,18 +334,17 @@ impl ToolInvocation for SkillCall {
 }
 
 impl SkillCall {
-    fn load(&self) -> Result<String, ToolError> {
+    fn load(&self) -> Result<SkillOutput, ToolError> {
         if let Some(skill) = self
             .remote_skills
             .iter()
             .flat_map(|skills| skills.iter())
             .find(|skill| skill.name == self.name)
         {
-            return Ok(format!(
-                "{}\n{}",
-                skill.source.source_label(),
-                numbered(&skill.content)
-            ));
+            return Ok(SkillOutput {
+                location: skill.source.source_label(),
+                body: skill.content.clone(),
+            });
         }
         load_from(&self.name, &self.dirs, &installed_builtins())
     }
@@ -353,7 +354,7 @@ fn load_from(
     name: &str,
     dirs: &[SkillDirCandidate],
     builtins: &[Arc<BuiltinSkill>],
-) -> Result<String, ToolError> {
+) -> Result<SkillOutput, ToolError> {
     let discovered = discover(dirs, builtins);
     let Some(skill) = discovered.get(name) else {
         return Err(ToolError::new(
@@ -361,8 +362,8 @@ fn load_from(
             format!("{NOT_FOUND}{name}{}", skill_list(&discovered)),
         ));
     };
-    let (content, location) = read_skill(skill, builtins)?;
-    Ok(format!("{location}\n{}", numbered(&content)))
+    let (body, location) = read_skill(skill, builtins)?;
+    Ok(SkillOutput { location, body })
 }
 
 /// The model reads this to decide whether to load anything at all, so it
@@ -453,16 +454,6 @@ fn read_skill(skill: &Skill, builtins: &[Arc<BuiltinSkill>]) -> Result<(String, 
         .map_err(|e| format!("cannot read {}: {e}", skill.location))?;
     let (_, body) = parse_frontmatter(&content);
     Ok((body, relative_path(&skill.location)))
-}
-
-/// Line numbers so the model can cite and re-read a section by offset.
-fn numbered(content: &str) -> String {
-    content
-        .lines()
-        .enumerate()
-        .map(|(i, line)| format!("{:4} | {line}", i + 1))
-        .collect::<Vec<_>>()
-        .join("\n")
 }
 
 /// Only the scalar `key: value` pairs are read: `name` and `description` are
@@ -633,6 +624,7 @@ mod tests {
                 remote_skills: tool.remote_skills.clone(),
             }
             .load()
+            .map(|skill| skill.model_text())
         };
         assert!(call(&embedded, SHARED_SKILL).unwrap().contains(LOCAL_BODY));
         assert!(
@@ -689,7 +681,7 @@ mod tests {
             "deploy",
             "---\nname: deploy\ndescription: ship it\n---\nfirst\nsecond\n",
         );
-        let out = load_from("deploy", &[root], &[]).unwrap();
+        let out = load_from("deploy", &[root], &[]).unwrap().model_text();
         assert!(out.contains("   1 | first"), "{out}");
         assert!(out.contains("   2 | second"), "{out}");
         assert!(!out.contains("description: ship it"), "frontmatter leaked");
@@ -800,8 +792,8 @@ mod tests {
             BUILTIN_DESC
         );
         let out = load_from(BUILTIN_NAME, &[], &builtins).unwrap();
-        assert!(out.contains(BUILTIN_BODY), "{out}");
-        assert!(out.contains(&builtin_location(BUILTIN_NAME)), "{out}");
+        assert_eq!(out.body, BUILTIN_BODY);
+        assert_eq!(out.location, builtin_location(BUILTIN_NAME));
     }
 
     /// Every builtin is its own entry, and each loads its own body rather
@@ -821,10 +813,7 @@ mod tests {
         let found = discover(&[], &builtins);
         assert!(found.contains_key(BUILTIN_NAME) && found.contains_key(OTHER_NAME));
         let out = load_from(OTHER_NAME, &[], &builtins).unwrap();
-        assert!(
-            out.contains(OTHER_BODY) && !out.contains(BUILTIN_BODY),
-            "{out}"
-        );
+        assert_eq!(out.body, OTHER_BODY);
     }
 
     /// The plugin-dev skill spills the API reference to disk and reports that
@@ -834,24 +823,21 @@ mod tests {
         let reference = PathBuf::from("/state/docs/lua-api.md");
         let builtin = plugin_dev_skill(Some(reference.clone()));
         let out = load_from(BUILTIN_NAME, &[], &[Arc::new(builtin)]).unwrap();
-        assert!(
-            out.starts_with(&reference.to_string_lossy().to_string()),
-            "{out}"
-        );
+        assert_eq!(out.location, reference.to_string_lossy());
     }
 
     #[test]
     fn a_disk_skill_of_the_same_name_does_not_take_the_builtin_path() {
+        const DISK_BODY: &str = "real file content";
         let temp = tempfile::tempdir().unwrap();
         let root = skill_dir(
             &temp,
             "ondisk",
-            &format!("---\nname: {BUILTIN_NAME}\n---\nreal file content\n"),
+            &format!("---\nname: {BUILTIN_NAME}\n---\n{DISK_BODY}\n"),
         );
         let builtin = plugin_dev_skill(None);
         let out = load_from(BUILTIN_NAME, &[root], &[Arc::new(builtin)]).unwrap();
-        assert!(out.contains("real file content"), "{out}");
-        assert!(!out.contains(BUILTIN_BODY), "{out}");
+        assert_eq!(out.body, DISK_BODY);
     }
 
     const TIERS: &[&str] = &["caudra", "claude", "opencode", "agents"];

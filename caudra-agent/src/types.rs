@@ -65,6 +65,7 @@ const MEMORY_NOTE_SEPARATOR: &str = "\n\n";
 const MEMORY_INDEX_SEPARATOR: &str = "\n";
 const MEMORY_NOTE_NOUN: &str = "note";
 const MEMORY_TAG_NOUN: &str = "tag";
+const LINE_NOUN: &str = "line";
 
 const STATE_KIND_FIELD: &str = "kind";
 /// Results sized by what they cost the model rather than by their lines: a
@@ -772,6 +773,47 @@ impl MemoryOutput {
     }
 }
 
+/// A skill as it was loaded: where it came from, and its instructions with the
+/// frontmatter already stripped.
+///
+/// Carried structurally rather than as the text the model reads, because the
+/// two readers want different things of the same body. The model reads it
+/// numbered, so it can cite a line and re-read from it. A person reads the
+/// document it is, and a gutter in front of every row draws a heading as the
+/// source of one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkillOutput {
+    pub location: String,
+    pub body: String,
+}
+
+impl SkillOutput {
+    /// What the model reads, and what `caudra skills <name>` prints.
+    pub(crate) fn model_text(&self) -> String {
+        format!("{}\n{}", self.location, numbered(&self.body))
+    }
+
+    fn display_text(&self) -> String {
+        format!("{}\n{}", self.location, self.body)
+    }
+
+    /// Counted over the instructions alone: the location says where they came
+    /// from and is not a line of them.
+    fn annotation(&self) -> String {
+        counted(self.body.lines().count(), LINE_NOUN)
+    }
+}
+
+/// Line numbers so the model can cite and re-read a section by offset.
+fn numbered(content: &str) -> String {
+    content
+        .lines()
+        .enumerate()
+        .map(|(i, line)| format!("{:4} | {line}", i + 1))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// `1 note`, `3 notes`. Small enough to inline everywhere it is needed, and
 /// wrong often enough when it is.
 fn counted(count: usize, noun: &str) -> String {
@@ -1166,6 +1208,9 @@ pub enum ToolOutput {
     /// markdown it used to be, so a card can tell one note from the next and a
     /// collapsed one can still say which notes came back.
     Memory(MemoryOutput),
+    /// A loaded skill, which the model reads numbered and a card draws as the
+    /// document it is.
+    Skill(SkillOutput),
     /// A code-graph answer: a headline, ranked or reached rows, an optional
     /// body, and the footer describing the graph they came from.
     ///
@@ -1315,6 +1360,7 @@ impl ToolOutput {
                 format!("{total_count} entries")
             }),
             Self::Memory(output) => Some(output.annotation()),
+            Self::Skill(skill) => Some(skill.annotation()),
             Self::Shell(output) => Some(if output.timed_out {
                 "timed out".into()
             } else if output.output_limit_exceeded {
@@ -1425,6 +1471,7 @@ impl ToolOutput {
             | Self::GrepResult { .. }
             | Self::Index(_)
             | Self::Memory(_)
+            | Self::Skill(_)
             | Self::CodeGraph { .. }
             | Self::Shell(_)
             | Self::TodoList(_)
@@ -1456,6 +1503,7 @@ impl ToolOutput {
             Self::Diff { summary, .. } => summary.clone(),
             Self::TodoList(_) => "ok".into(),
             Self::Shell(output) => output.model_text.clone(),
+            Self::Skill(skill) => skill.model_text(),
             Self::Plain(t) | Self::Markdown(t) | Self::ReadDir(t) => {
                 let mut out = t.text.clone();
                 if let Some(blocks) = &t.instructions {
@@ -1543,6 +1591,7 @@ impl ToolOutput {
             Self::Index(IndexOutput::File { skeleton, .. }) => skeleton.clone(),
             Self::Index(IndexOutput::Directory { listing, .. }) => listing.clone(),
             Self::Memory(output) => output.as_display_text(),
+            Self::Skill(skill) => skill.display_text(),
             Self::Shell(output) => output.raw_text(),
             Self::ReadCode {
                 start_line,
@@ -3143,6 +3192,43 @@ mod tests {
         );
     }
 
+    const SKILL_LOCATION: &str = "builtin:herdr";
+    const SKILL_BODY: &str = "# Herdr\n\nDrive panes.";
+    const SKILL_MODEL_TEXT: &str = "builtin:herdr\n   1 | # Herdr\n   2 | \n   3 | Drive panes.";
+
+    fn skill() -> ToolOutput {
+        ToolOutput::Skill(SkillOutput {
+            location: SKILL_LOCATION.into(),
+            body: SKILL_BODY.into(),
+        })
+    }
+
+    /// The model cites a skill by line and re-reads from one, so the numbered
+    /// text it always read is kept to the byte.
+    #[test]
+    fn a_skill_reads_to_the_model_as_numbered_lines_under_its_location() {
+        assert_eq!(skill().as_text(), SKILL_MODEL_TEXT);
+    }
+
+    /// A card draws the document itself, and a card with structured text is
+    /// never handed to a Lua renderer on restore.
+    #[test]
+    fn a_skill_displays_its_body_as_written() {
+        assert_eq!(
+            skill().structured_display_text(),
+            Some(format!("{SKILL_LOCATION}\n{SKILL_BODY}"))
+        );
+    }
+
+    #[test]
+    fn a_skill_survives_being_stored_and_reopened() {
+        let stored = serde_json::to_string(&skill()).expect("a skill serializes");
+        let restored: ToolOutput = serde_json::from_str(&stored).expect("and loads back");
+
+        assert_eq!(restored.as_text(), SKILL_MODEL_TEXT);
+        assert_eq!(restored.as_display_text(), skill().as_display_text());
+    }
+
     #[test]
     fn shell_output_separates_model_and_raw_projections() {
         let output = ToolOutput::Shell(shell_output());
@@ -3175,6 +3261,7 @@ mod tests {
     #[test_case(ToolOutput::GrepResult { entries: vec![GrepFileEntry { path: "a.rs".into(), groups: vec![GrepMatchGroup::single(1, "hit")] }], capped: Some(SearchCap { files_scanned: 40, files_listed: 900 }) }, Some("1 matches in 1 file (capped, 40/900 searched)") ; "grep_capped_reports_how_far_it_got")]
     #[test_case(ToolOutput::Diff { path: "a.rs".into(), before: "a\nb\n".into(), after: "a\nc\nd\n".into(), summary: "ok".into() }, Some("+2 -1") ; "diff_counts_both_sides")]
     #[test_case(ToolOutput::Diff { path: "a.rs".into(), before: String::new(), after: "new\n".into(), summary: "ok".into() }, Some("+1 -0") ; "diff_pure_insert")]
+    #[test_case(skill(), Some("3 lines") ; "skill_counts_its_body_not_its_location")]
     fn annotation_cases(output: ToolOutput, expected: Option<&str>) {
         assert_eq!(output.annotation().as_deref(), expected);
     }

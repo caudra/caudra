@@ -3087,12 +3087,13 @@ mod tests {
     use crate::provenance::Provenance;
     use crate::selection::ScreenSelection;
     use caudra_agent::tools::{
-        BATCH_TOOL_NAME, FILE_GREP_TOOL_NAME, FILE_READ_TOOL_NAME, SHELL_TOOL_NAME, TASK_TOOL_NAME,
-        ToolEffect,
+        BATCH_TOOL_NAME, FILE_GREP_TOOL_NAME, FILE_READ_TOOL_NAME, SHELL_TOOL_NAME,
+        SKILL_TOOL_NAME, TASK_TOOL_NAME, ToolEffect,
     };
     use caudra_agent::{
         BatchToolEntry, BatchToolStatus, GrepFileEntry, GrepMatchGroup, ShellFilterInfo,
-        SnapshotLine, SnapshotSpan, SubagentActivity, TextOutput, ToolInput, ToolOutput,
+        SkillOutput, SnapshotLine, SnapshotSpan, SubagentActivity, TextOutput, ToolInput,
+        ToolOutput,
     };
     use std::time::Duration;
     use test_case::test_case;
@@ -3890,6 +3891,86 @@ mod tests {
         assert!(text.contains(HEADING_TEXT), "{text}");
         assert_eq!(text.contains(HEADING_SOURCE), keeps_markers, "{text}");
         assert_eq!(!tl.highlight.is_empty(), keeps_markers);
+    }
+
+    const SKILL_NAME: &str = "herdr";
+    const SKILL_LOCATION: &str = "builtin:herdr";
+    const SKILL_LAST_LINE: &str = "Last skill line.";
+    const SKILL_GUTTER: &str = "1 | ";
+    const SKILL_BUDGET_MSG: &str =
+        "the location is drawn outside the budget, which the document spends alone";
+
+    fn skill_msg() -> DisplayMessage {
+        let skill = SkillOutput {
+            location: SKILL_LOCATION.into(),
+            body: format!(
+                "{HEADING_SOURCE}\n\n- first\n- second\n- third\n- fourth\n\n{SKILL_LAST_LINE}"
+            ),
+        };
+        DisplayMessage {
+            role: DisplayRole::Tool(Box::new(ToolRole {
+                id: "t1".into(),
+                effect: ToolEffect::Unknown,
+                status: ToolStatus::Success,
+                name: SKILL_TOOL_NAME.into(),
+            })),
+            ..write_msg(SKILL_NAME, None, Some(ToolOutput::Skill(skill)))
+        }
+    }
+
+    /// The model reads a skill numbered so it can cite a line. A person reads
+    /// the document, and a document asking for highlighting would have the
+    /// worker splice its source back over it.
+    #[test_case(false ; "resting")]
+    #[test_case(true  ; "opened")]
+    fn a_loaded_skill_is_drawn_as_the_document_it_is(full: bool) {
+        let tl = build_tool_lines(
+            &skill_msg(),
+            ToolStatus::Success,
+            &test_rctx(UNBROKEN),
+            Some(exp(full)),
+        );
+        let text = lines_text(&tl);
+
+        assert!(text.contains(HEADING_TEXT), "{text}");
+        assert!(!text.contains(HEADING_SOURCE), "{text}");
+        assert!(!text.contains(SKILL_GUTTER), "{text}");
+        assert!(tl.highlight.is_empty());
+        assert_eq!(text.contains(SKILL_LAST_LINE), full, "{text}");
+        assert_eq!(tl.truncation, !full);
+    }
+
+    #[test]
+    fn a_skill_location_is_a_dim_row_outside_the_budget() {
+        let tl = build_tool_lines(
+            &skill_msg(),
+            ToolStatus::Success,
+            &test_rctx(UNBROKEN),
+            Some(Disclosure::default()),
+        );
+        let rows: Vec<String> = tl.lines.iter().map(line_text).collect();
+        let location = rows
+            .iter()
+            .position(|row| row.contains(SKILL_LOCATION))
+            .expect("the card names where the skill was loaded from");
+        let notice = rows
+            .iter()
+            .position(|row| row.contains(TRUNCATION_PREFIX))
+            .expect("a resting skill longer than its budget says so");
+
+        assert!(
+            has_styled_span(
+                &tl.lines[location].spans,
+                SKILL_LOCATION,
+                theme::current().tool_dim
+            ),
+            "{rows:?}"
+        );
+        assert_eq!(
+            notice - location - 1,
+            TOL.get(SKILL_TOOL_NAME),
+            "{SKILL_BUDGET_MSG}: {rows:?}"
+        );
     }
 
     /// What the header could show of a multiline command: one space-joined

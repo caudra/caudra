@@ -59,6 +59,8 @@ The frontmatter is optional. Without it, the directory name is the skill name an
 
 The `skill` tool lists every skill it found, the agent calls it with a name and gets the body back. A wrong name errors and reprints the list so the model can pick again.
 
+The model receives the body with each line numbered, so it can cite a line and read on from it. The card in your transcript shows the file the skill came from, then the body as rendered Markdown. An open card shows the first `ui.tool_output_lines.other` rows of it, and a click shows the rest.
+
 Skills are not slash commands: typing `/git-release` does nothing unless you also add a [custom command](/docs/commands/#custom-commands). Ask the agent to use a skill, or let it pick one on its own.
 
 ## Seeing what the agent has
