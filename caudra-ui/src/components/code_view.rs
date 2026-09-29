@@ -189,6 +189,7 @@ pub struct BodySource {
 #[derive(Clone, Debug)]
 pub struct CodeBlock {
     pub rows: Range<usize>,
+    pub source: Range<u32>,
     pub language: Option<String>,
 }
 
@@ -282,6 +283,8 @@ impl SourceTrace {
         self.code.extend(body.code.into_iter().map(|mut code| {
             code.rows.start += start;
             code.rows.end += start;
+            code.source.start += base;
+            code.source.end += base;
             code
         }));
         self.rows.resize(start, None);
@@ -327,25 +330,65 @@ fn rebase_row(row: &mut LineProvenance, by: u32) {
     }
 }
 
-/// The source behind one painted code row. The gutter names nothing, and the
-/// rest is a slice of the line the row was drawn from.
-///
-/// Tabs expand and trailing newlines vanish on the way to the screen, so a
-/// line that does not survive that round trip is marked atomic: its glyph
-/// offsets no longer count its bytes, and any touch of it copies it whole.
-fn code_row(spans: &[Span<'static>], text: &str, at: u32) -> LineProvenance {
+fn code_row(spans: &mut Vec<Span<'static>>, text: &str, at: u32) -> LineProvenance {
     let line = at..at + text.len() as u32;
-    let verbatim = caudra_highlight::normalize_text(text) == text;
     let mut sources = vec![SpanSource::Chrome];
-    let mut offset = at;
-    for span in spans.iter().skip(1) {
-        let end = offset + span.content.len() as u32;
-        sources.push(SpanSource::Range(match verbatim {
-            true => Source::verbatim(offset..end),
-            false => Source::atomic(line.clone()),
-        }));
-        offset = end;
+    if !text.contains('\t') {
+        let mut offset = at;
+        for span in spans.iter().skip(1) {
+            let end = offset + span.content.len() as u32;
+            sources.push(SpanSource::Range(Source::verbatim(offset..end)));
+            offset = end;
+        }
+        return LineProvenance {
+            line: Some(line),
+            spans: sources,
+        };
     }
+    let mut mapped = vec![spans[0].clone()];
+    let mut offset = 0;
+    let mut tab_remaining = 0;
+    for span in spans.iter().skip(1) {
+        let mut drawn = 0;
+        while drawn < span.content.len() {
+            let start = at + offset as u32;
+            if tab_remaining != 0 || text.as_bytes().get(offset) == Some(&b'\t') {
+                if tab_remaining == 0 {
+                    tab_remaining = caudra_highlight::TAB_SPACES.len();
+                }
+                let len = tab_remaining.min(span.content.len() - drawn);
+                mapped.push(Span::styled(
+                    span.content[drawn..drawn + len].to_owned(),
+                    span.style,
+                ));
+                sources.push(SpanSource::Range(Source::atomic(start..start + 1)));
+                drawn += len;
+                tab_remaining -= len;
+                if tab_remaining == 0 {
+                    offset += 1;
+                }
+            } else {
+                let remaining = &text[offset..];
+                let len = remaining
+                    .find('\t')
+                    .unwrap_or(remaining.len())
+                    .min(span.content.len() - drawn);
+                if len == 0 {
+                    break;
+                }
+                mapped.push(Span::styled(
+                    span.content[drawn..drawn + len].to_owned(),
+                    span.style,
+                ));
+                sources.push(SpanSource::Range(Source::verbatim(
+                    start..start + len as u32,
+                )));
+                offset += len;
+                drawn += len;
+            }
+        }
+    }
+    *spans = mapped;
     LineProvenance {
         line: Some(line),
         spans: sources,
@@ -394,7 +437,7 @@ fn render_code(
             Some(h) => spans.extend(highlight_spans(h, text)),
             None => spans.push(fallback_span(text)),
         }
-        let row = code_row(&spans, text, at);
+        let row = code_row(&mut spans, text, at);
         at += text.len() as u32 + 1;
         let broken = wrap_styled(spans, 1, &hang, width);
         source.rows.extend(wrapped_provenance(&broken, &row));
@@ -402,6 +445,7 @@ fn render_code(
     }
     source.code.push(CodeBlock {
         rows: 0..lines.len(),
+        source: 0..source.text.len() as u32,
         language: None,
     });
 
@@ -1708,6 +1752,7 @@ pub(super) fn plain_body(text: &str, width: u16) -> (Vec<Line<'static>>, BodySou
     }
     let code = Vec::from([CodeBlock {
         rows: 0..rows.len(),
+        source: 0..text.len() as u32,
         language: None,
     }]);
     (
@@ -3188,7 +3233,20 @@ impl HighlightRegion {
     }
 
     pub fn render(&self, input: Option<&ToolInput>, output: Option<&ToolOutput>) -> ToolContent {
-        let mut content = render_tool_content(input, output, true, self.limits.clone());
+        self.render_with_highlight(input, output, true)
+    }
+
+    pub fn render_fallback(&self, input: &ToolInput) -> ToolContent {
+        self.render_with_highlight(Some(input), None, false)
+    }
+
+    fn render_with_highlight(
+        &self,
+        input: Option<&ToolInput>,
+        output: Option<&ToolOutput>,
+        highlight: bool,
+    ) -> ToolContent {
+        let mut content = render_tool_content(input, output, highlight, self.limits.clone());
         for transform in self.transforms.iter().skip(1) {
             match transform {
                 HighlightTransform::Indent(indent, style) => {
@@ -3679,6 +3737,38 @@ mod tests {
 
     const SPANS_PER_ROW: &str = "a row's sources must stay parallel to its painted spans";
     const GUTTER_IS_CHROME: &str = "the line-number gutter must name no source";
+
+    #[test_case(false; "plain")]
+    #[test_case(true; "highlighted")]
+    fn tabs_keep_local_atomic_ranges_and_unicode_keeps_verbatim_offsets(highlight: bool) {
+        const CODE: &str = "\tlet café = \"日本語\";\tprintln!(\"{café}\");";
+        let hl = highlight.then(|| caudra_highlight::Highlighter::for_path("test.rs"));
+        let rendered = render_code(hl, 1, &[CODE.to_owned()], 1, usize::MAX, CODE_CARD_WIDTH);
+        let mut copied = String::new();
+        let mut previous = None;
+        let mut tabs = 0;
+        for (row, line) in rendered.source.rows.iter().zip(&rendered.lines) {
+            assert_eq!(row.spans.len(), line.spans.len(), "{SPANS_PER_ROW}");
+            for (origin, span) in row.spans.iter().zip(&line.spans) {
+                if let SpanSource::Range(origin) = origin {
+                    let text = &CODE[origin.range.start as usize..origin.range.end as usize];
+                    if origin.verbatim {
+                        assert!(text.starts_with(span.content.as_ref()));
+                    } else {
+                        assert_eq!(text, "\t");
+                        tabs += usize::from(previous.as_ref() != Some(&origin.range));
+                    }
+                    if previous.as_ref() != Some(&origin.range) {
+                        copied.push_str(text);
+                    }
+                    previous = Some(origin.range.clone());
+                }
+            }
+        }
+        assert_eq!(tabs, CODE.matches('\t').count());
+        assert_eq!(copied, CODE);
+        assert_eq!(rendered.source.code[0].source, 0..CODE.len() as u32);
+    }
 
     const NUMBERED_ONCE: &str = "a source line is numbered once however many rows it takes, and \
         its continuations hang under the code rather than restarting at column zero";

@@ -5345,6 +5345,7 @@ impl MessagesPanel {
                     result.lines,
                     result.rows,
                     result.source_rows,
+                    &self.hl_worker,
                 );
                 dirty = Dirty::YES;
             }

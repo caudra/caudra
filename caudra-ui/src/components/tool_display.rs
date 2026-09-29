@@ -1235,12 +1235,7 @@ impl HighlightRequest {
     }
 
     pub fn matches(&self, other: &Self) -> bool {
-        if self.region.path != other.region.path
-            || self.region.role != other.region.role
-            || self.region.limits.width != other.region.limits.width
-            || self.region.limits.budget != other.region.limits.budget
-            || self.region.transforms != other.region.transforms
-        {
+        if !self.same_view(other) {
             return false;
         }
         let (input, output) = self.sources();
@@ -1253,6 +1248,47 @@ impl HighlightRequest {
                 }
                 _ => false,
             }
+    }
+
+    fn same_view(&self, other: &Self) -> bool {
+        self.region.path == other.region.path
+            && self.region.role == other.region.role
+            && self.region.limits.width == other.region.limits.width
+            && self.region.limits.budget == other.region.limits.budget
+            && self.region.transforms == other.region.transforms
+    }
+
+    pub fn append_compatible(&self, other: &Self) -> bool {
+        if self.region.role != CodeRole::Input || !self.same_view(other) {
+            return false;
+        }
+        match (self.sources().0, other.sources().0) {
+            (
+                Some(ToolInput::Code { language, code }),
+                Some(ToolInput::Code {
+                    language: next_language,
+                    code: next_code,
+                }),
+            )
+            | (
+                Some(ToolInput::Script { language, code }),
+                Some(ToolInput::Script {
+                    language: next_language,
+                    code: next_code,
+                }),
+            ) => language == next_language && next_code.starts_with(code),
+            _ => false,
+        }
+    }
+
+    pub fn input_source(&self) -> Option<String> {
+        self.sources().0.map(|input| {
+            let (ToolInput::Code { code, .. } | ToolInput::Script { code, .. }) = input;
+            code.trim_end_matches('\n')
+                .lines()
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
     }
 }
 

@@ -7,7 +7,9 @@ use super::super::code_view::{BodySource, CodeBlock, RowTarget, ScrollSpan};
 use super::super::tool_display::{HighlightRequest, ToolLines};
 use super::layout::{SegmentChrome, SegmentKind};
 use crate::provenance::LineProvenance;
+use caudra_markdown::Source;
 use caudra_markdown::render::SpanSource;
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
 use std::cell::Cell;
@@ -37,13 +39,61 @@ struct CachedHeight {
 struct HighlightCache {
     request: HighlightRequest,
     theme_gen: u64,
-    pending: Option<u64>,
+    pending: Option<PendingHighlight>,
     paint: Option<Arc<HighlightPaint>>,
+    local_source_rows: Option<Vec<LineProvenance>>,
 }
 
 struct HighlightPaint {
+    request: HighlightRequest,
     lines: Vec<Line<'static>>,
     source_rows: Option<Vec<LineProvenance>>,
+    syntax: Option<SourcePaint>,
+}
+
+struct PendingHighlight {
+    id: u64,
+    request: HighlightRequest,
+    text: Vec<String>,
+}
+
+struct SourcePaint {
+    source: String,
+    styles: Vec<(Range<u32>, Style)>,
+}
+
+impl SourcePaint {
+    fn new(
+        request: &HighlightRequest,
+        lines: &[Line<'_>],
+        rows: &[LineProvenance],
+    ) -> Option<Self> {
+        let source = request.input_source()?;
+        if rows.len() != lines.len() {
+            return None;
+        }
+        let mut styles = Vec::new();
+        for (line, row) in lines.iter().zip(rows) {
+            if line.spans.len() != row.spans.len() {
+                return None;
+            }
+            for (span, origin) in line.spans.iter().zip(&row.spans) {
+                if let SpanSource::Range(origin) = origin {
+                    let text =
+                        source.get(origin.range.start as usize..origin.range.end as usize)?;
+                    if !caudra_highlight::normalize_text(text).starts_with(span.content.as_ref()) {
+                        return None;
+                    }
+                    if !origin.range.is_empty() {
+                        styles.push((origin.range.clone(), span.style));
+                    }
+                }
+            }
+        }
+        styles.sort_by_key(|(range, _)| (range.start, range.end));
+        styles.dedup();
+        Some(Self { source, styles })
+    }
 }
 
 #[derive(Default)]
@@ -408,18 +458,22 @@ impl Segment {
         let generation = theme::generation();
         for request in tl.highlight.drain(..) {
             let cached = previous.iter().position(|cached| {
-                cached.theme_gen == generation && cached.request.matches(&request)
+                cached.theme_gen == generation
+                    && (cached.request.matches(&request)
+                        || cached.request.append_compatible(&request))
             });
             let mut cached = match cached {
                 Some(index) => previous.swap_remove(index),
                 None => HighlightCache {
-                    pending: Some(worker.send(request.clone())),
+                    pending: None,
                     request: request.clone(),
                     theme_gen: generation,
                     paint: None,
+                    local_source_rows: None,
                 },
             };
             cached.request = request;
+            cached.local_source_rows = None;
             self.highlights.push(cached);
         }
         self.spinner_lines = tl.spinner_lines;
@@ -436,16 +490,54 @@ impl Segment {
         self.set_source(tl.source);
         for index in 0..self.highlights.len() {
             if let Some(paint) = self.highlights[index].paint.clone() {
-                let range = self.highlights[index].request.region.range.clone();
-                self.paint_highlight(range, &paint);
+                self.paint_cached(index, &paint);
             }
+            self.schedule_highlight(index, worker);
+        }
+    }
+
+    fn schedule_highlight(&mut self, index: usize, worker: &RenderWorker) {
+        let cached = &mut self.highlights[index];
+        if cached.pending.is_none()
+            && cached
+                .paint
+                .as_ref()
+                .is_none_or(|paint| !paint.request.matches(&cached.request))
+        {
+            cached.pending = Some(PendingHighlight {
+                id: worker.send(cached.request.clone()),
+                request: cached.request.clone(),
+                text: self.lines[cached.request.region.range.clone()]
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect(),
+            });
+        }
+    }
+
+    fn paint_cached(&mut self, index: usize, paint: &HighlightPaint) -> bool {
+        let request = &self.highlights[index].request;
+        let range = request.region.range.clone();
+        if paint.request.matches(request) {
+            self.paint_highlight(range, paint)
+        } else if paint.request.append_compatible(request) {
+            let source = request.input_source();
+            match (&paint.syntax, source) {
+                (Some(syntax), Some(source)) => self.paint_source(index, &source, syntax),
+                _ => false,
+            }
+        } else {
+            false
         }
     }
 
     pub fn matches_pending_highlight(&self, id: u64) -> bool {
-        self.highlights
-            .iter()
-            .any(|cached| cached.pending == Some(id))
+        self.highlights.iter().any(|cached| {
+            cached
+                .pending
+                .as_ref()
+                .is_some_and(|pending| pending.id == id)
+        })
     }
 
     pub fn apply_highlight_result(
@@ -454,25 +546,194 @@ impl Segment {
         lines: Vec<Line<'static>>,
         rows: Vec<Option<RowTarget>>,
         source_rows: Option<Vec<LineProvenance>>,
+        worker: &RenderWorker,
     ) {
-        let Some(index) = self
-            .highlights
-            .iter()
-            .position(|cached| cached.pending == Some(id))
-        else {
+        let Some(index) = self.highlights.iter().position(|cached| {
+            cached
+                .pending
+                .as_ref()
+                .is_some_and(|pending| pending.id == id)
+        }) else {
             return;
         };
-        self.highlights[index].pending = None;
-        if self.stale
-            || self.highlights[index].theme_gen != theme::generation()
-            || rows.len() != lines.len()
-        {
+        let Some(pending) = self.highlights[index].pending.take() else {
+            return;
+        };
+        if self.stale || self.highlights[index].theme_gen != theme::generation() {
             return;
         }
-        let paint = HighlightPaint { lines, source_rows };
-        let range = self.highlights[index].request.region.range.clone();
-        if self.paint_highlight(range, &paint) {
-            self.highlights[index].paint = Some(Arc::new(paint));
+        if rows.len() == lines.len()
+            && lines.len() == pending.text.len()
+            && lines.iter().zip(&pending.text).all(|(line, text)| {
+                line.spans
+                    .iter()
+                    .flat_map(|span| span.content.bytes())
+                    .eq(text.bytes())
+            })
+        {
+            let syntax = source_rows
+                .as_ref()
+                .and_then(|rows| SourcePaint::new(&pending.request, &lines, rows));
+            let paint = HighlightPaint {
+                request: pending.request.clone(),
+                lines,
+                source_rows,
+                syntax,
+            };
+            if self.paint_cached(index, &paint) {
+                self.highlights[index].paint = Some(Arc::new(paint));
+            }
+        }
+        if !pending.request.matches(&self.highlights[index].request) {
+            self.schedule_highlight(index, worker);
+        }
+    }
+
+    fn paint_source(&mut self, index: usize, source: &str, paint: &SourcePaint) -> bool {
+        if !source.starts_with(&paint.source) || !self.links.is_aligned(&self.lines) {
+            return false;
+        }
+        let cached = &mut self.highlights[index];
+        let range = cached.request.region.range.clone();
+        let (mut rows, base) = if let Some(provenance) = &self.provenance {
+            let Some(rows) = provenance.lines_in(range.clone()) else {
+                return false;
+            };
+            let Some(base) = self.code_blocks.iter().find_map(|block| {
+                (block.rows.start <= range.start
+                    && block.rows.end >= range.end
+                    && provenance
+                        .source()
+                        .get(block.source.start as usize..block.source.end as usize)
+                        == Some(source))
+                .then_some(block.source.start)
+            }) else {
+                return false;
+            };
+            (rows, base)
+        } else if let Some(rows) = cached.local_source_rows.take() {
+            (rows, 0)
+        } else {
+            let Some(input) = cached.request.sources().0 else {
+                return false;
+            };
+            let fallback = cached.request.region.render_fallback(input);
+            let Some(local) = fallback.source else {
+                return false;
+            };
+            let current = &self.lines[range.clone()];
+            if local.text != source
+                || fallback.lines.len() != current.len()
+                || !fallback.lines.iter().zip(current).all(|(left, right)| {
+                    left.spans.len() == right.spans.len()
+                        && left
+                            .spans
+                            .iter()
+                            .zip(&right.spans)
+                            .all(|(left, right)| left.content == right.content)
+                })
+            {
+                return false;
+            }
+            (local.rows, 0)
+        };
+        if rows.len() != range.len()
+            || rows
+                .iter()
+                .zip(&self.lines[range.clone()])
+                .any(|(row, line)| row.spans.len() != line.spans.len())
+        {
+            return false;
+        }
+        for (index, row) in range.clone().zip(&mut rows) {
+            let mut spans = Vec::new();
+            let mut origins = Vec::new();
+            let mut links = Vec::new();
+            for ((span, origin), link) in self.lines[index]
+                .spans
+                .iter()
+                .zip(&row.spans)
+                .zip(&self.links.rows[index])
+            {
+                let mut push = |text: &str, style, origin| {
+                    spans.push(Span::styled(text.to_owned(), style));
+                    origins.push(origin);
+                    links.push(link.clone());
+                };
+                let SpanSource::Range(mapped) = origin else {
+                    push(&span.content, span.style, origin.clone());
+                    continue;
+                };
+                let Some(start) = mapped.range.start.checked_sub(base) else {
+                    push(&span.content, span.style, origin.clone());
+                    continue;
+                };
+                let first = paint
+                    .styles
+                    .partition_point(|(range, _)| range.end <= start);
+                if !mapped.verbatim {
+                    let style = paint
+                        .styles
+                        .get(first)
+                        .filter(|(range, _)| {
+                            range.start <= start && range.end >= mapped.range.end - base
+                        })
+                        .map_or(span.style, |(_, style)| *style);
+                    push(&span.content, style, origin.clone());
+                    continue;
+                }
+                let mut taken = 0;
+                for (range, style) in &paint.styles[first..] {
+                    let from = range.start.saturating_sub(start) as usize;
+                    if from >= span.content.len() {
+                        break;
+                    }
+                    let to = ((range.end - start) as usize).min(span.content.len());
+                    let from = from.max(taken);
+                    if from > taken {
+                        push(
+                            &span.content[taken..from],
+                            span.style,
+                            SpanSource::Range(Source::verbatim(
+                                mapped.range.start + taken as u32..mapped.range.start + from as u32,
+                            )),
+                        );
+                    }
+                    if to > from {
+                        let end = if to == span.content.len() {
+                            mapped.range.end
+                        } else {
+                            mapped.range.start + to as u32
+                        };
+                        push(
+                            &span.content[from..to],
+                            *style,
+                            SpanSource::Range(Source::verbatim(
+                                mapped.range.start + from as u32..end,
+                            )),
+                        );
+                    }
+                    taken = to.max(taken);
+                }
+                if taken < span.content.len() || span.content.is_empty() {
+                    push(
+                        &span.content[taken..],
+                        span.style,
+                        SpanSource::Range(Source::verbatim(
+                            mapped.range.start + taken as u32..mapped.range.end,
+                        )),
+                    );
+                }
+            }
+            self.lines[index].spans = spans;
+            self.links.rows[index] = links;
+            row.spans = origins;
+        }
+        if let Some(provenance) = &mut self.provenance {
+            provenance.splice_lines(range, rows)
+        } else {
+            self.highlights[index].local_source_rows = Some(rows);
+            true
         }
     }
 
@@ -742,6 +1003,7 @@ mod tests {
     use crate::components::code_view::{self, RenderLimits, SourceTrace};
     use caudra_agent::ToolInput;
     use test_case::test_case;
+    use unicode_width::UnicodeWidthStr;
 
     const WIDTH: u16 = 40;
     const NARROW_WIDTH: u16 = 24;
@@ -1025,6 +1287,468 @@ mod tests {
     const EXPECT_FRESH: &str = "highlighting must not replace current live rows";
     const EXPECT_SHAPE: &str = "highlighting cannot change text, height, or targets";
     const EXPECT_PAINT: &str = "syntax colors must be applied";
+    const EXPECT_COALESCED: &str = "only the in-flight request and newest desired source survive";
+    const STREAM_CODE: &str = "fn main() {\n\tlet café = \"日本語  ";
+    const APPENDS: &[&str] = &["hello", " world\";", "\n\tprintln!(\"{café}\");\n}"];
+    const CURRENT_LINK: &str = "current-source-link";
+
+    fn deliver_next(seg: &mut Segment, worker: &RenderWorker) {
+        let result = worker.render_next();
+        seg.apply_highlight_result(
+            result.id,
+            result.lines,
+            result.rows,
+            result.source_rows,
+            worker,
+        );
+    }
+
+    fn input_lines(code: &str, script: bool, prefix: &str, width: u16) -> ToolLines {
+        let mut lines = code_tool_lines(code, prefix, LIVE_AFTER, width);
+        if script {
+            for request in &mut lines.highlight {
+                request.input = Some(Arc::new(ToolInput::Script {
+                    language: "rust".into(),
+                    code: code.into(),
+                }));
+            }
+        }
+        lines
+    }
+
+    fn assert_source_frame(seg: &Segment, fallback: &ToolLines, paint: &SourcePaint, width: u16) {
+        assert_eq!(
+            seg.lines
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            fallback
+                .lines
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            "{EXPECT_SHAPE}"
+        );
+        assert_eq!(seg.rows, fallback.rows, "{EXPECT_SHAPE}");
+        assert_eq!(
+            seg.code_blocks
+                .iter()
+                .map(|block| (&block.rows, &block.source, &block.language))
+                .collect::<Vec<_>>(),
+            fallback
+                .source
+                .as_ref()
+                .unwrap()
+                .code
+                .iter()
+                .map(|block| (&block.rows, &block.source, &block.language))
+                .collect::<Vec<_>>()
+        );
+        let provenance = seg.provenance.as_ref().unwrap();
+        let source = fallback.source.as_ref().unwrap();
+        assert_eq!(provenance.source().as_ref(), source.text);
+        assert!(seg.links.is_aligned(&seg.lines));
+        let region = &seg.highlights[0].request.region;
+        let base = source
+            .code
+            .iter()
+            .find(|block| {
+                block.rows.start <= region.range.start && block.rows.end >= region.range.end
+            })
+            .unwrap()
+            .source
+            .start;
+        let rows = provenance.lines_in(region.range.clone()).unwrap();
+        let mut retained = 0;
+        let mut neutral = 0;
+        for (index, row) in region.range.clone().zip(rows) {
+            assert_eq!(row.line, source.rows[index].line);
+            let mut column = 0;
+            for (span_index, (span, origin)) in
+                seg.lines[index].spans.iter().zip(row.spans).enumerate()
+            {
+                if let SpanSource::Range(origin) = origin {
+                    assert_eq!(
+                        seg.links.rows[index][span_index].as_deref(),
+                        Some(CURRENT_LINK)
+                    );
+                    for (offset, ch) in span.content.char_indices() {
+                        let byte =
+                            origin.range.start + if origin.verbatim { offset as u32 } else { 0 };
+                        assert_eq!(
+                            provenance.byte_at(&seg.lines, width, index as u16, column as u16),
+                            origin.verbatim.then_some(byte)
+                        );
+                        if let Some((_, style)) = paint
+                            .styles
+                            .iter()
+                            .find(|(range, _)| range.contains(&(byte - base)))
+                        {
+                            assert_eq!(span.style, *style, "{EXPECT_PAINT}");
+                            retained += 1;
+                        } else if byte - base >= paint.source.len() as u32 {
+                            assert_eq!(span.style, theme::current().code_block, "{EXPECT_PAINT}");
+                            neutral += 1;
+                        }
+                        column += UnicodeWidthStr::width(ch.to_string().as_str());
+                    }
+                } else {
+                    column += UnicodeWidthStr::width(span.content.as_ref());
+                }
+            }
+        }
+        assert!(retained > 0, "{EXPECT_PAINT}");
+        assert!(neutral > 0, "{EXPECT_PAINT}");
+    }
+
+    fn linked_input_lines(code: &str, script: bool, prefix: &str, width: u16) -> ToolLines {
+        let mut lines = input_lines(code, script, prefix, width);
+        let source = lines.source.as_ref().unwrap();
+        for (row, links) in source.rows.iter().zip(&mut lines.links.rows) {
+            for (origin, link) in row.spans.iter().zip(links) {
+                if matches!(origin, SpanSource::Range(_)) {
+                    *link = Some(Arc::from(CURRENT_LINK));
+                }
+            }
+        }
+        lines
+    }
+
+    #[test_case(false; "code")]
+    #[test_case(true; "script")]
+    fn append_frames_preserve_source_styles_through_unicode_tabs_and_wrapping(script: bool) {
+        let worker = RenderWorker::manual();
+        let mut seg = Segment::default();
+        seg.apply_highlight(
+            input_lines(STREAM_CODE, script, PREFIX, NARROW_WIDTH),
+            &worker,
+            false,
+        );
+        let before = seg.lines.clone();
+        deliver_next(&mut seg, &worker);
+        assert_ne!(seg.lines, before, "{EXPECT_PAINT}");
+        let paint = seg.highlights[0].paint.clone().unwrap();
+        let syntax = paint.syntax.as_ref().unwrap();
+        let mut code = STREAM_CODE.to_owned();
+        let mut pending = None;
+        for append in APPENDS {
+            code.push_str(append);
+            seg.update_with_reuse(
+                linked_input_lines(&code, script, MOVED_PREFIX, NARROW_WIDTH),
+                &worker,
+                false,
+            );
+            let fallback = linked_input_lines(&code, script, MOVED_PREFIX, NARROW_WIDTH);
+            assert_source_frame(&seg, &fallback, syntax, NARROW_WIDTH);
+            assert_eq!(worker.queued(), 1, "{EXPECT_COALESCED}");
+            let id = seg.highlights[0].pending.as_ref().unwrap().id;
+            assert_eq!(*pending.get_or_insert(id), id, "{EXPECT_COALESCED}");
+        }
+    }
+
+    #[test_case(false, false; "code")]
+    #[test_case(true, false; "script")]
+    #[test_case(false, true; "clipped_code")]
+    fn append_paint_without_card_provenance_matches_traced_frames(script: bool, clipped: bool) {
+        let build = |code: &str, linked: bool| {
+            if clipped {
+                clipped_input_lines(code, linked)
+            } else if linked {
+                linked_input_lines(code, script, MOVED_PREFIX, NARROW_WIDTH)
+            } else {
+                input_lines(code, script, MOVED_PREFIX, NARROW_WIDTH)
+            }
+        };
+        let mut traced = Segment::default();
+        let mut untraced = Segment::default();
+        let traced_worker = RenderWorker::manual();
+        let untraced_worker = RenderWorker::manual();
+        let mut initial = build(STREAM_CODE, false);
+        let plain = initial.lines.clone();
+        initial.source = None;
+        untraced.apply_highlight(initial, &untraced_worker, false);
+        traced.apply_highlight(build(STREAM_CODE, false), &traced_worker, false);
+        deliver_next(&mut traced, &traced_worker);
+        deliver_next(&mut untraced, &untraced_worker);
+        assert_ne!(untraced.lines, plain, "{EXPECT_PAINT}");
+        let mut code = STREAM_CODE.to_owned();
+        for append in APPENDS {
+            code.push_str(append);
+            let mut current = build(&code, true);
+            let rows = current.rows.clone();
+            current.source = None;
+            untraced.update_with_reuse(current, &untraced_worker, false);
+            traced.update_with_reuse(build(&code, true), &traced_worker, false);
+            assert_eq!(untraced.lines, traced.lines, "{EXPECT_PAINT}");
+            assert_eq!(untraced.links.rows, traced.links.rows);
+            assert_eq!(untraced.rows, rows, "{EXPECT_SHAPE}");
+            assert!(untraced.provenance.is_none());
+            assert!(untraced.code_blocks.is_empty());
+            assert!(untraced.highlights[0].local_source_rows.is_some());
+            assert_eq!(untraced_worker.queued(), 1, "{EXPECT_COALESCED}");
+        }
+        deliver_next(&mut traced, &traced_worker);
+        deliver_next(&mut untraced, &untraced_worker);
+        assert_eq!(untraced.lines, traced.lines, "{EXPECT_PAINT}");
+        assert_eq!(untraced.links.rows, traced.links.rows);
+        assert!(untraced.provenance.is_none());
+        assert_eq!(untraced_worker.queued(), 1, "{EXPECT_COALESCED}");
+        let mut current = build(&code, false);
+        current.source = None;
+        untraced.update_with_reuse(current, &untraced_worker, false);
+        traced.update_with_reuse(build(&code, false), &traced_worker, false);
+        deliver_next(&mut traced, &traced_worker);
+        deliver_next(&mut untraced, &untraced_worker);
+        assert_eq!(untraced.lines, traced.lines, "{EXPECT_PAINT}");
+        assert!(!untraced.has_pending_highlight());
+        assert!(untraced.provenance.is_none());
+        assert!(untraced.code_blocks.is_empty());
+        let request = &untraced.highlights[0].request;
+        assert_eq!(
+            untraced.lines[request.region.range.clone()],
+            request.region.render(request.sources().0, None).lines,
+            "{EXPECT_PAINT}"
+        );
+    }
+
+    #[test]
+    fn local_source_reconstruction_rejects_mismatched_current_text() {
+        let worker = RenderWorker::manual();
+        let mut seg = Segment::default();
+        let mut initial = input_lines(STREAM_CODE, false, PREFIX, WIDTH);
+        initial.source = None;
+        seg.apply_highlight(initial, &worker, false);
+        deliver_next(&mut seg, &worker);
+        let mut current = input_lines(
+            &format!("{STREAM_CODE}{}", APPENDS[0]),
+            false,
+            PREFIX,
+            WIDTH,
+        );
+        current.source = None;
+        let first = current.highlight[0].region.range.start;
+        current.lines[first].spans.last_mut().unwrap().content = CHANGED_CODE.into();
+        let expected = current.lines.clone();
+        seg.update_with_reuse(current, &worker, false);
+        assert_eq!(seg.lines, expected, "{EXPECT_SHAPE}");
+        assert!(seg.highlights[0].local_source_rows.is_none());
+        deliver_next(&mut seg, &worker);
+        assert_eq!(seg.lines, expected, "{EXPECT_SHAPE}");
+        assert!(seg.provenance.is_none());
+        assert!(seg.links.is_aligned(&seg.lines));
+    }
+
+    #[test_case(false; "code")]
+    #[test_case(true; "script")]
+    fn older_result_paints_prefix_and_schedules_latest_without_an_input_event(script: bool) {
+        let worker = RenderWorker::manual();
+        let mut seg = Segment::default();
+        seg.apply_highlight(
+            input_lines(STREAM_CODE, script, PREFIX, NARROW_WIDTH),
+            &worker,
+            false,
+        );
+        let id = seg.highlights[0].pending.as_ref().unwrap().id;
+        let mut code = STREAM_CODE.to_owned();
+        for append in APPENDS {
+            code.push_str(append);
+            seg.update_with_reuse(
+                input_lines(&code, script, MOVED_PREFIX, NARROW_WIDTH),
+                &worker,
+                false,
+            );
+            assert!(seg.matches_pending_highlight(id), "{EXPECT_COALESCED}");
+            assert_eq!(worker.queued(), 1, "{EXPECT_COALESCED}");
+        }
+        let text = seg
+            .lines
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        let before = seg.lines.clone();
+        deliver_next(&mut seg, &worker);
+        assert_ne!(seg.lines, before, "{EXPECT_PAINT}");
+        assert_eq!(worker.queued(), 1, "{EXPECT_COALESCED}");
+        let pending = seg.highlights[0].pending.as_ref().unwrap();
+        assert_ne!(pending.id, id);
+        assert_eq!(pending.request.input_source().unwrap(), code);
+        assert_eq!(
+            seg.lines
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            text,
+            "{EXPECT_SHAPE}"
+        );
+        deliver_next(&mut seg, &worker);
+        assert!(!seg.has_pending_highlight());
+        assert_eq!(worker.queued(), 0, "{EXPECT_COALESCED}");
+        let request = &seg.highlights[0].request;
+        let expected = request.region.render(request.sources().0, None);
+        assert_eq!(
+            seg.lines[request.region.range.clone()],
+            expected.lines,
+            "{EXPECT_PAINT}"
+        );
+        assert_eq!(
+            seg.lines
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            text,
+            "{EXPECT_SHAPE}"
+        );
+    }
+
+    #[test]
+    fn append_paint_uses_current_gutters_after_line_number_growth() {
+        let worker = RenderWorker::manual();
+        let mut seg = Segment::default();
+        let code = format!("{}{}", "\n".repeat(98), CODE);
+        seg.apply_highlight(
+            input_lines(&code, false, PREFIX, NARROW_WIDTH),
+            &worker,
+            false,
+        );
+        deliver_next(&mut seg, &worker);
+        let paint = seg.highlights[0].paint.clone().unwrap();
+        let appended = format!("{code}\n{CHANGED_CODE}");
+        seg.update_with_reuse(
+            linked_input_lines(&appended, false, PREFIX, NARROW_WIDTH),
+            &worker,
+            false,
+        );
+        assert_source_frame(
+            &seg,
+            &linked_input_lines(&appended, false, PREFIX, NARROW_WIDTH),
+            paint.syntax.as_ref().unwrap(),
+            NARROW_WIDTH,
+        );
+    }
+
+    fn clipped_input_lines(code: &str, linked: bool) -> ToolLines {
+        let mut lines = if linked {
+            linked_input_lines(code, false, code, WIDTH)
+        } else {
+            input_lines(code, false, code, WIDTH)
+        };
+        let start = lines.highlight[0].region.range.start + 1;
+        let kept = start..start + 1;
+        assert!(lines.highlight[0].region.keep(&kept));
+        lines.source = lines
+            .source
+            .and_then(|source| source.keep_rows(kept.clone()));
+        lines.lines = lines.lines[kept.clone()].to_vec();
+        lines.rows = lines.rows[kept.clone()].to_vec();
+        lines.links.rows = lines.links.rows[kept].to_vec();
+        lines
+    }
+
+    #[test]
+    fn clipped_prefix_paint_uses_its_own_block_source_not_identical_header_text() {
+        const CODE: &str = "fn first() {}\nfn second() {}";
+        let worker = RenderWorker::manual();
+        let mut seg = Segment::default();
+        seg.apply_highlight(clipped_input_lines(CODE, false), &worker, false);
+        deliver_next(&mut seg, &worker);
+        let paint = seg.highlights[0].paint.clone().unwrap();
+        let append = format!("{CODE} // appended");
+        seg.update_with_reuse(clipped_input_lines(&append, true), &worker, false);
+        assert_source_frame(
+            &seg,
+            &clipped_input_lines(&append, true),
+            paint.syntax.as_ref().unwrap(),
+            WIDTH,
+        );
+    }
+
+    #[test_case(0; "replacement")]
+    #[test_case(1; "shrink")]
+    #[test_case(2; "language")]
+    #[test_case(3; "resize")]
+    #[test_case(4; "theme")]
+    #[test_case(5; "closure")]
+    #[test_case(6; "input_kind")]
+    #[test_case(7; "viewport")]
+    fn incompatible_append_retires_paint_and_in_flight_ownership(change: usize) {
+        let worker = RenderWorker::manual();
+        let mut seg = Segment::default();
+        seg.apply_highlight(
+            input_lines(STREAM_CODE, false, PREFIX, WIDTH),
+            &worker,
+            false,
+        );
+        deliver_next(&mut seg, &worker);
+        let append = format!("{STREAM_CODE}{}", APPENDS[0]);
+        seg.update_with_reuse(input_lines(&append, false, PREFIX, WIDTH), &worker, false);
+        let old = worker.render_next();
+        let mut current = match change {
+            0 => input_lines(CHANGED_CODE, false, PREFIX, WIDTH),
+            1 => input_lines(STREAM_CODE, false, PREFIX, WIDTH),
+            3 => input_lines(&append, false, PREFIX, NARROW_WIDTH),
+            5 => streamed_tool_lines(1),
+            6 => input_lines(&append, true, PREFIX, WIDTH),
+            7 => clipped_input_lines(&append, false),
+            _ => input_lines(&append, false, PREFIX, WIDTH),
+        };
+        if change == 2 {
+            current.highlight[0].input = Some(Arc::new(ToolInput::Code {
+                language: "python".into(),
+                code: append,
+            }));
+        } else if change == 4 {
+            seg.highlights[0].theme_gen = theme::generation().wrapping_sub(1);
+        }
+        let plain = current.lines.clone();
+        seg.update_with_reuse(current, &worker, false);
+        assert_eq!(seg.lines, plain, "{EXPECT_FRESH}");
+        assert!(!seg.matches_pending_highlight(old.id));
+        seg.apply_highlight_result(old.id, old.lines, old.rows, old.source_rows, &worker);
+        assert_eq!(seg.lines, plain, "{EXPECT_FRESH}");
+        assert_eq!(
+            worker.queued(),
+            usize::from(change != 5),
+            "{EXPECT_COALESCED}"
+        );
+    }
+
+    #[test]
+    fn appended_input_retains_completed_colors_before_result() {
+        let worker = RenderWorker::new();
+        let mut seg = Segment::default();
+        seg.apply_highlight(
+            code_tool_lines(CODE, PREFIX, LIVE_BEFORE, WIDTH),
+            &worker,
+            false,
+        );
+        let request = seg.highlights[0].request.clone();
+        let id = seg.highlights[0].pending.as_ref().unwrap().id;
+        let result = request.region.render(request.sources().0, None);
+        let fallback = seg.lines.clone();
+        seg.apply_highlight_result(
+            id,
+            result.lines,
+            result.rows,
+            result.source.map(|s| s.rows),
+            &worker,
+        );
+        assert_ne!(seg.lines, fallback, "{EXPECT_PAINT}");
+        let painted = seg.lines[request.region.range.start].clone();
+        seg.update_with_reuse(
+            code_tool_lines(
+                &format!("{CODE}\n{CHANGED_CODE}"),
+                PREFIX,
+                LIVE_AFTER,
+                WIDTH,
+            ),
+            &worker,
+            false,
+        );
+        assert_eq!(
+            seg.lines[request.region.range.start], painted,
+            "{EXPECT_PAINT}"
+        );
+    }
 
     #[test]
     fn pending_regions_relocate_and_completed_paints_rebase_source() {
@@ -1036,7 +1760,7 @@ mod tests {
             false,
         );
         let request = seg.highlights[0].request.clone();
-        let id = seg.highlights[0].pending.unwrap();
+        let id = seg.highlights[0].pending.as_ref().unwrap().id;
         seg.update_with_reuse(
             code_tool_lines(CODE, MOVED_PREFIX, LIVE_AFTER, WIDTH),
             &worker,
@@ -1051,6 +1775,7 @@ mod tests {
             result.lines,
             result.rows,
             result.source.map(|source| source.rows),
+            &worker,
         );
         let range = seg.highlights[0].request.region.range.clone();
         let painted = seg.lines[range.clone()].to_vec();
@@ -1088,7 +1813,7 @@ mod tests {
             &worker,
             false,
         );
-        let id = seg.highlights[0].pending.unwrap();
+        let id = seg.highlights[0].pending.as_ref().unwrap().id;
         let request = seg.highlights[0].request.clone();
         let (code, width) = if resized {
             (CODE, NARROW_WIDTH)
@@ -1109,6 +1834,7 @@ mod tests {
             result.lines,
             result.rows,
             result.source.map(|source| source.rows),
+            &worker,
         );
         assert_eq!(seg.lines, before, "{EXPECT_FRESH}");
     }
@@ -1122,7 +1848,7 @@ mod tests {
             &worker,
             false,
         );
-        let id = seg.highlights[0].pending.unwrap();
+        let id = seg.highlights[0].pending.as_ref().unwrap().id;
         seg.highlights[0].theme_gen = theme::generation().wrapping_sub(1);
         seg.update_with_reuse(
             code_tool_lines(CODE, PREFIX, LIVE_BEFORE, WIDTH),
@@ -1146,7 +1872,7 @@ mod tests {
             &worker,
             false,
         );
-        let id = seg.highlights[0].pending.unwrap();
+        let id = seg.highlights[0].pending.as_ref().unwrap().id;
         let range = seg.highlights[0].request.region.range.clone();
         let mut lines = seg.lines[range.clone()].to_vec();
         let mut rows = seg.rows[range].to_vec();
@@ -1160,7 +1886,7 @@ mod tests {
         }
         let before = seg.lines.clone();
         let targets = seg.rows.clone();
-        seg.apply_highlight_result(id, lines, rows, None);
+        seg.apply_highlight_result(id, lines, rows, None, &worker);
         assert_eq!(seg.lines, before, "{EXPECT_SHAPE}");
         assert_eq!(seg.rows, targets, "{EXPECT_SHAPE}");
         assert!(seg.links.is_aligned(&seg.lines));

@@ -22,6 +22,19 @@ struct RenderJob {
     request: HighlightRequest,
 }
 
+impl RenderJob {
+    fn render(self) -> RenderResult {
+        let (input, output) = self.request.sources();
+        let content = self.request.region.render(input, output);
+        RenderResult {
+            id: self.id,
+            lines: content.lines,
+            rows: content.rows,
+            source_rows: content.source.map(|source: BodySource| source.rows),
+        }
+    }
+}
+
 pub struct RenderResult {
     pub id: u64,
     pub lines: Vec<Line<'static>>,
@@ -80,6 +93,23 @@ impl RenderWorker {
         self.result_rx.try_recv().ok()
     }
 
+    #[cfg(test)]
+    pub(crate) fn manual() -> Self {
+        let mut worker = Self::new();
+        Arc::get_mut(&mut worker.inner).unwrap().max_threads = 0;
+        worker
+    }
+
+    #[cfg(test)]
+    pub(crate) fn queued(&self) -> usize {
+        self.inner.job_rx.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn render_next(&self) -> RenderResult {
+        self.inner.job_rx.try_recv().unwrap().render()
+    }
+
     fn maybe_spawn_thread(&self) {
         let current = self.inner.active_threads.load(Ordering::Acquire);
         if current >= self.inner.max_threads {
@@ -107,18 +137,7 @@ impl RenderWorker {
 
 fn worker_loop(inner: &PoolInner) {
     while let Ok(job) = inner.job_rx.recv_timeout(IDLE_TIMEOUT) {
-        let (input, output) = job.request.sources();
-        let content = job.request.region.render(input, output);
-        if inner
-            .result_tx
-            .send(RenderResult {
-                id: job.id,
-                lines: content.lines,
-                rows: content.rows,
-                source_rows: content.source.map(|source: BodySource| source.rows),
-            })
-            .is_err()
-        {
+        if inner.result_tx.send(job.render()).is_err() {
             break;
         }
     }

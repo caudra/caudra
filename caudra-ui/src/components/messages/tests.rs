@@ -9413,6 +9413,139 @@ const HIGHLIGHT_GEOMETRY_MSG: &str = "highlight completion must not change card 
 const HIGHLIGHT_STABILITY_MSG: &str = "unrelated output must not remove existing syntax colors";
 const WRAPPED_SCRIPT: &str = "for file in alpha beta gamma delta epsilon zeta eta theta\ndo\n  printf '%s\\n' \"$file\"\ndone";
 const MIN_HIGHLIGHT_WRAP_WIDTH: u16 = 12;
+const DRAFT_COMMAND: &str = "for file in alpha";
+const DRAFT_FRAGMENTS: [&str; 4] = [
+    " beta",
+    " gamma delta epsilon zeta eta theta",
+    "\ndo\n  printf '%s\\n' \"$file\"",
+    "\ndone",
+];
+const DRAFT_COLOR_MSG: &str = "appending command input must retain previously painted syntax";
+const DRAFT_DIFF_ADDED: &str = "let appended = true;";
+
+fn draft_command_roster(code: &str, script: bool, nested: bool) -> Vec<BatchToolEntry> {
+    let input = if script {
+        ToolInput::Script {
+            language: "bash".into(),
+            code: code.into(),
+        }
+    } else {
+        ToolInput::Code {
+            language: "bash".into(),
+            code: code.into(),
+        }
+    };
+    let entries = vec![BatchToolEntry {
+        input: Some(input),
+        ..pending_child(SHELL_TOOL_NAME)
+    }];
+    let mut entries = if nested {
+        vec![BatchToolEntry {
+            output: Some(ToolOutput::Batch {
+                entries,
+                text: String::new(),
+            }),
+            ..pending_child(BATCH_TOOL_NAME)
+        }]
+    } else {
+        entries
+    };
+    entries.push(running_child(SHELL_TOOL_NAME));
+    entries
+}
+
+#[test_case(false, false, STREAM_HIGHLIGHT_WIDTH, false; "code")]
+#[test_case(true, false, STREAM_HIGHLIGHT_WIDTH, false; "script")]
+#[test_case(false, true, STREAM_HIGHLIGHT_WIDTH, false; "nested_code")]
+#[test_case(true, true, STREAM_HIGHLIGHT_WIDTH, false; "nested_script")]
+#[test_case(false, false, STREAM_HIGHLIGHT_NARROW_WIDTH, false; "wrapped_code")]
+#[test_case(true, true, STREAM_HIGHLIGHT_NARROW_WIDTH, false; "wrapped_nested_script")]
+#[test_case(false, false, STREAM_HIGHLIGHT_NARROW_WIDTH, true; "diff_sibling")]
+#[test_case(true, true, STREAM_HIGHLIGHT_NARROW_WIDTH, true; "nested_diff_sibling")]
+fn streamed_command_input_retains_colors_between_highlights(
+    script: bool,
+    nested: bool,
+    width: u16,
+    structured: bool,
+) {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.tool_pending(TOOL_ID.into(), BATCH_TOOL_NAME);
+    if nested {
+        panel
+            .batch_views
+            .insert(TOOL_ID.into(), BatchViews::new([0]));
+    }
+    let roster = |code: &str| {
+        let mut entries = draft_command_roster(code, script, nested);
+        if structured {
+            entries.push(BatchToolEntry {
+                output: Some(ToolOutput::Diff {
+                    path: COPY_FILE_PATH.into(),
+                    before: String::new(),
+                    after: DRAFT_DIFF_ADDED.into(),
+                    summary: String::new(),
+                }),
+                ..batch_child(FILE_EDIT_TOOL_NAME, "diff")
+            });
+        }
+        entries
+    };
+    let mut command = DRAFT_COMMAND.to_owned();
+    panel.tool_input_roster(TOOL_ID, Some(roster(&command)));
+    render(&mut panel, width, STREAM_HIGHLIGHT_HEIGHT);
+    assert!(wait_for_batch_header_highlights(&mut panel));
+    let painted = script_token_styles(&panel, TOOL_ID);
+    assert_eq!(painted.len(), 1, "{DRAFT_COLOR_MSG}");
+    for (index, fragment) in DRAFT_FRAGMENTS.into_iter().enumerate() {
+        command.push_str(fragment);
+        panel.tool_input_roster(TOOL_ID, Some(roster(&command)));
+        let output = STREAM_OUTPUTS[index % STREAM_OUTPUTS.len()];
+        panel.set_batch_child_output(TOOL_ID, 1, output);
+        panel.flush_dirty_cards();
+        assert_eq!(
+            script_token_styles(&panel, TOOL_ID).first(),
+            painted.first(),
+            "{DRAFT_COLOR_MSG}: {command}"
+        );
+        let text = seg_text(&panel, TOOL_ID);
+        assert!(
+            text.contains(fragment.split_whitespace().last().unwrap()),
+            "{text}"
+        );
+        assert!(text.contains(output), "{text}");
+        if structured {
+            assert!(text.contains(DRAFT_DIFF_ADDED), "{text}");
+        }
+    }
+    panel.leave_stage(TOOL_ID, CallStage::Drafting);
+    panel.flush_dirty_cards();
+    let heights = panel.segment_heights();
+    assert!(wait_for_batch_header_highlights(&mut panel));
+    assert_eq!(panel.segment_heights(), heights, "{HIGHLIGHT_GEOMETRY_MSG}");
+    assert_eq!(
+        script_token_styles(&panel, TOOL_ID).len(),
+        CHILD_SCRIPT_TOKENS.len(),
+        "{DRAFT_COLOR_MSG}"
+    );
+    render(&mut panel, width, STREAM_HIGHLIGHT_HEIGHT);
+    assert_eq!(
+        script_token_styles(&panel, TOOL_ID).len(),
+        CHILD_SCRIPT_TOKENS.len(),
+        "{DRAFT_COLOR_MSG}"
+    );
+}
+
+#[test]
+fn standalone_command_previews_remain_neutral_while_drafting() {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.tool_pending(TOOL_ID.into(), SHELL_TOOL_NAME);
+    for fragment in [DRAFT_COMMAND].into_iter().chain(DRAFT_FRAGMENTS) {
+        panel.tool_input_body(TOOL_ID, Some(fragment.into()));
+        render(&mut panel, STREAM_HIGHLIGHT_WIDTH, STREAM_HIGHLIGHT_HEIGHT);
+        assert!(!wait_for_batch_header_highlights(&mut panel));
+        assert!(seg_text(&panel, TOOL_ID).contains(fragment.split_whitespace().last().unwrap()));
+    }
+}
 
 #[test_case("bash", WRAPPED_SCRIPT; "shell")]
 #[test_case("rust", "let value = 123;"; "rust")]
