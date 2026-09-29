@@ -73,6 +73,17 @@ impl WorkflowStore {
         })
     }
 
+    pub async fn insert_named_run(&self, row: WorkflowRunRow) -> Result<String, WorkflowError> {
+        self.call(move |worker| {
+            worker
+                .database
+                .insert_named_workflow_run(row)
+                .map_err(storage)
+        })
+        .await
+    }
+
+    #[cfg(test)]
     pub async fn insert_run(&self, row: WorkflowRunRow) -> Result<(), WorkflowError> {
         self.call(move |worker| worker.database.insert_workflow_run(&row).map_err(storage))
             .await
@@ -331,7 +342,9 @@ fn storage(error: impl std::fmt::Display) -> WorkflowError {
 #[cfg(test)]
 mod tests {
     use caudra_providers::{Message, WorkflowEventOrigin, expand_message};
+    use futures_lite::future::zip;
     use std::fs;
+    use test_case::test_case;
 
     use caudra_storage::workflow::{
         WORKFLOW_CALL_NOT_STARTED, WorkflowCallKind, WorkflowCallState, WorkflowRunStatus,
@@ -513,6 +526,38 @@ mod tests {
 
             assert_eq!(store.interrupt_active().await.unwrap(), 0);
             store.shutdown().await;
+        });
+    }
+
+    #[test_case(false; "same_session")]
+    #[test_case(true; "different_sessions")]
+    fn workflow_name_collisions_keep_both_durable_runs(other_session: bool) {
+        const PHRASE: &str = "neat-wanted-cowbird";
+        const SECOND: &str = "neat-wanted-cowbird-2";
+        smol::block_on(async {
+            let (_temp, state_dir, session_id) = open();
+            let first = WorkflowStore::spawn(state_dir.clone(), session_id).unwrap();
+            let second_session = if other_session {
+                let mut session = StoredSession::new(MODEL, CWD);
+                session.save(&state_dir).unwrap();
+                session.id
+            } else {
+                session_id
+            };
+            let second = WorkflowStore::spawn(state_dir.clone(), second_session).unwrap();
+            let mut a = run(session_id);
+            a.run_id = PHRASE.into();
+            let mut b = run(second_session);
+            b.run_id = PHRASE.into();
+            let (a, b) = zip(first.insert_named_run(a), second.insert_named_run(b)).await;
+            let mut ids = vec![a.unwrap(), b.unwrap()];
+            ids.sort();
+            assert_eq!(ids, [PHRASE, SECOND]);
+            first.shutdown().await;
+            second.shutdown().await;
+            let database = SessionDatabase::open(&state_dir).unwrap();
+            assert!(database.load_workflow_run(PHRASE).unwrap().is_some());
+            assert!(database.load_workflow_run(SECOND).unwrap().is_some());
         });
     }
 

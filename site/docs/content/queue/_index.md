@@ -11,7 +11,9 @@ The input stays active while Caudra works. Each prompt can wait for another run,
 
 ## Send next
 
-Press `Enter` or click `next` while Caudra is working. The prompt stays in the queue until the current run returns control, then starts as the next run. This is the default because it cannot change work already in progress.
+Press `Enter` or click `next` while Caudra is working. The prompt waits until the main agent and its background tasks, shell commands, and workflows finish. Pending reports and results still wake the main agent, even with next prompts waiting. The main agent processes those results before the next prompt starts. A final response that leaves background work running does not release the queue.
+
+Queued user input takes priority over automatic `/goal` checks. If no input is waiting, the goal can be checked after the current work and result delivery settle.
 
 Queued prompts appear above the input. A section header names each group and counts what is waiting in it, and the sections appear in the order Caudra claims them. Focus the queue with `/queue`, `Enter` on an idle task panel, or a click.
 
@@ -25,6 +27,8 @@ Press `Ctrl+X g` or click `guide` to send the input as guidance. Caudra waits fo
 
 A late guide may arrive after the run's final boundary. It then starts before queued next-run prompts instead of being lost. If a replacement is pending, all waiting guides enter its first model request before the replacement message.
 
+When the main agent is waiting for background work, guide wakes it without cancelling the running tasks or commands. Main-chat guidance goes to the main agent, not to every child. Open a task chat to guide that child directly.
+
 ## Stop and replace
 
 Press `Ctrl+X x` or click `replace` to cancel the active run and start the input as its replacement. Existing Up next prompts remain queued behind it. Sending another replacement before it starts updates the pending replacement, so the newest one wins.
@@ -35,7 +39,7 @@ Deleting a pending replacement turns the operation into a plain cancellation. Ca
 
 `Esc Esc` stops the main run and all session tasks and workflows, clears the queue, and suppresses automatic continuation from late reports or completion notices. To pick the cancelled turn back up later, use `/continue`, which resumes without adding a message of your own. See [Commands](/docs/commands/#resuming-after-an-interruption).
 
-Replacing a main run also stops its session tasks and workflows before the replacement starts. A new user turn re-enables automatic continuation. For task-specific cancellation and promotion, see [Background tasks](/docs/sessions/#background-tasks).
+Replacing a main run also stops and drains its session tasks, shell commands, and workflows before the replacement starts. This applies while the main agent is waiting for background work too. A new user turn re-enables automatic continuation. For task-specific cancellation and promotion, see [Background tasks](/docs/sessions/#background-tasks).
 
 ## Recovery
 

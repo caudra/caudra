@@ -1,11 +1,11 @@
 use std::borrow::Cow;
 
 use caudra_config::{ExecutionMode, effective_task_execution};
-use caudra_storage::background::JobOwner;
+use caudra_storage::background::{BackgroundCursor, JobOwner, MAX_HISTORY_PAGE};
 use serde_json::{Value, json};
 
 use crate::{
-    ToolOutput,
+    TaskCard, ToolOutput,
     tools::{
         DescriptionContext, ToolAudience, ToolContext,
         registry::{
@@ -15,7 +15,7 @@ use crate::{
     },
 };
 
-pub const DESCRIPTION: &str = "Inspect or control jobs visible to this owner. Actions: list, status, cancel. Use status when details are needed, not as a polling loop.";
+pub const DESCRIPTION: &str = "Inspect or control jobs visible to this owner. Actions: list, status, cancel. List returns resident jobs and a bounded history page; pass next as before to read older history. Use status when details are needed, not as a polling loop.";
 const PROMOTION_GUIDANCE: &str =
     "The background action promotes a running foreground task without restarting it.";
 const PROMOTION_DENIED: &str =
@@ -39,7 +39,9 @@ fn schema(promote: bool) -> Value {
     };
     json!({"type":"object","additionalProperties":false,"properties":{
         "action":{"type":"string","enum":actions},
-        "task_id":{"type":"string","description":"Required except for list."}
+        "task_id":{"type":"string","description":"Required except for list."},
+        "before":{"type":"object","additionalProperties":false,"properties":{"sequence":{"type":"integer","minimum":0},"invocation_id":{"type":"string"}},"required":["sequence","invocation_id"],"description":"History cursor returned as next by list."},
+        "limit":{"type":"integer","minimum":1,"maximum":MAX_HISTORY_PAGE}
     },"required":["action"]})
 }
 
@@ -47,6 +49,8 @@ pub struct TaskControl;
 struct ControlCall {
     action: String,
     task_id: Option<String>,
+    before: Option<BackgroundCursor>,
+    limit: usize,
 }
 
 impl Tool for TaskControl {
@@ -66,7 +70,10 @@ impl Tool for TaskControl {
         let object = input
             .as_object()
             .ok_or_else(|| ParseError::custom("task control input must be an object"))?;
-        if object.keys().any(|key| key != "action" && key != "task_id") {
+        if object
+            .keys()
+            .any(|key| !matches!(key.as_str(), "action" | "task_id" | "before" | "limit"))
+        {
             return Err(ParseError::custom("unknown task control field"));
         }
         let action = input
@@ -83,9 +90,27 @@ impl Tool for TaskControl {
         if action != "list" && task_id.is_none() {
             return Err(ParseError::custom("task_id is required"));
         }
+        let before = input
+            .get("before")
+            .map(|value| serde_json::from_value::<BackgroundCursor>(value.clone()))
+            .transpose()
+            .map_err(|error| ParseError::custom(error.to_string()))?;
+        let limit = match input.get("limit") {
+            None => MAX_HISTORY_PAGE,
+            Some(value) => value
+                .as_u64()
+                .filter(|limit| (1..=MAX_HISTORY_PAGE as u64).contains(limit))
+                .ok_or_else(|| ParseError::custom("invalid history page limit"))?
+                as usize,
+        };
+        if action != "list" && (before.is_some() || input.get("limit").is_some()) {
+            return Err(ParseError::custom("history cursor and limit require list"));
+        }
         Ok(Box::new(ControlCall {
             action: action.into(),
             task_id,
+            before,
+            limit,
         }))
     }
 }
@@ -107,15 +132,47 @@ impl ToolInvocation for ControlCall {
                 {
                     return Err(ToolError::new(ToolFailure::Denied, PROMOTION_DENIED));
                 }
+                if self.action == "list" {
+                    let first = self.before.is_none();
+                    let (mut cards, page) = if let Some(jobs) = &ctx.jobs {
+                        (
+                            if first { jobs.list() } else { Vec::new() },
+                            jobs.history_page(self.before, self.limit).await?,
+                        )
+                    } else {
+                        let tasks = ctx
+                            .background
+                            .as_ref()
+                            .ok_or("task controls require a supported session")?;
+                        (
+                            if first { tasks.list() } else { Vec::new() },
+                            tasks.history_page(self.before, self.limit).await?,
+                        )
+                    };
+                    if page.tasks.is_empty() && page.next.is_none() {
+                        return Ok(ToolOutput::Tasks(cards));
+                    }
+                    for card in page.tasks {
+                        if !cards
+                            .iter()
+                            .any(|existing| existing.invocation_id == card.invocation_id)
+                        {
+                            cards.push(card);
+                        }
+                    }
+                    return Ok(ToolOutput::Plain(
+                        json!({"tasks":cards.iter().map(TaskCard::model_value).collect::<Vec<_>>(), "next":page.next}).to_string().into(),
+                    ));
+                }
                 let id = self.task_id.as_deref().unwrap_or_default();
                 if self.action != "background"
                     && let Some(jobs) = &ctx.jobs
                 {
                     let cards = match self.action.as_str() {
                         "list" => jobs.list(),
-                        "status" => vec![jobs.status(id).map_err(invisible)?],
+                        "status" => vec![jobs.status_async(id).await.map_err(invisible)?],
                         _ => {
-                            jobs.status(id).map_err(invisible)?;
+                            jobs.status_async(id).await.map_err(invisible)?;
                             vec![jobs.cancel(id).await?]
                         }
                     };
@@ -127,9 +184,9 @@ impl ToolInvocation for ControlCall {
                     .ok_or("task controls require a supported session")?;
                 let cards = match self.action.as_str() {
                     "list" => tasks.list(),
-                    "status" => vec![tasks.status(id).map_err(invisible)?],
+                    "status" => vec![tasks.status_async(id).await.map_err(invisible)?],
                     action => {
-                        tasks.status(id).map_err(invisible)?;
+                        tasks.status_async(id).await.map_err(invisible)?;
                         vec![match action {
                             "cancel" => tasks.cancel(id).await?,
                             _ => tasks.promote(id).await?,

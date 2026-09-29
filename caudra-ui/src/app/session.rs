@@ -817,7 +817,7 @@ impl App {
         }
     }
 
-    fn fire_restore_items(&self, items: Vec<caudra_lua::RestoreItem>) {
+    pub(super) fn fire_restore_items(&self, items: Vec<caudra_lua::RestoreItem>) {
         let Some(tx) = &self.restore_event_tx else {
             return;
         };

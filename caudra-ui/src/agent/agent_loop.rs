@@ -237,6 +237,7 @@ impl AgentLoop {
                 if claimed.is_empty() {
                     break;
                 }
+                self.queue.hold_next_turn();
                 let Some((_, last)) = claimed.last() else {
                     continue;
                 };
@@ -491,6 +492,11 @@ impl AgentLoop {
         };
         let delivery_fence = Arc::clone(&self.delivery_fence);
         let _parent = delivery_fence.enter().await;
+        if (!input.message.is_empty() || !input.images.is_empty() || input.resume)
+            && let Some(background) = &self.background
+        {
+            background.rearm();
+        }
         let selected_slot = self.model_slot.load_full();
         let purpose = model_purpose(&input.mode);
         let effective_slot = if purpose == ModelPurpose::Plan {

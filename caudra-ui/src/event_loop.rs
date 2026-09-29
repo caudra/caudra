@@ -322,7 +322,7 @@ impl SessionStatus {
     fn of(app: &App) -> Self {
         if app.awaiting_input() {
             Self::NeedsInput
-        } else if app.status == Status::Streaming {
+        } else if app.status == Status::Streaming || app.waiting_for_background() {
             Self::Working
         } else {
             Self::Idle
@@ -430,6 +430,8 @@ impl SessionRuntime {
 
     fn work_quiescent(&self) -> bool {
         self.parent_ready()
+            && self.handles.queue.is_empty()
+            && !self.app.has_session_work()
             && self.handles.active_background_tasks() == 0
             && self
                 .handles
@@ -442,12 +444,11 @@ impl SessionRuntime {
     }
 
     fn delivery_idle(&self) -> bool {
-        self.handles.queue.is_empty() && !self.handles.queue.is_processing()
+        !self.handles.queue.has_priority_input() && !self.handles.queue.is_processing()
     }
 
     fn parent_ready(&self) -> bool {
-        self.handles.queue.is_empty()
-            && !self.handles.queue.is_processing()
+        self.delivery_idle()
             && !self.app.holds_recovery_text()
             && !self
                 .app
@@ -2539,6 +2540,15 @@ impl<'t> EventLoop<'t> {
         // next wake, which repaints then.
         self.emit_focus_change();
         dirty |= self.start_mailbox_runs();
+        for runtime in &self.sessions {
+            let ready = runtime.app.status == Status::Idle
+                && !runtime.app.awaiting_input()
+                && !runtime.app.has_session_work()
+                && !runtime.app.automatic_wakes_suppressed
+                && !runtime.app.holds_recovery_text()
+                && runtime.app.shell.active_ids().is_empty();
+            runtime.handles.queue.allow_next_turn(ready);
+        }
         dirty |= self.start_goal_checkins();
         self.emit_status_changes();
         self.publish_live_sessions();
@@ -2821,7 +2831,8 @@ impl<'t> EventLoop<'t> {
             .enumerate()
             .filter_map(|(index, runtime)| {
                 if !runtime.parent_ready()
-                    || SessionStatus::of(&runtime.app) != SessionStatus::Idle
+                    || runtime.app.status != Status::Idle
+                    || runtime.app.awaiting_input()
                     || runtime.app.automatic_wakes_suppressed
                     || runtime.app.sandbox_network_dispatch_blocker().is_some()
                 {
@@ -2835,7 +2846,6 @@ impl<'t> EventLoop<'t> {
                 if runtime.app.background_delivery.pending() {
                     return None;
                 }
-                let _ = runtime.handles.background_wake_resume.try_send(());
                 let mut preamble = runtime.handles.claim_mailbox_wake();
                 match runtime.app.claim_workflow_completions() {
                     Ok(messages) => preamble.extend(messages),
@@ -2886,6 +2896,7 @@ impl<'t> EventLoop<'t> {
             .enumerate()
             .filter_map(|(index, runtime)| {
                 (runtime.quiescent()
+                    && runtime.handles.queue.is_empty()
                     && !runtime.app.automatic_wakes_suppressed
                     && runtime.app.sandbox_network_dispatch_blocker().is_none()
                     && runtime.app.goal_checkin_due()
@@ -3933,7 +3944,7 @@ impl<'t> EventLoop<'t> {
             }
             Action::CancelSubagent { tool_use_id } => {
                 if let Some(background) = &self.sessions[idx].handles.background
-                    && background.status(&tool_use_id).is_ok()
+                    && background.resident_status(&tool_use_id).is_some()
                 {
                     if let Err(error) = smol::block_on(background.cancel(&tool_use_id)) {
                         self.sessions[idx].app.flash(error);

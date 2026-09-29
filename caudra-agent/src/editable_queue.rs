@@ -380,6 +380,22 @@ impl<T> EditableQueueReceiver<T> {
         claimed
     }
 
+    pub fn claim_front_matching(&self, matches: impl Fn(&T) -> bool) -> Vec<(QueueItemId, T)> {
+        let mut state = lock(&self.state);
+        if !state
+            .items
+            .front()
+            .is_some_and(|item| !item.editing && matches(&item.value))
+        {
+            return Vec::new();
+        }
+        state
+            .items
+            .pop_front()
+            .map(|item| vec![(item.id, item.value)])
+            .unwrap_or_default()
+    }
+
     pub fn claim_all_matching(&self, matches: impl Fn(&T) -> bool) -> Vec<(QueueItemId, T)> {
         let mut state = lock(&self.state);
         let indices = state

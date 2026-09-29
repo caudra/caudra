@@ -22,6 +22,7 @@ pub(crate) mod session_state;
 pub(crate) mod shell;
 mod shells;
 mod stash;
+mod task_history;
 pub(crate) mod tasks;
 #[cfg(test)]
 pub(crate) mod tests;
@@ -481,6 +482,7 @@ pub struct App {
     shell_snapshot: Watch<ShellSnapshot>,
     task_interactions: tasks::TaskInteractions,
     task_controls: tasks::TaskControls,
+    task_history: task_history::TaskHistory,
     pub(crate) background_claims: Vec<Message>,
     background_saved_revision: Option<u64>,
     pub(crate) background_delivery: background_delivery::BackgroundDelivery,
@@ -725,6 +727,7 @@ impl App {
             shell_snapshot: Watch::default(),
             task_interactions: tasks::TaskInteractions::default(),
             task_controls: tasks::TaskControls::default(),
+            task_history: task_history::TaskHistory::default(),
             background_claims: Vec::new(),
             background_saved_revision: None,
             background_delivery: background_delivery::BackgroundDelivery::default(),
@@ -4025,7 +4028,8 @@ impl App {
         }
         if let Some(origin) = &envelope.task
             && let Some(runtime) = &self.background
-            && let Ok(card) = runtime.status_invocation(&origin.task_id, &origin.invocation_id)
+            && let Some(card) =
+                runtime.resident_invocation_status(&origin.task_id, &origin.invocation_id)
             && card.kind == JobKind::Shell
             && matches!(
                 envelope.event,
@@ -4540,8 +4544,8 @@ impl App {
             if let Some(origin) = &envelope.task {
                 if self.task_response_current(origin)
                     && let Some(runtime) = &self.background
-                    && let Ok(card) =
-                        runtime.status_invocation(&origin.task_id, &origin.invocation_id)
+                    && let Some(card) =
+                        runtime.resident_invocation_status(&origin.task_id, &origin.invocation_id)
                     && card.active()
                 {
                     let call_id = card.call_id.clone();
@@ -4614,14 +4618,12 @@ impl App {
                 return vec![];
             }
             AgentEvent::GoalDeferred {
-                active_background_tasks,
+                active_background_tasks: _,
             } => {
                 self.goal_deferred = true;
                 self.main_chat().push(DisplayMessage::new(
                     DisplayRole::Notice,
-                    format!(
-                        "Goal evaluation deferred while {active_background_tasks} background task(s) run."
-                    ),
+                    "Goal evaluation deferred until outstanding work, result delivery, and queued input settle.".into(),
                 ));
                 return vec![];
             }
@@ -5051,7 +5053,7 @@ impl App {
             "/stash-pop" => self.run_builtin(BuiltinAction::StashPop),
             "/stash-list" => self.run_builtin(BuiltinAction::StashList),
             "/memory" => self.memory_browse(),
-            "/tasks" | "/task" => self.execute_task_control(&cmd.args),
+            "/tasks" => self.execute_task_control(&cmd.args),
             "/shells" => self.shells_browse(),
             "/workflows" => self.workflows_browse(),
             "/workflow" => self.execute_workflow(&cmd.args),
@@ -5768,6 +5770,7 @@ impl App {
             | self.refresh_session_picker()
             | self.poll_workflow_replies()
             | self.poll_task_controls()
+            | self.poll_task_history()
             | self.poll_shells()
             | self.tick_workbench()
             | self.poll_commit_index()
@@ -6050,6 +6053,7 @@ impl App {
                 &self.status,
                 self.restoring.load(Ordering::Relaxed),
                 self.state.goal.snapshot().is_some(),
+                self.waiting_for_background(),
             ),
             self.selection_state
                 .as_ref()
@@ -6079,7 +6083,7 @@ impl App {
             if chat.task_id().is_some_and(|id| {
                 self.background
                     .as_ref()
-                    .is_some_and(|background| background.status(id).is_ok())
+                    .is_some_and(|background| background.resident_status(id).is_some())
             }) {
                 continue;
             }
@@ -6102,7 +6106,7 @@ impl App {
                     && self.chats[sub_idx].task_id().is_some_and(|id| {
                         self.background
                             .as_ref()
-                            .is_some_and(|background| background.status(id).is_ok())
+                            .is_some_and(|background| background.resident_status(id).is_some())
                     })
             {
                 true

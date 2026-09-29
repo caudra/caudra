@@ -716,6 +716,7 @@ impl App {
                         && decisions.status().reachable == Some(false)
                 }),
             restoring: self.restoring.load(Ordering::Relaxed),
+            background_waiting: self.waiting_for_background(),
             goal: goal.as_ref(),
             active_tasks: activity.agents,
             active_shells: activity.shells,

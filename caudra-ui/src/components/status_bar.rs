@@ -36,6 +36,7 @@ const SINGLE_ROW: u16 = 1;
 /// The spinner's two columns while nothing spins, so the chips after it hold
 /// still when a turn starts or ends.
 const SPINNER_SLOT_BLANK: &str = "  ";
+const BACKGROUND_WAITING_LABEL: &str = " waiting for background work";
 const BACK_TO_MAIN_LABEL: &str = "[< Main]";
 const TASKS_LABEL: &str = "tasks";
 const SHELLS_LABEL: &str = "shell";
@@ -323,6 +324,7 @@ pub struct StatusBarContext<'a> {
     pub permission_mode: PermissionMode,
     pub decisions_offline: bool,
     pub restoring: bool,
+    pub background_waiting: bool,
     pub goal: Option<&'a GoalSnapshot>,
     pub active_tasks: usize,
     pub active_shells: usize,
@@ -958,9 +960,18 @@ impl StatusBar {
     /// It sits next to [`Self::view`] so a new moving span cannot forget to
     /// claim its frames; the retry countdown is the exception, claimed by the
     /// chat that owns it because the bar only borrows it to draw.
-    pub fn cadence(&self, status: &Status, restoring: bool, goal_active: bool) -> Cadence {
+    pub fn cadence(
+        &self,
+        status: &Status,
+        restoring: bool,
+        goal_active: bool,
+        background_waiting: bool,
+    ) -> Cadence {
         Cadence::any([
-            Cadence::when(*status == Status::Streaming || restoring, Cadence::SPINNER),
+            Cadence::when(
+                *status == Status::Streaming || restoring || background_waiting,
+                Cadence::SPINNER,
+            ),
             Cadence::when(goal_active, Cadence::CLOCK),
             Cadence::when(self.marquee.active(), Cadence::due(MARQUEE_STEP)),
         ])
@@ -1008,22 +1019,19 @@ impl StatusBar {
             return;
         }
         let mut left = Strip::default();
-        if *ctx.status == Status::Streaming {
-            left.push(Span::styled(
-                format!("{GAP}{}", self.spinner()),
-                theme::current().spinner,
-            ));
-        }
-        if ctx.restoring {
-            left.push(Span::styled(
-                format!("{GAP}{}", self.spinner()),
-                theme::current().status_notice,
-            ));
+        if *ctx.status == Status::Streaming || ctx.restoring || ctx.background_waiting {
+            left.push(self.spinner_slot(ctx));
         }
         self.push_settings(&mut left, ctx, area.width);
         push_resume(&mut left, ctx);
         push_goal(&mut left, ctx);
         push_activity(&mut left, ctx);
+        if ctx.background_waiting {
+            left.push(Span::styled(
+                BACKGROUND_WAITING_LABEL,
+                theme::current().status_notice,
+            ));
+        }
         push_retry(&mut left, ctx);
         push_decisions_status(&mut left, ctx);
         shorten_mode(&mut left, ctx, area.width, false);
@@ -1087,6 +1095,12 @@ impl StatusBar {
         push_goal(&mut activity, ctx);
         push_activity(&mut activity, ctx);
         let mut messages = Strip::default();
+        if ctx.background_waiting {
+            messages.push(Span::styled(
+                BACKGROUND_WAITING_LABEL,
+                theme::current().status_notice,
+            ));
+        }
         push_resume(&mut messages, ctx);
         push_retry(&mut messages, ctx);
         if let Status::Error { message, .. } = ctx.status {
@@ -1136,7 +1150,7 @@ impl StatusBar {
     fn spinner_slot(&self, ctx: &StatusBarContext<'_>) -> Span<'static> {
         let style = if *ctx.status == Status::Streaming {
             theme::current().spinner
-        } else if ctx.restoring {
+        } else if ctx.restoring || ctx.background_waiting {
             theme::current().status_notice
         } else {
             return Span::raw(SPINNER_SLOT_BLANK);
@@ -2195,6 +2209,7 @@ mod tests {
         goal: Option<&'a GoalSnapshot>,
         active_tasks: usize,
         active_shells: usize,
+        background_waiting: bool,
         retry_info: Option<&'a RetryInfo>,
         workflows: Option<WorkflowChip>,
         main_chat: bool,
@@ -2223,6 +2238,7 @@ mod tests {
                 goal: None,
                 active_tasks: 0,
                 active_shells: 0,
+                background_waiting: false,
                 retry_info: None,
                 workflows: None,
                 main_chat: true,
@@ -2266,6 +2282,7 @@ mod tests {
                 permission_mode: self.permission_mode,
                 decisions_offline: self.decisions_offline,
                 restoring: false,
+                background_waiting: self.background_waiting,
                 goal: self.goal,
                 active_tasks: self.active_tasks,
                 active_shells: self.active_shells,
@@ -2417,6 +2434,7 @@ mod tests {
             permission_mode: PermissionMode::Yolo,
             decisions_offline: false,
             restoring: false,
+            background_waiting: false,
             goal: None,
             active_tasks: 0,
             active_shells: 0,
@@ -3044,6 +3062,30 @@ mod tests {
         );
     }
 
+    #[test_case(SINGLE_ROW; "single")]
+    #[test_case(SPLIT_ROWS; "split")]
+    fn parked_work_spins_without_a_running_main_request(rows: u16) {
+        let ctx = Fixture {
+            background_waiting: true,
+            ..Default::default()
+        }
+        .into_ctx();
+        let bar = StatusBar::new(FLASH_TTL, ".", false);
+        let slot = bar.spinner_slot(&ctx);
+        assert_eq!(slot.style, theme::current().status_notice);
+        assert_ne!(slot.content, SPINNER_SLOT_BLANK);
+        assert_eq!(
+            bar.cadence(&Status::Idle, false, false, true),
+            Cadence::SPINNER
+        );
+        let drawn = draw(&ctx, BAR_WIDTH, rows);
+        assert!(
+            drawn
+                .row(rows - 1)
+                .contains(BACKGROUND_WAITING_LABEL.trim())
+        );
+    }
+
     /// The cwd and the model carry no padding of their own, so wherever the
     /// right side fits exactly it would run into the last chip on the left
     /// unless the row holds a gap back for it.
@@ -3175,7 +3217,7 @@ mod tests {
         });
 
         assert_eq!(
-            bar.cadence(&Status::Idle, false, false),
+            bar.cadence(&Status::Idle, false, false, false),
             Cadence::due(MARQUEE_STEP)
         );
     }

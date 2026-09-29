@@ -187,6 +187,11 @@ impl ShellExecutions {
         self.0.published.load_full()
     }
 
+    pub(super) fn pending(&self) -> bool {
+        let state = self.lock();
+        !state.active.is_empty() || state.writes > 0
+    }
+
     /// Stops this execution and nothing else: its caller gets the ordinary
     /// cancelled result and carries on.
     pub fn cancel(&self, execution_id: &str) -> Result<(), String> {

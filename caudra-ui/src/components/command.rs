@@ -177,12 +177,6 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         scope: ChatScope::Any,
     },
     BuiltinCommand {
-        name: "/task",
-        description: "Task controls: list, status <id>, background <id> (without restart), cancel <id>",
-        max_args: usize::MAX,
-        scope: ChatScope::Any,
-    },
-    BuiltinCommand {
         name: "/shells",
         description: "Browse shell commands and stop running ones",
         max_args: 0,
@@ -1244,6 +1238,12 @@ mod tests {
                 )),
             },
         ])
+    }
+
+    #[test_case("/tasks", true; "plural")]
+    #[test_case("/task", false; "no_singular_alias")]
+    fn task_command_requires_plural(name: &str, recognized: bool) {
+        assert_eq!(synced("/").resolve(name).is_some(), recognized);
     }
 
     #[test]

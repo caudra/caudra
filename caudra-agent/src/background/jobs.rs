@@ -6,7 +6,10 @@ use std::sync::Arc;
 use caudra_providers::Message;
 use caudra_storage::{
     StateDir,
-    background::{JobOwner, JobPayload, MAX_INVOCATIONS, ShellJobMetadata, TaskEvent, TaskRecord},
+    background::{
+        BackgroundCursor, JobOwner, JobPayload, MAX_INVOCATIONS, ShellJobMetadata, TaskEvent,
+        TaskRecord,
+    },
     id::CaudraId,
     now_epoch,
     sessions::{RuntimeRetry, SessionDatabase},
@@ -18,7 +21,8 @@ use serde_json::{Value, json};
 
 use super::{
     Admission, BackgroundTasks, CLOSED, DriverGuard, MAX_ACTIVE, MAX_ID_BYTES, MAX_REQUEST_BYTES,
-    MAX_RESULT_BYTES, STALE_INVOCATION, TRANSITION, bounded, deliverable, shells::ShellExecutions,
+    MAX_RESULT_BYTES, STALE_INVOCATION, TRANSITION, TaskHistoryPage, bounded, deliverable,
+    shells::ShellExecutions,
 };
 use crate::{
     CancelToken, History, SubagentHistoryStore, TaskCard, TaskProvenance, ToolDoneEvent,
@@ -188,20 +192,46 @@ impl JobScope {
         self.tasks
             .list()
             .into_iter()
-            .filter(|card| card.owner == self.owner && card.generation == self.generation)
+            .filter(|card| {
+                card.owner == self.owner
+                    && (self.owner == JobOwner::Main || card.generation == self.generation)
+            })
             .collect()
     }
 
     pub fn status(&self, task_id: &str) -> Result<TaskCard, String> {
         let card = self.tasks.status(task_id)?;
-        if card.owner != self.owner || card.generation != self.generation {
+        if card.owner != self.owner
+            || (self.owner != JobOwner::Main && card.generation != self.generation)
+        {
             return Err(FOREIGN_JOB.into());
         }
         Ok(card)
     }
 
+    pub async fn history_page(
+        &self,
+        before: Option<BackgroundCursor>,
+        limit: usize,
+    ) -> Result<TaskHistoryPage, String> {
+        self.tasks
+            .history_page_for(
+                before,
+                limit,
+                Some(self.owner.clone()),
+                (self.owner != JobOwner::Main).then_some(self.generation),
+            )
+            .await
+    }
+
+    pub async fn status_async(&self, task_id: &str) -> Result<TaskCard, String> {
+        let scope = self.clone();
+        let task_id = task_id.to_owned();
+        smol::unblock(move || scope.status(&task_id)).await
+    }
+
     pub async fn cancel(&self, task_id: &str) -> Result<TaskCard, String> {
-        let card = self.status(task_id)?;
+        let card = self.status_async(task_id).await?;
         self.tasks
             .cancel_invocation(task_id, &card.invocation_id, self.generation)
             .await
@@ -320,37 +350,44 @@ impl JobScope {
         admission.check()?;
         let gate = self.tasks.0.gate.lock_arc().await;
         admission.check()?;
+        if let Some(record) = self
+            .tasks
+            .retry_record(&self.owner, &metadata.call_id)
+            .await?
+        {
+            return if record.payload == JobPayload::Shell(metadata) {
+                Ok(TaskCard::from(&record))
+            } else {
+                Err(RETRY_MISMATCH.into())
+            };
+        }
+        let gate = self.tasks.archive_settled(gate).await?;
+        admission.check()?;
         {
             let state = self.tasks.lock();
             if state.transition.is_some() {
                 return Err(TRANSITION.into());
             }
-            if let Some(record) = state.records.values().find(|record| {
-                self.owns(record)
-                    && record.request.get("call_id").and_then(Value::as_str)
-                        == Some(&metadata.call_id)
-            }) {
-                return if record.payload == JobPayload::Shell(metadata) {
-                    Ok(TaskCard::from(record))
-                } else {
-                    Err(RETRY_MISMATCH.into())
-                };
+            if state.records.len() >= MAX_INVOCATIONS {
+                return Err(format!(
+                    "session pending-delivery/resident capacity exhausted: {} / {MAX_INVOCATIONS}",
+                    state.records.len()
+                ));
             }
-            if state.records.len() >= MAX_INVOCATIONS
-                || state
-                    .records
-                    .values()
-                    .filter(|record| record.active())
-                    .count()
-                    >= MAX_ACTIVE
-                || state
-                    .records
-                    .values()
-                    .filter(|record| self.owns(record) && record.active())
-                    .count()
-                    >= MAX_OWNER_ACTIVE
-            {
-                return Err(CAPACITY.into());
+            let active = state
+                .records
+                .values()
+                .filter(|record| record.active())
+                .count();
+            let owned = state
+                .records
+                .values()
+                .filter(|record| self.owns(record) && record.active())
+                .count();
+            if active >= MAX_ACTIVE || owned >= MAX_OWNER_ACTIVE {
+                return Err(format!(
+                    "{CAPACITY}: active {active}/{MAX_ACTIVE}, owner {owned}/{MAX_OWNER_ACTIVE}"
+                ));
             }
         }
         let dir = self.tasks.0.dir.clone();
@@ -798,6 +835,122 @@ mod tests {
             }],
             ..Default::default()
         }
+    }
+
+    #[test_case(false; "owner_limit")]
+    #[test_case(true; "session_limit")]
+    fn active_shell_limits_do_not_evict_or_replay_work(session_limit: bool) {
+        smol::block_on(async {
+            let fixture = Fixture::new().await;
+            let count = if session_limit {
+                super::MAX_ACTIVE
+            } else {
+                super::MAX_OWNER_ACTIVE
+            };
+            let (_release, wait) = flume::bounded::<()>(1);
+            for index in 0..count {
+                let scope = if index < super::MAX_OWNER_ACTIVE {
+                    fixture.tasks.child_scope(CHILD)
+                } else {
+                    fixture.tasks.child_scope(OTHER)
+                };
+                let wait = wait.clone();
+                scope
+                    .admit_shell(
+                        ShellJobMetadata {
+                            call_id: format!("{CALL}-{index}"),
+                            ..metadata()
+                        },
+                        &fixture.history,
+                        move |cancel, _| async move {
+                            let _ = cancel.race(wait.recv_async()).await;
+                            done()
+                        },
+                    )
+                    .await
+                    .unwrap();
+            }
+            let scope = if session_limit {
+                fixture.tasks.main_scope()
+            } else {
+                fixture.tasks.child_scope(CHILD)
+            };
+            let error = scope
+                .admit_shell(metadata(), &fixture.history, |_, _| async {
+                    panic!("capacity rejection cannot execute")
+                })
+                .await
+                .unwrap_err();
+            assert!(error.starts_with(super::CAPACITY));
+            assert_eq!(fixture.tasks.active_count(), count);
+            fixture.tasks.shutdown().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn archived_shell_retry_keeps_outcome_and_never_replays_factory() {
+        smol::block_on(async {
+            let mut fixture = Fixture::new().await;
+            let scope = fixture.tasks.main_scope();
+            let count = super::MAX_INVOCATIONS + 2;
+            let mut first = None;
+            for index in 0..count {
+                let metadata = ShellJobMetadata {
+                    call_id: format!("{CALL}-{index}"),
+                    ..metadata()
+                };
+                let card = scope
+                    .admit_shell(metadata, &fixture.history, |_, _| async { done() })
+                    .await
+                    .unwrap();
+                fixture.tasks.join_jobs().await.unwrap();
+                scope.settle_launches(&[receipt()]).await.unwrap();
+                let messages = scope.claim_messages().unwrap();
+                fixture
+                    .session
+                    .replace_messages(History::new(messages.clone()).into_items());
+                fixture.session.save(&fixture.dir).unwrap();
+                scope.accept_messages(&messages).await.unwrap();
+                if first.is_none() {
+                    first = Some(fixture.tasks.status(&card.task_id).unwrap());
+                }
+                assert!(fixture.tasks.lock().records.is_empty());
+            }
+            let first = first.unwrap();
+            fixture.tasks.shutdown().await.unwrap();
+            let restored = BackgroundTasks::spawn(fixture.dir.clone(), fixture.session.id)
+                .await
+                .unwrap();
+            let retried = restored
+                .main_scope()
+                .admit_shell(
+                    ShellJobMetadata {
+                        call_id: format!("{CALL}-0"),
+                        ..metadata()
+                    },
+                    &fixture.history,
+                    |_, _| async { panic!("archived retry must not execute") },
+                )
+                .await
+                .unwrap();
+            assert_eq!(retried.invocation_id, first.invocation_id);
+            assert_eq!(retried.result, first.result);
+            assert_eq!(retried.output_ref, first.output_ref);
+            assert!(restored.lock().records.is_empty());
+            restored
+                .main_scope()
+                .admit_shell(
+                    ShellJobMetadata {
+                        call_id: format!("{CALL}-new"),
+                        ..metadata()
+                    },
+                    &fixture.history,
+                    |_, _| async { done() },
+                )
+                .await
+                .unwrap();
+            restored.shutdown().await.unwrap();
+        });
     }
 
     #[test_case(false, false; "eventual_admission")]

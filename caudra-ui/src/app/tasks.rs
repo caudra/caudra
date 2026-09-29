@@ -6,7 +6,7 @@
 //! Both `caudra.task.list()` and the `TaskStatusChanged` autocmd serialize the
 //! types below, so the two can never spell a status differently.
 
-use caudra_agent::background::{BackgroundTasks, ShellSnapshot};
+use caudra_agent::background::{BackgroundTasks, SessionWork, ShellSnapshot};
 use caudra_agent::types::BACKGROUND_EVENT_RUN_ID;
 use caudra_agent::{AgentEvent, Envelope, SubagentInfo, TaskCard, TaskProvenance};
 use std::collections::{HashMap, HashSet};
@@ -272,8 +272,8 @@ impl App {
                 || self.background.as_ref().is_none_or(|runtime| {
                     runtime.generation() != reply.generation
                         || !runtime
-                            .status(&reply.task.task_id)
-                            .is_ok_and(|task| task.invocation_id == reply.task.invocation_id)
+                            .resident_status(&reply.task.task_id)
+                            .is_some_and(|task| task.invocation_id == reply.task.invocation_id)
                 })
             {
                 continue;
@@ -291,14 +291,38 @@ impl App {
         task_response_current(self.background.as_ref(), origin)
     }
     pub(crate) fn has_session_work(&self) -> bool {
-        self.background
-            .as_ref()
-            .is_some_and(|background| background.active_count() > 0 || background.has_pending())
-            || self
-                .workflow
-                .runs()
-                .iter()
-                .any(|run| run.status == caudra_workflow::RunStatus::Active)
+        self.session_work().pending()
+    }
+
+    pub(crate) fn session_work(&self) -> SessionWork {
+        let workflow = self.workflow.runtime_handle();
+        let foreground_tasks = self
+            .chats
+            .iter()
+            .filter(|chat| chat.task_id().is_some() && chat.task_status() == TaskStatus::Working)
+            .count();
+        let mut work = SessionWork::capture(
+            self.background.as_ref(),
+            workflow.as_ref(),
+            foreground_tasks,
+        );
+        work.running |= self
+            .workflow
+            .runs()
+            .iter()
+            .any(|run| run.status == RunStatus::Active);
+        work.settling |= self.workflow.has_delivery()
+            || !self.background_claims.is_empty()
+            || self.background_delivery.pending();
+        work
+    }
+
+    pub(crate) fn waiting_for_background(&self) -> bool {
+        if self.status != crate::components::Status::Idle || self.automatic_wakes_suppressed {
+            return false;
+        }
+        let work = self.session_work();
+        work.pending() && !work.unavailable
     }
 
     pub(crate) fn rearm_background(&mut self) {
@@ -393,7 +417,11 @@ impl App {
                 if !self.show_shell(id) {
                     self.tasks_browse();
                     if !self.task_picker.select(id) {
-                        self.flash(format!("{UNKNOWN_TASK_ERR}{id}"));
+                        if self.background.is_some() {
+                            self.load_task_status(id);
+                        } else {
+                            self.flash(format!("{UNKNOWN_TASK_ERR}{id}"));
+                        }
                     }
                     let _ = self.refresh_task_picker();
                 }
@@ -403,8 +431,11 @@ impl App {
                     .background
                     .as_ref()
                     .ok_or_else(|| TASK_UNAVAILABLE.to_owned())
-                    .and_then(|runtime| runtime.status(id))
-                {
+                    .and_then(|runtime| {
+                        runtime
+                            .resident_status(id)
+                            .ok_or_else(|| format!("{UNKNOWN_TASK_ERR}{id}"))
+                    }) {
                     Ok(task) => self.start_task_control(
                         task,
                         operation == "background",
@@ -431,7 +462,7 @@ impl App {
     pub(super) fn session_owns_task(&self, task_id: &str) -> bool {
         self.background
             .as_ref()
-            .is_some_and(|background| background.status(task_id).is_ok())
+            .is_some_and(|background| background.resident_status(task_id).is_some())
     }
 
     pub(super) fn retain_session_task_routes(&mut self) {
@@ -501,19 +532,7 @@ impl App {
 
     /// The runtime's cards, the picker's selected one in full detail.
     fn runtime_tasks(&self) -> Vec<TaskCard> {
-        let mut runtime = self
-            .background
-            .as_ref()
-            .map(BackgroundTasks::list)
-            .unwrap_or_default();
-        if let Some(id) = self.task_picker.selected_id()
-            && let Some(background) = &self.background
-            && let Ok(detail) = background.status(&id)
-            && let Some(task) = runtime.iter_mut().find(|task| task.task_id == id)
-        {
-            *task = detail;
-        }
-        runtime
+        self.task_history_cards()
     }
 
     /// Every chat, the main one first, with its runtime card if it has one.
@@ -566,6 +585,18 @@ impl App {
         let runtime = self.runtime_tasks();
         let mut tasks = self.chat_tasks(&runtime);
         let mut seen = HashSet::new();
+        for card in runtime.iter().filter(|card| card.kind == JobKind::Agent) {
+            if !tasks.iter().any(|task| task.id.as_ref() == card.task_id) {
+                tasks.push(TaskInfo {
+                    id: Arc::from(card.task_id.as_str()),
+                    name: card.label.clone(),
+                    status: Some(runtime_status(card)),
+                    focused: false,
+                    runtime: Some(card.clone()),
+                    workflow: None,
+                });
+            }
+        }
         for (run, agent, id) in roster_agents(self.workflow.runs()) {
             if !seen.insert(id) {
                 continue;
@@ -696,6 +727,7 @@ pub(super) fn task_response_current(
 impl App {
     pub(super) fn tasks_browse(&mut self) -> Vec<Action> {
         self.shell_modal.close();
+        self.load_task_history(false);
         self.task_picker.set_promotion_enabled(
             self.background
                 .as_ref()
@@ -740,6 +772,10 @@ impl App {
                 .chats
                 .iter()
                 .position(|chat| chat.task_id().is_some_and(|id| id.as_ref() == task.task_id));
+            if index.is_none() && !task.active() {
+                changed |= self.chats[0].task_card_update(task);
+                continue;
+            }
             let index = index.unwrap_or_else(|| {
                 self.resolve_or_create_chat(&SubagentInfo {
                     parent_tool_use_id: task.call_id.clone(),
@@ -794,6 +830,7 @@ impl App {
 
     pub(super) fn handle_task_picker_action(&mut self, action: TaskPickerAction) -> Vec<Action> {
         match action {
+            TaskPickerAction::History { older } => self.load_task_history(older),
             TaskPickerAction::Consumed => {}
             TaskPickerAction::Opened(id) => self.preview_task(&id),
             TaskPickerAction::Control { task, promote } => {
@@ -838,6 +875,15 @@ impl App {
     }
 
     pub(super) fn preview_task(&mut self, id: &str) {
+        self.task_history.cancel_transcript();
+        if !self
+            .chats
+            .iter()
+            .any(|chat| chat.task_id().is_some_and(|task| task.as_ref() == id))
+            && self.load_archived_chat(id)
+        {
+            return;
+        }
         if let Err(error) = self.focus_task(id) {
             self.flash(error);
         }

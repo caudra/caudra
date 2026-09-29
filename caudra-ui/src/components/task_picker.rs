@@ -50,6 +50,9 @@ const CANCEL: Bind = Bind {
 #[must_use]
 pub enum TaskPickerAction {
     Consumed,
+    History {
+        older: bool,
+    },
     /// The selection moved. The app focuses this task so the transcript behind
     /// the float is the one being previewed.
     Preview(String),
@@ -231,6 +234,12 @@ impl TaskPicker {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> TaskPickerAction {
+        if key.modifiers == KeyModifiers::ALT && matches!(key.code, KeyCode::Left | KeyCode::Right)
+        {
+            return TaskPickerAction::History {
+                older: key.code == KeyCode::Right,
+            };
+        }
         if PROMOTE.matches(key) || CANCEL.matches(key) {
             let promote = PROMOTE.matches(key);
             return self
@@ -388,6 +397,7 @@ fn footer() -> Vec<Hint> {
     vec![
         Hint::bind(key::ENTER, "open"),
         Hint::bind(key::ESC, "cancel"),
+        Hint::inert("Alt+←/→", "recent/older"),
     ]
 }
 

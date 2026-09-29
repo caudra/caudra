@@ -1036,6 +1036,21 @@ mod background_runtime {
             self.app.flush_background_delivery(true).await.unwrap();
         }
 
+        async fn drain_response(&mut self) {
+            loop {
+                let envelope = self.handles.agent_rx.recv_async().await.unwrap();
+                let done = envelope.subagent.is_none()
+                    && envelope.task.is_none()
+                    && envelope.run_id == self.app.run_id
+                    && matches!(envelope.event, AgentEvent::Done { .. });
+                self.app.update(Msg::Agent(Box::new(envelope)));
+                if done {
+                    break;
+                }
+            }
+            self.app.flush_background_delivery(true).await.unwrap();
+        }
+
         fn envelope(&self, event: AgentEvent) -> Envelope {
             let task = self
                 .handles
@@ -1316,6 +1331,84 @@ mod background_runtime {
                     .iter()
                     .any(|tool| tool["name"] == "task_control")
             );
+            fixture.close().await;
+        }));
+    }
+
+    #[test_case(false; "next_after_result")]
+    #[test_case(true; "guide_wakes_parked_parent")]
+    fn parked_parent_keeps_next_until_background_result_is_processed(guide: bool) {
+        const NEXT: &str = "Start the next independent change.";
+        const GUIDE: &str = "Include the audit finding in the current change.";
+        smol::block_on(bounded(async {
+            let mut fixture = Fixture::after_final().await;
+            let background = fixture.handles.background.as_ref().unwrap().clone();
+            assert!(fixture.app.waiting_for_background());
+            let prompt = |text: &str| QueuedMessage {
+                text: text.into(),
+                images: Vec::new(),
+                mentions: Vec::new(),
+                commits: Vec::new(),
+                paste_ranges: Vec::new(),
+            };
+            assert!(matches!(
+                fixture.app.submit_prompt(prompt(NEXT)),
+                SubmitOutcome::Queued
+            ));
+            assert_eq!(fixture.handles.queue.len(), 1);
+            assert!(fixture.requests.is_empty());
+            if guide {
+                assert!(matches!(
+                    fixture.app.submit_prompt_with_admission(
+                        prompt(GUIDE),
+                        caudra_agent::PromptAdmission::Steer
+                    ),
+                    SubmitOutcome::Queued
+                ));
+                let request = fixture.requests.recv_async().await.unwrap();
+                assert!(request.messages.iter().any(|message| {
+                    message
+                        .first_text_content()
+                        .is_some_and(|text| text.contains(GUIDE))
+                }));
+                request.reply.send(final_response()).unwrap();
+                fixture.drain_response().await;
+                assert_eq!(background.active_count(), 1);
+                assert_eq!(fixture.handles.queue.len(), 1);
+            }
+            fixture.child.reply.send(final_response()).unwrap();
+            background.notified().await;
+            let messages = background.claim_messages().unwrap();
+            assert!(!messages.is_empty());
+            let actions = fixture.app.start_mailbox_run(messages);
+            enqueue(&fixture.app, &fixture.handles, actions);
+            let request = fixture.requests.recv_async().await.unwrap();
+            assert!(
+                request
+                    .messages
+                    .iter()
+                    .any(|message| message.task_event.is_some())
+            );
+            assert!(
+                !request
+                    .messages
+                    .iter()
+                    .any(|message| message.first_text_content() == Some(NEXT))
+            );
+            assert_eq!(fixture.handles.queue.len(), 1);
+            request.reply.send(final_response()).unwrap();
+            fixture.drain_response().await;
+            let _ = fixture.app.reconcile_tasks();
+            assert!(!fixture.app.has_session_work());
+            fixture.handles.queue.allow_next_turn(true);
+            let request = fixture.requests.recv_async().await.unwrap();
+            assert!(request.messages.iter().any(|message| {
+                message
+                    .first_text_content()
+                    .is_some_and(|text| text.contains(NEXT))
+            }));
+            request.reply.send(final_response()).unwrap();
+            fixture.drain_parent().await;
             fixture.close().await;
         }));
     }
@@ -2656,7 +2749,10 @@ fn replacement_without_an_active_run_starts_without_waiting_for_a_terminal_event
         panic!("expected replacement");
     };
 
-    assert!(actions.is_empty());
+    assert!(matches!(
+        actions.as_slice(),
+        [Action::CancelAgent { run_id: 1 }]
+    ));
     assert_eq!(app.cancelling_run, None);
     assert_eq!(app.run_id, 2);
 }
@@ -2843,9 +2939,7 @@ fn type_and_submit(app: &mut App, text: &str) -> Vec<Action> {
 }
 
 #[test_case("/tasks"; "plural")]
-#[test_case("/task"; "singular")]
 #[test_case("/tasks list"; "plural_list")]
-#[test_case("/task list"; "singular_list")]
 fn task_commands_open_local_picker_without_transcript(command: &str) {
     let mut app = app_with_subagent();
     let before = app.chats[0].message_count();
@@ -2894,9 +2988,9 @@ fn shell_and_task_modals_replace_each_other_over_the_same_chat() {
 
 #[test_case("/tasks status"; "missing_id")]
 #[test_case("/tasks list extra"; "extra_list_id")]
-#[test_case("/task cancel id extra"; "extra_cancel_argument")]
+#[test_case("/tasks cancel id extra"; "extra_cancel_argument")]
 #[test_case("/tasks invalid id"; "invalid_operation")]
-#[test_case("/task status id extra more"; "many_extra_arguments")]
+#[test_case("/tasks status id extra more"; "many_extra_arguments")]
 fn malformed_task_commands_never_send_or_steer(command: &str) {
     let mut app = app_with_subagent();
     app.active_chat = 1;
@@ -2908,7 +3002,6 @@ fn malformed_task_commands_never_send_or_steer(command: &str) {
 }
 
 #[test_case("/tasks"; "plural")]
-#[test_case("/task"; "alias")]
 fn task_status_selects_without_preview_then_enter_opens(command: &str) {
     let mut app = app_with_subagent();
     assert!(type_and_submit(&mut app, &format!("{command} status {TASK_ID}")).is_empty());
@@ -4588,6 +4681,7 @@ fn custom_command_falls_back_to_main_when_the_task_cannot_be_steered() {
     let (mut app, _steer_tx) = focused_task_composer();
     with_custom_command(&mut app, "audit", RENDERED);
     app.subagent_steers.remove(TASK_ID);
+    app.chats[app.active_chat].mark_finished(TaskOutcome::Done, DONE_TEXT);
 
     let actions = app.execute_command(cmd("/project:audit"), 0);
 
@@ -7451,8 +7545,12 @@ fn a_retry_countdown_reaches_app_cadence_through_the_chat_that_owns_it() {
 
     assert_eq!(app.chats[0].cadence(), Cadence::SPINNER);
     assert_eq!(
-        app.status_bar
-            .cadence(&app.status, false, app.state.goal.snapshot().is_some()),
+        app.status_bar.cadence(
+            &app.status,
+            false,
+            app.state.goal.snapshot().is_some(),
+            false
+        ),
         Cadence::IDLE,
         "{BAR_CLAIMS_THE_COUNTDOWN}"
     );

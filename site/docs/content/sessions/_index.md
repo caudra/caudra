@@ -60,6 +60,8 @@ The parent can keep working on a separate scope. When nothing independent remain
 
 The main agent also receives bounded [background-work reminders](/docs/context/#background-work-awareness) when state changes and after compaction. Periodic refresh during ongoing work is opt-in through `agent.background_reminder_turns`, which defaults to `0` (disabled). These reminders do not start idle turns.
 
+The footer keeps a differently styled spinner and a waiting label while background work or result delivery will wake the main agent. It does not mean a model request is running. Queued next messages and goal checks wait until that work settles and the main agent processes its results. See [Queue and Steering](/docs/queue/) for guide and replace behavior.
+
 ### Inspect and control tasks
 
 Open `/tasks` or press `Ctrl+X a` to inspect transcripts and steer running children. These commands act locally without sending a model prompt or adding transcript messages:
@@ -72,11 +74,13 @@ Open `/tasks` or press `Ctrl+X a` to inspect transcripts and steer running child
 | `/tasks cancel <id>` | Cancel that invocation, showing cancelling until it settles |
 | `/shells` | Open the shell modal to inspect or stop shell commands |
 
-Singular `/task` forms remain compatibility aliases. The task picker lists subagents and workflow agents. Press Enter or click an agent task to open its chat. A workflow agent without a transcript opens its run in the workflow inspector. The picker shows `bg` at the right of background rows, including finished tasks. Task results and reports render as Markdown and structured values as JSON. See [task navigation](/docs/commands/#tasks) for filtering and keyboard controls.
+The task picker lists subagents and workflow agents. Press Enter or click an agent task to open its chat. A workflow agent without a transcript opens its run in the workflow inspector. The picker shows `bg` at the right of background rows, including finished tasks. Task results and reports render as Markdown and structured values as JSON. See [task navigation](/docs/commands/#tasks) for filtering and keyboard controls.
 
 The shell modal lists `shell` calls from the main agent, subagents, and workflow agents, in the foreground or the background. Output appears as literal text. `Ctrl+K` stops only the selected command, and its owner continues with a cancelled result. `/tasks status <id>` with a shell ID opens this modal. The footer shows `[tasks · N]` for running agents and `[shell · N]` for running commands, and each chip disappears at zero. See [shell commands](/docs/commands/#shell-commands) for navigation and controls.
 
 The model can inspect and cancel jobs through [`task_control`](/docs/tools/#task_control). Task `auto` also permits promotion of agent tasks. All actions except `list` require `task_id`. A later `task` call can continue a settled agent task from its saved history, but cannot resume an active or cancelling invocation. Shell jobs cannot be resumed or promoted. Run a new shell call when another command is needed.
+
+Settled tasks and background shell jobs are archived with the session once delivery is complete. Finished history does not consume live admission capacity. In either modal, `Alt+Right` loads older archived entries and `Alt+Left` returns to recent history. Details and task transcripts load on demand. Old IDs, results, and continuation history remain available until the session is deleted or removed by retention. The model can page history with the `next` cursor returned by `task_control list`, passing it as `before` on the next call.
 
 Shell results retain Workcell's output bounds and filtering. A truncated result can include a `tool_output` reference for the retained output, which is not an unlimited process log. Saved references remain usable after history reloads and forks.
 
@@ -97,6 +101,8 @@ Stored output handles identify the producer, such as `output-file-grep` or `outp
 Collisions add `-2`, `-3`, and later numeric suffixes. New IDs are at most 64 characters, including prefixes and suffixes. Shell jobs and their outputs allocate suffixes independently. Always use the returned `task_id` or output reference unchanged rather than reconstructing it from a label.
 
 Existing IDs and output handles remain valid. Continuations and workflow replay keep the original task ID even when its description changes. Reloading or copying a session preserves its saved output references.
+
+Workflow run IDs use random word-list names like plan files, such as `neat-wanted-cowbird`. Collisions add numeric suffixes within the same 64-character limit. Existing workflow IDs remain valid, and pause, resume, and history keep the original ID.
 
 ### Child reports
 

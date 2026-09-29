@@ -304,12 +304,14 @@ The published task arguments and instructions follow `agent.task_execution`: `sy
 
 ### `task_control` {#task_control}
 
-Inspect or control jobs visible to this owner. Actions: list, status, cancel. Use status when details are needed, not as a polling loop. The background action promotes a running foreground task without restarting it.
+Inspect or control jobs visible to this owner. Actions: list, status, cancel. List returns resident jobs and a bounded history page; pass next as before to read older history. Use status when details are needed, not as a polling loop. The background action promotes a running foreground task without restarting it.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `action` | string | yes |  |
 | `task_id` | string | no | Required except for list. |
+| `before` | object | no | History cursor returned as next by list. |
+| `limit` | integer | no |  |
 
 ### `workflow` <span class="badge">on demand</span> {#workflow}
 

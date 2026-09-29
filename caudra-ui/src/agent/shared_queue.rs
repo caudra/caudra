@@ -192,6 +192,7 @@ impl QueueItem {
 #[derive(Clone)]
 pub(crate) struct QueueSender {
     dispatch_guard: SharedDispatchGuard,
+    next_ready: Arc<AtomicBool>,
     queue: EditableQueue<QueueItem>,
     paused: Arc<AtomicBool>,
     claim_gate: Arc<Mutex<()>>,
@@ -202,6 +203,7 @@ pub(crate) struct QueueSender {
 
 pub(crate) struct QueueReceiver {
     dispatch_guard: SharedDispatchGuard,
+    next_ready: Arc<AtomicBool>,
     queue: EditableQueueReceiver<QueueItem>,
     paused: Arc<AtomicBool>,
     claim_gate: Arc<Mutex<()>>,
@@ -221,9 +223,11 @@ pub(crate) fn queue() -> (QueueSender, QueueReceiver) {
     let active_run_id = Arc::new(AtomicU64::new(0));
     let processing = Arc::new(AtomicBool::new(false));
     let dispatch_guard = SharedDispatchGuard::default();
+    let next_ready = Arc::new(AtomicBool::new(true));
     (
         QueueSender {
             dispatch_guard: dispatch_guard.clone(),
+            next_ready: Arc::clone(&next_ready),
             queue,
             paused: Arc::clone(&paused),
             claim_gate: Arc::clone(&claim_gate),
@@ -233,6 +237,7 @@ pub(crate) fn queue() -> (QueueSender, QueueReceiver) {
         },
         QueueReceiver {
             dispatch_guard,
+            next_ready,
             queue: receiver,
             paused,
             claim_gate,
@@ -254,6 +259,29 @@ impl QueueSender {
         self.queue.wake();
     }
 
+    pub(crate) fn allow_next_turn(&self, ready: bool) {
+        let _claim = self.lock_dispatch();
+        let ready = ready && !self.is_processing();
+        if self.next_ready.swap(ready, Ordering::AcqRel) != ready && ready {
+            self.queue.wake();
+        }
+    }
+
+    pub(crate) fn has_priority_input(&self) -> bool {
+        self.queue.has_matching(|item| {
+            matches!(
+                item,
+                QueueItem::Message {
+                    displayed: true,
+                    ..
+                }
+            ) || matches!(
+                item.admission(),
+                PromptAdmission::Steer | PromptAdmission::Interrupt
+            )
+        })
+    }
+
     pub(crate) fn set_dispatch_guard(&self, guard: Arc<dyn Fn() -> bool + Send + Sync>) {
         if let Ok(mut slot) = self.dispatch_guard.lock() {
             *slot = Some(guard);
@@ -261,7 +289,23 @@ impl QueueSender {
     }
 
     pub(crate) fn push(&self, entry: QueueItem) -> QueueItemId {
-        self.queue.push(entry)
+        if matches!(
+            entry,
+            QueueItem::Message {
+                displayed: true,
+                ..
+            }
+        ) {
+            let run_id = entry.run_id();
+            self.queue.retain_mut_and_push(entry, |item| {
+                if item.run_id() < run_id {
+                    item.set_run_id(run_id);
+                }
+                true
+            })
+        } else {
+            self.queue.push(entry)
+        }
     }
 
     pub(crate) fn remove_id(&self, id: QueueItemId) -> Option<QueueItem> {
@@ -490,6 +534,10 @@ impl QueueSender {
 }
 
 impl QueueReceiver {
+    pub(crate) fn hold_next_turn(&self) {
+        self.next_ready.store(false, Ordering::Release);
+    }
+
     fn dispatch_allowed(&self) -> bool {
         !crate::sandbox::transfer::active()
             && self
@@ -545,7 +593,7 @@ impl QueueReceiver {
                 {
                     self.processing.store(false, Ordering::Release);
                     return Vec::new();
-                } else {
+                } else if self.next_ready.load(Ordering::Acquire) {
                     self.queue.claim(|item| {
                         matches!(
                             item,
@@ -556,6 +604,9 @@ impl QueueReceiver {
                             }
                         )
                     })
+                } else {
+                    self.queue
+                        .claim_front_matching(|item| matches!(item, QueueItem::Compact { .. }))
                 }
             };
             if claimed.is_empty() {
@@ -641,6 +692,18 @@ impl QueueReceiver {
 }
 
 impl InterruptSource for QueueReceiver {
+    fn has_pending_input(&self) -> bool {
+        self.queue.has_matching(|item| {
+            matches!(
+                item,
+                QueueItem::Message {
+                    displayed: false,
+                    ..
+                }
+            )
+        })
+    }
+
     fn poll(&self) -> Option<ExtractedCommand> {
         let mut claimed = self.claim_steers();
         match claimed.len() {
@@ -677,6 +740,50 @@ mod tests {
 
     const PADDED_DRAFT: &str = "  ab cd  ";
     const PLAN_PATH: &str = ".caudra/plans/test.md";
+
+    #[test_case(QueueDelivery::Separate, 1; "separate")]
+    #[test_case(QueueDelivery::TogetherNextTurn, 2; "together")]
+    fn next_waits_for_handoff_without_blocking_guidance_or_results(
+        delivery: QueueDelivery,
+        count: usize,
+    ) {
+        let (sender, receiver) = queue();
+        receiver.hold_next_turn();
+        sender.set_delivery(delivery);
+        let first = sender.push(msg(false));
+        sender.push(msg(false));
+        assert!(receiver.claim_idle(0).is_empty());
+        assert!(!sender.has_priority_input());
+        assert!(receiver.has_pending_input());
+        let guide = sender.push(steer(AgentMode::Build));
+        assert!(sender.has_priority_input());
+        assert_eq!(receiver.claim_idle(0)[0].0, guide);
+        receiver.clear_active_run();
+        let mut result = msg(true);
+        result.set_run_id(1);
+        let result = sender.push(result);
+        assert_eq!(receiver.claim_idle(0)[0].0, result);
+        sender.allow_next_turn(true);
+        receiver.clear_active_run();
+        assert!(receiver.claim_idle(0).is_empty());
+        sender.allow_next_turn(true);
+        let claimed = receiver.claim_idle(0);
+        assert_eq!(claimed.len(), count);
+        assert_eq!(claimed[0].0, first);
+        assert!(claimed.iter().all(|(_, item)| item.run_id() == 1));
+    }
+
+    #[test_case(false; "compact_before_next")]
+    #[test_case(true; "compact_after_next")]
+    fn parked_queue_preserves_compact_barriers(next_first: bool) {
+        let (sender, receiver) = queue();
+        receiver.hold_next_turn();
+        if next_first {
+            sender.push(msg(false));
+        }
+        sender.push(QueueItem::Compact { run_id: 0 });
+        assert_eq!(receiver.claim_idle(0).is_empty(), next_first);
+    }
 
     #[test_case(false; "idle")]
     #[test_case(true; "steer")]

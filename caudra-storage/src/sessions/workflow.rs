@@ -18,9 +18,12 @@ use serde::{Deserialize, Serialize};
 use crate::StorageError;
 use crate::id::CaudraId;
 use crate::sessions::{SessionDatabase, SessionError};
+use crate::words::DescriptiveIdCandidates;
 
 const MAX_SOURCE_BYTES: usize = 256 * 1024;
 const MAX_IDENTIFIER_BYTES: usize = 256;
+const WORKFLOW_ID_FALLBACK: &str = "workflow";
+const WORKFLOW_IDS_EXHAUSTED: &str = "workflow run name candidates exhausted";
 const MAX_TEXT_BYTES: usize = 64 * 1024;
 const MAX_PATH_BYTES: usize = 32 * 1024;
 const MAX_RUNS_PER_LOAD: i64 = 64;
@@ -289,6 +292,31 @@ pub(crate) struct WorkflowTrim {
 }
 
 impl SessionDatabase {
+    pub fn insert_named_workflow_run(
+        &self,
+        mut row: WorkflowRunRow,
+    ) -> Result<String, SessionError> {
+        let transaction =
+            Transaction::new_unchecked(self.connection(), TransactionBehavior::Immediate)?;
+        for candidate in DescriptiveIdCandidates::new(&row.run_id, WORKFLOW_ID_FALLBACK) {
+            let exists: bool = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM workflow_runs WHERE run_id = ?1)",
+                params![candidate],
+                |row| row.get(0),
+            )?;
+            if !exists {
+                row.run_id = candidate;
+                self.insert_workflow_run(&row)?;
+                transaction.commit()?;
+                return Ok(row.run_id);
+            }
+        }
+        Err(refused(
+            io::ErrorKind::AlreadyExists,
+            WORKFLOW_IDS_EXHAUSTED,
+        ))
+    }
+
     pub fn insert_workflow_run(&self, row: &WorkflowRunRow) -> Result<(), SessionError> {
         validate_run(row)?;
         self.connection().execute(

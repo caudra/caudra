@@ -59,7 +59,10 @@ impl MessageQueue {
         self.shared.is_some()
     }
 
-    #[cfg(test)]
+    pub(crate) fn is_processing(&self) -> bool {
+        self.shared.as_ref().is_some_and(QueueSender::is_processing)
+    }
+
     pub(crate) fn is_empty(&self) -> bool {
         self.shared.as_ref().is_none_or(|s| s.is_empty())
     }
@@ -898,7 +901,12 @@ impl App {
         {
             return SubmitOutcome::Rejected(super::REVERT_BUSY_MSG);
         }
-        if self.status == Status::Streaming {
+        if self.status == Status::Streaming
+            || (self.status == Status::Idle
+                && (self.has_session_work()
+                    || self.queue.is_processing()
+                    || !self.queue.is_empty()))
+        {
             if admission == PromptAdmission::Interrupt {
                 return self.replace_and_notify(msg);
             }
@@ -984,7 +992,9 @@ impl App {
             return false;
         };
         let input = self.build_agent_input(&msg);
-        self.rearm_background();
+        if self.automatic_wakes_suppressed {
+            self.rearm_background();
+        }
         shared.push(QueueItem::Message {
             text: msg.text,
             image_count: msg.images.len(),
@@ -1029,18 +1039,14 @@ impl App {
         }
         let cancelled_run = self.run_id;
         let replacement_run = cancelled_run + 1;
+        self.stop_background_work();
         let (id, active) = shared.replace(cancelled_run, replacement_run, replacement);
         let cancelled_run = self.begin_main_cancel(true, active);
         debug_assert_eq!(self.run_id, replacement_run);
         self.replacement_item = Some(id);
-        SubmitOutcome::Replacing(
-            active
-                .then_some(Action::CancelAgent {
-                    run_id: cancelled_run,
-                })
-                .into_iter()
-                .collect(),
-        )
+        SubmitOutcome::Replacing(vec![Action::CancelAgent {
+            run_id: cancelled_run,
+        }])
     }
 
     /// Push restored queue items only here, never in `restore_display`: on
@@ -1136,7 +1142,9 @@ impl App {
         if self.replacement_item == Some(id) {
             self.replacement_item = None;
             self.cancelling_run = None;
+            self.rearm_background();
         }
+        self.goal_deferred = false;
         self.queue.clamp_focus();
         self.status = Status::Streaming;
         self.main_chat()
@@ -1150,7 +1158,9 @@ impl App {
         {
             self.replacement_item = None;
             self.cancelling_run = None;
+            self.rearm_background();
         }
+        self.goal_deferred = false;
         self.queue.clamp_focus();
         self.status = Status::Streaming;
         let messages = items

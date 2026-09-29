@@ -2116,7 +2116,7 @@ impl MessagesPanel {
         }
         let mut changed = false;
         for (invocation, task_id) in identities {
-            if let Ok(card) = runtime.status_invocation(&task_id, &invocation) {
+            if let Some(card) = runtime.resident_invocation_status(&task_id, &invocation) {
                 changed |= self.task_card_update(card);
             }
         }

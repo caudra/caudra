@@ -31,7 +31,6 @@ Commands marked Main only act on the main session's turn or history. They stay l
 | `/stash-list` | Browse stashed prompts |  |
 | `/memory` | View, edit, and delete memory files |  |
 | `/tasks` | Browse tasks and steer running subagents |  |
-| `/task` | Task controls: list, status <id>, background <id> (without restart), cancel <id> |  |
 | `/shells` | Browse shell commands and stop running ones |  |
 | `/workflows` | Browse, trust, and launch workflows | Main only |
 | `/workflow` | Start a workflow, or list, pause, resume, and stop runs | Main only |
@@ -105,7 +104,7 @@ Each `task` subagent has a separate transcript. Open the task picker with `/task
 
 `/tasks list` opens or refreshes the picker. `/tasks status <task_id>` opens it with that task selected and its details visible. Press Enter or click an agent row to open its chat. Workflow agents are listed too, and one without a transcript opens its run in the workflow inspector. Escape restores the original focus. Inspection stays local and does not send a model prompt or add transcript messages. Shell commands have their own modal, described in [Shell commands](#shell-commands). `/tasks status` with a shell ID opens that modal instead.
 
-`/tasks background <task_id>` lets a foreground agent task continue asynchronously without restarting it when `agent.task_execution = "auto"`. `/tasks cancel <task_id>` cancels that invocation. The picker offers `Ctrl+B` to promote and `Ctrl+K` to cancel an eligible selected task. Ordinary letters filter the list. Main and finished tasks have no execution controls. Singular `/task` forms remain compatibility aliases. See [background tasks](/docs/sessions/#background-tasks) for execution policies, delivery, and shutdown behavior.
+`/tasks background <task_id>` lets a foreground agent task continue asynchronously without restarting it when `agent.task_execution = "auto"`. `/tasks cancel <task_id>` cancels that invocation. The picker offers `Ctrl+B` to promote and `Ctrl+K` to cancel an eligible selected task. Ordinary letters filter the list. Main and finished tasks have no execution controls. See [background tasks](/docs/sessions/#background-tasks) for execution policies, delivery, and shutdown behavior.
 
 Background rows show a right-aligned `bg` indicator beside the state or spinner, including after completion. New task IDs come from the description, such as `implement-active-footer-chips`, with `-2`, `-3`, and later suffixes for collisions. Display labels stay unchanged. Shell jobs use safe command labels such as `shell-cargo-test`, falling back to `shell`. Use the returned ID unchanged. Older IDs remain valid for inspection, control, and continuation. See [task and output IDs](/docs/sessions/#task-and-output-ids) for naming and compatibility.
 
@@ -129,6 +128,8 @@ Finished commands stay listed after a reload. See [shell history](/docs/sessions
 
 A workflow is a script that launches subagents in phases, keeps a journal, and can be paused and resumed. Each session runs one workflow runtime. Runs continue after a normal main-turn completion. `Esc Esc` stops the main turn, background tasks, and workflows, and suppresses automatic completion turns. A run belongs to the session that started it and stays with that session when you switch to another.
 
+New workflow run IDs use three words from the plan-name word lists, such as `neat-wanted-cowbird`. A collision adds a numeric suffix. Existing run IDs remain valid, and resuming a run keeps its original ID.
+
 `/workflows` opens the catalog: every script from the built-ins, the project's `.caudra/workflows/`, and your user config, with the ones that failed to parse listed under it. A project or user script runs only after its content digest has been trusted. `Enter` on an untrusted entry shows the digest and asks you to confirm it, and a script that changes on disk needs trusting again. `Enter` on a trusted entry fills the composer with `/workflow <name> ` so you can add the arguments.
 
 `/workflow <name> [--agent-budget N] [args]` starts a run. Arguments written as a JSON object are handed to the script as they are. Any other text becomes its `query` and `objective`. `--agent-budget` caps how many agents the run may admit. Starting an untrusted script reports it and points you at `/workflows`. `/deep-research <query>` is `/workflow deep-research <query>`.
@@ -145,7 +146,7 @@ Closing Caudra interrupts every active run, and an interrupted run is over. Paus
 
 `/goal <condition>` asks Caudra to keep working until the conversation contains evidence that the condition is met. One goal can be active per session, and a new condition replaces the current one. Conditions are limited to 4,000 characters.
 
-At the end of each natural work turn, a separate model call evaluates the condition against a private copy of the transcript. The evaluator has no tools and its messages do not enter the conversation. A met goal clears itself. An unmet goal adds hidden guidance and starts another work turn. A genuinely impossible goal stops with the evaluator's reason and clears itself.
+At the end of each natural work turn, a separate model call evaluates the condition against a private copy of the transcript. Background tasks, shell commands, workflows, and their result delivery must settle first. The main agent processes their results before the turn is complete. Queued user input takes priority over a goal check. The evaluator has no tools and its messages do not enter the conversation. A met goal clears itself. An unmet goal adds hidden guidance and starts another work turn. A genuinely impossible goal stops with the evaluator's reason and clears itself.
 
 Run `/goal-model` to open the Goal assignment page directly. `/goal model` is also accepted as an alias. Left unbound, Goal follows Fast. See [Model jobs](#model-jobs) for other assignments and failure behavior.
 

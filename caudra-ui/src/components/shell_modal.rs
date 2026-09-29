@@ -111,6 +111,9 @@ impl ShellInputs {
 #[must_use]
 pub enum ShellModalAction {
     Consumed,
+    History {
+        older: bool,
+    },
     Stop(ShellStop),
     /// The details page needs what an earlier runtime kept of this execution.
     LoadOutput(String),
@@ -396,6 +399,14 @@ impl ShellModal {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> ShellModalAction {
+        if self.page.is_none()
+            && key.modifiers == KeyModifiers::ALT
+            && matches!(key.code, KeyCode::Left | KeyCode::Right)
+        {
+            return ShellModalAction::History {
+                older: key.code == KeyCode::Right,
+            };
+        }
         if STOP.matches(key) {
             return self
                 .selected_id()
@@ -880,7 +891,11 @@ fn notice(text: &'static str) -> Line<'static> {
 }
 
 fn footer() -> Vec<Hint> {
-    vec![Hint::bind(key::ENTER, DETAILS), Hint::bind(key::ESC, CLOSE)]
+    vec![
+        Hint::bind(key::ENTER, DETAILS),
+        Hint::bind(key::ESC, CLOSE),
+        Hint::inert("Alt+←/→", "recent/older"),
+    ]
 }
 
 fn running_footer() -> Vec<Hint> {

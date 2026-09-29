@@ -130,7 +130,6 @@ pub(crate) struct AgentHandles {
     session_id: Option<CaudraId>,
     subagent_history: SubagentHistoryStore,
     pub(crate) background_wake_rx: flume::Receiver<()>,
-    pub(crate) background_wake_resume: flume::Sender<()>,
     _background_notifier: Option<smol::Task<()>>,
     /// Tab-lifetime, like the output channel: the loop being replaced and the
     /// workflow agents that outlive it may still be writing, so every
@@ -529,16 +528,14 @@ fn spawn_agent_internal(
     local_documents: Option<Arc<LocalDocumentStore>>,
 ) -> AgentHandles {
     let (background_wake_tx, background_wake_rx) = flume::bounded(1);
-    let (background_wake_resume, resume_rx) = flume::bounded(1);
     let background_notifier = background.clone().map(|background| {
         smol::spawn(async move {
             loop {
-                background.notified().await;
-                if background_wake_tx.send_async(()).await.is_err()
-                    || resume_rx.recv_async().await.is_err()
-                {
+                let changed = background.listen();
+                if background_wake_tx.send_async(()).await.is_err() {
                     break;
                 }
+                changed.await;
             }
         })
     });
@@ -701,7 +698,6 @@ fn spawn_agent_internal(
         session_id: session_id.map(|session| session.id()),
         subagent_history,
         background_wake_rx,
-        background_wake_resume,
         _background_notifier: background_notifier,
         path_locks,
         workspace_session,

@@ -12,6 +12,7 @@ use arc_swap::ArcSwap;
 use caudra_storage::StateDir;
 use caudra_storage::id::CaudraId;
 use caudra_storage::paths::config_dir;
+use caudra_storage::random_task_id;
 use caudra_storage::workflow::{
     MAX_HISTORY_RUNS, WorkflowCallKind, WorkflowCallRow, WorkflowCallState, WorkflowRunPatch,
     WorkflowRunRow, WorkflowRunStatus, WorkflowUpdate,
@@ -45,6 +46,7 @@ use crate::types::{AgentEvent, Envelope, EventSender, WORKFLOW_EVENT_RUN_ID, Wor
 
 const OBJECTIVE_ARG: &str = "objective";
 const QUERY_ARG: &str = "query";
+const WORKFLOW_ID_ERROR: &str = "workflow ID generation failed";
 const DISPLAY_NAME_SEPARATOR: &str = "-";
 const FIRST_DUPLICATE_SUFFIX: u32 = 2;
 const MODE_BUILD: &str = "build";
@@ -381,10 +383,11 @@ impl Manager {
         let agent_budget = launch.agent_budget.unwrap_or(DEFAULT_AGENT_BUDGET);
         check_budget(agent_budget)?;
         self.check_capacity()?;
-        let run_id = CaudraId::generate().to_string();
+        let run_id = random_task_id()
+            .map_err(|error| WorkflowError::Storage(format!("{WORKFLOW_ID_ERROR}: {error}")))?;
         let launch_mode = mode_label(&(self.env.mode)());
         let row = WorkflowRunRow {
-            run_id: run_id.clone(),
+            run_id,
             session_id: self.session_id,
             display_name: self.unique_display_name(&resolved.meta.name),
             workflow_name: resolved.meta.name,
@@ -414,7 +417,7 @@ impl Manager {
             updated_at: 0,
             bytes: 0,
         };
-        self.env.store.insert_run(row).await?;
+        let run_id = self.env.store.insert_named_run(row).await?;
         let row = self.load_row(&run_id).await?;
         let snapshot = snapshot_from_row(&row);
         publish(&self.env.published, &snapshot);
@@ -1783,6 +1786,13 @@ complete(result);
 
             let started = start(&handle, ECHO, None).await;
             assert_eq!(started.status, RunStatus::Active);
+            assert_eq!(started.run_id.split('-').count(), 3);
+            assert!(
+                started
+                    .run_id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte == b'-')
+            );
             assert_eq!(started.workflow_name, ECHO);
             assert_eq!(started.agent_budget, DEFAULT_AGENT_BUDGET);
             assert_eq!(handle.active_count(), 1);

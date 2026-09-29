@@ -321,6 +321,15 @@ impl WorkflowUi {
         !self.claimed.is_empty()
     }
 
+    pub(crate) fn has_delivery(&self) -> bool {
+        self.has_claims()
+            || !self.ready.is_empty()
+            || self
+                .runs
+                .iter()
+                .any(|run| run.outbox_pending && !self.suppressed.contains(&run.run_id))
+    }
+
     pub(super) fn apply_delivery(&mut self, result: WorkflowDeliveryResult) {
         for origin in result.acked {
             #[cfg(test)]

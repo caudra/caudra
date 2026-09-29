@@ -13,6 +13,7 @@ use crate::{
 };
 
 pub const MAX_INVOCATIONS: usize = 128;
+pub const MAX_HISTORY_PAGE: usize = 32;
 pub const MAX_REPORTS: usize = 32;
 pub const MAX_RECORD_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_SESSION_BYTES: usize = 64 * 1024 * 1024;
@@ -36,6 +37,45 @@ CREATE TABLE background_receipts (
     PRIMARY KEY(session_id, event_id)
 ) STRICT, WITHOUT ROWID;
 "#;
+pub(crate) const ARCHIVE_SCHEMA: &str = r#"
+ALTER TABLE background_tasks ADD COLUMN archived INTEGER NOT NULL DEFAULT 0 CHECK(archived IN (0, 1));
+ALTER TABLE background_tasks ADD COLUMN last_sequence INTEGER NOT NULL DEFAULT 0;
+UPDATE background_tasks SET last_sequence = max(json_extract(payload, '$.sequence'), coalesce((SELECT max(json_extract(value, '$.sequence')) FROM json_each(payload, '$.events')), 0));
+CREATE INDEX background_sequence ON background_tasks(session_id, last_sequence DESC);
+CREATE INDEX background_generation ON background_tasks(session_id, json_extract(payload, '$.generation') DESC);
+CREATE INDEX background_task_history ON background_tasks(session_id, json_extract(payload, '$.task_id'), json_extract(payload, '$.sequence') DESC, invocation_id DESC);
+CREATE INDEX background_owner_history ON background_tasks(session_id, coalesce(json_extract(payload, '$.owner.kind'), 'main'), json_extract(payload, '$.owner.invocation_id'), archived, json_extract(payload, '$.sequence') DESC, invocation_id DESC);
+CREATE INDEX background_history ON background_tasks(session_id, archived, json_extract(payload, '$.sequence') DESC, invocation_id DESC);
+CREATE INDEX background_task_version ON background_tasks(session_id, json_extract(payload, '$.task_id'), json_extract(payload, '$.request.call_id'), json_extract(payload, '$.sequence') DESC);
+CREATE INDEX background_call_owner ON background_tasks(session_id, coalesce(json_extract(payload, '$.owner.kind'), 'main'), json_extract(payload, '$.owner.invocation_id'), json_extract(payload, '$.request.call_id'), json_extract(payload, '$.sequence') DESC);
+"#;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BackgroundCursor {
+    pub sequence: u64,
+    pub invocation_id: String,
+}
+
+#[derive(Debug)]
+pub struct BackgroundPage {
+    pub records: Vec<TaskRecord>,
+    pub next: Option<BackgroundCursor>,
+}
+
+pub enum BackgroundLookup<'a> {
+    Invocation(&'a str),
+    Task {
+        task_id: &'a str,
+        version: Option<&'a str>,
+    },
+    Call {
+        owner: &'a JobOwner,
+        generation: Option<u64>,
+        call_id: &'a str,
+    },
+}
+
 pub(crate) const SESSION_BYTES: &str = "coalesce((SELECT sum(bytes) FROM background_tasks WHERE session_id = sessions.id), 0) + coalesce((SELECT sum(length(event_id)) FROM background_receipts WHERE session_id = sessions.id), 0)";
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -119,6 +159,21 @@ impl TaskRecord {
             JobPayload::Agent => JobKind::Agent,
             JobPayload::Shell(_) => JobKind::Shell,
         }
+    }
+
+    pub fn settled(&self) -> bool {
+        !self.active()
+            && self.outcome.is_some()
+            && self
+                .events
+                .iter()
+                .all(|event| event.accepted || event.suppressed)
+            && (self.receipt_accepted
+                || self.state == "interrupted"
+                || self
+                    .events
+                    .iter()
+                    .any(|event| event.terminal && event.suppressed))
     }
 
     pub fn active(&self) -> bool {
@@ -251,30 +306,230 @@ impl SessionDatabase {
         )?)
     }
 
+    /// Compatibility detail window. Use resident records for restore and history pages for browsing.
     pub fn background_tasks(&self, session: CaudraId) -> Result<Vec<TaskRecord>, SessionError> {
-        let bytes: u32 = self.connection().query_row(
-            "SELECT coalesce(sum(bytes), 0) FROM background_tasks WHERE session_id = ?1",
+        let mut statement = self.connection().prepare(
+            "SELECT payload FROM background_tasks WHERE session_id = ?1 ORDER BY json_extract(payload, '$.sequence') DESC, invocation_id DESC LIMIT ?2",
+        )?;
+        let mut rows = statement.query(params![
+            session.as_bytes().as_slice(),
+            MAX_INVOCATIONS as i64
+        ])?;
+        let mut records = Vec::new();
+        let mut bytes = 0;
+        while let Some(row) = rows.next()? {
+            let payload: String = row.get(0)?;
+            if bytes + payload.len() > MAX_SESSION_BYTES {
+                break;
+            }
+            bytes += payload.len();
+            records.push(Self::decode_background_task(&payload)?);
+        }
+        Ok(records)
+    }
+
+    pub fn background_resident_tasks(
+        &self,
+        session: CaudraId,
+    ) -> Result<Vec<TaskRecord>, SessionError> {
+        let (count, bytes): (u32, u32) = self.connection().query_row(
+            "SELECT count(*), coalesce(sum(bytes), 0) FROM background_tasks WHERE session_id = ?1 AND archived = 0",
             params![session.as_bytes().as_slice()],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
         Self::validate_len(
-            "background session bytes",
+            "background resident invocations",
+            count as usize,
+            MAX_INVOCATIONS,
+        )?;
+        Self::validate_len(
+            "background resident bytes",
             bytes as usize,
             MAX_SESSION_BYTES,
         )?;
         let mut statement = self.connection().prepare(
-            "SELECT payload FROM background_tasks WHERE session_id = ?1 ORDER BY invocation_id LIMIT ?2",
+            "SELECT payload FROM background_tasks WHERE session_id = ?1 AND archived = 0 ORDER BY json_extract(payload, '$.sequence'), invocation_id",
         )?;
-        let rows = statement.query_map(
-            params![session.as_bytes().as_slice(), MAX_INVOCATIONS as i64],
-            |row| row.get::<_, String>(0),
-        )?;
-        rows.map(|row| {
-            let payload = row?;
-            Self::validate_len("background task", payload.len(), MAX_RECORD_BYTES)?;
-            Ok(serde_json::from_str(&payload).map_err(StorageError::from)?)
+        statement
+            .query_map(params![session.as_bytes().as_slice()], |row| {
+                row.get::<_, String>(0)
+            })?
+            .map(|row| Self::decode_background_task(&row?))
+            .collect()
+    }
+
+    fn decode_background_task(payload: &str) -> Result<TaskRecord, SessionError> {
+        Self::validate_len("background task", payload.len(), MAX_RECORD_BYTES)?;
+        Ok(serde_json::from_str(payload).map_err(StorageError::from)?)
+    }
+
+    pub fn background_restore_runtime(
+        &self,
+        session: CaudraId,
+        retry: &RuntimeRetry<'_>,
+    ) -> Result<(Vec<TaskRecord>, (u64, u64)), SessionError> {
+        self.connection().busy_timeout(Duration::ZERO)?;
+        retry.run("background restore", || {
+            Ok((
+                self.background_resident_tasks(session)?,
+                self.background_watermarks(session)?,
+            ))
         })
-        .collect()
+    }
+
+    pub fn background_watermarks(&self, session: CaudraId) -> Result<(u64, u64), SessionError> {
+        let (generation, sequence): (i64, i64) = self.connection().query_row(
+            "SELECT coalesce((SELECT max(json_extract(payload, '$.generation')) FROM background_tasks WHERE session_id = ?1), 0), coalesce((SELECT max(last_sequence) FROM background_tasks WHERE session_id = ?1), 0)",
+            params![session.as_bytes().as_slice()], |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        Ok((unsigned_integer(generation)?, unsigned_integer(sequence)?))
+    }
+
+    pub fn background_lookup_runtime(
+        &self,
+        session: CaudraId,
+        lookup: BackgroundLookup<'_>,
+        retry: &RuntimeRetry<'_>,
+    ) -> Result<Option<TaskRecord>, SessionError> {
+        self.connection().busy_timeout(Duration::ZERO)?;
+        retry.run("background history lookup", || {
+            self.background_lookup(session, &lookup)
+        })
+    }
+
+    pub fn background_lookup(
+        &self,
+        session: CaudraId,
+        lookup: &BackgroundLookup<'_>,
+    ) -> Result<Option<TaskRecord>, SessionError> {
+        let payload: Option<String> = match lookup {
+            BackgroundLookup::Invocation(invocation) => self.connection().query_row(
+                "SELECT payload FROM background_tasks WHERE session_id = ?1 AND invocation_id = ?2",
+                params![session.as_bytes().as_slice(), invocation], |row| row.get(0),
+            ).optional()?,
+            BackgroundLookup::Task { task_id, version } => self.connection().query_row(
+                "SELECT payload FROM background_tasks WHERE session_id = ?1 AND json_extract(payload, '$.task_id') = ?2 AND (?3 IS NULL OR json_extract(payload, '$.request.call_id') = ?3) ORDER BY json_extract(payload, '$.sequence') DESC, invocation_id DESC LIMIT 1",
+                params![session.as_bytes().as_slice(), task_id, version], |row| row.get(0),
+            ).optional()?,
+            BackgroundLookup::Call { owner, generation, call_id } => {
+                let generation = generation.map(sql_integer).transpose()?;
+                let (kind, invocation) = match owner {
+                    JobOwner::Main => ("main", None),
+                    JobOwner::Child { invocation_id } => ("child", Some(invocation_id.as_str())),
+                };
+                self.connection().query_row(
+                    "SELECT payload FROM background_tasks WHERE session_id = ?1 AND coalesce(json_extract(payload, '$.owner.kind'), 'main') = ?2 AND json_extract(payload, '$.owner.invocation_id') IS ?3 AND json_extract(payload, '$.request.call_id') = ?4 AND (?5 IS NULL OR json_extract(payload, '$.generation') = ?5) ORDER BY json_extract(payload, '$.sequence') DESC, invocation_id DESC LIMIT 1",
+                    params![session.as_bytes().as_slice(), kind, invocation, call_id, generation], |row| row.get(0),
+                ).optional()?
+            }
+        };
+        payload
+            .as_deref()
+            .map(Self::decode_background_task)
+            .transpose()
+    }
+
+    pub fn background_history_runtime(
+        &self,
+        session: CaudraId,
+        before: Option<&BackgroundCursor>,
+        limit: usize,
+        scope: Option<(&JobOwner, Option<u64>)>,
+        retry: &RuntimeRetry<'_>,
+    ) -> Result<BackgroundPage, SessionError> {
+        self.connection().busy_timeout(Duration::ZERO)?;
+        retry.run("background history page", || {
+            self.background_history(
+                session,
+                before,
+                limit,
+                scope.map(|(owner, _)| owner),
+                scope.and_then(|(_, generation)| generation),
+            )
+        })
+    }
+
+    /// Bounded cold summaries; payloads, report bodies and transcripts stay on disk.
+    pub fn background_history(
+        &self,
+        session: CaudraId,
+        before: Option<&BackgroundCursor>,
+        limit: usize,
+        owner: Option<&JobOwner>,
+        generation: Option<u64>,
+    ) -> Result<BackgroundPage, SessionError> {
+        let limit = limit.clamp(1, MAX_HISTORY_PAGE);
+        let sequence = before
+            .map(|cursor| sql_integer(cursor.sequence))
+            .transpose()?;
+        let generation = generation.map(sql_integer).transpose()?;
+        let (kind, invocation) = match owner {
+            None => (None, None),
+            Some(JobOwner::Main) => (Some("main"), None),
+            Some(JobOwner::Child { invocation_id }) => {
+                (Some("child"), Some(invocation_id.as_str()))
+            }
+        };
+        let mut statement = self.connection().prepare(
+            "SELECT json_set(json_remove(payload, '$.history', '$.spec'), '$.outcome', NULL, '$.events', json('[]'), '$.request', json_object('call_id', json_extract(payload, '$.request.call_id'), 'label', substr(json_extract(payload, '$.request.label'), 1, 4096), 'owner_call_id', json_extract(payload, '$.request.owner_call_id'), 'owner_task_id', json_extract(payload, '$.request.owner_task_id'))) FROM background_tasks WHERE session_id = ?1 AND archived = 1 AND (?2 IS NULL OR (json_extract(payload, '$.sequence'), invocation_id) < (?2, ?3)) AND (?4 IS NULL OR (coalesce(json_extract(payload, '$.owner.kind'), 'main') = ?4 AND json_extract(payload, '$.owner.invocation_id') IS ?5)) AND (?6 IS NULL OR json_extract(payload, '$.generation') = ?6) ORDER BY json_extract(payload, '$.sequence') DESC, invocation_id DESC LIMIT ?7",
+        )?;
+        let mut rows = statement.query(params![
+            session.as_bytes().as_slice(),
+            sequence,
+            before.map(|cursor| cursor.invocation_id.as_str()),
+            kind,
+            invocation,
+            generation,
+            (limit + 1) as i64
+        ])?;
+        let mut records = Vec::new();
+        let mut bytes = 0;
+        let mut more = false;
+        while let Some(row) = rows.next()? {
+            let payload: String = row.get(0)?;
+            if records.len() == limit
+                || (!records.is_empty() && bytes + payload.len() > MAX_RECORD_BYTES)
+            {
+                more = true;
+                break;
+            }
+            bytes += payload.len();
+            records.push(Self::decode_background_task(&payload)?);
+        }
+        let next = records
+            .last()
+            .filter(|_| more)
+            .map(|record| BackgroundCursor {
+                sequence: record.sequence,
+                invocation_id: record.invocation_id.clone(),
+            });
+        Ok(BackgroundPage { records, next })
+    }
+
+    pub fn archive_background_task_runtime(
+        &self,
+        session: CaudraId,
+        record: &TaskRecord,
+        retry: &RuntimeRetry<'_>,
+    ) -> Result<bool, SessionError> {
+        if !record.settled() {
+            return Ok(false);
+        }
+        let payload = serde_json::to_string(record).map_err(StorageError::from)?;
+        self.connection().busy_timeout(Duration::ZERO)?;
+        let transaction = retry.run("background archive", || {
+            Ok(Transaction::new_unchecked(
+                self.connection(),
+                TransactionBehavior::Immediate,
+            )?)
+        })?;
+        let changed = transaction.execute(
+            "UPDATE background_tasks SET archived = 1 WHERE session_id = ?1 AND invocation_id = ?2 AND payload = ?3",
+            params![session.as_bytes().as_slice(), record.invocation_id, payload],
+        )?;
+        retry.check("background archive")?;
+        transaction.commit()?;
+        Ok(changed == 1)
     }
 
     pub fn save_background_task(
@@ -308,25 +563,40 @@ impl SessionDatabase {
             retry.check(RUNTIME_BACKGROUND_SAVE)?;
         }
         let count: i64 = transaction.query_row(
-            "SELECT count(*) FROM background_tasks WHERE session_id = ?1 AND invocation_id != ?2",
+            "SELECT count(*) FROM background_tasks WHERE session_id = ?1 AND archived = 0 AND invocation_id != ?2",
             params![session.as_bytes().as_slice(), record.invocation_id],
             |row| row.get(0),
         )?;
         Self::validate_len(
-            "background invocations",
+            "background resident invocations",
             count as usize + 1,
             MAX_INVOCATIONS,
         )?;
-        let bytes: u32 = transaction.query_row("SELECT coalesce(sum(bytes), 0) FROM background_tasks WHERE session_id = ?1 AND invocation_id != ?2", params![session.as_bytes().as_slice(), record.invocation_id], |row| row.get(0))?;
+        let bytes: u32 = transaction.query_row("SELECT coalesce(sum(bytes), 0) FROM background_tasks WHERE session_id = ?1 AND archived = 0 AND invocation_id != ?2", params![session.as_bytes().as_slice(), record.invocation_id], |row| row.get(0))?;
         Self::validate_len(
-            "background session bytes",
+            "background resident bytes",
             (bytes as usize).saturating_add(payload.len()),
             MAX_SESSION_BYTES,
         )?;
-        transaction.execute(
-            "INSERT INTO background_tasks(session_id, invocation_id, payload, bytes) VALUES (?1, ?2, ?3, ?4) ON CONFLICT(session_id, invocation_id) DO UPDATE SET payload = excluded.payload, bytes = excluded.bytes",
-            params![session.as_bytes().as_slice(), record.invocation_id, payload, payload.len() as i64],
+        let last_sequence = sql_integer(
+            record
+                .events
+                .iter()
+                .map(|event| event.sequence)
+                .max()
+                .unwrap_or_default()
+                .max(record.sequence),
         )?;
+        let changed = transaction.execute(
+            "INSERT INTO background_tasks(session_id, invocation_id, payload, bytes, last_sequence) VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT(session_id, invocation_id) DO UPDATE SET payload = excluded.payload, bytes = excluded.bytes, last_sequence = excluded.last_sequence WHERE background_tasks.archived = 0",
+            params![session.as_bytes().as_slice(), record.invocation_id, payload, payload.len() as i64, last_sequence],
+        )?;
+        if changed != 1 {
+            return Err(SessionError::CorruptDatabaseValue {
+                field: "background archive",
+                reason: "archived invocations are read-only".into(),
+            });
+        }
         if let Some(retry) = retry {
             retry.check(RUNTIME_BACKGROUND_SAVE)?;
         }
@@ -381,12 +651,26 @@ impl SessionDatabase {
     }
 }
 
+fn sql_integer(value: u64) -> Result<i64, SessionError> {
+    i64::try_from(value).map_err(|error| SessionError::CorruptDatabaseValue {
+        field: "background integer",
+        reason: error.to_string(),
+    })
+}
+
+fn unsigned_integer(value: i64) -> Result<u64, SessionError> {
+    u64::try_from(value).map_err(|error| SessionError::CorruptDatabaseValue {
+        field: "background integer",
+        reason: error.to_string(),
+    })
+}
+
 pub(crate) fn protects_session(
     connection: &Connection,
     session: CaudraId,
 ) -> Result<bool, SessionError> {
     Ok(connection.query_row(
-        "SELECT EXISTS(SELECT 1 FROM background_tasks WHERE session_id = ?1 AND (json_extract(payload, '$.state') IN ('queued', 'running', 'cancelling') OR EXISTS(SELECT 1 FROM json_each(payload, '$.events') WHERE json_extract(value, '$.accepted') = 0 AND json_extract(value, '$.suppressed') = 0)))",
+        "SELECT EXISTS(SELECT 1 FROM background_tasks WHERE session_id = ?1 AND archived = 0 AND (json_extract(payload, '$.state') IN ('queued', 'running', 'cancelling') OR EXISTS(SELECT 1 FROM json_each(payload, '$.events') WHERE json_extract(value, '$.accepted') = 0 AND json_extract(value, '$.suppressed') = 0)))",
         params![session.as_bytes().as_slice()], |row| row.get(0),
     )?)
 }
@@ -466,6 +750,206 @@ mod tests {
                 suppressed: false,
             }],
         }
+    }
+
+    #[test]
+    fn archive_outlives_resident_limits_and_preserves_exact_versions_and_checkpoints() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = StateDir::from_path(temp.path().to_path_buf());
+        let mut session = TestSession::new(MODEL, CWD);
+        session.save(&dir).unwrap();
+        let database = SessionDatabase::open(&dir).unwrap();
+        let count = super::MAX_INVOCATIONS + super::MAX_HISTORY_PAGE;
+        for index in 0..count {
+            let retry = RuntimeRetry::new(None, &|| false);
+            let mut task = record();
+            task.invocation_id = format!("{INVOCATION}-{index}");
+            task.sequence = index as u64 + 1;
+            task.request = json!({"call_id": format!("{TASK}-{index}"), "label": TASK});
+            task.history = json!([index]);
+            task.events[0].suppressed = true;
+            database
+                .save_background_task_runtime(session.id, &task, &retry)
+                .unwrap();
+            database
+                .checkpoint_job_owner(session.id, &task.invocation_id, TASK, &[json!(index)])
+                .unwrap();
+            assert!(
+                database
+                    .archive_background_task_runtime(session.id, &task, &retry)
+                    .unwrap()
+            );
+            assert!(
+                database
+                    .archive_background_task_runtime(session.id, &task, &retry)
+                    .unwrap()
+            );
+            assert!(
+                database
+                    .save_background_task_runtime(session.id, &task, &retry)
+                    .is_err()
+            );
+        }
+        drop(database);
+        let mut database = SessionDatabase::open(&dir).unwrap();
+        let retry = RuntimeRetry::new(None, &|| false);
+        assert!(
+            database
+                .background_resident_tasks(session.id)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(database.task_identity_exists(session.id, TASK).unwrap());
+        let first_call = format!("{TASK}-0");
+        let first = database
+            .background_lookup_runtime(
+                session.id,
+                super::BackgroundLookup::Task {
+                    task_id: TASK,
+                    version: Some(&first_call),
+                },
+                &retry,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.history, json!([0]));
+        let retried = database
+            .background_lookup_runtime(
+                session.id,
+                super::BackgroundLookup::Call {
+                    owner: &JobOwner::Main,
+                    generation: None,
+                    call_id: &first_call,
+                },
+                &retry,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(retried.invocation_id, first.invocation_id);
+        assert_eq!(
+            database
+                .load_job_owner_checkpoint::<Value>(session.id, &first.invocation_id, TASK)
+                .unwrap(),
+            Some(vec![json!(0)])
+        );
+        let mut cursor = None;
+        let mut sequences = Vec::new();
+        loop {
+            let page = database
+                .background_history_runtime(session.id, cursor.as_ref(), usize::MAX, None, &retry)
+                .unwrap();
+            assert!(page.records.len() <= super::MAX_HISTORY_PAGE);
+            for task in page.records {
+                assert!(task.history.is_null());
+                assert!(task.outcome.is_none());
+                sequences.push(task.sequence);
+            }
+            cursor = page.next;
+            if cursor.is_none() {
+                break;
+            }
+        }
+        assert_eq!(sequences, (1..=count as u64).rev().collect::<Vec<_>>());
+        assert_eq!(
+            database.background_watermarks(session.id).unwrap().1,
+            count as u64
+        );
+        assert!(database.stats().unwrap().background_bytes > 0);
+        database
+            .delete(session.id, session.persisted_write_version())
+            .unwrap();
+        assert!(
+            database
+                .background_lookup(
+                    session.id,
+                    &super::BackgroundLookup::Invocation(&first.invocation_id)
+                )
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test_case(false; "pending_delivery")]
+    #[test_case(true; "active_execution")]
+    fn resident_capacity_is_not_an_archive_eviction_policy(active: bool) {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = StateDir::from_path(temp.path().to_path_buf());
+        let mut session = TestSession::new(MODEL, CWD);
+        session.save(&dir).unwrap();
+        let database = SessionDatabase::open(&dir).unwrap();
+        let retry = RuntimeRetry::new(None, &|| false);
+        for index in 0..super::MAX_INVOCATIONS {
+            let mut task = record();
+            task.invocation_id = format!("{INVOCATION}-{index}");
+            if active {
+                task.state = "running".into();
+            }
+            database.save_background_task(session.id, &task).unwrap();
+            assert!(
+                !database
+                    .archive_background_task_runtime(session.id, &task, &retry)
+                    .unwrap()
+            );
+        }
+        assert!(matches!(
+            database.save_background_task(session.id, &record()),
+            Err(SessionError::LimitExceeded {
+                maximum: super::MAX_INVOCATIONS,
+                ..
+            })
+        ));
+        assert_eq!(
+            database
+                .background_resident_tasks(session.id)
+                .unwrap()
+                .len(),
+            super::MAX_INVOCATIONS
+        );
+    }
+
+    #[test]
+    fn archive_retries_writer_acquisition_without_changing_payload() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = StateDir::from_path(temp.path().to_path_buf());
+        let mut session = TestSession::new(MODEL, CWD);
+        session.save(&dir).unwrap();
+        let database = SessionDatabase::open(&dir).unwrap();
+        let mut task = record();
+        task.events[0].suppressed = true;
+        database.save_background_task(session.id, &task).unwrap();
+        let opening = RuntimeRetry::new(None, &|| false);
+        let runtime = SessionDatabase::open_runtime(&dir, &opening).unwrap();
+        let writer = RefCell::new(Some(
+            Transaction::new_unchecked(database.connection(), TransactionBehavior::Immediate)
+                .unwrap(),
+        ));
+        let checks = Cell::new(0);
+        let cancelled = || {
+            checks.set(checks.get() + 1);
+            if checks.get() == 2 {
+                writer.borrow_mut().take().unwrap().rollback().unwrap();
+            }
+            false
+        };
+        let retry = RuntimeRetry::new(None, &cancelled);
+        assert!(
+            runtime
+                .archive_background_task_runtime(session.id, &task, &retry)
+                .unwrap()
+        );
+        assert!(writer.borrow().is_none());
+        let restored = runtime
+            .background_lookup_runtime(
+                session.id,
+                super::BackgroundLookup::Invocation(INVOCATION),
+                &retry,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(restored).unwrap(),
+            serde_json::to_value(task).unwrap()
+        );
     }
 
     #[test]
@@ -685,8 +1169,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn task_outcome_reference_is_retained_accounted_and_session_scoped() {
+    #[test_case(false; "hot")]
+    #[test_case(true; "archived")]
+    fn task_outcome_reference_is_retained_accounted_and_session_scoped(archived: bool) {
         let temp = tempfile::tempdir().unwrap();
         let dir = StateDir::from_path(temp.path().to_path_buf());
         let mut session = TestSession::new(MODEL, CWD);
@@ -698,6 +1183,18 @@ mod tests {
         task.output_ref = Some(reference.clone());
         let db = SessionDatabase::open(&dir).unwrap();
         db.save_background_task(session.id, &task).unwrap();
+        if archived {
+            task.events[0].suppressed = true;
+            db.save_background_task(session.id, &task).unwrap();
+            assert!(
+                db.archive_background_task_runtime(
+                    session.id,
+                    &task,
+                    &RuntimeRetry::new(None, &|| false)
+                )
+                .unwrap()
+            );
+        }
         for entry in fs::read_dir(
             dir.path()
                 .join(TOOL_OUTPUT_DIR)

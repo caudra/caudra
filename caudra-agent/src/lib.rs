@@ -148,6 +148,10 @@ pub struct QueuedInterrupt {
 
 pub trait InterruptSource: Send + Sync {
     fn poll(&self) -> Option<ExtractedCommand>;
+
+    fn has_pending_input(&self) -> bool {
+        false
+    }
 }
 
 #[derive(Clone)]

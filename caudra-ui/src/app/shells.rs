@@ -2,7 +2,6 @@
 //! open and refresh hands it the tracker's snapshot and the background
 //! runtime's cards, and a stop names exactly the execution its row showed.
 
-use caudra_agent::background::BackgroundTasks;
 use caudra_storage::background::JobKind;
 
 use crate::app::App;
@@ -18,7 +17,7 @@ impl App {
         let runtime = self.background.as_ref();
         ShellInputs {
             snapshot: runtime.map(|runtime| runtime.shells().snapshot()),
-            cards: runtime.map(BackgroundTasks::list).unwrap_or_default(),
+            cards: self.task_history_cards(),
         }
     }
 
@@ -40,6 +39,7 @@ impl App {
 
     /// Running commands are listed first, so opening lands on one.
     pub(super) fn shells_browse(&mut self) -> Vec<Action> {
+        self.load_task_history(false);
         if self.task_picker.is_open() {
             let action = self.task_picker.cancel();
             let _ = self.handle_task_picker_action(action);
@@ -53,9 +53,9 @@ impl App {
     /// names. False, with nothing opened, when `id` names no shell command.
     pub(super) fn show_shell(&mut self, id: &str) -> bool {
         let known = self.background.as_ref().is_some_and(|runtime| {
-            runtime
-                .status(id)
-                .is_ok_and(|task| task.kind == JobKind::Shell)
+            self.task_history_cards()
+                .iter()
+                .any(|task| task.task_id == id && task.kind == JobKind::Shell)
                 || runtime
                     .shells()
                     .snapshot()
@@ -75,6 +75,7 @@ impl App {
 
     pub(super) fn handle_shell_modal_action(&mut self, action: ShellModalAction) -> Vec<Action> {
         match action {
+            ShellModalAction::History { older } => self.load_task_history(older),
             ShellModalAction::Consumed => {}
             ShellModalAction::Stop(ShellStop::Foreground(id)) => {
                 let stopped = self

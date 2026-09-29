@@ -38,7 +38,7 @@ use super::steering::{
 use super::streaming::{StreamError, stream_with_retry};
 use super::title;
 use super::tool_dispatch::{self, RecentCalls, ResponseObservations, ToolObservation};
-use crate::background::JobScope;
+use crate::background::{BackgroundTasks, JobScope, SessionWork};
 use crate::cancel::{CancelMap, CancelToken};
 use crate::context::{
     BuiltinToolsInput, ContextCapture, ContextInventory, ContextPublisher, ContextReadiness,
@@ -1671,6 +1671,34 @@ impl<'h> Agent<'h> {
         Ok(outcome)
     }
 
+    fn goal_completion_ready(&self) -> bool {
+        !SessionWork::capture(
+            self.background.as_ref(),
+            self.workflow.as_ref(),
+            self.subagent_cancels.active_count(),
+        )
+        .pending()
+            && !self
+                .interrupt_source
+                .as_ref()
+                .is_some_and(|source| source.has_pending_input())
+    }
+
+    fn defer_goal(&self, done_reason: DoneReason) -> Result<TurnOutcome, AgentError> {
+        let active_background_tasks = self.subagent_cancels.active_count().max(
+            self.background
+                .as_ref()
+                .map_or(0, BackgroundTasks::active_count),
+        ) + self
+            .workflow
+            .as_ref()
+            .map_or(0, WorkflowHandle::active_count);
+        self.event_tx.send(AgentEvent::GoalDeferred {
+            active_background_tasks,
+        })?;
+        Ok(TurnOutcome::Done(done_reason))
+    }
+
     async fn goal_completion(
         &mut self,
         done_reason: DoneReason,
@@ -1678,12 +1706,8 @@ impl<'h> Agent<'h> {
         let Some(goal) = self.goal.snapshot() else {
             return Ok(TurnOutcome::Done(done_reason));
         };
-        let active_background_tasks = self.subagent_cancels.active_count();
-        if active_background_tasks > 0 {
-            self.event_tx.send(AgentEvent::GoalDeferred {
-                active_background_tasks,
-            })?;
-            if self.wait_for_background {
+        if !self.goal_completion_ready() {
+            if self.wait_for_background && self.subagent_cancels.active_count() > 0 {
                 futures_lite::future::race(
                     async {
                         self.subagent_cancels.wait_for_idle().await;
@@ -1698,10 +1722,13 @@ impl<'h> Agent<'h> {
                 self.push_arrivals(Vec::new());
                 return Ok(TurnOutcome::Continue);
             }
-            return Ok(TurnOutcome::Done(done_reason));
+            return self.defer_goal(done_reason);
         }
 
         let prescreen = self.prescreen_goal(&goal.condition).await;
+        if !self.goal_completion_ready() {
+            return self.defer_goal(done_reason);
+        }
         if !self.permissions.is_yolo()
             && prescreen.as_ref().is_some_and(|(decisions, outcome)| {
                 should_skip_goal(
@@ -1778,6 +1805,9 @@ impl<'h> Agent<'h> {
                 return Ok(TurnOutcome::Done(done_reason));
             }
         };
+        if !self.goal_completion_ready() {
+            return self.defer_goal(done_reason);
+        }
         let mut result = Evaluator {
             provider: &*evaluator.provider,
             model: &evaluator.model,
@@ -1790,7 +1820,10 @@ impl<'h> Agent<'h> {
         .run()
         .await;
         let fallback = match &result {
-            Err(failure) if self.goal.is_generation_active(goal.generation) => {
+            Err(failure)
+                if self.goal.is_generation_active(goal.generation)
+                    && self.goal_completion_ready() =>
+            {
                 evaluator.fallback_to_current(&failure.error, &self.provider, &self.model)
             }
             _ => None,
@@ -1860,9 +1893,13 @@ impl<'h> Agent<'h> {
         self.goal
             .record_usage_for(goal.generation, result.usage, result.cost, result.billing);
         let reason: Arc<str> = Arc::from(result.reason.as_str());
-        let apply =
+        let deferred = !self.goal_completion_ready() || self.cancel.is_cancelled();
+        let apply = if deferred {
+            GoalApply::Stale
+        } else {
             self.goal
-                .apply_evaluation(goal.generation, result.verdict, Arc::clone(&reason));
+                .apply_evaluation(goal.generation, result.verdict, Arc::clone(&reason))
+        };
         self.event_tx.send(AgentEvent::GoalEvaluation {
             verdict: result.verdict,
             reason: result.reason.clone(),
@@ -1874,6 +1911,12 @@ impl<'h> Agent<'h> {
             model: result.model,
         })?;
 
+        if self.cancel.is_cancelled() {
+            return Err(AgentError::Cancelled);
+        }
+        if deferred {
+            return self.defer_goal(done_reason);
+        }
         match apply {
             GoalApply::Stale => Ok(TurnOutcome::Done(done_reason)),
             GoalApply::Terminal => {
@@ -4087,6 +4130,47 @@ mod tests {
         commands: Mutex<VecDeque<ExtractedCommand>>,
     }
 
+    struct PendingInput(AtomicBool);
+
+    impl InterruptSource for PendingInput {
+        fn poll(&self) -> Option<ExtractedCommand> {
+            None
+        }
+
+        fn has_pending_input(&self) -> bool {
+            self.0.load(Ordering::Acquire)
+        }
+    }
+
+    #[test_case(true; "queued_next_defers_goal")]
+    #[test_case(false; "idle_evaluates_goal")]
+    fn goal_evaluation_yields_to_pending_user_input(pending: bool) {
+        smol::block_on(async {
+            let mut history = History::new(Vec::new());
+            let provider = MockProvider::new(vec![goal_response(true, false, DECISION_VERDICT)]);
+            let requests = Arc::clone(&provider.captured_messages);
+            let (mut agent, events) = make_agent(provider, &mut history);
+            agent.goal.set(DECISION_GOAL).unwrap();
+            let input = Arc::new(PendingInput(AtomicBool::new(pending)));
+            agent.interrupt_source = Some(input.clone());
+            assert!(matches!(
+                agent.goal_completion(DoneReason::EndTurn).await.unwrap(),
+                TurnOutcome::Done(DoneReason::EndTurn)
+            ));
+            assert_eq!(requests.lock().unwrap().len(), usize::from(!pending));
+            if pending {
+                assert!(
+                    events
+                        .try_iter()
+                        .any(|event| matches!(event.event, AgentEvent::GoalDeferred { .. }))
+                );
+                input.0.store(false, Ordering::Release);
+                agent.goal_completion(DoneReason::EndTurn).await.unwrap();
+                assert_eq!(requests.lock().unwrap().len(), 1);
+            }
+        });
+    }
+
     impl MockInterruptSource {
         fn new(commands: Vec<ExtractedCommand>) -> Arc<Self> {
             Arc::new(Self {
@@ -5271,6 +5355,56 @@ mod tests {
                     ..
                 }
             )));
+        });
+    }
+
+    #[test_case(false; "unmet_verdict_cannot_continue_ahead_of_next")]
+    #[test_case(true; "met_verdict_cannot_finish_a_superseded_goal_check")]
+    fn queued_input_supersedes_an_in_flight_goal_check(met: bool) {
+        const EVALUATOR_OUTPUT_TOKENS: u32 = 7;
+        smol::block_on(async {
+            let (started_tx, started_rx) = flume::bounded(1);
+            let (response_tx, response_rx) = flume::bounded(1);
+            let provider = ControlledEvaluatorProvider {
+                calls: AtomicUsize::new(0),
+                evaluator_started: started_tx,
+                evaluator_response: response_rx,
+            };
+            let goal = GoalHandle::default();
+            goal.set(DECISION_GOAL).unwrap();
+            let input = Arc::new(PendingInput(AtomicBool::new(false)));
+            let mut history = History::new(Vec::new());
+            let (agent, events) = make_agent(provider, &mut history);
+            let mut agent = agent
+                .with_goal(goal.clone())
+                .with_interrupt_source(input.clone());
+            let control = async {
+                started_rx.recv_async().await.unwrap();
+                input.0.store(true, Ordering::Release);
+                let mut response = goal_response(met, false, DECISION_VERDICT);
+                response.usage.output = EVALUATOR_OUTPUT_TOKENS;
+                response_tx.send_async(response).await.unwrap();
+            };
+            let (result, ()) = futures_lite::future::zip(agent.run(default_input()), control).await;
+            assert_eq!(result.unwrap(), DoneReason::EndTurn);
+            let snapshot = goal.snapshot().unwrap();
+            assert_eq!(snapshot.evaluations, 0);
+            assert_eq!(snapshot.usage.output, EVALUATOR_OUTPUT_TOKENS);
+            let events = events
+                .try_iter()
+                .map(|envelope| envelope.event)
+                .collect::<Vec<_>>();
+            assert!(
+                events
+                    .iter()
+                    .any(|event| matches!(event, AgentEvent::GoalDeferred { .. }))
+            );
+            assert!(
+                events.iter().any(|event| matches!(
+                    event,
+                    AgentEvent::GoalEvaluation { applied: false, .. }
+                ))
+            );
         });
     }
 

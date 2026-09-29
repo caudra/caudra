@@ -80,7 +80,7 @@ use crate::{
 pub const SESSIONS_DB_FILE: &str = "caudra.sqlite";
 pub const SESSIONS_DB_LOCK_FILE: &str = "caudra.sqlite.lock";
 
-const SCHEMA_VERSION: i64 = 17;
+const SCHEMA_VERSION: i64 = 18;
 const APPLICATION_ID: i64 = i32::from_be_bytes(*b"CAUD") as i64;
 /// Pages copied per step of the pre-migration backup. The whole file is copied
 /// under the initialization lock, so this only bounds how long the backup holds
@@ -672,6 +672,11 @@ const MIGRATIONS: &[Migration] = &[
         to: 17,
         sql: crate::shell_history::TABLES,
     },
+    Migration {
+        from: 17,
+        to: 18,
+        sql: crate::background::ARCHIVE_SCHEMA,
+    },
 ];
 
 const JOB_OWNER_CHECKPOINTS_TABLE: &str = r#"
@@ -922,10 +927,11 @@ CREATE TABLE pending_archives (
 /// What a fresh database gets: every migration already folded in.
 fn full_schema() -> String {
     format!(
-        "{SCHEMA}{USAGE_LEDGER_TABLE}{WORKFLOW_TABLES}{WORKFLOW_EVENTS_TABLE}{WORKFLOW_RECEIPTS_TABLE}{PERMISSION_REVISION_SCHEMA}{TOOL_USAGE_TABLES}{JOB_OWNER_CHECKPOINTS_TABLE}{}{}{}",
+        "{SCHEMA}{USAGE_LEDGER_TABLE}{WORKFLOW_TABLES}{WORKFLOW_EVENTS_TABLE}{WORKFLOW_RECEIPTS_TABLE}{PERMISSION_REVISION_SCHEMA}{TOOL_USAGE_TABLES}{JOB_OWNER_CHECKPOINTS_TABLE}{}{}{}{}",
         crate::background::TABLES,
         crate::shell_durations::TABLES,
-        crate::shell_history::TABLES
+        crate::shell_history::TABLES,
+        crate::background::ARCHIVE_SCHEMA
     )
 }
 
@@ -2213,7 +2219,7 @@ impl SessionDatabase {
             });
         }
         let (count, existing_bytes): (i64, i64) = transaction.query_row(
-            "SELECT count(*), coalesce(sum(byte_count + length(CAST(invocation_id AS BLOB)) + length(CAST(task_id AS BLOB))), 0) FROM job_owner_checkpoints WHERE session_id = ?1 AND invocation_id != ?2",
+            "SELECT count(*), coalesce(sum(byte_count + length(CAST(invocation_id AS BLOB)) + length(CAST(task_id AS BLOB))), 0) FROM job_owner_checkpoints c WHERE session_id = ?1 AND invocation_id != ?2 AND NOT EXISTS (SELECT 1 FROM background_tasks b WHERE b.session_id = c.session_id AND b.invocation_id = c.invocation_id AND b.archived = 1)",
             params![session.as_bytes().as_slice(), owner_invocation_id],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
@@ -6281,6 +6287,7 @@ mod tests {
     const OTHER_CHILD_INVOCATION: &str = "other-child-invocation";
     const CHILD_TASK: &str = "child-task";
     const OTHER_CHILD_TASK: &str = "other-child-task";
+    const BACKGROUND_ARCHIVE_DOWNGRADE: &str = "DROP INDEX background_history; DROP INDEX background_task_version; DROP INDEX background_call_owner; DROP INDEX background_sequence; DROP INDEX background_generation; DROP INDEX background_task_history; DROP INDEX background_owner_history; ALTER TABLE background_tasks DROP COLUMN archived; ALTER TABLE background_tasks DROP COLUMN last_sequence;";
     const OWNER_CHECKPOINT_PREVIOUS_SCHEMA: i64 = 13;
     const WORKFLOW_DECISION_PREVIOUS_SCHEMA: i64 = 14;
     const WORKFLOW_CALL_HASH: &str = "call-hash";
@@ -7066,9 +7073,7 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
         database.save(&session, None).unwrap();
         database
             .connection
-            .execute_batch(
-                "DROP TABLE job_owner_checkpoints; DROP TABLE shell_durations; DROP TABLE shell_executions;",
-            )
+            .execute_batch(&format!("DROP TABLE job_owner_checkpoints; DROP TABLE shell_durations; DROP TABLE shell_executions; {BACKGROUND_ARCHIVE_DOWNGRADE}"))
             .unwrap();
         database
             .connection
@@ -10074,7 +10079,7 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
         let database = SessionDatabase::open(&state_dir).unwrap();
         database
             .connection
-            .execute_batch("DROP TABLE workflow_receipts; DROP TABLE job_owner_checkpoints; DROP TABLE shell_durations; DROP TABLE shell_executions;")
+            .execute_batch(&format!("DROP TABLE workflow_receipts; DROP TABLE job_owner_checkpoints; DROP TABLE shell_durations; DROP TABLE shell_executions; {BACKGROUND_ARCHIVE_DOWNGRADE}"))
             .unwrap();
         database
             .connection
@@ -10134,7 +10139,7 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
         if migrate {
             database
                 .connection
-                .execute_batch("DROP TABLE shell_durations; DROP TABLE shell_executions;")
+                .execute_batch(&format!("DROP TABLE shell_durations; DROP TABLE shell_executions; {BACKGROUND_ARCHIVE_DOWNGRADE}"))
                 .unwrap();
             database
                 .connection
@@ -10165,6 +10170,37 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
     }
 
     #[test]
+    fn schema_seventeen_preserves_background_payloads_as_hot_records() {
+        const PREVIOUS_SCHEMA: i64 = 17;
+        const INVOCATION: &str = "migration-invocation";
+        let (_temp, state) = state_dir();
+        let (_fresh_temp, fresh_state) = state_dir();
+        let mut database = SessionDatabase::open(&state).unwrap();
+        let session = TestSession::new(MODEL, CWD);
+        database.save(&session, None).unwrap();
+        database
+            .connection
+            .execute_batch(BACKGROUND_ARCHIVE_DOWNGRADE)
+            .unwrap();
+        let payload =
+            json!({"sequence": 7, "generation": 3, "events": [{"sequence": 9}]}).to_string();
+        database.connection.execute("INSERT INTO background_tasks(session_id, invocation_id, payload, bytes) VALUES (?1, ?2, ?3, ?4)", params![session.id.as_bytes().as_slice(), INVOCATION, payload, payload.len() as i64]).unwrap();
+        database
+            .connection
+            .pragma_update(None, "user_version", PREVIOUS_SCHEMA)
+            .unwrap();
+        drop(database);
+        let database = SessionDatabase::open(&state).unwrap();
+        let fresh = SessionDatabase::open(&fresh_state).unwrap();
+        assert_eq!(schema_objects(&database), schema_objects(&fresh));
+        let (stored, archived, sequence): (String, bool, i64) = database.connection.query_row("SELECT payload, archived, last_sequence FROM background_tasks WHERE invocation_id = ?1", [INVOCATION], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))).unwrap();
+        assert_eq!(stored, payload);
+        assert!(!archived);
+        assert_eq!(sequence, 9);
+        assert_eq!(database.background_watermarks(session.id).unwrap(), (3, 9));
+    }
+
+    #[test]
     fn schema_sixteen_adds_an_empty_shell_history() {
         const PREVIOUS_SCHEMA: i64 = 16;
         let (_temp, state) = state_dir();
@@ -10175,7 +10211,9 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
         database.save(&session, None).unwrap();
         database
             .connection
-            .execute_batch("DROP TABLE shell_executions")
+            .execute_batch(&format!(
+                "DROP TABLE shell_executions; {BACKGROUND_ARCHIVE_DOWNGRADE}"
+            ))
             .unwrap();
         database
             .connection
@@ -10215,9 +10253,7 @@ ALTER TABLE sessions DROP COLUMN workspace_binding;
             assert_ne!(legacy_sql, current_sql);
             database
                 .connection
-                .execute_batch(
-                    "DROP TABLE workflow_calls; DROP TABLE shell_durations; DROP TABLE shell_executions;",
-                )
+                .execute_batch(&format!("DROP TABLE workflow_calls; DROP TABLE shell_durations; DROP TABLE shell_executions; {BACKGROUND_ARCHIVE_DOWNGRADE}"))
                 .unwrap();
             database.connection.execute_batch(&legacy_sql).unwrap();
             database
@@ -10756,6 +10792,7 @@ CREATE TABLE subagent_history_items (
         connection
             .execute_batch(
                 &full_schema()
+                    .replace(crate::background::ARCHIVE_SCHEMA, "")
                     .replace(crate::shell_history::TABLES, "")
                     .replace(crate::shell_durations::TABLES, "")
                     .replace(JOB_OWNER_CHECKPOINTS_TABLE, "")
@@ -10852,6 +10889,7 @@ CREATE TABLE subagents (
         connection
             .execute_batch(
                 &full_schema()
+                    .replace(crate::background::ARCHIVE_SCHEMA, "")
                     .replace(crate::shell_history::TABLES, "")
                     .replace(crate::shell_durations::TABLES, "")
                     .replace(JOB_OWNER_CHECKPOINTS_TABLE, "")
