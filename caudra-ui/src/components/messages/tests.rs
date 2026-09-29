@@ -2,7 +2,7 @@ use super::segment;
 use super::*;
 use crate::animation::test_clock::FrozenSpinner;
 use crate::chat::{DONE_TEXT, ERROR_TEXT};
-use crate::components::code_view::ScrollSpan;
+use crate::components::code_view::{BatchViews, RenderLimits, ScrollSpan, render_tool_content};
 use crate::components::prompt_progress::PROMPT_PROGRESS_LABEL;
 use crate::components::tool_display::{
     AWAITING_APPROVAL, FOLLOWING, NOTICE_PREFIX, PAUSED, WRITING_PROMPT, scroll_footer_text,
@@ -480,8 +480,8 @@ const BATCH_HEADER_STATUS_MSG: &str =
     "the batch must retain the requested child lifecycle and its pending sibling";
 const CANCELLED_HEADER_MSG: &str =
     "a cancelled batch must keep full wrapped headers even while children remain pending";
-const BATCH_HEADER_HIGHLIGHT_SETUP_MSG: &str =
-    "a fresh batch header phase must enqueue a real highlight";
+const BATCH_HEADER_NO_HIGHLIGHT_MSG: &str =
+    "batch headers without code must not enqueue syntax work";
 const BATCH_HEADER_HIGHLIGHT_TIMEOUT_MSG: &str =
     "the batch header highlight worker did not finish before the deadline";
 const VARIABLE_ROSTER_SETUP_MSG: &str =
@@ -7553,6 +7553,7 @@ fn a_settled_child_can_still_be_scrolled() {
         text: String::new(),
     });
     panel.tool_start(ev);
+    panel.toggle_batch_child("t1", 0);
     let terminal = render(&mut panel, 80, 24);
     settle_highlights(&mut panel);
 
@@ -7747,6 +7748,7 @@ fn panel_with_a_wrapping_child() -> MessagesPanel {
         text: String::new(),
     });
     panel.tool_start(ev);
+    panel.toggle_batch_child("t1", 0);
     panel
 }
 
@@ -7932,6 +7934,7 @@ const FITTING_SPAN_MSG: &str =
 #[test]
 fn a_settled_child_that_fits_keeps_its_span_but_not_its_window() {
     let mut panel = panel_with_running_shell();
+    panel.toggle_batch_child("t1", 0);
     panel.set_batch_child_output("t1", 0, &shell_stream());
     let terminal = render(&mut panel, 80, 24);
     let (column, _) = card_bar_rows(&terminal)[0];
@@ -9243,6 +9246,7 @@ fn a_settled_child_says_nothing_about_a_tail_either() {
         },
         ..done("t1")
     });
+    panel.toggle_batch_child("t1", 0);
     render(&mut panel, 80, 24);
 
     let text = seg_text(&panel, "t1");
@@ -9401,6 +9405,240 @@ const CHILD_ONE_LINER_MSG: &str =
     "a one-line script is drawn in the body and given up by the summary row";
 const CHILD_LIVE_SCRIPT_MSG: &str =
     "a child still running shows what it is running, not only what it has printed";
+const STREAM_HIGHLIGHT_WIDTH: u16 = 100;
+const STREAM_HIGHLIGHT_NARROW_WIDTH: u16 = 48;
+const STREAM_HIGHLIGHT_HEIGHT: u16 = 40;
+const STREAM_OUTPUTS: [&str; 2] = ["first live output", "later live output"];
+const HIGHLIGHT_GEOMETRY_MSG: &str = "highlight completion must not change card geometry";
+const HIGHLIGHT_STABILITY_MSG: &str = "unrelated output must not remove existing syntax colors";
+const WRAPPED_SCRIPT: &str = "for file in alpha beta gamma delta epsilon zeta eta theta\ndo\n  printf '%s\\n' \"$file\"\ndone";
+const MIN_HIGHLIGHT_WRAP_WIDTH: u16 = 12;
+
+#[test_case("bash", WRAPPED_SCRIPT; "shell")]
+#[test_case("rust", "let value = 123;"; "rust")]
+fn syntax_spans_do_not_change_wrapped_command_text(language: &str, code: &str) {
+    let input = ToolInput::Code {
+        language: language.into(),
+        code: code.into(),
+    };
+    for width in MIN_HIGHLIGHT_WRAP_WIDTH..STREAM_HIGHLIGHT_WIDTH {
+        let limits = RenderLimits::default().with_width(width);
+        let plain = render_tool_content(Some(&input), None, false, limits.clone());
+        let highlighted = render_tool_content(Some(&input), None, true, limits);
+        let text = |lines: &[Line<'_>]| lines.iter().map(ToString::to_string).collect::<Vec<_>>();
+        assert_eq!(
+            text(&plain.lines),
+            text(&highlighted.lines),
+            "{HIGHLIGHT_GEOMETRY_MSG}: width={width}"
+        );
+    }
+}
+
+#[test_case(ViewMode::Auto, false, STREAM_HIGHLIGHT_WIDTH; "auto_open")]
+#[test_case(ViewMode::Expanded, false, STREAM_HIGHLIGHT_WIDTH; "expanded_open")]
+#[test_case(ViewMode::Compact, false, STREAM_HIGHLIGHT_WIDTH; "compact_manually_open")]
+#[test_case(ViewMode::Auto, true, STREAM_HIGHLIGHT_WIDTH; "auto_closed")]
+#[test_case(ViewMode::Expanded, true, STREAM_HIGHLIGHT_WIDTH; "expanded_closed")]
+#[test_case(ViewMode::Compact, true, STREAM_HIGHLIGHT_WIDTH; "compact_closed")]
+#[test_case(ViewMode::Auto, false, STREAM_HIGHLIGHT_NARROW_WIDTH; "narrow_auto_open")]
+#[test_case(ViewMode::Compact, false, STREAM_HIGHLIGHT_NARROW_WIDTH; "narrow_compact_open")]
+fn background_shell_highlights_preserve_task_body(view: ViewMode, closed: bool, width: u16) {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.set_view(view);
+    panel.tool_start(ToolStartEvent {
+        input: Some(ToolInput::Code {
+            language: "bash".into(),
+            code: CHILD_SCRIPT.into(),
+        }),
+        ..start(TOOL_ID, SHELL_TOOL_NAME)
+    });
+    let mut task = live_task_card(TOOL_ID, LIVE_STATE);
+    task.kind = JobKind::Shell;
+    panel.tool_done(ToolDoneEvent {
+        tool: SHELL_TOOL_NAME.into(),
+        output: ToolOutput::Tasks(vec![task]),
+        ..done(TOOL_ID)
+    });
+    render(&mut panel, width, STREAM_HIGHLIGHT_HEIGHT);
+    if closed {
+        panel.close_tool_card(TOOL_ID);
+    } else if view == ViewMode::Compact {
+        assert!(panel.toggle_expansion(TOOL_ID));
+    }
+    let mut previous_styles = None;
+    for output in STREAM_OUTPUTS {
+        panel.tool_output(TOOL_ID, output);
+        render(&mut panel, width, STREAM_HIGHLIGHT_HEIGHT);
+        let heights = panel.segment_heights();
+        if let Some(styles) = &previous_styles {
+            assert_eq!(
+                &script_token_styles(&panel, TOOL_ID),
+                styles,
+                "{HIGHLIGHT_STABILITY_MSG}"
+            );
+        }
+        wait_for_batch_header_highlights(&mut panel);
+        assert_eq!(panel.segment_heights(), heights, "{HIGHLIGHT_GEOMETRY_MSG}");
+        let text = seg_text(&panel, TOOL_ID);
+        assert_eq!(text.contains(output), !closed, "{text}");
+        assert_eq!(panel.card_closed(TOOL_ID), closed);
+        if !closed {
+            assert!(text.contains(LIVE_TASK_ID), "{text}");
+            let styles = script_token_styles(&panel, TOOL_ID);
+            assert_eq!(
+                styles.len(),
+                CHILD_SCRIPT_TOKENS.len(),
+                "{HIGHLIGHT_STABILITY_MSG}: {text}"
+            );
+            previous_styles = Some(styles);
+        }
+        render(&mut panel, width, STREAM_HIGHLIGHT_HEIGHT);
+        assert_eq!(panel.segment_heights(), heights, "{HIGHLIGHT_GEOMETRY_MSG}");
+    }
+}
+
+#[test_case(false; "code_input")]
+#[test_case(true; "script_input")]
+fn streaming_shell_reuses_command_highlights(script: bool) {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    let input = if script {
+        ToolInput::Script {
+            language: "bash".into(),
+            code: CHILD_SCRIPT.into(),
+        }
+    } else {
+        ToolInput::Code {
+            language: "bash".into(),
+            code: CHILD_SCRIPT.into(),
+        }
+    };
+    panel.tool_start(ToolStartEvent {
+        input: Some(input),
+        ..start(TOOL_ID, SHELL_TOOL_NAME)
+    });
+    render(&mut panel, STREAM_HIGHLIGHT_WIDTH, STREAM_HIGHLIGHT_HEIGHT);
+    wait_for_batch_header_highlights(&mut panel);
+    let styles = script_token_styles(&panel, TOOL_ID);
+    assert_eq!(
+        styles.len(),
+        CHILD_SCRIPT_TOKENS.len(),
+        "{HIGHLIGHT_STABILITY_MSG}"
+    );
+    for output in STREAM_OUTPUTS {
+        panel.tool_output(TOOL_ID, output);
+        render(&mut panel, STREAM_HIGHLIGHT_WIDTH, STREAM_HIGHLIGHT_HEIGHT);
+        assert_eq!(
+            script_token_styles(&panel, TOOL_ID),
+            styles,
+            "{HIGHLIGHT_STABILITY_MSG}"
+        );
+        assert!(seg_text(&panel, TOOL_ID).contains(output));
+    }
+}
+
+#[test_case(false; "batch")]
+#[test_case(true; "nested_batch")]
+fn batch_sibling_updates_preserve_command_highlights(nested: bool) {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    let stable = BatchToolEntry {
+        input: Some(ToolInput::Code {
+            language: "bash".into(),
+            code: CHILD_SCRIPT.into(),
+        }),
+        ..batch_child(FILE_WRITE_TOOL_NAME, "stable")
+    };
+    let mut running = BatchToolEntry {
+        status: BatchToolStatus::Running,
+        output: None,
+        ..batch_child(SHELL_TOOL_NAME, "running")
+    };
+    let entries = |running: &BatchToolEntry| {
+        let entries = vec![stable.clone(), running.clone()];
+        if nested {
+            vec![BatchToolEntry {
+                output: Some(ToolOutput::Batch {
+                    entries,
+                    text: String::new(),
+                }),
+                ..running_child(BATCH_TOOL_NAME)
+            }]
+        } else {
+            entries
+        }
+    };
+    panel.tool_start(ToolStartEvent {
+        output: Some(ToolOutput::Batch {
+            entries: entries(&running),
+            text: String::new(),
+        }),
+        ..start(TOOL_ID, BATCH_TOOL_NAME)
+    });
+    panel
+        .batch_views
+        .insert(TOOL_ID.into(), BatchViews::new([0, 1]));
+    render(&mut panel, STREAM_HIGHLIGHT_WIDTH, STREAM_HIGHLIGHT_HEIGHT);
+    wait_for_batch_header_highlights(&mut panel);
+    let styles = script_token_styles(&panel, TOOL_ID);
+    assert_eq!(
+        styles.len(),
+        CHILD_SCRIPT_TOKENS.len(),
+        "{HIGHLIGHT_STABILITY_MSG}"
+    );
+    for output in STREAM_OUTPUTS {
+        running.annotation = Some(output.into());
+        if nested {
+            panel.batch_progress(TOOL_ID, 0, entries(&running).remove(0));
+        } else {
+            panel.batch_progress(TOOL_ID, 1, running.clone());
+            panel.set_batch_child_output(TOOL_ID, 1, output);
+        }
+        render(&mut panel, STREAM_HIGHLIGHT_WIDTH, STREAM_HIGHLIGHT_HEIGHT);
+        assert_eq!(
+            script_token_styles(&panel, TOOL_ID),
+            styles,
+            "{HIGHLIGHT_STABILITY_MSG}"
+        );
+        assert!(seg_text(&panel, TOOL_ID).contains(output));
+    }
+}
+
+#[test_case(false, false, false; "settled_child_folds")]
+#[test_case(true, false, true; "streaming_child_opens")]
+#[test_case(false, true, false; "always_collapsed_settled_child")]
+#[test_case(true, true, false; "always_collapsed_streaming_child")]
+fn batch_panel_windows_do_not_override_visibility(streaming: bool, collapsed: bool, visible: bool) {
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    panel.set_view(ViewMode::Expanded);
+    if collapsed {
+        panel.policy.always_collapsed = Arc::from([SHELL_TOOL_NAME.to_owned()]);
+    }
+    let entry = BatchToolEntry {
+        input: Some(ToolInput::Code {
+            language: "bash".into(),
+            code: CHILD_SCRIPT.into(),
+        }),
+        status: if streaming {
+            BatchToolStatus::Running
+        } else {
+            BatchToolStatus::Success
+        },
+        output: (!streaming).then(|| ToolOutput::Plain(STREAM_OUTPUTS[0].into())),
+        ..batch_child(SHELL_TOOL_NAME, "visibility")
+    };
+    panel.tool_start(ToolStartEvent {
+        output: Some(ToolOutput::Batch {
+            entries: vec![entry],
+            text: String::new(),
+        }),
+        ..start(TOOL_ID, BATCH_TOOL_NAME)
+    });
+    render(&mut panel, STREAM_HIGHLIGHT_WIDTH, STREAM_HIGHLIGHT_HEIGHT);
+    assert!(!panel.child_windows(TOOL_ID).is_empty());
+    assert_eq!(
+        seg_text(&panel, TOOL_ID).contains(CHILD_SCRIPT_TOKENS[0]),
+        visible
+    );
+}
 
 /// Styles of the shell keywords in a child's script, which are plain until the
 /// highlighter has run over them.
@@ -9437,6 +9675,9 @@ fn panel_with_script_child(script: &str, output: ToolOutput) -> MessagesPanel {
     });
     panel.tool_start(ev);
     panel.set_view(ViewMode::Expanded);
+    panel
+        .batch_views
+        .insert(TOOL_ID.into(), BatchViews::new([0]));
     panel
 }
 
@@ -10957,9 +11198,7 @@ fn a_live_batch_child_header_draws_its_whole_path(tool: &str) {
         for highlighted in [false, true] {
             if highlighted {
                 let saw_pending = wait_for_batch_header_highlights(&mut panel);
-                if status == BatchToolStatus::Pending {
-                    assert!(saw_pending, "{BATCH_HEADER_HIGHLIGHT_SETUP_MSG}");
-                }
+                assert!(!saw_pending, "{BATCH_HEADER_NO_HIGHLIGHT_MSG}");
             }
             let (seen, rows) = render_batch_header_frame(&mut panel);
             let drawn = format!("{status:?}, highlighted={highlighted}");
@@ -10999,9 +11238,7 @@ fn cancelling_a_batch_keeps_wrapped_headers_with_pending_children(initial: Batch
     for highlighted in [false, true] {
         if highlighted {
             let saw_pending = wait_for_batch_header_highlights(&mut panel);
-            if initial == BatchToolStatus::Pending {
-                assert!(saw_pending, "{BATCH_HEADER_HIGHLIGHT_SETUP_MSG}");
-            }
+            assert!(!saw_pending, "{BATCH_HEADER_NO_HIGHLIGHT_MSG}");
         }
         let (seen, rows) = render_batch_header_frame(&mut panel);
         assert!(rows[MIDDLE_CHILD].len() > 1, "{CANCELLED_HEADER_MSG}");

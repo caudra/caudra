@@ -9,9 +9,9 @@ use std::time::Duration;
 
 use tracing::error;
 
-use crate::components::code_view::{self, BodySource, RenderLimits, RowTarget};
+use crate::components::code_view::{BodySource, RowTarget};
+use crate::components::tool_display::HighlightRequest;
 use crate::provenance::LineProvenance;
-use caudra_agent::{ToolInput, ToolOutput};
 use ratatui::text::Line;
 
 const IDLE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -19,9 +19,7 @@ const FALLBACK_MAX_THREADS: usize = 4;
 
 struct RenderJob {
     id: u64,
-    tool_input: Option<Arc<ToolInput>>,
-    tool_output: Option<Arc<ToolOutput>>,
-    limits: RenderLimits,
+    request: HighlightRequest,
 }
 
 pub struct RenderResult {
@@ -71,19 +69,9 @@ impl RenderWorker {
         }
     }
 
-    pub fn send(
-        &self,
-        tool_input: Option<Arc<ToolInput>>,
-        tool_output: Option<Arc<ToolOutput>>,
-        limits: RenderLimits,
-    ) -> u64 {
+    pub fn send(&self, request: HighlightRequest) -> u64 {
         let id = NEXT_JOB_ID.fetch_add(1, Ordering::Relaxed);
-        let _ = self.job_tx.send(RenderJob {
-            id,
-            tool_input,
-            tool_output,
-            limits,
-        });
+        let _ = self.job_tx.send(RenderJob { id, request });
         self.maybe_spawn_thread();
         id
     }
@@ -119,12 +107,8 @@ impl RenderWorker {
 
 fn worker_loop(inner: &PoolInner) {
     while let Ok(job) = inner.job_rx.recv_timeout(IDLE_TIMEOUT) {
-        let content = code_view::render_tool_content(
-            job.tool_input.as_deref(),
-            job.tool_output.as_deref(),
-            true,
-            job.limits,
-        );
+        let (input, output) = job.request.sources();
+        let content = job.request.region.render(input, output);
         if inner
             .result_tx
             .send(RenderResult {

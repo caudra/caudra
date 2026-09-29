@@ -5340,7 +5340,12 @@ impl MessagesPanel {
                 .iter_mut()
                 .find(|s| s.matches_pending_highlight(result.id))
             {
-                seg.apply_highlight_result(result.lines, result.rows, result.source_rows);
+                seg.apply_highlight_result(
+                    result.id,
+                    result.lines,
+                    result.rows,
+                    result.source_rows,
+                );
                 dirty = Dirty::YES;
             }
         }

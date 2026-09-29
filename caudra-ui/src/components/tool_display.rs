@@ -9,8 +9,8 @@ use caudra_config::{ClockFormat, ToolOutputLines};
 use caudra_storage::background::JobKind;
 use code_view::{
     BatchLiveMap, BatchProgressMap, BatchStartedMap, BatchViewMap, BatchViews, BodySource,
-    CardPolicy, Disclosure, RenderLimits, RowTarget, ScrollSpan, ScrollWindow, SourceTrace,
-    UNCONSTRAINED_WIDTH, WrappedRows,
+    CardPolicy, CodeRole, Disclosure, HighlightRegion, RenderLimits, RowTarget, ScrollSpan,
+    ScrollWindow, SourceTrace, UNCONSTRAINED_WIDTH, WrappedRows,
 };
 
 use std::borrow::Cow;
@@ -31,9 +31,9 @@ use caudra_markdown::render::truncate_long_lines;
 
 use crate::markdown::{LinkMap, expand_notice, should_truncate, text_to_painted};
 use caudra_agent::{
-    ActivityChild, BatchToolStatus, BufferSnapshot, CallStage, InstructionBlock, NO_FILES_FOUND,
-    ShellOutput, SnapshotSpan, SpanStyle, SubagentActivity, SubagentProgress, TaskCard, ToolInput,
-    ToolOutput, format_live_duration, format_settled_duration,
+    ActivityChild, BatchToolStatus, BufferSnapshot, CallStage, IndexOutput, InstructionBlock,
+    NO_FILES_FOUND, ShellOutput, SnapshotSpan, SpanStyle, SubagentActivity, SubagentProgress,
+    TaskCard, ToolInput, ToolOutput, format_live_duration, format_settled_duration,
     tools::{
         FILE_READ_TOOL_NAME, FILE_WRITE_TOOL_NAME, IMAGE_GENERATE_TOOL_NAME,
         LOCAL_DOCUMENT_WRITE_TOOL_NAME, MEMORY_TOOL_NAME, PYTHON_EXECUTION_TOOL_NAME,
@@ -44,8 +44,6 @@ use caudra_workcell::{CURRENT_WORKDIR, effective_timeout, requested_workdir};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use serde_json::Value;
-
-use crate::render_worker::RenderWorker;
 
 const JSON_ESCAPE_CHARS: usize = 6;
 const REPORT_TOOL_NAME: &str = "report_to_parent";
@@ -1184,7 +1182,7 @@ pub struct ToolLines {
     pub lines: Vec<Line<'static>>,
     pub links: LinkMap,
     pub search_text: String,
-    pub highlight: Option<HighlightRequest>,
+    pub highlight: Vec<HighlightRequest>,
     pub spinner_lines: Vec<(usize, usize)>,
     /// Index of the first live-buffer snapshot line, recorded in the same
     /// pass that lays out `lines`, so click rows can never drift from them.
@@ -1209,68 +1207,161 @@ pub struct ToolLines {
     pub source: Option<BodySource>,
 }
 
+#[derive(Clone)]
 pub struct HighlightRequest {
-    pub range: (usize, usize),
+    pub region: HighlightRegion,
     pub input: Option<Arc<ToolInput>>,
     pub output: Option<Arc<ToolOutput>>,
-    pub limits: RenderLimits,
 }
 
 impl HighlightRequest {
-    fn new(
-        range: (usize, usize),
-        input: Option<Arc<ToolInput>>,
-        output: Option<Arc<ToolOutput>>,
-        limits: RenderLimits,
-    ) -> Option<Self> {
-        if range.0 == range.1 || limits.has_live_rows() {
-            return None;
+    pub fn sources(&self) -> (Option<&ToolInput>, Option<&ToolOutput>) {
+        let mut input = self.input.as_deref();
+        let mut output = self.output.as_deref();
+        for index in &self.region.path {
+            let Some(ToolOutput::Batch { entries, .. }) = output else {
+                return (None, None);
+            };
+            let Some(entry) = entries.get(*index) else {
+                return (None, None);
+            };
+            input = entry.input.as_ref();
+            output = entry.output.as_ref();
         }
-        let output = output.and_then(|o| match *o {
-            ToolOutput::ReadCode { .. }
-            | ToolOutput::WriteCode { .. }
-            | ToolOutput::Diff { .. }
-            | ToolOutput::Patch { .. }
-            | ToolOutput::GrepResult { .. }
-            | ToolOutput::Index(_)
-            | ToolOutput::CodeGraph { .. }
-            | ToolOutput::Instructions { .. } => Some(o),
-            ToolOutput::Plain(_)
-            | ToolOutput::Markdown(_)
-            | ToolOutput::ReadDir(_)
-            | ToolOutput::TodoList(_)
-            | ToolOutput::Answers(_)
-            | ToolOutput::Shell(_)
-            | ToolOutput::Environment { .. }
-            // A note is markdown, and the renderer that paints it already
-            // highlights the fences inside it.
-            | ToolOutput::Memory(_)
-            | ToolOutput::WorkflowRun(_)
-            | ToolOutput::Tasks(_)
-            | ToolOutput::Image { .. } => None,
-            // Children carry their own code and diffs, so a batch reaches the
-            // highlighting worker exactly as a lone child would. A batch with
-            // a child still reporting or still printing is the exception: its
-            // rows move faster than the worker's cache key, so an answer
-            // spliced back over them would freeze what the reader is watching.
-            ToolOutput::Batch { ref entries, .. } => (!entries.is_empty()).then_some(o),
-        });
-        if input.is_none() && output.is_none() {
-            return None;
+        match self.region.role {
+            CodeRole::Input => (input, None),
+            CodeRole::Output => (None, output),
         }
-        Some(Self {
-            range,
-            input,
-            output,
-            limits,
-        })
+    }
+
+    pub fn matches(&self, other: &Self) -> bool {
+        if self.region.path != other.region.path
+            || self.region.role != other.region.role
+            || self.region.limits.width != other.region.limits.width
+            || self.region.limits.budget != other.region.limits.budget
+            || self.region.transforms != other.region.transforms
+        {
+            return false;
+        }
+        let (input, output) = self.sources();
+        let (other_input, other_output) = other.sources();
+        input == other_input
+            && match (output, other_output) {
+                (None, None) => true,
+                (Some(left), Some(right)) => {
+                    std::ptr::eq(left, right) || same_syntax_output(left, right)
+                }
+                _ => false,
+            }
     }
 }
 
-impl ToolLines {
-    pub fn send_highlight(&self, worker: &RenderWorker) -> Option<u64> {
-        let hl = self.highlight.as_ref()?;
-        Some(worker.send(hl.input.clone(), hl.output.clone(), hl.limits.clone()))
+fn same_syntax_output(left: &ToolOutput, right: &ToolOutput) -> bool {
+    match (left, right) {
+        (
+            ToolOutput::ReadCode {
+                path: lp,
+                start_line: ls,
+                lines: ll,
+                ..
+            },
+            ToolOutput::ReadCode {
+                path: rp,
+                start_line: rs,
+                lines: rl,
+                ..
+            },
+        ) => (lp, ls, ll) == (rp, rs, rl),
+        (
+            ToolOutput::WriteCode {
+                path: lp,
+                lines: ll,
+                ..
+            },
+            ToolOutput::WriteCode {
+                path: rp,
+                lines: rl,
+                ..
+            },
+        ) => (lp, ll) == (rp, rl),
+        (
+            ToolOutput::Diff {
+                path: lp,
+                before: lb,
+                after: la,
+                ..
+            },
+            ToolOutput::Diff {
+                path: rp,
+                before: rb,
+                after: ra,
+                ..
+            },
+        ) => (lp, lb, la) == (rp, rb, ra),
+        (ToolOutput::Patch { files: left }, ToolOutput::Patch { files: right }) => left
+            .iter()
+            .map(|f| (&f.path, &f.patch, f.additions, f.deletions, f.truncated))
+            .eq(right
+                .iter()
+                .map(|f| (&f.path, &f.patch, f.additions, f.deletions, f.truncated))),
+        (
+            ToolOutput::GrepResult {
+                entries: left,
+                capped: lc,
+            },
+            ToolOutput::GrepResult {
+                entries: right,
+                capped: rc,
+            },
+        ) => {
+            lc.as_ref().map(|c| (c.files_scanned, c.files_listed))
+                == rc.as_ref().map(|c| (c.files_scanned, c.files_listed))
+                && left.len() == right.len()
+                && left.iter().zip(right).all(|(l, r)| {
+                    l.path == r.path
+                        && l.groups.len() == r.groups.len()
+                        && l.groups.iter().zip(&r.groups).all(|(l, r)| {
+                            l.lines
+                                .iter()
+                                .map(|l| (l.line_nr, &l.text, l.is_match))
+                                .eq(r.lines.iter().map(|l| (l.line_nr, &l.text, l.is_match)))
+                        })
+                })
+        }
+        (
+            ToolOutput::Index(IndexOutput::File {
+                language: ll,
+                lines: lr,
+                ..
+            }),
+            ToolOutput::Index(IndexOutput::File {
+                language: rl,
+                lines: rr,
+                ..
+            }),
+        ) => (ll, lr) == (rl, rr),
+        (
+            ToolOutput::CodeGraph {
+                headline: lh,
+                rows: lr,
+                source: ls,
+                footer: lf,
+                ..
+            },
+            ToolOutput::CodeGraph {
+                headline: rh,
+                rows: rr,
+                source: rs,
+                footer: rf,
+                ..
+            },
+        ) => (lh, lr, ls, lf) == (rh, rr, rs, rf),
+        (ToolOutput::Instructions { blocks: left }, ToolOutput::Instructions { blocks: right }) => {
+            left.iter()
+                .map(|b| (&b.path, &b.content))
+                .eq(right.iter().map(|b| (&b.path, &b.content)))
+        }
+        _ => false,
     }
 }
 
@@ -1536,6 +1627,7 @@ struct ToolLineBuilder {
     shell_toggle_line: Option<usize>,
     scroll_footer_line: Option<usize>,
     scroll_spans: Vec<ScrollSpan>,
+    highlights: Vec<HighlightRegion>,
     content_range: (usize, usize),
     rows: Vec<Option<RowTarget>>,
     source: SourceTrace,
@@ -1572,6 +1664,7 @@ impl ToolLineBuilder {
             shell_toggle_line: None,
             scroll_footer_line: None,
             scroll_spans: Vec::new(),
+            highlights: Vec::new(),
             content_range: (0, 0),
             rows: Vec::new(),
             source: SourceTrace::default(),
@@ -1802,6 +1895,16 @@ impl ToolLineBuilder {
         let (above, below) = hidden.unwrap_or_default();
         let start = first + above;
         let end = start + body.len();
+        self.highlights.retain_mut(|region| {
+            if region.range.end <= first {
+                return true;
+            }
+            if !region.keep(&(start..end)) {
+                return false;
+            }
+            region.shift(first);
+            true
+        });
         let keep_row = |line: &mut usize| {
             if *line < first {
                 return true;
@@ -1845,9 +1948,6 @@ impl ToolLineBuilder {
     }
 
     fn push_code_content(&mut self, input: Option<&ToolInput>, output: Option<&ToolOutput>) {
-        // `content_range` stays empty for a rendered document, because the
-        // highlighting worker answers a `WriteCode` range with the file's
-        // source and would splice it back over what was drawn.
         match output {
             Some(ToolOutput::WriteCode { path, lines, .. }) if renders_as_markdown(path) => {
                 self.push_markdown_body(&lines.join("\n"), RowLimit::WHOLE);
@@ -1879,6 +1979,12 @@ impl ToolLineBuilder {
             self.link_rows.push((self.lines.len(), links));
             self.lines.push(line);
         }
+        self.highlights
+            .extend(content.highlights.into_iter().map(|mut region| {
+                region.shift(start);
+                region.indent(TOOL_BODY_INDENT.into(), Style::default());
+                region
+            }));
         self.content_range = (start, self.lines.len());
         self.rows.resize(start, None);
         self.rows.extend(content.rows);
@@ -2188,18 +2294,22 @@ impl ToolLineBuilder {
                 links.rows[first + offset] = spans;
             }
         }
-        let (start, end) = self.content_range;
-        let content = wrapped.range(start..end);
         ToolLines {
             lines,
             links,
             search_text: self.search_text,
-            highlight: HighlightRequest::new(
-                (content.start, content.end),
-                input,
-                output,
-                self.limits,
-            ),
+            highlight: self
+                .highlights
+                .into_iter()
+                .map(|mut region| {
+                    region.wrap(&wrapped, self.width);
+                    HighlightRequest {
+                        region,
+                        input: input.clone(),
+                        output: output.clone(),
+                    }
+                })
+                .collect(),
             spinner_lines: self
                 .spinner_lines
                 .into_iter()
@@ -2880,14 +2990,11 @@ pub fn build_instructions_lines(
     );
     b.prepend_indicator(Instant::now());
 
-    let start = b.lines.len();
-    b.truncation |=
-        code_view::render_instructions(blocks, &mut b.lines, b.limits.budget, false, width);
-    b.source.abandon();
-    for line in &mut b.lines[start..] {
-        line.spans.insert(0, Span::raw(TOOL_BODY_INDENT));
-    }
-    b.content_range = (start, b.lines.len());
+    let output = Arc::new(ToolOutput::Instructions {
+        blocks: blocks.to_vec(),
+    });
+    b.limits.width = width;
+    b.push_rendered_code(None, Some(&output));
 
     b.push_search_text(
         &blocks
@@ -2897,9 +3004,6 @@ pub fn build_instructions_lines(
             .join("\n\n"),
     );
 
-    let output = Arc::new(ToolOutput::Instructions {
-        blocks: blocks.to_vec(),
-    });
     b.finish(None, Some(output), TOOL_BODY_INDENT)
 }
 
@@ -2922,7 +3026,7 @@ fn compact_instruction_lines(blocks: &[InstructionBlock]) -> ToolLines {
         links: LinkMap::none_for(&lines),
         lines,
         search_text,
-        highlight: None,
+        highlight: Vec::new(),
         spinner_lines: Vec::new(),
         snapshot_base: None,
         snapshot_skip: 0,
@@ -3144,10 +3248,13 @@ mod tests {
             &test_rctx(80),
             Some(Disclosure::default()),
         );
-        assert_eq!(tl.highlight.is_some(), expect_highlight);
-        if let Some(hl) = &tl.highlight {
-            assert_eq!(hl.output.is_some(), expect_output);
-        }
+        assert_eq!(!tl.highlight.is_empty(), expect_highlight);
+        assert_eq!(
+            tl.highlight
+                .iter()
+                .any(|request| request.sources().1.is_some()),
+            expect_output
+        );
     }
 
     fn has_styled_span(spans: &[Span<'_>], text: &str, style: Style) -> bool {
@@ -3745,7 +3852,7 @@ mod tests {
         let text = lines_text(&tl);
         assert!(text.contains(HEADING_TEXT), "{text}");
         assert_eq!(text.contains(HEADING_SOURCE), keeps_markers, "{text}");
-        assert_eq!(tl.highlight.is_some(), keeps_markers);
+        assert_eq!(!tl.highlight.is_empty(), keeps_markers);
     }
 
     /// What the header could show of a multiline command: one space-joined
@@ -4307,7 +4414,7 @@ mod tests {
                     effect: ToolEffect::Unknown,
                     summary: String::new(),
                     status: BatchToolStatus::Success,
-                    input: None,
+                    input: code_input(),
                     raw_input: None,
                     output: Some(output),
                     annotation: None,
@@ -4324,6 +4431,9 @@ mod tests {
             output
         };
         let mut msg = task_msg(String::new());
+        if !batched {
+            msg.tool_input = code_input().map(Arc::new);
+        }
         msg.tool_output = Some(Arc::new(output));
         let views = HashMap::from([("t1".into(), BatchViews::new([0]))]);
         let ctx = RenderCtx {
@@ -4366,23 +4476,24 @@ mod tests {
         );
         assert!(tl.rows[row].is_some());
         assert!(tl.lines.iter().all(|line| line.width() <= 48));
-        if let Some(request) = &tl.highlight {
-            let content = code_view::render_tool_content(
-                request.input.as_deref(),
-                request.output.as_deref(),
-                true,
-                request.limits.clone(),
-            );
-            assert!(content.links.is_aligned(&content.lines));
-            assert!(
-                content
-                    .links
-                    .rows
+        assert_eq!(tl.highlight.len(), 1);
+        for request in &tl.highlight {
+            let (input, output) = request.sources();
+            assert!(output.is_none());
+            let rendered = request.region.render(input, output);
+            assert_eq!(
+                rendered.lines.iter().map(line_text).collect::<Vec<_>>(),
+                tl.lines[request.region.range.clone()]
                     .iter()
-                    .flatten()
-                    .any(|link| link.as_deref() == Some(LINK))
+                    .map(line_text)
+                    .collect::<Vec<_>>()
             );
         }
+        assert!(
+            tl.highlight
+                .iter()
+                .all(|request| !request.region.range.contains(&row))
+        );
     }
 
     fn task_msg(output: String) -> DisplayMessage {
@@ -5612,7 +5723,7 @@ mod tests {
             content: "follow style guide".into(),
         }];
         let tl = build_instructions_lines(&blocks, 80, Some(false));
-        assert!(tl.highlight.is_some());
+        assert!(!tl.highlight.is_empty());
         let text = lines_text(&tl);
         assert!(text.contains("follow style guide"));
     }
@@ -5754,28 +5865,32 @@ mod tests {
         )
     }
 
-    /// A clock is a moving row. The worker's cache key cannot see it, so a
-    /// batch holding one has to be withheld: the answer spliced back over
-    /// those rows freezes the number the reader is watching, which is what
-    /// `reuse_highlight` then keeps doing every frame.
     #[test]
-    fn a_batch_with_a_ticking_child_is_withheld_from_the_worker() {
+    fn a_batch_with_a_ticking_child_highlights_only_stable_regions() {
         let clocked = BatchStartedMap::from([(
             "t1".to_owned(),
             Arc::new(HashMap::from([(1_usize, Instant::now())])),
         )]);
-
-        assert!(
-            batch_of(vec![code_child()], &BatchStartedMap::new())
-                .highlight
-                .is_some(),
-            "a settled batch is the worker's whole purpose"
+        let settled = batch_of(vec![code_child()], &BatchStartedMap::new());
+        let ticking = batch_of(vec![code_child(), running_shell_child()], &clocked);
+        assert_eq!(settled.highlight.len(), 1);
+        assert_eq!(ticking.highlight.len(), 1);
+        let request = &ticking.highlight[0];
+        assert_eq!(request.region.path, [0]);
+        let (input, output) = request.sources();
+        let result = request.region.render(input, output);
+        assert_eq!(
+            result.lines.iter().map(line_text).collect::<Vec<_>>(),
+            ticking.lines[request.region.range.clone()]
+                .iter()
+                .map(line_text)
+                .collect::<Vec<_>>()
         );
         assert!(
-            batch_of(vec![code_child(), running_shell_child()], &clocked)
-                .highlight
-                .is_none(),
-            "a batch with a clock counting up must render locally every frame"
+            !result
+                .lines
+                .iter()
+                .any(|line| line_text(line).contains(DURATION_SEPARATOR))
         );
     }
 
@@ -6102,7 +6217,7 @@ mod tests {
                 whole.links.rows[start + header_rows..end + header_rows],
                 "{HISTORY_LINK_MSG}"
             );
-            assert!(tl.highlight.is_none(), "{HISTORY_WORKER_MSG}");
+            assert!(tl.highlight.is_empty(), "{HISTORY_WORKER_MSG}");
         }
         assert!(
             whole
@@ -6191,21 +6306,31 @@ mod tests {
     }
 
     #[test]
-    fn retained_history_blocks_highlighting_even_with_an_input() {
+    fn retained_history_does_not_block_stable_input_highlighting() {
         let limits = RenderLimits {
             progress: Arc::new(HashMap::from([(0, retained_task_progress())])),
+            width: HISTORY_WIDTH,
             ..RenderLimits::default()
         };
-        let highlight = HighlightRequest::new(
-            (0, 1),
-            code_input().map(Arc::new),
-            Some(Arc::new(ToolOutput::Batch {
-                entries: vec![code_child()],
-                text: String::new(),
-            })),
-            limits,
+        let input = code_input().unwrap();
+        let output = ToolOutput::Batch {
+            entries: vec![code_child()],
+            text: String::new(),
+        };
+        let content = code_view::render_tool_content(Some(&input), Some(&output), false, limits);
+        assert!(
+            content
+                .highlights
+                .iter()
+                .any(|region| region.path.is_empty() && region.role == CodeRole::Input)
         );
-        assert!(highlight.is_none(), "{HISTORY_WORKER_MSG}");
+        for region in content.highlights {
+            assert!(
+                !content.lines[region.range]
+                    .iter()
+                    .any(|line| line_text(line).contains(HISTORY_FIRST))
+            );
+        }
     }
 
     /// The reported bug: a subagent running a batch reported only `Batching 3

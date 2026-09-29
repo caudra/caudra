@@ -1003,6 +1003,7 @@ fn option_lines(label: &str, picked: bool, t: &theme::Theme) -> Vec<Line<'static
 /// exactly where they are worst, since a long search header is what wraps.
 fn render_batch(entries: &[BatchToolEntry], highlight: bool, limits: &RenderLimits) -> BatchCard {
     let t = theme::current();
+    let mut highlights = Vec::new();
     let mut lines = Vec::new();
     let mut rows = Vec::new();
     let mut links = LinkMap::default();
@@ -1154,6 +1155,11 @@ fn render_batch(entries: &[BatchToolEntry], highlight: bool, limits: &RenderLimi
             body = Some(combined);
         }
         if let Some(body) = body {
+            highlights.extend(body.highlights.into_iter().map(|mut region| {
+                region.path.insert(0, index);
+                region.shift(lines.len());
+                region
+            }));
             if let Some(span) = body.span {
                 spans_out.push(span.shifted(lines.len(), Some(index)));
             }
@@ -1182,6 +1188,7 @@ fn render_batch(entries: &[BatchToolEntry], highlight: bool, limits: &RenderLimi
         .rows
         .extend(LinkMap::none_for(&lines[links.rows.len()..]).rows);
     BatchCard {
+        highlights,
         links,
         source: trace.finish(&lines),
         lines,
@@ -1237,6 +1244,7 @@ fn heading_rows(broken: &[Vec<SpanPiece>], heading: BodySource) -> BodySource {
 /// to be readable through: a click resolves a row to the child that owns it,
 /// and a selection resolves it to the text that child answered with.
 struct BatchCard {
+    highlights: Vec<HighlightRegion>,
     links: LinkMap,
     lines: Vec<Line<'static>>,
     rows: Vec<Option<RowTarget>>,
@@ -1343,6 +1351,7 @@ fn child_body(
         }
         let source = trace.finish(&lines);
         return ChildBody {
+            highlights: Vec::new(),
             rows: vec![None; lines.len()],
             lines,
             links,
@@ -1403,6 +1412,7 @@ fn child_body(
             let content =
                 render_tool_content(entry.input.as_ref(), output, highlight, limits.clone());
             ChildBody {
+                highlights: content.highlights,
                 links: content.links,
                 lines: content.lines,
                 rows: content.rows,
@@ -1420,6 +1430,7 @@ fn child_body(
 /// change the line count between here and the card: a row one of them left
 /// behind points a copy at text that was never drawn.
 struct ChildBody {
+    highlights: Vec<HighlightRegion>,
     links: LinkMap,
     lines: Vec<Line<'static>>,
     rows: Vec<Option<RowTarget>>,
@@ -1433,6 +1444,7 @@ struct ChildBody {
 impl ChildBody {
     fn traced(lines: Vec<Line<'static>>, source: BodySource) -> Self {
         Self {
+            highlights: Vec::new(),
             links: LinkMap::none_for(&lines),
             rows: vec![None; lines.len()],
             lines,
@@ -1443,6 +1455,7 @@ impl ChildBody {
     }
 
     fn keep_rows(&mut self, kept: Range<usize>) {
+        self.highlights.retain_mut(|region| region.keep(&kept));
         self.links.rows = self
             .links
             .rows
@@ -1454,6 +1467,12 @@ impl ChildBody {
     }
 
     fn indented(mut self, continuation: &str) -> Self {
+        for region in &mut self.highlights {
+            region.indent(
+                format!("{continuation}{BATCH_BODY_PAD}"),
+                theme::current().tool_dim,
+            );
+        }
         for row in &mut self.links.rows {
             row.insert(0, None);
         }
@@ -1528,6 +1547,11 @@ fn with_script(
         lines.push(Line::default());
     }
     let shift = lines.len();
+    let mut highlights = script.highlights;
+    highlights.extend(body.highlights.into_iter().map(|mut region| {
+        region.shift(shift);
+        region
+    }));
     let mut links = script.links;
     links
         .rows
@@ -1547,6 +1571,7 @@ fn with_script(
         }
     }
     ChildBody {
+        highlights,
         source: trace.finish(&lines),
         links,
         lines,
@@ -1624,12 +1649,6 @@ fn capped(mut lines: Vec<Line<'static>>, budget: usize) -> (Vec<Line<'static>>, 
 /// the indent saying which child the row belongs to is lost. A subagent
 /// reporting a structured result is a fenced block, so this is the case that
 /// matters.
-///
-/// The width rides on the limits, which is what reaches the highlight worker,
-/// and `HighlightKey` carries it so a resize re-renders instead of splicing
-/// back an answer broken for the width the terminal used to be. Zero is the
-/// renderer's own word for not wrapping, and stays what a caller with no width
-/// to give gets.
 ///
 /// Breaking a paragraph here does not put a newline on the clipboard: the rows
 /// of one source line all name that line, so copy reads it back as it was
@@ -1797,6 +1816,18 @@ fn wrap_styled(
                 whole.trim_end_matches(' '),
                 &span,
             ));
+            for piece in row.iter_mut().rev() {
+                if piece.origin.is_none_or(|origin| origin < gutter) {
+                    break;
+                }
+                let kept = piece.span.content.trim_end_matches(' ').len();
+                if kept != piece.span.content.len() {
+                    piece.span.content.to_mut().truncate(kept);
+                }
+                if kept != 0 {
+                    break;
+                }
+            }
             rows.push(std::mem::take(&mut row));
             row.push(SpanPiece {
                 origin: None,
@@ -2947,21 +2978,6 @@ impl RenderLimits {
         Self { cwd, ..self }
     }
 
-    /// Whether any child is still moving: a report redrawn every tick, a
-    /// stream arriving as often as the command prints, or a clock counting up.
-    /// A batch holding any of them renders here instead of being sent out and
-    /// spliced back stale.
-    ///
-    /// None of them is in the worker's cache key, and none usefully could be:
-    /// they all move on every frame. Without this a streaming child shows the
-    /// first window that reached the worker and then freezes there until the
-    /// call settles, and a running child's clock freezes with it.
-    pub fn has_live_rows(&self) -> bool {
-        !self.live.is_empty()
-            || !self.started.is_empty()
-            || self.progress.values().any(ToolProgress::is_live)
-    }
-
     pub fn is_expanded(&self) -> bool {
         self.budget == usize::MAX
     }
@@ -3027,21 +3043,27 @@ impl RenderLimits {
         // A script arrives before the call it belongs to is dispatched, so a
         // child that has one is worth watching a frame earlier than one whose
         // only claim is output it has started to print.
-        let streaming = entry.output.is_none()
-            && (entry.input.is_some()
-                || self.live.get(&index).is_some_and(|tail| !tail.is_empty()))
-            && !self.policy.stays_collapsed(&entry.tool);
-        let scroll = self.child_scroll.get(&index).copied().or_else(|| {
-            self.policy
-                .window(&entry.tool, 0, true)
-                .filter(|_| open || streaming || !is_collapsible(entry.effect, &entry.tool))
-        });
+        let streaming = match entry.output.as_ref() {
+            None => {
+                entry.input.is_some() || self.live.get(&index).is_some_and(|tail| !tail.is_empty())
+            }
+            Some(ToolOutput::Tasks(tasks)) => tasks.iter().any(|task| task.active()),
+            Some(_) => false,
+        };
+        if !open
+            && (self.policy.stays_collapsed(&entry.tool)
+                || (!streaming && is_collapsible(entry.effect, &entry.tool)))
+        {
+            return None;
+        }
+        let scroll = self
+            .child_scroll
+            .get(&index)
+            .copied()
+            .or_else(|| self.policy.window(&entry.tool, 0, true));
         let budget = match scroll {
             Some(window) => window.height,
             None if open => usize::MAX,
-            None if self.policy.stays_collapsed(&entry.tool) => return None,
-            None if streaming => self.tool_lines.get(&entry.tool),
-            None if is_collapsible(entry.effect, &entry.tool) => return None,
             None => self.tool_lines.get(&entry.tool),
         };
         Some(Self {
@@ -3097,7 +3119,113 @@ impl RowTarget {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CodeRole {
+    Input,
+    Output,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub enum HighlightTransform {
+    Indent(String, Style),
+    Wrap(u16),
+    Keep(Range<usize>),
+}
+
+#[derive(Clone)]
+pub struct HighlightRegion {
+    pub range: Range<usize>,
+    pub path: Vec<usize>,
+    pub role: CodeRole,
+    pub limits: RenderLimits,
+    pub transforms: Vec<HighlightTransform>,
+}
+
+impl HighlightRegion {
+    fn new(range: Range<usize>, role: CodeRole, limits: &RenderLimits) -> Self {
+        let budget = match role {
+            CodeRole::Input => usize::MAX,
+            CodeRole::Output => limits.budget,
+        };
+        Self {
+            range,
+            path: Vec::new(),
+            role,
+            limits: RenderLimits {
+                budget,
+                width: limits.width,
+                ..RenderLimits::default()
+            },
+            transforms: Vec::new(),
+        }
+    }
+
+    pub fn shift(&mut self, by: usize) {
+        self.range = self.range.start + by..self.range.end + by;
+    }
+
+    pub fn indent(&mut self, indent: String, style: Style) {
+        self.transforms
+            .push(HighlightTransform::Indent(indent, style));
+    }
+
+    pub(crate) fn wrap(&mut self, wrapped: &WrappedRows, width: u16) {
+        self.range = wrapped.range(self.range.clone());
+        self.transforms.push(HighlightTransform::Wrap(width));
+    }
+
+    pub(crate) fn keep(&mut self, kept: &Range<usize>) -> bool {
+        let start = self.range.start.max(kept.start);
+        let end = self.range.end.min(kept.end);
+        if start >= end {
+            return false;
+        }
+        self.transforms.push(HighlightTransform::Keep(
+            start - self.range.start..end - self.range.start,
+        ));
+        self.range = start - kept.start..end - kept.start;
+        true
+    }
+
+    pub fn render(&self, input: Option<&ToolInput>, output: Option<&ToolOutput>) -> ToolContent {
+        let mut content = render_tool_content(input, output, true, self.limits.clone());
+        for transform in self.transforms.iter().skip(1) {
+            match transform {
+                HighlightTransform::Indent(indent, style) => {
+                    for line in &mut content.lines {
+                        line.spans.insert(0, Span::styled(indent.clone(), *style));
+                    }
+                    for row in &mut content.links.rows {
+                        row.insert(0, None);
+                    }
+                    content.source = content.source.map(BodySource::indented);
+                }
+                HighlightTransform::Wrap(width) => content = wrapped_content(content, *width),
+                HighlightTransform::Keep(range) => {
+                    content.lines = content
+                        .lines
+                        .get(range.clone())
+                        .unwrap_or_default()
+                        .to_vec();
+                    content.rows = content.rows.get(range.clone()).unwrap_or_default().to_vec();
+                    content.links.rows = content
+                        .links
+                        .rows
+                        .get(range.clone())
+                        .unwrap_or_default()
+                        .to_vec();
+                    content.source = content
+                        .source
+                        .and_then(|source| source.keep_rows(range.clone()));
+                }
+            }
+        }
+        content
+    }
+}
+
 pub struct ToolContent {
+    pub highlights: Vec<HighlightRegion>,
     pub(crate) links: LinkMap,
     pub lines: Vec<Line<'static>>,
     /// Parallel to `lines`. Both render paths build it the same way, so the
@@ -3160,6 +3288,8 @@ pub fn render_tool_content(
     limits: RenderLimits,
 ) -> ToolContent {
     let mut lines = Vec::new();
+    let mut highlights = Vec::new();
+    let mut output_highlights = Vec::new();
     let mut truncation = false;
     let mut output_rows: Vec<Option<RowTarget>> = Vec::new();
     let mut output_spans: Vec<ScrollSpan> = Vec::new();
@@ -3185,6 +3315,13 @@ pub fn render_tool_content(
         let script = render_code(hl, 1, &code_lines, total, total, limits.width);
         trace.record(lines.len(), script.source.named(language));
         lines.extend(script.lines);
+        if !highlight && !lines.is_empty() {
+            highlights.push(HighlightRegion::new(
+                0..lines.len(),
+                CodeRole::Input,
+                &limits,
+            ));
+        }
     }
     let (output_lines, output_trunc) = match output {
         Some(ToolOutput::ReadCode {
@@ -3310,6 +3447,7 @@ pub fn render_tool_content(
         // truncation of its own: there is no one thing for it to open.
         Some(ToolOutput::Batch { entries, .. }) if !entries.is_empty() => {
             let card = render_batch(entries, highlight, &limits);
+            output_highlights = card.highlights;
             output_rows = card.rows;
             output_spans = card.spans;
             output_source = card.source;
@@ -3329,6 +3467,32 @@ pub fn render_tool_content(
         *row = target;
     }
     let body_start = lines.len();
+    if !highlight
+        && !output_lines.is_empty()
+        && matches!(
+            output,
+            Some(
+                ToolOutput::ReadCode { .. }
+                    | ToolOutput::WriteCode { .. }
+                    | ToolOutput::Diff { .. }
+                    | ToolOutput::Patch { .. }
+                    | ToolOutput::GrepResult { .. }
+                    | ToolOutput::Index(IndexOutput::File { .. })
+                    | ToolOutput::CodeGraph { .. }
+                    | ToolOutput::Instructions { .. }
+            )
+        )
+    {
+        output_highlights.push(HighlightRegion::new(
+            0..output_lines.len(),
+            CodeRole::Output,
+            &limits,
+        ));
+    }
+    highlights.extend(output_highlights.into_iter().map(|mut region| {
+        region.shift(body_start);
+        region
+    }));
     let mut links = LinkMap::none_for(&lines);
     if output_links.rows.is_empty() {
         output_links = LinkMap::none_for(&output_lines);
@@ -3349,6 +3513,7 @@ pub fn render_tool_content(
         .collect();
     wrapped_content(
         ToolContent {
+            highlights,
             links,
             lines,
             rows,
@@ -3368,6 +3533,14 @@ pub fn render_tool_content(
 fn wrapped_content(content: ToolContent, width: u16) -> ToolContent {
     let wrapped = WrappedRows::new(content.lines, 0, width);
     ToolContent {
+        highlights: content
+            .highlights
+            .into_iter()
+            .map(|mut region| {
+                region.wrap(&wrapped, width);
+                region
+            })
+            .collect(),
         links: LinkMap {
             rows: content
                 .links
@@ -3683,6 +3856,7 @@ mod tests {
             .map(|index| Line::from(format!("row{index} {over_wide}")))
             .collect();
         let content = ToolContent {
+            highlights: Vec::new(),
             links: LinkMap::none_for(&lines),
             rows: vec![None; lines.len()],
             lines,
@@ -6714,6 +6888,125 @@ mod tests {
         let card = render_batch(&[entry], false, &limits(BatchViews::default()));
 
         assert_eq!(body_count(&card.lines), 0, "{CHANGED_MSG}");
+    }
+
+    #[test_case(false, false, false, false, false, false; "settled_shell_folds")]
+    #[test_case(true, false, false, false, false, true; "streaming_shell_opens")]
+    #[test_case(false, false, true, false, false, false; "always_collapsed_settled_shell_folds")]
+    #[test_case(true, false, true, false, false, false; "always_collapsed_streaming_shell_folds")]
+    #[test_case(true, false, false, true, false, false; "compact_streaming_shell_folds")]
+    #[test_case(true, false, false, false, true, false; "ancestor_body_folds_streaming_shell")]
+    #[test_case(false, true, false, false, false, true; "explicit_open_settled_shell")]
+    #[test_case(false, true, true, false, false, true; "explicit_open_overrides_always_collapsed")]
+    #[test_case(true, true, true, false, false, true; "explicit_open_overrides_always_collapsed_stream")]
+    #[test_case(false, true, false, true, false, true; "explicit_open_overrides_compact")]
+    #[test_case(false, true, false, false, true, true; "explicit_open_overrides_ancestor_body")]
+    fn supplied_child_windows_respect_visibility(
+        streaming: bool,
+        open: bool,
+        always_collapsed: bool,
+        compact: bool,
+        body_taken: bool,
+        visible: bool,
+    ) {
+        const VISIBILITY_MSG: &str = "a supplied window sizes a visible child but never opens it";
+        const WINDOW_MSG: &str = "an opened child retains its supplied window and reading position";
+        const WINDOW: ScrollWindow = ScrollWindow {
+            height: NESTED_WINDOW_LINES as usize,
+            offset: 1,
+            follow: false,
+        };
+        let mut entry = BatchToolEntry {
+            effect: ToolEffect::Mutating,
+            ..batch_entry(SHELL_CHILD, NESTED_BODY_LINES)
+        };
+        if streaming {
+            entry.status = BatchToolStatus::Running;
+            entry.output = None;
+        }
+        let limits = RenderLimits {
+            body_taken,
+            live: Arc::new(HashMap::from([(
+                0,
+                [CHILD_BODY; NESTED_BODY_LINES].join("\n"),
+            )])),
+            ..limits(BatchViews::new(open.then_some(0))).with_policy(
+                CardPolicy {
+                    compact,
+                    always_collapsed: if always_collapsed {
+                        Arc::from([SHELL_CHILD.to_owned()])
+                    } else {
+                        Arc::default()
+                    },
+                    scroll_card_lines: NESTED_WINDOW_LINES * 2,
+                    ..CardPolicy::default()
+                },
+                Arc::new(HashMap::from([(0, WINDOW)])),
+            )
+        };
+        let child = limits.child(0, &entry);
+        assert_eq!(child.is_some(), visible, "{VISIBILITY_MSG}");
+        if let Some(child) = child {
+            assert_eq!(child.scroll, Some(WINDOW), "{WINDOW_MSG}");
+            assert_eq!(child.budget, WINDOW.height, "{WINDOW_MSG}");
+            assert!(child.body_taken, "{ONE_BODY_MSG}");
+            assert!(child.child_scroll.is_empty(), "{WINDOW_MSG}");
+            assert_eq!(child.views, BatchViews::default());
+            assert!(
+                child
+                    .child(0, &dispatch_entry(NESTED_CHILD, NESTED_BODY_LINES))
+                    .is_none(),
+                "{ONE_BODY_MSG}"
+            );
+        }
+        let card = render_batch(&[entry], false, &limits);
+        assert_eq!(
+            body_count(&card.lines),
+            if visible { WINDOW.height } else { 0 },
+            "{VISIBILITY_MSG}"
+        );
+        assert_eq!(card.spans.len(), usize::from(visible), "{WINDOW_MSG}");
+    }
+
+    #[test_case("queued", false, true; "queued_receipt_opens")]
+    #[test_case("running", false, true; "active_receipt_opens")]
+    #[test_case("cancelling", false, true; "cancelling_receipt_opens")]
+    #[test_case("succeeded", false, false; "terminal_receipt_folds")]
+    #[test_case("failed", false, false; "failed_receipt_folds")]
+    #[test_case("cancelled", false, false; "cancelled_receipt_folds")]
+    #[test_case("running", true, false; "always_collapsed_hides_active_receipt")]
+    #[test_case("succeeded", true, false; "always_collapsed_hides_terminal_receipt")]
+    fn shell_receipt_visibility_follows_task_state(
+        state: &str,
+        always_collapsed: bool,
+        visible: bool,
+    ) {
+        const RECEIPT_MSG: &str = "admission succeeds before the shell receipt becomes terminal";
+        const OPEN_MSG: &str = "explicit opening overrides automatic receipt visibility";
+        let receipt = serde_json::from_value(serde_json::json!({
+            "kind": "shell", "task_id": "shell-task", "invocation_id": "invocation",
+            "call_id": "batch:0", "root_call_id": "batch", "label": "Print", "state": state,
+            "mode": "build", "background": true, "generation": 1, "created_at": 1, "updated_at": 2,
+        }))
+        .unwrap();
+        let entry = BatchToolEntry {
+            effect: ToolEffect::Mutating,
+            output: Some(ToolOutput::Tasks(vec![receipt])),
+            ..batch_entry(SHELL_CHILD, 0)
+        };
+        let mut limits = scrolling_limits(BatchViews::default());
+        if always_collapsed {
+            limits.policy.always_collapsed = Arc::from([SHELL_CHILD.to_owned()]);
+        }
+        assert_eq!(limits.child(0, &entry).is_some(), visible, "{RECEIPT_MSG}");
+        limits.policy.compact = true;
+        assert!(limits.child(0, &entry).is_none(), "{RECEIPT_MSG}");
+        limits.policy.compact = false;
+        limits.body_taken = true;
+        assert!(limits.child(0, &entry).is_none(), "{ONE_BODY_MSG}");
+        limits.policy.compact = true;
+        limits.views = BatchViews::new([0]);
+        assert!(limits.child(0, &entry).is_some(), "{OPEN_MSG}");
     }
 
     /// Otherwise a batch of five writes is five whole files, which is the
