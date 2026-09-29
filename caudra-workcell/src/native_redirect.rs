@@ -12,7 +12,10 @@
 //! refusing a search that no tool can then perform leaves a model with nowhere
 //! to go.
 
-use workcell::shell::ShellCommandScope;
+use workcell::shell::{
+    ShellCommandScope,
+    bash::{BashCommand, BashFragmentValue, BashNodeKind, BashOperatorKind, BashProgram},
+};
 
 use crate::pattern_analysis::CommandFacts;
 use crate::read_only_shell::literal_arguments;
@@ -21,6 +24,83 @@ const END_OF_FLAGS: &str = "--";
 const GREP: Native = Native::new("file_grep", "pattern, path, include, -A/-B/-C, head_limit");
 const READ: Native = Native::new("file_read", "filePath, offset, limit");
 const GLOB: Native = Native::new("file_glob", "pattern, path");
+pub(crate) const WORKDIR_REFUSAL: &str = "Use the shell tool's workdir argument instead of a leading \
+    cd. Remove the leading cd <directory> && from command and set workdir to that directory. \
+    Resolve a relative directory against this call's initial workdir (the project directory when \
+    omitted), not against a different base. Keep the remaining command unchanged. \
+    Set agent.shell_workdir_redirect = false in user config to disable this check.";
+
+pub(crate) fn leading_workdir(program: &BashProgram) -> bool {
+    if !program.is_complete()
+        || !program.nodes().iter().all(|node| match &node.structure {
+            BashNodeKind::Sequence { items, .. } => items.len() == 1,
+            BashNodeKind::AndOr { operator, .. } => operator.kind == BashOperatorKind::And,
+            BashNodeKind::Command { .. } | BashNodeKind::Pipeline { .. } => true,
+            _ => false,
+        })
+    {
+        return false;
+    }
+    let mut node = program.root();
+    let mut conditional = false;
+    loop {
+        match &program.nodes()[node.0].structure {
+            BashNodeKind::Sequence { items, .. } => node = items[0],
+            BashNodeKind::AndOr { left, .. } => {
+                conditional = true;
+                node = *left;
+            }
+            BashNodeKind::Command { command }
+                if conditional
+                    && command.assignments.is_empty()
+                    && command.redirects.is_empty() =>
+            {
+                let Some(argv) = command.static_argv() else {
+                    return false;
+                };
+                if !matches!(argv.as_slice(), ["cd", path] | ["cd", "--", path]
+                    if !path.is_empty() && !path.starts_with('-'))
+                {
+                    return false;
+                }
+                return program
+                    .commands()
+                    .all(|(id, command)| id == node || !uses_directory_state(program, command));
+            }
+            _ => return false,
+        }
+    }
+}
+
+fn uses_directory_state(program: &BashProgram, command: &BashCommand) -> bool {
+    command
+        .words
+        .first()
+        .is_some_and(|word| matches!(word.literal.as_deref(), Some("cd" | "command" | "builtin")))
+        || command
+            .words
+            .iter()
+            .chain(
+                command
+                    .assignments
+                    .iter()
+                    .map(|assignment| &assignment.value),
+            )
+            .chain(
+                command
+                    .redirects
+                    .iter()
+                    .filter_map(|redirect| redirect.target.as_ref()),
+            )
+            .any(|word| {
+                word.fragments.iter().any(|fragment| {
+                    matches!(fragment.value, BashFragmentValue::Dynamic(_))
+                        && program
+                            .text(&fragment.span)
+                            .is_some_and(|source| source.contains("PWD"))
+                })
+            })
+}
 
 /// The tool to call instead, and the parameters that make the call without a
 /// second lookup.
@@ -238,10 +318,68 @@ mod tests {
     use test_case::test_case;
     use workcell::shell::bash::parse_bash;
 
-    use super::{detect, refusal as message};
+    use super::{detect, leading_workdir, refusal as message};
     use crate::pattern_analysis::shell_facts;
 
     const PROJECT: &str = "/home/dev/project";
+
+    #[test_case("cd ../workcell-mcp && grep -rn --include=*.rs -E"; "user_example")]
+    #[test_case("cd src && cargo test"; "shell_command")]
+    #[test_case("cd /tmp/project && cargo test"; "absolute_path")]
+    #[test_case("cd 'path with spaces' && cargo test"; "single_quoted_path")]
+    #[test_case("cd \"path with spaces\" && cargo test"; "double_quoted_path")]
+    #[test_case("cd path\\ with\\ spaces && cargo test"; "escaped_path")]
+    #[test_case("  \ncd -- src && cargo test\n"; "whitespace_and_end_of_flags")]
+    #[test_case("cd src && cargo build && cargo test"; "and_chain")]
+    #[test_case("cd src && rg -i needle | sort"; "remaining_pipeline")]
+    #[test_case("cd src && printf '%s' \"$VALUE\""; "remaining_expansion")]
+    fn leading_cd_redirects_to_workdir(command: &str) {
+        let program = parse_bash(command).expect("program");
+        assert!(leading_workdir(&program), "{program:?}");
+    }
+
+    #[test_case("cargo test"; "no_cd")]
+    #[test_case("cd src"; "standalone_cd")]
+    #[test_case("echo 'cd src && cargo test'"; "quoted_command")]
+    #[test_case("true && cd src && cargo test"; "non_leading_cd")]
+    #[test_case("cd src; cargo test"; "semicolon")]
+    #[test_case("cd src\ncargo test"; "newline")]
+    #[test_case("cd src && cargo test; pwd"; "trailing_sequence")]
+    #[test_case("cd src && cargo test > output.txt"; "redirected_list")]
+    #[test_case("cd src || cargo test"; "fallback")]
+    #[test_case("cd src && cargo test || pwd"; "trailing_fallback")]
+    #[test_case("(cd src && cargo test)"; "subshell")]
+    #[test_case("{ cd src && cargo test; }"; "brace_group")]
+    #[test_case("cd src && cargo test &"; "background")]
+    #[test_case("cd src | cat && cargo test"; "piped_cd")]
+    #[test_case("CDPATH=/tmp cd src && cargo test"; "assignment")]
+    #[test_case("cd src 2>/dev/null && cargo test"; "redirected_cd")]
+    #[test_case("command cd src && cargo test"; "wrapped_cd")]
+    #[test_case("./cd src && cargo test"; "executable_path")]
+    #[test_case("cd \"$DIR\" && cargo test"; "dynamic_path")]
+    #[test_case("cd $(pwd) && cargo test"; "command_substitution")]
+    #[test_case("cd ~/src && cargo test"; "tilde")]
+    #[test_case("cd src/* && cargo test"; "glob")]
+    #[test_case("cd && cargo test"; "home_directory")]
+    #[test_case("cd - && cargo test"; "previous_directory")]
+    #[test_case("cd -P src && cargo test"; "physical_directory")]
+    #[test_case("cd -L src && cargo test"; "logical_directory_flag")]
+    #[test_case("cd '' && cargo test"; "empty_path")]
+    #[test_case("cd src extra && cargo test"; "extra_argument")]
+    #[test_case("cd src &&"; "incomplete_command")]
+    #[test_case("cd src && cd - && cargo test"; "previous_directory_in_suffix")]
+    #[test_case("cd link && cd .. && cargo test"; "logical_parent_in_suffix")]
+    #[test_case("cd src && cd nested && cargo test"; "multiple_directory_changes")]
+    #[test_case("cd src && builtin cd - && cargo test"; "wrapped_directory_change")]
+    #[test_case("cd src && printf '%s' \"$OLDPWD\""; "previous_directory_expansion")]
+    #[test_case("cd src && printf '%s' \"${OLDPWD}\""; "braced_previous_directory")]
+    #[test_case("cd link && printf '%s' \"$PWD\""; "logical_directory_expansion")]
+    #[test_case("cd src && PREVIOUS=$OLDPWD cargo test"; "previous_directory_assignment")]
+    #[test_case("cd src && cargo test > \"$OLDPWD/output\""; "previous_directory_redirect")]
+    fn non_replaceable_cd_is_left_alone(command: &str) {
+        let program = parse_bash(command).expect("program");
+        assert!(!leading_workdir(&program), "{program:?}");
+    }
 
     /// Runs the real parse, so quoting, pipelines, and redirections reach the
     /// rules exactly as they do in a session.

@@ -1107,6 +1107,7 @@ pub struct AgentFileConfig {
     pub eager_batch_dispatch: Option<bool>,
     pub eager_tool_dispatch: Option<bool>,
     pub shell_output_filter: Option<bool>,
+    pub shell_workdir_redirect: Option<bool>,
     pub shell_native_redirect: Option<ShellNativeRedirect>,
     pub defer_builtin_tools: Option<DeferBuiltinTools>,
     pub image_model: Option<ImageModel>,
@@ -1139,6 +1140,7 @@ impl AgentFileConfig {
             eager_batch_dispatch,
             eager_tool_dispatch,
             shell_output_filter,
+            shell_workdir_redirect,
             shell_native_redirect,
             defer_builtin_tools,
             image_model
@@ -2044,6 +2046,12 @@ pub struct AgentConfig {
     pub shell_output_filter: bool,
 
     #[config(
+        default = true,
+        desc = "Refuse shell commands with a leading literal `cd ... &&` in favor of the shell `workdir` parameter. Set to `false` to disable this nudge independently of `shell_native_redirect`"
+    )]
+    pub shell_workdir_redirect: bool,
+
+    #[config(
         default = ShellNativeRedirect::Enforce,
         ty = "string",
         default_doc = "enforce",
@@ -2136,6 +2144,7 @@ impl AgentConfig {
                 .or(file.eager_batch_dispatch)
                 .unwrap_or(true),
             shell_output_filter: !no_rtk && file.shell_output_filter.unwrap_or(true),
+            shell_workdir_redirect: file.shell_workdir_redirect.unwrap_or(true),
             shell_native_redirect: file.shell_native_redirect.unwrap_or_default(),
             defer_builtin_tools: file.defer_builtin_tools.unwrap_or_default(),
             image_model: file.image_model.unwrap_or_default(),
@@ -3383,6 +3392,7 @@ mod tests {
     const TODO_REMINDER_FIELD: &str = "todo_reminder";
     const BOOLEAN_EXPECTED_ERROR: &str = "expected a boolean";
     const SHELL_THRESHOLD_FIELD: &str = "shell_async_threshold_secs";
+    const SHELL_WORKDIR_REDIRECT_FIELD: &str = "shell_workdir_redirect";
     const EMPTY_SOURCE_DIGEST: &str =
         "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
     const ABC_SOURCE_DIGEST: &str =
@@ -4061,6 +4071,37 @@ mod tests {
 
         assert_eq!(
             raw.into_config(no_rtk).unwrap().agent.shell_output_filter,
+            expected
+        );
+    }
+
+    #[test_case("", false, true; "enabled_by_default")]
+    #[test_case("shell_workdir_redirect = false", false, false; "disabled_in_config")]
+    #[test_case("shell_workdir_redirect = true", false, true; "enabled_in_config")]
+    #[test_case("shell_native_redirect = 'off'", false, true; "native_redirect_off_is_independent")]
+    #[test_case("shell_workdir_redirect = false\nshell_native_redirect = 'enforce'", false, false; "native_redirect_enforce_is_independent")]
+    #[test_case("shell_workdir_redirect = true\nshell_output_filter = false", true, true; "output_filter_and_cli_flag_are_independent")]
+    fn shell_workdir_redirect_config(source: &str, no_rtk: bool, expected: bool) {
+        let raw: RawConfig = toml::from_str(&format!("[agent]\n{source}")).unwrap();
+        let config = raw.into_config(no_rtk).unwrap();
+        assert_eq!(config.agent.shell_workdir_redirect, expected);
+        assert_eq!(
+            serde_json::to_value(&config.agent).unwrap()[SHELL_WORKDIR_REDIRECT_FIELD],
+            expected
+        );
+    }
+
+    #[test_case(false, "", false; "false_survives_empty_overlay")]
+    #[test_case(false, "shell_native_redirect = 'off'", false; "false_survives_unrelated_overlay")]
+    #[test_case(true, "shell_workdir_redirect = false", false; "overlay_disables")]
+    #[test_case(false, "shell_workdir_redirect = true", true; "overlay_enables")]
+    fn shell_workdir_redirect_merge(base: bool, overlay: &str, expected: bool) {
+        let mut raw: RawConfig =
+            toml::from_str(&format!("[agent]\n{SHELL_WORKDIR_REDIRECT_FIELD} = {base}")).unwrap();
+        raw.merge(toml::from_str(&format!("[agent]\n{overlay}")).unwrap());
+        raw.merge(RawConfig::default());
+        assert_eq!(
+            raw.into_config(false).unwrap().agent.shell_workdir_redirect,
             expected
         );
     }

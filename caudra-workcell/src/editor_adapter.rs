@@ -519,6 +519,7 @@ async fn prepare_example(
                 &project,
                 Some(&raw),
                 ShellNativeRedirect::Off,
+                false,
             )
             .map_err(|error| error.message)
         }

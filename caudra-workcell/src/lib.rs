@@ -1290,6 +1290,7 @@ impl WorkcellInvocation {
                     &project,
                     self.raw_input.as_ref(),
                     ctx.config.shell_native_redirect,
+                    ctx.config.shell_workdir_redirect,
                 )?
             }
             Input::Code(_) => exact_custom_prepared(
@@ -3658,6 +3659,7 @@ fn shell_prepared(
     project: &Path,
     raw_input: Option<&Value>,
     redirect: ShellNativeRedirect,
+    workdir_redirect: bool,
 ) -> Result<PreparedInvocation, ToolError> {
     let raw_input = raw_input
         .filter(|input| input.get("command").and_then(Value::as_str) == Some(shell.command()));
@@ -3665,6 +3667,16 @@ fn shell_prepared(
     let mut resources = Vec::new();
     let mut scopes = Vec::new();
     if let Ok(program) = shell.bash_program() {
+        if workdir_redirect && native_redirect::leading_workdir(program) {
+            tracing::info!(
+                argument = "workdir",
+                "shell command uses a leading cd instead of workdir"
+            );
+            return Err(ToolError::new(
+                ToolFailure::Denied,
+                native_redirect::WORKDIR_REFUSAL,
+            ));
+        }
         let contexts = shell
             .bash_command_contexts()
             .unwrap_or_else(|_| program.command_contexts(shell.workdir()));
@@ -4839,6 +4851,7 @@ mod tests {
     use smol::lock::Mutex as AsyncMutex;
     use smol::net::TcpListener;
     use std::any::TypeId;
+    use std::fs;
     use std::io::ErrorKind;
     use std::ops::RangeInclusive;
     use std::slice;
@@ -4906,6 +4919,7 @@ mod tests {
     const SHELL_SUCCEEDED: &str = "succeeded";
     const SHELL_CANCELLED_STATE: &str = "cancelled";
     const OBSERVED_ROW: &str = "observed without a transcript";
+    const LEADING_CD_COMMAND: &str = "cd ../workcell-mcp && grep -rn --include=*.rs -E";
 
     async fn bounded_shell_test<T>(operation: impl Future<Output = T>) -> T {
         future::race(operation, async {
@@ -5690,6 +5704,7 @@ mod tests {
         // branches rather than about which command was chosen. The redirect has
         // its own cases, which turn it back on.
         ctx.config.shell_native_redirect = ShellNativeRedirect::Off;
+        ctx.config.shell_workdir_redirect = false;
         ctx
     }
 
@@ -6336,11 +6351,13 @@ mod tests {
     fn shell_redirect_preflight(
         command: &str,
         redirect: ShellNativeRedirect,
+        workdir_redirect: bool,
     ) -> Result<(), ToolError> {
         let root = TempDir::new().expect("tempdir");
         let (_host, registry) = host_and_registry(root.path());
         let mut ctx = context(root.path(), Arc::clone(&registry), CancelToken::none());
         ctx.config.shell_native_redirect = redirect;
+        ctx.config.shell_workdir_redirect = workdir_redirect;
         let invocation = registry
             .get("shell")
             .expect("registered shell")
@@ -6357,13 +6374,14 @@ mod tests {
     #[test_case(ShellNativeRedirect::Annotate ; "annotating only observes")]
     #[test_case(ShellNativeRedirect::Off ; "the check is disabled")]
     fn a_duplicating_command_still_runs_outside_enforcement(redirect: ShellNativeRedirect) {
-        assert!(shell_redirect_preflight(DUPLICATING_COMMAND, redirect).is_ok());
+        assert!(shell_redirect_preflight(DUPLICATING_COMMAND, redirect, false).is_ok());
     }
 
     #[test]
     fn enforcement_refuses_a_duplicating_command_and_names_the_tool() {
-        let error = shell_redirect_preflight(DUPLICATING_COMMAND, ShellNativeRedirect::Enforce)
-            .expect_err("enforcement must refuse");
+        let error =
+            shell_redirect_preflight(DUPLICATING_COMMAND, ShellNativeRedirect::Enforce, false)
+                .expect_err("enforcement must refuse");
 
         assert!(
             error.message.contains("file_grep"),
@@ -6377,8 +6395,65 @@ mod tests {
     #[test]
     fn enforcement_leaves_a_search_the_native_tool_cannot_express() {
         assert!(
-            shell_redirect_preflight(IRREPLACEABLE_COMMAND, ShellNativeRedirect::Enforce).is_ok()
+            shell_redirect_preflight(IRREPLACEABLE_COMMAND, ShellNativeRedirect::Enforce, false)
+                .is_ok()
         );
+    }
+
+    #[test_case(ShellNativeRedirect::Enforce; "native_enforced")]
+    #[test_case(ShellNativeRedirect::Annotate; "native_annotated")]
+    #[test_case(ShellNativeRedirect::Off; "native_disabled")]
+    fn workdir_redirect_is_independent_of_native_redirect(redirect: ShellNativeRedirect) {
+        let error = shell_redirect_preflight(LEADING_CD_COMMAND, redirect, true)
+            .expect_err("leading cd must be refused");
+
+        assert_eq!(error.failure, ToolFailure::Denied);
+        assert_eq!(error.message, native_redirect::WORKDIR_REFUSAL);
+        assert!(shell_redirect_preflight(LEADING_CD_COMMAND, redirect, false).is_ok());
+    }
+
+    #[test]
+    fn workdir_redirect_takes_precedence_over_native_redirect() {
+        let error =
+            shell_redirect_preflight("cd src && rg needle", ShellNativeRedirect::Enforce, true)
+                .expect_err("leading cd must be refused");
+
+        assert_eq!(error.message, native_redirect::WORKDIR_REFUSAL);
+    }
+
+    #[test_case("cd src && cd - && cargo test"; "previous_directory")]
+    #[test_case("cd src && printf '%s' \"$OLDPWD\""; "previous_directory_expansion")]
+    #[test_case("cd link && cd .. && cargo test"; "logical_parent_directory")]
+    fn workdir_redirect_preserves_directory_state_commands(command: &str) {
+        assert!(shell_redirect_preflight(command, ShellNativeRedirect::Enforce, true).is_ok());
+    }
+
+    #[test_case("nested"; "inside_project")]
+    #[test_case("../../workcell-mcp"; "sibling_project")]
+    fn workdir_redirect_accepts_retry_from_an_existing_workdir(target: &str) {
+        let root = TempDir::new().expect("tempdir");
+        let project = root.path().join("project");
+        let initial = project.join("initial");
+        let destination = initial.join(target);
+        fs::create_dir_all(&initial).expect("initial directory");
+        fs::create_dir_all(&destination).expect("destination directory");
+        let (_host, registry) = host_and_registry(&project);
+        let mut ctx = context(&project, Arc::clone(&registry), CancelToken::none());
+        ctx.config.shell_workdir_redirect = true;
+        ctx.config.shell_native_redirect = ShellNativeRedirect::Enforce;
+        let shell = registry.get("shell").expect("registered shell");
+        let invocation = shell
+            .tool
+            .parse(&json!({"command": format!("cd {target} && cargo test"), "workdir": "initial"}))
+            .expect("valid shell input");
+        let error = smol::block_on(invocation.preflight(&ctx)).expect_err("leading cd refused");
+        assert_eq!(error.message, native_redirect::WORKDIR_REFUSAL);
+
+        let retry = shell
+            .tool
+            .parse(&json!({"command": "cargo test", "workdir": destination}))
+            .expect("valid retry");
+        smol::block_on(retry.preflight(&ctx)).expect("retry accepts workdir");
     }
 
     fn shell_preflight_intent(root: &Path, command: &str) -> PermissionIntent {
