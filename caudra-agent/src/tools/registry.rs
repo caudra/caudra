@@ -31,6 +31,7 @@ use super::deferral::DeferredTool;
 use super::{DescriptionContext, LockKey, ToolContext};
 
 const CANCELLED_CODE: &str = "cancelled";
+const TIMED_OUT_CODE: &str = "timed_out";
 const NOT_FOUND_CODE: &str = "not_found";
 const DENIED_CODES: &[&str] = &[
     "path_outside_root",
@@ -38,8 +39,10 @@ const DENIED_CODES: &[&str] = &[
     "filesystem_permission_denied",
     "code_graph_denied",
     "shell_command_refused",
+    "web_request_denied",
 ];
 const INVALID_INPUT_CODES: &[&str] = &[
+    "invalid_input",
     "invalid_arguments",
     "code_graph_invalid",
     "shell_preparation_failed",
@@ -242,6 +245,7 @@ impl ToolFailure {
     pub fn from_code(code: &str) -> Self {
         match code {
             CANCELLED_CODE => Self::Cancelled,
+            TIMED_OUT_CODE => Self::Timeout,
             NOT_FOUND_CODE => Self::NotFound,
             code if DENIED_CODES.contains(&code) => Self::Denied,
             code if INVALID_INPUT_CODES.contains(&code) => Self::InvalidInput,

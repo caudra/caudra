@@ -101,7 +101,7 @@ use workcell::output_filter::RowRenderer;
 use workcell::shell::{
     MAX_TIMEOUT_MS as SHELL_MAX_TIMEOUT_MS, PreparedShell, ShellExecution,
     ShellFilterInfo as WorkcellShellFilterInfo, ShellInput, ShellOutput as WorkcellShellOutput,
-    ShellProgressChunk, ShellProgressSink, ShellStream, ShellToolGroup,
+    ShellPreparationError, ShellProgressChunk, ShellProgressSink, ShellStream, ShellToolGroup,
 };
 use workcell::web::{
     PreparedWebfetch, PreparedWebsearch, ProxyConfiguration, WebExecution, WebToolGroup,
@@ -1277,7 +1277,10 @@ impl WorkcellInvocation {
                     .run(ctx, move |_| async move {
                         let groups = host.project_groups(cwd).await?;
                         let group = groups.shell.with_output_filter(output_filter);
-                        let prepared = group.prepare(input).await.map_err(invalid_input)?;
+                        let prepared = group
+                            .prepare(input)
+                            .await
+                            .map_err(shell_preparation_error)?;
                         Ok::<_, ToolError>((group, prepared))
                     })
                     .await??;
@@ -3320,12 +3323,11 @@ fn filesystem_error(error: FilesystemError) -> ToolError {
 }
 
 fn webfetch_error(error: WebfetchError) -> ToolError {
-    let failure = match &error {
-        WebfetchError::InvalidInput(_) => ToolFailure::InvalidInput,
-        WebfetchError::Aborted => ToolFailure::Cancelled,
-        WebfetchError::Operation(_) => ToolFailure::Other,
-    };
-    ToolError::new(failure, error.to_string())
+    ToolError::new(ToolFailure::from_code(error.code()), error.to_string())
+}
+
+fn shell_preparation_error(error: ShellPreparationError) -> ToolError {
+    ToolError::new(ToolFailure::from_code(error.code()), error.to_string())
 }
 
 fn code_graph_error(error: CodeGraphError) -> ToolError {
@@ -9017,6 +9019,8 @@ mod tests {
     #[test_case(FilesystemError::Io { context: HOST_REFUSAL.into(), source: ErrorKind::PermissionDenied.into() }, ToolFailure::Denied ; "a_permission_error")]
     #[test_case(FilesystemError::Aborted, ToolFailure::Cancelled ; "an_aborted_operation")]
     #[test_case(FilesystemError::Stale(HOST_REFUSAL.into()), ToolFailure::Other ; "a_stale_resource")]
+    #[test_case(FilesystemError::Invalid(HOST_REFUSAL.into()), ToolFailure::InvalidInput ; "a_refused_request")]
+    #[test_case(FilesystemError::Operation(HOST_REFUSAL.into()), ToolFailure::Other ; "a_failed_operation")]
     fn a_file_failure_lands_in_one_bucket_locally_and_remotely(
         error: FilesystemError,
         failure: ToolFailure,
@@ -9036,6 +9040,24 @@ mod tests {
 
         assert_eq!(remote.failure, Some(failure));
         assert_eq!(filesystem_error(error).failure, failure);
+    }
+
+    /// Web and shell refusals are placed by the same code a host reports them
+    /// with, so a timeout or a blocked target never reads as a plain failure.
+    #[test_case(webfetch_error(WebfetchError::InvalidInput(HOST_REFUSAL.into())), ToolFailure::InvalidInput ; "a_malformed_url")]
+    #[test_case(webfetch_error(WebfetchError::Aborted), ToolFailure::Cancelled ; "an_aborted_fetch")]
+    #[test_case(webfetch_error(WebfetchError::TimedOut(HOST_REFUSAL.into())), ToolFailure::Timeout ; "a_timed_out_fetch")]
+    #[test_case(webfetch_error(WebfetchError::Denied(HOST_REFUSAL.into())), ToolFailure::Denied ; "a_blocked_target")]
+    #[test_case(webfetch_error(WebfetchError::NotFound(HOST_REFUSAL.into())), ToolFailure::NotFound ; "a_missing_page")]
+    #[test_case(webfetch_error(WebfetchError::Operation(HOST_REFUSAL.into())), ToolFailure::Other ; "a_failed_fetch")]
+    #[test_case(shell_preparation_error(ShellPreparationError::OutsideRoot(HOST_REFUSAL.into())), ToolFailure::Denied ; "a_workdir_outside_the_root")]
+    #[test_case(shell_preparation_error(ShellPreparationError::NotFound(HOST_REFUSAL.into())), ToolFailure::NotFound ; "a_missing_workdir")]
+    #[test_case(shell_preparation_error(ShellPreparationError::Invalid(HOST_REFUSAL.into())), ToolFailure::InvalidInput ; "an_invalid_command")]
+    fn a_web_or_shell_refusal_lands_in_the_bucket_its_code_names(
+        error: ToolError,
+        failure: ToolFailure,
+    ) {
+        assert_eq!(error.failure, failure);
     }
 
     /// A host reports only that an operation was cancelled, so it is a timeout

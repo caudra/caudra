@@ -508,7 +508,11 @@ async fn prepare_example(
     let groups = host.project_groups(project.clone()).await?;
     match input {
         Input::Shell(input) => {
-            let shell = groups.shell.prepare(input).await?;
+            let shell = groups
+                .shell
+                .prepare(input)
+                .await
+                .map_err(|error| error.to_string())?;
             shell_prepared(
                 groups.shell,
                 shell,
@@ -1097,7 +1101,7 @@ mod tests {
     #[test_case("cat notes.md", vec![true]; "confined_reader")]
     #[test_case("cat .env", vec![false]; "protected_operand")]
     #[test_case("cat /etc/shadow", vec![false]; "outside_operand")]
-    #[test_case("cd . && cat notes.md", vec![true, true]; "known_cwd")]
+    #[test_case("cd src && cat notes.md", vec![true, true]; "known_cwd")]
     #[test_case("cd - && cat notes.md", vec![false, false]; "unknown_cwd")]
     fn prepared_scope_success_does_not_bypass_confinement(command: &str, confined: Vec<bool>) {
         let fixture = Fixture::new();
