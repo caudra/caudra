@@ -140,6 +140,8 @@ pub const MODEL_SLOT: &str = "{model}";
 /// constant so history stays the source of truth.
 pub const BUILD_MODE_MARKER: &str = "# Build Mode";
 pub const PLAN_MODE_MARKER: &str = "# Plan Mode";
+/// One kind between them: whichever was announced last is the mode in force.
+pub(crate) const MODE_MARKERS: &[&str] = &[BUILD_MODE_MARKER, PLAN_MODE_MARKER];
 pub const RESEARCH_PROMPT: &str = include_str!("prompts/research.md");
 pub const GENERAL_PROMPT: &str = include_str!("prompts/general.md");
 pub const COMPACTION_SYSTEM: &str = include_str!("prompts/compaction.md");
@@ -158,6 +160,16 @@ pub const TRANSCRIPT_SLOT: &str = "{transcript}";
 pub const TASK_MODE_MARKER: &str = "# Host mode contract";
 pub const TASK_PLAN_CONTRACT: &str = "<system-reminder>\n# Host mode contract\n\nYou are in plan mode. Inspect, reason, and report, but do not modify files, persistent state, or external systems. If implementation is needed, describe the exact changes without applying them.\n</system-reminder>";
 pub const TASK_BUILD_CONTRACT: &str = "<system-reminder>\n# Host mode contract\n\nYou are in build mode. You may modify the workspace using the available tools. Complete the requested work, verify it, and report the result concisely.\n</system-reminder>";
+/// Every kind of standing reminder, each named by the markers its blocks
+/// carry, in the order a turn announces them. The latest block of a kind stays
+/// in force until another replaces it, so a compaction that summarizes it away
+/// has to restate it.
+pub(crate) const STANDING_KINDS: &[&[&str]] = &[
+    &[ENVIRONMENT_MARKER],
+    &[INSTRUCTIONS_CHANGED_MARKER],
+    &[TASK_MODE_MARKER],
+    MODE_MARKERS,
+];
 
 const INSTRUCTIONS_MARKER: &str = "{{instructions}}";
 const TASK_STYLE_HEADING: &str = "# Output discipline\n";

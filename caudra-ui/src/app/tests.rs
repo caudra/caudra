@@ -829,6 +829,10 @@ mod background_runtime {
     const FINAL: &str = "Implementation is ready; the audit is still running.";
     const SUMMARY: &str = "The audit was delegated and was last observed running.";
     const EMPTY_BACKGROUND: &str = "No active background work";
+    const ENVIRONMENT_RESTATED: &str =
+        "the summary took the only environment block, so compaction must restate it";
+    const SNAPSHOT_STAYS_LAST: &str =
+        "restated reminders land before the background snapshot, which stays last";
     const COMPACT_COMMAND: &str = "/compact";
     const REVIEW_WORKFLOW: &str = "review-changes";
     const WORKFLOW_BUDGET: u32 = 1;
@@ -1202,6 +1206,7 @@ mod background_runtime {
                 .unwrap();
             let mut reminder = None;
             let mut summary_seen = false;
+            let mut restated = false;
             let mut done = false;
             loop {
                 let envelope = fixture.handles.agent_rx.recv_async().await.unwrap();
@@ -1211,6 +1216,14 @@ mod background_runtime {
                             assert!(turn.message.is_compaction_summary);
                             assert!(!done);
                             summary_seen = true;
+                        }
+                        AgentEvent::Injected {
+                            text,
+                            task_event: None,
+                        } if text.contains(caudra_agent::prompt::ENVIRONMENT_MARKER) => {
+                            assert!(summary_seen);
+                            assert!(reminder.is_none(), "{SNAPSHOT_STAYS_LAST}");
+                            restated = true;
                         }
                         AgentEvent::Injected {
                             text,
@@ -1250,6 +1263,7 @@ mod background_runtime {
                 fixture.app.checkpoint();
             }
             assert!(done);
+            assert!(restated, "{ENVIRONMENT_RESTATED}");
             assert_eq!(fixture.app.status, Status::Idle);
             assert!(fixture.requests.is_empty());
             assert!(fixture.handles.queue.is_empty());

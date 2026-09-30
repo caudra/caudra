@@ -194,6 +194,8 @@ These runtime snapshots arrive as messages, keeping the cached system prefix sta
 
 Where one lands depends on whether anything else still holds a copy. A standing reminder — the environment, a mode announcement, an instruction change — is appended after the message it steers, and rewinding that message takes the reminder with it, because Caudra re-sends it on the next turn anyway. A one-shot notice — a finished background task, a settled workflow, the output of a `/!` command, an MCP prompt's canned exchange — is appended before the message, because it happened first and the transcript is the only place it still exists, so a rewind has to spare it.
 
+Compaction keeps standing reminders in force. When the summarized turns hold the latest block of a kind and the turns kept after the summary hold none, Caudra restates that block after them. A planning turn that compacts midway keeps its plan rules, and switching to build afterwards is still announced.
+
 Each one appears in the transcript as a dim row folded to its heading. Click the row to read the exact text the model was sent, and click again to fold it back. Mentioned file contents are the exception: the model gets them, and the transcript shows the `@path` you typed rather than the body behind it.
 
 Set `ui.show_reminders = false` to keep the transcript to the conversation alone. The messages still reach the model.

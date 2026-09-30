@@ -37,7 +37,7 @@ Do not edit files unless the user explicitly asks.
 
 The system prompt is identical in plan and build mode, and carries no working directory, date, or model. All of those are announced in the conversation instead, and re-announced only when they change, so switching mode, crossing midnight, or changing model does not invalidate the prompt cache. Editing an instruction file mid-session is announced the same way, as a diff against the copy the prompt already carries. Task prompts follow the same rule: a subagent is told its environment and the mode it was granted in the conversation.
 
-Those announcements arrive wrapped in `<system-reminder>`. They are appended to the conversation and never edited, so a kind is restated only when its content changes and earlier blocks of the same kind remain as history. The most recent block of a kind is the only one in force; the system prompt tells the model this, and that a reminder is not the user talking.
+Those announcements arrive wrapped in `<system-reminder>`. They are appended to the conversation and never edited, so a kind is restated only when its content changes or a compaction summarized the block in force, and earlier blocks of the same kind remain as history. The most recent block of a kind is the only one in force; the system prompt tells the model this, and that a reminder is not the user talking.
 
 ## Control the layout
 

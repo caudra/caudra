@@ -18,7 +18,7 @@ use super::history::{History, is_user_turn, remove_orphaned_tool_results, repair
 use super::requirements::{
     self, REQUIREMENTS_MARKER, REQUIREMENTS_OUTPUT_TOKENS, RequirementsInput,
 };
-use super::run::estimate_message_tokens;
+use super::run::{estimate_message_tokens, push_injected, stranded_reminders};
 use super::side_model::{self, SideModel};
 use super::streaming::{StreamError, stream_with_retry};
 use crate::cancel::CancelToken;
@@ -245,12 +245,15 @@ pub(super) async fn compact_history(
         let _ = event_tx.send(AgentEvent::TextDelta { text: appended });
     }
     let usage = response.usage;
+    let stranded = stranded_reminders(history.as_slice(), head_end);
     let result = finish_compact(response, history, head_end, event_tx, compact_start, model);
-    if result.is_ok()
-        && had_background
-        && let Some(session) = session
-    {
-        session.refresh(history, event_tx, config.background_reminder_turns, true);
+    if result.is_ok() {
+        for reminder in stranded {
+            push_injected(history, event_tx, reminder);
+        }
+        if had_background && let Some(session) = session {
+            session.refresh(history, event_tx, config.background_reminder_turns, true);
+        }
     }
     Ok(CompactionOutcome {
         usage,
@@ -1053,6 +1056,63 @@ mod tests {
                 !reached_summarizer(RECENT),
                 "the preserved tail must not be summarized as well"
             );
+        });
+    }
+
+    /// The last block of a kind is in force until another replaces it, so the
+    /// compacted transcript states each exactly once: kept in the tail, or
+    /// restated after it with a row for the chat to draw.
+    #[test_case(false ; "summarized_blocks_are_restated")]
+    #[test_case(true ; "blocks_the_tail_keeps_stay_put")]
+    fn compaction_keeps_every_standing_reminder_in_force(tail_keeps_them: bool) {
+        smol::block_on(async {
+            const REMINDERS: &[&str] = &[
+                crate::prompt::ENVIRONMENT_PROMPT,
+                crate::prompt::PLAN_PROMPT,
+            ];
+            let reminders = || {
+                REMINDERS
+                    .iter()
+                    .map(|text| Message::observation((*text).into()))
+            };
+            let mut messages = vec![Message::user("first".into())];
+            messages.extend(reminders());
+            messages.extend([assistant_text("reply one"), Message::user("second".into())]);
+            if tail_keeps_them {
+                messages.extend(reminders());
+            }
+            messages.push(assistant_text("reply two"));
+            let provider = MockProvider::new(vec![Ok(text_response(StopReason::EndTurn))]);
+            let (raw_tx, rx) = flume::unbounded();
+            let mut history = History::new(messages);
+
+            compact(
+                &provider,
+                &default_model(),
+                &mut history,
+                &EventSender::new(raw_tx, 0),
+                &AgentConfig::default(),
+                None,
+            )
+            .await
+            .unwrap();
+
+            let injected: Vec<_> = rx
+                .drain()
+                .filter_map(|envelope| match envelope.event {
+                    AgentEvent::Injected { text, .. } => Some(text),
+                    _ => None,
+                })
+                .collect();
+            let restated: &[&str] = if tail_keeps_them { &[] } else { REMINDERS };
+            assert_eq!(injected, restated);
+            let standing: Vec<_> = history
+                .as_slice()
+                .iter()
+                .filter(|message| message.is_observation())
+                .filter_map(Message::user_text)
+                .collect();
+            assert_eq!(standing, REMINDERS);
         });
     }
 

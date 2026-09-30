@@ -1019,20 +1019,8 @@ impl<'h> Agent<'h> {
         }
     }
 
-    /// Every harness-authored user message goes through here, so the transcript
-    /// can show what was injected rather than only that something was. Mention
-    /// preambles are pushed silently: the user already sees the path they typed,
-    /// and the file body would swamp the rows that carry new information.
     fn push_injected(&mut self, message: Message) {
-        if !message.is_mention()
-            && let Some(ContentBlock::Text { text }) = message.content.first()
-        {
-            let _ = self.event_tx.send(AgentEvent::Injected {
-                text: text.clone(),
-                task_event: message.task_event.clone(),
-            });
-        }
-        self.history.push(message);
+        push_injected(self.history, &self.event_tx, message);
     }
 
     async fn run_loop(&mut self) -> Result<DoneReason, AgentError> {
@@ -2866,8 +2854,24 @@ impl AnnouncedMode {
     }
 }
 
-/// The text of the most recent standing reminder carrying `marker`.
-fn last_announced<'a>(history: &'a [Message], marker: &str) -> Option<&'a str> {
+/// Every harness-authored user message goes through here, so the transcript
+/// can show what was injected rather than only that something was. Mention
+/// preambles are pushed silently: the user already sees the path they typed,
+/// and the file body would swamp the rows that carry new information.
+pub(super) fn push_injected(history: &mut History, event_tx: &EventSender, message: Message) {
+    if !message.is_mention()
+        && let Some(ContentBlock::Text { text }) = message.content.first()
+    {
+        let _ = event_tx.send(AgentEvent::Injected {
+            text: text.clone(),
+            task_event: message.task_event.clone(),
+        });
+    }
+    history.push(message);
+}
+
+/// The text of the most recent standing reminder of the kind `markers` name.
+fn last_announced<'a>(history: &'a [Message], markers: &[&str]) -> Option<&'a str> {
     history
         .iter()
         .rev()
@@ -2877,18 +2881,37 @@ fn last_announced<'a>(history: &'a [Message], marker: &str) -> Option<&'a str> {
                 && message.workflow_event.is_none()
                 && message.standing_reminder.is_none()
         })
-        .find_map(|message| message.user_text().filter(|text| text.contains(marker)))
+        .find_map(|message| {
+            message
+                .user_text()
+                .filter(|text| markers.iter().any(|marker| text.contains(marker)))
+        })
 }
 
 /// Restates `text` when the transcript does not already carry this exact block.
 /// Idempotent by construction, which is what covers a first turn, a change in
-/// the underlying value, and a compaction that dropped the last announcement.
+/// the underlying value, and a rewind that took the last announcement with it.
 fn standing_notice(history: &[Message], marker: &str, text: Option<&str>) -> Option<Message> {
     let text = text?;
-    if last_announced(history, marker) == Some(text) {
+    if last_announced(history, &[marker]) == Some(text) {
         return None;
     }
     Some(Message::observation(text.to_owned()))
+}
+
+/// The blocks a compaction cut at `head_end` would take out of force: for each
+/// kind the kept tail does not state, the last block of it in the summarized
+/// head. Restated after the summary, they keep the rest of the turn under the
+/// rules it was given, and they keep the mode on record for the next turn,
+/// which reads a transcript without one as build.
+pub(super) fn stranded_reminders(history: &[Message], head_end: usize) -> Vec<Message> {
+    let (head, tail) = history.split_at(head_end);
+    crate::prompt::STANDING_KINDS
+        .iter()
+        .filter(|markers| last_announced(tail, markers).is_none())
+        .filter_map(|markers| last_announced(head, markers))
+        .map(|text| Message::observation(text.to_owned()))
+        .collect()
 }
 
 /// Names both ends of a move when `environment` puts the session in another
@@ -2897,7 +2920,10 @@ fn standing_notice(history: &[Message], marker: &str, text: Option<&str>) -> Opt
 /// checkout. Said on the one turn the environment changes, so never twice.
 fn relocation_notice(history: &[Message], environment: Option<&str>) -> Option<Message> {
     let to = working_directory(environment?)?;
-    let from = working_directory(last_announced(history, crate::prompt::ENVIRONMENT_MARKER)?)?;
+    let from = working_directory(last_announced(
+        history,
+        &[crate::prompt::ENVIRONMENT_MARKER],
+    )?)?;
     (from != to).then(|| {
         Message::observation(
             crate::prompt::RELOCATED_PROMPT
@@ -2944,28 +2970,14 @@ fn working_directory(environment: &str) -> Option<&str> {
 /// for every run while history outlives it, so an in-memory previous mode is
 /// always the default and never a transition. Reading the transcript also
 /// survives a restart, which is the case that matters most: a session resumed
-/// days later still knows it was planning.
+/// days later still knows it was planning. A transcript without an
+/// announcement reads as build, the mode the system prompt assumes then.
 fn last_announced_mode(history: &[Message]) -> AnnouncedMode {
-    history
-        .iter()
-        .rev()
-        .filter(|message| {
-            message.is_observation()
-                && message.task_event.is_none()
-                && message.workflow_event.is_none()
-                && message.standing_reminder.is_none()
-        })
-        .find_map(|message| {
-            let text = message.user_text()?;
-            if text.contains(crate::prompt::BUILD_MODE_MARKER) {
-                Some(AnnouncedMode::Build)
-            } else if text.contains(crate::prompt::PLAN_MODE_MARKER) {
-                Some(AnnouncedMode::Plan)
-            } else {
-                None
-            }
-        })
-        .unwrap_or(AnnouncedMode::Build)
+    match last_announced(history, crate::prompt::MODE_MARKERS) {
+        Some(text) if text.contains(crate::prompt::BUILD_MODE_MARKER) => AnnouncedMode::Build,
+        Some(_) => AnnouncedMode::Plan,
+        None => AnnouncedMode::Build,
+    }
 }
 
 /// Announces the active mode to the model, or `None` when the transcript
@@ -2975,8 +2987,10 @@ fn last_announced_mode(history: &[Message]) -> AnnouncedMode {
 /// is the only place they appear: the system prompt is deliberately identical in
 /// both modes so that toggling does not re-cache the conversation. An
 /// announcement trails the turn it governs, so the cut that preserves that turn
-/// preserves it too; losing one anyway is self-healing, since the next turn then
-/// finds no match and announces again.
+/// preserves it too. A compaction that summarizes the last one away restates it
+/// (see [`stranded_reminders`]). Otherwise the transcript would read as build:
+/// the rest of a plan turn would run without its rules, and a later switch to
+/// build would find nothing to announce.
 fn mode_switch_notice(history: &[Message], next: &AgentMode) -> Option<Message> {
     let announced = AnnouncedMode::of(next)?;
     if announced == last_announced_mode(history) {
@@ -3714,6 +3728,8 @@ mod tests {
     const TEST_PLAN_PATH: &str = ".caudra/plans/123.md";
     const EXPECTED_PLAN_NOTICE: &str = "entering plan mode must be announced";
     const EXPECTED_BUILD_NOTICE: &str = "leaving plan mode must be announced";
+    const PLAN_RESTATED: &str =
+        "a compaction must restate the plan announcement it summarized away, before the switch";
     const ENVIRONMENT: &str =
         "<system-reminder>\n# Environment\n\n- Date: 2026-09-09\n</system-reminder>";
     const ENVIRONMENT_NEXT_DAY: &str =
@@ -3773,7 +3789,7 @@ mod tests {
         ));
         assert!(mode_switch_notice(&history, &AgentMode::Plan(TEST_PLAN_PATH.into())).is_some());
         assert_eq!(
-            last_announced(&history, crate::prompt::ENVIRONMENT_MARKER),
+            last_announced(&history, &[crate::prompt::ENVIRONMENT_MARKER]),
             Some(ENVIRONMENT)
         );
         assert!(
@@ -5940,6 +5956,88 @@ mod tests {
         assert!(mode_switch_notice(&history, &AgentMode::Build).is_none());
     }
 
+    fn build_announcement() -> Message {
+        mode_switch_notice(&[plan_announcement()], &AgentMode::Build).expect(EXPECTED_BUILD_NOTICE)
+    }
+
+    fn turn() -> Message {
+        Message::user(GO.into())
+    }
+
+    fn reply() -> Message {
+        text_response(StopReason::EndTurn).message
+    }
+
+    /// `expected` indexes `history`: the blocks a cut at `head_end` restates,
+    /// in the order a turn announces their kinds.
+    #[test_case(vec![turn(), environment_announcement(ENVIRONMENT), plan_announcement(), reply(), turn(), reply()], 4, &[1, 2] ; "summarized_blocks_are_restated")]
+    #[test_case(vec![turn(), environment_announcement(ENVIRONMENT), plan_announcement(), reply(), turn(), environment_announcement(ENVIRONMENT), plan_announcement(), reply()], 4, &[] ; "blocks_the_tail_states_stay_put")]
+    #[test_case(vec![turn(), plan_announcement(), reply(), turn(), build_announcement(), reply()], 3, &[] ; "a_later_mode_in_the_tail_supersedes")]
+    #[test_case(vec![turn(), environment_announcement(ENVIRONMENT), reply(), turn(), environment_announcement(ENVIRONMENT_NEXT_DAY), reply(), turn(), reply()], 6, &[4] ; "only_the_last_block_of_a_kind")]
+    #[test_case(vec![turn(), plan_announcement(), Message::observation(crate::prompt::TASK_PLAN_CONTRACT.into()), Message::observation(INSTRUCTIONS_CHANGED.into()), environment_announcement(ENVIRONMENT), reply()], 6, &[4, 3, 2, 1] ; "everything_summarized_in_announcement_order")]
+    fn a_compaction_restates_the_kinds_its_tail_lacks(
+        history: Vec<Message>,
+        head_end: usize,
+        expected: &[usize],
+    ) {
+        let restated = stranded_reminders(&history, head_end);
+
+        assert!(restated.iter().all(Message::is_observation));
+        assert_eq!(
+            restated.iter().map(Message::user_text).collect::<Vec<_>>(),
+            expected
+                .iter()
+                .map(|&index| history[index].user_text())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// The reported symptom: a plan announcement summarized away left the
+    /// transcript reading as build, so the switch to build announced nothing
+    /// and the chat drew no row for it.
+    #[test_case(false; "automatic")]
+    #[test_case(true; "queued")]
+    fn leaving_plan_is_announced_across_a_compaction(queued: bool) {
+        smol::block_on(async {
+            let mut history = History::new(vec![turn(), plan_announcement(), reply()]);
+            let (mut agent, events) = make_agent(
+                MockProvider::new(vec![
+                    text_response(StopReason::EndTurn),
+                    text_response(StopReason::EndTurn),
+                ]),
+                &mut history,
+            );
+            agent.config.generate_titles = false;
+            agent.auto_compact = true;
+            agent.measured = Some(MeasuredContext {
+                reported: u32::MAX,
+                history_len: agent.history.len(),
+            });
+            if queued {
+                agent.interrupt_source =
+                    Some(MockInterruptSource::new(vec![ExtractedCommand::Compact(0)]));
+                assert!(agent.handle_queued_command().await.unwrap());
+            } else {
+                assert!(agent.try_auto_compact().await.unwrap());
+            }
+
+            agent.run(default_input()).await.unwrap();
+            drop(agent);
+
+            let injected: Vec<String> = drain_events(&events)
+                .into_iter()
+                .filter_map(|envelope| match envelope.event {
+                    AgentEvent::Injected { text, .. } => Some(text),
+                    _ => None,
+                })
+                .collect();
+            let announced = |marker: &str| injected.iter().position(|text| text.contains(marker));
+            let restated = announced(crate::prompt::PLAN_MODE_MARKER).expect(PLAN_RESTATED);
+            let left = announced(crate::prompt::BUILD_MODE_MARKER).expect(EXPECTED_BUILD_NOTICE);
+            assert!(restated < left, "{PLAN_RESTATED}");
+        });
+    }
+
     fn environment_announcement(environment: &str) -> Message {
         standing_notice(&[], crate::prompt::ENVIRONMENT_MARKER, Some(environment))
             .expect(EXPECTED_ENVIRONMENT_NOTICE)
@@ -5995,7 +6093,7 @@ mod tests {
         ];
         assert!(matches!(last_announced_mode(&history), AnnouncedMode::Plan));
         assert_eq!(
-            last_announced(&history, crate::prompt::ENVIRONMENT_MARKER),
+            last_announced(&history, &[crate::prompt::ENVIRONMENT_MARKER]),
             None
         );
     }
