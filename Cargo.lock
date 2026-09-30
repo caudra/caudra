@@ -5717,6 +5717,7 @@ dependencies = [
  "proptest",
  "sha2",
  "tempfile",
+ "test-case",
  "tree-sitter",
  "workcell-source-languages",
 ]

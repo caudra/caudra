@@ -76,6 +76,47 @@
 ; the whole node spans `operator bool() const`, so ingest.cpp trims it to the `operator <type>` name)
 (operator_cast) @name @definition.method
 
+; ---- body spans (Workcell addition) ----
+; Every function pattern above anchors on the declarator, which ends at the parameter list, so a call
+; in the body sat inside no definition and minted no edge. These capture the same @name again on the
+; function_definition that owns the declarator; extraction merges the two captures of one name token
+; and keeps the wider span. Declarator shapes no pattern above names stay out, and a prototype keeps
+; its signature span.
+(function_definition
+  declarator: [
+    (function_declarator declarator: (identifier) @name)
+    (pointer_declarator declarator: (function_declarator declarator: (identifier) @name))
+    (pointer_declarator declarator: (pointer_declarator
+      declarator: (function_declarator declarator: (identifier) @name)))
+    (reference_declarator (function_declarator declarator: (identifier) @name))
+  ]) @definition.function
+
+(function_definition
+  declarator: [
+    (function_declarator declarator: [
+      (field_identifier) @name
+      (operator_name) @name
+      (qualified_identifier name: [(identifier) (qualified_identifier) (operator_name)] @name)
+    ])
+    (pointer_declarator declarator: (function_declarator declarator: [
+      (field_identifier) @name
+      (operator_name) @name
+      (qualified_identifier name: [(identifier) (qualified_identifier) (operator_name)] @name)
+    ]))
+    (pointer_declarator declarator: (pointer_declarator declarator: (function_declarator declarator: [
+      (field_identifier) @name
+      (operator_name) @name
+      (qualified_identifier name: [(identifier) (qualified_identifier) (operator_name)] @name)
+    ])))
+    (reference_declarator (function_declarator declarator: [
+      (field_identifier) @name
+      (operator_name) @name
+      (qualified_identifier name: [(identifier) (qualified_identifier) (operator_name)] @name)
+    ]))
+    (operator_cast) @name
+    (qualified_identifier name: (operator_cast) @name)
+  ]) @definition.method
+
 (type_definition declarator: (type_identifier) @name) @definition.type
 
 ; `using TokenId = std::int32_t;` is the C++11 spelling of the typedef above (Workcell addition).

@@ -48,6 +48,17 @@
 (function_declarator
   declarator: (identifier) @name) @definition.function
 
+; Body spans (Workcell addition). The declarator ends at the parameter list, so a call in the body
+; sat inside no definition and minted no edge. The same @name captured on the function_definition
+; merges with the capture above at extraction, which keeps the wider span.
+(function_definition
+  declarator: [
+    (function_declarator declarator: (identifier) @name)
+    (pointer_declarator declarator: (function_declarator declarator: (identifier) @name))
+    (pointer_declarator declarator: (pointer_declarator
+      declarator: (function_declarator declarator: (identifier) @name)))
+  ]) @definition.function
+
 ; #define NAME ...            (object-like macro)
 (preproc_def
   name: (identifier) @name) @definition.macro

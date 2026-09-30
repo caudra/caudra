@@ -287,7 +287,8 @@ fn extract_from_tree(
 /// Identity is `(name token start, name)`. One definition routinely matches several patterns: a
 /// method inside an `impl` matches both the method and the general function pattern. Keeping the
 /// higher `SymbolKind` is what makes it record as a method, and keeping the *widest* span is what
-/// preserves the whole body when one pattern captured only the signature.
+/// preserves the whole body when one pattern captured only the signature. A C declarator holds the
+/// parameter list its body capture cannot see, so the parameter count is the larger of the two.
 ///
 /// The result is sorted by `(span.start, name_start)`, which is the order node ids are assigned in.
 fn dedup(mut captured: Vec<(RawDefinition, ByteSpan)>) -> Vec<(RawDefinition, ByteSpan)> {
@@ -309,12 +310,17 @@ fn dedup(mut captured: Vec<(RawDefinition, ByteSpan)>) -> Vec<(RawDefinition, By
                 if definition.kind > previous.kind {
                     previous.kind = definition.kind;
                 }
+                let parameters = previous
+                    .metrics
+                    .parameters
+                    .max(definition.metrics.parameters);
                 if span.len() > previous_span.len() {
                     *previous_span = span;
                     previous.span = span;
                     previous.lines = definition.lines;
                     previous.metrics = definition.metrics;
                 }
+                previous.metrics.parameters = parameters;
                 previous.test_scope |= definition.test_scope;
                 if previous.documentation.is_none() {
                     previous.documentation = definition.documentation;
@@ -559,6 +565,8 @@ fn in_test_scope(node: Node<'_>, bytes: &[u8]) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use test_case::test_case;
+
     use super::*;
 
     fn facts(source: &str, language: Language) -> FileFacts {
@@ -709,6 +717,55 @@ fn branchy(value: u32) -> u32 {
         assert_eq!(plain.metrics.complexity, 1);
         assert!(branchy.metrics.complexity > plain.metrics.complexity);
         assert_eq!(branchy.metrics.parameters, 1);
+    }
+
+    #[test_case(Language::C, "int caller(int v) { return callee(v); }", "caller" ; "a c function")]
+    #[test_case(Language::C, "char *caller(void) { return callee(); }", "caller" ; "a c function returning a pointer")]
+    #[test_case(Language::C, "char **caller(void) { return callee(); }", "caller" ; "a c function returning a pointer to a pointer")]
+    #[test_case(Language::Cpp, "template <typename T> T caller(T v) { return callee(v); }", "caller" ; "a function template")]
+    #[test_case(Language::Cpp, "char *caller() { return callee(); }", "caller" ; "a function returning a pointer")]
+    #[test_case(Language::Cpp, "char **caller() { return callee(); }", "caller" ; "a function returning a pointer to a pointer")]
+    #[test_case(Language::Cpp, "int &caller() { return callee(); }", "caller" ; "a function returning a reference")]
+    #[test_case(Language::Cpp, "class W { int caller() { return callee(); } };", "caller" ; "an inline method")]
+    #[test_case(Language::Cpp, "class W { bool operator<(const W &o) const { return callee(o); } };", "operator<" ; "an inline operator")]
+    #[test_case(Language::Cpp, "class W { operator bool() const { return callee(); } };", "operator bool() const" ; "an inline conversion operator")]
+    #[test_case(Language::Cpp, "int W::caller() { return callee(); }", "caller" ; "an out of line method")]
+    #[test_case(Language::Cpp, "void a::W::caller() { callee(); }", "W::caller" ; "a method qualified twice")]
+    #[test_case(Language::Cpp, "W *W::caller() { return callee(); }", "caller" ; "a method returning a pointer")]
+    #[test_case(Language::Cpp, "char **W::caller() { return callee(); }", "caller" ; "a method returning a pointer to a pointer")]
+    #[test_case(Language::Cpp, "W &W::caller() { return callee(); }", "caller" ; "a method returning a reference")]
+    #[test_case(Language::Cpp, "bool W::operator==(const W &o) const { return callee(o); }", "operator==" ; "an out of line operator")]
+    #[test_case(Language::Cpp, "W::operator bool() const { return callee(); }", "operator bool() const" ; "an out of line conversion operator")]
+    fn a_c_family_call_is_attributed_to_the_definition_whose_body_holds_it(
+        language: Language,
+        source: &str,
+        caller: &str,
+    ) {
+        let facts = facts(source, language);
+        let call = facts
+            .references
+            .iter()
+            .find(|reference| reference.name == "callee")
+            .expect("call to callee");
+        let enclosing = call
+            .enclosing
+            .map(|index| facts.definitions[index].name.as_str());
+        assert_eq!(enclosing, Some(caller));
+    }
+
+    #[test_case(Language::C ; "c")]
+    #[test_case(Language::Cpp ; "cpp")]
+    fn a_c_family_function_spans_its_body_and_keeps_its_parameters(language: Language) {
+        let source = "int *pick(int a, int b)\n{\n    if (a) { return 0; }\n    return 0;\n}\n";
+        let facts = facts(source, language);
+        let pick = facts
+            .definitions
+            .iter()
+            .find(|definition| definition.name == "pick")
+            .expect("pick");
+        assert_eq!(pick.lines, LineSpan { start: 1, end: 5 });
+        assert_eq!(pick.metrics.complexity, 2);
+        assert_eq!(pick.metrics.parameters, 2);
     }
 
     #[test]

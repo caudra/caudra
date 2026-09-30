@@ -53,6 +53,10 @@ than losing to whichever pattern matched second.
   wrapper has no `body:` field, so span widening climbs to the enclosing block and every definition
   in it inherits the block's span. Enclosing attribution then resolves every call in the block to
   one arbitrary member. `rust_captures_the_exact_shape_the_span_fix_depends_on` pins this.
+- The C family names a function inside a declarator that ends at the parameter list. Its queries
+  capture the same `@name` a second time on the `function_definition`, and the merge keeps the wider
+  span, so a call in the body belongs to its function. Without that span the call has no caller and
+  mints no edge.
 - Every `@definition.*` pattern also captures a `@name`. A definition that cannot be addressed by
   name cannot be ranked or resolved against, so an unnamed one is a pattern bug, not a partial
   result.
