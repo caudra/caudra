@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::ops::ControlFlow;
 use std::sync::{Arc, LazyLock};
 
@@ -51,6 +51,7 @@ pub(crate) const WIDE_CONTEXT_WINDOW: u32 = 372_000;
 const CLAUDE_CODE_IDENTITY: &str = "You are Claude Code, Anthropic's official CLI for Claude.";
 const BILLING_PREFIX: &str = "59cf53e54c78";
 const TEXT_BLOCK: &str = "text";
+const THINKING_DROPPED: &str = "thinking_dropped";
 
 pub(crate) fn strip_long_context(model_id: &str) -> &str {
     model_id
@@ -112,10 +113,45 @@ impl From<Usage> for TokenUsage {
     }
 }
 
+/// A change the API made to the request before the model read it. Later
+/// checks add kinds and reasons, so both stay open strings.
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct InputTransformation {
+    #[serde(rename = "type")]
+    kind: String,
+    path: String,
+    reason: String,
+}
+
 #[derive(Deserialize)]
 struct MessagePayload {
     #[serde(default)]
     usage: Option<Usage>,
+    #[serde(default)]
+    input_transformations: Option<Vec<InputTransformation>>,
+}
+
+/// Each dropped block is reasoning the model answered without, whether a
+/// prefix edit, a model switch or another account invalidated it.
+fn warn_dropped_thinking(transformations: &[InputTransformation]) {
+    let dropped: Vec<&InputTransformation> = transformations
+        .iter()
+        .filter(|transformation| transformation.kind == THINKING_DROPPED)
+        .collect();
+    let Some(first) = dropped.first() else {
+        return;
+    };
+    let reasons: BTreeSet<&str> = dropped
+        .iter()
+        .map(|transformation| transformation.reason.as_str())
+        .collect();
+    warn!(
+        dropped = dropped.len(),
+        first_path = %first.path,
+        ?reasons,
+        "the API dropped thinking blocks before the model read them"
+    );
 }
 
 #[derive(Deserialize)]
@@ -600,10 +636,11 @@ impl EventParser {
                         aliases: self.oauth_tool_names.clone().map(Arc::new),
                     })
                     .await?;
-                if let Ok(ev) = serde_json::from_str::<MessageStartEvent>(data)
-                    && let Some(u) = ev.message.usage
-                {
-                    self.usage = TokenUsage::from(u);
+                if let Ok(ev) = serde_json::from_str::<MessageStartEvent>(data) {
+                    if let Some(u) = ev.message.usage {
+                        self.usage = TokenUsage::from(u);
+                    }
+                    warn_dropped_thinking(&ev.message.input_transformations.unwrap_or_default());
                 }
             }
             "content_block_start" => match serde_json::from_str::<ContentBlockStartEvent>(data) {
@@ -1112,7 +1149,7 @@ mod tests {
     };
     use crate::{
         ContentBlock, Message, Model, ProviderEvent, StandingReminderKind, SteeringKind,
-        ThinkingConfig, invalid_tool_input,
+        ThinkingConfig, TokenUsage, invalid_tool_input,
     };
 
     const STEERING_TEXT: &str = "Continue with a useful response.";
@@ -1120,6 +1157,12 @@ mod tests {
     const TOOL_ID: &str = "call_1";
     const TOOL_NAME: &str = "shell";
     const MALFORMED_COMMAND: &str = r#"{"command":"echo safe""#;
+    const START_USAGE: TokenUsage = TokenUsage {
+        input: 12,
+        output: 1,
+        cache_creation: 0,
+        cache_read: 30,
+    };
 
     #[test_case("tool_use", true, true ; "completed_response")]
     #[test_case("max_tokens", true, false ; "token_truncated_after_block_stop")]
@@ -1226,6 +1269,27 @@ mod tests {
         let model = Model::from_spec(spec).unwrap();
         let body = super::request_body(&model, &[], None, "", &json!([]), &ThinkingConfig::Off);
         assert_eq!(body["thinking"], expected);
+    }
+
+    /// The drop report shares `message_start` with the usage, so no shape of
+    /// it may cost the turn its token count.
+    #[test_case(json!([{"type": "thinking_dropped", "path": "messages.3.content.0", "reason": "prefix_binding_mismatch"}]) ; "a_dropped_block")]
+    #[test_case(json!([{"type": "a_later_kind"}]) ; "an_unrecognized_entry")]
+    #[test_case(json!(null) ; "an_explicit_null")]
+    fn input_transformations_keep_the_usage(transformations: Value) {
+        smol::block_on(async {
+            let (tx, _rx) = flume::unbounded();
+            let mut parser = EventParser::new();
+            let start = json!({"type": "message_start", "message": {
+                "usage": START_USAGE,
+                "input_transformations": transformations,
+            }});
+            let _ = parser
+                .process("message_start", &start.to_string(), &tx)
+                .await
+                .unwrap();
+            assert_eq!(parser.finish().usage, START_USAGE);
+        });
     }
 
     use super::{

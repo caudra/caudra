@@ -22,6 +22,7 @@ use tracing::{debug, info, warn};
 
 use crate::model::{Billing, Model};
 use crate::provider::{BoxFuture, Provider, WireRequest};
+use crate::types::THINKING_ADAPTIVE;
 use crate::{
     AgentError, CacheKey, Message, ProviderEvent, ProviderUsage, RequestOptions, StreamResponse,
     UsageLimit,
@@ -37,6 +38,8 @@ const MODELS_PATH: &str = "/v1/models?limit=1000";
 const USAGE_PATH: &str = "/api/oauth/usage";
 const PROFILE_PATH: &str = "/api/oauth/profile";
 const FAST_MODE_BETA: &str = "fast-mode-2026-02-01";
+const BLOCK_BINDING_BETA: &str = "thinking-binding-controls-2026-08-01";
+const DROP_BLOCK: &str = "drop_block";
 const OAUTH_BETA: &str = "oauth-2025-04-20";
 const OAUTH_MESSAGE_BETAS: &[&str] = &[
     "claude-code-20250219",
@@ -82,6 +85,21 @@ fn apply_fast_mode(body: &mut Value, model: &Model, opts: &RequestOptions) -> bo
         body["speed"] = json!("fast");
     }
     on
+}
+
+/// Newer models sign each thinking block over everything before it, and newer
+/// accounts reject a turn whose signed prefix changed. Caudra changes it
+/// routinely (pruned tool results, reloaded tools and instructions), so the
+/// binding asks the API to drop the stale blocks instead. Only adaptive
+/// thinking takes one: `between_tools` rejects any other field, and budgets
+/// belong to models that run no prefix check. Returns whether the beta header
+/// must be attached.
+fn apply_block_binding(body: &mut Value) -> bool {
+    let adaptive = body["thinking"]["type"] == THINKING_ADAPTIVE;
+    if adaptive {
+        body["thinking"]["block_binding"] = json!({"prefix_mismatch_behavior": DROP_BLOCK});
+    }
+    adaptive
 }
 
 #[derive(Deserialize, Default)]
@@ -441,12 +459,12 @@ struct AuthSnapshot {
 }
 
 /// A turn as [`Anthropic::prepare`] builds it, with what its send needs beside
-/// the request: the wire-to-canonical names that read an OAuth reply, and
-/// whether the fast-mode beta header goes along.
+/// the request: the wire-to-canonical names that read an OAuth reply, and the
+/// betas its body relies on.
 struct PreparedRequest {
     wire: WireRequest,
     oauth_tool_names: Option<HashMap<String, String>>,
-    fast: bool,
+    betas: Vec<&'static str>,
 }
 
 struct AuthState {
@@ -710,7 +728,17 @@ impl Anthropic {
         let oauth_tool_names = oauth.then(|| {
             shared::apply_oauth_request_profile(&mut body, system, auth::CLAUDE_CODE_VERSION)
         });
-        let fast = apply_fast_mode(&mut body, model, opts);
+        let mut betas = if oauth {
+            OAUTH_MESSAGE_BETAS.to_vec()
+        } else {
+            Vec::new()
+        };
+        if apply_fast_mode(&mut body, model, opts) {
+            betas.push(FAST_MODE_BETA);
+        }
+        if apply_block_binding(&mut body) {
+            betas.push(BLOCK_BINDING_BETA);
+        }
         let path = if oauth {
             OAUTH_MESSAGES_PATH
         } else {
@@ -719,7 +747,7 @@ impl Anthropic {
         PreparedRequest {
             wire: WireRequest::post(api_url(&auth.resolved, path), body),
             oauth_tool_names,
-            fast,
+            betas,
         }
     }
 
@@ -782,15 +810,8 @@ impl Anthropic {
                 cache_key.map(CacheKey::as_str),
             )
             .header("content-type", "application/json");
-        let mut betas = Vec::new();
-        if oauth {
-            betas.extend_from_slice(OAUTH_MESSAGE_BETAS);
-        }
-        if request.fast {
-            betas.push(FAST_MODE_BETA);
-        }
-        if !betas.is_empty() {
-            builder = builder.header("anthropic-beta", betas.join(","));
+        if !request.betas.is_empty() {
+            builder = builder.header("anthropic-beta", request.betas.join(","));
         }
         let response = self.client.send_async(builder.body(json_body)?).await?;
         let status = response.status().as_u16();
@@ -960,7 +981,7 @@ impl Provider for Anthropic {
             let auth_snapshot = self.auth_for_request().await?;
             let request = self.prepare(&auth_snapshot, model, messages, system, tools, &opts);
 
-            debug!(model = %model.id, num_messages = messages.len(), thinking = ?opts.thinking, fast = request.fast, "sending API request");
+            debug!(model = %model.id, num_messages = messages.len(), thinking = ?opts.thinking, betas = ?request.betas, "sending API request");
             if auth_snapshot.mode != AuthMode::ClaudeOauth {
                 let attempted_credential = auth_credential(&auth_snapshot.resolved);
                 let result = self
@@ -1195,7 +1216,7 @@ mod tests {
     use crate::providers::test_support::CREDENTIAL_IN_URL;
     use crate::{
         CaudraId, ContentBlock, EMPTY_RESPONSE_MARKER, INVALID_TOOL_JSON_KEY, ProviderEvent, Role,
-        StopReason, TokenUsage,
+        StopReason, ThinkingConfig, TokenUsage,
     };
     use caudra_storage::tool_outputs::ToolOutputRef;
     use serde_json::{Value, json};
@@ -1216,6 +1237,7 @@ mod tests {
     const SYSTEM_PREFIX: &str = "Operator prefix";
     const CACHE_CONTROL_KEY: &str = "\"cache_control\"";
     const BREAKPOINT_BUDGET: usize = 4;
+    const THINKING_BUDGET: u32 = 4_096;
     const OVER_BUDGET: &str = "the Messages API rejects a request with more than four breakpoints";
     const BREAKPOINT_MISPLACED: &str =
         "only the last tool and the last block of the last message cache what precedes them";
@@ -2083,6 +2105,41 @@ data: {\"type\":\"content_block_stop\"}\n";
         let header = apply_fast_mode(&mut body, &model, &RequestOptions::default());
         assert!(!header);
         assert!(body.get("speed").is_none());
+    }
+
+    /// `between_tools` and budgets reject a binding, and a binding without its
+    /// beta header is a 400.
+    #[test_case(resolve_auth_from_key(CREDENTIAL, None), AuthMode::ApiKey, "anthropic/claude-sonnet-5-5", ThinkingConfig::Adaptive, true ; "adaptive_sonnet_5_5_binds")]
+    #[test_case(oauth_auth(), AuthMode::ClaudeOauth, "anthropic/claude-opus-5-5", ThinkingConfig::Adaptive, true ; "adaptive_opus_5_5_binds_on_a_subscription")]
+    #[test_case(resolve_auth_from_key(CREDENTIAL, None), AuthMode::ApiKey, "anthropic/claude-sonnet-5-5", ThinkingConfig::Off, false ; "between_tools_takes_no_binding")]
+    #[test_case(resolve_auth_from_key(CREDENTIAL, None), AuthMode::ApiKey, "anthropic/claude-sonnet-4-5", ThinkingConfig::Budget(THINKING_BUDGET), false ; "a_budget_takes_no_binding")]
+    fn only_adaptive_thinking_binds_its_blocks(
+        resolved: ResolvedAuth,
+        mode: AuthMode,
+        spec: &str,
+        thinking: ThinkingConfig,
+        bound: bool,
+    ) {
+        let provider = Anthropic::with_test_auth(resolved, mode);
+        let request = provider.prepare(
+            &provider.auth_snapshot(),
+            &Model::from_spec(spec).unwrap(),
+            &[Message::user(USER_TEXT.into())],
+            SYSTEM_PROMPT,
+            &shell_tool(),
+            &RequestOptions {
+                thinking,
+                ..Default::default()
+            },
+        );
+
+        let thinking_body = request.wire.body.get("thinking").unwrap();
+        let binding = json!({"prefix_mismatch_behavior": DROP_BLOCK});
+        assert_eq!(
+            thinking_body.get("block_binding"),
+            bound.then_some(&binding)
+        );
+        assert_eq!(request.betas.contains(&BLOCK_BINDING_BETA), bound);
     }
 
     #[test]

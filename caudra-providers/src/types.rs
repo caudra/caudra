@@ -682,6 +682,8 @@ const EARLY_ADAPTIVE_VERSION: (u32, u32) = (4, 6);
 /// keeps up-front thinking off, as its lowest setting.
 const SONNET_REASONS_UNASKED_SINCE: (u32, u32) = (5, 0);
 const BETWEEN_TOOLS_SINCE: (u32, u32) = (5, 5);
+/// Read back by the Anthropic provider, which binds only adaptive thinking.
+pub(crate) const THINKING_ADAPTIVE: &str = "adaptive";
 const THINKING_DISABLED: &str = "disabled";
 const THINKING_BETWEEN_TOOLS: &str = "between_tools";
 const OPUS: &str = "opus";
@@ -952,7 +954,7 @@ impl ThinkingConfig {
                 }
                 return;
             }
-            body["thinking"] = json!({"type": "adaptive"});
+            body["thinking"] = json!({"type": THINKING_ADAPTIVE});
             // Claude 4.6 defaults to summaries. Newer models default to
             // omitted, so ask for the same summary explicitly.
             if Self::omits_adaptive_thinking(&model.id) {
@@ -965,7 +967,7 @@ impl ThinkingConfig {
         }
         match resolved {
             ResolvedThinking::Off => {}
-            ResolvedThinking::On => body["thinking"] = json!({"type": "adaptive"}),
+            ResolvedThinking::On => body["thinking"] = json!({"type": THINKING_ADAPTIVE}),
             ResolvedThinking::Budget(tokens) => {
                 body["thinking"] = json!({"type": "enabled", "budget_tokens": tokens});
             }
