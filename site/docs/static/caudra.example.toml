@@ -813,11 +813,13 @@ version = 1
 # The typed decision engine. It needs `decision_engine = true` under
 # [experimental]. Connection settings and thresholds are global-only.
 
-# Full request URL. HTTPS required except for numeric loopback HTTP or explicit
+# Decision API base URL, such as `https://api.typesafe.ai`. Caudra appends
+# `/v1/systemone` and keeps any path prefix. `TYPESAFE_BASE_URL` replaces a
+# configured value. HTTPS required except for numeric loopback HTTP or explicit
 # `allow_http` consent. No credentials, query, fragment, whitespace, or control
 # characters.
 # Type: string. Default: unset.
-# endpoint = <string>
+# base_url = <string>
 
 # Decision model identifier, nonblank and without control characters.
 # Type: string.
@@ -936,7 +938,9 @@ version = 1
 # shell_heavy = 0.9
 
 # Confidence required for tool search, skill suggestions, and subagent routing.
-# Tool-search choice probability must also meet it.
+# Tool-search choice probability must also meet it. Yes/no answers carry no
+# confidence, so subagent routing requires each yes/no probability to be at
+# least this value or at most 1 minus it.
 # Type: float.
 # routing_confidence = 0.9
 

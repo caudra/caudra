@@ -1,5 +1,5 @@
 use caudra_config::decisions::FeatureMode;
-use caudra_decision::{Answer, DecisionResponse, QuestionSet};
+use caudra_decision::{Answer, DecisionResponse, Question, QuestionSet, QuestionType};
 use caudra_storage::{
     decision_log::DecisionLabel,
     now_epoch,
@@ -8,7 +8,12 @@ use caudra_storage::{
     },
 };
 use serde_json::{Value, json};
-use std::{collections::VecDeque, sync::Arc, thread, time::Instant};
+use std::{
+    collections::{BTreeMap, VecDeque},
+    sync::Arc,
+    thread,
+    time::Instant,
+};
 
 use super::{DecisionContext, DecisionFeature, DecisionReceipt, Decisions};
 use crate::{
@@ -17,12 +22,11 @@ use crate::{
     tools::{ToolContext, ToolExecResult},
 };
 
-const QUESTION_SET: &str = "shell_duration.v1";
-const QUESTIONS: &str = r#"{
-    "endless":{"type":"noul","instructions":"Does this command normally keep running until stopped?"},
-    "heavy":{"type":"noul","instructions":"Is this command likely to require substantial computation or lengthy network transfers?"},
-    "duration":{"type":"choice","instructions":"Estimate this command's execution duration.","criteria":["instant","short","long","endless"]}
-}"#;
+const QUESTION_SET: &str = "shell_duration.v2";
+const INSTANT: &str = "instant";
+const SHORT: &str = "short";
+const LONG: &str = "long";
+const ENDLESS: &str = "endless";
 const TIMEOUT_FIELD: &str = "timeoutSec";
 const HISTORY_CACHE_ENTRIES: usize = 256;
 const MILLIS_PER_SECOND: u64 = 1_000;
@@ -160,10 +164,7 @@ impl Decisions {
             Err(error) => tracing::warn!(%error, "shell duration history unavailable"),
             Ok(None) => {}
         }
-        let questions = serde_json::from_str(QUESTIONS)
-            .ok()
-            .and_then(|questions| QuestionSet::new(QUESTION_SET, questions).ok());
-        if let Some(questions) = questions {
+        if let Some(questions) = duration_questions(plan.threshold_ms) {
             let context = DecisionContext {
                 project: Some(root.display().to_string()),
                 session: ctx.session_id.as_ref().map(ToString::to_string),
@@ -204,6 +205,70 @@ pub(crate) fn history_key(workspace: &str, workdir: &str, command: &str) -> Shel
     }
 }
 
+/// The duration buckets follow `duration_label`, so a measured label always
+/// names an option the engine was offered.
+fn duration_questions(threshold_ms: u64) -> Option<QuestionSet> {
+    let instant_secs = INSTANT_MS / MILLIS_PER_SECOND;
+    let threshold_secs = threshold_ms.div_ceil(MILLIS_PER_SECOND);
+    let mut criteria = BTreeMap::from([
+        (
+            INSTANT,
+            format!("Finishes on its own within {instant_secs} second."),
+        ),
+        (
+            ENDLESS,
+            "Keeps running until stopped, such as a server, watcher, or interactive session."
+                .to_owned(),
+        ),
+    ]);
+    if threshold_ms > INSTANT_MS {
+        criteria.insert(
+            SHORT,
+            format!(
+                "Finishes on its own after more than {instant_secs} second and in under {threshold_secs} seconds."
+            ),
+        );
+        criteria.insert(
+            LONG,
+            format!("Finishes on its own, but only after {threshold_secs} seconds or more."),
+        );
+    } else {
+        criteria.insert(
+            LONG,
+            format!("Finishes on its own, but only after more than {instant_secs} second."),
+        );
+    }
+    let noul = |instructions: &str| Question {
+        kind: QuestionType::Noul,
+        instructions: json!(instructions),
+        criteria: None,
+    };
+    QuestionSet::new(
+        QUESTION_SET,
+        BTreeMap::from([
+            (
+                "endless".into(),
+                noul("Does this command normally keep running until stopped?"),
+            ),
+            (
+                "heavy".into(),
+                noul(
+                    "Is this command likely to require substantial computation or lengthy network transfers?",
+                ),
+            ),
+            (
+                "duration".into(),
+                Question {
+                    kind: QuestionType::Choice,
+                    instructions: json!("Estimate this command's execution duration."),
+                    criteria: Some(json!(criteria)),
+                },
+            ),
+        ]),
+    )
+    .ok()
+}
+
 fn prior(
     response: &DecisionResponse,
     heavy: f64,
@@ -215,20 +280,18 @@ fn prior(
         return (None, true);
     }
     let choice = match response.answers.get("duration") {
-        Some(Answer::Choice(answer)) if answer.metadata.confidence >= heavy => {
-            answer.choice.as_str()
-        }
+        Some(Answer::Choice(answer)) if answer.confidence >= heavy => Some(answer.choice.as_str()),
         _ => None,
     };
-    if choice == Some("endless") {
+    if choice == Some(ENDLESS) {
         return (None, true);
     }
     let is_heavy =
         matches!(response.answers.get("heavy"), Some(Answer::Noul(answer)) if answer.noul >= heavy);
     let (p50_ms, p90_ms, extend_timeout) = match choice {
-        Some("long") => (LONG_P50_MS, LONG_P90_MS, true),
-        Some("instant") => (INSTANT_MS, INSTANT_MS, false),
-        Some("short") => (SHORT_P50_MS.min(threshold_ms), threshold_ms, false),
+        Some(LONG) => (LONG_P50_MS, LONG_P90_MS, true),
+        Some(INSTANT) => (INSTANT_MS, INSTANT_MS, false),
+        Some(SHORT) => (SHORT_P50_MS.min(threshold_ms), threshold_ms, false),
         _ if is_heavy => (LONG_P50_MS, LONG_P90_MS, true),
         _ => return (None, false),
     };
@@ -458,10 +521,10 @@ fn duration_label(
     threshold_ms: u64,
 ) -> Option<&'static str> {
     match outcome {
-        DurationOutcome::Ok if elapsed_ms <= INSTANT_MS => Some("instant"),
-        DurationOutcome::Ok if elapsed_ms < threshold_ms => Some("short"),
-        DurationOutcome::Ok => Some("long"),
-        _ if elapsed_ms >= threshold_ms => Some("long"),
+        DurationOutcome::Ok if elapsed_ms <= INSTANT_MS => Some(INSTANT),
+        DurationOutcome::Ok if elapsed_ms < threshold_ms => Some(SHORT),
+        DurationOutcome::Ok => Some(LONG),
+        _ if elapsed_ms >= threshold_ms => Some(LONG),
         _ => None,
     }
 }
@@ -469,8 +532,9 @@ fn duration_label(
 #[cfg(test)]
 mod tests {
     use super::{
-        Estimate, HISTORY_CACHE_ENTRIES, LONG_P90_MS, QUESTIONS, ShellDurationCache,
-        ShellDurationPlan, duration_label, history_key, prior,
+        ENDLESS, Estimate, HISTORY_CACHE_ENTRIES, INSTANT, INSTANT_MS, LONG, LONG_P90_MS, SHORT,
+        ShellDurationCache, ShellDurationPlan, duration_label, duration_questions, history_key,
+        prior,
     };
     use crate::{
         AgentMode,
@@ -483,15 +547,13 @@ mod tests {
         PermissionsConfig,
         decisions::{DecisionsConfig, FeatureMode},
     };
-    use caudra_decision::{
-        DecisionEngine, DecisionError, DecisionRequest, DecisionResponse, QuestionSet,
-    };
+    use caudra_decision::{DecisionEngine, DecisionError, DecisionRequest, DecisionResponse};
     use caudra_storage::{
         StateDir,
         shell_durations::{DurationOutcome, ShellDurations},
     };
     use serde_json::{Value, json};
-    use std::{sync::Arc, time::Instant};
+    use std::{collections::BTreeSet, sync::Arc, time::Instant};
     use test_case::test_case;
 
     const COMMAND: &str = "cargo test -p private-package";
@@ -500,7 +562,8 @@ mod tests {
     const DEFAULT_SECS: u64 = 120;
     const CAP_SECS: u64 = 21_600;
     const EXECUTION_ERROR: &str = "execution unavailable";
-    const ENDPOINT: &str = "http://127.0.0.1:1/v1/systemone";
+    const BASE_URL: &str = "http://127.0.0.1:1";
+    const MODEL: &str = "jev-latest";
 
     struct FailedEngine(DecisionError);
 
@@ -589,12 +652,12 @@ mod tests {
         assert_eq!(duration_label(&outcome, elapsed, THRESHOLD_MS), expected);
     }
 
-    #[test_case("long", 0.99, 0.01, 0.01, Some(LONG_P90_MS), false)]
-    #[test_case("short", 0.99, 0.01, 0.01, Some(THRESHOLD_MS), false)]
-    #[test_case("instant", 0.01, 0.99, 0.01, Some(LONG_P90_MS), false)]
-    #[test_case("long", 0.01, 0.01, 0.01, None, false)]
-    #[test_case("long", 0.99, 0.99, 0.99, None, true)]
-    #[test_case("endless", 0.99, 0.99, 0.01, None, true)]
+    #[test_case(LONG, 0.99, 0.01, 0.01, Some(LONG_P90_MS), false)]
+    #[test_case(SHORT, 0.99, 0.01, 0.01, Some(THRESHOLD_MS), false)]
+    #[test_case(INSTANT, 0.01, 0.99, 0.01, Some(LONG_P90_MS), false)]
+    #[test_case(LONG, 0.01, 0.01, 0.01, None, false)]
+    #[test_case(LONG, 0.99, 0.99, 0.99, None, true)]
+    #[test_case(ENDLESS, 0.99, 0.99, 0.01, None, true)]
     fn priors_require_confidence_and_never_extend_endless(
         choice: &str,
         confidence: f64,
@@ -603,18 +666,39 @@ mod tests {
         expected: Option<u64>,
         is_endless: bool,
     ) {
-        QuestionSet::new("test", serde_json::from_str(QUESTIONS).unwrap()).unwrap();
         let response: DecisionResponse = serde_json::from_value(json!({
+            "model": MODEL,
             "answers": {
-                "duration": {"type":"choice","choice":choice,"confidence":confidence,"probabilities":{"instant":0.1,"short":0.1,"long":0.7,"endless":0.1}},
-                "heavy": {"type":"noul","noul":heavy,"confidence":1.0},
-                "endless": {"type":"noul","noul":endless,"confidence":1.0}
+                "duration": {"type":"choice","choice":choice,"confidence":confidence,"probabilities":{INSTANT:0.1,SHORT:0.1,LONG:0.7,ENDLESS:0.1}},
+                "heavy": {"type":"noul","noul":heavy},
+                "endless": {"type":"noul","noul":endless}
             },
             "usage":{"input_tokens":0,"output_tokens":0}
         })).unwrap();
         let (estimate, endless) = prior(&response, 0.9, 0.9, THRESHOLD_MS);
         assert_eq!(estimate.map(|estimate| estimate.p90_ms), expected);
         assert_eq!(endless, is_endless);
+    }
+
+    #[test_case(THRESHOLD_MS, &[ENDLESS, INSTANT, LONG, SHORT]; "default_threshold")]
+    #[test_case(INSTANT_MS, &[ENDLESS, INSTANT, LONG]; "threshold_within_instant")]
+    fn duration_options_match_measured_labels(threshold_ms: u64, expected: &[&str]) {
+        let questions = duration_questions(threshold_ms).unwrap();
+        let options: BTreeSet<_> = questions.questions()["duration"]
+            .criteria
+            .as_ref()
+            .and_then(Value::as_object)
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        let measured: BTreeSet<_> = [INSTANT_MS, INSTANT_MS + 1, threshold_ms - 1, threshold_ms]
+            .into_iter()
+            .filter_map(|elapsed| duration_label(&DurationOutcome::Ok, elapsed, threshold_ms))
+            .chain([ENDLESS])
+            .collect();
+        assert_eq!(options, measured);
+        assert_eq!(options, expected.iter().copied().collect());
     }
 
     #[test_case(FeatureMode::Off, false, false)]
@@ -723,7 +807,7 @@ mod tests {
             let temp = tempfile::tempdir().unwrap();
             let dir = StateDir::from_path(temp.path().join("state"));
             let mut config = DecisionsConfig {
-                endpoint: Some(ENDPOINT.parse().unwrap()),
+                base_url: Some(BASE_URL.parse().unwrap()),
                 ..Default::default()
             };
             config.features.shell_duration = FeatureMode::Enforce;

@@ -87,24 +87,15 @@ impl WorkflowHost for SmokeHost {
             for (id, question) in questions {
                 let answer = match question["type"].as_str() {
                     Some("choice") => {
-                        let options: Vec<Value> = match &question["criteria"] {
-                            Value::Object(options) => {
-                                options.keys().cloned().map(Value::String).collect()
-                            }
-                            Value::Array(options) => options.clone(),
-                            _ => Vec::new(),
-                        };
+                        let options: Vec<&String> = question["criteria"]
+                            .as_object()
+                            .map(|options| options.keys().collect())
+                            .unwrap_or_default();
                         let probabilities: Map<String, Value> = options
                             .iter()
                             .enumerate()
                             .map(|(index, option)| {
-                                (
-                                    option
-                                        .as_str()
-                                        .map(str::to_owned)
-                                        .unwrap_or_else(|| option.to_string()),
-                                    json!(if index == 0 { 1.0 } else { 0.0 }),
-                                )
+                                ((*option).clone(), json!(if index == 0 { 1.0 } else { 0.0 }))
                             })
                             .collect();
                         json!({ "type": "choice", "choice": options.first(), "probabilities": probabilities, "confidence": 1.0 })
@@ -123,7 +114,7 @@ impl WorkflowHost for SmokeHost {
                         }
                         json!({ "type": "score", "score": 0.0, "legend": legend, "probabilities": probabilities, "confidence": 1.0 })
                     }
-                    _ => json!({ "type": "noul", "noul": 0.0, "confidence": 1.0 }),
+                    _ => json!({ "type": "noul", "noul": 0.0 }),
                 };
                 answers.insert(id.clone(), answer);
             }
@@ -227,13 +218,18 @@ mod tests {
                 route: #{{ type: "choice", instructions: "Route?", criteria: #{{ a: "first", b: "second" }} }},
                 level: #{{ type: "score", instructions: "Level?", criteria: ["low", "high"] }}
             }});
-            complete([result.answers.ready.noul, result.answers.route.choice, result.answers.level.score, result.model]);"#
+            complete([result.answers.ready, result.answers.route.choice, result.answers.level.score, result.model]);"#
         );
         let report = validate(&source).unwrap();
         assert_eq!(report.smoke.host_calls, 1);
         assert_eq!(
             report.smoke.outcome,
-            WorkflowOutcome::Completed(json!([0.0, "a", 0.0, SMOKE_DECISION_MODEL]))
+            WorkflowOutcome::Completed(json!([
+                {"type": "noul", "noul": 0.0},
+                "a",
+                0.0,
+                SMOKE_DECISION_MODEL
+            ]))
         );
         assert_eq!(
             validate(&source).unwrap().smoke.outcome,

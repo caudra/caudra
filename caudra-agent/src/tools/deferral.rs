@@ -108,7 +108,6 @@ pub(crate) async fn rank_tool_search<'a, 'b>(
                 kind: QuestionType::Choice,
                 instructions: json!(SEARCH_INSTRUCTIONS),
                 criteria: Some(Value::Object(options)),
-                labels: None,
             },
         )]
         .into(),
@@ -125,15 +124,14 @@ pub(crate) async fn rank_tool_search<'a, 'b>(
     let Answer::Choice(answer) = response.answers.get(SEARCH_QUESTION)? else {
         return None;
     };
-    let choice = answer.choice.as_str()?;
     let threshold = decisions.config().thresholds.routing_confidence;
-    if answer.metadata.confidence < threshold
-        || answer.probabilities.get(choice).copied()? < threshold
+    if answer.confidence < threshold
+        || answer.probabilities.get(&answer.choice).copied()? < threshold
     {
         return None;
     }
     Some(ToolSearchRanking {
-        index: ids.iter().position(|id| id == choice)?,
+        index: ids.iter().position(|id| *id == answer.choice)?,
         decisions,
         receipt: outcome.receipt,
     })
@@ -650,8 +648,7 @@ pub(crate) mod tests {
     use caudra_config::decisions::DecisionsConfig;
     use caudra_config::{Feature, FeatureFlags};
     use caudra_decision::{
-        AnswerMetadata, ChoiceAnswer, DecisionEngine, DecisionError, DecisionRequest,
-        DecisionResponse, Usage,
+        ChoiceAnswer, DecisionEngine, DecisionError, DecisionRequest, DecisionResponse, Usage,
     };
     use caudra_storage::StateDir;
     use futures_lite::future;
@@ -682,7 +679,7 @@ pub(crate) mod tests {
     const UNREACHABLE_CHOICE: &str = "unreachable";
     pub(crate) const PENDING_CHOICE: &str = "pending";
     const TEST_THRESHOLD: f64 = 0.9;
-    const TEST_ENDPOINT: &str = "http://127.0.0.1:1/v1/systemone";
+    const TEST_BASE_URL: &str = "http://127.0.0.1:1";
     const TEST_TIMEOUT_MS: u64 = 5_000;
     const SEARCH_REDACTED: &str = "[redacted]";
     const WORKFLOWS_ON: FeatureFlags = FeatureFlags::NONE.with(Feature::Workflows);
@@ -730,17 +727,13 @@ pub(crate) mod tests {
                 })
                 .collect();
             Ok(DecisionResponse {
-                model: None,
+                model: request.model.clone(),
                 answers: [(
                     SEARCH_QUESTION.into(),
                     Answer::Choice(ChoiceAnswer {
-                        choice: json!(self.choice),
+                        choice: self.choice.clone(),
                         probabilities,
-                        metadata: AnswerMetadata {
-                            confidence: self.confidence,
-                            answer_confidence: None,
-                            action: None,
-                        },
+                        confidence: self.confidence,
                     }),
                 )]
                 .into(),
@@ -748,7 +741,6 @@ pub(crate) mod tests {
                     input_tokens: 1,
                     output_tokens: 1,
                 },
-                routing: None,
                 cache_hit: false,
             })
         }
@@ -795,7 +787,7 @@ pub(crate) mod tests {
             let root = tempfile::tempdir().unwrap();
             let requests = Arc::new(Mutex::new(Vec::new()));
             let mut config = DecisionsConfig {
-                endpoint: Some(TEST_ENDPOINT.parse().unwrap()),
+                base_url: Some(TEST_BASE_URL.parse().unwrap()),
                 timeout_ms: TEST_TIMEOUT_MS,
                 log,
                 ..DecisionsConfig::default()

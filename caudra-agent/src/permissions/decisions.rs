@@ -388,8 +388,7 @@ mod tests {
     use caudra_config::decisions::{DecisionsConfig, FeatureMode};
     use caudra_config::{Effect, PermissionsConfig, ToolKey};
     use caudra_decision::{
-        Answer, AnswerMetadata, DecisionEngine, DecisionError, DecisionRequest, DecisionResponse,
-        NoulAnswer, Usage,
+        Answer, DecisionEngine, DecisionError, DecisionRequest, DecisionResponse, NoulAnswer, Usage,
     };
     use caudra_storage::StateDir;
     use caudra_storage::decision_log::{DecisionEffect, DecisionLog};
@@ -402,7 +401,7 @@ mod tests {
     use tempfile::TempDir;
     use test_case::test_case;
 
-    const ENDPOINT: &str = "http://127.0.0.1:1/v1/systemone";
+    const BASE_URL: &str = "http://127.0.0.1:1";
     const TIMEOUT_MS: u64 = 5_000;
     const SHORT_TIMEOUT_MS: u64 = 1;
     const UNKNOWN_FLAG: &str = "untrusted text";
@@ -445,30 +444,17 @@ mod tests {
                 Behavior::Pending => return future::pending().await,
             };
             Ok(DecisionResponse {
-                model: None,
+                model: request.model.clone(),
                 answers: request
                     .questions
                     .keys()
                     .filter(|_| !matches!(self.behavior, Behavior::Invalid))
-                    .map(|id| {
-                        (
-                            id.clone(),
-                            Answer::Noul(NoulAnswer {
-                                noul: probability,
-                                metadata: AnswerMetadata {
-                                    confidence: 1.0,
-                                    answer_confidence: None,
-                                    action: None,
-                                },
-                            }),
-                        )
-                    })
+                    .map(|id| (id.clone(), Answer::Noul(NoulAnswer { noul: probability })))
                     .collect(),
                 usage: Usage {
                     input_tokens: 1,
                     output_tokens: 1,
                 },
-                routing: None,
                 cache_hit: false,
             })
         }
@@ -489,7 +475,7 @@ mod tests {
         delayed: bool,
     ) -> Service {
         let mut config = DecisionsConfig {
-            endpoint: Some(ENDPOINT.parse().unwrap()),
+            base_url: Some(BASE_URL.parse().unwrap()),
             timeout_ms: TIMEOUT_MS,
             ..Default::default()
         };
@@ -982,7 +968,7 @@ mod tests {
     ) {
         smol::block_on(async {
             let mut config = DecisionsConfig {
-                endpoint: Some(ENDPOINT.parse().unwrap()),
+                base_url: Some(BASE_URL.parse().unwrap()),
                 timeout_ms: TIMEOUT_MS,
                 ..Default::default()
             };
@@ -1023,7 +1009,7 @@ mod tests {
     fn shell_effect_and_permission_flags_merge_without_changing_authority() {
         smol::block_on(async {
             let mut config = DecisionsConfig {
-                endpoint: Some(ENDPOINT.parse().unwrap()),
+                base_url: Some(BASE_URL.parse().unwrap()),
                 timeout_ms: TIMEOUT_MS,
                 ..Default::default()
             };
@@ -1078,7 +1064,7 @@ mod tests {
 
     fn logged_service() -> Service {
         let mut config = DecisionsConfig {
-            endpoint: Some(ENDPOINT.parse().unwrap()),
+            base_url: Some(BASE_URL.parse().unwrap()),
             timeout_ms: TIMEOUT_MS,
             log: true,
             ..Default::default()
@@ -1241,7 +1227,7 @@ mod tests {
     fn explicit_answers_attach_only_user_approval_labels(answer: PermissionAnswer, approves: bool) {
         smol::block_on(async {
             let mut config = DecisionsConfig {
-                endpoint: Some(ENDPOINT.parse().unwrap()),
+                base_url: Some(BASE_URL.parse().unwrap()),
                 timeout_ms: TIMEOUT_MS,
                 log: true,
                 ..Default::default()

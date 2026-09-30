@@ -101,7 +101,6 @@ fn project_questions(value: &Value) -> Result<QuestionSet, DecisionError> {
                 "type" => value.clone(),
                 "instructions" => redact(value)?,
                 "criteria" => project_criteria(kind, value)?,
-                "labels" => preserve(value)?,
                 _ => return Err(DecisionError::Rejected(INVALID_REQUEST)),
             };
             fields.insert(key.clone(), value);
@@ -126,6 +125,8 @@ fn project_criteria(kind: &str, value: &Value) -> Result<Value, DecisionError> {
             projected.insert(id.clone(), redact(description)?);
         }
         Ok(Value::Object(projected))
+    } else if kind == "choice" {
+        Err(DecisionError::Rejected(INVALID_REQUEST))
     } else {
         preserve(value)
     }
@@ -160,8 +161,7 @@ mod tests {
     use async_trait::async_trait;
     use caudra_config::decisions::DecisionsConfig;
     use caudra_decision::{
-        Answer, AnswerMetadata, DecisionEngine, DecisionError, DecisionRequest, DecisionResponse,
-        NoulAnswer, Usage,
+        Answer, DecisionEngine, DecisionError, DecisionRequest, DecisionResponse, NoulAnswer, Usage,
     };
     use caudra_storage::decision_log::{DecisionLabel, DecisionLog};
     use caudra_storage::usage_ledger::UsageLedger;
@@ -171,10 +171,13 @@ mod tests {
     use serde_json::{Value, json};
     use test_case::test_case;
 
-    use super::{DecisionContext, DecisionFeature, Decisions, UNSAFE_MODEL, project_questions};
+    use super::{
+        DecisionContext, DecisionFeature, Decisions, INVALID_REQUEST, UNSAFE_MODEL,
+        project_questions,
+    };
 
     const SECRET: &str = "do-not-send-this-value";
-    const ENDPOINT: &str = "http://127.0.0.1:1/v1/systemone";
+    const BASE_URL: &str = "http://127.0.0.1:1";
     const MODEL: &str = "workflow-model";
     const OTHER_MODEL: &str = "other-workflow-model";
     const TIMEOUT_MS: u64 = 5_000;
@@ -202,29 +205,16 @@ mod tests {
                 return future::pending().await;
             }
             Ok(DecisionResponse {
-                model: None,
+                model: request.model.clone(),
                 answers: request
                     .questions
                     .keys()
-                    .map(|id| {
-                        (
-                            id.clone(),
-                            Answer::Noul(NoulAnswer {
-                                noul: 1.0,
-                                metadata: AnswerMetadata {
-                                    confidence: 1.0,
-                                    answer_confidence: None,
-                                    action: None,
-                                },
-                            }),
-                        )
-                    })
+                    .map(|id| (id.clone(), Answer::Noul(NoulAnswer { noul: 1.0 })))
                     .collect(),
                 usage: Usage {
                     input_tokens: INPUT_TOKENS,
                     output_tokens: OUTPUT_TOKENS,
                 },
-                routing: None,
                 cache_hit: false,
             })
         }
@@ -232,7 +222,7 @@ mod tests {
 
     fn config(log: bool) -> DecisionsConfig {
         DecisionsConfig {
-            endpoint: Some(ENDPOINT.parse().unwrap()),
+            base_url: Some(BASE_URL.parse().unwrap()),
             timeout_ms: TIMEOUT_MS,
             log,
             ..Default::default()
@@ -382,7 +372,7 @@ mod tests {
     }
 
     #[test]
-    fn no_endpoint_returns_unavailable_without_creating_state() {
+    fn no_base_url_returns_unavailable_without_creating_state() {
         smol::block_on(async {
             let root = tempfile::tempdir().unwrap();
             let path = root.path().join("absent");
@@ -431,11 +421,19 @@ mod tests {
     }
 
     #[test_case(json!({"TOKEN=secret": {"type": "noul", "instructions": "test"}}); "question_id")]
-    #[test_case(json!({"route": {"type": "choice", "instructions": "test", "criteria": ["TOKEN=secret"]}}); "choice_array_label")]
-    #[test_case(json!({"route": {"type": "choice", "instructions": "test", "criteria": {"TOKEN=secret": "description"}}}); "choice_object_id")]
-    #[test_case(json!({"score": {"type": "score", "instructions": "test", "criteria": ["TOKEN=secret"]}}); "score_legend")]
+    #[test_case(json!({"route": {"type": "choice", "instructions": "test", "criteria": {"TOKEN=secret": "description"}}}); "choice_option")]
+    #[test_case(json!({"score": {"type": "score", "instructions": "test", "criteria": ["TOKEN=secret", "low"]}}); "score_legend")]
     fn redaction_never_renames_answers(questions: Value) {
         assert!(project_questions(&questions).is_err());
+    }
+
+    #[test_case(json!({"route": {"type": "choice", "instructions": "test", "criteria": ["fast", "slow"]}}); "choice_array")]
+    #[test_case(json!({"route": {"type": "noul", "instructions": "test", "labels": ["yes", "no"]}}); "labels")]
+    fn questions_follow_the_official_schema(questions: Value) {
+        assert_eq!(
+            project_questions(&questions).unwrap_err(),
+            DecisionError::Rejected(INVALID_REQUEST)
+        );
     }
 
     #[test]

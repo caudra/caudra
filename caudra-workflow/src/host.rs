@@ -1,4 +1,3 @@
-use std::collections::BTreeSet;
 use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
@@ -7,11 +6,13 @@ use serde_json::Value;
 use crate::journal::CallKey;
 
 pub const MAX_DECISION_QUESTIONS: usize = 64;
-pub const MAX_DECISION_CHOICE_OPTIONS: usize = 100;
+pub const MAX_DECISION_CHOICE_OPTIONS: usize = 255;
+pub const MIN_DECISION_SCORE_LEVELS: usize = 2;
 pub const MAX_DECISION_SCORE_LEVELS: usize = 10;
 pub const MAX_DECISION_TOTAL_OPTIONS: usize = 512;
 pub const MAX_DECISION_STATE_CHARS: usize = 50_000;
 pub const MAX_DECISION_REQUEST_BYTES: usize = 2 * 1024 * 1024;
+const NOUL_CRITERIA_KEYS: [&str; 2] = ["false", "true"];
 
 /// Script spellings accepted for `capability_mode`: Grok Build's four plus Caudra's `build`.
 pub const CAPABILITY_MODE_NAMES: [(&str, CapabilityMode); 5] = [
@@ -181,107 +182,70 @@ impl DecisionRequest {
             let question = question
                 .as_object()
                 .ok_or_else(|| invalid("definition must be a map"))?;
-            if question.keys().any(|key| {
-                !matches!(
-                    key.as_str(),
-                    "type" | "instructions" | "criteria" | "labels"
-                )
-            }) {
+            if question
+                .keys()
+                .any(|key| !matches!(key.as_str(), "type" | "instructions" | "criteria"))
+            {
                 return Err(invalid(
-                    "unknown field; expected type, instructions, criteria, or labels",
+                    "unknown field; expected type, instructions, or criteria",
                 ));
             }
-            if !matches!(
-                question.get("instructions"),
-                Some(Value::String(_) | Value::Object(_) | Value::Array(_))
-            ) {
+            if !question.get("instructions").is_some_and(is_content) {
                 return Err(invalid("instructions must be a string, map, or array"));
             }
-            let kind = question.get("type").and_then(Value::as_str);
             let criteria = question.get("criteria");
-            let count = match kind {
+            let count = match question.get("type").and_then(Value::as_str) {
                 Some("choice") => {
-                    let count = match criteria {
-                        Some(Value::Object(options)) => options.len(),
-                        Some(Value::Array(options))
-                            if options.iter().all(|v| !v.is_array() && !v.is_object()) =>
-                        {
-                            let keys: BTreeSet<String> = options
-                                .iter()
-                                .map(|option| {
-                                    option
-                                        .as_str()
-                                        .map(str::to_owned)
-                                        .unwrap_or_else(|| option.to_string())
-                                })
-                                .collect();
-                            if keys.len() != options.len() {
-                                return Err(invalid("choice labels must be unique"));
-                            }
-                            options.len()
-                        }
-                        _ => {
-                            return Err(invalid(
-                                "choice criteria must be a map or array of scalar labels",
-                            ));
-                        }
+                    let Some(Value::Object(options)) = criteria else {
+                        return Err(invalid("choice criteria must be a map"));
                     };
-                    if count == 0 || count > MAX_DECISION_CHOICE_OPTIONS {
-                        return Err(invalid("choice criteria must contain 1 to 100 options"));
+                    if options.is_empty() || options.len() > MAX_DECISION_CHOICE_OPTIONS {
+                        return Err(invalid(&format!(
+                            "choice criteria must contain 1 to {MAX_DECISION_CHOICE_OPTIONS} options"
+                        )));
                     }
-                    count
+                    if !options
+                        .values()
+                        .all(|description| description.is_null() || is_content(description))
+                    {
+                        return Err(invalid(
+                            "choice descriptions must be a string, map, array, or null",
+                        ));
+                    }
+                    options.len()
                 }
                 Some("score") => {
                     let Some(Value::Array(levels)) = criteria else {
                         return Err(invalid("score criteria must be an array"));
                     };
-                    if levels.is_empty()
-                        || levels.len() > MAX_DECISION_SCORE_LEVELS
-                        || levels.iter().any(Value::is_null)
+                    if !(MIN_DECISION_SCORE_LEVELS..=MAX_DECISION_SCORE_LEVELS)
+                        .contains(&levels.len())
+                        || !levels.iter().all(is_content)
                     {
-                        return Err(invalid(
-                            "score criteria must contain 1 to 10 non-null levels",
-                        ));
+                        return Err(invalid(&format!(
+                            "score criteria must contain {MIN_DECISION_SCORE_LEVELS} to {MAX_DECISION_SCORE_LEVELS} string, map, or array levels"
+                        )));
                     }
                     levels.len()
                 }
                 Some("noul") => {
-                    match criteria {
-                        None | Some(Value::Null) => (),
-                        Some(Value::Object(criteria))
-                            if criteria.keys().all(|key| {
-                                key.eq_ignore_ascii_case("true")
-                                    || key.eq_ignore_ascii_case("false")
-                            }) => {}
-                        _ => {
-                            return Err(invalid(
-                                "noul criteria must be a map keyed only true/false",
-                            ));
-                        }
+                    if !criteria.is_none_or(|criteria| {
+                        criteria.is_null()
+                            || criteria.as_object().is_some_and(|criteria| {
+                                criteria.iter().all(|(key, description)| {
+                                    NOUL_CRITERIA_KEYS.contains(&key.as_str())
+                                        && is_content(description)
+                                })
+                            })
+                    }) {
+                        return Err(invalid(
+                            "noul criteria must map true or false to a string, map, or array",
+                        ));
                     }
                     0
                 }
                 _ => return Err(invalid("type must be noul, choice, or score")),
             };
-            if question.contains_key("labels") && kind != Some("noul") {
-                return Err(invalid("labels are only supported for noul questions"));
-            }
-            if let Some(labels) = question.get("labels").filter(|labels| !labels.is_null()) {
-                let labels = labels
-                    .as_object()
-                    .ok_or_else(|| invalid("labels must be a map"))?;
-                let false_label = labels.get("false").and_then(Value::as_str).map(str::trim);
-                let true_label = labels.get("true").and_then(Value::as_str).map(str::trim);
-                if labels.len() != 2
-                    || false_label.is_none_or(str::is_empty)
-                    || true_label.is_none_or(str::is_empty)
-                    || false_label == true_label
-                {
-                    return Err(invalid(
-                        "labels must map true/false to distinct non-empty strings for a noul",
-                    ));
-                }
-            }
             total_options += count;
         }
         if total_options > MAX_DECISION_TOTAL_OPTIONS {
@@ -293,6 +257,10 @@ impl DecisionRequest {
         }
         Ok(())
     }
+}
+
+fn is_content(value: &Value) -> bool {
+    matches!(value, Value::String(_) | Value::Array(_) | Value::Object(_))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -364,10 +332,17 @@ mod tests {
         }
     }
 
+    fn choice_options(count: usize) -> Value {
+        Value::Object(
+            (0..count)
+                .map(|index| (index.to_string(), Value::Null))
+                .collect(),
+        )
+    }
+
     #[test_case(json!({ "type": "noul", "instructions": "Ready?" }); "noul")]
-    #[test_case(json!({ "type": "noul", "instructions": ["Ready?"], "criteria": { "true": ["yes"], "false": {"answer": "no"} }, "labels": { "true": "yes", "false": "no" } }); "structured_noul")]
-    #[test_case(json!({ "type": "choice", "instructions": { "question": "Route?" }, "criteria": { "a": "first", "b": ["second"] } }); "choice_map")]
-    #[test_case(json!({ "type": "choice", "instructions": "Route?", "criteria": ["a", 1, false, null] }); "choice_scalar_labels")]
+    #[test_case(json!({ "type": "noul", "instructions": ["Ready?"], "criteria": { "true": ["yes"], "false": {"answer": "no"} } }); "structured_noul")]
+    #[test_case(json!({ "type": "choice", "instructions": { "question": "Route?" }, "criteria": { "a": "first", "b": ["second"], "c": null } }); "choice_map")]
     #[test_case(json!({ "type": "score", "instructions": "Level?", "criteria": ["low", { "description": "high" }] }); "score")]
     fn valid_decision_question_shapes(question: Value) {
         decision_request(json!({ "q": question }))
@@ -383,15 +358,17 @@ mod tests {
     #[test_case(json!({ "q": { "type": "noul", "instructions": 1 } }); "numeric_instructions")]
     #[test_case(json!({ "q": { "type": "noul", "instructions": "Ready?", "criteria": [] } }); "noul_array")]
     #[test_case(json!({ "q": { "type": "noul", "instructions": "Ready?", "criteria": { "yes": "yes" } } }); "noul_wrong_keys")]
-    #[test_case(json!({ "q": { "type": "noul", "instructions": "Ready?", "labels": { "false": "same", "true": "same" } } }); "noul_duplicate_labels")]
+    #[test_case(json!({ "q": { "type": "noul", "instructions": "Ready?", "criteria": { "TRUE": "yes" } } }); "noul_uppercase_key")]
+    #[test_case(json!({ "q": { "type": "noul", "instructions": "Ready?", "criteria": { "true": null } } }); "noul_null_description")]
+    #[test_case(json!({ "q": { "type": "noul", "instructions": "Ready?", "labels": { "false": "no", "true": "yes" } } }); "labels")]
     #[test_case(json!({ "q": { "type": "choice", "instructions": "Route?", "criteria": {} } }); "empty_choice")]
-    #[test_case(json!({ "q": { "type": "choice", "instructions": "Route?", "criteria": [["nested"]] } }); "choice_nested_label")]
-    #[test_case(json!({ "q": { "type": "choice", "instructions": "Route?", "criteria": ["same", "same"] } }); "choice_duplicate_label")]
+    #[test_case(json!({ "q": { "type": "choice", "instructions": "Route?", "criteria": ["a", "b"] } }); "choice_array")]
+    #[test_case(json!({ "q": { "type": "choice", "instructions": "Route?", "criteria": { "a": 1 } } }); "choice_numeric_description")]
     #[test_case(json!({ "q": { "type": "noul", "instructions": "Ready?", "typo": "x" } }); "unknown_field")]
     #[test_case(json!({ "": { "type": "noul", "instructions": "Ready?" } }); "empty_id")]
     #[test_case(json!({ "q": { "type": "score", "instructions": "Level?", "criteria": { "0": "low" } } }); "score_map")]
-    #[test_case(json!({ "q": { "type": "score", "instructions": "Level?", "criteria": [null] } }); "score_null_level")]
-    #[test_case(json!({ "q": { "type": "score", "instructions": "Level?", "criteria": ["low"], "labels": null } }); "score_labels")]
+    #[test_case(json!({ "q": { "type": "score", "instructions": "Level?", "criteria": ["low", null] } }); "score_null_level")]
+    #[test_case(json!({ "q": { "type": "score", "instructions": "Level?", "criteria": ["low"] } }); "score_single_level")]
     fn invalid_decision_question_shapes(questions: Value) {
         let error = decision_request(questions).validate().unwrap_err();
         assert!(error.to_string().contains(INVALID_DECISION));
@@ -400,15 +377,22 @@ mod tests {
     #[test_case("choice", MAX_DECISION_CHOICE_OPTIONS; "choice")]
     #[test_case("score", MAX_DECISION_SCORE_LEVELS; "score")]
     fn decision_option_limits(kind: &str, limit: usize) {
-        let mut request = decision_request(json!({ "q": {
-            "type": kind, "instructions": "Choose", "criteria": (0..limit).map(|index| index.to_string()).collect::<Vec<_>>(),
-        }}));
-        request.validate().unwrap();
-        request.questions["q"]["criteria"]
-            .as_array_mut()
-            .unwrap()
-            .push(json!("extra"));
-        assert!(request.validate().is_err());
+        let request = |count: usize| {
+            let criteria = if kind == "choice" {
+                choice_options(count)
+            } else {
+                json!(
+                    (0..count)
+                        .map(|index| index.to_string())
+                        .collect::<Vec<_>>()
+                )
+            };
+            decision_request(
+                json!({ "q": { "type": kind, "instructions": "Choose", "criteria": criteria } }),
+            )
+        };
+        request(limit).validate().unwrap();
+        assert!(request(limit + 1).validate().is_err());
     }
 
     #[test]
@@ -427,7 +411,7 @@ mod tests {
         request.questions["extra"] = json!({ "type": "noul", "instructions": "Ready?" });
         assert!(request.validate().is_err());
         request.questions = Value::Object((0..MAX_DECISION_TOTAL_OPTIONS.div_ceil(MAX_DECISION_CHOICE_OPTIONS)).map(|index| {
-            (index.to_string(), json!({ "type": "choice", "instructions": "Route?", "criteria": (0..MAX_DECISION_CHOICE_OPTIONS).map(|index| index.to_string()).collect::<Vec<_>>() }))
+            (index.to_string(), json!({ "type": "choice", "instructions": "Route?", "criteria": choice_options(MAX_DECISION_CHOICE_OPTIONS) }))
         }).collect());
         assert!(request.validate().is_err());
     }

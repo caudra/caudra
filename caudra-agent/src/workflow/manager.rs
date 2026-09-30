@@ -1048,7 +1048,7 @@ complete(first.output.echo);
     const DECIDING: &str = "deciding";
     const DECISION_MODEL: &str = "workflow/model";
     const DECISION_SECRET: &str = "workflow-test-secret";
-    const DECISION_ENDPOINT: &str = "http://127.0.0.1:8000/v1/systemone";
+    const DECISION_BASE_URL: &str = "http://127.0.0.1:8000";
     const DECISION_TIMEOUT_MS: u64 = 60_000;
     const CONTROL_TEST_TIMEOUT: Duration = Duration::from_secs(5);
     const CONTROL_TIMEOUT_ERROR: &str = "workflow control waited for the decision deadline";
@@ -1115,7 +1115,8 @@ complete(result);
                 return Err(error.clone());
             }
             Ok(serde_json::from_value(json!({
-                "answers": { "ready": { "type": "noul", "noul": 0.9, "confidence": 0.9 } },
+                "model": request.model,
+                "answers": { "ready": { "type": "noul", "noul": 0.9 } },
                 "usage": { "input_tokens": 1, "output_tokens": 1 },
             }))
             .unwrap())
@@ -1142,7 +1143,7 @@ complete(result);
             block,
         });
         let config = DecisionsConfig {
-            endpoint: Some(DECISION_ENDPOINT.parse().unwrap()),
+            base_url: Some(DECISION_BASE_URL.parse().unwrap()),
             model: MODEL.into(),
             timeout_ms: DECISION_TIMEOUT_MS,
             ..DecisionsConfig::default()

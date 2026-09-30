@@ -201,7 +201,7 @@ let result = decide(#{ task: args.objective }, #{
 let job = if result.answers.deep_reasoning.noul >= 0.9 { "best" } else { "fast" };
 ```
 
-Question IDs map to definitions with `type`, `instructions`, and optional `criteria`. Types are `noul` (probability in the answer's `noul` field), `choice` (named criteria or an option array), and `score` (ordered level array). Limits: 64 questions, 100 choice options, 10 score levels, 512 total options. Optional `model` selects a decision model, not an agent model. Optional `timeout_ms` can shorten but cannot extend the user's configured deadline.
+Question IDs map to definitions with `type`, `instructions`, and optional `criteria`. Types are `noul` (only a probability, in the answer's `noul` field), `choice` (a map from option name to description or `()`), and `score` (ordered array of 2 to 10 levels). Choice and score answers also carry `confidence`. Limits: 64 questions, 255 choice options, 512 total options. Optional `model` selects a decision model, not an agent model. Optional `timeout_ms` can shorten but cannot extend the user's configured deadline.
 
 Use short, non-sensitive states. The runtime redacts and bounds serialized states to 1,500 bytes. Oversized states and questions whose answer semantics would change under redaction are rejected. Endpoint failures and timeouts are catchable errors. Successful calls are committed before returning and replayed without network calls on resume. Failed or uncommitted calls can be retried. Decision request bodies are hidden from the workflow journal. Opt-in decision logging stores the redacted state sent to the endpoint.
 

@@ -488,9 +488,9 @@ Auto is not a security boundary. An engine miss can let an eligible call run. En
 
 ### Decision engine advice
 
-The decision engine needs the same `experimental.decision_engine` switch, and so do `caudra decisions` and `/decisions`. While the switch is off, `[decisions]` settings have no effect, and existing decision logs and shell duration history stay untouched. Turning the switch on enables nothing by itself. The engine still needs its endpoint and a mode for each feature, and Auto still has to be selected.
+The decision engine needs the same `experimental.decision_engine` switch, and so do `caudra decisions` and `/decisions`. While the switch is off, `[decisions]` settings have no effect, and existing decision logs and shell duration history stay untouched. Turning the switch on enables nothing by itself. The engine still needs a base URL and a mode for each feature, and Auto still has to be selected.
 
-Decision features are opt-in and configured in the `[decisions]` table of the global `caudra.toml`. A project may disable a feature or logging and shorten retention, but cannot redirect the endpoint, change thresholds, or enable a feature. Non-loopback endpoints require `allow_remote = true` because decision context leaves the machine. See the [configuration reference](/docs/configuration/#decisions) for fields, defaults, and supported modes.
+Decision features are opt-in and configured in the `[decisions]` table of the global `caudra.toml`. A project may disable a feature or logging and shorten retention, but cannot change the base URL or thresholds, or enable a feature. A non-loopback base URL requires `allow_remote = true` because decision context leaves the machine. See the [configuration reference](/docs/configuration/#decisions) for fields, defaults, and supported modes.
 
 Decision requests connect directly to the configured endpoint. They ignore ambient proxy variables and do not follow HTTP redirects, so project environment settings cannot redirect a loopback request.
 
@@ -498,7 +498,7 @@ HTTPS is required except for numeric loopback HTTP. A user-global `allow_http = 
 
 ```toml
 [decisions]
-endpoint = "http://127.0.0.1:8000/v1/systemone"
+base_url = "http://127.0.0.1:8000"
 timeout_ms = 400
 log = false
 

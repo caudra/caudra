@@ -470,13 +470,13 @@ Inside a Herdr pane, `auto` asks Herdr to create and remove worktrees, so each o
 
 ### `decisions`
 
-Configure the optional typed decision engine in the `[decisions]` table. The engine is experimental and needs `decision_engine = true` under [`[experimental]`](#experimental-features). Without that switch Caudra still validates this table and starts no engine. It then sends no decision requests, reads no engine credentials, and leaves decision logs and shell duration history untouched. No endpoint, passive feature, or decision logging is enabled by default. Explicit workflow [`decide()` calls](/docs/workflows/#typed-decisions) need an endpoint but do not need a passive feature enabled. Shell duration history can work without an endpoint.
+Configure the optional typed decision engine in the `[decisions]` table. The engine is experimental and needs `decision_engine = true` under [`[experimental]`](#experimental-features). Without that switch Caudra still validates this table and starts no engine. It then sends no decision requests, reads no engine credentials, and leaves decision logs and shell duration history untouched. No base URL, passive feature, or decision logging is enabled by default. Explicit workflow [`decide()` calls](/docs/workflows/#typed-decisions) need a base URL but do not need a passive feature enabled. Shell duration history can work without a base URL.
 
 Connection settings and thresholds are global-only. Projects may set individual features to `"off"`, set `log = false`, or keep or shorten inherited log retention. Other project overrides are errors, even when they repeat a global value. Disabling globally required Auto screening or its active content screening restores prompting for eligible Auto calls.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `endpoint` | string | unset | Full request URL. HTTPS required except for numeric loopback HTTP or explicit `allow_http` consent. No credentials, query, fragment, whitespace, or control characters. |
+| `base_url` | string | unset | Decision API base URL, such as `https://api.typesafe.ai`. Caudra appends `/v1/systemone` and keeps any path prefix. `TYPESAFE_BASE_URL` replaces a configured value. HTTPS required except for numeric loopback HTTP or explicit `allow_http` consent. No credentials, query, fragment, whitespace, or control characters. |
 | `model` | string | `jev-latest` | Decision model identifier, nonblank and without control characters. |
 | `api_key_env` | string | `TYPESAFE_API_KEY` | Environment variable containing the optional credential, never the credential itself. Project environment values are excluded. |
 | `allow_remote` | boolean | `false` | Explicit global consent to send decision context to a non-loopback endpoint. |
@@ -487,7 +487,19 @@ Connection settings and thresholds are global-only. Projects may set individual 
 | `features` | table | `{}` | Per-feature modes below. |
 | `thresholds` | table | `{}` | Probability thresholds, all finite and within 0–1 inclusive. |
 
-`TYPESAFE_BASE_URL` replaces only the origin of an explicitly configured endpoint, preserving its path. It must be an origin without a path and passes the same endpoint and both transport opt-in checks. The variable alone never activates the engine. Requests ignore ambient proxies and do not follow redirects. `localhost` is a DNS name, not numeric loopback for this policy. Private and CGNAT addresses receive no automatic HTTP exemption. These settings do not change Workcell transport policy.
+Caudra sends each request to `base_url` with `/v1/systemone` appended. A path prefix stays in place, so a server mounted under `/typesafe` uses `base_url = "http://127.0.0.1:8080/typesafe"` and receives requests at `/typesafe/v1/systemone`. Leave `/v1/systemone` out of `base_url`. The hosted API also needs remote consent:
+
+```toml
+[decisions]
+base_url = "https://api.typesafe.ai"
+allow_remote = true
+```
+
+`TYPESAFE_BASE_URL` replaces the whole configured base URL, path prefix included, and passes the same URL and transport opt-in checks. It applies only when `base_url` is set, so the variable alone never activates the engine. Project `.env` files cannot set it.
+
+Caudra retries HTTP 408, 429, and 5xx responses at most twice. Each retry waits for the delay the server requests in `retry-after-ms` or `Retry-After`, or else for an exponential backoff that starts near half a second. No retry waits past `timeout_ms`, so under the default 400 ms deadline most retries need a short server-requested delay. Connection failures, 401, 422, and other client errors fail at once.
+
+Requests ignore ambient proxies and do not follow redirects. `localhost` is a DNS name, not numeric loopback for this policy. Private and CGNAT addresses receive no automatic HTTP exemption. These settings do not change Workcell transport policy.
 
 Redaction is best effort. Decision context can include commands, task text, tool output, and candidate descriptions. Review what you send and any exports before sharing them. See [decision advice and logging](/docs/permissions/#decision-engine-advice).
 
@@ -519,7 +531,7 @@ Flag thresholds trigger at or above the configured value. Goal prescreening uses
 | `content_addressed_to_agent` | float | `0.9` | Probability that sampled content addresses the agent. |
 | `shell_endless` | float | `0.9` | Probability that a shell command runs until stopped. |
 | `shell_heavy` | float | `0.9` | Probability for a heavy-command prior and confidence required for a duration choice. |
-| `routing_confidence` | float | `0.9` | Confidence required for tool search, skill suggestions, and subagent routing. Tool-search choice probability must also meet it. |
+| `routing_confidence` | float | `0.9` | Confidence required for tool search, skill suggestions, and subagent routing. Tool-search choice probability must also meet it. Yes/no answers carry no confidence, so subagent routing requires each yes/no probability to be at least this value or at most 1 minus it. |
 | `goal_skip_below` | float | `0.05` | Skip an evaluator at or below this completion probability, within the continuation budget. |
 | `shell_writes` | float | unset | Optional project-write warning threshold. Omission leaves the warning disabled. No built-in enforcement threshold. |
 
@@ -527,13 +539,15 @@ Flag thresholds trigger at or above the configured value. Goal prescreening uses
 
 `shell_duration` applies only to eligible local native shell calls, not remote workspaces or managed sandboxes. Measured exact-command history takes priority over command-family history, and both take priority over a model estimate. Timeouts, cancellations, and failures are recorded separately from completed latency samples. History is separate from the opt-in decision log, so `log = false` does not disable duration observations.
 
+A model estimate picks a bucket. `instant` finishes within 1 second, `short` finishes under `agent.shell_async_threshold_secs`, `long` finishes at or beyond that threshold, and `endless` runs until stopped. Measured runs are labeled with the same buckets.
+
 In `advise`, estimates and warnings leave execution unchanged. In `enforce`, an omitted `timeoutSec` may receive a default based on 1.5 times estimated p90, bounded by the tool schema's default and maximum. An explicit timeout is never changed. An endless prediction gives caution only and does not remove the execution deadline.
 
 With `agent.shell_execution = "auto"`, Enforce estimates can select synchronous or asynchronous delivery at admission, bounded by the effective timeout and `agent.shell_async_threshold_secs`. Explicit sync/async settings still win. Elapsed runtime never promotes a synchronous call to asynchronous delivery. An admission receipt is not completion or success.
 
 #### Question overrides
 
-Only the permission question set currently supports a user-global file override: `~/.config/caudra/decisions/permission.json`. It must be a regular JSON file no larger than 64 KiB, retain all required question IDs as `noul`, and pass question validation. It is read when an endpoint and permission advice or Auto screening are enabled. Projects cannot supply this override. Other feature question sets have no file override.
+Only the permission question set currently supports a user-global file override: `~/.config/caudra/decisions/permission.json`. It must be a regular JSON file no larger than 64 KiB, retain all required question IDs as `noul`, and pass question validation. It is read when a base URL is set and permission advice or Auto screening is enabled. Projects cannot supply this override. Other feature question sets have no file override.
 
 ## Plugins
 

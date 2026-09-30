@@ -521,9 +521,9 @@ fn write_decisions_section(out: &mut String) {
          [`[experimental]`](#experimental-features). Without that switch Caudra still validates \
          this table and starts no engine. It then sends no decision requests, reads no engine \
          credentials, and leaves decision logs and shell duration history untouched. \
-         No endpoint, passive feature, or decision logging is enabled by default. \
-         Explicit workflow [`decide()` calls](/docs/workflows/#typed-decisions) need an endpoint \
-         but do not need a passive feature enabled. Shell duration history can work without an endpoint.\n\n\
+         No base URL, passive feature, or decision logging is enabled by default. \
+         Explicit workflow [`decide()` calls](/docs/workflows/#typed-decisions) need a base URL \
+         but do not need a passive feature enabled. Shell duration history can work without a base URL.\n\n\
          Connection settings and thresholds are global-only. Projects may set individual features \
          to `\"off\"`, set `log = false`, or keep or shorten inherited log retention. \
          Other project overrides are errors, even when they repeat a global value. \
@@ -532,9 +532,24 @@ fn write_decisions_section(out: &mut String) {
     );
     write_table(out, DecisionsConfig::FIELDS);
     out.push_str(
-        "\n`TYPESAFE_BASE_URL` replaces only the origin of an explicitly configured endpoint, \
-         preserving its path. It must be an origin without a path and passes the same endpoint \
-         and both transport opt-in checks. The variable alone never activates the engine. \
+        "\nCaudra sends each request to `base_url` with `/v1/systemone` appended. A path prefix \
+         stays in place, so a server mounted under `/typesafe` uses \
+         `base_url = \"http://127.0.0.1:8080/typesafe\"` and receives requests at \
+         `/typesafe/v1/systemone`. Leave `/v1/systemone` out of `base_url`. The hosted API also \
+         needs remote consent:\n\n\
+         ```toml\n\
+         [decisions]\n\
+         base_url = \"https://api.typesafe.ai\"\n\
+         allow_remote = true\n\
+         ```\n\n\
+         `TYPESAFE_BASE_URL` replaces the whole configured base URL, path prefix included, and \
+         passes the same URL and transport opt-in checks. It applies only when `base_url` is set, \
+         so the variable alone never activates the engine. Project `.env` files cannot set it.\n\n\
+         Caudra retries HTTP 408, 429, and 5xx responses at most twice. Each retry waits for the \
+         delay the server requests in `retry-after-ms` or `Retry-After`, or else for an exponential \
+         backoff that starts near half a second. No retry waits past `timeout_ms`, so under the \
+         default 400 ms deadline most retries need a short server-requested delay. Connection \
+         failures, 401, 422, and other client errors fail at once.\n\n\
          Requests ignore ambient proxies and do not follow redirects. `localhost` is a DNS name, \
          not numeric loopback for this policy. Private and CGNAT addresses receive no automatic HTTP exemption. \
          These settings do not change Workcell transport policy.\n\n\
@@ -584,6 +599,9 @@ fn write_decisions_section(out: &mut String) {
          history, and both take priority over a model estimate. Timeouts, cancellations, and failures \
          are recorded separately from completed latency samples. History is separate from the \
          opt-in decision log, so `log = false` does not disable duration observations.\n\n\
+         A model estimate picks a bucket. `instant` finishes within 1 second, `short` finishes \
+         under `agent.shell_async_threshold_secs`, `long` finishes at or beyond that threshold, \
+         and `endless` runs until stopped. Measured runs are labeled with the same buckets.\n\n\
          In `advise`, estimates and warnings leave execution unchanged. In `enforce`, an omitted \
          `timeoutSec` may receive a default based on 1.5 times estimated p90, bounded by the \
          tool schema's default and maximum. An explicit timeout is never changed. An endless \
@@ -597,7 +615,7 @@ fn write_decisions_section(out: &mut String) {
          Only the permission question set currently supports a user-global file override: \
          `~/.config/caudra/decisions/permission.json`. It must be a regular JSON file no larger \
          than 64 KiB, retain all required question IDs as `noul`, and pass question validation. \
-         It is read when an endpoint and permission advice or Auto screening are enabled. \
+         It is read when a base URL is set and permission advice or Auto screening is enabled. \
          Projects cannot supply this override. Other feature question sets have no file override.\n\n",
     );
 }

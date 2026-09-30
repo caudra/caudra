@@ -113,7 +113,7 @@ use test_case::test_case;
 
 const WRITER_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 const DECISIONS_COMMAND: &str = "/decisions";
-const DECISIONS_TEST_ENDPOINT: &str = "http://127.0.0.1:9";
+const DECISIONS_TEST_BASE_URL: &str = "http://127.0.0.1:9";
 const DECISIONS_TEST_MODEL: &str = "test-decision-model";
 const DECISIONS_TEST_ERROR: &str = "transport";
 const DECISIONS_NOT_CHECKED: &str = "Cached reachability: unknown (not checked)";
@@ -9636,7 +9636,7 @@ fn decisions_command_reports_off_without_changing_permissions(task: bool, mode: 
 fn decisions_command_reads_configuration_without_probing(mode: PermissionMode) {
     let mut app = test_app();
     let config = DecisionsConfig {
-        endpoint: Some(DECISIONS_TEST_ENDPOINT.parse().unwrap()),
+        base_url: Some(DECISIONS_TEST_BASE_URL.parse().unwrap()),
         model: DECISIONS_TEST_MODEL.into(),
         ..Default::default()
     };
@@ -9647,7 +9647,7 @@ fn decisions_command_reads_configuration_without_probing(mode: PermissionMode) {
     assert!(app.execute_command(cmd(DECISIONS_COMMAND), 0).is_empty());
     let text = app.active_chat().last_message_text();
     for expected in [
-        DECISIONS_TEST_ENDPOINT,
+        DECISIONS_TEST_BASE_URL,
         DECISIONS_TEST_MODEL,
         DECISIONS_NOT_CHECKED,
         "Session tainted: yes",
@@ -9668,7 +9668,7 @@ fn decisions_status_reports_only_cached_health_and_configured_modes(
     expected: &str,
 ) {
     let config = DecisionsConfig {
-        endpoint: Some(DECISIONS_TEST_ENDPOINT.parse().unwrap()),
+        base_url: Some(DECISIONS_TEST_BASE_URL.parse().unwrap()),
         features: DecisionFeatures {
             permission_advice: FeatureMode::Advise,
             auto_screening: FeatureMode::Enforce,
@@ -9707,9 +9707,9 @@ fn decisions_status_reports_only_cached_health_and_configured_modes(
 
 #[test_case("https://private-user:private-password@example.com:8443/private-path?private-query#private-fragment", "https://example.com:8443"; "remote")]
 #[test_case("http://private-user:private-password@[::1]:8080/private-path?private-query#private-fragment", "http://[::1]:8080"; "ipv6")]
-fn decisions_status_displays_only_the_endpoint_origin(endpoint: &str, origin: &str) {
+fn decisions_status_displays_only_the_endpoint_origin(base_url: &str, origin: &str) {
     let config = DecisionsConfig {
-        endpoint: Some(endpoint.parse().unwrap()),
+        base_url: Some(base_url.parse().unwrap()),
         model: "test-model\n\u{1b}[2J".into(),
         api_key_env: "PRIVATE_API_KEY_ENV".into(),
         ..Default::default()

@@ -1,20 +1,27 @@
 use std::io::ErrorKind;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use async_io::Timer;
 use async_trait::async_trait;
 use futures_lite::{future, io::AsyncReadExt};
 use isahc::config::{Configurable, RedirectPolicy};
-use isahc::http::{HeaderValue, Uri, header};
+use isahc::http::{HeaderMap, HeaderValue, StatusCode, Uri, header};
 use isahc::{HttpClient, Request};
+use jiff::fmt::rfc2822::DateTimeParser;
 use url::Url;
 
 use crate::engine::{DecisionEngine, DecisionError, check_deadline};
 use crate::question_set::bounded_json;
 use crate::wire::{DecisionRequest, DecisionResponse, MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES};
 
-const RETRY_DELAY: Duration = Duration::from_millis(25);
-const MAX_ATTEMPTS: usize = 2;
+const MAX_RETRIES: u32 = 2;
+const BACKOFF_INITIAL: Duration = Duration::from_millis(500);
+const BACKOFF_MAX: Duration = Duration::from_secs(5);
+const BACKOFF_MULTIPLIER: u32 = 2;
+const BACKOFF_JITTER: f64 = 0.25;
+const RETRY_AFTER_MS: &str = "retry-after-ms";
+const MILLIS_PER_SECOND: f64 = 1_000.0;
+static HTTP_DATE: DateTimeParser = DateTimeParser::new();
 
 pub struct HttpDecisionClient {
     client: HttpClient,
@@ -73,7 +80,8 @@ impl HttpDecisionClient {
         deadline: Instant,
     ) -> Result<DecisionResponse, DecisionError> {
         let body = bounded_json(request, MAX_REQUEST_BYTES)?;
-        for attempt in 0..MAX_ATTEMPTS {
+        let mut retries = 0;
+        loop {
             check_deadline(deadline)?;
             let mut builder = Request::post(self.endpoint.clone())
                 .timeout(deadline.saturating_duration_since(Instant::now()))
@@ -97,27 +105,27 @@ impl HttpDecisionClient {
                         DecisionError::Unreachable
                     }
                 })?;
-            let status = response.status().as_u16();
-            if attempt == 0 && matches!(status, 429 | 503 | 529) {
-                let delay = response
-                    .headers()
-                    .get(header::RETRY_AFTER)
-                    .and_then(|value| value.to_str().ok())
-                    .and_then(|value| value.parse::<u64>().ok())
-                    .map(Duration::from_secs)
-                    .unwrap_or(RETRY_DELAY);
-                drop(response);
-                let Some(retry_at) = Instant::now()
-                    .checked_add(delay)
-                    .filter(|at| *at < deadline)
-                else {
-                    return Err(DecisionError::Timeout);
+            let status = response.status();
+            if !status.is_success() {
+                let failure = DecisionError::Http {
+                    status: status.as_u16(),
                 };
+                if retries == MAX_RETRIES || !is_retryable(status) {
+                    return Err(failure);
+                }
+                let retry_at = retry_delay(
+                    response.headers(),
+                    retries,
+                    SystemTime::now(),
+                    fastrand::f64(),
+                )
+                .and_then(|delay| Instant::now().checked_add(delay))
+                .filter(|at| *at < deadline)
+                .ok_or(failure)?;
+                drop(response);
                 Timer::at(retry_at).await;
+                retries += 1;
                 continue;
-            }
-            if !(200..300).contains(&status) {
-                return Err(DecisionError::Http { status });
             }
             if response
                 .headers()
@@ -152,8 +160,46 @@ impl HttpDecisionClient {
             check_deadline(deadline)?;
             return Ok(response);
         }
-        Err(DecisionError::Timeout)
     }
+}
+
+fn is_retryable(status: StatusCode) -> bool {
+    matches!(
+        status,
+        StatusCode::REQUEST_TIMEOUT | StatusCode::TOO_MANY_REQUESTS
+    ) || status.is_server_error()
+}
+
+/// Server retry headers win over backoff. One that cannot be read ends the
+/// retries rather than risk retrying sooner than the server asked.
+fn retry_delay(
+    headers: &HeaderMap,
+    retries: u32,
+    now: SystemTime,
+    jitter: f64,
+) -> Option<Duration> {
+    if let Some(value) = headers.get(RETRY_AFTER_MS) {
+        let millis: f64 = value.to_str().ok()?.trim().parse().ok()?;
+        return Duration::try_from_secs_f64(millis / MILLIS_PER_SECOND).ok();
+    }
+    let Some(value) = headers.get(header::RETRY_AFTER) else {
+        return Some(backoff(retries, jitter));
+    };
+    let value = value.to_str().ok()?.trim();
+    match value.parse() {
+        Ok(seconds) => Duration::try_from_secs_f64(seconds).ok(),
+        Err(_) => {
+            let retry_at = SystemTime::from(HTTP_DATE.parse_timestamp(value).ok()?);
+            Some(retry_at.duration_since(now).unwrap_or_default())
+        }
+    }
+}
+
+fn backoff(retries: u32, jitter: f64) -> Duration {
+    BACKOFF_INITIAL
+        .saturating_mul(BACKOFF_MULTIPLIER.saturating_pow(retries))
+        .min(BACKOFF_MAX)
+        .mul_f64(1.0 - BACKOFF_JITTER * jitter)
 }
 
 #[async_trait]
@@ -181,16 +227,17 @@ mod tests {
     use std::process::Command;
     use std::sync::{Arc, Mutex, mpsc};
     use std::thread::{self, JoinHandle};
-    use std::time::{Duration, Instant};
+    use std::time::{Duration, Instant, UNIX_EPOCH};
 
     use async_io::{Async, Timer};
     use futures_lite::future;
+    use isahc::http::{HeaderMap, HeaderName, HeaderValue};
     use test_case::test_case;
 
-    use super::HttpDecisionClient;
+    use super::{BACKOFF_INITIAL, BACKOFF_MAX, HttpDecisionClient, backoff, retry_delay};
     use crate::engine::{DecisionEngine, DecisionError};
     use crate::wire::{
-        MAX_RESPONSE_BYTES,
+        DecisionResponse, MAX_RESPONSE_BYTES,
         tests::{request, response},
     };
 
@@ -201,6 +248,10 @@ mod tests {
     const STATUS_REDIRECT: u16 = 307;
     const STATUS_UNAUTHORIZED: u16 = 401;
     const STATUS_UNAVAILABLE: u16 = 503;
+    const RETRY_NOW: &str = "Retry-After: 0\r\n";
+    const NOW_UNIX_SECS: u64 = 1_445_412_477;
+    const LATER_HTTP_DATE: &str = "Wed, 21 Oct 2015 07:28:00 GMT";
+    const EARLIER_HTTP_DATE: &str = "Wed, 21 Oct 2015 07:27:00 GMT";
     const DIRECT_REQUEST_TEST: &str = "client::tests::sends_full_endpoint_bearer_and_wire_body";
 
     struct Server {
@@ -328,52 +379,106 @@ mod tests {
         assert!(sent.contains(&serde_json::to_string(&request()).unwrap()));
     }
 
-    #[test_case(429; "rate_limited")]
-    #[test_case(503; "unavailable")]
-    #[test_case(529; "overloaded")]
-    fn retries_transient_status_once(status: u16) {
-        let server = server(vec![
-            http_response(status, "ignored", "Retry-After: 0\r\n"),
-            success(),
-        ]);
+    fn decide_with(replies: Vec<String>) -> (Result<DecisionResponse, DecisionError>, usize) {
+        let server = server(replies);
         let result = future::block_on(
             client(&server.endpoint).decide(&request(), Instant::now() + TEST_TIMEOUT),
         );
         server.task.join().unwrap();
-        assert!(result.is_ok());
-        assert_eq!(server.requests.lock().unwrap().len(), 2);
+        let attempts = server.requests.lock().unwrap().len();
+        (result, attempts)
+    }
+
+    #[test_case(408; "request_timeout")]
+    #[test_case(429; "rate_limited")]
+    #[test_case(500; "internal_error")]
+    #[test_case(503; "unavailable")]
+    #[test_case(529; "overloaded")]
+    fn retries_sdk_statuses(status: u16) {
+        let (result, attempts) =
+            decide_with(vec![http_response(status, "ignored", RETRY_NOW), success()]);
+        assert_eq!(result, Ok(response()));
+        assert_eq!(attempts, 2);
+    }
+
+    #[test_case(400; "bad_request")]
+    #[test_case(401; "unauthorized")]
+    #[test_case(404; "not_found")]
+    #[test_case(422; "unprocessable")]
+    fn client_errors_are_not_retried(status: u16) {
+        let (result, attempts) = decide_with(vec![http_response(status, "", RETRY_NOW)]);
+        assert_eq!(result, Err(DecisionError::Http { status }));
+        assert_eq!(attempts, 1);
     }
 
     #[test]
-    fn never_retries_a_third_time() {
-        let unavailable = http_response(STATUS_UNAVAILABLE, "ignored", "Retry-After: 0\r\n");
-        let server = server(vec![unavailable.clone(), unavailable]);
-        let result = future::block_on(
-            client(&server.endpoint).decide(&request(), Instant::now() + TEST_TIMEOUT),
-        );
-        server.task.join().unwrap();
+    fn stops_after_two_retries() {
+        let unavailable = http_response(STATUS_UNAVAILABLE, "ignored", RETRY_NOW);
+        let (result, attempts) = decide_with(vec![unavailable; 3]);
         assert_eq!(
             result,
             Err(DecisionError::Http {
                 status: STATUS_UNAVAILABLE
             })
         );
-        assert_eq!(server.requests.lock().unwrap().len(), 2);
+        assert_eq!(attempts, 3);
+    }
+
+    #[test_case("Retry-After: 3600\r\n"; "beyond_deadline")]
+    #[test_case("Retry-After: soon\r\n"; "unreadable_delay")]
+    fn retry_the_server_does_not_allow_returns_its_status(headers: &str) {
+        let (result, attempts) = decide_with(vec![http_response(STATUS_UNAVAILABLE, "", headers)]);
+        assert_eq!(
+            result,
+            Err(DecisionError::Http {
+                status: STATUS_UNAVAILABLE
+            })
+        );
+        assert_eq!(attempts, 1);
     }
 
     #[test]
-    fn rejects_retry_that_cannot_fit_deadline() {
-        let server = server(vec![http_response(
+    fn retry_after_ms_takes_precedence() {
+        let throttled = http_response(
             STATUS_UNAVAILABLE,
             "",
-            "Retry-After: 3600\r\n",
-        )]);
-        let result = future::block_on(
-            client(&server.endpoint).decide(&request(), Instant::now() + TEST_TIMEOUT),
+            "retry-after-ms: 0\r\nRetry-After: 3600\r\n",
         );
-        server.task.join().unwrap();
-        assert_eq!(result, Err(DecisionError::Timeout));
-        assert_eq!(server.requests.lock().unwrap().len(), 1);
+        let (result, attempts) = decide_with(vec![throttled, success()]);
+        assert_eq!(result, Ok(response()));
+        assert_eq!(attempts, 2);
+    }
+
+    #[test_case(&[], Some(BACKOFF_INITIAL); "backoff_without_headers")]
+    #[test_case(&[("retry-after-ms", "250")], Some(Duration::from_millis(250)); "milliseconds")]
+    #[test_case(&[("retry-after-ms", "1.5")], Some(Duration::from_micros(1_500)); "fractional_milliseconds")]
+    #[test_case(&[("retry-after-ms", "-1")], None; "negative_milliseconds")]
+    #[test_case(&[("retry-after-ms", "0"), ("retry-after", "3600")], Some(Duration::ZERO); "milliseconds_first")]
+    #[test_case(&[("retry-after", "2")], Some(Duration::from_secs(2)); "seconds")]
+    #[test_case(&[("retry-after", "0.25")], Some(Duration::from_millis(250)); "decimal_seconds")]
+    #[test_case(&[("retry-after", LATER_HTTP_DATE)], Some(Duration::from_secs(3)); "future_http_date")]
+    #[test_case(&[("retry-after", EARLIER_HTTP_DATE)], Some(Duration::ZERO); "past_http_date")]
+    #[test_case(&[("retry-after", "soon")], None; "unreadable")]
+    fn retry_delay_honors_server_headers(pairs: &[(&str, &str)], expected: Option<Duration>) {
+        let mut headers = HeaderMap::new();
+        for (name, value) in pairs {
+            headers.insert(
+                HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                HeaderValue::from_str(value).unwrap(),
+            );
+        }
+        let now = UNIX_EPOCH + Duration::from_secs(NOW_UNIX_SECS);
+        assert_eq!(retry_delay(&headers, 0, now, 0.0), expected);
+    }
+
+    #[test_case(0, 0.0, Duration::from_millis(500); "initial")]
+    #[test_case(1, 0.0, Duration::from_secs(1); "doubled")]
+    #[test_case(2, 0.0, Duration::from_secs(2); "doubled_twice")]
+    #[test_case(4, 0.0, BACKOFF_MAX; "capped")]
+    #[test_case(0, 0.5, Duration::from_micros(437_500); "half_jitter")]
+    #[test_case(1, 1.0, Duration::from_millis(750); "full_jitter")]
+    fn backoff_doubles_to_its_cap_less_jitter(retries: u32, jitter: f64, expected: Duration) {
+        assert_eq!(backoff(retries, jitter), expected);
     }
 
     #[test]
@@ -433,7 +538,7 @@ mod tests {
     }
 
     #[test_case("not json"; "invalid_json")]
-    #[test_case(r#"{"answers":{},"usage":{"input_tokens":0,"output_tokens":0}}"#; "missing_answers")]
+    #[test_case(r#"{"model":"m","answers":{},"usage":{"input_tokens":0,"output_tokens":0}}"#; "missing_answers")]
     fn rejects_malformed_success(body: &str) {
         let server = server(vec![http_response(STATUS_OK, body, "")]);
         let result = future::block_on(

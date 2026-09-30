@@ -6405,7 +6405,7 @@ fn decision_status_message(
     tainted: bool,
 ) -> String {
     let endpoint = config
-        .endpoint
+        .base_url
         .as_ref()
         .map(|url| url.origin().ascii_serialization());
     let reachability = match status.reachable {

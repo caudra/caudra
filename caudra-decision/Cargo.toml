@@ -1,6 +1,6 @@
 [package]
 name = "caudra-decision"
-description = "Runtime-neutral Jev and Laya decision contracts and client"
+description = "Runtime-neutral TypeSafe System One decision contracts and client"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
@@ -11,8 +11,10 @@ rust-version.workspace = true
 [dependencies]
 async-io = { workspace = true }
 async-trait = { workspace = true }
+fastrand = { workspace = true }
 futures-lite = { workspace = true }
 isahc = { workspace = true }
+jiff = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }

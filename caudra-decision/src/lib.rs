@@ -9,6 +9,6 @@ pub use client::HttpDecisionClient;
 pub use engine::{CachedDecisionEngine, DecisionEngine, DecisionError};
 pub use question_set::QuestionSet;
 pub use wire::{
-    Answer, AnswerMetadata, ChoiceAnswer, DecisionRequest, DecisionResponse, NoulAnswer, Question,
-    QuestionType, Questions, ScoreAnswer, Usage,
+    Answer, ChoiceAnswer, DecisionRequest, DecisionResponse, NoulAnswer, Question, QuestionType,
+    Questions, ScoreAnswer, Usage,
 };

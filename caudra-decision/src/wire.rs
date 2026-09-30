@@ -4,18 +4,20 @@ use std::marker::PhantomData;
 
 use serde::de::{Error, MapAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 use crate::engine::DecisionError;
 use crate::question_set::bounded_json;
 
 pub const MAX_QUESTIONS: usize = 64;
-pub const MAX_CHOICE_OPTIONS: usize = 100;
+pub const MAX_CHOICE_OPTIONS: usize = 255;
+pub const MIN_SCORE_LEVELS: usize = 2;
 pub const MAX_SCORE_LEVELS: usize = 10;
 pub const MAX_TOTAL_OPTIONS: usize = 512;
 pub const MAX_STATE_CHARS: usize = 50_000;
 pub const MAX_REQUEST_BYTES: usize = 2 * 1024 * 1024;
 pub const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
+const NOUL_CRITERIA_KEYS: [&str; 2] = ["false", "true"];
 const ROUNDING_ERROR: f64 = 0.000_05;
 const FLOAT_TOLERANCE: f64 = 0.000_001;
 
@@ -37,67 +39,52 @@ pub struct Question {
     pub instructions: Value,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub criteria: Option<Value>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub labels: Option<BTreeMap<String, String>>,
 }
 
 impl Question {
     pub fn validate(&self) -> Result<(), DecisionError> {
-        if !matches!(
-            self.instructions,
-            Value::String(_) | Value::Array(_) | Value::Object(_)
-        ) {
+        if !is_content(&self.instructions) {
             return Err(DecisionError::Rejected(
                 "instructions must be a string, object, or array",
             ));
-        }
-        if let Some(labels) = &self.labels {
-            let valid = self.kind == QuestionType::Noul
-                && labels.len() == 2
-                && labels
-                    .get("false")
-                    .zip(labels.get("true"))
-                    .is_some_and(|(no, yes)| {
-                        !no.trim().is_empty() && !yes.trim().is_empty() && no.trim() != yes.trim()
-                    });
-            if !valid {
-                return Err(DecisionError::Rejected(
-                    "noul labels must name false and true with distinct nonempty strings",
-                ));
-            }
         }
         match self.kind {
             QuestionType::Noul => {
                 if let Some(criteria) = &self.criteria
                     && !criteria.as_object().is_some_and(|criteria| {
-                        criteria.keys().all(|key| {
-                            key.eq_ignore_ascii_case("false") || key.eq_ignore_ascii_case("true")
+                        criteria.iter().all(|(key, description)| {
+                            NOUL_CRITERIA_KEYS.contains(&key.as_str()) && is_content(description)
                         })
                     })
                 {
                     return Err(DecisionError::Rejected(
-                        "noul criteria must be an object keyed by false or true",
+                        "noul criteria must map true or false to a string, object, or array",
                     ));
                 }
             }
             QuestionType::Choice => {
-                let keys = self.choice_keys()?;
-                if keys.is_empty() || keys.len() > MAX_CHOICE_OPTIONS {
+                let options = self.choice_options()?;
+                if options.is_empty() || options.len() > MAX_CHOICE_OPTIONS {
                     return Err(DecisionError::Rejected(
                         "choice option count is outside the supported limits",
                     ));
                 }
-            }
-            QuestionType::Score => {
-                let Some(levels) = self.criteria.as_ref().and_then(Value::as_array) else {
-                    return Err(DecisionError::Rejected("score criteria must be an array"));
-                };
-                if levels.is_empty()
-                    || levels.len() > MAX_SCORE_LEVELS
-                    || levels.iter().any(Value::is_null)
+                if !options
+                    .values()
+                    .all(|description| description.is_null() || is_content(description))
                 {
                     return Err(DecisionError::Rejected(
-                        "score requires nonnull levels within the supported limits",
+                        "choice descriptions must be a string, object, array, or null",
+                    ));
+                }
+            }
+            QuestionType::Score => {
+                let levels = self.score_levels()?;
+                if !(MIN_SCORE_LEVELS..=MAX_SCORE_LEVELS).contains(&levels.len())
+                    || !levels.iter().all(is_content)
+                {
+                    return Err(DecisionError::Rejected(
+                        "score requires string, object, or array levels within the supported limits",
                     ));
                 }
             }
@@ -105,43 +92,32 @@ impl Question {
         Ok(())
     }
 
-    fn choice_keys(&self) -> Result<BTreeSet<String>, DecisionError> {
-        match self.criteria.as_ref() {
-            Some(Value::Object(options)) => Ok(options.keys().cloned().collect()),
-            Some(Value::Array(options)) => {
-                let keys = options
-                    .iter()
-                    .map(scalar_key)
-                    .collect::<Option<BTreeSet<_>>>()
-                    .ok_or(DecisionError::Rejected(
-                        "choice labels must be scalar values",
-                    ))?;
-                if keys.len() != options.len() {
-                    return Err(DecisionError::Rejected("choice labels must be unique"));
-                }
-                Ok(keys)
-            }
-            _ => Err(DecisionError::Rejected(
-                "choice criteria must be an object or array",
-            )),
-        }
+    fn choice_options(&self) -> Result<&Map<String, Value>, DecisionError> {
+        self.criteria
+            .as_ref()
+            .and_then(Value::as_object)
+            .ok_or(DecisionError::Rejected("choice criteria must be an object"))
+    }
+
+    fn score_levels(&self) -> Result<&[Value], DecisionError> {
+        self.criteria
+            .as_ref()
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .ok_or(DecisionError::Rejected("score criteria must be an array"))
     }
 
     fn option_count(&self) -> usize {
-        match &self.criteria {
-            Some(Value::Object(options)) if self.kind == QuestionType::Choice => options.len(),
-            Some(Value::Array(options)) => options.len(),
-            _ => 0,
+        match self.kind {
+            QuestionType::Noul => 0,
+            QuestionType::Choice => self.choice_options().map_or(0, Map::len),
+            QuestionType::Score => self.score_levels().map_or(0, <[Value]>::len),
         }
     }
 }
 
-fn scalar_key(value: &Value) -> Option<String> {
-    match value {
-        Value::String(value) => Some(value.clone()),
-        Value::Null | Value::Bool(_) | Value::Number(_) => Some(value.to_string()),
-        _ => None,
-    }
+fn is_content(value: &Value) -> bool {
+    matches!(value, Value::String(_) | Value::Array(_) | Value::Object(_))
 }
 
 pub fn validate_questions(questions: &Questions) -> Result<(), DecisionError> {
@@ -203,44 +179,26 @@ impl DecisionRequest {
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-pub struct AnswerMetadata {
-    pub confidence: f64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub answer_confidence: Option<f64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub action: Option<Action>,
-}
-
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-pub struct Action {
-    pub act_probability: f64,
-}
-
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct NoulAnswer {
     pub noul: f64,
-    #[serde(flatten)]
-    pub metadata: AnswerMetadata,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct ChoiceAnswer {
-    pub choice: Value,
+    pub choice: String,
     #[serde(deserialize_with = "unique_map")]
     pub probabilities: BTreeMap<String, f64>,
-    #[serde(flatten)]
-    pub metadata: AnswerMetadata,
+    pub confidence: f64,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct ScoreAnswer {
     pub score: f64,
     #[serde(deserialize_with = "unique_map")]
-    pub legend: BTreeMap<String, Value>,
+    pub legend: BTreeMap<String, String>,
     #[serde(deserialize_with = "unique_map")]
     pub probabilities: BTreeMap<String, f64>,
-    #[serde(flatten)]
-    pub metadata: AnswerMetadata,
+    pub confidence: f64,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -260,34 +218,19 @@ impl Answer {
         }
     }
 
-    pub fn metadata(&self) -> &AnswerMetadata {
-        match self {
-            Self::Noul(answer) => &answer.metadata,
-            Self::Choice(answer) => &answer.metadata,
-            Self::Score(answer) => &answer.metadata,
-        }
-    }
-
     fn validate(&self, question: &Question) -> Result<(), DecisionError> {
         if self.kind() != question.kind {
             return Err(DecisionError::Invalid(
                 "answer type does not match the question",
             ));
         }
-        let metadata = self.metadata();
-        probability(metadata.confidence)?;
-        if let Some(confidence) = metadata.answer_confidence {
-            probability(confidence)?;
-        }
-        if let Some(action) = &metadata.action {
-            probability(action.act_probability)?;
-        }
         match self {
             Self::Noul(answer) => probability(answer.noul),
             Self::Choice(answer) => {
-                let keys = question.choice_keys()?;
+                probability(answer.confidence)?;
+                let keys = question.choice_options()?.keys().cloned().collect();
                 distribution(&answer.probabilities, &keys)?;
-                if !scalar_key(&answer.choice).is_some_and(|key| keys.contains(&key)) {
+                if !keys.contains(&answer.choice) {
                     return Err(DecisionError::Invalid(
                         "choice is not one of the requested options",
                     ));
@@ -295,33 +238,25 @@ impl Answer {
                 Ok(())
             }
             Self::Score(answer) => {
-                let levels = question
-                    .criteria
-                    .as_ref()
-                    .and_then(Value::as_array)
-                    .ok_or(DecisionError::Rejected("score criteria must be an array"))?;
-                let legend: BTreeMap<_, _> = levels
-                    .iter()
-                    .enumerate()
-                    .map(|(index, level)| (index.to_string(), level.clone()))
-                    .collect();
-                if answer.legend != legend {
+                probability(answer.confidence)?;
+                let levels = question.score_levels()?.len();
+                let keys: BTreeSet<_> = (0..levels).map(|index| index.to_string()).collect();
+                if !answer.legend.keys().eq(keys.iter()) {
                     return Err(DecisionError::Invalid(
                         "score legend does not match the requested levels",
                     ));
                 }
-                distribution(&answer.probabilities, &legend.keys().cloned().collect())?;
-                let maximum = levels.len().saturating_sub(1) as f64;
+                distribution(&answer.probabilities, &keys)?;
+                let maximum = levels.saturating_sub(1) as f64;
                 if !answer.score.is_finite() || !(0.0..=maximum).contains(&answer.score) {
                     return Err(DecisionError::Invalid(
                         "score is outside the requested levels",
                     ));
                 }
-                let expected: f64 = (0..levels.len())
+                let expected: f64 = (0..levels)
                     .map(|index| index as f64 * answer.probabilities[&index.to_string()])
                     .sum();
-                let tolerance =
-                    ROUNDING_ERROR * (1.0 + levels.len() as f64 * maximum) + FLOAT_TOLERANCE;
+                let tolerance = ROUNDING_ERROR * (1.0 + levels as f64 * maximum) + FLOAT_TOLERANCE;
                 if (answer.score - expected).abs() > tolerance {
                     return Err(DecisionError::Invalid(
                         "score does not match its probability distribution",
@@ -370,13 +305,10 @@ pub struct Usage {
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct DecisionResponse {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub model: Option<String>,
+    pub model: String,
     #[serde(deserialize_with = "unique_map")]
     pub answers: BTreeMap<String, Answer>,
     pub usage: Usage,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub routing: Option<Value>,
     #[serde(skip)]
     pub cache_hit: bool,
 }
@@ -429,32 +361,43 @@ pub(crate) mod tests {
 
     use super::{
         Answer, DecisionRequest, DecisionResponse, MAX_CHOICE_OPTIONS, MAX_QUESTIONS,
-        MAX_SCORE_LEVELS, MAX_STATE_CHARS, Question,
+        MAX_SCORE_LEVELS, MAX_STATE_CHARS, Question, QuestionType,
     };
     use crate::DecisionError;
 
+    const REQUEST_MODEL: &str = "jev-latest";
+    const RESPONSE_MODEL: &str = "jev-1.13.0";
+    const QUESTION_ID: &str = "writes";
+
     pub(crate) fn request() -> DecisionRequest {
         serde_json::from_value(json!({
-            "model": "english",
+            "model": REQUEST_MODEL,
             "state": {"command": "git status"},
-            "questions": {"writes": {"type": "noul", "instructions": "Does this modify files?"}}
+            "questions": {QUESTION_ID: {"type": "noul", "instructions": "Does this modify files?"}}
         }))
         .unwrap()
     }
 
     pub(crate) fn response() -> DecisionResponse {
         serde_json::from_value(json!({
-            "model": "laya-rl-agent",
-            "answers": {"writes": {"type": "noul", "noul": 0.1, "confidence": 0.9}},
-            "usage": {"input_tokens": 17, "output_tokens": 0}
+            "model": RESPONSE_MODEL,
+            "answers": {QUESTION_ID: {"type": "noul", "noul": 0.1}},
+            "usage": {"input_tokens": 17, "output_tokens": 20}
         }))
         .unwrap()
     }
 
+    fn with_question(question: Value) -> DecisionRequest {
+        let mut request = request();
+        request.questions.insert(
+            QUESTION_ID.into(),
+            serde_json::from_value(question).unwrap(),
+        );
+        request
+    }
+
     #[test_case(json!({"type":"noul", "instructions":{"task":"check"}, "criteria":{"true":["yes"], "false":{"text":"no"}}}); "structured_noul")]
-    #[test_case(json!({"type":"choice", "instructions":["pick"], "criteria":{"a":{"description":"first"}, "b":["second"]}}); "structured_choice")]
-    #[test_case(json!({"type":"choice", "instructions":"pick", "criteria":["first", "second"]}); "choice_array")]
-    #[test_case(json!({"type":"choice", "instructions":"pick", "criteria":[0, true, null]}); "scalar_choice_array")]
+    #[test_case(json!({"type":"choice", "instructions":["pick"], "criteria":{"a":{"description":"first"}, "b":["second"], "c":null}}); "structured_choice")]
     #[test_case(json!({"type":"score", "instructions":"rate", "criteria":["low", {"level":"high"}]} ); "structured_score")]
     fn question_round_trip(value: Value) {
         let question: Question = serde_json::from_value(value.clone()).unwrap();
@@ -464,13 +407,16 @@ pub(crate) mod tests {
 
     #[test_case(json!({"type":"noul", "instructions":"check", "criteria":"yes"}); "noul_string_criteria")]
     #[test_case(json!({"type":"noul", "instructions":"check", "criteria":{"yes":"yes"}}); "noul_unknown_key")]
+    #[test_case(json!({"type":"noul", "instructions":"check", "criteria":{"TRUE":"yes"}}); "noul_uppercase_key")]
+    #[test_case(json!({"type":"noul", "instructions":"check", "criteria":{"true":null}}); "noul_null_description")]
     #[test_case(json!({"type":"noul", "instructions":null}); "null_instructions")]
-    #[test_case(json!({"type":"noul", "instructions":"check", "labels":{"true":"yes","false":" yes "}}); "duplicate_labels")]
-    #[test_case(json!({"type":"choice", "instructions":"pick", "criteria":[]}); "empty_choice")]
-    #[test_case(json!({"type":"choice", "instructions":"pick", "criteria":["a","a"]}); "duplicate_choice")]
-    #[test_case(json!({"type":"choice", "instructions":"pick", "criteria":[["nested"]]}); "nested_choice")]
+    #[test_case(json!({"type":"choice", "instructions":"pick", "criteria":{}}); "empty_choice")]
+    #[test_case(json!({"type":"choice", "instructions":"pick", "criteria":["a", "b"]}); "choice_array")]
+    #[test_case(json!({"type":"choice", "instructions":"pick", "criteria":{"a":1}}); "numeric_choice_description")]
     #[test_case(json!({"type":"score", "instructions":"rate", "criteria":{"a":"low"}}); "score_object")]
-    #[test_case(json!({"type":"score", "instructions":"rate", "criteria":[null]}); "null_score_level")]
+    #[test_case(json!({"type":"score", "instructions":"rate", "criteria":["only"]}); "single_score_level")]
+    #[test_case(json!({"type":"score", "instructions":"rate", "criteria":["low", null]}); "null_score_level")]
+    #[test_case(json!({"type":"score", "instructions":"rate", "criteria":["low", 1]}); "numeric_score_level")]
     fn rejects_invalid_question(value: Value) {
         let question: Question = serde_json::from_value(value).unwrap();
         assert!(matches!(
@@ -479,27 +425,31 @@ pub(crate) mod tests {
         ));
     }
 
-    #[test_case("noul", json!({"type":"noul", "noul":0.7312, "confidence":0.7312}), None; "jev_noul")]
-    #[test_case("choice", json!({"type":"choice", "choice":"a", "probabilities":{"a":0.7,"b":0.3}, "confidence":0.1187}), Some(json!({"a":"first","b":"second"})); "jev_choice")]
-    #[test_case("score", json!({"type":"score", "score":0.3, "legend":{"0":"low","1":"high"}, "probabilities":{"0":0.7,"1":0.3}, "confidence":0.1187}), Some(json!(["low","high"])); "jev_score")]
-    fn answer_round_trip(kind: &str, answer: Value, criteria: Option<Value>) {
-        let mut request = request();
-        request.questions.insert(
-            "writes".into(),
-            serde_json::from_value(json!({"type":kind,"instructions":"check","criteria":criteria}))
-                .unwrap(),
-        );
-        let mut fixture =
-            json!({"answers":{"writes":answer}, "usage":{"input_tokens":17,"output_tokens":0}});
-        let response: DecisionResponse = serde_json::from_value(fixture.clone()).unwrap();
+    #[test]
+    fn questions_have_no_fields_beyond_the_official_schema() {
+        let labelled =
+            json!({"type":"noul", "instructions":"check", "labels":{"true":"yes","false":"no"}});
+        assert!(serde_json::from_value::<Question>(labelled).is_err());
+    }
+
+    #[test_case(json!({"type":"noul", "noul":0.95}), None; "official_noul")]
+    #[test_case(json!({"type":"choice", "choice":"billing", "probabilities":{"billing":0.88,"technical":0.12,"sales":0.0}, "confidence":0.81}), Some(json!({"billing":"Payments, invoicing, refunds","technical":"Bugs, outages, integrations","sales":null})); "official_choice")]
+    #[test_case(json!({"type":"score", "score":1.05, "legend":{"0":"Calm","1":"Frustrated","2":"Very angry"}, "probabilities":{"0":0.0,"1":0.95,"2":0.05}, "confidence":0.92}), Some(json!(["Calm","Frustrated","Very angry"])); "official_score")]
+    #[test_case(json!({"type":"score", "score":0.9921, "legend":{"0":"Calm","1":"level: Very angry\nsignals:\n  - caps"}, "probabilities":{"0":0.0079,"1":0.9921}, "confidence":0.9842}), Some(json!(["Calm",{"level":"Very angry","signals":["caps"]}])); "structured_score_legend")]
+    fn answer_round_trip(answer: Value, criteria: Option<Value>) {
+        let kind = answer["type"].clone();
+        let request =
+            with_question(json!({"type":kind, "instructions":"check", "criteria":criteria}));
+        let fixture = json!({
+            "model": RESPONSE_MODEL,
+            "answers": {QUESTION_ID: answer},
+            "usage": {"input_tokens":17, "output_tokens":20}
+        });
+        let mut served = fixture.clone();
+        served["latency_ms"] = json!(94.2);
+        let response: DecisionResponse = serde_json::from_value(served).unwrap();
         response.validate_for(&request).unwrap();
         assert_eq!(serde_json::to_value(response).unwrap(), fixture);
-        fixture["routing"] = json!({"model":"english", "reason":"default"});
-        fixture["answers"]["writes"]["answer_confidence"] = json!(0.7312);
-        fixture["answers"]["writes"]["action"] = json!({"act_probability":0.95});
-        let laya: DecisionResponse = serde_json::from_value(fixture.clone()).unwrap();
-        laya.validate_for(&request).unwrap();
-        assert_eq!(serde_json::to_value(laya).unwrap(), fixture);
     }
 
     #[test_case(-0.1; "negative")]
@@ -508,7 +458,7 @@ pub(crate) mod tests {
     #[test_case(f64::INFINITY; "infinity")]
     fn rejects_invalid_probability(value: f64) {
         let mut response = response();
-        let Answer::Noul(answer) = response.answers.get_mut("writes").unwrap() else {
+        let Answer::Noul(answer) = response.answers.get_mut(QUESTION_ID).unwrap() else {
             unreachable!()
         };
         answer.noul = value;
@@ -518,11 +468,8 @@ pub(crate) mod tests {
         ));
     }
 
-    #[test_case("/answers/writes/confidence", json!(1.1); "confidence")]
-    #[test_case("/answers/writes/answer_confidence", json!(-0.1); "answer_confidence")]
-    #[test_case("/answers/writes/action", json!({"act_probability":-0.1}); "action")]
     #[test_case("/answers", json!({}); "missing_answer")]
-    #[test_case("/answers/extra", json!({"type":"noul","noul":0.1,"confidence":0.9}); "unexpected_answer")]
+    #[test_case("/answers/extra", json!({"type":"noul","noul":0.1}); "unexpected_answer")]
     #[test_case("/answers/writes", json!({"type":"choice","choice":"a","probabilities":{"a":1.0},"confidence":1.0}); "wrong_answer_type")]
     fn rejects_invalid_response(pointer: &str, value: Value) {
         let mut fixture = serde_json::to_value(response()).unwrap();
@@ -535,21 +482,17 @@ pub(crate) mod tests {
         ));
     }
 
-    #[test_case(json!({"a":0.2,"b":0.2}), "a"; "not_normalized")]
-    #[test_case(json!({"a":1.0}), "a"; "missing_probability")]
-    #[test_case(json!({"a":0.5,"b":0.5}), "c"; "unknown_choice")]
-    #[test_case(json!({"a":-0.1,"b":1.1}), "a"; "invalid_range")]
-    fn rejects_invalid_choice(probabilities: Value, choice: &str) {
-        let mut request = request();
-        request.questions.insert(
-            "writes".into(),
-            serde_json::from_value(
-                json!({"type":"choice","instructions":"pick","criteria":["a","b"]}),
-            )
-            .unwrap(),
+    #[test_case(json!({"a":0.2,"b":0.2}), "a", 0.5; "not_normalized")]
+    #[test_case(json!({"a":1.0}), "a", 0.5; "missing_probability")]
+    #[test_case(json!({"a":0.5,"b":0.5}), "c", 0.5; "unknown_choice")]
+    #[test_case(json!({"a":-0.1,"b":1.1}), "a", 0.5; "invalid_range")]
+    #[test_case(json!({"a":0.5,"b":0.5}), "a", 1.1; "invalid_confidence")]
+    fn rejects_invalid_choice(probabilities: Value, choice: &str, confidence: f64) {
+        let request = with_question(
+            json!({"type":"choice","instructions":"pick","criteria":{"a":null,"b":null}}),
         );
         let mut response = response();
-        response.answers.insert("writes".into(), serde_json::from_value(json!({"type":"choice","choice":choice,"confidence":0.5,"probabilities":probabilities})).unwrap());
+        response.answers.insert(QUESTION_ID.into(), serde_json::from_value(json!({"type":"choice","choice":choice,"confidence":confidence,"probabilities":probabilities})).unwrap());
         assert!(matches!(
             response.validate_for(&request),
             Err(DecisionError::Invalid(_))
@@ -569,8 +512,9 @@ pub(crate) mod tests {
     #[test_case("score", json!(-0.1); "negative_score")]
     #[test_case("score", json!(1.1); "above_maximum")]
     #[test_case("score", json!(0.8); "inconsistent_expected_score")]
-    #[test_case("legend", json!({"0":"high","1":"low"}); "wrong_legend")]
+    #[test_case("legend", json!({"0":"low","2":"high"}); "wrong_legend_levels")]
     #[test_case("probabilities", json!({"0":1.0}); "missing_level")]
+    #[test_case("confidence", json!(1.1); "invalid_confidence")]
     fn rejects_invalid_score(field: &str, value: Value) {
         let question: Question = serde_json::from_value(
             json!({"type":"score","instructions":"rate","criteria":["low","high"]}),
@@ -585,22 +529,22 @@ pub(crate) mod tests {
         ));
     }
 
-    #[test_case("choice", MAX_CHOICE_OPTIONS; "choice_limit")]
-    #[test_case("score", MAX_SCORE_LEVELS; "score_limit")]
-    fn enforces_option_limits(kind: &str, limit: usize) {
-        let mut question: Question = serde_json::from_value(
-            json!({"type":kind,"instructions":"pick","criteria":(0..limit).collect::<Vec<_>>()}),
-        )
-        .unwrap();
-        question.validate().unwrap();
-        question
-            .criteria
-            .as_mut()
-            .unwrap()
-            .as_array_mut()
-            .unwrap()
-            .push(json!(limit));
-        assert!(question.validate().is_err());
+    #[test_case(QuestionType::Choice, MAX_CHOICE_OPTIONS; "choice_limit")]
+    #[test_case(QuestionType::Score, MAX_SCORE_LEVELS; "score_limit")]
+    fn enforces_option_limits(kind: QuestionType, limit: usize) {
+        let question = |count: usize| {
+            let options = (0..count).map(|index| format!("option {index}"));
+            Question {
+                kind: kind.clone(),
+                instructions: json!("pick"),
+                criteria: Some(match kind {
+                    QuestionType::Choice => options.map(|option| (option, Value::Null)).collect(),
+                    _ => options.map(Value::String).collect(),
+                }),
+            }
+        };
+        question(limit).validate().unwrap();
+        assert!(question(limit + 1).validate().is_err());
     }
 
     #[test]
@@ -620,11 +564,14 @@ pub(crate) mod tests {
         assert!(request.validate().is_err());
     }
 
-    #[test_case(r#"{"answers":{},"usage":{"input_tokens":-1,"output_tokens":0}}"#; "negative_usage")]
-    #[test_case(r#"{"answers":{},"usage":{}}"#; "missing_usage_fields")]
-    #[test_case(r#"{"answers":{"writes":{"type":"noul","noul":0.1}} ,"usage":{"input_tokens":0,"output_tokens":0}}"#; "missing_confidence")]
-    #[test_case(r#"{"answers":{"writes":{"type":"noul","noul":0.1,"confidence":0.9},"writes":{"type":"noul","noul":0.9,"confidence":0.9}},"usage":{"input_tokens":0,"output_tokens":0}}"#; "duplicate_answer")]
-    #[test_case(r#"{"answers":{"writes":{"type":"choice","choice":"a","probabilities":{"a":0.1,"a":1.0},"confidence":1.0}},"usage":{"input_tokens":0,"output_tokens":0}}"#; "duplicate_probability")]
+    #[test_case(r#"{"model":"m","answers":{},"usage":{"input_tokens":-1,"output_tokens":0}}"#; "negative_usage")]
+    #[test_case(r#"{"model":"m","answers":{},"usage":{}}"#; "missing_usage_fields")]
+    #[test_case(r#"{"answers":{"writes":{"type":"noul","noul":0.1}},"usage":{"input_tokens":0,"output_tokens":0}}"#; "missing_model")]
+    #[test_case(r#"{"model":"m","answers":{"writes":{"type":"choice","choice":"a","probabilities":{"a":1.0}}},"usage":{"input_tokens":0,"output_tokens":0}}"#; "choice_without_confidence")]
+    #[test_case(r#"{"model":"m","answers":{"writes":{"type":"score","score":0.0,"legend":{"0":"a","1":"b"},"probabilities":{"0":1.0,"1":0.0}}},"usage":{"input_tokens":0,"output_tokens":0}}"#; "score_without_confidence")]
+    #[test_case(r#"{"model":"m","answers":{"writes":{"type":"score","score":0.0,"legend":{"0":{"level":"a"},"1":"b"},"probabilities":{"0":1.0,"1":0.0},"confidence":1.0}},"usage":{"input_tokens":0,"output_tokens":0}}"#; "unrendered_legend")]
+    #[test_case(r#"{"model":"m","answers":{"writes":{"type":"noul","noul":0.1},"writes":{"type":"noul","noul":0.9}},"usage":{"input_tokens":0,"output_tokens":0}}"#; "duplicate_answer")]
+    #[test_case(r#"{"model":"m","answers":{"writes":{"type":"choice","choice":"a","probabilities":{"a":0.1,"a":1.0},"confidence":1.0}},"usage":{"input_tokens":0,"output_tokens":0}}"#; "duplicate_probability")]
     fn rejects_invalid_schema(fixture: &str) {
         assert!(serde_json::from_str::<DecisionResponse>(fixture).is_err());
     }

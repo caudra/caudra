@@ -8,6 +8,7 @@ use crate::workcell::{WorkcellEndpoint, WorkcellEndpointError};
 use crate::{ConfigField, ConfigValue};
 
 pub const BASE_URL_ENV: &str = "TYPESAFE_BASE_URL";
+pub const SYSTEM_ONE_PATH: &str = "/v1/systemone";
 const DEFAULT_MODEL: &str = "jev-latest";
 const DEFAULT_API_KEY_ENV: &str = "TYPESAFE_API_KEY";
 const DEFAULT_TIMEOUT_MS: u64 = 400;
@@ -15,7 +16,9 @@ const DEFAULT_LOG_RETENTION_DAYS: u32 = 90;
 const DEFAULT_FLAG_THRESHOLD: f64 = 0.85;
 const DEFAULT_CONFIDENCE_THRESHOLD: f64 = 0.9;
 const DEFAULT_GOAL_SKIP_BELOW: f64 = 0.05;
-const INVALID_ENDPOINT_MESSAGE: &str = "must be an absolute HTTP(S) URL without credentials, query, fragment, whitespace or control characters";
+const INVALID_BASE_URL_MESSAGE: &str = "must be an absolute HTTP(S) URL without credentials, query, fragment, whitespace or control characters";
+const FULL_ENDPOINT_MESSAGE: &str =
+    "Caudra appends /v1/systemone; set base_url to the part before it";
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -57,6 +60,8 @@ pub enum DecisionsConfigError {
         "invalid project config: decisions.{0} is global-only; projects may only disable features or logging and shorten log retention"
     )]
     ProjectOverride(&'static str),
+    #[error("TYPESAFE_BASE_URL environment override rejected: {0}")]
+    Environment(Box<DecisionsConfigError>),
 }
 
 fn invalid(field: &'static str, message: &'static str) -> DecisionsConfigError {
@@ -235,7 +240,7 @@ impl DecisionThresholds {
             min: None,
             max: None,
             env: None,
-            description: "Confidence required for tool search, skill suggestions, and subagent routing. Tool-search choice probability must also meet it.",
+            description: "Confidence required for tool search, skill suggestions, and subagent routing. Tool-search choice probability must also meet it. Yes/no answers carry no confidence, so subagent routing requires each yes/no probability to be at least this value or at most 1 minus it.",
         },
         ConfigField {
             name: "goal_skip_below",
@@ -289,7 +294,7 @@ impl DecisionThresholds {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct RawDecisionsConfig {
-    pub endpoint: Option<String>,
+    pub base_url: Option<String>,
     pub model: Option<String>,
     pub api_key_env: Option<String>,
     pub allow_remote: Option<bool>,
@@ -307,7 +312,7 @@ pub struct RawDecisionsConfig {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct DecisionsConfig {
-    pub endpoint: Option<Url>,
+    pub base_url: Option<Url>,
     pub model: String,
     pub api_key_env: String,
     pub allow_remote: bool,
@@ -323,7 +328,7 @@ pub struct DecisionsConfig {
 impl Default for DecisionsConfig {
     fn default() -> Self {
         Self {
-            endpoint: None,
+            base_url: None,
             model: DEFAULT_MODEL.into(),
             api_key_env: DEFAULT_API_KEY_ENV.into(),
             allow_remote: false,
@@ -348,7 +353,7 @@ impl RawDecisionsConfig {
             };
         }
         replace!(
-            endpoint,
+            base_url,
             model,
             api_key_env,
             allow_remote,
@@ -375,7 +380,7 @@ impl RawDecisionsConfig {
             return Err(error);
         }
         for (field, present) in [
-            ("endpoint", overlay.endpoint.is_some()),
+            ("base_url", overlay.base_url.is_some()),
             ("model", overlay.model.is_some()),
             ("api_key_env", overlay.api_key_env.is_some()),
             ("allow_remote", overlay.allow_remote.is_some()),
@@ -411,33 +416,30 @@ impl RawDecisionsConfig {
         Ok(())
     }
 
-    pub fn resolve(self, base_url: Option<&str>) -> Result<DecisionsConfig, DecisionsConfigError> {
+    /// `base_url_override` replaces a configured base URL, path included. It
+    /// never supplies one on its own.
+    pub fn resolve(
+        self,
+        base_url_override: Option<&str>,
+    ) -> Result<DecisionsConfig, DecisionsConfigError> {
         if let Some(error) = self.project_error {
             return Err(error);
         }
         let allow_remote = self.allow_remote.unwrap_or(false);
         let allow_http = self.allow_http.unwrap_or(false);
-        let endpoint = self
-            .endpoint
+        let base_url = self
+            .base_url
             .as_deref()
-            .map(|endpoint| -> Result<Url, DecisionsConfigError> {
-                let mut endpoint = parse_endpoint(endpoint, allow_remote, allow_http)?;
-                if let Some(base_url) = base_url {
-                    let mut origin = parse_endpoint(base_url, allow_remote, allow_http)?;
-                    if origin.path() != "/" {
-                        return Err(invalid(
-                            "endpoint",
-                            "TYPESAFE_BASE_URL must be an origin without a path",
-                        ));
-                    }
-                    origin.set_path(endpoint.path());
-                    endpoint = parse_endpoint(origin.as_str(), allow_remote, allow_http)?;
-                }
-                Ok(endpoint)
+            .map(|configured| {
+                let configured = parse_base_url(configured, allow_remote, allow_http)?;
+                base_url_override.map_or(Ok(configured), |value| {
+                    parse_base_url(value, allow_remote, allow_http)
+                        .map_err(|error| DecisionsConfigError::Environment(Box::new(error)))
+                })
             })
             .transpose()?;
         let config = DecisionsConfig {
-            endpoint,
+            base_url,
             model: self.model.unwrap_or_else(|| DEFAULT_MODEL.into()),
             api_key_env: self
                 .api_key_env
@@ -458,16 +460,16 @@ impl RawDecisionsConfig {
     }
 
     pub(crate) fn resolve_env(self) -> Result<DecisionsConfig, DecisionsConfigError> {
-        if self.endpoint.is_none() {
+        if self.base_url.is_none() {
             return self.resolve(None);
         }
         let base_url = env::var(BASE_URL_ENV)
             .map(Some)
             .or_else(|error| match error {
                 env::VarError::NotPresent => Ok(None),
-                env::VarError::NotUnicode(_) => {
-                    Err(invalid("endpoint", "TYPESAFE_BASE_URL must be UTF-8"))
-                }
+                env::VarError::NotUnicode(_) => Err(DecisionsConfigError::Environment(Box::new(
+                    invalid("base_url", "must be UTF-8"),
+                ))),
             })?;
         self.resolve(base_url.as_deref())
     }
@@ -476,13 +478,13 @@ impl RawDecisionsConfig {
 impl DecisionsConfig {
     pub const FIELDS: &[ConfigField] = &[
         ConfigField {
-            name: "endpoint",
+            name: "base_url",
             ty: "string",
             default: ConfigValue::Unset,
             min: None,
             max: None,
             env: None,
-            description: "Full request URL. HTTPS required except for numeric loopback HTTP or explicit `allow_http` consent. No credentials, query, fragment, whitespace, or control characters.",
+            description: "Decision API base URL, such as `https://api.typesafe.ai`. Caudra appends `/v1/systemone` and keeps any path prefix. `TYPESAFE_BASE_URL` replaces a configured value. HTTPS required except for numeric loopback HTTP or explicit `allow_http` consent. No credentials, query, fragment, whitespace, or control characters.",
         },
         ConfigField {
             name: "model",
@@ -567,9 +569,20 @@ impl DecisionsConfig {
         },
     ];
 
+    pub fn endpoint(&self) -> Option<Url> {
+        self.base_url.as_ref().map(|base_url| {
+            let mut endpoint = base_url.clone();
+            endpoint.set_path(&format!(
+                "{}{SYSTEM_ONE_PATH}",
+                base_url.path().trim_end_matches('/')
+            ));
+            endpoint
+        })
+    }
+
     pub fn validate(&self) -> Result<(), DecisionsConfigError> {
-        if let Some(endpoint) = &self.endpoint {
-            parse_endpoint(endpoint.as_str(), self.allow_remote, self.allow_http)?;
+        if let Some(base_url) = &self.base_url {
+            parse_base_url(base_url.as_str(), self.allow_remote, self.allow_http)?;
         }
         let mut key = self.api_key_env.bytes();
         if !key
@@ -615,65 +628,84 @@ impl DecisionsConfig {
     }
 }
 
-fn parse_endpoint(
-    endpoint: &str,
+fn parse_base_url(
+    base_url: &str,
     allow_remote: bool,
     allow_http: bool,
 ) -> Result<Url, DecisionsConfigError> {
-    if endpoint
+    if base_url
         .chars()
         .any(|character| character.is_control() || character.is_whitespace())
-        || !endpoint
+        || !base_url
             .split_once(':')
             .and_then(|(_, authority)| authority.strip_prefix("//"))
             .is_some_and(|authority| !authority.starts_with(['/', '\\']))
     {
-        return Err(invalid("endpoint", INVALID_ENDPOINT_MESSAGE));
+        return Err(invalid("base_url", INVALID_BASE_URL_MESSAGE));
     }
-    let (endpoint, is_loopback) = match WorkcellEndpoint::parse(endpoint) {
+    let (url, is_loopback) = match WorkcellEndpoint::parse(base_url) {
         Ok(endpoint) => (endpoint.as_url().clone(), endpoint.is_loopback()),
         Err(WorkcellEndpointError::InsecureRemote) => (
-            Url::parse(endpoint).map_err(|_| invalid("endpoint", INVALID_ENDPOINT_MESSAGE))?,
+            Url::parse(base_url).map_err(|_| invalid("base_url", INVALID_BASE_URL_MESSAGE))?,
             false,
         ),
-        Err(_) => return Err(invalid("endpoint", INVALID_ENDPOINT_MESSAGE)),
+        Err(_) => return Err(invalid("base_url", INVALID_BASE_URL_MESSAGE)),
     };
+    if url.path().trim_end_matches('/').ends_with(SYSTEM_ONE_PATH) {
+        return Err(invalid("base_url", FULL_ENDPOINT_MESSAGE));
+    }
     if !is_loopback && !allow_remote {
         return Err(invalid(
             "allow_remote",
             "non-loopback endpoints send data off-machine; set allow_remote = true in global config to opt in",
         ));
     }
-    if !is_loopback && endpoint.scheme() == "http" && !allow_http {
+    if !is_loopback && url.scheme() == "http" && !allow_http {
         return Err(invalid(
             "allow_http",
             "non-loopback HTTP endpoints send data and credentials without TLS; set allow_http = true in global config to opt in",
         ));
     }
-    Ok(endpoint)
+    Ok(url)
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        DecisionsConfig, DecisionsConfigError, FeatureMode, INVALID_ENDPOINT_MESSAGE,
-        RawDecisionsConfig, invalid,
+        DecisionsConfig, DecisionsConfigError, FULL_ENDPOINT_MESSAGE, FeatureMode,
+        INVALID_BASE_URL_MESSAGE, RawDecisionsConfig, invalid,
     };
     use crate::{ConfigError, RawConfig};
     use test_case::test_case;
     use url::Url;
 
+    const LOCAL_BASE_URL: &str = "http://127.0.0.1:8000";
     const LOCAL_ENDPOINT: &str = "http://127.0.0.1:8000/v1/systemone";
-    const REMOTE_ORIGIN: &str = "https://decisions.example.test";
+    const PREFIXED_BASE_URL: &str = "http://127.0.0.1:8080/typesafe";
+    const PREFIXED_ENDPOINT: &str = "http://127.0.0.1:8080/typesafe/v1/systemone";
+    const TAILNET_BASE_URL: &str = "http://100.64.0.3:8080/typesafe";
+    const TAILNET_ENDPOINT: &str = "http://100.64.0.3:8080/typesafe/v1/systemone";
+    const REMOTE_BASE_URL: &str = "https://decisions.example.test";
     const REMOTE_ENDPOINT: &str = "https://decisions.example.test/v1/systemone";
-    const REMOTE_HTTP_ORIGIN: &str = "http://decisions.example.test:443";
+    const REMOTE_HTTP_BASE_URL: &str = "http://decisions.example.test:443";
     const REMOTE_HTTP_ENDPOINT: &str = "http://decisions.example.test:443/v1/systemone";
-    const ENDPOINT_SIZE_LIMIT: usize = 2048;
+    const BASE_URL_SIZE_LIMIT: usize = 2048;
+    const REMOVED_ENDPOINT_MESSAGE: &str = "unknown field `endpoint`, expected one of `base_url`";
+
+    fn environment_error_field(error: DecisionsConfigError) -> Option<&'static str> {
+        match error {
+            DecisionsConfigError::Environment(error) => match *error {
+                DecisionsConfigError::Invalid { field, .. } => Some(field),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
 
     #[test]
     fn defaults_and_environment_never_activate_decisions() {
         let config = RawDecisionsConfig::default()
-            .resolve(Some(REMOTE_ORIGIN))
+            .resolve(Some(REMOTE_BASE_URL))
             .unwrap();
         assert_eq!(config, DecisionsConfig::default());
         assert!(!config.features.any_enabled());
@@ -686,7 +718,7 @@ mod tests {
                 .into_config(false)
                 .unwrap()
                 .decisions
-                .endpoint
+                .base_url
                 .is_none()
         );
     }
@@ -721,37 +753,66 @@ mod tests {
         assert_eq!(serde_json::to_value(&mode).unwrap(), mode.as_str());
     }
 
-    #[test_case("http://127.0.0.1:8000/v1/systemone", false, true; "numeric_loopback")]
-    #[test_case("http://[::1]:8000/v1/systemone", false, true; "ipv6_loopback")]
-    #[test_case("https://decisions.example.test/v1/systemone", false, false; "remote_requires_opt_in")]
-    #[test_case("https://decisions.example.test/v1/systemone", true, true; "remote_opt_in")]
-    #[test_case("http://decisions.example.test/v1/systemone", true, false; "remote_requires_tls")]
-    #[test_case("https://localhost/v1/systemone", false, false; "dns_is_not_loopback")]
-    #[test_case("http://127.0.0.1.evil.test/v1/systemone", false, false; "loopback_lookalike")]
-    #[test_case("https://user:secret@decisions.example.test/v1/systemone", true, false; "credentials")]
-    #[test_case("https://@decisions.example.test/v1/systemone", true, false; "empty_userinfo")]
-    #[test_case("https://decisions.example.test/v1/systemone#secret", true, false; "fragment")]
-    #[test_case("https://decisions.example.test/v1/systemone?api_key=secret", true, false; "query")]
+    #[test_case(LOCAL_BASE_URL, false, true; "numeric_loopback")]
+    #[test_case("http://[::1]:8000", false, true; "ipv6_loopback")]
+    #[test_case(PREFIXED_BASE_URL, false, true; "path_prefix")]
+    #[test_case(REMOTE_BASE_URL, false, false; "remote_requires_opt_in")]
+    #[test_case(REMOTE_BASE_URL, true, true; "remote_opt_in")]
+    #[test_case("http://decisions.example.test", true, false; "remote_requires_tls")]
+    #[test_case("https://localhost", false, false; "dns_is_not_loopback")]
+    #[test_case("http://127.0.0.1.evil.test", false, false; "loopback_lookalike")]
+    #[test_case("https://user:secret@decisions.example.test", true, false; "credentials")]
+    #[test_case("https://@decisions.example.test", true, false; "empty_userinfo")]
+    #[test_case("https://decisions.example.test#secret", true, false; "fragment")]
+    #[test_case("https://decisions.example.test?api_key=secret", true, false; "query")]
     #[test_case("file:///etc/passwd", true, false; "unsupported_scheme")]
-    fn endpoint_policy(endpoint: &str, allow_remote: bool, valid: bool) {
+    fn base_url_policy(base_url: &str, allow_remote: bool, valid: bool) {
         let raw = RawDecisionsConfig {
-            endpoint: Some(endpoint.into()),
+            base_url: Some(base_url.into()),
             allow_remote: Some(allow_remote),
             ..RawDecisionsConfig::default()
         };
         assert_eq!(raw.resolve(None).is_ok(), valid);
     }
 
-    #[test_case(REMOTE_HTTP_ENDPOINT; "dns")]
-    #[test_case("http://decisions.example.test:80/v1/systemone"; "default_port")]
-    #[test_case("http://192.0.2.1:8000/v1/systemone"; "ipv4")]
-    #[test_case("http://[2001:db8::1]:8000/v1/systemone"; "ipv6")]
-    #[test_case("http://100.64.0.1:8000/v1/systemone"; "cgnat_start")]
-    #[test_case("http://100.127.255.254:8000/v1/systemone"; "cgnat_end")]
-    #[test_case("http://localhost:8000/v1/systemone"; "localhost_is_dns")]
-    #[test_case("http://127.0.0.1.evil.test/v1/systemone"; "loopback_lookalike")]
-    #[test_case("HTTP://decisions.example.test:443/v1/systemone"; "uppercase_scheme")]
-    fn remote_http_requires_both_global_opt_ins(endpoint: &str) {
+    #[test_case(LOCAL_ENDPOINT; "origin")]
+    #[test_case(PREFIXED_ENDPOINT; "prefix")]
+    #[test_case("http://127.0.0.1:8080/typesafe/v1/systemone/"; "trailing_slash")]
+    fn base_url_is_not_the_full_endpoint(base_url: &str) {
+        let raw = RawDecisionsConfig {
+            base_url: Some(base_url.into()),
+            ..RawDecisionsConfig::default()
+        };
+        assert_eq!(
+            raw.resolve(None),
+            Err(invalid("base_url", FULL_ENDPOINT_MESSAGE))
+        );
+    }
+
+    #[test_case(LOCAL_BASE_URL, LOCAL_ENDPOINT; "origin")]
+    #[test_case("http://127.0.0.1:8000/", LOCAL_ENDPOINT; "origin_trailing_slash")]
+    #[test_case(PREFIXED_BASE_URL, PREFIXED_ENDPOINT; "prefix")]
+    #[test_case("http://127.0.0.1:8080/typesafe/", PREFIXED_ENDPOINT; "prefix_trailing_slash")]
+    #[test_case("https://api.typesafe.ai", "https://api.typesafe.ai/v1/systemone"; "hosted")]
+    fn endpoint_appends_the_system_one_path(base_url: &str, endpoint: &str) {
+        let config = DecisionsConfig {
+            base_url: Some(Url::parse(base_url).unwrap()),
+            ..DecisionsConfig::default()
+        };
+        assert_eq!(config.endpoint().unwrap().as_str(), endpoint);
+    }
+
+    #[test_case(REMOTE_HTTP_BASE_URL; "dns")]
+    #[test_case("http://decisions.example.test:80"; "default_port")]
+    #[test_case("http://192.0.2.1:8000"; "ipv4")]
+    #[test_case("http://[2001:db8::1]:8000"; "ipv6")]
+    #[test_case("http://100.64.0.1:8000"; "cgnat_start")]
+    #[test_case("http://100.127.255.254:8000"; "cgnat_end")]
+    #[test_case(TAILNET_BASE_URL; "cgnat_prefix")]
+    #[test_case("http://localhost:8000"; "localhost_is_dns")]
+    #[test_case("http://127.0.0.1.evil.test"; "loopback_lookalike")]
+    #[test_case("HTTP://decisions.example.test:443"; "uppercase_scheme")]
+    fn remote_http_requires_both_global_opt_ins(base_url: &str) {
         for (allow_remote, allow_http, error_field) in [
             (false, false, Some("allow_remote")),
             (false, true, Some("allow_remote")),
@@ -759,13 +820,13 @@ mod tests {
             (true, true, None),
         ] {
             let raw = RawDecisionsConfig {
-                endpoint: Some(endpoint.into()),
+                base_url: Some(base_url.into()),
                 allow_remote: Some(allow_remote),
                 allow_http: Some(allow_http),
                 ..RawDecisionsConfig::default()
             };
             let expected = DecisionsConfig {
-                endpoint: Some(Url::parse(endpoint).unwrap()),
+                base_url: Some(Url::parse(base_url).unwrap()),
                 allow_remote,
                 allow_http,
                 ..DecisionsConfig::default()
@@ -813,28 +874,26 @@ mod tests {
     #[test_case("ftp://decisions.example.test"; "ftp_scheme")]
     #[test_case("/v1/systemone"; "relative")]
     #[test_case(""; "empty")]
-    fn http_opt_in_does_not_relax_url_validation(endpoint: &str) {
+    fn http_opt_in_does_not_relax_url_validation(base_url: &str) {
         let raw = RawDecisionsConfig {
-            endpoint: Some(endpoint.into()),
+            base_url: Some(base_url.into()),
             allow_remote: Some(true),
             allow_http: Some(true),
             ..RawDecisionsConfig::default()
         };
         assert_eq!(
             raw.resolve(None),
-            Err(invalid("endpoint", INVALID_ENDPOINT_MESSAGE))
+            Err(invalid("base_url", INVALID_BASE_URL_MESSAGE))
         );
     }
 
-    #[test_case(ENDPOINT_SIZE_LIMIT, true; "at_limit")]
-    #[test_case(ENDPOINT_SIZE_LIMIT + 1, false; "over_limit")]
-    fn http_opt_in_preserves_endpoint_size_limit(length: usize, valid: bool) {
-        let endpoint = format!(
-            "{REMOTE_HTTP_ENDPOINT}{}",
-            "a".repeat(length - REMOTE_HTTP_ENDPOINT.len())
-        );
+    #[test_case(BASE_URL_SIZE_LIMIT, true; "at_limit")]
+    #[test_case(BASE_URL_SIZE_LIMIT + 1, false; "over_limit")]
+    fn http_opt_in_preserves_base_url_size_limit(length: usize, valid: bool) {
+        let prefix = format!("{REMOTE_HTTP_BASE_URL}/");
+        let base_url = format!("{prefix}{}", "a".repeat(length - prefix.len()));
         let raw = RawDecisionsConfig {
-            endpoint: Some(endpoint),
+            base_url: Some(base_url),
             allow_remote: Some(true),
             allow_http: Some(true),
             ..RawDecisionsConfig::default()
@@ -846,40 +905,62 @@ mod tests {
     #[test_case("allow_http = false"; "explicit_false")]
     #[test_case("allow_http = true"; "explicit_true")]
     fn numeric_loopback_http_does_not_require_opt_in(setting: &str) {
-        for endpoint in [LOCAL_ENDPOINT, "http://[::1]:8000/v1/systemone"] {
+        for (base_url, endpoint) in [
+            (LOCAL_BASE_URL, LOCAL_ENDPOINT),
+            (PREFIXED_BASE_URL, PREFIXED_ENDPOINT),
+            ("http://[::1]:8000", "http://[::1]:8000/v1/systemone"),
+        ] {
             let raw: RawDecisionsConfig =
-                toml::from_str(&format!("endpoint = '{endpoint}'\n{setting}")).unwrap();
+                toml::from_str(&format!("base_url = '{base_url}'\n{setting}")).unwrap();
             let config = raw.resolve(None).unwrap();
-            assert_eq!(config.endpoint.unwrap().as_str(), endpoint);
+            assert_eq!(config.endpoint().unwrap().as_str(), endpoint);
             assert!(!config.allow_remote);
         }
     }
 
+    #[test_case(LOCAL_BASE_URL, TAILNET_BASE_URL, TAILNET_ENDPOINT; "adds_prefix")]
+    #[test_case(PREFIXED_BASE_URL, LOCAL_BASE_URL, LOCAL_ENDPOINT; "drops_prefix")]
+    #[test_case(REMOTE_BASE_URL, PREFIXED_BASE_URL, PREFIXED_ENDPOINT; "replaces_host")]
+    fn environment_replaces_the_whole_base_url(
+        configured: &str,
+        environment: &str,
+        endpoint: &str,
+    ) {
+        let raw = RawDecisionsConfig {
+            base_url: Some(configured.into()),
+            allow_remote: Some(true),
+            allow_http: Some(true),
+            ..RawDecisionsConfig::default()
+        };
+        let config = raw.resolve(Some(environment)).unwrap();
+        assert_eq!(config.endpoint().unwrap().as_str(), endpoint);
+    }
+
     #[test_case(false; "remote_redirect_rejected")]
     #[test_case(true; "remote_redirect_opted_in")]
-    fn environment_origin_is_revalidated(allow_remote: bool) {
+    fn environment_base_url_is_revalidated(allow_remote: bool) {
         let raw = RawDecisionsConfig {
-            endpoint: Some(LOCAL_ENDPOINT.into()),
+            base_url: Some(LOCAL_BASE_URL.into()),
             allow_remote: Some(allow_remote),
             ..RawDecisionsConfig::default()
         };
-        let result = raw.resolve(Some(REMOTE_ORIGIN));
+        let result = raw.resolve(Some(REMOTE_BASE_URL));
         if allow_remote {
-            assert_eq!(result.unwrap().endpoint.unwrap().as_str(), REMOTE_ENDPOINT);
+            assert_eq!(
+                result.unwrap().endpoint().unwrap().as_str(),
+                REMOTE_ENDPOINT
+            );
         } else {
-            assert!(matches!(
-                result,
-                Err(DecisionsConfigError::Invalid {
-                    field: "allow_remote",
-                    ..
-                })
-            ));
+            assert_eq!(
+                environment_error_field(result.unwrap_err()),
+                Some("allow_remote")
+            );
         }
     }
 
-    #[test_case(LOCAL_ENDPOINT; "local_http")]
-    #[test_case("https://127.0.0.1:8000/v1/systemone"; "local_https")]
-    fn environment_remote_http_requires_both_opt_ins(endpoint: &str) {
+    #[test_case(LOCAL_BASE_URL; "local_http")]
+    #[test_case("https://127.0.0.1:8000"; "local_https")]
+    fn environment_remote_http_requires_both_opt_ins(base_url: &str) {
         for (allow_remote, allow_http, error_field) in [
             (false, false, Some("allow_remote")),
             (false, true, Some("allow_remote")),
@@ -887,22 +968,20 @@ mod tests {
             (true, true, None),
         ] {
             let raw = RawDecisionsConfig {
-                endpoint: Some(endpoint.into()),
+                base_url: Some(base_url.into()),
                 allow_remote: Some(allow_remote),
                 allow_http: Some(allow_http),
                 ..RawDecisionsConfig::default()
             };
-            let result = raw.resolve(Some(REMOTE_HTTP_ORIGIN));
-            if let Some(field) = error_field {
-                assert!(matches!(
-                    result,
-                    Err(DecisionsConfigError::Invalid { field: actual, .. }) if actual == field
-                ));
-            } else {
-                assert_eq!(
-                    result.unwrap().endpoint.unwrap().as_str(),
+            let result = raw.resolve(Some(REMOTE_HTTP_BASE_URL));
+            match error_field {
+                Some(field) => {
+                    assert_eq!(environment_error_field(result.unwrap_err()), Some(field));
+                }
+                None => assert_eq!(
+                    result.unwrap().endpoint().unwrap().as_str(),
                     REMOTE_HTTP_ENDPOINT
-                );
+                ),
             }
         }
     }
@@ -911,66 +990,67 @@ mod tests {
     #[test_case(true; "https_downgrade_opted_in")]
     fn environment_https_downgrade_requires_http_opt_in(allow_http: bool) {
         let raw = RawDecisionsConfig {
-            endpoint: Some(REMOTE_ENDPOINT.into()),
+            base_url: Some(REMOTE_BASE_URL.into()),
             allow_remote: Some(true),
             allow_http: Some(allow_http),
             ..RawDecisionsConfig::default()
         };
-        let result = raw.resolve(Some(REMOTE_HTTP_ORIGIN));
+        let result = raw.resolve(Some(REMOTE_HTTP_BASE_URL));
         if allow_http {
             assert_eq!(
-                result.unwrap().endpoint.unwrap().as_str(),
+                result.unwrap().endpoint().unwrap().as_str(),
                 REMOTE_HTTP_ENDPOINT
             );
         } else {
-            assert!(matches!(
-                result,
-                Err(DecisionsConfigError::Invalid {
-                    field: "allow_http",
-                    ..
-                })
-            ));
+            assert_eq!(
+                environment_error_field(result.unwrap_err()),
+                Some("allow_http")
+            );
         }
     }
 
     #[test_case("https://user:secret@decisions.example.test"; "credentials")]
     #[test_case("https://decisions.example.test/#secret"; "fragment")]
     #[test_case("https://decisions.example.test/?api_key=secret"; "query")]
-    #[test_case("https://decisions.example.test/replacement"; "path_not_origin")]
+    #[test_case("https://decisions.example.test/v1/systemone"; "full_endpoint")]
     #[test_case("http://user:secret@decisions.example.test"; "http_credentials")]
     #[test_case("http://@decisions.example.test"; "http_empty_userinfo")]
     #[test_case("http://decisions.example.test/#secret"; "http_fragment")]
     #[test_case("http://decisions.example.test/?api_key=secret"; "http_query")]
-    #[test_case("http://decisions.example.test/replacement"; "http_path_not_origin")]
     #[test_case("http://decisions.\texample.test"; "http_control")]
     #[test_case("http://decisions.example.test/ "; "http_whitespace")]
     #[test_case(""; "empty")]
     fn environment_override_cannot_smuggle_url_components(base_url: &str) {
         let raw = RawDecisionsConfig {
-            endpoint: Some(LOCAL_ENDPOINT.into()),
+            base_url: Some(LOCAL_BASE_URL.into()),
             allow_remote: Some(true),
             allow_http: Some(true),
             ..RawDecisionsConfig::default()
         };
-        assert!(raw.resolve(Some(base_url)).is_err());
+        assert_eq!(
+            environment_error_field(raw.resolve(Some(base_url)).unwrap_err()),
+            Some("base_url")
+        );
     }
 
-    #[test]
-    fn environment_override_preserves_double_slash_path_without_reinterpreting_authority() {
+    #[test_case("http://127.0.0.1//other.example.test/predict", None, "127.0.0.1", "//other.example.test/predict/v1/systemone"; "configured")]
+    #[test_case(LOCAL_BASE_URL, Some("http://127.0.0.2:8001//other.example.test"), "127.0.0.2", "//other.example.test/v1/systemone"; "environment")]
+    fn double_slash_paths_never_reinterpret_the_authority(
+        base_url: &str,
+        environment: Option<&str>,
+        host: &str,
+        path: &str,
+    ) {
         let raw = RawDecisionsConfig {
-            endpoint: Some("http://127.0.0.1//other.example.test/predict".into()),
+            base_url: Some(base_url.into()),
             ..RawDecisionsConfig::default()
         };
-        let endpoint = raw
-            .resolve(Some("http://127.0.0.2:8001"))
-            .unwrap()
-            .endpoint
-            .unwrap();
-        assert_eq!(endpoint.host_str(), Some("127.0.0.2"));
-        assert_eq!(endpoint.path(), "//other.example.test/predict");
+        let endpoint = raw.resolve(environment).unwrap().endpoint().unwrap();
+        assert_eq!(endpoint.host_str(), Some(host));
+        assert_eq!(endpoint.path(), path);
     }
 
-    #[test_case("endpoint = 'https://decisions.example.test/v1/systemone'", "endpoint")]
+    #[test_case("base_url = 'https://decisions.example.test'", "base_url")]
     #[test_case("allow_remote = true", "allow_remote")]
     #[test_case("allow_http = true", "allow_http")]
     #[test_case("allow_http = false", "allow_http")]
@@ -1091,5 +1171,13 @@ mod tests {
     #[test_case("[thresholds]\nunknown = 0.1")]
     fn unknown_settings_are_not_silently_ignored(source: &str) {
         assert!(toml::from_str::<RawDecisionsConfig>(source).is_err());
+    }
+
+    #[test]
+    fn removed_endpoint_key_points_to_base_url() {
+        let error =
+            toml::from_str::<RawConfig>(&format!("[decisions]\nendpoint = '{LOCAL_ENDPOINT}'"))
+                .unwrap_err();
+        assert!(error.to_string().contains(REMOVED_ENDPOINT_MESSAGE));
     }
 }

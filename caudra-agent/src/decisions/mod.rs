@@ -24,7 +24,7 @@ use caudra_storage::{StateDir, now_epoch};
 use futures_lite::future;
 use serde_json::{Value, json};
 use thiserror::Error;
-use url::Host;
+use url::{Host, Url};
 
 use shell_duration::ShellDurationCache;
 
@@ -128,8 +128,7 @@ impl Decisions {
     pub fn new(config: DecisionsConfig, state_dir: &StateDir) -> Result<Self, DecisionsError> {
         config.validate()?;
         let engine = config
-            .endpoint
-            .as_ref()
+            .endpoint()
             .map(|endpoint| {
                 let api_key = config.api_key()?;
                 let client = HttpDecisionClient::new(endpoint.as_str(), api_key.as_deref())?;
@@ -154,7 +153,7 @@ impl Decisions {
         engine: E,
     ) -> Result<Self, DecisionsError> {
         config.validate()?;
-        let engine = config.endpoint.is_some().then(|| {
+        let engine = config.base_url.is_some().then(|| {
             Arc::new(CachedDecisionEngine::new(engine, CACHE_ENTRIES)) as Arc<dyn DecisionEngine>
         });
         Ok(Self::build(
@@ -382,9 +381,9 @@ impl Decisions {
             endpoint_kind: if self
                 .0
                 .config
-                .endpoint
+                .base_url
                 .as_ref()
-                .and_then(|endpoint| endpoint.host())
+                .and_then(Url::host)
                 .is_some_and(|host| match host {
                     Host::Ipv4(address) => address.is_loopback(),
                     Host::Ipv6(address) => address.is_loopback(),
@@ -588,8 +587,8 @@ mod tests {
     use async_trait::async_trait;
     use caudra_config::decisions::{DecisionsConfig, FeatureMode};
     use caudra_decision::{
-        Answer, AnswerMetadata, DecisionEngine, DecisionError, DecisionRequest, DecisionResponse,
-        NoulAnswer, QuestionSet, Usage,
+        Answer, DecisionEngine, DecisionError, DecisionRequest, DecisionResponse, NoulAnswer,
+        QuestionSet, Usage,
     };
     use caudra_storage::decision_log::{
         DECISIONS_DB_FILE, DecisionEffect, DecisionLabel, DecisionLog,
@@ -605,7 +604,7 @@ mod tests {
     };
 
     const SECRET: &str = "never-store-this-credential";
-    const ENDPOINT: &str = "http://127.0.0.1:1/v1/systemone";
+    const BASE_URL: &str = "http://127.0.0.1:1";
     const TEST_TIMEOUT_MS: u64 = 10;
     const TEST_NORMAL_TIMEOUT_MS: u64 = 5_000;
     const LABEL_SOURCE: &str = "user";
@@ -649,23 +648,17 @@ mod tests {
                             } else {
                                 probability
                             },
-                            metadata: AnswerMetadata {
-                                confidence: 1.0,
-                                answer_confidence: None,
-                                action: None,
-                            },
                         }),
                     )
                 })
                 .collect();
             Ok(DecisionResponse {
-                model: None,
+                model: request.model.clone(),
                 answers,
                 usage: Usage {
                     input_tokens: 1,
                     output_tokens: 1,
                 },
-                routing: None,
                 cache_hit: false,
             })
         }
@@ -673,7 +666,7 @@ mod tests {
 
     fn config(log: bool) -> DecisionsConfig {
         let mut config = DecisionsConfig {
-            endpoint: Some(ENDPOINT.parse().unwrap()),
+            base_url: Some(BASE_URL.parse().unwrap()),
             timeout_ms: TEST_NORMAL_TIMEOUT_MS,
             log,
             ..DecisionsConfig::default()
@@ -779,9 +772,9 @@ mod tests {
     }
 
     #[test_case(false, false; "off")]
-    #[test_case(false, true; "off_with_endpoint")]
-    #[test_case(true, false; "no_endpoint")]
-    fn disabled_service_never_calls_engine_or_creates_storage(enabled: bool, endpoint: bool) {
+    #[test_case(false, true; "off_with_base_url")]
+    #[test_case(true, false; "no_base_url")]
+    fn disabled_service_never_calls_engine_or_creates_storage(enabled: bool, base_url: bool) {
         smol::block_on(async {
             let root = tempfile::tempdir().unwrap();
             let path = root.path().join("not-created");
@@ -790,8 +783,8 @@ mod tests {
             if !enabled {
                 config.features = Default::default();
             }
-            if !endpoint {
-                config.endpoint = None;
+            if !base_url {
+                config.base_url = None;
             }
             let requests = Arc::new(Mutex::new(Vec::new()));
             let service = Decisions::with_engine(

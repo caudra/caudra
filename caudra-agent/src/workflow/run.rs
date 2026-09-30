@@ -511,11 +511,7 @@ impl Driver {
                             Ok(DecisionResult {
                                 answers: serde_json::to_value(response.answers)
                                     .map_err(|_| HostError::Failed(DECISION_INVALID.to_owned()))?,
-                                model: response.model.unwrap_or_else(|| {
-                                    request
-                                        .model
-                                        .unwrap_or_else(|| decisions.config().model.clone())
-                                }),
+                                model: response.model,
                             })
                         });
                     (result, outcome.latency_ms)

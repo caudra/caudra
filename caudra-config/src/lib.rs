@@ -5261,17 +5261,17 @@ mod tests {
     }
 
     #[test_case(false; "project_alone")]
-    #[test_case(true; "global_origin_preserved")]
-    fn decision_endpoint_environment_is_global_only(has_global: bool) {
-        const GLOBAL_ORIGIN: &str = "https://global.example.test";
-        const PROJECT_ORIGIN: &str = "https://project.example.test";
+    #[test_case(true; "global_base_url_preserved")]
+    fn decision_base_url_environment_is_global_only(has_global: bool) {
+        const GLOBAL_BASE_URL: &str = "https://global.example.test/typesafe";
+        const PROJECT_BASE_URL: &str = "https://project.example.test";
         let dir = TempDir::new().unwrap();
         let global = global_config_dir(dir.path());
         fs::create_dir_all(&global).unwrap();
         if has_global {
             fs::write(
                 global.join(".env"),
-                format!("{}={GLOBAL_ORIGIN}", decisions::BASE_URL_ENV),
+                format!("{}={GLOBAL_BASE_URL}", decisions::BASE_URL_ENV),
             )
             .unwrap();
         }
@@ -5279,13 +5279,13 @@ mod tests {
         fs::create_dir_all(&project).unwrap();
         fs::write(
             project.join(".env"),
-            format!("{}={PROJECT_ORIGIN}", decisions::BASE_URL_ENV),
+            format!("{}={PROJECT_BASE_URL}", decisions::BASE_URL_ENV),
         )
         .unwrap();
         let (vars, project_keys) = env_file_layers(dir.path(), Some(&global), true);
         assert_eq!(
             vars.get(decisions::BASE_URL_ENV).map(String::as_str),
-            has_global.then_some(GLOBAL_ORIGIN)
+            has_global.then_some(GLOBAL_BASE_URL)
         );
         assert!(!project_keys.contains(decisions::BASE_URL_ENV));
     }

@@ -195,7 +195,7 @@ Precedence runs from most specific configuration to least. A `subagent_model` pi
 
 ### Typed decisions
 
-`decide()` uses the endpoint in your global [`decisions` configuration](/docs/configuration/#decisions) and needs `experimental.decision_engine` as well as `experimental.workflows`. With the engine switch on, it is available even when passive decision features are off, including in YOLO. Non-loopback endpoints require `allow_remote = true`. Calls go directly to that endpoint without ambient proxies or HTTP redirects.
+`decide()` calls the System One endpoint under the `base_url` in your global [`decisions` configuration](/docs/configuration/#decisions) and needs `experimental.decision_engine` as well as `experimental.workflows`. With the engine switch on, it is available even when passive decision features are off, including in YOLO. A non-loopback base URL requires `allow_remote = true`. Calls go directly to that endpoint without ambient proxies or HTTP redirects.
 
 ```rhai
 let result = decide(
@@ -210,9 +210,9 @@ let answer = agent(args.objective, #{ model_job: job });
 complete(answer.output);
 ```
 
-Questions are keyed by ID. Supported types are `noul`, `choice`, and `score`. A `noul` answer contains a probability in `noul`. A choice needs named criteria or an array of options. A score needs an ordered array of levels. Calls allow at most 64 questions, 100 choices per question, 10 score levels, and 512 options in total.
+Questions are keyed by ID. Supported types are `noul`, `choice`, and `score`. A `noul` answer holds only a probability, in `noul`. A choice needs a map from each option name to its description, or to `()` for none. A score needs an ordered array of 2 to 10 levels. Choice and score answers also carry `confidence`. Calls allow at most 64 questions, 255 choices per question, and 512 options in total.
 
-The optional third argument accepts `model` and `timeout_ms`. A positive timeout is capped at the configured decision deadline. States are redacted and bounded to 1,500 serialized bytes, with depth and node limits. Oversized states are rejected rather than silently shortened. Dynamic question descriptions are also redacted. A question is rejected if redaction would change an answer label or question ID. Redaction is best effort, so keep credentials and sensitive material out of both states and questions.
+The optional third argument accepts `model` and `timeout_ms`. A positive timeout is capped at the configured decision deadline. States are redacted and bounded to 1,500 serialized bytes, with depth and node limits. Oversized states are rejected rather than silently shortened. Dynamic question descriptions are also redacted. A question is rejected if redaction would change an option name, a score level, or a question ID. Redaction is best effort, so keep credentials and sensitive material out of both states and questions.
 
 Endpoint errors and timeouts are catchable Rhai errors. A successful result is saved before the script continues and replayed on resume without another endpoint call. Calls that failed or were interrupted before their result was committed can run again. The workflow journal omits the decision request body. The separate opt-in decision log stores the redacted state that was sent, questions, and answers. Workflow effects remain `none` there, even if the script acts on an answer.
 

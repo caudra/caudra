@@ -103,15 +103,17 @@ mod tests {
     use test_case::test_case;
 
     const SECRET: &str = "do-not-transmit-this-value";
+    const MODEL: &str = "jev-latest";
 
     #[test_case(0.9, 0.9, true; "both_flags")]
     #[test_case(0.9, 0.1, false; "quoted_injection_only")]
     #[test_case(0.1, 0.9, false; "benign_agent_instructions")]
     fn two_signals_required(injection: f64, addressed: f64, expected: bool) {
         let response: DecisionResponse = serde_json::from_value(json!({
+            "model": MODEL,
             "answers": {
-                "injection": {"type": "noul", "noul": injection, "confidence": 1.0},
-                "addressed_to_agent": {"type": "noul", "noul": addressed, "confidence": 1.0}
+                "injection": {"type": "noul", "noul": injection},
+                "addressed_to_agent": {"type": "noul", "noul": addressed}
             },
             "usage": {"input_tokens": 0, "output_tokens": 0}
         }))

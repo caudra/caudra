@@ -185,9 +185,7 @@ mod tests {
     use std::fs;
 
     use caudra_config::decisions::{DecisionsConfig, FeatureMode};
-    use caudra_decision::{
-        Answer, AnswerMetadata, DecisionResponse, NoulAnswer, QuestionType, Usage,
-    };
+    use caudra_decision::{Answer, DecisionResponse, NoulAnswer, QuestionType, Usage};
     use caudra_storage::StateDir;
     use serde_json::json;
     use test_case::test_case;
@@ -206,9 +204,10 @@ mod tests {
         let mut config = DecisionsConfig::default();
         config.features.auto_screening = mode;
         config.thresholds.auto_flag = 1.0;
+        let model = config.model.clone();
         let service = Decisions::new(config, &StateDir::from_path(root.path().into())).unwrap();
         let response = Ok(DecisionResponse {
-            model: None,
+            model,
             answers: ["uploads", "credentials", "deletes"]
                 .into_iter()
                 .map(|flag| {
@@ -216,11 +215,6 @@ mod tests {
                         flag.into(),
                         Answer::Noul(NoulAnswer {
                             noul: TAINT_PROBABILITY,
-                            metadata: AnswerMetadata {
-                                confidence: 1.0,
-                                answer_confidence: None,
-                                action: None,
-                            },
                         }),
                     )
                 })
@@ -229,7 +223,6 @@ mod tests {
                 input_tokens: 0,
                 output_tokens: 0,
             },
-            routing: None,
             cache_hit: false,
         });
         assert!(

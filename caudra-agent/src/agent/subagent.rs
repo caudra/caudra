@@ -1301,19 +1301,16 @@ fn subagent_questions() -> Option<QuestionSet> {
             kind: QuestionType::Score,
             instructions: json!("Rate the difficulty of the task. A task label is incomplete evidence; use low confidence when uncertain."),
             criteria: Some(json!(["Simple, mechanical work", "Difficult work requiring deep reasoning"])),
-            labels: None,
         }),
         ("mechanical", Question {
             kind: QuestionType::Noul,
             instructions: json!("The task is mechanical and has a straightforward procedure."),
             criteria: None,
-            labels: None,
         }),
         ("deep_reasoning", Question {
             kind: QuestionType::Noul,
             instructions: json!("The task requires deep reasoning."),
             criteria: None,
-            labels: None,
         }),
     ].into_iter().map(|(id, question)| (id.into(), question)).collect()).ok()
 }
@@ -1328,14 +1325,7 @@ fn subagent_job(response: &DecisionResponse, threshold: f64) -> Option<ModelPurp
     let Answer::Noul(deep) = response.answers.get("deep_reasoning")? else {
         return None;
     };
-    if [
-        difficulty.metadata.confidence,
-        mechanical.metadata.confidence,
-        deep.metadata.confidence,
-    ]
-    .iter()
-    .any(|confidence| *confidence < threshold)
-    {
+    if difficulty.confidence < threshold {
         return None;
     }
     if difficulty.score <= 1.0 - threshold
@@ -1595,7 +1585,7 @@ mod tests {
     use test_case::test_case;
 
     const RUN_ID: u64 = 7;
-    const ROUTING_ENDPOINT: &str = "http://127.0.0.1:1/v1/systemone";
+    const ROUTING_BASE_URL: &str = "http://127.0.0.1:1";
     const ROUTING_TASK: &str = "Rename a variable";
     const ROUTING_BASELINE: &str = "anthropic/claude-sonnet-4-6";
     const ROUTING_FAST: &str = "anthropic/claude-haiku-4-5";
@@ -1656,12 +1646,13 @@ mod tests {
             }
             let levels = request.questions["difficulty"].criteria.as_ref().unwrap();
             Ok(serde_json::from_value(json!({
+                "model": request.model,
                 "answers": {
                     "difficulty": {"type": "score", "score": self.difficulty, "confidence": self.confidence,
                         "legend": {"0": levels[0], "1": levels[1]},
                         "probabilities": {"0": 1.0 - self.difficulty, "1": self.difficulty}},
-                    "mechanical": {"type": "noul", "noul": self.mechanical, "confidence": self.confidence},
-                    "deep_reasoning": {"type": "noul", "noul": self.deep, "confidence": self.confidence}
+                    "mechanical": {"type": "noul", "noul": self.mechanical},
+                    "deep_reasoning": {"type": "noul", "noul": self.deep}
                 }, "usage": {"input_tokens": 0, "output_tokens": 0}
             })).unwrap())
         }
@@ -1673,7 +1664,7 @@ mod tests {
         engine: RoutingEngine,
     ) -> Decisions {
         let mut config = DecisionsConfig {
-            endpoint: Some(ROUTING_ENDPOINT.parse().unwrap()),
+            base_url: Some(ROUTING_BASE_URL.parse().unwrap()),
             log: true,
             ..DecisionsConfig::default()
         };
@@ -1704,6 +1695,7 @@ mod tests {
     #[test_case(FeatureMode::Enforce, 1.0, 0.0, 1.0, 1.0, false, Some(ModelPurpose::Best); "best")]
     #[test_case(FeatureMode::Shadow, 0.0, 1.0, 0.0, 1.0, false, None; "shadow")]
     #[test_case(FeatureMode::Enforce, 0.0, 1.0, 0.0, 0.2, false, None; "low_confidence")]
+    #[test_case(FeatureMode::Enforce, 0.0, 0.5, 0.0, 1.0, false, None; "uncertain_yes_no")]
     #[test_case(FeatureMode::Enforce, 0.0, 1.0, 1.0, 1.0, false, None; "conflicting_signals")]
     #[test_case(FeatureMode::Enforce, 0.5, 1.0, 0.0, 1.0, false, None; "uncertain_difficulty")]
     #[test_case(FeatureMode::Enforce, 0.0, 1.0, 0.0, 1.0, true, None; "engine_error")]

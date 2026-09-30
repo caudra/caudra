@@ -26,8 +26,8 @@ pub(super) fn run(action: DecisionAction, cli: &Cli) -> Result<()> {
         println!(
             "{}",
             serde_json::to_string_pretty(&json!({
-                "configured": decisions.endpoint.is_some(),
-                "endpoint_origin": decisions.endpoint.as_ref().map(|url| url.origin().ascii_serialization()),
+                "configured": decisions.base_url.is_some(),
+                "endpoint_origin": decisions.base_url.as_ref().map(|url| url.origin().ascii_serialization()),
                 "model": decisions.model,
                 "timeout_ms": decisions.timeout_ms,
                 "logging": decisions.log,
