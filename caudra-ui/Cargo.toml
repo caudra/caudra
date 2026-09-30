@@ -10,6 +10,7 @@ caudra-agent = { workspace = true }
 caudra-config = { workspace = true }
 caudra-sandbox = { workspace = true }
 caudra-diff = { workspace = true }
+caudra-docs = { workspace = true }
 caudra-grab = { workspace = true }
 caudra-otel = { workspace = true }
 caudra-highlight = { workspace = true }

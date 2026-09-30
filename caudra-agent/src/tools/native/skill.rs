@@ -31,6 +31,7 @@ const SKILL_FILE: &str = "SKILL.md";
 const NOT_FOUND: &str = "skill not found: ";
 const NO_SKILLS: &str = "No skills available.";
 const SKILLS_SUBDIR: &str = "skills";
+const ADDRESS_SEPARATORS: [char; 2] = ['/', '?'];
 
 /// Tier lists, highest priority first. The first directory that exists is the
 /// only one read, so a Caudra directory shuts out the compatibility ones.
@@ -57,6 +58,10 @@ static SCHEMA: ParamSchema = ParamSchema::Object {
     reject_unknown: false,
 };
 
+/// Resolves an address under a builtin skill, given everything from its `/` or
+/// `?` on, so `caudra-docs/tools#shell` arrives as `/tools#shell`.
+pub type PageLoader = Box<dyn Fn(&str) -> Result<String, String> + Send + Sync>;
+
 /// A skill Caudra ships rather than discovers. `caudra-lua` installs the
 /// plugin-authoring skill here at startup: it is generated from the live Lua
 /// API docs, which only that crate can render, and `caudra-agent` must not
@@ -67,6 +72,9 @@ pub struct BuiltinSkill {
     /// Deferred because resolving may write the reference to disk, which is
     /// wasted work for every session that never loads the skill.
     pub resolve: Box<dyn Fn() -> (String, Option<PathBuf>) + Send + Sync>,
+    /// Addresses such as `<name>/<page>` or `<name>?<terms>`. They stay out of
+    /// the catalog, so they cost nothing until the skill body names them.
+    pub pages: Option<PageLoader>,
 }
 
 /// Empty until something installs one, which is exactly how
@@ -335,19 +343,34 @@ impl ToolInvocation for SkillCall {
 
 impl SkillCall {
     fn load(&self) -> Result<SkillOutput, ToolError> {
-        if let Some(skill) = self
-            .remote_skills
-            .iter()
-            .flat_map(|skills| skills.iter())
-            .find(|skill| skill.name == self.name)
-        {
+        self.load_with(&installed_builtins())
+    }
+
+    /// A remote skill shadows the builtin of its name, pages included, just as
+    /// a skill file does.
+    fn load_with(&self, builtins: &[Arc<BuiltinSkill>]) -> Result<SkillOutput, ToolError> {
+        let remote = self.remote_skills.as_deref().unwrap_or_default();
+        if let Some(skill) = remote.iter().find(|skill| skill.name == self.name) {
             return Ok(SkillOutput {
                 location: skill.source.source_label(),
                 body: skill.content.clone(),
             });
         }
-        load_from(&self.name, &self.dirs, &installed_builtins())
+        let unshadowed: Vec<Arc<BuiltinSkill>> = builtins
+            .iter()
+            .filter(|builtin| remote.iter().all(|skill| skill.name != builtin.name))
+            .cloned()
+            .collect();
+        load_from(&self.name, &self.dirs, &unshadowed)
     }
+}
+
+/// Splits `caudra-docs/tools#shell` into `caudra-docs` and the address its
+/// builtin resolves, `/tools#shell`. An exact skill name is looked up first,
+/// so a name that happens to hold a separator still loads.
+pub fn split_address(name: &str) -> Option<(&str, &str)> {
+    name.find(ADDRESS_SEPARATORS)
+        .map(|separator| name.split_at(separator))
 }
 
 fn load_from(
@@ -356,14 +379,27 @@ fn load_from(
     builtins: &[Arc<BuiltinSkill>],
 ) -> Result<SkillOutput, ToolError> {
     let discovered = discover(dirs, builtins);
-    let Some(skill) = discovered.get(name) else {
-        return Err(ToolError::new(
-            ToolFailure::NotFound,
-            format!("{NOT_FOUND}{name}{}", skill_list(&discovered)),
-        ));
-    };
-    let (body, location) = read_skill(skill, builtins)?;
-    Ok(SkillOutput { location, body })
+    if let Some(skill) = discovered.get(name) {
+        let (body, location) = read_skill(skill, builtins)?;
+        return Ok(SkillOutput { location, body });
+    }
+    if let Some((parent, address)) = split_address(name)
+        && let Some(pages) = discovered
+            .get(parent)
+            .and_then(|skill| builtin_for(skill, builtins))
+            .and_then(|builtin| builtin.pages.as_ref())
+    {
+        return pages(address)
+            .map(|body| SkillOutput {
+                location: builtin_location(name),
+                body,
+            })
+            .map_err(|message| ToolError::new(ToolFailure::NotFound, message));
+    }
+    Err(ToolError::new(
+        ToolFailure::NotFound,
+        format!("{NOT_FOUND}{name}{}", skill_list(&discovered)),
+    ))
 }
 
 /// The model reads this to decide whether to load anything at all, so it
@@ -438,11 +474,17 @@ fn scan(dir: &Path, scope: SkillScope, skills: &mut BTreeMap<String, Skill>) {
     }
 }
 
-fn read_skill(skill: &Skill, builtins: &[Arc<BuiltinSkill>]) -> Result<(String, String), String> {
-    if let Some(builtin) = builtins
+/// `None` when a skill file took the name, since the catalog entry then
+/// points at the file.
+fn builtin_for<'a>(skill: &Skill, builtins: &'a [Arc<BuiltinSkill>]) -> Option<&'a BuiltinSkill> {
+    builtins
         .iter()
         .find(|builtin| skill.location == builtin_location(&builtin.name))
-    {
+        .map(Arc::as_ref)
+}
+
+fn read_skill(skill: &Skill, builtins: &[Arc<BuiltinSkill>]) -> Result<(String, String), String> {
+    if let Some(builtin) = builtin_for(skill, builtins) {
         let (content, reference) = (builtin.resolve)();
         let location = reference.map_or_else(
             || skill.location.clone(),
@@ -567,6 +609,10 @@ mod tests {
     const LOCAL_BODY: &str = "local project canary";
     const GLOBAL_BODY: &str = "global skill body";
     const REMOTE_BODY: &str = "remote skill body";
+    const PAGE_BODY: &str = "page at ";
+    const PAGE_ADDRESS: &str = "/tools";
+    const MISSING_PAGE: &str = "/missing";
+    const PAGE_ERROR: &str = "unknown page: missing";
 
     fn remote_skill() -> RemoteSkill {
         let authority = AuthorityIdentity::new(
@@ -670,7 +716,67 @@ mod tests {
             name: BUILTIN_NAME.into(),
             description: BUILTIN_DESC.into(),
             resolve: Box::new(move || (BUILTIN_BODY.into(), reference.clone())),
+            pages: None,
         }
+    }
+
+    fn paged_skill() -> BuiltinSkill {
+        BuiltinSkill {
+            pages: Some(Box::new(|address| match address {
+                MISSING_PAGE => Err(PAGE_ERROR.to_owned()),
+                _ => Ok(format!("{PAGE_BODY}{address}")),
+            })),
+            ..plugin_dev_skill(None)
+        }
+    }
+
+    #[test_case("/tools#shell" ; "section")]
+    #[test_case("?shell timeout" ; "search")]
+    fn pages_and_searches_load_through_the_parent_name(address: &str) {
+        let name = format!("{BUILTIN_NAME}{address}");
+        let out = load_from(&name, &[], &[Arc::new(paged_skill())]).unwrap();
+        assert_eq!(out.body, format!("{PAGE_BODY}{address}"));
+        assert_eq!(out.location, builtin_location(&name));
+    }
+
+    #[test]
+    fn a_resolver_error_is_not_found_with_its_message() {
+        let name = format!("{BUILTIN_NAME}{MISSING_PAGE}");
+        let error = load_from(&name, &[], &[Arc::new(paged_skill())]).unwrap_err();
+        assert_eq!(error.failure, ToolFailure::NotFound);
+        assert_eq!(error.message, PAGE_ERROR);
+    }
+
+    #[test]
+    fn a_builtin_without_pages_has_no_addresses() {
+        let name = format!("{BUILTIN_NAME}{PAGE_ADDRESS}");
+        let builtins = [Arc::new(plugin_dev_skill(None))];
+        let error = load_from(&name, &[], &builtins).unwrap_err().message;
+        assert!(error.starts_with(NOT_FOUND), "{error}");
+    }
+
+    #[test_case(false ; "skill_file")]
+    #[test_case(true ; "remote_skill")]
+    fn a_skill_that_shadows_the_parent_turns_off_its_pages(remote: bool) {
+        let temp = tempfile::tempdir().unwrap();
+        let shadow = format!("---\nname: {BUILTIN_NAME}\n---\n{LOCAL_BODY}\n");
+        let call = SkillCall {
+            name: format!("{BUILTIN_NAME}{PAGE_ADDRESS}"),
+            dirs: if remote {
+                Vec::new()
+            } else {
+                vec![skill_dir(&temp, "ondisk", &shadow)]
+            },
+            remote_skills: remote.then(|| {
+                Arc::from([RemoteSkill {
+                    name: BUILTIN_NAME.into(),
+                    ..remote_skill()
+                }])
+            }),
+        };
+        let error = call.load_with(&[Arc::new(paged_skill())]).unwrap_err();
+        assert_eq!(error.failure, ToolFailure::NotFound);
+        assert!(error.message.starts_with(NOT_FOUND), "{}", error.message);
     }
 
     #[test]
@@ -808,6 +914,7 @@ mod tests {
                 name: OTHER_NAME.into(),
                 description: BUILTIN_DESC.into(),
                 resolve: Box::new(|| (OTHER_BODY.into(), None)),
+                pages: None,
             }),
         ];
         let found = discover(&[], &builtins);

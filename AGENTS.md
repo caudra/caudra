@@ -60,6 +60,7 @@ Rust workspace, key crates in root dir:
 - caudra-lua: Lua plugin system (API mirrored from neovim for plugin compatibility), built-in plugins in ./plugins dir
 - caudra-acp: ACP ndjson stdio server
 - caudra-workcell: Native Workcell adapter, Caudra authorization integration, and tool-result presentation
+- caudra-docs: The user docs as data: pages, section addresses, the model index, the TUI display text, and full-text search. It embeds nothing. The binary embeds `site/docs/content` (`src/docs.rs`, root `build.rs`), installs the `caudra-docs` builtin skill, and hands the same `Library` to caudra-ui for the `/docs` modal
 - caudra-workflow: Durable workflow scripting engine (Rhai behind a `WorkflowEngine` trait), replay journal, and the neutral catalog/run/request types; the session manager, catalog discovery, storage actor, and native `workflow` tool live in `caudra-agent/src/workflow`
 
 First-party Workcell tools are native Rust: file_read, file_glob, file_grep, file_write, file_edit, file_apply_patch, index, websearch, webfetch, shell, python_execution, execution_environment, and the code-graph family code_map, code_context, code_refs, code_impact, and code_expand.

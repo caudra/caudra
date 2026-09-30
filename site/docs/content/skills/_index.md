@@ -26,7 +26,7 @@ Project skills work the same way at each level of the walk from your current dir
 
 The `.claude`, `.opencode` and `.agents` directories are there so skills you already wrote for other agents keep working. Once you make a `.caudra/skills/` next to them, they stop being read. An empty `~/.config/caudra/skills/` counts as existing, so it switches the compatibility directories off. Delete it if you want them back.
 
-Levels still combine: a skill at the repo root and a skill in a subdirectory both load. When two skills share a name, the one found last wins, so project skills beat personal ones and the repo root beats a nested directory. The builtins `caudra-workflow-dev` and `caudra-plugin-dev` sit below all of them and any file of the same name replaces one.
+Levels still combine: a skill at the repo root and a skill in a subdirectory both load. When two skills share a name, the one found last wins, so project skills beat personal ones and the repo root beats a nested directory. The builtins `caudra-docs`, `caudra-workflow-dev` and `caudra-plugin-dev` sit below all of them and any file of the same name replaces one.
 
 Run `caudra skills --dirs` or `/skills` to see every candidate directory and which one won.
 
@@ -79,7 +79,22 @@ caudra skills --dirs          # candidate directories: selected, superseded, or 
 
 ## The builtins
 
-Caudra ships two skills. Each is a normal entry in the `skill` tool's list, and a `SKILL.md` of the same name in any of your directories replaces it. Each builtin also needs its [experimental feature](/docs/configuration/#experimental-features). Your own Markdown skills need no experimental switch.
+Caudra ships three skills. Each is a normal entry in the `skill` tool's list, and a `SKILL.md` of the same name in any of your directories replaces it. `caudra-workflow-dev` and `caudra-plugin-dev` also need their [experimental feature](/docs/configuration/#experimental-features). Your own Markdown skills need no experimental switch.
+
+### caudra-docs
+
+It is on by default. It holds this manual as it was when your binary was built, so the agent answers questions about Caudra from the docs of the version you run. Loading it returns an index of about 2.5k tokens: every page with its size, its one-line description and its sections. The agent then loads only the part it needs:
+
+| Name | Returns |
+|---|---|
+| `caudra-docs` | the index |
+| `caudra-docs/permissions` | one whole page |
+| `caudra-docs/permissions#plan-mode` | one section, up to the next heading of the same or a higher level |
+| `caudra-docs?shell timeout` | the 8 best sections that contain every word, each with its address and a snippet |
+
+An address follows the site URL: a link to `/docs/permissions/#plan-mode` is `caudra-docs/permissions#plan-mode`. A search ignores case and matches inside words, so `config` finds `configuration`. A misspelt word of five or more letters also matches the closest words in the docs, and the result names the correction.
+
+Until the agent loads it, the skill costs one line in the `skill` tool's list. `/context` and `/skills` count every page and search it loads under `caudra-docs`. Nothing is written to disk, so the skill works the same in remote workspaces, headless runs and subagents. [`/docs`](/docs/commands/#docs) shows you the same pages in the TUI.
 
 ### caudra-workflow-dev
 
@@ -91,13 +106,14 @@ The agent writes to the project directory when the plan belongs to the repositor
 
 It needs `experimental.lua_plugins`. With Lua on, it is still off by default. It teaches the agent how to write caudra Lua plugins, and on load it writes the full Lua API reference to a file in the state dir, so the agent can read it in pieces instead of swallowing it whole. It carries the same guide you can read in [Plugins](/docs/plugins/), so "write me a plugin that ..." is usually enough.
 
-Both are switches under `plugins.skill`:
+Each builtin has a switch under `plugins.skill`:
 
 ```toml
 # ~/.config/caudra/caudra.toml
 [plugins.skill]
+docs = false
 plugin_dev = true
 workflow_dev = false
 ```
 
-A switch has no effect while its experimental feature is off.
+`plugin_dev` and `workflow_dev` have no effect while their experimental feature is off. `docs = false` removes the skill only, and `/docs` keeps working.

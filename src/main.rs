@@ -4,6 +4,7 @@
 
 mod cli;
 mod cmd;
+mod docs;
 mod print;
 mod progress;
 mod sdk_mode;

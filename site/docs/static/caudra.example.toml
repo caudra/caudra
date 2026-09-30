@@ -974,6 +974,11 @@ version = 1
 # Type: boolean.
 # workflow_dev = true
 
+# Offer the builtin caudra-docs skill: this build's user documentation, loaded
+# one page or section at a time.
+# Type: boolean.
+# docs = true
+
 [plugins.task]
 
 # Max concurrently running subagents.

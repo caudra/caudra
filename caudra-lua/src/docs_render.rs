@@ -335,6 +335,7 @@ pub fn plugin_dev_skill() -> BuiltinSkill {
                 ),
             }
         }),
+        pages: None,
     }
 }
 

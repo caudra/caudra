@@ -132,9 +132,17 @@ pub const DEFAULT_SKILL_PLUGIN_DEV: bool = false;
 /// On by default: the skill is how the model learns to write a workflow for
 /// the session it is in, and a workflow is the answer to many multi-step asks.
 pub const DEFAULT_SKILL_WORKFLOW_DEV: bool = true;
+/// On by default: questions about Caudra itself are common, the catalog entry
+/// is one line, and the pages load a section at a time only when asked for.
+pub const DEFAULT_SKILL_DOCS: bool = true;
 const SKILL_PLUGIN_DEV_FIELD: &str = "plugin_dev";
 const SKILL_WORKFLOW_DEV_FIELD: &str = "workflow_dev";
-const SKILL_FIELDS: [&str; 2] = [SKILL_PLUGIN_DEV_FIELD, SKILL_WORKFLOW_DEV_FIELD];
+const SKILL_DOCS_FIELD: &str = "docs";
+const SKILL_FIELDS: [&str; 3] = [
+    SKILL_PLUGIN_DEV_FIELD,
+    SKILL_WORKFLOW_DEV_FIELD,
+    SKILL_DOCS_FIELD,
+];
 const TASK_MAX_CONCURRENT_FIELD: &str = "max_concurrent";
 pub const DEFAULT_TASK_MAX_CONCURRENT: usize = 8;
 pub const MIN_TASK_MAX_CONCURRENT: usize = 1;
@@ -220,6 +228,15 @@ pub const NATIVE_PLUGIN_OPTIONS: &[(&str, &[ConfigField])] = &[
                 max: None,
                 env: None,
                 description: "Offer the builtin caudra-workflow-dev skill for writing and running workflows. Needs `experimental.workflows`.",
+            },
+            ConfigField {
+                name: SKILL_DOCS_FIELD,
+                ty: "boolean",
+                default: ConfigValue::Bool(DEFAULT_SKILL_DOCS),
+                min: None,
+                max: None,
+                env: None,
+                description: "Offer the builtin caudra-docs skill: this build's user documentation, loaded one page or section at a time.",
             },
         ],
     ),
@@ -679,9 +696,7 @@ impl RawConfig {
         self.validate_plugin_tables()?;
         let index_max_file_size_mb = self.index_max_file_size_mb()?;
         let task_max_concurrent = self.task_max_concurrent()?;
-        let skill_plugin_dev = self.skill_flag(SKILL_PLUGIN_DEV_FIELD, DEFAULT_SKILL_PLUGIN_DEV)?;
-        let skill_workflow_dev =
-            self.skill_flag(SKILL_WORKFLOW_DEV_FIELD, DEFAULT_SKILL_WORKFLOW_DEV)?;
+        let builtin_skills = self.builtin_skills()?;
         let disabled_tools = self.resolve_disabled_tools()?;
         let config = Config {
             decisions: self.decisions.resolve_env()?,
@@ -699,8 +714,7 @@ impl RawConfig {
                 disabled_tools,
                 index_max_file_size_mb,
                 task_max_concurrent,
-                skill_plugin_dev,
-                skill_workflow_dev,
+                builtin_skills,
             ),
             provider: ProviderConfig::from_file(self.provider)?,
             storage: StorageConfig::from_file(self.storage),
@@ -828,6 +842,14 @@ impl RawConfig {
             )));
         }
         Ok(value as usize)
+    }
+
+    fn builtin_skills(&self) -> Result<BuiltinSkills, ConfigError> {
+        Ok(BuiltinSkills {
+            plugin_dev: self.skill_flag(SKILL_PLUGIN_DEV_FIELD, DEFAULT_SKILL_PLUGIN_DEV)?,
+            workflow_dev: self.skill_flag(SKILL_WORKFLOW_DEV_FIELD, DEFAULT_SKILL_WORKFLOW_DEV)?,
+            docs: self.skill_flag(SKILL_DOCS_FIELD, DEFAULT_SKILL_DOCS)?,
+        })
     }
 
     fn skill_flag(&self, field: &'static str, default: bool) -> Result<bool, ConfigError> {
@@ -2323,11 +2345,8 @@ pub struct AgentConfig {
     #[config(skip, default = DEFAULT_TASK_MAX_CONCURRENT)]
     pub task_max_concurrent: usize,
 
-    #[config(skip, default = DEFAULT_SKILL_PLUGIN_DEV)]
-    pub skill_plugin_dev: bool,
-
-    #[config(skip, default = DEFAULT_SKILL_WORKFLOW_DEV)]
-    pub skill_workflow_dev: bool,
+    #[config(skip, default = "BuiltinSkills::default()")]
+    pub builtin_skills: BuiltinSkills,
 
     /// The process's startup snapshot of `[experimental]`; never read from a
     /// settings layer, so neither a project nor `init.lua` can opt in.
@@ -2343,8 +2362,7 @@ impl AgentConfig {
         disabled_tools: Vec<String>,
         index_max_file_size_mb: usize,
         task_max_concurrent: usize,
-        skill_plugin_dev: bool,
-        skill_workflow_dev: bool,
+        builtin_skills: BuiltinSkills,
     ) -> Self {
         Self {
             no_rtk,
@@ -2384,9 +2402,26 @@ impl AgentConfig {
             disabled_tools,
             index_max_file_size_mb,
             task_max_concurrent,
-            skill_plugin_dev,
-            skill_workflow_dev,
+            builtin_skills,
             features: FeatureFlags::NONE,
+        }
+    }
+}
+
+/// The builtin skills `[plugins.skill]` offers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct BuiltinSkills {
+    pub plugin_dev: bool,
+    pub workflow_dev: bool,
+    pub docs: bool,
+}
+
+impl Default for BuiltinSkills {
+    fn default() -> Self {
+        Self {
+            plugin_dev: DEFAULT_SKILL_PLUGIN_DEV,
+            workflow_dev: DEFAULT_SKILL_WORKFLOW_DEV,
+            docs: DEFAULT_SKILL_DOCS,
         }
     }
 }
@@ -5697,15 +5732,27 @@ mod tests {
         assert!(error.to_string().contains(expected), "{error}");
     }
 
-    #[test_case("", DEFAULT_SKILL_PLUGIN_DEV, DEFAULT_SKILL_WORKFLOW_DEV ; "defaults")]
-    #[test_case("plugin_dev = true", true, DEFAULT_SKILL_WORKFLOW_DEV ; "plugin_dev_alone")]
-    #[test_case("workflow_dev = false", DEFAULT_SKILL_PLUGIN_DEV, false ; "workflow_dev_alone")]
-    #[test_case("plugin_dev = true\nworkflow_dev = false", true, false ; "both")]
-    fn skill_flags_are_read_independently(options: &str, plugin_dev: bool, workflow_dev: bool) {
+    #[test_case("", DEFAULT_SKILL_PLUGIN_DEV, DEFAULT_SKILL_WORKFLOW_DEV, DEFAULT_SKILL_DOCS ; "defaults")]
+    #[test_case("plugin_dev = true", true, DEFAULT_SKILL_WORKFLOW_DEV, DEFAULT_SKILL_DOCS ; "plugin_dev_alone")]
+    #[test_case("workflow_dev = false", DEFAULT_SKILL_PLUGIN_DEV, false, DEFAULT_SKILL_DOCS ; "workflow_dev_alone")]
+    #[test_case("docs = false", DEFAULT_SKILL_PLUGIN_DEV, DEFAULT_SKILL_WORKFLOW_DEV, false ; "docs_alone")]
+    #[test_case("plugin_dev = true\nworkflow_dev = false\ndocs = false", true, false, false ; "all")]
+    fn skill_flags_are_read_independently(
+        options: &str,
+        plugin_dev: bool,
+        workflow_dev: bool,
+        docs: bool,
+    ) {
         let raw: RawConfig = toml::from_str(&format!("[plugins.skill]\n{options}\n")).unwrap();
         let config = raw.into_config(false).unwrap();
-        assert_eq!(config.agent.skill_plugin_dev, plugin_dev);
-        assert_eq!(config.agent.skill_workflow_dev, workflow_dev);
+        assert_eq!(
+            config.agent.builtin_skills,
+            BuiltinSkills {
+                plugin_dev,
+                workflow_dev,
+                docs,
+            }
+        );
     }
 
     #[test_case("workflow_dev = \"no\"", "expected a boolean" ; "wrong_type")]

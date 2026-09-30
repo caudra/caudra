@@ -31,6 +31,15 @@ Fine when genuine: anaphora in scannable checklists ("No prompt text / No model 
 - Generated pages (tools, providers, configuration, lua-api, plugins, keybindings, commands) come from `caudra-docgen`: edit the source, run `just gen-docs`, never edit output by hand.
 - Hand-written pages can hold generated regions between `<!-- caudra-docgen:NAME -->` and `<!-- /caudra-docgen:NAME -->`. Write around the markers, never between them. The `*.example.toml` files in `static/` are generated too.
 
+## In the binary
+
+- Every page under `content/` is compiled into Caudra. The agent reads it through the builtin `caudra-docs` skill, and users read it in the `/docs` modal.
+- The landing page `content/_index.md` is the table of contents for both. A new page needs a card there, and a test fails without one.
+- Tests resolve every `/docs/<page>/#<anchor>` and `#<anchor>` link against the page headings, so renaming a heading means updating its links.
+- Search corrects a misspelt word only while that word appears nowhere in the docs. Never write a misspelling as an example.
+- The TUI renders no inline HTML. It keeps the text inside a tag, shows a `badge` span as inline code and `<br>` as a space, and prints blockquotes as plain lines.
+- An HTML comment on lines of its own, such as a `caudra-docgen` region marker, is dropped before the modal or the model sees the page. A comment inside a paragraph is not dropped, so never put one there.
+
 ## Product identity
 
 - Position Caudra as a terminal coding agent that turns context into effective action.

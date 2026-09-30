@@ -1,0 +1,17 @@
+[package]
+name = "caudra-docs"
+description = "Caudra's user documentation as a library: pages, sections, the model's index, and search."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+memchr = { workspace = true }
+strsim = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+test-case = { workspace = true }

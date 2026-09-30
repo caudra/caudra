@@ -67,11 +67,14 @@ The docs are sorted by what you came here to do:
     <a class="card" href="/docs/mcp/"><span class="card-title">MCP</span><span class="card-desc">External tool servers over stdio or HTTP.</span></a>
     <a class="card" href="/docs/commands/"><span class="card-title">Commands</span><span class="card-desc">The / palette, sessions, toggles, custom commands.</span></a>
     <a class="card" href="/docs/keybindings/"><span class="card-title">Keybindings</span><span class="card-desc">Defaults, precedence, rebinding from Lua.</span></a>
+    <a class="card" href="/docs/markdown/"><span class="card-title">Markdown</span><span class="card-desc">How replies render: tables, code, maths and Mermaid flowcharts.</span></a>
     <a class="card" href="/docs/lua-api/"><span class="card-title">Lua API</span><span class="card-desc">The plugin surface, mirrored from Neovim (experimental).</span></a>
     <a class="card" href="/docs/cli/"><span class="card-title">CLI</span><span class="card-desc">Flags and subcommands (auth, models, acp, prompt, ...).</span></a>
     <a class="card" href="/docs/logging/"><span class="card-title">Logging</span><span class="card-desc">The structured log every run writes, and the two ways to read it.</span></a>
     <a class="card" href="/docs/telemetry/"><span class="card-title">Telemetry</span><span class="card-desc">Opt-in OpenTelemetry metrics and events, to a collector you run.</span></a>
   </div>
 </div>
+
+Inside Caudra, `/docs` opens these pages for the version you run, and `/` searches every page.
 
 Something missing or wrong? Open an issue on [GitHub](https://github.com/caudra/caudra).

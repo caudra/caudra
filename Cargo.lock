@@ -785,6 +785,7 @@ dependencies = [
  "caudra-acp",
  "caudra-agent",
  "caudra-config",
+ "caudra-docs",
  "caudra-lua",
  "caudra-otel",
  "caudra-providers",
@@ -798,6 +799,7 @@ dependencies = [
  "color-eyre",
  "flume",
  "futures-lite",
+ "include_dir",
  "indicatif",
  "isahc",
  "jiff",
@@ -966,6 +968,16 @@ dependencies = [
  "serde_json",
  "strum 0.28.0",
  "test-case",
+]
+
+[[package]]
+name = "caudra-docs"
+version = "0.1.0"
+dependencies = [
+ "memchr",
+ "strsim",
+ "test-case",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -1216,6 +1228,7 @@ dependencies = [
  "caudra-agent",
  "caudra-config",
  "caudra-diff",
+ "caudra-docs",
  "caudra-grab",
  "caudra-highlight",
  "caudra-lua",

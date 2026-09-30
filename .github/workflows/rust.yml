@@ -30,6 +30,7 @@ jobs:
               - "src/**"
               - "caudra-*/**"
               - "plugins/**"
+              - "site/docs/content/**"
               - "THIRD_PARTY_LICENSES/**"
               - "justfile"
               - ".github/workflows/rust.yml"

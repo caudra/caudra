@@ -40,6 +40,7 @@ use caudra_agent::{
 };
 use caudra_config::sandbox::SandboxName;
 use caudra_config::{Feature, ModelPolicy, SnapshotsConfig, UiConfig, load_permissions};
+use caudra_docs::DocsLibrary;
 use caudra_lua::{
     EventHandle, HintReader, KeymapReader, LuaCommandReader, ModelRequest, SessionRequest,
     TaskRequest, UiAction, UiReply,
@@ -179,6 +180,7 @@ pub struct EventLoopParams {
     pub allow_workspace_recovery: bool,
     pub input_history_size: usize,
     pub max_log_files: u32,
+    pub docs: DocsLibrary,
     pub permissions: Arc<PermissionManager>,
     pub pattern_suggestion_loader: Option<PatternSuggestionLoader>,
     pub permission_authority_factory: Option<PermissionAuthorityFactory>,
@@ -1039,6 +1041,7 @@ struct SpawnCtx {
     allow_workspace_recovery: bool,
     input_history_size: usize,
     max_log_files: u32,
+    docs: DocsLibrary,
     /// Prototype only: every runtime forks its own manager so session
     /// rules stay per-session.
     permissions: Arc<PermissionManager>,
@@ -1283,6 +1286,7 @@ impl SpawnCtx {
             self.ui_config.clone(),
             self.input_history_size,
             self.max_log_files,
+            self.docs,
             permissions,
             if self.no_commands {
                 Arc::from([])
@@ -1634,6 +1638,7 @@ impl<'t> EventLoop<'t> {
             allow_workspace_recovery,
             input_history_size,
             max_log_files,
+            docs,
             permissions,
             pattern_suggestion_loader,
             permission_authority_factory,
@@ -1723,6 +1728,7 @@ impl<'t> EventLoop<'t> {
             allow_workspace_recovery,
             input_history_size,
             max_log_files,
+            docs,
             permissions,
             pattern_suggestion_loader,
             permission_authority_factory,
@@ -4711,6 +4717,7 @@ fn background_flash(title: &str, previous: SessionStatus, status: SessionStatus)
 mod tests {
     use super::*;
     use crate::app::tests::test_app;
+    use crate::components::docs_modal::fixture as docs_fixture;
     use crate::components::{key, test_model};
     use crate::sandbox::transfer::{TransferCommand, TransferLink, TransferScope};
     use caudra_agent::background::BackgroundTasks;
@@ -4855,6 +4862,7 @@ mod tests {
             UiConfig::default(),
             RELOCATION_INPUT_HISTORY,
             caudra_storage::log::DEFAULT_MAX_FILES,
+            docs_fixture::library,
             Arc::new(PermissionManager::new_nonpersistent(
                 PermissionsConfig::default(),
                 cwd.to_path_buf(),

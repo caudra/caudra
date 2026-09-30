@@ -2624,6 +2624,8 @@ impl SkillSuggestion {
     }
 }
 
+/// A page or search such as `caudra-docs/tools#shell` counts as loading its
+/// skill, so suggestions stop offering it.
 fn loaded_skills(history: &[HistoryItem]) -> BTreeSet<String> {
     let calls: BTreeMap<_, _> = history
         .iter()
@@ -2646,7 +2648,11 @@ fn loaded_skills(history: &[HistoryItem]) -> BTreeSet<String> {
                 ..
             } = &item.kind
             {
-                calls.get(call_id.as_str()).map(|name| (*name).to_owned())
+                calls.get(call_id.as_str()).map(|name| {
+                    skill::split_address(name)
+                        .map_or(*name, |(parent, _)| parent)
+                        .to_owned()
+                })
             } else {
                 None
             }
@@ -3598,16 +3604,22 @@ mod tests {
         assert!(reminder.contains("\\\"do this"));
     }
 
-    #[test_case(false, 1; "successful_load")]
-    #[test_case(true, 0; "failed_load")]
-    fn decision_skill_load_guard_reads_archived_results(is_error: bool, expected: usize) {
+    #[test_case("", false, 1; "successful_load")]
+    #[test_case("", true, 0; "failed_load")]
+    #[test_case("/tools#shell", false, 1; "page_load_marks_its_skill")]
+    #[test_case("?shell timeout", false, 1; "search_marks_its_skill")]
+    fn decision_skill_load_guard_reads_archived_results(
+        address: &str,
+        is_error: bool,
+        expected: usize,
+    ) {
         let prior = History::new(vec![
             Message {
                 role: Role::Assistant,
                 content: vec![ContentBlock::tool_use(
                     RESUME_TOOL_ID,
                     SKILL_TOOL_NAME,
-                    json!({"name": DECISION_SKILL}),
+                    json!({"name": format!("{DECISION_SKILL}{address}")}),
                 )],
                 ..Message::default()
             },

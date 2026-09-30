@@ -10,7 +10,7 @@ use std::ops::Range;
 
 use crossterm::event::{KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::Frame;
-use ratatui::layout::Rect;
+use ratatui::layout::{Position, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
@@ -20,6 +20,7 @@ use crate::components::input::apply_selection;
 use crate::components::modal::{FooterHits, FooterLine, Modal};
 use crate::components::scrollbar::{Scrollbar, ScrollbarMouse};
 use crate::components::{ModalScroll, bar_area};
+use crate::selection::line_text;
 use crate::theme;
 
 /// Every modal scrolls by a `u16` offset, so a document keeps no more rows than
@@ -75,7 +76,7 @@ impl Painted {
     }
 
     fn row_text(&self, row: usize) -> Option<String> {
-        self.lines.get(row).map(ToString::to_string)
+        self.lines.get(row).map(line_text)
     }
 
     fn last_position(&self) -> (usize, usize) {
@@ -226,6 +227,16 @@ impl<K: PartialEq> DocumentView<K> {
         self.selection = None;
     }
 
+    /// Swaps in rows restyled for `key`. Their text is where it was, so unlike
+    /// [`ensure`] this leaves a standing sweep over it, and one being dragged.
+    ///
+    /// [`ensure`]: Self::ensure
+    pub(crate) fn restyle(&mut self, key: K, paint: impl FnOnce() -> Painted) {
+        let selection = self.selection.take();
+        self.ensure(key, self.gutter, paint);
+        self.selection = selection;
+    }
+
     fn rows(&self) -> u16 {
         u16::try_from(self.painted.lines.len()).unwrap_or(u16::MAX)
     }
@@ -252,11 +263,49 @@ impl<K: PartialEq> DocumentView<K> {
         self.scroll.handle_key(key_event)
     }
 
+    /// The first row on screen.
+    pub(crate) fn top(&self) -> usize {
+        usize::from(self.scroll.offset())
+    }
+
+    /// The rows on screen, as tall as the last frame drew the body.
+    pub(crate) fn visible(&self) -> Range<usize> {
+        let top = self.top();
+        top..top + usize::from(self.content.height)
+    }
+
+    /// Measures `rows`, the rows about to be drawn, against a body `height`
+    /// rows tall ahead of the frame that draws them, so a row asked for on
+    /// rows painted this frame is reached rather than clamped to the rows drawn
+    /// before them.
+    pub(crate) fn fit(&mut self, rows: usize, height: u16) {
+        self.scroll
+            .update_dimensions(u16::try_from(rows).unwrap_or(u16::MAX), height);
+    }
+
+    /// Brings `row` to the top, as far as the scroll reaches.
+    pub(crate) fn scroll_to(&mut self, row: usize) {
+        self.scroll
+            .scroll_to(u16::try_from(row).unwrap_or(u16::MAX));
+    }
+
+    /// Scrolls the least distance that brings `row` on screen. It stays there
+    /// even after `End`, which had the view following its last row.
+    pub(crate) fn reveal(&mut self, row: usize) {
+        self.scroll
+            .reveal_and_hold(u16::try_from(row).unwrap_or(u16::MAX), 1);
+    }
+
+    /// Back to the left margin, for a reader arriving somewhere new.
+    pub(crate) fn reset_pan(&mut self) {
+        self.scroll.pan_to(0);
+    }
+
     /// Brings the next or previous section's first row to the top, as far as
     /// the scroll reaches. Nothing moves where no section lies that way.
     pub(crate) fn jump(&mut self, jump: Jump) {
         let anchors = &self.painted.anchors;
-        let top = usize::from(self.scroll.offset());
+        let top = self.top();
         let target = match jump {
             Jump::Next => anchors.get(anchors.partition_point(|&row| row <= top)),
             Jump::Previous => anchors
@@ -265,8 +314,7 @@ impl<K: PartialEq> DocumentView<K> {
                 .and_then(|index| anchors.get(index)),
         };
         if let Some(&row) = target {
-            self.scroll
-                .scroll_to(u16::try_from(row).unwrap_or(u16::MAX));
+            self.scroll_to(row);
         }
     }
 
@@ -346,6 +394,12 @@ impl<K: PartialEq> DocumentView<K> {
         (!text.is_empty()).then_some(text)
     }
 
+    /// Where the sweep starts and where it stops short of, in painted rows and
+    /// characters within them, first end first.
+    pub(crate) fn sweep_ends(&self) -> Option<((usize, usize), (usize, usize))> {
+        self.selection.map(Selection::ordered)
+    }
+
     pub(crate) fn select_all(&mut self) {
         self.selection = Some(Selection {
             anchor: (0, 0),
@@ -354,19 +408,29 @@ impl<K: PartialEq> DocumentView<K> {
     }
 
     /// Where a press landed in the body, in the same rows and characters the
-    /// selection is held in. `None` for a press outside the body.
+    /// selection is held in. `None` for a press outside the body, and one below
+    /// the last row lands on it.
     fn position_at(&self, event: &MouseEvent) -> Option<(usize, usize)> {
-        let column = event.column.checked_sub(self.content.x)?;
-        let row = event.row.checked_sub(self.content.y)?;
+        let (row, column) = self.cell_at(Position::new(event.column, event.row))?;
+        let row = row.min(self.painted.lines.len().saturating_sub(1));
+        let text = self.painted.row_text(row)?;
+        Some((row, char_at_column(&text, column)))
+    }
+
+    /// The row and the display column of the document drawn at `position`,
+    /// as the last frame placed the body. `None` off the body. A row past the
+    /// last one is left there, so an owner asking what was drawn at the pointer
+    /// finds nothing below a short document.
+    pub(crate) fn cell_at(&self, position: Position) -> Option<(usize, usize)> {
+        let column = position.x.checked_sub(self.content.x)?;
+        let row = position.y.checked_sub(self.content.y)?;
         if column >= self.content.width || row >= self.content.height {
             return None;
         }
-        let row = usize::from(self.scroll.offset())
-            .saturating_add(usize::from(row))
-            .min(self.painted.lines.len().saturating_sub(1));
-        let text = self.painted.row_text(row)?;
-        let column = usize::from(self.scroll.pan()).saturating_add(usize::from(column));
-        Some((row, char_at_column(&text, column)))
+        Some((
+            self.top().saturating_add(usize::from(row)),
+            usize::from(self.scroll.pan()).saturating_add(usize::from(column)),
+        ))
     }
 
     /// Draws the document in the popup every document modal shares: `title` on
@@ -405,8 +469,11 @@ impl<K: PartialEq> DocumentView<K> {
     }
 
     /// Draws the rows on screen and their gutter cells into `body`, and the
-    /// bars along the edges of `inner`.
-    fn draw(&mut self, frame: &mut Frame, inner: Rect, body: Rect) {
+    /// bars along the edges of `inner`. An owner that lays out its own popup,
+    /// with the document as one pane of it, calls this instead of [`render`].
+    ///
+    /// [`render`]: Self::render
+    pub(crate) fn draw(&mut self, frame: &mut Frame, inner: Rect, body: Rect) {
         let rows = self.rows();
         let painted = &self.painted;
         let gutter_area = Rect {
@@ -459,8 +526,7 @@ impl<K: PartialEq> DocumentView<K> {
     /// The characters of a drawn row the sweep covers, measured against the
     /// row's own text so a selection running past its end stops there.
     fn row_selection(&self, row: usize, line: &Line<'static>) -> Option<Range<usize>> {
-        self.selection?
-            .on_row(row, line.to_string().chars().count())
+        self.selection?.on_row(row, line_text(line).chars().count())
     }
 
     #[cfg(test)]
@@ -537,6 +603,7 @@ mod tests {
     const GUTTER_TAKEN: &str = "a click on the gutter must be left to the owner";
     const GUTTER_MOVED: &str = "the gutter must stay put while the body pans";
     const REPAINT_WRONG: &str = "rows must be repainted only for a new key";
+    const RESTYLE_DROPPED: &str = "restyled rows keep their text, so the sweep over it must stay";
     const JUMP_WRONG: &str = "a jump must bring the section's first row to the top";
     const CAP_WRONG: &str = "a capped document must keep its newest rows behind the notice";
 
@@ -707,6 +774,20 @@ mod tests {
             view.selected_text().is_some(),
             sweep_kept,
             "{REPAINT_WRONG}"
+        );
+    }
+
+    #[test]
+    fn a_restyle_keeps_the_sweep() {
+        let mut view = opened(sample());
+        view.select_all();
+
+        view.restyle(OTHER_KEY, sample);
+
+        assert_eq!(
+            view.selected_text(),
+            Some(ROWS.join("\n")),
+            "{RESTYLE_DROPPED}"
         );
     }
 

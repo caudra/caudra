@@ -13,7 +13,7 @@ use caudra_markdown::render::{self, SpanSource};
 use ratatui::text::Line;
 use unicode_width::UnicodeWidthChar;
 
-use crate::selection::{ScreenSelection, col_range, line_chars, wrap_breaks};
+use crate::selection::{ScreenSelection, col_range, line_chars, line_text, wrap_breaks};
 
 /// Provenance for one painted line. `spans` is parallel to the line's
 /// ratatui spans.
@@ -145,6 +145,84 @@ impl Provenance {
 
         Some(render::source_text(&self.source, ranges))
     }
+
+    /// Source text for a sweep over `rows`, painted one to a provenance line,
+    /// from `start` up to `end`, both `(row, char)` and `end` exclusive.
+    /// Returns `None` where the rows are not the ones these lines describe, or
+    /// a swept span lacks provenance.
+    ///
+    /// Every row a block wrapped onto repeats the block's range, so the block
+    /// is copied whole, syntax and all, only where the sweep takes in every
+    /// row of it. A sweep that starts or stops inside it copies the source
+    /// from the first span it covers to the last: between two spans of one
+    /// block lies only that block's syntax, such as the backticks around
+    /// inline code, which `source_text` would break onto a line of its own.
+    pub fn extract_rows(
+        &self,
+        rows: &[Line<'_>],
+        start: (usize, usize),
+        end: (usize, usize),
+    ) -> Option<String> {
+        if self.lines.len() != rows.len() {
+            return None;
+        }
+        let last = end.0.min(rows.len().checked_sub(1)?);
+        let covered = |row: usize| {
+            let len = line_text(&rows[row]).chars().count();
+            let from = if row == start.0 { start.1.min(len) } else { 0 };
+            let to = if row == end.0 { end.1.min(len) } else { len };
+            (len, from..to)
+        };
+        let whole = |row: usize| {
+            (start.0..=end.0).contains(&row) && {
+                let (len, chars) = covered(row);
+                len == 0 || chars == (0..len)
+            }
+        };
+
+        let mut ranges: Vec<Range<u32>> = Vec::new();
+        let mut row = start.0;
+        while row <= last {
+            let line = self.lines[row].line.as_ref();
+            let run = match line {
+                Some(range) => {
+                    let same = |other: &&LineProvenance| other.line.as_ref() == Some(range);
+                    let before = self.lines[..row].iter().rev().take_while(same).count();
+                    let after = self.lines[row..].iter().take_while(same).count();
+                    row - before..row + after
+                }
+                None => row..row + 1,
+            };
+            match line {
+                Some(range) if run.clone().all(whole) => ranges.push(range.clone()),
+                _ => {
+                    let mut spans = Vec::new();
+                    let swept = row..run.end.min(last + 1);
+                    let swept_rows = rows[swept.clone()].iter().zip(&self.lines[swept.clone()]);
+                    for (at, (painted, provenance)) in swept.zip(swept_rows) {
+                        let (_, chars) = covered(at);
+                        if !chars.is_empty() {
+                            span_ranges(painted, provenance, &chars, &mut spans)?;
+                        }
+                    }
+                    match line {
+                        Some(_) => ranges.extend(bridged(&spans)),
+                        None => ranges.extend(spans),
+                    }
+                }
+            }
+            row = run.end;
+        }
+
+        Some(render::source_text(&self.source, ranges))
+    }
+}
+
+/// One slice from the first byte `spans` cover to the last.
+fn bridged(spans: &[Range<u32>]) -> Option<Range<u32>> {
+    let start = spans.iter().map(|span| span.start).min()?;
+    let end = spans.iter().map(|span| span.end).max()?;
+    Some(start..end)
 }
 
 /// Char index at which each display row of a wrapped line starts.
@@ -276,12 +354,29 @@ fn span_ranges(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::markdown::text_to_painted;
+    use crate::markdown::{text_to_painted, text_to_rows};
     use ratatui::style::Style;
 
     const WIDTH: u16 = 40;
     const WRONG_BYTE: &str = "the cell does not name the source byte behind it";
     const NOT_INERT: &str = "a rewritten span named a source byte it cannot have";
+    /// Narrow enough to wrap [`PARAGRAPH`] over three rows.
+    const ROWS_WIDTH: u16 = 16;
+    const HEADING: &str = "## Heading";
+    const PARAGRAPH: &str = "Some **bold** words and a [link](https://example.com/x) that wrap.";
+    const FENCE: &str = "```rust\nlet x = 1;\n```";
+    const FIRST_WORD: &str = "Some";
+    /// The first word of the paragraph's second row.
+    const SECOND_ROW: &str = "and";
+    const LAST_WORD: &str = "wrap.";
+    /// The start of the paragraph's first row as painted, and the source behind it.
+    const CUT_PAINTED: &str = "Some bold wo";
+    const CUT_SOURCE: &str = "Some **bold** wo";
+    const SOURCE_LOST: &str = "the copy is not the Markdown behind the rows";
+    const OVER_COPIED: &str = "the copy reaches past the rows swept";
+    const UNWRAPPED: &str = "the paragraph has to wrap for this to test anything";
+    const NO_ROW: &str = "no row starts with";
+    const NO_COPY: &str = "the sweep copied nothing";
 
     fn painted(text: &str, width: u16) -> (Vec<Line<'static>>, Provenance) {
         let (painted, parsed) = text_to_painted(
@@ -294,6 +389,89 @@ mod tests {
             Vec::new(),
         );
         (painted.lines, Provenance::new(parsed, painted.provenance))
+    }
+
+    fn document() -> String {
+        format!("{HEADING}\n\n{PARAGRAPH}\n\n{FENCE}")
+    }
+
+    /// The document painted a row to a line, as the docs reader paints a page.
+    fn rows() -> (Vec<Line<'static>>, Provenance) {
+        let (painted, source) = text_to_rows(&document(), Style::default(), ROWS_WIDTH, Vec::new());
+        (painted.lines, Provenance::new(source, painted.provenance))
+    }
+
+    fn row_with(lines: &[Line<'_>], text: &str) -> usize {
+        lines
+            .iter()
+            .position(|line| line_text(line).starts_with(text))
+            .unwrap_or_else(|| panic!("{NO_ROW} {text}"))
+    }
+
+    fn end_of(lines: &[Line<'_>], row: usize) -> (usize, usize) {
+        (row, line_text(&lines[row]).chars().count())
+    }
+
+    #[test]
+    fn a_sweep_over_every_row_copies_the_whole_source() {
+        let (lines, provenance) = rows();
+        let end = end_of(&lines, lines.len() - 1);
+
+        let copied = provenance.extract_rows(&lines, (0, 0), end);
+
+        assert_eq!(copied, Some(document()), "{SOURCE_LOST}");
+    }
+
+    #[test]
+    fn a_sweep_stopping_inside_a_wrapped_paragraph_copies_no_further() {
+        let (lines, provenance) = rows();
+        let first = row_with(&lines, FIRST_WORD);
+        let end = (first, FIRST_WORD.len());
+
+        let copied = provenance.extract_rows(&lines, (0, 0), end);
+
+        assert_eq!(
+            copied,
+            Some(format!("{HEADING}\n\n{FIRST_WORD}")),
+            "{OVER_COPIED}"
+        );
+    }
+
+    #[test]
+    fn a_sweep_starting_on_a_later_wrapped_row_leaves_the_rows_above_out() {
+        let (lines, provenance) = rows();
+        let second = row_with(&lines, SECOND_ROW);
+        let end = end_of(&lines, lines.len() - 1);
+
+        let copied = provenance
+            .extract_rows(&lines, (second, 0), end)
+            .expect(NO_COPY);
+
+        assert!(copied.starts_with(SECOND_ROW), "{OVER_COPIED}: {copied}");
+        assert!(!copied.contains(FIRST_WORD), "{OVER_COPIED}: {copied}");
+        assert!(copied.ends_with(FENCE), "{SOURCE_LOST}: {copied}");
+    }
+
+    #[test]
+    fn a_sweep_cutting_a_row_keeps_the_syntax_between_its_spans() {
+        let (lines, provenance) = rows();
+        let row = row_with(&lines, CUT_PAINTED);
+
+        let copied = provenance.extract_rows(&lines, (row, 0), (row, CUT_PAINTED.chars().count()));
+
+        assert_eq!(copied.as_deref(), Some(CUT_SOURCE), "{SOURCE_LOST}");
+    }
+
+    #[test]
+    fn a_sweep_over_one_whole_wrapped_paragraph_copies_its_source_once() {
+        let (lines, provenance) = rows();
+        let first = row_with(&lines, FIRST_WORD);
+        let last = row_with(&lines, LAST_WORD);
+        assert!(last > first + 1, "{UNWRAPPED}");
+
+        let copied = provenance.extract_rows(&lines, (first, 0), end_of(&lines, last));
+
+        assert_eq!(copied.as_deref(), Some(PARAGRAPH), "{SOURCE_LOST}");
     }
 
     #[test]

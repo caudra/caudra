@@ -151,6 +151,11 @@ impl App {
             self.handle_logs_action(action);
             return Vec::new();
         }
+        if self.docs_modal.is_open() && !self.permission_prompt.is_open() {
+            self.clear_control_hovers();
+            let action = self.docs_modal.handle_mouse(event);
+            return self.handle_docs_action(action);
+        }
         if self.context_modal.is_open() && !self.permission_prompt.is_open() {
             self.clear_control_hovers();
             self.context_modal.handle_mouse(event);
@@ -792,8 +797,8 @@ impl App {
     /// Offers a sideways wheel to the open modal. Only the ones that draw
     /// unwrapped lines can use it; the rest reflow, so there is nothing off
     /// screen for a pan to reach and the event is dropped as it was before.
-    /// `/logs` is absent because it answers the wheel in its own `handle_mouse`,
-    /// which runs long before this.
+    /// `/logs` and `/docs` are absent because they answer the wheel in their own
+    /// `handle_mouse`, which runs long before this.
     fn pan_modal(&mut self, delta: i32) {
         if self.usage_modal.is_open() {
             self.usage_modal.pan(delta);
@@ -1243,6 +1248,7 @@ impl App {
         dismiss!(self.help_modal);
         dismiss!(self.usage_modal);
         dismiss!(self.logs_modal);
+        dismiss!(self.docs_modal);
         dismiss!(self.context_modal);
         dismiss!(self.tools_modal);
         dismiss!(self.skills_modal);

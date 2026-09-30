@@ -53,6 +53,7 @@ use crate::components::command::{CommandAction, CommandPalette, ParsedCommand, d
 use crate::components::command_modal::{CommandModal, CommandModalAction};
 use crate::components::commit_popup::{CommitAction, CommitIndex, CommitPopup};
 use crate::components::context_modal::ContextModal;
+use crate::components::docs_modal::{DocsAction, DocsModal};
 use crate::components::file_picker::{FilePickerModal, FilePickerModalAction};
 use crate::components::goal_modal::GoalModal;
 use crate::components::help_modal::HelpModal;
@@ -139,6 +140,7 @@ use caudra_config::{
     Feature, FeatureDisabled, FeatureFlags, ModelPolicy, PermissionsConfig, SnapshotsConfig,
     UiConfig,
 };
+use caudra_docs::DocsLibrary;
 use caudra_lua::{
     BuiltinAction, EventHandle, HintReader, HintSnapshot, KeymapReader, LuaCommandReader, WinView,
 };
@@ -392,6 +394,7 @@ pub struct App {
     pub(super) usage_modal: UsageModal,
     pub(super) context_modal: ContextModal,
     pub(super) logs_modal: LogsModal,
+    pub(super) docs_modal: DocsModal,
     pub(super) tools_modal: ToolsModal,
     pub(super) skills_modal: SkillsModal,
     pub(super) storage_modal: StorageModal,
@@ -607,6 +610,7 @@ impl App {
         ui_config: UiConfig,
         input_history_size: usize,
         max_log_files: u32,
+        docs: DocsLibrary,
         permissions: Arc<PermissionManager>,
         custom_commands: Arc<[caudra_agent::command::CustomCommand]>,
         lua_event_handle: EventHandle,
@@ -662,6 +666,7 @@ impl App {
             usage_modal: UsageModal::new(),
             context_modal: ContextModal::new(),
             logs_modal: LogsModal::new(max_log_files),
+            docs_modal: DocsModal::new(docs),
             tools_modal: ToolsModal::new(),
             skills_modal: SkillsModal::new(),
             storage_modal: StorageModal::new(),
@@ -1707,7 +1712,11 @@ impl App {
                     }
                     return vec![];
                 }
-                if self.session_relocation_picker.is_open() || self.worktree_picker.is_open() {
+                if self.session_relocation_picker.is_open()
+                    || self.worktree_picker.is_open()
+                    || self.logs_modal.is_open()
+                    || self.docs_modal.is_open()
+                {
                     self.route_text_paste(&text);
                     return vec![];
                 }
@@ -1851,6 +1860,10 @@ impl App {
         }
         if self.logs_modal.is_open() {
             self.logs_modal.scroll(delta);
+            return None;
+        }
+        if self.docs_modal.is_open() {
+            self.docs_modal.scroll_at(pos, delta);
             return None;
         }
         if self.context_modal.is_open() {
@@ -2183,6 +2196,12 @@ impl App {
             let action = self.logs_modal.handle_key(key);
             self.handle_logs_action(action);
             return Some(vec![]);
+        }
+
+        if self.docs_modal.is_open() {
+            guard_repeat!(self.docs_modal.text_input_active());
+            let action = self.docs_modal.handle_key(key);
+            return Some(self.handle_docs_action(action));
         }
 
         if self.context_modal.is_open() {
@@ -3590,6 +3609,17 @@ impl App {
         }
     }
 
+    fn handle_docs_action(&mut self, action: DocsAction) -> Vec<Action> {
+        match action {
+            DocsAction::Consumed => {}
+            DocsAction::Close => self.docs_modal.close(),
+            DocsAction::Flash(message) => self.flash(message.into()),
+            DocsAction::Copy { text, label } => self.copy_labelled(&text, label),
+            DocsAction::OpenUrl(url) => return vec![Action::OpenUrl(url)],
+        }
+        vec![]
+    }
+
     /// Copies `text` and says so in `label`'s words. An empty copy stays
     /// quiet, since there was nothing to hand over.
     fn copy_labelled(&mut self, text: &str, label: &str) {
@@ -4751,6 +4781,7 @@ impl App {
             self.storage_modal.close();
             self.system_prompt_modal.close();
             self.projection_modal.close();
+            self.docs_modal.close();
             if self.permissions_picker.is_open() {
                 self.suspend_permission_editor();
                 self.permission_config_trust_deferred =
@@ -5052,6 +5083,10 @@ impl App {
             "/storage" => self.execute_storage(&cmd.args),
             "/logs" => {
                 self.logs_modal.open();
+                vec![]
+            }
+            "/docs" => {
+                self.docs_modal.open(&cmd.args);
                 vec![]
             }
             "/tools" => {
@@ -5551,10 +5586,11 @@ impl App {
         }
     }
 
-    fn overlays(&self) -> [&dyn Overlay; 40] {
+    fn overlays(&self) -> [&dyn Overlay; 41] {
         [
             &self.workbench,
             &self.logs_modal,
+            &self.docs_modal,
             &self.help_modal,
             &self.usage_modal,
             &self.context_modal,
@@ -5596,10 +5632,11 @@ impl App {
         ]
     }
 
-    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 40] {
+    fn overlays_mut(&mut self) -> [&mut dyn Overlay; 41] {
         [
             &mut self.workbench,
             &mut self.logs_modal,
+            &mut self.docs_modal,
             &mut self.help_modal,
             &mut self.usage_modal,
             &mut self.context_modal,
@@ -6186,6 +6223,10 @@ impl App {
         }
         if self.logs_modal.is_open() {
             self.logs_modal.handle_paste(text);
+            return;
+        }
+        if self.docs_modal.is_open() {
+            self.docs_modal.handle_paste(text);
             return;
         }
         if self.search_modal.is_open() {

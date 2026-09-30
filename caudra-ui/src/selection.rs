@@ -441,6 +441,16 @@ pub(crate) fn line_chars(line: &Line<'_>) -> Vec<char> {
     line.spans.iter().flat_map(|s| s.content.chars()).collect()
 }
 
+/// A painted line's text, joined from its spans. `Line`'s `Display` drops a
+/// line break inside a span, so a range or position measured in what it
+/// prints drifts from the spans it was measured for.
+pub(crate) fn line_text(line: &Line<'_>) -> String {
+    line.spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect()
+}
+
 fn compute_wrap_types(line: &Line<'_>, width: u16) -> Vec<bool> {
     wrap_breaks(&line_chars(line), width)
         .into_iter()

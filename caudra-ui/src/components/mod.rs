@@ -4,6 +4,7 @@ pub(crate) mod command_modal;
 pub(crate) mod commit_popup;
 pub(crate) mod completion;
 pub(crate) mod context_modal;
+pub(crate) mod docs_modal;
 pub(crate) mod document_view;
 pub(crate) mod environment_card;
 pub(crate) mod file_picker;
@@ -766,6 +767,15 @@ impl ModalScroll {
                 .saturating_sub(self.viewport_h.max(1));
         }
         self.clamp();
+    }
+
+    /// [`Self::reveal`] for a view the selection leads. Settling above the
+    /// bottom stops following the tail, so the next [`Self::update_dimensions`]
+    /// keeps the range in view instead of snapping back to the end. A live view
+    /// calls `reveal`, which moves to its cursor without giving its tail up.
+    pub fn reveal_and_hold(&mut self, top: u16, height: u16) {
+        self.reveal(top, height);
+        self.repin();
     }
 
     pub fn handle_key(&mut self, key_event: KeyEvent) -> bool {
@@ -1934,6 +1944,19 @@ mod tests {
         assert_eq!(scroll.offset(), MODAL_HALF_PAGE);
 
         scroll.update_dimensions(MODAL_TOTAL, MODAL_TOTAL);
+        scroll.update_dimensions(MODAL_TOTAL, MODAL_VIEWPORT);
+        assert_eq!(scroll.offset(), 0);
+    }
+
+    /// `End` pins the view to its tail, and a selection moved to the top after
+    /// it has to stay on screen past the next redraw rather than snap back.
+    #[test_case(ModalScroll::new()     ; "bottom_default")]
+    #[test_case(ModalScroll::new_top() ; "top_default")]
+    fn a_held_reveal_survives_the_next_redraw(mut scroll: ModalScroll) {
+        scroll.update_dimensions(MODAL_TOTAL, MODAL_VIEWPORT);
+        assert!(scroll.handle_key(keybindings::key::DOC_BOTTOM.to_key_event()));
+
+        scroll.reveal_and_hold(0, 1);
         scroll.update_dimensions(MODAL_TOTAL, MODAL_VIEWPORT);
         assert_eq!(scroll.offset(), 0);
     }

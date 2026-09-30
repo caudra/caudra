@@ -21,6 +21,7 @@ use color_eyre::eyre::Context;
 
 use caudra_agent::herdr::{HerdrEnv, herdr_skill};
 use caudra_agent::tools::ToolRegistry;
+use caudra_agent::tools::native::skill::install_builtin_skill;
 use caudra_config::config_file::{
     self, ConfigFileError, global_init_lua_path, project_init_lua_path,
 };
@@ -30,6 +31,7 @@ use caudra_storage::sessions::PermissionMode;
 use caudra_storage::{EphemeralRoot, StateDir};
 
 use crate::cli::{AuthAction, Cli, Command, McpAction, WorkcellAuthAction, normalize_tool_name};
+use crate::docs;
 use crate::sdk_mode::AUTO_PERMISSION_MODE;
 use crate::startup::Startup;
 use crate::update;
@@ -234,24 +236,24 @@ fn reconcile_worktrees(storage: &StateDir, cwd: &Path) -> Vec<String> {
 /// directly, so `caudra-agent` stays free of a config dependency it would
 /// otherwise need only for two numbers.
 ///
-/// The `caudra-plugin-dev` skill is rendered from the live Lua API docs, so
-/// only `caudra-lua` can build it. Not installing it is how
-/// `plugins.skill.plugin_dev = false` takes effect, and how an experiment that
-/// is off keeps its authoring skill out of sight. The `herdr` skill exists
-/// only inside a Herdr pane, the one place its CLI reaches a session.
+/// Not installing a builtin skill is how its `plugins.skill` switch takes
+/// effect, and how an experiment that is off keeps its authoring skill out of
+/// sight. The `caudra-plugin-dev` skill is rendered from the live Lua API
+/// docs, so only `caudra-lua` can build it, and `caudra-docs` reads the user
+/// docs this binary embeds. The `herdr` skill exists only inside a Herdr pane,
+/// the one place its CLI reaches a session.
 fn configure_native_tools(agent: &AgentConfig) {
-    if agent.skill_plugin_dev && agent.features.enabled(Feature::LuaPlugins) {
-        caudra_agent::tools::native::skill::install_builtin_skill(
-            caudra_lua::docs_render::plugin_dev_skill(),
-        );
+    if agent.builtin_skills.plugin_dev && agent.features.enabled(Feature::LuaPlugins) {
+        install_builtin_skill(caudra_lua::docs_render::plugin_dev_skill());
     }
-    if agent.skill_workflow_dev && agent.features.enabled(Feature::Workflows) {
-        caudra_agent::tools::native::skill::install_builtin_skill(
-            caudra_agent::workflow::workflow_dev_skill(),
-        );
+    if agent.builtin_skills.workflow_dev && agent.features.enabled(Feature::Workflows) {
+        install_builtin_skill(caudra_agent::workflow::workflow_dev_skill());
+    }
+    if agent.builtin_skills.docs {
+        install_builtin_skill(docs::skill());
     }
     if let Some(herdr) = HerdrEnv::detect() {
-        caudra_agent::tools::native::skill::install_builtin_skill(herdr_skill(herdr));
+        install_builtin_skill(herdr_skill(herdr));
     }
     caudra_agent::tools::native::task::set_max_concurrent(agent.task_max_concurrent);
 }

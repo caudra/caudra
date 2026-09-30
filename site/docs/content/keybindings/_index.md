@@ -136,6 +136,23 @@ Holding `Alt` while turning the wheel scrolls four times as far. A middle-click 
 | `Home` / `End` | First / last item |
 | `Ctrl+U` | Scroll page up |
 
+## Docs
+
+| Key | Action |
+|-----|--------|
+| `↑` / `↓` | Scroll the page, or move through the contents or the results |
+| `←` / `→` | Pan across a row too wide for the reader |
+| `n` / `p` | Next or previous heading |
+| `Tab` / `Shift+Tab` | Select the next or previous link on screen |
+| `Enter` | Follow the link, or open the page or result; links out open in the browser |
+| `Backspace` / `[` | Back to the place a link or result was opened from |
+| `]` | Forward again |
+| `/` | Search every page; Esc returns to the page |
+| `F3` / `Shift+F3` | Next or previous search highlight |
+| `c` | Contents; typing filters them, Esc clears the filter |
+| `Ctrl+C` | Copy the selection, or close |
+| `Esc` / `q` | Close, keeping the place for the next /docs |
+
 ## Sandbox Manager
 
 These keys exist only with `sandboxes = true` under `[experimental]`. See [Experimental features](/docs/configuration/#experimental-features).

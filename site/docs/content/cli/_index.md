@@ -445,7 +445,14 @@ caudra skills --json          # full records
 caudra skills --dirs          # candidate directories: selected, superseded, or missing
 ```
 
-Applies the same directory precedence a real run does, including the builtin `caudra-workflow-dev` and `caudra-plugin-dev` skills when their `plugins.skill` switches and their experimental features are on. `--dirs` answers why a skill is missing: a directory reads `superseded` when a higher-priority one exists, and `missing` when nothing is there. See [Skills](/docs/skills/#where-skills-live).
+Applies the same directory precedence a real run does, including the builtin skills that `plugins.skill` and the experimental features leave on. A `caudra-docs` address loads one page, one section or one search, as the model would. Quote it, because `#`, `?` and spaces mean something to your shell:
+
+```bash
+caudra skills 'caudra-docs/permissions#plan-mode'
+caudra skills 'caudra-docs?shell timeout'
+```
+
+`--dirs` answers why a skill is missing: a directory reads `superseded` when a higher-priority one exists, and `missing` when nothing is there. See [Skills](/docs/skills/#where-skills-live).
 
 ### `caudra config`
 

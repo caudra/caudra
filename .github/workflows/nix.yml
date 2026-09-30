@@ -30,6 +30,7 @@ jobs:
               - "prompts/**"
               - "themes/**"
               - "words/**"
+              - "site/docs/content/**"
               - ".github/workflows/nix.yml"
 
   build:

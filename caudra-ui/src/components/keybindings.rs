@@ -299,6 +299,10 @@ pub mod key {
     };
     pub const SELECT_ALL: Bind = Bind::from_workbench(wb::SELECT_ALL);
     pub const UNDO: Bind = Bind::from_workbench(wb::UNDO);
+    /// The workbench's find keys, which `/docs` steps through its search
+    /// highlights with.
+    pub const FIND_NEXT: Bind = Bind::from_workbench(wb::FIND_NEXT);
+    pub const FIND_PREV: Bind = Bind::from_workbench(wb::FIND_PREV);
 }
 
 /// Second keys of the `Ctrl+X` chords. They are a namespace of their own:
@@ -367,6 +371,7 @@ pub enum KeybindContext {
     Review,
     Search,
     Logs,
+    Docs,
     Extract,
     Btw,
     FilePicker,
@@ -402,6 +407,7 @@ impl KeybindContext {
             Self::Review => "Review",
             Self::Search => "Search",
             Self::Logs => "Logs",
+            Self::Docs => "Docs",
             Self::Extract => "Extract",
             Self::Btw => "Side Question",
             Self::FilePicker => "File Picker",
@@ -1175,6 +1181,78 @@ pub const KEYBINDS: &[Keybind] = &[
         label: KeyLabel::Single("Esc"),
         description: "Close",
         context: KeybindContext::Logs,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Alt("↑", "↓"),
+        description: "Scroll the page, or move through the contents or the results",
+        context: KeybindContext::Docs,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Alt("\u{2190}", "\u{2192}"),
+        description: "Pan across a row too wide for the reader",
+        context: KeybindContext::Docs,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Alt("n", "p"),
+        description: "Next or previous heading",
+        context: KeybindContext::Docs,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Alt("Tab", SHIFT_TAB_LABEL),
+        description: "Select the next or previous link on screen",
+        context: KeybindContext::Docs,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Single("Enter"),
+        description: "Follow the link, or open the page or result; links out open in the browser",
+        context: KeybindContext::Docs,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Alt("Backspace", "["),
+        description: "Back to the place a link or result was opened from",
+        context: KeybindContext::Docs,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Single("]"),
+        description: "Forward again",
+        context: KeybindContext::Docs,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Single("/"),
+        description: "Search every page; Esc returns to the page",
+        context: KeybindContext::Docs,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Alt(key::FIND_NEXT.label, key::FIND_PREV.label),
+        description: "Next or previous search highlight",
+        context: KeybindContext::Docs,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Single("c"),
+        description: "Contents; typing filters them, Esc clears the filter",
+        context: KeybindContext::Docs,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Single(key::QUIT.label),
+        description: "Copy the selection, or close",
+        context: KeybindContext::Docs,
+        platform: Platform::All,
+    },
+    Keybind {
+        label: KeyLabel::Alt("Esc", "q"),
+        description: "Close, keeping the place for the next /docs",
+        context: KeybindContext::Docs,
         platform: Platform::All,
     },
     Keybind {

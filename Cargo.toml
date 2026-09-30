@@ -32,6 +32,7 @@ caudra-otel = { workspace = true }
 caudra-workcell = { workspace = true }
 caudra-workspace = { workspace = true }
 caudra-workflow = { workspace = true }
+caudra-docs = { workspace = true }
 clap = { workspace = true }
 color-eyre = { workspace = true }
 indicatif = { workspace = true }
@@ -51,6 +52,7 @@ flume = { workspace = true }
 open = { workspace = true }
 rpassword = { workspace = true }
 jiff = { workspace = true }
+include_dir = { workspace = true }
 
 [dev-dependencies]
 test-case = { workspace = true }
@@ -64,6 +66,7 @@ members = [
   "caudra-sandbox",
   "caudra-diff",
   "caudra-docgen",
+  "caudra-docs",
   "caudra-grab",
   "caudra-highlight",
   "caudra-interpreter",
@@ -99,6 +102,7 @@ caudra-config = { path = "caudra-config" }
 caudra-decision = { path = "caudra-decision" }
 caudra-sandbox = { path = "caudra-sandbox" }
 caudra-diff = { path = "caudra-diff" }
+caudra-docs = { path = "caudra-docs" }
 caudra-interpreter = { path = "caudra-interpreter" }
 caudra-providers = { path = "caudra-providers" }
 caudra-storage = { path = "caudra-storage" }
@@ -137,6 +141,7 @@ fastrand = "2"
 test-case = "3"
 ignore = "0.4"
 memchr = "2"
+strsim = "0.11"
 strum = { version = "0.28", features = ["derive"] }
 htmd = "0.5"
 tempfile = "3"

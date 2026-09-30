@@ -25,6 +25,7 @@ pub fn workflow_dev_skill() -> BuiltinSkill {
             .cloned()
             .unwrap_or_default(),
         resolve: Box::new(move || (body.clone(), None)),
+        pages: None,
     }
 }
 

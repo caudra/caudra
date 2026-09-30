@@ -161,6 +161,13 @@ pub const BUILTIN_COMMANDS: &[BuiltinCommand] = &[
         features: &[],
     },
     BuiltinCommand {
+        name: "/docs",
+        description: "Read Caudra's documentation, or search it",
+        max_args: usize::MAX,
+        scope: ChatScope::Any,
+        features: &[],
+    },
+    BuiltinCommand {
         name: "/tools",
         description: "Show which tools the model can reach",
         max_args: 0,

@@ -22,6 +22,7 @@ pub fn herdr_skill(herdr: HerdrEnv) -> BuiltinSkill {
         name: HERDR_SKILL.to_owned(),
         description: DESCRIPTION.to_owned(),
         resolve: Box::new(move || (body(&herdr), None)),
+        pages: None,
     }
 }
 

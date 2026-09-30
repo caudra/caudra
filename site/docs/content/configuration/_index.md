@@ -571,6 +571,7 @@ enabled = false
 |-------|------|---------|-------------|
 | `plugin_dev` | boolean | `false` | Offer the builtin caudra-plugin-dev skill for writing caudra plugins. Needs `experimental.lua_plugins`. |
 | `workflow_dev` | boolean | `true` | Offer the builtin caudra-workflow-dev skill for writing and running workflows. Needs `experimental.workflows`. |
+| `docs` | boolean | `true` | Offer the builtin caudra-docs skill: this build's user documentation, loaded one page or section at a time. |
 
 ### `plugins.task`
 

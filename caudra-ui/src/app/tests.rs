@@ -8,6 +8,7 @@ use crate::components::command::{BUILTIN_COMMANDS, CommandPalette, ParsedCommand
 use crate::components::context_modal::{
     EXPANDED_TITLE as CONTEXT_EXPANDED_TITLE, TITLE as CONTEXT_TITLE,
 };
+use crate::components::docs_modal::fixture as docs_fixture;
 use crate::components::file_walk::UNREADABLE_DIR_MSG;
 use crate::components::goal_modal::GoalTarget;
 use crate::components::input::ChordHint;
@@ -285,6 +286,11 @@ const GOAL_CONDITION: &str = "all focused tests pass";
 const GOAL_CHIP_PREFIX: &str = "[goal \u{b7}";
 const CONTEXT_COMMAND: &str = "/context";
 const LOGS_COMMAND: &str = "/logs";
+const DOCS_COMMAND: &str = "/docs";
+const DOCS_ADDRESS: &str = "permissions#modes";
+const DOCS_QUERY: &str = "shell timeout";
+const IMAGE_PATH_PASTE: &str = "file:///tmp/nonexistent.png";
+const IMAGE_UNDER_MODAL: &str = "a paste into an open modal reached the composer behind it";
 const CONTEXT_UPPERCASE_COMMAND: &str = "/CONTEXT";
 const CONTEXT_TRAILING_COMMAND: &str = "/context   ";
 const CONTEXT_ALL_COMMAND: &str = "/context all";
@@ -371,6 +377,7 @@ fn build_app_with_lua(
         UiConfig::default(),
         100,
         caudra_storage::log::DEFAULT_MAX_FILES,
+        docs_fixture::library,
         Arc::new(PermissionManager::new_nonpersistent(
             PermissionsConfig {
                 rules: vec![],
@@ -2569,9 +2576,22 @@ fn shell_paste_expands_before_execution() {
 #[test]
 fn paste_file_path_triggers_image_load() {
     let mut app = test_app();
-    app.update(Msg::Paste("file:///tmp/nonexistent.png".into()));
+    app.update(Msg::Paste(IMAGE_PATH_PASTE.into()));
     assert!(!app.image_paste_rx.is_empty());
     assert_eq!(app.input_box.buffer.value(), "");
+}
+
+/// An empty paste is how a terminal hands over an image on the clipboard.
+#[test_case(open_logs_modal, IMAGE_PATH_PASTE ; "path_into_logs")]
+#[test_case(open_docs_modal, IMAGE_PATH_PASTE ; "path_into_docs")]
+#[test_case(open_logs_modal, ""               ; "clipboard_into_logs")]
+#[test_case(open_docs_modal, ""               ; "clipboard_into_docs")]
+fn an_image_paste_into_a_modal_stays_out_of_the_composer(open: fn(&mut App), text: &str) {
+    let mut app = test_app();
+    open(&mut app);
+    app.update(Msg::Paste(text.into()));
+    assert!(app.image_paste_rx.is_empty(), "{IMAGE_UNDER_MODAL}");
+    assert_eq!(app.input_box.buffer.value(), "", "{IMAGE_UNDER_MODAL}");
 }
 
 #[test]
@@ -6396,6 +6416,21 @@ fn a_closed_logs_modal_never_owes_a_repaint() {
     app.execute_command(cmd(LOGS_COMMAND), 0);
     app.logs_modal.close();
     assert_eq!(app.tick(), Dirty::NO, "{QUIET}");
+}
+
+#[test_case(DOCS_ADDRESS, false ; "an_address_opens_the_reader")]
+#[test_case(DOCS_QUERY, true ; "other_words_open_the_search")]
+fn the_docs_command_opens_where_its_argument_points(args: &str, searching: bool) {
+    let mut app = app_without_splash();
+    app.execute_command(
+        ParsedCommand {
+            name: DOCS_COMMAND.into(),
+            args: args.into(),
+        },
+        0,
+    );
+    assert!(app.docs_modal.is_open());
+    assert_eq!(app.docs_modal.text_input_active(), searching);
 }
 
 #[test]
@@ -16140,6 +16175,10 @@ fn open_logs_modal(app: &mut App) {
     app.logs_modal.open();
 }
 
+fn open_docs_modal(app: &mut App) {
+    app.execute_command(cmd(DOCS_COMMAND), 0);
+}
+
 fn open_tools_modal(app: &mut App) {
     app.tools_modal.open();
 }
@@ -16183,6 +16222,7 @@ fn open_argument_prompt(app: &mut App) {
 #[test_case(open_usage_modal   ; "usage_modal")]
 #[test_case(open_context_modal ; "context_modal")]
 #[test_case(open_logs_modal    ; "logs_modal")]
+#[test_case(open_docs_modal    ; "docs_modal")]
 #[test_case(open_tools_modal   ; "tools_modal")]
 #[test_case(open_skills_modal  ; "skills_modal")]
 #[test_case(open_storage_modal ; "storage_modal")]
@@ -16213,6 +16253,7 @@ fn a_press_outside_a_modal_dismisses_it(open: fn(&mut App)) {
 #[test_case(open_usage_modal   ; "usage_modal")]
 #[test_case(open_context_modal ; "context_modal")]
 #[test_case(open_logs_modal    ; "logs_modal")]
+#[test_case(open_docs_modal    ; "docs_modal")]
 #[test_case(open_tools_modal   ; "tools_modal")]
 #[test_case(open_skills_modal  ; "skills_modal")]
 #[test_case(open_storage_modal ; "storage_modal")]
@@ -18196,6 +18237,7 @@ fn open_permission_test_leader(app: &mut App) {
 #[test_case(open_help_modal; "help")]
 #[test_case(open_usage_modal; "usage")]
 #[test_case(open_logs_modal; "logs")]
+#[test_case(open_docs_modal; "docs")]
 #[test_case(open_context_modal; "context")]
 #[test_case(open_tools_modal; "tools")]
 #[test_case(open_skills_modal; "skills")]
@@ -18255,6 +18297,7 @@ fn permission_ownership_survives_overlays_before_and_after_arrival(open: fn(&mut
 
 #[test_case(open_help_modal; "help")]
 #[test_case(open_logs_modal; "logs")]
+#[test_case(open_docs_modal; "docs")]
 #[test_case(open_permission_test_editor; "paste_editor")]
 #[test_case(|app| { app.run_builtin(BuiltinAction::Workbench); }; "workbench")]
 fn visible_permission_buttons_own_the_pointer_over_other_overlays(open: fn(&mut App)) {
@@ -18562,6 +18605,45 @@ fn logs_filter_preserves_edit_repeats_without_repeating_log_actions(kind: KeyEve
     }
     app.update(Msg::Key(key(KeyCode::Char('q'))));
     assert!(!app.logs_modal.is_open());
+    assert!(app.input_box.is_empty());
+}
+
+#[test_case(KeyEventKind::Press; "press")]
+#[test_case(KeyEventKind::Repeat; "repeat")]
+fn docs_query_preserves_edit_repeats_without_repeating_docs_actions(kind: KeyEventKind) {
+    let mut app = test_app();
+    open_docs_modal(&mut app);
+    assert!(
+        dispatch_reported_key(&mut app, key(KeyCode::Char('/')), KeyEventKind::Repeat).is_empty()
+    );
+    assert!(!app.docs_modal.text_input_active());
+    app.update(Msg::Key(key(KeyCode::Char('/'))));
+    assert!(app.docs_modal.text_input_active());
+    app.update(Msg::Paste(REPEAT_FIELD_TEXT.into()));
+    dispatch_reported_key(&mut app, key(KeyCode::Char('q')), kind);
+    let extended = format!("{REPEAT_FIELD_TEXT}q");
+    assert!(rendered(&mut app).contains(&extended));
+    dispatch_reported_key(&mut app, key(KeyCode::Backspace), kind);
+    let screen = rendered(&mut app);
+    assert!(screen.contains(REPEAT_FIELD_TEXT));
+    assert!(!screen.contains(&extended));
+    for event in [
+        key(KeyCode::Enter),
+        key(KeyCode::Esc),
+        kb::QUIT.to_key_event(),
+    ] {
+        assert!(dispatch_reported_key(&mut app, event, KeyEventKind::Repeat).is_empty());
+        assert!(app.docs_modal.text_input_active());
+    }
+    app.update(Msg::Key(key(KeyCode::Esc)));
+    assert!(!app.docs_modal.text_input_active());
+    for code in [KeyCode::Char('q'), KeyCode::Char('/')] {
+        assert!(dispatch_reported_key(&mut app, key(code), KeyEventKind::Repeat).is_empty());
+        assert!(app.docs_modal.is_open());
+        assert!(!app.docs_modal.text_input_active());
+    }
+    app.update(Msg::Key(key(KeyCode::Char('q'))));
+    assert!(!app.docs_modal.is_open());
     assert!(app.input_box.is_empty());
 }
 

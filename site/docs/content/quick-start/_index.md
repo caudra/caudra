@@ -102,6 +102,7 @@ Type what you want done, press Enter, watch it work. Worth knowing on day one:
 - **Your shell.** Prefix input with `!` to run a command yourself (`!cargo test`). `!!` hides command and output from the agent.
 - **Escape hatch.** `Esc Esc` stops the main run and all session tasks and workflows. With no session work left, it opens rewind instead. See [Stop and replace](/docs/queue/#stop-and-replace).
 - **Help.** `F1` lists every keybinding, or see [Keybindings](/docs/keybindings/).
+- **These docs.** `/docs` opens this manual inside Caudra, for the version you run, and `/` searches every page. The agent reads the same pages through the [`caudra-docs` skill](/docs/skills/#caudra-docs).
 
 ## Default model (optional)
 

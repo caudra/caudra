@@ -25,6 +25,7 @@ A command with an Experiment entry exists only while that switch is on under `[e
 | `/context` | Inspect active context window usage |  |  |
 | `/storage` | Inspect what the state directory holds |  |  |
 | `/logs` | Browse the structured log |  |  |
+| `/docs` | Read Caudra's documentation, or search it |  |  |
 | `/tools` | Show which tools the model can reach |  |  |
 | `/skills` | Show the skills the model can load and where they come from |  |  |
 | `/queue` | Inspect and edit queued prompts |  |  |
@@ -190,6 +191,16 @@ Token counts are estimates. Deferred MCP definitions and memory or skill bodies 
 
 `/usage` is the cumulative view. It totals provider-reported tokens and priced spend for completed calls across the session, and its global view shows lifetime spend. Both scopes break the work down per model, and per provider once more than one served it, with a `hit` column for [cache hit rate](/docs/token-economy/#cache-hit-rate). See [Context](/docs/context/) for how requests are assembled and [Token Economy](/docs/token-economy/#lifetime-spend) for the spending ledger.
 
+## Docs
+
+`/docs` opens this manual inside Caudra, as it was when your binary was built. The first time, it shows the contents, grouped as on the docs home page. After that it reopens where you left it. `/docs permissions` opens a page, and `/docs permissions#plan-mode` opens one section. Every form the site uses works, so a copied `https://caudra.ai/docs/...` link does too. Any other text, such as `/docs shell timeout`, opens a search for those words.
+
+Press `/` to search every page. A section matches when it contains every word, ignoring case and matching inside longer words, and a misspelt word of five or more letters also matches the closest words in the docs. Sections with the words in their heading come first. `Enter` opens a result with the words highlighted, and `F3` and `Shift+F3` move between the highlights. `Esc` returns to the page and keeps the query for the next `/`.
+
+`Tab` and `Shift+Tab` select a link on screen, and `Enter` follows it. A link to another page opens here, and a link out of the docs opens in your browser. `Backspace` or `[` goes back, and `]` goes forward again. `n` and `p` jump to the next or previous heading. A click follows a link or opens a contents row or a result. A drag over the page copies the [Markdown source](/docs/markdown/#copying) of what it covers, as in the transcript. While the pointer is on a link, the bottom row shows where it goes: the page and section for a link into the docs, or the address of any other link.
+
+On a terminal about 110 columns wide or more, the contents stay beside the page and mark the page and section you are reading. On a narrower one, `c` shows the contents in place of the page. Typing there filters the pages, and `Tab` or `Esc` returns to the page. The agent reads the same pages through the [`caudra-docs` skill](/docs/skills/#caudra-docs).
+
 ## Logs
 
 `/logs` opens the structured log Caudra writes for every run. It reads only the rows on screen plus a small buffer, so the modal opens at the same speed on a 5 KB file and a 5 MB one.
@@ -206,7 +217,7 @@ Press `/` to filter. Each term matches as a subsequence, so `tolcal` finds `tool
 
 A line the parser cannot read, such as a panic backtrace, is shown as it was written and treated as an error so a filter never hides it.
 
-Prompt text and tool input are not written to the log unless you opt in. See [Telemetry](/docs/telemetry/#privacy). Run `caudra logs` for the same records outside the TUI, and see [Logging](/docs/logging/) for the file, its rotation, and the level.
+Prompt text and tool input are not written to the log unless you opt in. See [Telemetry](/docs/telemetry/#what-does-not). Run `caudra logs` for the same records outside the TUI, and see [Logging](/docs/logging/) for the file, its rotation, and the level.
 
 ## Requirements
 

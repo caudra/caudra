@@ -51,6 +51,7 @@ use crate::cmd::permissions::discover::{
     DiscoveryLimits, DiscoveryReport, RECOGNIZER_CAPACITY, RECOGNIZER_ORDER_BIAS,
     discover_for_project_cancellable,
 };
+use crate::docs;
 use crate::progress::SandboxProgress;
 use crate::setup;
 
@@ -1613,6 +1614,7 @@ pub fn run(mut cli: Cli, tightened: Vec<PathBuf>) -> Result<ExitCode> {
                 allow_workspace_recovery: committed_relocation.is_none(),
                 input_history_size: stack.config.storage.input_history_size,
                 max_log_files: stack.config.storage.max_log_files,
+                docs: docs::library,
                 permissions,
                 pattern_suggestion_loader: pattern_suggestions
                     .as_ref()

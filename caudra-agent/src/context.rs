@@ -898,9 +898,13 @@ impl ContextInventory {
         for skill in &mut self.skills.skills {
             skill.loaded_tokens = accounting
                 .skill_results
-                .get(&skill.name)
-                .copied()
-                .unwrap_or_default();
+                .iter()
+                .filter(|(loaded, _)| {
+                    **loaded == skill.name
+                        || skill::split_address(loaded)
+                            .is_some_and(|(parent, _)| parent == skill.name)
+                })
+                .fold(0, |total, (_, tokens)| total.saturating_add(*tokens));
         }
         self.builtins.apply_request_tokens(
             &accounting.builtin_definitions,
@@ -1708,6 +1712,42 @@ mod tests {
                 .saturating_add(accounting.skills),
             total
         );
+    }
+
+    #[test]
+    fn page_and_search_loads_are_charged_to_their_skill() {
+        const DOCS_SKILL: &str = "caudra-docs";
+        let mut inventory = ContextInventory {
+            skills: ContextSkillInventory {
+                skills: [DOCS_SKILL, SKILL_NAME]
+                    .map(|name| ContextSkill {
+                        name: name.into(),
+                        description: String::new(),
+                        loaded_tokens: 0,
+                    })
+                    .into(),
+                ..ContextSkillInventory::default()
+            },
+            ..ContextInventory::default()
+        };
+        let accounting = RequestAccounting {
+            skill_results: BTreeMap::from([
+                (DOCS_SKILL.to_owned(), 1),
+                (format!("{DOCS_SKILL}/tools#shell"), 2),
+                (format!("{DOCS_SKILL}?shell timeout"), 4),
+                (format!("{DOCS_SKILL}-other"), 8),
+                (SKILL_NAME.to_owned(), 16),
+            ]),
+            ..RequestAccounting::default()
+        };
+        inventory.apply_accounting(&accounting);
+        let loaded: Vec<u32> = inventory
+            .skills
+            .skills
+            .iter()
+            .map(|skill| skill.loaded_tokens)
+            .collect();
+        assert_eq!(loaded, [1 + 2 + 4, 16]);
     }
 
     #[test]
