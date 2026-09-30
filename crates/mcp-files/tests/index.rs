@@ -260,6 +260,12 @@ const LANGUAGE_CASES: &[LanguageCase] = &[
         language: "proto",
         expected: "mod: [1]\n  demo\n\ntypes:\n  message Item [2-5]\n    string id = 1\n  message Item.Part [4]\n  enum Kind [6]\n    KIND_A, KIND_B",
     },
+    LanguageCase {
+        filename: "case.xml",
+        source: "<?xml version=\"1.0\"?>\n<project>\n  <dependencies>\n    <dependency><id>a</id></dependency>\n    <dependency><id>b</id></dependency>\n  </dependencies>\n  <build><plugins><plugin/></plugins></build>\n</project>\n",
+        language: "xml",
+        expected: "structure:\n  <project> [2-8]\n    <dependencies> [3-6]\n      <dependency> ×2 [4-5]\n    <build> [7]\n      <plugins> [7]",
+    },
 ];
 
 const NATIVE_CONSTRUCT_CASES: &[NativeConstructCase] = &[
@@ -488,6 +494,20 @@ const NATIVE_CONSTRUCT_CASES: &[NativeConstructCase] = &[
         filename: "many_fields.proto",
         source: "message Many {\n  int32 a = 1;\n  int32 b = 2;\n  int32 c = 3;\n  int32 d = 4;\n  int32 e = 5;\n  int32 f = 6;\n  int32 g = 7;\n  int32 h = 8;\n  int32 i = 9;\n  map<string, int32> j = 10;\n}\n",
         required: &["    int32 h = 8\n    [2 more truncated]"],
+    },
+    NativeConstructCase {
+        filename: "native.csproj",
+        source: "<Project Sdk=\"Microsoft.NET.Sdk\">\n  <PropertyGroup>\n    <TargetFramework>net8.0</TargetFramework>\n  </PropertyGroup>\n  <PropertyGroup Condition=\"'$(Configuration)' == 'Release'\">\n    <Optimize>true</Optimize>\n  </PropertyGroup>\n  <ItemGroup>\n    <PackageReference Include=\"Serilog\" Version=\"3.1.1\" />\n    <PackageReference Include=\"Microsoft.Extensions.DependencyInjection.Abstractions.Testing\" />\n    <Compile Include='src/**/*.cs' />\n    <Content Include=\"wwwroot/**;\n      appsettings.json\" />\n  </ItemGroup>\n  <Target Name=\"Stamp\" BeforeTargets=\"Build\">\n    <Message Text=\"stamping\" />\n  </Target>\n  <section xml:id=\"intro\" />\n</Project>\n",
+        required: &[
+            "structure:\n  <Project> [1-19]\n    <PropertyGroup> [2-4]\n      <TargetFramework> [3]\n    <PropertyGroup> [5-7]\n      <Optimize> [6]\n    <ItemGroup> [8-14]\n      <PackageReference Include=Serilog> [9]\n      <PackageReference Include=Microsoft.Extensions.DependencyInjection.Abstract[truncated]> [10]\n      <Compile Include=src/**/*.cs> [11]\n      <Content Include=wwwroot/**; appsettings.json> [12-13]\n    <Target Name=Stamp> [15-17]\n      <Message> [16]\n    <section xml:id=intro> [18]",
+        ],
+    },
+    NativeConstructCase {
+        filename: "native.plist",
+        source: "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\">\n<dict>\n\t<key>CFBundleName</key>\n\t<string>Canvas</string>\n\t<key>CFBundleVersion</key>\n\t<string>1.2</string>\n\t<key>LSRequiresIPhoneOS</key>\n\t<true/>\n</dict>\n</plist>\n",
+        required: &[
+            "structure:\n  <plist> [3-12]\n    <dict> [4-11]\n      <key> ×3 [5-9]\n      <string> ×2 [6-8]\n      <true> [10]",
+        ],
     },
     NativeConstructCase {
         filename: "native.cs",
@@ -1495,6 +1515,20 @@ async fn every_extension_and_exact_filename_mapping_is_preserved() {
         ("mak", "make"),
         ("cmake", "cmake"),
         ("proto", "proto"),
+        ("xml", "xml"),
+        ("xsd", "xml"),
+        ("xsl", "xml"),
+        ("xslt", "xml"),
+        ("xaml", "xml"),
+        ("plist", "xml"),
+        ("resx", "xml"),
+        ("wsdl", "xml"),
+        ("csproj", "xml"),
+        ("fsproj", "xml"),
+        ("vbproj", "xml"),
+        ("vcxproj", "xml"),
+        ("props", "xml"),
+        ("targets", "xml"),
     ];
     const FILENAMES: &[(&str, &str)] = &[
         ("MODULE.bazel", "bazel_module"),

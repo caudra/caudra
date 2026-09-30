@@ -1330,8 +1330,8 @@ delete sections.
   It does not add or hide harness-specific instruction files.
 - Supported families are Rust, Python, TypeScript/JavaScript, Gleam, Go, HTML, Java,
   C/C++/CUDA/Objective-C/C#, Ruby, PHP, Swift, Kotlin, Scala, Bash, Lua, Elixir, Markdown,
-  Bazel/Starlark, Zig, Nix, Dart, TOML, YAML, SQL, CSS, JSON, HCL, Containerfile, Make, CMake, and
-  Protobuf.
+  Bazel/Starlark, Zig, Nix, Dart, TOML, YAML, SQL, CSS, JSON, HCL, Containerfile, Make, CMake,
+  Protobuf, and XML.
 - A `.h` header is parsed as C++. A C header parses acceptably under the C++ grammar, while a C++
   header under the C grammar loses its namespaces, classes, and templates; the code map resolves C,
   C++, CUDA, and Objective-C symbols against each other so a `.c`, `.cu`, or `.m` definition still
@@ -1360,6 +1360,14 @@ delete sections.
   service with its rpcs. In the code map they are data, like the config formats: messages, enums,
   services, and rpcs are symbols and field types are reads, but nothing is a call, and an import's
   quoted path is not a symbol.
+- XML files (`.xml`, `.xsd`, `.xsl`, `.xslt`, `.xaml`, `.plist`, `.resx`, `.wsdl`, and MSBuild's
+  `.csproj`, `.fsproj`, `.vbproj`, `.vcxproj`, `.props`, and `.targets`) show their element tree
+  three levels deep. Each element is labelled by its tag and by its first `id`, `name`, `key`, or
+  `Include` attribute, matched by local name in any case, so `x:Name` and `android:id` count.
+  Elements that would show nothing beneath them and share a label collapse into one counted row
+  spanning the first to the last, as in `<dependency> ×12`. In the code map the root element and
+  its children are sections named by their tags, and nothing is a call. SVG, `.xib`, and
+  `.storyboard` files are not indexed: each is large generated markup.
 - Extraction and formatting are native Rust visitors over tree-sitter nodes. The index feature does
   not embed a scripting runtime or load extractor code at runtime.
 - MCP model text is the bare skeleton or listing. `structuredContent` carries the same bounded output;

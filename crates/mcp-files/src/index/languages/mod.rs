@@ -31,6 +31,7 @@ mod sql;
 mod swift;
 mod toml;
 mod typescript;
+mod xml;
 mod yaml;
 mod zig;
 
@@ -58,6 +59,7 @@ pub(super) fn extract(
         Language::Hcl => hcl::extract(root, context),
         Language::Containerfile => containerfile::extract(root, context),
         Language::Make => make::extract(root, context),
+        Language::Xml => xml::extract(root, context),
         _ => extract_default(root, context, spec(language)),
     }
 }
@@ -99,6 +101,7 @@ fn spec(language: Language) -> LanguageSpec {
         | Language::Json
         | Language::Hcl
         | Language::Containerfile
-        | Language::Make => unreachable!("custom extractor requested as a default extractor"),
+        | Language::Make
+        | Language::Xml => unreachable!("custom extractor requested as a default extractor"),
     }
 }

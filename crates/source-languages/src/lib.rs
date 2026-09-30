@@ -67,6 +67,7 @@ pub enum Language {
     ObjC,
     CMake,
     Protobuf,
+    Xml,
 }
 
 /// What a language contributes to the graph.
@@ -128,6 +129,7 @@ pub const ALL: &[Language] = &[
     Language::ObjC,
     Language::CMake,
     Language::Protobuf,
+    Language::Xml,
 ];
 
 impl Language {
@@ -178,6 +180,9 @@ impl Language {
     ///
     /// Metal Shading Language (`.metal`) is a C++14 dialect and resolves to C++: its address-space
     /// qualifiers error-recover to single tokens and leave the enclosing definitions intact.
+    ///
+    /// SVG, `.xib`, and `.storyboard` files are XML but stay unsupported. Each is large generated
+    /// markup, and the code map would ingest every icon and view as sections.
     #[must_use]
     pub fn from_extension(extension: &str) -> Option<Self> {
         let language = match extension {
@@ -218,6 +223,8 @@ impl Language {
             "m" | "mm" => Self::ObjC,
             "cmake" => Self::CMake,
             "proto" => Self::Protobuf,
+            "xml" | "xsd" | "xsl" | "xslt" | "xaml" | "plist" | "resx" | "wsdl" | "csproj"
+            | "fsproj" | "vbproj" | "vcxproj" | "props" | "targets" => Self::Xml,
             _ => return None,
         };
         Some(language)
@@ -265,6 +272,7 @@ impl Language {
             Self::ObjC => "objc",
             Self::CMake => "cmake",
             Self::Protobuf => "proto",
+            Self::Xml => "xml",
         }
     }
 
@@ -322,6 +330,7 @@ impl Language {
             Self::ObjC => tree_sitter_objc::LANGUAGE.into(),
             Self::CMake => tree_sitter_cmake::LANGUAGE.into(),
             Self::Protobuf => tree_sitter_proto::LANGUAGE.into(),
+            Self::Xml => tree_sitter_xml::LANGUAGE_XML.into(),
         }
     }
 
@@ -364,7 +373,7 @@ impl Language {
             | Self::Nix
             | Self::Containerfile
             | Self::Protobuf => LanguageFamily::Config,
-            Self::Markdown | Self::Html | Self::Css => LanguageFamily::Prose,
+            Self::Markdown | Self::Html | Self::Css | Self::Xml => LanguageFamily::Prose,
         }
     }
 
@@ -484,6 +493,12 @@ mod tests {
     #[test_case("a/cmake/Warnings.cmake", Some(Language::CMake) ; "a cmake module is cmake")]
     #[test_case("a/notes.txt", None ; "another text file is not cmake")]
     #[test_case("a/canvas.proto", Some(Language::Protobuf) ; "a protobuf schema is protobuf")]
+    #[test_case("a/pom.xml", Some(Language::Xml) ; "an xml document is xml")]
+    #[test_case("a/App.csproj", Some(Language::Xml) ; "an msbuild project is xml")]
+    #[test_case("a/Info.plist", Some(Language::Xml) ; "a property list is xml")]
+    #[test_case("a/icon.svg", None ; "an svg image is unsupported")]
+    #[test_case("a/Main.storyboard", None ; "a storyboard is unsupported")]
+    #[test_case("a/View.xib", None ; "an interface builder file is unsupported")]
     #[test_case("a/main.rs", Some(Language::Rust) ; "an extension resolves")]
     #[test_case("a/kernel.cu", Some(Language::Cuda) ; "a cuda source is cuda")]
     #[test_case("a/kernel.cuh", Some(Language::Cuda) ; "a cuda header is cuda")]

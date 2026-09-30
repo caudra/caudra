@@ -328,6 +328,15 @@ fn protobuf_reads_a_qualified_type_once() {
     assert_eq!(captured.named_references, 1, "{:?}", captured.references);
 }
 
+#[test_case("<?xml version=\"1.0\"?>\n<project/>\n", &["section:project"] ; "an empty root")]
+#[test_case("<project><build/></project>\n", &["section:build", "section:project"] ; "an empty child")]
+#[test_case("<project><build><plugins><plugin/></plugins></build></project>\n", &["section:build", "section:project"] ; "nothing below the root's children")]
+fn xml_sections_are_the_root_and_its_children(source: &str, expected: &[&str]) {
+    let captured = capture(Language::Xml, source);
+    let sections: Vec<_> = captured.definitions.keys().map(String::as_str).collect();
+    assert_eq!(sections, expected);
+}
+
 #[test_case("struct Widget { Widget(int, char) stray; };\n", "field:stray" ; "a constructor followed by a stray token")]
 #[test_case("void set_callback(item *i, int (*callback)(item *i));\n", "constant:set_callback" ; "a prototype the grammar reads as a variable")]
 fn cpp_header_recovery_mints_no_false_definition(source: &str, unexpected: &str) {

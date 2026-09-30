@@ -43,6 +43,7 @@ tree-sitter-starlark.workspace = true
 tree-sitter-swift.workspace = true
 tree-sitter-toml-ng.workspace = true
 tree-sitter-typescript.workspace = true
+tree-sitter-xml.workspace = true
 tree-sitter-yaml.workspace = true
 tree-sitter-zig.workspace = true
 
