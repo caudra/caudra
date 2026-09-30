@@ -909,6 +909,7 @@ pub(crate) mod tests {
 
     use async_trait::async_trait;
     use caudra_config::config_version::CONFIG_VERSION_KEY;
+    use caudra_config::example::{self, Render};
     use caudra_workspace::{
         CwdHandle, OperationId, ProjectAssetContent, ProjectAssetManifest, ProjectKey,
         ResourceScope, SessionBindingId, SessionWorkspaceBinding, SourceTrustAnchor,
@@ -1745,6 +1746,16 @@ pub(crate) mod tests {
         assert_eq!(
             parse_remote_permissions(source.as_bytes()),
             Err(permission_content_error())
+        );
+    }
+
+    #[test_case(Render::Reference ; "reference")]
+    #[test_case(Render::Live { defaults: false } ; "example_tables")]
+    fn the_permissions_reference_declares_nothing(render: Render) {
+        let reference = example::permissions::document().render(render);
+        assert_eq!(
+            parse_remote_permissions(reference.as_bytes()),
+            Ok(RemotePermissionDeclarations::default())
         );
     }
 

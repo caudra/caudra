@@ -6,6 +6,8 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde::Deserialize;
+#[cfg(test)]
+use serde::Serialize;
 use sha2::{Digest, Sha256};
 use toml_edit::DocumentMut;
 use url::{Host, Url};
@@ -13,12 +15,8 @@ use url::{Host, Url};
 use super::error::McpError;
 use crate::tools::is_builtin_tool;
 use caudra_config::config_version::ConfigVersion;
+use caudra_config::mcp::{DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS, MCP_FILE, MCP_VERSION};
 use caudra_config::{global_config_dir, is_valid_server_name};
-
-const MCP_CONFIG_FILE: &str = "mcp.toml";
-const MCP_CONFIG_VERSION: u32 = 1;
-const DEFAULT_TIMEOUT_MS: u64 = 30_000;
-const MAX_TIMEOUT_MS: u64 = 300_000;
 
 #[derive(Debug, Clone)]
 pub enum McpConfigError {
@@ -151,6 +149,7 @@ pub struct McpServerInfo {
 }
 
 #[derive(Deserialize, Default)]
+#[cfg_attr(test, derive(Serialize))]
 pub struct McpConfig {
     #[serde(skip)]
     pub local_execution: LocalExecutionPolicy,
@@ -170,6 +169,7 @@ pub struct McpConfig {
 }
 
 #[derive(Deserialize, Clone)]
+#[cfg_attr(test, derive(Serialize))]
 pub struct RawServerConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
@@ -194,6 +194,7 @@ impl RawServerConfig {
 }
 
 #[derive(Deserialize, Clone)]
+#[cfg_attr(test, derive(Serialize))]
 #[serde(untagged)]
 pub enum RawTransport {
     Stdio(RawStdioFields),
@@ -201,6 +202,7 @@ pub enum RawTransport {
 }
 
 #[derive(Deserialize, Clone)]
+#[cfg_attr(test, derive(Serialize))]
 pub struct RawStdioFields {
     pub command: Vec<String>,
     #[serde(default)]
@@ -208,6 +210,7 @@ pub struct RawStdioFields {
 }
 
 #[derive(Deserialize, Clone)]
+#[cfg_attr(test, derive(Serialize))]
 pub struct RawHttpFields {
     pub url: String,
     #[serde(default)]
@@ -229,6 +232,7 @@ pub struct ServerConfig {
 
 /// Static OAuth client used when the server has no registration endpoint.
 #[derive(Deserialize, Clone, Debug)]
+#[cfg_attr(test, derive(Serialize))]
 pub struct OauthClientConfig {
     pub client_id: String,
     #[serde(default)]
@@ -626,7 +630,7 @@ pub fn load_config(cwd: &Path) -> (McpConfig, McpConfigErrors) {
     let mut errors = McpConfigErrors::new(cwd.to_path_buf());
 
     if let Some(global_dir) = global_config_dir() {
-        let global_path = global_dir.join(MCP_CONFIG_FILE);
+        let global_path = global_dir.join(MCP_FILE);
         merge_config(
             &mut merged,
             &mut errors,
@@ -634,7 +638,7 @@ pub fn load_config(cwd: &Path) -> (McpConfig, McpConfigErrors) {
             McpConfigSource::Global,
         );
     }
-    let project_path = cwd.join(".caudra").join(MCP_CONFIG_FILE);
+    let project_path = cwd.join(".caudra").join(MCP_FILE);
     merge_config(
         &mut merged,
         &mut errors,
@@ -658,7 +662,7 @@ fn load_global_config_from(cwd: &Path, global_dir: Option<&Path>) -> (McpConfig,
         merge_config(
             &mut merged,
             &mut errors,
-            &global_dir.join(MCP_CONFIG_FILE),
+            &global_dir.join(MCP_FILE),
             McpConfigSource::Global,
         );
     }
@@ -729,7 +733,7 @@ fn read_config(path: &Path) -> Result<Option<McpConfig>, McpConfigError> {
             });
         }
     };
-    ConfigVersion::<MCP_CONFIG_VERSION>::check_document(&content)
+    ConfigVersion::<MCP_VERSION>::check_document(&content)
         .and_then(|_| toml::from_str(&content))
         .inspect_err(|e| {
             tracing::warn!(
@@ -746,12 +750,23 @@ fn read_config(path: &Path) -> Result<Option<McpConfig>, McpConfigError> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use super::*;
+    use caudra_config::ConfigField;
     use caudra_config::config_version::{CONFIG_VERSION_KEY, ConfigVersionError};
+    use caudra_config::example::mcp::{HTTP_SERVER, OAUTH_CLIENT, STDIO_SERVER};
+    use caudra_config::example::{self, Render};
+    use caudra_config::mcp::{
+        DEFAULT_CALLBACK_HOSTNAME, DEFAULT_CALLBACK_PATH, DEFAULT_DEFER_TOOLS, HTTP_FIELDS,
+        OAUTH_FIELDS, SERVER_FIELDS, STDIO_FIELDS, TOP_LEVEL_FIELDS,
+    };
+    use serde_json::Value;
     use test_case::test_case;
 
     const GLOBAL_SERVER: &str = "global-server";
     const PROJECT_CANARY: &str = "project-canary";
+    const SERVERS_TABLE: &str = "mcp";
 
     fn stdio_raw(cmd: &[&str]) -> RawServerConfig {
         RawServerConfig {
@@ -804,12 +819,12 @@ mod tests {
         fs::create_dir_all(&global).unwrap();
         fs::create_dir_all(project.join(".caudra")).unwrap();
         fs::write(
-            global.join(MCP_CONFIG_FILE),
+            global.join(MCP_FILE),
             format!("[mcp.{GLOBAL_SERVER}]\ncommand = ['true']\n"),
         )
         .unwrap();
         fs::write(
-            project.join(".caudra").join(MCP_CONFIG_FILE),
+            project.join(".caudra").join(MCP_FILE),
             format!("[mcp.{PROJECT_CANARY}]\ncommand = ['false']\n"),
         )
         .unwrap();
@@ -1217,7 +1232,7 @@ command = ["echo", "hello"]
 
     fn write_versioned_config(version: u32) -> (tempfile::TempDir, PathBuf) {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join(MCP_CONFIG_FILE);
+        let path = dir.path().join(MCP_FILE);
         fs::write(
             &path,
             format!(
@@ -1230,7 +1245,7 @@ command = ["echo", "hello"]
 
     #[test]
     fn read_config_loads_servers_from_the_current_version() {
-        let (_dir, path) = write_versioned_config(MCP_CONFIG_VERSION);
+        let (_dir, path) = write_versioned_config(MCP_VERSION);
 
         let config = read_config(&path).unwrap().unwrap();
 
@@ -1239,11 +1254,11 @@ command = ["echo", "hello"]
 
     #[test]
     fn read_config_refuses_a_newer_version() {
-        let found = MCP_CONFIG_VERSION + 1;
+        let found = MCP_VERSION + 1;
         let (_dir, path) = write_versioned_config(found);
         let expected = ConfigVersionError::Newer {
             found: i64::from(found),
-            latest: MCP_CONFIG_VERSION,
+            latest: MCP_VERSION,
         }
         .to_string();
 
@@ -1251,5 +1266,87 @@ command = ["echo", "hello"]
             read_config(&path),
             Err(McpConfigError::Parse { error, .. }) if error.contains(&expected)
         ));
+    }
+
+    fn load_reference(render: Render) -> McpConfig {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(MCP_FILE);
+        fs::write(&path, example::mcp::document().render(render)).unwrap();
+        read_config(&path).unwrap().unwrap()
+    }
+
+    /// What Caudra acts on, with each unset option replaced by the default
+    /// Caudra uses in its place.
+    fn effective(mut config: McpConfig) -> Value {
+        config.defer_tools.get_or_insert(DEFAULT_DEFER_TOOLS);
+        for server in config.mcp.values_mut() {
+            if let RawTransport::Http(RawHttpFields {
+                oauth: Some(oauth), ..
+            }) = &mut server.transport
+            {
+                oauth
+                    .callback_path
+                    .get_or_insert_with(|| DEFAULT_CALLBACK_PATH.to_owned());
+                oauth
+                    .callback_hostname
+                    .get_or_insert_with(|| DEFAULT_CALLBACK_HOSTNAME.to_owned());
+            }
+        }
+        serde_json::to_value(&config).unwrap()
+    }
+
+    fn json_pointer(header: &str) -> String {
+        header
+            .split('.')
+            .filter(|segment| !segment.is_empty())
+            .map(|segment| format!("/{segment}"))
+            .collect()
+    }
+
+    #[test]
+    fn the_reference_adds_no_server() {
+        let config = load_reference(Render::Reference);
+        assert!(config.mcp.is_empty());
+        assert_eq!(config.defer_tools, None);
+    }
+
+    #[test]
+    fn the_reference_states_the_real_defaults() {
+        assert_eq!(
+            effective(load_reference(Render::Live { defaults: true })),
+            effective(load_reference(Render::Live { defaults: false }))
+        );
+    }
+
+    #[test]
+    fn the_reference_samples_are_valid_servers() {
+        let config = load_reference(Render::Live { defaults: false });
+        assert!(!config.mcp.is_empty());
+        for (name, server) in config.mcp {
+            if let Err(error) = parse_server(name.clone(), server) {
+                panic!("{name}: {error}");
+            }
+        }
+    }
+
+    #[test_case("", &[TOP_LEVEL_FIELDS], &[SERVERS_TABLE] ; "top_level")]
+    #[test_case(STDIO_SERVER, &[SERVER_FIELDS, STDIO_FIELDS], &[] ; "stdio_server")]
+    #[test_case(HTTP_SERVER, &[SERVER_FIELDS, HTTP_FIELDS], &[] ; "http_server")]
+    #[test_case(OAUTH_CLIENT, &[OAUTH_FIELDS], &[] ; "oauth_client")]
+    fn the_reference_describes_every_key(header: &str, fields: &[&[ConfigField]], tables: &[&str]) {
+        let config = serde_json::to_value(load_reference(Render::Live { defaults: true })).unwrap();
+        let keys: BTreeSet<&str> = config
+            .pointer(&json_pointer(header))
+            .and_then(Value::as_object)
+            .unwrap_or_else(|| panic!("no [{header}] table"))
+            .keys()
+            .map(String::as_str)
+            .collect();
+        let described: BTreeSet<&str> = fields
+            .iter()
+            .flat_map(|fields| fields.iter().map(|field| field.name))
+            .chain(tables.iter().copied())
+            .collect();
+        assert_eq!(keys, described);
     }
 }

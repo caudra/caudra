@@ -106,14 +106,56 @@ on_exit = "detach"
 
 The implemented schema is in `caudra-config/src/sandbox.rs`: `SandboxProvider`, `NetworkPolicy`, `TransferPolicy`, `SandboxProfile`, and the versioned `SandboxDocument`. Persistence rules are in `caudra-config/src/sandbox/persistence.rs`.
 
-| Record | Rules and defaults |
-|--------|--------------------|
-| Provider | `kind` is `e2b-libvirt`. Both endpoints are origins, without paths, credentials, query or fragment. HTTPS is accepted, or HTTP on a numeric loopback address. `http://localhost` is rejected. `credential_ref` is a lifecycle `sandbox-api:NAME` reference, not a Workcell `credential:NAME` reference. |
-| Profile | Provider, template ID, resources, cwd, network, transfer and running TTL are required. A running TTL of `0` has [no expiry](#leases-with-no-expiry). `persistent` defaults to `true`. `on_exit` defaults to `detach`, the only supported value. `cwd` is Workcell-root-relative, with `.` selecting the root. |
-| Network | `enforcement` is required and is `required` or `off`. TLS defaults to `sni-only`, and lists default to empty. Required enforcement with empty lists is deny-all. `off` must have empty lists and cannot select MITM. |
-| Transfer | Defaults are `respect_gitignore = true`, `initial_seed = "ask"`, and `delete_extraneous = false`. `initial_seed = "none"` disables the initial-seed offer, not later explicit transfers. `delete_extraneous = true` is rejected. |
+<!-- caudra-docgen:sandbox-records -->
 
-Omitting `exclude` keeps the built-in profile defaults: `**/.git/**`, `**/.env*`, `**/target/**`, `**/node_modules/**`, `**/.venv/**`, `**/.ssh/**`, `**/.aws/**`, `**/.caudra/**`, `**/*.pem`, and `**/*.key`. Supplying an array replaces those defaults. Exclusions are relative globs without traversal, negation or absolute paths. Independent protected-path checks remain in force even with `exclude = []` or gitignore handling disabled.
+#### `[sandbox.providers.NAME]`
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `kind` | string | required | The provider type. `e2b-libvirt` is the only one |
+| `api_endpoint` | string | required | The origin of the lifecycle API: HTTPS, or HTTP on a numeric loopback address, with no path, credentials, query, or fragment. Caudra refuses `http://localhost` |
+| `proxy_endpoint` | string | required | The origin of the sandbox proxy, with the same rules as `api_endpoint` |
+| `credential_ref` | string | required | The lifecycle API key, as `sandbox-api:NAME`, not a Workcell `credential:NAME`. `caudra auth sandbox generate NAME` or `caudra auth sandbox set NAME` saves it |
+
+#### `[sandbox.networks.NAME]`
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `enforcement` | string | required | `required` enforces the lists below, so empty lists deny all traffic. `off` enforces nothing, and then both lists must be empty and `tls_mode` must stay `sni-only` |
+| `tls_mode` | string | `sni-only` | `sni-only` or `mitm` |
+| `domains` | string[] | `[]` | Domains the sandbox may reach, such as `github.com` or `*.githubusercontent.com` |
+| `cidrs` | string[] | `[]` | Address ranges the sandbox may reach, such as `10.0.0.0/8` |
+
+#### `[sandbox.transfers.NAME]`
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `respect_gitignore` | bool | `true` | Leave out the files that `.gitignore` ignores |
+| `initial_seed` | string | `ask` | `ask` offers to copy the project into a new sandbox, and `none` skips the offer. Later transfers work either way |
+| `delete_extraneous` | bool | `false` | Only `false` works, because Caudra never deletes files on its own |
+| `exclude` | string[] | `["**/.git/**", "**/.env*", "**/target/**", "**/node_modules/**", "**/.venv/**", "**/.ssh/**", "**/.aws/**", "**/.caudra/**", "**/*.pem", "**/*.key"]` | Relative globs of paths never to copy. A list you set replaces the one shown. A glob cannot start with `/` or `!`, or hold `.`, `..`, `\`, or `:` |
+
+#### `[sandbox.profiles.NAME]`
+
+| Field | Type | Default | Min | Description |
+|-------|------|---------|-----|-------------|
+| `provider` | string | required | - | The name of a [sandbox.providers.NAME] record |
+| `template` | string | required | - | A template ID from the provider catalog. Each launch uses the revision the catalog lists at that time |
+| `cpus` | integer | required | 1 | Virtual CPUs |
+| `memory_mib` | integer | required | 1 | Memory in MiB |
+| `disk_gib` | integer | required | 1 | Virtual disk size in GiB. It reserves no host space |
+| `cwd` | string | required | - | The working directory, relative to the Workcell root, where `.` is the root itself |
+| `network` | string | required | - | The name of a [sandbox.networks.NAME] record |
+| `transfer` | string | required | - | The name of a [sandbox.transfers.NAME] record |
+| `persistent` | bool | `true` | - | Keep the disk when the sandbox pauses or its lease ends. Only a persistent sandbox can pause |
+| `running_ttl_seconds` | integer | required | - | Seconds the sandbox may run before its lease ends. `0` never ends, which needs a provider without a lease cap |
+| `on_exit` | string | `detach` | - | What happens to the sandbox when Caudra exits. `detach` is the only value |
+
+`caudra config example sandboxes` prints every `sandboxes.toml` key with its default, all commented out. [sandboxes.example.toml](/docs/sandboxes.example.toml) holds the same text.
+
+<!-- /caudra-docgen:sandbox-records -->
+
+Omitting `exclude` keeps the built-in transfer defaults shown above, and supplying an array replaces them. Independent protected-path checks remain in force even with `exclude = []` or gitignore handling disabled.
 
 CPU count, memory MiB, disk GiB and TTL must fit discovered provider limits and template minimums. A TTL of `0` fits only a provider without a lease cap. Unsupported architecture, topology, TLS or persistence is refused before creation. Disk size is virtual capacity, not a reservation of host space or a promise to resize the guest filesystem. Save can validate configuration offline, but launch compatibility remains unverified until discovery succeeds.
 

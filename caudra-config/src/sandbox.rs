@@ -11,6 +11,8 @@ use std::str::FromStr;
 use thiserror::Error;
 use url::Url;
 
+use crate::{ConfigField, ConfigValue};
+
 pub mod persistence;
 
 pub const SANDBOX_FILE: &str = "sandboxes.toml";
@@ -32,6 +34,8 @@ const NO_EXPIRY: &str = "no expiry";
 const TTL_CAPABILITY: &str = "running TTL";
 const NO_EXPIRY_CAPABILITY: &str =
     "running TTL of 0 (no expiry) needs a provider started with E2B_LOCAL_MAX_TIMEOUT=0";
+/// Resource counts are `NonZeroU32`.
+const MIN_RESOURCE: u64 = 1;
 const DEFAULT_EXCLUDES: &[&str] = &[
     "**/.git/**",
     "**/.env*",
@@ -297,6 +301,45 @@ pub struct SandboxProvider {
 }
 
 impl SandboxProvider {
+    pub const FIELDS: &[ConfigField] = &[
+        ConfigField {
+            name: "kind",
+            ty: "string",
+            default: ConfigValue::Required("\"e2b-libvirt\""),
+            min: None,
+            max: None,
+            env: None,
+            description: "The provider type. `e2b-libvirt` is the only one",
+        },
+        ConfigField {
+            name: "api_endpoint",
+            ty: "string",
+            default: ConfigValue::Required("\"http://127.0.0.1:3000\""),
+            min: None,
+            max: None,
+            env: None,
+            description: "The origin of the lifecycle API: HTTPS, or HTTP on a numeric loopback address, with no path, credentials, query, or fragment. Caudra refuses `http://localhost`",
+        },
+        ConfigField {
+            name: "proxy_endpoint",
+            ty: "string",
+            default: ConfigValue::Required("\"http://127.0.0.1:49983\""),
+            min: None,
+            max: None,
+            env: None,
+            description: "The origin of the sandbox proxy, with the same rules as `api_endpoint`",
+        },
+        ConfigField {
+            name: "credential_ref",
+            ty: "string",
+            default: ConfigValue::Required("\"sandbox-api:local\""),
+            min: None,
+            max: None,
+            env: None,
+            description: "The lifecycle API key, as `sandbox-api:NAME`, not a Workcell `credential:NAME`. `caudra auth sandbox generate NAME` or `caudra auth sandbox set NAME` saves it",
+        },
+    ];
+
     pub fn revision(&self) -> Result<Revision, SandboxError> {
         Revision::of(self)
     }
@@ -331,6 +374,45 @@ pub struct NetworkPolicy {
 }
 
 impl NetworkPolicy {
+    pub const FIELDS: &[ConfigField] = &[
+        ConfigField {
+            name: "enforcement",
+            ty: "string",
+            default: ConfigValue::Required("\"required\""),
+            min: None,
+            max: None,
+            env: None,
+            description: "`required` enforces the lists below, so empty lists deny all traffic. `off` enforces nothing, and then both lists must be empty and `tls_mode` must stay `sni-only`",
+        },
+        ConfigField {
+            name: "tls_mode",
+            ty: "string",
+            default: ConfigValue::Str("sni-only"),
+            min: None,
+            max: None,
+            env: None,
+            description: "`sni-only` or `mitm`",
+        },
+        ConfigField {
+            name: "domains",
+            ty: "string[]",
+            default: ConfigValue::Toml("[]"),
+            min: None,
+            max: None,
+            env: None,
+            description: "Domains the sandbox may reach, such as `github.com` or `*.githubusercontent.com`",
+        },
+        ConfigField {
+            name: "cidrs",
+            ty: "string[]",
+            default: ConfigValue::Toml("[]"),
+            min: None,
+            max: None,
+            env: None,
+            description: "Address ranges the sandbox may reach, such as `10.0.0.0/8`",
+        },
+    ];
+
     fn normalize(&mut self) -> Result<(), SandboxError> {
         if self.domains.len() + self.cidrs.len() > MAX_NETWORK_RULES {
             return Err(SandboxError::Limit);
@@ -385,6 +467,47 @@ impl Default for TransferPolicy {
 }
 
 impl TransferPolicy {
+    pub const FIELDS: &[ConfigField] = &[
+        ConfigField {
+            name: "respect_gitignore",
+            ty: "bool",
+            default: ConfigValue::Bool(true),
+            min: None,
+            max: None,
+            env: None,
+            description: "Leave out the files that `.gitignore` ignores",
+        },
+        ConfigField {
+            name: "initial_seed",
+            ty: "string",
+            default: ConfigValue::Str("ask"),
+            min: None,
+            max: None,
+            env: None,
+            description: "`ask` offers to copy the project into a new sandbox, and `none` skips the offer. Later transfers work either way",
+        },
+        ConfigField {
+            name: "delete_extraneous",
+            ty: "bool",
+            default: ConfigValue::Bool(false),
+            min: None,
+            max: None,
+            env: None,
+            description: "Only `false` works, because Caudra never deletes files on its own",
+        },
+        ConfigField {
+            name: "exclude",
+            ty: "string[]",
+            default: ConfigValue::Toml(
+                r#"["**/.git/**", "**/.env*", "**/target/**", "**/node_modules/**", "**/.venv/**", "**/.ssh/**", "**/.aws/**", "**/.caudra/**", "**/*.pem", "**/*.key"]"#,
+            ),
+            min: None,
+            max: None,
+            env: None,
+            description: "Relative globs of paths never to copy. A list you set replaces the one shown. A glob cannot start with `/` or `!`, or hold `.`, `..`, `\\`, or `:`",
+        },
+    ];
+
     fn normalize(&mut self) -> Result<(), SandboxError> {
         if self.exclude.len() > MAX_TRANSFER_EXCLUDES {
             return Err(SandboxError::Limit);
@@ -508,6 +631,108 @@ fn persistent_default() -> bool {
 }
 
 impl SandboxProfile {
+    pub const FIELDS: &[ConfigField] = &[
+        ConfigField {
+            name: "provider",
+            ty: "string",
+            default: ConfigValue::Required("\"local\""),
+            min: None,
+            max: None,
+            env: None,
+            description: "The name of a [sandbox.providers.NAME] record",
+        },
+        ConfigField {
+            name: "template",
+            ty: "string",
+            default: ConfigValue::Required("\"caudra-rust\""),
+            min: None,
+            max: None,
+            env: None,
+            description: "A template ID from the provider catalog. Each launch uses the revision the catalog lists at that time",
+        },
+        ConfigField {
+            name: "cpus",
+            ty: "integer",
+            default: ConfigValue::Required("4"),
+            min: Some(MIN_RESOURCE),
+            max: None,
+            env: None,
+            description: "Virtual CPUs",
+        },
+        ConfigField {
+            name: "memory_mib",
+            ty: "integer",
+            default: ConfigValue::Required("4096"),
+            min: Some(MIN_RESOURCE),
+            max: None,
+            env: None,
+            description: "Memory in MiB",
+        },
+        ConfigField {
+            name: "disk_gib",
+            ty: "integer",
+            default: ConfigValue::Required("20"),
+            min: Some(MIN_RESOURCE),
+            max: None,
+            env: None,
+            description: "Virtual disk size in GiB. It reserves no host space",
+        },
+        ConfigField {
+            name: "cwd",
+            ty: "string",
+            default: ConfigValue::Required("\".\""),
+            min: None,
+            max: None,
+            env: None,
+            description: "The working directory, relative to the Workcell root, where `.` is the root itself",
+        },
+        ConfigField {
+            name: "network",
+            ty: "string",
+            default: ConfigValue::Required("\"default\""),
+            min: None,
+            max: None,
+            env: None,
+            description: "The name of a [sandbox.networks.NAME] record",
+        },
+        ConfigField {
+            name: "transfer",
+            ty: "string",
+            default: ConfigValue::Required("\"default\""),
+            min: None,
+            max: None,
+            env: None,
+            description: "The name of a [sandbox.transfers.NAME] record",
+        },
+        ConfigField {
+            name: "persistent",
+            ty: "bool",
+            default: ConfigValue::Bool(true),
+            min: None,
+            max: None,
+            env: None,
+            description: "Keep the disk when the sandbox pauses or its lease ends. Only a persistent sandbox can pause",
+        },
+        ConfigField {
+            name: "running_ttl_seconds",
+            ty: "integer",
+            default: ConfigValue::Required("3600"),
+            min: None,
+            max: None,
+            env: None,
+            description: "Seconds the sandbox may run before its lease ends. `0` never ends, which needs a provider without a lease cap",
+        },
+        ConfigField {
+            name: "on_exit",
+            ty: "string",
+            default: ConfigValue::Str("detach"),
+            min: None,
+            max: None,
+            env: None,
+            description: "What happens to the sandbox when Caudra exits. `detach` is the only value",
+        },
+    ];
+
     pub fn resources(&self) -> Resources {
         Resources {
             cpus: self.cpus,

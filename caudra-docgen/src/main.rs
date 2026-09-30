@@ -4,12 +4,16 @@ mod gen_keybindings;
 mod gen_lua_api;
 mod gen_plugins;
 mod gen_providers;
+mod gen_regions;
 mod gen_tools;
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::thread;
+
+use caudra_config::files;
 
 const CONTENT_DIR: &str = "site/docs/content";
 const STATIC_DIR: &str = "site/docs/static";
@@ -31,6 +35,24 @@ const PAGES: [Page; 7] = [
 
 fn page_path(section: &str) -> PathBuf {
     Path::new(CONTENT_DIR).join(section).join("_index.md")
+}
+
+/// Hand-written pages, with every generated region brought up to date.
+fn spliced_pages() -> Vec<(PathBuf, String)> {
+    let mut pages: BTreeMap<&str, String> = BTreeMap::new();
+    for region in gen_regions::REGIONS {
+        let path = page_path(region.page);
+        let page = pages.entry(region.page).or_insert_with(|| {
+            fs::read_to_string(&path).unwrap_or_else(|error| panic!("{}: {error}", path.display()))
+        });
+        *page = region
+            .splice(page)
+            .unwrap_or_else(|error| panic!("{}: region {}: {error}", path.display(), region.name));
+    }
+    pages
+        .into_iter()
+        .map(|(section, page)| (page_path(section), page))
+        .collect()
 }
 
 fn write_file(path: &Path, content: &str) {
@@ -65,11 +87,15 @@ fn main() -> ExitCode {
         let running = PAGES.map(|(section, generate)| (page_path(section), scope.spawn(generate)));
         running.map(|(path, page)| (path, page.join().unwrap()))
     });
-    let config_example = (
-        Path::new(STATIC_DIR).join(gen_config::CONFIG_EXAMPLE_FILE),
-        caudra_config::example_toml(),
-    );
-    let outputs: Vec<(PathBuf, String)> = pages.into_iter().chain([config_example]).collect();
+    let examples = files::examples().filter_map(|file| {
+        let path = Path::new(STATIC_DIR).join(gen_config::example_file_name(file));
+        file.reference().map(|reference| (path, reference))
+    });
+    let outputs: Vec<(PathBuf, String)> = pages
+        .into_iter()
+        .chain(examples)
+        .chain(spliced_pages())
+        .collect();
 
     if check {
         let mismatches = outputs

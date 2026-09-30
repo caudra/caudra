@@ -97,7 +97,21 @@ expected_server_id = "dev-server"
 expected_workspace_id = "dev-workspace"
 ```
 
-`endpoint`, `cwd`, and `credential_ref` are required in each profile. The two `expected_*` fields are optional identity checks. There is no `[profiles.NAME]` shorthand. Unknown fields and unsupported file versions are rejected. The profile file must be a regular, non-symlink file owned by the user and not writable by group or other users on Unix. `chmod 600 ~/.config/caudra/workcell.toml` satisfies the permission requirement.
+<!-- caudra-docgen:workcell-profile-fields -->
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `endpoint` | string | required | The Workcell endpoint: HTTPS with any host, or HTTP on a numeric loopback address such as `127.0.0.1`. Caudra refuses `localhost`, user information, a query, and a fragment |
+| `cwd` | string | required | The working directory, relative to the Workcell root, where `.` is the root itself. It cannot start with `/` or hold `..` |
+| `credential_ref` | string | required | The saved bearer credential, as `credential:NAME`, which `caudra auth workcell set NAME` creates. A loopback profile needs one too |
+| `expected_server_id` | string | unset | An identity check: the connection fails unless the server reports this ID |
+| `expected_workspace_id` | string | unset | An identity check: the connection fails unless the workspace reports this ID |
+
+`caudra config example workcell` prints every `workcell.toml` key with its default, all commented out. [workcell.example.toml](/docs/workcell.example.toml) holds the same text.
+
+<!-- /caudra-docgen:workcell-profile-fields -->
+
+There is no `[profiles.NAME]` shorthand. Unknown fields and unsupported file versions are rejected. The profile file must be a regular, non-symlink file owned by the user and not writable by group or other users on Unix. `chmod 600 ~/.config/caudra/workcell.toml` satisfies the permission requirement.
 
 Endpoints must use HTTPS, except HTTP on numeric loopback addresses such as `127.0.0.1` or `[::1]`. `http://localhost` is rejected. User information, query strings, and fragments are forbidden. Non-loopback endpoints require a saved `credential:NAME` reference. Raw tokens, `env:` references, and file references are not accepted selectors.
 

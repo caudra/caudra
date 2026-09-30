@@ -1,4 +1,5 @@
 mod acp;
+mod config;
 mod decisions;
 mod logs;
 mod permissions;
@@ -11,7 +12,6 @@ mod workcell_runtime;
 mod worktree;
 
 use std::env;
-use std::io::{self, Write};
 use std::path::Path;
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -29,9 +29,7 @@ use caudra_lua::PluginHost;
 use caudra_storage::sessions::PermissionMode;
 use caudra_storage::{EphemeralRoot, StateDir};
 
-use crate::cli::{
-    AuthAction, Cli, Command, ConfigAction, McpAction, WorkcellAuthAction, normalize_tool_name,
-};
+use crate::cli::{AuthAction, Cli, Command, McpAction, WorkcellAuthAction, normalize_tool_name};
 use crate::sdk_mode::AUTO_PERMISSION_MODE;
 use crate::startup::Startup;
 use crate::update;
@@ -445,11 +443,7 @@ pub fn dispatch(mut cli: Cli, startup: Result<Startup, ConfigFileError>) -> Resu
         }) => {
             subcmd::skills(&cli, name.as_deref(), names, json, dirs)?;
         }
-        Some(Command::Config {
-            action: ConfigAction::Example,
-        }) => {
-            io::stdout().write_all(caudra_config::example_toml().as_bytes())?;
-        }
+        Some(Command::Config { action }) => config::run(action)?,
         Some(Command::Logs {
             follow,
             level,

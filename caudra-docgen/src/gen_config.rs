@@ -2,6 +2,8 @@ use std::fmt::Write;
 
 use caudra_config::config_file::CONFIG_VERSION;
 use caudra_config::decisions::{DecisionFeatures, DecisionThresholds, FeatureMode};
+use caudra_config::example::Entry;
+use caudra_config::files::{self, CONFIG_FILES, ConfigFile, Scope};
 use caudra_config::steering::{SteeringRule, SteeringRulesConfig};
 use caudra_config::{
     AgentConfig, ConfigField, ConfigValue, DEFAULT_MAX_LOG_FILES, DEFAULT_MAX_OUTPUT_LINES,
@@ -10,15 +12,24 @@ use caudra_config::{
     StorageConfig, TOP_LEVEL_FIELDS, TelemetryConfig, ToolOutputLines, UiConfig, WorktreesConfig,
 };
 
-pub const CONFIG_EXAMPLE_FILE: &str = "caudra.example.toml";
+use crate::gen_providers::join_and;
+
+const EXAMPLE_SUFFIX: &str = ".example.toml";
 /// The one feature with a section of its own further down the page.
 const SHELL_DURATION_FEATURE: &str = "shell_duration";
 const SHELL_DURATION_LINK: &str = " See [shell duration](#shell-duration).";
 
+/// The file under the site's static root that holds a file's reference.
+pub fn example_file_name(file: &ConfigFile) -> String {
+    format!("{}{EXAMPLE_SUFFIX}", file.stem())
+}
+
 /// Shown bare, since the text is prose rather than a value to copy.
 fn default_cell(value: &ConfigValue) -> String {
     match value {
-        ConfigValue::Unset | ConfigValue::Varies(_) => value.format_default(),
+        ConfigValue::Unset | ConfigValue::Varies(_) | ConfigValue::Required(_) => {
+            value.format_default()
+        }
         _ => format!("`{}`", value.format_default()),
     }
 }
@@ -30,12 +41,18 @@ fn range_cell(field: &ConfigField) -> String {
     }
 }
 
-type ExtraColumn = (&'static str, fn(&ConfigField) -> String);
+type ExtraColumn = (&'static str, fn(&Entry) -> String);
 
 fn write_table(out: &mut String, fields: &[ConfigField]) {
+    let entries: Vec<Entry> = fields.iter().map(Entry::from).collect();
+    write_entries(out, &entries);
+}
+
+pub fn write_entries<'a>(out: &mut String, entries: impl IntoIterator<Item = &'a Entry>) {
+    let entries: Vec<&Entry> = entries.into_iter().collect();
     let mut extras: Vec<ExtraColumn> = Vec::new();
-    if fields.iter().any(|f| f.env.is_some()) {
-        extras.push(("Env", |f: &ConfigField| {
+    if entries.iter().any(|f| f.env.is_some()) {
+        extras.push(("Env", |f: &Entry| {
             f.env.map_or("-".to_string(), |e| {
                 e.split(", ")
                     .map(|v| format!("`{v}`"))
@@ -44,13 +61,13 @@ fn write_table(out: &mut String, fields: &[ConfigField]) {
             })
         }));
     }
-    if fields.iter().any(|f| f.min.is_some()) {
-        extras.push(("Min", |f: &ConfigField| {
+    if entries.iter().any(|f| f.min.is_some()) {
+        extras.push(("Min", |f: &Entry| {
             f.min.map_or("-".to_string(), |v| v.to_string())
         }));
     }
-    if fields.iter().any(|f| f.max.is_some()) {
-        extras.push(("Max", |f: &ConfigField| {
+    if entries.iter().any(|f| f.max.is_some()) {
+        extras.push(("Max", |f: &Entry| {
             f.max.map_or("-".to_string(), |v| v.to_string())
         }));
     }
@@ -62,7 +79,7 @@ fn write_table(out: &mut String, fields: &[ConfigField]) {
     let rule: String = extras.iter().map(|_| "-----|").collect();
     writeln!(out, "| Field | Type | Default |{header} Description |").unwrap();
     writeln!(out, "|-------|------|---------|{rule}-------------|").unwrap();
-    for f in fields {
+    for f in entries {
         let cells: String = extras
             .iter()
             .map(|(_, cell)| format!(" {} |", cell(f)))
@@ -623,6 +640,57 @@ fn write_tool_output_section(out: &mut String) {
     writeln!(out).unwrap();
 }
 
+const CONFIG_FILES_INTRO: &str = "## Config files\n\n\
+    `caudra.toml` holds the settings that only you write. A file stays separate from it when \
+    Caudra also writes the file, when the file decides where credentials or processes go, or when \
+    it has its own rules for trust, errors, or privacy.\n\n\
+    | File | Scope | Holds | Kept separate because | Reference |\n\
+    |------|-------|-------|-----------------------|-----------|\n";
+const CONFIG_FILES_COMMANDS: &str = "\n`caudra config files` lists where each file lives on your \
+    machine and whether it is there. `caudra config example FILE` prints the reference of a TOML \
+    file, such as `caudra config example mcp`. See [`caudra config`](/docs/cli/#caudra-config).\n";
+
+fn write_config_files_section(out: &mut String) {
+    out.push_str(CONFIG_FILES_INTRO);
+    for file in CONFIG_FILES {
+        let scopes: Vec<&str> = file.scopes.iter().map(|scope| scope.label()).collect();
+        let needs = file
+            .feature
+            .map(|feature| format!(" (needs `experimental.{}`)", feature.key()))
+            .unwrap_or_default();
+        let reference = if file.example.is_some() {
+            format!(
+                "`{}`, [{name}](/docs/{name})",
+                file.example_command(),
+                name = example_file_name(file)
+            )
+        } else {
+            "-".to_owned()
+        };
+        writeln!(
+            out,
+            "| [`{name}`]({docs}) | {scopes} | {holds}{needs} | {why} | {reference} |",
+            name = file.name,
+            docs = file.docs,
+            scopes = scopes.join(", "),
+            holds = file.holds,
+            why = file.separate_because,
+        )
+        .unwrap();
+    }
+    out.push_str(CONFIG_FILES_COMMANDS);
+}
+
+/// Every file the global config directory can hold, in catalog order.
+fn config_dir_files() -> String {
+    let names: Vec<String> = CONFIG_FILES
+        .iter()
+        .filter(|file| file.scopes.contains(&Scope::Global))
+        .map(|file| format!("`{}`", file.name))
+        .collect();
+    join_and(&names)
+}
+
 pub fn generate() -> String {
     let mut out = String::with_capacity(4096);
 
@@ -655,11 +723,13 @@ Settings apply in this order, and each layer overrides the ones before it:
 6. Command-line flags
 
 Remote sessions load only the client's global configuration. They skip both project layers, project environment files, and project MCP configuration. Remote project context uses a bounded declarative asset manifest instead. See [Remote Workspaces](/docs/remote-workspaces/#project-context-and-trust).
-
-Remote endpoint profiles live in a separate user `workcell.toml`, with `version = 1` and tables named `[workcell.profiles.NAME]`. They are not `caudra.toml` settings. See [profile configuration](/docs/remote-workspaces/#configure-a-profile) for the exact fields and credential rules.
-
-Managed sandbox providers, profiles, network policies and transfer defaults live in user-global `sandboxes.toml`, also with `version = 1`. They are separate from direct Workcell and model-provider profiles. See [Managed Sandboxes](/docs/sandboxes/#configuration-schema) for the schema, TUI editor and release status. Saving these defaults does not create a VM or change a running instance.
-
+"
+    )
+    .unwrap();
+    write_config_files_section(&mut out);
+    writeln!(
+        out,
+        "
 ## Example
 
 ```toml
@@ -702,7 +772,7 @@ For every setting in one file, with its type, default, and description, run [`ca
         max_output_lines = DEFAULT_MAX_OUTPUT_LINES + 1000,
         max_log_files = DEFAULT_MAX_LOG_FILES / 2,
         version = CONFIG_VERSION,
-        example_file = CONFIG_EXAMPLE_FILE,
+        example_file = example_file_name(&files::CAUDRA),
     )
     .unwrap();
     write_experimental_section(&mut out);
@@ -788,7 +858,7 @@ Caudra follows platform directory conventions. On Linux and macOS that is XDG. O
 | Cache | `~/.cache/caudra/` | `%LOCALAPPDATA%\\caudra\\` |
 | Scratch | `$TMPDIR/caudra/` | `%TEMP%\\caudra\\` |
 
-Config holds `caudra.toml`, `init.lua`, `permissions.toml`, `mcp.toml`, `providers.toml`, `workcell.toml`, `sandboxes.toml`, and `commands/`. State holds sessions, auth tokens, memories, plans, model-job bindings, sandbox lifecycle records and transfer recovery journals. The install script puts the binary under `%LOCALAPPDATA%\\caudra` on Windows; that is separate from these runtime dirs.
+Config holds {config_files}. State holds sessions, auth tokens, memories, plans, model-job bindings, sandbox lifecycle records and transfer recovery journals. The install script puts the binary under `%LOCALAPPDATA%\\caudra` on Windows; that is separate from these runtime dirs.
 
 Scratch holds work that belongs outside your project, such as a file the model writes while thinking or a temporary a command leaves behind. Each project gets its own subdirectory, named by the project directory plus a three-word phrase derived from its path, as in `caudra-heroic-easy-grouse`. Two checkouts sharing a name get different phrases, so they cannot overwrite each other. The phrase is derived rather than drawn at random, so a project returns to the same directory on every run. Caudra creates it at startup and points `TMPDIR`, `TMP`, and `TEMP` at it, so every command Caudra runs puts its own temporary files there instead of the shared temp root. The model is told the path, and writing anywhere under the scratch root needs no approval. Paths beside the root still ask.
 
@@ -802,7 +872,7 @@ Set `CAUDRA_NAMESPACE` to choose the directory name yourself instead of letting 
 
 ## Config file versions
 
-Each TOML config file takes a top-level `version`, and every format is at version 1. Where the key is optional, a file without it counts as version 1. A build that finds a newer version than it reads refuses the file instead of guessing what it means, and the error says to upgrade Caudra.
+Each TOML config file takes a top-level `version`, and every format is at version 1. Where the key is optional, a file without it counts as version 1. A build that finds a newer version than it reads refuses the file instead of guessing what it means. For a file with an optional key, the error says the file needs a newer Caudra.
 
 | File | `version` | Newer than this build reads |
 |------|-----------|-----------------------------|
@@ -833,7 +903,8 @@ The `memory` tool and `/memory` command store small Markdown notes under the sta
 
 (Linux/macOS: `~/.local/state/caudra/…`; Windows: `%APPDATA%\\caudra\\…`). Use them for non-obvious gotchas and decisions that should survive across sessions. They are separate from skills and from `AGENTS.md`.
 
-Related pages: [Skills](/docs/skills/), [CLI](/docs/cli/), [Providers](/docs/providers/#providers-toml)."
+Related pages: [Skills](/docs/skills/), [CLI](/docs/cli/), [Providers](/docs/providers/#providers-toml).",
+        config_files = config_dir_files(),
     )
     .unwrap();
 

@@ -11,12 +11,47 @@ use caudra_storage::paths;
 use caudra_storage::thinking::ReasoningOptions;
 
 use crate::config_version::{CONFIG_VERSION_KEY, ConfigVersion};
+use crate::{ConfigField, ConfigValue};
 
-const PROVIDERS_FILE: &str = "providers.toml";
-const PROVIDERS_VERSION: u32 = 1;
+pub(crate) const PROVIDERS_FILE: &str = "providers.toml";
+pub(crate) const PROVIDERS_VERSION: u32 = 1;
 const BAD_CONFIG_EXIT_CODE: i32 = 2;
 /// The only built-in that reads `enable_free_models`.
 const OPENCODE_SLUG: &str = "opencode";
+/// Keys a built-in slug ignores, because built-ins keep their compiled
+/// protocol, model catalog and auth wiring. Opencode reads the last one.
+pub const BUILTIN_IGNORED_FIELDS: [&str; 5] = [
+    "protocol",
+    "api_key_env",
+    "discover_models",
+    "models",
+    "enable_free_models",
+];
+const DISCOVERED_OR_PROTOCOL: &str = "discovered, or the protocol default";
+const OFF_UNLESS_DECLARED: &str = "false";
+const UNPRICED: &str = "0";
+
+/// The keys of a `[SLUG.purposes]` table.
+pub(crate) const PURPOSE_FIELDS: &[ConfigField] = &[
+    ConfigField {
+        name: ModelPurpose::Fast.as_str(),
+        ty: "string | string[]",
+        default: ConfigValue::Unset,
+        min: None,
+        max: None,
+        env: None,
+        description: "Model id prefixes for small, fast models, best first. A prefix covers every id that starts with it, and the first one also names the model that fills the slot, so it has to be a real id",
+    },
+    ConfigField {
+        name: ModelPurpose::Best.as_str(),
+        ty: "string | string[]",
+        default: ConfigValue::Unset,
+        min: None,
+        max: None,
+        env: None,
+        description: "Model id prefixes for flagship models, best first. A prefix cannot also be in `fast`. A model a job is bound to in the picker wins over both lists",
+    },
+];
 
 /// A workload slot a model can be bound to. A purpose records what the user
 /// wants a model used for, never a claim about what the model is capable of.
@@ -228,6 +263,19 @@ pub struct ModelDef {
     pub fields: ModelFields,
 }
 
+impl ModelDef {
+    /// The keys beside the flattened [`ModelFields::FIELDS`].
+    pub(crate) const FIELDS: &[ConfigField] = &[ConfigField {
+        name: "id",
+        ty: "string",
+        default: ConfigValue::Required("\"my-model\""),
+        min: None,
+        max: None,
+        env: None,
+        description: "The model id, which makes the spec `SLUG/ID`",
+    }];
+}
+
 /// Facts declarable per model, or for every model of a provider at once via
 /// [`ProviderDef::model_defaults`]. Facts only: which workload a model serves is
 /// a binding, declared in [`ProviderDef::purposes`].
@@ -273,6 +321,135 @@ pub struct ModelFields {
 }
 
 impl ModelFields {
+    pub(crate) const FIELDS: &[ConfigField] = &[
+        ConfigField {
+            name: "context_window",
+            ty: "integer",
+            default: ConfigValue::Varies(DISCOVERED_OR_PROTOCOL),
+            min: None,
+            max: None,
+            env: None,
+            description: "Tokens of context",
+        },
+        ConfigField {
+            name: "max_output_tokens",
+            ty: "integer",
+            default: ConfigValue::Varies(DISCOVERED_OR_PROTOCOL),
+            min: None,
+            max: None,
+            env: None,
+            description: "The most tokens one response may hold",
+        },
+        ConfigField {
+            name: "supports_tool_examples",
+            ty: "bool",
+            default: ConfigValue::Varies(OFF_UNLESS_DECLARED),
+            min: None,
+            max: None,
+            env: None,
+            description: "Send tool examples as a structured field. It is off unless declared, because the protocol says nothing about the model behind it",
+        },
+        ConfigField {
+            name: "supports_thinking",
+            ty: "bool",
+            default: ConfigValue::Varies(DISCOVERED_OR_PROTOCOL),
+            min: None,
+            max: None,
+            env: None,
+            description: "The model accepts extended thinking",
+        },
+        ConfigField {
+            name: "requires_thinking",
+            ty: "bool",
+            default: ConfigValue::Varies(OFF_UNLESS_DECLARED),
+            min: None,
+            max: None,
+            env: None,
+            description: "For an API that rejects requests with thinking off. It implies `supports_thinking` and raises thinking to minimal effort when it is off, compaction included",
+        },
+        ConfigField {
+            name: "supports_vision",
+            ty: "bool",
+            default: ConfigValue::Varies(OFF_UNLESS_DECLARED),
+            min: None,
+            max: None,
+            env: None,
+            description: "The model accepts images. When false, image input and `view_image` are off",
+        },
+        ConfigField {
+            name: "supports_cache_breakpoints",
+            ty: "bool",
+            default: ConfigValue::Varies(OFF_UNLESS_DECLARED),
+            min: None,
+            max: None,
+            env: None,
+            description: "`openai-responses` only. The endpoint honours an explicit `prompt_cache_breakpoint`, so the system prompt closes with one",
+        },
+        ConfigField {
+            name: "reasoning_options",
+            ty: "table[]",
+            default: ConfigValue::Unset,
+            min: None,
+            max: None,
+            env: None,
+            description: "The reasoning controls the model takes, such as `[{ type = \"effort\", values = [\"low\", \"high\"] }]`. A `type` is `toggle`, `effort` with `values`, or `budget_tokens` with an optional `min` and `max`. `[]` declares that it takes none, so Caudra sends no reasoning level",
+        },
+        ConfigField {
+            name: "pricing_input",
+            ty: "float",
+            default: ConfigValue::Varies(UNPRICED),
+            min: None,
+            max: None,
+            env: None,
+            description: "USD per million input tokens",
+        },
+        ConfigField {
+            name: "pricing_output",
+            ty: "float",
+            default: ConfigValue::Varies(UNPRICED),
+            min: None,
+            max: None,
+            env: None,
+            description: "USD per million output tokens",
+        },
+        ConfigField {
+            name: "pricing_cache_write",
+            ty: "float",
+            default: ConfigValue::Varies(UNPRICED),
+            min: None,
+            max: None,
+            env: None,
+            description: "USD per million tokens written to the prompt cache",
+        },
+        ConfigField {
+            name: "pricing_cache_read",
+            ty: "float",
+            default: ConfigValue::Varies(UNPRICED),
+            min: None,
+            max: None,
+            env: None,
+            description: "USD per million tokens read from the prompt cache",
+        },
+        ConfigField {
+            name: "pricing_fast_input",
+            ty: "float",
+            default: ConfigValue::Unset,
+            min: None,
+            max: None,
+            env: None,
+            description: "USD per million input tokens in fast mode",
+        },
+        ConfigField {
+            name: "pricing_fast_output",
+            ty: "float",
+            default: ConfigValue::Unset,
+            min: None,
+            max: None,
+            env: None,
+            description: "USD per million output tokens in fast mode",
+        },
+    ];
+
     /// Any pricing field set means the user provided pricing (other fields default to 0).
     pub fn has_pricing(&self) -> bool {
         self.pricing_input.is_some()
@@ -414,6 +591,67 @@ pub struct OverrideFields {
     pub path_prefix: Option<String>,
 }
 
+impl OverrideFields {
+    pub(crate) const FIELDS: &[ConfigField] = &[
+        ConfigField {
+            name: "context_window",
+            ty: "integer",
+            default: ConfigValue::Unset,
+            min: None,
+            max: None,
+            env: None,
+            description: "Tokens of context",
+        },
+        ConfigField {
+            name: "max_output_tokens",
+            ty: "integer",
+            default: ConfigValue::Unset,
+            min: None,
+            max: None,
+            env: None,
+            description: "The most tokens one response may hold",
+        },
+        ConfigField {
+            name: "supports_thinking",
+            ty: "bool",
+            default: ConfigValue::Unset,
+            min: None,
+            max: None,
+            env: None,
+            description: "The models accept extended thinking",
+        },
+        ConfigField {
+            name: "supports_vision",
+            ty: "bool",
+            default: ConfigValue::Unset,
+            min: None,
+            max: None,
+            env: None,
+            description: "The models accept images",
+        },
+        ConfigField {
+            name: "base",
+            ty: "string",
+            default: ConfigValue::Unset,
+            min: None,
+            max: None,
+            env: None,
+            description: "The native provider an opaque upstream works like, such as `llama-cpp`, `google`, or `anthropic`. Caudra warns about a value it does not know and ignores it",
+        },
+        ConfigField {
+            name: "path_prefix",
+            ty: "string",
+            default: ConfigValue::Varies(
+                "`/v1`, `/v1beta` for Gemini routes, none for Anthropic and Z.AI",
+            ),
+            min: None,
+            max: None,
+            env: None,
+            description: "The path Caudra sends ahead of each request, which Aperture appends to the upstream base URL. Set it to `\"\"` when that URL already has its own path",
+        },
+    ];
+}
+
 /// Overrides for a single gateway provider (Aperture), keyed by its id (e.g.
 /// `zai`, `ollama`, `ikora-openai`). Provider-level fields apply to every model
 /// from that provider; `models` refine individual models.
@@ -423,6 +661,19 @@ pub struct ProviderOverride {
     pub default: OverrideFields,
     #[serde(default)]
     pub models: HashMap<String, OverrideFields>,
+}
+
+impl ProviderOverride {
+    /// The keys beside the flattened [`OverrideFields::FIELDS`].
+    pub(crate) const FIELDS: &[ConfigField] = &[ConfigField {
+        name: "models",
+        ty: "table",
+        default: ConfigValue::Toml("{}"),
+        min: None,
+        max: None,
+        env: None,
+        description: "Overrides for single models, keyed by model id, which win key by key. Quote an id that holds a dot, such as `models.\"qwen-3.6\"`",
+    }];
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -468,6 +719,126 @@ pub struct ProviderDef {
 }
 
 impl ProviderDef {
+    pub(crate) const FIELDS: &[ConfigField] = &[
+        ConfigField {
+            name: "display_name",
+            ty: "string",
+            default: ConfigValue::Varies("the built-in name, or the slug"),
+            min: None,
+            max: None,
+            env: None,
+            description: "The name pickers and auth status show",
+        },
+        ConfigField {
+            name: "protocol",
+            ty: "string",
+            default: ConfigValue::Required("\"openai\""),
+            min: None,
+            max: None,
+            env: None,
+            description: "The wire format: `openai`, `openai-responses`, `anthropic`, or `google`",
+        },
+        ConfigField {
+            name: "base_url",
+            ty: "string",
+            default: ConfigValue::Varies("the plan URL, or the built-in URL"),
+            min: None,
+            max: None,
+            env: Some("<SLUG>_BASE_URL"),
+            description: "The API origin. Caudra appends the protocol paths",
+        },
+        ConfigField {
+            name: "plan",
+            ty: "string",
+            default: ConfigValue::Unset,
+            min: None,
+            max: None,
+            env: None,
+            description: "A built-in plan key, which sets the base URL and the default model",
+        },
+        ConfigField {
+            name: "api_key_env",
+            ty: "string",
+            default: ConfigValue::Varies("`<SLUG>_API_KEY`"),
+            min: None,
+            max: None,
+            env: None,
+            description: "The environment variable that holds the API key",
+        },
+        ConfigField {
+            name: "api_key",
+            ty: "string",
+            default: ConfigValue::Unset,
+            min: None,
+            max: None,
+            env: None,
+            description: "An API key, stored as plain text. Caudra tries the environment variable and saved credentials first",
+        },
+        ConfigField {
+            name: "default_model",
+            ty: "string",
+            default: ConfigValue::Unset,
+            min: None,
+            max: None,
+            env: None,
+            description: "The model to use after login when none is saved yet, such as `my-provider/my-model`",
+        },
+        ConfigField {
+            name: "discover_models",
+            ty: "bool",
+            default: ConfigValue::Bool(false),
+            min: None,
+            max: None,
+            env: None,
+            description: "Also list the models the provider's model endpoint reports",
+        },
+        ConfigField {
+            name: "enable_free_models",
+            ty: "bool",
+            default: ConfigValue::Unset,
+            min: None,
+            max: None,
+            env: None,
+            description: "Opencode only. Show the free models of its catalog. Unset counts as `false`",
+        },
+        ConfigField {
+            name: "overrides",
+            ty: "table",
+            default: ConfigValue::Unset,
+            min: None,
+            max: None,
+            env: None,
+            description: "Aperture only. Overrides for the upstream providers it routes, keyed by upstream id",
+        },
+        ConfigField {
+            name: "model_defaults",
+            ty: "table",
+            default: ConfigValue::Unset,
+            min: None,
+            max: None,
+            env: None,
+            description: "Model keys for every model of the provider",
+        },
+        ConfigField {
+            name: "purposes",
+            ty: "table",
+            default: ConfigValue::Unset,
+            min: None,
+            max: None,
+            env: None,
+            description: "Model id prefixes for the `fast` and `best` purposes",
+        },
+        ConfigField {
+            name: "models",
+            ty: "table[]",
+            default: ConfigValue::Unset,
+            min: None,
+            max: None,
+            env: None,
+            description: "The models the provider serves",
+        },
+    ];
+
     /// Effective declared settings for `model_id`.
     ///
     /// An exact `models` entry wins field by field over `model_defaults`, so a
@@ -618,23 +989,26 @@ pub fn resolve_base_url(slug: &str, def: Option<&ProviderDef>) -> Option<String>
 /// Callers decide what counts as built-in (the inventory misses the `opencode`
 /// slugs) and when to report it.
 pub fn ignored_builtin_fields(slug: &str, def: &ProviderDef) -> Vec<&'static str> {
-    let mut ignored = Vec::new();
-    if def.protocol.is_some() {
-        ignored.push("protocol");
-    }
-    if def.api_key_env.is_some() {
-        ignored.push("api_key_env");
-    }
-    if def.discover_models {
-        ignored.push("discover_models");
-    }
-    if !def.models.is_empty() {
-        ignored.push("models");
-    }
-    if def.enable_free_models.is_some() && slug != OPENCODE_SLUG {
-        ignored.push("enable_free_models");
-    }
-    ignored
+    let [
+        protocol,
+        api_key_env,
+        discover_models,
+        models,
+        enable_free_models,
+    ] = BUILTIN_IGNORED_FIELDS;
+    [
+        (protocol, def.protocol.is_some()),
+        (api_key_env, def.api_key_env.is_some()),
+        (discover_models, def.discover_models),
+        (models, !def.models.is_empty()),
+        (
+            enable_free_models,
+            def.enable_free_models.is_some() && slug != OPENCODE_SLUG,
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(field, set)| set.then_some(field))
+    .collect()
 }
 
 pub fn resolve_protocol(slug: &str, def: Option<&ProviderDef>) -> Option<Protocol> {

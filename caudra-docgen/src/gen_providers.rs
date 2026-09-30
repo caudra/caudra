@@ -1,9 +1,15 @@
+use std::fmt::Write;
+
+use caudra_config::example;
+use caudra_config::files;
+use caudra_config::providers::BUILTIN_IGNORED_FIELDS;
 use caudra_providers::manifest::{ManifestRegistry, ProviderManifest};
 use caudra_providers::model::ModelEntry;
 use caudra_providers::provider::ProviderKind;
 use caudra_providers::{EFFORT_LEVELS, ModelMarker};
-use std::fmt::Write;
 use strum::IntoEnumIterator;
+
+use crate::gen_regions::{footer, keys_table, reference};
 
 const FRONT_MATTER: &str = r#"+++
 title = "Providers"
@@ -197,6 +203,14 @@ Env `<SLUG>_BASE_URL` still wins over both the plan and a `base_url` in this fil
         )
     };
 
+    let document = reference(&files::PROVIDERS);
+    let provider_fields = keys_table(&document, &[example::providers::PROVIDER]);
+    let purpose_fields = keys_table(&document, &[example::providers::PURPOSES]);
+    let model_fields = keys_table(&document, &[example::providers::MODELS]);
+    let override_fields = keys_table(&document, &[example::providers::UPSTREAM]);
+    let builtin_ignored = join_and(&BUILTIN_IGNORED_FIELDS.map(|name| format!("`{name}`")));
+    let reference = footer(&files::PROVIDERS);
+
     format!(
         r#"## providers.toml
 
@@ -240,40 +254,21 @@ supports_vision = false
 
 The file can start with `version = 1`, and a file without it counts as version 1. Caudra writes the key whenever it saves the file. A newer version stops Caudra with an error rather than being misread. Because `version` belongs to the file, a custom provider cannot use it as a name. See [Config file versions](/docs/configuration/#config-file-versions).
 
+{reference}
+
 ### Provider fields
 
-| Field | Type | Notes |
-|-------|------|-------|
-| `display_name` | string | Shown in pickers and auth status |
-| `protocol` | string | `openai`, `openai-responses`, `anthropic`, or `google`. Required for custom slugs |
-| `base_url` | string | Origin of the API. Caudra appends the protocol paths |
-| `plan` | string | Built-in plan key (see Plans below). Sets base URL and default model |
-| `api_key_env` | string | Env var that holds the key. Defaults to `<SLUG>_API_KEY` |
-| `api_key` | string | Inline key (prefer the env var or `caudra auth login`) |
-| `default_model` | string | Used after login when no model is saved yet |
-| `discover_models` | bool | When true, also probe the provider's model list endpoint (default false) |
-| `enable_free_models` | bool | Opencode only. Show free catalog models (default false) |
-| `model_defaults` | table | Model fields applied to every model of this provider (see below) |
-| `purposes` | table | Model id prefixes for `fast` and `best`. A string or ordered list. Fast entries are small, Best entries are non-small, and the first entry is preferred. A global job binding wins |
-| `models` | array | Declared models for custom providers (see below) |
-| `overrides` | table | Aperture only. Per-upstream model overrides (see below) |
+{provider_fields}
+A built-in slug keeps its compiled protocol, model catalog, and auth setup, so it ignores {builtin_ignored}. Opencode still reads `enable_free_models`.
 
+A `[SLUG.purposes]` table takes these keys:
+
+{purpose_fields}
 ### Model fields
 
-| Field | Type | Default | Notes |
-|-------|------|---------|-------|
-| `id` | string | required | Model id. Spec becomes `{{slug}}/{{id}}` |
-| `context_window` | u32 | protocol default | Tokens of context |
-| `max_output_tokens` | u32 | protocol default | Max completion tokens |
-| `supports_tool_examples` | bool | false | Send tool examples as a structured field. Off unless declared, because the protocol says nothing about the weights behind it |
-| `supports_thinking` | bool | protocol default | |
-| `requires_thinking` | bool | false | For APIs that reject requests with thinking disabled. Implies `supports_thinking` and raises thinking to minimal effort when off (including compaction) |
-| `supports_vision` | bool | false | Off unless declared. When false, image input and `view_image` are off |
-| `supports_cache_breakpoints` | bool | false | `openai-responses` only. The endpoint honours OpenAI's explicit `prompt_cache_breakpoint`, so the system prompt moves into a developer message that closes with one (see [token economy](/docs/token-economy/)) |
-| `pricing_input` / `pricing_output` | f64 | 0 | USD per 1M tokens |
-| `pricing_cache_write` / `pricing_cache_read` | f64 | 0 | USD per 1M tokens |
-| `pricing_fast_input` / `pricing_fast_output` | f64 | unset | Fast-mode pricing when the provider supports it |
+Each `[[SLUG.models]]` entry declares one model:
 
+{model_fields}
 ### Model defaults
 
 A `models` entry only applies to the exact `id` it names. When a provider's ids change often, or `discover_models` finds models you never declared, put the shared settings in `model_defaults` instead:
@@ -314,8 +309,9 @@ context_window = 262144
 supports_vision = true
 ```
 
-Provider-level fields apply to every model from that upstream; per-model entries under `models` win field by field. Fields: `context_window`, `max_output_tokens`, `supports_thinking`, `supports_vision`, `base` (remaps an opaque vendor to a native provider; e.g. `llama-cpp`, `google`, `anthropic`), and `path_prefix`. Model ids containing dots must be quoted (`"qwen3.6"`) since TOML treats a bare dotted key as a nested table.
+Provider-level fields apply to every model from that upstream. Per-model entries under `models` win field by field, and take the same keys apart from `models`. Model ids containing dots must be quoted (`"qwen3.6"`) since TOML treats a bare dotted key as a nested table.
 
+{override_fields}
 Caudra sends `/v1` (or `/v1beta` for Gemini routes, nothing for Anthropic and Z.AI), and Aperture appends that path to the upstream's base url. If an upstream base url already carries its own path, set `path_prefix = ""` for it to avoid a doubled path. Z.AI defaults to no prefix since its API path has no `/v1` segment; point the upstream base url at the full API root (e.g. `https://api.z.ai/api/paas/v4`).
 
 ### Plans
@@ -609,7 +605,7 @@ fn write_model_table(out: &mut String, manifest: &ProviderManifest) {
 
 /// Oxford-free list for prose, where a trailing comma before "and" would read
 /// as another item.
-fn join_and(items: &[String]) -> String {
+pub fn join_and(items: &[String]) -> String {
     match items.split_last() {
         None => String::new(),
         Some((last, [])) => last.clone(),
@@ -721,4 +717,23 @@ pub fn generate() -> String {
     let _ = writeln!(out, "{}", dynamic_providers_section());
 
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use caudra_config::files;
+
+    use super::providers_toml_section;
+    use crate::gen_regions::reference;
+
+    #[test]
+    fn the_providers_section_lists_every_key_of_the_reference() {
+        let section = providers_toml_section();
+        for table in reference(&files::PROVIDERS).tables {
+            for entry in table.entries {
+                let row = format!("| `{}` |", entry.name);
+                assert!(section.contains(&row), "{row}");
+            }
+        }
+    }
 }

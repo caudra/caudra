@@ -416,39 +416,56 @@ supports_vision = false
 
 The file can start with `version = 1`, and a file without it counts as version 1. Caudra writes the key whenever it saves the file. A newer version stops Caudra with an error rather than being misread. Because `version` belongs to the file, a custom provider cannot use it as a name. See [Config file versions](/docs/configuration/#config-file-versions).
 
+`caudra config example providers` prints every `providers.toml` key with its default, all commented out. [providers.example.toml](/docs/providers.example.toml) holds the same text.
+
 ### Provider fields
 
-| Field | Type | Notes |
-|-------|------|-------|
-| `display_name` | string | Shown in pickers and auth status |
-| `protocol` | string | `openai`, `openai-responses`, `anthropic`, or `google`. Required for custom slugs |
-| `base_url` | string | Origin of the API. Caudra appends the protocol paths |
-| `plan` | string | Built-in plan key (see Plans below). Sets base URL and default model |
-| `api_key_env` | string | Env var that holds the key. Defaults to `<SLUG>_API_KEY` |
-| `api_key` | string | Inline key (prefer the env var or `caudra auth login`) |
-| `default_model` | string | Used after login when no model is saved yet |
-| `discover_models` | bool | When true, also probe the provider's model list endpoint (default false) |
-| `enable_free_models` | bool | Opencode only. Show free catalog models (default false) |
-| `model_defaults` | table | Model fields applied to every model of this provider (see below) |
-| `purposes` | table | Model id prefixes for `fast` and `best`. A string or ordered list. Fast entries are small, Best entries are non-small, and the first entry is preferred. A global job binding wins |
-| `models` | array | Declared models for custom providers (see below) |
-| `overrides` | table | Aperture only. Per-upstream model overrides (see below) |
+| Field | Type | Default | Env | Description |
+|-------|------|---------|-----|-------------|
+| `display_name` | string | the built-in name, or the slug | - | The name pickers and auth status show |
+| `protocol` | string | required | - | The wire format: `openai`, `openai-responses`, `anthropic`, or `google` |
+| `base_url` | string | the plan URL, or the built-in URL | `<SLUG>_BASE_URL` | The API origin. Caudra appends the protocol paths |
+| `plan` | string | unset | - | A built-in plan key, which sets the base URL and the default model |
+| `api_key_env` | string | `<SLUG>_API_KEY` | - | The environment variable that holds the API key |
+| `api_key` | string | unset | - | An API key, stored as plain text. Caudra tries the environment variable and saved credentials first |
+| `default_model` | string | unset | - | The model to use after login when none is saved yet, such as `my-provider/my-model` |
+| `discover_models` | bool | `false` | - | Also list the models the provider's model endpoint reports |
+| `enable_free_models` | bool | unset | - | Opencode only. Show the free models of its catalog. Unset counts as `false` |
+| `overrides` | table | unset | - | Aperture only. Overrides for the upstream providers it routes, keyed by upstream id |
+| `model_defaults` | table | unset | - | Model keys for every model of the provider |
+| `purposes` | table | unset | - | Model id prefixes for the `fast` and `best` purposes |
+| `models` | table[] | unset | - | The models the provider serves |
+
+A built-in slug keeps its compiled protocol, model catalog, and auth setup, so it ignores `protocol`, `api_key_env`, `discover_models`, `models` and `enable_free_models`. Opencode still reads `enable_free_models`.
+
+A `[SLUG.purposes]` table takes these keys:
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `fast` | string \| string[] | unset | Model id prefixes for small, fast models, best first. A prefix covers every id that starts with it, and the first one also names the model that fills the slot, so it has to be a real id |
+| `best` | string \| string[] | unset | Model id prefixes for flagship models, best first. A prefix cannot also be in `fast`. A model a job is bound to in the picker wins over both lists |
 
 ### Model fields
 
-| Field | Type | Default | Notes |
-|-------|------|---------|-------|
-| `id` | string | required | Model id. Spec becomes `{slug}/{id}` |
-| `context_window` | u32 | protocol default | Tokens of context |
-| `max_output_tokens` | u32 | protocol default | Max completion tokens |
-| `supports_tool_examples` | bool | false | Send tool examples as a structured field. Off unless declared, because the protocol says nothing about the weights behind it |
-| `supports_thinking` | bool | protocol default | |
-| `requires_thinking` | bool | false | For APIs that reject requests with thinking disabled. Implies `supports_thinking` and raises thinking to minimal effort when off (including compaction) |
-| `supports_vision` | bool | false | Off unless declared. When false, image input and `view_image` are off |
-| `supports_cache_breakpoints` | bool | false | `openai-responses` only. The endpoint honours OpenAI's explicit `prompt_cache_breakpoint`, so the system prompt moves into a developer message that closes with one (see [token economy](/docs/token-economy/)) |
-| `pricing_input` / `pricing_output` | f64 | 0 | USD per 1M tokens |
-| `pricing_cache_write` / `pricing_cache_read` | f64 | 0 | USD per 1M tokens |
-| `pricing_fast_input` / `pricing_fast_output` | f64 | unset | Fast-mode pricing when the provider supports it |
+Each `[[SLUG.models]]` entry declares one model:
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `id` | string | required | The model id, which makes the spec `SLUG/ID` |
+| `context_window` | integer | discovered, or the protocol default | Tokens of context |
+| `max_output_tokens` | integer | discovered, or the protocol default | The most tokens one response may hold |
+| `supports_tool_examples` | bool | false | Send tool examples as a structured field. It is off unless declared, because the protocol says nothing about the model behind it |
+| `supports_thinking` | bool | discovered, or the protocol default | The model accepts extended thinking |
+| `requires_thinking` | bool | false | For an API that rejects requests with thinking off. It implies `supports_thinking` and raises thinking to minimal effort when it is off, compaction included |
+| `supports_vision` | bool | false | The model accepts images. When false, image input and `view_image` are off |
+| `supports_cache_breakpoints` | bool | false | `openai-responses` only. The endpoint honours an explicit `prompt_cache_breakpoint`, so the system prompt closes with one |
+| `reasoning_options` | table[] | unset | The reasoning controls the model takes, such as `[{ type = "effort", values = ["low", "high"] }]`. A `type` is `toggle`, `effort` with `values`, or `budget_tokens` with an optional `min` and `max`. `[]` declares that it takes none, so Caudra sends no reasoning level |
+| `pricing_input` | float | 0 | USD per million input tokens |
+| `pricing_output` | float | 0 | USD per million output tokens |
+| `pricing_cache_write` | float | 0 | USD per million tokens written to the prompt cache |
+| `pricing_cache_read` | float | 0 | USD per million tokens read from the prompt cache |
+| `pricing_fast_input` | float | unset | USD per million input tokens in fast mode |
+| `pricing_fast_output` | float | unset | USD per million output tokens in fast mode |
 
 ### Model defaults
 
@@ -490,7 +507,17 @@ context_window = 262144
 supports_vision = true
 ```
 
-Provider-level fields apply to every model from that upstream; per-model entries under `models` win field by field. Fields: `context_window`, `max_output_tokens`, `supports_thinking`, `supports_vision`, `base` (remaps an opaque vendor to a native provider; e.g. `llama-cpp`, `google`, `anthropic`), and `path_prefix`. Model ids containing dots must be quoted (`"qwen3.6"`) since TOML treats a bare dotted key as a nested table.
+Provider-level fields apply to every model from that upstream. Per-model entries under `models` win field by field, and take the same keys apart from `models`. Model ids containing dots must be quoted (`"qwen3.6"`) since TOML treats a bare dotted key as a nested table.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `context_window` | integer | unset | Tokens of context |
+| `max_output_tokens` | integer | unset | The most tokens one response may hold |
+| `supports_thinking` | bool | unset | The models accept extended thinking |
+| `supports_vision` | bool | unset | The models accept images |
+| `base` | string | unset | The native provider an opaque upstream works like, such as `llama-cpp`, `google`, or `anthropic`. Caudra warns about a value it does not know and ignores it |
+| `path_prefix` | string | `/v1`, `/v1beta` for Gemini routes, none for Anthropic and Z.AI | The path Caudra sends ahead of each request, which Aperture appends to the upstream base URL. Set it to `""` when that URL already has its own path |
+| `models` | table | `{}` | Overrides for single models, keyed by model id, which win key by key. Quote an id that holds a dot, such as `models."qwen-3.6"` |
 
 Caudra sends `/v1` (or `/v1beta` for Gemini routes, nothing for Anthropic and Z.AI), and Aperture appends that path to the upstream's base url. If an upstream base url already carries its own path, set `path_prefix = ""` for it to avoid a doubled path. Z.AI defaults to no prefix since its API path has no `/v1` segment; point the upstream base url at the full API root (e.g. `https://api.z.ai/api/paas/v4`).
 

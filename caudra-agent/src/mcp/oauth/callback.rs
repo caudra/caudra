@@ -1,9 +1,9 @@
+use caudra_config::mcp::{DEFAULT_CALLBACK_HOSTNAME, DEFAULT_CALLBACK_PATH};
 use futures_lite::AsyncWriteExt;
 use smol::net::TcpListener;
 
 const PREFERRED_PORT: u16 = 19876;
 const MAX_HEADER_SIZE: usize = 8192;
-const CALLBACK_PATH: &str = "/mcp/oauth/callback";
 const SUCCESS_HTML: &str =
     "<html><body><h1>Authentication successful</h1><p>You can close this tab.</p></body></html>";
 const ERROR_HTML: &str =
@@ -12,8 +12,6 @@ const ERROR_HTML: &str =
 pub struct CallbackResult {
     pub code: String,
 }
-
-const DEFAULT_HOSTNAME: &str = "127.0.0.1";
 
 pub struct CallbackServer {
     pub port: u16,
@@ -42,8 +40,8 @@ impl CallbackServer {
             Err(e) => return Err(format!("failed to bind callback port {requested}: {e}")),
         };
         let port = listener.local_addr().map_err(|e| e.to_string())?.port();
-        let path = path.unwrap_or(CALLBACK_PATH).to_string();
-        let hostname = hostname.unwrap_or(DEFAULT_HOSTNAME).to_string();
+        let path = path.unwrap_or(DEFAULT_CALLBACK_PATH).to_string();
+        let hostname = hostname.unwrap_or(DEFAULT_CALLBACK_HOSTNAME).to_string();
         Ok(Self {
             port,
             hostname,
@@ -214,7 +212,7 @@ mod tests {
                 .await
                 .unwrap();
             let req = format!(
-                "GET {CALLBACK_PATH}?code=auth-code&state=test-state HTTP/1.1\r\nHost: localhost\r\n\r\n"
+                "GET {DEFAULT_CALLBACK_PATH}?code=auth-code&state=test-state HTTP/1.1\r\nHost: localhost\r\n\r\n"
             );
             stream.write_all(req.as_bytes()).await.unwrap();
 
@@ -273,7 +271,7 @@ mod tests {
                 .unwrap();
             assert_eq!(
                 server.redirect_uri(),
-                format!("http://localhost:{}{CALLBACK_PATH}", server.port)
+                format!("http://localhost:{}{DEFAULT_CALLBACK_PATH}", server.port)
             );
         });
     }
@@ -284,7 +282,7 @@ mod tests {
             let server = CallbackServer::bind(None, None, None).await.unwrap();
             assert_eq!(
                 server.redirect_uri(),
-                format!("http://127.0.0.1:{}{CALLBACK_PATH}", server.port)
+                format!("http://127.0.0.1:{}{DEFAULT_CALLBACK_PATH}", server.port)
             );
         });
     }

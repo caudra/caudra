@@ -21,9 +21,11 @@ use crate::config_version::ConfigVersion;
 
 const PROJECT_DIR: &str = ".caudra";
 const PERMISSIONS_FILE: &str = "permissions.toml";
+const ENV_FILE: &str = ".env";
 pub const PERMISSIONS_VERSION: u32 = 1;
 const SHELL_PERMISSION_TOOLS: &[&str] = &["bash", "shell"];
 const UNSET_DEFAULT: &str = "unset";
+const REQUIRED_DEFAULT: &str = "required";
 /// An `[mcp.SERVER]` rule entry that covers every tool of the server.
 const MCP_WHOLE_SERVER: &str = "*";
 /// Tools whose card never opens on its own. A truncated prefix of one of
@@ -54,16 +56,16 @@ static PROJECT_ENV_KEYS: Mutex<Option<HashSet<String>>> = Mutex::new(None);
 pub mod config_file;
 pub mod config_version;
 pub mod decisions;
+pub mod example;
 pub mod experimental;
+pub mod files;
+pub mod mcp;
 pub mod providers;
 pub mod sandbox;
 pub mod steering;
 pub mod workcell;
 
-mod example;
-
 pub use decisions::{DecisionsConfig, FeatureMode};
-pub use example::example_toml;
 pub use experimental::{Feature, FeatureDisabled, FeatureFlags};
 pub use steering::SteeringConfig;
 
@@ -444,6 +446,9 @@ pub enum ConfigValue {
     Unset,
     /// A default that depends on where Caudra runs, so only prose can state it.
     Varies(&'static str),
+    /// No default, because every record has to set it. The payload is a
+    /// sample value spelled as TOML.
+    Required(&'static str),
 }
 
 impl ConfigValue {
@@ -454,6 +459,7 @@ impl ConfigValue {
             Self::F64(value) => value.to_string(),
             Self::Str(text) | Self::Toml(text) | Self::Varies(text) => (*text).to_string(),
             Self::Unset => UNSET_DEFAULT.to_string(),
+            Self::Required(_) => REQUIRED_DEFAULT.to_string(),
         }
     }
 
@@ -463,7 +469,7 @@ impl ConfigValue {
             Self::Bool(_) | Self::U64(_) | Self::Toml(_) => Some(self.format_default()),
             Self::F64(value) => Some(format!("{value:?}")),
             Self::Str(text) => Some(toml::Value::from(*text).to_string()),
-            Self::Unset | Self::Varies(_) => None,
+            Self::Unset | Self::Varies(_) | Self::Required(_) => None,
         }
     }
 }
@@ -1401,6 +1407,101 @@ struct PermissionsFileConfig {
     tools: HashMap<String, ToolPermissions>,
     mcp: McpPermissions,
     loaded_file: Option<(PathBuf, String)>,
+}
+
+impl PermissionsFileConfig {
+    /// Keys beside the `[TOOL]` and `[mcp.SERVER]` tables.
+    const FIELDS: &[ConfigField] = &[ConfigField {
+        name: "default",
+        ty: "string",
+        default: ConfigValue::Str("prompt"),
+        min: None,
+        max: None,
+        env: None,
+        description: "What a call that no rule matches does: `allow`, `deny`, or `prompt`. `allow` acts as `prompt` and waits in /permissions for review, and a project cannot weaken a global `deny`",
+    }];
+}
+
+impl ToolPermissions {
+    const FIELDS: &[ConfigField] = &[
+        ConfigField {
+            name: "allow",
+            ty: "bool | string[]",
+            default: ConfigValue::Unset,
+            min: None,
+            max: None,
+            env: None,
+            description: "Scopes the tool may use without asking, such as `[\"git status *\"]`, or `true` for every call. Only shell allows grant access, and a project shell allow waits until you trust the project policy. Other allows wait in /permissions for review",
+        },
+        ConfigField {
+            name: "ask",
+            ty: "bool | string[]",
+            default: ConfigValue::Unset,
+            min: None,
+            max: None,
+            env: None,
+            description: "Scopes that always ask, such as `[\"git push *\"]`, or `true` for every call",
+        },
+        ConfigField {
+            name: "deny",
+            ty: "bool | string[]",
+            default: ConfigValue::Unset,
+            min: None,
+            max: None,
+            env: None,
+            description: "Scopes the tool may never use, such as `[\"rm -rf *\"]`, or `true` for every call. A deny in either file blocks the whole call",
+        },
+        ConfigField {
+            name: "default",
+            ty: "string",
+            default: ConfigValue::Unset,
+            min: None,
+            max: None,
+            env: None,
+            description: "What a call of this tool that no rule matches does: `allow`, `deny`, or `prompt`. Unset follows the top-level `default`",
+        },
+    ];
+}
+
+impl McpPermissions {
+    const FIELDS: &[ConfigField] = &[
+        ConfigField {
+            name: "allow",
+            ty: "bool | string | string[]",
+            default: ConfigValue::Unset,
+            min: None,
+            max: None,
+            env: None,
+            description: "Tools to allow without asking: a list of names, one name, `\"*\"` for every tool, or `true` for every tool. MCP allows wait in /permissions for review",
+        },
+        ConfigField {
+            name: "ask",
+            ty: "bool | string | string[]",
+            default: ConfigValue::Unset,
+            min: None,
+            max: None,
+            env: None,
+            description: "Tools that always ask, in the same forms as `allow`",
+        },
+        ConfigField {
+            name: "deny",
+            ty: "bool | string | string[]",
+            default: ConfigValue::Unset,
+            min: None,
+            max: None,
+            env: None,
+            description: "Tools the model may never call, in the same forms as `allow`. `false` in any of the three adds nothing",
+        },
+        ConfigField {
+            name: "default",
+            ty: "string",
+            default: ConfigValue::Unset,
+            min: None,
+            max: None,
+            env: None,
+            description: "What a call to a tool of this server that no rule matches does: `allow`, `deny`, or `prompt`. Unset follows the top-level `default`",
+        },
+    ];
 }
 
 impl<'de> Deserialize<'de> for PermissionsFileConfig {
@@ -3358,11 +3459,11 @@ fn env_file_layers(
 ) -> (HashMap<String, String>, HashSet<String>) {
     let mut vars = HashMap::new();
     if let Some(path) = global {
-        collect_env_vars(&path.join(".env"), &mut vars);
+        collect_env_vars(&path.join(ENV_FILE), &mut vars);
     }
     let mut project_vars = HashMap::new();
     if include_project {
-        collect_env_vars(&cwd.join(PROJECT_DIR).join(".env"), &mut project_vars);
+        collect_env_vars(&cwd.join(PROJECT_DIR).join(ENV_FILE), &mut project_vars);
         project_vars.remove(decisions::BASE_URL_ENV);
     }
     let project_keys: HashSet<_> = project_vars.keys().cloned().collect();

@@ -1,0 +1,79 @@
+# Every permissions.toml setting. Each one is commented out, so this file
+# changes nothing until you edit it. `caudra config example permissions` prints
+# it.
+#
+# Each commented table header starts an example. To use one, copy the header
+# and the lines you need, remove the "#", and put your own names and values in
+# place of the examples. Leave the lines without a "#" as they are. A required
+# key shows a sample value, and any other key shows its default. A value in
+# angle brackets, such as <string>, marks a key with no default to show.
+#
+# The global file is ~/.config/caudra/permissions.toml, or
+# %APPDATA%\caudra\permissions.toml on Windows. A project
+# .caudra/permissions.toml adds rules of its own. Deny and ask rules from both
+# files apply, and a project shell allow waits until you trust the project
+# policy in /permissions.
+#
+# A file that is unreadable, malformed, or newer than this build fails closed:
+# Caudra denies tool calls until you fix it.
+#
+# Full reference: https://caudra.ai/docs/permissions/#toml-policy
+
+version = 1
+
+# What a call that no rule matches does: `allow`, `deny`, or `prompt`. `allow`
+# acts as `prompt` and waits in /permissions for review, and a project cannot
+# weaken a global `deny`.
+# Type: string.
+# default = "prompt"
+
+# [shell]
+# Each [TOOL] table holds the rules of one tool, such as [shell] here, and
+# ["*"] holds rules for every tool. A shell allow or ask pattern is literal
+# words with an optional final ` *`, such as `git status *`, in at most 8 words
+# and 256 bytes. One invalid pattern makes the whole file fail closed.
+
+# Scopes the tool may use without asking, such as `["git status *"]`, or `true`
+# for every call. Only shell allows grant access, and a project shell allow
+# waits until you trust the project policy. Other allows wait in /permissions
+# for review.
+# Type: bool | string[]. Default: unset.
+# allow = <bool | string[]>
+
+# Scopes that always ask, such as `["git push *"]`, or `true` for every call.
+# Type: bool | string[]. Default: unset.
+# ask = <bool | string[]>
+
+# Scopes the tool may never use, such as `["rm -rf *"]`, or `true` for every
+# call. A deny in either file blocks the whole call.
+# Type: bool | string[]. Default: unset.
+# deny = <bool | string[]>
+
+# What a call of this tool that no rule matches does: `allow`, `deny`, or
+# `prompt`. Unset follows the top-level `default`.
+# Type: string. Default: unset.
+# default = <string>
+
+# [mcp.github]
+# Each [mcp.SERVER] table holds the rules for the tools of one MCP server, such
+# as [mcp.github] here. Name each tool as the server does, without the
+# `github__` prefix.
+
+# Tools to allow without asking: a list of names, one name, `"*"` for every
+# tool, or `true` for every tool. MCP allows wait in /permissions for review.
+# Type: bool | string | string[]. Default: unset.
+# allow = <bool | string | string[]>
+
+# Tools that always ask, in the same forms as `allow`.
+# Type: bool | string | string[]. Default: unset.
+# ask = <bool | string | string[]>
+
+# Tools the model may never call, in the same forms as `allow`. `false` in any
+# of the three adds nothing.
+# Type: bool | string | string[]. Default: unset.
+# deny = <bool | string | string[]>
+
+# What a call to a tool of this server that no rule matches does: `allow`,
+# `deny`, or `prompt`. Unset follows the top-level `default`.
+# Type: string. Default: unset.
+# default = <string>

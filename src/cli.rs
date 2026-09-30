@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 
+use clap::builder::{PossibleValue, PossibleValuesParser, TypedValueParser};
 use clap::{
     Args, Command as ClapCommand, CommandFactory, Error as CliError, FromArgMatches, Parser,
     Subcommand, ValueEnum, error::ErrorKind,
@@ -8,6 +9,7 @@ use color_eyre::Result;
 use color_eyre::eyre::bail;
 
 use caudra_agent::tools::all_builtin_tool_names;
+use caudra_config::files::{self, ConfigFile};
 use caudra_config::sandbox::LeaseSeconds;
 use caudra_config::{Feature, FeatureDisabled, FeatureFlags, is_disableable_tool};
 use caudra_storage::auth::WorkcellCredentialName;
@@ -19,6 +21,7 @@ use crate::startup::Startup;
 
 const DEFAULT_LOG_LINES: usize = 200;
 const PERMISSION_MODE_CONFLICT: &str = "--auto cannot be used with --yolo";
+const NO_REFERENCE: &str = "this file has no reference";
 
 #[derive(Clone, ValueEnum, Default)]
 pub enum PromptVariant {
@@ -515,7 +518,7 @@ pub enum Command {
         #[arg(long, conflicts_with_all = ["names", "json"])]
         dirs: bool,
     },
-    /// Show the settings caudra.toml accepts
+    /// Show config files and the settings they take
     Config {
         #[command(subcommand)]
         action: ConfigAction,
@@ -589,8 +592,26 @@ impl Command {
 
 #[derive(Subcommand)]
 pub enum ConfigAction {
-    /// Print every caudra.toml setting, commented out and set to its default
-    Example,
+    /// List every file Caudra reads settings from, and which ones exist
+    Files,
+    /// Print every setting a file takes, commented out and set to its default
+    Example {
+        /// The file, by stem or by name, such as mcp or mcp.toml
+        #[arg(
+            value_name = "FILE",
+            value_parser = example_file_parser(),
+            default_value = files::CAUDRA.stem()
+        )]
+        file: &'static ConfigFile,
+    },
+}
+
+/// The stems are the listed values, and the file names are aliases.
+fn example_file_parser() -> impl TypedValueParser<Value = &'static ConfigFile> {
+    PossibleValuesParser::new(
+        files::examples().map(|file| PossibleValue::new(file.stem()).alias(file.name)),
+    )
+    .try_map(|name| files::find_example(&name).ok_or(NO_REFERENCE))
 }
 
 #[derive(Subcommand)]
@@ -1191,6 +1212,7 @@ mod tests {
     use test_case::test_case;
 
     const LOGS_NOT_PARSED: &str = "expected the logs subcommand";
+    const CONFIG_EXAMPLE_NOT_PARSED: &str = "expected the config example subcommand";
     const MODELS_NOT_PARSED: &str = "expected the models subcommand";
     const TRIM_NOT_PARSED: &str = "expected the storage trim subcommand";
     const MODEL_SPEC: &str = "openai/gpt-5";
@@ -1466,6 +1488,7 @@ mod tests {
     }
 
     #[test_case(&["caudra", "config", "example"], true ; "config_example")]
+    #[test_case(&["caudra", "config", "files"], true ; "config_files")]
     #[test_case(&["caudra", "logs"], true ; "logs")]
     #[test_case(&["caudra", "rollback"], true ; "rollback")]
     #[test_case(&["caudra", "models"], false ; "models")]
@@ -1476,6 +1499,30 @@ mod tests {
             cli.command.as_ref().map(Command::runs_without_config),
             Some(expected)
         );
+    }
+
+    #[test_case(&[], files::CAUDRA.name ; "caudra_toml_by_default")]
+    #[test_case(&["mcp"], files::MCP.name ; "stem")]
+    #[test_case(&["mcp.toml"], files::MCP.name ; "file_name")]
+    #[test_case(&["sandboxes"], files::SANDBOXES.name ; "experimental_file")]
+    fn config_example_takes_a_file_by_stem_or_name(extra: &[&str], expected: &str) {
+        let args = ["caudra", "config", "example"].iter().chain(extra);
+        let Some(Command::Config {
+            action: ConfigAction::Example { file },
+        }) = Cli::try_parse_from(args).unwrap().command
+        else {
+            panic!("{CONFIG_EXAMPLE_NOT_PARSED}");
+        };
+        assert_eq!(file.name, expected);
+    }
+
+    #[test_case("init.lua" ; "file_without_a_reference")]
+    #[test_case("settings" ; "unknown_name")]
+    fn config_example_rejects_other_files(file: &str) {
+        let error = Cli::try_parse_from(["caudra", "config", "example", file])
+            .err()
+            .unwrap();
+        assert_eq!(error.kind(), ErrorKind::InvalidValue);
     }
 
     #[test_case(&["caudra", "models"], false, None ; "plain_listing")]

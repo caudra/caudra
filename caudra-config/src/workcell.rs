@@ -11,15 +11,19 @@ use caudra_storage::auth::{WorkcellCredentialRef, WorkcellCredentialRefError};
 use caudra_storage::paths;
 use caudra_workspace::{WorkspacePath, WorkspacePathError};
 use serde::Deserialize;
+#[cfg(test)]
+use serde::Serialize;
 use thiserror::Error;
 use url::{Host, Url};
 
-const WORKCELL_PROFILE_FILE: &str = "workcell.toml";
-const WORKCELL_PROFILE_VERSION: u32 = 1;
-const MAX_PROFILE_FILE_BYTES: u64 = 256 * 1024;
-const MAX_PROFILE_NAME_BYTES: usize = 64;
-const MAX_ENDPOINT_BYTES: usize = 2048;
-const MAX_EXPECTED_ID_BYTES: usize = 512;
+use crate::{ConfigField, ConfigValue};
+
+pub(crate) const WORKCELL_PROFILE_FILE: &str = "workcell.toml";
+pub(crate) const WORKCELL_PROFILE_VERSION: u32 = 1;
+pub(crate) const MAX_PROFILE_FILE_BYTES: u64 = 256 * 1024;
+pub(crate) const MAX_PROFILE_NAME_BYTES: usize = 64;
+pub(crate) const MAX_ENDPOINT_BYTES: usize = 2048;
+pub(crate) const MAX_EXPECTED_ID_BYTES: usize = 512;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum WorkcellProfileNameError {
@@ -369,6 +373,7 @@ struct RawWorkcellProfiles {
 }
 
 #[derive(Deserialize)]
+#[cfg_attr(test, derive(Serialize))]
 #[serde(deny_unknown_fields)]
 struct RawWorkcellProfile {
     endpoint: String,
@@ -377,6 +382,55 @@ struct RawWorkcellProfile {
     expected_server_id: Option<String>,
     expected_workspace_id: Option<String>,
 }
+
+/// The keys of one `[workcell.profiles.NAME]` table.
+pub(crate) const PROFILE_FIELDS: &[ConfigField] = &[
+    ConfigField {
+        name: "endpoint",
+        ty: "string",
+        default: ConfigValue::Required("\"https://workcell.example/mcp\""),
+        min: None,
+        max: None,
+        env: None,
+        description: "The Workcell endpoint: HTTPS with any host, or HTTP on a numeric loopback address such as `127.0.0.1`. Caudra refuses `localhost`, user information, a query, and a fragment",
+    },
+    ConfigField {
+        name: "cwd",
+        ty: "string",
+        default: ConfigValue::Required("\"projects/app\""),
+        min: None,
+        max: None,
+        env: None,
+        description: "The working directory, relative to the Workcell root, where `.` is the root itself. It cannot start with `/` or hold `..`",
+    },
+    ConfigField {
+        name: "credential_ref",
+        ty: "string",
+        default: ConfigValue::Required("\"credential:dev\""),
+        min: None,
+        max: None,
+        env: None,
+        description: "The saved bearer credential, as `credential:NAME`, which `caudra auth workcell set NAME` creates. A loopback profile needs one too",
+    },
+    ConfigField {
+        name: "expected_server_id",
+        ty: "string",
+        default: ConfigValue::Unset,
+        min: None,
+        max: None,
+        env: None,
+        description: "An identity check: the connection fails unless the server reports this ID",
+    },
+    ConfigField {
+        name: "expected_workspace_id",
+        ty: "string",
+        default: ConfigValue::Unset,
+        min: None,
+        max: None,
+        env: None,
+        description: "An identity check: the connection fails unless the workspace reports this ID",
+    },
+];
 
 pub fn load_workcell_profiles() -> Result<WorkcellProfiles, WorkcellProfileError> {
     let config_dir = paths::config_dir().map_err(WorkcellProfileError::ConfigDirectory)?;
@@ -402,8 +456,12 @@ pub fn load_workcell_profiles_from(
     if content.len() as u64 > MAX_PROFILE_FILE_BYTES {
         return Err(WorkcellProfileError::FileTooLarge);
     }
+    parse_profile_file(&content)
+}
+
+fn parse_profile_file(content: &str) -> Result<WorkcellProfiles, WorkcellProfileError> {
     let raw: WorkcellProfileFile =
-        toml::from_str(&content).map_err(|_| WorkcellProfileError::Parse)?;
+        toml::from_str(content).map_err(|_| WorkcellProfileError::Parse)?;
     WorkcellProfiles::try_from(raw)
 }
 
@@ -555,11 +613,14 @@ pub fn select_workcell(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
     #[cfg(unix)]
     use std::os::unix::fs::{PermissionsExt, symlink};
 
     use tempfile::TempDir;
     use test_case::test_case;
+
+    use crate::example::{self, Render};
 
     const PROFILE_NAME: &str = "production";
     const CREDENTIAL_REF: &str = "credential:production";
@@ -599,6 +660,42 @@ expected_workspace_id = "workspace-1"
         let profiles = load_workcell_profiles_from(directory.path()).expect("missing is valid");
 
         assert!(profiles.is_empty());
+    }
+
+    fn reference(render: Render) -> WorkcellProfiles {
+        parse_profile_file(&example::workcell::document().render(render)).expect("reference")
+    }
+
+    #[test]
+    fn the_reference_loads_no_profile() {
+        assert!(reference(Render::Reference).is_empty());
+    }
+
+    #[test]
+    fn the_live_reference_loads_its_example_profile() {
+        let profiles = reference(Render::Live { defaults: false });
+        assert!(!profiles.is_empty());
+        assert_eq!(reference(Render::Live { defaults: true }), profiles);
+    }
+
+    #[test]
+    fn every_profile_key_is_described() {
+        let profile = RawWorkcellProfile {
+            endpoint: String::new(),
+            cwd: String::new(),
+            credential_ref: String::new(),
+            expected_server_id: None,
+            expected_workspace_id: None,
+        };
+        let value = serde_json::to_value(profile).expect("serialize profile");
+        let keys: BTreeSet<&str> = value
+            .as_object()
+            .expect("table")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        let described: BTreeSet<&str> = PROFILE_FIELDS.iter().map(|field| field.name).collect();
+        assert_eq!(described, keys);
     }
 
     #[test]

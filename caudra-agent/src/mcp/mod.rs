@@ -31,6 +31,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use arc_swap::{ArcSwap, Guard};
+use caudra_config::mcp::DEFAULT_DEFER_TOOLS;
 use caudra_providers::{ContentBlock, Message};
 use caudra_storage::StateDir;
 use caudra_storage::mcp_trust::{is_project_trusted, revoke_project_trust, trust_project};
@@ -55,10 +56,6 @@ use crate::tools::schema::sanitize_tool_input_schema;
 const SEPARATOR: &str = ".";
 const WIRE_SEPARATOR: &str = "__";
 pub const UNKNOWN_MCP: &str = "unknown_mcp";
-/// Below this many deferrable tools, a search round-trip plus its
-/// prompt-cache miss cost more than a handful of upfront definitions.
-/// Overridden by `defer_tools` in mcp.toml.
-const DEFAULT_DEFER_TOOLS: usize = 10;
 /// Loads per search are capped so one broad query can't flood the context.
 const MAX_SEARCH_LOADS: usize = 5;
 const NAME_HIT_SCORE: usize = 2;

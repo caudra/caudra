@@ -1,6 +1,5 @@
-# Every caudra.toml setting with its default. Each one is commented out, so
-# this file changes nothing until you edit it. `caudra config example` prints
-# it.
+# Every caudra.toml setting. Each one is commented out, so this file changes
+# nothing until you edit it. `caudra config example caudra` prints it.
 #
 # To change a setting, copy its line into your caudra.toml under the same
 # [table] header, remove the "#", and set your value. A value in angle
@@ -8,6 +7,17 @@
 # file is ~/.config/caudra/caudra.toml, or %APPDATA%\caudra\caudra.toml on
 # Windows. A project .caudra/caudra.toml takes the same settings, except
 # [experimental] and the ones marked global-only.
+#
+# caudra.toml holds the settings only you write. Other files hold what Caudra
+# writes itself, or what needs rules of its own: permissions.toml (permission
+# rules for tools and MCP servers), mcp.toml (MCP servers), providers.toml
+# (model providers and their models), workcell.toml (profiles for direct remote
+# Workcell connections), sandboxes.toml (managed sandbox providers, networks,
+# transfers, and profiles), init.lua (Lua code that sets up plugins), .env
+# (environment variables, such as API keys, for any the environment does not
+# set), commands/ (custom slash commands, one Markdown file each).
+# `caudra config files` shows where each one lives, and
+# `caudra config example FILE` prints the reference of a TOML file.
 #
 # Full reference: https://caudra.ai/docs/configuration/
 

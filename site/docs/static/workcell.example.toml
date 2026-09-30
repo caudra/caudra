@@ -1,0 +1,53 @@
+# Every workcell.toml setting. Each one is commented out, so this file changes
+# nothing until you edit it. `caudra config example workcell` prints it.
+#
+# Each commented table header starts an example. To use one, copy the header
+# and the lines you need, remove the "#", and put your own names and values in
+# place of the examples. Leave the lines without a "#" as they are. A required
+# key shows a sample value, and any other key shows its default. A value in
+# angle brackets, such as <string>, marks a key with no default to show.
+#
+# The global file is ~/.config/caudra/workcell.toml, or
+# %APPDATA%\caudra\workcell.toml on Windows. There is no project file. It has
+# to be a regular file, not a symlink, that you own and that group and others
+# cannot write, so `chmod 600` suits it. It holds at most 256 KiB.
+#
+# Caudra reads this file only while `remote_workcell` is true under
+# [experimental] in the global caudra.toml.
+#
+# Full reference: https://caudra.ai/docs/remote-workspaces/#configure-a-profile
+
+version = 1
+
+[workcell.profiles]
+# Keep this header, because the file needs it even without profiles.
+
+# [workcell.profiles.dev]
+# Each [workcell.profiles.NAME] table is one profile, which
+# `caudra --workcell-profile NAME` connects to. NAME is 1 to 64 ASCII letters,
+# digits, ".", "-", and "_", and starts with a letter or digit. `endpoint` is
+# at most 2048 bytes, and each expected ID at most 512.
+
+# The Workcell endpoint: HTTPS with any host, or HTTP on a numeric loopback
+# address such as `127.0.0.1`. Caudra refuses `localhost`, user information, a
+# query, and a fragment.
+# Type: string. Required.
+# endpoint = "https://workcell.example/mcp"
+
+# The working directory, relative to the Workcell root, where `.` is the root
+# itself. It cannot start with `/` or hold `..`.
+# Type: string. Required.
+# cwd = "projects/app"
+
+# The saved bearer credential, as `credential:NAME`, which
+# `caudra auth workcell set NAME` creates. A loopback profile needs one too.
+# Type: string. Required.
+# credential_ref = "credential:dev"
+
+# An identity check: the connection fails unless the server reports this ID.
+# Type: string. Default: unset.
+# expected_server_id = <string>
+
+# An identity check: the connection fails unless the workspace reports this ID.
+# Type: string. Default: unset.
+# expected_workspace_id = <string>

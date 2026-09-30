@@ -1,0 +1,156 @@
+# Every sandboxes.toml setting. Each one is commented out, so this file changes
+# nothing until you edit it. `caudra config example sandboxes` prints it.
+#
+# Each commented table header starts an example. To use one, copy the header
+# and the lines you need, remove the "#", and put your own names and values in
+# place of the examples. Leave the lines without a "#" as they are. A required
+# key shows a sample value, and any other key shows its default. A value in
+# angle brackets, such as <string>, marks a key with no default to show.
+#
+# The global file is ~/.config/caudra/sandboxes.toml, or
+# %APPDATA%\caudra\sandboxes.toml on Windows. There is no project file. It has
+# to be a regular file with one link, owned by you, that group and others have
+# no access to, so `chmod 600` suits it. The directory that holds it has to be
+# yours, and each directory above that has to be yours or root's. None of them
+# may let group or others write, except a sticky directory that root owns, such
+# as /tmp. No part of the path may be a symlink.
+#
+# The file holds at most 256 records and 1024 KiB, and one record at most 64
+# KiB. A network lists at most 256 domains and CIDRs together, and a transfer
+# at most 128 globs.
+#
+# `/sandbox` saves this file and keeps your comments. Saving creates no VM.
+#
+# Caudra reads this file only while `sandboxes` is true under [experimental] in
+# the global caudra.toml.
+#
+# Full reference: https://caudra.ai/docs/sandboxes/#configuration-schema
+
+version = 1
+
+[sandbox]
+# Keep this header, because the file needs it even without records.
+
+# [sandbox.providers.local]
+# Each [sandbox.providers.NAME] table is one sandbox provider. Every kind of
+# record has names of its own: 1 to 64 ASCII letters, digits, ".", "-", and
+# "_", starting with a letter or digit.
+
+# The provider type. `e2b-libvirt` is the only one.
+# Type: string. Required.
+# kind = "e2b-libvirt"
+
+# The origin of the lifecycle API: HTTPS, or HTTP on a numeric loopback
+# address, with no path, credentials, query, or fragment. Caudra refuses
+# `http://localhost`.
+# Type: string. Required.
+# api_endpoint = "http://127.0.0.1:3000"
+
+# The origin of the sandbox proxy, with the same rules as `api_endpoint`.
+# Type: string. Required.
+# proxy_endpoint = "http://127.0.0.1:49983"
+
+# The lifecycle API key, as `sandbox-api:NAME`, not a Workcell
+# `credential:NAME`. `caudra auth sandbox generate NAME` or
+# `caudra auth sandbox set NAME` saves it.
+# Type: string. Required.
+# credential_ref = "sandbox-api:local"
+
+# [sandbox.networks.default]
+# Each [sandbox.networks.NAME] table is one network policy, which profiles can
+# share.
+
+# `required` enforces the lists below, so empty lists deny all traffic. `off`
+# enforces nothing, and then both lists must be empty and `tls_mode` must stay
+# `sni-only`.
+# Type: string. Required.
+# enforcement = "required"
+
+# `sni-only` or `mitm`.
+# Type: string.
+# tls_mode = "sni-only"
+
+# Domains the sandbox may reach, such as `github.com` or
+# `*.githubusercontent.com`.
+# Type: string[].
+# domains = []
+
+# Address ranges the sandbox may reach, such as `10.0.0.0/8`.
+# Type: string[].
+# cidrs = []
+
+# [sandbox.transfers.default]
+# Each [sandbox.transfers.NAME] table is one file transfer policy, which
+# profiles can share. Protected paths stay protected even with `exclude = []`.
+
+# Leave out the files that `.gitignore` ignores.
+# Type: bool.
+# respect_gitignore = true
+
+# `ask` offers to copy the project into a new sandbox, and `none` skips the
+# offer. Later transfers work either way.
+# Type: string.
+# initial_seed = "ask"
+
+# Only `false` works, because Caudra never deletes files on its own.
+# Type: bool.
+# delete_extraneous = false
+
+# Relative globs of paths never to copy. A list you set replaces the one shown.
+# A glob cannot start with `/` or `!`, or hold `.`, `..`, `\`, or `:`.
+# Type: string[].
+# exclude = ["**/.git/**", "**/.env*", "**/target/**", "**/node_modules/**", "**/.venv/**", "**/.ssh/**", "**/.aws/**", "**/.caudra/**", "**/*.pem", "**/*.key"]
+
+# [sandbox.profiles.dev]
+# Each [sandbox.profiles.NAME] table is one launch profile, which
+# `caudra --sandbox NAME` starts. The file is refused while a record the
+# profile names is missing. The provider checks the template, the resources,
+# and the lease only at launch.
+
+# The name of a [sandbox.providers.NAME] record.
+# Type: string. Required.
+# provider = "local"
+
+# A template ID from the provider catalog. Each launch uses the revision the
+# catalog lists at that time.
+# Type: string. Required.
+# template = "caudra-rust"
+
+# Virtual CPUs.
+# Type: integer, at least 1. Required.
+# cpus = 4
+
+# Memory in MiB.
+# Type: integer, at least 1. Required.
+# memory_mib = 4096
+
+# Virtual disk size in GiB. It reserves no host space.
+# Type: integer, at least 1. Required.
+# disk_gib = 20
+
+# The working directory, relative to the Workcell root, where `.` is the root
+# itself.
+# Type: string. Required.
+# cwd = "."
+
+# The name of a [sandbox.networks.NAME] record.
+# Type: string. Required.
+# network = "default"
+
+# The name of a [sandbox.transfers.NAME] record.
+# Type: string. Required.
+# transfer = "default"
+
+# Keep the disk when the sandbox pauses or its lease ends. Only a persistent
+# sandbox can pause.
+# Type: bool.
+# persistent = true
+
+# Seconds the sandbox may run before its lease ends. `0` never ends, which
+# needs a provider without a lease cap.
+# Type: integer. Required.
+# running_ttl_seconds = 3600
+
+# What happens to the sandbox when Caudra exits. `detach` is the only value.
+# Type: string.
+# on_exit = "detach"

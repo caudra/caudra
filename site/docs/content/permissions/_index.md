@@ -338,6 +338,36 @@ deny = [
 deny = ["admin_delete"]
 ```
 
+<!-- caudra-docgen:permissions-keys -->
+
+#### Top level
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `default` | string | `prompt` | What a call that no rule matches does: `allow`, `deny`, or `prompt`. `allow` acts as `prompt` and waits in /permissions for review, and a project cannot weaken a global `deny` |
+
+#### `[TOOL]`
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `allow` | bool \| string[] | unset | Scopes the tool may use without asking, such as `["git status *"]`, or `true` for every call. Only shell allows grant access, and a project shell allow waits until you trust the project policy. Other allows wait in /permissions for review |
+| `ask` | bool \| string[] | unset | Scopes that always ask, such as `["git push *"]`, or `true` for every call |
+| `deny` | bool \| string[] | unset | Scopes the tool may never use, such as `["rm -rf *"]`, or `true` for every call. A deny in either file blocks the whole call |
+| `default` | string | unset | What a call of this tool that no rule matches does: `allow`, `deny`, or `prompt`. Unset follows the top-level `default` |
+
+#### `[mcp.SERVER]`
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `allow` | bool \| string \| string[] | unset | Tools to allow without asking: a list of names, one name, `"*"` for every tool, or `true` for every tool. MCP allows wait in /permissions for review |
+| `ask` | bool \| string \| string[] | unset | Tools that always ask, in the same forms as `allow` |
+| `deny` | bool \| string \| string[] | unset | Tools the model may never call, in the same forms as `allow`. `false` in any of the three adds nothing |
+| `default` | string | unset | What a call to a tool of this server that no rule matches does: `allow`, `deny`, or `prompt`. Unset follows the top-level `default` |
+
+`caudra config example permissions` prints every `permissions.toml` key with its default, all commented out. [permissions.example.toml](/docs/permissions.example.toml) holds the same text.
+
+<!-- /caudra-docgen:permissions-keys -->
+
 Shell allow and ask patterns use literal tokens followed by an optional bare `*` token. The wildcard matches zero or more complete arguments. It must be separated by a space, so `git status *` is valid and `git status*` is rejected. `allow = true` is the all-command `*` pattern for native shell tools. Patterns contain at most eight tokens and 256 bytes. Literal tokens may contain ASCII letters, digits, `.`, `_`, `/`, `@`, `:`, `=`, `+`, and `-`.
 
 Token prefix patterns do not authorize redirects to ordinary files or heredocs. These produce a protected request carrying the complete original command. Literal `/dev/null` redirects and file descriptor duplication such as `2>&1` can remain reviewable when their effects are understood. Argument patterns exclude all redirects. Path-qualified executables remain path-qualified, so `git status *` does not authorize `/tmp/git status`.

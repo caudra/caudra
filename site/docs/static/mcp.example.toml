@@ -1,0 +1,94 @@
+# Every mcp.toml setting. Each one is commented out, so this file changes
+# nothing until you edit it. `caudra config example mcp` prints it.
+#
+# Each commented table header starts an example. To use one, copy the header
+# and the lines you need, remove the "#", and put your own names and values in
+# place of the examples. Leave the lines without a "#" as they are. A required
+# key shows a sample value, and any other key shows its default. A value in
+# angle brackets, such as <string>, marks a key with no default to show.
+#
+# The global file is ~/.config/caudra/mcp.toml, or %APPDATA%\caudra\mcp.toml on
+# Windows. A project .caudra/mcp.toml adds servers, and a project server
+# replaces a global server with the same name. A project server that runs a
+# command, or that reaches a private address, waits until you review it in
+# /mcp.
+#
+# When /mcp turns a server on or off, Caudra sets `enabled` in the file that
+# defines the server and keeps your comments.
+#
+# Full reference: https://caudra.ai/docs/mcp/
+
+version = 1
+
+# Defer MCP tools behind `tool_search` only when the servers offer more than
+# this many. `0` always defers. A project value replaces the global one.
+# Type: integer.
+# defer_tools = 10
+
+# [mcp.filesystem]
+# Each [mcp.NAME] table is one server, and a stdio server like this one runs
+# `command`. NAME is 1 to 64 ASCII letters, digits, and hyphens, and cannot be
+# the name of a built-in tool. The tools of the server are named NAME__TOOL.
+
+# Start the server. `/mcp` sets this key when it turns a server on or off.
+# Type: bool.
+# enabled = true
+
+# Milliseconds to wait for each response from the server.
+# Type: integer, 1 to 300000.
+# timeout = 30000
+
+# Load every tool of the server up front instead of through `tool_search`.
+# Type: bool.
+# always_load = false
+
+# Stdio servers: the program and its arguments. It must not be empty. When
+# `url` is also set, `command` wins.
+# Type: string[]. Required.
+# command = ["npx", "-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+
+# Stdio servers: environment variables for the server process, such as
+# `{ GITHUB_TOKEN = "..." }`. Values are stored as plain text.
+# Type: table.
+# environment = {}
+
+# [mcp.analytics]
+# An HTTP server connects to `url` instead of running a command. `enabled`,
+# `timeout`, and `always_load` work here too.
+
+# HTTP servers: the server URL. It must start with `http://` or `https://`.
+# Type: string. Required.
+# url = "https://mcp.example.com/mcp"
+
+# HTTP servers: headers sent with every request, such as
+# `{ Authorization = "Bearer ..." }`. Values are stored as plain text.
+# Type: table.
+# headers = {}
+
+# [mcp.analytics.oauth]
+# The static OAuth client of [mcp.analytics], for a server that has no dynamic
+# client registration. Without it, Caudra registers a client when the server
+# asks for a login.
+
+# The client ID of the app you registered with the server.
+# Type: string. Required.
+# client_id = "analytics-client"
+
+# The client secret, for a confidential client. It is stored as plain text.
+# Type: string. Default: unset.
+# client_secret = <string>
+
+# Pin the loopback port of the redirect URI, so you can register the URI in
+# advance. Unset tries the default port, then any free port, so the URI can
+# change between runs.
+# Type: integer, at most 65535. Default: unset.
+# callback_port = <integer>
+
+# The path of the redirect URI. It must start with `/`.
+# Type: string.
+# callback_path = "/mcp/oauth/callback"
+
+# The host name of the redirect URI, such as `localhost` when the server
+# registered that form. The listener still binds to 127.0.0.1.
+# Type: string.
+# callback_hostname = "127.0.0.1"

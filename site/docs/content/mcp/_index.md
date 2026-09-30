@@ -16,7 +16,7 @@ An external stdio server is an unsandboxed local process. Per-tool permissions c
 Add servers under `[mcp.*]` in your MCP config:
 
 - **Global**: `~/.config/caudra/mcp.toml`
-- **Project**: `.caudra/mcp.toml` (project config wins when both set a value)
+- **Project**: `.caudra/mcp.toml`. A project server replaces a global server with the same name.
 
 ### Stdio
 
@@ -49,25 +49,36 @@ oauth = { client_id = "acme-client", client_secret = "s3cret", callback_port = 3
 
 ### All options
 
-| Field | Type | Default | Notes |
-|-------|------|---------|-------|
-| `command` | array | | Stdio: program + args |
-| `url` | string | | HTTP: server URL |
-| `environment` | map | | Stdio only |
-| `headers` | map | | HTTP only |
-| `oauth` | table | | HTTP only: static client (`client_id`, optional `client_secret`, optional `callback_port`, optional `callback_path`, optional `callback_hostname`) |
-| `timeout` | u64 | 30000 | Milliseconds (1-300000) |
-| `enabled` | bool | true | |
-| `always_load` | bool | false | Skip tool search, load all tools upfront |
+<!-- caudra-docgen:mcp-server-fields -->
+
+| Field | Type | Default | Min | Max | Description |
+|-------|------|---------|-----|-----|-------------|
+| `enabled` | bool | `true` | - | - | Start the server. `/mcp` sets this key when it turns a server on or off |
+| `timeout` | integer | `30000` | 1 | 300000 | Milliseconds to wait for each response from the server |
+| `always_load` | bool | `false` | - | - | Load every tool of the server up front instead of through `tool_search` |
+| `command` | string[] | required | - | - | Stdio servers: the program and its arguments. It must not be empty. When `url` is also set, `command` wins |
+| `environment` | table | `{}` | - | - | Stdio servers: environment variables for the server process, such as `{ GITHUB_TOKEN = "..." }`. Values are stored as plain text |
+| `url` | string | required | - | - | HTTP servers: the server URL. It must start with `http://` or `https://` |
+| `headers` | table | `{}` | - | - | HTTP servers: headers sent with every request, such as `{ Authorization = "Bearer ..." }`. Values are stored as plain text |
+| `oauth` | table | unset | - | - | HTTP servers: a static OAuth client, for a server that has no dynamic client registration |
+
+<!-- /caudra-docgen:mcp-server-fields -->
 
 Set `command` for stdio, `url` for HTTP. Pick one.
 
-Two options live at the top level of `mcp.toml`, outside any server:
+Keys at the top level of `mcp.toml`, outside any server:
 
-| Field | Type | Default | Notes |
-|-------|------|---------|-------|
-| `defer_tools` | usize | 10 | Defer tools only when more than this many exist |
-| `version` | integer | 1 | File format version. When it is newer than this build reads, no server in the file starts and Caudra shows the error. See [Config file versions](/docs/configuration/#config-file-versions) |
+<!-- caudra-docgen:mcp-top-level -->
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `defer_tools` | integer | `10` | Defer MCP tools behind `tool_search` only when the servers offer more than this many. `0` always defers. A project value replaces the global one |
+
+`caudra config example mcp` prints every `mcp.toml` key with its default, all commented out. [mcp.example.toml](/docs/mcp.example.toml) holds the same text.
+
+<!-- /caudra-docgen:mcp-top-level -->
+
+The file can start with `version = 1`, and a file without it counts as version 1. When the version is newer than this build reads, no server in the file starts and Caudra shows the error. See [Config file versions](/docs/configuration/#config-file-versions).
 
 ## Tool search
 
@@ -175,15 +186,19 @@ caudra mcp auth <server-name>     # manually trigger auth
 caudra mcp logout <server-name>   # remove stored tokens
 ```
 
-Servers without dynamic client registration need a client you registered yourself (e.g. your own app on their platform). Add it to the server config so the auth flow uses it instead of trying to register:
+Servers without dynamic client registration need a client you registered yourself (e.g. your own app on their platform). Add it as `oauth` in the server table, or as a `[mcp.NAME.oauth]` table, so the auth flow uses it instead of trying to register:
 
-| Field | Type | Notes |
-|-------|------|-------|
-| `client_id` | string | Client id of your registered app |
-| `client_secret` | string | Optional, for confidential clients |
-| `callback_port` | u16 | Optional, pins the loopback port so the redirect URI can be pre-registered |
-| `callback_path` | string | Optional, loopback path of the redirect URI (default `/mcp/oauth/callback`) |
-| `callback_hostname` | string | Optional, loopback hostname of the redirect URI (default `127.0.0.1`) |
+<!-- caudra-docgen:mcp-oauth -->
+
+| Field | Type | Default | Max | Description |
+|-------|------|---------|-----|-------------|
+| `client_id` | string | required | - | The client ID of the app you registered with the server |
+| `client_secret` | string | unset | - | The client secret, for a confidential client. It is stored as plain text |
+| `callback_port` | integer | unset | 65535 | Pin the loopback port of the redirect URI, so you can register the URI in advance. Unset tries the default port, then any free port, so the URI can change between runs |
+| `callback_path` | string | `/mcp/oauth/callback` | - | The path of the redirect URI. It must start with `/` |
+| `callback_hostname` | string | `127.0.0.1` | - | The host name of the redirect URI, such as `localhost` when the server registered that form. The listener still binds to 127.0.0.1 |
+
+<!-- /caudra-docgen:mcp-oauth -->
 
 Set `callback_port` when the server only accepts exact redirect URIs. Otherwise Caudra falls back to its default port, then to any free port, so the redirect URI changes between runs. Set `callback_path` when the server registered a different path (e.g. `/callback`). Set `callback_hostname` to `localhost` when the server registered the name form instead of the IP (the listener still binds to 127.0.0.1).
 

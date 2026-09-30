@@ -450,11 +450,17 @@ Applies the same directory precedence a real run does, including the builtin `ca
 ### `caudra config`
 
 ```bash
+caudra config files                           # every config file, where it lives, and whether it is there
 caudra config example                         # every caudra.toml setting, commented out
+caudra config example mcp                     # every mcp.toml key, commented out
 caudra config example > caudra.example.toml   # keep a copy to read or diff
 ```
 
-Prints every `caudra.toml` setting with its type, default, allowed range, environment variable, and description. Each setting is commented out, so the whole output is a valid config that changes nothing. To change a setting, copy its line into your `caudra.toml` under the same table and remove the `#`. It does not need your settings, so it works even when `caudra.toml` has an error. The same text is available as [caudra.example.toml](/docs/caudra.example.toml). See [Configuration](/docs/configuration/).
+`files` lists every file Caudra reads settings from. For each one it shows what the file holds, the experimental switch it needs, each global and project path with whether the file is there, its docs page, and its `example` command. It follows `CAUDRA_NAMESPACE` and debug builds, and it creates nothing.
+
+`example` prints every setting of one TOML file with its type, default, allowed range, environment variable, and description. FILE names one of the TOML files that `caudra config files` lists, with or without `.toml`, and defaults to `caudra`. Everything is commented out apart from `version` and the table headers a file needs, so the whole output is a valid file that changes nothing. To use a setting, copy its line into your file under the same table and remove the `#`. For a record such as `[mcp.NAME]`, copy the header too and put your own name in it.
+
+Neither command needs your settings, so both work even when `caudra.toml` has an error. The same text is available as [caudra.example.toml](/docs/caudra.example.toml) and one `.example.toml` file for each of the others. See [Config files](/docs/configuration/#config-files).
 
 ### `caudra logs`
 

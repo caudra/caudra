@@ -25,9 +25,23 @@ Settings apply in this order, and each layer overrides the ones before it:
 
 Remote sessions load only the client's global configuration. They skip both project layers, project environment files, and project MCP configuration. Remote project context uses a bounded declarative asset manifest instead. See [Remote Workspaces](/docs/remote-workspaces/#project-context-and-trust).
 
-Remote endpoint profiles live in a separate user `workcell.toml`, with `version = 1` and tables named `[workcell.profiles.NAME]`. They are not `caudra.toml` settings. See [profile configuration](/docs/remote-workspaces/#configure-a-profile) for the exact fields and credential rules.
+## Config files
 
-Managed sandbox providers, profiles, network policies and transfer defaults live in user-global `sandboxes.toml`, also with `version = 1`. They are separate from direct Workcell and model-provider profiles. See [Managed Sandboxes](/docs/sandboxes/#configuration-schema) for the schema, TUI editor and release status. Saving these defaults does not create a VM or change a running instance.
+`caudra.toml` holds the settings that only you write. A file stays separate from it when Caudra also writes the file, when the file decides where credentials or processes go, or when it has its own rules for trust, errors, or privacy.
+
+| File | Scope | Holds | Kept separate because | Reference |
+|------|-------|-------|-----------------------|-----------|
+| [`caudra.toml`](/docs/configuration/) | global, project | settings, and in the global file the [experimental] switches | It is the main file, and only you write it | `caudra config example caudra`, [caudra.example.toml](/docs/caudra.example.toml) |
+| [`permissions.toml`](/docs/permissions/#toml-policy) | global, project | permission rules for tools and MCP servers | It has its own error rule: a file that fails to load denies every tool call | `caudra config example permissions`, [permissions.example.toml](/docs/permissions.example.toml) |
+| [`mcp.toml`](/docs/mcp/) | global, project | MCP servers | Caudra writes it when `/mcp` turns a server on or off, and it starts processes | `caudra config example mcp`, [mcp.example.toml](/docs/mcp.example.toml) |
+| [`providers.toml`](/docs/providers/#providers-toml) | global | model providers and their models | `caudra auth login` and `caudra auth logout` write it, and it can hold API keys | `caudra config example providers`, [providers.example.toml](/docs/providers.example.toml) |
+| [`workcell.toml`](/docs/remote-workspaces/#configure-a-profile) | global | profiles for direct remote Workcell connections (needs `experimental.remote_workcell`) | It decides where credentials go, so it has to be a private file | `caudra config example workcell`, [workcell.example.toml](/docs/workcell.example.toml) |
+| [`sandboxes.toml`](/docs/sandboxes/#configuration-schema) | global | managed sandbox providers, networks, transfers, and profiles (needs `experimental.sandboxes`) | The `/sandbox` manager writes it, and it has to be a private file | `caudra config example sandboxes`, [sandboxes.example.toml](/docs/sandboxes.example.toml) |
+| [`init.lua`](/docs/plugins/) | global, project | Lua code that sets up plugins (needs `experimental.lua_plugins`) | It is a program, not settings | - |
+| [`.env`](/docs/configuration/#config-files) | global, project | environment variables, such as API keys, for any the environment does not set | It holds secrets | - |
+| [`commands/`](/docs/commands/#custom-commands) | global, project | custom slash commands, one Markdown file each | Each command is a file of its own | - |
+
+`caudra config files` lists where each file lives on your machine and whether it is there. `caudra config example FILE` prints the reference of a TOML file, such as `caudra config example mcp`. See [`caudra config`](/docs/cli/#caudra-config).
 
 ## Example
 
@@ -583,7 +597,7 @@ Caudra follows platform directory conventions. On Linux and macOS that is XDG. O
 | Cache | `~/.cache/caudra/` | `%LOCALAPPDATA%\caudra\` |
 | Scratch | `$TMPDIR/caudra/` | `%TEMP%\caudra\` |
 
-Config holds `caudra.toml`, `init.lua`, `permissions.toml`, `mcp.toml`, `providers.toml`, `workcell.toml`, `sandboxes.toml`, and `commands/`. State holds sessions, auth tokens, memories, plans, model-job bindings, sandbox lifecycle records and transfer recovery journals. The install script puts the binary under `%LOCALAPPDATA%\caudra` on Windows; that is separate from these runtime dirs.
+Config holds `caudra.toml`, `permissions.toml`, `mcp.toml`, `providers.toml`, `workcell.toml`, `sandboxes.toml`, `init.lua`, `.env` and `commands/`. State holds sessions, auth tokens, memories, plans, model-job bindings, sandbox lifecycle records and transfer recovery journals. The install script puts the binary under `%LOCALAPPDATA%\caudra` on Windows; that is separate from these runtime dirs.
 
 Scratch holds work that belongs outside your project, such as a file the model writes while thinking or a temporary a command leaves behind. Each project gets its own subdirectory, named by the project directory plus a three-word phrase derived from its path, as in `caudra-heroic-easy-grouse`. Two checkouts sharing a name get different phrases, so they cannot overwrite each other. The phrase is derived rather than drawn at random, so a project returns to the same directory on every run. Caudra creates it at startup and points `TMPDIR`, `TMP`, and `TEMP` at it, so every command Caudra runs puts its own temporary files there instead of the shared temp root. The model is told the path, and writing anywhere under the scratch root needs no approval. Paths beside the root still ask.
 
@@ -597,7 +611,7 @@ Set `CAUDRA_NAMESPACE` to choose the directory name yourself instead of letting 
 
 ## Config file versions
 
-Each TOML config file takes a top-level `version`, and every format is at version 1. Where the key is optional, a file without it counts as version 1. A build that finds a newer version than it reads refuses the file instead of guessing what it means, and the error says to upgrade Caudra.
+Each TOML config file takes a top-level `version`, and every format is at version 1. Where the key is optional, a file without it counts as version 1. A build that finds a newer version than it reads refuses the file instead of guessing what it means. For a file with an optional key, the error says the file needs a newer Caudra.
 
 | File | `version` | Newer than this build reads |
 |------|-----------|-----------------------------|

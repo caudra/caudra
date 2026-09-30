@@ -1,0 +1,262 @@
+# Every providers.toml setting. Each one is commented out, so this file changes
+# nothing until you edit it. `caudra config example providers` prints it.
+#
+# Each commented table header starts an example. To use one, copy the header
+# and the lines you need, remove the "#", and put your own names and values in
+# place of the examples. Leave the lines without a "#" as they are. A required
+# key shows a sample value, and any other key shows its default. A value in
+# angle brackets, such as <string>, marks a key with no default to show.
+#
+# The global file is ~/.config/caudra/providers.toml, or
+# %APPDATA%\caudra\providers.toml on Windows. There is no project file.
+#
+# `caudra auth login` and `caudra auth logout` rewrite this file and drop its
+# comments, so keep a copy of the ones you want.
+#
+# Full reference: https://caudra.ai/docs/providers/#providers-toml
+
+version = 1
+
+# [my-provider]
+# Each top-level table is one provider, named by its slug. A new slug, such as
+# my-provider here, adds a custom provider whose models are
+# `my-provider/MODEL`. A built-in slug, such as [anthropic], changes that
+# provider and ignores `protocol`, `api_key_env`, `discover_models`, `models`,
+# `enable_free_models`, except that opencode reads `enable_free_models`. In an
+# environment variable name, `<SLUG>` is the slug in capitals with `_` for `-`.
+
+# The name pickers and auth status show.
+# Type: string. Default: the built-in name, or the slug.
+# display_name = <string>
+
+# The wire format: `openai`, `openai-responses`, `anthropic`, or `google`.
+# Type: string. Required.
+# protocol = "openai"
+
+# The API origin. Caudra appends the protocol paths.
+# Type: string. Default: the plan URL, or the built-in URL. Env:
+# <SLUG>_BASE_URL.
+# base_url = <string>
+
+# A built-in plan key, which sets the base URL and the default model.
+# Type: string. Default: unset.
+# plan = <string>
+
+# The environment variable that holds the API key.
+# Type: string. Default: `<SLUG>_API_KEY`.
+# api_key_env = <string>
+
+# An API key, stored as plain text. Caudra tries the environment variable and
+# saved credentials first.
+# Type: string. Default: unset.
+# api_key = <string>
+
+# The model to use after login when none is saved yet, such as
+# `my-provider/my-model`.
+# Type: string. Default: unset.
+# default_model = <string>
+
+# Also list the models the provider's model endpoint reports.
+# Type: bool.
+# discover_models = false
+
+# Opencode only. Show the free models of its catalog. Unset counts as `false`.
+# Type: bool. Default: unset.
+# enable_free_models = <bool>
+
+# Aperture only. Overrides for the upstream providers it routes, keyed by
+# upstream id.
+# Type: table. Default: unset.
+# overrides = <table>
+
+# [my-provider.purposes]
+# Which models of my-provider are small and which are flagships. Each key takes
+# one prefix or a list.
+
+# Model id prefixes for small, fast models, best first. A prefix covers every
+# id that starts with it, and the first one also names the model that fills the
+# slot, so it has to be a real id.
+# Type: string | string[]. Default: unset.
+# fast = <string | string[]>
+
+# Model id prefixes for flagship models, best first. A prefix cannot also be in
+# `fast`. A model a job is bound to in the picker wins over both lists.
+# Type: string | string[]. Default: unset.
+# best = <string | string[]>
+
+# [my-provider.model_defaults]
+# Model keys for every model of my-provider, including the ones only discovery
+# finds. A [[my-provider.models]] entry wins key by key.
+
+# Tokens of context.
+# Type: integer. Default: discovered, or the protocol default.
+# context_window = <integer>
+
+# The most tokens one response may hold.
+# Type: integer. Default: discovered, or the protocol default.
+# max_output_tokens = <integer>
+
+# Send tool examples as a structured field. It is off unless declared, because
+# the protocol says nothing about the model behind it.
+# Type: bool. Default: false.
+# supports_tool_examples = <bool>
+
+# The model accepts extended thinking.
+# Type: bool. Default: discovered, or the protocol default.
+# supports_thinking = <bool>
+
+# For an API that rejects requests with thinking off. It implies
+# `supports_thinking` and raises thinking to minimal effort when it is off,
+# compaction included.
+# Type: bool. Default: false.
+# requires_thinking = <bool>
+
+# The model accepts images. When false, image input and `view_image` are off.
+# Type: bool. Default: false.
+# supports_vision = <bool>
+
+# `openai-responses` only. The endpoint honours an explicit
+# `prompt_cache_breakpoint`, so the system prompt closes with one.
+# Type: bool. Default: false.
+# supports_cache_breakpoints = <bool>
+
+# The reasoning controls the model takes, such as
+# `[{ type = "effort", values = ["low", "high"] }]`. A `type` is `toggle`,
+# `effort` with `values`, or `budget_tokens` with an optional `min` and `max`.
+# `[]` declares that it takes none, so Caudra sends no reasoning level.
+# Type: table[]. Default: unset.
+# reasoning_options = <table[]>
+
+# USD per million input tokens.
+# Type: float. Default: 0.
+# pricing_input = <float>
+
+# USD per million output tokens.
+# Type: float. Default: 0.
+# pricing_output = <float>
+
+# USD per million tokens written to the prompt cache.
+# Type: float. Default: 0.
+# pricing_cache_write = <float>
+
+# USD per million tokens read from the prompt cache.
+# Type: float. Default: 0.
+# pricing_cache_read = <float>
+
+# USD per million input tokens in fast mode.
+# Type: float. Default: unset.
+# pricing_fast_input = <float>
+
+# USD per million output tokens in fast mode.
+# Type: float. Default: unset.
+# pricing_fast_output = <float>
+
+# [[my-provider.models]]
+# One model my-provider serves, so repeat the table for each model. A key it
+# leaves out comes from [my-provider.model_defaults], then from discovery, and
+# then from the default shown.
+
+# The model id, which makes the spec `SLUG/ID`.
+# Type: string. Required.
+# id = "my-model"
+
+# Tokens of context.
+# Type: integer. Default: discovered, or the protocol default.
+# context_window = <integer>
+
+# The most tokens one response may hold.
+# Type: integer. Default: discovered, or the protocol default.
+# max_output_tokens = <integer>
+
+# Send tool examples as a structured field. It is off unless declared, because
+# the protocol says nothing about the model behind it.
+# Type: bool. Default: false.
+# supports_tool_examples = <bool>
+
+# The model accepts extended thinking.
+# Type: bool. Default: discovered, or the protocol default.
+# supports_thinking = <bool>
+
+# For an API that rejects requests with thinking off. It implies
+# `supports_thinking` and raises thinking to minimal effort when it is off,
+# compaction included.
+# Type: bool. Default: false.
+# requires_thinking = <bool>
+
+# The model accepts images. When false, image input and `view_image` are off.
+# Type: bool. Default: false.
+# supports_vision = <bool>
+
+# `openai-responses` only. The endpoint honours an explicit
+# `prompt_cache_breakpoint`, so the system prompt closes with one.
+# Type: bool. Default: false.
+# supports_cache_breakpoints = <bool>
+
+# The reasoning controls the model takes, such as
+# `[{ type = "effort", values = ["low", "high"] }]`. A `type` is `toggle`,
+# `effort` with `values`, or `budget_tokens` with an optional `min` and `max`.
+# `[]` declares that it takes none, so Caudra sends no reasoning level.
+# Type: table[]. Default: unset.
+# reasoning_options = <table[]>
+
+# USD per million input tokens.
+# Type: float. Default: 0.
+# pricing_input = <float>
+
+# USD per million output tokens.
+# Type: float. Default: 0.
+# pricing_output = <float>
+
+# USD per million tokens written to the prompt cache.
+# Type: float. Default: 0.
+# pricing_cache_write = <float>
+
+# USD per million tokens read from the prompt cache.
+# Type: float. Default: 0.
+# pricing_cache_read = <float>
+
+# USD per million input tokens in fast mode.
+# Type: float. Default: unset.
+# pricing_fast_input = <float>
+
+# USD per million output tokens in fast mode.
+# Type: float. Default: unset.
+# pricing_fast_output = <float>
+
+# [aperture.overrides.llmserver]
+# Aperture routes the models of upstream providers as
+# `aperture/UPSTREAM/MODEL`. Each [aperture.overrides.UPSTREAM] table overrides
+# the models of one upstream, such as llmserver here.
+
+# Tokens of context.
+# Type: integer. Default: unset.
+# context_window = <integer>
+
+# The most tokens one response may hold.
+# Type: integer. Default: unset.
+# max_output_tokens = <integer>
+
+# The models accept extended thinking.
+# Type: bool. Default: unset.
+# supports_thinking = <bool>
+
+# The models accept images.
+# Type: bool. Default: unset.
+# supports_vision = <bool>
+
+# The native provider an opaque upstream works like, such as `llama-cpp`,
+# `google`, or `anthropic`. Caudra warns about a value it does not know and
+# ignores it.
+# Type: string. Default: unset.
+# base = <string>
+
+# The path Caudra sends ahead of each request, which Aperture appends to the
+# upstream base URL. Set it to `""` when that URL already has its own path.
+# Type: string. Default: `/v1`, `/v1beta` for Gemini routes, none for Anthropic
+# and Z.AI.
+# path_prefix = <string>
+
+# Overrides for single models, keyed by model id, which win key by key. Quote
+# an id that holds a dot, such as `models."qwen-3.6"`.
+# Type: table.
+# models = {}
