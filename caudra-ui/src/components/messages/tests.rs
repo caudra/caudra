@@ -2196,6 +2196,21 @@ fn extract_partial_column_selection() {
     assert_eq!(text, "world");
 }
 
+/// Each styled run of a line has its own source range, and the delimiters
+/// between them belong to none, so a sweep that stops inside the line has to
+/// copy from its first run to its last rather than a run to a line.
+#[test]
+fn a_partial_sweep_keeps_the_markdown_between_styled_words() {
+    const DOC: &str = "Some **bold** words";
+    const SWEPT: &str = "Some bold wo";
+    const SWEPT_SOURCE: &str = "Some **bold** wo";
+    let panel = panel_with_msgs(&[DOC], 80, 24);
+    let area = Rect::new(0, 0, 80, 24);
+    let last = MESSAGE_START_COL + SWEPT.len() as u16 - 1;
+    let sel = make_sel(area, (0, MESSAGE_START_COL), (0, last));
+    assert_eq!(panel.extract_selection_text(&sel, area), SWEPT_SOURCE);
+}
+
 const MARKDOWN_DOC: &str = "# Title with **bold**\n\nA paragraph with `code` and *italic*.\n\n- first item\n- second item\n\n```rust\nfn main() {}\n```\n\n| Name | Value |\n| --- | --- |\n| foo | 42 |\n\nTrailing text.";
 
 /// Selecting a whole message copies the markdown that produced it, not the

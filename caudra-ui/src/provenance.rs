@@ -13,7 +13,7 @@ use caudra_markdown::render::{self, SpanSource};
 use ratatui::text::Line;
 use unicode_width::UnicodeWidthChar;
 
-use crate::selection::{ScreenSelection, col_range, line_chars, line_text, wrap_breaks};
+use crate::selection::{ScreenSelection, col_range, line_chars, wrap_breaks};
 
 /// Provenance for one painted line. `spans` is parallel to the line's
 /// ratatui spans.
@@ -120,43 +120,22 @@ impl Provenance {
         if width == 0 || self.lines.len() != lines.len() {
             return None;
         }
-
-        let mut ranges: Vec<Range<u32>> = Vec::new();
         let mut row: u16 = 0;
-
-        for (index, line) in lines.iter().enumerate() {
-            let chars = line_chars(line);
-            let starts = row_starts(&chars, width);
-            let covered = covered_chars(&chars, &starts, sel, width, from, to, &mut row);
-            let Some(covered) = covered else { continue };
-
-            let provenance = &self.lines[index];
-            if covered.start == 0 && covered.end == chars.len() {
-                match &provenance.line {
-                    Some(range) => ranges.push(range.clone()),
-                    // A fully covered row with no line range still has spans
-                    // worth reading, so fall through rather than drop it.
-                    None => span_ranges(line, provenance, &covered, &mut ranges)?,
-                }
-            } else {
-                span_ranges(line, provenance, &covered, &mut ranges)?;
-            }
-        }
-
-        Some(render::source_text(&self.source, ranges))
+        let covered: Vec<_> = lines
+            .iter()
+            .map(|line| {
+                let chars = line_chars(line);
+                let starts = row_starts(&chars, width);
+                covered_chars(&chars, &starts, sel, width, from, to, &mut row)
+            })
+            .collect();
+        self.swept_source(lines, &covered)
     }
 
     /// Source text for a sweep over `rows`, painted one to a provenance line,
     /// from `start` up to `end`, both `(row, char)` and `end` exclusive.
     /// Returns `None` where the rows are not the ones these lines describe, or
     /// a swept span lacks provenance.
-    ///
-    /// Every row a block wrapped onto repeats the block's range, so the block
-    /// is copied whole, syntax and all, only where the sweep takes in every
-    /// row of it. A sweep that starts or stops inside it copies the source
-    /// from the first span it covers to the last: between two spans of one
-    /// block lies only that block's syntax, such as the backticks around
-    /// inline code, which `source_text` would break onto a line of its own.
     pub fn extract_rows(
         &self,
         rows: &[Line<'_>],
@@ -166,56 +145,76 @@ impl Provenance {
         if self.lines.len() != rows.len() {
             return None;
         }
-        let last = end.0.min(rows.len().checked_sub(1)?);
-        let covered = |row: usize| {
-            let len = line_text(&rows[row]).chars().count();
-            let from = if row == start.0 { start.1.min(len) } else { 0 };
-            let to = if row == end.0 { end.1.min(len) } else { len };
-            (len, from..to)
-        };
-        let whole = |row: usize| {
-            (start.0..=end.0).contains(&row) && {
-                let (len, chars) = covered(row);
-                len == 0 || chars == (0..len)
-            }
-        };
+        let covered: Vec<_> = rows
+            .iter()
+            .enumerate()
+            .map(|(row, painted)| {
+                (start.0..=end.0).contains(&row).then(|| {
+                    let len = char_count(painted);
+                    let from = if row == start.0 { start.1.min(len) } else { 0 };
+                    let to = if row == end.0 { end.1.min(len) } else { len };
+                    from..to
+                })
+            })
+            .collect();
+        self.swept_source(rows, &covered)
+    }
 
+    /// The source behind the chars `covered` names on each of `lines`, `None`
+    /// for a line the sweep missed.
+    ///
+    /// Every line a block was broken onto repeats the block's range, so the
+    /// block is copied whole, syntax and all, only where the sweep takes in
+    /// every line of it. A sweep that starts or stops inside it copies the
+    /// source from the first span it covers to the last: between two spans of
+    /// one block lies only that block's syntax, such as the asterisks around
+    /// bold text, which `source_text` would break onto a line of its own.
+    fn swept_source(&self, lines: &[Line<'_>], covered: &[Option<Range<usize>>]) -> Option<String> {
+        let whole = |index: usize| covered[index] == Some(0..char_count(&lines[index]));
         let mut ranges: Vec<Range<u32>> = Vec::new();
-        let mut row = start.0;
-        while row <= last {
-            let line = self.lines[row].line.as_ref();
-            let run = match line {
-                Some(range) => {
-                    let same = |other: &&LineProvenance| other.line.as_ref() == Some(range);
-                    let before = self.lines[..row].iter().rev().take_while(same).count();
-                    let after = self.lines[row..].iter().take_while(same).count();
-                    row - before..row + after
-                }
-                None => row..row + 1,
-            };
-            match line {
-                Some(range) if run.clone().all(whole) => ranges.push(range.clone()),
-                _ => {
-                    let mut spans = Vec::new();
-                    let swept = row..run.end.min(last + 1);
-                    let swept_rows = rows[swept.clone()].iter().zip(&self.lines[swept.clone()]);
-                    for (at, (painted, provenance)) in swept.zip(swept_rows) {
-                        let (_, chars) = covered(at);
-                        if !chars.is_empty() {
-                            span_ranges(painted, provenance, &chars, &mut spans)?;
-                        }
-                    }
-                    match line {
-                        Some(_) => ranges.extend(bridged(&spans)),
-                        None => ranges.extend(spans),
-                    }
+        let mut index = 0;
+        while let Some(first) = (index..lines.len()).find(|&at| covered[at].is_some()) {
+            let run = self.block_lines(first);
+            index = run.end;
+            let block = self.lines[first].line.as_ref();
+            if let Some(range) = block
+                && run.clone().all(whole)
+            {
+                ranges.push(range.clone());
+                continue;
+            }
+            let mut spans = Vec::new();
+            for at in first..run.end {
+                if let Some(chars) = covered[at].as_ref().filter(|chars| !chars.is_empty()) {
+                    span_ranges(&lines[at], &self.lines[at], chars, &mut spans)?;
                 }
             }
-            row = run.end;
+            match block {
+                Some(_) => ranges.extend(bridged(&spans)),
+                None => ranges.extend(spans),
+            }
         }
-
         Some(render::source_text(&self.source, ranges))
     }
+
+    /// The lines the block painted on line `index` was broken onto: its
+    /// neighbours that repeat its range, or the line alone when it has none.
+    fn block_lines(&self, index: usize) -> Range<usize> {
+        let Some(range) = self.lines[index].line.as_ref() else {
+            return index..index + 1;
+        };
+        let same = |other: &&LineProvenance| other.line.as_ref() == Some(range);
+        let before = self.lines[..index].iter().rev().take_while(same).count();
+        let after = self.lines[index..].iter().take_while(same).count();
+        index - before..index + after
+    }
+}
+
+fn char_count(line: &Line<'_>) -> usize {
+    line.spans
+        .iter()
+        .map(|span| span.content.chars().count())
+        .sum()
 }
 
 /// One slice from the first byte `spans` cover to the last.
@@ -355,6 +354,7 @@ fn span_ranges(
 mod tests {
     use super::*;
     use crate::markdown::{text_to_painted, text_to_rows};
+    use crate::selection::line_text;
     use ratatui::style::Style;
 
     const WIDTH: u16 = 40;
@@ -460,6 +460,30 @@ mod tests {
         let copied = provenance.extract_rows(&lines, (row, 0), (row, CUT_PAINTED.chars().count()));
 
         assert_eq!(copied.as_deref(), Some(CUT_SOURCE), "{SOURCE_LOST}");
+    }
+
+    /// A card's body is broken to the card, and every row of a paragraph names
+    /// the whole paragraph, so a sweep over one row must not take the rest.
+    #[test]
+    fn a_selection_of_one_wrapped_row_copies_that_row_alone() {
+        let (lines, provenance) = rows();
+        let second = row_with(&lines, SECOND_ROW) as u16;
+        let row = ScreenSelection {
+            start_row: second,
+            start_col: 0,
+            end_row: second,
+            end_col: ROWS_WIDTH - 1,
+        };
+
+        let copied = provenance
+            .extract(&lines, ROWS_WIDTH, &row, second, second + 1)
+            .expect(NO_COPY);
+
+        assert!(copied.starts_with(SECOND_ROW), "{SOURCE_LOST}: {copied}");
+        assert!(
+            !copied.contains(FIRST_WORD) && !copied.contains(LAST_WORD),
+            "{OVER_COPIED}: {copied}"
+        );
     }
 
     #[test]
