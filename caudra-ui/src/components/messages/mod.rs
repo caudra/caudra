@@ -14,7 +14,7 @@ use layout::{SegmentChrome, SegmentKind};
 use super::tool_display::{
     RenderCtx, ScrollTail, ToolLines, append_annotation, append_right_info, assistant_style,
     build_instructions_lines, build_tool_lines, done_style, draws_live_script, error_style,
-    format_timestamp_now, names_tool, notice_style, shell_elapsed, thinking_style,
+    format_timestamp_now, names_tool, notice_style, shell_clock_ticks, thinking_style,
     truncate_to_header, user_style,
 };
 use super::{
@@ -50,7 +50,7 @@ use caudra_workflow::RunSnapshot;
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::mem;
+use std::mem::{self, Discriminant};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -1735,20 +1735,8 @@ impl MessagesPanel {
     }
 
     pub fn bind_sources(&mut self, source_messages: &[DisplayMessage]) {
-        let mut start = 0;
-        for message in &mut self.messages {
-            let Some(offset) = source_messages[start..]
-                .iter()
-                .position(|source| same_display_item(message, source))
-            else {
-                continue;
-            };
-            let source = &source_messages[start + offset];
-            message.source = source.source;
-            start += offset + 1;
-            if start == source_messages.len() {
-                break;
-            }
+        for (row, source) in matched_sources(&self.messages, source_messages) {
+            self.messages[row].source = source;
         }
     }
 
@@ -5322,8 +5310,10 @@ impl MessagesPanel {
                 // A batch keeps a clock per child, since the reports belong to
                 // rows the card has no header for and it carries none itself.
                 // The header clock asks the renderer's own question, so the set
-                // refreshed here cannot drift from the set that draws one.
-                let ticking = shell_elapsed(msg, tool.status).is_some()
+                // refreshed here cannot drift from the set whose clock moves.
+                // Every settled shell draws a clock too, and counting those
+                // rebuilt each one in the transcript on every frame.
+                let ticking = shell_clock_ticks(msg, tool.status)
                     || msg.progress.as_ref().is_some_and(ToolProgress::is_live)
                     || progress
                         .get(&tool.id)
@@ -5682,6 +5672,67 @@ fn merge_batch_snapshot(msg: &mut DisplayMessage, mut incoming: Vec<BatchToolEnt
         entries: incoming,
         text,
     }));
+}
+
+/// What [`same_display_item`] needs two rows to share, cheap enough to index a
+/// whole transcript by: a text row keys on its length, never on the text.
+#[derive(PartialEq, Eq, Hash)]
+enum DisplayKey<'a> {
+    Tool(&'a str),
+    Delivery,
+    Text(Discriminant<DisplayRole>, usize),
+}
+
+fn display_key(message: &DisplayMessage) -> Option<DisplayKey<'_>> {
+    match &message.role {
+        DisplayRole::Tool(tool) => Some(DisplayKey::Tool(&tool.id)),
+        DisplayRole::TaskDelivery(_) => Some(DisplayKey::Delivery),
+        DisplayRole::User
+        | DisplayRole::Assistant
+        | DisplayRole::Thinking
+        | DisplayRole::Notice
+        | DisplayRole::Injected => Some(DisplayKey::Text(
+            mem::discriminant(&message.role),
+            message.text.len(),
+        )),
+        DisplayRole::Error | DisplayRole::Done => None,
+    }
+}
+
+/// Pairs each row with the first source row after the previous match that
+/// shows the same item, and hands back that source by row index. Every row
+/// older than the sources, which after a compaction is most of them, used to
+/// rescan all the sources; indexing them by key makes each row one lookup.
+fn matched_sources(
+    rows: &[DisplayMessage],
+    sources: &[DisplayMessage],
+) -> Vec<(usize, Option<DisplaySource>)> {
+    let mut by_key: HashMap<DisplayKey, Vec<usize>> = HashMap::new();
+    for (index, source) in sources.iter().enumerate() {
+        if let Some(key) = display_key(source) {
+            by_key.entry(key).or_default().push(index);
+        }
+    }
+    let mut matched = Vec::new();
+    let mut start = 0;
+    for (row, message) in rows.iter().enumerate() {
+        let Some(candidates) = display_key(message).and_then(|key| by_key.get(&key)) else {
+            continue;
+        };
+        let unclaimed = &candidates[candidates.partition_point(|&index| index < start)..];
+        let Some(&index) = unclaimed
+            .iter()
+            .find(|&&index| same_display_item(message, &sources[index]))
+        else {
+            continue;
+        };
+        matched.push((row, sources[index].source));
+        start = index + 1;
+        if start == sources.len() {
+            break;
+        }
+    }
+    matched
 }
 
 fn same_display_item(left: &DisplayMessage, right: &DisplayMessage) -> bool {

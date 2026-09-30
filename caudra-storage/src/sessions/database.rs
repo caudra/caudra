@@ -4051,6 +4051,7 @@ where
         updated_at: root.updated_at,
         revision: 0,
         content_revision: 0,
+        messages_revision: 0,
         epoch: next_epoch(),
         rewrites: 0,
         base_write_version: AtomicI64::new(root.write_version),

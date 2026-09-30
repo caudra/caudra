@@ -684,6 +684,90 @@ fn message_action_handles_map_every_source_kind() {
     );
 }
 
+const OLDER_PROMPT: &str = "an older prompt";
+const OLDER_CALL: &str = "older-call";
+const BOUND_PROMPT: &str = "fix the flaky test";
+const BOUND_CALL: &str = "bound-call";
+const BOUND_REPLY: &str = "the fix is in";
+const RETRY_NOTICE: &str = "retrying after a rate limit";
+const SAME_LENGTH_NOTICE: &str = "retrying after a rate LIMIT";
+const FAILURE: &str = "the request failed";
+const BIND_MSG: &str = "each row takes the first source past the last match that shows its item";
+
+fn text_row(role: DisplayRole, text: &str) -> DisplayMessage {
+    DisplayMessage::new(role, text.into())
+}
+
+fn call_row(id: &str) -> DisplayMessage {
+    let role = DisplayRole::Tool(Box::new(ToolRole {
+        id: id.into(),
+        effect: ToolEffect::Unknown,
+        status: ToolStatus::Success,
+        name: FILE_READ_TOOL_NAME.into(),
+    }));
+    DisplayMessage::new(role, String::new())
+}
+
+/// Binding runs on every append, and a transcript that crossed a compaction
+/// seam has rows no source matches. The matching has to stay the same greedy,
+/// in-order walk it always was while those rows stop costing a rescan each.
+#[test_case(
+    vec![text_row(DisplayRole::User, OLDER_PROMPT), call_row(OLDER_CALL), text_row(DisplayRole::User, BOUND_PROMPT), call_row(BOUND_CALL), text_row(DisplayRole::Assistant, BOUND_REPLY)],
+    vec![text_row(DisplayRole::User, BOUND_PROMPT), call_row(BOUND_CALL), text_row(DisplayRole::Assistant, BOUND_REPLY)],
+    &[None, None, Some(0), Some(1), Some(2)] ;
+    "an_unmatched_prefix_from_before_the_seam"
+)]
+#[test_case(
+    vec![text_row(DisplayRole::Assistant, BOUND_REPLY), text_row(DisplayRole::Assistant, BOUND_REPLY), text_row(DisplayRole::Assistant, BOUND_REPLY)],
+    vec![text_row(DisplayRole::Assistant, BOUND_REPLY), text_row(DisplayRole::Assistant, BOUND_REPLY)],
+    &[Some(0), Some(1), None] ;
+    "duplicate_texts_bind_in_order"
+)]
+#[test_case(
+    vec![text_row(DisplayRole::User, BOUND_PROMPT), text_row(DisplayRole::Notice, RETRY_NOTICE), text_row(DisplayRole::Error, FAILURE), text_row(DisplayRole::Notice, RETRY_NOTICE), text_row(DisplayRole::Assistant, BOUND_REPLY)],
+    vec![text_row(DisplayRole::User, BOUND_PROMPT), text_row(DisplayRole::Notice, RETRY_NOTICE), text_row(DisplayRole::Error, FAILURE), text_row(DisplayRole::Assistant, BOUND_REPLY)],
+    &[Some(0), Some(1), None, None, Some(3)] ;
+    "interleaved_notices_and_errors"
+)]
+#[test_case(
+    vec![text_row(DisplayRole::Notice, SAME_LENGTH_NOTICE), text_row(DisplayRole::Notice, RETRY_NOTICE)],
+    vec![text_row(DisplayRole::Notice, RETRY_NOTICE)],
+    &[None, Some(0)] ;
+    "an_equal_length_still_compares_the_text"
+)]
+fn bind_sources_walks_the_sources_in_order(
+    rows: Vec<DisplayMessage>,
+    sources: Vec<DisplayMessage>,
+    expected: &[Option<usize>],
+) {
+    let sources: Vec<_> = sources
+        .into_iter()
+        .map(|mut source| {
+            source.source = Some(DisplaySource::User(CaudraId::generate()));
+            source
+        })
+        .collect();
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    for row in rows {
+        panel.push(row);
+    }
+
+    panel.bind_sources(&sources);
+
+    let bound: Vec<_> = panel
+        .messages
+        .iter()
+        .map(|row| {
+            row.source.and_then(|bound| {
+                sources
+                    .iter()
+                    .position(|source| source.source == Some(bound))
+            })
+        })
+        .collect();
+    assert_eq!(bound, expected, "{BIND_MSG}");
+}
+
 #[test]
 fn message_action_handles_are_disabled_without_main_chat_access() {
     let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
@@ -6775,6 +6859,32 @@ fn a_settled_shell_card_swaps_the_live_clock_for_the_measured_one() {
 
     assert!(text.contains(SHELL_MEASURED_CLOCK), "{text}");
     assert!(!text.contains(SHELL_LIVE_CLOCK), "{text}");
+}
+
+/// Written into a settled shell's output behind its cached card, so the card
+/// draws it only if something rebuilds the card.
+const RESTAMPED_DURATION_MS: u64 = 20;
+const RESTAMPED_CLOCK: &str = "· 20ms";
+
+/// A settled shell draws its measured clock, which never moves, so the
+/// clock-driven refresh must leave the card alone while another call runs.
+/// Counting it rebuilt every shell a long transcript held on every frame.
+#[test]
+fn a_settled_shell_card_stays_cached_while_another_call_runs() {
+    let mut panel = panel_with_tools(&[("t1", SHELL_TOOL_NAME), ("t2", FILE_GREP_TOOL_NAME)]);
+    panel.tool_done(shell_done("t1", false));
+    render(&mut panel, 80, 40);
+
+    let Some(ToolOutput::Shell(output)) = panel.messages[0].tool_output.as_deref() else {
+        panic!("a settled shell keeps its output");
+    };
+    let mut restamped = output.clone();
+    restamped.duration_ms = RESTAMPED_DURATION_MS;
+    panel.messages[0].tool_output = Some(Arc::new(ToolOutput::Shell(restamped)));
+    let text = buffer_text(&render(&mut panel, 80, 40));
+
+    assert!(text.contains(SHELL_MEASURED_CLOCK), "{text}");
+    assert!(!text.contains(RESTAMPED_CLOCK), "{text}");
 }
 
 #[test_case(Duration::from_millis(420), "0.4s" ; "sub_second")]

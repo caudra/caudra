@@ -224,7 +224,7 @@ pub fn expand_message(message: &Message, parent_id: Option<CaudraId>) -> Vec<His
 /// Validates and projects an ancestor-ordered item path into provider-facing
 /// grouped messages.
 pub fn project_messages(items: &[HistoryItem]) -> Result<Vec<Message>, HistoryProjectionError> {
-    validate_items(items)?;
+    validate_history_items(items)?;
 
     let mut messages = Vec::new();
     let mut start = 0;
@@ -401,7 +401,7 @@ pub fn merge_history_items(
     stored: &mut Vec<HistoryItem>,
     active: &[HistoryItem],
 ) -> Result<(), HistoryProjectionError> {
-    validate_items(active)?;
+    validate_history_items(active)?;
     let mut merged = stored.clone();
     let mut index = validate_history_graph(&merged)?;
     for item in active {
@@ -740,7 +740,10 @@ fn assistant_kind(
     }
 }
 
-fn validate_items(items: &[HistoryItem]) -> Result<(), HistoryProjectionError> {
+/// Checks an ancestor-ordered item path: unique ids, each item parented on the
+/// one before it, contiguous groups of one kind, and tool results that answer
+/// the calls before them.
+pub fn validate_history_items(items: &[HistoryItem]) -> Result<(), HistoryProjectionError> {
     validate_item_structure(items)?;
     validate_tool_order(items)
 }

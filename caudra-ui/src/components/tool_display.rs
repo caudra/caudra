@@ -2532,7 +2532,7 @@ fn draws_live_markdown(tool_name: &str, header: &str) -> bool {
 /// the output, so it is the one tool whose card reads the same restored as it
 /// did live. The running branch has to ask the tool's name; the settled one
 /// does not, because nothing else produces a [`ToolOutput::Shell`].
-pub(super) fn shell_elapsed(msg: &DisplayMessage, status: ToolStatus) -> Option<Duration> {
+fn shell_elapsed(msg: &DisplayMessage, status: ToolStatus) -> Option<Duration> {
     if status == ToolStatus::InProgress {
         return msg
             .tool_started
@@ -2543,6 +2543,13 @@ pub(super) fn shell_elapsed(msg: &DisplayMessage, status: ToolStatus) -> Option<
         Some(ToolOutput::Shell(output)) => Some(Duration::from_millis(output.duration_ms)),
         _ => None,
     }
+}
+
+/// Whether [`shell_elapsed`] reads the wall clock for this card. A settled
+/// shell draws its measured duration, which never moves, so only a running
+/// one owes a repaint as time passes.
+pub(super) fn shell_clock_ticks(msg: &DisplayMessage, status: ToolStatus) -> bool {
+    status == ToolStatus::InProgress && shell_elapsed(msg, status).is_some()
 }
 
 /// What the header says in parentheses: how much work the call has done, then

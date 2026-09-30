@@ -532,6 +532,11 @@ pub struct Session<M, U, T> {
     /// which can wait for the keystrokes behind it.
     #[serde(skip)]
     content_revision: u64,
+    /// Bumped by every change to `messages` and by nothing else, so an owner
+    /// merging its history in can tell the conversation moving from a tool
+    /// output or a usage record landing.
+    #[serde(skip)]
+    messages_revision: u64,
     /// The append-only run `messages` belongs to, adopted from the producer's
     /// snapshot or minted fresh when this session rewrites them itself. Once
     /// it changes, every append cursor into the log is void.
@@ -577,6 +582,7 @@ impl<M: Clone, U: Clone, T: Clone> Clone for Session<M, U, T> {
             updated_at: self.updated_at,
             revision: self.revision,
             content_revision: self.content_revision,
+            messages_revision: self.messages_revision,
             epoch: self.epoch,
             rewrites: self.rewrites,
             base_write_version: AtomicI64::new(write_version),
@@ -1028,6 +1034,7 @@ where
             updated_at: now,
             revision: 0,
             content_revision: 0,
+            messages_revision: 0,
             epoch: next_epoch(),
             rewrites: 0,
             base_write_version: AtomicI64::new(-1),
@@ -1061,6 +1068,10 @@ where
 
     pub fn content_revision(&self) -> u64 {
         self.content_revision
+    }
+
+    pub fn messages_revision(&self) -> u64 {
+        self.messages_revision
     }
 
     pub fn persisted_write_version(&self) -> Option<i64> {
@@ -1117,11 +1128,13 @@ where
     /// splicing its tail onto a rewound log.
     fn rewrite_messages(&mut self) {
         self.epoch = next_epoch();
+        self.messages_revision += 1;
         self.rewrite();
     }
 
     pub fn push_message(&mut self, msg: M) {
         Arc::make_mut(&mut self.messages).push(msg);
+        self.messages_revision += 1;
         self.touch();
     }
 
@@ -1142,11 +1155,30 @@ where
         let append_only = messages.starts_with(self.messages.as_slice());
         self.messages = Arc::new(messages);
         self.epoch = snapshot.epoch;
+        self.messages_revision += 1;
         if append_only {
             self.touch();
         } else {
             self.rewrite();
         }
+    }
+
+    /// [`Self::merge_history`] for a producer that only appended: the items
+    /// of `snapshot` past the first `known` join the log as they are, sparing
+    /// the clone and compare of everything already in it. The caller vouches
+    /// that those first `known` items are already here.
+    pub fn append_history(&mut self, snapshot: &HistorySnapshot<M>, known: usize) {
+        let Some(added) = snapshot
+            .messages
+            .get(known..)
+            .filter(|added| !added.is_empty())
+        else {
+            return;
+        };
+        Arc::make_mut(&mut self.messages).extend_from_slice(added);
+        self.epoch = snapshot.epoch;
+        self.messages_revision += 1;
+        self.touch();
     }
 
     pub fn truncate_messages(&mut self, len: usize) {
@@ -1162,6 +1194,7 @@ where
     fn set_history(&mut self, snapshot: &HistorySnapshot<M>) {
         self.messages = Arc::clone(&snapshot.messages);
         self.epoch = snapshot.epoch;
+        self.messages_revision += 1;
         self.touch();
     }
 
@@ -2661,7 +2694,7 @@ mod tests {
 
     const PROPERTY_SEED: u64 = 0x2545_F491_4F6C_DD1D;
     const PROPERTY_STEPS: usize = 500;
-    const MUTATION_KINDS: u64 = 8;
+    const MUTATION_KINDS: u64 = 9;
 
     /// Deterministic xorshift so a failure is always the same failure.
     struct Rng(u64);
@@ -2746,6 +2779,16 @@ mod tests {
             }
             5 => session.replace_messages(vec![user_message(&format!("fresh-{step}"))]),
             6 => session.prune_orphans(tool_ids),
+            7 => {
+                let known = session.messages().len();
+                let mut items = session.messages().to_vec();
+                items.push(user_message(&format!("appended-{step}")));
+                let produced = HistorySnapshot {
+                    epoch: session.epoch,
+                    messages: Arc::new(items),
+                };
+                session.append_history(&produced, known);
+            }
             _ => {
                 session.set_title(format!("title-{step}"));
                 session.set_meta(SessionMeta {
@@ -2830,6 +2873,40 @@ mod tests {
         assert!(session.content_revision() > content);
     }
 
+    const MESSAGES_REVISION_MSG: &str =
+        "messages_revision moves with the conversation and with nothing else";
+
+    fn append_reply(session: &mut TestSession) {
+        let known = session.messages().len();
+        let mut items = session.messages().to_vec();
+        items.push(assistant_message("appended"));
+        session.append_history(&HistorySnapshot::new(items), known);
+    }
+
+    /// An owner re-merges its history only when `messages_revision` moves, so
+    /// a tool output or a usage record landing must leave it where it was.
+    #[test_case(|s| s.insert_tool_output("t1".into(), Value::Null), false ; "a_tool_output")]
+    #[test_case(|s| s.add_model_usage("m", StoredTokenUsage::default()), false ; "a_usage_record")]
+    #[test_case(|s| s.set_meta(SessionMeta { input_draft: Some(PENDING_DRAFT.into()), ..s.meta.clone() }), false ; "a_meta_change")]
+    #[test_case(|s| s.push_message(user_message("b")), true ; "a_pushed_message")]
+    #[test_case(append_reply, true ; "an_appended_history")]
+    #[test_case(|s| s.merge_history(&HistorySnapshot::new(Vec::new()), vec![user_message("c")]), true ; "a_merged_history")]
+    #[test_case(|s| s.truncate_messages(0), true ; "a_truncation")]
+    #[test_case(|s| s.replace_messages(vec![user_message("d")]), true ; "a_replacement")]
+    fn only_the_conversation_moves_messages_revision(mutate: fn(&mut TestSession), moves: bool) {
+        let mut session: TestSession = Session::new("m", "/project");
+        session.push_message(user_message("a"));
+        let before = session.messages_revision();
+
+        mutate(&mut session);
+
+        assert_eq!(
+            session.messages_revision() != before,
+            moves,
+            "{MESSAGES_REVISION_MSG}"
+        );
+    }
+
     /// A mutator called with the value already there is not a change, and a
     /// truncate that cuts nothing must leave the epoch alone or every open
     /// cursor into the store dies for nothing.
@@ -2848,6 +2925,11 @@ mod tests {
         session.set_meta(session.meta.clone());
         session.truncate_messages(session.messages().len());
         session.truncate_messages(session.messages().len() + 1);
+        let unchanged = HistorySnapshot {
+            epoch: next_epoch(),
+            messages: Arc::new(session.messages().to_vec()),
+        };
+        session.append_history(&unchanged, session.messages().len());
 
         assert_eq!(session.revision(), revision);
         assert_eq!(session.updated_at, updated_at);

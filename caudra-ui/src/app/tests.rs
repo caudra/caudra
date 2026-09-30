@@ -64,7 +64,7 @@ use caudra_lua::{BuiltinAction, HintReader, KeymapReader, LuaCommandInfo, LuaCom
 use caudra_providers::model_registry::{self, Binding};
 use caudra_providers::{
     Billing, ContentBlock, HistoryItemKind, Message, RequestOptions, Role, THINKING_USAGE,
-    TaskEventOrigin, TokenUsage, UserOrigin, expand_message, project_messages,
+    TaskEventOrigin, TokenUsage, UserOrigin, expand_message, merge_history_items, project_messages,
 };
 use caudra_storage::id::CaudraId;
 use caudra_storage::permission_patterns::{
@@ -19634,6 +19634,84 @@ fn an_unchanged_history_skips_the_merge() {
     history.push(tool_use_msg("t1"));
     let snapshot = app.shared_history.as_ref().unwrap().load_full();
     assert!(app.history_moved(&snapshot), "{MERGE_PUSH_MSG}");
+}
+
+const MERGE_MESSAGES_ONLY_MSG: &str =
+    "only the session's own messages moving may bring the merge back";
+const MERGE_USAGE_MODEL: &str = "usage-model";
+
+/// Every tool call lands an output and every response a usage record, and
+/// neither changes what the merge reads. Keyed on the content revision, each
+/// one used to walk the whole transcript again.
+#[test_case(|session| session.insert_tool_output("t1".into(), ToolOutput::Plain(tool_text("t1").into())), false ; "a_tool_output")]
+#[test_case(|session| session.add_model_usage(MERGE_USAGE_MODEL, StoredTokenUsage::default()), false ; "a_usage_record")]
+#[test_case(|session| session.truncate_messages(1), true ; "a_truncation")]
+fn only_the_sessions_messages_bring_the_merge_back(mutate: fn(&mut AppSession), moves: bool) {
+    let (_tmp, _dir, _writer, mut app) = tempdir_app();
+    let _history = attach_live_history(
+        &mut app,
+        vec![
+            Message::user("go".into()),
+            tool_use_msg("t1"),
+            tool_result_msg("t1", &tool_text("t1")),
+        ],
+    );
+    app.checkpoint();
+
+    mutate(app.state.session_mut());
+
+    let snapshot = app.shared_history.as_ref().unwrap().load_full();
+    assert_eq!(
+        app.history_moved(&snapshot),
+        moves,
+        "{MERGE_MESSAGES_ONLY_MSG}"
+    );
+}
+
+const APPENDED_REPLY: &str = "the appended reply";
+const APPEND_FAST_PATH_MSG: &str = "a producer that only appended must take the fast path";
+const APPEND_ORACLE_MSG: &str = "the fast path must store exactly what the full merge would";
+const APPEND_BOUND_MSG: &str = "a row the fast path appended must still learn its source";
+
+/// The fast path appends without walking the graph, so the full merge is its
+/// oracle, and the rows it adds must still be bound to their items.
+#[test]
+fn an_appended_history_stores_what_the_full_merge_would() {
+    let (_tmp, _dir, _writer, mut app) = tempdir_app();
+    let mut history = attach_live_history(&mut app, vec![Message::user("go".into())]);
+    app.main_chat().push_user_message("go");
+    app.checkpoint();
+    let before = app.state.session.messages().to_vec();
+
+    history.push(tool_use_msg("t1"));
+    history.push(tool_result_msg("t1", &tool_text("t1")));
+    history.push(assistant_message(APPENDED_REPLY));
+    app.main_chat().push(DisplayMessage::new(
+        DisplayRole::Assistant,
+        APPENDED_REPLY.into(),
+    ));
+    let snapshot = app.shared_history.as_ref().unwrap().load_full();
+    assert_eq!(
+        app.appended_since_merge(&snapshot),
+        Some(before.len()),
+        "{APPEND_FAST_PATH_MSG}"
+    );
+
+    app.checkpoint();
+
+    let mut expected = before;
+    merge_history_items(&mut expected, &snapshot.messages).unwrap();
+    assert_eq!(
+        app.state.session.messages(),
+        expected.as_slice(),
+        "{APPEND_ORACLE_MSG}"
+    );
+    let reply = snapshot.messages.last().unwrap().id;
+    assert_eq!(
+        app.main_chat().message_at(1).unwrap().source,
+        Some(DisplaySource::AssistantText(reply)),
+        "{APPEND_BOUND_MSG}"
+    );
 }
 
 /// Pointer identity cannot notice a whole history being swapped underneath the

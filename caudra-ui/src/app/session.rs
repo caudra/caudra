@@ -23,8 +23,8 @@ use caudra_agent::snapshots::{
 use caudra_agent::workspace_baseline::{BaselineError, WorkspaceBaseline};
 use caudra_agent::{GoalHandle, GoalStatus};
 use caudra_providers::{
-    HistoryItem, HistoryItemKind, ImageSource, Model, TokenUsage, active_history_items,
-    merge_history_items, project_messages,
+    HistoryItem, HistoryItemKind, HistoryProjectionError, ImageSource, Model, TokenUsage,
+    active_history_items, merge_history_items, project_messages, validate_history_items,
 };
 use caudra_storage::id::CaudraId;
 use caudra_storage::sessions::{
@@ -124,8 +124,8 @@ pub(super) struct Sent {
     pub at: Instant,
 }
 
-/// The producer snapshot `App::checkpoint` last merged, and the session
-/// revision the merge left behind.
+/// The producer snapshot `App::checkpoint` last merged, and the session's
+/// messages revision the merge left behind.
 ///
 /// The merge walks the whole history graph, and the event loop checkpoints
 /// every frame, so an idle session would pay that walk ten times a second
@@ -133,10 +133,29 @@ pub(super) struct Sent {
 /// pointer identity an exact "the producer added nothing" test, and holding
 /// the `Arc` is what stops a later snapshot from landing on the same address.
 /// The revision covers the other side: a rewind or a compaction moves the
-/// session's own messages without the producer publishing anything.
+/// session's own messages without the producer publishing anything. It is the
+/// messages revision because a tool output or a usage record changes nothing
+/// the merge reads, and in a long session each one used to cost a full walk.
 pub(super) struct MergedHistory {
     snapshot: Arc<HistorySnapshot>,
-    content_revision: u64,
+    messages_revision: u64,
+}
+
+/// How many items `snapshot` shares with `merged` when it only appended to it:
+/// the same run, strictly longer, and the same ids up to the old end. The ids
+/// matter within one run too, since dropping a run marker and then appending
+/// keeps the epoch while replacing the item the next one is parented on.
+fn appended_len(merged: &HistorySnapshot, snapshot: &HistorySnapshot) -> Option<usize> {
+    let known = merged.messages.len();
+    let appended = merged.epoch == snapshot.epoch
+        && known > 0
+        && snapshot.messages.len() > known
+        && merged
+            .messages
+            .iter()
+            .zip(snapshot.messages.iter())
+            .all(|(old, new)| old.id == new.id);
+    appended.then_some(known)
 }
 
 /// The one content check: `App::checkpoint` saves a session only when this
@@ -186,21 +205,32 @@ impl App {
         let snapshot = self.shared_history.as_ref().map(|h| h.load_full());
         let mut meta = self.build_meta();
         if let Some(snapshot) = snapshot.filter(|snapshot| self.history_moved(snapshot)) {
-            let known: HashSet<_> = self
-                .state
-                .session
-                .messages()
-                .iter()
-                .map(|item| item.id)
-                .collect();
-            let added = snapshot
-                .messages
-                .iter()
-                .any(|item| !known.contains(&item.id));
+            let appended = self.appended_since_merge(&snapshot);
+            let added = appended.is_some() || {
+                let known: HashSet<_> = self
+                    .state
+                    .session
+                    .messages()
+                    .iter()
+                    .map(|item| item.id)
+                    .collect();
+                snapshot
+                    .messages
+                    .iter()
+                    .any(|item| !known.contains(&item.id))
+            };
             let sanitizer_only = added
-                && crate::active_session_history(&self.state.session).is_ok_and(|active| {
-                    is_sanitizer_only_unavailable_extension(&active, &snapshot.messages)
-                });
+                && match appended {
+                    Some(known) => is_sanitizer_only_unavailable_extension(
+                        &snapshot.messages[..known],
+                        &snapshot.messages,
+                    ),
+                    None => {
+                        crate::active_session_history(&self.state.session).is_ok_and(|active| {
+                            is_sanitizer_only_unavailable_extension(&active, &snapshot.messages)
+                        })
+                    }
+                };
             let actual_work_added = added && !sanitizer_only;
             let commits_file_revert = actual_work_added
                 && meta
@@ -233,17 +263,11 @@ impl App {
                     return;
                 }
             }
-            let mut merged = self.state.session.messages().to_vec();
-            match merge_history_items(&mut merged, &snapshot.messages) {
+            match self.merge_snapshot(&snapshot, appended) {
                 Ok(()) => {
                     meta.history_head = snapshot.messages.last().map(|item| item.id);
                     if actual_work_added {
                         meta.pending_revert = None;
-                    }
-                    if merged.as_slice() != self.state.session.messages() {
-                        let session = self.state.session_mut();
-                        session.merge_history(&snapshot, merged);
-                        session.update_title_if_default();
                     }
                     if added {
                         let (messages, _) = history_to_display(
@@ -259,7 +283,7 @@ impl App {
                     // flash re-raised, on the next frame.
                     self.merged_history = Some(MergedHistory {
                         snapshot,
-                        content_revision: self.state.session.content_revision(),
+                        messages_revision: self.state.session.messages_revision(),
                     });
                 }
                 Err(error) => {
@@ -332,8 +356,49 @@ impl App {
     pub(super) fn history_moved(&self, snapshot: &Arc<HistorySnapshot>) -> bool {
         self.merged_history.as_ref().is_none_or(|merged| {
             !Arc::ptr_eq(&merged.snapshot, snapshot)
-                || merged.content_revision != self.state.session.content_revision()
+                || merged.messages_revision != self.state.session.messages_revision()
         })
+    }
+
+    /// The fast path's starting point: how many items of `snapshot` the store
+    /// already holds exactly as the last merge left them. That needs the
+    /// producer to have only appended since, and the session to have kept its
+    /// messages and its head, so the stored active chain is still the old
+    /// snapshot.
+    pub(super) fn appended_since_merge(&self, snapshot: &HistorySnapshot) -> Option<usize> {
+        let session = &self.state.session;
+        let merged = self.merged_history.as_ref().filter(|merged| {
+            merged.messages_revision == session.messages_revision()
+                && crate::session_history_head(session)
+                    == merged.snapshot.messages.last().map(|item| item.id)
+        })?;
+        appended_len(&merged.snapshot, snapshot)
+    }
+
+    /// Brings the producer's snapshot into the stored graph. A pure append
+    /// joins as it is, sparing the clone, the graph walk and the three deep
+    /// compares of everything already stored, which grow with the session
+    /// rather than with the context window. Anything else takes the full merge.
+    fn merge_snapshot(
+        &mut self,
+        snapshot: &HistorySnapshot,
+        appended: Option<usize>,
+    ) -> Result<(), HistoryProjectionError> {
+        if let Some(known) = appended {
+            validate_history_items(&snapshot.messages)?;
+            let session = self.state.session_mut();
+            session.append_history(snapshot, known);
+            session.update_title_if_default();
+            return Ok(());
+        }
+        let mut merged = self.state.session.messages().to_vec();
+        merge_history_items(&mut merged, &snapshot.messages)?;
+        if merged.as_slice() != self.state.session.messages() {
+            let session = self.state.session_mut();
+            session.merge_history(snapshot, merged);
+            session.update_title_if_default();
+        }
+        Ok(())
     }
 
     /// Everything the session mirrors from live state, built field by field so
@@ -2745,12 +2810,14 @@ fn is_sanitizer_only_unavailable_extension(
     original: &[HistoryItem],
     candidate: &[HistoryItem],
 ) -> bool {
-    if original.is_empty() || candidate.len() <= original.len() || !candidate.starts_with(original)
-    {
+    let Some(last) = original.last() else {
+        return false;
+    };
+    if candidate.len() <= original.len() {
         return false;
     }
 
-    let call_group_id = original.last().unwrap().group_id;
+    let call_group_id = last.group_id;
     let mut call_ids: HashSet<_> = original
         .iter()
         .rev()
@@ -2781,6 +2848,9 @@ fn is_sanitizer_only_unavailable_extension(
                     && call_ids.remove(call_id.as_str())
             )
     }) && call_ids.is_empty()
+        // Last because it deep-compares the whole chain, and the additions
+        // rule out nearly every append on their own.
+        && candidate.starts_with(original)
 }
 
 fn pending_workspace_head(pending: &PendingConversationRevert) -> Option<CaudraId> {
@@ -3113,15 +3183,56 @@ fn now_secs() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::collect_tool_output_refs;
-    use caudra_providers::{ContentBlock, Message, Role};
+    use super::{appended_len, collect_tool_output_refs};
+    use caudra_agent::HistorySnapshot;
+    use caudra_providers::{ContentBlock, HistoryItem, Message, Role, expand_message};
     use caudra_storage::tool_outputs::ToolOutputRef;
     use std::collections::HashSet;
+    use std::sync::Arc;
     use test_case::test_case;
 
     const OUTPUT_ID: &str = "calm-blue-wren";
     const PROSE_ONLY_ID: &str = "bright-small-heron";
     const OUTCOME: &str = "Complete retained task outcome";
+    const MERGED_LEN: usize = 2;
+    const APPENDED_LEN_MSG: &str =
+        "only a same-run extension of the merged ids may skip the full merge";
+
+    /// `turns` more prompts chained onto `items`, the way a producer appends.
+    fn with_turns(items: &[HistoryItem], turns: usize) -> Vec<HistoryItem> {
+        let mut items = items.to_vec();
+        for turn in 0..turns {
+            let parent = items.last().map(|item| item.id);
+            items.extend(expand_message(&Message::user(turn.to_string()), parent));
+        }
+        items
+    }
+
+    fn same_run(merged: &HistorySnapshot, messages: Vec<HistoryItem>) -> HistorySnapshot {
+        HistorySnapshot {
+            epoch: merged.epoch,
+            messages: Arc::new(messages),
+        }
+    }
+
+    #[test_case(MERGED_LEN, |merged| same_run(merged, with_turns(&merged.messages, 1)), Some(MERGED_LEN) ; "a_pure_append")]
+    #[test_case(MERGED_LEN, |merged| HistorySnapshot::new(with_turns(&merged.messages, 1)), None ; "another_run")]
+    #[test_case(MERGED_LEN, |merged| same_run(merged, merged.messages[..1].to_vec()), None ; "a_shorter_run")]
+    #[test_case(MERGED_LEN, |merged| same_run(merged, merged.messages.to_vec()), None ; "the_same_length")]
+    #[test_case(0, |merged| same_run(merged, with_turns(&[], 1)), None ; "nothing_merged_yet")]
+    #[test_case(MERGED_LEN, |merged| same_run(merged, with_turns(&merged.messages[..1], 2)), None ; "a_replaced_boundary")]
+    fn only_an_append_to_the_merged_run_skips_the_full_merge(
+        merged_len: usize,
+        candidate: fn(&HistorySnapshot) -> HistorySnapshot,
+        expected: Option<usize>,
+    ) {
+        let merged = HistorySnapshot::new(with_turns(&[], merged_len));
+        assert_eq!(
+            appended_len(&merged, &candidate(&merged)),
+            expected,
+            "{APPENDED_LEN_MSG}"
+        );
+    }
 
     #[test_case(1; "single_observation")]
     #[test_case(3; "repeated_observations_and_refs")]
