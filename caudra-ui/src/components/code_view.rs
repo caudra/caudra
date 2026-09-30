@@ -2528,6 +2528,8 @@ fn index_highlight_token(language: &str) -> &str {
         "bazel_build" | "bazel_module" | "bazel_bzl" => "bzl",
         "containerfile" => "dockerfile",
         "make" => "Makefile",
+        "cuda" => "cpp",
+        "objc" => "Objective-C",
         _ => language,
     }
 }
@@ -4943,6 +4945,19 @@ mod tests {
                 .any(|span| span.content.contains("pub") && span.style != theme::current().tool)
         );
         assert_eq!(lines[2].spans[0].style, theme::current().tool_dim);
+    }
+
+    #[test_case("c" ; "c")]
+    #[test_case("cpp" ; "cpp")]
+    #[test_case("cuda" ; "cuda")]
+    #[test_case("objc" ; "objc")]
+    #[test_case("cmake" ; "cmake")]
+    #[test_case("proto" ; "proto")]
+    #[test_case("xml" ; "xml")]
+    fn index_language_highlights_with_a_real_syntax(language: &str) {
+        let plain_text = &caudra_highlight::syntax_set().find_syntax_plain_text().name;
+        let syntax = caudra_highlight::syntax_for_token(index_highlight_token(language));
+        assert_ne!(&syntax.name, plain_text);
     }
 
     #[test]
