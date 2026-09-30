@@ -65,7 +65,7 @@ inventory::submit!(caudra_config::providers::BuiltInProvider {
     protocol: caudra_config::providers::Protocol::Anthropic,
     default_base_url: API_ORIGIN,
     default_api_key_env: ENV_VAR,
-    default_model: "anthropic/claude-sonnet-4-6",
+    default_model: "anthropic/claude-sonnet-5-5",
     plans: None,
     login_url: Some("https://console.anthropic.com/settings/keys"),
     needs_url: false,

@@ -94,6 +94,7 @@ The built-in provider still owns the slug, so `protocol`, `api_key_env`, `discov
 | Fast | **claude-haiku-4-5** (default) | $1.00 / $5.00 | 200K ctx / 64K out |
 |  | claude-sonnet-4-5 | $3.00 / $15.00 | 200K ctx / 64K out |
 |  | claude-sonnet-4-6 | $3.00 / $15.00 | 372K ctx / 64K out |
+|  | claude-sonnet-5-5 | $2.00 / $10.00 | 372K ctx / 128K out |
 |  | claude-sonnet-5 | $2.00 / $10.00 | 372K ctx / 128K out |
 |  | claude-sonnet-4 | $3.00 / $15.00 | 200K ctx / 64K out |
 |  | claude-opus-4-5 | $5.00 / $25.00 | 200K ctx / 64K out |
@@ -195,6 +196,7 @@ Routing defaults: gemini-2.0-flash-lite (Fast), gemini-2.5-pro (Best)
 |  | gemini-3.6-flash | $0.75 / $3.75 | 200K ctx / 65K out |
 |  | gemini-3.7-flash | $0.75 / $3.75 | 200K ctx / 65K out |
 |  | claude-sonnet-4.5, claude-sonnet-4.6 | $3.00 / $15.00 | 200K ctx / 64K out |
+|  | claude-sonnet-5.5 | $2.00 / $10.00 | 200K ctx / 100K out |
 |  | claude-sonnet-5 | $2.00 / $10.00 | 200K ctx / 100K out |
 |  | gpt-5.5 | $5.00 / $30.00 | 200K ctx / 100K out |
 |  | kimi-k2.7-code | $0.95 / $4.00 | 200K ctx / 100K out |

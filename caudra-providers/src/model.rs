@@ -1882,6 +1882,7 @@ mod tests {
     #[test_case("claude-opus-5-1m", true  ; "long_context_suffix_still_matches_prefix")]
     #[test_case("claude-opus-4-7",  false ; "fast_withdrawn_from_the_table")]
     #[test_case("claude-sonnet-5",  false ; "entry_without_fast_pricing")]
+    #[test_case("claude-sonnet-5-5", false ; "sonnet_5_5_sells_no_fast_mode")]
     #[test_case("claude-opus-99",   false ; "no_entry_at_all")]
     fn supports_fast_follows_anthropic_table(model_id: &str, expected: bool) {
         let model = Model::from_base(

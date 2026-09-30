@@ -866,12 +866,29 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
             reasoning_options: Some(EFFORT_TO_MAX_WITH_BUDGET),
         },
         ModelEntry {
+            prefixes: &["claude-sonnet-5-5"],
+            small: false,
+            family: ModelFamily::Claude,
+            vision: true,
+            default: false,
+            pricing: ModelPricing {
+                input: 2.00,
+                output: 10.00,
+                cache_write: 2.50,
+                cache_read: 0.20,
+                fast: None,
+                tiers: ModelPricing::UNTIERED,
+            },
+            max_output_tokens: Some(128000),
+            context_window: WIDE_CONTEXT_WINDOW,
+            reasoning_options: Some(TOGGLE_WITH_EFFORT_TO_MAX),
+        },
+        ModelEntry {
             prefixes: &["claude-sonnet-5"],
             small: false,
             family: ModelFamily::Claude,
             vision: true,
             default: false,
-            // Introductory rates until 2026-09-01, then 3.00 / 15.00 / 3.75 / 0.30.
             pricing: ModelPricing {
                 input: 2.00,
                 output: 10.00,
@@ -1181,6 +1198,7 @@ mod tests {
     }
 
     #[test_case("anthropic/claude-sonnet-5", &["low", "medium", "high", "xhigh", "max"] ; "sonnet_5_has_no_minimal")]
+    #[test_case("anthropic/claude-sonnet-5-5", &["low", "medium", "high", "xhigh", "max"] ; "sonnet_5_5_has_no_minimal")]
     #[test_case("anthropic/claude-opus-5",   &["low", "medium", "high", "xhigh", "max"] ; "opus_5_has_no_minimal")]
     #[test_case("anthropic/claude-opus-4-5", &["low", "medium", "high"]                 ; "opus_4_5_stops_at_high")]
     #[test_case("anthropic/claude-sonnet-4-5", &["high", "max"]                         ; "budget_only_model_gets_two_steps")]
@@ -1203,6 +1221,7 @@ mod tests {
     /// Off resolves through the table: Sonnet's toggle keeps it off rather than
     /// snapping it to a level, and the version decides how it is said.
     #[test_case("anthropic/claude-sonnet-5", json!({"type": "disabled"}) ; "sonnet_5_says_disabled")]
+    #[test_case("anthropic/claude-sonnet-5-5", json!({"type": "between_tools"}) ; "sonnet_5_5_says_between_tools")]
     fn thinking_off_reaches_the_wire_as_the_model_spells_it(spec: &str, expected: Value) {
         let model = Model::from_spec(spec).unwrap();
         let body = super::request_body(&model, &[], None, "", &json!([]), &ThinkingConfig::Off);
@@ -1234,6 +1253,7 @@ mod tests {
     /// and the 1M ceiling are API totals, so they keep the larger reserve.
     #[test_case("anthropic/claude-sonnet-4-6", WIDE_CONTEXT_WINDOW,   true  ; "sonnet_4_6_is_wide")]
     #[test_case("anthropic/claude-sonnet-5", WIDE_CONTEXT_WINDOW,     true  ; "sonnet_5_is_wide")]
+    #[test_case("anthropic/claude-sonnet-5-5", WIDE_CONTEXT_WINDOW,   true  ; "sonnet_5_5_is_wide")]
     #[test_case("anthropic/claude-opus-4-8", WIDE_CONTEXT_WINDOW,     true  ; "opus_4_8_is_wide")]
     #[test_case("anthropic/claude-opus-5", WIDE_CONTEXT_WINDOW,       true  ; "opus_5_is_wide")]
     #[test_case("anthropic/claude-fable-5", WIDE_CONTEXT_WINDOW,      true  ; "fable_5_is_wide")]
