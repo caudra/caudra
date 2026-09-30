@@ -70,7 +70,8 @@ than losing to whichever pattern matched second.
 
 ## Adding a Language
 
-1. Add the variant, and rows in `ALL`, `from_extension`, `name`, `grammar`, and `family`.
+1. Add the variant, and rows in `ALL`, `from_extension` or the exact filenames in `from_path`,
+   `name`, `grammar`, and `family`.
 2. Add `queries/<language>/tags.scm` and a row in `src/queries.rs`. A grammar generated as an
    extension of another shares that grammar's query instead, as CUDA shares C++'s, or appends its
    own layer to it, as Objective-C does to C's. Never repeat a parent's reference pattern in the

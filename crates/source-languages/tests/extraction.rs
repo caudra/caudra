@@ -261,6 +261,44 @@ fn objc_mints_one_call_reference_per_call_site() {
     assert_eq!(captured.references.get("call:count"), None);
 }
 
+#[test_case("function(canvas_add_test name)\nendfunction()\n", "function:canvas_add_test" ; "a function")]
+#[test_case("macro(canvas_warn target)\nendmacro()\n", "macro:canvas_warn" ; "a macro")]
+#[test_case("add_library(canvas STATIC a.c)\n", "function:canvas" ; "a library target")]
+#[test_case("ADD_EXECUTABLE(canvas_cli main.c)\n", "function:canvas_cli" ; "a target command in upper case")]
+#[test_case("option(CANVAS_TESTS \"Build the tests\" ON)\n", "constant:CANVAS_TESTS" ; "an option")]
+#[test_case("set(CANVAS_SOURCES a.c)\n", "constant:CANVAS_SOURCES" ; "a variable")]
+#[test_case("canvas_add_test(shape)\n", "call:canvas_add_test" ; "a command invocation")]
+#[test_case("message(${CANVAS_SOURCES})\n", "read:CANVAS_SOURCES" ; "a variable read")]
+#[test_case("find_package(Threads REQUIRED)\n", "import:Threads" ; "a package")]
+#[test_case("Include(cmake/Warnings.cmake)\n", "import:cmake/Warnings.cmake" ; "a module included in mixed case")]
+fn cmake_captures_commands_definitions_and_variables(source: &str, expected: &str) {
+    let captured = capture(Language::CMake, source);
+    assert!(
+        captured.definitions.contains_key(expected) || captured.references.contains_key(expected),
+        "missing {expected}; captured {:?} and {:?}",
+        captured.definitions,
+        captured.references
+    );
+}
+
+#[test_case("add_executable(${name} main.c)\n" ; "a target")]
+#[test_case("set(${prefix}_DIR x)\n" ; "a variable")]
+#[test_case("function(${prefix}_run)\nendfunction()\n" ; "a function")]
+#[test_case("include(${dir}/x.cmake)\ninclude(\"x.cmake\")\n" ; "an import")]
+fn cmake_names_nothing_after_an_expansion_or_a_quoted_argument(source: &str) {
+    let captured = capture(Language::CMake, source);
+    let imports: Vec<_> = captured
+        .references
+        .keys()
+        .filter(|key| key.starts_with(ReferenceKind::Import.name()))
+        .collect();
+    assert!(
+        captured.definitions.is_empty() && imports.is_empty(),
+        "named {:?} and {imports:?}",
+        captured.definitions
+    );
+}
+
 #[test_case("struct Widget { Widget(int, char) stray; };\n", "field:stray" ; "a constructor followed by a stray token")]
 #[test_case("void set_callback(item *i, int (*callback)(item *i));\n", "constant:set_callback" ; "a prototype the grammar reads as a variable")]
 fn cpp_header_recovery_mints_no_false_definition(source: &str, unexpected: &str) {

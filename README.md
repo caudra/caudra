@@ -1330,7 +1330,7 @@ delete sections.
   It does not add or hide harness-specific instruction files.
 - Supported families are Rust, Python, TypeScript/JavaScript, Gleam, Go, HTML, Java,
   C/C++/CUDA/Objective-C/C#, Ruby, PHP, Swift, Kotlin, Scala, Bash, Lua, Elixir, Markdown,
-  Bazel/Starlark, Zig, Nix, Dart, TOML, YAML, SQL, CSS, JSON, HCL, Containerfile, and Make.
+  Bazel/Starlark, Zig, Nix, Dart, TOML, YAML, SQL, CSS, JSON, HCL, Containerfile, Make, and CMake.
 - A `.h` header is parsed as C++. A C header parses acceptably under the C++ grammar, while a C++
   header under the C grammar loses its namespaces, classes, and templates; the code map resolves C,
   C++, CUDA, and Objective-C symbols against each other so a `.c`, `.cu`, or `.m` definition still
@@ -1347,6 +1347,13 @@ delete sections.
   `NS_ASSUME_NONNULL_BEGIN` is lost, sometimes with the declaration after it. Detection is by path
   alone: an Objective-C header is a `.h` and parses as C++, which does not know `@interface`, and a
   MATLAB `.m` file is read as Objective-C.
+- CMake files (`CMakeLists.txt`, `.cmake`) show the project, included modules, found packages, and
+  added subdirectories, `set` and `option` variables, build targets, functions, and macros, including
+  those inside `if`, `foreach`, `while`, and `block`, but not the locals inside a function body. In
+  the code map, a command invocation inside a function or macro is a call to the function or macro
+  of that name, matched by exact spelling although CMake ignores the case of command names. Only a
+  literal unquoted argument names a code-map symbol, so neither a target named `${name}` nor an
+  `include("x.cmake")` is one.
 - Extraction and formatting are native Rust visitors over tree-sitter nodes. The index feature does
   not embed a scripting runtime or load extractor code at runtime.
 - MCP model text is the bare skeleton or listing. `structuredContent` carries the same bounded output;

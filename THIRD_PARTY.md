@@ -21,9 +21,9 @@ which differs from ripwire's, and capture names were normalized to the vocabular
 `@definition.method` span fix and the `::`-path and turbofish call patterns upstream lacks — are
 carried forward with their reasoning intact, because the reasoning is what makes them reviewable.
 
-The remaining fifteen — containerfile, css, dart, elixir, gleam, hcl, html, kotlin, make, markdown,
-nix, scala, sql, starlark, zig — are authored here against the vendored grammars and carry no
-upstream provenance.
+The remaining sixteen — cmake, containerfile, css, dart, elixir, gleam, hcl, html, kotlin, make,
+markdown, nix, scala, sql, starlark, zig — are authored here against the vendored grammars and carry
+no upstream provenance.
 
 ## Code-graph pipeline
 

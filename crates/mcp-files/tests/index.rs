@@ -248,6 +248,12 @@ const LANGUAGE_CASES: &[LanguageCase] = &[
         language: "objc",
         expected: "classes:\n  @interface Canvas : NSObject [2-4]\n    - (void)draw [3]",
     },
+    LanguageCase {
+        filename: "CMakeLists.txt",
+        source: "project(Demo)\nfunction(build target)\n  set(local 1)\nendfunction()\n",
+        language: "cmake",
+        expected: "mod: [1]\n  Demo\n\nfns:\n  function(build target) [2-4]",
+    },
 ];
 
 const NATIVE_CONSTRUCT_CASES: &[NativeConstructCase] = &[
@@ -438,6 +444,20 @@ const NATIVE_CONSTRUCT_CASES: &[NativeConstructCase] = &[
             "@property (nonatomic) ShapeKind kind",
             "@implementation Shape",
             "- (void)draw",
+        ],
+    },
+    NativeConstructCase {
+        filename: "cmake/native.cmake",
+        source: "cmake_minimum_required(VERSION 3.20)\nproject(\"Canvas\" VERSION 1.2 LANGUAGES C CXX)\ninclude(cmake/Warnings.cmake)\nfind_package(Threads REQUIRED)\noption(CANVAS_TESTS \"Build the tests\" ON)\nset(CANVAS_SOURCES\n    src/canvas.cpp\n    src/shape.cpp\n)\nmacro(canvas_warn target)\nendmacro()\nif(CANVAS_TESTS)\n  ADD_EXECUTABLE(canvas_cli main.c)\nelse()\n  add_library(canvas STATIC ${CANVAS_SOURCES})\nendif()\n",
+        required: &[
+            "mod: [2]\n  Canvas",
+            "cmake/Warnings.cmake",
+            "Threads",
+            "option(CANVAS_TESTS \"Build the tests\" ON) [5]",
+            "set(CANVAS_SOURCES src/canvas.cpp src/shape.cpp) [6-9]",
+            "macro(canvas_warn target) [10-11]",
+            "ADD_EXECUTABLE(canvas_cli main.c) [13]",
+            "add_library(canvas STATIC ${CANVAS_SOURCES}) [15]",
         ],
     },
     NativeConstructCase {
@@ -1444,6 +1464,7 @@ async fn every_extension_and_exact_filename_mapping_is_preserved() {
         ("dockerfile", "containerfile"),
         ("mk", "make"),
         ("mak", "make"),
+        ("cmake", "cmake"),
     ];
     const FILENAMES: &[(&str, &str)] = &[
         ("MODULE.bazel", "bazel_module"),
@@ -1456,6 +1477,7 @@ async fn every_extension_and_exact_filename_mapping_is_preserved() {
         ("GNUmakefile", "make"),
         ("Makefile", "make"),
         ("makefile", "make"),
+        ("CMakeLists.txt", "cmake"),
     ];
     let root = tempdir().expect("root");
     for (extension, _) in EXTENSIONS {

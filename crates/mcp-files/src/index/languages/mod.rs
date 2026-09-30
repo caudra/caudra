@@ -1,6 +1,7 @@
 mod bash;
 mod bazel;
 mod c;
+mod cmake;
 mod common;
 mod containerfile;
 mod cpp;
@@ -83,6 +84,7 @@ fn spec(language: Language) -> LanguageSpec {
         Language::Zig => zig::spec(),
         Language::Dart => dart::spec(),
         Language::Sql => sql::spec(),
+        Language::CMake => cmake::spec(),
         Language::Html
         | Language::Markdown
         | Language::BazelBuild

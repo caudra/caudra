@@ -754,6 +754,25 @@ mod tests {
     }
 
     #[test]
+    fn a_cmake_command_invocation_is_a_call_edge() {
+        let (facts, graph) = graph_of(&[
+            (
+                "CMakeLists.txt",
+                "function(canvas_add_test name)\n  add_executable(${name} a.c)\n  canvas_warn(${name})\nendfunction()\n",
+            ),
+            (
+                "cmake/warn.cmake",
+                "macro(canvas_warn target)\nendmacro()\n",
+            ),
+        ]);
+        assert!(has_edge(
+            &graph,
+            node(&facts, "canvas_add_test"),
+            node(&facts, "canvas_warn")
+        ));
+    }
+
+    #[test]
     fn csr_rows_are_contiguous_and_offsets_are_monotonic() {
         let (facts, graph) = graph_of(&[(
             "a.rs",

@@ -65,6 +65,7 @@ pub enum Language {
     Make,
     Cuda,
     ObjC,
+    CMake,
 }
 
 /// What a language contributes to the graph.
@@ -123,6 +124,7 @@ pub const ALL: &[Language] = &[
     Language::Make,
     Language::Cuda,
     Language::ObjC,
+    Language::CMake,
 ];
 
 impl Language {
@@ -139,6 +141,7 @@ impl Language {
             "BUILD" | "BUILD.bazel" => Some(Self::BazelBuild),
             "Containerfile" | "Dockerfile" => Some(Self::Containerfile),
             "GNUmakefile" | "Makefile" | "makefile" => Some(Self::Make),
+            "CMakeLists.txt" => Some(Self::CMake),
             _ => None,
         };
         exact
@@ -210,6 +213,7 @@ impl Language {
             "mk" | "mak" => Self::Make,
             "cu" | "cuh" => Self::Cuda,
             "m" | "mm" => Self::ObjC,
+            "cmake" => Self::CMake,
             _ => return None,
         };
         Some(language)
@@ -255,6 +259,7 @@ impl Language {
             Self::Make => "make",
             Self::Cuda => "cuda",
             Self::ObjC => "objc",
+            Self::CMake => "cmake",
         }
     }
 
@@ -310,6 +315,7 @@ impl Language {
             Self::Make => tree_sitter_make::LANGUAGE.into(),
             Self::Cuda => tree_sitter_cuda::LANGUAGE.into(),
             Self::ObjC => tree_sitter_objc::LANGUAGE.into(),
+            Self::CMake => tree_sitter_cmake::LANGUAGE.into(),
         }
     }
 
@@ -343,7 +349,8 @@ impl Language {
             | Self::BazelBzl
             | Self::Make
             | Self::Cuda
-            | Self::ObjC => LanguageFamily::Code,
+            | Self::ObjC
+            | Self::CMake => LanguageFamily::Code,
             Self::Toml | Self::Yaml | Self::Json | Self::Hcl | Self::Nix | Self::Containerfile => {
                 LanguageFamily::Config
             }
@@ -463,6 +470,9 @@ mod tests {
     #[test_case("a/BUILD.bazel", Some(Language::BazelBuild) ; "an exact filename beats its extension")]
     #[test_case("a/Dockerfile", Some(Language::Containerfile) ; "an exact filename needs no extension")]
     #[test_case("a/makefile", Some(Language::Make) ; "a lowercase makefile is make")]
+    #[test_case("a/CMakeLists.txt", Some(Language::CMake) ; "a cmake project file is cmake")]
+    #[test_case("a/cmake/Warnings.cmake", Some(Language::CMake) ; "a cmake module is cmake")]
+    #[test_case("a/notes.txt", None ; "another text file is not cmake")]
     #[test_case("a/main.rs", Some(Language::Rust) ; "an extension resolves")]
     #[test_case("a/kernel.cu", Some(Language::Cuda) ; "a cuda source is cuda")]
     #[test_case("a/kernel.cuh", Some(Language::Cuda) ; "a cuda header is cuda")]
