@@ -1328,16 +1328,25 @@ delete sections.
   and includes typed entries, total count, listing text, and truncation status. `totalCount` is exact
   when `truncated` is false and is a lower bound on processed visible entries when `truncated` is true.
   It does not add or hide harness-specific instruction files.
-- Supported families are Rust, Python, TypeScript/JavaScript, Gleam, Go, HTML, Java, C/C++/CUDA/C#,
-  Ruby, PHP, Swift, Kotlin, Scala, Bash, Lua, Elixir, Markdown, Bazel/Starlark, Zig, Nix, Dart, TOML,
-  YAML, SQL, CSS, JSON, HCL, Containerfile, and Make.
+- Supported families are Rust, Python, TypeScript/JavaScript, Gleam, Go, HTML, Java,
+  C/C++/CUDA/Objective-C/C#, Ruby, PHP, Swift, Kotlin, Scala, Bash, Lua, Elixir, Markdown,
+  Bazel/Starlark, Zig, Nix, Dart, TOML, YAML, SQL, CSS, JSON, HCL, Containerfile, and Make.
 - A `.h` header is parsed as C++. A C header parses acceptably under the C++ grammar, while a C++
   header under the C grammar loses its namespaces, classes, and templates; the code map resolves C,
-  C++, and CUDA symbols against each other so a `.c` or `.cu` definition still meets its header's
-  prototype.
+  C++, CUDA, and Objective-C symbols against each other so a `.c`, `.cu`, or `.m` definition still
+  meets its header's prototype.
 - CUDA sources show kernels with their execution-space specifiers and launch bounds, and
   namespace-scope `__constant__`, `__device__`, `__managed__`, and `__shared__` variables as
   constants. A `kernel<<<grid, block>>>(…)` launch is a call in the code map.
+- Objective-C sources (`.m`, `.mm`) show each `@interface` with its properties and method
+  declarations, each `@implementation` with its methods, and each `@protocol`, beside their C
+  functions, types, and macros. A message send is a call in the code map, named by its first
+  selector keyword as the method is. The grammar does not know C++, so an Objective-C++ `.mm` file
+  error-recovers around its C++ constructs. Nor does it know Foundation's unterminated macros: an
+  `NS_ENUM` typedef is not read as a type, and an `@interface` or `@implementation` directly after
+  `NS_ASSUME_NONNULL_BEGIN` is lost, sometimes with the declaration after it. Detection is by path
+  alone: an Objective-C header is a `.h` and parses as C++, which does not know `@interface`, and a
+  MATLAB `.m` file is read as Objective-C.
 - Extraction and formatting are native Rust visitors over tree-sitter nodes. The index feature does
   not embed a scripting runtime or load extractor code at runtime.
 - MCP model text is the bare skeleton or listing. `structuredContent` carries the same bounded output;

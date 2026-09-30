@@ -19,6 +19,7 @@ mod lua;
 mod make;
 mod markdown;
 mod nix;
+mod objc;
 mod php;
 mod python;
 mod ruby;
@@ -69,6 +70,7 @@ fn spec(language: Language) -> LanguageSpec {
         Language::Java => java::spec(),
         Language::C => c::spec(),
         Language::Cpp | Language::Cuda => cpp::spec(),
+        Language::ObjC => objc::spec(),
         Language::CSharp => csharp::spec(),
         Language::Ruby => ruby::spec(),
         Language::Php => php::spec(),

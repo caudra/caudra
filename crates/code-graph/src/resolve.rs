@@ -720,6 +720,7 @@ mod tests {
     #[test_case("a.cu", "b.cpp" ; "cuda resolves cpp")]
     #[test_case("a.cpp", "b.cu" ; "cpp resolves cuda")]
     #[test_case("a.cu", "b.c" ; "cuda resolves c")]
+    #[test_case("a.m", "b.h" ; "objc resolves a header")]
     fn a_c_family_call_resolves_across_the_family(caller_path: &str, callee_path: &str) {
         let (facts, graph) = graph_of(&[
             (caller_path, "void caller(void) { shared_helper(); }"),
@@ -737,6 +738,19 @@ mod tests {
     fn a_cuda_kernel_launch_is_a_call_edge(source: &str) {
         let (facts, graph) = graph_of(&[("kernels.cu", source)]);
         assert!(has_edge(&graph, node(&facts, "run"), node(&facts, "scale")));
+    }
+
+    #[test]
+    fn an_objc_message_send_is_a_call_edge() {
+        let (facts, graph) = graph_of(&[(
+            "Canvas.m",
+            "@implementation Canvas\n- (void)run { [self drawInContext:nil]; }\n- (void)drawInContext:(id)context {}\n@end\n",
+        )]);
+        assert!(has_edge(
+            &graph,
+            node(&facts, "run"),
+            node(&facts, "drawInContext")
+        ));
     }
 
     #[test]

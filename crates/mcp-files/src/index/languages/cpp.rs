@@ -23,10 +23,7 @@ const CUDA_MEMORY_SPACES: [&str; 4] = ["__constant__", "__device__", "__managed_
 
 pub(super) fn spec() -> LanguageSpec {
     let mut spec = LanguageSpec::new("/", extract_nodes);
-    spec.is_doc_comment = Some(|node, context| {
-        node.kind() == "comment"
-            && (context.text(node).starts_with("/**") || context.text(node).starts_with("///"))
-    });
+    spec.is_doc_comment = Some(c::is_doc_comment);
     spec
 }
 

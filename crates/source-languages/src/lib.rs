@@ -64,6 +64,7 @@ pub enum Language {
     Containerfile,
     Make,
     Cuda,
+    ObjC,
 }
 
 /// What a language contributes to the graph.
@@ -121,6 +122,7 @@ pub const ALL: &[Language] = &[
     Language::Containerfile,
     Language::Make,
     Language::Cuda,
+    Language::ObjC,
 ];
 
 impl Language {
@@ -207,6 +209,7 @@ impl Language {
             "dockerfile" => Self::Containerfile,
             "mk" | "mak" => Self::Make,
             "cu" | "cuh" => Self::Cuda,
+            "m" | "mm" => Self::ObjC,
             _ => return None,
         };
         Some(language)
@@ -251,6 +254,7 @@ impl Language {
             Self::Containerfile => "containerfile",
             Self::Make => "make",
             Self::Cuda => "cuda",
+            Self::ObjC => "objc",
         }
     }
 
@@ -263,6 +267,9 @@ impl Language {
     /// CUDA's grammar is generated as an extension of C++'s, so it shares the C++ tags query. It
     /// adds the execution-space and memory-space keywords and parses a `kernel<<<grid, block>>>(…)`
     /// launch as an ordinary call expression.
+    ///
+    /// Objective-C's grammar extends C's rather than C++'s, so an Objective-C++ `.mm` file parses
+    /// its Objective-C and C and error-recovers around templates, namespaces, and `::`.
     #[must_use]
     pub fn grammar(self) -> tree_sitter::Language {
         match self {
@@ -302,6 +309,7 @@ impl Language {
             Self::Containerfile => tree_sitter_containerfile::LANGUAGE.into(),
             Self::Make => tree_sitter_make::LANGUAGE.into(),
             Self::Cuda => tree_sitter_cuda::LANGUAGE.into(),
+            Self::ObjC => tree_sitter_objc::LANGUAGE.into(),
         }
     }
 
@@ -334,7 +342,8 @@ impl Language {
             | Self::BazelModule
             | Self::BazelBzl
             | Self::Make
-            | Self::Cuda => LanguageFamily::Code,
+            | Self::Cuda
+            | Self::ObjC => LanguageFamily::Code,
             Self::Toml | Self::Yaml | Self::Json | Self::Hcl | Self::Nix | Self::Containerfile => {
                 LanguageFamily::Config
             }
@@ -346,11 +355,11 @@ impl Language {
     ///
     /// Same-language is always compatible. TypeScript and JavaScript are mutually compatible
     /// because they share a grammar, a module system, and in practice a single project. C, C++,
-    /// and CUDA are mutually compatible as well: they link into one symbol namespace, and every
-    /// `.h` parses as C++, so a `.c` or `.cu` definition has to resolve against the prototype its
-    /// header declares. Everything else is refused: a YAML key named `deploy` and a Go function
-    /// named `deploy` are not the same symbol, and letting one resolve the other manufactures edges
-    /// out of a spelling coincidence.
+    /// CUDA, and Objective-C are mutually compatible as well: they link into one symbol namespace,
+    /// and every `.h` parses as C++, so a `.c`, `.cu`, or `.m` definition has to resolve against the
+    /// prototype its header declares. Everything else is refused: a YAML key named `deploy` and a
+    /// Go function named `deploy` are not the same symbol, and letting one resolve the other
+    /// manufactures edges out of a spelling coincidence.
     #[must_use]
     pub const fn compatible_with(self, other: Self) -> bool {
         matches!(
@@ -362,8 +371,8 @@ impl Language {
         ) || matches!(
             (self, other),
             (
-                Self::C | Self::Cpp | Self::Cuda,
-                Self::C | Self::Cpp | Self::Cuda
+                Self::C | Self::Cpp | Self::Cuda | Self::ObjC,
+                Self::C | Self::Cpp | Self::Cuda | Self::ObjC
             )
         ) || matches!(
             (self, other),
@@ -457,6 +466,8 @@ mod tests {
     #[test_case("a/main.rs", Some(Language::Rust) ; "an extension resolves")]
     #[test_case("a/kernel.cu", Some(Language::Cuda) ; "a cuda source is cuda")]
     #[test_case("a/kernel.cuh", Some(Language::Cuda) ; "a cuda header is cuda")]
+    #[test_case("a/View.m", Some(Language::ObjC) ; "an objective c source is objc")]
+    #[test_case("a/View.mm", Some(Language::ObjC) ; "an objective c plus plus source is objc")]
     #[test_case("a/Dockerfile.dev", Some(Language::Containerfile) ; "a dockerfile variant is a containerfile")]
     #[test_case("a/Containerfile.ci", Some(Language::Containerfile) ; "a containerfile variant is a containerfile")]
     #[test_case("a/Dockerfile.md", Some(Language::Markdown) ; "a known extension beats the variant stem")]
@@ -489,6 +500,8 @@ mod tests {
     #[test_case(Language::Cpp, Language::Cuda ; "cpp resolves cuda")]
     #[test_case(Language::Cuda, Language::C ; "cuda resolves c")]
     #[test_case(Language::C, Language::Cuda ; "c resolves cuda")]
+    #[test_case(Language::ObjC, Language::C ; "objc resolves c")]
+    #[test_case(Language::Cpp, Language::ObjC ; "cpp resolves objc")]
     fn c_family_sources_resolve_against_each_other(referrer: Language, definer: Language) {
         assert!(referrer.compatible_with(definer));
     }
@@ -497,6 +510,7 @@ mod tests {
     #[test_case(Language::C, Language::Go ; "c does not resolve go")]
     #[test_case(Language::Cpp, Language::Json ; "cpp does not resolve a config key")]
     #[test_case(Language::Cuda, Language::Python ; "cuda does not resolve python")]
+    #[test_case(Language::ObjC, Language::Swift ; "objc does not resolve swift")]
     fn the_c_family_bridge_stops_at_the_family(referrer: Language, definer: Language) {
         assert!(!referrer.compatible_with(definer));
         assert!(!definer.compatible_with(referrer));

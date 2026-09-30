@@ -8,11 +8,12 @@ the dependency check.
 
 `crates/source-languages/queries/<language>/tags.scm`
 
-Sixteen queries — bash, c, c_sharp, cpp, go, java, json, lua, php, python, ruby, rust, swift, toml,
-typescript, yaml — are seeded from [ripwire](https://github.com/redhat-et/ripwire), Apache-2.0,
+Seventeen queries — bash, c, c_sharp, cpp, go, java, json, lua, objc, php, python, ruby, rust, swift,
+toml, typescript, yaml — are seeded from [ripwire](https://github.com/redhat-et/ripwire), Apache-2.0,
 which derived them in turn from the upstream tree-sitter grammar repositories, MIT. Each file states
 its provenance and any deliberate divergence from upstream in its header. CUDA has no query of its
-own: its grammar extends C++'s, and it shares `cpp`.
+own: its grammar extends C++'s, and it shares `cpp`. Objective-C's grammar extends C's, and `objc`
+holds only the Objective-C layer that is appended to `c`.
 
 They are not copies. Every seeded query was re-verified against the grammar version vendored here,
 which differs from ripwire's, and capture names were normalized to the vocabulary in

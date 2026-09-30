@@ -242,6 +242,12 @@ const LANGUAGE_CASES: &[LanguageCase] = &[
         language: "cuda",
         expected: "fns:\n  __global__ void scale(float* data) [1]",
     },
+    LanguageCase {
+        filename: "case.m",
+        source: "@class Forward;\n@interface Canvas : NSObject\n- (void)draw;\n@end\n",
+        language: "objc",
+        expected: "classes:\n  @interface Canvas : NSObject [2-4]\n    - (void)draw [3]",
+    },
 ];
 
 const NATIVE_CONSTRUCT_CASES: &[NativeConstructCase] = &[
@@ -399,6 +405,39 @@ const NATIVE_CONSTRUCT_CASES: &[NativeConstructCase] = &[
             "__device__ __forceinline__ float half_of(float value)",
             "template<int BLOCK> __global__ __launch_bounds__(256) void scale_rows(const float* input, float* output)",
             "void launch(const float* input, float* output)",
+        ],
+    },
+    NativeConstructCase {
+        filename: "native.m",
+        source: "#import <Foundation/Foundation.h>\n@import CoreGraphics;\n#define MAX_SHAPES 16\n@protocol Drawable <NSObject>\n- (void)drawInContext:(CGContextRef)context;\n@optional\n@property (nonatomic) CGFloat alpha;\n@end\n@interface Canvas : NSObject <Drawable>\n@property (nonatomic, copy) NSString *title;\n- (instancetype)initWithTitle:(NSString *)title\n                     capacity:(NSUInteger)capacity;\n@end\n@interface Canvas (Export)\n- (NSData *)exportPNG;\n@end\nstatic CGFloat clamp_unit(CGFloat value) { return value; }\n#if TARGET_OS_IOS\n@implementation Canvas\n- (NSData *)exportPNG { return [self render]; }\n@end\n#endif\n",
+        required: &[
+            "Foundation/Foundation.h",
+            "CoreGraphics",
+            "MAX_SHAPES 16",
+            "traits:",
+            "@protocol Drawable <NSObject>",
+            "- (void)drawInContext:(CGContextRef)context",
+            "@property (nonatomic) CGFloat alpha",
+            "classes:",
+            "@interface Canvas : NSObject <Drawable>",
+            "@property (nonatomic, copy) NSString *title",
+            "- (instancetype)initWithTitle:(NSString *)title capacity:(NSUInteger)capacity",
+            "@interface Canvas (Export)",
+            "- (NSData *)exportPNG",
+            "CGFloat clamp_unit(CGFloat value)",
+            "impls:",
+            "@implementation Canvas",
+        ],
+    },
+    NativeConstructCase {
+        filename: "native_foundation.m",
+        source: "#import \"Shape.h\"\n\nNS_ASSUME_NONNULL_BEGIN\n\ntypedef NS_ENUM(NSInteger, ShapeKind) {\n    ShapeKindCircle,\n    ShapeKindSquare,\n};\n\nNSString *const ShapeErrorDomain = @\"ShapeErrorDomain\";\n\n@interface Shape ()\n@property (nonatomic) ShapeKind kind;\n@end\n\n@implementation Shape\n- (void)draw {}\n@end\n\nNS_ASSUME_NONNULL_END\n",
+        required: &[
+            "Shape.h",
+            "@interface Shape ()",
+            "@property (nonatomic) ShapeKind kind",
+            "@implementation Shape",
+            "- (void)draw",
         ],
     },
     NativeConstructCase {
@@ -1367,6 +1406,8 @@ async fn every_extension_and_exact_filename_mapping_is_preserved() {
         ("metal", "cpp"),
         ("cu", "cuda"),
         ("cuh", "cuda"),
+        ("m", "objc"),
+        ("mm", "objc"),
         ("cs", "c_sharp"),
         ("rb", "ruby"),
         ("rake", "ruby"),

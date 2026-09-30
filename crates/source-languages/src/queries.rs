@@ -10,6 +10,7 @@ use crate::Language;
 ///
 /// TypeScript and JavaScript share a query because they share a grammar. Bazel's three file shapes
 /// share Starlark's for the same reason. CUDA shares C++'s because its grammar extends C++'s.
+/// Objective-C's grammar extends C's, so its query is C's with the Objective-C layer appended.
 pub(crate) const fn source(language: Language) -> &'static str {
     match language {
         Language::Rust => include_str!("../queries/rust/tags.scm"),
@@ -47,5 +48,9 @@ pub(crate) const fn source(language: Language) -> &'static str {
         Language::Hcl => include_str!("../queries/hcl/tags.scm"),
         Language::Containerfile => include_str!("../queries/containerfile/tags.scm"),
         Language::Make => include_str!("../queries/make/tags.scm"),
+        Language::ObjC => concat!(
+            include_str!("../queries/c/tags.scm"),
+            include_str!("../queries/objc/tags.scm")
+        ),
     }
 }

@@ -64,15 +64,17 @@ than losing to whichever pattern matched second.
   an edge minted from one would assert control flow that no execution performs.
 - `compatible_with` refuses cross-language resolution. TypeScript/JavaScript and the three Bazel
   file shapes are mutually compatible because each pair shares a grammar and a module system. C,
-  C++, and CUDA are mutually compatible because they link into one symbol namespace and every `.h`
-  parses as C++. Everything else is refused, so a YAML `deploy` key and a Go `deploy` function stay
-  distinct.
+  C++, CUDA, and Objective-C are mutually compatible because they link into one symbol namespace and
+  every `.h` parses as C++. Everything else is refused, so a YAML `deploy` key and a Go `deploy`
+  function stay distinct.
 
 ## Adding a Language
 
 1. Add the variant, and rows in `ALL`, `from_extension`, `name`, `grammar`, and `family`.
 2. Add `queries/<language>/tags.scm` and a row in `src/queries.rs`. A grammar generated as an
-   extension of another shares that grammar's query instead, as CUDA shares C++'s.
+   extension of another shares that grammar's query instead, as CUDA shares C++'s, or appends its
+   own layer to it, as Objective-C does to C's. Never repeat a parent's reference pattern in the
+   layer: references are not deduplicated, so each repeat mints the reference again.
 3. Add exactly one fixture under `tests/fixtures/` that `Language::from_path` resolves to the new
    variant. The shared harness discovers fixtures by that rule, so no test file is edited.
 
@@ -98,6 +100,6 @@ empty map.
 
 ## Attribution
 
-Sixteen queries are seeded from [ripwire](https://github.com/redhat-et/ripwire) (Apache-2.0), which
+Seventeen queries are seeded from [ripwire](https://github.com/redhat-et/ripwire) (Apache-2.0), which
 derived them in turn from the upstream tree-sitter grammar repositories (MIT). Each file names its
 provenance and any deliberate divergence in its header. See `THIRD_PARTY.md`.

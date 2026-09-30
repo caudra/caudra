@@ -230,6 +230,37 @@ fn cuda_parses_under_the_shared_cpp_query(source: &str, expected: &str) {
     );
 }
 
+#[test_case("@interface Canvas : NSObject\n@end\n", "class:Canvas" ; "an interface")]
+#[test_case("@implementation Canvas (Drawing)\n@end\n", "class:Canvas" ; "a category names the class it extends")]
+#[test_case("@protocol Drawable\n- (void)draw;\n@end\n", "interface:Drawable" ; "a protocol")]
+#[test_case("@protocol P\n- (id)initWithTitle:(id)t count:(int)c;\n@end\n", "method:initWithTitle" ; "a method named by its first keyword")]
+#[test_case("@interface Canvas : NSObject\n@property NSString *title;\n@end\n", "field:title" ; "a property")]
+#[test_case("static int clamp(int v) { return v; }\n", "function:clamp" ; "a c function")]
+#[test_case("void f(id c) { [c drawInContext:nil]; }\n", "call:drawInContext" ; "a message send")]
+#[test_case("@import CoreGraphics;\n", "import:CoreGraphics" ; "a module import")]
+fn objc_captures_its_layer_on_top_of_c(source: &str, expected: &str) {
+    let captured = capture(Language::ObjC, source);
+    assert!(
+        captured.definitions.contains_key(expected) || captured.references.contains_key(expected),
+        "missing {expected}; captured {:?} and {:?}",
+        captured.definitions,
+        captured.references
+    );
+}
+
+#[test]
+fn objc_mints_one_call_reference_per_call_site() {
+    // The C patterns already capture C calls, so a repeated pattern in the Objective-C layer would
+    // double every edge, and a selector's later keywords are not separate methods.
+    let captured = capture(
+        Language::ObjC,
+        "void f(id c) { clamp(1); [c initWithTitle:@\"a\" count:1]; }\n",
+    );
+    assert_eq!(captured.references.get("call:clamp"), Some(&1));
+    assert_eq!(captured.references.get("call:initWithTitle"), Some(&1));
+    assert_eq!(captured.references.get("call:count"), None);
+}
+
 #[test_case("struct Widget { Widget(int, char) stray; };\n", "field:stray" ; "a constructor followed by a stray token")]
 #[test_case("void set_callback(item *i, int (*callback)(item *i));\n", "constant:set_callback" ; "a prototype the grammar reads as a variable")]
 fn cpp_header_recovery_mints_no_false_definition(source: &str, unexpected: &str) {

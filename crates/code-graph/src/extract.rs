@@ -737,6 +737,8 @@ fn branchy(value: u32) -> u32 {
     #[test_case(Language::Cpp, "bool W::operator==(const W &o) const { return callee(o); }", "operator==" ; "an out of line operator")]
     #[test_case(Language::Cpp, "W::operator bool() const { return callee(); }", "operator bool() const" ; "an out of line conversion operator")]
     #[test_case(Language::Cuda, "__global__ void caller(float *d) { callee(d); }", "caller" ; "a cuda kernel")]
+    #[test_case(Language::ObjC, "char *caller(void) { return callee(); }", "caller" ; "an objc c function")]
+    #[test_case(Language::ObjC, "@implementation W\n- (void)caller { [self callee]; }\n@end\n", "caller" ; "an objc method")]
     fn a_c_family_call_is_attributed_to_the_definition_whose_body_holds_it(
         language: Language,
         source: &str,
@@ -757,6 +759,7 @@ fn branchy(value: u32) -> u32 {
     #[test_case(Language::C ; "c")]
     #[test_case(Language::Cpp ; "cpp")]
     #[test_case(Language::Cuda ; "cuda")]
+    #[test_case(Language::ObjC ; "objc")]
     fn a_c_family_function_spans_its_body_and_keeps_its_parameters(language: Language) {
         let source = "int *pick(int a, int b)\n{\n    if (a) { return 0; }\n    return 0;\n}\n";
         let facts = facts(source, language);

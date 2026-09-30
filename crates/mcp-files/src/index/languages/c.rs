@@ -11,14 +11,16 @@ use crate::index::{
 
 pub(super) fn spec() -> LanguageSpec {
     let mut spec = LanguageSpec::new("/", extract_nodes);
-    spec.is_doc_comment = Some(|node, context| {
-        node.kind() == "comment"
-            && (context.text(node).starts_with("/**") || context.text(node).starts_with("///"))
-    });
+    spec.is_doc_comment = Some(is_doc_comment);
     spec
 }
 
-fn extract_nodes(
+pub(super) fn is_doc_comment(node: Node<'_>, context: &Context<'_>) -> bool {
+    node.kind() == "comment"
+        && (context.text(node).starts_with("/**") || context.text(node).starts_with("///"))
+}
+
+pub(super) fn extract_nodes(
     node: Node<'_>,
     context: &Context<'_>,
     _attrs: &[Node<'_>],
