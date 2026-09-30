@@ -25,7 +25,8 @@ mod owned_jobs_tests {
 
     use super::{
         Agent, History, MockProvider, default_input, empty_response, make_agent,
-        make_agent_with_output_store, text_response, tool_use_response,
+        make_agent_with_output_store, mixed_todos, text_response, todo_reminders,
+        tool_use_response,
     };
     use crate::agent::subagent::TaskIdentity;
     use crate::agent::task_runner::{
@@ -64,6 +65,12 @@ mod owned_jobs_tests {
     const JOB_REEXECUTED: &str = "the child launched the same controlled command twice";
     const LARGE_OUTPUT_LINES: usize = 4096;
     const UNACCEPTED_RECEIPT: &str = "the child shell receipt must be accepted from its own history before another provider request";
+    const SHELL_HOLDS_REMINDER: &str =
+        "a running background shell hands control back without a todo reminder";
+    const REPORT_BEFORE_REMINDER: &str =
+        "the finished shell's report reaches the model before the todo reminder";
+    const SETTLING_DOES_NOT_HOLD: &str =
+        "a report still awaiting acknowledgement does not hold the reminder back";
 
     struct OutputShell;
 
@@ -313,6 +320,69 @@ mod owned_jobs_tests {
             }
             fixture.tasks.shutdown().await.unwrap();
         }));
+    }
+
+    #[test]
+    fn a_running_background_shell_holds_back_the_todo_reminder() {
+        smol::block_on(bounded(async {
+            let fixture = Fixture::new().await;
+            let scope = fixture.tasks.main_scope();
+            let (execution, control) = execution();
+            let job = scope
+                .admit_shell(metadata(), &fixture.history, move |cancel, _| {
+                    execution.run(cancel)
+                })
+                .await
+                .unwrap();
+            loop {
+                let revision = scope.revision();
+                if scope.status(&job.task_id).unwrap().state == "running" {
+                    break;
+                }
+                scope.wait_for_change(revision).await.unwrap();
+            }
+            let mut history = receipt_history().with_todos(Some(mixed_todos()));
+            let reminded = |request: &[Message]| {
+                request.iter().any(|message| {
+                    message.standing_reminder == Some(StandingReminderKind::OpenTodos)
+                })
+            };
+
+            let requests = run_main(&mut history, &fixture.tasks, 1).await;
+            assert_eq!(requests.len(), 1, "{SHELL_HOLDS_REMINDER}");
+            assert_eq!(todo_reminders(&history), 0, "{SHELL_HOLDS_REMINDER}");
+
+            control.finish.send(()).unwrap();
+            terminal(&scope).await;
+            let requests = run_main(&mut history, &fixture.tasks, 3).await;
+            assert_eq!(requests.len(), 3);
+            assert!(
+                requests[1].iter().any(|message| message.task_event.is_some())
+                    && !reminded(&requests[1]),
+                "{REPORT_BEFORE_REMINDER}"
+            );
+            assert!(reminded(&requests[2]));
+            assert_eq!(todo_reminders(&history), 1);
+            assert!(fixture.tasks.work().settling, "{SETTLING_DOES_NOT_HOLD}");
+            fixture.tasks.shutdown().await.unwrap();
+        }));
+    }
+
+    async fn run_main(
+        history: &mut History,
+        tasks: &BackgroundTasks,
+        answers: usize,
+    ) -> Vec<Vec<Message>> {
+        let provider = MockProvider::new((0..answers).map(|_| response(FINAL)).collect());
+        let requests = Arc::clone(&provider.captured_messages);
+        let (mut agent, _events) = make_agent(provider, history);
+        agent.background = Some(tasks.clone());
+        assert_eq!(
+            agent.run(default_input()).await.unwrap(),
+            DoneReason::EndTurn
+        );
+        drop(agent);
+        std::mem::take(&mut *requests.lock().unwrap())
     }
 
     struct Fixture {

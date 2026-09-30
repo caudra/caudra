@@ -2227,7 +2227,7 @@ pub struct AgentConfig {
 
     #[config(
         default = true,
-        desc = "Before the main agent hands control back with pending or in-progress todos, remind it once per user turn, repeating the full todo list, to verify the work and update the list"
+        desc = "Before the main agent hands control back with pending or in-progress todos and no background work running, remind it once per run, repeating the full todo list, to verify the work and update the list"
     )]
     pub todo_reminder: bool,
 

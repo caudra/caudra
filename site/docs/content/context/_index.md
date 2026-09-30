@@ -188,7 +188,7 @@ Part of what the model reads was written by Caudra rather than typed by you. The
 | Goal check-in | While a goal is running, to report progress against it |
 | Continuation | After a nudge or a compaction, to say what the model should pick up |
 | Background work | Before an already-scheduled main request when task/workflow state changes or the configured response interval expires, and after successful compaction of a session with background work |
-| Open todo items | When the main agent is about to hand control back while its todo list has pending or in-progress items, at most once per message you send |
+| Open todo items | When the main agent is about to hand control back while its todo list has pending or in-progress items and no background work is running, at most once per run |
 
 These runtime snapshots arrive as messages, keeping the cached system prefix stable. Most are sent only when their content changes. Background-work snapshots can also repeat at a configured interval or after compaction.
 
@@ -219,7 +219,9 @@ Compaction preserves a Delegated work section with assignments, scope, expected 
 
 When the main agent ends its answer while its todo list still has pending or in-progress items, Caudra holds the handoff once and sends a reminder. The reminder repeats the whole list as last recorded, including completed and cancelled items. It asks the model to check each open item against the work, correct the list with `todo_write`, and continue any work it can do now. Blocked items, items waiting on you, and background work may stay open. After one more answer, control returns to you whatever the list says.
 
-The reminder adds at most one request per message you send. Subagents never receive it. Runs that are cancelled, fail, or reach the turn limit end as they would without it. A resumed session reads its last list back from the stored transcript, including across compaction.
+Caudra checks the list before a queued next prompt starts and before an automatic `/goal` check, so both come after the model has answered the reminder. While a background task, shell job, or workflow is still running, the answer hands control back without a reminder. That work wakes the main agent when it reports, and the run it starts is checked when it ends with nothing left running. Work that ends without a report, such as work you stop, leaves no reminder behind.
+
+The reminder adds at most one request per run, whether you or a background report started it. Subagents never receive it. Runs that are cancelled, fail, or reach the turn limit end as they would without it. A resumed session reads its last list back from the stored transcript, including across compaction.
 
 To turn it off:
 

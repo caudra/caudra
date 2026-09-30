@@ -418,6 +418,7 @@ pub struct Agent<'h> {
     goal_evaluator: Option<ResolvedEvaluator>,
     goal_blocks: u32,
     goal_prescreen_skips: u32,
+    todos_reminded: bool,
     wait_for_background: bool,
 }
 
@@ -538,6 +539,7 @@ impl<'h> Agent<'h> {
             goal_evaluator: None,
             goal_blocks: 0,
             goal_prescreen_skips: 0,
+            todos_reminded: false,
             wait_for_background: false,
         }
     }
@@ -694,6 +696,7 @@ impl<'h> Agent<'h> {
     ) -> Result<DoneReason, AgentError> {
         self.goal_blocks = 0;
         self.goal_prescreen_skips = 0;
+        self.todos_reminded = false;
         self.response_text = None;
         self.continuing_response = false;
         if !self.shared_steering {
@@ -1034,7 +1037,6 @@ impl<'h> Agent<'h> {
 
     async fn run_loop(&mut self) -> Result<DoneReason, AgentError> {
         let mut initial = true;
-        let mut todos_reminded = false;
         loop {
             if self.cancel.is_cancelled() {
                 return Err(AgentError::Cancelled);
@@ -1068,11 +1070,6 @@ impl<'h> Agent<'h> {
                     {
                         continue;
                     }
-                    if reason == DoneReason::EndTurn && !todos_reminded && self.remind_open_todos()
-                    {
-                        todos_reminded = true;
-                        continue;
-                    }
                     return Ok(reason);
                 }
             }
@@ -1090,23 +1087,25 @@ impl<'h> Agent<'h> {
         self.audience.contains(ToolAudience::MAIN) && self.root_tool_use_id.is_none()
     }
 
-    /// Holds a handoff back to the user while the todo list still has open
-    /// items, reporting whether the reminder went in and the loop goes on. The
-    /// turn limit is checked here because a reminder no request answers would
-    /// only turn a finished run into a truncated one.
+    /// Holds a handoff back to the user, once per run, while the todo list
+    /// still has open items, reporting whether the reminder went in. Work that
+    /// is still running skips it: its report wakes the agent, and the run that
+    /// report starts is checked in turn. Work that is only settling does not,
+    /// because acknowledging the report that woke this run can outlast it.
     fn remind_open_todos(&mut self) -> bool {
-        if !self.config.todo_reminder
+        if self.todos_reminded
+            || !self.config.todo_reminder
             || !self.is_main_session()
-            || steering::lock(&self.steering).turn_limit_reached(self.config.max_turns)
+            || self.session_work().running
         {
             return false;
         }
         let Some(reminder) = self.history.todos().and_then(open_todos_reminder) else {
             return false;
         };
+        self.todos_reminded = true;
         self.response_text = None;
         self.push_injected(reminder);
-        self.publish_prepared_context();
         true
     }
 
@@ -1657,10 +1656,19 @@ impl<'h> Agent<'h> {
         }
         // Context maintenance alone cannot reopen a disabled truncation recovery.
         // Explicit user input and goal evaluation retain their own continuation policy.
-        let outcome = if has_tools || (compacted && stop_reason != Some(StopReason::MaxTokens)) {
-            TurnOutcome::Continue
+        let handoff = !has_tools && !(compacted && stop_reason != Some(StopReason::MaxTokens));
+        let done_reason = DoneReason::from(stop_reason);
+        // Checked ahead of goal completion, which evaluates the goal or defers
+        // it behind queued next prompts, so both follow the reminder. Returning
+        // here keeps the reminder the last message of its request.
+        if handoff && done_reason == DoneReason::EndTurn && self.remind_open_todos() {
+            self.publish_prepared_context();
+            return Ok(TurnOutcome::Continue);
+        }
+        let outcome = if handoff {
+            self.goal_completion(done_reason).await?
         } else {
-            self.goal_completion(stop_reason.into()).await?
+            TurnOutcome::Continue
         };
         // Hints can decorate an independently scheduled request, never create
         // one by reopening a normal final answer.
@@ -1671,13 +1679,16 @@ impl<'h> Agent<'h> {
         Ok(outcome)
     }
 
-    fn goal_completion_ready(&self) -> bool {
-        !SessionWork::capture(
+    fn session_work(&self) -> SessionWork {
+        SessionWork::capture(
             self.background.as_ref(),
             self.workflow.as_ref(),
             self.subagent_cancels.active_count(),
         )
-        .pending()
+    }
+
+    fn goal_completion_ready(&self) -> bool {
+        !self.session_work().pending()
             && !self
                 .interrupt_source
                 .as_ref()
@@ -8557,6 +8568,9 @@ mod tests {
     const REMINDER_CLOSE: &str = "</system-reminder>";
     const REMINDED_ONCE: &str = "a handoff is held at most once per invocation";
     const NOT_HELD: &str = "this handoff goes straight back to the user";
+    const RUNNING_TASK: &str = "task-still-running";
+    const GOAL_CHECKED_ONCE: &str = "the goal is checked once, after the reminder was answered";
+    const TODOS_BEFORE_GOAL: &str = "the todo reminder goes in before the goal is checked";
 
     fn todo(content: &str, status: TodoStatus, priority: TodoPriority) -> TodoItem {
         TodoItem {
@@ -8664,6 +8678,14 @@ mod tests {
     #[test_case(Some(mixed_todos()), StopReason::EndTurn, |a| a.config.max_turns = Some(1) ; "turn_limit_reached")]
     #[test_case(
         Some(mixed_todos()),
+        StopReason::EndTurn,
+        |a| {
+            a.subagent_cancels.insert(RUNNING_TASK.into(), CancelToken::new().0);
+        } ;
+        "a_task_still_running"
+    )]
+    #[test_case(
+        Some(mixed_todos()),
         StopReason::MaxTokens,
         |a| Arc::make_mut(&mut a.config.steering).enabled = Some(false) ;
         "a_truncated_answer"
@@ -8748,6 +8770,57 @@ mod tests {
                 todo_reminders(&history),
                 2,
                 "a later user invocation gets its own reminder"
+            );
+        });
+    }
+
+    #[test_case(true ; "next_prompt_waiting")]
+    #[test_case(false ; "idle")]
+    fn the_todo_reminder_precedes_the_goal_check(next_waiting: bool) {
+        smol::block_on(async {
+            let mut history = History::default().with_todos(Some(mixed_todos()));
+            let mut responses = vec![answer(FIRST_ANSWER), answer(SECOND_ANSWER)];
+            if !next_waiting {
+                responses.push(goal_response(true, false, DECISION_VERDICT));
+            }
+            let expected_requests = responses.len();
+            let provider = MockProvider::new(responses);
+            let requests = Arc::clone(&provider.captured_messages);
+            let (mut agent, events) = make_agent(provider, &mut history);
+            agent.goal.set(DECISION_GOAL).unwrap();
+            agent.interrupt_source = Some(Arc::new(PendingInput(AtomicBool::new(next_waiting))));
+
+            assert_eq!(
+                agent.run(default_input()).await.unwrap(),
+                DoneReason::EndTurn
+            );
+            drop(agent);
+
+            assert_eq!(requests.lock().unwrap().len(), expected_requests);
+            assert_eq!(todo_reminders(&history), 1, "{REMINDED_ONCE}");
+            let events = drain_events(&events);
+            let reminded = events.iter().position(|envelope| {
+                matches!(&envelope.event, AgentEvent::Injected { text, .. } if text.contains(TODOS_OPEN))
+            });
+            let goal_checks: Vec<_> = events
+                .iter()
+                .enumerate()
+                .filter(|(_, envelope)| {
+                    matches!(
+                        envelope.event,
+                        AgentEvent::GoalDeferred { .. } | AgentEvent::GoalEvaluating { .. }
+                    )
+                })
+                .collect();
+            assert_eq!(goal_checks.len(), 1, "{GOAL_CHECKED_ONCE}");
+            let (checked_at, check) = goal_checks[0];
+            assert!(
+                reminded.is_some_and(|reminded_at| reminded_at < checked_at),
+                "{TODOS_BEFORE_GOAL}"
+            );
+            assert_eq!(
+                matches!(check.event, AgentEvent::GoalDeferred { .. }),
+                next_waiting
             );
         });
     }

@@ -13,7 +13,7 @@ The input stays active while Caudra works. Each prompt can wait for another run,
 
 Press `Enter` or click `next` while Caudra is working. The prompt waits until the main agent and its background tasks, shell commands, and workflows finish. Pending reports and results still wake the main agent, even with next prompts waiting. The main agent processes those results before the next prompt starts. A final response that leaves background work running does not release the queue.
 
-Queued user input takes priority over automatic `/goal` checks. If no input is waiting, the goal can be checked after the current work and result delivery settle.
+Queued user input takes priority over automatic `/goal` checks. If no input is waiting, the goal can be checked after the current work and result delivery settle. An [open todo reminder](/docs/context/#open-todo-items) comes before both, as part of the run that is ending.
 
 Queued prompts appear above the input. A section header names each group and counts what is waiting in it, and the sections appear in the order Caudra claims them. Focus the queue with `/queue`, `Enter` on an idle task panel, or a click.
 
