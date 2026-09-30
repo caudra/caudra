@@ -771,6 +771,47 @@ const NATIVE_CONSTRUCT_CASES: &[NativeConstructCase] = &[
     },
 ];
 
+const RETURN_TYPE_CASES: &[NativeConstructCase] = &[
+    NativeConstructCase {
+        filename: "return_types.c",
+        source: "const char *label(int code);\nchar **split(const char *text);\nstatic inline const char* inline_label(int code) { return 0; }\nchar const* suffixed(void);\nunsigned long *const fixed(void);\nint (*handler(void))(int);\n",
+        required: &[
+            "const char *label(int code)",
+            "char **split(const char *text)",
+            "const char* inline_label(int code)",
+            "char const* suffixed(void)",
+            "unsigned long *const fixed(void)",
+            "int (*handler(void))(int)",
+        ],
+    },
+    NativeConstructCase {
+        filename: "return_types.hpp",
+        source: "const std::string& name(int id);\nstd::string&& take();\nauto trailing() -> const char*;\ntemplate <typename T> const T& pick(const T& a) { return a; }\nclass Widget {\n  const char* label() const { return nullptr; }\n  Widget& self() & { return *this; }\n};\nconst char* Widget::describe() const { return nullptr; }\n",
+        required: &[
+            "const std::string& name(int id)",
+            "std::string&& take()",
+            "auto trailing() -> const char*",
+            "template<typename T> const T& pick(const T& a)",
+            "const char* label() const",
+            "Widget& self() &",
+            "const char* Widget::describe() const",
+        ],
+    },
+    NativeConstructCase {
+        filename: "return_types.cu",
+        source: "__host__ __device__ const float& at(float* data, int i) { return data[i]; }\ntemplate <int BLOCK>\n__global__ void __launch_bounds__(256) scale(float* data) { }\n",
+        required: &[
+            "__host__ __device__ const float& at(float* data, int i)",
+            "template<int BLOCK> __global__ __launch_bounds__(256) void scale(float* data)",
+        ],
+    },
+    NativeConstructCase {
+        filename: "return_types.m",
+        source: "static const char *shape_label(int kind) { return 0; }\n",
+        required: &["const char *shape_label(int kind)"],
+    },
+];
+
 const PARITY_CASES: &[ParityCase] = &[
     ParityCase {
         filename: "parity.php",
@@ -1199,8 +1240,17 @@ async fn representative_maki_language_corpus_is_supported() {
 
 #[tokio::test]
 async fn native_extractors_cover_representative_language_constructs() {
+    assert_required_constructs(NATIVE_CONSTRUCT_CASES).await;
+}
+
+#[tokio::test]
+async fn c_family_signatures_keep_the_declared_return_type_and_qualifiers() {
+    assert_required_constructs(RETURN_TYPE_CASES).await;
+}
+
+async fn assert_required_constructs(cases: &[NativeConstructCase]) {
     let root = tempdir().expect("root");
-    for case in NATIVE_CONSTRUCT_CASES {
+    for case in cases {
         if let Some(parent) = root.path().join(case.filename).parent() {
             fs::create_dir_all(parent).expect("fixture parent");
         }
@@ -1210,7 +1260,7 @@ async fn native_extractors_cover_representative_language_constructs() {
         .await
         .expect("group");
 
-    for case in NATIVE_CONSTRUCT_CASES {
+    for case in cases {
         let output = group
             .index(
                 IndexInput {

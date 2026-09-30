@@ -9,6 +9,8 @@ use crate::index::{
     traversal::Context,
 };
 
+pub(super) const DECLARATOR_WRAPPERS: [&str; 2] = ["pointer_declarator", "reference_declarator"];
+
 pub(super) fn spec() -> LanguageSpec {
     let mut spec = LanguageSpec::new("/", extract_nodes);
     spec.is_doc_comment = Some(is_doc_comment);
@@ -88,15 +90,55 @@ fn function_signature(node: Node<'_>, context: &Context<'_>) -> ExtractResult<Op
     let parameters = context
         .field(declaration, "parameters")?
         .map_or("()", |parameters| context.text(parameters));
-    let return_type = context
-        .field(node, "type")?
-        .map_or(String::new(), |return_type| {
-            format!("{} ", context.text(return_type))
-        });
     Ok(Some(compact_whitespace(&format!(
-        "{return_type}{}{parameters}",
+        "{}{}{parameters}",
+        return_type(node, context)?,
         context.text(name)
     ))))
+}
+
+/// The declarator a wrapper declarator decorates. A `reference_declarator` names it with no field,
+/// and its first child is the anonymous `&` token, so the fallback is the first named child.
+pub(super) fn inner_declarator(node: Node<'_>) -> Option<Node<'_>> {
+    node.child_by_field_name("declarator")
+        .or_else(|| node.named_child(0))
+}
+
+/// The return type as declared, up to the name: its qualifiers and type in source order, then the
+/// `*`, `&`, or `&&` declarators wrapping the name, spaced as written, so `const char *f(…)` keeps
+/// its `const` and `*`. Storage classes, attributes, and execution-space specifiers are left out.
+/// Empty for a declaration that names no type, such as a constructor.
+pub(super) fn return_type(node: Node<'_>, context: &Context<'_>) -> ExtractResult<String> {
+    let (Some(type_specifier), Some(declarator)) = (
+        context.field(node, "type")?,
+        context.field(node, "declarator")?,
+    ) else {
+        return Ok(String::new());
+    };
+    let mut specifiers = Vec::new();
+    let mut specifiers_end = type_specifier.end_byte();
+    for child in context.children(node)? {
+        if child == type_specifier || child.kind() == "type_qualifier" {
+            specifiers.push(context.text(child));
+            specifiers_end = child.end_byte();
+        }
+    }
+    let mut name = declarator;
+    while DECLARATOR_WRAPPERS.contains(&name.kind())
+        && let Some(inner) = inner_declarator(name)
+    {
+        name = inner;
+    }
+    let wrappers = context
+        .text(declarator)
+        .get(..name.start_byte() - declarator.start_byte())
+        .unwrap_or_default();
+    let separator = if declarator.start_byte() > specifiers_end {
+        " "
+    } else {
+        ""
+    };
+    Ok(format!("{}{separator}{wrappers}", specifiers.join(" ")))
 }
 
 pub(super) fn extract_function_macro(

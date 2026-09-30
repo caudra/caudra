@@ -20,6 +20,7 @@ const CUDA_FUNCTION_SPECIFIERS: [&str; 6] = [
     "launch_bounds",
 ];
 const CUDA_MEMORY_SPACES: [&str; 4] = ["__constant__", "__device__", "__managed__", "__shared__"];
+const FUNCTION_QUALIFIERS: [&str; 3] = ["type_qualifier", "ref_qualifier", "trailing_return_type"];
 
 pub(super) fn spec() -> LanguageSpec {
     let mut spec = LanguageSpec::new("/", extract_nodes);
@@ -123,15 +124,8 @@ fn declarator_name<'a>(node: Node<'_>, context: &'a Context<'_>) -> &'a str {
         return context.text(node);
     }
     node.child_by_field_name("name")
-        .or_else(|| inner_declarator(node))
+        .or_else(|| c::inner_declarator(node))
         .map_or("_", |inner| declarator_name(inner, context))
-}
-
-/// The declarator a wrapper declarator decorates. A `reference_declarator` names it with no field,
-/// and its first child is the anonymous `&` token, so the fallback is the first named child.
-fn inner_declarator(node: Node<'_>) -> Option<Node<'_>> {
-    node.child_by_field_name("declarator")
-        .or_else(|| node.named_child(0))
 }
 
 fn declarator_signature(node: Node<'_>, context: &Context<'_>) -> ExtractResult<Option<String>> {
@@ -144,16 +138,30 @@ fn declarator_signature(node: Node<'_>, context: &Context<'_>) -> ExtractResult<
                 .field(node, "parameters")?
                 .map_or("()", |parameters| context.text(parameters));
             Ok(Some(format!(
-                "{}{parameters}",
-                declarator_name(inner, context)
+                "{}{parameters}{}",
+                declarator_name(inner, context),
+                function_qualifiers(node, context)?
             )))
         }
-        "reference_declarator" | "pointer_declarator" => match inner_declarator(node) {
+        "reference_declarator" | "pointer_declarator" => match c::inner_declarator(node) {
             Some(inner) => declarator_signature(inner, context),
             None => Ok(None),
         },
         _ => Ok(Some(declarator_name(node, context).to_owned())),
     }
+}
+
+/// What a function declarator says after its parameters about its object and its result: `const`
+/// or `volatile`, a `&` or `&&` ref-qualifier, and a trailing `-> T` return type, each after a space.
+fn function_qualifiers(node: Node<'_>, context: &Context<'_>) -> ExtractResult<String> {
+    let mut qualifiers = String::new();
+    for child in context.children(node)? {
+        if FUNCTION_QUALIFIERS.contains(&child.kind()) {
+            qualifiers.push(' ');
+            qualifiers.push_str(context.text(child));
+        }
+    }
+    Ok(qualifiers)
 }
 
 fn method_signature(node: Node<'_>, context: &Context<'_>) -> ExtractResult<Option<String>> {
@@ -163,17 +171,10 @@ fn method_signature(node: Node<'_>, context: &Context<'_>) -> ExtractResult<Opti
     let Some(signature) = declarator_signature(declaration, context)? else {
         return Ok(None);
     };
-    let return_type = context
-        .field(node, "type")?
-        .map_or("", |return_type| context.text(return_type));
-    let signature = if return_type.is_empty() {
-        signature
-    } else {
-        format!("{return_type} {signature}")
-    };
     Ok(Some(compact_whitespace(&format!(
-        "{}{signature}",
-        cuda_function_specifiers(node, context)?
+        "{}{}{signature}",
+        cuda_function_specifiers(node, context)?,
+        c::return_type(node, context)?
     ))))
 }
 
@@ -224,10 +225,10 @@ fn cuda_memory_binding(node: Node<'_>, context: &Context<'_>) -> ExtractResult<O
 
 fn declaration_signature(node: Node<'_>, context: &Context<'_>) -> ExtractResult<Option<String>> {
     let mut declaration = context.field(node, "declarator")?;
-    while let Some(wrapper) = declaration
-        .filter(|node| matches!(node.kind(), "pointer_declarator" | "reference_declarator"))
+    while let Some(wrapper) =
+        declaration.filter(|node| c::DECLARATOR_WRAPPERS.contains(&node.kind()))
     {
-        declaration = inner_declarator(wrapper);
+        declaration = c::inner_declarator(wrapper);
     }
     match declaration.map(|declaration| (declaration.kind(), declaration)) {
         Some(("function_declarator", _)) => method_signature(node, context),
