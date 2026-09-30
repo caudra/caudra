@@ -15,6 +15,8 @@ const HELP_SEGMENTS: &[(&str, bool)] = &[
     (" help", false),
     (" · ", false),
     ("/help", true),
+    (" or ", false),
+    ("/docs", true),
     (" in chat", false),
 ];
 
@@ -528,7 +530,10 @@ impl Splash {
         let fg = extract_rgb(theme.foreground, FG_FALLBACK);
         let bg_rgb = extract_rgb(bg, BG_FALLBACK);
 
-        let total_width: u16 = HELP_SEGMENTS.iter().map(|(s, _)| s.len() as u16).sum();
+        let total_width: u16 = HELP_SEGMENTS
+            .iter()
+            .map(|(s, _)| s.chars().count() as u16)
+            .sum();
         let x_start = area.x + area.width.saturating_sub(total_width) / 2;
 
         let segments: Vec<_> = HELP_SEGMENTS
@@ -1085,6 +1090,28 @@ mod tests {
         let screen = rendered(&splash);
         assert!(screen.contains(UPDATE_HINT.trim_end()), "{POLLED}");
         assert!(screen.contains(NEW_VERSION), "{POLLED}");
+    }
+
+    const DOCS_COMMAND: &str = "/docs";
+    const DOCS_UNNAMED: &str = "the start screen must name /docs beside /help";
+    const OFF_CENTRE: &str = "the help line must sit as far from one edge as the other";
+
+    /// `·` is two bytes and one cell, so a width counted in bytes pushes the
+    /// line a column to the left of the tagline above it.
+    #[test]
+    fn the_help_line_names_the_docs_and_sits_centred() {
+        let buf = painted(&seeded(false), at_phase(0.0));
+        let row = (AREA.y..AREA.bottom())
+            .map(|y| {
+                (AREA.x..AREA.right())
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .find(|row| row.contains(DOCS_COMMAND))
+            .expect(DOCS_UNNAMED);
+        let left = row.len() - row.trim_start().len();
+        let right = row.len() - row.trim_end().len();
+        assert!(left.abs_diff(right) <= 1, "{OFF_CENTRE}: {row:?}");
     }
 
     /// `splash_animation = false` is what a user on a slow machine reaches

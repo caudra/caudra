@@ -11,6 +11,7 @@ use crate::components::context_modal::{
 use crate::components::docs_modal::fixture as docs_fixture;
 use crate::components::file_walk::UNREADABLE_DIR_MSG;
 use crate::components::goal_modal::GoalTarget;
+use crate::components::help_modal::HelpTarget;
 use crate::components::input::ChordHint;
 use crate::components::keybindings::{Bind, KeybindContext, key as kb, leader as chord};
 use crate::components::messages::{ASSISTANT_LABEL, ReviewTarget};
@@ -6431,6 +6432,27 @@ fn the_docs_command_opens_where_its_argument_points(args: &str, searching: bool)
     );
     assert!(app.docs_modal.is_open());
     assert_eq!(app.docs_modal.text_input_active(), searching);
+}
+
+const HELP_FOOTER_MISSING: &str = "the help footer must offer /docs";
+const DOCS_UNOPENED: &str = "a click on /docs in the help footer must open the docs";
+const HELP_KEPT_KEYS: &str = "help keeps every key, so it must close for the docs to be read";
+const PRESS_SWEPT: &str = "a press on a footer control must not start a sweep";
+
+#[test]
+fn a_click_on_docs_in_the_help_footer_opens_the_docs() {
+    let mut app = app_without_splash();
+    app.help_modal.toggle();
+    let _ = rendered(&mut app);
+    let hit = app.help_modal.footer_hit(HelpTarget::Command(DOCS_COMMAND));
+    assert!(!hit.is_empty(), "{HELP_FOOTER_MISSING}");
+
+    let actions = click_at(&mut app, hit);
+
+    assert!(actions.is_empty());
+    assert!(app.docs_modal.is_open(), "{DOCS_UNOPENED}");
+    assert!(!app.help_modal.is_open(), "{HELP_KEPT_KEYS}");
+    assert!(app.selection_state.is_none(), "{PRESS_SWEPT}");
 }
 
 #[test]

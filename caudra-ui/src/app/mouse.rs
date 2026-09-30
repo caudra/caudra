@@ -1,8 +1,8 @@
 use std::time::{Duration, Instant};
 
 use crate::agent::AgentCommand;
-use crate::components::Overlay;
 use crate::components::command::ChatScope;
+use crate::components::help_modal::HelpMouse;
 use crate::components::input::{ChordHint, InputHit};
 use crate::components::paste_editor::PasteEditorAction;
 use crate::components::permission_prompt::PromptMouse;
@@ -10,6 +10,7 @@ use crate::components::queue_panel::{QueueAction, QueueHit, QueueHitTarget};
 use crate::components::status_bar::{StatusBarHit, StatusBarHitTarget};
 use crate::components::stream_modal::StreamAction;
 use crate::components::workflow_card::CardHit;
+use crate::components::{Action, Overlay};
 use crate::selection::{self, ContentRegion, EdgeScroll, Selection, SelectionState, SelectionZone};
 use caudra_agent::{CommitRef, Mention};
 use caudra_storage::sessions::PermissionMode;
@@ -64,7 +65,7 @@ fn autoscroll_rows(distance: i32) -> i32 {
 }
 
 impl App {
-    pub(super) fn handle_mouse(&mut self, event: MouseEvent) -> Vec<crate::components::Action> {
+    pub(super) fn handle_mouse(&mut self, event: MouseEvent) -> Vec<Action> {
         if self.sandbox_manager.is_open() {
             self.clear_control_hovers();
             self.autoscroll = None;
@@ -197,13 +198,7 @@ impl App {
                 return Vec::new();
             };
             self.goal_modal.close();
-            return match self.run_cmdline(cmdline, 0) {
-                Ok(actions) => actions,
-                Err(error) => {
-                    self.flash(error);
-                    Vec::new()
-                }
-            };
+            return self.run_footer_command(cmdline);
         }
         if self.stream_modal.is_open() && !self.permission_prompt.is_open() {
             self.clear_control_hovers();
@@ -224,12 +219,19 @@ impl App {
             self.help_modal.is_open() || self.usage_modal.is_open() || self.float_mgr.is_open();
         if passive_modal_open {
             self.clear_control_hovers();
-            // None of these reads the pointer for anything but its bar, and at
-            // most one is up, so the first taker wins and the rest no-op.
-            if self.help_modal.handle_mouse(&event)
-                || self.usage_modal.handle_mouse(&event)
-                || self.float_mgr.handle_mouse(&event)
-            {
+            // Help keeps every key while it is up, so it closes before its
+            // footer's command runs or the docs it opens could not be read.
+            match self.help_modal.handle_mouse(&event) {
+                HelpMouse::Ignored => {}
+                HelpMouse::Consumed => return Vec::new(),
+                HelpMouse::Command(cmdline) => {
+                    self.help_modal.close();
+                    return self.run_footer_command(cmdline);
+                }
+            }
+            // Neither of these reads the pointer for anything but its bar, and
+            // at most one is up, so the first taker wins and the other no-ops.
+            if self.usage_modal.handle_mouse(&event) || self.float_mgr.handle_mouse(&event) {
                 return Vec::new();
             }
         } else if self.permission_prompt.is_open() {
@@ -672,7 +674,7 @@ impl App {
                             self.message_action_mouse_down = None;
                             self.queue_mouse_down = None;
                             self.status_mouse_down = None;
-                            return vec![crate::components::Action::OpenUrl(target.to_string())];
+                            return vec![Action::OpenUrl(target.to_string())];
                         }
                         if zone == SelectionZone::Messages
                             && !self.has_modal_overlay()
@@ -792,6 +794,18 @@ impl App {
             _ => {}
         }
         Vec::new()
+    }
+
+    /// A footer that names a session command runs it as typing it would, and
+    /// says why when the command is refused.
+    fn run_footer_command(&mut self, cmdline: &str) -> Vec<Action> {
+        match self.run_cmdline(cmdline, 0) {
+            Ok(actions) => actions,
+            Err(error) => {
+                self.flash(error);
+                Vec::new()
+            }
+        }
     }
 
     /// Offers a sideways wheel to the open modal. Only the ones that draw
@@ -1068,7 +1082,7 @@ impl App {
 
     /// A click stands in for the chord the hint names, so the two paths can
     /// never advertise one thing and do another.
-    fn press_chord_hint(&mut self, target: ChordHint) -> Vec<crate::components::Action> {
+    fn press_chord_hint(&mut self, target: ChordHint) -> Vec<Action> {
         match target {
             ChordHint::Tasks => self.tasks_browse(),
             ChordHint::PlanOrTodo => {
@@ -1088,7 +1102,7 @@ impl App {
 
     /// The scope table is the bar's, so a control the bar drew inert cannot be
     /// activated by a click landing on a hit rect from an earlier frame.
-    fn handle_status_click(&mut self, hit: StatusBarHit) -> Vec<crate::components::Action> {
+    fn handle_status_click(&mut self, hit: StatusBarHit) -> Vec<Action> {
         if hit.target.scope() == ChatScope::MainOnly && !self.is_main_chat() {
             return Vec::new();
         }
@@ -1186,7 +1200,7 @@ impl App {
         }
     }
 
-    fn handle_queue_click(&mut self, hit: QueueHit) -> Vec<crate::components::Action> {
+    fn handle_queue_click(&mut self, hit: QueueHit) -> Vec<Action> {
         self.queue_hover = None;
         match hit.target {
             QueueHitTarget::ToggleTogether => self.toggle_active_queue_delivery(),
@@ -1207,7 +1221,7 @@ impl App {
     /// The docked forms are absent by design. The agent is parked on them until
     /// they are answered, and the transcript behind them stays live, so they
     /// own no outside to press.
-    fn dismiss_at(&mut self, pos: Position) -> Option<Vec<crate::components::Action>> {
+    fn dismiss_at(&mut self, pos: Position) -> Option<Vec<Action>> {
         // Both take the mouse ahead of everything else, and the paste editor
         // holds edits that no stray press should throw away.
         if self.paste_editor.is_open() || self.permission_prompt.is_open() {
@@ -1314,8 +1328,8 @@ impl App {
         &mut self,
         event: MouseEvent,
         dispatch: impl FnOnce(&mut Self, MouseEvent) -> T,
-        map: impl FnOnce(&mut Self, T) -> Vec<crate::components::Action>,
-    ) -> Option<Vec<crate::components::Action>> {
+        map: impl FnOnce(&mut Self, T) -> Vec<Action>,
+    ) -> Option<Vec<Action>> {
         self.clear_control_hovers();
         if event.kind == MouseEventKind::Up(MouseButton::Left) && self.dragging_selection() {
             return None;
