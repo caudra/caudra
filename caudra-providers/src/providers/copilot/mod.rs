@@ -79,8 +79,9 @@ const EFFORT_TO_HIGH_NO_NONE: &[StaticReasoningOption] =
     &[StaticReasoningOption::Effort(&["low", "medium", "high"])];
 const KIMI_EFFORT: &[StaticReasoningOption] =
     &[StaticReasoningOption::Effort(&["low", "high", "max"])];
-/// Claude on Copilot reasons unconditionally: no `none`, no toggle.
-const CLAUDE_EFFORT_MAX: &[StaticReasoningOption] = &[StaticReasoningOption::Effort(&[
+/// Claude on Copilot and gpt-6.1-sol reason unconditionally: no `none`, no
+/// toggle.
+const EFFORT_TO_MAX_NO_NONE: &[StaticReasoningOption] = &[StaticReasoningOption::Effort(&[
     "low", "medium", "high", "xhigh", "max",
 ])];
 const CLAUDE_BUDGET: &[StaticReasoningOption] = &[StaticReasoningOption::BudgetTokens {
@@ -289,7 +290,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
             },
             max_output_tokens: Some(100_000),
             context_window: 200_000,
-            reasoning_options: Some(CLAUDE_EFFORT_MAX),
+            reasoning_options: Some(EFFORT_TO_MAX_NO_NONE),
         },
         ModelEntry {
             prefixes: &["claude-sonnet-5"],
@@ -307,7 +308,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
             },
             max_output_tokens: Some(100_000),
             context_window: 200_000,
-            reasoning_options: Some(CLAUDE_EFFORT_MAX),
+            reasoning_options: Some(EFFORT_TO_MAX_NO_NONE),
         },
         ModelEntry {
             prefixes: &["gpt-5.5"],
@@ -398,6 +399,24 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
             max_output_tokens: Some(100_000),
             context_window: 200_000,
             reasoning_options: Some(EFFORT_WITH_MAX),
+        },
+        ModelEntry {
+            prefixes: &["gpt-6.1-sol"],
+            small: false,
+            family: ModelFamily::Generic,
+            vision: true,
+            default: false,
+            pricing: ModelPricing {
+                input: 2.00,
+                output: 10.00,
+                cache_write: 2.50,
+                cache_read: 0.10,
+                fast: None,
+                tiers: ModelPricing::UNTIERED,
+            },
+            max_output_tokens: Some(100_000),
+            context_window: 200_000,
+            reasoning_options: Some(EFFORT_TO_MAX_NO_NONE),
         },
         ModelEntry {
             prefixes: &["gpt-6-sol"],
@@ -523,7 +542,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
             },
             max_output_tokens: Some(128_000),
             context_window: 200_000,
-            reasoning_options: Some(CLAUDE_EFFORT_MAX),
+            reasoning_options: Some(EFFORT_TO_MAX_NO_NONE),
         },
         ModelEntry {
             prefixes: &[
@@ -547,7 +566,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
             },
             max_output_tokens: Some(64_000),
             context_window: 200_000,
-            reasoning_options: Some(CLAUDE_EFFORT_MAX),
+            reasoning_options: Some(EFFORT_TO_MAX_NO_NONE),
         },
         ModelEntry {
             prefixes: &["claude-opus-4.8-fast", "claude-fable-5"],
@@ -565,7 +584,7 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
             },
             max_output_tokens: Some(100_000),
             context_window: 200_000,
-            reasoning_options: Some(CLAUDE_EFFORT_MAX),
+            reasoning_options: Some(EFFORT_TO_MAX_NO_NONE),
         },
         ModelEntry {
             prefixes: &["grok-4.5"],
@@ -1369,6 +1388,7 @@ mod tests {
     #[test_case("claude-opus-5.5", Endpoint::Messages ; "claude_takes_messages")]
     #[test_case("gpt-6-sol", Endpoint::Responses ; "gpt_6_takes_responses")]
     #[test_case("gpt-6-luna", Endpoint::Responses ; "gpt_6_luna_takes_responses")]
+    #[test_case("gpt-6.1-sol", Endpoint::Responses ; "gpt_6_point_release_takes_responses")]
     #[test_case("gpt-5.6-sol", Endpoint::Responses ; "gpt_5_takes_responses")]
     #[test_case("gpt-5.3-codex", Endpoint::Responses ; "codex_takes_responses")]
     #[test_case("gemini-3.1-pro-preview", Endpoint::ChatCompletions ; "everything_else_takes_chat")]
@@ -1527,6 +1547,7 @@ mod tests {
     #[test_case("copilot/claude-opus-5.5", 1_000_000, 1_000_000, 4.00 + 20.00; "opus 5.5 beats opus 5 prefix")]
     #[test_case("copilot/gpt-6-sol", 1_000_000, 1_000_000, 2.00 + 10.00; "gpt 6 sol has its own rates")]
     #[test_case("copilot/gpt-6-luna", 1_000_000, 1_000_000, 0.10 + 0.50; "gpt 6 luna has its own rates")]
+    #[test_case("copilot/gpt-6.1-sol", 1_000_000, 1_000_000, 2.00 + 10.00; "gpt 6.1 sol has its own rates")]
     fn manifest_models_report_cost(spec: &str, input: u32, output: u32, expected: f64) {
         let usage = TokenUsage {
             input,

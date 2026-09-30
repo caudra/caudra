@@ -35,6 +35,7 @@ static CONFIG: OpenAiCompatConfig = OpenAiCompatConfig {
 // `coding_plan_context_window`, so they never need listing here.
 pub(crate) const PLAN_MODELS: &[&str] = &[
     "gpt-6-astra",
+    "gpt-6.1-sol",
     "gpt-6-sol",
     "gpt-6-luna",
     "gpt-5.6-luna",
@@ -48,12 +49,13 @@ pub(crate) const PLAN_MODELS: &[&str] = &[
 
 /// Families that accept an explicit `prompt_cache_breakpoint`; earlier models
 /// are implicit-only and reject the field.
-const EXPLICIT_CACHE_FAMILIES: &[&str] = &["gpt-5.6-", "gpt-6-"];
+const EXPLICIT_CACHE_FAMILIES: &[&str] = &["gpt-5.6-", "gpt-6-", "gpt-6.1-"];
 const CODEX_PLAN_CONTEXT_WINDOW: u32 = 272_000;
-/// Plan window for the long-context families, gpt-5.6 and gpt-astra. Neither is
+/// Plan window for the long-context families, gpt-5.6 and gpt-6. Neither is
 /// published; `adjust_model` clamps to the smaller of this and the model's own
 /// window, so this only ever narrows what the static table already declared.
 const WIDE_PLAN_CONTEXT_WINDOW: u32 = 372_000;
+const WIDE_PLAN_FAMILIES: &[&str] = &["gpt-5.6-", "gpt-6-", "gpt-6.1-"];
 const USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
 /// The header the Codex backend derives cache affinity from; Codex CLI sends
 /// its thread id here alongside the body's `prompt_cache_key`.
@@ -108,13 +110,14 @@ fn coding_plan_context_window(model_id: &str) -> Option<u32> {
     if !PLAN_MODELS.contains(&model_id) {
         return None;
     }
-    Some(
-        if model_id.starts_with("gpt-5.6-") || model_id.starts_with("gpt-6-") {
-            WIDE_PLAN_CONTEXT_WINDOW
-        } else {
-            CODEX_PLAN_CONTEXT_WINDOW
-        },
-    )
+    let wide = WIDE_PLAN_FAMILIES
+        .iter()
+        .any(|family| model_id.starts_with(family));
+    Some(if wide {
+        WIDE_PLAN_CONTEXT_WINDOW
+    } else {
+        CODEX_PLAN_CONTEXT_WINDOW
+    })
 }
 
 /// Models an OAuth session may run. The subscription sells a different set to
@@ -826,6 +829,7 @@ mod tests {
     }
 
     #[test_case("gpt-6-astra")]
+    #[test_case("gpt-6.1-sol")]
     #[test_case("gpt-5.6-luna")]
     #[test_case("gpt-5.6-terra")]
     #[test_case("gpt-5.6-sol")]
@@ -834,6 +838,7 @@ mod tests {
     }
 
     #[test_case("gpt-6-astra", true)]
+    #[test_case("gpt-6.1-sol", true)]
     #[test_case("gpt-5.6-luna", true)]
     #[test_case("gpt-5.6-sol", true)]
     #[test_case("gpt-5.5", false ; "gpt_5_5_is_implicit_only")]
@@ -914,6 +919,7 @@ mod tests {
     }
 
     #[test_case("gpt-6-astra", Some(372_000))]
+    #[test_case("gpt-6.1-sol", Some(372_000))]
     #[test_case("gpt-6-sol", Some(372_000))]
     #[test_case("gpt-6-luna", Some(372_000))]
     #[test_case("gpt-5.6-luna", Some(372_000))]
@@ -954,6 +960,7 @@ mod tests {
     #[test_case("openai/gpt-6-luna", true, Some(PRIORITY_SERVICE_TIER) ; "luna_sells_a_fast_tier_too")]
     #[test_case("openai/gpt-6-astra", true, Some(PRIORITY_SERVICE_TIER) ; "astra_sells_a_fast_tier")]
     #[test_case("openai/gpt-5.6-sol", true, Some(PRIORITY_SERVICE_TIER) ; "gpt_5_6_sells_a_fast_tier")]
+    #[test_case("openai/gpt-6.1-sol", true, Some(PRIORITY_SERVICE_TIER) ; "gpt_6_1_sol_sells_a_fast_tier")]
     #[test_case("openai/gpt-6-sol", false, None ; "standard_sends_no_tier")]
     #[test_case("openai/gpt-5.5", true, None ; "a_model_without_fast_pricing_stays_standard")]
     fn fast_mode_sets_the_service_tier(spec: &str, fast: bool, expected: Option<&str>) {
@@ -1030,6 +1037,7 @@ mod tests {
     #[test_case("gpt-5.6-sol", effort("max"), Some("max") ; "max_passes_through_on_5_6_sol")]
     #[test_case("gpt-5.6-terra", effort("max"), Some("max") ; "max_passes_through_on_5_6_terra")]
     #[test_case("gpt-5.6-luna", effort("max"), Some("max") ; "max_passes_through_on_5_6_luna")]
+    #[test_case("gpt-6.1-sol", ThinkingConfig::Off, Some("low") ; "off_is_the_shallowest_level_on_6_1_sol")]
     fn responses_reasoning_uses_the_levels_the_model_declares(
         model_id: &str,
         thinking: ThinkingConfig,

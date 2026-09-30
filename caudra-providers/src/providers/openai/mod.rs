@@ -12,10 +12,10 @@ use crate::model::{
     StaticReasoningOption,
 };
 
-/// Working window for the long-context OpenAI models: gpt-5.6 luna/terra/sol
-/// and the gpt-astra family. Deliberately below what the API accepts — astra
-/// alone advertises 1,050,000 — because the window is what caudra fills before
-/// compacting, and cost and latency scale with it.
+/// Working window for the long-context OpenAI models, gpt-5.6 and gpt-6.
+/// Deliberately below what the API accepts — gpt-6 advertises 1,050,000 —
+/// because the window is what caudra fills before compacting, and cost and
+/// latency scale with it.
 const WIDE_CONTEXT_WINDOW: u32 = 372_000;
 const WIDE_MAX_OUTPUT_TOKENS: u32 = 128_000;
 /// A request whose prompt runs past this many tokens bills in full at twice
@@ -51,20 +51,21 @@ const EFFORT_TO_HIGH: &[StaticReasoningOption] = &[StaticReasoningOption::Effort
 /// The o-series predates the explicit opt-out, so it always reasons.
 const EFFORT_TO_HIGH_NO_NONE: &[StaticReasoningOption] =
     &[StaticReasoningOption::Effort(&["low", "medium", "high"])];
-/// The gpt-astra family reasons unconditionally, so it drops the `none` the
-/// gpt-5.6 ladder offers while keeping the rungs above it.
+/// gpt-6-astra and gpt-6.1-sol reason unconditionally, so they drop the `none`
+/// the gpt-5.6 ladder offers while keeping the rungs above it.
 const EFFORT_TO_MAX_NO_NONE: &[StaticReasoningOption] = &[StaticReasoningOption::Effort(&[
     "low", "medium", "high", "xhigh", "max",
 ])];
 
 /// The two ladders OpenAI currently sells side by side. Each carries its own
 /// Fast and Best, so a conversation on one never has a lane answered from the
-/// other while its own line still has a model for the job.
+/// other while its own line still has a model for the job. A point release
+/// such as gpt-6.1 extends its ladder rather than starting one.
 pub(crate) const fn generations() -> &'static [ModelGeneration] {
     const GENERATIONS: &[ModelGeneration] = &[
         ModelGeneration {
             label: "gpt-6",
-            members: &["gpt-6-"],
+            members: &["gpt-6-", "gpt-6.1-"],
         },
         ModelGeneration {
             label: "gpt-5.6",
@@ -145,6 +146,41 @@ pub(crate) const fn models() -> &'static [ModelEntry] {
             max_output_tokens: Some(WIDE_MAX_OUTPUT_TOKENS),
             context_window: WIDE_CONTEXT_WINDOW,
             reasoning_options: Some(EFFORT_WITH_MAX),
+        },
+        ModelEntry {
+            prefixes: &["gpt-6.1-sol"],
+            small: false,
+            family: ModelFamily::Gpt,
+            vision: true,
+            default: false,
+            pricing: ModelPricing {
+                input: 2.00,
+                output: 10.00,
+                cache_write: 2.50,
+                cache_read: 0.10,
+                fast: Some(FastPricing {
+                    input: 4.00,
+                    output: 20.00,
+                    cache_write: 5.00,
+                    cache_read: 0.20,
+                }),
+                tiers: Cow::Borrowed(&[PricingTier {
+                    above: LONG_CONTEXT_ABOVE,
+                    input: 4.00,
+                    output: 15.00,
+                    cache_write: 5.00,
+                    cache_read: 0.20,
+                    fast: Some(FastPricing {
+                        input: 8.00,
+                        output: 30.00,
+                        cache_write: 10.00,
+                        cache_read: 0.40,
+                    }),
+                }]),
+            },
+            max_output_tokens: Some(WIDE_MAX_OUTPUT_TOKENS),
+            context_window: WIDE_CONTEXT_WINDOW,
+            reasoning_options: Some(EFFORT_TO_MAX_NO_NONE),
         },
         ModelEntry {
             prefixes: &["gpt-6-sol"],
@@ -661,6 +697,7 @@ mod tests {
     }
 
     #[test_case("gpt-6-astra", true)]
+    #[test_case("gpt-6.1-sol", true)]
     #[test_case("gpt-6-sol", true)]
     #[test_case("gpt-6-luna", true)]
     #[test_case("gpt-5.6-sol", true)]

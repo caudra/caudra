@@ -143,6 +143,7 @@ You can override the model with `ANTHROPIC_MODEL` and the endpoint with `ANTHROP
 | Small | gpt-5.4-mini | $0.75 / $4.50 | 400K ctx / 128K out |
 | Small | gpt-4.1-nano | $0.10 / $0.40 | 1047K ctx / 32K out |
 | Best | **gpt-6-astra** (gpt-6 default) | $10.00 / $50.00 | 372K ctx / 128K out |
+|  | gpt-6.1-sol | $2.00 / $10.00 | 372K ctx / 128K out |
 |  | gpt-6-sol | $2.00 / $10.00 | 372K ctx / 128K out |
 |  | gpt-5.6-terra | $2.00 / $12.00 | 372K ctx / 128K out |
 | Best | **gpt-5.6-sol** (gpt-5.6 default) | $4.00 / $20.00 | 372K ctx / 128K out |
@@ -202,6 +203,7 @@ Routing defaults: gemini-2.0-flash-lite (Fast), gemini-2.5-pro (Best)
 |  | kimi-k2.7-code | $0.95 / $4.00 | 200K ctx / 100K out |
 |  | kimi-k3 | $3.00 / $15.00 | 200K ctx / 100K out |
 |  | gemini-3.1-pro-preview | $2.00 / $12.00 | 200K ctx / 65K out |
+|  | gpt-6.1-sol | $2.00 / $10.00 | 200K ctx / 100K out |
 |  | gpt-6-sol | $2.00 / $10.00 | 200K ctx / 100K out |
 |  | gpt-5.4 | $2.50 / $15.00 | 200K ctx / 100K out |
 |  | gpt-5.6-sol | $4.00 / $20.00 | 200K ctx / 100K out |

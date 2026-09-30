@@ -471,6 +471,7 @@ mod tests {
     use caudra_storage::thinking::ReasoningOption;
     use std::str::FromStr;
     use strum::IntoEnumIterator;
+    use test_case::test_case;
 
     const NO_CATALOG_NO_RATES: &str = "a cold catalog must not invent rates";
     const TIERS_COME_FROM_CATALOG: &str =
@@ -615,6 +616,16 @@ mod tests {
         assert_eq!(wide.first().copied(), Some("gpt-6-luna"));
         assert_eq!(lined.len(), wide.len());
         assert!(lined.iter().all(|prefix| wide.contains(prefix)));
+    }
+
+    /// `gpt-6-` alone does not match a point release, which would then answer
+    /// its lanes provider-wide rather than from the ladder it extends.
+    #[test_case("gpt-6.1-sol", Some("gpt-6") ; "a_point_release_joins_its_line")]
+    #[test_case("gpt-5.5", None ; "an_older_model_sits_in_no_line")]
+    fn a_model_answers_from_the_line_it_extends(model_id: &str, expected: Option<&str>) {
+        let manifest = ManifestRegistry::get("openai").unwrap();
+        let line = ManifestRegistry::generation_of(manifest, model_id).map(|line| line.label);
+        assert_eq!(line, expected);
     }
 
     #[test]
