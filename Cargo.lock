@@ -5968,6 +5968,7 @@ dependencies = [
 name = "workcell-source-languages"
 version = "0.1.0"
 dependencies = [
+ "test-case",
  "tree-sitter",
  "tree-sitter-bash",
  "tree-sitter-c",

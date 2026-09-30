@@ -122,7 +122,8 @@ pub const ALL: &[Language] = &[
 ];
 
 impl Language {
-    /// Resolves a language from a path, by exact filename first and extension second.
+    /// Resolves a language from a path: by exact filename first, extension second, and container
+    /// build variant last.
     ///
     /// Returns `None` for anything unrecognized. Callers decide whether that is an error (the
     /// `index` tool refuses) or a skip that gets counted and disclosed (the code map crawl).
@@ -133,29 +134,48 @@ impl Language {
             "MODULE.bazel" => Some(Self::BazelModule),
             "BUILD" | "BUILD.bazel" => Some(Self::BazelBuild),
             "Containerfile" | "Dockerfile" => Some(Self::Containerfile),
-            "GNUmakefile" | "Makefile" => Some(Self::Make),
+            "GNUmakefile" | "Makefile" | "makefile" => Some(Self::Make),
             _ => None,
         };
-        if exact.is_some() {
-            return exact;
-        }
-        Self::from_extension(path.extension().and_then(|value| value.to_str())?)
+        exact
+            .or_else(|| {
+                path.extension()
+                    .and_then(|value| value.to_str())
+                    .and_then(Self::from_extension)
+            })
+            .or_else(|| Self::container_variant(filename))
+    }
+
+    /// `Dockerfile.dev` and `Containerfile.ci` name build variants. They rank below the extension
+    /// so `Dockerfile.md` stays Markdown, and the ignore files that share the stem are not
+    /// Containerfiles.
+    fn container_variant(filename: &str) -> Option<Self> {
+        let variant = filename
+            .strip_prefix("Dockerfile.")
+            .or_else(|| filename.strip_prefix("Containerfile."))?;
+        let ignore_file =
+            filename.ends_with(".dockerignore") || filename.ends_with(".containerignore");
+        (!variant.is_empty() && !ignore_file).then_some(Self::Containerfile)
     }
 
     /// Resolves a language from a bare extension, without the leading dot.
+    ///
+    /// Metal Shading Language (`.metal`) is a C++14 dialect and resolves to C++: its address-space
+    /// qualifiers error-recover to single tokens and leave the enclosing definitions intact.
     #[must_use]
     pub fn from_extension(extension: &str) -> Option<Self> {
         let language = match extension {
             "rs" => Self::Rust,
             "py" | "pyi" => Self::Python,
-            "ts" | "tsx" => Self::TypeScript,
+            "ts" | "tsx" | "mts" | "cts" => Self::TypeScript,
             "js" | "jsx" | "mjs" | "cjs" => Self::JavaScript,
             "gleam" => Self::Gleam,
             "go" => Self::Go,
             "htm" | "html" => Self::Html,
             "java" => Self::Java,
             "c" | "h" => Self::C,
-            "cpp" | "cc" | "cxx" | "hpp" | "hxx" | "hh" | "ixx" => Self::Cpp,
+            "cpp" | "cc" | "cxx" | "c++" | "hpp" | "hxx" | "hh" | "h++" | "ixx" | "cppm"
+            | "ccm" | "cxxm" | "inl" | "ipp" | "tpp" | "tcc" | "metal" => Self::Cpp,
             "cs" => Self::CSharp,
             "rb" | "rake" | "gemspec" => Self::Ruby,
             "php" => Self::Php,
@@ -165,7 +185,7 @@ impl Language {
             "sh" | "bash" | "zsh" => Self::Bash,
             "lua" => Self::Lua,
             "ex" | "exs" => Self::Elixir,
-            "md" | "markdown" => Self::Markdown,
+            "md" | "markdown" | "mdx" => Self::Markdown,
             "bzl" => Self::BazelBzl,
             "zig" => Self::Zig,
             "nix" => Self::Nix,
@@ -174,10 +194,10 @@ impl Language {
             "yaml" | "yml" => Self::Yaml,
             "sql" => Self::Sql,
             "css" => Self::Css,
-            "json" => Self::Json,
+            "json" | "jsonc" => Self::Json,
             "hcl" | "tf" | "tfvars" => Self::Hcl,
             "dockerfile" => Self::Containerfile,
-            "mk" => Self::Make,
+            "mk" | "mak" => Self::Make,
             _ => return None,
         };
         Some(language)
@@ -367,6 +387,8 @@ impl Language {
 
 #[cfg(test)]
 mod tests {
+    use test_case::test_case;
+
     use super::*;
 
     #[test]
@@ -404,22 +426,24 @@ mod tests {
         assert_eq!(names.len(), count);
     }
 
-    #[test]
-    fn detection_prefers_exact_filenames_over_extensions() {
-        assert_eq!(
-            Language::from_path(Path::new("a/BUILD.bazel")),
-            Some(Language::BazelBuild)
-        );
-        assert_eq!(
-            Language::from_path(Path::new("a/Dockerfile")),
-            Some(Language::Containerfile)
-        );
-        assert_eq!(
-            Language::from_path(Path::new("a/main.rs")),
-            Some(Language::Rust)
-        );
-        assert_eq!(Language::from_path(Path::new("a/README")), None);
-        assert_eq!(Language::from_path(Path::new("a/thing.unknown")), None);
+    #[test_case("a/BUILD.bazel", Some(Language::BazelBuild) ; "an exact filename beats its extension")]
+    #[test_case("a/Dockerfile", Some(Language::Containerfile) ; "an exact filename needs no extension")]
+    #[test_case("a/makefile", Some(Language::Make) ; "a lowercase makefile is make")]
+    #[test_case("a/main.rs", Some(Language::Rust) ; "an extension resolves")]
+    #[test_case("a/Dockerfile.dev", Some(Language::Containerfile) ; "a dockerfile variant is a containerfile")]
+    #[test_case("a/Containerfile.ci", Some(Language::Containerfile) ; "a containerfile variant is a containerfile")]
+    #[test_case("a/Dockerfile.md", Some(Language::Markdown) ; "a known extension beats the variant stem")]
+    #[test_case("a/Dockerfile.dockerignore", None ; "a dockerignore is not a containerfile")]
+    #[test_case("a/Dockerfile.dev.dockerignore", None ; "a variant dockerignore is not a containerfile")]
+    #[test_case("a/Containerfile.containerignore", None ; "a containerignore is not a containerfile")]
+    #[test_case("a/Dockerfile.", None ; "an empty variant is not a containerfile")]
+    #[test_case("a/README", None ; "a bare unknown filename is unsupported")]
+    #[test_case("a/thing.unknown", None ; "an unknown extension is unsupported")]
+    fn a_path_resolves_by_filename_then_extension_then_variant(
+        path: &str,
+        expected: Option<Language>,
+    ) {
+        assert_eq!(Language::from_path(Path::new(path)), expected);
     }
 
     #[test]

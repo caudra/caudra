@@ -1280,6 +1280,8 @@ async fn every_extension_and_exact_filename_mapping_is_preserved() {
         ("pyi", "python"),
         ("ts", "typescript"),
         ("tsx", "typescript"),
+        ("mts", "typescript"),
+        ("cts", "typescript"),
         ("js", "javascript"),
         ("jsx", "javascript"),
         ("mjs", "javascript"),
@@ -1294,10 +1296,20 @@ async fn every_extension_and_exact_filename_mapping_is_preserved() {
         ("cpp", "cpp"),
         ("cc", "cpp"),
         ("cxx", "cpp"),
+        ("c++", "cpp"),
         ("hpp", "cpp"),
         ("hxx", "cpp"),
         ("hh", "cpp"),
+        ("h++", "cpp"),
         ("ixx", "cpp"),
+        ("cppm", "cpp"),
+        ("ccm", "cpp"),
+        ("cxxm", "cpp"),
+        ("inl", "cpp"),
+        ("ipp", "cpp"),
+        ("tpp", "cpp"),
+        ("tcc", "cpp"),
+        ("metal", "cpp"),
         ("cs", "c_sharp"),
         ("rb", "ruby"),
         ("rake", "ruby"),
@@ -1316,6 +1328,7 @@ async fn every_extension_and_exact_filename_mapping_is_preserved() {
         ("exs", "elixir"),
         ("md", "markdown"),
         ("markdown", "markdown"),
+        ("mdx", "markdown"),
         ("bzl", "bazel_bzl"),
         ("zig", "zig"),
         ("nix", "nix"),
@@ -1326,11 +1339,13 @@ async fn every_extension_and_exact_filename_mapping_is_preserved() {
         ("sql", "sql"),
         ("css", "css"),
         ("json", "json"),
+        ("jsonc", "json"),
         ("hcl", "hcl"),
         ("tf", "hcl"),
         ("tfvars", "hcl"),
         ("dockerfile", "containerfile"),
         ("mk", "make"),
+        ("mak", "make"),
     ];
     const FILENAMES: &[(&str, &str)] = &[
         ("MODULE.bazel", "bazel_module"),
@@ -1338,8 +1353,11 @@ async fn every_extension_and_exact_filename_mapping_is_preserved() {
         ("BUILD.bazel", "bazel_build"),
         ("Containerfile", "containerfile"),
         ("Dockerfile", "containerfile"),
+        ("Containerfile.ci", "containerfile"),
+        ("Dockerfile.dev", "containerfile"),
         ("GNUmakefile", "make"),
         ("Makefile", "make"),
+        ("makefile", "make"),
     ];
     let root = tempdir().expect("root");
     for (extension, _) in EXTENSIONS {
@@ -1571,6 +1589,7 @@ async fn host_limits_bound_source_output_lines_nodes_and_depth() {
 async fn rejects_unsupported_binary_and_non_utf8_files_and_honors_cancellation() {
     let root = tempdir().expect("root");
     fs::write(root.path().join("plain.txt"), "text").expect("unsupported");
+    fs::write(root.path().join("Dockerfile.dockerignore"), "target\n").expect("ignore file");
     fs::write(root.path().join("binary.rs"), b"source\0binary").expect("binary");
     fs::write(root.path().join("invalid.rs"), b"fn main() {}\n\xff").expect("invalid UTF-8");
     fs::write(root.path().join("valid.rs"), "fn main() {}\n").expect("valid");
@@ -1580,6 +1599,10 @@ async fn rejects_unsupported_binary_and_non_utf8_files_and_honors_cancellation()
 
     for (path, expected) in [
         ("plain.txt", "Unsupported file type: .txt"),
+        (
+            "Dockerfile.dockerignore",
+            "Unsupported file type: .dockerignore",
+        ),
         ("binary.rs", "binary file"),
         ("invalid.rs", "strict UTF-8"),
     ] {
