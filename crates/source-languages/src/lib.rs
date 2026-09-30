@@ -66,6 +66,7 @@ pub enum Language {
     Cuda,
     ObjC,
     CMake,
+    Protobuf,
 }
 
 /// What a language contributes to the graph.
@@ -77,7 +78,8 @@ pub enum Language {
 pub enum LanguageFamily {
     /// Call graphs are meaningful. Definitions and references both participate.
     Code,
-    /// Structured data. Keys become navigable sections; no call edges are ever emitted.
+    /// Structured data and schemas. Keys become navigable sections and a schema's declarations
+    /// become symbols; no call edges are ever emitted.
     Config,
     /// Prose and markup. Headings and elements become sections; no call edges.
     Prose,
@@ -125,6 +127,7 @@ pub const ALL: &[Language] = &[
     Language::Cuda,
     Language::ObjC,
     Language::CMake,
+    Language::Protobuf,
 ];
 
 impl Language {
@@ -214,6 +217,7 @@ impl Language {
             "cu" | "cuh" => Self::Cuda,
             "m" | "mm" => Self::ObjC,
             "cmake" => Self::CMake,
+            "proto" => Self::Protobuf,
             _ => return None,
         };
         Some(language)
@@ -260,6 +264,7 @@ impl Language {
             Self::Cuda => "cuda",
             Self::ObjC => "objc",
             Self::CMake => "cmake",
+            Self::Protobuf => "proto",
         }
     }
 
@@ -316,6 +321,7 @@ impl Language {
             Self::Cuda => tree_sitter_cuda::LANGUAGE.into(),
             Self::ObjC => tree_sitter_objc::LANGUAGE.into(),
             Self::CMake => tree_sitter_cmake::LANGUAGE.into(),
+            Self::Protobuf => tree_sitter_proto::LANGUAGE.into(),
         }
     }
 
@@ -351,9 +357,13 @@ impl Language {
             | Self::Cuda
             | Self::ObjC
             | Self::CMake => LanguageFamily::Code,
-            Self::Toml | Self::Yaml | Self::Json | Self::Hcl | Self::Nix | Self::Containerfile => {
-                LanguageFamily::Config
-            }
+            Self::Toml
+            | Self::Yaml
+            | Self::Json
+            | Self::Hcl
+            | Self::Nix
+            | Self::Containerfile
+            | Self::Protobuf => LanguageFamily::Config,
             Self::Markdown | Self::Html | Self::Css => LanguageFamily::Prose,
         }
     }
@@ -473,6 +483,7 @@ mod tests {
     #[test_case("a/CMakeLists.txt", Some(Language::CMake) ; "a cmake project file is cmake")]
     #[test_case("a/cmake/Warnings.cmake", Some(Language::CMake) ; "a cmake module is cmake")]
     #[test_case("a/notes.txt", None ; "another text file is not cmake")]
+    #[test_case("a/canvas.proto", Some(Language::Protobuf) ; "a protobuf schema is protobuf")]
     #[test_case("a/main.rs", Some(Language::Rust) ; "an extension resolves")]
     #[test_case("a/kernel.cu", Some(Language::Cuda) ; "a cuda source is cuda")]
     #[test_case("a/kernel.cuh", Some(Language::Cuda) ; "a cuda header is cuda")]
@@ -521,6 +532,7 @@ mod tests {
     #[test_case(Language::Cpp, Language::Json ; "cpp does not resolve a config key")]
     #[test_case(Language::Cuda, Language::Python ; "cuda does not resolve python")]
     #[test_case(Language::ObjC, Language::Swift ; "objc does not resolve swift")]
+    #[test_case(Language::Cuda, Language::Protobuf ; "cuda does not resolve a protobuf type")]
     fn the_c_family_bridge_stops_at_the_family(referrer: Language, definer: Language) {
         assert!(!referrer.compatible_with(definer));
         assert!(!definer.compatible_with(referrer));

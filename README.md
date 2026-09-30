@@ -1330,7 +1330,8 @@ delete sections.
   It does not add or hide harness-specific instruction files.
 - Supported families are Rust, Python, TypeScript/JavaScript, Gleam, Go, HTML, Java,
   C/C++/CUDA/Objective-C/C#, Ruby, PHP, Swift, Kotlin, Scala, Bash, Lua, Elixir, Markdown,
-  Bazel/Starlark, Zig, Nix, Dart, TOML, YAML, SQL, CSS, JSON, HCL, Containerfile, Make, and CMake.
+  Bazel/Starlark, Zig, Nix, Dart, TOML, YAML, SQL, CSS, JSON, HCL, Containerfile, Make, CMake, and
+  Protobuf.
 - A `.h` header is parsed as C++. A C header parses acceptably under the C++ grammar, while a C++
   header under the C grammar loses its namespaces, classes, and templates; the code map resolves C,
   C++, CUDA, and Objective-C symbols against each other so a `.c`, `.cu`, or `.m` definition still
@@ -1354,6 +1355,11 @@ delete sections.
   of that name, matched by exact spelling although CMake ignores the case of command names. Only a
   literal unquoted argument names a code-map symbol, so neither a target named `${name}` nor an
   `include("x.cmake")` is one.
+- Protobuf schemas (`.proto`) show the package, imports, file options, each message with its
+  fields and each enum with its values, nested types as `Outer.Inner`, `extend` blocks, and each
+  service with its rpcs. In the code map they are data, like the config formats: messages, enums,
+  services, and rpcs are symbols and field types are reads, but nothing is a call, and an import's
+  quoted path is not a symbol.
 - Extraction and formatting are native Rust visitors over tree-sitter nodes. The index feature does
   not embed a scripting runtime or load extractor code at runtime.
 - MCP model text is the bare skeleton or listing. `structuredContent` carries the same bounded output;

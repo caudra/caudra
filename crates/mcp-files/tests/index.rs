@@ -254,6 +254,12 @@ const LANGUAGE_CASES: &[LanguageCase] = &[
         language: "cmake",
         expected: "mod: [1]\n  Demo\n\nfns:\n  function(build target) [2-4]",
     },
+    LanguageCase {
+        filename: "case.proto",
+        source: "package demo;\nmessage Item {\n  string id = 1;\n  message Part {}\n}\nenum Kind { KIND_A = 0; KIND_B = 1; }\n",
+        language: "proto",
+        expected: "mod: [1]\n  demo\n\ntypes:\n  message Item [2-5]\n    string id = 1\n  message Item.Part [4]\n  enum Kind [6]\n    KIND_A, KIND_B",
+    },
 ];
 
 const NATIVE_CONSTRUCT_CASES: &[NativeConstructCase] = &[
@@ -459,6 +465,29 @@ const NATIVE_CONSTRUCT_CASES: &[NativeConstructCase] = &[
             "ADD_EXECUTABLE(canvas_cli main.c) [13]",
             "add_library(canvas STATIC ${CANVAS_SOURCES}) [15]",
         ],
+    },
+    NativeConstructCase {
+        filename: "native.proto",
+        source: "syntax = \"proto3\";\npackage canvas.v1;\nimport \"google/protobuf/timestamp.proto\";\nimport public \"canvas/v1/shape.proto\";\noption go_package = \"example.com/canvas/v1;canvasv1\";\nmessage Canvas {\n  string id = 1;\n  map<string, string> labels = 2;\n  oneof background {\n    string color = 3;\n    bytes image = 4;\n  }\n  message Layer {\n    string name = 1;\n  }\n}\nextend google.protobuf.FieldOptions {\n  string label = 50000;\n}\nservice CanvasService {\n  rpc GetCanvas(GetCanvasRequest) returns (Canvas);\n  rpc WatchCanvas(stream GetCanvasRequest)\n      returns (stream Canvas) {\n    option deprecated = true;\n  }\n}\n",
+        required: &[
+            "imports: [3-4]\n  canvas/v1/shape.proto\n  google/protobuf/timestamp.proto",
+            "mod: [2]\n  canvas.v1",
+            "option go_package = \"example.com/canvas/v1;canvasv1\" [5]",
+            "message Canvas [6-16]",
+            "map<string, string> labels = 2",
+            "oneof background { string color = 3; bytes image = 4 }",
+            "message Canvas.Layer [13-15]",
+            "extend google.protobuf.FieldOptions [17-19]",
+            "string label = 50000",
+            "traits:\n  service CanvasService [20-26]",
+            "rpc GetCanvas(GetCanvasRequest) returns (Canvas) [21]",
+            "rpc WatchCanvas(stream GetCanvasRequest) returns (stream Canvas) [22-25]",
+        ],
+    },
+    NativeConstructCase {
+        filename: "many_fields.proto",
+        source: "message Many {\n  int32 a = 1;\n  int32 b = 2;\n  int32 c = 3;\n  int32 d = 4;\n  int32 e = 5;\n  int32 f = 6;\n  int32 g = 7;\n  int32 h = 8;\n  int32 i = 9;\n  map<string, int32> j = 10;\n}\n",
+        required: &["    int32 h = 8\n    [2 more truncated]"],
     },
     NativeConstructCase {
         filename: "native.cs",
@@ -1465,6 +1494,7 @@ async fn every_extension_and_exact_filename_mapping_is_preserved() {
         ("mk", "make"),
         ("mak", "make"),
         ("cmake", "cmake"),
+        ("proto", "proto"),
     ];
     const FILENAMES: &[(&str, &str)] = &[
         ("MODULE.bazel", "bazel_module"),

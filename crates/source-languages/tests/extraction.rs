@@ -299,6 +299,35 @@ fn cmake_names_nothing_after_an_expansion_or_a_quoted_argument(source: &str) {
     );
 }
 
+#[test_case("message Canvas {}\n", "class:Canvas" ; "a message")]
+#[test_case("message Canvas { message Layer {} }\n", "class:Layer" ; "a nested message")]
+#[test_case("enum Unit { UNIT_PIXEL = 0; }\n", "class:Unit" ; "an enum")]
+#[test_case("syntax = \"proto2\";\nmessage M { optional group Result = 1 { optional string url = 2; } }\n", "class:Result" ; "a group")]
+#[test_case("service Canvases { rpc Get(GetRequest) returns (Canvas); }\n", "interface:Canvases" ; "a service")]
+#[test_case("service Canvases { rpc Get(GetRequest) returns (Canvas); }\n", "method:Get" ; "an rpc")]
+#[test_case("service Canvases { rpc Watch(Req) returns (stream Canvas); }\n", "read:Canvas" ; "a streamed response type")]
+#[test_case("message M { Shape shape = 1; }\n", "read:Shape" ; "a field type")]
+#[test_case("message M { map<string, Shape> shapes = 1; }\n", "read:Shape" ; "a map value type")]
+#[test_case("message M { google.protobuf.Timestamp at = 1; }\n", "read:Timestamp" ; "a qualified type by its last component")]
+fn protobuf_captures_types_services_and_type_references(source: &str, expected: &str) {
+    let captured = capture(Language::Protobuf, source);
+    assert!(
+        captured.definitions.contains_key(expected) || captured.references.contains_key(expected),
+        "missing {expected}; captured {:?} and {:?}",
+        captured.definitions,
+        captured.references
+    );
+}
+
+#[test]
+fn protobuf_reads_a_qualified_type_once() {
+    let captured = capture(
+        Language::Protobuf,
+        "message M { google.protobuf.Timestamp at = 1; }\n",
+    );
+    assert_eq!(captured.named_references, 1, "{:?}", captured.references);
+}
+
 #[test_case("struct Widget { Widget(int, char) stray; };\n", "field:stray" ; "a constructor followed by a stray token")]
 #[test_case("void set_callback(item *i, int (*callback)(item *i));\n", "constant:set_callback" ; "a prototype the grammar reads as a variable")]
 fn cpp_header_recovery_mints_no_false_definition(source: &str, unexpected: &str) {

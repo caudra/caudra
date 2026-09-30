@@ -22,6 +22,7 @@ mod markdown;
 mod nix;
 mod objc;
 mod php;
+mod proto;
 mod python;
 mod ruby;
 mod rust;
@@ -85,6 +86,7 @@ fn spec(language: Language) -> LanguageSpec {
         Language::Dart => dart::spec(),
         Language::Sql => sql::spec(),
         Language::CMake => cmake::spec(),
+        Language::Protobuf => proto::spec(),
         Language::Html
         | Language::Markdown
         | Language::BazelBuild
