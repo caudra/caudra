@@ -65,8 +65,9 @@ use caudra_lua::test_support::{HintWriterHandle, hint_writer_pair};
 use caudra_lua::{BuiltinAction, HintReader, KeymapReader, LuaCommandInfo, LuaCommandReader};
 use caudra_providers::model_registry::{self, Binding};
 use caudra_providers::{
-    Billing, ContentBlock, HistoryItemKind, Message, RequestOptions, Role, THINKING_USAGE,
-    TaskEventOrigin, TokenUsage, UserOrigin, expand_message, merge_history_items, project_messages,
+    Billing, ContentBlock, HistoryItem, HistoryItemKind, Message, RequestOptions, Role,
+    THINKING_USAGE, TaskEventOrigin, TokenUsage, UserOrigin, expand_message, merge_history_items,
+    project_messages,
 };
 use caudra_storage::id::CaudraId;
 use caudra_storage::permission_patterns::{
@@ -5905,15 +5906,210 @@ fn live_rows_receive_sources_when_history_is_merged() {
     let (_temp, _, _, mut app) = tempdir_app();
     app.main_chat().push_user_message("hello");
     let items = crate::history_items(&[Message::user("hello".into())]);
-    app.shared_history = Some(Arc::new(ArcSwap::from_pointee(HistorySnapshot::new(
-        items.clone(),
-    ))));
+    publish_history(&mut app, items.clone());
 
     app.checkpoint_with(Duration::ZERO);
 
     assert_eq!(
         app.main_chat().message_at(0).unwrap().source,
         Some(DisplaySource::User(items[0].id))
+    );
+}
+
+const RUN_END_PROMPT: &str = "fix the flaky test";
+const RUN_END_REPLY: &str = "the fix is in";
+const RUN_END_ERROR: &str = "the connection dropped";
+const RUN_END_MSG: &str = "the reply a run ends on must be bound to its history";
+const IMAGE_PROMPT: &str = "what does this chart show";
+const IMAGE_DATA: &str = "aW1hZ2U=";
+const IMAGE_BOUND_MSG: &str = "a prompt with images must be bound to its history";
+const IMAGE_RESTORED_MSG: &str = "a restored prompt must read as it was drawn";
+const MCP_PROMPT_SERVER_NAME: &str = "review:diff";
+const MCP_PROMPT_QUALIFIED_NAME: &str = "review/diff";
+const MCP_PROMPT_DESCRIPTION: &str = "Review a diff";
+const MCP_PROMPT_ARGS: &str = "main";
+const MCP_PROMPT_BODY: &str = "Review the diff against main.";
+const MCP_BOUND_MSG: &str = "an MCP prompt must be bound to the message the agent records";
+const EARLIER_PROMPT: &str = "the turn the summary replaces";
+const EARLIER_REPLY: &str = "an answer the summary covers";
+const KEPT_PROMPT: &str = "the turn compaction keeps";
+const KEPT_REPLY: &str = "an answer compaction keeps";
+const COMPACTION_SUMMARY: &str = "## Objective";
+const SEAM_BOUND_MSG: &str = "every row with history must stay bound across a compaction";
+const SENT_MSG: &str = "the submission must send one message to the agent";
+
+fn publish_history(app: &mut App, items: Vec<HistoryItem>) {
+    app.shared_history = Some(Arc::new(ArcSwap::from_pointee(HistorySnapshot::new(items))));
+}
+
+fn main_chat_sources(app: &mut App) -> Vec<Option<DisplaySource>> {
+    let chat = app.main_chat();
+    (0..chat.message_count())
+        .filter_map(|index| chat.message_at(index))
+        .map(|message| message.source)
+        .collect()
+}
+
+fn sent_input(actions: &[Action]) -> &AgentInput {
+    let [Action::SendMessage(input)] = actions else {
+        panic!("{SENT_MSG}");
+    };
+    input
+}
+
+/// The agent publishes its history before the event that ends the run, so a
+/// merge can land while the reply is still streaming and has no row to bind.
+#[test_case(done() ; "after_done")]
+#[test_case(AgentEvent::Error { message: RUN_END_ERROR.into() } ; "after_error")]
+fn the_reply_a_run_ends_on_is_bound_after_an_earlier_merge(end: AgentEvent) {
+    let (_temp, _, _, mut app) = tempdir_app();
+    app.status = Status::Streaming;
+    app.run_id = 1;
+    app.main_chat().push_user_message(RUN_END_PROMPT);
+    app.update(agent_msg(AgentEvent::TextDelta {
+        text: RUN_END_REPLY.into(),
+    }));
+    let items = crate::history_items(&[
+        Message::user(RUN_END_PROMPT.into()),
+        assistant_message(RUN_END_REPLY),
+    ]);
+    publish_history(&mut app, items.clone());
+    app.checkpoint_with(Duration::ZERO);
+
+    app.update(agent_msg(end));
+
+    assert_eq!(
+        main_chat_sources(&mut app)[..2],
+        [
+            Some(DisplaySource::User(items[0].id)),
+            Some(DisplaySource::AssistantText(items[1].id)),
+        ],
+        "{RUN_END_MSG}"
+    );
+}
+
+#[test]
+fn a_prompt_with_images_is_bound_and_restores_as_drawn() {
+    let (_temp, _, _, mut app) = tempdir_app();
+    let actions = app.start_from_queue(&QueuedMessage {
+        images: vec![ImageSource::new(ImageMediaType::Png, Arc::from(IMAGE_DATA))],
+        ..queued_msg(IMAGE_PROMPT)
+    });
+    let input = sent_input(&actions);
+    let items = crate::history_items(&[Message::user_with_images(
+        input.message.clone(),
+        input.images.clone(),
+    )]);
+    publish_history(&mut app, items.clone());
+
+    app.checkpoint_with(Duration::ZERO);
+
+    assert_eq!(
+        main_chat_sources(&mut app),
+        [Some(DisplaySource::User(items[0].id))],
+        "{IMAGE_BOUND_MSG}"
+    );
+    let drawn = app.main_chat().message_at(0).unwrap().text.clone();
+    app.restore_display();
+    assert_eq!(
+        app.main_chat().message_at(0).map(|message| &message.text),
+        Some(&drawn),
+        "{IMAGE_RESTORED_MSG}"
+    );
+}
+
+/// The agent records the prompt's own messages first and then the command the
+/// user typed, which is the text the bubble shows.
+#[test]
+fn an_mcp_prompt_is_bound_to_the_message_the_agent_records() {
+    let (_temp, _, _, mut app) = tempdir_app();
+    app.command_palette = CommandPalette::new(
+        Arc::from([]),
+        McpSnapshotReader::from_snapshot(McpSnapshot {
+            infos: Vec::new(),
+            prompts: vec![McpPromptInfo {
+                display_name: MCP_PROMPT_SERVER_NAME.into(),
+                qualified_name: MCP_PROMPT_QUALIFIED_NAME.into(),
+                description: MCP_PROMPT_DESCRIPTION.into(),
+                arguments: Vec::new(),
+            }],
+            pids: Vec::new(),
+            generation: 0,
+        }),
+        LuaCommandReader::empty(),
+        FeatureFlags::all(),
+    );
+    let actions = app.execute_mcp_prompt(&format!("/{MCP_PROMPT_SERVER_NAME}"), MCP_PROMPT_ARGS);
+    let input = sent_input(&actions);
+    let items = crate::history_items(&[
+        Message::user(MCP_PROMPT_BODY.into()),
+        Message::user(input.message.clone()),
+    ]);
+    publish_history(&mut app, items.clone());
+
+    app.checkpoint_with(Duration::ZERO);
+
+    assert_eq!(
+        main_chat_sources(&mut app),
+        [Some(DisplaySource::User(items[1].id))],
+        "{MCP_BOUND_MSG}"
+    );
+}
+
+/// A compaction draws its summary below the turns it keeps, and the history
+/// re-adds those turns below the summary with fresh ids. Turns the summary
+/// replaced keep the sources they had.
+#[test]
+fn rows_with_history_stay_bound_across_a_compaction() {
+    let (_temp, _, _, mut app) = tempdir_app();
+    app.status = Status::Streaming;
+    app.run_id = 1;
+    for (role, text) in [
+        (DisplayRole::User, EARLIER_PROMPT),
+        (DisplayRole::Assistant, EARLIER_REPLY),
+        (DisplayRole::User, KEPT_PROMPT),
+        (DisplayRole::Assistant, KEPT_REPLY),
+    ] {
+        app.main_chat().push(DisplayMessage::new(role, text.into()));
+    }
+    let turns = crate::history_items(&[
+        Message::user(EARLIER_PROMPT.into()),
+        assistant_message(EARLIER_REPLY),
+        Message::user(KEPT_PROMPT.into()),
+        assistant_message(KEPT_REPLY),
+    ]);
+    publish_history(&mut app, turns.clone());
+    app.checkpoint_with(Duration::ZERO);
+
+    app.update(agent_msg(AgentEvent::Compacting));
+    app.update(agent_msg(AgentEvent::TextDelta {
+        text: COMPACTION_SUMMARY.into(),
+    }));
+    app.update(agent_msg(AgentEvent::CompactionDone));
+    let mut compacted = crate::history_items(&[
+        Message::synthetic(caudra_agent::COMPACTION_ANCHOR.into()),
+        Message {
+            is_compaction_summary: true,
+            ..assistant_message(COMPACTION_SUMMARY)
+        },
+        Message::user(KEPT_PROMPT.into()),
+        assistant_message(KEPT_REPLY),
+    ]);
+    compacted[0].supersedes = Some(turns[1].id);
+    publish_history(&mut app, compacted.clone());
+    app.checkpoint_with(Duration::ZERO);
+
+    assert_eq!(
+        main_chat_sources(&mut app),
+        [
+            Some(DisplaySource::User(turns[0].id)),
+            Some(DisplaySource::AssistantText(turns[1].id)),
+            Some(DisplaySource::User(compacted[2].id)),
+            Some(DisplaySource::AssistantText(compacted[3].id)),
+            None,
+            Some(DisplaySource::AssistantText(compacted[1].id)),
+        ],
+        "{SEAM_BOUND_MSG}"
     );
 }
 

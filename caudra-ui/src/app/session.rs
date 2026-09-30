@@ -270,13 +270,7 @@ impl App {
                         meta.pending_revert = None;
                     }
                     if added {
-                        let (messages, _) = history_to_display(
-                            &snapshot.messages,
-                            self.state.session.tool_outputs(),
-                            &self.ui_config.tool_output_lines,
-                            self.ui_config.show_reminders,
-                        );
-                        self.main_chat().bind_sources(&messages);
+                        self.bind_main_chat_sources_to(&snapshot.messages);
                     }
                     // Only a merge that reached a consistent graph may be
                     // remembered. A failed one has to be retried, and its
@@ -338,6 +332,32 @@ impl App {
 
         self.storage_writer.send(Arc::clone(&self.state.session));
         self.last_sent = Some(sent);
+    }
+
+    /// A merge binds only the rows drawn by then, and the reply a run ends on
+    /// is flushed when `Done` arrives, which can be after the merge that
+    /// carried its item. No later merge adds anything, so the end of a run
+    /// binds again against the history already merged. A history that is not
+    /// merged yet is left to the checkpoint that merges it.
+    pub(super) fn bind_main_chat_sources(&mut self) {
+        let Some(snapshot) = self
+            .merged_history
+            .as_ref()
+            .map(|merged| Arc::clone(&merged.snapshot))
+        else {
+            return;
+        };
+        self.bind_main_chat_sources_to(&snapshot.messages);
+    }
+
+    fn bind_main_chat_sources_to(&mut self, items: &[HistoryItem]) {
+        let (messages, _) = history_to_display(
+            items,
+            self.state.session.tool_outputs(),
+            &self.ui_config.tool_output_lines,
+            self.ui_config.show_reminders,
+        );
+        self.main_chat().bind_sources(&messages);
     }
 
     /// Drops the merge memo so the next checkpoint walks the graph again.

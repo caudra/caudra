@@ -49,7 +49,7 @@ use crate::agent::SharedMode;
 use crate::app::tasks::TaskOutcome;
 use crate::app::workbench::StoredDocument;
 use crate::chat::Chat;
-use crate::chat::{CANCELLED_TEXT, ChatEventResult, DONE_TEXT, ERROR_TEXT};
+use crate::chat::{CANCELLED_TEXT, ChatEventResult, DONE_TEXT, ERROR_TEXT, format_with_images};
 use crate::clipboard::{ClipboardState, CopyResult};
 use crate::components::command::{CommandAction, CommandPalette, ParsedCommand, disabled_feature};
 use crate::components::command_modal::{CommandModal, CommandModalAction};
@@ -4957,6 +4957,7 @@ impl App {
             match result {
                 ChatEventResult::Done => {
                     self.status_bar.clear_flash();
+                    self.bind_main_chat_sources();
                     if !self.goal_deferred {
                         self.state.turns += 1;
                         self.terminalize_turn(MISSING_TOOL_COMPLETION);
@@ -4969,6 +4970,7 @@ impl App {
                     }
                 }
                 ChatEventResult::Error(message) => {
+                    self.bind_main_chat_sources();
                     self.cancel_queue_edit();
                     // The transcript keeps what the turn managed to write, so say so here: the
                     // remedy is one command and nothing else in the UI names it.
@@ -6617,12 +6619,4 @@ fn sync_search_highlight(modal: &SearchModal, chat: &mut Chat) {
         chat.scroll_to_segment(i);
     }
     chat.set_highlight_segment(idx);
-}
-
-fn format_with_images(text: &str, image_count: usize) -> String {
-    match image_count {
-        0 => text.to_string(),
-        1 => format!("{text} [1 image]"),
-        n => format!("{text} [{n} images]"),
-    }
 }

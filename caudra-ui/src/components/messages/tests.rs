@@ -1056,9 +1056,31 @@ const RETRY_NOTICE: &str = "retrying after a rate limit";
 const SAME_LENGTH_NOTICE: &str = "retrying after a rate LIMIT";
 const FAILURE: &str = "the request failed";
 const BIND_MSG: &str = "each row takes the first source past the last match that shows its item";
+const REPEATED_PROMPT: &str = "continue";
+const COMPACTION_BORDER: &str = "the turns above were replaced by the summary below";
+const COMPACTION_SUMMARY: &str = "## Objective";
+const SEAM_MSG: &str = "rows drawn before a compaction bind to the history it left behind";
+
+/// What a row points at, before a bind and after it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Bound {
+    Nothing,
+    Listed(usize),
+    Replaced,
+}
 
 fn text_row(role: DisplayRole, text: &str) -> DisplayMessage {
     DisplayMessage::new(role, text.into())
+}
+
+fn with_sources(sources: Vec<DisplayMessage>) -> Vec<DisplayMessage> {
+    sources
+        .into_iter()
+        .map(|mut source| {
+            source.source = Some(DisplaySource::User(CaudraId::generate()));
+            source
+        })
+        .collect()
 }
 
 fn call_row(id: &str) -> DisplayMessage {
@@ -1103,13 +1125,7 @@ fn bind_sources_walks_the_sources_in_order(
     sources: Vec<DisplayMessage>,
     expected: &[Option<usize>],
 ) {
-    let sources: Vec<_> = sources
-        .into_iter()
-        .map(|mut source| {
-            source.source = Some(DisplaySource::User(CaudraId::generate()));
-            source
-        })
-        .collect();
+    let sources = with_sources(sources);
     let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
     for row in rows {
         panel.push(row);
@@ -1129,6 +1145,66 @@ fn bind_sources_walks_the_sources_in_order(
         })
         .collect();
     assert_eq!(bound, expected, "{BIND_MSG}");
+}
+
+/// A compaction draws its summary below the turns it keeps, and the history
+/// re-adds those turns below the summary with fresh ids. Every row with a
+/// counterpart has to find it, and a row whose turn the summary replaced must
+/// not take the source of a newer one with the same text.
+#[test_case(
+    vec![(text_row(DisplayRole::User, BOUND_PROMPT), Bound::Replaced), (text_row(DisplayRole::Assistant, BOUND_REPLY), Bound::Replaced), (text_row(DisplayRole::Notice, COMPACTION_BORDER), Bound::Nothing), (text_row(DisplayRole::Assistant, COMPACTION_SUMMARY), Bound::Nothing)],
+    vec![text_row(DisplayRole::Notice, COMPACTION_BORDER), text_row(DisplayRole::Assistant, COMPACTION_SUMMARY), text_row(DisplayRole::User, BOUND_PROMPT), text_row(DisplayRole::Assistant, BOUND_REPLY)],
+    &[Bound::Listed(2), Bound::Listed(3), Bound::Listed(0), Bound::Listed(1)] ;
+    "the_summary_binds_above_the_turns_it_kept"
+)]
+#[test_case(
+    vec![(text_row(DisplayRole::User, REPEATED_PROMPT), Bound::Replaced), (text_row(DisplayRole::Notice, COMPACTION_BORDER), Bound::Nothing), (text_row(DisplayRole::Assistant, COMPACTION_SUMMARY), Bound::Nothing), (text_row(DisplayRole::User, REPEATED_PROMPT), Bound::Nothing)],
+    vec![text_row(DisplayRole::Notice, COMPACTION_BORDER), text_row(DisplayRole::Assistant, COMPACTION_SUMMARY), text_row(DisplayRole::User, REPEATED_PROMPT)],
+    &[Bound::Replaced, Bound::Listed(0), Bound::Listed(1), Bound::Listed(2)] ;
+    "a_new_prompt_binds_before_a_replaced_one_with_its_text"
+)]
+#[test_case(
+    vec![(text_row(DisplayRole::User, REPEATED_PROMPT), Bound::Replaced), (text_row(DisplayRole::User, REPEATED_PROMPT), Bound::Replaced), (text_row(DisplayRole::Notice, COMPACTION_BORDER), Bound::Nothing), (text_row(DisplayRole::Assistant, COMPACTION_SUMMARY), Bound::Nothing)],
+    vec![text_row(DisplayRole::Notice, COMPACTION_BORDER), text_row(DisplayRole::Assistant, COMPACTION_SUMMARY), text_row(DisplayRole::User, REPEATED_PROMPT)],
+    &[Bound::Replaced, Bound::Listed(2), Bound::Listed(0), Bound::Listed(1)] ;
+    "a_kept_turn_binds_before_an_older_one_with_its_text"
+)]
+#[test_case(
+    vec![(text_row(DisplayRole::User, REPEATED_PROMPT), Bound::Replaced), (text_row(DisplayRole::User, REPEATED_PROMPT), Bound::Listed(2)), (text_row(DisplayRole::Notice, COMPACTION_BORDER), Bound::Nothing), (text_row(DisplayRole::Assistant, COMPACTION_SUMMARY), Bound::Listed(1)), (text_row(DisplayRole::User, REPEATED_PROMPT), Bound::Nothing)],
+    vec![text_row(DisplayRole::Notice, COMPACTION_BORDER), text_row(DisplayRole::Assistant, COMPACTION_SUMMARY), text_row(DisplayRole::User, REPEATED_PROMPT), text_row(DisplayRole::User, REPEATED_PROMPT)],
+    &[Bound::Replaced, Bound::Listed(2), Bound::Listed(0), Bound::Listed(1), Bound::Listed(3)] ;
+    "bound_rows_keep_their_sources"
+)]
+fn bind_sources_crosses_a_compaction_seam(
+    rows: Vec<(DisplayMessage, Bound)>,
+    sources: Vec<DisplayMessage>,
+    expected: &[Bound],
+) {
+    let sources = with_sources(sources);
+    let mut panel = MessagesPanel::new(UiConfig::default(), EventHandle::disconnected_for_test());
+    for (mut row, bound) in rows {
+        row.source = match bound {
+            Bound::Nothing => None,
+            Bound::Listed(index) => sources[index].source,
+            Bound::Replaced => Some(DisplaySource::User(CaudraId::generate())),
+        };
+        panel.push(row);
+    }
+
+    panel.bind_sources(&sources);
+
+    let bound: Vec<_> = panel
+        .messages
+        .iter()
+        .map(|row| match row.source {
+            None => Bound::Nothing,
+            Some(bound) => sources
+                .iter()
+                .position(|source| source.source == Some(bound))
+                .map_or(Bound::Replaced, Bound::Listed),
+        })
+        .collect();
+    assert_eq!(bound, expected, "{SEAM_MSG}");
 }
 
 #[test]

@@ -969,6 +969,14 @@ pub fn history_to_display(
     show_reminders: bool,
 ) -> (Vec<DisplayMessage>, Vec<caudra_lua::RestoreItem>) {
     let results = build_tool_results_map(items);
+    let mut image_counts: HashMap<CaudraId, usize> = HashMap::new();
+    for item in items {
+        if let HistoryItemKind::User { images, .. } = &item.kind
+            && !images.is_empty()
+        {
+            *image_counts.entry(item.group_id).or_default() += images.len();
+        }
+    }
     let mut display = Vec::new();
     let mut restore_items: Vec<caudra_lua::RestoreItem> = Vec::new();
     let mut displayed_user_groups = HashSet::new();
@@ -1012,7 +1020,11 @@ pub fn history_to_display(
                 if displayed_user_groups.insert(item.group_id)
                     && let Some((id, text)) = visible_user_text(items, item.group_id)
                 {
-                    let mut message = DisplayMessage::new(DisplayRole::User, text.to_owned());
+                    let image_count = image_counts.get(&item.group_id).copied().unwrap_or(0);
+                    let mut message = DisplayMessage::new(
+                        DisplayRole::User,
+                        format_with_images(text, image_count),
+                    );
                     message.source = Some(DisplaySource::User(id));
                     display.push(message);
                 }
@@ -1155,6 +1167,16 @@ pub fn history_to_display(
         }
     }
     (display, restore_items)
+}
+
+/// The text a prompt's bubble shows, live and restored alike, so the two can
+/// be matched to bind the live bubble to its history.
+pub(crate) fn format_with_images(text: &str, image_count: usize) -> String {
+    match image_count {
+        0 => text.to_owned(),
+        1 => format!("{text} [1 image]"),
+        n => format!("{text} [{n} images]"),
+    }
 }
 
 fn visible_user_text(items: &[HistoryItem], group_id: CaudraId) -> Option<(CaudraId, &str)> {

@@ -5699,10 +5699,18 @@ fn display_key(message: &DisplayMessage) -> Option<DisplayKey<'_>> {
     }
 }
 
-/// Pairs each row with the first source row after the previous match that
-/// shows the same item, and hands back that source by row index. Every row
-/// older than the sources, which after a compaction is most of them, used to
-/// rescan all the sources; indexing them by key makes each row one lookup.
+/// Pairs rows with the source rows that show the same item, and hands back
+/// each new pairing by row index. Sources are indexed by key, so a row costs
+/// one lookup however many sources there are.
+///
+/// A row whose source is still listed keeps it and anchors the rows around
+/// it. Sourceless rows bind next, oldest first, each to the first unclaimed
+/// source past the last bound row, or else to any unclaimed one: a compaction
+/// draws its summary below the turns it kept while the history re-adds those
+/// turns below the summary, so order alone cannot place it. Rows whose source
+/// a compaction replaced bind last, to whatever is left, so an old prompt
+/// cannot take the source of a new one with the same text. They walk newest
+/// first, because the turns a compaction keeps are the newest it saw.
 fn matched_sources(
     rows: &[DisplayMessage],
     sources: &[DisplayMessage],
@@ -5713,26 +5721,86 @@ fn matched_sources(
             by_key.entry(key).or_default().push(index);
         }
     }
+    let mut bound: Vec<Option<usize>> = rows
+        .iter()
+        .map(|row| {
+            let source = row.source?;
+            key_candidates(&by_key, row)?
+                .iter()
+                .copied()
+                .find(|&index| sources[index].source == Some(source))
+        })
+        .collect();
+    let mut claimed = vec![false; sources.len()];
+    for &index in bound.iter().flatten() {
+        claimed[index] = true;
+    }
     let mut matched = Vec::new();
-    let mut start = 0;
-    for (row, message) in rows.iter().enumerate() {
-        let Some(candidates) = display_key(message).and_then(|key| by_key.get(&key)) else {
-            continue;
-        };
-        let unclaimed = &candidates[candidates.partition_point(|&index| index < start)..];
-        let Some(&index) = unclaimed
-            .iter()
-            .find(|&&index| same_display_item(message, &sources[index]))
-        else {
-            continue;
-        };
-        matched.push((row, sources[index].source));
-        start = index + 1;
-        if start == sources.len() {
-            break;
+    let mut visit = |row: usize, last: Option<usize>, replaced: bool| {
+        if bound[row].is_some() {
+            return bound[row];
         }
+        let message = &rows[row];
+        if message.source.is_some() != replaced {
+            return last;
+        }
+        let fits = |index: usize| !claimed[index] && same_display_item(message, &sources[index]);
+        let Some(index) = key_candidates(&by_key, message)
+            .and_then(|candidates| nearest_candidate(candidates, last, replaced, fits))
+        else {
+            return last;
+        };
+        claimed[index] = true;
+        bound[row] = Some(index);
+        matched.push((row, sources[index].source));
+        Some(index)
+    };
+    let mut last = None;
+    for row in 0..rows.len() {
+        last = visit(row, last, false);
+    }
+    let mut last = None;
+    for row in (0..rows.len()).rev() {
+        last = visit(row, last, true);
     }
     matched
+}
+
+fn key_candidates<'a>(
+    by_key: &'a HashMap<DisplayKey<'a>, Vec<usize>>,
+    message: &'a DisplayMessage,
+) -> Option<&'a [usize]> {
+    by_key.get(&display_key(message)?).map(Vec::as_slice)
+}
+
+/// The first candidate `fits` accepts, walking away from `last` in the
+/// direction of the pass and then wrapping around to the rest.
+fn nearest_candidate(
+    candidates: &[usize],
+    last: Option<usize>,
+    newest_first: bool,
+    fits: impl Fn(usize) -> bool,
+) -> Option<usize> {
+    if newest_first {
+        let split = last.map_or(candidates.len(), |last| {
+            candidates.partition_point(|&index| index < last)
+        });
+        let (before, after) = candidates.split_at(split);
+        before
+            .iter()
+            .rev()
+            .chain(after.iter().rev())
+            .copied()
+            .find(|&index| fits(index))
+    } else {
+        let split = last.map_or(0, |last| candidates.partition_point(|&index| index <= last));
+        let (before, after) = candidates.split_at(split);
+        after
+            .iter()
+            .chain(before)
+            .copied()
+            .find(|&index| fits(index))
+    }
 }
 
 fn same_display_item(left: &DisplayMessage, right: &DisplayMessage) -> bool {

@@ -8,9 +8,10 @@ use caudra_agent::{PromptAdmission, QueueDelivery, QueueItemId, is_run_failure_m
 use caudra_providers::{HistoryItemKind, ImageMediaType, ImageSource};
 use caudra_storage::id::CaudraId;
 
-use super::{Action, App, Status, format_with_images};
+use super::{Action, App, Status};
 
 use crate::agent::shared_queue::{QueueItem, QueueSender};
+use crate::chat::format_with_images;
 use crate::components::input::{InputAction, InputState, Submission};
 use crate::components::mode_submission::{ModeSubmissionAction, ModeSubmissionChoice};
 use crate::components::queue_panel::{QueueEntry, set_movement_flags};
