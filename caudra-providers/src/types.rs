@@ -677,6 +677,13 @@ pub const THINKING_USAGE: &str = "Usage: /thinking [off|adaptive|<effort level>|
 /// uses it from 4.7 onward.
 const ADAPTIVE_SINCE: (u32, u32) = (4, 7);
 const EARLY_ADAPTIVE_VERSION: (u32, u32) = (4, 6);
+/// From Sonnet 5 a request without a `thinking` field reasons, so off has to
+/// be said. Sonnet 5.5 rejects `disabled` and names `between_tools`, which
+/// keeps up-front thinking off, as its lowest setting.
+const SONNET_REASONS_UNASKED_SINCE: (u32, u32) = (5, 0);
+const BETWEEN_TOOLS_SINCE: (u32, u32) = (5, 5);
+const THINKING_DISABLED: &str = "disabled";
+const THINKING_BETWEEN_TOOLS: &str = "between_tools";
 const OPUS: &str = "opus";
 const SONNET: &str = "sonnet";
 
@@ -938,6 +945,11 @@ impl ThinkingConfig {
         let resolved = self.resolve(model);
         if Self::supports_adaptive(&model.id) && !matches!(resolved, ResolvedThinking::Budget(_)) {
             if !resolved.is_enabled() {
+                // `between_tools` takes no other field and runs only up to
+                // `high`, so off names neither a display nor an effort.
+                if let Some(off) = Self::explicit_off(&model.id) {
+                    body["thinking"] = json!({"type": off});
+                }
                 return;
             }
             body["thinking"] = json!({"type": "adaptive"});
@@ -977,6 +989,17 @@ impl ThinkingConfig {
 
     fn omits_adaptive_thinking(model_id: &str) -> bool {
         claude_version(model_id).is_some_and(|(_, version)| version >= ADAPTIVE_SINCE)
+    }
+
+    /// Off for a model that reasons when the field is absent. Only Sonnet
+    /// offers off at all: Opus and Fable declare no toggle, so their off
+    /// resolves to the shallowest effort instead.
+    fn explicit_off(model_id: &str) -> Option<&'static str> {
+        match claude_version(model_id)? {
+            (SONNET, version) if version >= BETWEEN_TOOLS_SINCE => Some(THINKING_BETWEEN_TOOLS),
+            (SONNET, version) if version >= SONNET_REASONS_UNASKED_SINCE => Some(THINKING_DISABLED),
+            _ => None,
+        }
     }
 
     /// The level to send, or `None` when this model has none to name and its
@@ -1542,6 +1565,11 @@ mod tests {
     #[test_case(effort("high"), "claude-opus-4.7", json!({"thinking": {"type": "adaptive", "display": "summarized"}, "output_config": {"effort": "high"}}) ; "effort_adaptive_copilot_dotted_id")]
     #[test_case(effort("high"), "anthropic/claude-opus-4-7", json!({"thinking": {"type": "adaptive", "display": "summarized"}, "output_config": {"effort": "high"}}) ; "effort_adaptive_gateway_prefixed_id")]
     #[test_case(ThinkingConfig::Budget(2048), "claude-3-5-sonnet-20241022", json!({"thinking": {"type": "enabled", "budget_tokens": 2048}}) ; "budget_legacy_dated_id")]
+    #[test_case(ThinkingConfig::Off, "claude-sonnet-4-6", json!({}) ; "sonnet_4_6_is_off_without_the_field")]
+    #[test_case(ThinkingConfig::Off, "claude-sonnet-5", json!({"thinking": {"type": "disabled"}}) ; "sonnet_5_says_disabled")]
+    #[test_case(ThinkingConfig::Off, "claude-sonnet-5-5", json!({"thinking": {"type": "between_tools"}}) ; "sonnet_5_5_says_between_tools")]
+    #[test_case(ThinkingConfig::Off, "claude-sonnet-5.5", json!({"thinking": {"type": "between_tools"}}) ; "sonnet_5_5_copilot_dotted_id_says_between_tools")]
+    #[test_case(effort("high"), "claude-sonnet-5-5", json!({"thinking": {"type": "adaptive", "display": "summarized"}, "output_config": {"effort": "high"}}) ; "sonnet_5_5_effort_stays_adaptive")]
     fn thinking_apply_to_body(config: ThinkingConfig, model_id: &str, expected: Value) {
         let mut body = json!({});
         config.apply_to_body(&mut body, &thinking_model(model_id));

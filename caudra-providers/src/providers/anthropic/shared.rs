@@ -1095,7 +1095,7 @@ mod tests {
     };
     use crate::{
         ContentBlock, Message, Model, ProviderEvent, StandingReminderKind, SteeringKind,
-        invalid_tool_input,
+        ThinkingConfig, invalid_tool_input,
     };
 
     const STEERING_TEXT: &str = "Continue with a useful response.";
@@ -1198,6 +1198,15 @@ mod tests {
         let model = Model::from_spec(spec).unwrap();
         let options = model.reasoning_options();
         assert_eq!(options.snap(asked), Some(expected), "{REJECTED_LEVEL}");
+    }
+
+    /// Off resolves through the table: Sonnet's toggle keeps it off rather than
+    /// snapping it to a level, and the version decides how it is said.
+    #[test_case("anthropic/claude-sonnet-5", json!({"type": "disabled"}) ; "sonnet_5_says_disabled")]
+    fn thinking_off_reaches_the_wire_as_the_model_spells_it(spec: &str, expected: Value) {
+        let model = Model::from_spec(spec).unwrap();
+        let body = super::request_body(&model, &[], None, "", &json!([]), &ThinkingConfig::Off);
+        assert_eq!(body["thinking"], expected);
     }
 
     use super::{
