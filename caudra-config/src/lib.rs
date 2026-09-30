@@ -24,6 +24,8 @@ const PERMISSIONS_FILE: &str = "permissions.toml";
 pub const PERMISSIONS_VERSION: u32 = 1;
 const SHELL_PERMISSION_TOOLS: &[&str] = &["bash", "shell"];
 const UNSET_DEFAULT: &str = "unset";
+/// An `[mcp.SERVER]` rule entry that covers every tool of the server.
+const MCP_WHOLE_SERVER: &str = "*";
 /// Tools whose card never opens on its own. A truncated prefix of one of
 /// these bodies carries nothing: a read and a fetch are windows into a
 /// document, and a glob, a grep and an index are ordered by path or by source
@@ -1356,18 +1358,48 @@ impl RetentionFileConfig {
     }
 }
 
-#[derive(Debug, Clone)]
-struct ParsedPermissionRule {
-    tool: ToolKey,
-    effect: Effect,
+/// One rule of an `[mcp.SERVER]` table. MCP rules name whole tools, so none
+/// carries a scope.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpPermissionRule {
+    pub tool: ToolKey,
+    pub effect: Effect,
+}
+
+/// The `[mcp]` table of a permissions file. The local loader and the remote
+/// project context both read it through [`McpPermissions::parse`], so a rule
+/// that works in one works in the other.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct McpPermissions {
+    pub rules: Vec<McpPermissionRule>,
+    pub defaults: HashMap<ToolKey, DefaultEffect>,
+}
+
+#[derive(Debug, Error)]
+pub enum McpPermissionsError {
+    #[error("[mcp] is not a table")]
+    NotATable,
+    #[error("[mcp.{0}] is not a table")]
+    ServerNotATable(String),
+    #[error("invalid MCP server name {0}; expected only alphanumeric characters and hyphens")]
+    ServerName(String),
+    #[error("[mcp.{server}].{key} entries must be strings")]
+    NonStringEntry { server: String, key: String },
+    #[error("[mcp.{server}].{key} must be an array of tool names, a tool name, or a boolean")]
+    RuleType { server: String, key: String },
+    #[error("invalid MCP tool name: {0}")]
+    ToolName(#[from] ToolKeyParseError),
+    #[error("invalid [mcp.{0}].default; expected allow, deny, or prompt")]
+    Default(String),
+    #[error("unknown key [mcp.{server}].{key}")]
+    UnknownKey { server: String, key: String },
 }
 
 #[derive(Default)]
 struct PermissionsFileConfig {
     default: Option<DefaultEffect>,
     tools: HashMap<String, ToolPermissions>,
-    mcp_rules: Vec<ParsedPermissionRule>,
-    mcp_defaults: HashMap<ToolKey, DefaultEffect>,
+    mcp: McpPermissions,
     loaded_file: Option<(PathBuf, String)>,
 }
 
@@ -1383,34 +1415,14 @@ impl<'de> Deserialize<'de> for PermissionsFileConfig {
             .transpose()?;
 
         let mut tools = HashMap::new();
-        let mut mcp_rules = Vec::new();
-        let mut mcp_defaults = HashMap::new();
+        let mut mcp = McpPermissions::default();
 
         for (k, v) in table.iter() {
             if k == "default" {
                 continue;
             }
             if k == "mcp" {
-                // TOML [mcp.server] creates nested table: mcp → {server → {...}}
-                if let Some(mcp_table) = v.as_table() {
-                    for (server_name, server_value) in mcp_table {
-                        if let Some(server_table) = server_value.as_table() {
-                            parse_mcp_server_table(
-                                server_name,
-                                server_table,
-                                &mut mcp_rules,
-                                &mut mcp_defaults,
-                            )
-                            .map_err(serde::de::Error::custom)?;
-                        } else {
-                            return Err(serde::de::Error::custom(format!(
-                                "[mcp.{server_name}] is not a table"
-                            )));
-                        }
-                    }
-                } else {
-                    return Err(serde::de::Error::custom("[mcp] is not a table"));
-                }
+                mcp = McpPermissions::parse(v).map_err(serde::de::Error::custom)?;
             } else {
                 if k != "*" && !is_valid_wire_name(k) {
                     return Err(serde::de::Error::custom(format!(
@@ -1427,8 +1439,7 @@ impl<'de> Deserialize<'de> for PermissionsFileConfig {
         Ok(Self {
             default,
             tools,
-            mcp_rules,
-            mcp_defaults,
+            mcp,
             loaded_file: None,
         })
     }
@@ -2979,110 +2990,81 @@ pub fn is_valid_server_name(name: &str) -> bool {
         && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
 }
 
-fn push_mcp_tool_rule(
-    rules: &mut Vec<ParsedPermissionRule>,
-    server_name: &str,
-    tool_name: &str,
-    effect: Effect,
-) -> Result<(), String> {
-    let qualified = format!("{server_name}.{tool_name}");
-    match ToolKey::parse(&qualified) {
-        Ok(key) => rules.push(ParsedPermissionRule { tool: key, effect }),
-        Err(error) => return Err(format!("invalid MCP tool name: {error}")),
-    }
-    Ok(())
-}
-
-fn parse_mcp_server_table(
-    server_name: &str,
-    table: &toml::Table,
-    rules: &mut Vec<ParsedPermissionRule>,
-    mcp_defaults: &mut HashMap<ToolKey, DefaultEffect>,
-) -> Result<(), String> {
-    if !is_valid_server_name(server_name) {
-        return Err(format!(
-            "invalid MCP server name {server_name}; expected only alphanumeric characters and hyphens"
-        ));
-    }
-
-    for (key, value) in table {
-        match key.as_str() {
-            "allow" | "ask" | "deny" => {
-                let effect = match key.as_str() {
-                    "allow" => Effect::Allow,
-                    "ask" => Effect::Ask,
-                    "deny" => Effect::Deny,
-                    _ => unreachable!(),
-                };
-                match value {
-                    toml::Value::Array(arr) => {
-                        for item in arr {
-                            let tool_name = item.as_str().ok_or_else(|| {
-                                format!("[mcp.{server_name}].{key} entries must be strings")
-                            })?;
-                            if tool_name == "*" {
-                                rules.push(ParsedPermissionRule {
-                                    tool: ToolKey::McpServer {
-                                        server: server_name.into(),
-                                    },
-                                    effect,
-                                });
-                                continue;
-                            }
-                            push_mcp_tool_rule(rules, server_name, tool_name, effect)?;
-                        }
-                    }
-                    toml::Value::Boolean(true) => {
-                        rules.push(ParsedPermissionRule {
-                            tool: ToolKey::McpServer {
-                                server: server_name.into(),
-                            },
-                            effect,
-                        });
-                    }
-                    toml::Value::Boolean(false) => {
-                        // No-op: explicitly disabled.
-                    }
-                    toml::Value::String(s) => {
-                        let tool_name = s.as_str();
-                        if tool_name == "*" {
-                            // Treat `allow = "*"` the same as `allow = ["*"]` —
-                            // create a hard McpServer rule, not a default.
-                            rules.push(ParsedPermissionRule {
-                                tool: ToolKey::McpServer {
-                                    server: server_name.into(),
-                                },
-                                effect,
-                            });
-                        } else {
-                            push_mcp_tool_rule(rules, server_name, tool_name, effect)?;
-                        }
-                    }
-                    _ => {
-                        return Err(format!(
-                            "[mcp.{server_name}].{key} must be an array of tool names, a tool name, or a boolean"
-                        ));
-                    }
-                }
-            }
-            "default" => {
-                if let Ok(d) = value.clone().try_into::<DefaultEffect>() {
-                    mcp_defaults.insert(
-                        ToolKey::McpServer {
-                            server: server_name.into(),
-                        },
-                        d,
-                    );
-                } else {
-                    return Err(format!(
-                        "invalid [mcp.{server_name}].default; expected allow, deny, or prompt"
-                    ));
-                }
-            }
-            other => return Err(format!("unknown key [mcp.{server_name}].{other}")),
+impl McpPermissions {
+    /// Reads the `[mcp]` value of a permissions file: one table per server,
+    /// each holding `allow`, `ask`, and `deny` rules and a `default`.
+    pub fn parse(mcp: &toml::Value) -> Result<Self, McpPermissionsError> {
+        let servers = mcp.as_table().ok_or(McpPermissionsError::NotATable)?;
+        let mut permissions = Self::default();
+        for (server, table) in servers {
+            let table = table
+                .as_table()
+                .ok_or_else(|| McpPermissionsError::ServerNotATable(server.clone()))?;
+            permissions.add_server(server, table)?;
         }
+        Ok(permissions)
     }
-    Ok(())
+
+    fn add_server(&mut self, server: &str, table: &toml::Table) -> Result<(), McpPermissionsError> {
+        if !is_valid_server_name(server) {
+            return Err(McpPermissionsError::ServerName(server.to_owned()));
+        }
+        let whole_server = ToolKey::McpServer {
+            server: server.into(),
+        };
+        for (key, value) in table {
+            let effect = match key.as_str() {
+                "allow" => Effect::Allow,
+                "ask" => Effect::Ask,
+                "deny" => Effect::Deny,
+                "default" => {
+                    let default = value
+                        .clone()
+                        .try_into()
+                        .map_err(|_| McpPermissionsError::Default(server.to_owned()))?;
+                    self.defaults.insert(whole_server.clone(), default);
+                    continue;
+                }
+                _ => {
+                    return Err(McpPermissionsError::UnknownKey {
+                        server: server.to_owned(),
+                        key: key.clone(),
+                    });
+                }
+            };
+            let tools = match value {
+                toml::Value::Boolean(true) => vec![MCP_WHOLE_SERVER],
+                toml::Value::Boolean(false) => Vec::new(),
+                toml::Value::String(tool) => vec![tool.as_str()],
+                toml::Value::Array(entries) => entries
+                    .iter()
+                    .map(|entry| {
+                        entry
+                            .as_str()
+                            .ok_or_else(|| McpPermissionsError::NonStringEntry {
+                                server: server.to_owned(),
+                                key: key.clone(),
+                            })
+                    })
+                    .collect::<Result<_, _>>()?,
+                _ => {
+                    return Err(McpPermissionsError::RuleType {
+                        server: server.to_owned(),
+                        key: key.clone(),
+                    });
+                }
+            };
+            for tool in tools {
+                let tool = if tool == MCP_WHOLE_SERVER {
+                    whole_server.clone()
+                } else {
+                    ToolKey::parse(&format!("{server}.{tool}"))?
+                };
+                self.rules.push(McpPermissionRule { tool, effect });
+            }
+        }
+        Ok(())
+    }
 }
 
 fn build_permissions(
@@ -3117,7 +3099,7 @@ fn build_permissions(
             }
         }
     }
-    for (key, d) in &global.mcp_defaults {
+    for (key, d) in &global.mcp.defaults {
         if *d != DefaultEffect::Allow {
             tool_defaults.insert(key.clone(), *d);
         }
@@ -3145,7 +3127,7 @@ fn build_permissions(
             }
         }
     }
-    for (key, d) in &project.mcp_defaults {
+    for (key, d) in &project.mcp.defaults {
         if *d != DefaultEffect::Allow {
             let inherited = tool_defaults.get(key).copied().unwrap_or(global_default);
             tool_defaults.insert(
@@ -3160,13 +3142,13 @@ fn build_permissions(
     }
 
     let mut rules = Vec::new();
-    push_parsed_rules(&mut rules, &global.mcp_rules, Effect::Deny);
+    push_parsed_rules(&mut rules, &global.mcp.rules, Effect::Deny);
     push_rules(&mut rules, &global.tools, Effect::Deny);
     push_rules(&mut rules, &project.tools, Effect::Deny);
-    push_parsed_rules(&mut rules, &project.mcp_rules, Effect::Deny);
+    push_parsed_rules(&mut rules, &project.mcp.rules, Effect::Deny);
     for config in [&global, &project] {
         push_rules(&mut rules, &config.tools, Effect::Ask);
-        push_parsed_rules(&mut rules, &config.mcp_rules, Effect::Ask);
+        push_parsed_rules(&mut rules, &config.mcp.rules, Effect::Ask);
     }
     push_rules(&mut rules, &global.tools, Effect::Allow);
 
@@ -3177,13 +3159,13 @@ fn build_permissions(
     push_rules(&mut project_restrictive_rules, &project.tools, Effect::Deny);
     push_parsed_rules(
         &mut project_restrictive_rules,
-        &project.mcp_rules,
+        &project.mcp.rules,
         Effect::Deny,
     );
     push_rules(&mut project_restrictive_rules, &project.tools, Effect::Ask);
     push_parsed_rules(
         &mut project_restrictive_rules,
-        &project.mcp_rules,
+        &project.mcp.rules,
         Effect::Ask,
     );
 
@@ -3199,7 +3181,7 @@ fn build_permissions(
         for effect in [Effect::Deny, Effect::Ask, Effect::Allow] {
             push_rules(&mut loaded_rules, &config.tools, effect);
             if effect != Effect::Allow {
-                push_parsed_rules(&mut loaded_rules, &config.mcp_rules, effect);
+                push_parsed_rules(&mut loaded_rules, &config.mcp.rules, effect);
             }
         }
         loaded_sources.extend(loaded_rules.into_iter().map(|rule| LoadedPermissionSource {
@@ -3238,7 +3220,7 @@ fn has_invalid_shell_patterns(config: &PermissionsFileConfig) -> bool {
 
 fn push_parsed_rules(
     rules: &mut Vec<PermissionRule>,
-    parsed_rules: &[ParsedPermissionRule],
+    parsed_rules: &[McpPermissionRule],
     effect: Effect,
 ) {
     rules.extend(
@@ -3317,7 +3299,7 @@ fn push_review_candidates(
             ScopeSet::All(false) => {}
         }
     }
-    for (tool, default) in &config.mcp_defaults {
+    for (tool, default) in &config.mcp.defaults {
         if *default == DefaultEffect::Allow {
             candidates.push(PermissionReviewCandidate {
                 source,
@@ -3327,7 +3309,7 @@ fn push_review_candidates(
             });
         }
     }
-    for rule in &config.mcp_rules {
+    for rule in &config.mcp.rules {
         if rule.effect == Effect::Allow {
             candidates.push(PermissionReviewCandidate {
                 source,

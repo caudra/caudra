@@ -3,8 +3,8 @@ use std::sync::{Arc, LazyLock, Mutex};
 
 use caudra_config::config_version::{ConfigVersion, ConfigVersionError};
 use caudra_config::{
-    DefaultEffect, Effect, Feature, FeatureFlags, PERMISSIONS_VERSION, PermissionRule,
-    PermissionsConfig, ToolKey,
+    DefaultEffect, Effect, Feature, FeatureFlags, McpPermissionRule, McpPermissions,
+    PERMISSIONS_VERSION, PermissionRule, PermissionsConfig, ToolKey,
 };
 use caudra_workflow::meta::MAX_SOURCE_BYTES;
 use caudra_workflow::{WORKFLOW_ABI_VERSION, WORKFLOW_LANGUAGE_VERSION, WorkflowMeta, parse_meta};
@@ -796,7 +796,7 @@ pub fn parse_remote_permissions(
             continue;
         }
         if name == "mcp" {
-            parse_remote_mcp(value, &mut declarations)?;
+            parse_remote_mcp(&value, &mut declarations)?;
             continue;
         }
         let key = ToolKey::parse(&name).map_err(|_| permission_content_error())?;
@@ -806,29 +806,23 @@ pub fn parse_remote_permissions(
 }
 
 fn parse_remote_mcp(
-    value: toml::Value,
+    value: &toml::Value,
     declarations: &mut RemotePermissionDeclarations,
 ) -> Result<(), RemoteProjectContextError> {
-    let servers = value.as_table().ok_or_else(permission_content_error)?;
-    for (server, value) in servers {
-        let table = value.as_table().ok_or_else(permission_content_error)?;
-        for (tool, value) in table {
-            let name = if tool == "default" {
-                format!("{server}.*")
-            } else {
-                format!("{server}.{tool}")
-            };
-            let key = ToolKey::parse(&name).map_err(|_| permission_content_error())?;
-            if tool == "default" {
-                let effect: DefaultEffect = value
-                    .clone()
-                    .try_into()
-                    .map_err(|_| permission_content_error())?;
-                insert_default(key, effect, declarations);
-            } else {
-                parse_tool_declaration(key, value.clone(), declarations)?;
-            }
-        }
+    let permissions = McpPermissions::parse(value).map_err(|_| permission_content_error())?;
+    for McpPermissionRule { tool, effect } in permissions.rules {
+        let rules = match effect {
+            Effect::Allow => &mut declarations.allow_rules,
+            Effect::Ask | Effect::Deny => &mut declarations.restrictive_rules,
+        };
+        rules.push(PermissionRule {
+            tool,
+            scope: None,
+            effect,
+        });
+    }
+    for (tool, effect) in permissions.defaults {
+        insert_default(tool, effect, declarations);
     }
     Ok(())
 }
@@ -931,6 +925,8 @@ pub(crate) mod tests {
     const MANIFEST_REVISION: &str = "manifest-1";
     const UNKNOWN_INSTRUCTION: &str = "docs/NOTES.md";
     const PERSONAL_RULE: &str = "personal rule";
+    const MCP_SERVER: &str = "github";
+    const MCP_TOOL: &str = "admin_delete";
     /// Pinned copy of `INSTRUCTION_FILES` in
     /// `workcell-mcp/crates/mcp-files/src/workspace.rs`. Update it deliberately,
     /// after teaching Caudra to accept whatever Workcell started declaring.
@@ -1686,6 +1682,70 @@ pub(crate) mod tests {
         assert_eq!(declarations.restrictive_rules[0].effect, Effect::Deny);
         assert_eq!(declarations.allow_rules.len(), 1);
         assert_eq!(declarations.allow_rules[0].effect, Effect::Allow);
+    }
+
+    fn mcp_server() -> ToolKey {
+        ToolKey::McpServer {
+            server: MCP_SERVER.into(),
+        }
+    }
+
+    #[test_case("[mcp.github]\ndeny = [\"admin_delete\"]\n", Effect::Deny, false ; "deny_list")]
+    #[test_case("[mcp.github]\nask = \"admin_delete\"\n", Effect::Ask, false ; "ask_one_name")]
+    #[test_case("[mcp.github]\ndeny = \"*\"\n", Effect::Deny, true ; "deny_star")]
+    #[test_case("[mcp.github]\nask = [\"*\"]\n", Effect::Ask, true ; "ask_star_in_list")]
+    #[test_case("[mcp.github]\nallow = true\n", Effect::Allow, true ; "allow_whole_server")]
+    fn documented_mcp_rules_apply_to_remote_projects(
+        source: &str,
+        effect: Effect,
+        whole_server: bool,
+    ) {
+        let declarations = parse_remote_permissions(source.as_bytes()).unwrap();
+        let tool = if whole_server {
+            mcp_server()
+        } else {
+            ToolKey::McpTool {
+                server: MCP_SERVER.into(),
+                tool: MCP_TOOL.into(),
+            }
+        };
+        let (declared, other) = match effect {
+            Effect::Allow => (&declarations.allow_rules, &declarations.restrictive_rules),
+            Effect::Ask | Effect::Deny => {
+                (&declarations.restrictive_rules, &declarations.allow_rules)
+            }
+        };
+        assert_eq!(
+            declared,
+            &[PermissionRule {
+                tool,
+                scope: None,
+                effect,
+            }]
+        );
+        assert!(other.is_empty());
+    }
+
+    #[test]
+    fn a_remote_mcp_default_is_a_default_and_a_false_rule_is_none() {
+        let declarations =
+            parse_remote_permissions(b"[mcp.github]\nallow = false\ndefault = \"deny\"\n").unwrap();
+        assert!(declarations.restrictive_rules.is_empty());
+        assert!(declarations.allow_rules.is_empty());
+        assert_eq!(
+            declarations.restrictive_defaults,
+            HashMap::from([(mcp_server(), DefaultEffect::Deny)])
+        );
+    }
+
+    #[test_case("[mcp.github]\nremove = true\n" ; "unknown_key")]
+    #[test_case("[mcp.github.admin_delete]\ndeny = true\n" ; "nested_tool_table")]
+    #[test_case("[mcp.github]\ndeny = 1\n" ; "wrong_rule_type")]
+    fn remote_mcp_rules_the_local_loader_refuses_are_refused(source: &str) {
+        assert_eq!(
+            parse_remote_permissions(source.as_bytes()),
+            Err(permission_content_error())
+        );
     }
 
     #[test]
