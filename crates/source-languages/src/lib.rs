@@ -160,6 +160,12 @@ impl Language {
 
     /// Resolves a language from a bare extension, without the leading dot.
     ///
+    /// A `.h` header resolves to C++. Which language owns a header is not decidable from the file
+    /// alone, and the two wrong answers are not equally bad: a C header parses acceptably under the
+    /// C++ grammar, while a C++ header under the C grammar loses its namespaces, classes, and
+    /// templates. [`Language::compatible_with`] lets a `.c` definition still resolve against the
+    /// declaration in its header.
+    ///
     /// Metal Shading Language (`.metal`) is a C++14 dialect and resolves to C++: its address-space
     /// qualifiers error-recover to single tokens and leave the enclosing definitions intact.
     #[must_use]
@@ -173,8 +179,8 @@ impl Language {
             "go" => Self::Go,
             "htm" | "html" => Self::Html,
             "java" => Self::Java,
-            "c" | "h" => Self::C,
-            "cpp" | "cc" | "cxx" | "c++" | "hpp" | "hxx" | "hh" | "h++" | "ixx" | "cppm"
+            "c" => Self::C,
+            "h" | "cpp" | "cc" | "cxx" | "c++" | "hpp" | "hxx" | "hh" | "h++" | "ixx" | "cppm"
             | "ccm" | "cxxm" | "inl" | "ipp" | "tpp" | "tcc" | "metal" => Self::Cpp,
             "cs" => Self::CSharp,
             "rb" | "rake" | "gemspec" => Self::Ruby,
@@ -329,9 +335,12 @@ impl Language {
     /// Whether a reference written in `self` may resolve to a definition written in `other`.
     ///
     /// Same-language is always compatible. TypeScript and JavaScript are mutually compatible
-    /// because they share a grammar, a module system, and in practice a single project. Everything
-    /// else is refused: a YAML key named `deploy` and a Go function named `deploy` are not the same
-    /// symbol, and letting one resolve the other manufactures edges out of a spelling coincidence.
+    /// because they share a grammar, a module system, and in practice a single project. C and C++
+    /// are mutually compatible as well: they link into one symbol namespace, and every `.h` parses
+    /// as C++, so a `.c` definition has to resolve against the prototype its header declares.
+    /// Everything else is refused: a YAML key named `deploy` and a Go function named `deploy` are
+    /// not the same symbol, and letting one resolve the other manufactures edges out of a spelling
+    /// coincidence.
     #[must_use]
     pub const fn compatible_with(self, other: Self) -> bool {
         matches!(
@@ -340,13 +349,15 @@ impl Language {
                 Self::TypeScript | Self::JavaScript,
                 Self::TypeScript | Self::JavaScript
             )
-        ) || matches!(
-            (self, other),
-            (
-                Self::BazelBuild | Self::BazelModule | Self::BazelBzl,
-                Self::BazelBuild | Self::BazelModule | Self::BazelBzl
+        ) || matches!((self, other), (Self::C | Self::Cpp, Self::C | Self::Cpp))
+            || matches!(
+                (self, other),
+                (
+                    Self::BazelBuild | Self::BazelModule | Self::BazelBzl,
+                    Self::BazelBuild | Self::BazelModule | Self::BazelBzl
+                )
             )
-        ) || (self as u8) == (other as u8)
+            || (self as u8) == (other as u8)
     }
 
     /// The uncompiled tags query source for this language.
@@ -454,6 +465,20 @@ mod tests {
         assert!(!Language::Json.compatible_with(Language::TypeScript));
         assert!(!Language::Markdown.compatible_with(Language::Rust));
         assert!(Language::Yaml.compatible_with(Language::Yaml));
+    }
+
+    #[test_case(Language::C, Language::Cpp ; "c resolves cpp")]
+    #[test_case(Language::Cpp, Language::C ; "cpp resolves c")]
+    fn c_family_sources_resolve_against_each_other(referrer: Language, definer: Language) {
+        assert!(referrer.compatible_with(definer));
+    }
+
+    #[test_case(Language::Cpp, Language::Rust ; "cpp does not resolve rust")]
+    #[test_case(Language::C, Language::Go ; "c does not resolve go")]
+    #[test_case(Language::Cpp, Language::Json ; "cpp does not resolve a config key")]
+    fn the_c_family_bridge_stops_at_the_family(referrer: Language, definer: Language) {
+        assert!(!referrer.compatible_with(definer));
+        assert!(!definer.compatible_with(referrer));
     }
 
     #[test]

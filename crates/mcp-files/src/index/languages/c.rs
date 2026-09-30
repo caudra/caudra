@@ -26,19 +26,7 @@ fn extract_nodes(
     match node.kind() {
         "preproc_include" => Ok(extract_include(node, context)?.into_iter().collect()),
         "preproc_def" => Ok(extract_define(node, context)?.into_iter().collect()),
-        "preproc_function_def" => {
-            let Some(name) = context.field(node, "name")? else {
-                return Ok(Vec::new());
-            };
-            let parameters = context
-                .field(node, "parameters")?
-                .map_or("", |parameters| context.text(parameters));
-            Ok(vec![Entry::item(
-                Section::Macro,
-                node,
-                format!("{}{parameters}", context.text(name)),
-            )])
-        }
+        "preproc_function_def" => Ok(extract_function_macro(node, context)?.into_iter().collect()),
         "function_definition" => Ok(function_signature(node, context)?
             .map(|signature| Entry::item(Section::Function, node, signature))
             .into_iter()
@@ -109,7 +97,36 @@ fn function_signature(node: Node<'_>, context: &Context<'_>) -> ExtractResult<Op
     ))))
 }
 
-fn extract_struct(node: Node<'_>, context: &Context<'_>, keyword: &str) -> ExtractResult<Entry> {
+pub(super) fn extract_function_macro(
+    node: Node<'_>,
+    context: &Context<'_>,
+) -> ExtractResult<Option<Entry>> {
+    let Some(name) = context.field(node, "name")? else {
+        return Ok(None);
+    };
+    let parameters = context
+        .field(node, "parameters")?
+        .map_or("", |parameters| context.text(parameters));
+    Ok(Some(Entry::item(
+        Section::Macro,
+        node,
+        format!("{}{parameters}", context.text(name)),
+    )))
+}
+
+fn field_text(field: Node<'_>, context: &Context<'_>) -> ExtractResult<String> {
+    Ok(
+        compact_whitespace(context.text(field).trim_end_matches(';'))
+            .trim()
+            .to_owned(),
+    )
+}
+
+pub(super) fn extract_struct(
+    node: Node<'_>,
+    context: &Context<'_>,
+    keyword: &str,
+) -> ExtractResult<Entry> {
     let name = context
         .field(node, "name")?
         .map_or("", |name| context.text(name));
@@ -127,13 +144,7 @@ fn extract_struct(node: Node<'_>, context: &Context<'_>, keyword: &str) -> Extra
     );
     if let Some(body) = context.child(node, "field_declaration_list")? {
         entry.item_mut().children =
-            extract_fields_truncated(body, context, "field_declaration", |field, context| {
-                Ok(
-                    compact_whitespace(context.text(field).trim_end_matches(';'))
-                        .trim()
-                        .to_owned(),
-                )
-            })?;
+            extract_fields_truncated(body, context, "field_declaration", field_text)?;
     }
     Ok(entry)
 }
@@ -165,78 +176,68 @@ fn extract_typedef(node: Node<'_>, context: &Context<'_>) -> ExtractResult<Optio
     let Some(field_type) = context.field(node, "type")? else {
         return Ok(None);
     };
+    if let Some(entry) = typedef_with_body(node, field_type, context)? {
+        return Ok(Some(entry));
+    }
+    Ok(Some(match field_type.kind() {
+        "struct_specifier" | "union_specifier" => extract_struct(field_type, context, "struct")?,
+        "enum_specifier" => extract_enum(field_type, context)?,
+        _ => {
+            let declaration = context
+                .field(node, "declarator")?
+                .map_or("", |declaration| context.text(declaration));
+            Entry::item(
+                Section::Type,
+                node,
+                compact_whitespace(&format!(
+                    "typedef {} {declaration}",
+                    context.text(field_type)
+                )),
+            )
+        }
+    }))
+}
+
+/// A `typedef` whose struct, union, or enum carries its body, rendered with the body's fields or
+/// variants as children. `None` for every other typedef, which each language renders its own way.
+pub(super) fn typedef_with_body(
+    node: Node<'_>,
+    field_type: Node<'_>,
+    context: &Context<'_>,
+) -> ExtractResult<Option<Entry>> {
+    let (keyword, body_kind) = match field_type.kind() {
+        "struct_specifier" => ("struct", "field_declaration_list"),
+        "union_specifier" => ("union", "field_declaration_list"),
+        "enum_specifier" => ("enum", "enumerator_list"),
+        _ => return Ok(None),
+    };
+    let Some(body) = context.child(field_type, body_kind)? else {
+        return Ok(None);
+    };
+    let name = context
+        .field(field_type, "name")?
+        .map_or("", |name| context.text(name));
+    let inner = if name.is_empty() {
+        keyword.to_owned()
+    } else {
+        format!("{keyword} {name}")
+    };
     let declaration = context
         .field(node, "declarator")?
         .map_or("", |declaration| context.text(declaration));
-    match field_type.kind() {
-        "struct_specifier" | "union_specifier" => {
-            if let Some(body) = context.child(field_type, "field_declaration_list")? {
-                let name = context
-                    .field(field_type, "name")?
-                    .map_or("", |name| context.text(name));
-                let keyword = if field_type.kind() == "union_specifier" {
-                    "union"
-                } else {
-                    "struct"
-                };
-                let inner = if name.is_empty() {
-                    keyword.to_owned()
-                } else {
-                    format!("{keyword} {name}")
-                };
-                let mut entry = Entry::item(
-                    Section::Type,
-                    node,
-                    format!("typedef {inner} {declaration}"),
-                );
-                entry.item_mut().children = extract_fields_truncated(
-                    body,
-                    context,
-                    "field_declaration",
-                    |field, context| {
-                        Ok(
-                            compact_whitespace(context.text(field).trim_end_matches(';'))
-                                .trim()
-                                .to_owned(),
-                        )
-                    },
-                )?;
-                Ok(Some(entry))
-            } else {
-                Ok(Some(extract_struct(field_type, context, "struct")?))
-            }
-        }
-        "enum_specifier" => {
-            if let Some(body) = context.child(field_type, "enumerator_list")? {
-                let name = context
-                    .field(field_type, "name")?
-                    .map_or("", |name| context.text(name));
-                let inner = if name.is_empty() {
-                    "enum".to_owned()
-                } else {
-                    format!("enum {name}")
-                };
-                let mut entry = Entry::item(
-                    Section::Type,
-                    node,
-                    format!("typedef {inner} {declaration}"),
-                );
-                entry.item_mut().children = extract_enum_variants(body, context, "enumerator")?;
-                entry.item_mut().child_kind = ChildKind::Brief;
-                Ok(Some(entry))
-            } else {
-                Ok(Some(extract_enum(field_type, context)?))
-            }
-        }
-        _ => Ok(Some(Entry::item(
-            Section::Type,
-            node,
-            compact_whitespace(&format!(
-                "typedef {} {declaration}",
-                context.text(field_type)
-            )),
-        ))),
+    let mut entry = Entry::item(
+        Section::Type,
+        node,
+        format!("typedef {inner} {declaration}"),
+    );
+    if keyword == "enum" {
+        entry.item_mut().children = extract_enum_variants(body, context, "enumerator")?;
+        entry.item_mut().child_kind = ChildKind::Brief;
+    } else {
+        entry.item_mut().children =
+            extract_fields_truncated(body, context, "field_declaration", field_text)?;
     }
+    Ok(Some(entry))
 }
 
 fn extract_define(node: Node<'_>, context: &Context<'_>) -> ExtractResult<Option<Entry>> {

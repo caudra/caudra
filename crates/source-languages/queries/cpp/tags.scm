@@ -12,6 +12,17 @@
 
 (function_declarator declarator: (identifier) @name) @definition.function
 
+; ---- prototypes read as variables (Workcell addition) ----
+; `void f(T *a, int (*cb)(T *a));` is a prototype whose parameter list also parses as an argument list,
+; and the grammar takes it for a direct-initialised variable. No variable has type void, so the
+; recovery is exact. C headers declaring callback setters are where this shape lives.
+(declaration
+  type: (primitive_type) @_type
+  declarator: (init_declarator
+    declarator: (identifier) @name
+    value: (argument_list))
+  (#eq? @_type "void")) @definition.function
+
 (function_declarator declarator: (field_identifier) @name) @definition.method
 
 (function_declarator declarator: (qualified_identifier name: (identifier) @name)) @definition.method
@@ -67,6 +78,9 @@
 
 (type_definition declarator: (type_identifier) @name) @definition.type
 
+; `using TokenId = std::int32_t;` is the C++11 spelling of the typedef above (Workcell addition).
+(alias_declaration name: (type_identifier) @name) @definition.type
+
 (enum_specifier name: (type_identifier) @name) @definition.type
 
 (class_specifier name: (type_identifier) @name) @definition.class
@@ -117,12 +131,31 @@
 ; type_qualifier on the declaration ALSO keeps, case-blind — the qualifier keyword is the evidence
 ; (the Rust const_item rationale), which is what makes `constexpr std::uint32_t kParserVer = 61;`
 ; findable by name. Mutable non-SCREAMING globals still drop.
+;
+; Workcell divergence: the bare-identifier shape is its own pattern, gated off `void`. A void binding
+; with no pointer cannot be a variable; it is the misread prototype captured as a function above, and
+; left here it would merge into a constant.
 
 (translation_unit
   (declaration
     declarator: (init_declarator
       declarator: [
-        (identifier) @name
+        (pointer_declarator declarator: (identifier) @name)
+        (array_declarator declarator: (identifier) @name)
+        (pointer_declarator declarator: (array_declarator declarator: (identifier) @name))
+      ])) @definition.constant)
+
+(translation_unit
+  (declaration
+    type: (_) @_type
+    declarator: (init_declarator
+      declarator: (identifier) @name)) @definition.constant
+  (#not-eq? @_type "void"))
+
+(declaration_list
+  (declaration
+    declarator: (init_declarator
+      declarator: [
         (pointer_declarator declarator: (identifier) @name)
         (array_declarator declarator: (identifier) @name)
         (pointer_declarator declarator: (array_declarator declarator: (identifier) @name))
@@ -130,13 +163,10 @@
 
 (declaration_list
   (declaration
+    type: (_) @_type
     declarator: (init_declarator
-      declarator: [
-        (identifier) @name
-        (pointer_declarator declarator: (identifier) @name)
-        (array_declarator declarator: (identifier) @name)
-        (pointer_declarator declarator: (array_declarator declarator: (identifier) @name))
-      ])) @definition.constant)
+      declarator: (identifier) @name)) @definition.constant
+  (#not-eq? @_type "void"))
 
 ; ---- class-static constants (ripwire addition — the module-constant round, 2026-08-12) ----
 ; `static constexpr int kMaxDepth = 3;` inside a class/struct/union body is a field_declaration
@@ -181,6 +211,27 @@
       (array_declarator declarator: (field_identifier) @name)
       (pointer_declarator declarator: (array_declarator declarator: (field_identifier) @name))
     ]) @definition.field)
+
+; ---- macro-typed fields (Workcell addition) ----
+; `TAILQ_ENTRY(node) link;` and `TAILQ_HEAD(list, node) head;` declare a field whose type is a macro
+; call. The C grammar parses that as a macro_type_specifier; the C++ grammar has none, so it reads the
+; macro as a type with a parenthesized declarator, or as a constructor, and leaves the field name alone
+; in an ERROR node. Every `.h` parses here, so without these a C header's queue and list members
+; vanish. The SCREAMING_SNAKE gate on the macro keeps a constructor followed by a stray token out.
+; Disclosed: the constructor reading still captures the macro itself as a function, exactly as a real
+; constructor declaration is captured. No pattern can tell the two apart except by the ERROR after it.
+(field_declaration_list
+  (field_declaration
+    type: (type_identifier) @_macro
+    declarator: (parenthesized_declarator)
+    (ERROR . (identifier) @name .) .) @definition.field
+  (#match? @_macro "^[A-Z][A-Z0-9_]*$"))
+
+(field_declaration_list
+  (declaration
+    declarator: (function_declarator declarator: (identifier) @_macro)
+    (ERROR . (identifier) @name .) .) @definition.field
+  (#match? @_macro "^[A-Z][A-Z0-9_]*$"))
 
 ; ---- CUDA memory-space module bindings (ripwire addition — the cudacheck §7b close-out) ----
 ; `__constant__ float rk_scaleTable[ 64 ];` carries NO initializer (host fills it via
@@ -286,11 +337,18 @@
 ; grammar, so edges out of the body come from ingest.cpp's captureMacroBodyCalls lexical scan, and a
 ; call-shaped invocation of the name is re-tagged role="macro", never role="call"). This closes the
 ; macro-only-header hole (a header holding nothing but macros contributed ZERO symbols; ensemble.h's
-; coverage precondition names exactly that shape). Deliberately NOT captured on the C++ path: OBJECT-LIKE
-; `#define MAXN 42` (preproc_def) — a value alias, not a call-edge participant (the C tags.scm keeps its
-; historical preproc_def capture, now honestly kinded t="macro"). Empty-body function-like macros are
-; dropped in ingest.cpp (preprocFunctionDefHasBody): an empty replacement defines nothing callable.
+; coverage precondition names exactly that shape). Empty-body function-like macros are dropped in
+; ingest.cpp (preprocFunctionDefHasBody): an empty replacement defines nothing callable. Workcell has
+; no such gate and keeps them.
 (preproc_function_def
+  name: (identifier) @name) @definition.macro
+
+; ---- object-like macros (Workcell divergence from ripwire) ----
+; ripwire leaves `#define MAXN 42` out of the C++ path as a value alias. Workcell parses every `.h` with
+; this grammar, and a query cannot tell a C header from a C++ one, so dropping them here would erase
+; every constant a C header declares — measured on qubes-gui-daemon, 189 of the 420 names the C query
+; extracts from its headers. The pattern is therefore the C query's own, guards included.
+(preproc_def
   name: (identifier) @name) @definition.macro
 
 ; ---- references (ripwire addition — calls drive the PageRank edges) ----

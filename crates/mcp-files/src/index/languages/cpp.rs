@@ -1,6 +1,9 @@
 use tree_sitter::Node;
 
-use super::common::{ExtractResult, LanguageSpec, extract_enum_variants, split_path};
+use super::{
+    c,
+    common::{ExtractResult, LanguageSpec, extract_enum_variants, split_path},
+};
 use crate::index::{
     model::{ChildKind, Entry, Section},
     render::{FIELD_TRUNCATE_THRESHOLD, compact_whitespace, ranged, truncate, truncated_message},
@@ -8,7 +11,7 @@ use crate::index::{
 };
 
 pub(super) fn spec() -> LanguageSpec {
-    let mut spec = LanguageSpec::new("::", extract_nodes);
+    let mut spec = LanguageSpec::new("/", extract_nodes);
     spec.is_doc_comment = Some(|node, context| {
         node.kind() == "comment"
             && (context.text(node).starts_with("/**") || context.text(node).starts_with("///"))
@@ -28,26 +31,35 @@ fn extract_nodes(
         "class_specifier" => Ok(extract_class(node, context, true, None, None)?
             .into_iter()
             .collect()),
-        "struct_specifier" => Ok(extract_class(node, context, false, None, None)?
-            .into_iter()
-            .collect()),
+        "struct_specifier" => Ok(vec![
+            match extract_class(node, context, false, None, None)? {
+                Some(entry) => entry,
+                None => c::extract_struct(node, context, "struct")?,
+            },
+        ]),
+        "union_specifier" => Ok(vec![c::extract_struct(node, context, "union")?]),
         "enum_specifier" => Ok(extract_enum(node, context)?.into_iter().collect()),
         "function_definition" => Ok(method_signature(node, context)?
             .map(|signature| Entry::item(Section::Function, node, signature))
             .into_iter()
             .collect()),
         "template_declaration" => extract_template(node, context),
-        "preproc_def" | "preproc_function_def" => {
-            Ok(extract_define(node, context)?.into_iter().collect())
-        }
+        "preproc_def" => Ok(extract_define(node, context)?.into_iter().collect()),
+        "preproc_function_def" => Ok(c::extract_function_macro(node, context)?
+            .into_iter()
+            .collect()),
         "declaration" => Ok(declaration_signature(node, context)?
             .map(|signature| Entry::item(Section::Function, node, signature))
             .into_iter()
             .collect()),
         "type_definition" => {
-            let field_type = context
-                .field(node, "type")?
-                .map_or("_", |field_type| context.text(field_type));
+            let field_type = context.field(node, "type")?;
+            if let Some(field_type) = field_type
+                && let Some(entry) = c::typedef_with_body(node, field_type, context)?
+            {
+                return Ok(vec![entry]);
+            }
+            let field_type = field_type.map_or("_", |field_type| context.text(field_type));
             let declaration = context
                 .field(node, "declarator")?
                 .map_or("_", |declaration| context.text(declaration));
@@ -96,12 +108,20 @@ fn declarator_name<'a>(node: Node<'_>, context: &'a Context<'_>) -> &'a str {
             | "destructor_name"
             | "operator_name"
             | "qualified_identifier"
+            | "parenthesized_declarator"
     ) {
         return context.text(node);
     }
     node.child_by_field_name("name")
-        .or_else(|| node.child(0))
+        .or_else(|| inner_declarator(node))
         .map_or("_", |inner| declarator_name(inner, context))
+}
+
+/// The declarator a wrapper declarator decorates. A `reference_declarator` names it with no field,
+/// and its first child is the anonymous `&` token, so the fallback is the first named child.
+fn inner_declarator(node: Node<'_>) -> Option<Node<'_>> {
+    node.child_by_field_name("declarator")
+        .or_else(|| node.named_child(0))
 }
 
 fn declarator_signature(node: Node<'_>, context: &Context<'_>) -> ExtractResult<Option<String>> {
@@ -118,14 +138,10 @@ fn declarator_signature(node: Node<'_>, context: &Context<'_>) -> ExtractResult<
                 declarator_name(inner, context)
             )))
         }
-        "reference_declarator" | "pointer_declarator" => {
-            let inner = context.field(node, "declarator")?.or_else(|| node.child(0));
-            if let Some(inner) = inner {
-                declarator_signature(inner, context)
-            } else {
-                Ok(None)
-            }
-        }
+        "reference_declarator" | "pointer_declarator" => match inner_declarator(node) {
+            Some(inner) => declarator_signature(inner, context),
+            None => Ok(None),
+        },
         _ => Ok(Some(declarator_name(node, context).to_owned())),
     }
 }
@@ -149,13 +165,45 @@ fn method_signature(node: Node<'_>, context: &Context<'_>) -> ExtractResult<Opti
 }
 
 fn declaration_signature(node: Node<'_>, context: &Context<'_>) -> ExtractResult<Option<String>> {
-    let Some(declaration) = context.field(node, "declarator")? else {
+    let mut declaration = context.field(node, "declarator")?;
+    while let Some(wrapper) = declaration
+        .filter(|node| matches!(node.kind(), "pointer_declarator" | "reference_declarator"))
+    {
+        declaration = inner_declarator(wrapper);
+    }
+    match declaration.map(|declaration| (declaration.kind(), declaration)) {
+        Some(("function_declarator", _)) => method_signature(node, context),
+        Some(("init_declarator", declaration)) => misread_prototype(node, declaration, context),
+        _ => Ok(None),
+    }
+}
+
+/// `void f(T *a, int (*cb)(T *a));` is a prototype whose parameter list also parses as an argument
+/// list, and the C++ grammar reads it as a direct-initialised variable. No variable has type `void`,
+/// so such a declaration is the prototype it looks like.
+fn misread_prototype(
+    node: Node<'_>,
+    declaration: Node<'_>,
+    context: &Context<'_>,
+) -> ExtractResult<Option<String>> {
+    let (Some(return_type), Some(name), Some(arguments)) = (
+        context.field(node, "type")?,
+        context.field(declaration, "declarator")?,
+        context.field(declaration, "value")?,
+    ) else {
         return Ok(None);
     };
-    if declaration.kind() != "function_declarator" {
+    if context.text(return_type) != "void"
+        || name.kind() != "identifier"
+        || arguments.kind() != "argument_list"
+    {
         return Ok(None);
     }
-    method_signature(node, context)
+    Ok(Some(compact_whitespace(&format!(
+        "void {}{}",
+        context.text(name),
+        context.text(arguments)
+    ))))
 }
 
 fn extract_class(
@@ -237,6 +285,8 @@ fn extract_include(node: Node<'_>, context: &Context<'_>) -> ExtractResult<Entry
     Ok(Entry::import(node, vec![split_path(path, '/')], None))
 }
 
+/// A `using` path is one segment: imports split on the include separator, `/`, and a `::` path
+/// must render verbatim rather than as `std/vector`.
 fn extract_using(node: Node<'_>, context: &Context<'_>) -> Entry {
     let text = context.text(node);
     let cleaned = text
@@ -245,11 +295,7 @@ fn extract_using(node: Node<'_>, context: &Context<'_>) -> Entry {
         .unwrap_or(text)
         .trim_end_matches(';')
         .trim();
-    Entry::import(
-        node,
-        vec![cleaned.split("::").map(str::to_owned).collect()],
-        None,
-    )
+    Entry::import(node, vec![vec![cleaned.to_owned()]], None)
 }
 
 fn extract_namespace(node: Node<'_>, context: &Context<'_>) -> ExtractResult<Vec<Entry>> {

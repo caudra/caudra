@@ -59,8 +59,9 @@ than losing to whichever pattern matched second.
 - `LanguageFamily::Config` and `LanguageFamily::Prose` emit no call references. A YAML key is data;
   an edge minted from one would assert control flow that no execution performs.
 - `compatible_with` refuses cross-language resolution. TypeScript/JavaScript and the three Bazel
-  file shapes are mutually compatible because each pair shares a grammar and a module system.
-  Everything else is refused, so a YAML `deploy` key and a Go `deploy` function stay distinct.
+  file shapes are mutually compatible because each pair shares a grammar and a module system. C and
+  C++ are mutually compatible because they link into one symbol namespace and every `.h` parses as
+  C++. Everything else is refused, so a YAML `deploy` key and a Go `deploy` function stay distinct.
 
 ## Adding a Language
 

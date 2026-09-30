@@ -11,6 +11,7 @@
 
 use std::{collections::BTreeMap, path::Path};
 
+use test_case::test_case;
 use tree_sitter::StreamingIterator as _;
 use workcell_source_languages::{ALL, CaptureRole, Language, LanguageFamily, ReferenceKind};
 
@@ -187,6 +188,42 @@ fn every_definition_carries_a_name() {
         }
     }
     assert!(offending.is_empty(), "{}", offending.join("\n"));
+}
+
+#[test_case("#define LIMIT 4\n", "macro:LIMIT" ; "an object like macro")]
+#[test_case("struct node { TAILQ_ENTRY(node) link; };\n", "field:link" ; "a field typed by a one argument macro")]
+#[test_case("struct list { TAILQ_HEAD(head, node) first; };\n", "field:first" ; "a field typed by a two argument macro")]
+#[test_case("void set_callback(item *i, int (*callback)(item *i));\n", "function:set_callback" ; "a prototype the grammar reads as a variable")]
+fn a_c_header_parsed_as_cpp_keeps_its_definitions(source: &str, expected: &str) {
+    // Every `.h` parses as C++, so the C++ query has to recover what the C grammar parses natively.
+    let captured = capture(Language::Cpp, source);
+    assert!(
+        captured.definitions.contains_key(expected),
+        "missing {expected}; captured {:?}",
+        captured.definitions
+    );
+}
+
+#[test_case("using TokenId = int;\n", "class:TokenId" ; "a type alias")]
+#[test_case("template <typename T> using Rows = std::vector<T>;\n", "class:Rows" ; "an alias template")]
+fn a_cpp_type_alias_is_a_type_definition(source: &str, expected: &str) {
+    let captured = capture(Language::Cpp, source);
+    assert!(
+        captured.definitions.contains_key(expected),
+        "missing {expected}; captured {:?}",
+        captured.definitions
+    );
+}
+
+#[test_case("struct Widget { Widget(int, char) stray; };\n", "field:stray" ; "a constructor followed by a stray token")]
+#[test_case("void set_callback(item *i, int (*callback)(item *i));\n", "constant:set_callback" ; "a prototype the grammar reads as a variable")]
+fn cpp_header_recovery_mints_no_false_definition(source: &str, unexpected: &str) {
+    let captured = capture(Language::Cpp, source);
+    assert!(
+        !captured.definitions.contains_key(unexpected),
+        "minted {unexpected}; captured {:?}",
+        captured.definitions
+    );
 }
 
 #[test]
