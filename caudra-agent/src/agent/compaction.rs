@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 use std::env;
+use std::slice;
 use std::sync::Arc;
 
 use caudra_config::{
@@ -8,8 +9,8 @@ use caudra_config::{
 };
 use caudra_providers::provider::Provider;
 use caudra_providers::{
-    Billing, ContentBlock, Message, Model, ModelPurpose, RequestOptions, Role, StreamResponse,
-    Timeouts, TokenUsage,
+    Billing, ContentBlock, Message, Model, ModelPurpose, ReasoningTransport, RequestOptions, Role,
+    StreamResponse, Timeouts, TokenUsage,
 };
 use caudra_storage::usage_ledger::LedgerPurpose;
 use tracing::{info, warn};
@@ -329,7 +330,7 @@ fn head_end(messages: &[Message], budget: u32) -> usize {
     let mut tokens = 0;
     let mut split = messages.len();
     for (index, message) in messages.iter().enumerate().rev() {
-        tokens += estimate_message_tokens(std::slice::from_ref(message));
+        tokens += estimate_message_tokens(slice::from_ref(message));
         if tokens > budget {
             break;
         }
@@ -374,7 +375,8 @@ fn finish_compact(
     response.message.retained_output_refs = retained_output_refs(summarized);
     response.message.retained_subagent_ids = retained_subagent_ids(summarized);
 
-    let tail = history.as_slice()[head_end..].to_vec();
+    let mut tail = history.as_slice()[head_end..].to_vec();
+    strip_invalidated_thinking(&mut tail);
     let preserved = tail.len();
     // Read before the swap, and taken at the boundary rather than at the head:
     // the preserved tail is re-expanded with fresh ids below the summary, so
@@ -544,6 +546,26 @@ fn strip_thinking(messages: &mut [Message]) {
     }
 }
 
+/// Anthropic signs each thinking block over everything before it, and the
+/// summary replaces that prefix, so no kept block would pass the check again.
+/// Removing every one is valid on any provider. Only Anthropic reasoning is
+/// touched, so OpenAI reasoning items and Gemini signatures survive. A reply
+/// that was only thinking goes too; padding stays, since it marks a turn that
+/// said nothing.
+fn strip_invalidated_thinking(tail: &mut Vec<Message>) {
+    tail.retain_mut(|message| {
+        let signed = message
+            .reasoning_source
+            .as_ref()
+            .is_some_and(|source| source.transport == ReasoningTransport::AnthropicMessages);
+        if !signed || !message.content.iter().any(ContentBlock::is_thinking) {
+            return true;
+        }
+        strip_thinking(slice::from_mut(message));
+        message.is_empty_padding() || !message.content.is_empty()
+    });
+}
+
 fn strip_old_tool_results(messages: &mut [Message]) {
     let mut seen = 0;
     for message in messages.iter_mut().rev() {
@@ -657,8 +679,8 @@ mod tests {
 
     use caudra_providers::provider::{BoxFuture, Provider};
     use caudra_providers::{
-        CacheKey, ContentBlock, Message, Model, ProviderEvent, RequestOptions, Role, StopReason,
-        StreamResponse, TokenUsage,
+        CacheKey, ContentBlock, Message, Model, ProviderEvent, ReasoningSource, RequestOptions,
+        Role, StopReason, StreamResponse, TokenUsage,
     };
     use caudra_storage::id::CaudraId;
     use caudra_storage::tool_outputs::ToolOutputRef;
@@ -667,6 +689,12 @@ mod tests {
 
     use super::*;
     use crate::AgentConfig;
+
+    const KEPT_THINKING: &str = "weighing the kept turn";
+    const KEPT_SIGNATURE: &str = "signed-over-the-old-prefix";
+    const KEPT_REPLY: &str = "reply two";
+    /// The anchor, the summary and the kept user turn come first.
+    const KEPT_REPLY_INDEX: usize = 3;
 
     struct MockProvider {
         responses: Mutex<Vec<Result<StreamResponse, AgentError>>>,
@@ -728,6 +756,20 @@ mod tests {
         Message {
             role: Role::Assistant,
             content: vec![ContentBlock::Text { text: text.into() }],
+            ..Default::default()
+        }
+    }
+
+    fn reasoned_reply(transport: ReasoningTransport, reply: Option<&str>) -> Message {
+        let mut content = vec![ContentBlock::thinking(
+            KEPT_THINKING.into(),
+            Some(KEPT_SIGNATURE.into()),
+        )];
+        content.extend(reply.map(|text| ContentBlock::Text { text: text.into() }));
+        Message {
+            role: Role::Assistant,
+            content,
+            reasoning_source: Some(ReasoningSource::new(&default_model(), transport)),
             ..Default::default()
         }
     }
@@ -1056,6 +1098,48 @@ mod tests {
                 !reached_summarizer(RECENT),
                 "the preserved tail must not be summarized as well"
             );
+        });
+    }
+
+    /// The summary replaces the prefix Anthropic signed each kept thinking
+    /// block over. `None` means the reply itself is gone.
+    #[test_case(reasoned_reply(ReasoningTransport::AnthropicMessages, Some(KEPT_REPLY)), Some(0) ; "an_anthropic_turn_loses_its_thinking")]
+    #[test_case(reasoned_reply(ReasoningTransport::OpenAiResponses, Some(KEPT_REPLY)), Some(1) ; "an_openai_turn_keeps_its_reasoning")]
+    #[test_case(reasoned_reply(ReasoningTransport::AnthropicMessages, None), None ; "a_thinking_only_reply_disappears")]
+    #[test_case(Message { padding: true, ..reasoned_reply(ReasoningTransport::AnthropicMessages, None) }, Some(0) ; "padding_still_marks_the_empty_turn")]
+    fn compaction_strips_the_thinking_its_summary_invalidates(
+        reply: Message,
+        kept_thinking: Option<usize>,
+    ) {
+        smol::block_on(async {
+            let provider = MockProvider::new(vec![Ok(text_response(StopReason::EndTurn))]);
+            let (raw_tx, _rx) = flume::unbounded();
+            let mut history = History::new(vec![
+                Message::user("first".into()),
+                assistant_text("reply one"),
+                Message::user("second".into()),
+                reply,
+            ]);
+
+            compact(
+                &provider,
+                &default_model(),
+                &mut history,
+                &EventSender::new(raw_tx, 0),
+                &AgentConfig::default(),
+                None,
+            )
+            .await
+            .unwrap();
+
+            let kept = history.as_slice().get(KEPT_REPLY_INDEX).map(|message| {
+                message
+                    .content
+                    .iter()
+                    .filter(|block| block.is_thinking())
+                    .count()
+            });
+            assert_eq!(kept, kept_thinking);
         });
     }
 
