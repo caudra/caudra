@@ -47,6 +47,11 @@ const MAX_CANDIDATE_PREIMAGE_BYTES: usize = 32 * 1024;
 const MAX_CANDIDATE_PREIMAGE_DEPTH: usize = 64;
 const SELECTED_ENTRY_NODES: usize = 3;
 const ATTACHED_VALUE_FLAGS: &[&str] = &["-u", "-H", "-d"];
+const CURL_CLIENTS: &[&str] = &["curl", "curlie"];
+const CURL_CREDENTIAL_FLAGS: &[&str] = &["-H", "-u", "--user", "--header"];
+const CURL_CONTENT_FLAGS: &[&str] = &["-d", "--data", "--data-raw", "--data-binary", "--json"];
+const AUTH_SCHEMES: &[&str] = &["Bearer", "Basic"];
+const CREDENTIAL_SHAPE: &[char] = &[':', '=', '@', '{', '['];
 const KNOWN_RESOURCE_ATTRIBUTES: &[&str] = &[
     POSSIBLE_WORKDIRS_ATTRIBUTE,
     BROWSE_RECURSION_ATTRIBUTE,
@@ -921,6 +926,7 @@ pub(crate) fn redact_text(value: &str) -> String {
     let urls = redact_url(value);
     let value = urls.as_str();
     let words = review_words(value);
+    let curl = curl_words(value, &words);
     let mut result = String::new();
     let mut copied = 0;
     let mut index = 0;
@@ -939,62 +945,95 @@ pub(crate) fn redact_text(value: &str) -> String {
         let spaced = words
             .get(index + 1)
             .is_some_and(|&(start, end, _)| &value[start..end] == "=");
-        let credential_flag = matches!(
-            name,
-            "-H" | "-u" | "--user" | "--header" | "Bearer" | "Basic"
-        );
-        let content_flag = matches!(
-            name,
-            "-d" | "--data" | "--data-raw" | "--data-binary" | "--json"
-        );
-        if !credential_flag
-            && !content_flag
-            && (!secret_key(name) || (separator.is_none() && !name.starts_with("--") && !spaced))
-        {
+        let content_flag = CURL_CONTENT_FLAGS.contains(&name);
+        let curl_flag = content_flag || CURL_CREDENTIAL_FLAGS.contains(&name);
+        let credential = AUTH_SCHEMES.contains(&name)
+            || (secret_key(name) && (separator.is_some() || name.starts_with("--") || spaced));
+        let mut secret_start = None;
+        let mut secret_end = end;
+        let mut incomplete = !closed;
+        let mut next = index + 1;
+        if credential || curl_flag {
+            secret_start = attached
+                .or_else(|| separator.map(|offset| offset + 1))
+                .map(|offset| {
+                    start + (word.len() - word.trim_start_matches(['\'', '"']).len()) + offset
+                })
+                .filter(|&position| !value[position..end].trim_matches(['\'', '"']).is_empty());
+            if secret_start.is_none() {
+                next += usize::from(spaced);
+                if words
+                    .get(next)
+                    .is_some_and(|&(start, end, _)| AUTH_SCHEMES.contains(&&value[start..end]))
+                {
+                    next += 1;
+                }
+                if let Some(&(start, end, closed)) = words.get(next)
+                    && continues_command(value, &words, next)
+                {
+                    secret_start = Some(start);
+                    secret_end = end;
+                    incomplete |= !closed;
+                    next += 1;
+                }
+            }
+        }
+        let Some(secret_start) = secret_start.filter(|&position| {
+            credential || curl[index] || value[position..secret_end].contains(CREDENTIAL_SHAPE)
+        }) else {
             result.push_str(&value[copied..start]);
             result.push_str(&redact_url(word));
             copied = end;
             index += 1;
             continue;
-        }
-        let mut secret_start =
-            attached
-                .or_else(|| separator.map(|offset| offset + 1))
-                .map(|offset| {
-                    start + (word.len() - word.trim_start_matches(['\'', '"']).len()) + offset
-                });
-        let mut secret_end = end;
-        let mut incomplete = !closed;
-        if secret_start
-            .is_none_or(|position| value[position..end].trim_matches(['\'', '"']).is_empty())
-        {
-            index += 1 + usize::from(spaced);
-            if words
-                .get(index)
-                .is_some_and(|&(start, end, _)| matches!(&value[start..end], "Bearer" | "Basic"))
-            {
-                index += 1;
-            }
-            if let Some(&(start, end, closed)) = words.get(index) {
-                secret_start = Some(start);
-                secret_end = end;
-                incomplete |= !closed;
-            }
-        }
-        let start = secret_start.unwrap_or(end);
-        let secret = &value[start..secret_end];
+        };
+        let secret = &value[secret_start..secret_end];
         incomplete |= secret.contains("$(") || secret.contains('`') || secret.ends_with('$');
-        result.push_str(&value[copied..start]);
+        result.push_str(&value[copied..secret_start]);
         result.push_str(if content_flag { BULK_CONTENT } else { REDACTED });
         if incomplete {
             result.push_str(INCOMPLETE_COMMAND);
             return result;
         }
         copied = secret_end;
-        index += 1;
+        index = next;
     }
     result.push_str(&value[copied..]);
     result
+}
+
+/// Whether each word belongs to a simple command that runs a curl-compatible
+/// client, whose `-u`, `-H`, and `-d` style flags always carry credentials or
+/// payloads. Elsewhere they often mean something else, such as `find -delete`
+/// or `git push -u origin`, so their values are redacted only when shaped like
+/// a credential or payload.
+fn curl_words(value: &str, words: &[(usize, usize, bool)]) -> Vec<bool> {
+    let mut curl = false;
+    let mut previous_end = 0;
+    words
+        .iter()
+        .map(|&(start, end, _)| {
+            let word = &value[start..end];
+            let separator = match word {
+                ";" | "|" | "(" | ")" => true,
+                "&" => !value[..start].ends_with(['<', '>']) && !value[end..].starts_with('>'),
+                _ => value[previous_end..start].contains('\n'),
+            };
+            if separator {
+                curl = false;
+            }
+            previous_end = end;
+            let program = word.trim_matches(['\'', '"', '`', '\\']);
+            let program = program.rsplit_once('/').map_or(program, |(_, name)| name);
+            curl |= CURL_CLIENTS.contains(&program);
+            curl
+        })
+        .collect()
+}
+
+fn continues_command(value: &str, words: &[(usize, usize, bool)], index: usize) -> bool {
+    let start = words[index].0;
+    !value[words[index - 1].1..start].contains('\n') && !value[start..].starts_with(shell_operator)
 }
 
 fn shell_operator(character: char) -> bool {
@@ -1055,8 +1094,8 @@ mod tests {
         PermissionResourceKind, PermissionResourceSelector, PermissionReviewSource,
         PermissionSubject, REDACTED, REVIEW_MAX_INPUT_DEPTH, REVIEW_MAX_INPUT_NODES,
         REVIEW_MAX_RESOURCES, REVIEW_MAX_STRING_BYTES, StructuredPermissionRule, UNKNOWN_FIELD,
-        UNKNOWN_INPUT, display_text, review_for_rule, review_from_candidates, selector_label,
-        url_subtree_digest, visit_review_candidate_preimages,
+        UNKNOWN_INPUT, display_text, redact_text, review_for_rule, review_from_candidates,
+        selector_label, url_subtree_digest, visit_review_candidate_preimages,
     };
     use crate::permissions::{PermissionRowGrant, canonical_json_sha256, selected_input_digest};
 
@@ -1210,6 +1249,31 @@ mod tests {
         assert!(display.contains("deploy"));
         assert!(!display.contains("top-secret"));
         assert!(display.contains(super::INCOMPLETE_COMMAND));
+    }
+
+    #[test_case("find target/decision-smoke -delete"; "find_delete")]
+    #[test_case("git clean -dfx && git branch -d feature/login"; "git_delete_flags")]
+    #[test_case("git push -u origin main"; "upstream")]
+    #[test_case("pip install --user requests; systemctl --user restart caudra"; "user_scope")]
+    #[test_case("gh pr list --json number,title"; "json_fields")]
+    #[test_case("npm ls --json | jq ."; "operator_is_not_a_value")]
+    #[test_case("grep -Hn needle src/main.rs && kill -HUP 1234"; "attached_letters")]
+    #[test_case("curl -s https://example.test\nfind . -delete"; "newline_ends_curl")]
+    #[test_case("curl -s https://example.test && git push -u origin main"; "operator_ends_curl")]
+    #[test_case("deploy --token\nrm -rf target"; "value_never_crosses_lines")]
+    fn non_credential_flags_are_preserved(command: &str) {
+        assert_eq!(redact_text(command), command);
+    }
+
+    #[test_case("curl -u top-secret https://example.test"; "user")]
+    #[test_case("curl -dtop-secret https://example.test"; "attached_data")]
+    #[test_case("sudo /usr/bin/curl --data top-secret https://example.test"; "wrapped_path")]
+    #[test_case("echo ok | curl -H top-secret https://example.test"; "pipeline")]
+    #[test_case("curl https://example.test 2>&1 --user top-secret"; "redirection_is_not_a_separator")]
+    fn curl_flags_are_always_redacted(command: &str) {
+        let text = redact_text(command);
+        assert!(!text.contains("top-secret"));
+        assert!(text.contains("https://example.test"));
     }
 
     #[test_case(PermissionReviewSource::Approved; "approved")]

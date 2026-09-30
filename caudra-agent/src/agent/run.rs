@@ -46,7 +46,8 @@ use crate::context::{
     ContextSnapshot, estimate_context_usage,
 };
 use crate::decisions::{
-    DecisionContext, DecisionFeature, DecisionOutcome, DecisionReceipt, Decisions,
+    DecisionContext, DecisionFeature, DecisionOutcome, DecisionReceipt, DecisionState, Decisions,
+    redacted_excerpt,
 };
 use crate::mcp::{McpRequestSnapshot, McpSession};
 use crate::nudge::Nudge;
@@ -77,8 +78,19 @@ use caudra_storage::usage_ledger::LedgerPurpose;
 use caudra_workspace::WorkspaceSession;
 
 const MAX_REAUTH_ATTEMPTS: u32 = 2;
-const MAX_SKILL_CANDIDATES: usize = 99;
 const SKILL_NONE: &str = "none";
+const SKILL_TASK_EXCERPT_BYTES: usize = 480;
+const SKILL_DESCRIPTION_EXCERPT_BYTES: usize = 320;
+/// Words too common to say which skill a task wants, including the "use"
+/// that skill descriptions open with by convention.
+const SKILL_STOPWORDS: &[&str] = &[
+    "about", "an", "and", "any", "are", "as", "at", "be", "but", "by", "can", "could", "do",
+    "does", "for", "from", "get", "has", "have", "help", "how", "if", "in", "into", "is", "it",
+    "its", "like", "make", "me", "my", "need", "not", "of", "on", "or", "our", "please", "should",
+    "so", "some", "that", "the", "their", "them", "then", "there", "these", "this", "those", "to",
+    "up", "us", "use", "using", "want", "was", "we", "what", "when", "where", "which", "while",
+    "who", "why", "will", "with", "would", "you", "your",
+];
 const MAX_GOAL_PRESCREEN_SKIPS: u32 = 2;
 const GOAL_PRESCREEN_CONTINUATION: &str =
     "Continue working toward the goal. Verify the remaining requirements before finishing.";
@@ -1954,14 +1966,9 @@ impl<'h> Agent<'h> {
             return None;
         }
         let loaded = loaded_skills(&self.history.transcript_items());
-        let candidates = skill_shortlist(task, skill::inventory(&self.registry), &loaded);
+        let ranked = skill_shortlist(task, skill::inventory(&self.registry), &loaded);
+        let (state, candidates) = skill_state(task, ranked);
         let questions = skill_questions(&candidates)?;
-        let state = json!({
-            "task": task,
-            "skills": candidates.iter().enumerate().map(|(index, skill)| {
-                json!({"option": skill_option(index), "name": skill.name, "description": skill.description})
-            }).collect::<Vec<_>>()
-        });
         let outcome = self
             .cancel
             .race(self.permissions.run_passive_decision(decisions.evaluate(
@@ -2653,7 +2660,7 @@ fn skill_shortlist(
     inventory: Vec<SkillInventoryEntry>,
     loaded: &BTreeSet<String>,
 ) -> Vec<SkillInventoryEntry> {
-    let tokens: BTreeSet<_> = task
+    let named: BTreeSet<_> = task
         .split(|character: char| {
             !character.is_alphanumeric() && character != '-' && character != '_'
         })
@@ -2662,18 +2669,17 @@ fn skill_shortlist(
         .collect();
     if inventory
         .iter()
-        .any(|skill| tokens.contains(&skill.name.to_lowercase()))
+        .any(|skill| named.contains(&skill.name.to_lowercase()))
     {
         return Vec::new();
     }
+    let words = skill_words(task);
     let mut ranked: Vec<_> = inventory
         .into_iter()
         .filter(|skill| !loaded.contains(&skill.name))
         .map(|skill| {
-            let text = format!("{} {}", skill.name, skill.description).to_lowercase();
-            let score = tokens
-                .iter()
-                .filter(|token| text.contains(token.as_str()))
+            let score = skill_words(&format!("{} {}", skill.name, skill.description))
+                .intersection(&words)
                 .count();
             (score, skill)
         })
@@ -2684,11 +2690,37 @@ fn skill_shortlist(
             .cmp(left_score)
             .then_with(|| left.name.cmp(&right.name))
     });
-    ranked
-        .into_iter()
-        .take(MAX_SKILL_CANDIDATES)
-        .map(|(_, skill)| skill)
+    ranked.into_iter().map(|(_, skill)| skill).collect()
+}
+
+fn skill_words(text: &str) -> BTreeSet<String> {
+    text.split(|character: char| !character.is_alphanumeric())
+        .filter(|word| word.chars().nth(1).is_some())
+        .map(str::to_lowercase)
+        .filter(|word| !SKILL_STOPWORDS.contains(&word.as_str()))
         .collect()
+}
+
+/// An excerpt of the task and as many of the ranked skills as fit the state
+/// bound, best first, so a long prompt narrows the choice instead of having
+/// the whole request refused.
+fn skill_state(task: &str, ranked: Vec<SkillInventoryEntry>) -> (Value, Vec<SkillInventoryEntry>) {
+    let task = redacted_excerpt(task, SKILL_TASK_EXCERPT_BYTES);
+    let mut skills = Vec::new();
+    let mut candidates = Vec::new();
+    for skill in ranked {
+        skills.push(json!({
+            "option": skill_option(candidates.len()),
+            "name": skill.name,
+            "description": redacted_excerpt(&skill.description, SKILL_DESCRIPTION_EXCERPT_BYTES),
+        }));
+        if DecisionState::new(&json!({"task": task, "skills": skills})).is_err() {
+            skills.pop();
+            break;
+        }
+        candidates.push(skill);
+    }
+    (json!({"task": task, "skills": skills}), candidates)
 }
 
 fn skill_option(index: usize) -> String {
@@ -3568,7 +3600,7 @@ mod tests {
     }
 
     #[test]
-    fn decision_skill_shortlist_guards_and_wire_cap() {
+    fn decision_skill_shortlist_guards() {
         let loaded = BTreeSet::from([DECISION_SKILL.into()]);
         assert!(
             skill_shortlist("testing", vec![decision_skill(DECISION_SKILL)], &loaded).is_empty()
@@ -3581,12 +3613,41 @@ mod tests {
             )
             .is_empty()
         );
-        let inventory = (0..MAX_SKILL_CANDIDATES + 10)
-            .map(|index| decision_skill(&format!("helper-{index}")))
+    }
+
+    #[test_case("fix the code", 1; "whole_word")]
+    #[test_case("tidy the cod", 0; "part_of_a_word")]
+    #[test_case("is it in there", 0; "stopwords")]
+    fn decision_skill_shortlist_matches_whole_words(task: &str, expected: usize) {
+        let shortlist =
+            skill_shortlist(task, vec![decision_skill(DECISION_SKILL)], &BTreeSet::new());
+        assert_eq!(shortlist.len(), expected);
+    }
+
+    #[test]
+    fn decision_skill_state_fills_by_rank_within_the_bound() {
+        let task = format!("{DECISION_SKILL_TASK} {}", "testing ".repeat(200));
+        let ranked: Vec<_> = (0..20)
+            .map(|index| SkillInventoryEntry {
+                description: "testing ".repeat(100),
+                ..decision_skill(&format!("helper-{index}"))
+            })
             .collect();
-        let shortlist = skill_shortlist("testing", inventory, &BTreeSet::new());
-        assert_eq!(shortlist.len(), MAX_SKILL_CANDIDATES);
-        let questions = skill_questions(&shortlist).unwrap();
+
+        let (state, candidates) = skill_state(&task, ranked.clone());
+
+        assert!(DecisionState::new(&state).is_ok());
+        assert!(state["task"].as_str().unwrap().len() <= SKILL_TASK_EXCERPT_BYTES);
+        assert!(!candidates.is_empty());
+        assert!(candidates.len() < ranked.len());
+        assert_eq!(candidates, ranked[..candidates.len()]);
+        let skills = state["skills"].as_array().unwrap();
+        assert_eq!(skills.len(), candidates.len());
+        for (index, (skill, candidate)) in skills.iter().zip(&candidates).enumerate() {
+            assert_eq!(skill["option"], skill_option(index));
+            assert_eq!(skill["name"], candidate.name);
+        }
+        let questions = skill_questions(&candidates).unwrap();
         assert_eq!(
             questions.questions()["skill"]
                 .criteria
@@ -3595,7 +3656,7 @@ mod tests {
                 .as_object()
                 .unwrap()
                 .len(),
-            MAX_SKILL_CANDIDATES + 1
+            candidates.len() + 1
         );
     }
 

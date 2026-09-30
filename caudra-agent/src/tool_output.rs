@@ -169,19 +169,20 @@ pub(crate) async fn limit_named(
         source.truncate(source.trim_end_matches(['\r', '\n']).len());
     }
     let trailer = suffix.map_or_else(String::new, |suffix| format!("\n\n{suffix}"));
-    let preview_body = preview_body(
+    let body = preview_body(
         &source,
         &marker,
         &trailer,
         limits.max_lines,
         limits.max_bytes,
     );
-    let model_output = preview_body + trailer.as_str();
-    done.model_output = Some(hard_bound(
-        &model_output,
-        limits.max_lines,
-        limits.max_bytes,
-    ));
+    let composed = format!("{body}{trailer}");
+    done.model_output = Some(if fits(&composed, limits.max_lines, limits.max_bytes) {
+        body
+    } else {
+        done.model_suffix = None;
+        hard_bound(&composed, limits.max_lines, limits.max_bytes)
+    });
     bound_presentation(
         &mut done.output,
         &marker,
@@ -791,24 +792,49 @@ mod tests {
         smol::block_on(limit(&mut done, &ctx));
 
         let output_ref = done.output_ref.as_ref().unwrap();
-        let model_output = done.model_output.as_ref().unwrap();
-        assert!(model_output.len() <= ctx.config.max_output_bytes);
-        assert!(line_count(model_output) <= ctx.config.max_output_lines);
-        assert!(model_output.starts_with("first"));
-        assert!(model_output.contains("last"));
-        assert!(model_output.contains(&format!("Full output ID: {}", output_ref.id)));
-        assert!(model_output.contains(&format!(
+        assert!(
+            !done
+                .model_output
+                .as_ref()
+                .unwrap()
+                .contains("model-only guidance")
+        );
+        let model_text = done.composed_model_output();
+        assert!(model_text.len() <= ctx.config.max_output_bytes);
+        assert!(line_count(&model_text) <= ctx.config.max_output_lines);
+        assert!(model_text.starts_with("first"));
+        assert!(model_text.contains("last"));
+        assert!(model_text.contains(&format!("Full output ID: {}", output_ref.id)));
+        assert!(model_text.contains(&format!(
             "{}(output_id=",
             crate::tools::TOOL_OUTPUT_TOOL_NAME
         )));
-        assert!(model_output.contains("pattern=\"...\""));
-        assert!(model_output.ends_with("model-only guidance"));
-        assert_eq!(model_output.matches("model-only guidance").count(), 1);
+        assert!(model_text.contains("pattern=\"...\""));
+        assert!(model_text.ends_with("model-only guidance"));
+        assert_eq!(model_text.matches("model-only guidance").count(), 1);
 
         let stored = store
             .read(session.id(), output_ref.id.clone(), 1, 2_000)
             .unwrap();
         assert_eq!(stored.text, format!("{full_text}\n\nmodel-only guidance"));
+    }
+
+    #[test]
+    fn suffix_longer_than_the_limit_is_bounded_with_the_output() {
+        let temp = TempDir::new().unwrap();
+        let (ctx, _store, _session) = stored_context(&temp, 9, 420);
+        let mut done =
+            done("line\n".repeat(200), false).with_model_suffix(Some("guidance ".repeat(100)));
+
+        smol::block_on(limit(&mut done, &ctx));
+
+        assert!(done.model_suffix.is_none());
+        let id = done.output_ref.as_ref().unwrap().id.to_string();
+        let model_text = done.composed_model_output();
+        assert!(model_text.contains(&id));
+        assert!(model_text.contains("guidance"));
+        assert!(model_text.len() <= ctx.config.max_output_bytes);
+        assert!(line_count(&model_text) <= ctx.config.max_output_lines);
     }
 
     #[test]
@@ -1183,10 +1209,10 @@ mod tests {
         assert!(done.output.as_text().contains("streamed-0-"));
         assert!(done.output.as_text().contains("streamed-29-"));
         assert!(done.output.as_text().contains("Full output ID:"));
-        let model_output = done.model_output.as_ref().unwrap();
-        assert!(model_output.len() <= ctx.config.max_output_bytes);
+        let model_text = done.composed_model_output();
+        assert!(model_text.len() <= ctx.config.max_output_bytes);
         assert_eq!(
-            model_output
+            model_text
                 .matches("stream stopped at the output limit")
                 .count(),
             1

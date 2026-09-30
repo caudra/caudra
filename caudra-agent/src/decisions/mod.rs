@@ -29,8 +29,8 @@ use url::{Host, Url};
 use shell_duration::ShellDurationCache;
 
 pub use permission::{PermissionAction, PermissionDecision, PermissionFlag, PermissionPurpose};
-pub(crate) use state::redact_decision_text;
 pub use state::{DecisionState, DecisionStateError};
+pub(crate) use state::{redact_decision_text, redacted_excerpt};
 
 const CACHE_ENTRIES: usize = 128;
 const STATE_REJECTED: &str = "state exceeds the bounded redacted context";
@@ -243,26 +243,16 @@ impl Decisions {
             return None;
         }
         let started = Instant::now();
-        let state = match DecisionState::new(state) {
-            Ok(state) => state,
-            Err(_) => {
-                caudra_otel::emit::decision(
-                    feature.name(),
-                    "none",
-                    elapsed_ms(started),
-                    &self.config().model,
-                    Some("rejected"),
-                );
-                return Some(DecisionOutcome {
-                    result: Err(DecisionError::Rejected(STATE_REJECTED)),
-                    latency_ms: elapsed_ms(started),
-                    receipt: None,
-                });
-            }
+        let Ok(bounded) = DecisionState::new(state) else {
+            let latency_ms = elapsed_ms(started);
+            return Some(
+                self.refuse(feature, questions, state, latency_ms, context)
+                    .await,
+            );
         };
         let request = DecisionRequest {
             model: self.0.config.model.clone(),
-            state: state.value().clone(),
+            state: bounded.value().clone(),
             questions: questions.questions().clone(),
         };
         Some(
@@ -275,6 +265,41 @@ impl Decisions {
             )
             .await,
         )
+    }
+
+    /// A state over the bound is never sent, but a logged session still gets a
+    /// row for it, so a feature that outgrows the bound shows in `caudra
+    /// decisions stats` and not only in telemetry. The row keeps the state's
+    /// size, never its content, and no receipt comes back because there is no
+    /// answer to label.
+    async fn refuse(
+        &self,
+        feature: DecisionFeature,
+        questions: &QuestionSet,
+        state: &Value,
+        latency_ms: u64,
+        context: &DecisionContext,
+    ) -> DecisionOutcome {
+        let result: Result<DecisionResponse, _> = Err(DecisionError::Rejected(STATE_REJECTED));
+        caudra_otel::emit::decision(
+            feature.name(),
+            "none",
+            latency_ms,
+            &self.config().model,
+            result.as_ref().err().map(error_kind),
+        );
+        let request = DecisionRequest {
+            model: self.0.config.model.clone(),
+            state: json!({"rejected": STATE_REJECTED, "bytes": state.to_string().len()}),
+            questions: questions.questions().clone(),
+        };
+        self.record(&feature, questions, &request, &result, latency_ms, context)
+            .await;
+        DecisionOutcome {
+            result,
+            latency_ms,
+            receipt: None,
+        }
     }
 
     async fn run(
@@ -976,23 +1001,25 @@ mod tests {
     }
 
     #[test]
-    fn rejected_projection_is_never_sent_or_logged_raw() {
+    fn rejected_state_is_logged_by_size_but_never_sent_or_stored() {
         smol::block_on(async {
             let root = tempfile::tempdir().unwrap();
+            let state_dir = StateDir::from_path(root.path().into());
             let requests = Arc::new(Mutex::new(Vec::new()));
             let service = Decisions::with_engine(
                 config(true),
-                &StateDir::from_path(root.path().into()),
+                &state_dir,
                 FakeEngine {
                     requests: requests.clone(),
                     behavior: Behavior::Answer(1.0),
                 },
             )
             .unwrap();
+            let state = json!({"command": format!("{SECRET}{}", "x".repeat(super::state::MAX_STATE_BYTES))});
             let result = service
                 .permission(
                     PermissionPurpose::AutoScreening,
-                    &json!({"command": "x".repeat(super::state::MAX_STATE_BYTES)}),
+                    &state,
                     &DecisionContext::default(),
                 )
                 .await
@@ -1004,6 +1031,22 @@ mod tests {
             assert!(matches!(result.action, Some(PermissionAction::Escalate(_))));
             assert!(result.evaluation.receipt.is_none());
             assert!(requests.lock().unwrap().is_empty());
+
+            let mut log = DecisionLog::open_existing(&state_dir).unwrap().unwrap();
+            let label_without_meta = DecisionLabel {
+                meta: Value::Null,
+                ..label()
+            };
+            log.attach_label(1, &label_without_meta).unwrap();
+            let mut output = Vec::new();
+            assert_eq!(log.export_jsonl(&mut output, None).unwrap(), 1);
+            let exported: Value = serde_json::from_slice(&output).unwrap();
+            assert_eq!(
+                exported["state"],
+                json!({"rejected": STATE_REJECTED, "bytes": state.to_string().len()})
+            );
+            assert_eq!(exported["caudra"]["error"], "rejected");
+            assert!(!String::from_utf8(output).unwrap().contains(SECRET));
         });
     }
 

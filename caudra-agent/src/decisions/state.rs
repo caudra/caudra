@@ -112,14 +112,51 @@ pub(crate) fn redact_decision_text(value: &str) -> String {
         .into_owned()
 }
 
+/// The start of `text`, redacted and at most `limit` bytes. The raw text is
+/// cut on whitespace first so redaction sees whole words, and only a bounded
+/// prefix of a long prompt is ever scanned.
+pub(crate) fn redacted_excerpt(text: &str, limit: usize) -> String {
+    let cut = text.floor_char_boundary(limit);
+    let raw = if cut < text.len() {
+        text[..cut]
+            .rsplit_once(char::is_whitespace)
+            .map_or("", |(head, _)| head)
+    } else {
+        text
+    };
+    let mut excerpt = redact_decision_text(raw);
+    excerpt.truncate(excerpt.floor_char_boundary(limit));
+    excerpt
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
     use test_case::test_case;
 
-    use super::{DecisionState, DecisionStateError, MAX_STATE_BYTES, REDACTED};
+    use super::{DecisionState, DecisionStateError, MAX_STATE_BYTES, REDACTED, redacted_excerpt};
 
     const SECRET: &str = "do-not-send-this-value";
+
+    #[test_case("fix the build", 64, "fix the build"; "fits")]
+    #[test_case("fix the build now", 11, "fix the"; "cut_on_whitespace")]
+    #[test_case("refactoring", 4, ""; "no_whitespace_before_the_cut")]
+    fn excerpts_keep_whole_words(text: &str, limit: usize, expected: &str) {
+        assert_eq!(redacted_excerpt(text, limit), expected);
+    }
+
+    #[test]
+    fn excerpts_are_redacted_within_the_limit() {
+        const LIMIT: usize = 64;
+        let text = format!(
+            "curl -u {SECRET} https://example.test {}",
+            "word ".repeat(100)
+        );
+        let excerpt = redacted_excerpt(&text, LIMIT);
+        assert!(!excerpt.contains(SECRET));
+        assert!(excerpt.starts_with("curl -u"));
+        assert!(excerpt.len() <= LIMIT);
+    }
 
     #[test_case("api_key"; "api_key")]
     #[test_case("Authorization"; "authorization")]

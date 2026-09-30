@@ -140,7 +140,7 @@ mod tests {
 
         let flattened = flatten(&done).unwrap();
         assert!(flattened.len() <= ctx.config.max_output_bytes);
-        assert!(flattened.contains("model-only context"));
+        assert!(!flattened.contains("model-only context"));
         assert!(flattened.contains("Full output was unavailable"));
     }
 

@@ -1728,6 +1728,8 @@ pub struct ToolDoneEvent {
     pub output_ref: Option<ToolOutputRef>,
     #[serde(skip)]
     pub output_limits: Option<ToolOutputLimits>,
+    /// Notes for the model only. They are never part of `model_output`;
+    /// [`Self::composed_model_output`] joins the two into what the model reads.
     #[serde(skip)]
     pub model_suffix: Option<String>,
     #[serde(skip)]
@@ -1820,9 +1822,7 @@ impl ToolDoneEvent {
             .model_output
             .clone()
             .unwrap_or_else(|| self.output.as_text());
-        if let Some(model_suffix) = self.model_suffix() {
-            append_model_suffix(&mut content, model_suffix);
-        }
+        append_model_suffix(&mut content, self.model_suffix());
         content
     }
 
@@ -1850,11 +1850,13 @@ impl ToolDoneEvent {
     }
 }
 
-fn append_model_suffix(content: &mut String, model_suffix: &str) {
-    let model_suffix = model_suffix.trim_matches(['\r', '\n']);
-    if model_suffix.is_empty() {
+fn append_model_suffix(content: &mut String, model_suffix: Option<&str>) {
+    let Some(model_suffix) = model_suffix
+        .map(|suffix| suffix.trim_matches(['\r', '\n']))
+        .filter(|suffix| !suffix.is_empty())
+    else {
         return;
-    }
+    };
     let content_len = content.trim_end_matches(['\r', '\n']).len();
     content.truncate(content_len);
     if !content.is_empty() {
@@ -1868,10 +1870,8 @@ pub fn tool_results(results: Vec<ToolDoneEvent>) -> Message {
     let mut images = Vec::new();
     let mut tool_result_image_owners = Vec::new();
     for mut r in results {
-        let result_content = r
-            .model_output
-            .take()
-            .unwrap_or_else(|| r.composed_model_output());
+        let mut result_content = r.model_output.take().unwrap_or_else(|| r.output.as_text());
+        append_model_suffix(&mut result_content, r.model_suffix());
         if let ToolOutput::Image { source, .. } = &r.output {
             images.push(ContentBlock::Image {
                 source: source.clone(),
@@ -3519,6 +3519,26 @@ mod tests {
         );
     }
 
+    #[test_case(false ; "success")]
+    #[test_case(true ; "error")]
+    fn tool_results_keeps_model_suffix_after_exact_model_output(is_error: bool) {
+        const MODEL_OUTPUT: &str = "exit code: 0\nfinished";
+        const NOTE: &str = "The call took 3s; it was estimated as instant.";
+        let mut done =
+            ToolDoneEvent::error("t1".into(), "presentation").with_model_suffix(Some(NOTE.into()));
+        done.is_error = is_error;
+        done.model_output = Some(MODEL_OUTPUT.into());
+        let expected = format!("{MODEL_OUTPUT}{MODEL_SUFFIX_SEPARATOR}{NOTE}");
+        assert_eq!(done.composed_model_output(), expected);
+
+        let message = tool_results(vec![done]);
+
+        assert!(matches!(
+            &message.content[0],
+            ContentBlock::ToolResult { content, .. } if *content == expected
+        ));
+    }
+
     #[test]
     fn tool_results_prefers_bounded_model_output_and_attaches_output_ref() {
         let temp = TempDir::new().unwrap();
@@ -3539,7 +3559,7 @@ mod tests {
             output_ref: Some(output_ref.clone()),
             output_limits: None,
             model_suffix: Some("model context".into()),
-            model_output: Some("bounded preview\n\nmodel context".into()),
+            model_output: Some("bounded preview".into()),
             model_output_from_ref: false,
             accounting: ToolAccounting::default(),
         };
