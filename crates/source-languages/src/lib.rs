@@ -63,6 +63,7 @@ pub enum Language {
     Hcl,
     Containerfile,
     Make,
+    Cuda,
 }
 
 /// What a language contributes to the graph.
@@ -119,6 +120,7 @@ pub const ALL: &[Language] = &[
     Language::Hcl,
     Language::Containerfile,
     Language::Make,
+    Language::Cuda,
 ];
 
 impl Language {
@@ -204,6 +206,7 @@ impl Language {
             "hcl" | "tf" | "tfvars" => Self::Hcl,
             "dockerfile" => Self::Containerfile,
             "mk" | "mak" => Self::Make,
+            "cu" | "cuh" => Self::Cuda,
             _ => return None,
         };
         Some(language)
@@ -247,6 +250,7 @@ impl Language {
             Self::Hcl => "hcl",
             Self::Containerfile => "containerfile",
             Self::Make => "make",
+            Self::Cuda => "cuda",
         }
     }
 
@@ -255,6 +259,10 @@ impl Language {
     /// JavaScript is deliberately parsed with the TypeScript grammar: it is a superset for every
     /// construct extraction cares about, and using one grammar keeps a `.js` and a `.ts` file
     /// producing the same node kinds, which is what lets them share one tags query.
+    ///
+    /// CUDA's grammar is generated as an extension of C++'s, so it shares the C++ tags query. It
+    /// adds the execution-space and memory-space keywords and parses a `kernel<<<grid, block>>>(…)`
+    /// launch as an ordinary call expression.
     #[must_use]
     pub fn grammar(self) -> tree_sitter::Language {
         match self {
@@ -293,6 +301,7 @@ impl Language {
             Self::Hcl => tree_sitter_hcl::LANGUAGE.into(),
             Self::Containerfile => tree_sitter_containerfile::LANGUAGE.into(),
             Self::Make => tree_sitter_make::LANGUAGE.into(),
+            Self::Cuda => tree_sitter_cuda::LANGUAGE.into(),
         }
     }
 
@@ -324,7 +333,8 @@ impl Language {
             | Self::BazelBuild
             | Self::BazelModule
             | Self::BazelBzl
-            | Self::Make => LanguageFamily::Code,
+            | Self::Make
+            | Self::Cuda => LanguageFamily::Code,
             Self::Toml | Self::Yaml | Self::Json | Self::Hcl | Self::Nix | Self::Containerfile => {
                 LanguageFamily::Config
             }
@@ -335,12 +345,12 @@ impl Language {
     /// Whether a reference written in `self` may resolve to a definition written in `other`.
     ///
     /// Same-language is always compatible. TypeScript and JavaScript are mutually compatible
-    /// because they share a grammar, a module system, and in practice a single project. C and C++
-    /// are mutually compatible as well: they link into one symbol namespace, and every `.h` parses
-    /// as C++, so a `.c` definition has to resolve against the prototype its header declares.
-    /// Everything else is refused: a YAML key named `deploy` and a Go function named `deploy` are
-    /// not the same symbol, and letting one resolve the other manufactures edges out of a spelling
-    /// coincidence.
+    /// because they share a grammar, a module system, and in practice a single project. C, C++,
+    /// and CUDA are mutually compatible as well: they link into one symbol namespace, and every
+    /// `.h` parses as C++, so a `.c` or `.cu` definition has to resolve against the prototype its
+    /// header declares. Everything else is refused: a YAML key named `deploy` and a Go function
+    /// named `deploy` are not the same symbol, and letting one resolve the other manufactures edges
+    /// out of a spelling coincidence.
     #[must_use]
     pub const fn compatible_with(self, other: Self) -> bool {
         matches!(
@@ -349,15 +359,19 @@ impl Language {
                 Self::TypeScript | Self::JavaScript,
                 Self::TypeScript | Self::JavaScript
             )
-        ) || matches!((self, other), (Self::C | Self::Cpp, Self::C | Self::Cpp))
-            || matches!(
-                (self, other),
-                (
-                    Self::BazelBuild | Self::BazelModule | Self::BazelBzl,
-                    Self::BazelBuild | Self::BazelModule | Self::BazelBzl
-                )
+        ) || matches!(
+            (self, other),
+            (
+                Self::C | Self::Cpp | Self::Cuda,
+                Self::C | Self::Cpp | Self::Cuda
             )
-            || (self as u8) == (other as u8)
+        ) || matches!(
+            (self, other),
+            (
+                Self::BazelBuild | Self::BazelModule | Self::BazelBzl,
+                Self::BazelBuild | Self::BazelModule | Self::BazelBzl
+            )
+        ) || (self as u8) == (other as u8)
     }
 
     /// The uncompiled tags query source for this language.
@@ -441,6 +455,8 @@ mod tests {
     #[test_case("a/Dockerfile", Some(Language::Containerfile) ; "an exact filename needs no extension")]
     #[test_case("a/makefile", Some(Language::Make) ; "a lowercase makefile is make")]
     #[test_case("a/main.rs", Some(Language::Rust) ; "an extension resolves")]
+    #[test_case("a/kernel.cu", Some(Language::Cuda) ; "a cuda source is cuda")]
+    #[test_case("a/kernel.cuh", Some(Language::Cuda) ; "a cuda header is cuda")]
     #[test_case("a/Dockerfile.dev", Some(Language::Containerfile) ; "a dockerfile variant is a containerfile")]
     #[test_case("a/Containerfile.ci", Some(Language::Containerfile) ; "a containerfile variant is a containerfile")]
     #[test_case("a/Dockerfile.md", Some(Language::Markdown) ; "a known extension beats the variant stem")]
@@ -469,6 +485,10 @@ mod tests {
 
     #[test_case(Language::C, Language::Cpp ; "c resolves cpp")]
     #[test_case(Language::Cpp, Language::C ; "cpp resolves c")]
+    #[test_case(Language::Cuda, Language::Cpp ; "cuda resolves cpp")]
+    #[test_case(Language::Cpp, Language::Cuda ; "cpp resolves cuda")]
+    #[test_case(Language::Cuda, Language::C ; "cuda resolves c")]
+    #[test_case(Language::C, Language::Cuda ; "c resolves cuda")]
     fn c_family_sources_resolve_against_each_other(referrer: Language, definer: Language) {
         assert!(referrer.compatible_with(definer));
     }
@@ -476,6 +496,7 @@ mod tests {
     #[test_case(Language::Cpp, Language::Rust ; "cpp does not resolve rust")]
     #[test_case(Language::C, Language::Go ; "c does not resolve go")]
     #[test_case(Language::Cpp, Language::Json ; "cpp does not resolve a config key")]
+    #[test_case(Language::Cuda, Language::Python ; "cuda does not resolve python")]
     fn the_c_family_bridge_stops_at_the_family(referrer: Language, definer: Language) {
         assert!(!referrer.compatible_with(definer));
         assert!(!definer.compatible_with(referrer));

@@ -10,6 +10,17 @@ use crate::index::{
     traversal::Context,
 };
 
+const VALUE_TRUNCATE: usize = 40;
+const CUDA_FUNCTION_SPECIFIERS: [&str; 6] = [
+    "__global__",
+    "__device__",
+    "__host__",
+    "__forceinline__",
+    "__noinline__",
+    "launch_bounds",
+];
+const CUDA_MEMORY_SPACES: [&str; 4] = ["__constant__", "__device__", "__managed__", "__shared__"];
+
 pub(super) fn spec() -> LanguageSpec {
     let mut spec = LanguageSpec::new("/", extract_nodes);
     spec.is_doc_comment = Some(|node, context| {
@@ -48,10 +59,12 @@ fn extract_nodes(
         "preproc_function_def" => Ok(c::extract_function_macro(node, context)?
             .into_iter()
             .collect()),
-        "declaration" => Ok(declaration_signature(node, context)?
-            .map(|signature| Entry::item(Section::Function, node, signature))
-            .into_iter()
-            .collect()),
+        "declaration" => Ok(match declaration_signature(node, context)? {
+            Some(signature) => Some(Entry::item(Section::Function, node, signature)),
+            None => cuda_memory_binding(node, context)?,
+        }
+        .into_iter()
+        .collect()),
         "type_definition" => {
             let field_type = context.field(node, "type")?;
             if let Some(field_type) = field_type
@@ -161,7 +174,55 @@ fn method_signature(node: Node<'_>, context: &Context<'_>) -> ExtractResult<Opti
     } else {
         format!("{return_type} {signature}")
     };
-    Ok(Some(compact_whitespace(&signature)))
+    Ok(Some(compact_whitespace(&format!(
+        "{}{signature}",
+        cuda_function_specifiers(node, context)?
+    ))))
+}
+
+/// CUDA execution-space specifiers and launch bounds, each followed by a space, so a kernel reads
+/// `__global__ void k(…)`. The C++ grammar has none of these node kinds.
+fn cuda_function_specifiers(node: Node<'_>, context: &Context<'_>) -> ExtractResult<String> {
+    let mut specifiers = String::new();
+    for child in context.children(node)? {
+        if CUDA_FUNCTION_SPECIFIERS.contains(&child.kind()) {
+            specifiers.push_str(context.text(child));
+            specifiers.push(' ');
+        }
+    }
+    Ok(specifiers)
+}
+
+/// A namespace-scope variable in a CUDA memory space, such as `__constant__ float table[64]`. The
+/// grammar wraps most memory spaces in a `type_qualifier` but leaves `__device__` a bare token of
+/// the declaration.
+fn cuda_memory_binding(node: Node<'_>, context: &Context<'_>) -> ExtractResult<Option<Entry>> {
+    let in_memory_space = context.children(node)?.into_iter().any(|child| {
+        let token = if child.kind() == "type_qualifier" {
+            child.child(0)
+        } else {
+            Some(child)
+        };
+        token.is_some_and(|token| CUDA_MEMORY_SPACES.contains(&token.kind()))
+    });
+    if !in_memory_space {
+        return Ok(None);
+    }
+    let text = context.text(node).trim_end_matches(';');
+    let initialized = match context.field(node, "declarator")? {
+        Some(declarator) if declarator.kind() == "init_declarator" => {
+            context.field(declarator, "value")?.and_then(|value| {
+                text.get(..value.start_byte() - node.start_byte())
+                    .map(|head| format!("{head}{}", truncate(context.text(value), VALUE_TRUNCATE)))
+            })
+        }
+        _ => None,
+    };
+    Ok(Some(Entry::item(
+        Section::Constant,
+        node,
+        compact_whitespace(initialized.as_deref().unwrap_or(text)),
+    )))
 }
 
 fn declaration_signature(node: Node<'_>, context: &Context<'_>) -> ExtractResult<Option<String>> {
@@ -381,7 +442,9 @@ fn extract_define(node: Node<'_>, context: &Context<'_>) -> ExtractResult<Option
     };
     let value = context
         .field(node, "value")?
-        .map_or(String::new(), |value| truncate(context.text(value), 40));
+        .map_or(String::new(), |value| {
+            truncate(context.text(value), VALUE_TRUNCATE)
+        });
     let text = if value.is_empty() {
         context.text(name).to_owned()
     } else {

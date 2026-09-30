@@ -4778,6 +4778,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "tree-sitter-cuda"
+version = "0.21.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e88ed4ad300c2fb7ed7dde1d9c1b0926bd93fc8ae1c8766898191bd85f2220f5"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
 name = "tree-sitter-dart"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5977,6 +5987,7 @@ dependencies = [
  "tree-sitter-containerfile",
  "tree-sitter-cpp",
  "tree-sitter-css",
+ "tree-sitter-cuda",
  "tree-sitter-dart",
  "tree-sitter-elixir",
  "tree-sitter-gleam",

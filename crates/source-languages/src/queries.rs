@@ -9,7 +9,7 @@ use crate::Language;
 /// Returns the vendored tags query source for a language.
 ///
 /// TypeScript and JavaScript share a query because they share a grammar. Bazel's three file shapes
-/// share Starlark's for the same reason.
+/// share Starlark's for the same reason. CUDA shares C++'s because its grammar extends C++'s.
 pub(crate) const fn source(language: Language) -> &'static str {
     match language {
         Language::Rust => include_str!("../queries/rust/tags.scm"),
@@ -22,7 +22,7 @@ pub(crate) const fn source(language: Language) -> &'static str {
         Language::Html => include_str!("../queries/html/tags.scm"),
         Language::Java => include_str!("../queries/java/tags.scm"),
         Language::C => include_str!("../queries/c/tags.scm"),
-        Language::Cpp => include_str!("../queries/cpp/tags.scm"),
+        Language::Cpp | Language::Cuda => include_str!("../queries/cpp/tags.scm"),
         Language::CSharp => include_str!("../queries/c_sharp/tags.scm"),
         Language::Ruby => include_str!("../queries/ruby/tags.scm"),
         Language::Php => include_str!("../queries/php/tags.scm"),

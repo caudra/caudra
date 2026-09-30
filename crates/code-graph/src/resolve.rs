@@ -467,6 +467,8 @@ fn build_csr(
 
 #[cfg(test)]
 mod tests {
+    use test_case::test_case;
+
     use super::*;
     use crate::ingest::{IngestLimits, SourceInput, ingest};
 
@@ -712,6 +714,29 @@ mod tests {
             ("a.rs", "fn c() { build(); }"),
         ]);
         assert_eq!(graph.edge_count(), 0);
+    }
+
+    #[test_case("a.c", "b.h" ; "c resolves a header")]
+    #[test_case("a.cu", "b.cpp" ; "cuda resolves cpp")]
+    #[test_case("a.cpp", "b.cu" ; "cpp resolves cuda")]
+    #[test_case("a.cu", "b.c" ; "cuda resolves c")]
+    fn a_c_family_call_resolves_across_the_family(caller_path: &str, callee_path: &str) {
+        let (facts, graph) = graph_of(&[
+            (caller_path, "void caller(void) { shared_helper(); }"),
+            (callee_path, "void shared_helper(void) {}"),
+        ]);
+        assert!(has_edge(
+            &graph,
+            node(&facts, "caller"),
+            node(&facts, "shared_helper")
+        ));
+    }
+
+    #[test_case("__global__ void scale(float* d) {}\nvoid run(float* d) { scale<<<1, 32>>>(d); }" ; "a kernel launch")]
+    #[test_case("template <int N> __global__ void scale(float* d) {}\nvoid run(float* d) { scale<32><<<1, 32>>>(d); }" ; "a templated kernel launch")]
+    fn a_cuda_kernel_launch_is_a_call_edge(source: &str) {
+        let (facts, graph) = graph_of(&[("kernels.cu", source)]);
+        assert!(has_edge(&graph, node(&facts, "run"), node(&facts, "scale")));
     }
 
     #[test]

@@ -16,6 +16,7 @@ tree-sitter-c-sharp.workspace = true
 tree-sitter-containerfile.workspace = true
 tree-sitter-cpp.workspace = true
 tree-sitter-css.workspace = true
+tree-sitter-cuda.workspace = true
 tree-sitter-dart.workspace = true
 tree-sitter-elixir.workspace = true
 tree-sitter-gleam.workspace = true

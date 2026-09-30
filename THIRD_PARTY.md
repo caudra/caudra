@@ -11,7 +11,8 @@ the dependency check.
 Sixteen queries — bash, c, c_sharp, cpp, go, java, json, lua, php, python, ruby, rust, swift, toml,
 typescript, yaml — are seeded from [ripwire](https://github.com/redhat-et/ripwire), Apache-2.0,
 which derived them in turn from the upstream tree-sitter grammar repositories, MIT. Each file states
-its provenance and any deliberate divergence from upstream in its header.
+its provenance and any deliberate divergence from upstream in its header. CUDA has no query of its
+own: its grammar extends C++'s, and it shares `cpp`.
 
 They are not copies. Every seeded query was re-verified against the grammar version vendored here,
 which differs from ripwire's, and capture names were normalized to the vocabulary in

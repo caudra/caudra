@@ -236,6 +236,12 @@ const LANGUAGE_CASES: &[LanguageCase] = &[
         language: "make",
         expected: "targets:\n  build: [1-2]",
     },
+    LanguageCase {
+        filename: "case.cu",
+        source: "__global__ void scale(float* data);\n",
+        language: "cuda",
+        expected: "fns:\n  __global__ void scale(float* data) [1]",
+    },
 ];
 
 const NATIVE_CONSTRUCT_CASES: &[NativeConstructCase] = &[
@@ -378,6 +384,21 @@ const NATIVE_CONSTRUCT_CASES: &[NativeConstructCase] = &[
             "enum Color",
             "Red, Green",
             "template<typename T> T run(T value)",
+        ],
+    },
+    NativeConstructCase {
+        filename: "native.cu",
+        source: "#include <cuda_runtime.h>\n__constant__ float scale_table[64];\n__constant__ int primes[16] = {2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53};\n__device__ int hit_counter;\n__managed__ int ready = 0;\n__device__ __forceinline__ float half_of(float value) { return value / 2; }\ntemplate <int BLOCK>\n__global__ void __launch_bounds__(256) scale_rows(const float* input, float* output) { output[0] = half_of(input[0]); }\nvoid launch(const float* input, float* output) { scale_rows<256><<<1, 256>>>(input, output); }\n",
+        required: &[
+            "cuda_runtime.h",
+            "consts:",
+            "__constant__ float scale_table[64]",
+            "__constant__ int primes[16] = {2, 3, 5, 7, 11, 13, 17, 19, [truncated]",
+            "__device__ int hit_counter",
+            "__managed__ int ready = 0",
+            "__device__ __forceinline__ float half_of(float value)",
+            "template<int BLOCK> __global__ __launch_bounds__(256) void scale_rows(const float* input, float* output)",
+            "void launch(const float* input, float* output)",
         ],
     },
     NativeConstructCase {
@@ -1344,6 +1365,8 @@ async fn every_extension_and_exact_filename_mapping_is_preserved() {
         ("tpp", "cpp"),
         ("tcc", "cpp"),
         ("metal", "cpp"),
+        ("cu", "cuda"),
+        ("cuh", "cuda"),
         ("cs", "c_sharp"),
         ("rb", "ruby"),
         ("rake", "ruby"),

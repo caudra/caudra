@@ -68,7 +68,7 @@ fn spec(language: Language) -> LanguageSpec {
         Language::Go => go::spec(),
         Language::Java => java::spec(),
         Language::C => c::spec(),
-        Language::Cpp => cpp::spec(),
+        Language::Cpp | Language::Cuda => cpp::spec(),
         Language::CSharp => csharp::spec(),
         Language::Ruby => ruby::spec(),
         Language::Php => php::spec(),

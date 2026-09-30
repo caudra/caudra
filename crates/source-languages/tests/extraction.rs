@@ -215,6 +215,21 @@ fn a_cpp_type_alias_is_a_type_definition(source: &str, expected: &str) {
     );
 }
 
+#[test_case("__global__ void scale(float* data) {}\n", "function:scale" ; "a kernel")]
+#[test_case("__device__ __forceinline__ float half_of(float v) { return v / 2; }\n", "function:half_of" ; "a device function")]
+#[test_case("__constant__ float table[64];\n", "constant:table" ; "a constant memory table")]
+#[test_case("void run(float* d) { scale<<<1, 32>>>(d); }\n", "call:scale" ; "a kernel launch")]
+#[test_case("void run(float* d) { scale<32><<<1, 32>>>(d); }\n", "call:scale" ; "a templated kernel launch")]
+fn cuda_parses_under_the_shared_cpp_query(source: &str, expected: &str) {
+    let captured = capture(Language::Cuda, source);
+    assert!(
+        captured.definitions.contains_key(expected) || captured.references.contains_key(expected),
+        "missing {expected}; captured {:?} and {:?}",
+        captured.definitions,
+        captured.references
+    );
+}
+
 #[test_case("struct Widget { Widget(int, char) stray; };\n", "field:stray" ; "a constructor followed by a stray token")]
 #[test_case("void set_callback(item *i, int (*callback)(item *i));\n", "constant:set_callback" ; "a prototype the grammar reads as a variable")]
 fn cpp_header_recovery_mints_no_false_definition(source: &str, unexpected: &str) {
